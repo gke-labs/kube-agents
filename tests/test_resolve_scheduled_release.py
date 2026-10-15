@@ -6,8 +6,8 @@ that passed the gate, something new to ship, and no breaking change in the range
 
 The exit codes carry as much of the design as the verdicts do, so they are
 asserted everywhere rather than only where a test is about them. Conditions 1
-and 2 failing must exit 0: a quiet week is not a broken pipeline, and a workflow
-that goes red on quiet weeks is one nobody reads, which costs more than the
+and 2 failing must exit 0: a quiet day is not a broken pipeline, and a workflow
+that goes red on quiet days is one nobody reads, which costs more than the
 automation gains. Condition 3 must exit non-zero, because a breaking change does
 not clear itself — every later run takes the same branch and GA releases stop
 until somebody publishes by hand.
@@ -260,7 +260,7 @@ class ResolveScheduledReleaseTest(unittest.TestCase):
         """Two releasable runs back to back both say yes — the cron is the cadence.
 
         The resolver deliberately has no weekday anchor and no "one release per
-        week" limiter, so nothing here rations releases by elapsed time. A
+        day" limiter, so nothing here rations releases by elapsed time. A
         limiter reintroduced later fails this.
         """
         temp_dir, repo_dir, _, head = self._repo()

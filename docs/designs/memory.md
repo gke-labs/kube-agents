@@ -452,7 +452,7 @@ It adds exactly two workloads to `kubeagents-system`.
 
 **1. `hindsight-api` — a `Deployment`, one replica** (`api.yaml`).
 
-- Image `ghcr.io/vectorize-io/hindsight-api:0.9.2`, pinned by digest. The pin
+- Image `ghcr.io/vectorize-io/hindsight-api:0.10.2`, pinned by digest. The pin
   lives in `images.json` at the repository root and the manifest takes it as a
   variable, so a mirrored install can point it at an approved registry.
 - Serves HTTP on **8888** behind a ClusterIP `Service` of the same name;
@@ -492,7 +492,11 @@ It adds exactly two workloads to `kubeagents-system`.
   there was measured against a live install and the retain still returned 400,
   because LiteLLM honours it in a model entry's `litellm_params` rather than
   globally. Per-model it would work, at the price of editing a config every
-  agent request passes through in order to accommodate one caller.
+  agent request passes through in order to accommodate one caller. The chart
+  has since paid that price for every caller on a Claude model: it renders
+  per-model `additional_drop_params` for `temperature`, `top_p` and `top_k`
+  ([inference gateway](../site/src/content/docs/concepts/inference-gateway.md#setting-the-default-model)).
+  The `none` stays, for a model outside that test that refuses temperature.
 - Requests 250m CPU/1Gi, limits 4 CPU/4Gi. The request covers steady state, reported at
   about 9m on a live install when the request came down from 2 CPU; the install and the
   sampling window were not recorded, so read it as an order of magnitude. The limit is
@@ -532,8 +536,8 @@ It adds exactly two workloads to `kubeagents-system`.
   feel.** GUCs are registered by the shared library at load, not declared in the
   extension's SQL, so a new one appears as soon as a backend loads the new library —
   which the StatefulSet restart guarantees. `hnsw.iterative_scan` is the one that
-  matters: Hindsight 0.9 defaults `HINDSIGHT_API_ANN_ITERATIVE_SCAN=true` and asks
-  for it on every pooled connection. Without it an HNSW scan makes one ground-layer
+  matters: Hindsight has defaulted `HINDSIGHT_API_ANN_ITERATIVE_SCAN=true` since 0.9
+  and asks for it on every pooled connection. Without it an HNSW scan makes one ground-layer
   pass and ends when that pass is exhausted, which can happen before the query's
   `LIMIT` is met; with it the scan resumes in `ef_search`-sized rounds until the
   `LIMIT` is met or `hnsw.max_scan_tuples` is reached. Hindsight sets that ceiling to

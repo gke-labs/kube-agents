@@ -1,0 +1,85 @@
+"agentSandbox":
+  "image":
+    "tag": "latest"
+"githubMinter":
+  "allowedServiceAccount": "mock-service-account@tftest-project.iam.gserviceaccount.com"
+  "appId": ""
+  "enabled": false
+  "kms":
+    "key": "github-token-minter-key"
+    "keyring": "github-token-minter-keyring"
+  "org": "acme"
+  "repo": "infra"
+"global":
+  "imagePullSecrets": []
+  "imageRegistry": ""
+  "thirdPartyImageRegistry": ""
+"litellm":
+  "maxTokens": 0
+  "modelDefaultName": ""
+  "modelProvider": "gemini"
+"operator":
+  "image":
+    "tag": "latest"
+  "webhooks":
+    "enabled": true
+"platformAgent":
+  "annotations": {}
+  "credentials":
+    "create": true
+    "data":
+      "API_SERVER_KEY": "k"
+      "SANDBOX_SSH_PRIVATE_KEY": "mock-private-key"
+      "SANDBOX_SSH_PUBLIC_KEY": "mock-public-key"
+      "SESSION_KV_API_KEY": "mock-password"
+      "SESSION_KV_SALT": "mock-password"
+  "deployment":
+    "availability":
+      "runtimeClassName": ""
+    "image":
+      "tag": "latest"
+  "harness":
+    "clusterName": "c"
+    "hermes":
+      "dashboardEnabled": null
+    "location": "us-central1"
+    "memory":
+      "enabled": null
+      "provider": ""
+      "userProfileEnabled": null
+    "projectId": "tftest-project"
+  "integration":
+    "github":
+      "gitRepo": "acme/infra"
+      "org": "acme"
+  "scope":
+    "exclude":
+      "clusters": []
+      "projects": []
+    "folders": []
+    "maxProjects": 100
+    "metricsScopes": []
+    "organizations": []
+    "projects": []
+    "sharedVpcHosts": []
+  "security":
+    "scopedServiceAccountPool":
+      "enabled": false
+      "serviceAccounts": []
+    "serviceAccountAnnotations":
+      "iam.gke.io/gcp-service-account": "mock-service-account@tftest-project.iam.gserviceaccount.com"
+    "serviceAccountName": "kubeagents-platform-agent"
+"plugins":
+  "pubsubPlatform":
+    "enabled": false
+    "image":
+      "tag": "latest"
+  "stockoutInvestigator":
+    "clusterName": "c"
+    "enabled": false
+    "image":
+      "tag": "latest"
+    "pubsub":
+      "sink": "gke-stockout-alerts-sink"
+      "subscription": "gke-stockout-alerts-sub"
+      "topic": "gke-stockout-alerts-topic"

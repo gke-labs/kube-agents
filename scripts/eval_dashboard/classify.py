@@ -96,9 +96,11 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 try:
+    from . import nightly as nightly_report
     from . import tiers
 except ImportError:  # imported by path (render.py run as a script)
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import nightly as nightly_report
     import tiers
 try:
     import eval_rosters
@@ -152,6 +154,24 @@ STORM_REASON_RE = re.compile(
 # two cannot drift.
 DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
 
+# --- Replay errors (#2328) ---------------------------------------------------
+# A card-wake replay whose plant or turn failed in the image (ReplayBroken) or
+# whose directive/prompt was invalid returns an errored result; at bench-gate
+# it blocks at rung 3. The reason carries "the record is not evidence of a real
+# agent run" and "trajectory is empty", which STORM_REASON_RE matches;
+# recognised before the storm check so a broken replay is classified as a
+# graded fail rather than a storm repetition.
+REPLAY_ERROR_RE = re.compile(
+    r"ReplayBroken"
+    r"|ReplayMismatch"
+    r"|failure wake:"
+    r"|question wake:"
+    r"|thread context:"
+    r"|replay declares"
+    r"|\[bench:(?:card-failure|slack-question)-wake\]",
+    re.IGNORECASE,
+)
+
 # --- Setup death (#1172, #1176) -----------------------------------------------
 # Zero tasks, concluded FAILURE, and over inside this long: the run died at
 # clone or deploy before any case ran (the adjudicator's setup-death rule).
@@ -183,8 +203,9 @@ RATE_CACHE_MAX = 8
 
 # --- The nightly beside the verdict ---------------------------------------------
 # The newest nightly run that graded the case and finished within this long
-# of the run being classified, on either side: a night is one build, so two
-# days always covers the nearest one when the periodic is running at all.
+# of the run being classified, on either side: a night is one or two builds
+# started at 00:00 UTC, so two days always covers the nearest one when the
+# periodic is running at all.
 NIGHTLY_RECENT_WINDOW = timedelta(days=2)
 
 # --- Vocabulary shared with health.json ---------------------------------------
@@ -291,15 +312,19 @@ def rep_kind(rep: dict) -> str:
     rep is one the harness could not grade: an infra verdict, or a fail whose
     reason is a never-ran phrasing. A ceiling rep is one the harness stopped
     watching with the worker still running (its reason leads with
-    DELEGATION_CEILING_MARKER); it reads `infra` too, but is not a storm."""
+    DELEGATION_CEILING_MARKER); it reads `infra` too, but is not a storm.
+    A harness-declared replay error (#2328) is a graded fail, not a storm."""
     result = str(rep.get("result") or "").lower()
     if result == "pass":
         return REP_PASS
-    if DELEGATION_CEILING_MARKER in (rep.get("reason") or ""):
+    reason = rep.get("reason") or ""
+    if DELEGATION_CEILING_MARKER in reason:
         return REP_CEILING
+    if result != "infra" and "KUBE_AGENTS_INFRA_FAILURE" not in reason and REPLAY_ERROR_RE.search(reason):
+        return REP_FAIL
     if result == "infra":
         return REP_STORM
-    if STORM_REASON_RE.search(rep.get("reason") or ""):
+    if STORM_REASON_RE.search(reason):
         return REP_STORM
     return REP_FAIL
 
@@ -637,19 +662,38 @@ def split_tiers(runs: list[dict]) -> tuple[list[dict], list[dict]]:
     return gate, nightly
 
 
+# Each nightly run's whole night as one run (nightly.joined_night_runs),
+# memoized on the nightly list split_tiers hands out, the same way.
+_NIGHT_CACHE: dict[tuple, tuple[list, dict]] = {}
+
+
+def nights_of(nightly: list[dict]) -> dict[int, dict]:
+    key = (id(nightly), len(nightly))
+    hit = _NIGHT_CACHE.get(key)
+    if hit is not None and hit[0] is nightly:
+        return hit[1]
+    nights = nightly_report.joined_night_runs(nightly)
+    if len(_NIGHT_CACHE) >= RATE_CACHE_MAX:
+        _NIGHT_CACHE.clear()
+    _NIGHT_CACHE[key] = (nightly, nights)
+    return nights
+
+
 def nightly_failed_recent(case: str, run: dict, nightly: list[dict]) -> bool | None:
     """Whether the newest nightly run within NIGHTLY_RECENT_WINDOW of `run`
     that graded `case` failed it on every graded repetition. None when no
     nightly graded it in the window (or the run has no finish time). A night
     that was a run-level event -- nearly everything failed -- says nothing
-    about one case and is skipped, as the pages skip it in per-case rates."""
+    about one case and is skipped, as the pages skip it in per-case rates;
+    a split night is judged whole, not by its small writers part alone."""
     finish = run_finish(run)
     if finish is None:
         return None
+    nights = nights_of(nightly)
     newest = None
     for other in nightly:
         when = run_finish(other)
-        if when is None or abs(when - finish) > NIGHTLY_RECENT_WINDOW or is_run_event(other):
+        if when is None or abs(when - finish) > NIGHTLY_RECENT_WINDOW or is_run_event(nights.get(id(other), other)):
             continue
         outcome = _run_facts(other)["outcomes"].get(case)
         if outcome not in (OUTCOME_PASSED, OUTCOME_PARTIAL, OUTCOME_FAILED):

@@ -283,9 +283,25 @@ class MarkTest(FlagOn):
         blocks = self.draw(_turn())
         self.assertTrue(blocks[0]["text"]["text"].startswith("**I couldn't find seeded-z.**"))
         (button,) = _buttons(blocks)
-        self.assertEqual(button["text"]["text"], "check it there")
-        self.assertEqual(button["value"], "check it there")
+        # A fixed label, whatever the question; the reply above keeps the question.
+        self.assertEqual(button["text"]["text"], "Try again")
+        self.assertEqual(button["value"], "Try again")
+        self.assertIn("Check it there?", blocks[0]["text"]["text"])
         self.assertRegex(button["action_id"], slack_presenter.CHOICE_ACTION_ID_PATTERN)
+
+    def test_under_next_a_marked_reply_is_laid_out_as_a_chat_message(self):
+        # The chat.notify stand-in asks chat_for under the same mark, and gets
+        # the reply's first sentence as the headline and Try again as a choice.
+        runtime.note_wake(SUB, {"gave_up"}, WAKE)
+        token = runtime.begin(_turn())
+        try:
+            chat = runtime.chat_for(REPLY)
+        finally:
+            runtime.end(token)
+        self.assertEqual(chat["headline"], "I couldn't find seeded-z.")
+        self.assertEqual(chat["choices"], [{"text": "Try again"}])
+        self.assertIn("Check it there?", chat["detail"])
+        self.assertIsNone(runtime.chat_for(REPLY), "an unmarked reply is not laid out")
 
     def test_a_reply_needs_its_turn_to_have_claimed_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
@@ -507,8 +523,7 @@ class MarkTest(FlagOn):
 class FlagOff(unittest.TestCase):
     def test_nothing_is_marked(self):
         runtime._marks.clear()
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop(FLAG_ENV, None)
+        with mock.patch.dict(os.environ, {FLAG_ENV: "false"}):
             runtime.note_wake(SUB, {"gave_up"}, WAKE)
         self.assertEqual(runtime._marks, {})
         self.assertIsNone(runtime.begin(_event()))

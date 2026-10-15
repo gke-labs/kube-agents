@@ -33,6 +33,9 @@ mcp_servers:
       GCP_PROJECT_ID: "${GCP_PROJECT_ID}"
       GOOGLE_CHAT_HOME_CHANNEL: "${GOOGLE_CHAT_HOME_CHANNEL}"
       SLACK_HOME_CHANNEL: "${SLACK_HOME_CHANNEL}"
+      A2A_NOTIFY_PLATFORM: "${A2A_NOTIFY_PLATFORM}"
+      NATS_URL: "${NATS_URL}"
+      A2A_BUS_USER: "${A2A_BUS_USER}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
       SESSION_KV_API_KEY: "${SESSION_KV_API_KEY}"
       SESSION_KV_DB_PATH: "${SESSION_KV_DB_PATH}"
@@ -43,10 +46,32 @@ mcp_servers:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
       - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
-      - "https://container.googleapis.com/mcp"
+      - "${KUBE_AGENTS_MCP_RELAY_URL}/gke"
+      - "--allow-http"
+      - "--transport"
+      - "http-only"
+    env:
+      MCP_REMOTE_BEARER_FILE: "${CREDENTIAL_PROXY_TOKEN_FILE}"
     lazy: true
     connect_timeout: 30
     timeout: 60
+    tools:
+      include:
+        - check_k8s_auth
+        - describe_k8s_resource
+        - get_cluster
+        - get_k8s_cluster_info
+        - get_k8s_logs
+        - get_k8s_resource
+        - get_k8s_rollout_status
+        - get_k8s_version
+        - get_node_pool
+        - get_operation
+        - list_clusters
+        - list_k8s_api_resources
+        - list_k8s_events
+        - list_node_pools
+        - list_operations
 
 platform_toolsets:
   cli:
@@ -73,6 +98,12 @@ toolsets:
 
 agent:
   max_turns: 250
+  disabled_toolsets:
+    - browser
+    - computer_use
+    - image_gen
+    - tts
+    - vision
 
 context_file_max_chars: 100000
 
@@ -89,12 +120,15 @@ memory:
 # The Platform Agent is not the chat ingress (the Chat Agent / `default`
 # profile owns that), so the session_store / session_otel_bridge ingress plugins
 # move to the Chat Agent. Keep otel for observability parity and tool_call_audit
-# to audit this privileged specialist's tool calls.
+# to audit this privileged specialist's tool calls. pr_opened records each pull
+# request this profile's kanban workers open on their card, which is what posts
+# the thread's PR message (plugins/pr_opened/__init__.py).
 plugins:
   enabled:
     - hermes_otel
     - tool_call_audit
     - incident_context
+    - pr_opened
 ```
 
 ## Sections
@@ -106,9 +140,9 @@ MCP servers Hermes exposes to the agent. `developer_knowledge` is not listed her
 Every server is `lazy: true`, so none of them is started at boot. Hermes registers a server's tools from the profile's `cache/mcp_schema_cache.json` and spawns the child process on the first call to one of its tools. The agent sees an identical tool list either way; what changes is who pays the connect. It matters because most Platform Agent turns run in a throwaway kanban worker, and connecting every server eagerly cost each of those workers roughly three seconds before the agent could say anything — a cost the long-lived gateway pays once at boot and a worker re-paid every task. The trade is that a server which cannot start now fails on its first tool call rather than at startup.
 
 - **`platform_control`** — In-pod Python MCP server (`agents/platform/scripts/platform_mcp_server.py`). Handles session state and agent-internal ops (chat ingress lives with the Planning Agent). The `env:` block is an allowlist rather than a pass-through: Hermes gives a stdio MCP server a safe baseline (`PATH`, `HOME`, `TMPDIR`, `XDG_*`) plus exactly the keys named there and drops every other pod variable, so anything a tool needs has to be listed. Currently the Kubernetes DNS variables, Hermes home, the Chat Pub/Sub config, the project ids, the Google Chat and Slack home channels, the API server key, the Session KV bearer token and database path, and the data root (`PLATFORM_AGENT_HOME`) the Cluster Agent roster tools read the profiles tree from. A home channel is what `send_notification` falls back to when a notification has no thread to reply into — every alert-driven investigation — and it needs `spec.integration.googleChat.homeChannel` set to carry a value; the bearer token is what lets it read `chat_id` and `thread_id` back in the first place, so an absent one costs the thread and the incident report both. See the comments on those keys in the source file.
-- **`gke`** — Remote GKE MCP server proxied via `mcp-remote`. All Kubernetes/GKE reads and writes route through this endpoint.
+- **`gke`** — Remote GKE MCP server, reached through `mcp-remote` and the credential proxy. `mcp-remote` sends each call to the proxy's MCP relay (the operator sets `KUBE_AGENTS_MCP_RELAY_URL` on the agent container) and presents the agent's projected token from the file `MCP_REMOTE_BEARER_FILE` names. The proxy relays only the server's read-only tools and refuses the rest, and forwards on its own credential, so the agent container needs none. `developer_knowledge` is reached the same way. `tools.include` registers only the server's read tools, the ones it annotates `readOnlyHint`, so its cluster, node-pool and manifest writes are never offered to the model; the proxy enforces the same list (`mcp_policy.GKE_READ_TOOLS`), so a write is refused even if the offer drifts. It is an allowlist on both sides: a tool the server adds later stays hidden and refused until it is named. A cluster profile already on the volume gets the `tools.include` list at the next pod start if it has none, and keeps the list it holds when a later image changes it; the proxy's list is what is enforced either way.
 
-The two servers reached through `mcp-remote` — `gke` here, and `developer_knowledge` from the shared defaults — each pass `--header User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)`. Without it the request reaches Google as undici's default `node` and the API team serving the endpoint cannot separate kube-agents traffic from anything else running on Node. Hermes resolves `${KUBE_AGENTS_VERSION}` in `args` from the agent process environment, where the image build put it — the commit the image was built from, or `dev` for a build that passed no version. `(daemon)` is the execution mode, carried in the RFC 9110 comment after the product token because that is where the API team's telemetry parser reads it from; every kube-agents profile is a background controller, so the value is the same for all of them. The string is the same everywhere it appears, including in the Cluster Agent template; it names the product, the build and the mode, and nothing else. A profile already on the volume when an image changes the string takes the new one at the next pod start: the entrypoint rewrites that one value in place in each cluster profile's `config.yaml`, and in the platform profile's when it is the front door, since the fill-only back-fill those two files get does not reach a value inside a list — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile).
+The two servers reached through `mcp-remote` — `gke` here, and `developer_knowledge` from the shared defaults — each pass `--header User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)`. Without it the request reaches Google as undici's default `node` and the API team serving the endpoint cannot separate kube-agents traffic from anything else running on Node. Hermes resolves `${KUBE_AGENTS_VERSION}` in `args` from the agent process environment, where the image build put it — the commit the image was built from, or `dev` for a build that passed no version. `(daemon)` is the execution mode, carried in the RFC 9110 comment after the product token because that is where the API team's telemetry parser reads it from; every kube-agents profile is a background controller, so the value is the same for all of them. The string is the same everywhere it appears, including in the Cluster Agent template; it names the product, the build and the mode, and nothing else. A profile already on the volume when an image changes the string takes the new one at the next pod start: the entrypoint repairs the remote server entries in each cluster profile's `config.yaml`, and in the platform profile's when it is the front door, since the fill-only back-fill those two files get does not reach a value inside a list. For the two relayed servers that repair makes the whole `args` list and the token entry the image's — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile).
 
 The two servers are timed out differently on purpose. `platform_control` gets `connect_timeout: 120` for cold-start latency — under `lazy` that bounds the first tool call rather than startup — and `timeout: 300` for long reasoning chains; it is a local subprocess, so a slow call is a slow call. `gke` gets `connect_timeout: 30` / `timeout: 60` because it is a remote endpoint reached through `mcp-remote`, where a failed call can consume the whole deadline without ever returning; the rationale is recorded in full alongside the block in [`agents/platform/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/config.yaml). Healthy calls to it measure under a second.
 
@@ -124,6 +158,8 @@ Toolsets group MCP servers into named bundles for different Hermes surfaces:
 Both include the same MCP servers plus their respective Hermes-native tools (`hermes-cli` / `hermes-api-server`), and both list `memory`. That entry is a gate, not a tool grant: Hermes only injects the memory provider's tools into a profile that names it, and a specialist reached as a kanban worker resolves its toolsets from `cli` while the API-server path uses `api_server`, so it has to appear on both for the two routes to see the same memory. Which tools it actually yields is decided by the provider — see [`memory`](#memory). `mcp-developer_knowledge` (a remote proxy to `developerknowledge.googleapis.com/mcp`) is declared in the shared defaults config ([`deploy/shared/defaults/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/defaults/config.yaml)) and merged in at build time.
 
 Note that the two files' toolset lists are **unioned**, not overridden — the build-time merge combines two lists as `list(dict.fromkeys(a + b))`. Removing an entry from `agents/platform/config.yaml` alone has no effect if the shared defaults still list it.
+
+`agent.disabled_toolsets` then removes `browser`, `computer_use`, `image_gen`, `tts` and `vision` from both surfaces, on the Platform Agent and on every Cluster Agent. Hermes applies it last, so it also narrows the toolsets a kanban worker is spawned with. None of the agents' work uses them, and declaring the full set puts Gemini on Vertex on an intermittent slow path before the first token: in a replay of a captured worker request, the 90th-percentile wait fell from 13.7s (up to 57s) to 2.8s once they were gone.
 
 No MCP server exposes an agent-to-agent call tool; delegation between agents is kanban-only.
 
@@ -164,6 +200,7 @@ Hermes plugins enabled:
 - **`hermes_otel`** — OpenTelemetry export. Its trace backend is baked into the image but rewritten at container start to the endpoint the operator resolved; see [Deploy → Telemetry](/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
 - **`tool_call_audit`** — writes per-tool-call records for audit and debug.
 - **`incident_context`** — injects Kubernetes incident context into known chat threads on reply (`pre_gateway_dispatch` hook). The work happens on the Planning Agent, which enables it too: the pod runs a single gateway and it is homed at that profile, so an incident-thread reply is dispatched there and never here. It stands aside for a message that starts with `/`: `legacy_slash_commands` is on the same hook, and prepending the triage report first would move the command off the front of the line where that plugin's anchored pattern can no longer see it.
+- **`pr_opened`** — records each pull or merge request this profile's kanban workers open as a `pr_opened` event on their card (`transform_terminal_output` hook), once the forge confirms the agent's own credential opened it; with `KAGE_SLACK_UX` on, the gateway then posts it as its own message in the card's Slack thread ([ChatOps](/kube-agents/concepts/chatops/)). With [`platformFrontDoor`](/kube-agents/operator/platformagent-crd/#platformfrontdoor) on, the operator's overlay enables it, since the back-fill never adds an entry to a list the live file already holds.
 
 The chat-ingress plugins — `session_store` (durable session state) and `session_otel_bridge` (enriches OTel spans with session context, see [Session metadata](/kube-agents/concepts/observability/#session-metadata-plumbing)) — run on the Planning Agent profile, which owns chat ingress. Their sources live in [`agents/chat/defaults/plugins/`](https://github.com/gke-labs/kube-agents/tree/main/agents/chat/defaults/plugins).
 

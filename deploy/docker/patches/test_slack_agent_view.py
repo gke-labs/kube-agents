@@ -185,7 +185,7 @@ class FlagOffTest(unittest.TestCase):
         apply(patched)
         before = load(original, MANIFEST)
         after = load(patched, MANIFEST)
-        for value in (None, "", "0", "false", "off"):
+        for value in ("", "0", "false", "off"):
             for flags in ({}, {"agent_view": True}, {"no_assistant": True}, {"agent_view": True, "name": "kube-agents"}):
                 with self.subTest(flag=value, args=flags), flag(value):
                     self.assertEqual(manifest(after, **flags), manifest(before, **flags))
@@ -197,7 +197,7 @@ class FlagOffTest(unittest.TestCase):
         before = load(original, ADAPTER)
         after = load(patched, ADAPTER)
         configured = [{"title": "t", "message": "m"}]
-        with flag(None):
+        with flag("false"):
             for extra in ({}, {"suggested_prompts": configured}):
                 with self.subTest(extra=extra):
                     self.assertEqual(prompts(after, extra), prompts(before, extra))
@@ -228,6 +228,11 @@ class FlagOnTest(unittest.TestCase):
         # Nothing handles a Stop press yet, so Slack must not offer one.
         self.assertNotIn(STOP_EVENT, events)
         self.assertIn("app_home_opened", events)
+
+    def test_flag_unset_is_on(self):
+        with flag(None):
+            got = prompts(load(self.root, ADAPTER), {})
+        self.assertEqual([row["message"] for row in got], list(SUGGESTED_PROMPTS))
 
     def test_unset_prompts_fall_back_to_the_three_asks(self):
         with flag("true"):

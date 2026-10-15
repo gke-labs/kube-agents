@@ -24,7 +24,7 @@ Every commit and build progresses through six distinct lifecycle tiers:
 | **RC Validated**           | `rc_YYMMDDHHMM_<SHORT_SHA>_validated` | Successful GKE E2E suite                      | Quality gate: proof that `install.sh` succeeded on a real GKE cluster.                                                                                                      |
 | **Eval Candidate**         | `evalcand_YYMMDDHHMM_<SHORT_SHA>`     | Successful nightly matrix                     | Nomination, not a promotion: starts the agent eval against the candidate's images, over the same case matrix that gates a pull request. Deploys nothing.                    |
 | **Staging Promoted**       | `staging_YYMMDDHHMM_<SHORT_SHA>`      | Green eval on the nomination                  | Quality gate for GA: the nightly E2E matrix and the agent eval both passed. Also the deploy trigger for the staging estate.                                                 |
-| **GA Stable**              | `X.Y.Z` (pure numeric SemVer)         | Weekly cron / manual dispatch                 | Official production release tagged on a stamped commit parented by the target commit (staging-promoted by default), and pushed to the version's release line `release/X.Y`. |
+| **GA Stable**              | `X.Y.Z` (pure numeric SemVer)         | Daily cron / manual dispatch                  | Official production release tagged on a stamped commit parented by the target commit (staging-promoted by default), and pushed to the version's release line `release/X.Y`. |
 
 Only a staging-promoted commit is releasable from `main`; a patch from a release line is gated on
 the `rc_*_validated` tag on the line's head instead. An `rc_*_validated` tag records the narrow
@@ -56,15 +56,20 @@ with manual dispatches available for overrides and off-schedule releases.
 | :-------------------------- | :----------------------------------------------------------------------------------------------------------------------------------- |
 | RC selection and validation | Every three hours, at 17 minutes past. Dispatches nothing when the newest candidate on `main` has already been tried.                |
 | Staging promotion           | Daily at 02:17 UTC, against the newest validated candidate on `main`. One already nominated or promoted is re-tested, not re-tagged. |
-| GA release                  | Weekly on Fridays at 05:17 UTC, or when a maintainer dispatches it.                                                                  |
+| GA release                  | Daily at 06:17 UTC, or when a maintainer dispatches it. A candidate promoted after that tick ships at the next one.                  |
 
 A staging promotion is not finished when its matrix goes green. The eval runs between the
 nomination and the tag and takes hours, so the `staging_*` tag can appear most of a working day
 after the run that produced it started.
 
 Scheduled runs start when GitHub's scheduler picks them up, so the minute is a floor, not a
-promise. A scheduled GA release ships unattended on Fridays if a new staging-promoted
+promise. A scheduled GA release ships unattended each day a new staging-promoted
 candidate exists, or maintainers may dispatch the workflow by hand.
+
+Every release from `main` bumps the minor number: a day's range almost always carries a `feat:`,
+and a fix-only range bumps minor too once the previous minor has its release line (see the table
+below). So the minor number advances with each release rather than with how much changed, and the
+release notes are where to read what changed between two versions.
 
 ### What the next release contains
 
@@ -115,7 +120,7 @@ Once `1.0.0` is established, the automated calculator resumes standard SemVer ru
 
 ## Who cuts a release
 
-Maintainers do, on the Friday schedule above or by hand. A patch release, `X.Y.Z+1`, is cut from the release line `release/X.Y` rather than from `main`: fixes are cherry-picked onto the line, its head passes the RC validation, and a maintainer dispatches the release naming the line; once a line has its branch, a fix-only week on `main` releases as the next minor. An emergency hotfix can skip the live-cluster validation gate — reserved for a zero-day vulnerability in a container dependency or a regression prolonging user-facing downtime — but never the build-integrity guarantees below: the images must already exist for the commit, a written justification is required, and a version tag that already points at another commit aborts the release. The dispatch commands, the bypass, and the post-release reconciliation are the maintainers' runbook in [`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release).
+Maintainers do, on the daily schedule above or by hand. A patch release, `X.Y.Z+1`, is cut from the release line `release/X.Y` rather than from `main`: fixes are cherry-picked onto the line, its head passes the RC validation, and a maintainer dispatches the release naming the line; once a line has its branch, a fix-only day on `main` releases as the next minor. An emergency hotfix can skip the live-cluster validation gate — reserved for a zero-day vulnerability in a container dependency or a regression prolonging user-facing downtime — but never the build-integrity guarantees below: the images must already exist for the commit, a written justification is required, and a version tag that already points at another commit aborts the release. The dispatch commands, the bypass, and the post-release reconciliation are the maintainers' runbook in [`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release).
 
 ## Clean promotion and artifact guarantees
 

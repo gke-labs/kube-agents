@@ -60,6 +60,9 @@ Environment:
         that ran to the delegation ceiling leaves its worker transcript under
         ``<ARTIFACTS>/worker-logs/``; unset, the stderr goes to a temp directory
         and no transcript is kept.
+    KUBE_AGENTS_TIMING_FILE: When set, the opening turn's wall-clock seconds
+        are written there as ``{"turn1_s": ...}`` (best effort; the
+        presubmit sets it per repetition). Unset, nothing is written.
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
 
     AGENT_TRANSPORT: ``api`` (default; everything above) or ``inject``, which
@@ -170,13 +173,12 @@ _log = logging.getLogger("kube_agents_bench.harness")
 
 SERVICE_API_PORT = 8642
 
-# Prefix on ``AgentResult.errors[0]`` that marks a run whose transport died on
-# every attempt: the agent tunnel never established, the opening turn never
-# reached the agent, or the delegation wait lost the endpoint on every
-# status-turn retry with cards still outstanding. ``scoring.py`` matches this
-# string on a record's error and classifies the repetition as infrastructure
-# rather than grading it. The literal is duplicated there (importing the
-# harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
+# Prefix on ``AgentResult.errors[0]`` that marks a run when the harness
+# recorded a condition under which no answer can be graded: transport exhausted,
+# or the server reporting a provider rate limit or billing stop on the opening turn.
+# ``scoring.py`` matches this string on a record's error and classifies the repetition
+# as infrastructure rather than grading it. The literal is duplicated there (importing
+# the harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
 # asserts the two strings agree: change it in both files or in neither.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
@@ -211,11 +213,17 @@ _INJECT_STATUS_TURN_SUFFIX = "/status-"
 _DEFAULT_HTTP_TIMEOUT = "600"
 _DEFAULT_DELEGATION_TIMEOUT = "1800"
 _DEFAULT_DELEGATION_POLL_INTERVAL = "30"
-# What ``tokens`` say on an inject record: the gateway reports no usage, and a
-# null bucket is the truthful value rather than a zero (``scoring.py`` reads
-# the task's final ``a2a.status-update`` entry in the trajectory as the
-# liveness signal instead).
-_INJECT_TOKENS_NOTE = "the inject transport carries no token usage; every bucket is null"
+# What ``tokens`` say on an inject record: the gateway reports no usage for
+# the turn it ran, and a null bucket is the truthful value rather than a zero
+# (``scoring.py`` reads the task's final ``a2a.status-update`` entry in the
+# trajectory as the liveness signal instead). The delegated workers are
+# another matter: when the delegation wait found the cards in the session
+# store, ``_settle`` reads the workers' sessions and their counts land under
+# ``tokens["workers"]``, beside the null top-level buckets.
+_INJECT_TOKENS_NOTE = (
+    "the inject transport carries no token usage for the turn; its buckets are null, and "
+    "tokens.workers holds the delegated workers' counts when the delegation wait read them"
+)
 # The case and repetition the presubmit is running (hack/ci-eval-pr.sh exports
 # both), which with the run id become the conversation key and the backend
 # message id so the gateway's ingress log joins to the eval record. Outside
@@ -291,6 +299,11 @@ _MAX_WORKER_LOG_BYTES = 512_000
 # Where a stalled card's transcript is kept. Prow sets ARTIFACTS to the
 # directory it uploads; a local run leaves it unset and nothing is written.
 _ARTIFACTS_ENV = "ARTIFACTS"
+# Where the opening turn's wall clock goes, for the eval dashboard.
+# hack/ci-eval-pr.sh sets it per repetition; unset, nothing is written.
+_TIMING_FILE_ENV = "KUBE_AGENTS_TIMING_FILE"
+_TIMING_TURN1_KEY = "turn1_s"
+_TIMING_DECIMALS = 3
 _WORKER_LOG_SUBDIR = "worker-logs"
 _PF_LOG_SUBDIR = "port-forward"
 # Written at the top of each spawn's stderr in the (appended) port log.
@@ -620,6 +633,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
 
 _SESSION_ID_HEADER = "X-Hermes-Session-Id"
+_FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
+_INFRA_FAILURE_REASONS = frozenset({"rate_limit", "billing"})
 
 # The session lookup only refines accounting, so it never inherits the agent's
 # (minutes-long) budget: a hung route would be billed as the agent's latency.
@@ -698,6 +713,10 @@ _POLL_PROMPT = (
 # run record on every turn, so an agent looping on kanban_create would inflate
 # both without bound. Far above any real fan-out.
 _MAX_AWAITED_TASKS = 32
+# Reads in a row on which the inject wait's board has no row for an awaited
+# card before the card is dropped from the wait. The status-turn wait ends the
+# same case after _MAX_SILENT_TURNS turns that report nothing for it.
+_MAX_UNKNOWN_CARD_READS = 3
 
 # Consecutive status turns that may report nothing before the wait is
 # abandoned. One off-turn is cheap to absorb; a run of them means the agent will
@@ -1141,6 +1160,34 @@ def _pending_first(task_ids: list[str], statuses: dict[str, str]) -> list[str]:
     return pending + [t for t in task_ids if t not in set(pending)]
 
 
+def _record_ceiling(
+    result: AgentResult,
+    observed: list[dict[str, Any]],
+    awaited: list[str],
+    outstanding: list[str],
+    statuses: dict[str, str],
+    delegation_timeout: float,
+) -> None:
+    """Record that ``outstanding`` cards outran the delegation budget.
+
+    With nothing delivered the record holds the acknowledgement alone; the
+    marker routes it to its own class in the scorer rather than a graded
+    failure of the agent under test. A partial delivery keeps the plain report
+    and grades on what arrived. Both delegation waits end their deadline path
+    here, so the two transports cannot drift on what the scorer reads.
+    """
+    if not outstanding:
+        return
+    report = (
+        "delegated tasks did not finish within "
+        f"{delegation_timeout:.0f}s: "
+        + ", ".join(f"{t} ({statuses.get(t, 'unknown')})" for t in outstanding)
+    )
+    if not delivered_results(observed, awaited):
+        report = f"{DELEGATION_CEILING_MARKER}: {report}"
+    result.errors.append(report)
+
+
 def _fold_status_turn(base: AgentResult, turn: AgentResult, *, settled: bool) -> None:
     """Fold a status turn's *accounting* into the result, and nothing else.
 
@@ -1197,18 +1244,29 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
 
 
 class _TransportError(RuntimeError):
-    """A turn that never reached the agent, or came back unreadable.
+    """A turn that failed at the transport level or returned a server failure reason.
 
-    Distinct from an agent that answered badly: the message is ready for
-    ``AgentResult.errors``.
+    Covers turns that never reached the agent, came back unreadable, or returned
+    an HTTP error. When ``failure_reason`` is populated from ``X-Hermes-Failure-Reason``,
+    the turn reached the agent handler and was classified (e.g. rate limit, billing,
+    or tool error) rather than failing invisibly in transit.
 
     ``retryable`` says whether issuing the same request again could plausibly
     succeed. It is False by default so a new raise site has to opt in.
     """
 
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        failure_reason: str | None = None,
+        status_code: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.failure_reason = failure_reason
+        self.status_code = status_code
 
 
 # Gateway statuses a proxy in front of the agent emits when the upstream is
@@ -1218,12 +1276,20 @@ class _TransportError(RuntimeError):
 # true of an opening turn and of a status poll alike, where the delegating
 # turn already ran but this poll was refused at the door -- and the condition
 # clears when a slot frees, the same run class as a saturated gateway. On
-# exhaustion both turn paths deliberately end in _infra_failure rather than
+# pure transport exhaustion both turn paths deliberately end in _infra_failure rather than
 # grading a partial record: see _DelegationTransportExhausted for why settling
 # the cards into a record that is about to be replaced wholesale is not a
-# rescue. Every other status is an answer about the request itself and
-# repeating the request cannot change it, 500 included: a handler that raised
-# will raise again.
+# rescue. A client error (non-429 4xx) or a body that is not JSON is an
+# answer about the request itself and repeating the request cannot change it:
+# a handler that raised will raise again, so those remain graded agent errors.
+# On the opening turn, a non-retryable 5xx is given one bounded retry to clear
+# transient endpoint races (such as the .env reload race, #2430); if it recurs,
+# it remains a graded agent error.
+# When the server attaches X-Hermes-Failure-Reason on an opening request,
+# the turn executed; a rate-limit or billing reason is routed to infrastructure
+# on the opening turn, while any other failure reason (or any failure reason
+# on subsequent answer turns) returns an errored result directly ahead of any
+# transport retry so the executed turn is graded as an agent error.
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 
 
@@ -1242,6 +1308,32 @@ def _connection_dropped(exc: BaseException) -> bool:
     if isinstance(exc, TimeoutError):
         return False
     return isinstance(exc, ConnectionError | http.client.IncompleteRead)
+
+
+def _write_turn_timing(turn1_s: float) -> None:
+    """Write the opening turn's seconds to ``KUBE_AGENTS_TIMING_FILE``.
+
+    Best effort, like the worker logs: a file that will not write is logged
+    and never changes the run. The temp file and ``os.replace`` make sure a
+    reader never sees half a file.
+    """
+    path = os.environ.get(_TIMING_FILE_ENV)
+    if not path:
+        return
+    target = Path(path)
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({_TIMING_TURN1_KEY: round(turn1_s, _TIMING_DECIMALS)}, handle)
+        os.replace(tmp, target)
+    except OSError as exc:
+        _log.warning("could not write the turn timing to %s: %s", target, exc)
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _post_turn(
@@ -1263,30 +1355,47 @@ def _post_turn(
             payload = json.loads(response.read().decode("utf-8"))
             session_id = response.headers.get(_SESSION_ID_HEADER, "")
     except urllib.error.HTTPError as exc:
+        failure_reason = (
+            exc.headers.get(_FAILURE_REASON_HEADER) if exc.headers else None
+        )
+        if failure_reason is not None:
+            failure_reason = failure_reason.strip()
+        retryable = exc.code in _RETRYABLE_STATUSES and failure_reason is None
         raise _TransportError(
             f"HTTP {exc.code} from agent endpoint: {_http_error_detail(exc)}",
-            retryable=exc.code in _RETRYABLE_STATUSES,
+            retryable=retryable,
+            failure_reason=failure_reason,
+            status_code=exc.code,
         ) from exc
-    except (OSError, http.client.HTTPException, ValueError) as exc:
-        # Timeouts, resets, a mid-read protocol failure, and a body that is
-        # neither UTF-8 nor JSON: transport, not agent, bugs.
+    except (OSError, http.client.HTTPException) as exc:
+        # Timeouts, resets, and mid-read protocol failures: transport bugs.
         raise _TransportError(
             f"{type(exc).__name__}: {exc}", retryable=_connection_dropped(exc)
         ) from exc
+    except ValueError as exc:
+        # A body that is neither UTF-8 nor JSON: a handler answered, so this
+        # is an answered agent turn, not an unreached transport drop.
+        raise _TransportError(
+            f"{type(exc).__name__}: {exc}",
+            retryable=False,
+        ) from exc
 
     if not isinstance(payload, dict):
-        raise _TransportError(f"agent endpoint returned non-object JSON: {type(payload).__name__}")
+        raise _TransportError(
+            f"agent endpoint returned non-object JSON: {type(payload).__name__}"
+        )
     return parse_response(payload), session_id
 
 
 def _infra_failure(detail: str) -> AgentResult:
-    """A run whose transport died under it, recorded as infrastructure.
+    """A run where no answer can be graded, recorded as infrastructure.
 
-    ``output`` is deliberately left empty. ``AgentResult.errored`` copies its
-    message into ``output``, which the eval harness writes to results.json as
-    the "Actual Output" the LLM judge grades -- and on build
-    2092339233527173120 that is how a proxy's HTTP 502 error page came to be
-    graded as the agent's answer to ``gpu-stress-test-diagnosis``
+    Covers runs where transport was exhausted or the opening turn reported an
+    infrastructure failure (rate limit or billing). ``output`` is deliberately
+    left empty. ``AgentResult.errored`` copies its message into ``output``, which
+    the eval harness writes to results.json as the "Actual Output" the LLM judge
+    grades -- and on build 2092339233527173120 that is how a proxy's HTTP 502 error
+    page came to be graded as the agent's answer to ``gpu-stress-test-diagnosis``
     ("The Actual Output consists entirely of an HTTP 502 Bad Gateway",
     OutcomeValidity 0.0). A transport failure has to set a run class, not an
     output: the marker on ``errors[0]`` is what ``scoring.py`` reads.
@@ -1444,7 +1553,13 @@ class KubeAgentsHarness(AgentHarness):
         )
         return result
 
-    def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+    def _execute(
+        self,
+        prompt: str,
+        workspace_path: Path | None = None,
+        *,
+        opening_turn: bool = True,
+    ) -> AgentResult:
         try:
             replay = card_wake.parse(prompt)
         except ValueError as exc:
@@ -1534,17 +1649,54 @@ class KubeAgentsHarness(AgentHarness):
         # upstream, so the tunnel is torn down and respawned, never merely
         # probed.
         transport_failures = 0
+        opening_5xx_retries = 0
         while True:
             try:
+                # Only the attempt that succeeds is timed: failed attempts,
+                # their backoff and the tunnel respawns are not the turn.
+                turn_started = time.monotonic()
                 result, session_id = _post_turn(url, body, headers, timeout)
+                turn1_s = time.monotonic() - turn_started
                 break
             except _TransportError as exc:
-                # A 500, a 4xx other than 429, or a body that is not JSON
-                # says a handler answered; that is the agent's own failure and
-                # still belongs in front of the judge. Only a gateway status,
-                # an admission-control 429, or a dropped connection is worth a
-                # second attempt: see _RETRYABLE_STATUSES.
+                # If the server response carried X-Hermes-Failure-Reason, an
+                # agent turn executed and produced a classified outcome.
+                # When the reason indicates an infrastructure condition
+                # (token budget exhausted on billing or provider rate limit)
+                # and this is the opening turn, it is classified as
+                # infrastructure. On subsequent answer turns (e.g. card-wake)
+                # or for agent errors (such as tool error), it returns an
+                # errored result directly ahead of any gateway transport retry
+                # so the executed and billed turn remains graded and preserved.
+                if exc.failure_reason is not None:
+                    if exc.failure_reason in _INFRA_FAILURE_REASONS and opening_turn:
+                        return _infra_failure(
+                            f"opening turn hit infrastructure failure ({exc.failure_reason}): {exc}"
+                        )
+                    detail = exc.failure_reason or "unknown"
+                    return AgentResult.errored(
+                        f"agent turn failed with {detail}: {exc}"
+                    )
+                # A 500, a 4xx other than 429, or a body that is not JSON says a handler
+                # answered. A handler that raised will raise again, so those remain graded
+                # agent errors. However, a non-retryable 5xx on the opening turn may be a
+                # transient race (such as the .env reload race, #2430) before any agent
+                # execution: give it one bounded retry without tunnel respawn. If it clears,
+                # execution continues normally. If it recurs, it remains a graded agent error.
                 if not exc.retryable:
+                    if (
+                        opening_turn
+                        and exc.status_code is not None
+                        and 500 <= exc.status_code < 600
+                        and opening_5xx_retries < 1
+                    ):
+                        opening_5xx_retries += 1
+                        _log.warning(
+                            "opening turn failed with HTTP %d: %s; retrying once (#2430)",
+                            exc.status_code,
+                            exc,
+                        )
+                        continue
                     return AgentResult.errored(str(exc))
                 transport_failures += 1
                 _log.warning(
@@ -1567,6 +1719,8 @@ class KubeAgentsHarness(AgentHarness):
                     # Counted, not returned: a forward that will not come back
                     # is the same outage, and the loop's own ceiling ends it.
                     _log.warning("port-forward respawn failed before retry: %s", pf_exc)
+        if opening_turn:
+            _write_turn_timing(turn1_s)
 
         if delegation_timeout > 0:
 
@@ -1586,6 +1740,7 @@ class KubeAgentsHarness(AgentHarness):
                         timeout=timeout,
                         delegation_timeout=delegation_timeout,
                         poll_interval=poll_interval,
+                        opening_turn=opening_turn,
                     )
                     or session_id
                 )
@@ -1661,11 +1816,11 @@ class KubeAgentsHarness(AgentHarness):
         pinned = _PINNED_RUN_ID.set(_run_id())
         answer_turn = None
         try:
-            wake_turn = self._execute(planted.wake, workspace_path)
+            wake_turn = self._execute(planted.wake, workspace_path, opening_turn=True)
             if not card_wake.no_reply(wake_turn) and not failure and replay.fresh:
                 answer_turn = self._execute_fresh_answer(replay, planted, wake_turn, workspace_path)
             elif not card_wake.no_reply(wake_turn) and not failure:
-                answer_turn = self._execute(planted.answer(replay), workspace_path)
+                answer_turn = self._execute(planted.answer(replay), workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(pinned)
             settled = card_wake.archive(_agent_shell, planted.key, _EXEC_TIMEOUT)
@@ -1705,7 +1860,7 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(str(exc))
         fresh = _PINNED_RUN_ID.set(_mint_run_id())
         try:
-            return self._execute(prompt, workspace_path)
+            return self._execute(prompt, workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(fresh)
 
@@ -2171,6 +2326,28 @@ class KubeAgentsHarness(AgentHarness):
             # task's terminal has already released the conversation. Each
             # turn gets its own message id, or the door's dedupe would answer
             # the second turn with the first turn's task.
+            #
+            # Under the bridge's api executor, though, the turn ran in the
+            # Hermes session named after the conversation's contextId, which
+            # the read route reports. That session's store holds the
+            # ``kanban_create`` results the door cannot carry, so the cards
+            # are found there and waited on off the board, with no status
+            # turn (#2619). A door too old to report the contextId, or an
+            # install whose turns do not run in that session (the cli
+            # executor), falls through to the wait below.
+            context_id = exchange.probe.context_id if exchange.probe else ""
+            session_id = board.api_session_id(context_id) if context_id else ""
+            if session_id:
+                try:
+                    if self._await_delegated_cards(
+                        result,
+                        session_id,
+                        delegation_timeout=delegation_timeout,
+                        poll_interval=poll_interval,
+                    ):
+                        return result
+                except _DelegationTransportExhausted as exc:
+                    return _infra_failure(str(exc))
             turns = 0
 
             def _status_turn(poll: str, turn_timeout: float) -> tuple[AgentResult, str]:
@@ -2188,7 +2365,8 @@ class KubeAgentsHarness(AgentHarness):
                     turn_exchange = _exchange(follow, turn_timeout, opening=False)
                 except inject.InjectUnavailable as exc:
                     raise _TransportError(
-                        f"{exc}{_abandon(follow)}", retryable=exc.retryable
+                        f"{exc}{_abandon(follow)}",
+                        retryable=exc.retryable,
                     ) from exc
                 if turn_exchange.outcome == inject.OUTCOME_NOT_ACCEPTED:
                     # Retryable, and therefore infrastructure once the wait's
@@ -2223,6 +2401,191 @@ class KubeAgentsHarness(AgentHarness):
                 return _infra_failure(str(exc))
         return result
 
+    def _await_delegated_cards(
+        self,
+        result: AgentResult,
+        session_id: str,
+        *,
+        delegation_timeout: float,
+        poll_interval: float,
+    ) -> bool:
+        """Wait off the board for the cards ``session_id`` filed; ``False`` if it filed none.
+
+        The inject transport's wait under the bridge's api executor. The
+        delegating turn's ``kanban_create`` results are in the session's own
+        store rather than in the trajectory, and a status turn cannot carry a
+        card's result back through the door either, so both the ids and the
+        results come from the pod (:func:`board.read_session_cards`, one
+        ``kubectl exec`` per poll and no model turn). Polls read statuses
+        only. Once no awaited card is moving, one last read takes the
+        deliverables of the cards the board shows terminal, and each is handed
+        to :meth:`_settle` shaped as the ``kanban_show`` result an agent would
+        have read back, so the delivered results, the graded
+        ``final_message`` and everything after are what the other waits
+        produce. A card still moving at the ceiling is read back with nothing:
+        it delivers no text, is recorded at the ceiling, and is only archived
+        and purged. Like the other waits this one follows the cards the front
+        agent filed, not their workers' children (:mod:`worker_trajectory`
+        reads those), caps them pending-first (:func:`_pending_first`) at
+        :data:`_MAX_AWAITED_TASKS`, and lets a card the session files later
+        join the wait. A card the board has no row for on
+        :data:`_MAX_UNKNOWN_CARD_READS` reads running is dropped from the
+        wait with a line on ``errors``, and nothing is graded for it.
+
+        Every read is retried up to :data:`_MAX_TRANSPORT_FAILURES` times
+        running. Returns ``False``, having changed nothing else, when the store
+        holds no card for the session -- an install whose turns do not run
+        there, or a turn that did not delegate -- and the caller waits the way
+        it always has. A first read that never succeeds falls back the same
+        way, with a line on ``errors`` saying a delegated answer may be graded
+        on the acknowledgement: ``errors`` is kept in the record, ``metadata``
+        is not. After the first read, the same exhaustion makes the run
+        infrastructure, as a status turn's transport failures do.
+
+        Raises:
+            _DelegationTransportExhausted: The board could not be read
+                :data:`_MAX_TRANSPORT_FAILURES` times running after the first
+                read succeeded.
+        """
+
+        def _read(want: Sequence[str] = ()) -> board.SessionCards | None:
+            """One read, retried; ``None`` once every try has failed."""
+            for attempt in range(1, _MAX_TRANSPORT_FAILURES + 1):
+                got = board.read_session_cards(
+                    _agent_shell,
+                    session_id,
+                    _EXEC_TIMEOUT,
+                    want=want,
+                    max_want=_MAX_AWAITED_TASKS,
+                )
+                if got is not None:
+                    return got
+                _log.warning(
+                    "session cards read failed (%d/%d)", attempt, _MAX_TRANSPORT_FAILURES
+                )
+                if attempt < _MAX_TRANSPORT_FAILURES:
+                    time.sleep(max(0.0, poll_interval))
+            return None
+
+        read = _read()
+        if read is None:
+            result.errors.append(
+                f"the session store for {session_id} could not be read "
+                f"{_MAX_TRANSPORT_FAILURES} times running; the delegation wait fell back to the "
+                "trajectory's cards, so a delegated answer may be graded on the acknowledgement"
+            )
+            return False
+        if not read.session_found or not read.card_ids:
+            why = "is not in the store" if not read.session_found else "filed no card"
+            _log.info("session %s %s; waiting on the trajectory's cards instead", session_id, why)
+            return False
+        result.metadata["delegated_cards_source"] = f"{read.source} ({session_id})"
+        if read.total > len(read.card_ids):
+            result.errors.append(
+                f"the session filed {read.total} cards; the read scanned the first "
+                f"{len(read.card_ids)}"
+            )
+
+        def _status(task_id: str) -> str:
+            return str(read.cards.get(task_id, {}).get("status") or "unknown")
+
+        def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
+            _purge_card_state(awaited, _EXEC_TIMEOUT)
+            return _DelegationTransportExhausted(
+                f"the kanban board could not be read {_MAX_TRANSPORT_FAILURES} times running; "
+                "still waiting on: " + (", ".join(still) or "nothing (reading results)")
+            )
+
+        # Cards the board has had no row for on consecutive reads, and the
+        # ones dropped for it: a create on another board, or a card deleted
+        # after filing, would otherwise hold the wait to the ceiling.
+        unknown: dict[str, int] = {}
+        missing: list[str] = []
+        awaited: list[str] = []
+        capped = False
+
+        def _merge() -> list[str]:
+            nonlocal awaited, capped
+            merged = [t for t in dict.fromkeys(awaited + read.card_ids) if t not in missing]
+            statuses = {t: _status(t) for t in merged}
+            awaited = self._capped(_pending_first(merged, statuses), None if capped else result)
+            capped = capped or len(merged) > _MAX_AWAITED_TASKS
+            for t in awaited:
+                unknown[t] = unknown.get(t, 0) + 1 if t not in read.cards else 0
+            gone = [t for t in awaited if unknown[t] >= _MAX_UNKNOWN_CARD_READS]
+            for t in gone:
+                result.errors.append(
+                    f"card {t} not on the board after {_MAX_UNKNOWN_CARD_READS} reads; "
+                    "dropped from the delegation wait, nothing graded for it"
+                )
+            missing.extend(gone)
+            awaited = [t for t in awaited if t not in gone]
+            return [t for t in awaited if _status(t) not in _TERMINAL_STATUSES]
+
+        outstanding = _merge()
+        deadline = time.monotonic() + delegation_timeout
+        timed_out = False
+        while outstanding:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            _log.info("waiting %.0fs on delegated tasks: %s", poll_interval, ", ".join(outstanding))
+            time.sleep(max(0.0, min(poll_interval, remaining)))
+            fresh = _read()
+            if fresh is None:
+                raise _exhausted(outstanding)
+            read = fresh
+            outstanding = _merge()
+
+        # Only a card the board shows terminal is read back, as the status-turn
+        # wait only ever reads a card it has seen terminal. A card still moving
+        # at the ceiling can carry text that is not its answer -- an earlier
+        # run's summary (a 429-blocked run closes with the provider's error and
+        # the card is unblocked to run again), or a ``tasks.result`` stashed
+        # before a refused completion -- and delivering it would both grade
+        # that text and hide the ceiling from the scorer.
+        settled = [t for t in awaited if _status(t) in _TERMINAL_STATUSES]
+        if settled:
+            final = _read(settled)
+            if final is None:
+                raise _exhausted(outstanding)
+            final.cards = {**read.cards, **{t: c for t, c in final.cards.items() if t in settled}}
+            read = final
+        observed: list[dict[str, Any]] = list(result.trajectory)
+        observed.extend(
+            e
+            for t in settled
+            if _status(t) in _TERMINAL_STATUSES and (e := read.as_shown(t)) is not None
+        )
+        result.metadata["delegated_cards"] = {t: _status(t) for t in awaited}
+        if missing:
+            result.metadata["delegated_cards_missing"] = list(missing)
+        if timed_out:
+            _record_ceiling(
+                result,
+                observed,
+                awaited,
+                outstanding,
+                {t: _status(t) for t in outstanding},
+                delegation_timeout,
+            )
+        # The scorer reads an inject record with no activity marker and
+        # nothing outside the envelope as one whose door showed no trace, and
+        # sets its router-scope ``tool_called`` aside (scoring._inject_blind).
+        # The workers' entries _settle appends sit outside the envelope and
+        # would flip that, grading a router check against no router calls. So
+        # on such a record they are kept off the trajectory: the worker-scope
+        # checks that could read them are set aside on inject records anyway.
+        shown = any(e.get("name") == inject.EVENT_ENTRY_ACTIVITY for e in result.trajectory)
+        before = len(result.trajectory)
+        self._settle(result, observed, awaited, stalled=outstanding if timed_out else [])
+        if not shown and len(result.trajectory) > before:
+            withheld = result.trajectory[before:]
+            del result.trajectory[before:]
+            result.metadata["worker_entries_withheld"] = len(withheld)
+        return True
+
     def _await_delegated_work(
         self,
         result: AgentResult,
@@ -2233,6 +2596,7 @@ class KubeAgentsHarness(AgentHarness):
         timeout: float,
         delegation_timeout: float,
         poll_interval: float,
+        opening_turn: bool = True,
     ) -> str:
         """Poll the agent until every card it filed settles.
 
@@ -2298,6 +2662,7 @@ class KubeAgentsHarness(AgentHarness):
         session_id = ""
         silent = 0
         transport_failures = 0
+        had_answered_failure = False
         timed_out = True
         # The freshest status seen for each card, from whichever source read
         # it last -- the board or a status turn -- for the deadline report.
@@ -2350,6 +2715,13 @@ class KubeAgentsHarness(AgentHarness):
             try:
                 status_turn, turn_session = turn(poll, min(timeout, remaining))
             except _TransportError as exc:
+                if exc.failure_reason in _INFRA_FAILURE_REASONS and opening_turn:
+                    _purge_card_state(awaited, _EXEC_TIMEOUT)
+                    raise _DelegationTransportExhausted(
+                        f"status turn hit infrastructure failure ({exc.failure_reason}): {exc}"
+                    ) from exc
+                if not exc.retryable:
+                    had_answered_failure = True
                 transport_failures += 1
                 _log.warning(
                     "status turn failed (%d/%d): %s",
@@ -2380,7 +2752,7 @@ class KubeAgentsHarness(AgentHarness):
                                 "port-forward respawn failed before retry: %s", pf_exc
                             )
                     continue
-                if exc.retryable:
+                if not had_answered_failure:
                     # Classified, not graded: appending here used to leave the
                     # run validating with the delegation receipt graded as the
                     # answer -- the exact failure this wait exists to prevent.
@@ -2394,19 +2766,20 @@ class KubeAgentsHarness(AgentHarness):
                         "running; still waiting on: " + ", ".join(outstanding) + "; "
                         f"tunnel log: {_tail(_pf_log_path(local_port))}"
                     ) from exc
-                # A handler answered every time (a non-429 4xx, a 500,
-                # non-JSON): that is the agent's own failure, so it stays in
-                # front of the judge as before -- recorded, not just logged,
-                # which is what stops devops-bench promoting the partial
-                # record.
+                # At least one turn reached a handler (a non-429 4xx, a 500,
+                # non-JSON, or a 5xx with a non-infrastructure failure reason):
+                # that is the agent's own failure, so it stays in front of the
+                # judge as before -- recorded, not just logged, which is what
+                # stops devops-bench promoting the partial record.
                 result.errors.append(
-                    f"status turns failed in transport {transport_failures} times running; "
+                    f"status turns failed in transport {transport_failures} times running (answered); "
                     "still waiting on: " + ", ".join(outstanding) + "; "
                     f"tunnel log: {_tail(_pf_log_path(local_port))}"
                 )
                 timed_out = False
                 break
             transport_failures = 0
+            had_answered_failure = False
             # Freshness comes off the turn's *new* calls, not the whole
             # replayed episode. Every earlier board reading comes back on every
             # poll, so the cumulative view would let an agent that has stopped
@@ -2449,18 +2822,7 @@ class KubeAgentsHarness(AgentHarness):
         # the budget is untouched, and claiming it ran out would misreport why
         # the run stopped.
         if outstanding and timed_out:
-            report = (
-                "delegated tasks did not finish within "
-                f"{delegation_timeout:.0f}s: "
-                + ", ".join(f"{t} ({latest.get(t, 'unknown')})" for t in outstanding)
-            )
-            # With nothing delivered the record holds the acknowledgement
-            # alone; the marker routes it to its own class in the scorer
-            # rather than a graded failure of the agent under test. A partial
-            # delivery keeps the plain report and grades on what arrived.
-            if not delivered_results(observed, awaited):
-                report = f"{DELEGATION_CEILING_MARKER}: {report}"
-            result.errors.append(report)
+            _record_ceiling(result, observed, awaited, outstanding, latest, delegation_timeout)
         # Only the deadline path leaves transcripts behind: a card still
         # outstanding after a transport failure or a mute agent did not stall,
         # and the run stopped for a reason the record already names.
@@ -2497,9 +2859,11 @@ class KubeAgentsHarness(AgentHarness):
 
         The workers' token counts land under ``tokens["workers"]`` in the
         record's buckets, per profile and summed, or ``None`` when no session
-        could be billed. They are added into the run's top-level buckets later,
-        in :meth:`_execute`, after the front door's session row is read
-        (:func:`_fold_worker_tokens` says why the order matters).
+        could be billed. On the api transport they are added into the run's
+        top-level buckets later, in :meth:`_execute`, after the front door's
+        session row is read (:func:`_fold_worker_tokens` says why the order
+        matters). On the inject transport the top-level buckets stay null (the
+        gateway reports no usage) and the counts stay under ``workers``.
         """
         _append_delivered(result, observed, awaited)
         _append_artifacts(result, awaited, _EXEC_TIMEOUT)

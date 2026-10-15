@@ -5,9 +5,9 @@ Standard command sequences for GKE upgrades. Replace placeholders: `CLUSTER_NAME
 ## Table of Contents
 - [Pre-flight](#pre-flight) (Line 12-31)
 - [Control plane upgrade](#control-plane-upgrade) (Line 32-47)
-- [Node pool upgrade (Standard only)](#node-pool-upgrade-standard-only) (Line 48-71)
-- [Maintenance window configuration](#maintenance-window-configuration) (Line 72-109)
-- [Rollback/Downgrade guidance](#rollbackdowngrade-guidance) (Line 110-145)
+- [Node pool upgrade (Standard only)](#node-pool-upgrade-standard-only) (Line 48-72)
+- [Maintenance window configuration](#maintenance-window-configuration) (Line 73-110)
+- [Rollback/Downgrade guidance](#rollbackdowngrade-guidance) (Line 111-151)
 
 ## Pre-flight
 
@@ -55,10 +55,11 @@ gcloud container node-pools update NODE_POOL_NAME \
   --max-surge-upgrade MAX_SURGE \
   --max-unavailable-upgrade MAX_UNAVAILABLE
 
-# Upgrade
-gcloud container node-pools upgrade NODE_POOL_NAME \
-  --cluster CLUSTER_NAME \
+# Upgrade (note: node pool upgrades use `clusters upgrade --node-pool`;
+# there is no `gcloud container node-pools upgrade` command)
+gcloud container clusters upgrade CLUSTER_NAME \
   --zone ZONE \
+  --node-pool NODE_POOL_NAME \
   --cluster-version TARGET_VERSION
 
 # Monitor progress
@@ -123,9 +124,9 @@ gcloud container clusters upgrade CLUSTER_NAME \
 
 ### Downgrade Node Pool (Direct)
 ```bash
-gcloud container node-pools upgrade NODE_POOL_NAME \
-  --cluster CLUSTER_NAME \
+gcloud container clusters upgrade CLUSTER_NAME \
   --zone ZONE \
+  --node-pool NODE_POOL_NAME \
   --cluster-version TARGET_PREVIOUS_VERSION
 ```
 
@@ -139,6 +140,46 @@ gcloud container node-pools create NODE_POOL_NAME-rollback \
   --num-nodes NUM_NODES \
   --machine-type MACHINE_TYPE
 
-# Cordon old pool and migrate workloads
+# Cordon old pool
 kubectl cordon -l cloud.google.com/gke-nodepool=NODE_POOL_NAME
+
+# Record current PDB state BEFORE touching anything — this file is how you put
+# it back. Do not skip; a relaxed PDB left in place is an outage waiting for
+# the next voluntary disruption.
+kubectl get pdb -A -o yaml > /tmp/pdb-backup-$(date +%s).yaml
+kubectl get pdb -A   # ALLOWED DISRUPTIONS = 0 will block the drain
+
+# Drain old pool to migrate workloads (respects PDBs)
+kubectl drain -l cloud.google.com/gke-nodepool=NODE_POOL_NAME \
+  --ignore-daemonsets --delete-emptydir-data
 ```
+
+If a PDB blocks the drain, relax it **temporarily** and restore it as a required
+step of the same runbook — never as a follow-up someone may forget:
+
+```bash
+# 1. Relax the blocking PDB (only after confirming the replacement pool is
+#    Ready and can accept the workload)
+kubectl patch pdb PDB_NAME -n NAMESPACE \
+  --type merge -p '{"spec":{"minAvailable":null,"maxUnavailable":"100%"}}'
+
+# 2. Drain, then verify workloads are Running on the replacement pool
+kubectl get pods -o wide --field-selector spec.nodeName!='' -A | grep NODE_POOL_NAME-rollback
+
+# 3. RESTORE the original PDB — mandatory, not optional. Patch back the value
+#    the backup records for PDB_NAME and clear the field step 1 set. Do not
+#    `kubectl apply` the backup: its stale resourceVersion is rejected with a
+#    conflict. If the PDB originally set minAvailable:
+kubectl patch pdb PDB_NAME -n NAMESPACE \
+  --type merge -p '{"spec":{"maxUnavailable":null,"minAvailable":ORIGINAL_MIN_AVAILABLE}}'
+#    If it originally set maxUnavailable:
+kubectl patch pdb PDB_NAME -n NAMESPACE \
+  --type merge -p '{"spec":{"maxUnavailable":ORIGINAL_MAX_UNAVAILABLE}}'
+#    (an integer as-is, a percentage quoted, e.g. "50%")
+
+# 4. Confirm the restore took effect
+kubectl get pdb -A   # ALLOWED DISRUPTIONS should match the pre-drain values
+```
+
+> A rollback runbook that relaxes PDBs without restoring them has silently
+> removed the cluster's disruption protection. Always include steps 3 and 4.

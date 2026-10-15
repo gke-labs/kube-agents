@@ -116,7 +116,7 @@ func TestBusCredentialsReadyTracksTheCallout(t *testing.T) {
 	}
 	// The rendered version travels in the message so an operator can compare
 	// it against what the callout reports at runtime.
-	authMapVersion, err := renderA2AAuthMap(a2aTestAgent())
+	authMapVersion, err := renderA2AAuthMap(a2aTestAgent(), nil)
 	if err != nil {
 		t.Fatalf("renderA2AAuthMap: %v", err)
 	}

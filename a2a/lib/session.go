@@ -48,6 +48,27 @@ const (
 	// drifted would leave a pod with the token and the shims but no Bash,
 	// and nothing would say so.
 	EnvClusterView = "A2A_CLUSTER_VIEW"
+	// EnvProfileExecutor marks a pod the dispatcher spawned for an
+	// AgentProfile (the A2A profile resource, not a Hermes profile
+	// directory). Literal "true" is on. Such a pod has no A2A_SESSION: it
+	// publishes as its profile and names its consumers for its pod, which is
+	// what the callout's profile narrowing grants. The worker refuses an
+	// empty A2A_SESSION under a bus token unless this says otherwise, so a
+	// session pod whose spawner dropped its session name still fails at
+	// startup rather than publishing as its profile.
+	EnvProfileExecutor = "A2A_PROFILE_EXECUTOR"
+	// EnvDelegateTool turns the session's delegate tool off when it is
+	// "off". The spawner sets it on a wake turn's pod: the wake exists to
+	// report a delegation's outcome, and a wake that delegates again on an
+	// interim answer ("still running, results will post here") loops until
+	// the depth bound refuses, with nothing answered.
+	EnvDelegateTool = "A2A_DELEGATE_TOOL"
+	// EnvPrimerFile names the file the spawner mounts the conversation's
+	// transcript primer at (the pod's rehydration-primer annotation, through
+	// the downward API). Every turn is a fresh pod, so this is how one picks
+	// up the conversation it is continuing. Unset, or an empty file, is a
+	// conversation with nothing before this turn.
+	EnvPrimerFile = "A2A_PRIMER_FILE"
 )
 
 const (

@@ -119,24 +119,25 @@ exit 7
 // assertions name it as Go prints it.
 const reapBoundForTest = 500 * time.Millisecond
 
-// escapingChildStub is a harness that never reads stdin and leaves a child
-// holding its stderr. The stub backgrounds a sleep under job control (its own
-// process group, out of the group kill's reach) that inherits stderr, writes
-// one stderr line, and exits with exitCode. The sleep outlives any test's
-// patience, so an unbounded reap fails on time rather than finishing late.
-// It returns the argv and the file the sleep's pid lands in; the sleep is
-// killed at cleanup.
-func escapingChildStub(t *testing.T, exitCode int, stderrLine string) ([]string, string) {
+// escapingChildStub is a harness that leaves a child holding its stderr. It
+// runs prelude first (empty for a stub that never reads stdin), then
+// backgrounds a sleep under job control (its own process group, out of the
+// group kill's reach) that inherits stderr, writes one stderr line, and exits
+// with exitCode. The sleep outlives any test's patience, so an unbounded reap
+// fails on time rather than finishing late. It returns the argv and the file
+// the sleep's pid lands in; the sleep is killed at cleanup.
+func escapingChildStub(t *testing.T, prelude string, exitCode int, stderrLine string) ([]string, string) {
 	t.Helper()
 	const sleepSeconds = 120
 	pidFile := filepath.Join(t.TempDir(), "escaped.pid")
 	harness := stub(t, fmt.Sprintf(`
+%s
 set -m
 sleep %d </dev/null >/dev/null &
 echo $! > %q
 echo %q >&2
 exit %d
-`, sleepSeconds, pidFile, stderrLine, exitCode))
+`, prelude, sleepSeconds, pidFile, stderrLine, exitCode))
 	t.Cleanup(func() {
 		raw, err := os.ReadFile(pidFile)
 		if err != nil {
@@ -202,7 +203,7 @@ func requireEscaped(t *testing.T, pidFile string) {
 // the reap ran the bound. After a failed exit Wait cannot say whether the
 // bound fired, so the line must not blame a held stderr.
 func TestStartHarness_OpeningPromptReapIsBounded(t *testing.T) {
-	harness, pidFile := escapingChildStub(t, 7, "stub left a child holding stderr")
+	harness, pidFile := escapingChildStub(t, "", 7, "stub left a child holding stderr")
 	msg := startHarnessWithin(t, harness).Error()
 	requireEscaped(t, pidFile)
 	for _, want := range []string{
@@ -256,7 +257,7 @@ func TestReapEvidence_SlowReapIsNotAHeldStderr(t *testing.T) {
 // exited cleanly and that something it started held stderr past the bound,
 // not relay "exec: WaitDelay expired before I/O complete".
 func TestStartHarness_OpeningPromptCleanExitHeldStderr(t *testing.T) {
-	harness, pidFile := escapingChildStub(t, 0, "usage: harness [--version]")
+	harness, pidFile := escapingChildStub(t, "", 0, "usage: harness [--version]")
 	msg := startHarnessWithin(t, harness).Error()
 	requireEscaped(t, pidFile)
 	for _, want := range []string{

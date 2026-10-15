@@ -57,7 +57,8 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Two today, B1-denylist-rule and A3-fastpath-redundant.
+    #: and KILLED is the failure. Three today: B1-denylist-rule, A3-fastpath-redundant
+    #: and B1-gke-mcp-overlay-copy-redundant.
     must_survive: bool = False
 
 
@@ -475,6 +476,140 @@ Mutation(
         "allows every verb beneath it, `delete` included",
     ),
     Mutation(
+        "B1-mcp-write-tool-allowed",
+        "agents/platform/scripts/mcp_policy.py",
+        ('        "list_operations",\n    }\n)\n',
+         '        "list_operations",\n        "patch_k8s_resource",\n    }\n)\n'),
+        "test_B1_the_broker_refuses_every_gke_mcp_write_tool",
+        "add the one write tool a workflow seems to need to the gke read set -- "
+        "every Platform Agent can then patch any workload in the fleet on the "
+        "broker's credential",
+    ),
+    Mutation(
+        "B1-mcp-server-reached-directly",
+        "deploy/shared/defaults/config.yaml",
+        ('      - "${KUBE_AGENTS_MCP_RELAY_URL}/gke"\n',
+         '      - "https://container.googleapis.com/mcp"\n'),
+        "test_B1_no_remote_mcp_server_is_reached_on_the_agents_own_credential",
+        "point the gke server back at Google to debug a relay problem and leave "
+        "it there -- the call then runs on whatever credential the agent "
+        "container has, past every allowlist",
+    ),
+    Mutation(
+        "B1-mcp-relay-opened-to-the-sandbox",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT,)),\n",
+         "    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_SHELL)),\n"),
+        "test_B1_only_the_gateway_reaches_the_mcp_relay",
+        "let the shell sandbox call MCP tools too, for a skill script -- every "
+        "model-authored command then has a GKE read path it never had",
+    ),
+    Mutation(
+        "B1-mcp-relay-path-drift",
+        "k8s-operator/internal/controller/platformagent_broker_split.go",
+        ('\tmcpRelayPath = "/v1/mcp"\n', '\tmcpRelayPath = "/v1/mcp-relay"\n'),
+        "test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route",
+        "rename the route on one side only -- every mcp-remote child then dials "
+        "a 404 and the gke tools stop working with no policy refusal to read",
+    ),
+    Mutation(
+        "B1-gke-mcp-allowlist-inverted",
+        "agents/cluster/config.yaml",
+        ("    tools:\n      include:\n", "    tools:\n      exclude:\n"),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "turn the Cluster Agent's allowlist into a denylist, the way a denylist "
+        "author would spell it -- the reads are now hidden and the eight write "
+        "tools, create_cluster among them, are offered to every cluster profile",
+    ),
+    Mutation(
+        "B1-gke-mcp-write-tool-in-shared-defaults",
+        "deploy/shared/defaults/config.yaml",
+        ("        - check_k8s_auth\n", "        - check_k8s_auth\n        - create_cluster\n"),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "re-offer create_cluster in the shared defaults alone. The platform "
+        "overlay is untouched, so only an assertion against the merged config "
+        "the image builds sees the union carry it to the Platform Agent",
+    ),
+    Mutation(
+        "B1-gke-mcp-unmodelled-profile",
+        "agents/chat/config.yaml",
+        ("mcp_servers:\n  router:\n",
+         'mcp_servers:\n  gke:\n    command: "node"\n    args:\n'
+         '      - "https://container.googleapis.com/mcp"\n  router:\n'),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "give the Chat Agent the gke server by copying the entry without its "
+        "filter -- a profile the test does not build is a profile it would "
+        "otherwise never read",
+    ),
+    Mutation(
+        "B1-gke-mcp-native-url-copy",
+        "agents/chat/config.yaml",
+        ("mcp_servers:\n  router:\n",
+         'mcp_servers:\n  gke2:\n    url: "https://container.googleapis.com/mcp"\n  router:\n'),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "reach the same server through Hermes' native HTTP transport instead "
+        "of mcp-remote, under a new name -- no argv for a URL match to find",
+    ),
+    Mutation(
+        "B1-gke-mcp-respelt-url-copy",
+        "agents/chat/config.yaml",
+        ("mcp_servers:\n  router:\n",
+         'mcp_servers:\n  gke2:\n    command: "node"\n    args:\n'
+         '      - "https://container.googleapis.com/mcp/"\n  router:\n'),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "copy the entry with a trailing slash on the URL -- the same endpoint, "
+        "and not byte-equal to the canonical spelling",
+    ),
+    Mutation(
+        # The platform overlay's copy of the allowlist is redundant with the
+        # shared defaults' one once the two are merged, and Hermes lets
+        # `include` win over `exclude`. Pinned as deliberate: a suite that went
+        # red here would be asserting the source file, not the profile.
+        "B1-gke-mcp-overlay-copy-redundant",
+        "agents/platform/config.yaml",
+        ("    tools:\n      include:\n", "    tools:\n      exclude:\n"),
+        "test_B1_the_gke_mcp_server_offers_no_write_tool",
+        "invert the platform overlay's copy alone; the merged config still "
+        "carries the shared defaults' allowlist, and include wins",
+        must_survive=True,
+    ),
+    Mutation(
+        "B1-slack-remove-allowlist-widened",
+        "agents/platform/scripts/credential_proxy.py",
+        ('SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove"})\n',
+         'SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove", "pins.remove"})\n'),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "exempt a second remove the same way the first was, one name added to "
+        "a set that reads as already settled",
+    ),
+    Mutation(
+        "B1-slack-remove-exemption-case-folded",
+        "agents/platform/scripts/credential_proxy.py",
+        ("            method not in SLACK_REMOVE_ALLOWLIST\n",
+         "            method.lower() not in SLACK_REMOVE_ALLOWLIST\n"),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "case-fold the exemption to match the verb rule beside it, which "
+        "forwards `Reactions.Remove` past the gate",
+    ),
+    Mutation(
+        "B1-slack-verb-rule-dropped",
+        "agents/platform/scripts/credential_proxy.py",
+        ('DESTRUCTIVE_SLACK_VERBS = frozenset({"delete", "remove", "kick", "archive"})\n',
+         'DESTRUCTIVE_SLACK_VERBS = frozenset({"kick", "archive"})\n'),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "replace the remove refusal with the allowlist rather than adding the "
+        "allowlist beside it",
+    ),
+    Mutation(
+        "B1-slack-method-shape-dropped",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if not SLACK_METHOD_SHAPE.fullmatch(method):\n",
+         "        if not method:\n"),
+        "test_B1_the_slack_relay_removes_nothing_but_its_own_reaction",
+        "drop the shape check as redundant beside the verb rule, which reads "
+        "only the text after the last dot and so forwards `chat.delete#x`",
+    ),
+    Mutation(
         "B2-second-pull-requests-write",
         ".github/workflows/conformance.yml",
         ("permissions:\n  contents: read\n\njobs:\n  conformance:\n",
@@ -624,8 +759,8 @@ Mutation(
     Mutation(
         "C1-gateway-sa-exemption",
         "charts/kube-agents/files/redactor.py",
-        ('r"[a-zA-Z0-9._%+\\-]+@(?!(?:[a-zA-Z0-9\\-]+\\.)*gserviceaccount\\.com(?!\\.?[\\w\\-]))"',
-         'r"[a-zA-Z0-9._%+\\-]+@"'),
+        ('r"+@(?!(?:[a-zA-Z0-9\\-]+\\.)*gserviceaccount\\.com(?!\\.?[\\w\\-]))"',
+         'r"+@"'),
         "test_C1_the_gateway_redactor_leaves_ordinary_manifest_content_alone",
         "simplify the e-mail pattern by dropping the service-account exemption; "
         "every IAM principal in a tool result then reaches the model as "
@@ -707,6 +842,54 @@ Mutation(
         "default branch holds, which is how the build broke in the first place; "
         "the SHA itself lives in an ARG, so the ref token is what a careless "
         "edit removes",
+    ),
+    Mutation(
+        "C4-skills-unchecked",
+        ".github/workflows/validate.yml",
+        ("run: make skills-check", "run: true"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "drop the offline lock check from validate, which a CI cleanup that "
+        "sees a step with no failures could do; the pins would then go unread",
+    ),
+    Mutation(
+        "C4-skills-check-silenced",
+        ".github/workflows/validate.yml",
+        ("run: make skills-check", "run: make skills-check || true"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "keep the step but discard its exit code, so a lock mismatch reports green",
+    ),
+    Mutation(
+        "C4-skills-check-blank-line-escape",
+        ".github/workflows/validate.yml",
+        ("        run: make skills-check\n",
+         "        run: make skills-check\n\n        continue-on-error: true\n"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "put continue-on-error after a blank line inside the step, valid YAML that GitHub honours, "
+        "which a reader that stops at the first blank line would miss",
+    ),
+    Mutation(
+        "C4-skills-check-comment-escape",
+        ".github/workflows/validate.yml",
+        ("        run: make skills-check\n",
+         "        run: make skills-check\n      # note\n        continue-on-error: true\n"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "put continue-on-error after a comment at the step's own indent; YAML still reads it as a "
+        "key of the step",
+    ),
+    Mutation(
+        "C4-skills-check-skips-lock",
+        "scripts/skill_overlay.py",
+        ("            require_mirrored(skill)\n            verify_copy(skill)\n",
+         "            require_mirrored(skill)\n"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "drop the lock check from `check` while tidying the loop, so a hand-edited copy passes",
+    ),
+    Mutation(
+        "C4-skills-make-noop",
+        "Makefile",
+        ("SKILL_OVERLAY := python3 scripts/skill_overlay.py", "SKILL_OVERLAY := true"),
+        "test_C4_upstream_skills_are_pinned_and_verified",
+        "point the make variable at a no-op, so every skills-* target succeeds without running",
     ),
     Mutation(
         "C5-minted-write-verb",
@@ -1254,6 +1437,117 @@ Mutation(
         "naming a cloud identity is still honoured",
     ),
     Mutation(
+        "A3-a2a-google-token-any-client",
+        "a2a/gateway/a2adoor_google.go",
+        ("\tif string(info.Aud) != v.clientID && string(info.Azp) != v.clientID {",
+         "\tif false {"),
+        "test_A3_a_google_token_is_bound_to_the_install_client_and_a_verified_email",
+        "accept a Google access token issued for any OAuth client, so a token "
+        "a developer granted some other app signs them in here",
+    ),
+    Mutation(
+        "A3-a2a-google-email-unverified",
+        "a2a/gateway/a2adoor_google.go",
+        ('\tif string(info.EmailVerified) != "true" {', "\tif false {"),
+        "test_A3_a_google_token_is_bound_to_the_install_client_and_a_verified_email",
+        "accept a token whose email Google has not verified, so the principal "
+        "is an address its holder never proved they own",
+    ),
+    Mutation(
+        "A3-a2a-google-prefix-unchecked",
+        "a2a/gateway/gchat.go",
+        ('\tif !ok || email == "" {', '\tif email == "" {'),
+        "test_A3_the_google_class_admits_only_a_prefixed_allowlisted_email",
+        "resolve an id that did not come through the door's Google check, so "
+        "any author stamped with the class's backend is admitted on the "
+        "allowlist alone",
+    ),
+    Mutation(
+        "A3-a2a-google-allowlist-bypassed",
+        "a2a/gateway/gchat.go",
+        ("\tif !g.a2aGoogleAllowed[strings.ToLower(email)] {", "\tif false {"),
+        "test_A3_the_google_class_admits_only_a_prefixed_allowlisted_email",
+        "admit every Google-verified email, so anyone with a Google account "
+        "and the install's public client id signs in",
+    ),
+    Mutation(
+        "A3-a2a-google-door-allowlist-skipped",
+        "a2a/gateway/a2adoor_google.go",
+        ("\tif err == nil && !d.googleAllowed[strings.ToLower(email)] {", "\tif false {"),
+        "test_A3_the_door_refuses_an_account_off_the_allowlist_before_holding_state",
+        "leave the allowlist to the gateway alone, so any Google account that "
+        "can mint a token for the install's client creates door conversations "
+        "and submissions that evict an allowed developer's",
+    ),
+    Mutation(
+        "A3-a2a-google-any-bearer-to-google",
+        "a2a/gateway/a2adoor_google.go",
+        ("\tif !strings.HasPrefix(token, a2aGoogleAccessTokenPrefix) {", "\tif false {"),
+        "test_A3_a_bearer_that_is_not_a_google_token_never_leaves_the_cluster",
+        "send every non-static bearer to Google's tokeninfo again, so a mistyped "
+        "door token or another secret pasted into Authorization leaves the cluster",
+    ),
+    Mutation(
+        "A3-a2a-google-prefix-spellable",
+        "a2a/gateway/a2adoor_google.go",
+        ('\ta2aGoogleCallerPrefix = ":google:"', '\ta2aGoogleCallerPrefix = "google:"'),
+        "test_A3_no_eval_caller_can_spell_a_google_caller",
+        "drop the leading colon, so an eval caller \"google\" naming the context "
+        "\"<email>:<ctx>\" spells a developer's conversation key with the "
+        "static token",
+    ),
+    Mutation(
+        "A3-a2a-eval-caller-colon-allowed",
+        "a2a/gateway/a2adoor.go",
+        ('\tif strings.Contains(caller, ":") {', "\tif false {"),
+        "test_A3_no_eval_caller_can_spell_a_google_caller",
+        "let an eval caller contain a colon, so the static token's holder can "
+        "name themselves \":google:<email>\" and read that developer's tasks",
+    ),
+    Mutation(
+        "A3-a2a-eval-caller-empty-allowed",
+        "a2a/gateway/a2adoor.go",
+        ('\tif caller == "" {', "\tif false {"),
+        "test_A3_no_eval_caller_can_spell_a_google_caller",
+        "let an eval caller be empty, so its conversation key starts a2a:: "
+        "like a Google caller's and the two namespaces meet",
+    ),
+    Mutation(
+        "A3-a2a-google-roster-chat-map",
+        "a2a/gateway/gateway.go",
+        ("\tif backend == consoleBackend || backend == a2aGoogleBackend {",
+         "\tif backend == consoleBackend {"),
+        "test_A3_the_google_class_roster_does_not_resolve_through_the_chat_map",
+        "send the Google class's roster through principalMapFor, whose default "
+        "is the chat map, so a door caller's id resolves as a chat identity",
+    ),
+    Mutation(
+        "A3-slack-allowlist-skipped",
+        "a2a/gateway/gchat.go",
+        ('\tif authorID == "" || (!g.slackAllowAll && !g.slackAllowed[authorID]) {',
+         '\tif authorID == "" {'),
+        "test_A3_an_unlisted_slack_sender_resolves_to_nothing",
+        "drop the Slack allowlist now that the map is no longer a gate, so any "
+        "member of the workspace is admitted as slack:<member id>",
+    ),
+    Mutation(
+        "A3-slack-foreign-workspace-admitted",
+        "a2a/gateway/slack.go",
+        ("\tif s.foreignSender(m) {\n\t\treturn InboundMessage{}, false\n\t}\n", ""),
+        "test_A3_another_workspaces_member_is_not_a_turn",
+        "drop the workspace check, so under allow-all a Slack Connect guest from "
+        "another organisation is admitted as slack:<member id> with the install's "
+        "capability",
+    ),
+    Mutation(
+        "A3-slack-map-asserts-member-prefix",
+        "a2a/gateway/gchat.go",
+        ("\t\tif strings.HasPrefix(mapped, slackMemberPrincipalPrefix) {", "\t\tif false {"),
+        "test_A3_the_slack_map_cannot_assert_a_member_id_principal",
+        "honour a map value that carries the reserved slack: prefix, so a map "
+        "entry can name a principal that claims to be some other member's id",
+    ),
+    Mutation(
         "C1-session-fence-selector-drift",
         "a2a/gateway/spawn.go",
         ('\tsessionRole = "a2a-session"', '\tsessionRole = "a2a-worker"'),
@@ -1262,6 +1556,47 @@ Mutation(
         "the shape a rename that misses the other Go module takes. Both Go "
         "suites stay green and the operator's NetworkPolicy then selects no "
         "pod, which the API server reports as success",
+    ),
+    Mutation(
+        "C1-a2a-gateway-collector-from-every-namespace",
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: gke-gmp-system\n",
+         "        - namespaceSelector: {}\n"),
+        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "drop the matchLabels from the inject fence's collector peer, the edit "
+        "that reads as \"admit Prometheus wherever it runs\" and admits every "
+        "pod in every namespace to the gateway's metrics port",
+    ),
+    Mutation(
+        "C1-a2a-gateway-collector-to-a-door-port",
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("      ports:\n        - port: 9096\n", "      ports:\n        - port: 8099\n"),
+        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "point the inject fence's collector rule at the inject door's port, so "
+        "the collector's namespace reaches a task-submission endpoint guarded "
+        "by its bearer token alone",
+    ),
+    Mutation(
+        "C1-a2a-gateway-second-ingress-rule",
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("      ports:\n        - port: 9096\n          protocol: TCP\n  podSelector:",
+         "      ports:\n        - port: 9096\n          protocol: TCP\n    - from:\n        - podSelector: {}\n"
+         "      ports:\n        - port: 8098\n          protocol: TCP\n  podSelector:"),
+        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "add a second rule beside the collector's, admitting every pod in the "
+        "namespace to the A2A door's port: the 'an in-cluster caller needs the "
+        "door' edit made without the decision the fence's comment asks for",
+    ),
+    Mutation(
+        "C1-a2a-gateway-fence-selects-a-label-the-pod-lacks",
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("  podSelector:\n    matchLabels:\n      app: test-agent-a2a-gateway\n",
+         "  podSelector:\n    matchLabels:\n      app.kubernetes.io/name: test-agent-a2a-gateway\n"),
+        "test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else",
+        "move the inject fence's selector to an app.kubernetes.io/name key the "
+        "gateway pod carries with another value, the half-done label migration: "
+        "the fence still names the Deployment, selects no pod, and the API "
+        "server reports that as success",
     ),
     Mutation(
         "C1-session-pod-gets-a-second-token",
@@ -1326,6 +1661,124 @@ Mutation(
         "Authorization header, and every brokered command from every session "
         "pod is a 401 -- with the Go suite and the Python suite both green, "
         "because neither names the other's spelling",
+    ),
+    Mutation(
+        "C1-target-allowlist-env-renamed-on-the-gateway-side",
+        "a2a/gateway/allowlist.go",
+        ('EnvTargetAllowedUsersGchat = "A2A_TARGET_ALLOWED_USERS_GCHAT"', 'EnvTargetAllowedUsersGchat = "A2A_TARGET_ALLOWEDUSERS_GCHAT"'),
+        "test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary",
+        "rename the Chat allowlist variable in the module that reads it. The "
+        "operator still renders the long name, so the gateway reads no list and "
+        "allows every delegation to the platform agent, which is the fail-open "
+        "direction and the quietest drift here",
+    ),
+    Mutation(
+        "C1-target-allowlist-env-renamed-on-the-operator-side",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ('a2aTargetAllowedUsersSlackEnvVar = "A2A_TARGET_ALLOWED_USERS_SLACK"', 'a2aTargetAllowedUsersSlackEnvVar = "A2A_TARGET_ALLOWED_USERS_SLACK_IDS"'),
+        "test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary",
+        "rename the Slack allowlist variable in the module that renders it; the "
+        "gateway keeps reading the old name and sees no list",
+    ),
+    Mutation(
+        "C1-target-allowlist-no-list-denies",
+        "a2a/gateway/allowlist.go",
+        ('\tset := g.targetAllowed[target][backend]\n\tif set == nil {\n\t\treturn true\n\t}',
+         '\tset := g.targetAllowed[target][backend]\n\tif set == nil {\n\t\treturn false\n\t}'),
+        "test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary",
+        "flip the absent-list branch from allow to deny -- a 'tighten the "
+        "default' change that looks safe and instead refuses every "
+        "delegation on a backend nobody configured a target allowlist for, "
+        "contradicting the documented bound (the ingress allowlist is the "
+        "only gate when no target list exists) that every other test here "
+        "assumes",
+    ),
+    Mutation(
+        "C1-target-allowlist-membership-check-loosened",
+        "a2a/gateway/allowlist.go",
+        ('return subject != "" && set[subject]',
+         'return subject != "" || set[subject]'),
+        "test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary",
+        "loosen the membership join from `&&` to `||`: under a configured "
+        "list, any requester with a non-blank subject is admitted whether or "
+        "not they are in the compiled set -- the allowlist stops gating "
+        "anything",
+    ),
+    Mutation(
+        "C1-target-allowlist-membership-loosened-under-a-comment",
+        "a2a/gateway/allowlist.go",
+        ('return subject != "" && set[subject]',
+         'return subject == "" || set[subject] // was: return subject != "" && set[subject]'),
+        "test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary",
+        "loosen the membership check and keep the old line in a trailing "
+        "comment; only a pin that reads the function's code without its "
+        "comments sees the check changed",
+    ),
+    Mutation(
+        "C1-relay-spells-the-delegate-artifact-by-hand",
+        "a2a/gateway/relay.go",
+        ('case lib.ArtifactDelegate:', 'case "delegate":'),
+        "test_C1_the_delegate_artifact_is_spelled_once",
+        "hand-spell the reserved artifact name in the relay's switch instead "
+        "of referencing lib.ArtifactDelegate -- compiles, routes identically "
+        "today, and stops agreeing with the constant the day its value "
+        "changes",
+    ),
+    Mutation(
+        "C1-worker-adapter-spells-the-delegate-artifact-by-hand",
+        "a2a/worker-adapter/adapter.go",
+        ('a.publishArtifactPart(ctx, lib.ArtifactDelegate,',
+         'a.publishArtifactPart(ctx, "delegate",'),
+        "test_C1_the_delegate_artifact_is_spelled_once",
+        "hand-spell the reserved artifact name at the adapter's one publish "
+        "site instead of referencing lib.ArtifactDelegate",
+    ),
+    Mutation(
+        "C1-delegate-text-cap-hand-spelled-in-delegation",
+        "a2a/gateway/delegation.go",
+        ('len(req.Text) > lib.DelegateTextCap {', 'len(req.Text) > 16*1024 {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "hand-type the cap in the gateway's own length check instead of "
+        "referencing lib.DelegateTextCap -- agrees with the constant today "
+        "and silently stops the day someone edits only the constant",
+    ),
+    Mutation(
+        "C1-delegate-text-cap-shifted-in-delegation",
+        "a2a/gateway/delegation.go",
+        ('len(req.Text) > lib.DelegateTextCap {', 'len(req.Text) > 1<<14 {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "spell the gateway's cap as a shift the magic-number regex does not "
+        "name; only the positive check, scoped to handleDelegateRequest, "
+        "sees that the shared constant is gone from the check (the rest of "
+        "delegation.go still references it)",
+    ),
+    Mutation(
+        "C1-delegate-text-cap-shifted-under-a-comment-naming-it",
+        "a2a/gateway/delegation.go",
+        ('len(req.Text) > lib.DelegateTextCap {', 'len(req.Text) > 1<<14 { // lib.DelegateTextCap, as a shift'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "spell the gateway's cap as a shift and leave the constant's name in "
+        "a comment on the same line; only a pin that reads the function's "
+        "code without its comments sees the constant gone",
+    ),
+    Mutation(
+        "C1-delegate-text-cap-hand-spelled-in-worker-adapter",
+        "a2a/worker-adapter/delegate.go",
+        ('len(req.Text) > lib.DelegateTextCap:', 'len(req.Text) > 16*1024:'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "hand-type the cap in the adapter's validateDelegate instead of "
+        "referencing lib.DelegateTextCap",
+    ),
+    Mutation(
+        "C1-delegate-schema-property-renamed",
+        "a2a/worker-adapter/mcp.go",
+        ('"addressee": map[string]any{"type": "string", "description": "The agent to hand the task to. Today only \\"platform\\"."},',
+         '"target": map[string]any{"type": "string", "description": "The agent to hand the task to. Today only \\"platform\\"."},'),
+        "test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape",
+        "rename the schema's addressee property to target without touching "
+        "lib.DelegateRequest: the model calls the tool exactly as the schema "
+        "says, the adapter decodes straight into DelegateRequest, and the "
+        "addressee it reads is always empty",
     ),
     Mutation(
         "C1-cluster-view-env-renamed-on-the-gateway-side",
@@ -1400,10 +1853,28 @@ Mutation(
         "user; the static credential it names is the half the bridge inherited",
     ),
     Mutation(
+        "C1-rendered-bridge-keeps-the-bus-token",
+        "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
+        ("\t\tif !a2aIsBusTokenMount(m) {\n\t\t\tmounts = append(mounts, m)\n\t\t}",
+         "\t\tmounts = append(mounts, m)"),
+        "test_C1_the_rendered_bridge_is_not_the_agent_principal",
+        "copy every agent mount into the rendered bridge, bus token included: "
+        "the bridge then authenticates as the agent principal and the A5 split "
+        "is undone by a volumeMount",
+    ),
+    Mutation(
+        "C1-rendered-bridge-inherits-the-agent-bus-user",
+        "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
+        ("\ta2aBusUserEnv:               true,\n", ""),
+        "test_C1_the_rendered_bridge_is_not_the_agent_principal",
+        "let the rendered bridge inherit A2A_BUS_USER=agent, the agent "
+        "principal's name and inbox prefix",
+    ),
+    Mutation(
         "A3-session-writes-its-own-supervisor-subject",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.TaskSupervisorSubject(pod, "*"),\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.TaskSupervisorSubject(addressee, "*"),\n\t\t},'),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",
         "derive a session a grant on its own supervisor subject -- the "
         "helpful-looking change that lets a worker adapter finalise itself "
@@ -1411,14 +1882,87 @@ Mutation(
         "infrastructure",
     ),
     Mutation(
-        "A3-session-per-task-wildcard",
+        "A3-bridge-sends-a-notify",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.notify.gchat",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "grant the static bridge publish on the notify subject, so a task the "
+        "bridge runs can post its result to the home channel directly -- it "
+        "shares the agent's pod and reads as the same workload. The gateway "
+        "then posts as the install's bot for a second principal",
+    ),
+    Mutation(
+        "A3-bridge-sends-a-slack-notify",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.notify.slack",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "grant the static bridge publish on the Slack notify subject, "
+        "so a task the bridge runs can make the Slack bot post to the home "
+        "channel without the agent",
+    ),
+    Mutation(
+        "A3-agent-answers-its-own-notify",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifyReplySubjects)\n"),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "give the agent publish on the notify reply namespace, the symmetric-"
+        "looking grant (it already reads there). The agent can then forge the "
+        "gateway's answer about where a post landed",
+    ),
+    Mutation(
+        "A3-session-sends-a-notify",
         "a2a/authcallout/session.go",
         ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.TaskInSubject(pod, "*"),\n\t\t},'),
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.NotifySubjectGchat,\n\t\t},'),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "derive a session pod a publish grant on the notify subject, so a "
+        "session can post its result to the home channel itself. The gateway "
+        "then posts as the install's bot for whatever runs in a session pod",
+    ),
+    Mutation(
+        "A3-session-per-task-wildcard",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.TaskInSubject(addressee, "*"),\n\t\t},'),
         "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
         "widen the session's task-plane grant toward the per-task wildcard the "
         "cards sketched, which puts the executor in its own in-subject writer "
         "set: it can steer and cancel itself as if from the user",
+    ),
+    Mutation(
+        "A3-profile-pod-writes-its-own-supervisor-subject",
+        "a2a/authcallout/profile_narrowing.go",
+        ("\tg := executorGrants(profile, pod)\n",
+         "\tg := executorGrants(profile, pod)\n\tg.Publish = append(g.Publish, lib.TaskSupervisorSubject(profile, \"*\"))\n"),
+        "test_A3_the_supervisor_subject_has_exactly_one_writer",
+        "derive an AgentProfile's pods a grant on their profile's supervisor "
+        "subject, the janitor's. A profile pod could then end its own task, or "
+        "a sibling's, and have it read as the janitor declaring it dead",
+    ),
+    Mutation(
+        "A3-profile-pod-writes-its-own-in-subject",
+        "a2a/authcallout/profile_narrowing.go",
+        ("\tg := executorGrants(profile, pod)\n",
+         "\tg := executorGrants(profile, pod)\n\tg.Publish = append(g.Publish, lib.TaskInSubject(profile, \"*\"))\n"),
+        "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
+        "derive an AgentProfile's pods a publish grant on their profile's in "
+        "subject. Every pod of the profile could then steer or cancel any of "
+        "the profile's tasks as if from the requester",
+    ),
+    Mutation(
+        "A3-session-gains-publish-on-anothers-in-subject",
+        "a2a/authcallout/session.go",
+        ('\tg.Publish = append(g.Publish, inbox)\n\treturn g, nil\n}',
+         '\tg.Publish = append(g.Publish, inbox)\n\tg.Publish = append(g.Publish, lib.TaskInSubject("platform", "*"))\n\treturn g, nil\n}'),
+        "test_A3_the_session_grants_no_publish_on_another_addressees_in_subject",
+        "append a literal-addressee grant to the session's Publish list after "
+        "its initial literal, which the narrower in-subject-wildcard mutation "
+        "above would not see: a session that can publish on another "
+        "addressee's `…in` can mint or steer that addressee's tasks as if "
+        "from the user",
     ),
     Mutation(
         "A3-bridge-events-grant-rewildcarded",
@@ -1490,6 +2034,32 @@ Mutation(
         "the conformance suite pins against a2a/lib, and after this edit the "
         "name the operator actually refuses is a literal no test reads. The "
         "next rename moves the constant and leaves the drop behind",
+    ),
+    Mutation(
+        "C1-reserved-principals-env-renamed-on-the-callout-side",
+        "a2a/cmd/authcallout/main.go",
+        ('envReservedPrincipals = "A2A_RESERVED_PRINCIPALS"',
+         'envReservedPrincipals = "A2A_STATIC_PRINCIPALS"'),
+        "test_C1_the_callouts_reserved_principals_env_is_spelled_the_same_in_both_modules",
+        "rename the callout's reserved-principals variable to say what the "
+        "names are, in the module that reads it. a2a builds and its tests set "
+        "the env by the same constant, so they stay green; the operator is not "
+        "rebuilt by this edit and goes on rendering A2A_RESERVED_PRINCIPALS. "
+        "The next callout rollout's pods exit with A2A_STATIC_PRINCIPALS is "
+        "required and never go Ready",
+    ),
+    Mutation(
+        "C1-reserved-addressees-env-renamed-on-the-callout-side",
+        "a2a/cmd/authcallout/main.go",
+        ('envReservedAddressees = "A2A_RESERVED_ADDRESSEES"',
+         'envReservedAddressees = "A2A_FIXED_ADDRESSEES"'),
+        "test_C1_the_callouts_reserved_addressees_env_is_spelled_the_same_in_both_modules",
+        "rename the callout's reserved-addressees variable to say what the "
+        "names are, in the module that reads it. a2a builds and its tests set "
+        "the env by the same constant, so they stay green; the operator is not "
+        "rebuilt by this edit and goes on rendering A2A_RESERVED_ADDRESSEES. "
+        "The next callout rollout's pods exit with A2A_FIXED_ADDRESSEES is "
+        "required and never go Ready",
     ),
     Mutation(
         "C1-agent-principal-gets-a-static-password",

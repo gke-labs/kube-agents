@@ -1,0 +1,23 @@
+Subject: Drop the unused NAMESPACE variable
+
+Why: find-scale-down-blockers.sh sets NAMESPACE but never reads it (the -n flag works through NS_FLAG), which shellcheck reports as SC2034 now that make shellcheck lints the gke-* skills. The patch drops the two dead lines; the script behaves the same.
+Local-Issue: none (#2867)
+Upstream-Issue: none filed yet
+Retire-When: upstream drops or uses the NAMESPACE variable
+
+diff --git a/assets/find-scale-down-blockers.sh b/assets/find-scale-down-blockers.sh
+--- a/assets/find-scale-down-blockers.sh
++++ b/assets/find-scale-down-blockers.sh
+@@ -35,12 +35,10 @@ EOF
+ }
+ 
+ NS_FLAG=(-A)
+-NAMESPACE=""
+ while [[ $# -gt 0 ]]; do
+   case "$1" in
+     -h|--help) usage; exit 0 ;;
+     -n)        [[ -z "${2:-}" ]] && { echo "Error: -n requires a namespace." >&2; exit 1; }
+-               NAMESPACE="$2"
+                NS_FLAG=(-n "$2"); shift 2 ;;
+     *)         echo "Unknown arg: $1" >&2; usage; exit 1 ;;
+   esac

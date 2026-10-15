@@ -54,7 +54,7 @@ numeric IDs), with the Cloud Asset Inventory search the reconcile runs for a con
 `searchAllResources` call scoped to it, filtered to `container.googleapis.com/Cluster`, the project
 read out of each asset name. The pool's accounts are Terraform's, one per project, so a member the
 reconcile would discover under the container has to be known at plan time to get one. The members
-get a pool account and nothing else: no binding of their own, since the container's grant is
+get a pool account and nothing else (no drift audit-log sink: which projects get one is the drift-pubsub README's "Exporting the scope's other projects"): no binding of their own, since the container's grant is
 inherited, and no place in the resolved-set cap, which counts containers at runtime after the
 explicit projects and the selectors. A project created under the container between applies is
 discovered and gets its profile, and every kubectl for it is refused until the next `upgrade.sh`
@@ -120,5 +120,6 @@ answers the postconditions refuse (a read the identity cannot make, a document t
 read, a second page, a selector past the per-selector cap), what an exclude entry or a legacy
 ID leaves out, and the container read for the pool (`tests/container_members.tftest.hcl`): what a
 folder and an organisation list to, that nothing is read with the pool off, and the answers refused. `make terraform-test` runs them, as the `validate` job in `validate.yml` does on every
-pull request; `mock_provider` needs Terraform 1.7 or newer, above the floor the module declares for an
+pull request; the suites need Terraform 1.11 or newer (`mock_provider` from 1.7, `override_during`
+from 1.11), above the floor the module declares for an
 install.

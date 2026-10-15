@@ -353,6 +353,30 @@ def _collector_waiver(audit_id: str, collector_audits: frozenset) -> List[str]:
     return ["--no-collector-manifest", "e2e fixture document; no collector ran"]
 
 
+def _sample_cluster_checks(spec) -> Tuple[str, str]:
+    """Return `(valid_check, na_check)` from `spec` for a cluster-scoped `finish` fixture.
+
+    Both tests invoke `audit_report.py finish` directly without a preceding `start`
+    run record. A finding whose check is in `spec.declarable` is treated as an
+    unsearched posture finding and withheld before ledger publication, leaving
+    `findings` empty and skipping `issue-update` when a stream's `checks[0]` is
+    declarable (e.g. `overrequest` on `fleet-wide-cost-analysis`). Pick the first
+    cluster-scoped check not in `spec.declarable` for `valid_check`, and a distinct
+    cluster-scoped check for `na_check` so the two never collide in `checks_run` vs
+    `checks_not_applicable`.
+    """
+    cluster_checks = next(
+        (checks for kind, checks in spec.scopes if kind == "cluster"),
+        spec.checks,
+    )
+    valid_check = next(
+        (c for c in cluster_checks if c not in spec.declarable),
+        cluster_checks[0],
+    )
+    na_check = next(c for c in cluster_checks if c != valid_check)
+    return valid_check, na_check
+
+
 @pytest.mark.parametrize(
     "audit_id,human_name",
     AUDIT_STREAMS,
@@ -379,8 +403,10 @@ def test_audit_report_ledger_dryrun_all_streams(
     cluster = gke_cluster_name or "test-cluster"
     project = gcp_project_id or "test-project"
 
-    # Retrieve first valid check slug for checks_run and a distinct second check slug for checks_not_applicable.
-    # audit_report.py rejects any document where the same check slug appears in both checks_run and checks_not_applicable.
+    # Retrieve first non-declarable cluster check slug for checks_run and a distinct second check slug
+    # for checks_not_applicable. audit_report.py rejects any document where the same check slug appears
+    # in both checks_run and checks_not_applicable, and withholds declarable posture checks when finish
+    # runs without a start run record.
     import sys
     script_dir_str = str(_AUDIT_REPORT_SCRIPT.parent)
     if script_dir_str not in sys.path:
@@ -392,10 +418,10 @@ def test_audit_report_ledger_dryrun_all_streams(
     from audit_report import AUDITS, COLLECTOR_AUDITS
 
     assert audit_id in AUDITS, f"Audit stream '{audit_id}' not found in audit_report.AUDITS"
-    roster = AUDITS[audit_id].checks
+    spec = AUDITS[audit_id]
+    roster = spec.checks
     assert len(roster) >= 2, f"Audit stream '{audit_id}' has {len(roster)} checks, expected at least 2"
-    valid_check = roster[0]
-    na_check = roster[1]
+    valid_check, na_check = _sample_cluster_checks(spec)
     na_reason = "GKE Autopilot: Google owns this resource; check is not applicable on Autopilot clusters."
     checks_not_applicable = [
         {
@@ -484,6 +510,10 @@ def test_audit_report_ledger_dryrun_all_streams(
         assert na_reason in proc.stdout, (
             f"Audit stream '{audit_id}' ({human_name}) dry-run output missing reason '{na_reason}' under Not applicable:\n"
             f"STDOUT:\n{proc.stdout}"
+        )
+        assert f"Sample finding for {human_name}" in proc.stdout, (
+            f"Audit stream '{audit_id}' ({human_name}) dry-run output missing sample finding title "
+            f"(finding may have been withheld):\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
         )
     finally:
         if os.path.exists(temp_path):
@@ -585,7 +615,11 @@ def test_audit_report_github_api_lifecycle_mocked(
         audit_report.resolve_repo = lambda *args, **kwargs: "test-org-kube-agent/agents-repo"
         audit_report.repo_root = lambda: workspace
 
-        valid_check = audit_report.AUDITS[audit_id].checks[0] if audit_id in audit_report.AUDITS and audit_report.AUDITS[audit_id].checks else "single-zone-nodepool"
+        valid_check = (
+            _sample_cluster_checks(audit_report.AUDITS[audit_id])[0]
+            if audit_id in audit_report.AUDITS and audit_report.AUDITS[audit_id].checks
+            else "single-zone-nodepool"
+        )
 
         doc = {
             "audit": audit_id,

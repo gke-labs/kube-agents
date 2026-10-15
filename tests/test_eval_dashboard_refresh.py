@@ -31,6 +31,7 @@ _SCRUB = (
     "EVAL_DASHBOARD_TARGET",
     "EVAL_DASHBOARD_PR_GLOB",
     "EVAL_DASHBOARD_NIGHTLY_PREFIX",
+    "EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX",
     "EVAL_DASHBOARD_SINCE_DAYS",
     "EVAL_DASHBOARD_TIMEOUT",
     "EVAL_DASHBOARD_FROM_DIR",
@@ -158,6 +159,7 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertIn("--from-dir", argv)
         self.assertNotIn("--pr-glob", argv)
         self.assertNotIn("--nightly-prefix", argv)
+        self.assertNotIn("--nightly-writers-prefix", argv)
         self.assertNotIn("<base href", (self.target / "index.html").read_text())
 
     def test_bucket_target_emits_derived_base_href(self):
@@ -299,7 +301,9 @@ class RefreshScriptTest(unittest.TestCase):
             "gsutil ls failed", (artifacts / "eval-dashboard-refresh.log").read_text()
         )
         # The bucket path hands collect.py both sources, the nightly one with
-        # its default prefix; an empty EVAL_DASHBOARD_NIGHTLY_PREFIX drops it.
+        # its default prefix and the nightly's writers periodic with its own;
+        # an empty EVAL_DASHBOARD_NIGHTLY_PREFIX or
+        # EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX drops that one.
         argv = collect_argv(argv_log)
         self.assertIn("--pr-glob", argv)
         self.assertIn("--nightly-prefix", argv)
@@ -307,16 +311,24 @@ class RefreshScriptTest(unittest.TestCase):
             argv[argv.index("--nightly-prefix") + 1],
             "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/",
         )
+        self.assertEqual(
+            argv[argv.index("--nightly-writers-prefix") + 1],
+            "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/",
+        )
         argv_log.unlink()
         run_script(
             env={
                 "EVAL_DASHBOARD_TARGET": "gs://fake-dashboards/evals/",
                 "JOB_TYPE": "periodic",
                 "EVAL_DASHBOARD_NIGHTLY_PREFIX": "",
+                "EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX": "",
             },
             path_prepend=str(stubs),
         )
-        self.assertNotIn("--nightly-prefix", collect_argv(argv_log))
+        argv = collect_argv(argv_log)
+        self.assertIn("--pr-glob", argv, "the second run reached collect.py")
+        self.assertNotIn("--nightly-prefix", argv)
+        self.assertNotIn("--nightly-writers-prefix", argv)
 
     @unittest.skipUnless(shutil.which("timeout"), "needs coreutils timeout")
     def test_a_hung_pipeline_times_out_red(self):

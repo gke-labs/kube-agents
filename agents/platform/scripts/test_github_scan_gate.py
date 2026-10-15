@@ -175,7 +175,7 @@ class IssuesSweepTest(unittest.TestCase):
         self.assertIn("not a url", result.warnings[0])
 
     def test_error_with_unreachable_repos_carries_unreachable_details(self):
-        with mock.patch("gitops_workspace.get_managed_github_repos", return_value=["org/r1", "org/r2"]):
+        with mock.patch("gitops_workspace.get_managed_repos", return_value=["org/r1", "org/r2"]):
             with self._poll({"status": "ERROR", "reason": "PARTIAL_FAILURE", "unreachable_repos": ["org/r2"]}):
                 result = gate.sweep_issues()
         self.assertEqual(result.cards, [])
@@ -438,7 +438,7 @@ class RunResolverPollTest(unittest.TestCase):
         for desc, repos, expected_timeout in test_cases:
             with self.subTest(desc=desc):
                 with mock.patch.object(gate, "_resolver_path", return_value=Path(__file__)), \
-                     mock.patch("gitops_workspace.get_managed_github_repos", return_value=repos), \
+                     mock.patch("gitops_workspace.get_managed_repos", return_value=repos), \
                      mock.patch.object(
                          subprocess, "run", return_value=_completed(json.dumps(payload), 0)
                      ) as mock_run:
@@ -745,7 +745,7 @@ class PrCommentsSweepTest(unittest.TestCase):
         else:
             managed = [repo] if repo else []
         managed_mock = mock.Mock(side_effect=repo_error) if repo_error else mock.Mock(return_value=managed)
-        with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
+        with mock.patch("gitops_workspace.get_managed_repos", managed_mock), \
              mock.patch.object(forge, "provider_for", return_value=provider), \
              mock.patch.dict("os.environ", env or {}, clear=False):
             import os
@@ -933,7 +933,7 @@ class PrCommentsSweepTest(unittest.TestCase):
 
         provider = MultiRepoFakeProvider()
         managed_mock = mock.Mock(return_value=["acme/repo1", "acme/repo2"])
-        with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
+        with mock.patch("gitops_workspace.get_managed_repos", managed_mock), \
              mock.patch.object(forge, "provider_for", return_value=provider):
             res = gate.sweep_pr_comments()
             self.assertEqual(len(res.cards), 2)

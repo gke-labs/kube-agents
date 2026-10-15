@@ -238,10 +238,11 @@ def test_the_stack_spells_the_mirrored_names_as_their_sources_do() -> None:
     def local(name: str) -> str:
         return re.search(rf'^\s*{name}\s*=\s*"([^"]*)"\s*$', stack, re.M).group(1)
 
+    # The scan is a stage of oobe: the gate runs inside oobe.py, so the stack looks for either script.
     scan_jobs = [job for job in jobs if job["id"] == local("scan_job")]
     assert len(scan_jobs) == 1
-    assert local("scan_job") == _module_constant(delivery, "SCAN_JOB_ID")
-    assert local("gate_script") == scan_jobs[0]["script"]
+    assert local("scan_job") == _module_constant(delivery, "OOBE_JOB_ID")
+    assert local("gate_script").split() == [scan_jobs[0]["script"], gate.name]
     for key in ("SCAN_IDEMPOTENCY_KEY", "CLUSTER_IDEMPOTENCY_KEY_PREFIX", "PRIORITIZE_IDEMPOTENCY_KEY"):
         assert _module_constant(gate, key).startswith(local("key_like").removesuffix("%")), key
     assert local("cluster_key_like") == _module_constant(gate, "CLUSTER_IDEMPOTENCY_KEY_PREFIX") + "%"

@@ -8,7 +8,18 @@ Terraform composition and the same Helm chart at a newer revision, re-rendering 
 the configuration it already has. A release copy of the script carries the version it upgrades to,
 so the ordinary upgrade names no version at all.
 
+An install whose GitHub forge is a GitHub Enterprise Server does not use `upgrade.sh`: it
+regenerates `terraform.tfvars` from `install.env`, which has no keys for the instance, and it can
+run from a checkout or a temporary copy of the engine that does not hold `ghes.auto.tfvars`. Move
+the checkout to the new release (change a pinned `image_tag` in `terraform.tfvars` to it), apply
+`charts/kube-agents/crds/`, and run `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply` in
+`terraform/examples/full-install`, with the forge kept in `ghes.auto.tfvars`: see
+[GitHub Enterprise Server in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#upgrade-switch-and-teardown).
+
 ## Before you start
+
+A GitLab install needs nothing extra for an upgrade: no token and no flag. See
+[Upgrade and uninstall](/kube-agents/install/gitlab/#upgrade-and-uninstall).
 
 Record what the install runs now, so you can tell afterwards what moved:
 
@@ -179,8 +190,8 @@ The run also writes a machine-readable report to `/tmp/kube-agents-upgrade-repor
 
 ## When an upgrade is refused
 
-Every one of these stops the run before any of the new release is applied. The first three are
-settled before the run touches the cluster at all. The last three need the cluster: they are settled
+Every one of these stops the run before any of the new release is applied. The first four are
+settled before the run touches the cluster at all. The last five need the cluster: they are settled
 after `kubectl` has been pointed at it, and after a real run's pre-flight Secret backfills — a plan
 skips those — but still before any CRD, chart or Terraform change of the new release.
 
@@ -199,6 +210,8 @@ skips those — but still before any CRD, chart or Terraform change of the new r
   any of the configuration locations described at the top of this page. An install predating 0.4.0,
   which kept its settings in the retired `k8s-operator/scripts/vars.sh` and never gained an
   `install.env`, is refused here: copy those settings into an `install.env` first.
+- **`GITHUB_APP_ID` is not a number.** The token minter needs the GitHub App's numeric ID, the "App
+  ID" on the App's General settings page, not its name or slug. `--dry-run` refuses it too.
 - **No Helm release.** The target namespace has no `kube-agents` release to upgrade.
 - **The memory store cannot be checked and nothing named one.** When the configuration records no
   `MEMORY`, the upgrade asks the cluster whether it runs the Hindsight memory store, so that a store
@@ -212,6 +225,28 @@ skips those — but still before any CRD, chart or Terraform change of the new r
   `--upgrade-mode=full`, which renders `install.env` onto the chart instead. On a rollback to a
   release that predates the value, re-run with `--drop-undeclared-values`. A full upgrade refuses
   that flag, since it has no recorded values to drop.
+- **A Slack setting the A2A gateway cannot use.** A full upgrade applies `PLATFORM_AGENT_MODE` from
+  `install.env`. With `next`, Slack on and Google Chat off, the A2A gateway takes Slack, and the run
+  refuses three settings it cannot use, naming each one:
+  - a `SLACK_ALLOWED_USERS` entry with an `@`: the list matches Slack member IDs exactly, so an
+    email matches nobody. Replace it with the person's member ID (in Slack, their profile, then
+    **⋮** (More), then **Copy member ID**).
+  - a `SLACK_HOME_CHANNEL` that is not a channel ID (`C...` or `G...`): the gateway's notify route
+    does not arm, so proactive posts and board-card reports stop. The ID is at the bottom of the
+    channel details' About tab.
+  - a `SLACK_BOT_TOKEN` that holds several tokens, or one with a comma or space left in it: the
+    gateway takes one workspace's token, whole. The run gives the count, never the token. Keep a
+    multi-workspace install on `today`.
+
+  `--plan` warns of the same three without refusing.
+
+- **The apply would remove GitOps.** The PlatformAgent opens pull requests through the GitHub token
+  minter, but `install.env` does not carry that repository in `GITOPS_ORG`, `GITOPS_REPO` and
+  `GITHUB_APP_ID`, so the run would render GitOps off and destroy the minter's Cloud KMS key, key
+  ring and service account. This is what an install whose GitOps came from `install.sh`'s flags looks like when it
+  was set up by a release that did not record them in `install.env`. The run prints the lines to
+  set, with the live values filled in where it can read them; set them and re-run the same command. To remove GitOps on purpose, re-run with `KUBE_AGENTS_REMOVE_GITOPS=true` in the
+  environment. `--plan` warns instead.
 
 ## Where to go next
 

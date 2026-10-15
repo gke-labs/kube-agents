@@ -30,6 +30,8 @@ most of them do -- inherits nothing it has to opt out of.
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass
 from typing import Callable, Mapping, Union
 
@@ -55,9 +57,16 @@ __all__ = [
     "GUIDANCE",
     "Guidance",
     "Override",
+    "TLS_GUIDANCE",
+    "TLS_UNTRUSTED_CODE",
     "UNAVAILABLE",
     "UNRECOGNISED",
+    "ca_missing_reason",
+    "ca_unloadable_reason",
+    "classify_tls",
     "forge_error",
+    "tls_refusal",
+    "tls_untrusted",
 ]
 
 
@@ -122,6 +131,161 @@ UNRECOGNISED = Guidance(
     "The forge did not answer this call and did not say why in a form this "
     "broker recognises. One retry is reasonable; two is not.",
 )
+
+
+# Every TLS failure answers one code, FORGE_TLS_UNTRUSTED: whatever the
+# cause, no retry fixes it, and the caller stops and reports. The text names
+# the cause, because each one sends the administrator somewhere else.
+TLS_UNTRUSTED_CODE = "FORGE_TLS_UNTRUSTED"
+TLS_GUIDANCE: dict[str, str] = {
+    "untrusted": (
+        "The broker could not verify the forge's TLS certificate: it does not "
+        "chain to a CA the broker trusts for this host. No retry fixes this. "
+        "Report it and stop. For a self-managed forge behind a private CA, an "
+        "administrator names that CA in the forge's caBundleRef (install.sh "
+        "--gitops-ca-file). For a forge's public host, which does not accept "
+        "caBundleRef, something between the broker and the forge, such as a "
+        "TLS-inspecting proxy, presents the certificate."
+    ),
+    "expired": (
+        "The forge's TLS certificate has expired, or is not valid yet. No retry "
+        "fixes this. Report it and stop: the forge's administrator renews the "
+        "certificate, or the broker's clock is wrong."
+    ),
+    "hostname": (
+        "The forge's TLS certificate does not name the host that the broker "
+        "called. No retry fixes this. Report it and stop: the certificate, or "
+        "the forge's configured host, is wrong."
+    ),
+    "ca_missing": (
+        "The CA bundle that the forge's caBundleRef names is not mounted. No "
+        "retry fixes this until it is. Report it and stop: an administrator "
+        "creates the Secret, with the key, that caBundleRef names."
+    ),
+    "ca_unloadable": (
+        "The CA bundle that the forge's caBundleRef names could not be loaded: "
+        "it is not PEM, or it holds no certificate. No retry fixes this. Report "
+        "it and stop: an administrator puts the PEM CA certificate in the "
+        "Secret key that caBundleRef names."
+    ),
+}
+
+# What git (libcurl with GnuTLS or OpenSSL) and Python's ssl module write for
+# each cause, lowercased, matched as substrings of one line. The kinds are
+# tried in this order: GnuTLS writes "server verification failed: certificate
+# has expired", which also holds an "untrusted" marker.
+_TLS_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # A CA file the client could not load. git words a missing file and a
+    # malformed one alike (GnuTLS: "Problem with the SSL CA cert"), so
+    # `tls_refusal` tells the two apart by whether the forge's file exists.
+    ("ca_load", (
+        "problem with the ssl ca cert",
+        "error setting certificate",
+        "could not load ca file",
+        "error reading ca cert",
+        "error adding trust anchors from file",
+    )),
+    ("expired", (
+        "certificate has expired",
+        "certificate is not yet valid",
+        "certificate expired",
+    )),
+    ("hostname", (
+        "does not match target hostname",
+        "no alternative certificate subject name matches",
+        "hostname mismatch",
+        "ip address mismatch",
+    )),
+    ("untrusted", (
+        "certificate signer not trusted",
+        "unable to get local issuer certificate",
+        "self-signed certificate",
+        "self signed certificate",
+        "certificate verify failed",
+        "ssl certificate problem",
+        "server verification failed",
+        # Older GnuTLS builds (Ubuntu's git) give no reason with it.
+        "server certificate verification failed",
+        "certificate is not trusted",
+    )),
+)
+
+_HOST_IN_LINE_RE = re.compile(r"https://([^/'\"\s]+)")
+
+
+def classify_tls(text: str) -> tuple[str, str]:
+    """`(kind, line)` for the first line of `text` that names a TLS failure.
+
+    `kind` is a key of TLS_GUIDANCE, or "" when no line does. Lines that git
+    prints from the server (`remote: ...`) are skipped: the forge's own words
+    are not the client's verdict on the forge's certificate. Only the matching
+    line is answered, cut short, so a caller can show it without the rest of
+    an output that may carry a credential.
+    """
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("remote:"):
+            continue
+        lowered = stripped.lower()
+        for kind, markers in _TLS_MARKERS:
+            if any(marker in lowered for marker in markers):
+                return kind, stripped[:200]
+    return "", ""
+
+
+def tls_untrusted(host: str, why: str, kind: str = "untrusted") -> WorkspaceError:
+    """The refusal for a TLS failure of `kind`, naming `host`."""
+    named = f"{host}: {why}" if host else why
+    return WorkspaceError(
+        TLS_GUIDANCE.get(kind, TLS_GUIDANCE["untrusted"]),
+        status=502,
+        code=TLS_UNTRUSTED_CODE,
+        detail=named.strip()[:400],
+    )
+
+
+def ca_missing_reason(ca_source: str, fallback: str = "") -> str:
+    """Why a forge's CA file is not there, naming its Secret and key if known."""
+    if ca_source:
+        return f"{ca_source} is missing"
+    return fallback or "the CA file that the forge's caBundleRef names is missing"
+
+
+def ca_unloadable_reason(ca_source: str, error: str = "") -> str:
+    """Why a forge's CA file could not be loaded, naming its Secret and key if known."""
+    where = f"the CA file from {ca_source.removeprefix('the ')}" if ca_source else "the CA file"
+    reason = f"{where} could not be loaded (not PEM, or no certificate in it)"
+    return f"{reason}: {error}" if error else reason
+
+
+def tls_refusal(
+    text: str,
+    ca_sources: Mapping[str, str] | None = None,
+    ca_files: Mapping[str, str] | None = None,
+) -> WorkspaceError | None:
+    """The FORGE_TLS_UNTRUSTED refusal a git error output stands for, or None.
+
+    `ca_sources` maps a forge host to where its CA comes from ("the Secret
+    <name> or its key <key>"), and `ca_files` to the file it is mounted at. A
+    CA file git could not load is answered as missing when the file is not
+    there and as unloadable when it is, with what to fix, as the API client
+    answers it. Without the file, git's line alone says nothing more, and the
+    answer is the missing case's.
+    """
+    kind, line = classify_tls(text)
+    if not kind:
+        return None
+    found = _HOST_IN_LINE_RE.search(line)
+    host = found.group(1) if found else ""
+    why = line
+    if kind == "ca_load":
+        source = (ca_sources or {}).get(host, "")
+        ca_file = (ca_files or {}).get(host, "")
+        if ca_file and os.path.exists(ca_file):
+            kind, why = "ca_unloadable", ca_unloadable_reason(source)
+        else:
+            kind, why = "ca_missing", ca_missing_reason(source, line)
+    return tls_untrusted(host, why, kind)
 
 
 def forge_error(

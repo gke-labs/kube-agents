@@ -316,6 +316,13 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "gke-labs/.git",
             "gke-labs/..git",
             "gke-labs/.git.git",
+            # GitHub caps a name at 100 characters, and a name that still
+            # ends in .git once one is dropped is read by the agent and the
+            # broker as the name without it; the operator refuses both.
+            "gke-labs/" + "a" * 101,
+            "a" * 101,
+            "gke-labs/foo.git.git",
+            "https://github.com/gke-labs/foo.git.git",
             # The operator accepts a port; the fold does not carry one, so the
             # lists render and the operator reads it as written.
             "https://github.com:443/gke-labs/infra",
@@ -407,8 +414,12 @@ class ChartGitIntegrationTest(unittest.TestCase):
             "/github.com",
             "github.com.git/",
             "https://user:p%40ss@github.com/gke-labs/infra",
+            # GitHub's longest name, and one .git suffix, which is dropped.
+            "gke-labs/" + "a" * 100,
+            "a" * 100 + ".git",
+            "gke-labs/foo.git",
         ):
-            with self.subTest(repo=repo):
+            with self.subTest(repo=repo[:80]):
                 integration = _integration(
                     *_forge(0, name="github", namespace="gke-labs"),
                     *_repo(0, forge="github", repository=repo, role="gitops"),
@@ -480,31 +491,309 @@ class ChartGitIntegrationTest(unittest.TestCase):
         for key in ("github", "forges", "repositories"):
             self.assertNotIn(key, integration)
 
+    def test_a_base_branch_renders_on_its_repository(self):
+        """baseBranch is per repository, on a gitops or a managed one, and
+        reaches the CR on the entry that set it and no other."""
+        integration = _integration(
+            *_forge(0, name="github", namespace="gke-labs"),
+            *_repo(0, forge="github", repository="infra", role="gitops",
+                   baseBranch="release/2026"),
+            *_repo(1, forge="github", repository="app", role="managed",
+                   baseBranch="main"),
+            *_repo(2, forge="github", repository="tools", role="managed"),
+        )
+        self.assertEqual(
+            [r.get("baseBranch") for r in integration["repositories"]],
+            ["release/2026", "main", None],
+        )
+        self.assertNotIn("baseBranch", integration)
+
+    def test_a_base_branch_keeps_a_foldable_declaration_as_the_lists(self):
+        """One GitHub forge and its gitops repository would fold into the
+        alias, which has nowhere to put a base; with one set they render as
+        the lists."""
+        integration = _integration(
+            *_forge(0, name="github", namespace="gke-labs"),
+            *_repo(0, forge="github", repository="infra", role="gitops",
+                   baseBranch="release"),
+        )
+        self.assertNotIn("github", integration)
+        self.assertEqual(
+            integration["repositories"],
+            [{"forge": "github", "repository": "infra", "role": "gitops",
+              "baseBranch": "release"}],
+        )
+
+    def test_no_base_branch_renders_no_key(self):
+        integration = _integration(
+            *_forge(0, name="github", namespace="gke-labs"),
+            *_repo(0, forge="github", repository="app", role="managed"),
+        )
+        self.assertNotIn("baseBranch", integration["repositories"][0])
+
+    def test_a_base_branch_the_schema_refuses_fails_the_render(self):
+        result = _render(
+            _CR_TEMPLATE,
+            *_forge(0, name="github", namespace="gke-labs"),
+            *_repo(0, forge="github", repository="infra", role="gitops",
+                   baseBranch="-main"),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("baseBranch", result.stderr)
+
+    def test_a_base_branch_takes_one_spelling_per_branch(self):
+        """The name, or refs/heads/ and the name, as the CRD and the broker
+        read it: a second prefix after refs/heads/, or a leading heads/,
+        would be read as another branch, so the render refuses it."""
+        for base in ("heads/x", "refs/heads/refs/heads/x", "refs/heads/heads/x"):
+            with self.subTest(base=base):
+                result = _render(
+                    _CR_TEMPLATE,
+                    *_forge(0, name="github", namespace="gke-labs"),
+                    *_repo(0, forge="github", repository="infra", role="gitops",
+                           baseBranch=base),
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("baseBranch", result.stderr)
+        for base in ("refs/heads/x", "x", "team/heads/x", "refs/heads/release/heads/x"):
+            with self.subTest(base=base):
+                integration = _integration(
+                    *_forge(0, name="github", namespace="gke-labs"),
+                    *_repo(0, forge="github", repository="infra", role="gitops",
+                           baseBranch=base),
+                )
+                self.assertEqual(integration["repositories"][0]["baseBranch"], base)
+
     def test_an_unregistered_provider_fails_the_render(self):
         """The CRD's enum would reject it at apply; the chart names the values
         key while the administrator is still looking at their values file."""
         result = _render(
-            _CR_TEMPLATE, *_forge(0, name="gitlab", provider="gitlab")
+            _CR_TEMPLATE, *_forge(0, name="bitbucket", provider="bitbucket")
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(f"{_P}forges[0].provider", result.stderr)
 
-    def test_the_minter_never_renders_without_a_github_forge(self):
-        """Asserts the outcome, not which guard produced it.
+    def test_a_gitlab_forge_renders_as_the_lists_with_its_secret(self):
+        """GitLab is never the alias: the alias has no provider, host or
+        credentialsRef to carry it in."""
+        integration = _integration(
+            *_forge(0, name="gitlab", provider="gitlab", host="gitlab.example.com",
+                    namespace="acme/platform"),
+            f"{_P}forges[0].credentialsRef.name=gitlab-token",
+            *_repo(0, forge="gitlab", repository="infra", role="gitops"),
+            *_repo(1, forge="gitlab", repository="acme/platform/tools/app", role="managed"),
+        )
+        self.assertNotIn("github", integration)
+        self.assertEqual(
+            integration["forges"],
+            [{"name": "gitlab", "provider": "gitlab", "host": "gitlab.example.com",
+              "namespace": "acme/platform", "credentialsRef": {"name": "gitlab-token"}}],
+        )
+        self.assertEqual(len(integration["repositories"]), 2)
 
-        With `github` the only registered provider,
-        `kube-agents.forgeProviders` refuses `gitlab` before
-        `github-minter.yaml`'s own check can fire. Both guards must hold: the
-        minter one is what keeps a GitLab-only install from provisioning a
-        GitHub App token minter once the registry widens.
-        """
+    def test_a_gitlab_forge_renders_its_ca_bundle(self):
+        """A self-managed instance behind a private CA names the
+        Secret that holds the CA. A forge without one renders no field."""
+        integration = _integration(
+            *_forge(0, name="gitlab", provider="gitlab", host="gitlab.internal",
+                    namespace="platform"),
+            f"{_P}forges[0].credentialsRef.name=gitlab-token",
+            f"{_P}forges[0].caBundleRef.name=gitlab-forge-ca",
+            f"{_P}forges[0].caBundleRef.key=root.pem",
+            *_forge(1, name="saas", provider="gitlab", namespace="acme"),
+            f"{_P}forges[1].credentialsRef.name=saas-token",
+            *_repo(0, forge="gitlab", repository="infra", role="gitops"),
+        )
+        self.assertEqual(
+            {"name": "gitlab-forge-ca", "key": "root.pem"},
+            integration["forges"][0]["caBundleRef"],
+        )
+        self.assertNotIn("caBundleRef", integration["forges"][1])
+        integration = _integration(
+            *_forge(0, name="gitlab", provider="gitlab", host="gitlab.internal",
+                    namespace="platform"),
+            f"{_P}forges[0].credentialsRef.name=gitlab-token",
+            f"{_P}forges[0].caBundleRef.name=gitlab-forge-ca",
+        )
+        self.assertEqual({"name": "gitlab-forge-ca"}, integration["forges"][0]["caBundleRef"])
+
+    def test_a_ca_bundle_the_operator_refuses_fails_the_render(self):
+        """The same refusals the CRD and the operator make, naming the values
+        key: github.com takes no private CA, and the names are Kubernetes names."""
+        for fields, expected in (
+            ({"provider": "github", "namespace": "gke-labs", "caBundleRef.name": "gh-ca"},
+             "caBundleRef is for a self-managed host"),
+            ({"provider": "github", "host": "WWW.GitHub.com", "namespace": "gke-labs", "caBundleRef.name": "gh-ca"},
+             "caBundleRef is for a self-managed host"),
+            ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.name": "Bad_Name"}, "caBundleRef.name"),
+            ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.name": "ok", "caBundleRef.key": "no/slash"}, "caBundleRef.key"),
+            # The operator's IsConfigMapKey also refuses these.
+            ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.name": "ok", "caBundleRef.key": ".."}, "caBundleRef.key"),
+            ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.name": "ok", "caBundleRef.key": "..ca"}, "caBundleRef.key"),
+            # A key with no name would render no caBundleRef at all.
+            ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.key": "root.pem"}, "caBundleRef needs a name"),
+            # Never on gitlab.com, in any spelling, or with no host: a private CA
+            # must never vouch for a host the public CAs sign.
+            ({"provider": "gitlab", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.name": "ca"}, "caBundleRef is for a self-managed host"),
+            ({"provider": "gitlab", "host": "gitlab.com", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.name": "ca"}, "caBundleRef is for a self-managed host"),
+            ({"provider": "gitlab", "host": "WWW.GitLab.com", "namespace": "acme", "credentialsRef.name": "t",
+              "caBundleRef.name": "ca"}, "caBundleRef is for a self-managed host"),
+        ):
+            with self.subTest(expected=expected, fields=fields):
+                result = _render(_CR_TEMPLATE, *_forge(0, name="f", **fields))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}forges[0].{expected.split()[0]}", result.stderr)
+                self.assertIn(expected, result.stderr)
+
+    def test_a_github_enterprise_server_forge_renders_as_the_lists(self):
+        """The alias has no host field, so a GitHub forge at a GitHub
+        Enterprise Server host renders as the lists, with its host and CA
+        bundle, even when the alias could carry everything else."""
+        integration = _integration(
+            *_forge(0, name="ghe", provider="github", host="ghe.example.com", namespace="acme"),
+            *_repo(0, forge="ghe", repository="infra", role="gitops"),
+        )
+        self.assertNotIn("github", integration)
+        self.assertEqual("ghe.example.com", integration["forges"][0]["host"])
+        integration = _integration(
+            *_forge(0, name="ghe", provider="github", host="ghe.example.com", namespace="acme"),
+            f"{_P}forges[0].caBundleRef.name=ghe-ca",
+        )
+        self.assertEqual({"name": "ghe-ca"}, integration["forges"][0]["caBundleRef"])
+
+    def test_github_hosts_the_operator_refuses_fail_the_render(self):
+        """Chart parity with the operator: a host under a domain GitHub
+        operates is not a GitHub Enterprise Server, an install serves one
+        GitHub host, and one host is one forge's."""
+        secret = f"{_P}forges[1].credentialsRef.name=gitlab-token"
+        for label, sets, expected in (
+            ("api host", _forge(0, name="gh", host="api.github.com", namespace="acme"), "forges[0].host"),
+            ("ghe.com", _forge(0, name="gh", host="acme.ghe.com", namespace="acme"), "forges[0].host"),
+            ("content host", _forge(0, name="gh", host="raw.githubusercontent.com", namespace="acme"), "forges[0].host"),
+            ("gitlab host", _forge(0, name="gh", host="gitlab.com", namespace="acme"), "forges[0].host"),
+            ("not a hostname", _forge(0, name="gh", host="ghe..example.com", namespace="acme"), "forges[0].host"),
+            ("two GitHub hosts", (*_forge(0, name="gh", namespace="acme"),
+                                  *_forge(1, name="ghe", provider="github", host="ghe.example.com", namespace="acme")),
+             "forges[1].host: this install's GitHub host is already github.com"),
+            ("two GHES hosts", (*_forge(0, name="gh", provider="github", host="ghe.example.com", namespace="acme"),
+                                *_forge(1, name="ghe", provider="github", host="ghe.other.example", namespace="acme")),
+             "forges[1].host: this install's GitHub host is already ghe.example.com"),
+            ("unnamed provider", _forge(0, name="gh", host="ghe.example.com", namespace="acme"),
+             "forges[0].provider is required"),
+            ("one host, two providers", (*_forge(0, name="gh", provider="github", host="git.example.com", namespace="acme"),
+                                         *_forge(1, name="gl", provider="gitlab", host="GIT.example.com", namespace="acme"),
+                                         secret),
+             "forges[1].host: git.example.com is already the host of a github forge"),
+            ("two CA bundles", (*_forge(0, name="a", provider="github", host="ghe.example.com", namespace="acme"),
+                                f"{_P}forges[0].caBundleRef.name=ca-one",
+                                *_forge(1, name="b", provider="github", host="ghe.example.com", namespace="beta"),
+                                f"{_P}forges[1].caBundleRef.name=ca-two"),
+             "forges[1].host: ghe.example.com already has a CA bundle"),
+        ):
+            with self.subTest(case=label):
+                result = _render(_CR_TEMPLATE, *sets)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}{expected}", result.stderr)
+        # Two forges on one GitHub host, in two spellings, are one host.
+        integration = _integration(
+            *_forge(0, name="a", namespace="acme"),
+            *_forge(1, name="b", host="www.github.com", namespace="beta"),
+        )
+        self.assertEqual(2, len(integration["forges"]))
+
+    def test_a_gitlab_forge_without_a_secret_fails_naming_it(self):
+        """The broker would have no token to call GitLab with; the operator
+        refuses the forge too, and this says so at `helm template`."""
+        result = _render(
+            _CR_TEMPLATE,
+            *_forge(0, name="gitlab", provider="gitlab", namespace="acme"),
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"{_P}forges[0]", result.stderr)
+        self.assertIn("credentialsRef", result.stderr)
+
+    def test_a_gitlab_forge_refuses_a_github_host_and_a_bad_group(self):
+        for label, fields, key in (
+            ("github host", {"host": "github.com"}, "host"),
+            ("not a hostname", {"host": "gitlab_example"}, "host"),
+            ("bad group", {"namespace": "-acme"}, "namespace"),
+        ):
+            with self.subTest(case=label):
+                result = _render(
+                    _CR_TEMPLATE,
+                    *_forge(0, name="gitlab", provider="gitlab", **fields),
+                    f"{_P}forges[0].credentialsRef.name=gitlab-token",
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}forges[0].{key}", result.stderr)
+
+    def test_a_gitlab_forge_refuses_what_the_operator_refuses(self):
+        """Chart parity with the operator (review round 1): a Secret name the
+        API server refuses, any GitHub name as the host, an over-long group
+        path, and a second gitlab forge at a host already declared."""
+        secret = f"{_P}forges[0].credentialsRef.name=gitlab-token"
+        for label, sets, key in (
+            ("secret name", (*_forge(0, name="gl", provider="gitlab"),
+                             f"{_P}forges[0].credentialsRef.name=Bad_Name"), "credentialsRef.name"),
+            # Bot review: the CRD refuses the name on every provider, so the
+            # chart has to as well -- not only inside the gitlab branch.
+            ("secret name on github", (*_forge(0, name="gh"),
+                                       f"{_P}forges[0].credentialsRef.name=Bad_Name"), "credentialsRef.name"),
+            ("github api host", (*_forge(0, name="gl", provider="gitlab", host="api.github.com"), secret), "host"),
+            ("githubusercontent", (*_forge(0, name="gl", provider="gitlab", host="raw.githubusercontent.com"), secret), "host"),
+            ("long group", (*_forge(0, name="gl", provider="gitlab", namespace="a" * 256), secret), "namespace"),
+            # Bot review round 4: a dash-edged or empty label passed the
+            # chart's regex; the operator's DNS-subdomain check refuses it.
+            ("empty label", (*_forge(0, name="gl", provider="gitlab", host="gitlab..example.com"), secret), "host"),
+            ("dash-edged label", (*_forge(0, name="gl", provider="gitlab", host="gitlab.x-.com"), secret), "host"),
+            # A forge host as the first group segment, and a reserved suffix.
+            ("host as group", (*_forge(0, name="gl", provider="gitlab", namespace="gitlab.com"), secret), "namespace"),
+            ("host as group prefix", (*_forge(0, name="gl", provider="gitlab", namespace="gitlab.com/acme"), secret), "namespace"),
+            ("github host as group", (*_forge(0, name="gl", provider="gitlab", namespace="github.com/acme"), secret), "namespace"),
+            ("own host as group", (*_forge(0, name="gl", provider="gitlab", host="gitlab.example.com",
+                                          namespace="gitlab.example.com/team"), secret), "namespace"),
+            (".git segment", (*_forge(0, name="gl", provider="gitlab", namespace="acme/infra.git"), secret), "namespace"),
+            (".atom segment", (*_forge(0, name="gl", provider="gitlab", namespace="acme.atom"), secret), "namespace"),
+            ("second forge at a host", (
+                *_forge(0, name="gl", provider="gitlab"), secret,
+                *_forge(1, name="gl2", provider="gitlab", host="www.gitlab.com"),
+                f"{_P}forges[1].credentialsRef.name=gitlab-token-2"), "host"),
+        ):
+            with self.subTest(case=label):
+                result = _render(_CR_TEMPLATE, *sets)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(key, result.stderr)
+
+    def test_the_minter_never_renders_without_a_github_forge(self):
+        """A GitLab-only install provisions no GitHub App token minter: the
+        minter guard refuses, naming the providers declared."""
         result = _render(
             _MINTER_TEMPLATE,
             *_MINTER,
             *_forge(0, name="gitlab", provider="gitlab"),
+            f"{_P}forges[0].credentialsRef.name=gitlab-token",
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("declares no github forge", result.stderr)
         self.assertNotIn("kind: Deployment", result.stdout)
+
+    def test_the_minter_renders_beside_a_gitlab_forge_when_github_is_declared(self):
+        result = _render(
+            _MINTER_TEMPLATE,
+            *_MINTER,
+            *_forge(0, name="github", provider="github"),
+            *_forge(1, name="gitlab", provider="gitlab"),
+            f"{_P}forges[1].credentialsRef.name=gitlab-token",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("name: github-token-minter", result.stdout)
 
     def test_the_no_repository_sentinel_does_not_collide_with_the_lists(self):
         """`None` means no repository, so it is not a second declaration.

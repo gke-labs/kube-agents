@@ -375,8 +375,13 @@ class HealthInputsTest(unittest.TestCase):
             render.normalize_health(health_doc("GREEN", pool=note))["pool"],
             {"verdict": "BREACH", "since": "2026-09-08T12:00:00+00:00", "measured_at": "2026-09-08T13:23:00+00:00",
              "day": "2026-09-07", "window_hours": None, "p50_s": 1320, "p95_s": 3660, "waiting_now": True,
-             "waiting_since": None, "over_threshold": 2, "threshold_p50_s": 900, "threshold_p95_s": 2700},
+             "waiting_since": None, "over_threshold": 2, "threshold_p50_s": 900, "threshold_p95_s": 2700,
+             "lease_failures": None, "lease_failures_hours": None},
         )
+        # The refusal count and its window reach the page as counts; anything
+        # else arrives as null, like the other numbers.
+        refused = render.normalize_health(health_doc("GREEN", pool=note | {"lease_failures": 26, "lease_failures_hours": "three"}))["pool"]
+        self.assertEqual((26, None), (refused["lease_failures"], refused["lease_failures_hours"]))
         # Dated like every other timestamp the page renders: a string that is
         # not one drops rather than reaching `new Date`.
         self.assertEqual("2026-09-08T16:45:00+00:00", render.normalize_health(health_doc("GREEN", pool=note | {"waiting_since": "2026-09-08T16:45:00+00:00"}))["pool"]["waiting_since"])
@@ -881,6 +886,35 @@ class BrowserTest(unittest.TestCase):
         out = render_to(pathlib.Path(self.tmp.name) / sub, self.data, health=health)
         return dom_text(out / "index.html")
 
+    def test_the_gitlab_lane_has_its_own_section_outside_the_gates_numbers(self):
+        """A tier-gitlab run is listed under "GitLab lane" with its own
+        Spyglass link and never among the gate's runs; without one the
+        section says how the lane is run."""
+        app = dom_text(self.index)
+        self.assertIn("GitLab lane", app)
+        self.assertIn("No GitLab run on record", app)
+        data = copy.deepcopy(self.data)
+        base = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        lane_run = dict(base, build_id="2097282860221206600", tier="gitlab", job="pull-kube-agents-smoke-test-gitlab", pr=2475, result="FAILURE", eval_verdict="RED")
+        data["runs"].append(lane_run)
+        out = render_to(pathlib.Path(self.tmp.name) / "gitlab", data, health=health_doc())
+        page = dom_text(out / "index.html")
+        self.assertIn("GitLab lane", page)
+        self.assertIn("1 run on record: 0 green, 1 not", page)
+        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/2475/pull-kube-agents-smoke-test-gitlab/2097282860221206600"', page)
+        self.assertIn("<th>Prow</th><th>Eval verdict</th>", page, "the result pill sits under Prow, not Job")
+        # The gate's own list does not carry it.
+        self.assertNotIn('href="run.html#build=2097282860221206600"', page)
+        # A night of the lane sits in the same section under Nights, linked by its own log_url.
+        self.assertIn("No GitLab night on record", page)
+        night = dict(base, build_id="2097282860221206700", tier="gitlab", job="ci-kube-agents-eval-nightly-gitlab", pr=None, result="SUCCESS", eval_verdict="GREEN", log_url="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700")
+        data["runs"].append(night)
+        out = render_to(pathlib.Path(self.tmp.name) / "gitlab-night", data, health=health_doc())
+        page = dom_text(out / "index.html")
+        self.assertIn("1 night on record: 1 green, 0 not", page)
+        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
+        self.assertIn("1 run on record: 0 green, 1 not", page, "the night is not among the lane's pull-request runs")
+
     def test_a_case_lost_to_the_delegation_ceiling_says_so_on_the_run_page(self):
         """Ceiling reps sit under their own key in `reps` (#1874). The card's
         totals must include them, or a three-rep case reads "all 0 reps lost
@@ -1222,6 +1256,20 @@ class BrowserTest(unittest.TestCase):
         live = dom_text(render_to(pathlib.Path(self.tmp.name) / "poollive", self.data,
                                   health=health_doc("GREEN", pool=note | {"day": None, "p50_s": None, "over_threshold": 3})) / "index.html")
         self.assertIn("Runs are waiting to start since Tue 8:00 AM ET: 3 runs queued past the 45 min limit.", live)
+        # A breach the refusals alone carry: no stretch, nothing queued, and
+        # before this the Brief said the gate was healthy while the chat alert
+        # for the same hour said the pool was full. The refusals are the clause.
+        refused = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolrefused", self.data,
+                                     health=health_doc("GREEN", pool=note | {"day": None, "p50_s": None, "waiting_now": False,
+                                                                              "lease_failures": 26, "lease_failures_hours": 3})) / "index.html")
+        self.assertIn("Runs were waiting to start since Tue 8:00 AM ET: 26 runs refused a project in the last 3h."
+                      " No backlog right now. A refused run did not start; retest once the pool has room.", refused)
+        self.assertNotIn("Runs still pass", refused.split("26 runs refused")[1][:200])
+        # Beside a live queue the refusals join it rather than displacing it.
+        both_kinds = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolrefusedqueue", self.data,
+                                        health=health_doc("GREEN", pool=note | {"day": None, "p50_s": None, "over_threshold": 3,
+                                                                                 "lease_failures": 2, "lease_failures_hours": 3})) / "index.html")
+        self.assertIn("3 runs queued past the 45 min limit; 2 runs refused a project in the last 3h.", both_kinds)
         # A `day` that is not a date never reaches the sentence -- render.py
         # drops it on shape, pages.js again on the way in -- and the live queue
         # is what is left to quote.

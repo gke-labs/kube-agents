@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled under `next` and Chat is not, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` Secret, mounted alone at the gateway's one principal-map path (the hand-made `principal-map` ConfigMap is not mounted on a Slack gateway); of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip; the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default, retired by declarative profiles or by gateway-side `AllowedUsers` enforcement, whichever lands first) is built
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door with its eval and Google sign-in identity classes); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own collector-only NetworkPolicy on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the door's Google sign-in env); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled under `next` and Chat is not, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one child at a time, `A2A_DELEGATION_DEPTH_MAX` 3); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip
 
 ## Purpose
 
@@ -45,8 +45,10 @@ reroute a message, and it never widens anything.
 pod at a time.** Concretely:
 
 - The session key is the backend-qualified conversation id - a DM, or a thread in a
-  group space (eg `discord:1234/5678`, `gchat:spaces/AAA/threads/BBB`). A channel or
-  space is not a session; a conversation in it is.
+  group space (eg `discord:1234/5678`, `gchat:spaces/AAA/threads/BBB`); on a backend whose
+  DMs are threaded, a thread in a DM can be its own conversation too (the Slack and
+  Google Chat adapter sections say when). A channel or space is not a session; a
+  conversation in it is.
 - `contextId` is minted at first contact with a conversation and persists across pod
   incarnations for the lifetime of the session record (until pruned after `A2A_SESSION_TTL`
   of inactivity). It is the durable name of the conversation on the bus. Minting MUST be create-only (a KV
@@ -159,36 +161,94 @@ Two routes exist, and the terms recur below: a conversation is **fixed-routed** 
 its tasks address the standing executor configured at deploy time (the platform front
 door), and **session-routed** when they address the conversation's own spawned worker.
 The two differ on steers: a session worker absorbs them at its next turn boundary,
-while the standing front door refuses them with an honest status reply - the refusal
-posture the payload spec's steering rule records.
+while the standing front door queues them and answers each as a further turn after the
+current one, with a status notice per follow-up (the payload spec's steering rule).
 
-The status matcher's width bias inverts per executor, and the inversion is the
-contract, not a tuning detail. Beyond the exact phrase set there is a wide
-interrogative rule (status-shaped words in an interrogative frame), and it applies only
-where the executor refuses steers - the fixed-route front door - because there a stolen
-false positive costs nothing. Where the executor absorbs steers, a session worker, only
-the exact phrases match: a stolen steer there is a dropped correction, and a
-status-shaped steer is a question the worker can answer itself. Anything no interceptor
-claims during a `working` task is a steer, per the 8/24 decision above.
+The status matcher is the exact phrase set wherever the executor runs follow-ups: a
+stolen steer there is a lost correction, and a status-shaped steer is a question the
+agent can answer itself. A wider interrogative rule (status-shaped words in an
+interrogative frame) applies only to a running task whose addressee refuses follow-ups,
+the platform executor's `cli` executor, which refuses each one `no-resume`: there a
+stolen false positive costs nothing, and a missed one is an acknowledgement followed by
+a refusal. The gateway cannot see the executor, so it learns this per addressee from
+the first `no-resume` refusal it relays, and forgets it when a later notice from that
+addressee says a follow-up was queued; the first follow-up to such an addressee after
+the gateway starts is still acknowledged and then refused. A detached task gets the
+exact phrases on either route: after a stop, the wide reading of "any update on the
+rollout" would steal a new task to replay a dead one. Anything no interceptor claims
+during a `working` task is a steer, per the 8/24 decision above.
 
 **Gateway-authored posts (amended 8/31).** Step 4's relay - events in, chat out - is
 not the whole output story: the gateway authors a small set of posts of its own. The
 placeholder that opens a task ("submitted…", which becomes the rolling line the relay
 edits), the status card, the steer acknowledgement, the release line for a task that
 produced no first event inside the grace (its id and the grace; Session lifecycle
-below), and failure notices (a submission or steer that never reached the bus). All
+below), the notice the reap scan posts once when that grace passes with no turn to
+carry the release line, and failure notices (a submission or steer that never reached the bus). All
 are deterministic templates over facts the
 gateway itself owns - its own publishes, its own registry, stream replay - which is
 what keeps them inside the no-model rule. They also say only what the gateway knows:
 the steer acknowledgement reports that the steer is on the stream, and what it says
-next is conditioned on the route the same way the width bias above is, because the
-gateway knows the route and the two executors do different things: on a
+next is conditioned on the route, because the gateway knows the route and the two
+executors do different things: on a
 session-routed conversation, that the worker picks it up at its next turn boundary
-if the task is still running; on a fixed-routed one, that the standing executor does
-not take mid-task input and the reply will say so. Neither claims the steer was
-absorbed, which the gateway cannot know. The payload spec's refusal posture - both
-the fixed-route refusal and the race-window one - is what closes the loop on the
-stream.
+if the task is still running; on a fixed-routed one, "got it, I'll take that next".
+A task with nothing on its stream
+yet gets neither, on either route: both assume an executor holds the task, and none
+has shown it does (a session pod may still be starting, or nothing took the task), so
+the line promises no reply and, when the task has a submission time to measure from,
+says when the conversation frees up. The executor's notice on the stream corrects it when the follow-up was not taken
+(the task's follow-up limit reached, which the platform executor counts per task, the
+task already ending, or an executor that cannot continue a session: the platform executor
+runs follow-ups on its `api` executor only, and its `cli` executor refuses each one
+`no-resume` as it arrives), and the gateway posts that refusal at once. At the task's
+terminal the gateway says, with a count, which follow-ups the executor never answered or never
+ran. The never-answered line posts only once the gateway has heard a steer notice from that
+addressee since it started: an executor that predates the notices answers none, and every
+follow-up would read as missed. Those counts are the relay's cache. A gateway restart in
+between forgets the follow-ups it sent and the notices before it, so that terminal never
+posts the never-answered line, and its not-run line counts only the notices that arrived
+after the restart. Each earlier turn's answer posts as it completes; the result is the
+last turn's answer and the only deliverable a program behind a door receives. A steer into a delegated
+child is checked against the target's list first (rule `delegation.child-steer`);
+refused, it is not published, its author is not recorded, and the room is told the
+target is not reachable from here.
+
+**The busy notice.** The gateway tells a person when their turn is going to wait, on the
+turn's own status line. Once a fixed-route turn's task is on the bus, the gateway counts the
+fixed addressee's other outstanding work: the session-state records whose active task was
+published to it, the turn's own task left out. The count is a read of the bucket (one KV
+watch over the session records), not an in-memory counter, so it is the same after a
+gateway restart as before it, and it falls as terminals arrive, because a terminal deletes
+the active task from its record. A terminal published while the gateway was down still
+lowers it: the relay's durable delivers the terminal once the gateway is back. Past the
+first-event grace a task is read from the stream and left out if nothing is on it, by the
+same test the never-started release below uses, or if its newest event is a terminal (a
+record whose clear was lost, which the heal would release on that conversation's next
+turn), so neither holds the number up. A detached task is counted while it is still its
+record's active task; a new turn in that conversation replaces it. At or above
+`A2A_BUSY_NOTICE_AT` the gateway edits the turn's "⏳ submitted…" placeholder, the message
+the relay's rolling-line edits target, to a queued state: "⏳ **queued** — 3 requests are
+ahead of yours; I'll start on it as soon as there's room" ("1 request is" for one). It posts
+nothing of its own. The relay's first edit past submitted (working, or the terminal)
+replaces the queued text as it would the placeholder, so the notice is never left under a
+"completed" header, where a separate post read as the output of some earlier command; the
+executor's own submitted event (the bridge publishes one on accept, before it has a worker)
+does not replace it. The line never moves backwards: the edit is made only while the task's
+line is still in its submitted state, and is skipped otherwise. It is made under the
+conversation's session lock, the same lock every relay batch renders under, which on the
+inbox path keeps the relay out from the placeholder post to the edit, so there the line is
+always still submitted; the check is for any path that loses that ordering. A turn whose placeholder post failed has no line to edit and gets the
+notice as a post. Nothing is refused, held back, or dropped; the notice is information, and
+a count that fails sends none. The operator renders the threshold as the bridge's worker
+count, 10 by default, so the turn told it waits is the first one that finds every worker
+taken; the operator's own `A2A_BUSY_NOTICE_AT` overrides it. It goes to every chat backend
+(Google Chat, Slack and Discord all edit the line in place) and the console. The inject and
+A2A doors get none, because their callers read the status line as data: the A2A door takes
+the line's first edit as the task going to `working`, so a queued edit would report a task
+no worker has as running, and the inject door hands every edit to the eval harness. The
+fallback post would be worse again, since both read every unedited post of a task as its
+output.
 
 ## The Delegate flow (added 8/31)
 
@@ -257,10 +317,11 @@ ingress as before (advisory today; see "Requester identity on the bus").
 Delegation on a human's behalf keeps the human's bound, and the gateway is where it is kept.
 A session does not mint a child task itself: it asks the gateway to, over the same local
 channel its turns arrive on, naming the addressee and the task text. The gateway is the only
-party that holds what the check needs - the plaintext requester the turn came in with (the bus
-carries a pseudonym), the target agent's `AllowedUsers`, and the `.in` credential - so it
-enforces the target's allowlist against that requester, mints the child with the `authority`
-block stamped as at ingress, and relays the child's events into the conversation as it does
+party that holds what the check needs - the requester the turn came in with and the install
+salt that pseudonymizes it (the bus and the session KV carry only the pseudonym, and the
+gateway hashes the allowlist the same way to compare), the target agent's `AllowedUsers`, and
+the `.in` credential - so it enforces the target's allowlist against that requester, mints the
+child with the `authority` block stamped as at ingress, and relays the child's events into the conversation as it does
 for any task. This is the Delegate flow above with the session, rather than a "delegate:"
 prefix, as the one asking; the machinery is the same. The session's routing judgment never
 becomes an authorization decision, because the session never writes an `authority` block and
@@ -271,24 +332,181 @@ holds for a delegation too. The audit record for a session-routed turn names the
 session at the gateway; the child task's envelope names the target, the session that asked,
 and the same requester.
 
+**The request is the reserved `delegate` artifact** on the session's own task, one `data` part
+shaped as `lib.DelegateRequest` (`{"addressee": "platform", "text": "..."}`), its text bounded at
+`lib.DelegateTextCap` (16 KiB) - the same bound the wake's result is held to in the other
+direction. The worker adapter serves it to the harness as one MCP tool, `mcp__a2a__delegate`,
+over a stdio server the harness is started with via `--mcp-config`; calling it is what ends the
+turn - the turn's own result is the one line `delegated to platform` - before the gateway has
+even seen the request. `A2A_DELEGATE_TOOL=off` is the tool's own switch, read wherever the tool
+is advertised or served, and it governs the tool even over an explicit `A2A_ALLOWED_TOOLS`
+override, so an operator overriding the harness's tool list does not have to re-name it to keep
+it off; `A2A_DELEGATE_SOCKET` names the unix socket the tool and the adapter agree on (a path in
+the pod's scratch volume by default). A call reaching the adapter after the turn has already
+ended - the deadline hit, the adapter received a `stop`'s cancel, or an earlier call this turn
+already delegated - is refused there, inside the same turn, and never reaches the gateway. The
+adapter knows of a `stop` only once its cancel arrives, so a call that raced the cancel, or an
+artifact already on the stream when the gateway handles the `stop`, still reaches the gateway; the
+gateway's own check below ignores it.
+
+**The gateway acts on it only from the task it started**, addressed to the record's current
+incarnation and still that incarnation's active task, and only while that task has not been
+stopped; a straggler from a retired incarnation, an event after the active task has moved on, or a
+request from a turn the human stopped (whichever of the two the gateway handled first) is ignored
+and logged under one rule (`delegation.stale`),
+never relayed - a different rule from a part that fails to parse, is blank, or is over the text cap,
+which is ignored and logged separately (`delegation.malformed`). Only `platform` can be the
+addressee today.
+Depth is bounded by `A2A_DELEGATION_DEPTH_MAX` (default 3; a child's depth is its parent's plus
+one, and a wake inherits its child's) - `FromEnv` refuses a configured value under 1 at boot
+rather than read it as "off", which is the worker's own `A2A_DELEGATE_TOOL` switch, a different
+knob. An absent `AllowedUsers`, or one that renders as `[""]`, admits every authenticated user, the
+same as today's ingress door; a list present but blank once its entries are trimmed and split
+admits nobody, the rule #2207 already holds for the Chat ingress list. The A2A door (backend
+`a2a`) is the exception that fails closed: its principal map admits programs, not people an
+operator listed, so a delegation checked against anyone who came in through it - requester,
+steer author or incarnation-set member - needs a list for that backend, and no list is nobody
+(`delegation.door-unlisted`). Nothing renders one yet (#2478 is the CR field), so a door turn
+cannot delegate today. The inject door is deliberately not held to that rule: it exists only where
+an operator arms it on a dev or eval install, its principal map already names who may use it, and
+live runs and evals delegate through it. The target's `AllowedUsers`
+is checked three times before a mint: against the turn's own
+requester, stored hashed as it came in (the earlier ground work); against every human who steered
+the turn, each stored hashed the same way and capped at eight - past the cap the delegation
+refuses rather than silently drop an author; and against every hashed author whose text has
+reached the session's current incarnation, requesters and steerers of every turn alike, capped at
+sixteen and cleared with the requester copy at `A2A_ASK_TTL` - a cleared or overflowed set refuses
+rather than admits. That third check is load-bearing: each turn gets a fresh one-task
+incarnation, but the incarnation reads the transcript primer (below, "Rehydrate"), which carries
+every earlier turn the stream still holds. So when the pod is started, the requesters and steer
+authors of every turn the primer replays join the set. A turn whose requester is no longer on
+record (cleared at `A2A_ASK_TTL`, with its text) is left out of the primer whole, so the pod never
+reads text whose authors the check can't count. The bound is the conversation as the primer
+carries it, not one incarnation. What else a session carries across incarnations is
+#2370. One live child per conversation, a detached-but-still-running one counting as live:
+the delegating turn's own repeat is ignored and logged, while a later turn's request reaching the
+gateway while that child still runs is refused with a notice naming the running task
+(`delegation.busy`) - a human asking again deserves an answer, the turn that already got one does
+not. Every refusal names the target only, held until the delegating turn's own answer has posted
+so the room reads "delegated to platform" first and the refusal after it; the audit line carries
+the rule, the backend, and the hashed subject that failed it. A steer into the running child is
+checked the same way before it is recorded or published (`delegation.child-steer`, or
+`delegation.door-unlisted` for a door the target does not list): the child runs on `platform`'s
+executor, which acts on a steer as a further turn (on its `api` executor), so an author the target's list refuses is
+refused here, with the same target-only notice and an audit line, and nothing reaches the child.
+
+**The child** carries the platform agent's own `in` subject, the parent's `correlationId`, and the
+parent's stored `authority` with fresh grants and `via: {taskId, session}` naming the turn and
+incarnation that asked. The conversation's rolling line for it is the same "working on" line any
+task gets, suffixed `(delegated to platform)`; the parent's own line is left in place on the
+parent's history entry and closes on the parent's own terminal, not the child's. From the mint on,
+the child is the conversation's active task: a follow-up steers it, `stop` cancels it, a status ask
+reports it. A heal releases the child from the conversation's active-task slot, and retires its
+route the same way a terminal would, in its two ordinary cases only: the child's terminal is on the
+stream, undelivered by the relay, or the child produced nothing within `A2A_FIRST_EVENT_GRACE`. A
+child still running is left active. A known limit: a child that hangs without ending blocks
+further delegation in its conversation until its terminal arrives (from its executor or the
+supervisor) or the record is reaped.
+
 One exception stands while its flag is on: the session pod's temporary read-only cluster view
 (`spec-mode-switch.md`, "Switches inside `next`") lets a session read clusters through the
 credential broker directly, with the platform agent's scope and no child task, so the only gate
 between the requester and that read is the gateway's ingress allowlist, not the target's
-`AllowedUsers`. Today both admit the same people. The view retires when declarative profiles
-carry a session's identity and tools or when the gateway enforces the target agent's
-`AllowedUsers` ([architecture 07](../architecture/07-implementation-roadmap.md)), whichever lands
-first; after the second, a session holding the view would be a way around that check.
+`AllowedUsers`. The view retires on the default flip (#2371); until then, on an install whose
+operator has turned the flag on and whose CR narrows the platform agent's allowlist, a person the
+gateway refuses a delegation to `platform` can still read its clusters through a session's view.
 
 Delegation ends the turn. A session's turn is a conversation turn, bounded at thirty minutes
 by the `chat` profile's own deadline, and the executors it delegates to run to two hours; the
 two do not nest. When the session delegates, its turn completes with a reply that says so
 ("delegated to `platform`, task `t_…`"), the gateway relays the child's events into the
 thread as it does for any task, and the child's terminal wakes the session for one more turn
-with the child's result as its input, so the session can synthesize or follow up. A follow-up
+with the child's result as its input, so the session can synthesize it (the wake can't delegate
+again; below). A follow-up
 the human sends while the child runs steers the child, through the gateway, as follow-ups do
-today. A session pod is therefore busy for seconds per turn, not for the life of the work it
-delegated, which is also what keeps the per-conversation pod cost small.
+today: the platform executor queues each one and answers it after the current turn (on its
+`api` executor; the `cli` executor refuses it `no-resume`), and
+the gateway checks the steer's author against the target's list first, as it checked the
+delegation's. A session pod
+is therefore busy for seconds per turn, not for the life of the work it delegated, which is also
+what keeps the per-conversation pod cost small. The delegating turn's answer is decided at the
+call, so an eviction that lands before its harness has exited (a fast child's wake retires the
+pod) completes the turn with that answer rather than failing it `worker-evicted`.
+
+**The wake** is one new turn on the delegating session, `via.session` naming the parent's own
+incarnation, started on the child's `completed`, `failed` or `rejected` terminal - a `canceled`
+the gateway published itself (a human's `stop`) does not wake the session whatever terminal
+follows it, a `canceled` nobody asked for (a supervisor tearing down a dead executor) counts as
+`failed`. It does not run if the delegating turn's requester has aged off the record (a notice
+says so instead) or if another task already holds the conversation (waking would retire that
+task's own pod); otherwise the wake is an ordinary session spawn and counts against
+`A2A_MAX_SESSIONS` like any other - refused at the cap, the child's result still stands as
+already relayed, and the room gets the standard cap notice rather than a second one. The wake
+inherits the child's chain depth, so depth counts delegations, not turns. The wake's pod is a fresh
+incarnation that reads the transcript primer like any other, and its text also opens with what the
+human asked, so the wake is self-contained: a worker image that doesn't read the primer, during a
+mixed rollout, still has the request and the result. The cost is reading them twice. It opens
+with the label `You were asked:` and the human's message that started the chain, fenced. It is the root turn's
+message, carried down a longer chain, never an intermediate wake's gateway-authored text. Then
+`You delegated to platform (task …), which completed.` (or failed, or was rejected), then the
+result, capped at `lib.DelegateTextCap` and fenced under the label
+`Result from platform (not from the user):`, so the model reads the child's output as data, never
+as a new instruction from the user; a backtick run in either fenced body that could close its fence
+early is broken before fencing. A child that ran follow-up turns wakes with every turn's answer in
+order, the first being the delegated request's, then the result, each follow-up's answer under
+`(follow-up N answer)`; one that answered turns and then failed or was rejected wakes with those
+answers, then its reason under `(then it failed)` (or `was rejected`). Over the cap the earlier
+answers are cut first, so the newest answer or the reason arrives whole unless it alone is over
+the cap. The request is stored on the turn's history entry capped at 1 KiB
+(each of up to fifty entries carries one, and 16 KiB each would put a full record near the KV's
+message ceiling). It is user content at rest under the same posture as the active task's ask copy,
+cleared with the requester copy at `A2A_ASK_TTL`. An entry with none, written before the field,
+wakes with the outcome header alone. A heal that finds the child's terminal already on the stream, undelivered by
+the relay, wakes the session exactly as the relay would have, with the same guards, cap and fence; a
+child that never started has no terminal and does not wake. After a heal wakes the session this
+way, the message that triggered the heal is routed against the wake: a follow-up (not a status ask
+or a stop) steers it, the way any follow-up steers a running turn, and a status ask is answered by
+replay. A heal that finds the delegating turn itself final on the stream, its delegate request and
+its own terminal not yet relayed, leaves both to the relay for `A2A_FIRST_EVENT_GRACE` after the
+stream stored that terminal (the server's timestamp, never the session's own envelope time), the
+same window the never-started heal waits; past it the relay's delivery is taken as
+lost, and the heal runs the request itself, every check applying, then relays the turn's terminal,
+so the chain is minted or refused as the relay would have done it. The relay does the same at the
+turn's terminal when the request's own event was lost before it ran (acked, then a gateway crash):
+a session turn's `completed` with neither a child nor a refusal on record runs the request read
+off the stream first. Both outcomes are written to the record when they are made - the child's
+link in the mint's own write, the refusal in its own - so neither path runs a request twice. The wake's text then closes with a guide chosen by where the chain's answer goes. In a chat the
+child's result is already posted, so it tells the session to reply with what it means rather than
+repeat it; to a program behind a door, which sees only the wake's reply, it asks for the whole
+answer. Either way it says to state plainly when the child failed or reports more work still
+running. The wake's pod has no delegate tool (`A2A_DELEGATE_TOOL=off`, set by the
+spawner for a wake turn): a wake that could delegate read an interim answer such as "still
+checking, the results will post here" as a reason to ask again, and each ask woke another pod
+until the depth bound refused, with nothing answered. A message the person sends while the wake
+runs steers the wake like any other running turn, so it is answered without the tool as well. A
+question sent after the wake answers is a new human turn and has the tool.
+
+**To a program behind a door, the chain is one task.** A caller through the A2A door (or the
+inject door) submitted one task, so the gateway tells the adapter's task observers about the chain
+under that task's id, its root (the human or door turn the chain started from, carried on every
+entry of the chain), and never names the child or the wake: no start, accept, deliverable or
+terminal under either id. The turn that delegated ends quietly, and the root's one deliverable and
+terminal come at the chain's end - the wake's result, then the wake's terminal, in that order; when
+no wake runs, the root ends `canceled` for a requester's `stop` and `failed` with
+`reason: wake-not-started - …` otherwise, with nothing delivered. The hand-off line
+(`delegated to <addressee>`) is never a deliverable: a session turn whose stream carries a delegate
+request and which minted no child ends the root `failed`, with nothing delivered -
+`reason: delegation-refused - <the room's notice>` when the gateway refused it, and
+`reason: delegation-not-started - <why>` otherwise (the child could not reach the bus, the turn was
+stopped, the request was malformed, or its outcome was lost or could not be read from the stream).
+The reason is kept on the turn's history entry when it is known, and the relay, the heal and the
+read route decide the end by the one rule, so all three report the same. A turn with no delegate
+request on its stream ends as its own terminal says. A heal composes with it: a healed
+child's result is not the root's deliverable, the heal's wake delivers as the relay's does. A
+cancel naming the root while the chain runs stops the running task, and the read route reads the
+root as the chain's running task, never final from a chain task's own terminal. Once the chain has
+settled it reports the end of the chain's last task as the root's: the wake's terminal and result,
+or, when no wake followed, the end the observers were told. Chat backends read the posts, which are unchanged.
 
 Transition. `platform` remains the default addressee until the session can hand platform
 topics on to the platform agent without the user noticing. The route is a deploy-time
@@ -304,14 +522,19 @@ with a note and `/session <text>` is `<text>`, the ordinary turn; `/session <tex
 refuses a command it has not registered, so there the form is `@<bot> /session`: the mention is
 stripped before the gateway reads the text, and in a channel thread the next message needs the
 mention too: the adapter forwards an unmentioned reply only once a task has started there, and
-the ack says so. The way back is answered even on an install whose spawner has since been disarmed, so a
+the ack says so. In a Slack DM the next message has to be in the same thread (the Slack
+adapter's conversation keys), and the ack says that instead. The way back is answered even on an install whose spawner has since been disarmed, so a
 record left session-routed by a rollback can always re-home. It is a debugging and opt-in door for the transition,
 not the taught interface. The default flips when the delegation primitive lands: the session's request to
 the gateway to mint a child task to a named addressee, the gateway's allowlist check and
 mint, the relay of the child's events into the conversation, and the wake-up turn on the
 child's terminal. The session's bus grants do not change for it (its only subscribe grant is
 its inbox, and it publishes only on its own task); what is new is the request shape between
-session and gateway and the gateway's record of which conversation a child belongs to. Working
+session and gateway and the gateway's record of which conversation a child belongs to. The
+request is the reserved `delegate` artifact on the session's own task; the gateway's record is the
+task history entry, which carries the turn's requester (backend and pseudonymized author id,
+in the KV only) and its pseudonymized attribution, so a child minted later and the wake-up after
+it run under the turn that asked. Working
 state richer than the transcript primer rehydrate builds today - what the session has
 discovered and decided, keyed by `contextId` - is part of the same work, so a resumed
 conversation is a resumed agent. A warm pool of ready pods is deferred; the cold start is
@@ -377,8 +600,10 @@ deadline plus a fixed grace for the image pull), so a wedged adapter also lands 
 Sweep's domain instead of holding its bus credential indefinitely. Two ends still have
 no terminal to wait for, and the record carries an independent bound for each rather
 than a justification that assumes a terminal that may not come. The `ask` copy is
-cleared by the reap scan once it is older than `A2A_ASK_TTL` (24 hours by default,
-under the stream's retention, which is what the content posture below needs). A task
+cleared by the reap scan once it is `A2A_ASK_TTL` old (24 hours by default,
+under the stream's retention, which is what the content posture below needs), and the
+same pass clears each task history entry's requester and attribution at the same age,
+so a child task can no longer be minted on behalf of a turn older than that. A task
 with nothing on either of its event subjects - no pod, or a pod that never ran - is
 released from the serialization at the conversation's next turn once it is older than the
 first-event grace (`A2A_FIRST_EVENT_GRACE`, 10 minutes by default), with one line in the
@@ -387,7 +612,16 @@ and assertion 9 exists because a task whose only event is its supervisor's termi
 empty. That release publishes no terminal: age alone is not
 evidence, a first event that is merely late could still arrive, and no supervisor path
 ever sees a task with no pod, so its submission ages out with the stream's retention -
-named here rather than papered over. Otherwise the terminal event this chain
+named here rather than papered over. A human who waits rather than writes is told too: the reap scan
+posts one line once the grace has passed with nothing on the stream, naming the task and
+saying the next message starts a new task. It marks the active-task record before it
+posts, so the line goes out at most once per task, across gateway restarts, and it
+releases nothing; the release stays with the next turn, which reads the stream again
+first. The line is for a placeholder somebody may still be watching, so it has a ceiling:
+a task older than three graces (30 minutes by default) gets none, and neither does a
+record the same reap pass deletes past `A2A_SESSION_TTL`. Without the ceiling the first
+pass after a rollout, or after an outage longer than the grace, would post into every
+conversation that wedged in the last week. Otherwise the terminal event this chain
 guarantees is what deletes the active-task record (and the `ask` copy riding it). A
 detached task is the exception on both counts: it does
 not exempt the session, so reap may delete a pod whose harness is still working, and
@@ -410,12 +644,27 @@ would break both that assertion and the payload spec's every-task-has-a-supervis
 rule. Do not
 reason from the config defaults here: the adapter's deadline runs from task start and
 the idle TTL from the last user message, so which fires first is a property of two
-independently tunable numbers, not a guarantee.
+independently tunable numbers, not a guarantee. **Amended for delegation:** a detached task is
+not always this pod's own - a session that delegated and then had its own pod deleted (Delegate's
+previous-incarnation rule, Reap, Sweep) left a child running on `platform`'s executor, not this
+one, so this rule checks whose task it is before publishing anything; a detached task running
+elsewhere is untouched here; the pod being deleted ends nothing for it, and that child still blocks
+a new delegation in its conversation (above) until its own terminal, or a heal, retires it.
 
 **Rehydrate.** The next message on a reaped conversation spawns a fresh pod. The
 gateway replays the context's tasks from JetStream - `tasks/get`, which folds each
 task's `…events` and `…supervisor` together - into a transcript primer, and hands it to
-the new pod as its first input. If the harness's own session file
+the new pod as its first input. The primer carries both sides of each earlier turn: what
+the user asked (the copy session-state keeps until `AskTTL`) and each result, labelled by
+who answered, and how a turn that didn't finish ended (failed, stopped or rejected, with the
+executor's reason), each fenced so a user's text can't pass for an earlier answer. A turn past
+`A2A_ASK_TTL` is left out. It keeps the
+newest turns that fit 8 KiB and says when earlier ones were dropped. The pod gets it as a
+downward-API file from its own annotation, and the worker puts it ahead of the new message,
+framed as history rather than instructions. The annotation is readable by anyone who can get
+pods in the install namespace, and the copy of the user's text on it isn't cleared at
+`A2A_ASK_TTL` the way session-state's is; it goes when the pod is reaped. Earlier results were
+already on the same annotation. Moving the primer to a per-pod Secret is tracked separately. If the harness's own session file
 happens to survive (it usually won't), `--resume` is a shortcut - correctness never
 depends on it; session files are cache, the stream is the record. Task-stream retention bounds how far
 back rehydration reaches (72h placeholder in the payload spec). I think that's a
@@ -558,9 +807,11 @@ How `principal` gets established depends on the backend, and the three are not e
   shape the mechanism is topic IAM, and the impersonation surface is exactly the set of
   identities holding `pubsub.publisher` on the topic. The Google Chat adapter section
   below names it precisely.)
-- **Slack:** join on the immutable `user_id` against a mapping table we maintain from our
-  own IdP. Never `profile.email` - whether that field is IdP-asserted or user-editable
-  depends on workspace config we don't control.
+- **Slack:** the immutable `user_id`, admitted by the allowed-users list. A mapping table
+  we maintain from our own IdP joins it to an IdP identity when it names the member;
+  otherwise the principal is the member id itself, `slack:<user_id>`, as Chat's is the
+  email Google asserts. Never `profile.email` - whether that field is IdP-asserted or
+  user-editable depends on workspace config we don't control.
 - **Discord:** a checked-in test mapping table from Discord user id to a test principal.
   Test-only, by construction: a Discord identity never maps to a real cloud principal,
   full stop.
@@ -744,7 +995,10 @@ not be silent about it.
   arrival order per artifact, which is stream order for an executor that appends to one artifact
   id, present as `[]` when the executor called nothing and absent when no stream was
   read, because the relay never posts that artifact and this is the harness's only view of it, newest 1000 entries when a run has more, with `activityDropped` counting the rest)
-  and the progress artifact's latest line (`progress`); plus the conversation's last post, the
+  and the progress artifact's latest line (`progress`); plus the conversation's A2A `contextId`
+  from its record (absent when there is no record; the bridge's `api` executor names its Hermes
+  session after it, which is how the harness finds the kanban cards a turn filed), the
+  conversation's last post, the
   gateway's configured first-event grace, and the armed backend with `injectOnly`. The gateway
   classifies nothing on it; the harness does. It is a pure read because the never-started heal
   is a write under the per-conversation lock inside the keyed queue, and a read that performed
@@ -828,9 +1082,10 @@ classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow
 `hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
 and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`, `hermes-api-failed`,
 `hermes-api-unreadable`, `hermes-api-read-failed`, `hermes-api-oversize`) and any reason it does not
-know; a `canceled` after the harness's own cancel is the graded timeout. An eval install that
-declares the bridge sidecar sets `BRIDGE_CONCURRENCY` to at least the harness's parallelism
-(`EVAL_TASK_PARALLELISM`), because the bridge publishes `submitted` when it queues a task behind
+know; a `canceled` after the harness's own cancel is the graded timeout. An eval install's bridge
+runs at least the harness's parallelism (`EVAL_TASK_PARALLELISM`) in workers - the operator
+renders the bridge, so the setting is the operator's `A2A_BRIDGE_CONCURRENCY`, or
+`BRIDGE_CONCURRENCY` on a bridge sidecar the install declares itself - because the bridge publishes `submitted` when it queues a task behind
 its cap and `working` only when it spawns, and a unit queued for the whole budget is
 infrastructure, not a graded answer.
 
@@ -883,7 +1138,8 @@ that treated the three alike is what this value exists to stop.
    it exists so that `kubectl port-forward svc/<cr>-a2a-inject` resolves to the pod and the
    port.
 5. **While it is armed, a NetworkPolicy fences the gateway pod against every pod on the cluster
-   network**: ingress with no rules. It is a second control over the edge the bind already
+   network**: one ingress rule, which admits the managed-Prometheus collector's namespace to
+   the metrics-only port and nothing to the door (see "Metrics" below). The gateway's own fence, which renders on every next gateway whether or not a door is armed, admits the same, so this copy is the door's record of the intent rather than the pod's only fence. It is a second control over the edge the bind already
    closes, kept so that a reader of the rendered objects sees the intent and so that a later
    change to the bind address does not open the pod network by itself. Neither it nor the bind
    governs the port-forward, which the kubelet serves from inside the pod's network namespace;
@@ -899,9 +1155,17 @@ namespace, no door armed and neither `spec.integration.googleChat` nor `spec.int
 enabled - gets no gateway Deployment at all, its `Ready` counts the rest
 of the stack (NATS, the auth callout, the provisioning Job's first completion, the sandbox, the
 broker, today's gateway), and an `A2AGateway` condition (`status: False`, `Reason: NoChatBackend`) names what
-would render it. The rule is creation-only, like the callout ordering gate: a gateway that
-exists keeps reconciling whatever happened to its backend, because deleting it would take
-every session pod that hangs off its UID. An eval install with this door armed has an ingress
+would render it. A gateway that already exists when its last backend goes is not deleted,
+because deleting it would take every session pod that hangs off its UID, and it is not left at
+one replica either, because that replica exits on `no chat backend` and crash-loops. The
+operator applies it at zero replicas, keeping the object and its UID, and its own NetworkPolicy
+(see "Metrics" below), and writes the same `A2AGateway` condition; `Ready` does not wait on it. So the backend question is asked on every
+pass: the door flags, Chat and Slack answer it without a read, and an install whose only backend is a
+Secret pays one uncached read per pass. When a backend comes back, the next pass applies one
+replica on the same Deployment, and the condition stays, as `WaitingForReplica`, until that
+replica is ready. The dark state shares the reconcile's 30 s requeue, so a Secret, which is
+not watched, is seen within one requeue; a door flag comes back with the operator restart that
+changing it causes, and Chat or Slack with the CR edit. An eval install with this door armed has an ingress
 the guard accepts, by the decision recorded above, and the render counts the door as a backend
 for the same reason. An install that enables Google Chat or Slack under `next` has a backend
 by that fact alone: the render asks the CR before it reads any Secret, and, because the gateway
@@ -911,12 +1175,13 @@ or Slack gateway starting. With both integrations enabled, Chat holds the gatewa
 stays on the legacy consumer rather than reaching nobody. The Slack refs are rendered on the
 gateway as required references, whatever the CR's own copy says, because the gateway refuses
 half a pair at boot: a missing Secret or key holds the pod at container creation, named in its
-events, instead of starting a pod that exits. The
-rule is creation-only in this direction too: disabling Google Chat on an install whose gateway
-has no other backend re-renders the existing gateway without one, and it exits on
-`no chat backend` until the admin flips the CR to `today` (which tears the stack down), enables
-Slack, creates a `discord-bot` Secret, or deletes the gateway Deployment and its session pods with it - the
-same shape as removing the Secret from under a Discord gateway, reached through the CR.
+events, instead of starting a pod that exits. Disabling Google Chat or Slack on an install whose
+gateway has no other backend takes the same path as removing the Secret from under a Discord
+gateway, or turning off the door an eval gateway started on: the existing gateway goes to zero
+replicas with the condition, its session pods stay, and enabling Chat or Slack again, creating a
+`discord-bot` Secret or arming a door brings it back on the same object. The gateway's
+secret-env digest is stamped only on a pass that renders it with a backend, never on the zero
+apply, so a dark gateway whose Secret is gone costs no read of it.
 
 ## The Google Chat adapter (added 9/5)
 
@@ -991,9 +1256,9 @@ second one for the A2A path, because the unacked backlog then follows the live c
 across a flip in either direction, where a second subscription would hold up to seven days
 of stale asks for the legacy consumer to drain on a rollback. The per-install choice of a
 different pairing is the mode switch's per-component override, sketched and not built; the
-predicate the operator consults (`a2aChatArmed`) is where it would be read. What this costs:
-under `next` the Hermes platform is off, so cron findings addressed to the Chat home channel
-have no target until the bus carries them. And the handover is not instantaneous: the pass
+predicate the operator consults (`a2aChatArmed`) is where it would be read. With the Hermes
+platform off, the agent's proactive posts (alerts, cron findings, audit reports) go to the
+gateway instead, over the chat.notify route below. And the handover is not instantaneous: the pass
 that flips a Chat install to `next` turns the Hermes consumer off while the gateway may still
 be held (the callout gate, a provisioning Job, an image pull), so until the gateway is up
 nobody consumes the subscription - messages wait in it rather than being lost, and the CR
@@ -1030,10 +1295,21 @@ and drops; in a DM (measured) it equals `text` with nothing stripped and no ment
 annotation — a typed `@app` there is plain text to Chat, and is delivered verbatim.
 
 **Conversation keys.** `gchat:spaces/AAA/threads/BBB` for a message in a threaded
-space — the canonical example above. `gchat:dm/spaces/AAA` for a DM space, whole space
-one session — and, because a DM space is threaded, replies render in the thread of the
-latest ask (measured: without that, an answer to a question asked inside a DM thread
-landed top-level). Presentation only; the key and the session do not move. A space whose threading state does not support replies (`UNTHREADED_MESSAGES`), or a
+space — the canonical example above. In a DM space, top-level messages share one conversation,
+`gchat:dm/spaces/AAA`, answered top-level, and a message typed inside an existing thread is
+a side thread, its own conversation `gchat:dm/spaces/AAA/threads/BBB`, answered in that
+thread. This is the main-flow and side-thread rule of the Hermes Google Chat adapter that
+default mode runs.
+Chat attaches a thread to every DM message, the one it auto-created for a top-level message
+included, so the thread name cannot tell them apart; Chat's `message.threadReply` flag does
+(true only for a reply in a thread, per the Chat API `Message` resource; measured: the
+captured in-thread DM reply carries it and the top-level DMs omit it). Hermes infers the
+split from a persisted per-thread inbound count instead, and the gateway keeps no count.
+The two differ on one case: the first reply into a thread Hermes has counted no inbound
+message in, such as the thread under a bot-posted report, is main flow to Hermes
+(`cron-report-relay.md`, "The first reply into a report's thread") and a side thread here. A record minted under the thread-less key before side threads existed still
+parses and posts top-level, and `openDirect` returns that key, so an unsolicited post to a
+DM lands top-level. A space whose threading state does not support replies (`UNTHREADED_MESSAGES`), or a
 `GROUP_CHAT`, binds the whole space as one conversation, `gchat:space/spaces/AAA`;
 anything that is not positively a DM is read as a group, since a space misread as a DM
 would bind every thread in it to one session — the honest reading of "a space is
@@ -1070,6 +1346,120 @@ email to the immutable `users/{id}` it learned from that person's own event, whi
 `findDirectMessage` does accept; a person who has never spoken cannot be opened. Ships
 as the primitive, unused, like the other backends.
 
+**Proactive posts: the chat.notify route.** A message the agent raises with nobody asking
+(an alert, a cron finding, an audit report) has no conversation to answer, and under `next`
+the Hermes platform that used to post it is off. So the agent asks the gateway, which holds
+the Chat credential, to post it. The agent container runs `a2a notify`, which publishes a
+core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?, "wait_ms"?, "conversation"?, "context_id"?, "blocks"?, "chat"?, "update"?}` (on Slack's subject, below, `chat.notify.slack`) with its reply subject
+under `chat.notify.reply.agent.`; the gateway posts the text into the home space
+(`googleChat.homeChannel`, carried as `A2A_GCHAT_HOME_CHANNEL`), as a new thread or as a reply
+on a thread of that space, and answers with `message_id` (the field `hermes send --json`
+prints) and `thread_id`, the thread it landed in, or an `error` naming why nothing was
+posted. The answer goes out once the first part has landed; a long text is chunked, and
+the rest follows into the same thread. A request the gateway took and did not answer in
+time may still post, so `a2a notify` exits with its own status then, and the alert path
+treats that as sent rather than sending again. `wait_ms` is how long the requester waits:
+a request that fails or is refused after it has nobody to tell and is already recorded as
+possibly posted, so the gateway logs it as lost, at error, with its first line. When the
+route is not there (no gateway subscribed, or the bus unreachable) `a2a notify` exits with
+a third status, nothing posted; the alert path, which has one shot, waits through about
+half a minute of those before giving up. The agent-side callers
+(`agents/platform/scripts/chat_notify.py`) switch on `A2A_NOTIFY_PLATFORM`, which the operator
+renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name, and send to every
+other platform through `hermes send` as before. The kanban notifier's report back to a gateway
+conversation (below) is armed by its own variable, `A2A_NOTIFY_CONVERSATIONS`, which the
+operator renders whenever the gateway arms the route: `homeChannel` unset (the route then
+serves conversation requests only) or a space name. The Hermes kanban notifier, which posts a card's events into the thread the card
+subscribes to and wakes its creator when a card blocks or fails, reaches the same route
+through a send-only stand-in adapter that exists only inside the notifier
+(`deploy/docker/patches/kanban_chat_notify.py`); nothing else in the Hermes gateway treats
+the platform as connected. Only the subscription's thread is forwarded: a thread of the home
+space goes as `--thread`, under the home-space rule (a thread of another space is refused), and a
+gateway conversation key (below) goes as `--conversation` with `--context`. A subscription with
+no thread is not delivered. A fanned-out child card's answer folds into its parent's on this
+path (`fold_fanout`): each child inherits the thread's subscription, and the parent completes
+only after its children with the synthesis, so the child's `completed` is held while the parent
+works and until the parent's own answer has been delivered on that thread, then dropped with its
+cursor moved past it, and posted after all if the parent ends blocked, its subscription is gone,
+or the hold passes two hours (then led "Interim result from <card title> …"). One that arrives after
+the parent's answer has posted opens with "Late result from <card title>:". Its other events (blocked, gave up, progress) post as before. A route probe (an empty notify, which an armed gateway refuses at once) tells the
+notifier when the route is unavailable (the gateway restarting), and it holds deliveries
+unclaimed then; only a send that meets the outage before the next probe spends one unit of
+the subscription's failure budget. Once, when routed delivery first goes live on an install,
+events that are already more than six hours old are advanced past without posting: they are
+the backlog nothing could deliver before.
+
+A request may name a conversation instead of the home channel: `conversation` (the gateway's
+session-record key, such as `gchat:spaces/A/threads/B`, or `slack:C1/1712.0001`) and `context_id`, on either backend's
+subject. This
+is how a kanban card filed in a gateway conversation reports back to it. The hermes-bridge's
+`api` executor records, before each turn, the conversation its Hermes session answers: the
+platform, the conversation key from the task's `authority.audience.conversation`, and the
+task's `contextId`, stored in the pod's session-kv (`PUT /v1/sessions/{id}/route`, loopback
+only, accepted for `a2a-*` sessions alone). `kanban_event_routing` swaps that route in for the
+`api_server` origin when the turn files a card, following Hermes's compression lineage
+(`parent_session_id`, parent ended `compression`) when the session has since been renamed. The
+kanban notifier then sends the card's report with `--conversation` and `--context`. The gateway
+posts it, through its own adapter and into the conversation's thread, only when it holds a
+session record for that key carrying that context id: a conversation the agent is working in.
+The bound is the set of live records rather than a secret: the agent principal, the one sender,
+can read every live conversation's context id (its Hermes sessions are named for them), so the
+check refuses a conversation with no record, a made-up key and a stale route, not a post into
+another conversation the agent holds a session for. No record, another
+context, or a record that cannot be read gets one refusal whatever the reason; a malformed request (a key on another backend, a thread and a conversation
+together, a conversation with no context id) is refused by name. Nothing is posted in either
+case. The subjects and grants are the same as for a home post; a route the
+bridge cannot record is said at the end of the turn's answer, since the card's report will not
+arrive.
+
+Slack has the same route on its own subject, `chat.notify.slack`. Home posts are armed when the
+gateway holds Slack (`a2aSlackArmed`) and `slack.homeChannel`, carried as
+`A2A_SLACK_HOME_CHANNEL`, is a channel id (`C...`, or `G...` for a private channel);
+`A2A_NOTIFY_PLATFORM` is then `slack`. Conversation posts are armed whenever the gateway holds
+Slack, `homeChannel` set or not, and `A2A_NOTIFY_CONVERSATIONS` is then `slack`
+(`a2aSlackNotifyArmed`); a `homeChannel` that is set but is not a channel id turns the whole
+route off, as on Chat. Chat holds the single-backend gateway when both are enabled, so at most
+one platform is ever routed. A conversation request carries no `blocks`; its layout is the `chat` field instead ("Chat messages" under the Slack adapter). A Slack `thread` is `<channel>/<ts>`, admitted only when the channel is the home channel
+and posted on the `ts`, or a bare `ts`, which names no channel, so the gateway checks it only for
+shape and posts it into the home channel: a `ts` from elsewhere can only ever thread (or fail to
+thread) there. The kanban notifier sends the qualified form, with the card's own channel, so a
+card filed under `today` in a DM or another channel and delivered after the switch to `next` is
+refused rather than reported into home; a Slack subscription with no channel is not sent. Slack
+lays out a home-channel request's `chat` message as it lays out a conversation's (the fleet
+audit's report card, `a2a notify --chat-file`): one that breaks a rule, or that Slack refuses,
+is dropped and its `text` posted, and the request's `update` and `mark` are not read. Chat posts
+the `text`. Slack also takes Block Kit: a request may carry `blocks`, a JSON array posted as one message with
+`text` as its notification and fallback (`a2a notify --blocks-file`). A backend without blocks, Chat today, refuses such a request
+rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back as the
+`error`, so the caller falls back to text. Blocks cannot be escaped the way text is, so the
+gateway refuses any block that carries a mention (`<!channel>`, `<!here>`, `<!subteam^…>`,
+`<@U…>`, a bare `@here`, `@channel` or `@everyone`, which a mrkdwn text object may parse into one, or a rich_text `broadcast`, `user` or `usergroup` element), and the caller posts the
+escaped text instead. The gateway answers clicks only on the choice buttons it draws itself
+from a chat message (the Slack adapter section), so a button on such a card would be clicked
+into nothing: the gateway refuses any interactive block or element in raw blocks (an `actions`
+or `input` block, a button, a select, a date or time picker, a text input). The blocks are decoded into slack-go's types and sent again,
+so a block type it does not know travels as written and a field it does not model may not. A
+home channel that is not a channel id leaves the route unarmed; the gateway logs
+"chat.notify route not armed" at start.
+
+A notify is not a task. It mints no capability, starts no executor, opens no session and
+carries no `authority` block; the requester rules above do not apply, because nobody
+requested it. What bounds it is where it may land and who may send it. Where: the home space,
+or a conversation the gateway holds a session record for carrying the request's context id; a
+thread of another space, or a conversation without that record and context, is refused before
+any post (on Slack, a home post lands in the home channel only, which the gateway sets on every
+post). Who: the agent principal alone publishes `chat.notify.gchat` and `chat.notify.slack`
+and reads `chat.notify.reply.agent.>`; the gateway alone reads the first two and publishes the
+third. The answer does not go to the agent's `_INBOX` for the reason the verifier's does not:
+the agent reads its JetStream replies there, and a gateway able to publish into it could
+forge them; a request whose reply subject is outside the namespace is dropped unanswered.
+The agent could already post the same text to the same channel or conversation through
+`hermes send` under `today`, so the route moves the post to the process holding the credential rather than adding
+a reach. A reply a human types in a notify's thread arrives at the gateway as an ordinary
+message from that human, through the usual ingress checks, and starts a conversation of its
+own: nothing binds it to the investigation that raised the alert. (On Slack a notify thread
+is not a session thread, so the reply needs to mention the bot to be a turn at all.)
+
 ## The Slack adapter (added 9/4)
 
 The mapped-identity adapter behind the five-operation interface, built ahead of gchat
@@ -1088,15 +1478,17 @@ slack platform and its relay env are off (`legacySlackConsumer`); under `today`,
 over the way Chat's does (2026-10-06): the operator renders it as `A2A_SLACK_ALLOWED_USERS`,
 normalized the way the gateway reads it, with `A2A_SLACK_ALLOW_ALL_USERS` from the legacy
 consumer's rule on the raw list (absent, or a single empty string, is everyone), so one CR
-means one thing in both modes. The gateway then admits a Slack sender only if the list
-admits them (exact `user_id` match, no case fold) AND the principal map below resolves
-them; allow-all lifts the list, never the map. Two things do not carry over on the flip:
+means one thing in both modes. The gateway then admits a Slack sender only if they belong
+to the bot's own workspace (a Slack Connect guest from another organisation is not a turn;
+see the mapping-table paragraph below) and the list admits them (exact `user_id` match, no
+case fold). The principal map below is an optional override for attribution, not a second
+gate. One thing does not carry over on the flip:
 the broker reads `SLACK_BOT_TOKEN` as a comma-separated list, one token per workspace,
 where the gateway's adapter takes one token, so a multi-workspace install stays on
-`today`; and `homeChannel` goes with the Hermes slack platform, so proactive alerts have no
-Slack target under `next`, the cost the Chat section states for Chat.
+`today`. `homeChannel` does carry over, as the home channel the gateway's chat.notify route
+posts proactive alerts into (below); `/sethome` no longer reaches it.
 
-Nothing enforces the multi-workspace rule. The arm reads the CR alone and never opens the
+The operator does not enforce the multi-workspace rule. The arm reads the CR alone and never opens the
 token Secret, so an install already on `next` whose bot-token Secret holds a list is flipped
 by the operator upgrade that brings the arm: the broker is no longer handed the pair, the
 gateway takes the whole list as one token, and Slack refuses it at `auth.test`. The pod does
@@ -1107,7 +1499,13 @@ Secret holds one workspace's token or the install goes back to `today`. Nothing 
 configured; the gateway pod's log carries the cause, and its events do for a missing Secret
 or key. Reading the Secret in the arm would catch it, at the cost of a
 Secret read on every pass and an arm that turns on Secret contents rather than the CR; the
-CR-only arm was kept and the limitation documented instead (2026-10-06).
+CR-only arm was kept and the limitation documented instead (2026-10-06). The installer
+checks the applies it makes (#2812). `install.sh`, its menu's apply and a full `upgrade.sh`
+refuse an apply that hands Slack to the gateway while `SLACK_BOT_TOKEN` holds a list, and
+also refuse the token when they recover it from the Secret
+([`scripts/installer/README.md`](../../scripts/installer/README.md)). Three paths still
+reach the state above unchecked: `upgrade.sh`'s operator and harness arms, which re-tag the
+release; an operator upgrade made any other way; and a CR edited by hand.
 
 Version skew double-consumes Slack, and this is where Slack differs from Chat. The arm uses
 Chat's rule, so an unrecognised `spec.mode` reads as `today` and the legacy consumer renders
@@ -1115,20 +1513,43 @@ again: the broker's Socket Mode relay and the Hermes slack platform. The reconci
 the A2A objects on skew rather than touching them, and a Slack gateway holds the token pair
 in its own pod env, so the frozen gateway keeps its own Socket Mode connection beside the
 legacy one, until the operator recognises the mode again. Slack delivers each event to one
-of the two connections, and the two consumers do not admit the same senders: both gate on
-`allowedUsers`, but the gateway also requires the principal map. A sender admitted by one gate
-and not the other is answered or dropped depending on which consumer receives the event. Chat's
+of the two connections. Both admit by `allowedUsers`, but only the gateway refuses another
+workspace's member, so a Slack Connect guest is answered or dropped depending on which
+consumer receives the event (as is a sender whose map entry carries the reserved `slack:`
+prefix, which only the gateway refuses). Chat's
 frozen gateway goes quiet instead, because it reaches Chat only through the broker's A2A
 relay, which the re-rendered broker drops. The Chat-identical rule was kept and the
 behaviour documented (2026-10-06).
 
-**Conversation keys.** `slack:dm/{channel}` for DMs, `slack:{channel}/{thread_ts}` for
-threads. Slack threads are implicit - replying with a `thread_ts` creates one - so a
-channel mention binds the session to the mention message's own ts as thread root, with
-no thread-creation failure mode to handle. Session semantics are unchanged: the whole
-DM is one conversation, a channel is not a session, a thread in it is.
+**Conversation keys.** `slack:{channel}/{thread_ts}` for a channel thread and
+`slack:dm/{channel}/{thread_ts}` for a DM thread. Slack threads are implicit - replying
+with a `thread_ts` creates one - so a channel mention binds the session to the mention
+message's own ts as thread root, with no thread-creation failure mode to handle. A DM is
+keyed the same way, to match the Hermes Slack platform on `today` (2026-10-08): a
+top-level DM is a new conversation rooted on its own ts, and its placeholder, status
+edits and answer post in that thread; a DM typed inside a thread is that thread's
+conversation, so it steers the running task or follows up in the same context, as a
+channel thread reply does. Two top-level questions are two conversations. On Slack a
+thread is the session in a DM as in a channel. So `stop`, a status question and
+`/session` act on the thread they are typed in. A `stop` or a status question typed at
+the top of the DM is a conversation with nothing running in it, so it starts no task
+and its reply says to send it in the question's thread instead; the adapter marks such
+a message top-level (`InboundMessage.TopLevel`, set only for a top-level DM), and the
+gateway keys the reply on that mark, not on the conversation's task history, so a
+`stop` in a thread with nothing running (a question refused at the session cap, say)
+gets the plain "nothing is running". A top-level status question matches the exact
+status phrases only; one shaped like a question ("how is the deploy doing") is an ask.
+A bare `/session` asks for the next message in its thread.
 
-**Which messages become turns.** DMs carry every message. A channel message must
+The thread-less `slack:dm/{channel}` parses and posts top-level, and no inbound message
+is keyed that way. It is the form a DM record from before DMs threaded carries, so such
+a record relays its task's terminal into the DM where the ask was, and a message sent
+since starts its own thread rather than steering or stopping that task. It is also what
+`openDirect` returns, which makes a post the user did not ask for a new top-level
+message; a reply under it roots its own conversation.
+
+**Which messages become turns.** DMs carry every message, in a thread or not; a DM
+thread needs no task started in it to carry a reply. A channel message must
 mention the bot, and the ask's own ts is the thread the session will live in. A thread
 reply is a turn when it mentions the bot or the thread is a session thread - one the
 gateway has started a task in. That is what lets a session thread carry every message
@@ -1140,7 +1561,8 @@ registry, which it asks whether a task has started in that thread (a record alon
 not enough, since one is minted for any verified turn, a "stop" with nothing running
 included). Nothing is derived from the root message. A mention on its own starts
 nothing and makes nothing a session thread, whoever typed it, so a channel mention from
-a sender the gateway refuses (the allowlist, then the principal map) roots nothing. A session thread stays one while a
+a sender the gateway refuses (another workspace's member, or one the allowlist does not
+admit) roots nothing. A session thread stays one while a
 task runs there or the session has had activity within the idle TTL; past that, the
 thread needs a fresh mention. The activity that counts is the last task's own: its start,
 and an executor's terminal for it, so the window opens at the answer, not at the ask that
@@ -1160,14 +1582,35 @@ applies; Discord's group DMs read as DMs, and the asymmetry is deliberate. The b
 only sees channels it has been invited to, so the invitation is the trust boundary for
 group ingress.
 
-**The mapping table - where it lives and who writes it.** The join is Slack's immutable
-`user_id` against a table sourced from our own IdP; never `profile.email` (the identity
-section above says why). The table is a Kubernetes Secret, mounted read-only at the
-gateway's principal-map path, same file format the Discord ConfigMap uses.
+**The mapping table - where it lives and who writes it.** The table is an optional
+override, not an admission gate: the allowed-users list admits, and the table joins an
+admitted sender's immutable `user_id` to an identity sourced from our own IdP; never
+`profile.email` (the identity section above says why). A sender the table does not name
+is attributed by member id, `slack:<user_id>`, with `verifiedBy`
+`slack-socket-mode`. The `slack:` prefix is reserved: a table value that carries it is
+refused (the sender drops, with an error in the gateway's log), so a principal that
+claims to be a bare member id always is one. The Slack principal decides attribution
+only: capability is minted from the install's tier for every sender, and sessions have no
+owner.
+
+Because an unmapped sender's member id is enough to be admitted, admission must not reach
+past the install's own workspace. Slack names the sender's workspace as `user_team` on a
+message in a channel shared between workspaces, and a message's own `team` field names the
+workspace it was posted from. The gateway refuses a message that names a workspace other
+than the bot's own (from `auth.test`) in either: it is not a turn, silent to the sender,
+and logged when it addressed the bot. Without a team id from `auth.test` it refuses any
+message that names a workspace, and warns once at start. A message that names no workspace
+in either field is taken as our own member's, which rests on Slack setting them on a
+shared channel's messages; no captured Slack Connect payload has confirmed it yet. Under allow-all this is the only boundary on
+who may reach the bot, and it is stricter than the legacy consumer, which has no such
+check. Under Enterprise Grid a member of a sister workspace in a shared channel is refused
+too, since the event does not carry the sender's enterprise.
+
+The table is a Kubernetes Secret, mounted read-only at the gateway's principal-map path, same file format the Discord ConfigMap uses.
 `a2a-slack-principal-map` is the name the operator mounts under `next`: alone at the
 gateway's one principal-map path, optional, so an install without its table is the
-gateway's own case (it runs, and every Slack sender drops at verification, with the
-warning the gateway logs when the map is empty). Alone because the gateway reads that
+gateway's own case (it runs, and every listed sender is attributed by member id, which
+the gateway notes in its log at start). Alone because the gateway reads that
 directory as one flat map and resolves a Slack sender against every key in it: the
 hand-made `principal-map` ConfigMap, Discord's table, mounted there too would let a
 ConfigMap write add a Slack `user_id`, so a Slack-armed gateway does not mount it. Every
@@ -1186,25 +1629,67 @@ the API server audit log. Generating
 the Secret's content from the IdP is a job we do not build yet; until it exists the
 table is maintained by hand, which is honest at the current install count.
 
-**Unmapped senders.** Dropped at ingress, as everywhere - but visibly now: the gateway
+**Unverified senders.** Dropped at ingress, as everywhere (on Slack that is an unlisted
+sender; an unmapped one is attributed by member id, below) - but visibly now: the gateway
 posts a one-line notice to the conversation, once per sender, and keeps the structured
 log line. A silent drop of a real user is a support burden. Per sender, not per
 conversation - a channel mention mints a fresh conversation every time, so a
 conversation-scoped dedupe would be no bound at all. The memory is capped and evicted
 wholesale at the cap, so the worst an unverified sender can do is make one notice
 repeat. This is gateway behavior, not Slack behavior, so Discord and Google Chat get
-it too - the notice names the remedy for whichever backend it fires on (here both the
-allowed-users list and the principal map, the allowed-users list on gchat). On Slack the
-notice is the same whichever of the two refused, so it does not tell a sender which table
-they are missing from.
+it too - the notice names the remedy for whichever backend it fires on (the allowed-users
+list on Slack and gchat; on Slack it also names the principal map, for the one refusal the
+map still makes, a listed member whose entry carries the reserved `slack:` prefix). A listed
+sender the table does not name is attributed by member id, not dropped.
 
 **Roster.** Channel membership via the members API, one page; past a page the roster
 reports incomplete rather than paging (the roster cap truncates far below it anyway).
 Slack has no per-thread membership, and anyone in the channel can read the thread, so
 channel membership is the honest answer to "who could have read this." Members are
-resolved through the same gate as the requester, the allowed-users list and then the map,
-so a mapped member the list refuses is recorded by their backend id, as an unmapped one
-is, never under the principal the gateway declined to grant them.
+resolved through the same rule as the requester, the allowed-users list and then the map,
+so a mapped member the list refuses is recorded by their raw backend id, never under the
+principal the gateway declined to grant them, and a listed member the map does not name
+as `slack:<user_id>`, the principal they get as a requester.
+
+**Reactions, clicks and Agent Sessions.** The adapter draws a chat message's `mark`
+(spec-a2a-payloads.md) as reactions on the asking message: today's emoji per ask kind, ⏸️ for
+`blocked`, ❌ for `failed`, nothing for `done`. The gateway owns the state (the chain's newest
+task's mark, the terminal default, a conversation notify's mark) and records what it drew on
+the chain's root history entry, so a mark draws only its difference, across a restart too; the
+adapter owns which emoji a token shows, and removes only its own reactions. A delegated child's
+terminal takes no default, since it is relayed before the wake that digests it exists: the
+wake's terminal settles the chain, or the child's end does when no wake starts. A chain that a
+click starts, or a typed answer to the conversation's open question (`InboundMessage.Answer`),
+continues that ask's work, so it marks the ask of the conversation's previous chain, from what
+is already drawn there: a click is no message of its own, and a card that settles after its
+question was answered then lifts ⏸️ on the ask rather than marking the answer. The chain it
+continued no longer marks that ask, so its late terminal (a stop confirmed after the answer)
+leaves the reactions to the continuing chain. Interactive
+envelopes are acked like events. A click on a choice button the renderer drew is a message from
+the clicker whose text is the choice's reply, handed to the gateway like a typed one, so the
+allowlist and the map judge it the same way and it carries no intent. The gateway tells the
+adapter whether each message's sender passed (`VerifiedObserver`), and only then does the
+adapter rewrite the clicked question: its choice buttons removed, "✓ <name>: <label>"
+added, the name from `users.info` (display name, real name, handle; never an id). A
+typed reply in a conversation whose question is still open answers it the same way, with the
+reply's first words; a gateway command (a stop, a status ask or a short question about
+progress in the wide form, `/session`, a delegate) answers nothing. A question is answered once, and a second click on it is dropped. The open question
+is the latest message the adapter laid out with choices in the conversation, and one laid out
+with choices again is a fresh question whatever answered it before; an edit that takes its
+choices away (a card's question settled by its notify `update` key, laid out or as text) closes
+it, and keeps the answered line when one was drawn. The open question and the answered set live in
+the process, so a question posted before a restart keeps its
+buttons until clicked, and a typed reply then rewrites nothing. A thread's Agent Session is
+`processing` from `TaskStarted` until the chain ends, and past that while the latest chain's
+mark still carries its ask (card work still open), `suspended` while its settle is `blocked`,
+and `closed` after. When the latest chain's mark holds no open work and an older ask's still
+does (its cards still running, or blocked), the session follows the newest such ask instead,
+so it holds until every chain's cards have settled. Only an older ask a notify `update` key
+is bound to holds it, and for at most four hours after its mark was last drawn or a keyed notify last repeated it (the latest across every chain that marked the ask, so a click or typed answer continuing it keeps the clock), since nothing else can settle an older ask and a lost settle would otherwise hold it for good. A terminal that draws nothing still tells Slack when that bound alone has moved the session. `closed` is sent even for a thread this process never opened, since a restarted gateway
+otherwise leaves the old process's Working… on it; the thread is renamed once from its first
+verified ask that is not a gateway command, with today's title sanitiser. That state is process
+memory too, so after a restart the next verified ask in a thread may title it again. `assistant_thread_started`, and `app_home_opened` on the Messages tab, get today's
+three suggested prompts. `agent_session_stopped` is not handled: Stop stays deferred.
 
 **One backend per gateway process.** The relay binds one durable, and two gateways on
 one durable split event deliveries - so config counts the armed backends and refuses
@@ -1214,18 +1699,36 @@ second Deployment with its own durable, when we want one. The inject side door i
 in that count - it may sit beside any one of the three, for the reason the inject
 section gives - and neither is the console adapter, which has no durable to split.
 
-`verifiedBy` is `slack-socket-mode+principal-map`: Slack authenticated the sender over
-the socket and asserted the `user_id`, our table joined it to a principal. Rendering
-into mrkdwn is a narrow deterministic translation of the two forms the relay emits
-(bold, links); the legacy Hermes converter stays where it is. The translation leaves
+`verifiedBy` is `slack-socket-mode+principal-map` when our table joined the sender to a
+principal, and `slack-socket-mode` when it did not: either way Slack authenticated the
+sender over the socket and asserted the `user_id`. Rendering
+into mrkdwn is a narrow deterministic translation; the legacy Hermes converter stays
+where it is. A line pass runs first, outside fenced blocks, for the forms mrkdwn has no
+syntax for: a heading, ATX or setext, becomes a bold line (shedding any bold pairs
+inside it, and left plain when a `**` that is not half of a pair remains), a
+thematic break is dropped, a list marker
+becomes `•`, and a pipe table becomes a fenced block with its columns padded (a cell
+keeps a code span's content without its backticks, sheds the marks of closed bold pairs, and shows a link as
+its label and URL, since a code block renders no link; only an escaped `\|` stays inside
+a cell). A table the chunker cuts gets its header and delimiter rows again at the head of the next chunk, so each part renders as a table. A
+heading run onto the end of a sentence with no line break is moved to its own line
+first. Bold and links are translated after it. The translation leaves
 code spans as written, converts bold only on a closed `**` pair, never alters a
 link's destination, and refuses a link whose label carries a URL naming a host other
-than the one it opens. Everything posted is escaped first (`&`, `<`, `>`) - relayed
-text is executor-authored, ie model output, and an unescaped `<!channel>` in a result
-would ping the room. The Google Chat adapter applies the same markdown rules behind its
-own defang, in two halves: the link defang reads prose, link text and an unclosed fence
-but not a closed code span or fenced block; the mention defang reads everything, code
-included. The adapters translate each chunk of a result alone, so the chunker closes a
+than the one it opens. A link the agent already wrote in the surfaces' own `<url|text>`
+form is kept as the link it is when it is closed, sits in prose (not in a code span or
+after an unclosed fence), has an `http(s)` URL with no whitespace, angle bracket or pipe
+in it, and has text that names no other host: the refusal a markdown link with that
+label meets. The markdown rules read a kept link as a link, so a bold pair
+around it converts and a markdown link that overlaps it is refused. Posts ask Slack not
+to unfurl links or media: an answer cites console and documentation links, and each
+unfurled into a preview card under it. Everything else posted is escaped first (`&`,
+`<`, `>`), a kept link's URL and text included - relayed text is executor-authored, ie
+model output, and an unescaped `<!channel>` in a result would ping the room. The Google
+Chat adapter applies the same markdown rules, and keeps the same links, behind its own
+defang, in two halves: the link defang reads prose, link text and an unclosed fence but
+not a closed code span, a fenced block or a kept link; the mention defang reads
+everything, code included, but a kept link, whose URL and text hold no `<`. The adapters translate each chunk of a result alone, so the chunker closes a
 fenced block it cuts and reopens it with a bare fence at the start of the next chunk,
 reading the cut with the same code-span parse the adapters use: every chunk is balanced on
 its fences, so a cut block never leaks its closer into the next chunk, the fences added stay
@@ -1235,6 +1738,82 @@ hard cut that lands inside a mid-line fence opener, still leaves the next chunk 
 differently from the whole, a display defect tracked as a follow-up. The opener's language tag is not carried onto the
 reopened fence (it is the rest of the opener's line, unbounded), so a continuation chunk
 loses the tag on Discord.
+
+**Chat messages (added 10/13).** A task's carriers may hold a `kube-agents.chat/v1` message
+beside their text (spec-a2a-payloads.md, "Chat messages"), and the relay reads it with
+`a2a/lib/chatmsg` on every carrier that spec lists: the result and a finished turn on their last
+chunk, a progress artifact, a `notice` artifact (one message of its own, posted once), the
+message of an `input-required` status, and a terminal status, whose chat message is its `mark`
+alone. A chat message that breaks a rule is dropped whole, logged with the rule it broke and
+counted (`chat_messages_total{outcome="invalid"}`, under Metrics), and its text posts as it
+would have; a bad `mark` drops alone, and a chat message that carries only a `mark` lays
+nothing out. A result recovered by replaying the stream after a restart arrives folded, which loses the chunk a chat message rode on, so the last-chunk rule is not applied to it. What survives reaches the adapter as a message value,
+`PostMessage` and `EditMessage` with the text and the chat message, beside the string `Post`
+and `Edit`. Discord, Google Chat, the inject door, the console and the A2A door answer
+`ErrTextOnly`, and the relay posts the text through `Post`, chunked under the cap, so each of
+them posts exactly what it posted before chat messages existed. The relay never hands the
+adapter a chat message without its text, and a backend that cannot hold one, or whose API
+refuses it, gets the text instead, once. Every carrier's `mark`, the terminal's included, is
+the gateway's to apply (`mark.go`): only from the chain's newest task, with the terminal
+default for a newest task that ends without one, drawn through the adapter's `React` and
+`RemoveReaction` (the Slack adapter section).
+
+The Slack adapter lays a chat message out as Block Kit, in the spec's fixed order and in the
+`today` presenter's shape (`slack_presenter.blocks_report`, `with_side_bar`,
+`slack_status.plan_blocks`), with the text as the message's `text` (escaped mrkdwn, so a
+notification and a thread read-back carry it): the headline bold with the note after it on the
+same line, as one `rich_text` block; the detail under it; the rows between two dividers, each led
+by its severity as inline code; the `after` lines; the fold as a collapsible `container`,
+collapsed (a fold with neither text nor a table is omitted), its text as escaped mrkdwn sections
+sent `verbatim`, cut smaller where escaping would take one past Slack's cap, and its table as a native `table`
+block whose first row is the column names; then the buttons, choices before links, five to an
+`actions` block, the one `primary` entry drawn as Slack's primary button. A choice's `value` is
+what a click sends, its `reply` or else its `text`, and a link button opens its url; action ids
+are the presenter's `kage.choice.<n>` and `kage.link.<n>`. A progress message's `plan` is
+Slack's `plan` block of `task_card`s, each row's steps listed under it and marked `✓`, the last
+step of an `in_progress` row `◌`. A `tone` colours a side bar (green `#2EB67D`, yellow `#ECB22E`,
+red `#E01E5A`) holding every block under the headline. Slack refuses a `container` inside the
+attachment a side bar is, and an attachment draws after every top-level block, so a message with
+a fold keeps the fold and everything above it top-level and the bar holds only the buttons; with
+no buttons it has no bar, and its tone shows nowhere (the text states the fact either way). Markdown in the detail, rows and `after`
+keeps code spans, bold, italic, strike and links whose url passes the links rule, the label check
+included; anything else shows as written. Every field but the fold's text goes out as
+`rich_text` or `plain_text`, which Slack shows as written, so a `<!here>` in one is inert text;
+the fold's mrkdwn is escaped, and a bare broadcast word in it (`@here`), which escaping cannot
+reach, makes the message one the adapter will not send (`blocksMention`, the notify route's
+check). The blocks go on the wire as the renderer wrote them, not through slack-go's types.
+The live message shows the newest progress chat message under every display mode, and keeps it
+when the task ends, its text turning to the terminal line; a progress artifact without one turns
+the message back to text. A layout the backend refuses is not offered again until the progress
+chat message changes, and the Slack adapter's text `Edit` sends the blocks and side bar cleared,
+so a live message laid out before a gateway restart does not keep a stale plan. A post or edit
+that fails for any other reason (a rate limit, an outage, a message that is gone) is no refusal:
+it is not counted, and the live message tries the layout again on its next artifact. A click on
+a choice button is a message from the clicker whose text is the button's `value` (Reactions,
+clicks and Agent Sessions, above); a link button opens its url and its click is only acked.
+That is the exception to the notify route's refusal of interactive blocks: a raw `blocks`
+request is the sender's layout and the gateway cannot vouch for what a click sends, while a chat
+message's buttons are the gateway's own, built from validated choices whose click text the
+gateway reads as an ordinary message. The fold's text goes through
+`toMrkdwn`, the translation the text path uses, so a heading there shows as a bold line and a
+bullet as `•`, as they do in a text answer. `a2a/gateway/testdata/slack-chat/` holds the layout of every chat
+message the shared cases in `tests/conformance/chat/` expect, checked on every run.
+
+A conversation notify request (below) reads its `chat` field and `update` key the same way.
+The `chat` object, with the request's `text` as its fallback, is laid out on Slack and posted as
+the text elsewhere. The first request with an `update` key posts one message, its text cut to one
+chunk since an edit reaches only one message, and a later request with the same key in the same
+conversation edits it, laid out or as text, on Google Chat too. A key with no message here
+(another conversation's, one forgotten, one lost to a restart) or a message the backend says can no longer be edited posts anew. A laid-out edit that fails otherwise (a rate limit, an outage) is tried once more, laid out, and failing again leaves the message as it was and answers the request with the error: a text edit would strip the card and close an open question.
+A conversation keeps 16 keys and the gateway keys for 1,024 conversations, the least recently used
+forgotten first, so a plan edited all along outlives the questions filed after it. A notify's
+`mark` is drawn once its post lands, on the ask of the chain its `update` key is bound to
+(spec-a2a-payloads.md, "Card work after the task ends"): the first keyed `mark` binds the key
+to the conversation's latest chain, recorded on that chain's root history entry beside its
+mark (at most 16 keys a chain, the least recently used dropped first, as the notifier drops them), so the binding survives a restart and a later `mark` with the
+key reaches that ask while a newer chain runs. A `mark` with no key goes to the latest chain
+once nothing runs, and is dropped, logged and counted (`notify_marks_dropped_total`) while a
+chain runs.
 
 ## The console adapter (added 9/23)
 
@@ -1356,7 +1935,10 @@ on a terminal that carries one. Every other post under the task is an agent mess
 the task's one artifact, named `result` as the bus names it, is the deliverable the relay hands
 the door whole before it posts it in chat-sized chunks (`DeliverableObserver`; the heal path
 hands over the artifact the stream carries), so the chunks stay history and the artifact is
-never inferred from a post's position. The door keeps up to 4 MiB of it; a longer deliverable
+never inferred from a post's position. A turn that delegates is one Task through its whole chain
+("Sessions by default"): the child's and the wake's posts land in its `history`, and the wake's
+result is its artifact. A chain that runs past the gateway's task deadline is no longer exempt
+from the door's conversation cap while the caller waits, which is a known limit. The door keeps up to 4 MiB of it; a longer deliverable
 is cut at a rune boundary with `metadata.resultTruncatedFrom` carrying the original length, so a
 client can fall back to `history`, which carries the chunks whole. Everything the door keeps per
 task (the caller's text, the posts, the deliverable) is summed across tasks under a 64 MiB budget;
@@ -1373,7 +1955,11 @@ events through as they come.
 **Conversation.** `a2a:<caller>:<contextId>`, kind `dm`. The caller is part of the key so two
 callers naming the same `contextId` do not share a conversation; a caller that sends none is
 minted one and reads it back on the `Task`. `Roster` is the caller alone, complete;
-`openDirect` returns the caller's last conversation, as on the inject door.
+`openDirect` returns the caller's last conversation, as on the inject door. A Google-verified
+caller (below) is `:google:<email>` inside the door, so its conversation is
+`a2a::google:<email>:<contextId>`: an eval caller may not contain a colon, so no eval key starts
+`a2a::` and no eval caller equals a Google one, which keeps the two classes' conversations and
+task scopes apart even though the static token's holder names their caller freely.
 
 **Identity, first version: the eval class.** The caller names itself - the `X-A2A-Caller` header,
 or `message.metadata.caller` for a client that cannot set headers - and is resolved through the
@@ -1385,23 +1971,48 @@ nothing is defaulted. `verifiedBy` is `a2a-bearer`, its own value, so an externa
 submission and an eval harness's are distinguishable downstream even though both resolve into
 the eval namespace today.
 
-That is the demo answer and not the product answer. The developer class (an ID token for the
-person whose harness is calling, audience this install's door, principal the same email the
-Google Chat adapter carries) and the unattended class (an organisation's service identity,
-read-only against protected targets) arrive as verifiers beside this map, never as entries in
-it, and each gets its own `verifiedBy`. Validating a token at the door is not the per-user
-token brokerage the permission model declined: the door holds an audience and an allowlist,
-never a refresh token.
+**Identity, second class: a developer signed in with Google.** A bearer that is not the door's
+static token is checked, when `A2A_DOOR_GOOGLE_CLIENT_ID` is set, as a Google OAuth access token:
+Google's tokeninfo endpoint must answer for it with the install's one pre-registered client as
+its audience or authorized party, a verified email, and an expiry still ahead. The email, as
+Google sent it, is the principal - the same string the Google Chat adapter carries for the same
+person, case-preserved as Chat keeps it for the audit join - admitted only if it is on the
+door's allowlist (`A2A_DOOR_ALLOWED_USERS`, compared case-insensitively; empty admits nobody, and
+there is no allow-all). The door checks the list before it holds any conversation or submission for
+the caller (the verifier's cache of the token's verdict is the one thing kept, bounded in
+bytes), so an account off it cannot fill the door's bounded state, and the gateway checks it again before it
+resolves the principal. The authority block records backend `a2a-google` and
+`verifiedBy` `a2a-google-token`. A request carrying the token may not also name a caller: the
+header or `message.metadata.caller` beside a token is refused, so a token never travels with a
+name that disagrees with it. A token Google refuses (tokeninfo's 400) is a 401 a client answers
+by signing in again; an account off the list is a 403; a check that could not be made (Google
+unreachable or answering with an error of its own, more checks in flight than the door allows)
+is a 503. An admission is remembered for at most five minutes or until the token
+expires, under a byte bound; a refusal is not remembered. This is a verifier beside the eval
+map, never an entry in it: the static token and its map work as before. The roster resolves the
+class's own way, never through the chat principal map that is the gateway's default.
+
+Validating a token at the door is not the per-user token brokerage the permission model
+declined: the door holds a client id and an allowlist (which the gateway checks again), never a refresh token or a
+client secret. The principal this class asserts is attribution: the task's capability is the
+install's, as it is for every ingress. Still to come as verifiers of their own, each with its
+own `verifiedBy`: JWT access tokens from an OpenID Connect provider (Entra, Okta), and the
+unattended class (an organisation's service identity, read-only against protected targets).
 
 **The card is the catalog.** One skill per destination this door routes to, which today is the
 gateway's default addressee. When profiles land the list is rendered from `DIRECTORY` and the
 caller's entitlements, per caller, and it is the same list the router's capability catalog is
 built from. The card is the one unauthenticated route, because discovery reads it to learn which
 security scheme to present; it discloses the endpoint URL, the scheme and the default
-destination's name, none of which a 401 hides.
+destination's name, none of which a 401 hides. With the Google class armed the card lists a
+second scheme beside the bearer, `openIdConnect` at Google's OpenID configuration, as an
+alternative.
 
 **Posture.** Every RPC request carries a bearer token (`A2A_DOOR_TOKEN`, required whenever
-`A2A_DOOR_LISTEN` is set, no unauthenticated mode); the caller map is its own file
+`A2A_DOOR_LISTEN` is set, no unauthenticated mode), or, with the Google class armed, a Google
+access token in its place; a bearer shaped like a Google access token (`ya29.`) is then sent
+to Google's tokeninfo endpoint to be checked, and any other is refused without leaving the
+cluster; the caller map is its own file
 (`A2A_DOOR_PRINCIPAL_MAP`); the card advertises `A2A_DOOR_PUBLIC_URL` when set, and otherwise
 the address the card was fetched from (the request's host, or the forwarded host and scheme
 behind a proxy), since behind a port-forward or an ingress the listen address is reachable by
@@ -1413,8 +2024,57 @@ under the door's own name, so each door comes and goes with its own flag. The re
 the door as a backend the way it counts the inject door (`a2aGatewayBackend`): a `mode: next`
 install with no `discord-bot` Secret and this door armed gets its gateway rather than the
 `NoChatBackend` condition, which is what the gateway's own start-up check already accepts. The
-identity classes above are what will let it be rendered on an install a customer reaches; until
-then it is a dev and eval door like the other.
+operator does not yet render the Google class's env; until it does, and until the door has
+ingress a customer reaches, it is a dev and eval door like the other.
+
+## Metrics (added 10/6)
+
+The gateway serves Prometheus counters on a metrics-only listener, the credential broker's
+pattern copied: its own port, `/metrics` and nothing else (any other path is 404, any method
+but GET or HEAD 405), every interface rather than loopback because its caller is the managed-Prometheus
+collector on the pod network. `A2A_METRICS_PORT` names the port; unset means no listener, and a
+value that is not a port, or is either door's port, refuses the boot. A port that will not bind
+costs the gateway its metrics and logs an `ALERT` line; conversations carry on. The operator
+renders `A2A_METRICS_PORT=9096` and declares container port `a2a-metrics` on 9096 from one
+constant (`a2aGatewayMetricsPort`), and the chart's `<name>-a2a-gateway-monitoring`
+`PodMonitoring` scrapes 9096 every 30 seconds behind the `platformAgent.podMonitoring` switch. The
+gateway's own NetworkPolicy, `<name>-a2a-gateway-netpol`, renders wherever the gateway Deployment
+does, door or no door, including a gateway scaled to zero replicas for want of a backend (only the
+stack's teardown removes it), and admits one peer: the `gke-gmp-system` namespace, to 9096 alone, the
+broker's second rule with the gateway's port in it. Each armed door renders a copy under its own
+name, and the doors' ports admit no pod. The gateway's fence used to render only with a door, which
+left the metrics port, bound on every interface, reachable from the whole pod network on an install
+with neither door armed; it renders on every `next` install now so that it is not (decided
+10/6 on #2473). It is Ingress-only, so the gateway's own dials to the bus are untouched.
+
+The site's [Observability page](../site/src/content/docs/concepts/observability.md) is
+canonical for what an operator reads off these series; this section is the design. Every label
+value comes from a closed list, never from a task, a conversation or an executor's
+text, so nothing a chat user or an executor sends can mint a series:
+
+| Metric                                               | Labels                                                                                                                                           | Counts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kubeagents_a2a_gateway_task_terminals_total`        | `state`: `completed`, `failed`, `canceled`, `rejected`, `other`; `source`: `executor`, `supervisor`, `gateway`, `gateway-never-started`, `other` | Each task terminal the gateway delivers to a conversation, counted once where every terminal path converges (`observeTaskTerminal`), by its final state and by whose word it is (`TerminalSource`): the executor's on the events subject, the supervisor's on the supervisor subject, or the gateway's own for a task whose submission never reached the bus (`gateway`) or that no executor took inside `A2A_FIRST_EVENT_GRACE` (`gateway-never-started`).                                                                                                                                  |
+| `kubeagents_a2a_gateway_gchat_events_received_total` | none                                                                                                                                             | Google Chat events pulled from the broker's relay, before parsing or classification. A payload that does not parse, or an event that is not a turn, still counts.                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `kubeagents_a2a_gateway_gchat_pulls_total`           | `outcome`: `events`, `empty`, `failed`                                                                                                           | Pulls of the Chat relay: one that returned an event, one that returned nothing, one the relay refused or that never answered. The same counts as the 15-minute `gchat events received` line, without the reset.                                                                                                                                                                                                                                                                                                                                                                              |
+| `kubeagents_a2a_gateway_chat_messages_total`         | `outcome`: `rendered`, `text_only`, `refused`, `invalid`                                                                                         | Each `kube-agents.chat/v1` message the gateway hands an adapter, and each it drops, on the relay and on a conversation notify ("Chat messages" under the Slack adapter): laid out by the backend; posted as its text by a backend that renders none; refused by a backend that does (too large for it, or its API said no) and posted as its text; or, under `invalid`, dropped for a broken rule with the text standing, or a bad `mark` dropped alone with the layout still rendering. Counted per hand-over, so a live message laid out again on each progress artifact counts each time. |
+| `kubeagents_a2a_gateway_notify_marks_dropped_total`  | none                                                                                                                                             | Conversation notify marks dropped because they name no chain (no `update` key bound to one) while a chain runs in the conversation ("Chat messages" under the Slack adapter).                                                                                                                                                                                                                                                                                                                                                                                                                |
+
+Every series is created at zero, so a `rate()` over a state that has not happened reads 0
+rather than no data. A pull carries at most one event today, so `gchat_events_received_total`
+equals `gchat_pulls_total{outcome="events"}`; they are separate so the first keeps its meaning if a
+pull ever returns more than one. An install that Chat publishes nothing to shows `empty` rising
+and `events` flat; a refused relay shows `failed` rising.
+
+The terminal counter counts every terminal the gateway hands its adapter, not only the relay's.
+It counts in `observeTaskTerminal`, the funnel each route ends in once: the relay; the stale-task
+heal, which delivers the terminal the relay missed, under the source its subject gives it; the
+never-started heal (`gateway-never-started`); and a submission that never reached the bus
+(`gateway`). The last two are failures the gateway declares itself, so a bus outage or an install
+with no executor shows `failed` rising under them rather than reading zero failed tasks while
+the chat shows ❌. The executor's reason token is not a label.
+The gateway does not know the executors' tokens, which are theirs to define, so it has no closed
+list to draw one from, and an open one is the cardinality the labels exist to avoid.
 
 ## What stage 2 builds from this doc
 

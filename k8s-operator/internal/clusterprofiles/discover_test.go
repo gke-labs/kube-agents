@@ -169,6 +169,49 @@ func TestDiscoverAttachesTheCredentialToEveryCluster(t *testing.T) {
 	}
 }
 
+// TestDiscoverCarriesTheAutopilotBit pins that the describe call's
+// Autopilot.Enabled reaches the caller. The event watcher's FailedScheduling
+// gate reads it to tell an Autopilot cluster that has scaled itself to zero
+// nodes from a Standard cluster whose nodes have gone, which look identical
+// from inside and mean opposite things. A cluster with no Autopilot block at
+// all — an older API response, a stub that does not set one — must read false
+// rather than panic, since that is the fail-open side of the question.
+func TestDiscoverCarriesTheAutopilotBit(t *testing.T) {
+	enabled := map[string]bool{"p/us-central1/auto": true, "p/us-central1/absent": false}
+	s := newStub()
+	d := s.discoverer()
+	d.Describe = func(_ context.Context, id Identity) (*container.Cluster, error) {
+		c := &container.Cluster{
+			Endpoint:   id.String() + ".example.invalid",
+			MasterAuth: &container.MasterAuth{ClusterCaCertificate: base64.StdEncoding.EncodeToString([]byte("ca-bytes"))},
+		}
+		// "absent" gets no Autopilot block at all, the others an explicit one.
+		if id.Cluster != "absent" {
+			c.Autopilot = &container.Autopilot{Enabled: enabled[id.String()]}
+		}
+		return c, nil
+	}
+
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-auto", "p", "auto", "us-central1")
+	writeClusterProfile(t, dir, "cluster-standard", "p", "standard", "us-central1")
+	writeClusterProfile(t, dir, "cluster-absent", "p", "absent", "us-central1")
+
+	clusters, err := d.Discover(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(clusters) != 3 {
+		t.Fatalf("got %d clusters (%v), want 3", len(clusters), profiles(clusters))
+	}
+	want := map[string]bool{"auto": true, "standard": false, "absent": false}
+	for _, c := range clusters {
+		if got := c.Autopilot; got != want[c.Identity.Cluster] {
+			t.Errorf("%s Autopilot = %t; want %t", c.Identity, got, want[c.Identity.Cluster])
+		}
+	}
+}
+
 func TestDiscoverSkipsNonClusterProfiles(t *testing.T) {
 	s := newStub()
 	dir := t.TempDir()

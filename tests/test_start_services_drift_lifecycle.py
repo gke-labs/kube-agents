@@ -806,5 +806,149 @@ class TheDaemonAddressIsDeclaredOnceAndUsedByBoth(_ScriptCase):
                 )
 
 
+class NormalizeBooleanResolvesWhatTheWatcherIsHandedAsAFlag(_ScriptCase):
+    """The boolean normaliser, exercised as bash rather than read as text.
+
+    Its output is pasted straight into `--autopilot-scale-to-zero-hold=`, so an
+    inverted arm does not fail anywhere visible: the watcher starts, parses the
+    flag, and silently runs with the Autopilot scale-to-zero hold off, which is
+    the behaviour the hold exists to prevent. A value Go's flag package cannot
+    parse is the other direction -- an immediate non-zero exit on every start.
+    """
+
+    def _resolve(self, value: str, default: str = "true") -> subprocess.CompletedProcess:
+        return _run_bash(
+            f"""
+            set -u
+            {self.lift("normalize_boolean")}
+            SETTING={shlex.quote(value)}
+            normalize_boolean SETTING {shlex.quote(default)}
+            printf "resolved=%s" "${{SETTING}}"
+            """
+        )
+
+    def test_it_resolves_every_spelling_the_enabled_gate_accepts(self) -> None:
+        for value, want in (
+            ("true", "true"),
+            ("TRUE", "true"),
+            ("True", "true"),
+            ("1", "true"),
+            ("yes", "true"),
+            ("on", "true"),
+            ("false", "false"),
+            ("FALSE", "false"),
+            ("0", "false"),
+            ("no", "false"),
+            ("off", "false"),
+        ):
+            with self.subTest(value=value):
+                result = self._resolve(value)
+                self.assertIn(f"resolved={want}", result.stdout)
+                self.assertNotIn("is not a recognised boolean", result.stderr)
+
+    def test_it_never_inverts_a_spelling_go_itself_would_have_parsed(self) -> None:
+        """`strconv.ParseBool`'s vocabulary, which the flag package uses.
+
+        A spelling missing from the table does not fail closed -- it falls to
+        the caller's fallback, so `F` with a `true` default reaches the watcher
+        as `--autopilot-scale-to-zero-hold=true`. The operator asked for the
+        hold off and got it on. Rejecting a spelling is survivable; rewriting
+        one to its opposite is not.
+        """
+        for value, want in (
+            ("t", "true"),
+            ("T", "true"),
+            ("TRUE", "true"),
+            ("True", "true"),
+            ("true", "true"),
+            ("1", "true"),
+            ("f", "false"),
+            ("F", "false"),
+            ("FALSE", "false"),
+            ("False", "false"),
+            ("false", "false"),
+            ("0", "false"),
+        ):
+            with self.subTest(value=value):
+                # Default deliberately opposite to `want`, so a value that
+                # falls through to the fallback reads as the inversion.
+                opposite = "false" if want == "true" else "true"
+                result = self._resolve(value, default=opposite)
+                self.assertIn(f"resolved={want}", result.stdout)
+                self.assertNotIn("is not a recognised boolean", result.stderr)
+
+    def test_an_unrecognised_value_lands_on_the_callers_default_and_says_so(self) -> None:
+        """Loudly, because the alternative is a flag error on every start."""
+        for value in ("bogus", "", "   ", "truthy", "0.0"):
+            with self.subTest(value=value):
+                result = self._resolve(value, default="true")
+                self.assertIn("resolved=true", result.stdout)
+                self.assertIn("is not a recognised boolean", result.stderr)
+                self.assertIn("SETTING", result.stderr)
+
+        # The fallback is the caller's, not a constant inside the helper.
+        result = self._resolve("bogus", default="false")
+        self.assertIn("resolved=false", result.stdout)
+
+    def test_surrounding_whitespace_does_not_invert_the_answer(self) -> None:
+        """A `case` pattern matches the whole word, so ` false` misses every arm.
+
+        Landing on the fallback is the wrong answer for a value whose intent is
+        not in doubt: `false ` from a quoted YAML scalar or a wrapper's printf
+        would reach the watcher as `--autopilot-scale-to-zero-hold=true`, the
+        opposite of what was set. The default is pinned opposite to the
+        expectation in each case, so a value that falls through reads as the
+        inversion rather than coincidentally matching -- which is what an
+        earlier version of this test did, asserting `" true"` against a `true`
+        default and passing while the bug was live.
+        """
+        for value, want in (
+            (" false", "false"),
+            ("false ", "false"),
+            ("  false  ", "false"),
+            ("\tfalse\n", "false"),
+            (" true", "true"),
+            ("true ", "true"),
+            ("  F  ", "false"),
+            (" off", "false"),
+            (" on ", "true"),
+        ):
+            with self.subTest(value=repr(value)):
+                opposite = "false" if want == "true" else "true"
+                result = self._resolve(value, default=opposite)
+                self.assertIn(f"resolved={want}", result.stdout)
+                self.assertNotIn("is not a recognised boolean", result.stderr)
+
+    def test_the_watcher_hold_is_normalised_and_defaulted_from_one_name(self) -> None:
+        """Both the unset path and the unrecognised path answer `true`.
+
+        Stated twice in the script they could drift into disagreeing, so the
+        default is a named constant and this is what holds it that way.
+        """
+        default = lift_constant(
+            "WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD_DEFAULT", self.text, _SCRIPT
+        )
+        self.assertIn("=true", default)
+
+        self.assertRegex(
+            self.text,
+            r'WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD="\$\{WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD:-'
+            r'\$\{WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD_DEFAULT\}\}"',
+            f"{_SCRIPT} no longer defaults the hold from the named constant",
+        )
+        self.assertIn(
+            "normalize_boolean WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD "
+            '"${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD_DEFAULT}"',
+            self.text,
+            f"{_SCRIPT} no longer normalises the hold against the named constant",
+        )
+
+        self.assertIn(
+            '--autopilot-scale-to-zero-hold="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD}"',
+            self.lift("start_event_watcher"),
+            "the normalised value no longer reaches the watcher",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

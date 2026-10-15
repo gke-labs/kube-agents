@@ -15,14 +15,17 @@ since that run, and flags an unchanged, behind member as `stalled` while a rollo
 active (another member moved, or `--rollout-in-progress` was passed).
 
 With `--readiness`, each member is also graded on whether it can take the upgrade to its
-target: drain-blocking PodDisruptionBudgets (read with one `kubectl get` per member after
+target: drain-blocking PodDisruptionBudgets and fail-closed admission webhooks with an
+unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC
+writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and
+kube-public; read with two `kubectl get` per member after
 `gcloud container clusters get-credentials` into a per-target kubeconfig), a maintenance
 exclusion in effect whose scope covers the upgrade, the maintenance window's state at
 `--at`, and node-pool version skew against the target control plane. The rules live in
 `upgrade_readiness.py`; this file reads and renders.
 
 Read-only against GCP: the gcloud commands it runs are `container clusters list`,
-`container get-server-config`, `projects list`, `config get-value project`, `projects
+`container get-server-config`, `projects list` (when neither `--project` nor a declared scope is passed), `config get-value project`, `projects
 describe` (to tie an API-disabled refusal to its project or resolve a numeric project
 number to its projectId) and, with
 `--readiness`, `container clusters get-credentials`. The only things it writes are its
@@ -36,12 +39,15 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 import tempfile
 from datetime import datetime, timezone
 
 import upgrade_readiness as readiness
 
-# Project resolution: explicit --project flags are the whole scope. Otherwise the
+# Project resolution: explicit --project flags are the whole scope, and so is the
+# declared scope the agent passes (--scope-projects, from the platform_control
+# fleet_scope tool). Otherwise the
 # per-profile project variables are unioned with the fleet's monitored-project list
 # when it is set, or with gcloud's configured project and every project
 # `gcloud projects list` returns when it is unset or blank.
@@ -53,7 +59,40 @@ PROJECT_ID_FORMAT = "--format=value(projectId)"
 PROJECTS_LIST_CMD = (GCLOUD, "projects", "list", PROJECT_ID_FORMAT)
 # The `project` a failed or filtered `gcloud projects list` is reported under.
 PROJECTS_LIST_ERROR_SCOPE = "(all projects: gcloud projects list)"
+# The same slot when the scope came from the fleet_scope tool and nothing was listed.
+DECLARED_SCOPE_ERROR_SCOPE = "(declared scope: fleet_scope)"
 PROJECTS_LIST_ERROR_CHARS = 300
+# Where the image and the shell sandbox ship the scripts the collectors share
+# (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
+# /opt/defaults/scripts), then the checkout's own copy for a run from the
+# repository.
+# The checkout's copy only when there is a checkout: a file three or fewer
+# directories below `/` has no parents[3], as collect.py guards the same path.
+SHARED_SCRIPT_DIRS = (
+    "/opt/defaults/scripts",
+    "/opt/data/scripts",
+    *([str(Path(__file__).resolve().parents[3] / "scripts")] if len(Path(__file__).resolve().parents) > 3 else []),
+)
+
+# The install's declared scope, handed in by the agent from the platform_control
+# `fleet_scope` tool (the collectors run in the shell sandbox and cannot read
+# the reconcile's snapshot themselves): the flags, their parsing and the note
+# live in fleet_scope_args, shared with every collector. `--scope-projects` is
+# the sweep, complete coverage; `--scope-unread` names each declared project
+# the install could not read, recorded as a coverage gap. Without them the
+# collector enumerates every project the identity can list, which is right on
+# a checkout and on an install that declares no scope; on a sandbox whose
+# operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
+# the session) a run without them refuses instead, and so does a --project
+# the scope does not list.
+for _shared_dir in SHARED_SCRIPT_DIRS:
+    if _shared_dir not in sys.path:
+        sys.path.append(_shared_dir)
+import fleet_scope_args  # noqa: E402
+
+# The scope this collector was handed, set by main from the two flags.
+declared_scope = fleet_scope_args.DeclaredScope()
+
 CONFIG_PROJECT_CMD = (GCLOUD, "config", "get-value", "project")
 API_DISABLED_MARKERS = (
     "SERVICE_DISABLED",
@@ -140,6 +179,15 @@ STATE_FILE_SUFFIX = ".json"
 # runs against one target at once (a chat turn and a delegated card) cannot truncate
 # each other's half-written file; the last rename wins whole.
 STATE_TMP_PREFIX = ".fleet-upgrade-record-"
+# The `--output` document is written the same way, whole, so a reader never meets a partial
+# one; a run that dies before it writes leaves the path as it found it, and a caller that must
+# tell its own run's file from an earlier one names the file per run (the persona's bullet).
+OUTPUT_TMP_PREFIX = ".fleet-upgrade-output-"
+# An `errors` row for the second, webhook read carries this key, so a reader of the report (the
+# readiness watch) can tell a member whose first read answered, and whose other rules were
+# graded, from one the API server never answered.
+ERROR_READ_KEY = "read"
+WEBHOOK_READ = "webhooks"
 # Bumped when the record's shape changes; a file with another version is reported and
 # treated as no prior run rather than compared field by field.
 STATE_FORMAT_VERSION = 1
@@ -197,9 +245,11 @@ PROGRESS_COLUMNS = (
 )
 VERSION_PAIR_SEPARATOR = " / "
 
-# Readiness (`--readiness`). The PDB check needs one kubectl read per member, which needs
-# credentials for that member: `get-credentials` writes a per-target kubeconfig, passed to
-# both commands as KUBECONFIG in the subprocess environment rather than through a flag,
+# Readiness (`--readiness`). The rules need two kubectl reads per member (PDBs with their
+# Deployments and StatefulSets, then webhook configurations with their Services and
+# EndpointSlices, and the Namespaces), which need credentials for that member: `get-credentials` writes a
+# per-target kubeconfig, passed to all three commands as KUBECONFIG in the subprocess
+# environment rather than through a flag,
 # because the gcloud and kubectl in the agent pod are credential-proxy shims that forward
 # that variable. The directory is `$HERMES_HOME/.kubeconfigs`, the platform AGENTS.md
 # convention, and the file name mirrors `_thread_kubeconfig_path` in
@@ -208,7 +258,50 @@ VERSION_PAIR_SEPARATOR = " / "
 # workspace, which is why the default is not /tmp. `--kubeconfig-dir` overrides it.
 KUBECTL = "kubectl"
 KUBECTL_TIMEOUT_SECONDS = 60
+# Error text from the first `kubectl get` after which the second read, against the same
+# kubeconfig, would fail the same way and only spend a second timeout: kubectl's transport
+# prefix, which a connection failure, a credential-plugin failure (`getting credentials:`) and a
+# certificate failure (`tls:`) all carry, and a dial or resolver failure. run_cmd's own deadline
+# is not one: in the agent sandbox kubectl is the credential-proxy client, whose broker may hold
+# a request in its admission queue for up to its slot wait before kubectl runs, so the deadline
+# measures the queue as often as the server, and a second read enters the queue afresh. The note
+# names the class, not an unreachable server, and kubectl's message stays in the error row. In
+# the sandbox the shim prints its own line when it cannot reach the broker (`credential proxy
+# unavailable: ...`), which the second call would print again. Matched without case: the errno
+# text behind the shim's line is capitalised. An error the server returned never skips, whatever
+# dial words its body quotes: kubectl prefixes one with `Error from server (<reason>):`, and an
+# InternalError quoting the apiserver's own etcd dial failure is an answer, which the second read
+# may still get.
+FIRST_READ_SKIP_MARKERS = ("unable to connect to the server", "i/o timeout", "connection refused", "no such host", "credential proxy unavailable")
+SERVER_ANSWERED_PREFIX = "error from server"
+WEBHOOK_READ_SKIPPED = "skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the credential proxy unreachable)"
+# The credential-proxy shim keeps the first --max-output-bytes of a command's stdout, drains the
+# rest, exits 0 and writes this line to stderr; a list cut there is unparsable JSON, and the
+# error row says so rather than blaming the server.
+PROXY_TRUNCATION_MARKER = "credential proxy output truncated"
+KUBECTL_OUTPUT_CUT = "{cmd} output was cut at the credential proxy's output cap, so the list did not fit in one read"
+# The member's note names the one cause its reads failed for, so an operator goes to the
+# step that failed: the directory, the credentials, the first read, the second read, or the
+# second read skipped because the first failed before the server answered it (the note names
+# the classes that produce that and the error row carries kubectl's message, rather than the
+# note calling the server unreachable). A skipped read is not a failed one: it gets no error
+# row of its own under the table.
+NOTE_DIRECTORY_FAILED = "kubeconfig directory could not be created; PDBs and webhooks not graded"
+NOTE_CREDENTIALS_FAILED = "credentials for the cluster could not be fetched; PDBs and webhooks not graded"
+NOTE_PDB_READ_FAILED = "PDB read failed; PDBs not graded"
+NOTE_WEBHOOK_READ_FAILED = "webhook read failed; webhooks not graded"
+NOTE_WEBHOOK_READ_SKIPPED = f"webhook read {WEBHOOK_READ_SKIPPED}; webhooks not graded"
+# Two reads, so a failure listing the webhook side (a large EndpointSlice list timing out or cut
+# at the proxy's cap, a custom role without webhook-configuration or namespace reads; the
+# installer's roles have both, and the name-label fallback in `bootstrap_namespace_labels` is for
+# a read that returns no Namespace object, not for a refused read) costs the webhook rule
+# only, never the PDBs. The webhook read lists every Service, EndpointSlice and Namespace in the
+# cluster though only the referenced Services and the two bootstrap namespaces (whose labels the
+# `namespaceSelector` is judged on) are consulted; a read proportional to the webhooks (the
+# configurations first, then each referenced Service and its slices, and the two namespaces by
+# name) is the change that removes the cluster-size bound, and is not made here.
 KUBECTL_RESOURCES = "pdb,deploy,statefulset"
+KUBECTL_WEBHOOK_RESOURCES = "validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces"
 KUBECONFIG_ENV = "KUBECONFIG"
 HERMES_HOME_ENV = "HERMES_HOME"
 DEFAULT_HERMES_HOME = "/opt/data"
@@ -232,12 +325,14 @@ READINESS_COLUMNS = (
     "location",
     "readiness",
     "drain-blocking PDBs",
+    "fail-closed webhooks",
     "maintenance",
     "node-pool skew",
     "note",
 )
 READINESS_NONE_CELL = "none"
 READINESS_READ_FAILED_CELL = "read failed"
+READINESS_READ_SKIPPED_CELL = "read skipped"
 READINESS_NOT_EVALUATED_CELL = "not evaluated"
 READINESS_NO_OPENING_CELL = f"none within {readiness.DAYS_PER_WEEK} days"
 
@@ -245,7 +340,40 @@ READINESS_NO_OPENING_CELL = f"none within {readiness.DAYS_PER_WEEK} days"
 # not abort the run; the exit code only says whether every requested read succeeded.
 EXIT_OK = 0
 EXIT_PARTIAL = 1
+NARROWED_RUN_NOTE = "Narrowed by --cluster: the rollout record was neither read nor written."
+# A `--cluster` spec that matched nothing is an error with exit 1, like a project that
+# could not be listed: an empty table with exit 0 would read as "nothing to grade".
+UNMATCHED_CLUSTER_SPEC = "no cluster matched --cluster {spec!r} in {projects}"
+# When a project's listing failed, the run cannot say the spec matched nothing
+# there: the line names the projects it did list and the ones it could not,
+# rather than sending the operator after a typo or a deleted cluster.
+UNMATCHED_CLUSTER_SPEC_PARTIAL = "no cluster matched --cluster {spec!r} in {listed}; {unlisted} could not be listed, so whether it is there is unknown"
+UNMATCHED_CLUSTER_SPEC_UNLISTED = "--cluster {spec!r} could not be matched: {unlisted} could not be listed"
 EXIT_USAGE = 2
+# `--rollout-in-progress` speaks to the rollout record, which a `--cluster` run neither
+# reads nor writes: the pair is refused, as `--at` without `--readiness` is, rather than
+# accepted and ignored.
+ROLLOUT_FLAG_NEEDS_FULL_READ = "--rollout-in-progress needs a full read: a --cluster run neither reads nor writes the rollout record"
+# `--cluster` takes `<location>/<name>` or a bare name and no third form. A spec
+# with an empty half (`/prod`, `prod/`) is refused before any read: `/prod` would
+# otherwise partition to the bare form and match `prod` in every location, the
+# opposite of what its slash says, and the unmatched-spec line would then name
+# a spec the operator did not type.
+CLUSTER_SPEC_SEPARATOR = "/"
+# Each half of a spec is a GKE name: lowercase letters, digits and hyphens, never
+# a hyphen first, as GKE spells every location and cluster name. Anything else --
+# whitespace from a pasted terminal line, an uppercase letter, a stray character,
+# a leading hyphen -- can match nothing, so the parser refuses it before any read
+# instead of letting the run report a miss that reads as a typo or a deleted
+# cluster. The grammar is the tree's GKE name component, character for character
+# as `credential_proxy_client._GKE_CONTEXT_COMPONENT` and `scoped_sa_pool._COMPONENT`
+# spell it, without their anchors because every use here is `fullmatch`; this
+# file does not import the broker's client for a regex, and the tests hold the
+# three equal (this half with the broker's component in this skill's suite, the
+# pool's copy with it in `test_scoped_sa_pool.py`), so a drift fails rather than
+# admitting a half the broker refuses.
+CLUSTER_SPEC_HALF_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+INVALID_CLUSTER_SPEC = "--cluster {spec!r} is neither <location>/<name> nor a bare name: each half is a GKE name (lowercase letters, digits and hyphens), a location before the slash and a name after it, or the name alone"
 
 
 def run_cmd(cmd: list[str], timeout: int = GCLOUD_TIMEOUT_SECONDS, env: dict | None = None) -> tuple[int, str, str]:
@@ -314,7 +442,13 @@ def _normalise_project_id(project: str, listing_errors: list[str] | None = None)
 
 
 def get_target_projects(cli_projects: list[str] | None = None, listing_errors: list[str] | None = None) -> list[str]:
-    """Resolves the projects to enumerate; --project wins, else env unioned with discovery.
+    """Resolves the projects to enumerate: --project wins, else the declared
+    scope the SOP passed from the fleet_scope tool (--scope-projects, swept as
+    given with nothing listed), else env unioned with discovery.
+
+    Under a declared scope the only entry appended to `listing_errors` is the
+    note naming the declared projects the install could not read
+    (--scope-unread), so the run reads as partial for them.
 
     A failed `gcloud projects list` is appended to `listing_errors` when the
     caller passes one, so the narrowed scope reads as a failed read rather than
@@ -322,7 +456,48 @@ def get_target_projects(cli_projects: list[str] | None = None, listing_errors: l
     configured project: it is filtered, not complete, as fleet_drift.py treats it.
     """
     if cli_projects:
-        return sorted({_normalise_project_id(p.strip()) or p.strip() for p in cli_projects if p.strip()})
+        # Refused before anything is read: a scoped sandbox without the flags
+        # must not describe a project the worker named.
+        if declared_scope.args_missing:
+            if listing_errors is not None:
+                listing_errors.append(declared_scope.empty_error())
+            return []
+        resolved: set[str] = set()
+        if not any(p.strip() for p in cli_projects):
+            # `--project "$VAR"` with the variable unset. Under a declared scope
+            # say so, with the remedy; without one the "no project" usage line
+            # main prints is the right answer, and this remedy would name a
+            # scope the install does not have.
+            if listing_errors is not None and declared_scope.declared:
+                listing_errors.append(fleet_scope_args.EMPTY_PROJECT_OVERRIDE_ERROR)
+            return []
+        for raw in (p.strip() for p in cli_projects if p.strip()):
+            project = _normalise_project_id(raw, listing_errors)
+            # Checked on the resolved id, so a number that names a listed project
+            # passes; a number the describe could not resolve reaches the holder
+            # as digits, which it refuses under a declared scope with the remedy
+            # and lets through without one, as before, with the failure recorded.
+            resolved.add(project or raw)
+        # On the resolved ids: a project number given here names the same
+        # project the tool lists by id.
+        override_errors = [declared_scope.override_error(p) for p in sorted(resolved)]
+        if any(override_errors):
+            if listing_errors is not None:
+                listing_errors.extend(e for e in override_errors if e)
+            return []
+        return sorted(resolved)
+    if declared_scope.declared:
+        # The declared scope the agent carried from the fleet_scope tool: the
+        # sweep as given, nothing listed, the unread rows as the one note. A
+        # declared scope with nothing readable enumerates nothing and says so,
+        # rather than widening to the listing.
+        if not declared_scope.projects:
+            if listing_errors is not None:
+                listing_errors.append(declared_scope.empty_error())
+            return []
+        if listing_errors is not None and declared_scope.note():
+            listing_errors.append(declared_scope.note())
+        return sorted(declared_scope.projects)
 
     # Parsed before it is tested, so a blank or separator-only value reads as
     # unset rather than as an override that names nothing and skips discovery.
@@ -334,6 +509,7 @@ def get_target_projects(cli_projects: list[str] | None = None, listing_errors: l
             raw_projects.add(val)
     if monitored:
         return sorted({_normalise_project_id(p) or p for p in raw_projects})
+
     # The host project is always in a discovered scope, whether or not a
     # `GCP_PROJECT_ID`-style variable also names one.
     rc, stdout, _ = run_cmd(list(CONFIG_PROJECT_CMD))
@@ -555,51 +731,97 @@ def get_credentials_cmd(cluster: dict, project: str) -> list[str]:
     ]
 
 
-def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> tuple[list | None, str | None, str]:
-    """(items, error, kubeconfig): the PDBs and workloads of one member, read through kubectl.
+def _kubectl_items(resources: str, env: dict) -> tuple[list | None, str | None]:
+    """(items, error) from one `kubectl get <resources> -A -o json` under `env`."""
+    cmd = [KUBECTL, "get", resources, "-A", "-o", "json"]
+    rc, stdout, stderr = run_cmd(cmd, KUBECTL_TIMEOUT_SECONDS, env)
+    if rc != 0:
+        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
+    try:
+        data = json.loads(stdout) if stdout.strip() else {}
+    except ValueError as e:
+        if PROXY_TRUNCATION_MARKER in stderr:
+            return None, KUBECTL_OUTPUT_CUT.format(cmd=" ".join(cmd))
+        return None, f"{' '.join(cmd)} returned unparsable JSON: {e}"
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None, f"{' '.join(cmd)} returned no items list"
+    return items, None
 
-    `get-credentials` writes the member's kubeconfig, then one `kubectl get` reads every
-    PodDisruptionBudget, Deployment and StatefulSet. Either command failing is the error;
-    the member is then graded `unknown` on the PDB rule and the run exits 1.
+
+def first_read_failed_before_the_server_answered(error: str) -> bool:
+    """Whether a first read's error is one of FIRST_READ_SKIP_MARKERS' classes and not an answer
+    the API server returned: kubectl prefixes a returned error with `Error from server (...)`, and
+    its body may quote a dial failure of the server's own (an InternalError on the path to etcd),
+    which the second read may still be answered through."""
+    lowered = error.lower()
+    return SERVER_ANSWERED_PREFIX not in lowered and any(marker in lowered for marker in FIRST_READ_SKIP_MARKERS)
+
+
+def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> dict:
+    """The objects of one member the readiness rules read, via kubectl.
+
+    `get-credentials` writes the member's kubeconfig; then one `kubectl get` reads every
+    PodDisruptionBudget, Deployment and StatefulSet, and a second reads the webhook
+    configurations, Services, EndpointSlices and Namespaces. Returns `items`/`error` for the first,
+    `webhook_items`/`webhook_error` for the second, and `kubeconfig`. A failed
+    `get-credentials` fails both, and so does a kubeconfig directory that cannot be created
+    (`directory_error`); a first read that failed before the server answered it (a connection,
+    credential-plugin or certificate failure, or the credential proxy unreachable; not the
+    deadline, which in the sandbox measures the credential proxy's queue, and not an error the
+    server returned, whatever it quotes) skips the second rather
+    than spend a second timeout on it
+    (`webhook_skipped`, with `webhook_error` saying so); otherwise
+    each read fails alone, grading only its own rule `unknown`, and any
+    failure makes the run exit 1.
     """
     path = kubeconfig_path(kubeconfig_dir, project, cluster.get("name", ""), cluster.get("location", ""))
+    result = {"items": None, "error": None, "webhook_items": None, "webhook_error": None, "webhook_skipped": False, "credentials_error": None, "directory_error": None, "kubeconfig": path}
     try:
         os.makedirs(kubeconfig_dir, exist_ok=True)
     except OSError as e:
-        return None, f"cannot create kubeconfig directory {kubeconfig_dir}: {e}", path
+        result["error"] = result["webhook_error"] = result["directory_error"] = f"cannot create kubeconfig directory {kubeconfig_dir}: {e}"
+        return result
     env = {**os.environ, KUBECONFIG_ENV: path}
     cmd = get_credentials_cmd(cluster, project)
     rc, _, stderr = run_cmd(cmd, GCLOUD_TIMEOUT_SECONDS, env)
     if rc != 0:
-        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}", path
-    cmd = [KUBECTL, "get", KUBECTL_RESOURCES, "-A", "-o", "json"]
-    rc, stdout, stderr = run_cmd(cmd, KUBECTL_TIMEOUT_SECONDS, env)
-    if rc != 0:
-        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}", path
-    try:
-        data = json.loads(stdout) if stdout.strip() else {}
-    except ValueError as e:
-        return None, f"{' '.join(cmd)} returned unparsable JSON: {e}", path
-    items = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return None, f"{' '.join(cmd)} returned no items list", path
-    return items, None, path
+        result["error"] = result["webhook_error"] = result["credentials_error"] = f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
+        return result
+    result["items"], result["error"] = _kubectl_items(KUBECTL_RESOURCES, env)
+    if result["error"] and first_read_failed_before_the_server_answered(result["error"]):
+        result["webhook_skipped"] = True
+        result["webhook_error"] = f"{WEBHOOK_READ_SKIPPED} ({result['error']})"
+        return result
+    result["webhook_items"], result["webhook_error"] = _kubectl_items(KUBECTL_WEBHOOK_RESOURCES, env)
+    return result
 
 
-def assess_readiness(cluster: dict, member: dict, items: list | None, read_error: str | None, at: datetime, kubeconfig: str) -> dict:
-    """The member's `readiness` object: the three rules against the row's target."""
+def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime) -> dict:
+    """The member's `readiness` object: every rule against the row's target."""
     target = parse_version(member["target_version"]) if member["target_version"] else None
     master = parse_version(member["control_plane_version"])
     pools = [{"name": p["name"], "version": p["version"], "parsed": parse_version(p["version"])} for p in member["node_pools"]]
     autopilot = bool((cluster.get("autopilot") or {}).get("enabled"))
+    items, read_error, webhook_items = read["items"], read["error"], read["webhook_items"]
     pdbs = None if items is None else readiness.grade_pdbs(*readiness.split_items(items))
+    webhooks = None if webhook_items is None else readiness.grade_webhooks(*readiness.split_webhook_items(webhook_items))
     maintenance = readiness.evaluate_maintenance(cluster.get("maintenancePolicy"), at, member["target_version"], target, master, pools)
     skew = readiness.evaluate_skew(target, pools, autopilot)
-    status = readiness.readiness_status(pdbs, maintenance, skew, target is not None)
+    status = readiness.readiness_status(pdbs, webhooks, maintenance, skew, target is not None)
 
     notes = []
-    if read_error:
-        notes.append("cluster read failed; PDBs not graded")
+    if read.get("directory_error"):
+        notes.append(NOTE_DIRECTORY_FAILED)
+    elif read["credentials_error"]:
+        notes.append(NOTE_CREDENTIALS_FAILED)
+    else:
+        if read_error:
+            notes.append(NOTE_PDB_READ_FAILED)
+        if read.get("webhook_skipped"):
+            notes.append(NOTE_WEBHOOK_READ_SKIPPED)
+        elif read["webhook_error"]:
+            notes.append(NOTE_WEBHOOK_READ_FAILED)
     if target is None:
         notes.append("no target; exclusion scope and skew not graded")
     if pdbs:
@@ -621,51 +843,126 @@ def assess_readiness(cluster: dict, member: dict, items: list | None, read_error
     return {
         "status": status,
         "evaluated_at": at.astimezone(timezone.utc).strftime(TIMESTAMP_FORMAT),
-        "kubeconfig": kubeconfig,
+        "kubeconfig": read["kubeconfig"],
         "read_error": read_error,
+        "webhook_read_error": read["webhook_error"],
+        "webhook_read_skipped": bool(read.get("webhook_skipped")),
         "autopilot": autopilot,
         "pdbs": pdbs,
+        "webhooks": webhooks,
         "maintenance": maintenance,
         "skew": skew,
         "note": NOTE_SEPARATOR.join(notes),
     }
 
 
-def build_report(projects: list[str], explicit_target: str | None, readiness_options: dict | None = None) -> dict:
+def parse_cluster_spec(spec: str) -> tuple[str, str] | None:
+    """`(location, name)` for `<location>/<name>`, `("", name)` for a bare name, and
+    None for anything else: an empty spec, an empty half, a second slash, or a
+    half outside the GKE name grammar (`CLUSTER_SPEC_HALF_RE`), none of which any
+    GKE location or cluster name carries. The grammar lives here alone; `main`
+    refuses what this rejects before any read."""
+    location, slash, name = spec.partition(CLUSTER_SPEC_SEPARATOR)
+    if not slash:
+        return ("", spec) if CLUSTER_SPEC_HALF_RE.fullmatch(spec) else None
+    if not (CLUSTER_SPEC_HALF_RE.fullmatch(location) and CLUSTER_SPEC_HALF_RE.fullmatch(name)):
+        return None
+    return location, name
+
+
+def _wanted(cluster: dict, wanted: set[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Every `--cluster` spec this cluster satisfies: its qualified form, its bare form,
+    or both when the caller named it both ways. Empty when it was not asked for."""
+    name = cluster.get("name", "")
+    location = cluster.get("location", "")
+    return [spec for spec in ((location, name), ("", name)) if spec in wanted]
+
+
+def build_report(projects: list[str], explicit_target: str | None, readiness_options: dict | None = None, clusters: list[str] | None = None) -> dict:
     """Enumerates every project and grades every member; one failure never aborts the rest.
 
     `readiness_options` (`at`, `kubeconfig_dir`) turns on the per-member readiness read and
-    grade; None leaves the report as the version table alone.
+    grade; None leaves the report as the version table alone. `clusters`, when given, is the
+    names to grade; every other cluster in the projects is skipped, so a caller that wants a
+    few members' readiness does not pay for the others' reads, and the report records them
+    under `narrowed_to` (`None` on a full run).
     """
+    # `<location>/<name>` pins one cluster; a bare name admits that name in
+    # every location of the projects (GKE names are unique per location).
+    # `main` refuses any other form before it gets here; a direct caller is
+    # refused the same way rather than matched against every location.
+    wanted: set[tuple[str, str]] | None = None
+    narrowed_to: list[str] | None = None
+    if clusters:
+        wanted = set()
+        for spec in clusters:
+            parsed = parse_cluster_spec(spec)
+            if parsed is None:
+                raise ValueError(INVALID_CLUSTER_SPEC.format(spec=spec))
+            wanted.add(parsed)
+        narrowed_to = sorted(set(clusters))
+    matched: set[tuple[str, str]] = set()
     cache = ServerConfigCache()
     members: list[dict] = []
     errors: list[dict] = []
+    # Projects whose listing failed: a spec can match nothing there, and the
+    # unmatched line below says so instead of claiming no match.
+    unlisted: list[str] = []
     for project in projects:
         cmd = [GCLOUD, "container", "clusters", "list", f"--project={project}", JSON_FORMAT_FLAG]
-        clusters, error = run_gcloud_json(cmd)
-        if error is not None or not isinstance(clusters, list):
+        listed, error = run_gcloud_json(cmd)
+        if error is not None or not isinstance(listed, list):
             if error is not None and any(marker in error for marker in API_DISABLED_MARKERS):
                 ours, why_not = refusal_names_project(project, error)
                 if ours:
                     continue
                 error = f"{error} ({why_not})"
             errors.append({"project": project, "location": None, "message": error or f"{' '.join(cmd)} returned no list"})
+            unlisted.append(project)
             continue
-        for cluster in clusters:
+        for cluster in listed:
             if not isinstance(cluster, dict):
                 continue
+            if wanted is not None:
+                hits = _wanted(cluster, wanted)
+                if not hits:
+                    continue
+                # Every spec the cluster satisfies counts, not the first: a bare and a
+                # qualified spec for one cluster are one request, not a hit and a miss.
+                matched.update(hits)
             member = grade_member(cluster, project, explicit_target, cache)
             if readiness_options is not None:
-                items, read_error, path = read_cluster_objects(cluster, project, readiness_options["kubeconfig_dir"])
-                if read_error is not None:
-                    errors.append({"project": project, "location": member["location"], "cluster": member["cluster"], "message": read_error})
-                member["readiness"] = assess_readiness(cluster, member, items, read_error, readiness_options["at"], path)
+                read = read_cluster_objects(cluster, project, readiness_options["kubeconfig_dir"])
+                # A credentials failure fills both slots with one message; a skipped second read is not a failure and gets no row.
+                failed = (read["error"], None if read.get("webhook_skipped") else read["webhook_error"])
+                for message in dict.fromkeys(m for m in failed if m):
+                    row = {"project": project, "location": member["location"], "cluster": member["cluster"], "message": message}
+                    if message != read["error"]:
+                        row[ERROR_READ_KEY] = WEBHOOK_READ
+                    errors.append(row)
+                member["readiness"] = assess_readiness(cluster, member, read, readiness_options["at"])
             members.append(member)
     errors.extend(cache.errors)
+    listed = [p for p in projects if p not in unlisted]
+    for location, name in sorted((wanted or set()) - matched):
+        spec = f"{location}/{name}" if location else name
+        if not unlisted:
+            message = UNMATCHED_CLUSTER_SPEC.format(spec=spec, projects=", ".join(projects))
+        elif listed:
+            message = UNMATCHED_CLUSTER_SPEC_PARTIAL.format(spec=spec, listed=", ".join(listed), unlisted=", ".join(unlisted))
+        else:
+            message = UNMATCHED_CLUSTER_SPEC_UNLISTED.format(spec=spec, unlisted=", ".join(unlisted))
+        errors.append({"project": None, "location": location or None, "cluster": name, "message": message})
     members.sort(key=lambda m: (m["project"], m["location"], m["cluster"]))
     report = {
         "target_version": explicit_target,
         "projects": list(projects),
+        # The `--cluster` specs this run was narrowed to, `None` on a full run,
+        # so a reader of `members[]` (the deprecation scan's floor, the audit
+        # collector's join) can tell a narrowed file from a full run whose
+        # project held one cluster. A `--project` narrowing is already visible
+        # in `projects`; this is the one the file otherwise hides.
+        "narrowed_to": narrowed_to,
         "members": members,
         "errors": errors,
         "summary": {status: sum(1 for m in members if m["status"] == status) for status in STATUS_ORDER},
@@ -722,8 +1019,12 @@ def render_table(report: dict) -> str:
         + (f"; target {report['target_version']}" if report["target_version"] else "; target: each cluster's channel default")
     )
     for err in report["errors"]:
-        where = err["project"] + (f" ({err['location']})" if err.get("location") else "") + (f" cluster {err['cluster']}" if err.get("cluster") else "")
-        lines.append(f"- read failed for {where}: {err['message']}")
+        parts = [err["project"]] if err.get("project") else []
+        if err.get("location"):
+            parts.append(f"({err['location']})" if parts else err["location"])
+        if err.get("cluster"):
+            parts.append(f"cluster {err['cluster']}")
+        lines.append(f"- read failed for {' '.join(parts) or 'the run'}: {err['message']}")
     return "\n".join(lines)
 
 
@@ -733,6 +1034,18 @@ def _pdb_cell(r: dict) -> str:
     if not r["pdbs"]["blocking"]:
         return READINESS_NONE_CELL
     return NOTE_SEPARATOR.join(readiness.describe_finding(f) for f in r["pdbs"]["blocking"])
+
+
+def _webhook_cell(r: dict) -> str:
+    """Blocking findings first (the upgrade's path, or the bootstrap-policy writes a dead webhook reaching `kube-system` or `kube-public` would refuse); unreachable-backend webhooks outside both after them,
+    since they are an outage now even though they do not grade the member."""
+    webhooks = r["webhooks"]
+    if webhooks is None:
+        return READINESS_READ_SKIPPED_CELL if r.get("webhook_read_skipped") else READINESS_READ_FAILED_CELL
+    findings = webhooks["blocking"] + webhooks["outage"]
+    if not findings:
+        return READINESS_NONE_CELL
+    return NOTE_SEPARATOR.join(readiness.describe_webhook_finding(f) for f in findings)
 
 
 def _maintenance_cell(r: dict) -> str:
@@ -780,14 +1093,14 @@ def render_readiness(report: dict) -> str:
     ]
     for m in report["members"]:
         r = m["readiness"]
-        row = (m["project"], m["cluster"], m["location"], r["status"], _pdb_cell(r), _maintenance_cell(r), _skew_cell(r), r["note"])
+        row = (m["project"], m["cluster"], m["location"], r["status"], _pdb_cell(r), _webhook_cell(r), _maintenance_cell(r), _skew_cell(r), r["note"])
         lines.append("| " + " | ".join(_cell(v) for v in row) + " |")
     summary = report["readiness"]["summary"]
     lines.append("")
     lines.append(
         f"Readiness at {report['readiness']['evaluated_at']}: "
         + ", ".join(f"{summary[s]} {s}" for s in readiness.READINESS_ORDER)
-        + "; a maintenance exclusion holds back GKE's automatic upgrades only, a drain-blocking PDB or skew any upgrade."
+        + "; a maintenance exclusion holds back GKE's automatic upgrades only, a drain-blocking PDB, a fail-closed webhook with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), or skew any upgrade."
     )
     return "\n".join(lines)
 
@@ -849,21 +1162,29 @@ def load_state(path: str) -> tuple[dict | None, str | None]:
     return data, None
 
 
-def save_state(path: str, state: dict) -> None:
-    """Writes the record atomically (unique temp file, then rename); raises OSError on failure."""
+def write_json_atomically(path: str, data: dict, tmp_prefix: str) -> None:
+    """Writes `data` as JSON whole: a unique temp file in the same directory, then a rename, so
+    a reader never meets a partial document and a write that fails leaves the previous file or
+    none. Raises what the write raised (OSError, or a serialisation error) after removing the
+    temp file."""
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=STATE_TMP_PREFIX, suffix=STATE_FILE_SUFFIX, dir=directory)
+    fd, tmp = tempfile.mkstemp(prefix=tmp_prefix, suffix=STATE_FILE_SUFFIX, dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=JSON_INDENT)
+            json.dump(data, f, indent=JSON_INDENT)
         os.replace(tmp, path)
-    except OSError:
+    except Exception:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+
+
+def save_state(path: str, state: dict) -> None:
+    """Writes the record atomically (unique temp file, then rename); raises OSError on failure."""
+    write_json_atomically(path, state, STATE_TMP_PREFIX)
 
 
 def _member_record(member: dict, unchanged_since: str, previous: dict | None) -> dict:
@@ -919,7 +1240,7 @@ def compute_progress(report: dict, previous: dict | None, now: datetime, rollout
     """
     now_text = format_timestamp(now)
     prior_members = previous["members"] if previous else {}
-    failed_projects = {e["project"] for e in report["errors"] if e.get("location") is None}
+    failed_projects = {e["project"] for e in report["errors"] if e.get("location") is None and e.get("project")}
     read_projects = set(report["projects"]) - failed_projects
 
     record: dict[str, dict] = {}
@@ -1027,16 +1348,21 @@ def render_progress(report: dict, previous: dict | None) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Per-member GKE version table against a target version.")
-    parser.add_argument("--project", action="append", help="GCP project to enumerate; repeatable. Defaults to the fleet's configured projects.")
+    # Exact flags only: the bench reads a worker's run of this script by the flag's full word,
+    # so argparse's prefix matching (`--readi`) would run a report the reader does not credit.
+    parser = argparse.ArgumentParser(description="Per-member GKE version table against a target version.", allow_abbrev=False)
+    parser.add_argument("--project", action="append", help="GCP project to enumerate; repeatable. On an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args; omit to sweep --scope-projects when given, else the fleet's configured projects")
+    fleet_scope_args.add_scope_arguments(parser)
     parser.add_argument("--target-version", help="Target for every member, e.g. 1.31.4-gke.1183000. Default: each cluster's channel defaultVersion.")
+    parser.add_argument("--cluster", action="append", help="Cluster to grade, as <location>/<name> (both halves) or a bare name; repeatable. With it, other clusters in the projects are skipped and the rollout record is neither read nor written (a narrowed read is not a rollout observation). Default: every cluster.")
     parser.add_argument("--output", help="Path to write the report as JSON.")
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help=f"Directory holding one record per target from the previous run (default: {DEFAULT_STATE_DIR}).")
     parser.add_argument("--rollout-in-progress", action="store_true", help="Assert a rollout is under way, so an unchanged, behind member is flagged stalled even when no other member moved.")
-    parser.add_argument("--readiness", action="store_true", help="Also grade each member's readiness for the upgrade: drain-blocking PDBs (one kubectl read per member), maintenance exclusions and window, node-pool skew.")
+    parser.add_argument("--readiness", action="store_true", help="Also grade each member's readiness for the upgrade: drain-blocking PDBs and fail-closed webhooks with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public) (two kubectl reads per member), maintenance exclusions and window, node-pool skew.")
     parser.add_argument("--at", help="RFC 3339 instant to evaluate maintenance exclusions and the window at (default: now). Only with --readiness.")
     parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $HERMES_HOME/.kubeconfigs).")
     args = parser.parse_args(argv)
+    declared_scope.set(args.scope_projects, args.scope_unread)
 
     if args.target_version and parse_version(args.target_version) is None:
         sys.stderr.write(f"--target-version {args.target_version!r} is not MAJOR.MINOR.PATCH[-gke.BUILD]\n")
@@ -1054,43 +1380,54 @@ def main(argv: list[str] | None = None) -> int:
     elif args.at or args.kubeconfig_dir:
         sys.stderr.write("--at and --kubeconfig-dir need --readiness\n")
         return EXIT_USAGE
+    if args.cluster and args.rollout_in_progress:
+        sys.stderr.write(ROLLOUT_FLAG_NEEDS_FULL_READ + "\n")
+        return EXIT_USAGE
+    for spec in args.cluster or []:
+        if parse_cluster_spec(spec) is None:
+            sys.stderr.write(INVALID_CLUSTER_SPEC.format(spec=spec) + "\n")
+            return EXIT_USAGE
 
     listing_errors: list[str] = []
     projects = get_target_projects(args.project, listing_errors)
+    scope_label = DECLARED_SCOPE_ERROR_SCOPE if declared_scope.declared else PROJECTS_LIST_ERROR_SCOPE
     if not projects:
         for error in listing_errors:
-            sys.stderr.write(f"gcloud projects list: {error}\n")
-        sys.stderr.write("no project: pass --project, or set MONITORED_PROJECT_IDS or GCP_PROJECT_ID\n")
+            sys.stderr.write(f"{scope_label}: {error}\n")
+        if not declared_scope.declared:
+            sys.stderr.write("no project: pass --project, or set MONITORED_PROJECT_IDS or GCP_PROJECT_ID\n")
         return EXIT_USAGE
 
-    report = build_report(projects, args.target_version, readiness_options)
+    report = build_report(projects, args.target_version, readiness_options, clusters=args.cluster)
     report["errors"][:0] = [
-        {"project": PROJECTS_LIST_ERROR_SCOPE, "location": None, "message": error} for error in listing_errors
+        {"project": scope_label, "location": None, "message": error} for error in listing_errors
     ]
-    path = state_path(args.state_dir, args.target_version)
-    previous, state_error = load_state(path)
-    state = compute_progress(report, previous, utc_now(), args.rollout_in_progress, path)
     print(render_table(report))
     if readiness_options is not None:
         print()
         print(render_readiness(report))
-    print()
-    print(render_progress(report, previous))
-    if state_error:
-        sys.stderr.write(state_error + "\n")
-
     write_failed = False
-    try:
-        save_state(path, state)
-    except OSError as e:
-        sys.stderr.write(f"failed to write the record {path}: {e}\n")
-        write_failed = True
+    if args.cluster:
+        # A narrowed read is not a rollout observation: the record would file
+        # every member it did not name as gone. Leave the record alone.
+        print(f"\n{NARROWED_RUN_NOTE}")
+    else:
+        path = state_path(args.state_dir, args.target_version)
+        previous, state_error = load_state(path)
+        state = compute_progress(report, previous, utc_now(), args.rollout_in_progress, path)
+        print()
+        print(render_progress(report, previous))
+        if state_error:
+            sys.stderr.write(state_error + "\n")
+        try:
+            save_state(path, state)
+        except OSError as e:
+            sys.stderr.write(f"failed to write the record {path}: {e}\n")
+            write_failed = True
 
     if args.output:
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-            with open(args.output, "w", encoding="utf-8") as f:
-                json.dump(report, f, indent=JSON_INDENT)
+            write_json_atomically(args.output, report, OUTPUT_TMP_PREFIX)
             print(f"\nWrote {len(report['members'])} member(s) to {args.output}")
         except OSError as e:
             sys.stderr.write(f"failed to write {args.output}: {e}\n")

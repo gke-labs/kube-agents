@@ -9,7 +9,8 @@ Two things are checked:
 
 1. The notifier. ``_send_event`` hands ``_progress_deliver`` the adapter
    ``_kage_slack_incident.adapter_for(adapter, self.platform_str, ev,
-   self.task, sub)`` returns, and that name is bound at module level.
+   self.task, sub)`` returns, and that name is bound at module level. The
+   first argument may be ``slack_ux_answer``'s adapter for the same event.
 2. The runtime module, loaded by path from ``gateway/``: flag off,
    ``adapter_for`` returns the notifier's own adapter; flag on, a triage
    report for an open alert thread edits the alert with one button per
@@ -38,6 +39,8 @@ NOTIFIER = "gateway/kanban_watchers_notifier.py"
 RUNTIME = "gateway/slack_ux_incident.py"
 BLOCK_KIT = "plugins/platforms/slack/block_kit.py"
 FLAG_ENV = "KAGE_SLACK_UX"
+#: Unset is on, so the flag-off path needs a value.
+FLAG_OFF = "false"
 DB_PATH_ENV = "SESSION_KV_DB_PATH"
 
 METHOD = "_send_event"
@@ -45,6 +48,9 @@ DELIVER = "_progress_deliver"
 ALIAS = "_kage_slack_incident"
 FACTORY = "adapter_for"
 EXPECTED_ARGS = "adapter, self.platform_str, ev, self.task, sub"
+#: ``apply_slack_ux_answer`` wraps the first argument; the rest stay.
+ANSWER_WRAPPED = "_kage_slack_answer.adapter_for(" + EXPECTED_ARGS + ")"
+REST_ARGS = EXPECTED_ARGS.split(", ", 1)[1]
 
 CHANNEL = "C0KAGE"
 ALERT_TS = "1700000000.000100"
@@ -88,7 +94,9 @@ def check_notifier(root: Path) -> None:
         and factory.func.attr == FACTORY
         and isinstance(factory.func.value, ast.Name)
         and factory.func.value.id == ALIAS
-        and ", ".join(ast.unparse(a) for a in factory.args) == EXPECTED_ARGS
+        and factory.args
+        and ast.unparse(factory.args[0]) in ("adapter", ANSWER_WRAPPED)
+        and ", ".join(ast.unparse(a) for a in factory.args[1:]) == REST_ARGS
     ):
         raise _fail(f"{DELIVER}()'s adapter argument is not {ALIAS}.{FACTORY}({EXPECTED_ARGS})")
     bound = any(
@@ -152,11 +160,14 @@ async def _drive(module, db_path: str, expected_fold: list[dict]) -> None:
     event = SimpleNamespace(kind="completed")
     task = SimpleNamespace(result=REPORT)
     sub = {"chat_id": CHANNEL, "thread_id": ALERT_TS}
-    os.environ.pop(FLAG_ENV, None)
+    os.environ[FLAG_ENV] = FLAG_OFF
     os.environ[DB_PATH_ENV] = db_path
     try:
         if module.adapter_for(adapter, "slack", event, task, sub) is not adapter:
-            raise _fail(f"adapter_for() wrapped the adapter with {FLAG_ENV} unset")
+            raise _fail(f"adapter_for() wrapped the adapter with {FLAG_ENV}={FLAG_OFF}")
+        os.environ.pop(FLAG_ENV, None)
+        if not module.enabled():
+            raise _fail(f"enabled() is false with {FLAG_ENV} unset, which is on")
         os.environ[FLAG_ENV] = "1"
         wrapped = module.adapter_for(adapter, "slack", event, task, sub)
         if wrapped is adapter:

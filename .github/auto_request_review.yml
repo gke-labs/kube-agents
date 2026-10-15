@@ -2,6 +2,7 @@ reviewers:
   # The default reviewers
   defaults:
     - repository-owners # group
+    - repository-reviewers # group
 
   # Reviewer groups each of which has a list of GitHub usernames
   groups:
@@ -11,6 +12,19 @@ reviewers:
       - toshiowang
       - dshnayder
       - bnaylor
+      - haoxuw
+    # Reviewers who are not root approvers. Prow takes their lgtm because
+    # OWNERS lists them under `reviewers` (scripts/test_request_reviewers.py
+    # pins that), but their approval cannot produce `approved`, so
+    # scripts/request_reviewers.py draws from this group only when the
+    # author's own approval already covers every changed file -- a root
+    # approver's pull request, which needs lgtm alone. Any other pull request
+    # takes an approver, at equal weight otherwise. Someone who becomes a root
+    # approver moves to repository-owners; the same test pins that.
+    repository-reviewers:
+      - lapis2002
+      - stalhaali
+      - Fuxiao-Gao
     # Mirrors the eval-crew alias in OWNERS_ALIASES: only it can /approve a
     # change to hack/eval/presubmit-cases.txt or hack/eval/blocking-roster.txt
     # (#1546; hack/OWNERS). Keep the two lists identical. A mixed pull request
@@ -25,6 +39,7 @@ files:
   # You can assign groups defined above as well as GitHub usernames.
   "**":
     - repository-owners # group
+    - repository-reviewers # group
   # Listed after "**" so the last match sends these to the only approvers
   # who can clear them. The author is never requested, so eval-crew's own
   # pull requests fall back to the defaults for their lgtm.

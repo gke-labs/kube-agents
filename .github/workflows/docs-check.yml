@@ -31,13 +31,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Tables that mirror jobs.json, images.json, the skill frontmatter, or
-      # the provisioning scripts must match their source, as must the
-      # collapsed-family roster derived from the docs map.
+      # the provisioning scripts must match their source.
       - name: Generated tables are current
         run: make docs-check-generated
 
-      # Relative links, and design-doc paths cited from code, must resolve.
-      # Catches paths broken by moved files and citations of unmerged docs.
+      # Relative links, and design-doc paths cited from code, must resolve,
+      # and every tracked document must be reachable from where a reader
+      # starts. Catches paths broken by moved files, citations of unmerged
+      # docs, and a page nothing links.
       - name: Links and cited design docs resolve
         run: make docs-check-links
 
@@ -45,12 +46,6 @@ jobs:
       # namespace, Go toolchain and cert-manager versions).
       - name: Terminology matches source
         run: make docs-check-terminology
-
-      # Every tracked .md/.mdx must have an inventory entry in the docs map,
-      # and every path the map claims must exist. Catches added, moved,
-      # renamed, or deleted docs that the hand-maintained map missed.
-      - name: Documentation map covers every doc
-        run: make docs-check-map
 
       # The published site is for people running kube-agents on their own
       # clusters. A workflow secret name, a GitHub App ID, or a service account

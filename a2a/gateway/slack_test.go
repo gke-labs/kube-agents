@@ -8,14 +8,17 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
@@ -24,15 +27,67 @@ import (
 // fakeSlackAPI fakes the five Web API calls the adapter makes; tests assert
 // on what was posted/updated.
 type fakeSlackAPI struct {
-	posted   []struct{ channel, thread, text string }
-	updated  []struct{ channel, ts, text string }
-	members  []string
-	cursor   string
-	openedIM string
+	// mu guards posted and updated for the tests that drive the fake from
+	// gateway workers; single-goroutine tests read the slices directly.
+	mu sync.Mutex
+	// team is the team id auth.test answers with.
+	team   string
+	posted []struct{ channel, thread, text string }
+	// postValues is every chat.postMessage's full form, for the fields
+	// posted does not name.
+	postValues []url.Values
+	updated    []struct{ channel, ts, text string }
+	members    []string
+	cursor     string
+	openedIM   string
+	// updatedBlocks and updatedAttachments are each update's blocks and
+	// attachments fields as sent, beside updated.
+	updatedBlocks      []string
+	updatedAttachments []string
+	// reactions records reactions.add and .remove as "+name channel/ts" and
+	// "-name channel/ts"; reactErr, when set, is every reaction call's error.
+	reactions []string
+	reactErr  error
+	// users answers users.info; userInfoCalls counts the calls.
+	users         map[string]*slack.User
+	userInfoCalls int
+	// prompts records setSuggestedPrompts calls.
+	prompts []slack.AssistantThreadsSetSuggestedPromptsParameters
+}
+
+func (f *fakeSlackAPI) AddReaction(name string, item slack.ItemRef) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reactions = append(f.reactions, "+"+name+" "+item.Channel+"/"+item.Timestamp)
+	return f.reactErr
+}
+
+func (f *fakeSlackAPI) RemoveReaction(name string, item slack.ItemRef) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reactions = append(f.reactions, "-"+name+" "+item.Channel+"/"+item.Timestamp)
+	return f.reactErr
+}
+
+func (f *fakeSlackAPI) GetUserInfo(user string, _ ...slack.GetUserInfoOption) (*slack.User, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.userInfoCalls++
+	if u, ok := f.users[user]; ok {
+		return u, nil
+	}
+	return nil, errors.New("user_not_found")
+}
+
+func (f *fakeSlackAPI) SetAssistantThreadsSuggestedPrompts(p slack.AssistantThreadsSetSuggestedPromptsParameters) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.prompts = append(f.prompts, p)
+	return nil
 }
 
 func (f *fakeSlackAPI) AuthTestContext(context.Context) (*slack.AuthTestResponse, error) {
-	return &slack.AuthTestResponse{UserID: "UBOT", User: "kage"}, nil
+	return &slack.AuthTestResponse{UserID: "UBOT", User: "kage", TeamID: f.team}, nil
 }
 
 func (f *fakeSlackAPI) PostMessage(channelID string, options ...slack.MsgOption) (string, string, error) {
@@ -40,9 +95,12 @@ func (f *fakeSlackAPI) PostMessage(channelID string, options ...slack.MsgOption)
 	if err != nil {
 		return "", "", err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.posted = append(f.posted, struct{ channel, thread, text string }{
 		values.Get("channel"), values.Get("thread_ts"), values.Get("text"),
 	})
+	f.postValues = append(f.postValues, values)
 	return channelID, "999.001", nil
 }
 
@@ -51,9 +109,16 @@ func (f *fakeSlackAPI) UpdateMessage(channelID, timestamp string, options ...sla
 	if err != nil {
 		return "", "", "", err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.updated = append(f.updated, struct{ channel, ts, text string }{
 		values.Get("channel"), timestamp, values.Get("text"),
 	})
+	// Blocks and attachments live outside the values UnsafeApplyMsgOptions
+	// returns, so they are read off the wire form a real client sends.
+	sent := sentUpdateForm(channelID, timestamp, options...)
+	f.updatedBlocks = append(f.updatedBlocks, sent.Get("blocks"))
+	f.updatedAttachments = append(f.updatedAttachments, sent.Get("attachments"))
 	return channelID, timestamp, "", nil
 }
 
@@ -203,7 +268,7 @@ func TestSlackWebAPIClientIsBounded(t *testing.T) {
 func TestSlackDMMentionIsStripped(t *testing.T) {
 	a := newTestSlackAdapter(&fakeSlackAPI{})
 	got, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", "<@UBOT> stop", "1.0", ""))
-	if !ok || got.Text != "stop" || got.Conversation != "slack:dm/D1" {
+	if !ok || got.Text != "stop" || got.Conversation != "slack:dm/D1/1.0" {
 		t.Fatalf("DM with a mention: delivered=%v text=%q conv=%q, want text \"stop\"", ok, got.Text, got.Conversation)
 	}
 	if _, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", "<@UBOT>", "2.0", "")); ok {
@@ -243,13 +308,11 @@ func TestSlackRunAuthTestHonoursCancel(t *testing.T) {
 	}
 }
 
-// TestSlackEmptyPrincipalMapWarnsAtBoot: the boot-time warning for an empty
-// map fires for every backend whose identity join IS the map — Slack as
-// much as Discord — and not for gchat, which never reads it. The operator
-// projects the Slack map Secret as optional, so a Slack gateway on an
-// install that never created it has a missing map, and it must not pass
-// boot silently and then drop every sender.
-func TestSlackEmptyPrincipalMapWarnsAtBoot(t *testing.T) {
+// TestEmptyPrincipalMapBootNotice: an empty map is a WARN on Discord, whose
+// identity join IS the map and which drops every sender without it. On Slack
+// the map is an optional override, so an empty one is an INFO that says
+// listed senders are attributed by member id. gchat never reads it.
+func TestEmptyPrincipalMapBootNotice(t *testing.T) {
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -258,11 +321,13 @@ func TestSlackEmptyPrincipalMapWarnsAtBoot(t *testing.T) {
 
 	for _, tc := range []struct {
 		backend string
-		warns   bool
+		notice  string
+		level   slog.Level
+		found   bool
 	}{
-		{slackBackend, true},
-		{discordBackend, true},
-		{gchatBackend, false},
+		{slackBackend, "the Slack principal map is empty", slog.LevelInfo, true},
+		{discordBackend, "principal map is empty; every discord message", slog.LevelWarn, true},
+		{gchatBackend, "principal map is empty", 0, false},
 	} {
 		t.Run(tc.backend, func(t *testing.T) {
 			client, err := lib.Connect(ctx, url, lib.WithName("gateway-test-"+tc.backend), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
@@ -281,12 +346,12 @@ func TestSlackEmptyPrincipalMapWarnsAtBoot(t *testing.T) {
 			if _, err := New(Options{Client: client, Adapter: newFakeAdapter(), Config: cfg, Backend: tc.backend, Logger: slog.New(logs)}); err != nil {
 				t.Fatalf("New: %v", err)
 			}
-			lvl, found := logs.level("principal map is empty")
-			if found != tc.warns {
-				t.Fatalf("backend %q: empty-map warning found=%t, want %t", tc.backend, found, tc.warns)
+			lvl, found := logs.level(tc.notice)
+			if found != tc.found {
+				t.Fatalf("backend %q: empty-map notice found=%t, want %t", tc.backend, found, tc.found)
 			}
-			if found && lvl != slog.LevelWarn {
-				t.Fatalf("backend %q: empty-map notice at %v, want WARN", tc.backend, lvl)
+			if found && lvl != tc.level {
+				t.Fatalf("backend %q: empty-map notice at %v, want %v", tc.backend, lvl, tc.level)
 			}
 		})
 	}
@@ -687,6 +752,26 @@ func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
 func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
 
+// has reports whether any record carries the attribute key with value.
+func (h *recordingHandler) has(key, value string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		found := false
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == key && a.Value.String() == value {
+				found = true
+				return false
+			}
+			return true
+		})
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
 // level reports the level of the first record whose message contains sub.
 func (h *recordingHandler) level(sub string) (slog.Level, bool) {
 	h.mu.Lock()
@@ -720,6 +805,92 @@ func slackMsg(channelType, channel, user, text, ts, threadTS string) *slackevent
 	}
 }
 
+// TestSlackRefusesAnotherWorkspacesMember: a message whose sender belongs
+// to another workspace (Slack Connect) is not a turn, whatever the
+// allowlist says; a sender of ours in a shared channel, and any message
+// that names no sender workspace, still is.
+func TestSlackRefusesAnotherWorkspacesMember(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.teamID = "T0URS"
+	ctx := context.Background()
+	foreign := slackMsg("im", "D1", "UGUEST", "drain node 4", "1.0", "")
+	foreign.UserTeam = "T0THER"
+	if _, ok := a.inbound(ctx, foreign); ok {
+		t.Error("a DM from another workspace's member was delivered as a turn")
+	}
+	mention := slackMsg("channel", "C1", "UGUEST", "<@UBOT> drain node 4", "2.0", "")
+	mention.UserTeam = "T0THER"
+	if _, ok := a.inbound(ctx, mention); ok {
+		t.Error("a mention from another workspace's member in a shared channel was delivered as a turn")
+	}
+	ours := slackMsg("channel", "C1", "U1", "<@UBOT> how is the fleet?", "3.0", "")
+	ours.UserTeam = "T0URS"
+	if _, ok := a.inbound(ctx, ours); !ok {
+		t.Error("our own member's mention in a shared channel was refused")
+	}
+	if _, ok := a.inbound(ctx, slackMsg("im", "D2", "U2", "hello", "4.0", "")); !ok {
+		t.Error("a DM that names no sender workspace was refused")
+	}
+	// A shape that names the sender's workspace only in the message's own
+	// team field is still checked.
+	teamOnly := slackMsg("im", "D4", "UGUEST", "drain node 4", "4.5", "")
+	teamOnly.Message = &slack.Msg{Team: "T0THER"}
+	logs := &recordingHandler{}
+	a.log = slog.New(logs)
+	if _, ok := a.inbound(ctx, teamOnly); ok {
+		t.Error("a message naming another workspace in its team field alone was delivered")
+	}
+	if !logs.has("messageTeam", "T0THER") {
+		t.Error("the refusal's log line does not name the workspace from the team field")
+	}
+	a.log = slog.Default()
+	// A guest's reply in a thread the gateway already holds as a session
+	// thread, which needs no mention, and a guest's file share, take the
+	// same refusal.
+	a.sessionThreads["C1/100.1"] = true
+	reply := slackMsg("channel", "C1", "UGUEST", "and node 5", "6.0", "100.1")
+	reply.UserTeam = "T0THER"
+	if _, ok := a.inbound(ctx, reply); ok {
+		t.Error("another workspace's member steered a session thread")
+	}
+	share := slackMsg("im", "D5", "UGUEST", "see attached", "7.0", "")
+	share.SubType, share.UserTeam = "file_share", "T0THER"
+	if _, ok := a.inbound(ctx, share); ok {
+		t.Error("another workspace's member's file share was delivered")
+	}
+	// No team id from auth.test: a message that names a sender workspace
+	// cannot be shown to be ours, so it is refused.
+	a.teamID = ""
+	unknown := slackMsg("im", "D3", "U3", "hello", "5.0", "")
+	unknown.UserTeam = "T0URS"
+	if _, ok := a.inbound(ctx, unknown); ok {
+		t.Error("with no team id known, a message naming a sender workspace was delivered")
+	}
+}
+
+// TestSlackConnectedRecordsTheTeam: auth.test's team id is what the
+// workspace check compares against.
+func TestSlackConnectedRecordsTheTeam(t *testing.T) {
+	api := &fakeSlackAPI{team: "T0URS"}
+	a := newTestSlackAdapter(api)
+	auth, err := api.AuthTestContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.connected(auth)
+	if a.teamID != "T0URS" {
+		t.Errorf("teamID = %q, want auth.test's T0URS", a.teamID)
+	}
+	// No team id: the check fails closed, and says so once at WARN.
+	logs := &recordingHandler{}
+	b := newTestSlackAdapter(&fakeSlackAPI{})
+	b.log = slog.New(logs)
+	b.connected(&slack.AuthTestResponse{UserID: "UBOT"})
+	if lvl, found := logs.level("auth.test returned no team id"); !found || lvl != slog.LevelWarn {
+		t.Errorf("no team id: warning found=%t level=%v, want WARN", found, lvl)
+	}
+}
+
 func TestSlackPostThreadsAndTranslates(t *testing.T) {
 	api := &fakeSlackAPI{}
 	a := newTestSlackAdapter(api)
@@ -734,8 +905,19 @@ func TestSlackPostThreadsAndTranslates(t *testing.T) {
 	if _, err := a.Post("slack:dm/D1", "hi"); err != nil {
 		t.Fatal(err)
 	}
-	if api.posted[1].thread != "" {
-		t.Error("DM posts must not set thread_ts")
+	if api.posted[1].channel != "D1" || api.posted[1].thread != "" {
+		t.Errorf("a post to the thread-less DM key must be top-level: %+v", api.posted[1])
+	}
+	if _, err := a.Post("slack:dm/D1/100.1", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if api.posted[2].channel != "D1" || api.posted[2].thread != "100.1" {
+		t.Errorf("a post to a DM thread's conversation must land in that thread: %+v", api.posted[2])
+	}
+	for i, v := range api.postValues {
+		if v.Get("unfurl_links") != "false" || v.Get("unfurl_media") != "false" {
+			t.Errorf("post %d: unfurl_links=%q unfurl_media=%q, want both false", i, v.Get("unfurl_links"), v.Get("unfurl_media"))
+		}
 	}
 	if _, err := a.Post("discord:1/2", "x"); err == nil {
 		t.Error("malformed conversation must error")
@@ -816,7 +998,8 @@ func TestSlackInboundAffordanceRule(t *testing.T) {
 		kind   string
 		text   string
 	}{
-		{"dm delivers", nil, slackMsg("im", "D1", "U1", "hi", "1.0", ""), true, "slack:dm/D1", "dm", "hi"},
+		{"dm delivers, rooted on its own ts", nil, slackMsg("im", "D1", "U1", "hi", "1.0", ""), true, "slack:dm/D1/1.0", "dm", "hi"},
+		{"dm thread reply is the thread's conversation", nil, slackMsg("im", "D1", "U1", "and this", "1.5", "1.0"), true, "slack:dm/D1/1.0", "dm", "and this"},
 		{"channel without mention drops", nil, slackMsg("channel", "C1", "U1", "hello", "2.0", ""), false, "", "", ""},
 		{"channel mention roots a thread on the ask", nil, slackMsg("channel", "C1", "U1", "<@UBOT> do a thing", "3.5", ""), true, "slack:C1/3.5", "group", "do a thing"},
 		{"display-name mention form strips", nil, slackMsg("channel", "C1", "U1", "<@UBOT|kage> do it", "3.6", ""), true, "slack:C1/3.6", "group", "do it"},
@@ -835,7 +1018,7 @@ func TestSlackInboundAffordanceRule(t *testing.T) {
 		{"bare mention drops", nil, slackMsg("channel", "C1", "U1", "<@UBOT>", "7.0", ""), false, "", "", ""},
 		// Slack transmits &, < and > entity-encoded; the ask must reach the
 		// executor as the user typed it.
-		{"entities decode in a dm", nil, slackMsg("im", "D1", "U1", "get pods -n foo &amp;&amp; describe node &lt;name&gt;", "10.0", ""), true, "slack:dm/D1", "dm", "get pods -n foo && describe node <name>"},
+		{"entities decode in a dm", nil, slackMsg("im", "D1", "U1", "get pods -n foo &amp;&amp; describe node &lt;name&gt;", "10.0", ""), true, "slack:dm/D1/10.0", "dm", "get pods -n foo && describe node <name>"},
 		{"entities decode after the mention strip", nil, slackMsg("channel", "C1", "U1", "<@UBOT> scale web if cpu &gt; 80%", "11.0", ""), true, "slack:C1/11.0", "group", "scale web if cpu > 80%"},
 		{"entities decode in a thread steer", nil, slackMsg("channel", "C1", "U3", "and &lt;this&gt; too", "12.0", "100.1"), true, "slack:C1/100.1", "group", "and <this> too"},
 	}
@@ -892,6 +1075,7 @@ func TestSlackConversationIDRoundTrip(t *testing.T) {
 		wantChannel, wantThread        string
 	}{
 		{"im", "D0AB1", "", "slack:dm/D0AB1", "D0AB1", ""},
+		{"im", "D0AB1", "1725193344.000100", "slack:dm/D0AB1/1725193344.000100", "D0AB1", "1725193344.000100"},
 		{"channel", "C042", "1725193344.000100", "slack:C042/1725193344.000100", "C042", "1725193344.000100"},
 		{"group", "G777", "1700.42", "slack:G777/1700.42", "G777", "1700.42"},
 		{"mpim", "C9", "1700.43", "slack:C9/1700.43", "C9", "1700.43"},
@@ -906,7 +1090,7 @@ func TestSlackConversationIDRoundTrip(t *testing.T) {
 			t.Errorf("slackChannelThread(%q) = %q,%q,%v want %q,%q,true", got, ch, ts, ok, c.wantChannel, c.wantThread)
 		}
 	}
-	for _, bad := range []string{"discord:1/2", "slack:", "slack:C1", "slack:C1/", "slack:dm/", "slack:/100.1"} {
+	for _, bad := range []string{"discord:1/2", "slack:", "slack:C1", "slack:C1/", "slack:dm/", "slack:/100.1", "slack:dm//1.0", "slack:dm/D1/", "slack:dm/D1/1.0/2.0"} {
 		if _, _, ok := slackChannelThread(bad); ok {
 			t.Errorf("slackChannelThread(%q) parsed; must refuse", bad)
 		}
@@ -941,6 +1125,44 @@ func TestToMrkdwn(t *testing.T) {
 		"<!channel> deploy done": "&lt;!channel&gt; deploy done",
 		"ping <@U999> now":       "ping &lt;@U999&gt; now",
 		"a & b < c":              "a &amp; b &lt; c",
+	}
+	for in, want := range cases {
+		if got := toMrkdwn(in); got != want {
+			t.Errorf("toMrkdwn(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestToMrkdwnKeepsAnExecutorsSlackLink mirrors
+// TestToGchatTextKeepsAnExecutorsChatLink: <url|text> is Slack's link form
+// too, and escaping turned every one the executor wrote into literal text
+// with a bare URL beside it (#3015 on Chat). A closed one in prose, with an
+// http(s) URL in the markdown destination class and text that names no
+// other host, is kept with its URL and text escaped as the rest of the text
+// is; everything else is escaped as before, Slack's other sequences
+// included.
+func TestToMrkdwnKeepsAnExecutorsSlackLink(t *testing.T) {
+	cases := map[string]string{
+		issue3015Reply:                                              issue3015Reply,
+		"<https://x.example/a?b=1&c=2|R&D>":                         "<https://x.example/a?b=1&amp;c=2|R&amp;D>",
+		"<https://x.example/a|a> and [b](https://x.example/b)":      "<https://x.example/a|a> and <https://x.example/b|b>",
+		"<https://evil.example/login|https://github.com/x>":         "&lt;https://evil.example/login|https://github.com/x&gt;",
+		"<https://evil.example|x](https://good.example) [y>":        "&lt;https://evil.example|x](https://good.example) [y&gt;",
+		"<https://a.example|<https://b.example|c>>":                 "&lt;https://a.example|<https://b.example|c>&gt;",
+		"<https://x.example/a|b|c>":                                 "&lt;https://x.example/a|b|c&gt;",
+		"see <https://evil.example|docs: <https://x.example/p|doc>": "see &lt;https://evil.example|docs: <https://x.example/p|doc>",
+		"<!channel|everyone>":                                       "&lt;!channel|everyone&gt;",
+		"<@U999|bob> and <#C1|chan>":                                "&lt;@U999|bob&gt; and &lt;#C1|chan&gt;",
+		"<mailto:a@x.example|mail>":                                 "&lt;mailto:a@x.example|mail&gt;",
+		"`<https://x.example|doc>`":                                 "`&lt;https://x.example|doc&gt;`",
+		"see ``` <https://x.example|doc>":                           "see ``` &lt;https://x.example|doc&gt;",
+		// The markdown rules read a kept link as the link it is: the bold
+		// a heading becomes wraps it, and a markdown link around it or
+		// inside it is refused rather than nested.
+		"# Opened <https://x.example/p|PR 3>":                "*Opened <https://x.example/p|PR 3>*",
+		"<https://x.example/p|**doc**>":                      "<https://x.example/p|*doc*>",
+		"[t](https://evil.example/<https://good.example|x>)": "[t](https://evil.example/<https://good.example|x>)",
+		"<https://x.example/a|[doc](https://x.example/b)>":   "<https://x.example/a|[doc](https://x.example/b)>",
 	}
 	for in, want := range cases {
 		if got := toMrkdwn(in); got != want {
@@ -987,10 +1209,12 @@ func TestToMrkdwnConvertsProseAfterAChunkedFence(t *testing.T) {
 func TestToMrkdwnRewritesBoldOnlyOnClosedPairs(t *testing.T) {
 	cases := map[string]string{
 		// The issue's rows: none of these is a bold pair.
-		"**kwargs":                "**kwargs",
-		"**/*.yaml":               "**/*.yaml",
-		"a ** b":                  "a ** b",
-		"***":                     "***",
+		"**kwargs":  "**kwargs",
+		"**/*.yaml": "**/*.yaml",
+		"a ** b":    "a ** b",
+		// Inline, since a line of only *** is a thematic break, which
+		// rewriteSlackBlocks drops (TestRewriteSlackBlocks).
+		"a *** b":                 "a *** b",
 		"def f(*args, **kwargs):": "def f(*args, **kwargs):",
 		// Bold-italic is the one triple that is a pair, and a single star
 		// inside a pair is emphasis inside it, not a second pair.
@@ -1868,20 +2092,19 @@ func TestSlackSessionLookupLogLevels(t *testing.T) {
 }
 
 // TestSlackDecodedTextDrivesTheAffordances pins a consequence of decoding the
-// inbound entities that nothing else in the suite notices. normalize() drops
+// inbound entities that nothing else in the suite notices. chattext.Normalize() drops
 // every non-alphanumeric, so the entity escaping used to survive it as
 // letters: "&lt;stop&gt;" normalized to "ltstopgt" and matched nothing.
 // Decoded first, the same wire text normalizes to "stop" — a hard task cancel.
 // Kept deliberately: the affordances should match what the user typed, not
-// what Slack's transport did to it. The same shift shortens normalized text,
-// so an ask can newly fall under isStatusQuery's wideMatchLenCap.
+// what Slack's transport did to it.
 func TestSlackDecodedTextDrivesTheAffordances(t *testing.T) {
 	a := newTestSlackAdapter(&fakeSlackAPI{})
 
 	// What Slack puts on the wire when a user types "<stop>".
 	const stopWire = "&lt;stop&gt;"
-	if got := normalize(stopWire); got != "ltstopgt" || isStop(stopWire) {
-		t.Fatalf("premise: normalize(%q) = %q, isStop = %v", stopWire, got, isStop(stopWire))
+	if got := chattext.Normalize(stopWire); got != "ltstopgt" || chattext.IsStop(stopWire) {
+		t.Fatalf("premise: chattext.Normalize(%q) = %q, chattext.IsStop = %v", stopWire, got, chattext.IsStop(stopWire))
 	}
 	msg, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", stopWire, "800.0", ""))
 	if !ok {
@@ -1890,21 +2113,8 @@ func TestSlackDecodedTextDrivesTheAffordances(t *testing.T) {
 	if msg.Text != "<stop>" {
 		t.Fatalf("inbound text = %q, want the decoded form", msg.Text)
 	}
-	if !isStop(msg.Text) {
+	if !chattext.IsStop(msg.Text) {
 		t.Error("a typed <stop> must cancel: the decode is what lets normalize see \"stop\"")
-	}
-
-	// The length half. Same words, entity-encoded and not.
-	const pokeWire = "any update on the &lt;prod&gt; rollout &amp; the canary?"
-	if isStatusQuery(pokeWire, true) {
-		t.Errorf("premise: the wire form normalizes to %d chars, over the %d cap", len(normalize(pokeWire)), wideMatchLenCap)
-	}
-	poke, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", pokeWire, "801.0", ""))
-	if !ok {
-		t.Fatal("dm must deliver")
-	}
-	if !isStatusQuery(poke.Text, true) {
-		t.Errorf("decoded %q normalizes to %d chars and must read as a status poke", poke.Text, len(normalize(poke.Text)))
 	}
 }
 
@@ -2123,6 +2333,7 @@ func TestSlackSessionLookupAnswersAColdCache(t *testing.T) {
 func TestSlackTaskStartedMarksOnlyThreads(t *testing.T) {
 	a := newTestSlackAdapter(&fakeSlackAPI{})
 	a.TaskStarted("slack:dm/D1", "task-dm")
+	a.TaskStarted("slack:dm/D1/9.0", "task-dm-thread")
 	a.TaskStarted("not-a-slack-key", "task-other")
 	if n := len(a.sessionThreads); n != 0 {
 		t.Fatalf("a DM or a foreign key marked %d threads, want 0: %v", n, a.sessionThreads)
@@ -2167,8 +2378,8 @@ func TestSlackGatewayAdoptsThreadOnStartedTaskAndSurvivesRestart(t *testing.T) {
 		DefaultAddressee: "platform",
 		IdleTTL:          30 * time.Minute,
 		AttributionSalt:  []byte("test-salt"),
-		// The CR-level gate is not under test here; the map is.
-		SlackAllowAllUsers: true,
+		// U1 is listed; U9, below, is not, and is the unverified sender.
+		SlackAllowedUsers: []string{"U1"},
 	}
 	g, err := New(Options{Client: client, Adapter: a, Config: cfg, Backend: slackBackend, Logger: slog.Default()})
 	if err != nil {
@@ -2209,7 +2420,7 @@ func TestSlackGatewayAdoptsThreadOnStartedTaskAndSurvivesRestart(t *testing.T) {
 		t.Errorf("the registry was consulted %d times for the follow-up, want 1 — the cache was empty and it is the only source", consulted)
 	}
 
-	// An unmapped sender's ask starts nothing, so it marks nothing.
+	// An unlisted sender's ask starts nothing, so it marks nothing.
 	g.handleInbound(InboundMessage{Conversation: "slack:C1/300.1", Kind: "group", AuthorID: "U9", MessageID: "6.0", Text: "drain node 4"})
 	a.mu.Lock()
 	v, cached := a.sessionThreads["C1/300.1"]
@@ -2519,31 +2730,130 @@ func TestSlackMappedButDisallowedSenderDropsVisiblyOnce(t *testing.T) {
 	}
 }
 
-// TestSlackUnmappedButAllowedSenderGetsTheSameNotice: the other half of the
-// pair - listed but not mapped - drops with the identical notice, so the
-// notice does not tell a sender which of the two tables refused them.
-func TestSlackUnmappedButAllowedSenderGetsTheSameNotice(t *testing.T) {
+// TestSlackVerificationIsToldToTheAdapter: the adapter learns the gateway's
+// word on every sender (VerifiedObserver), so a click from a sender the
+// gateway drops rewrites nothing, and an admitted one's does. A click is a
+// message like any other here: same path, same allowlist.
+func TestSlackVerificationIsToldToTheAdapter(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1"}, false)
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:C1/40.0", Kind: "group", AuthorID: "U2", MessageID: "60.1", Text: "Option A: restart"}
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:C1/40.0", Kind: "group", AuthorID: "U1", MessageID: "60.2", Text: "Option A: restart"}
+	waitFor(t, "both verdicts", func() bool { return len(r.adapter.verifiedCalls()) == 2 })
+	if got, want := r.adapter.verifiedCalls(), []string{"60.1:false", "60.2:true"}; !slices.Equal(got, want) {
+		t.Errorf("verdicts = %v, want %v", got, want)
+	}
+	slackAuthorityOf(t, r)
+}
+
+// TestSlackListedUnmappedSenderIsAttributedByMemberID: the map is an
+// override, not a gate. A listed sender it does not name is admitted and
+// attributed slack:<member id>, with the verifiedBy that says no map was
+// consulted, and they are in their own audience under that same principal.
+func TestSlackListedUnmappedSenderIsAttributedByMemberID(t *testing.T) {
 	r := startSlackGateRig(t, []string{"U1", "U9"}, false)
 	r.adapter.inbox <- InboundMessage{Conversation: "slack:D9", Kind: "dm", AuthorID: "U9", MessageID: "1.0", Text: "do a thing"}
-	waitFor(t, "the unverified-sender notice", func() bool { return len(r.adapter.postTexts()) >= 1 })
-	posts := r.adapter.postTexts()
-	want := "⛔ I can't verify who you are on slack (id U9), so I can't take asks from you yet — an admin has to add you to " + unverifiedRemedyFor(slackBackend) + "."
-	if posts[0] != want {
-		t.Errorf("notice = %q, want %q", posts[0], want)
+	auth := slackAuthorityOf(t, r)
+	ps := NewPseudonymizer([]byte("test-salt"))
+	if want := ps.Hash(slackMemberPrincipalPrefix + "U9"); auth.Requester.Principal != want {
+		t.Errorf("principal = %q, want the pseudonym of %q", auth.Requester.Principal, slackMemberPrincipalPrefix+"U9")
+	}
+	if auth.Requester.VerifiedBy != slackMemberVerifiedBy {
+		t.Errorf("verifiedBy = %q, want %q (no map was consulted)", auth.Requester.VerifiedBy, slackMemberVerifiedBy)
+	}
+	if !slices.Contains(auth.Audience.Roster, auth.Requester.Principal) {
+		t.Errorf("the requester's principal %q is not in their own audience %v", auth.Requester.Principal, auth.Audience.Roster)
 	}
 }
 
-// TestSlackAllowAllAdmitsEveryMappedSender: allow-all lifts the list, never
-// the map: a mapped sender is admitted, an unmapped one still drops.
-func TestSlackAllowAllAdmitsEveryMappedSender(t *testing.T) {
+// TestSlackPartialMapAttributesEachSenderItsOwnWay: with a map naming U1
+// and not U9, U1 is attributed by the map and U9 by member id, and each
+// authority block says which.
+func TestSlackPartialMapAttributesEachSenderItsOwnWay(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1", "U9"}, false)
+	for _, tc := range []struct{ id, principal, verifiedBy string }{
+		{"U1", "test:one", slackVerifiedBy},
+		{"U9", slackMemberPrincipalPrefix + "U9", slackMemberVerifiedBy},
+	} {
+		if got := r.g.resolvePrincipal(slackBackend, tc.id); got != tc.principal {
+			t.Errorf("%s resolved to %q, want %q", tc.id, got, tc.principal)
+		}
+		if got := r.g.verifiedByOf(slackBackend, tc.principal); got != tc.verifiedBy {
+			t.Errorf("%s: verifiedBy = %q, want %q", tc.id, got, tc.verifiedBy)
+		}
+	}
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:D1", Kind: "dm", AuthorID: "U1", MessageID: "1.0", Text: "do a thing"}
+	auth := slackAuthorityOf(t, r)
+	if auth.Requester.Principal != NewPseudonymizer([]byte("test-salt")).Hash("test:one") || auth.Requester.VerifiedBy != slackVerifiedBy {
+		t.Errorf("the mapped sender's requester = %+v, want the map's principal and %q", auth.Requester, slackVerifiedBy)
+	}
+}
+
+// TestSlackMapCannotAssertTheMemberIDPrefix: a map value carrying the
+// reserved prefix is refused, so no principal a map entry made can claim to
+// be a bare member id, and the mistake is a lockout, not a grant.
+func TestSlackMapCannotAssertTheMemberIDPrefix(t *testing.T) {
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("U5 "+slackMemberPrincipalPrefix+"U1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pm, err := LoadPrincipalMap(mapFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := &Gateway{pm: pm, slackAllowAll: true, log: slog.Default()}
+	if got := g.resolvePrincipal(slackBackend, "U5"); got != "" {
+		t.Errorf("a map value carrying %q resolved to %q; it must be refused", slackMemberPrincipalPrefix, got)
+	}
+	if got := g.resolvePrincipal(slackBackend, ""); got != "" {
+		t.Errorf("an empty member id resolved to %q", got)
+	}
+	// The notice such a member gets must point at the map entry, since they
+	// are already on the list.
+	if remedy := unverifiedRemedyFor(slackBackend); !strings.Contains(remedy, "principal map") {
+		t.Errorf("the Slack remedy %q does not name the principal map", remedy)
+	}
+}
+
+// TestSlackRosterRefusesTheReservedPrefixSilently: the roster resolves every
+// channel member on every turn, so a reserved-prefix map entry is refused
+// there without a log line; the requester path is where it is logged.
+func TestSlackRosterRefusesTheReservedPrefixSilently(t *testing.T) {
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("U5 "+slackMemberPrincipalPrefix+"U1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pm, err := LoadPrincipalMap(mapFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &recordingHandler{}
+	g := &Gateway{pm: pm, slackAllowAll: true, log: slog.New(logs)}
+	if got := g.rosterResolver(slackBackend)("U5"); got != "" {
+		t.Errorf("the roster resolved a reserved-prefix entry to %q", got)
+	}
+	if _, found := logs.level("reserved member-id prefix"); found {
+		t.Error("the roster path logged the reserved-prefix refusal; it must be silent")
+	}
+	if got := g.resolvePrincipal(slackBackend, "U5"); got != "" {
+		t.Errorf("the requester path resolved a reserved-prefix entry to %q", got)
+	}
+	if lvl, found := logs.level("reserved member-id prefix"); !found || lvl != slog.LevelError {
+		t.Errorf("the requester path's refusal: found=%t level=%v, want ERROR", found, lvl)
+	}
+}
+
+// TestSlackAllowAllAdmitsEverySender: allow-all lifts the list, the only
+// gate: a mapped sender is attributed by the map, an unmapped one by member
+// id.
+func TestSlackAllowAllAdmitsEverySender(t *testing.T) {
 	r := startSlackGateRig(t, nil, true)
 	r.adapter.inbox <- InboundMessage{Conversation: "slack:D2", Kind: "dm", AuthorID: "U2", MessageID: "1.0", Text: "hello"}
 	auth := slackAuthorityOf(t, r)
 	if want := NewPseudonymizer([]byte("test-salt")).Hash("test:two"); auth.Requester.Principal != want {
 		t.Errorf("principal = %q, want %q", auth.Requester.Principal, want)
 	}
-	if p := r.g.resolvePrincipal(slackBackend, "U9"); p != "" {
-		t.Errorf("allow-all admitted an unmapped sender as %q; the map is still a gate", p)
+	if p := r.g.resolvePrincipal(slackBackend, "U9"); p != slackMemberPrincipalPrefix+"U9" {
+		t.Errorf("allow-all resolved an unmapped sender to %q, want %q", p, slackMemberPrincipalPrefix+"U9")
 	}
 }
 
@@ -2583,4 +2893,43 @@ func TestSlackRosterDoesNotAttributeADisallowedMember(t *testing.T) {
 	if strings.Contains(strings.Join(rec.Roster, ","), ps.Hash("test:two")) {
 		t.Errorf("session record roster %v names the disallowed member's mapped principal", rec.Roster)
 	}
+}
+
+// TestSlackWorkspaceCheckReadsADecodedEvent: the workspace check on events
+// decoded the way Socket Mode delivers them (json into
+// slackevents.MessageEvent), not built by hand. slack-go decodes a plain
+// message's top-level fields into MessageEvent.Message as well, so the
+// message's own team field is read even when user_team is absent.
+func TestSlackWorkspaceCheckReadsADecodedEvent(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.teamID = "T0URS"
+	decode := func(raw string) *slackevents.MessageEvent {
+		t.Helper()
+		var m slackevents.MessageEvent
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			t.Fatalf("decoding %s: %v", raw, err)
+		}
+		return &m
+	}
+	for _, tc := range []struct {
+		name, raw string
+		turn      bool
+	}{
+		{"team only, foreign", `{"type":"message","channel":"D1","channel_type":"im","user":"UGUEST","text":"drain node 4","ts":"1.0","team":"T0THER"}`, false},
+		{"user_team, foreign", `{"type":"message","channel":"D2","channel_type":"im","user":"UGUEST","text":"drain node 4","ts":"2.0","team":"T0URS","user_team":"T0THER"}`, false},
+		{"ours", `{"type":"message","channel":"D3","channel_type":"im","user":"U1","text":"how is the fleet","ts":"3.0","team":"T0URS"}`, true},
+		{"no workspace named", `{"type":"message","channel":"D4","channel_type":"im","user":"U1","text":"hello","ts":"4.0"}`, true},
+	} {
+		m := decode(tc.raw)
+		if _, ok := a.inbound(context.Background(), m); ok != tc.turn {
+			t.Errorf("%s: delivered=%v, want %v (Message.Team=%q, UserTeam=%q)", tc.name, ok, tc.turn, teamOf(m), m.UserTeam)
+		}
+	}
+}
+
+func teamOf(m *slackevents.MessageEvent) string {
+	if m.Message == nil {
+		return "<nil Message>"
+	}
+	return m.Message.Team
 }

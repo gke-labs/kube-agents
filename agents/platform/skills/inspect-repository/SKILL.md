@@ -1,6 +1,6 @@
 ---
 name: inspect-repository
-description: Read and analyze the source of any GitHub repository — public or one this install has a token for — without a local checkout. Clones broker-side and pulls file content back; use it to answer questions about code, not to change it.
+description: Read and analyze the source of any repository on GitHub or on another forge this install serves (GitLab) — public or one this install has a token for — without a local checkout. Clones broker-side and pulls file content back; use it to answer questions about code, not to change it.
 ---
 
 # inspect-repository - Read a repository this pod has no checkout of

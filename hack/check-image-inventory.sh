@@ -21,6 +21,9 @@ INVENTORY=images.json
 readonly GO_MOD=k8s-operator/go.mod
 readonly GOLANG_IMAGE_ARG=GOLANG_IMAGE
 readonly GOTOOLCHAIN_PIN='ENV GOTOOLCHAIN=local'
+# Where the agent plugins live; every <plugin>/Dockerfile under it must go
+# through check_literal_from, which check_plugin_dockerfiles_are_fenced enforces.
+readonly PLUGIN_DIR=agentplugins
 MIRROR=registry.example.invalid/mirror
 
 # githubMinter.org and githubMinter.repo are required when the minter is
@@ -162,9 +165,76 @@ check_base_image distroless-static a2a/Dockerfile.console DISTROLESS_IMAGE DISTR
 # builder base to compare: its runtime base is the platform-agent image of the
 # same build, passed as a build arg with no default, so there is no runtime
 # pin in the Dockerfile. The image itself is a first-party inventory entry
-# (hermes-bridge), published by the release workflow beside the four A2A
-# images.
+# (hermes-bridge), published by the release workflow beside the A2A images,
+# and the operator renders it under next (check 2 holds its compiled name).
 check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
+
+# The agent plugin images pin their base with a literal `FROM repo:tag@digest`
+# rather than an ARG pair, so the ARG check above never reaches them. This
+# fence does not parse Dockerfiles and carries no grammar of its own: a plugin
+# Dockerfile is exactly `FROM <ref>` plus `COPY <src> /` (the shape both
+# builders read alike -- `docker build`, and the crane reader in
+# agentplugins/lib/plugin_image.sh, which takes the first word after `FROM`
+# as the base and stages the tree at `/`), so once comment and blank lines are
+# dropped the remainder must be exactly those two lines, byte for byte, with
+# the FROM reference normalised and compared to the inventory. Anything else
+# -- an indented or lowercase keyword, an empty reference, a flag, a tab, a
+# CR, a stage name, a continuation, a second stage, a RUN, a heredoc, another
+# COPY destination --
+# fails closed with the expected lines and the lines found, printed through
+# `cat -vet` so an invisible byte shows. One rule runs before the strip: a
+# comment line holding `=` anywhere in the leading run of comments is refused
+# by name, because `# syntax=<image>` there is a parser directive naming a
+# frontend image BuildKit pulls and runs that nothing pins or mirrors, and
+# BuildKit's own notion of the blanks around the key is wider than any class
+# worth transcribing here. That run is wider than Docker's directive window
+# (which closes at the first non-directive line) on purpose: a shebang first
+# line is discarded by BuildKit, so a directive behind one is live, and a
+# comment with `=` in it belongs below the first instruction, where it is a
+# comment to Docker and to this fence alike.
+check_literal_from() {
+  local name=$1 dockerfile=$2 src=$3
+  local want body other first second ref got
+  fenced_plugin_dockerfiles="${fenced_plugin_dockerfiles:-}$dockerfile"$'\n'
+  want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
+  other="$(sed -n -e '/^[[:blank:]]*#/!q' -e '/^[[:blank:]]*#.*=/p' "$dockerfile" | head -n1)"
+  if [ -n "$other" ]; then
+    fail "$dockerfile: line '$(printf '%s' "$other" | LC_ALL=C cat -vt)' holds '=' in the leading run of comments, where a parser directive such as syntax= names a second image that nothing pins or mirrors; the plugin pin fence refuses any '=' there. Put a comment like it below the FROM line (agentplugins/lib/plugin_image.sh)."
+    return
+  fi
+  body="$(sed -e '/^[[:blank:]]*#/d' -e '/^[[:blank:]]*$/d' "$dockerfile")"
+  first="$(printf '%s\n' "$body" | sed -n '1p')"
+  second="$(printf '%s\n' "$body" | sed -n '2p')"
+  ref="${first#FROM }"
+  got="$(normalise "$ref")"
+  if [ "$(printf '%s\n' "$body" | wc -l | tr -d ' ')" != 2 ] || [ "$ref" = "$first" ] || [ -z "$got" ] ||
+    [ "$ref" != "${ref%% *}" ] || [ "$second" != "COPY $src /" ] ||
+    printf '%s\n' "$body" | LC_ALL=C grep -q '[^[:print:]]'; then
+    fail "$dockerfile: after comment and blank lines, a plugin Dockerfile must be exactly two lines, 'FROM <ref>' (one space, nothing after the reference) and 'COPY $src /', the shape docker build and the crane reader in agentplugins/lib/plugin_image.sh read alike; found: $(printf '%s\n' "$body" | LC_ALL=C cat -vet | tr '\n' ' ')"
+    return
+  fi
+  [ "$got" = "$want" ] ||
+    fail "$dockerfile: FROM pins '$got', but $INVENTORY has '$want' for '$name'."
+}
+
+check_literal_from busybox agentplugins/pubsub-platform/Dockerfile files/platforms/pubsub/
+check_literal_from busybox agentplugins/gke-stockout-investigator/Dockerfile files/
+
+# The two calls above name their files, so a third plugin copied from the pair
+# (agentplugins/README.md, "Adding a plugin") would carry a pin nothing
+# compares to the inventory while this check stayed green. Every Dockerfile
+# under PLUGIN_DIR must have been through check_literal_from, which records
+# each file it is given before judging it, so a file that failed the fence is
+# reported once, as drift or shape, not again here.
+check_plugin_dockerfiles_are_fenced() {
+  local dockerfile
+  for dockerfile in "$PLUGIN_DIR"/*/Dockerfile; do
+    [ -e "$dockerfile" ] || continue
+    grep -qxF "$dockerfile" <<<"${fenced_plugin_dockerfiles:-}" ||
+      fail "$dockerfile has no check_literal_from call in hack/check-image-inventory.sh, so its FROM pin is not held in step with $INVENTORY. Add one beside the existing calls, naming the inventory entry and the COPY source (agentplugins/README.md, \"Adding a plugin\")."
+  done
+}
+check_plugin_dockerfiles_are_fenced
 
 # The Go builder and k8s-operator/go.mod's `go` directive must name the same
 # major.minor: a builder behind the directive fails the image build (the
@@ -250,7 +320,7 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
 #    is the string the operator renders into the pod template; the comparison
 #    is on the normalised form, the same way check 1 reads a Dockerfile ARG.
 #    The first-party next defaults (gateway, worker, callout, capability
-#    verifier, console) are release images with no fixed tag in the inventory,
+#    verifier, console, and the Hermes bridge sidecar) are release images with no fixed tag in the inventory,
 #    so the operator compiles in the bare image name and takes registry and tag
 #    from its own or the agent image; the second check below holds each name to
 #    the inventory's entry, and that entry's repository to the name under the
@@ -306,6 +376,7 @@ check_compiled_image_name a2a-worker k8s-operator/internal/controller/platformag
 check_compiled_image_name a2a-authcallout k8s-operator/internal/controller/platformagent_a2a_callout.go a2aCalloutImageName
 check_compiled_image_name a2a-verifier k8s-operator/internal/controller/platformagent_a2a_verifier.go a2aVerifierImageName
 check_compiled_image_name a2a-console k8s-operator/internal/controller/platformagent_a2a_console.go a2aConsoleImageName
+check_compiled_image_name hermes-bridge k8s-operator/internal/controller/platformagent_a2a_bridge.go a2aBridgeImageName
 check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository
 
 # ---------------------------------------------------------------------------

@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -226,6 +231,14 @@ func (f *fakePrimary) Edit(conversation, messageID, text string) error {
 	return nil
 }
 
+func (f *fakePrimary) PostMessage(conversation string, m gateway.OutMessage) (string, error) {
+	return f.Post(conversation, m.Text)
+}
+
+func (f *fakePrimary) EditMessage(conversation, messageID string, m gateway.OutMessage) error {
+	return nil
+}
+
 func (f *fakePrimary) Roster(conversation string) ([]string, bool, error) {
 	return nil, true, nil
 }
@@ -233,6 +246,9 @@ func (f *fakePrimary) Roster(conversation string) ([]string, bool, error) {
 func (f *fakePrimary) OpenDirect(userID string) (string, error) {
 	return "", nil
 }
+
+func (f *fakePrimary) React(string, string, string) error          { return nil }
+func (f *fakePrimary) RemoveReaction(string, string, string) error { return nil }
 
 // TestBuildAdaptersIncludesTheConsole proves buildAdapters wires both the
 // configured chat backend and the console adapter behind one mux: a post to
@@ -322,6 +338,165 @@ func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
 				if len(tc.primary.posts) != 1 || tc.primary.posts[0] != "discord:g/c" {
 					t.Errorf("primary saw posts %v, want only discord:g/c", tc.primary.posts)
 				}
+			}
+		})
+	}
+}
+
+// syncBuffer is an io.Writer a logger on another goroutine can write to
+// while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// alertErr returns the err attribute of the first metricsUnavailableAlert
+// record in a JSON log, and whether there is one.
+func alertErr(t *testing.T, logged string) (string, bool) {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(logged), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec struct {
+			Level string `json:"level"`
+			Msg   string `json:"msg"`
+			Err   string `json:"err"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line %q is not JSON: %v", line, err)
+		}
+		if rec.Msg == metricsUnavailableAlert && rec.Level == "ERROR" {
+			return rec.Err, true
+		}
+	}
+	return "", false
+}
+
+// A port that will not bind costs the gateway its metrics, not the
+// conversations: serve must log the ALERT line and still run the gateway,
+// and return what the gateway returns rather than the listener's error.
+// The port case holds the metrics port with a listener of the test's own on
+// every interface, as NewMetricsServer binds, so Run's net.Listen fails with
+// EADDRINUSE on its goroutine. The constructor case reaches the other
+// swallowed error, a port NewMetricsServer refuses.
+func TestServeKeepsTheGatewayWhenTheMetricsListenerCannotStart(t *testing.T) {
+	held, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("holding a port: %v", err)
+	}
+	t.Cleanup(func() { held.Close() })
+	heldPort := held.Addr().(*net.TCPAddr).Port
+
+	for _, tc := range []struct {
+		name    string
+		port    int
+		wantErr string
+	}{
+		{"port already bound", heldPort, fmt.Sprintf("metrics listener on :%d", heldPort)},
+		{"port the constructor refuses", 70000, "metrics listener port 70000 is not in"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var logged syncBuffer
+			log := slog.New(slog.NewJSONHandler(&logged, nil))
+			cfg := &gateway.Config{MetricsPort: tc.port}
+
+			// The stub gateway runs until the ALERT is logged (or 10s pass),
+			// so the listener's failure lands while the gateway is running,
+			// which is the production order; then it returns nil, as gw.Run
+			// does on a clean shutdown, and the checks below say which half
+			// is missing.
+			reached := false
+			run := func(context.Context) error {
+				reached = true
+				deadline := time.Now().Add(10 * time.Second)
+				for time.Now().Before(deadline) {
+					if _, ok := alertErr(t, logged.String()); ok {
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				return nil
+			}
+
+			if err := serve(ctx, cfg, gateway.NewMetrics(), log, run); err != nil {
+				t.Fatalf("serve returned %v, want nil: a metrics listener that cannot start must not end the gateway", err)
+			}
+			if !reached {
+				t.Fatal("serve returned without running the gateway")
+			}
+			got, ok := alertErr(t, logged.String())
+			if !ok {
+				t.Fatalf("no %q line logged; log:\n%s", metricsUnavailableAlert, logged.String())
+			}
+			if !strings.Contains(got, tc.wantErr) {
+				t.Errorf("ALERT err = %q, want it to name %q", got, tc.wantErr)
+			}
+		})
+	}
+}
+
+type stubConversations struct{}
+
+func (stubConversations) ConversationContext(context.Context, string) (string, error) { return "", nil }
+func (stubConversations) Post(string, string) (string, error)                         { return "", nil }
+func (stubConversations) PostMessage(string, gateway.OutMessage) (string, error)      { return "", nil }
+func (stubConversations) EditMessage(string, string, gateway.OutMessage) error        { return nil }
+
+// The chat.notify route arms for a Google Chat or Slack backend with or without a home
+// channel, always with the gateway's conversations behind it (a kanban
+// card's report back to its conversation needs them, and with no home channel
+// they are all the route serves); a malformed home channel or another backend
+// arms nothing.
+func TestTheChatNotifyRouteArmsWithConversations(t *testing.T) {
+	gchat, err := gateway.NewGoogleChatAdapter("http://relay.invalid", "/nonexistent/token", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slackBackend, err := gateway.NewSlackAdapter("xoxb-stub", "xapp-stub", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversations := func(gateway.Adapter) gateway.NotifyConversations { return stubConversations{} }
+	for _, tc := range []struct {
+		name    string
+		backend gateway.Adapter
+		home    string
+		armed   bool
+	}{
+		{"chat with a home channel", gchat, "spaces/AAAA", true},
+		{"chat with no home channel", gchat, "", true},
+		{"chat with a malformed home channel", gchat, "spaces/A/threads/B", false},
+		{"another backend", nil, "spaces/AAAA", false},
+		{"slack with a home channel", slackBackend, "C0HOME", true},
+		{"slack with no home channel", slackBackend, "", true},
+		{"slack with a malformed home channel", slackBackend, "#ops", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &gateway.Config{GchatHomeChannel: tc.home}
+			if tc.backend == slackBackend {
+				cfg = &gateway.Config{SlackHomeChannel: tc.home}
+			}
+			n := chatNotifier(cfg, tc.backend, conversations, slog.Default())
+			if (n != nil) != tc.armed {
+				t.Fatalf("armed = %v, want %v", n != nil, tc.armed)
+			}
+			if n != nil && !n.ServesConversations() {
+				t.Fatal("the route armed without the gateway's conversations: every card report would be refused")
 			}
 		})
 	}

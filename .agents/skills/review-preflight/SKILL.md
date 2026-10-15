@@ -198,7 +198,10 @@ A fix changes the shared range, so re-run whatever the fix invalidated — not w
 the finding. They are rarely the same set: rewriting a paragraph to answer an adversarial finding is
 exactly how the prose starts contradicting another document, which is docs-drift's question and not
 one `make docs-check` can answer. Work that still holds stays, and is not re-run just to have been
-run against the new head; `AGENTS.md` states that rule and this restates it.
+run against the new head; `AGENTS.md` states that rule and this restates it. Look where you fixed:
+a line changed to answer a finding — a pass's or a reviewer's — is where adjacent defects cluster,
+so the re-run's range covers those lines and what they touch, handed as a range and never as the
+finding.
 
 New context, same handoff. Feeding the previous round's findings into the re-run defeats the point
 of the fresh one.

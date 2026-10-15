@@ -1,0 +1,63 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "I opened PR #412 in fleet-config. It's yours to review.",
+                "type": "text"
+              },
+              {
+                "text": " Opened PR #412 raising the limit",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      }
+    ],
+    "attachments": [
+      {
+        "blocks": [
+          {
+            "elements": [
+              {
+                "action_id": "kage.link.0",
+                "style": "primary",
+                "text": {
+                  "emoji": true,
+                  "text": "Open PR ↗",
+                  "type": "plain_text"
+                },
+                "type": "button",
+                "url": "https://github.com/acme/fleet-config/pull/412"
+              },
+              {
+                "action_id": "kage.link.1",
+                "text": {
+                  "emoji": true,
+                  "text": "Files changed ↗",
+                  "type": "plain_text"
+                },
+                "type": "button",
+                "url": "https://github.com/acme/fleet-config/pull/412/files"
+              }
+            ],
+            "type": "actions"
+          }
+        ],
+        "color": "#2EB67D",
+        "fallback": "(the text fallback)"
+      }
+    ]
+  }
+]

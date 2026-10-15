@@ -147,7 +147,7 @@ KNOWN_FINDINGS: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         ' --project="$PROJECT" --quiet',
     ): (
         frozenset({"sensitive_env_export"}),
-        "this repository's SKILL_SUBSTITUTIONS text in scripts/sync-upstream-skills.py; "
+        "this repository's per-target kubeconfig patch in agents/platform/skill-overlays/gke-basics/; "
         "agents/platform/AGENTS.md and the compliance audit SOP teach the same export, so "
         "all of them change together",
     ),
@@ -175,6 +175,17 @@ KNOWN_FINDINGS: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         "kubectl apply -f"
         " https://raw.githubusercontent.com/kubeflow/mpi-operator/master/deploy/v2beta1/mpi-operator.yaml",
     ): (frozenset({"kubectl_apply_remote"}), "upstream google/skills text"),
+    (
+        "agents/platform/skills/gke-workload-identity/SKILL.md",
+        "# Token endpoint via the hardcoded metadata IP (a healthy path returns a token).\n"
+        "kubectl exec {pod_name} -n {namespace} -- \\\n"
+        "  curl -sS -H 'Metadata-Flavor: Google' \\\n"
+        "  'http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token'",
+    ): (
+        frozenset({"raw_ip_url"}),
+        "upstream google/skills text; the block tests the metadata IP path apart from DNS, "
+        "so the raw IP is what it checks",
+    ),
 }
 
 Scan = Callable[[str], dict]

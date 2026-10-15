@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# Verifies that an automated deployment to a long-lived environment (autopush, staging)
-# applied successfully and was not deferred or dropped due to lease contention.
-# Used by .github/workflows/autopush-deploy.yml and .github/workflows/staging-deploy.yml.
+# Verifies that an automated deployment to a long-lived environment (autopush,
+# autopush-next, staging) applied successfully and was not deferred or dropped
+# due to lease contention.
+# Used by .github/workflows/autopush-deploy.yml, autopush-next-deploy.yml and staging-deploy.yml.
+#
+# ALLOW_SKIPPED=true also accepts `skipped`, which reconcile-environment.yml
+# reports only for a caller that passed skip_unconfigured: the environment is
+# not provisioned yet. Unset, `skipped` fails like any unexpected result.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,14 +15,14 @@ source "${SCRIPT_DIR}/common.sh"
 
 env_target="${TARGET_ENVIRONMENT:-${1:-}}"
 if [ -z "${env_target}" ]; then
-  echo "❌ ERROR: Target environment (autopush or staging) must be specified via TARGET_ENVIRONMENT or as first argument." >&2
+  echo "❌ ERROR: Target environment (autopush, autopush-next or staging) must be specified via TARGET_ENVIRONMENT or as first argument." >&2
   exit 1
 fi
 
 case "${env_target}" in
-  autopush|staging) ;;
+  autopush|autopush-next|staging) ;;
   *)
-    echo "❌ ERROR: Invalid target environment: '${env_target}'. Must be 'autopush' or 'staging'." >&2
+    echo "❌ ERROR: Invalid target environment: '${env_target}'. Must be 'autopush', 'autopush-next' or 'staging'." >&2
     exit 1
     ;;
 esac
@@ -38,6 +43,15 @@ case "${deploy_result}" in
     echo "::error title=Deployment deferred::${env_target} deployment was deferred because the live-test lease was held. Deferrals are not permitted for automated release deployments." >&2
     echo "❌ ERROR: ${env_target} deployment deferred due to held live-test lease. Refusing silent drop." >&2
     exit 1
+    ;;
+  skipped)
+    if [ "${ALLOW_SKIPPED:-}" != "true" ]; then
+      echo "::error title=Deployment skipped::${env_target} deployment was skipped, and this caller does not allow a skip." >&2
+      echo "❌ ERROR: ${env_target} deployment skipped without ALLOW_SKIPPED=true." >&2
+      exit 1
+    fi
+    echo "::notice title=Deployment skipped::${env_target} is not provisioned yet (no GitHub environment, or no GCP_PROJECT_ID on it); nothing was deployed."
+    echo "⏭️ ${env_target} deployment skipped: environment not provisioned."
     ;;
   failed)
     echo "::error title=Deployment failed::${env_target} deployment failed." >&2

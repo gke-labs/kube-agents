@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import socket
+import sqlite3
 import threading
 import time
 from collections.abc import Generator
@@ -43,7 +44,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from kube_agents_bench import harness
+from kube_agents_bench import board, harness, worker_trajectory
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import scoring
 from kube_agents_bench.harness import KubeAgentsHarness
@@ -322,6 +323,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
     probe_activity: list[dict[str, Any]] | None = None
     probe_activity_dropped: int = 0
     probe_progress: str = ""
+    # The conversation's contextId, which the door reports from the session
+    # record on every probed read; "" is a door older than the field.
+    probe_context_id: str = ""
 
     def poll_fails(self) -> bool:
         """Whether this GET is one of the scripted failures."""
@@ -351,6 +355,8 @@ class _StubGatewayServer(ThreadingHTTPServer):
             "graceSeconds": self.grace_seconds,
             "active": active,
         }
+        if self.probe_context_id and self.submissions:
+            report["contextId"] = self.probe_context_id
         if self.probe_activity is not None and task == self.task_id:
             # A door that shows the trace: with ``task=`` the read describes
             # the named task whether or not the record still holds it as
@@ -2529,3 +2535,445 @@ def test_the_trace_is_taken_only_from_a_read_about_this_task() -> None:
     assert broken is not None
     task._note(fold, "task-1", broken)
     assert fold.activity_summary == {"calls": 1, "dropped": 0}
+
+
+# --------------------------------------------------------------------------
+# The delegation wait under the bridge's api executor (#2619). The turn ran in
+# the Hermes session named after the conversation's contextId; the door carries
+# no card id, so the cards come from that session's store and their results
+# off the board, with no status turn.
+
+from test_board import (  # noqa: E402 -- the store builders live with the board read's tests
+    FRONT as CARD_A,
+    CHILD as CARD_B,
+    SESSION as API_SESSION,
+    build_session_store,
+    local_shell,
+    set_card,
+)
+
+ACK = "On it: checking all 3 clusters."
+CONTEXT_ID = API_SESSION.removeprefix("a2a-")
+
+
+@pytest.fixture
+def api_executor(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> _StubGatewayServer:
+    """A door whose turn answered with an acknowledgement, on a short wait."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, ACK)
+    stub_gateway.probe_context_id = CONTEXT_ID
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "30")
+    return stub_gateway
+
+
+def test_a_delegated_card_is_graded_on_its_result_not_the_acknowledgement(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[CARD_A])
+    moves = {2: "running", 3: "done"}
+
+    def advance(n: int) -> None:
+        if n in moves:
+            set_card(
+                tmp_path,
+                CARD_A,
+                moves[n],
+                result="all 3 clusters healthy" if moves[n] == "done" else None,
+            )
+
+    shell = local_shell(tmp_path, monkeypatch, advance)
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not result.errors, result.errors
+    final = result.metadata["final_message"]
+    assert final.startswith(ACK)
+    assert f"Result of delegated task {CARD_A}:\nall 3 clusters healthy" in final
+    assert "all 3 clusters healthy" in result.output
+    assert result.metadata["delegated_cards"] == {CARD_A: "done"}
+    assert result.metadata["delegated_cards_source"] == f"state.db ({API_SESSION})"
+    # ready, running, done: three status reads and one for the result, and
+    # not one further turn.
+    assert len(shell.reads) == 4
+    assert len(api_executor.submissions) == 1
+
+
+def test_two_cards_are_each_waited_for_and_graded(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One finishes with a result, the other with a run summary alone (the
+    platform profile's way of completing), and the wait holds until both have."""
+    build_session_store(tmp_path, created=[CARD_A, CARD_B])
+
+    def advance(n: int) -> None:
+        if n == 2:
+            set_card(tmp_path, CARD_A, "done", result="fleet report")
+            set_card(tmp_path, CARD_B, "running")
+        if n == 3:
+            set_card(tmp_path, CARD_B, "done", summary="node pool resized")
+
+    shell = local_shell(tmp_path, monkeypatch, advance)
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+
+    result = KubeAgentsHarness().run("check the fleet and resize")
+
+    assert not result.errors, result.errors
+    final = result.metadata["final_message"]
+    assert f"Result of delegated task {CARD_A}:\nfleet report" in final
+    assert f"Result of delegated task {CARD_B}:\nnode pool resized" in final
+    assert len(shell.reads) == 4
+    assert len(api_executor.submissions) == 1
+
+
+def test_a_card_that_never_settles_ends_at_the_delegation_ceiling(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "running")
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "1")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.1")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.errors == [
+        f"{harness.DELEGATION_CEILING_MARKER}: delegated tasks did not finish within 1s: "
+        f"{CARD_A} (running)"
+    ]
+    assert result.metadata["final_message"] == ACK
+    assert len(api_executor.submissions) == 1
+
+
+def test_a_running_card_at_the_ceiling_delivers_nothing_from_an_earlier_run(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 429-blocked worker closes its run with the provider's error as the
+    summary, and the card is unblocked to run again; a still-running card can
+    also carry a stashed ``tasks.result``. Neither is the card's answer, so at
+    the ceiling the card is outstanding with nothing delivered, as on the
+    status-turn wait, which only ever reads a card it has seen terminal."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "blocked", summary="429 RESOURCE_EXHAUSTED")
+    set_card(tmp_path, CARD_A, "running", result="stashed before a refused completion")
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "1")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.1")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.errors == [
+        f"{harness.DELEGATION_CEILING_MARKER}: delegated tasks did not finish within 1s: "
+        f"{CARD_A} (running)"
+    ]
+    assert result.metadata["final_message"] == ACK
+    assert "RESOURCE_EXHAUSTED" not in result.output
+
+
+def test_a_board_that_stops_answering_is_infrastructure(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[CARD_A])
+    real = local_shell(tmp_path, monkeypatch)
+    calls = []
+
+    def flaky(script: str, timeout: float) -> str:
+        if board.SESSION_CARDS_PRESENT in script:
+            calls.append(script)
+            if len(calls) > 1:
+                return "error: unable to upgrade connection"
+        return real(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", flaky)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert infra(result)
+    assert "the kanban board could not be read 3 times running" in result.errors[0]
+
+
+@pytest.mark.parametrize(
+    "context_id, in_store, reads",
+    [
+        pytest.param("", True, 0, id="a door too old to report the contextId"),
+        pytest.param("ctx/odd", True, 0, id="a contextId the bridge would hash"),
+        pytest.param(CONTEXT_ID, False, 1, id="a session the store does not hold (cli executor)"),
+    ],
+)
+def test_without_the_session_the_wait_is_todays(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    context_id: str,
+    in_store: bool,
+    reads: int,
+) -> None:
+    """Nothing in the trajectory names a card, so the old wait settles at once
+    on the acknowledgement, exactly as it did before the store was read."""
+    api_executor.probe_context_id = context_id
+    build_session_store(tmp_path, created=[CARD_A], session=API_SESSION if in_store else "a2a-other")
+    shell = local_shell(tmp_path, monkeypatch)
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not result.errors, result.errors
+    assert result.metadata["final_message"] == ACK
+    assert "delegated_cards" not in result.metadata
+    assert len(shell.reads) == reads
+    assert len(api_executor.submissions) == 1
+
+
+def test_the_probe_carries_the_context_id() -> None:
+    assert inject.Probe.from_body({"probe": {"contextId": CONTEXT_ID}}).context_id == CONTEXT_ID
+    assert inject.Probe.from_body({"probe": {}}).context_id == ""
+
+
+WORKER_ENTRY = {
+    "name": "terminal",
+    "args": {"command": "kubectl get nodes"},
+    "result": "3 nodes",
+    "status": "completed",
+    "agent": "platform",
+    "task": CARD_A,
+}
+
+
+def _capture_one_worker_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``worker_trajectory.capture`` reading one call from the card's worker."""
+
+    def capture(shell: Any, task_ids: list[str], timeout: float) -> Any:
+        return worker_trajectory.WorkerCapture(
+            entries=[dict(WORKER_ENTRY)],
+            summary={"cards": {CARD_A: {"sessions": ["s1"]}}},
+            tokens={"platform": {"input_tokens": 10, "output_tokens": 2}},
+        )
+
+    monkeypatch.setattr(worker_trajectory, "capture", capture)
+
+
+@pytest.mark.parametrize(
+    "door_shows_trace", [pytest.param(False, id="no trace"), pytest.param(True, id="trace")]
+)
+def test_the_workers_entries_do_not_unblind_a_record_whose_door_showed_no_trace(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    door_shows_trace: bool,
+) -> None:
+    """The scorer sets a router-scope check aside on an inject record with no
+    activity marker and nothing outside the envelope. A worker's entry would
+    end that, grading the check against no router calls, so on such a record
+    the workers' entries stay off the trajectory; with a marker they join it."""
+    if door_shows_trace:
+        api_executor.probe_activity = []
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "done", result="all 3 clusters healthy")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+    _capture_one_worker_call(monkeypatch)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not result.errors, result.errors
+    assert "all 3 clusters healthy" in result.metadata["final_message"]
+    names = [e["name"] for e in result.trajectory]
+    if door_shows_trace:
+        assert "terminal" in names
+        assert not scoring._inject_blind(result.trajectory)
+    else:
+        assert "terminal" not in names
+        assert scoring._inject_blind(result.trajectory)
+        assert result.metadata["worker_entries_withheld"] == 1
+    # The counts are not entries and do not move the scorer: they stay.
+    assert result.tokens["workers"] is not None
+
+
+def _failing_first(shell: Any, failures: int) -> Any:
+    """``shell`` with its first ``failures`` session-cards reads failing."""
+    seen = []
+
+    def flaky(script: str, timeout: float) -> str:
+        if board.SESSION_CARDS_PRESENT in script:
+            seen.append(script)
+            if len(seen) <= failures:
+                return "error: unable to upgrade connection"
+        return shell(script, timeout)
+
+    return flaky
+
+
+def test_a_first_read_that_fails_is_retried(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "done", result="all 3 clusters healthy")
+    shell = local_shell(tmp_path, monkeypatch)
+    monkeypatch.setattr(harness, "_agent_shell", _failing_first(shell, 2))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not result.errors, result.errors
+    assert f"Result of delegated task {CARD_A}:\nall 3 clusters healthy" in (
+        result.metadata["final_message"]
+    )
+
+
+def test_a_first_read_that_never_succeeds_falls_back_and_says_so_on_the_record(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``errors`` is kept in the record and ``metadata`` is not, so the
+    fallback's reason goes on ``errors``; it carries no marker, so the scorer
+    still grades the reply."""
+    build_session_store(tmp_path, created=[CARD_A])
+    shell = local_shell(tmp_path, monkeypatch)
+    monkeypatch.setattr(harness, "_agent_shell", _failing_first(shell, 99))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.metadata["final_message"] == ACK
+    assert result.errors == [
+        f"the session store for {API_SESSION} could not be read 3 times running; the "
+        "delegation wait fell back to the trajectory's cards, so a delegated answer may be "
+        "graded on the acknowledgement"
+    ]
+    assert not infra(result)
+    assert len(api_executor.submissions) == 1
+
+
+def test_a_card_filed_later_joins_the_wait(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[CARD_A, CARD_B])
+    # The second create is not in the store yet: the session files it later.
+    with sqlite3.connect(tmp_path / board.STORE_FILE) as conn:
+        conn.execute("DELETE FROM messages WHERE role = 'tool' AND content LIKE ?", (f"%{CARD_B}%",))
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (CARD_B,))
+
+    def advance(n: int) -> None:
+        if n == 2:
+            with sqlite3.connect(tmp_path / board.STORE_FILE) as conn:
+                conn.execute(
+                    "INSERT INTO messages (session_id, role, content, tool_name)"
+                    " VALUES (?, 'tool', ?, 'kanban_create')",
+                    (API_SESSION, json.dumps({"task_id": CARD_B})),
+                )
+            set_card(tmp_path, CARD_A, "done", result="fleet report")
+            set_card(tmp_path, CARD_B, "running")
+        if n == 3:
+            set_card(tmp_path, CARD_B, "done", result="follow-up done")
+
+    shell = local_shell(tmp_path, monkeypatch, advance)
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not result.errors, result.errors
+    final = result.metadata["final_message"]
+    assert f"Result of delegated task {CARD_A}:\nfleet report" in final
+    assert f"Result of delegated task {CARD_B}:\nfollow-up done" in final
+    assert result.metadata["delegated_cards"] == {CARD_A: "done", CARD_B: "done"}
+
+
+def test_subscriptions_name_the_cards_through_the_harness(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[CARD_A], store_creates=False)
+    set_card(tmp_path, CARD_A, "done", summary="node pool resized")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("resize the pool")
+
+    assert not result.errors, result.errors
+    assert f"Result of delegated task {CARD_A}:\nnode pool resized" in (
+        result.metadata["final_message"]
+    )
+    assert result.metadata["delegated_cards_source"] == f"kanban_notify_subs ({API_SESSION})"
+
+
+def test_over_the_cap_the_cards_still_moving_are_the_ones_awaited(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fan-out past the cap whose first cards are already done: capping in
+    filing order would keep only finished cards and skip the wait, dropping the
+    running cards' results."""
+    cap = harness._MAX_AWAITED_TASKS
+    cards = [f"t_{n:08x}" for n in range(cap + 4)]
+    build_session_store(tmp_path, created=cards)
+    for tid in cards[:cap]:
+        set_card(tmp_path, tid, "done", result=f"early {tid}")
+    late = cards[cap:]
+    for tid in late:
+        set_card(tmp_path, tid, "running")
+
+    def advance(n: int) -> None:
+        if n == 2:
+            for tid in late:
+                set_card(tmp_path, tid, "done", result=f"late {tid}")
+
+    shell = local_shell(tmp_path, monkeypatch, advance)
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+
+    result = KubeAgentsHarness().run("audit every cluster")
+
+    final = result.metadata["final_message"]
+    for tid in late:
+        assert f"Result of delegated task {tid}:\nlate {tid}" in final
+    assert len(shell.reads) == 3
+    assert result.errors == [f"too many delegated tasks: awaiting {cap}, ignoring 4"]
+
+
+def test_a_card_the_board_does_not_know_is_dropped_not_waited_on_to_the_ceiling(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A create on another board, or a card deleted after filing, names an id
+    with no row in ``kanban.db``. The status-turn wait ends that in three
+    silent turns; this one drops the card after three reads with no row."""
+    build_session_store(tmp_path, created=[CARD_A, CARD_B])
+    set_card(tmp_path, CARD_B, "done", result="fleet report")
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("DELETE FROM tasks WHERE id = ?", (CARD_A,))
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "5")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.05")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.errors == [
+        f"card {CARD_A} not on the board after 3 reads; dropped from the delegation wait, "
+        "nothing graded for it"
+    ]
+    assert f"Result of delegated task {CARD_B}:\nfleet report" in result.metadata["final_message"]
+    assert CARD_A not in result.metadata["final_message"]
+    assert result.metadata["delegated_cards_missing"] == [CARD_A]
+
+
+def test_one_cap_counts_every_card_and_awaits_the_moving_ones_first(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 100-card fan-out whose first 70 are done: the cap is the harness's,
+    its message counts all 100, and the 30 still moving are the ones awaited."""
+    cap = harness._MAX_AWAITED_TASKS
+    cards = [f"t_{n:08x}" for n in range(100)]
+    build_session_store(tmp_path, created=cards)
+    for tid in cards[:70]:
+        set_card(tmp_path, tid, "done", result=f"early {tid}")
+    late = cards[70:]
+    for tid in late:
+        set_card(tmp_path, tid, "running")
+
+    def advance(n: int) -> None:
+        if n == 2:
+            for tid in late:
+                set_card(tmp_path, tid, "done", result=f"late {tid}")
+
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch, advance))
+
+    result = KubeAgentsHarness().run("audit every cluster")
+
+    assert result.errors == [f"too many delegated tasks: awaiting {cap}, ignoring {100 - cap}"]
+    final = result.metadata["final_message"]
+    for tid in late:
+        assert f"Result of delegated task {tid}:\nlate {tid}" in final

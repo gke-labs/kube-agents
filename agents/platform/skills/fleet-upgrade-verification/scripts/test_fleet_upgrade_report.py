@@ -8,12 +8,25 @@ import shutil
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+import subprocess
+from unittest import mock
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 import fleet_upgrade_report as report  # noqa: E402
+import credential_proxy_client  # noqa: E402 -- on sys.path through the reporter's SHARED_SCRIPT_DIRS
+
+# Every resolver asks the operator's answer when a run passes neither scope flag:
+# the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
+# that carries either (the sandbox session, a developer reproducing the guard)
+# would turn this suite's listing tests into refusals. The suite is about the
+# collector, not the host it runs on, so both are neutralised at import.
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+_fleet_scope_args = report.fleet_scope_args  # the collector's own import; one module, one path
+
+_fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
 
 def cluster(name, location, master, pools, channel="REGULAR", status="RUNNING"):
@@ -300,6 +313,160 @@ class RunCmdTest(unittest.TestCase):
 
 
 class ProjectFailureTest(unittest.TestCase):
+    def test_a_cluster_filter_skips_the_other_members(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("a", "us-central1", target, [("p", target)]), cluster("b", "us-central1", target, [("p", target)])]}, {})
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["p"], target, clusters=["b"])
+        self.assertEqual([m["cluster"] for m in result["members"]], ["b"])
+        with patch.object(report, "run_cmd", fake):
+            everything = report.build_report(["p"], target)
+        self.assertEqual([m["cluster"] for m in everything["members"]], ["a", "b"])
+
+    def test_a_location_qualified_filter_leaves_a_same_named_twin_alone(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)]), cluster("prod", "europe-west1", target, [("p", target)])]}, {})
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["p"], target, clusters=["us-central1/prod"])
+        self.assertEqual([(m["location"], m["cluster"]) for m in result["members"]], [("us-central1", "prod")])
+        with patch.object(report, "run_cmd", fake):
+            both = report.build_report(["p"], target, clusters=["prod"])
+        self.assertEqual(len(both["members"]), 2)
+
+    def test_an_unmatched_cluster_spec_is_an_error_and_exit_one_not_an_empty_report(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["p"], target, clusters=["prd", "europe-west1/prod", "prod"])
+        self.assertEqual([m["cluster"] for m in result["members"]], ["prod"])
+        self.assertEqual(
+            [(e["location"], e["cluster"], e["message"]) for e in result["errors"]],
+            [
+                (None, "prd", "no cluster matched --cluster 'prd' in p"),
+                ("europe-west1", "prod", "no cluster matched --cluster 'europe-west1/prod' in p"),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as state_dir, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()) as out:
+            rc = report.main(["--project", "p", "--cluster", "prd", "--target-version", target, "--state-dir", state_dir])
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        self.assertIn("no cluster matched --cluster 'prd' in p", out.getvalue())
+
+    def test_an_unmatched_spec_over_a_failed_listing_says_the_listing_failed_not_no_match(self):
+        """A project the run could not list may hold the cluster: the line says
+        which projects were listed and which were not, never "no match" over
+        a project it never read."""
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"other": [cluster("a", "us-central1", target, [("p", target)])]}, {}, failing_projects=["acme"])
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["acme", "other"], target, clusters=["us-central1/prod"])
+        messages = [e["message"] for e in result["errors"]]
+        self.assertEqual(len(messages), 2)
+        self.assertIn("permission denied on acme", messages[0])
+        self.assertEqual(messages[1], "no cluster matched --cluster 'us-central1/prod' in other; acme could not be listed, so whether it is there is unknown")
+        with patch.object(report, "run_cmd", fake):
+            alone = report.build_report(["acme"], target, clusters=["us-central1/prod"])
+        self.assertEqual([e["message"] for e in alone["errors"]][1], "--cluster 'us-central1/prod' could not be matched: acme could not be listed")
+        self.assertNotIn("no cluster matched", " ".join(e["message"] for e in alone["errors"]))
+
+    def test_a_qualified_and_a_bare_spec_naming_one_cluster_are_both_matched(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["p"], target, clusters=["prod", "us-central1/prod"])
+        self.assertEqual([m["cluster"] for m in result["members"]], ["prod"])
+        self.assertEqual(result["errors"], [])
+        with tempfile.TemporaryDirectory() as state_dir, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()) as out:
+            rc = report.main(["--project", "p", "--cluster", "prod", "--cluster", "us-central1/prod", "--target-version", target, "--state-dir", state_dir])
+        self.assertEqual(rc, report.EXIT_OK)
+        self.assertNotIn("no cluster matched", out.getvalue())
+
+    def test_a_cluster_spec_outside_the_gke_name_grammar_is_a_usage_error_before_any_read(self):
+        """Each half is a GKE name, lowercase letters, digits and hyphens, never
+        a hyphen first: an empty half, a second slash, whitespace from a pasted
+        line, an uppercase letter or a leading hyphen can match nothing, and is
+        refused with the spec as typed rather than reported as a miss."""
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
+        for spec in ("/prod", "prod/", "", "us-central1/prod/extra", "us-central1/prod ", " prod", "us-central1/Prod", "us central1/prod", "us-central1/-a", "-us-central1/prod", "-prod"):
+            with self.subTest(spec=spec):
+                err = io.StringIO()
+                with patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()), redirect_stderr(err):
+                    # One token, `--cluster=<spec>`: argparse reads a separate
+                    # `-prod` as an option and never hands it to the parser.
+                    rc = report.main(["--project", "p", f"--cluster={spec}", "--target-version", target])
+                self.assertEqual(rc, report.EXIT_USAGE)
+                # The line names the spec as typed, slash and all.
+                self.assertIn(f"--cluster {spec!r} is neither", err.getvalue())
+                self.assertEqual(fake.calls, [])
+        # `/prod` is not the bare form: a direct caller is refused too, rather
+        # than handed `prod` in every location.
+        with patch.object(report, "run_cmd", fake), self.assertRaises(ValueError):
+            report.build_report(["p"], target, clusters=["/prod"])
+        self.assertEqual(fake.calls, [])
+
+    def test_the_spec_half_grammar_is_the_brokers_gke_name_component(self):
+        """One GKE name grammar in the tree: the broker's context component,
+        the scoped pool's copy of it, and this file's spec half. Held equal
+        character for character, anchors aside (every use here is
+        `fullmatch`), and driven with the same inputs, so an edit to one fails
+        here rather than admitting a half the broker refuses."""
+        broker = credential_proxy_client._GKE_CONTEXT_COMPONENT
+        self.assertEqual(report.CLUSTER_SPEC_HALF_RE.pattern, broker.pattern.removeprefix("^").removesuffix(r"\Z"))
+        for candidate in ("abc", "a", "a-b-c", "us-east4", "0abc", "abc-", "-abc", "ABC", "a_b", "a.b", "a/b", "", "a b", "abc\n", "\nabc", "abc\r\n"):
+            with self.subTest(candidate=candidate):
+                self.assertEqual(
+                    bool(broker.fullmatch(candidate)),
+                    bool(report.CLUSTER_SPEC_HALF_RE.fullmatch(candidate)),
+                    f"the broker and the reporter disagree about {candidate!r}",
+                )
+        self.assertIsNone(report.parse_cluster_spec("us-central1/-a"))
+        self.assertIsNone(report.parse_cluster_spec("-prod"))
+        self.assertEqual(report.parse_cluster_spec("us-central1/a-1"), ("us-central1", "a-1"))
+
+    def test_rollout_in_progress_beside_cluster_is_a_usage_error_before_any_read(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)])]}, {})
+        err = io.StringIO()
+        with patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = report.main(["--project", "p", "--cluster", "prod", "--rollout-in-progress", "--target-version", target])
+        self.assertEqual(rc, report.EXIT_USAGE)
+        self.assertIn(report.ROLLOUT_FLAG_NEEDS_FULL_READ, err.getvalue())
+        self.assertEqual(fake.calls, [])
+
+    def test_a_narrowed_run_leaves_the_rollout_record_alone(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("a", "us-central1", target, [("p", target)]), cluster("b", "us-central1", target, [("p", target)])]}, {})
+        with tempfile.TemporaryDirectory() as state_dir, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()) as out:
+            rc = report.main(["--project", "p", "--target-version", target, "--state-dir", state_dir])
+            self.assertEqual(rc, report.EXIT_OK)
+            path = report.state_path(state_dir, target)
+            before = open(path, encoding="utf-8").read()
+            rc = report.main(["--project", "p", "--cluster", "us-central1/b", "--target-version", target, "--state-dir", state_dir])
+            self.assertEqual(rc, report.EXIT_OK)
+            self.assertEqual(open(path, encoding="utf-8").read(), before)
+            self.assertIn(report.NARROWED_RUN_NOTE, out.getvalue())
+
+    def test_a_narrowed_run_marks_its_report_and_a_full_run_does_not(self):
+        """A reader of the JSON (the deprecation scan's floor, the collector's
+        join) has to tell a narrowed `members[]` from a full run whose project
+        held one cluster; `narrowed_to` is that mark."""
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("a", "us-central1", target, [("p", target)]), cluster("b", "us-central1", target, [("p", target)])]}, {})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()):
+            output = os.path.join(tmp, "r.json")
+            rc = report.main(["--project", "p", "--cluster", "us-central1/b", "--cluster", "b", "--target-version", target, "--state-dir", tmp, "--output", output])
+            self.assertEqual(rc, report.EXIT_OK)
+            with open(output, encoding="utf-8") as handle:
+                narrowed = json.load(handle)
+            self.assertEqual(narrowed["narrowed_to"], ["b", "us-central1/b"])
+            self.assertEqual([m["cluster"] for m in narrowed["members"]], ["b"])
+            rc = report.main(["--project", "p", "--target-version", target, "--state-dir", tmp, "--output", output])
+            self.assertEqual(rc, report.EXIT_OK)
+            with open(output, encoding="utf-8") as handle:
+                full = json.load(handle)
+            self.assertIsNone(full["narrowed_to"])
+            self.assertEqual([m["cluster"] for m in full["members"]], ["a", "b"])
+
     def test_one_failed_project_does_not_abort_the_others(self):
         target = "1.31.0-gke.1"
         fake = FakeGcloud(
@@ -513,9 +680,45 @@ class OutputShapeTest(unittest.TestCase):
         self.assertIn(f"read failed for {report.PROJECTS_LIST_ERROR_SCOPE}", stdout.getvalue())
         self.assertIn("PERMISSION_DENIED", stdout.getvalue())
 
+    def test_write_json_atomically_leaves_the_previous_file_on_failure(self):
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "out.json")
+        report.write_json_atomically(path, {"run": 1}, report.OUTPUT_TMP_PREFIX)
+        with self.assertRaises(TypeError):
+            report.write_json_atomically(path, {"run": object()}, report.OUTPUT_TMP_PREFIX)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"run": 1})
+        self.assertEqual(os.listdir(directory), ["out.json"])
+        report.write_json_atomically(path, {"run": 2}, report.OUTPUT_TMP_PREFIX)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"run": 2})
+
+    def test_main_refuses_an_abbreviated_flag(self):
+        # The bench credits a run by the flag's full word; argparse's prefix matching would run
+        # the report on `--readi` and leave the run uncredited.
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit) as exc:
+            report.main(["--project", "p1", "--target-version", self.target, "--readi"])
+        self.assertEqual(exc.exception.code, report.EXIT_USAGE)
+        self.assertIn("--readi", err.getvalue())
+
+    def test_a_webhook_read_failure_row_is_tagged_and_a_first_read_failure_row_is_not(self):
+        # The readiness watch tells the two apart: a webhook-side row leaves the member graded
+        # `unknown`; a first-read row is a member the server never answered.
+        read_first_failed = {"error": "kubectl get pdb failed", "webhook_error": None, "webhook_skipped": True}
+        read_second_failed = {"error": None, "webhook_error": "kubectl output cut at the cap", "webhook_skipped": False}
+        for read, expect_tag in ((read_first_failed, False), (read_second_failed, True)):
+            with self.subTest(expect_tag=expect_tag):
+                with patch.object(report, "run_cmd", self.fake), patch.object(report, "read_cluster_objects", return_value=read), patch.object(report, "assess_readiness", return_value={"status": "unknown"}):
+                    data = report.build_report(["p1"], self.target, {"at": report.utc_now(), "kubeconfig_dir": tempfile.mkdtemp()})
+                rows = [e for e in data["errors"] if e.get("cluster")]
+                self.assertTrue(rows)
+                self.assertEqual(all(e.get(report.ERROR_READ_KEY) == report.WEBHOOK_READ for e in rows), expect_tag)
+
     def test_main_returns_partial_when_output_cannot_be_written(self):
         out_dir = tempfile.mkdtemp()
-        # A directory where the file should go: open() fails with IsADirectoryError, an OSError.
+        # A directory where the file should go: the temp file is written beside it and the rename
+        # onto it fails with an OSError (IsADirectoryError), which the whole-file write reports.
         with patch.object(report, "run_cmd", self.fake), redirect_stdout(io.StringIO()):
             rc = report.main(["--project", "p1", "--target-version", self.target, "--output", out_dir])
         self.assertEqual(rc, report.EXIT_PARTIAL)
@@ -874,6 +1077,142 @@ class RolloutTrackingTest(unittest.TestCase):
         self.assertEqual(data["rollout"]["summary"]["new"], 4)
 
 
+
+class DeclaredScopeFromTheToolTest(unittest.TestCase):
+    """The declared scope the agent carries from the platform_control fleet_scope
+    tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
+    an unread declared project is the one note, and without the flags the
+    listing runs as before."""
+
+    ENV = {report.MONITORED_PROJECTS_ENV: "", "GCP_PROJECT_ID": "ops-mgmt", "GKE_PROJECT_ID": "", "PROJECT_ID": ""}
+
+    def setUp(self):
+        # The variable half of the operator's answer, per test as well as at
+        # import; the file half is pointed at a path that does not exist above.
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        report.declared_scope.set(None, None)
+
+    def tearDown(self):
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        report.declared_scope.set(None, None)
+
+    def test_the_declared_scope_is_swept_and_nothing_is_listed(self):
+        notes: list[str] = []
+        report.declared_scope.set("payments-prod,ops-mgmt", "payments-staging=denied")
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed"))):
+            self.assertEqual(report.get_target_projects(None, notes), ["ops-mgmt", "payments-prod"])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("payments-staging (denied)", notes[0])
+
+    def test_every_declared_project_read_leaves_no_note(self):
+        notes: list[str] = []
+        report.declared_scope.set("ops-mgmt", "")
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (1, "", "")):
+            self.assertEqual(report.get_target_projects(None, notes), ["ops-mgmt"])
+        self.assertEqual(notes, [])
+
+    def test_without_the_flags_the_listing_runs_as_before(self):
+        def fake(cmd, **kwargs):
+            if "projects" in cmd and "list" in cmd:
+                return (0, "ops-mgmt\nother\n", "")
+            return (0, "ops-mgmt\n", "")
+        report.declared_scope.set(None, None)
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(report, "run_cmd", side_effect=fake):
+            self.assertEqual(report.get_target_projects(None, []), ["ops-mgmt", "other"])
+
+    def test_the_passed_scope_outranks_a_monitored_projects_variable(self):
+        # An operator's MONITORED_PROJECT_IDS narrows a listing; a scope the SOP
+        # passed from the fleet_scope tool is the whole scope, env or no env.
+        report.declared_scope.set("ops-mgmt", None)
+        with mock.patch.dict(os.environ, {**self.ENV, report.MONITORED_PROJECTS_ENV: "acme-only"}), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (1, "", "")):
+            self.assertEqual(report.get_target_projects(None, []), ["ops-mgmt"])
+
+    def test_a_project_outside_the_declared_scope_is_refused(self):
+        errors: list[str] = []
+        report.declared_scope.set("ops-mgmt,payments-prod", None)
+        with mock.patch.dict(os.environ, self.ENV):
+            self.assertEqual(report.get_target_projects(["payments-prod"], errors), ["payments-prod"])
+            self.assertEqual(report.get_target_projects(["acme-only"], errors), [])
+        self.assertTrue(any("declared scope does not list" in e for e in errors))
+
+    def test_the_one_project_the_audit_collector_hands_on_is_the_whole_scope_the_override_needs(self):
+        """The upgrade audit's collector runs this reporter per behind cluster
+        as `--project <p> --scope-projects <p> --cluster ...`, the one project
+        and never the sweep or the unread rows, so its recorded command does
+        not grow with the fleet. That is enough here: with `--project` the
+        scope is read only to pass the project through `override_error`, so
+        the run proceeds on a scoped sandbox with no error and no note."""
+        errors: list[str] = []
+        report.declared_scope.set("payments-prod", None)
+        with mock.patch.dict(os.environ, {**self.ENV, "KUBEAGENTS_SCOPE_DECLARED": "true"}), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing may be read"))):
+            self.assertEqual(report.get_target_projects(["payments-prod"], errors), ["payments-prod"])
+        self.assertEqual(errors, [])
+
+    def test_a_project_without_the_flags_on_a_scoped_sandbox_is_refused_before_any_read(self):
+        errors: list[str] = []
+        with mock.patch.dict(os.environ, {**self.ENV, "KUBEAGENTS_SCOPE_DECLARED": "true"}), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing may be read"))):
+            report.declared_scope.set(None, None)
+            self.assertEqual(report.get_target_projects(["123456789012"], errors), [])
+        self.assertIn("got no collector_args", errors[0])
+
+    def test_a_project_number_whose_describe_fails_is_reported_as_unresolved_not_outside(self):
+        errors: list[str] = []
+        report.declared_scope.set("ops-mgmt", None)
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (1, "", "denied")):
+            self.assertEqual(report.get_target_projects(["123456789012"], errors), [])
+        self.assertTrue(any("could not be resolved" in e for e in errors), errors)
+        self.assertFalse(any("declared scope does not list" in e for e in errors), errors)
+
+    def test_without_a_declared_scope_an_unresolved_project_number_proceeds_as_before(self):
+        # The refusal of an unresolved number belongs to the declared-scope
+        # case alone; a checkout or an install with no scope keeps main's
+        # behaviour, the raw number with the describe failure recorded.
+        notes: list[str] = []
+        report.declared_scope.set(None, None)
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (1, "", "denied")):
+            self.assertEqual(report.get_target_projects(["123456789012"], notes), ["123456789012"])
+        self.assertFalse(any("could not resolve" in n for n in notes), notes)
+
+    def test_a_blank_project_says_so_under_a_declared_scope(self):
+        errors: list[str] = []
+        report.declared_scope.set("ops-mgmt", None)
+        with mock.patch.dict(os.environ, self.ENV):
+            self.assertEqual(report.get_target_projects([""], errors), [])
+        self.assertTrue(any("no value" in e for e in errors), errors)
+        # Without a declared scope the usage line main prints is the answer;
+        # this remedy would name a scope the install does not have.
+        report.declared_scope.set(None, None)
+        errors = []
+        self.assertEqual(report.get_target_projects([""], errors), [])
+        self.assertEqual(errors, [])
+
+    def test_main_hands_the_flags_to_the_resolver(self):
+        # The wiring the SOP relies on: the two flags main parses reach the
+        # holder the resolver reads, before anything else runs.
+        with mock.patch.object(report.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
+            report.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+
+    def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
+        # `--scope-unread` alone (what collector_args carries when no declared
+        # project was readable) is a boundary with nothing inside it: the run
+        # reports that and must not widen to MONITORED_PROJECT_IDS or the listing.
+        errors: list[str] = []
+        report.declared_scope.set(None, "payments-staging=denied")
+        with mock.patch.dict(os.environ, {**self.ENV, report.MONITORED_PROJECTS_ENV: "acme-only"}):
+            self.assertEqual(report.get_target_projects(None, errors), [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("no project this install could read", errors[0])
+
+    def test_the_flags_are_parsed_from_the_command_line(self):
+        proc = subprocess.run([sys.executable, report.__file__, "--help"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--scope-projects", proc.stdout)
+        self.assertIn("--scope-unread", proc.stdout)
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -881,10 +1220,24 @@ if __name__ == "__main__":
 class FakeReadinessCommands(FakeGcloud):
     """FakeGcloud plus `get-credentials` and `kubectl get`, recording the KUBECONFIG each ran with."""
 
-    def __init__(self, clusters_by_project, config_by_location, objects_by_cluster, failing_kubectl=(), failing_credentials=()):
+    # What each resource name in a `kubectl get` list returns, so a read that stops asking for
+    # a kind stops receiving it, as a real API server would.
+    KINDS = {
+        "pdb": "PodDisruptionBudget",
+        "deploy": "Deployment",
+        "statefulset": "StatefulSet",
+        "validatingwebhookconfigurations": "ValidatingWebhookConfiguration",
+        "mutatingwebhookconfigurations": "MutatingWebhookConfiguration",
+        "services": "Service",
+        "endpointslices": "EndpointSlice",
+        "namespaces": "Namespace",
+    }
+
+    def __init__(self, clusters_by_project, config_by_location, objects_by_cluster, failing_kubectl=(), failing_credentials=(), failing_webhook_read=()):
         super().__init__(clusters_by_project, config_by_location)
         self.objects_by_cluster = objects_by_cluster
         self.failing_kubectl = set(failing_kubectl)
+        self.failing_webhook_read = set(failing_webhook_read)
         self.failing_credentials = set(failing_credentials)
         self.kubeconfigs = []
         self.current_cluster = None
@@ -902,7 +1255,11 @@ class FakeReadinessCommands(FakeGcloud):
             self.kubeconfigs.append(env.get("KUBECONFIG") if env else None)
             if self.current_cluster in self.failing_kubectl:
                 return 1, "", "Unable to connect to the server: dial tcp: i/o timeout"
-            return 0, json.dumps({"kind": "List", "items": self.objects_by_cluster.get(self.current_cluster, [])}), ""
+            wanted = {self.KINDS[name] for name in cmd[2].split(",")}
+            if "EndpointSlice" in wanted and self.current_cluster in self.failing_webhook_read:
+                return 1, "", "Error from server (Timeout): the server was unable to return a response in the time allotted"
+            items = [o for o in self.objects_by_cluster.get(self.current_cluster, []) if o.get("kind") in wanted]
+            return 0, json.dumps({"kind": "List", "items": items}), ""
         return super().__call__(cmd)
 
 
@@ -912,6 +1269,23 @@ def k8s_workload(kind, namespace, name, replicas, labels):
 
 def k8s_pdb(namespace, name, spec, expected):
     return {"kind": "PodDisruptionBudget", "metadata": {"namespace": namespace, "name": name}, "spec": spec, "status": {"expectedPods": expected, "disruptionsAllowed": 0}}
+
+
+def k8s_webhook(kind, config, webhook, policy, service, resources, operations=("CREATE",)):
+    rule = {"apiGroups": [""], "apiVersions": ["v1"], "operations": list(operations), "resources": list(resources)}
+    return {"kind": kind, "metadata": {"name": config}, "webhooks": [{"name": webhook, "failurePolicy": policy, "rules": [rule], "clientConfig": {"service": {"namespace": service[0], "name": service[1]}}}]}
+
+
+def k8s_service(namespace, name, port=443, port_name="https"):
+    return {"kind": "Service", "metadata": {"namespace": namespace, "name": name}, "spec": {"ports": [{"name": port_name, "port": port, "targetPort": 8443}]}}
+
+
+def k8s_endpointslice(namespace, service, ready, port_name="https"):
+    return {"kind": "EndpointSlice", "metadata": {"namespace": namespace, "name": f"{service}-x", "labels": {"kubernetes.io/service-name": service}}, "ports": [{"name": port_name, "port": 8443}], "endpoints": [{"conditions": {"ready": ready}}]}
+
+
+def k8s_namespace(name, labels=None):
+    return {"kind": "Namespace", "metadata": {"name": name, "labels": {"kubernetes.io/metadata.name": name, **(labels or {})}}}
 
 
 class ReadinessTest(unittest.TestCase):
@@ -952,6 +1326,24 @@ class ReadinessTest(unittest.TestCase):
                 k8s_pdb("readiness-1411", "orphan", {"maxUnavailable": 0, "selector": {"matchLabels": {"app": "gone"}}}, 0),
             ],
         }
+        # seeded-b: the seeded fleet's fixture shape, a gate on ConfigMaps only, whose Service does
+        # not exist, scoped to its own namespace as bench/tf/fleet/defects-b.tf scopes it. It is an
+        # outage because ConfigMaps are on neither graded list; the scope confines the gate.
+        seeded_gate = k8s_webhook("ValidatingWebhookConfiguration", "seeded-fail-closed-gate", "gate.seeded.invalid", "Fail", ("seeded-upgrade", "nonexistent-admission-gate"), ["configmaps"])
+        seeded_gate["webhooks"][0]["namespaceSelector"] = {"matchLabels": {"kubernetes.io/metadata.name": "seeded-upgrade"}}
+        self.objects["seeded-b"] = self.objects.get("seeded-b", []) + [seeded_gate]
+        # robot-host: a gate on pod creation whose Service exists but has no endpoints; the drain's replacements need it.
+        self.objects["robot-host"] = self.objects.get("robot-host", []) + [
+            k8s_webhook("ValidatingWebhookConfiguration", "pod-gate", "pods.example.com", "Fail", ("gate", "pod-hook"), ["pods"]),
+            k8s_service("gate", "pod-hook"),
+        ]
+        # seeded-a: a pod gate with a ready backend, and a fail-open one.
+        self.objects["seeded-a"] = self.objects.get("seeded-a", []) + [
+            k8s_webhook("ValidatingWebhookConfiguration", "healthy-gate", "ok.example.com", "Fail", ("kube-system", "live-hook"), ["pods"]),
+            k8s_service("kube-system", "live-hook"),
+            k8s_endpointslice("kube-system", "live-hook", ready=True),
+            k8s_webhook("MutatingWebhookConfiguration", "advisor", "advise.example.com", "Ignore", ("kube-system", "live-hook"), ["pods"]),
+        ]
 
     def _args(self, *extra):
         return ["--state-dir", self.state_dir, "--project", "p1", "--target-version", self.TARGET, *extra]
@@ -994,15 +1386,26 @@ class ReadinessTest(unittest.TestCase):
         self.assertFalse(host["skew"]["applicable"])
         self.assertIn("1 orphan PDB(s)", host["note"])
 
+        self.assertEqual([f["webhook"] for f in host["webhooks"]["blocking"]], ["pod-gate/pods.example.com"])
+        self.assertEqual(host["webhooks"]["blocking"][0]["upgrade_path"], ["CREATE pods"])
+        self.assertEqual(host["webhooks"]["blocking"][0]["reason"], "Service gate/pod-hook has no ready endpoints on port 443")
+
         b = by_name["seeded-b"]
         self.assertEqual(b["status"], "blocked")
         self.assertEqual(b["pdbs"]["blocking"], [])
+        # The fixture's gate matches ConfigMaps only: an outage for what it matches, not an upgrade blocker.
+        self.assertEqual(b["webhooks"]["blocking"], [])
+        self.assertEqual([f["webhook"] for f in b["webhooks"]["outage"]], ["seeded-fail-closed-gate/gate.seeded.invalid"])
+        self.assertEqual(b["webhooks"]["outage"][0]["reason"], "Service seeded-upgrade/nonexistent-admission-gate does not exist")
         self.assertEqual(b["maintenance"]["blocking_exclusions"], ["hold-the-minor-lag"])
         self.assertEqual(b["maintenance"]["window"]["state"], "closed")
         self.assertEqual(b["maintenance"]["window"]["next_opening"], "2026-09-15T03:00Z")
 
         a = by_name["seeded-a"]
         self.assertEqual(a["status"], "ready")
+        self.assertEqual(a["webhooks"]["blocking"], [])
+        self.assertEqual(a["webhooks"]["evaluated"], 1)
+        self.assertEqual(a["webhooks"]["fail_open"], 1)
         self.assertEqual(a["skew"]["pools"][0]["verdict"], "ok")
         self.assertEqual(data["readiness"]["summary"], {"blocked": 2, "ready": 1, "unknown": 0})
         self.assertEqual(data["readiness"]["evaluated_at"], "2026-09-14T15:00:00Z")
@@ -1014,6 +1417,8 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("no exclusion in effect; no maintenance window", host_row)
         self.assertIn("n/a (Autopilot", host_row)
         b_row = next(l for l in lines if l.startswith("| p1 | seeded-b |") and "| blocked |" in l)
+        self.assertIn("seeded-fail-closed-gate/gate.seeded.invalid (ValidatingWebhookConfiguration): failurePolicy Fail and Service seeded-upgrade/nonexistent-admission-gate does not exist; matches none of the operations this rule reads as the upgrade's path (its rules: CREATE configmaps at v1); it fails now every request the server sends it; reported, not graded", b_row)
+        self.assertIn("pod-gate/pods.example.com (ValidatingWebhookConfiguration): failurePolicy Fail and Service gate/pod-hook has no ready endpoints on port 443; matches CREATE pods", host_row)
         self.assertIn("exclusion hold-the-minor-lag (NO_MINOR_UPGRADES) blocks auto-upgrade to 1.35.1-gke.1000 until 2026-12-11T14:35Z", b_row)
         self.assertIn("window daily at 03:00Z for 4h: closed, next opening 2026-09-15T03:00Z", b_row)
         self.assertIn("Readiness at 2026-09-14T15:00:00Z: 2 blocked, 1 ready, 0 unknown", text)
@@ -1036,7 +1441,15 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(all(k and k.startswith(self.kubeconfig_dir + os.sep) for k in fake.kubeconfigs))
         self.assertTrue(os.path.isdir(self.kubeconfig_dir))
         kubectl = [c for c in fake.calls if c[:1] == ["kubectl"]]
-        self.assertEqual(kubectl, [["kubectl", "get", "pdb,deploy,statefulset", "-A", "-o", "json"]] * 3)
+        # Literal resource lists, not the constants: a list that drops a kind must fail here.
+        self.assertEqual(
+            kubectl,
+            [
+                ["kubectl", "get", "pdb,deploy,statefulset", "-A", "-o", "json"],
+                ["kubectl", "get", "validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces", "-A", "-o", "json"],
+            ]
+            * 3,
+        )
         self.assertEqual(data["readiness"]["kubeconfig_dir"], self.kubeconfig_dir)
         self.assertEqual({m["cluster"]: m["readiness"]["kubeconfig"] for m in data["members"]}["seeded-b"], expected)
 
@@ -1059,9 +1472,20 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("i/o timeout", by_name["seeded-a"]["read_error"])
         self.assertEqual(by_name["robot-host"]["status"], "blocked")
         self.assertEqual(by_name["seeded-b"]["status"], "blocked")
+        self.assertIsNone(by_name["seeded-a"]["webhooks"])
+        # An API server the first read could not reach is not asked a second time: one
+        # kubectl call for seeded-a, two for each of the other members.
+        self.assertEqual(len([c for c in fake.calls if c[:2] == ["kubectl", "get"]]), 5)
+        self.assertTrue(by_name["seeded-a"]["webhook_read_error"].startswith(report.WEBHOOK_READ_SKIPPED))
+        # The skipped read is reported as skipped, not failed: one error row, and a note that says why the webhooks are unread.
         self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-a"])
         self.assertIn("- read failed for p1 (us-central1-a) cluster seeded-a: kubectl get pdb,deploy,statefulset -A -o json failed (1)", text)
-        self.assertIn("| read failed |", text)
+        self.assertEqual([l for l in text.splitlines() if l.startswith("- read failed") and "skipped" in l], [])
+        self.assertIn("PDB read failed; PDBs not graded; webhook read skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the credential proxy unreachable); webhooks not graded", by_name["seeded-a"]["note"])
+        self.assertNotIn("webhook read failed", by_name["seeded-a"]["note"])
+        self.assertTrue(by_name["seeded-a"]["webhook_read_skipped"])
+        self.assertIn("| read failed | read skipped |", text)
+        self.assertNotIn("| read failed | read failed |", text)
         # The version row is unaffected, and the rollout record does not treat the project as unread.
         self.assertEqual({m["cluster"]: m["status"] for m in data["members"]}["seeded-a"], report.STATUS_CURRENT)
         self.assertEqual(data["rollout"]["missing_members"], [])
@@ -1075,7 +1499,135 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(b["status"], "blocked")
         self.assertIsNone(b["pdbs"])
         self.assertIn("forbidden", b["read_error"])
-        self.assertEqual(len([c for c in fake.calls if c[:1] == ["kubectl"]]), 2)
+        self.assertIsNone(b["webhooks"])
+        self.assertEqual(len([c for c in fake.calls if c[:1] == ["kubectl"]]), 4)
+        # One credentials failure is one error row, not one per read, and the note names credentials, not kubectl.
+        self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-b"])
+        self.assertIn("credentials for the cluster could not be fetched", b["note"])
+        self.assertNotIn("read failed", b["note"])
+
+    def test_an_unwritable_kubeconfig_dir_is_a_directory_error_not_a_credentials_error(self):
+        # `--kubeconfig-dir` is operator-chosen, so an unwritable path is ordinary input and
+        # the note has to send the operator to the path, not to IAM.
+        read = report.read_cluster_objects({"name": "c", "location": "l"}, "p", os.path.join(os.devnull, "kubeconfigs"))
+        self.assertIsNotNone(read["directory_error"])
+        self.assertIsNone(read["credentials_error"])
+        self.assertIn("cannot create kubeconfig directory", read["error"])
+        self.assertEqual(read["error"], read["webhook_error"])
+
+    def test_a_first_read_killed_by_the_deadline_does_not_skip_the_webhook_read(self):
+        # In the sandbox the deadline measures the credential proxy's admission queue as often as
+        # the server, and a second read enters that queue afresh.
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            if cmd[2] == report.KUBECTL_RESOURCES:
+                return -1, "", f"timed out after {report.KUBECTL_TIMEOUT_SECONDS} seconds"
+            return 0, '{"items": []}', ""
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertIn("timed out after", read["error"])
+        self.assertFalse(read["webhook_skipped"])
+        self.assertEqual((read["webhook_items"], read["webhook_error"]), ([], None))
+        self.assertEqual([c[2] for c in calls if c[0] == report.KUBECTL], [report.KUBECTL_RESOURCES, report.KUBECTL_WEBHOOK_RESOURCES])
+
+    def test_a_server_answered_error_quoting_a_dial_failure_does_not_skip_the_webhook_read(self):
+        # kubectl prefixes an error the API server returned with `Error from server (...)`; its
+        # body can quote the server's own dial failure (apiserver to etcd during a control-plane
+        # event), which is an answer, so the second read is made and may be answered.
+        calls = []
+        answered = 'Error from server (InternalError): an error on the server ("rpc error: code = Unavailable desc = dial tcp 10.0.0.2:2379: connect: connection refused") has prevented the request from succeeding'
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            if cmd[2] == report.KUBECTL_RESOURCES:
+                return 1, "", answered
+            return 0, '{"items": []}', ""
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertIn("connection refused", read["error"])
+        self.assertFalse(read["webhook_skipped"])
+        self.assertEqual((read["webhook_items"], read["webhook_error"]), ([], None))
+        self.assertEqual([c[2] for c in calls if c[0] == report.KUBECTL], [report.KUBECTL_RESOURCES, report.KUBECTL_WEBHOOK_RESOURCES])
+        self.assertTrue(report.first_read_failed_before_the_server_answered("Unable to connect to the server: dial tcp 10.0.0.1:443: connect: connection refused"))
+        self.assertFalse(report.first_read_failed_before_the_server_answered(answered))
+
+    def test_the_shims_broker_down_line_skips_the_webhook_read(self):
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            return 1, "", "credential proxy unavailable: [Errno 111] Connection refused\n"
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertTrue(read["webhook_skipped"])
+        self.assertTrue(read["webhook_error"].startswith(report.WEBHOOK_READ_SKIPPED))
+        self.assertEqual([c[2] for c in calls if c[0] == report.KUBECTL], [report.KUBECTL_RESOURCES])
+
+    def test_a_list_cut_at_the_proxy_cap_is_named_as_such(self):
+        def fake_run(cmd, *args, **kwargs):
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            if cmd[2] == report.KUBECTL_RESOURCES:
+                return 0, '{"items": []}', ""
+            return 0, '{"items": [{"kind": "Service", "metadata": {"na', f"{report.PROXY_TRUNCATION_MARKER}\n"
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertEqual((read["items"], read["error"]), ([], None))
+        self.assertIsNone(read["webhook_items"])
+        self.assertIn("cut at the credential proxy's output cap", read["webhook_error"])
+        self.assertNotIn("unparsable", read["webhook_error"])
+
+    def test_webhook_read_failure_leaves_the_pdb_rule_graded(self):
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects, failing_webhook_read=["robot-host"])
+        rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        host = next(m for m in data["members"] if m["cluster"] == "robot-host")["readiness"]
+        self.assertIsNone(host["webhooks"])
+        self.assertIsNotNone(host["pdbs"])
+        self.assertEqual(host["pdbs"]["blocking"][0]["pdb"], "readiness-1411/block-drain")
+        self.assertEqual(host["status"], "blocked")  # the PDB still blocks; the webhook rule alone is unread
+        self.assertIn("webhook read failed; webhooks not graded", host["note"])
+        row = next(l for l in text.splitlines() if l.startswith("| p1 | robot-host |") and "| blocked |" in l)
+        self.assertIn("(2 replicas)) | read failed |", row)
+        self.assertIn("kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces -A -o json failed (1)", text)
+
+    def test_the_namespace_read_feeds_the_selector(self):
+        # A dead Role gate that exempts kube-system and kube-public by a label the installer
+        # put on them is an outage on the cluster whose Namespace read shows the label, and a
+        # blocker on the cluster whose namespaces do not carry it.
+        gate = k8s_webhook("ValidatingWebhookConfiguration", "policy-gate", "roles.example.com", "Fail", ("policy", "absent"), ["roles"])
+        gate["webhooks"][0]["rules"][0]["apiGroups"] = ["rbac.authorization.k8s.io"]
+        gate["webhooks"][0]["namespaceSelector"] = {"matchExpressions": [{"key": "admission.policy.example/ignore", "operator": "DoesNotExist"}]}
+        exempt = [k8s_namespace("kube-system", {"admission.policy.example/ignore": "true"}), k8s_namespace("kube-public", {"admission.policy.example/ignore": "true"})]
+        plain = [k8s_namespace("kube-system"), k8s_namespace("kube-public")]
+        objects = {**self.objects, "seeded-a": self.objects["seeded-a"] + [gate] + exempt, "robot-host": self.objects["robot-host"] + [gate] + plain}
+        _, _, data = self._run(FakeReadinessCommands(self.clusters, {}, objects))
+        webhooks = {m["cluster"]: m["readiness"]["webhooks"] for m in data["members"]}
+        self.assertEqual(([f["webhook"] for f in webhooks["seeded-a"]["outage"]], webhooks["seeded-a"]["blocking"]), (["policy-gate/roles.example.com"], []))
+        blocking = {f["webhook"]: f["upgrade_path"] for f in webhooks["robot-host"]["blocking"]}
+        self.assertEqual(blocking["policy-gate/roles.example.com"], ["CREATE roles in kube-system,kube-public"])
+
+    def test_url_backend_is_counted_in_the_json_and_not_noted(self):
+        url_hook = {"kind": "ValidatingWebhookConfiguration", "metadata": {"name": "warden"}, "webhooks": [{"name": "warden.example.com", "failurePolicy": "Fail", "rules": [{"apiGroups": [""], "operations": ["CREATE"], "resources": ["pods"]}], "clientConfig": {"url": "https://localhost:5443/validate"}}]}
+        objects = {**self.objects, "seeded-a": self.objects["seeded-a"] + [url_hook]}
+        fake = FakeReadinessCommands(self.clusters, {}, objects)
+        _, _, data = self._run(fake)
+        a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        self.assertEqual(a["webhooks"]["url_backends"], 1)
+        self.assertEqual(a["status"], "ready")
+        self.assertNotIn("URL", a["note"])
 
     def test_unknown_target_grades_the_pdb_rule_and_marks_the_rest_unknown(self):
         record = cluster("nochannel", "us-central1", "1.34.0-gke.1", [("p", "1.34.0-gke.1")], channel=None)

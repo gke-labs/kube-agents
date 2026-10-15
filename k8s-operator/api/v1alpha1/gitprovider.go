@@ -31,9 +31,8 @@ package v1alpha1
 // a table entry rather than widening a shared check.
 // `docs/designs/version-control-support.md` §6 is the design.
 //
-// Only GitHub is registered. The dispatch is what this file delivers; the
-// GitLab entry lands with the agent-side `GitLabProvider` it needs to be honest,
-// because a provider the CRD accepts and the agent discards is a
+// GitHub and GitLab are registered, each with the agent-side provider that
+// honours it, because a provider the CRD accepts and the agent discards is a
 // worse failure than one the CRD refuses.
 
 import (
@@ -41,12 +40,21 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
 	// GitProviderGitHub is the `provider` value naming GitHub, and the `type` of
 	// a `managed_repos` entry the agent has a provider for.
 	GitProviderGitHub = "github"
+
+	// GitProviderGitLab names GitLab: gitlab.com, or a self-managed instance
+	// at the host the forge declares.
+	GitProviderGitLab = "gitlab"
+
+	// DefaultGitHubHost is the github provider's default host.
+	DefaultGitHubHost = "github.com"
 
 	// DefaultGitProvider is assumed when a forge's `provider` is
 	// omitted, and is what the deprecated `spec.integration.github` alias means.
@@ -64,12 +72,29 @@ const (
 
 	// githubPathDepth is GitHub's rule: a repository is exactly `owner/name`.
 	githubPathDepth = 2
+
+	// gitlabMinPathDepth is GitLab's floor: a project sits under at least one
+	// group or user. Groups nest, so there is no ceiling.
+	gitlabMinPathDepth = 2
+
+	// MaxGitHubRepoNameLength is GitHub's limit on a repository name. With
+	// the owner's 39 it also keeps the longest URL the operator renders,
+	// `https://github.com/` and `owner/name`, at 159 characters, inside the
+	// 256 repo_ref.py's MAX_REPO_LENGTH lets the broker read.
+	MaxGitHubRepoNameLength = 100
 )
 
-// githubHosts is every spelling of GitHub that can appear in a remote this
-// install produces. `ssh.github.com` is the SSH-over-443 endpoint. An
-// enterprise host is absent on purpose: Minty issues tokens for github.com
-// installations only.
+// gitlabNamespaceRegex is a GitLab group path: one or more segments, each
+// starting with a letter, digit or underscore and not ending in a dot. The
+// whole path is bounded by MaxGitNamespaceLength. RE2 matches in linear
+// time, so the nested repetition cannot backtrack.
+var gitlabNamespaceRegex = regexp.MustCompile(
+	`^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?(/[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?)*$`)
+
+// githubHosts is every spelling of github.com that can appear in a remote this
+// install produces. `ssh.github.com` is the SSH-over-443 endpoint. A GitHub
+// Enterprise Server host is not a spelling of github.com: it is a declared
+// host of the github provider, which is SelfManaged.
 var githubHosts = map[string]bool{
 	"github.com":     true,
 	"www.github.com": true,
@@ -96,6 +121,9 @@ type GitProvider struct {
 	NamespacePattern *regexp.Regexp
 	// MaxNamespaceLength bounds a namespace under this forge's own rules.
 	MaxNamespaceLength int
+	// MaxNameLength bounds the repository name, the path's last segment,
+	// under this forge's own rules. 0 means unbounded.
+	MaxNameLength int
 	// MinPathDepth and MaxPathDepth bound the repository path in segments.
 	// MaxPathDepth of 0 means unbounded, for a forge with nested groups.
 	MinPathDepth int
@@ -104,6 +132,32 @@ type GitProvider struct {
 	// its clone endpoints, and any host it serves content from. They cover
 	// every entry in Hosts, so a declaration naming one of those adds nothing.
 	Egress []string
+	// SelfManaged admits a declared host outside Hosts: an instance of this
+	// forge at a hostname its operator chose. A host another registered
+	// provider serves is still refused, and a repository on such a forge must
+	// name the declared host or none -- see Resolve.
+	SelfManaged bool
+	// ReservedSegmentSuffixes are endings the forge refuses on a group or
+	// project path segment. GitLab refuses `.git` and `.atom`; a namespace
+	// segment ending in one would be read by the broker with the clone
+	// suffix trimmed, so the two would disagree on what the token may reach.
+	ReservedSegmentSuffixes []string
+	// NeedsCredentials is a forge whose credential an administrator supplies
+	// in the Secret credentialsRef names, rather than one the install mints.
+	// A forge of this provider without credentialsRef is refused: the broker
+	// has nothing to call it with.
+	NeedsCredentials bool
+	// AcceptsCABundle is a forge whose broker client reads a CA bundle the
+	// administrator names in caBundleRef. A provider without it refuses the
+	// field: a CA that nothing reads would hide a certificate problem.
+	AcceptsCABundle bool
+	// ReservedDomains are domains under which the provider runs its own
+	// services. A host at one of them, or under one, is never a
+	// self-managed instance: `api.github.com` and `acme.ghe.com` are
+	// GitHub's, and a forge declared there would be handed a credential and
+	// a CA for a host the provider operates. Every other provider refuses
+	// them too, as it refuses Hosts.
+	ReservedDomains []string
 }
 
 // gitProviders is the registry. Adding a forge is adding an entry here and the
@@ -111,16 +165,48 @@ type GitProvider struct {
 var gitProviders = map[string]*GitProvider{
 	GitProviderGitHub: {
 		Name:               GitProviderGitHub,
-		DefaultHost:        "github.com",
+		DefaultHost:        DefaultGitHubHost,
 		Hosts:              githubHosts,
 		NamespacePattern:   githubOrgRegex,
 		MaxNamespaceLength: MaxGitHubOrgLength,
+		MaxNameLength:      MaxGitHubRepoNameLength,
 		MinPathDepth:       githubPathDepth,
 		MaxPathDepth:       githubPathDepth,
 		// raw.githubusercontent.com and the release/archive download hosts
 		// sit under githubusercontent.com; api.github.com and codeload under
 		// the wildcard.
 		Egress: []string{"github.com", "*.github.com", "*.githubusercontent.com"},
+		// A GitHub Enterprise Server instance at the host the forge declares.
+		// One GitHub host per install: see ResolvedIntegration.hostConflicts.
+		SelfManaged:     true,
+		AcceptsCABundle: true,
+		// github.com and its subdomains, the content and asset domains, the
+		// Pages and Codespaces domains, and GitHub Enterprise Cloud with data
+		// residency (`<name>.ghe.com`), which GitHub operates and which is
+		// not a Server instance.
+		ReservedDomains: []string{
+			"github.com", "githubusercontent.com", "githubassets.com", "githubapp.com",
+			"github.io", "github.dev", "ghe.com",
+		},
+	},
+	GitProviderGitLab: {
+		Name:        GitProviderGitLab,
+		DefaultHost: "gitlab.com",
+		// www.gitlab.com is a spelling of gitlab.com, and folds to it.
+		Hosts:              map[string]bool{"gitlab.com": true, "www.gitlab.com": true},
+		NamespacePattern:   gitlabNamespaceRegex,
+		MaxNamespaceLength: MaxGitNamespaceLength,
+		MinPathDepth:       gitlabMinPathDepth,
+		// Unbounded: groups nest.
+		MaxPathDepth: 0,
+		// The API and clones are gitlab.com itself; registry and pages
+		// content sit under the wildcard. A self-managed host is added as a
+		// literal by EgressPatterns.
+		Egress:                  []string{"gitlab.com", "*.gitlab.com"},
+		SelfManaged:             true,
+		ReservedSegmentSuffixes: []string{".git", ".atom"},
+		NeedsCredentials:        true,
+		AcceptsCABundle:         true,
 	},
 }
 
@@ -160,14 +246,120 @@ func lookupGitProvider(name string, table map[string]*GitProvider) (*GitProvider
 }
 
 // ValidateHost reports whether a declared host is one this provider serves.
-// An empty host is the provider's default and is always allowed.
+// An empty host is the provider's default and is always allowed. A
+// self-managed provider also serves a host of its operator's choosing, but
+// never one another registered provider claims: a GitLab forge declared at
+// github.com would otherwise send GitHub's repositories a GitLab token.
 func (p *GitProvider) ValidateHost(host string) error {
+	return p.validateHost(host, gitProviders)
+}
+
+func (p *GitProvider) validateHost(host string, table map[string]*GitProvider) error {
 	trimmed := lowerASCII(strings.TrimSpace(host))
-	if trimmed == "" {
+	if trimmed == "" || p.Hosts[trimmed] {
 		return nil
 	}
-	if !p.Hosts[trimmed] {
+	if !p.SelfManaged {
 		return fmt.Errorf("host %q is not a %s host", host, p.Name)
+	}
+	if p.reserves(trimmed) {
+		return fmt.Errorf("host %q is a service %s operates, not a self-managed %s instance", host, p.Name, p.Name)
+	}
+	for _, name := range providerNames(table) {
+		if other := table[name]; other != p && other.serves(trimmed) {
+			return fmt.Errorf("host %q is a %s host, not a %s one", host, other.Name, p.Name)
+		}
+	}
+	// A DNS subdomain label by label, and at least two labels: the regex this
+	// replaced admitted `gitlab..example.com` and `gitlab.-x.com`, which then
+	// reached the egress policy and the broker as a host nothing resolves.
+	if len(validation.IsDNS1123Subdomain(trimmed)) > 0 || !strings.Contains(trimmed, ".") {
+		return fmt.Errorf("host %q is not a hostname", host)
+	}
+	return nil
+}
+
+// serves reports whether host is this provider's: one of its spellings, or any
+// name its egress patterns cover -- api.github.com, gist.github.com and
+// raw.githubusercontent.com are GitHub's however they are spelled, and a
+// self-managed forge declared at one would be handed GitHub's traffic. A
+// wildcard pattern also covers the domain it is rooted at.
+func (p *GitProvider) serves(host string) bool {
+	if p.Hosts[host] || p.reserves(host) {
+		return true
+	}
+	for _, pattern := range p.Egress {
+		domain := strings.TrimPrefix(pattern, "*.")
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
+}
+
+// reserves reports whether host is one of ReservedDomains or under one.
+func (p *GitProvider) reserves(host string) bool {
+	for _, domain := range p.ReservedDomains {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
+}
+
+// canonicalHost is the host a repository on a forge declared at host
+// resolves to: a spelling of one of this provider's hosts folds to
+// DefaultHost, and a self-managed host is itself, lowered.
+func (p *GitProvider) canonicalHost(host string) string {
+	trimmed := lowerASCII(strings.TrimSpace(host))
+	if trimmed == "" || p.Hosts[trimmed] {
+		return p.DefaultHost
+	}
+	return trimmed
+}
+
+// BrokerMaxRepoRefLength is the longest repository reference the credential
+// broker parses: repo_ref.py's MAX_REPO_LENGTH, applied to the whole value. A
+// repository the operator seeds into managed_repos is read back by that parser,
+// so one longer than this would be accepted here and refused there on every
+// call. GitHub's own limits keep a github.com URL far below it; a nested GitLab
+// group path can reach it.
+const BrokerMaxRepoRefLength = 256
+
+// isForgeHost reports whether a path segment is a forge's host rather than a
+// group: a spelling of any registered provider's host, or this forge's own
+// declared host. GitLab's group grammar admits a dot, so its grammar alone
+// cannot tell `github.com` or `gitlab.example.com` from a group named
+// `my.group`; the broker lifts such a first segment off as a host and then
+// refuses it, so a namespace or a repository path starting with one is refused
+// here, where the status can name it, rather than rendered into a forge
+// configuration the broker will not start with.
+func isForgeHost(segment, canonical string) bool {
+	s := lowerASCII(strings.TrimSpace(segment))
+	if s == "" {
+		return false
+	}
+	if s == canonical {
+		return true
+	}
+	for _, provider := range gitProviders {
+		if provider.Hosts[s] {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateNamespaceOn is ValidateNamespace for a namespace declared on a forge
+// at host: the grammar, and a first segment that is not a forge host.
+func (p *GitProvider) ValidateNamespaceOn(host, namespace string) error {
+	if err := p.ValidateNamespace(namespace); err != nil {
+		return err
+	}
+	trimmed := strings.Trim(strings.TrimSpace(namespace), pathSeparator)
+	if first, _, _ := strings.Cut(trimmed, pathSeparator); isForgeHost(first, p.canonicalHost(host)) {
+		return fmt.Errorf("%s namespace %q starts with %q, which is a forge host, not a group; name the group alone",
+			p.Name, trimmed, first)
 	}
 	return nil
 }
@@ -186,6 +378,13 @@ func (p *GitProvider) ValidateNamespace(namespace string) error {
 	}
 	if !p.NamespacePattern.MatchString(trimmed) {
 		return fmt.Errorf("invalid %s namespace %q", p.Name, trimmed)
+	}
+	for _, segment := range strings.Split(trimmed, pathSeparator) {
+		for _, suffix := range p.ReservedSegmentSuffixes {
+			if strings.HasSuffix(lowerASCII(segment), suffix) {
+				return fmt.Errorf("invalid %s namespace %q: a segment may not end in %q", p.Name, trimmed, suffix)
+			}
+		}
 	}
 	return nil
 }
@@ -207,10 +406,9 @@ func (p *GitProvider) ValidateNamespace(namespace string) error {
 // agree, where before the declared spelling was carried through verbatim and
 // seeded a clone URL git cannot fetch over HTTPS.
 //
-// ValidateHost admits only a host in Hosts, so every host resolves to
-// DefaultHost. A provider for a self-managed forge at a customer-chosen
-// hostname will need its own rule here, and it must not let the declared host
-// replace one the repository names.
+// A self-managed forge's canonical host is the declared host itself, and a
+// repository on it may name that host or none: the declared host never
+// replaces one the repository names.
 //
 // The namespace this produces is checked against the provider's grammar
 // wherever it came from. Checking only the declared `namespace` field would
@@ -221,7 +419,16 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	if err := p.ValidateHost(host); err != nil {
 		return RepoRef{}, err
 	}
-	canonical := p.DefaultHost
+	canonical := p.canonicalHost(host)
+	// The hosts a repository on this forge may name. A self-managed forge is
+	// one instance at one host, so a repository naming any other -- gitlab.com
+	// on a forge declared at gitlab.example.com -- is refused, never moved onto
+	// the declared host. That is the rule the shared resolver promises every
+	// provider: a declared host never replaces a host the repository names.
+	ownHosts := p.Hosts
+	if canonical != p.DefaultHost {
+		ownHosts = map[string]bool{canonical: true}
+	}
 
 	// Every spelling of this provider's host lifts out of a schemeless path,
 	// not just DefaultHost. The parser this replaces stripped both
@@ -230,11 +437,11 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	// a namespace, because each contains a dot and GitHub's owner grammar
 	// allows none. repo_ref.py's KNOWN_HOSTS is narrower, and the Go side is
 	// the one bound by what the CRD already admitted.
-	ref, err := parseRepoRef(repository, p.schemelessHosts())
+	ref, err := parseRepoRef(repository, p.liftableHosts(canonical))
 	if err != nil {
 		return RepoRef{}, err
 	}
-	if ref.Host != "" && ref.Host != canonical && !p.Hosts[ref.Host] {
+	if ref.Host != "" && lowerASCII(ref.Host) != canonical && !ownHosts[lowerASCII(ref.Host)] {
 		return RepoRef{}, fmt.Errorf("repository %q names host %q, which is not a %s host",
 			repository, ref.Host, p.Name)
 	}
@@ -248,14 +455,15 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	// `/github.com` and `github.com.git/` spell that name as `/infra` and
 	// `infra.git/` spell `infra`.
 	if raw := strings.TrimSpace(repository); bare && strings.HasSuffix(raw, pathSeparator) &&
-		p.schemelessHosts()[lowerASCII(strings.Trim(raw, pathSeparator))] {
+		p.liftableHosts(canonical)[lowerASCII(strings.Trim(raw, pathSeparator))] {
 		return RepoRef{}, fmt.Errorf("repository %q names the host %q and no repository", repository, strings.Trim(raw, pathSeparator))
 	}
 	// A dotted first segment the namespace grammar refuses is a host, most
 	// often another forge's (`gitlab.com/group/project`). Said here, the
 	// refusal names it; left to the depth check, it would send the
 	// administrator to shorten the path instead.
-	if first, _, isPath := strings.Cut(ref.Path, pathSeparator); bare && isPath && strings.Contains(first, ".") && p.ValidateNamespace(first) != nil {
+	if first, _, isPath := strings.Cut(ref.Path, pathSeparator); bare && isPath && strings.Contains(first, ".") &&
+		(p.ValidateNamespace(first) != nil || isForgeHost(first, canonical)) {
 		return RepoRef{}, fmt.Errorf("repository %q starts with %q, which reads as a host %s does not serve; a repository on another forge needs a forge of its own",
 			repository, first, p.Name)
 	}
@@ -270,6 +478,13 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 	}
 
 	segments := ref.Segments()
+	// The namespace prepended above is checked the same way: a declared
+	// namespace that starts with a host would seed a path the broker reads with
+	// that host lifted off.
+	if len(segments) > 0 && isForgeHost(segments[0], canonical) {
+		return RepoRef{}, fmt.Errorf("repository %q resolves to a path starting with %q, which is a forge host, not a group",
+			repository, segments[0])
+	}
 	for _, segment := range segments {
 		if !safeRepoSegment(segment) {
 			return RepoRef{}, fmt.Errorf("invalid repository path segment %q", segment)
@@ -283,9 +498,26 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 		return RepoRef{}, fmt.Errorf("repository %q has %d path segments; %s allows at most %d",
 			repository, len(segments), p.Name, p.MaxPathDepth)
 	}
+	// The agent and the broker read the URL this renders with repo_ref.py,
+	// which drops a trailing `.git` again, so a name that still ends in one
+	// after the parser's single strip would name another repository there:
+	// `foo.git.git` renders `.../foo.git`, which they read as `foo`.
+	name := segments[len(segments)-1]
+	if strings.HasSuffix(name, gitSuffix) {
+		return RepoRef{}, fmt.Errorf("repository %q names %q, which still ends in %q once one %q is dropped; the agent and the broker would read it as %q",
+			repository, name, gitSuffix, gitSuffix, strings.TrimSuffix(name, gitSuffix))
+	}
+	if p.MaxNameLength > 0 && len(name) > p.MaxNameLength {
+		return RepoRef{}, fmt.Errorf("repository %q names %q, which exceeds %s's maximum repository name length of %d characters",
+			repository, name, p.Name, p.MaxNameLength)
+	}
 	resolvedNamespace := strings.Join(segments[:len(segments)-1], pathSeparator)
 	if err := p.ValidateNamespace(resolvedNamespace); err != nil {
 		return RepoRef{}, fmt.Errorf("repository %q resolves to %w", repository, err)
+	}
+	if n := len(ref.URL()); n > BrokerMaxRepoRefLength {
+		return RepoRef{}, fmt.Errorf("repository %q resolves to a %d-character URL; the credential broker reads at most %d",
+			repository, n, BrokerMaxRepoRefLength)
 	}
 	return ref, nil
 }
@@ -304,6 +536,18 @@ func (p *GitProvider) schemelessHosts() map[string]bool {
 	for host := range p.Hosts {
 		hosts[host] = true
 	}
+	return hosts
+}
+
+// liftableHosts is what Resolve lifts out of a schemeless path on a forge
+// whose canonical host is canonical: this provider's own spellings, and a
+// self-managed host. The provider's own spellings stay liftable on a
+// self-managed forge so that `gitlab.com/g/p` is read as naming gitlab.com
+// and refused by the host check, rather than as a three-segment path in a
+// group called gitlab.com.
+func (p *GitProvider) liftableHosts(canonical string) map[string]bool {
+	hosts := p.schemelessHosts()
+	hosts[canonical] = true
 	return hosts
 }
 

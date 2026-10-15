@@ -91,18 +91,18 @@ api() {
     "$@"
 }
 
-# Pilot-only fallback: point the repository's default branch at the run branch
-# for the duration of the run, and back at GITOPS_RESTORE_DEFAULT_BRANCH on
-# delete. submit-suggestion resolves its PR base from the remote's advertised
-# default (`git remote set-head origin --auto`, gitops_workspace.py) when
-# GITOPS_BASE_BRANCH is not set, which is the case on an operator whose sandbox
-# env allowlist predates that variable. The default branch is a repository-wide
-# setting, so this is one run at a time: create refuses to switch when the
-# default already points at a run/** branch (another run in flight, or a
-# previous run whose destroy never ran), and a run kept alive with
+# Pilot-only: point the repository's default branch at the run branch for the
+# duration of the run, and back at GITOPS_RESTORE_DEFAULT_BRANCH on delete.
+# submit-suggestion takes its PR base from the credential broker's clone, which
+# checks out the remote's default when the PlatformAgent's GitOps repository
+# entry sets no baseBranch (spec.integration.repositories[].baseBranch), and
+# the pilot sets none. The default branch is a
+# repository-wide setting, so this is one run at a time: create refuses to
+# switch when the default already points at a run/** branch (another run in
+# flight, or a previous run whose destroy never ran), and a run kept alive with
 # BENCH_NO_TEARDOWN=true leaves the switch in place until its destroy. Needs
-# "administration" permission on the token. Wave 2 replaces both modes with a
-# broker-enforced per-request base.
+# "administration" permission on the token. Setting baseBranch per run would
+# replace this switch.
 current_default_branch() {
   local code
   code="$(api "${GITHUB_API}/repos/${slug}")"

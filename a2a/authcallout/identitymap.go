@@ -21,6 +21,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // mintableAccounts is every NATS account the callout will issue a user into.
@@ -83,12 +85,22 @@ type Identity struct {
 
 	// Narrowing, when set, means this entry's grants are not in the map at
 	// all: they are derived at mint time from a claim the API server
-	// attested about the particular workload connecting. NarrowingPod is
-	// the only value this callout implements. Such an entry MUST carry no
+	// attested about the particular workload connecting: NarrowingPod or
+	// NarrowingProfile. Such an entry MUST carry no
 	// grants, and the map is refused if it does — see session.go for why an
 	// entry that could hold real grants AND be narrowed is one skipped code
 	// path away from handing every session everything.
 	Narrowing string `json:"narrowing,omitempty"`
+
+	// Profile is the AgentProfile a NarrowingProfile entry executes for: the
+	// addressee token on the task subjects its pods publish. Set only with
+	// that narrowing.
+	Profile string `json:"profile,omitempty"`
+
+	// Topics are a NarrowingProfile entry's blackboard grants in the
+	// profile's own spelling; the callout composes the subjects (see
+	// profile_narrowing.go). Set only with that narrowing.
+	Topics *TopicGrants `json:"topics,omitempty"`
 }
 
 // IdentityMap is what the operator renders and the callout serves. Version is
@@ -98,6 +110,13 @@ type Identity struct {
 type IdentityMap struct {
 	Version    string     `json:"version"`
 	Identities []Identity `json:"identities"`
+
+	// users is the set of names Users returns, built by ParseIdentityMap.
+	// It lives on the map rather than beside it so the Store's one pointer
+	// swap installs the map and its reserved names together: a connection
+	// that resolved its identity against this map is checked against this
+	// map's users, never an older map's (see Service.reservedAs).
+	users map[string]struct{}
 }
 
 // ParseIdentityMap decodes a rendered map and rejects one it cannot serve
@@ -114,6 +133,10 @@ func ParseIdentityMap(raw []byte) (*IdentityMap, error) {
 	}
 	if err := m.validate(); err != nil {
 		return nil, err
+	}
+	m.users = make(map[string]struct{}, len(m.Identities))
+	for _, u := range m.Users() {
+		m.users[u] = struct{}{}
 	}
 	return &m, nil
 }
@@ -162,6 +185,13 @@ func (id Identity) validate() error {
 	if id.User == "" {
 		return fmt.Errorf("serviceAccount %q has no user", id.ServiceAccount)
 	}
+	// The user becomes the `_INBOX.<user>.>` prefix, and reservedAs compares
+	// pod names against it byte for byte. A dotted user `a.b` would sit inside
+	// the inbox of a pod named `a` without matching it, so the user must be
+	// the same single lowercase label a pod name is.
+	if !lib.ValidSubjectToken(id.User) {
+		return fmt.Errorf("user %q must be a single lowercase DNS-1123 label, because it becomes the _INBOX.<user>.> prefix", id.User)
+	}
 	if id.Account == "" {
 		return fmt.Errorf("user %q has no account", id.User)
 	}
@@ -177,6 +207,12 @@ func (id Identity) validate() error {
 			id.User, id.Account, mintableAccounts)
 	}
 	hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
+	// The profile fields mean something only under NarrowingProfile. On any
+	// other entry they would be read by nothing, and a field the callout
+	// silently ignores is a grant someone believes exists.
+	if id.Narrowing != NarrowingProfile && (id.Profile != "" || id.Topics != nil) {
+		return fmt.Errorf("user %q carries profile or topics but narrows on %q; only %q reads them", id.User, id.Narrowing, NarrowingProfile)
+	}
 	switch id.Narrowing {
 	case "":
 		// An entry with an empty side is almost certainly a render bug,
@@ -209,6 +245,16 @@ func (id Identity) validate() error {
 			return fmt.Errorf("user %q narrows on %q, so its grants are derived from the attested claim and the map must carry none; it carries %d publish and %d subscribe",
 				id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
 		}
+	case NarrowingProfile:
+		// The same fail-closed shape as NarrowingPod: the map carries the
+		// profile and its topics, never subjects.
+		if hasGrants {
+			return fmt.Errorf("user %q narrows on %q, so its grants are derived from the profile and the attested pod and the map must carry none; it carries %d publish and %d subscribe",
+				id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
+		}
+		if err := validateProfileEntry(id); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("user %q names narrowing %q, which this callout does not implement", id.User, id.Narrowing)
 	}
@@ -228,6 +274,18 @@ func (m *IdentityMap) Lookup(serviceAccount string) (Identity, bool) {
 	return Identity{}, false
 }
 
+// Profiles returns the AgentProfile names the map's profile entries execute
+// for: addressees no narrowed pod may be named after.
+func (m *IdentityMap) Profiles() []string {
+	var profiles []string
+	for _, id := range m.Identities {
+		if id.Narrowing == NarrowingProfile {
+			profiles = append(profiles, id.Profile)
+		}
+	}
+	return profiles
+}
+
 // Users returns the NATS user names the map serves, sorted. The operator reads
 // this back when deciding whether the callout is serving the identity a
 // workload is about to need.
@@ -238,4 +296,22 @@ func (m *IdentityMap) Users() []string {
 	}
 	sort.Strings(users)
 	return users
+}
+
+// servesUser reports whether name is a user of one of this map's entries.
+// ParseIdentityMap builds the set, and Store.Update installs nothing else, but
+// a map built any other way (a test writing the store directly) has no set; it
+// falls back to scanning the entries rather than reporting no users, so the
+// refusal fails closed.
+func (m *IdentityMap) servesUser(name string) bool {
+	if m.users == nil {
+		for _, id := range m.Identities {
+			if id.User == name {
+				return true
+			}
+		}
+		return false
+	}
+	_, ok := m.users[name]
+	return ok
 }

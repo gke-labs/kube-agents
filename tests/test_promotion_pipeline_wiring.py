@@ -729,6 +729,87 @@ class AutopushDeployWiringTest(unittest.TestCase):
         self.assertEqual(deploy["if"], "github.repository == 'gke-labs/kube-agents'")
 
 
+_AUTOPUSH_NEXT_DEPLOY = "autopush-next-deploy.yml"
+
+
+class AutopushNextDeployWiringTest(unittest.TestCase):
+    """autopush-next deploys what autopush deploys, in a workflow of its own.
+
+    Its own file is what lets each lane hold a workflow-level group: a run holds
+    it from creation, so resolve and deploy are serialized as a unit and an
+    older publish can never land after a newer one. A job-level group would
+    be acquired in order of resolve completion instead.
+    """
+
+    def setUp(self):
+        self.doc = _doc(_WORKFLOWS / _AUTOPUSH_NEXT_DEPLOY)
+        self.jobs = self.doc["jobs"]
+        self.autopush = _doc(_WORKFLOWS / _AUTOPUSH_DEPLOY)
+
+    def test_it_has_its_own_workflow_level_lock(self):
+        """Shared only by runs that deploy.
+
+        A run created for a failed or cancelled publish deploys nothing, but in
+        the shared group it would still cancel a pending deploy of a good one.
+        """
+        concurrency = self.doc.get("concurrency", {})
+        self.assertEqual(
+            concurrency.get("group"),
+            "${{ (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')"
+            " && 'autopush-next-deploy' || format('autopush-next-deploy-noop-{0}', github.run_id) }}",
+        )
+        self.assertNotIn(f"'{self.autopush['concurrency']['group']}'", concurrency["group"])
+        self.assertFalse(concurrency.get("cancel-in-progress"), "running deploys must not be cancelled mid-flight")
+        for name, job in self.jobs.items():
+            with self.subTest(job=name):
+                self.assertNotIn("concurrency", job)
+
+    def test_it_triggers_exactly_as_autopush_does(self):
+        on = self.doc[True]
+        autopush_on = self.autopush[True]
+        self.assertEqual(on["workflow_run"], autopush_on["workflow_run"])
+        self.assertNotIn("schedule", on)
+        self.assertEqual(on["workflow_dispatch"]["inputs"]["lease_policy"]["default"], "fail")
+
+    def test_it_resolves_the_candidate_exactly_as_autopush_does(self):
+        resolve = self.jobs["resolve-candidate"]
+        autopush_resolve = self.autopush["jobs"]["resolve-candidate"]
+        self.assertEqual(resolve["if"], autopush_resolve["if"])
+        self.assertEqual(resolve["steps"], autopush_resolve["steps"])
+
+    def test_the_resolve_job_never_binds_autopush_next(self):
+        """Binding a GitHub environment that does not exist creates it, empty."""
+        self.assertEqual(self.jobs["resolve-candidate"].get("environment"), "autopush")
+
+    def test_deploy_reconciles_autopush_next_at_the_resolved_candidate(self):
+        deploy = self.jobs["deploy"]
+        autopush_deploy = self.autopush["jobs"]["deploy"]
+        self.assertEqual(deploy["needs"], "resolve-candidate")
+        self.assertEqual(deploy["uses"], autopush_deploy["uses"])
+        self.assertEqual(deploy["permissions"], autopush_deploy["permissions"])
+        self.assertEqual(deploy["with"]["github_environment"], "autopush-next")
+        self.assertEqual(deploy["with"]["mode"], "apply")
+        self.assertEqual(deploy["with"]["image_tag"], autopush_deploy["with"]["image_tag"])
+        self.assertEqual(deploy["with"]["lease_policy"], autopush_deploy["with"]["lease_policy"])
+        self.assertEqual(deploy["if"], "github.repository == 'gke-labs/kube-agents'")
+
+    def test_only_autopush_next_may_skip_while_unprovisioned(self):
+        self.assertIs(self.jobs["deploy"]["with"]["skip_unconfigured"], True)
+        self.assertNotIn("skip_unconfigured", self.autopush["jobs"]["deploy"]["with"])
+
+    def test_verify_allows_skipped_for_autopush_next_only(self):
+        verify = self.jobs["verify-deploy"]
+        self.assertEqual(set(verify["needs"]), {"resolve-candidate", "deploy"})
+        step = next(s for s in verify["steps"] if "verify_deploy_result.sh" in s.get("run", ""))
+        self.assertEqual(step["env"]["TARGET_ENVIRONMENT"], "autopush-next")
+        self.assertEqual(step["env"]["DEPLOY_RESULT"], "${{ needs.deploy.outputs.result }}")
+        self.assertEqual(step["env"]["ALLOW_SKIPPED"], "true")
+        autopush = next(
+            s for s in self.autopush["jobs"]["verify-deploy"]["steps"] if "verify_deploy_result.sh" in s.get("run", "")
+        )
+        self.assertNotIn("ALLOW_SKIPPED", autopush["env"])
+
+
 class DockerPublishGhcrWiringTest(unittest.TestCase):
     def setUp(self):
         self.doc = _doc(_WORKFLOWS / "docker-publish-ghcr.yml")

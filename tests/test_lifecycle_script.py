@@ -33,6 +33,8 @@ _FULL_INSTALL = _LIFECYCLE_SH.parent
 # scope resolver pin inside that module's own directory.
 _PROVIDER_OVERRIDE = "providers_lifecycle_override.tf"
 _SCOPE_OVERRIDE = "scope_resolver_lifecycle_override.tf"
+# How long a Ctrl-C test waits for the stub apply to start, and then to exit.
+_SIGINT_DEADLINE_SECONDS = 10
 _SCOPE_RESOLVER_SOURCE_RE = re.compile(r'module "scope_resolver" \{\s*source\s*=\s*"([^"]+)"')
 _OVERRIDE_DATA_RE = re.compile(r'^data "(\w+)" "(\w+)"', re.MULTILINE)
 _OVERRIDE_OUTPUT_RE = re.compile(r'^output "(\w+)"', re.MULTILINE)
@@ -101,7 +103,13 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_enable_stockout="false",
                    tfvar_stockout_topic='"gke-stockout-alerts-topic"',
                    tfvar_stockout_sub='"gke-stockout-alerts-sub"',
-                   console_fail_var=""):
+                   console_fail_var="",
+                   apply_stub="exit 0",
+                   show_rc=0,
+                   untaint_stub="exit 0",
+                   stdout_path=None,
+                   sigint_after=None,
+                   tee_fails=False):
         """Run a lifecycle.sh function against stubbed terraform and gcloud commands."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -214,22 +222,71 @@ elif [[ "$cmd" == "console" ]]; then
     fi
     echo 'null'
     exit 0
+elif [[ "$cmd" == "show" ]]; then
+    # The one read load_tainted makes for the tainted list; state_show stands
+    # in for the whole state, header lines included.
+    echo "show" >> "${{TF_STUB_LOG:-/dev/null}}"
+    cat << 'EOF'
+{state_show}
+EOF
+    exit {show_rc}
+elif [[ "$cmd" == "untaint" ]]; then
+    # The address is the last argument; -no-color precedes it.
+    echo "untaint ${{@: -1}}" >> "${{TF_STUB_LOG:-/dev/null}}"
+    {untaint_stub}
+elif [[ "$cmd" == "apply" ]]; then
+    # One line per attempt, for the retry tests; apply_stub decides the outcome.
+    echo "apply ${{@:2}}" >> "${{TF_STUB_LOG:-/dev/null}}"
+    {apply_stub}
 fi
 exit 0
 """)
             terraform_stub.chmod(0o755)
+            if tee_fails:
+                # A tee whose file write failed: POSIX has it keep copying to
+                # stdout and exit non-zero, as on a TMPDIR that filled.
+                tee_stub = bin_dir / "tee"
+                tee_stub.write_text("#!/usr/bin/env bash\ncat\nexit 1\n")
+                tee_stub.chmod(0o755)
 
             script = f"""
 KUBE_AGENTS_SOURCE_ONLY=true source "{_LIFECYCLE_SH}"
 {func_call}
 """
             env = get_isolated_test_env(bin_dir=str(bin_dir))
+            cwd = str(_REPO_ROOT / "terraform" / "examples" / "full-install")
+            if stdout_path is not None:
+                # stdout a regular file, as `./lifecycle.sh apply > apply.log`
+                # leaves it; appended, so a line written before the call is
+                # there to be preserved or clobbered. With sigint_after, the
+                # run gets its own process group and Ctrl-C (SIGINT to the
+                # group, as a terminal sends it) once that text has reached
+                # the file.
+                with open(stdout_path, "a") as out:
+                    if sigint_after is None:
+                        return subprocess.run(
+                            ["bash", "-c", script], stdout=out, stderr=subprocess.PIPE,
+                            text=True, env=env, cwd=cwd,
+                        )
+                    proc = subprocess.Popen(
+                        ["bash", "-c", script], stdout=out, stderr=subprocess.PIPE,
+                        text=True, env=env, cwd=cwd, start_new_session=True,
+                    )
+                    deadline = time.time() + _SIGINT_DEADLINE_SECONDS
+                    while sigint_after not in pathlib.Path(stdout_path).read_text():
+                        if time.time() > deadline:
+                            proc.kill()
+                            raise AssertionError(f"{sigint_after!r} never reached stdout")
+                        time.sleep(0.1)
+                    os.killpg(proc.pid, signal.SIGINT)
+                    _, err = proc.communicate(timeout=_SIGINT_DEADLINE_SECONDS)
+                    return subprocess.CompletedProcess(proc.args, proc.returncode, None, err)
             return subprocess.run(
                 ["bash", "-c", script],
                 capture_output=True,
                 text=True,
                 env=env,
-                cwd=str(_REPO_ROOT / "terraform" / "examples" / "full-install"),
+                cwd=cwd,
             )
 
     def test_guard_gsa_identity_no_op_when_gsa_not_in_state(self):
@@ -897,6 +954,337 @@ resource "google_service_account" "agent" {
         self.assertNotIn("drift_pubsub", proc.stdout)
         self.assertIn("resource adoption complete: 0 imported", proc.stdout)
 
+    # A tainted KMS resource in state. Cloud KMS answers 403 "API has not been
+    # used in project ... before or it is disabled" to some requests for a few
+    # minutes after a project's first enablement, including the read-back of a
+    # create that succeeded. Terraform then taints the resource, the next apply
+    # plans its replacement, and the create 409s because GCP cannot delete a key
+    # ring or key. adopt_kms untaints what exists rather than letting that run.
+
+    _KEYRING = "module.gke_cluster.google_kms_key_ring.gke_keyring[0]"
+    _KEY = "module.gke_cluster.google_kms_crypto_key.gke_key[0]"
+
+    def _run_with_stub_log(self, func_call, **kwargs):
+        """_run_guard with TF_STUB_LOG exported; returns (proc, log text)."""
+        with tempfile.NamedTemporaryFile(delete=False) as log:
+            log_path = log.name
+        try:
+            proc = self._run_guard(f'export TF_STUB_LOG="{log_path}"; {func_call}', **kwargs)
+            return proc, pathlib.Path(log_path).read_text()
+        finally:
+            os.unlink(log_path)
+
+    def test_adopt_kms_untaints_a_tainted_key_ring_that_exists(self):
+        proc, log = self._run_with_stub_log(
+            "adopt_kms",
+            state_list=f"{self._KEYRING}\n{self._KEY}",
+            state_show=f'# {self._KEYRING}: (tainted)\nresource "google_kms_key_ring" "gke_keyring" {{\n    name = "platform-agent-keyring"\n}}',
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"untainting {self._KEYRING}", proc.stdout)
+        self.assertIn(f"untaint {self._KEYRING}", log)
+        # The key is in state and sound, so it is neither untainted nor imported.
+        self.assertNotIn(f"untaint {self._KEY}", log)
+        self.assertNotIn("adopting", proc.stdout)
+        self.assertIn("resource adoption complete: 0 imported, 1 untainted", proc.stdout)
+
+    def test_adopt_kms_untaints_without_asking_gcloud(self):
+        """gcloud's describe can draw the same 403 in the same window; a
+        "does not exist" from it must not let the replacement run."""
+        proc, log = self._run_with_stub_log(
+            "adopt_kms",
+            state_list=self._KEYRING,
+            state_show=f"# {self._KEYRING}: (tainted)",
+            gcloud_stub="exit 1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"untaint {self._KEYRING}", log)
+
+    _STOCKOUT_TOPIC = "google_pubsub_topic.stockout_alerts[0]"
+
+    def test_adopt_kms_leaves_a_tainted_deletable_resource_to_its_replacement(self):
+        """`terraform taint` is how an operator rebuilds a stockout topic;
+        only what GCP cannot delete is untainted."""
+        proc, log = self._run_with_stub_log(
+            "adopt_kms",
+            state_list=self._STOCKOUT_TOPIC,
+            state_show=f"# {self._STOCKOUT_TOPIC}: (tainted)",
+            tfvar_enable_stockout="true",
+            gcloud_stub="exit 1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("untaint", log)
+        self.assertIn("0 imported, 0 untainted", proc.stdout)
+
+    def test_a_failed_show_is_said_rather_than_read_as_nothing_tainted(self):
+        proc, log = self._run_with_stub_log(
+            "adopt_kms",
+            state_list=self._KEYRING,
+            state_show="",
+            show_rc=1,
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("could not read the state for tainted resources", proc.stderr)
+        self.assertNotIn("untaint", log)
+
+    def test_a_header_read_before_show_failed_is_still_a_taint(self):
+        proc, log = self._run_with_stub_log(
+            "adopt_kms",
+            state_list=f"{self._KEYRING}\n{self._KEY}",
+            state_show=f"# {self._KEYRING}: (tainted)",
+            show_rc=1,
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("could not read the state for tainted resources", proc.stderr)
+        self.assertIn(f"untaint {self._KEYRING}", log)
+
+    def test_the_tainted_list_is_not_read_when_no_kms_resource_is_in_state(self):
+        proc, log = self._run_with_stub_log("adopt_kms", state_list="", gcloud_stub="exit 1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("show", log)
+
+    def test_the_tainted_list_is_read_by_adopt_kms_alone(self):
+        """terraform show loads every provider schema; the guards do not pay for it."""
+        proc, log = self._run_with_stub_log(
+            "guard_kms_identity; guard_cluster_ownership",
+            state_list=self._KEYRING,
+            state_show=f"# {self._KEYRING}:",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("show", log)
+
+    def test_a_failed_untaint_is_warned_and_the_apply_goes_on(self):
+        proc, log = self._run_with_stub_log(
+            "adopt_kms",
+            state_list=f"{self._KEYRING}\n{self._KEY}",
+            state_show=f"# {self._KEYRING}: (tainted)",
+            untaint_stub="exit 1",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"untaint {self._KEYRING}", log)
+        self.assertIn(f"could not untaint {self._KEYRING}", proc.stderr)
+        self.assertIn("0 imported, 0 untainted", proc.stdout)
+
+    def test_the_tainted_list_is_read_once_for_every_target(self):
+        proc, log = self._run_with_stub_log(
+            "adopt_kms",
+            state_list=f"{self._KEYRING}\n{self._KEY}",
+            state_show=f"# {self._KEYRING}: (tainted)\n# {self._KEY}: (tainted)",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(log.count("show"), 1, log)
+        self.assertEqual(log.count("untaint "), 2, log)
+
+    def test_adopt_kms_does_not_touch_a_sound_resource_in_state(self):
+        proc, log = self._run_with_stub_log(
+            "adopt_kms",
+            state_list=f"{self._KEYRING}\n{self._KEY}",
+            state_show=f"# {self._KEYRING}:",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("untaint", log)
+        self.assertNotIn("adopting", proc.stdout)
+        self.assertIn("resource adoption complete: 0 imported, 0 untainted", proc.stdout)
+
+    def test_adopt_kms_restores_the_versions_of_an_untainted_key(self):
+        proc, log = self._run_with_stub_log(
+            "adopt_kms",
+            state_list=f"{self._KEYRING}\n{self._KEY}",
+            state_show=f"# {self._KEY}: (tainted)",
+            gcloud_stub="exit 0",
+            gcloud_key_version="1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"untaint {self._KEY}", log)
+        self.assertIn("restoring key version k8s-secret-encryption-key/1", proc.stdout)
+
+    # run_apply: the apply is retried, after a wait, when it failed on that same
+    # propagation 403, and on nothing else.
+
+    _KMS_403 = (
+        "Error: Error creating CryptoKey: googleapi: Error 403: Google Cloud KMS API "
+        "has not been used in project 123 before or it is disabled."
+    )
+
+    def _apply_stub_failing_first(self, times, message):
+        """A terraform apply that fails `times` times with `message`, then succeeds."""
+        return (
+            f'if [[ $(grep -c "^apply" "$TF_STUB_LOG") -le {times} ]]; then '
+            f'echo "{message}" >&2; exit 1; fi; echo "Apply complete!"; exit 0'
+        )
+
+    def test_run_apply_continues_after_a_cloud_kms_propagation_failure(self):
+        proc, log = self._run_with_stub_log(
+            "KMS_API_PROPAGATION_WAIT_SECONDS=0 run_apply -auto-approve -input=false",
+            apply_stub=self._apply_stub_failing_first(1, self._KMS_403),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(log.count("apply -auto-approve -input=false"), 2, log)
+        self.assertIn("Apply complete!", proc.stdout)
+        self.assertIn("Cloud KMS", proc.stderr)
+        self.assertIn("attempt 2 of", proc.stderr)
+
+    def test_run_apply_retries_on_the_older_name_of_the_api(self):
+        older = (
+            "Error 403: Cloud Key Management Service (KMS) API has not been used in "
+            "project 123 before or it is disabled."
+        )
+        proc, log = self._run_with_stub_log(
+            "KMS_API_PROPAGATION_WAIT_SECONDS=0 run_apply -auto-approve -input=false",
+            apply_stub=self._apply_stub_failing_first(1, older),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(log.count("apply -auto-approve -input=false"), 2, log)
+
+    def test_run_apply_untaints_between_attempts(self):
+        proc, log = self._run_with_stub_log(
+            "KMS_API_PROPAGATION_WAIT_SECONDS=0 run_apply -auto-approve -input=false",
+            state_list=f"{self._KEYRING}\n{self._KEY}",
+            state_show=f"# {self._KEYRING}: (tainted)",
+            gcloud_stub="exit 0",
+            apply_stub=self._apply_stub_failing_first(1, self._KMS_403),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertLess(log.index("apply"), log.index(f"untaint {self._KEYRING}"), log)
+        self.assertLess(log.index(f"untaint {self._KEYRING}"), log.rindex("apply"), log)
+
+    def test_run_apply_does_not_retry_another_api_s_identical_403(self):
+        other_api = (
+            "Error 403: Kubernetes Engine API has not been used in project 123 before "
+            "or it is disabled."
+        )
+        proc, log = self._run_with_stub_log(
+            "KMS_API_PROPAGATION_WAIT_SECONDS=0 run_apply -auto-approve -input=false",
+            apply_stub=self._apply_stub_failing_first(1, other_api),
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(log.count("apply -auto-approve -input=false"), 1, log)
+
+    def test_run_apply_does_not_retry_any_other_failure(self):
+        proc, log = self._run_with_stub_log(
+            "KMS_API_PROPAGATION_WAIT_SECONDS=0 run_apply -auto-approve -input=false",
+            apply_stub=self._apply_stub_failing_first(1, "Error: Error creating Cluster: googleapi: Error 409"),
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(log.count("apply -auto-approve -input=false"), 1, log)
+        self.assertNotIn("attempt", proc.stderr)
+
+    def test_run_apply_gives_up_after_its_attempt_budget(self):
+        proc, log = self._run_with_stub_log(
+            "KMS_API_PROPAGATION_WAIT_SECONDS=0 KMS_API_PROPAGATION_ATTEMPTS=3 run_apply -auto-approve -input=false",
+            apply_stub=self._apply_stub_failing_first(99, self._KMS_403),
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(log.count("apply -auto-approve -input=false"), 3, log)
+        self.assertIn("run it again", proc.stderr)
+
+    def test_run_apply_keeps_a_log_file_that_stdout_points_at(self):
+        """`lifecycle.sh apply > apply.log`: what the guards wrote before the
+        apply stays, and the apply's output follows it. A capture through
+        /dev/fd/N re-opens and truncates the file on Linux."""
+        with tempfile.NamedTemporaryFile(delete=False) as out:
+            out_path = out.name
+        try:
+            proc = self._run_guard(
+                "echo before-the-apply; run_apply -auto-approve -input=false",
+                apply_stub='echo "Apply complete!"; exit 0',
+                stdout_path=out_path,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            text = pathlib.Path(out_path).read_text()
+        finally:
+            os.unlink(out_path)
+        self.assertLess(text.index("before-the-apply"), text.index("Apply complete!"), text)
+        self.assertNotIn("\0", text)
+
+    def test_run_apply_lets_terraform_finish_after_ctrl_c(self):
+        """Ctrl-C reaches the whole pipeline. The filter already ignores it
+        (test_the_filter_outlives_ctrl_c_so_terraform_can_shut_down); tee must
+        too, or terraform's next write hits a closed pipe and SIGPIPE kills it
+        before it has saved state."""
+        with tempfile.NamedTemporaryFile(delete=False) as out:
+            out_path = out.name
+        apply_stub = (
+            'trap \'echo "Interrupt received."; exit 1\' INT; '
+            'echo "apply started"; sleep 20; echo "apply finished"; exit 0'
+        )
+        try:
+            proc = self._run_guard(
+                "run_apply -auto-approve -input=false",
+                apply_stub=apply_stub,
+                stdout_path=out_path,
+                sigint_after="apply started",
+            )
+            text = pathlib.Path(out_path).read_text()
+        finally:
+            os.unlink(out_path)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Interrupt received.", text)
+
+    def test_run_apply_returns_terraforms_code_when_tee_cannot_write_its_copy(self):
+        proc, log = self._run_with_stub_log(
+            "run_apply -auto-approve -input=false",
+            apply_stub='echo "Apply complete!"; exit 0',
+            tee_fails=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Apply complete!", proc.stdout)
+        self.assertIn("could not keep a full copy of the apply output", proc.stderr)
+        self.assertEqual(log.count("apply -auto-approve -input=false"), 1, log)
+
+    def test_run_apply_does_not_retry_from_a_copy_tee_could_not_keep(self):
+        """The apply failed on the 403 but tee kept no copy of it; the
+        decision reads the copy, not the stream, so no retry."""
+        proc, log = self._run_with_stub_log(
+            "KMS_API_PROPAGATION_WAIT_SECONDS=0 run_apply -auto-approve -input=false",
+            apply_stub=self._apply_stub_failing_first(99, self._KMS_403),
+            tee_fails=True,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("could not keep a full copy", proc.stderr)
+        self.assertEqual(log.count("apply -auto-approve -input=false"), 1, log)
+
+    def test_run_apply_does_not_retry_an_apply_the_operator_interrupted(self):
+        """Terraform traps SIGINT and exits 1 after printing what it had
+        collected, a 403 included; its own interrupt line is the stop."""
+        with tempfile.NamedTemporaryFile(delete=False) as out:
+            out_path = out.name
+        # A second invocation exits at once, so a regression fails on the
+        # apply count below rather than on the harness deadline with a
+        # sleeping stub left behind.
+        apply_stub = (
+            'if [[ $(grep -c "^apply" "$TF_STUB_LOG") -gt 1 ]]; then echo "second apply"; exit 1; fi; '
+            'trap \'echo "Interrupt received."; echo "' + self._KMS_403 + '"; exit 1\' INT; '
+            'echo "apply started"; sleep 20; echo "apply finished"; exit 0'
+        )
+        try:
+            proc, log = self._run_with_stub_log(
+                "KMS_API_PROPAGATION_WAIT_SECONDS=0 run_apply -auto-approve -input=false",
+                apply_stub=apply_stub,
+                stdout_path=out_path,
+                sigint_after="apply started",
+            )
+        finally:
+            os.unlink(out_path)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(log.count("apply -auto-approve -input=false"), 1, log)
+        self.assertNotIn("attempt 2", proc.stderr)
+
+    def test_run_apply_passes_a_clean_apply_through_once(self):
+        proc, log = self._run_with_stub_log(
+            "run_apply -auto-approve -input=false",
+            apply_stub='echo "Apply complete!"; exit 0',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(log.count("apply"), 1, log)
+        self.assertIn("Apply complete!", proc.stdout)
+
     def test_guard_drift_adoption_refuses_a_trio_this_state_does_not_manage(self):
         """A second install in the project reaches the apply with all three
         already there; importing them takes over whichever install owns them."""
@@ -941,6 +1329,14 @@ resource "google_service_account" "agent" {
             proc.stderr,
         )
         self.assertIn("ENABLE_DRIFT_DETECTOR=false", proc.stderr)
+        # The source sinks a scoped install owns in the projects it lists, which the guard
+        # does not probe: the refusal names the address and the import ID, both derived from
+        # the names this state would create.
+        self.assertIn(
+            "terraform import 'module.drift_pubsub[0].google_logging_project_sink.source_drift_audit[\"<listed project>\"]' "
+            "projects/<listed project>/sinks/platform-agent-drift-audit-sink-test-project",
+            proc.stderr,
+        )
 
     def test_guard_drift_adoption_checks_the_names_this_state_would_create(self):
         """A second install that already named its own trio must pass: the
@@ -1082,7 +1478,8 @@ class DeleteAgentCrEndpointTest(unittest.TestCase):
     """
 
     def _run_delete(self, dns_endpoint="gke-abc.us-central1.gke.goog",
-                    allow_external="True", supports_flag=True, wedged=False):
+                    allow_external="True", supports_flag=True, wedged=False,
+                    agent_name="agent"):
         """Run delete_agent_cr against stubbed gcloud, kubectl and terraform.
 
         Returns (completed process, recorded get-credentials invocation).
@@ -1109,12 +1506,12 @@ exit 0
             # command that ran before it, not the deletion itself.
             kubectl = bin_dir / "kubectl"
             # wedged: one PlatformAgent whose delete times out, which walks the
-            # finalizer patch and both RBAC deletes as well.
+            # finalizer patch, RBAC deletes, and JetStream PVC delete as well.
             kubectl.write_text(f"""#!/usr/bin/env bash
 printf '%s\\n' "$*" >> '{kubectl_record}'
 if [[ "{wedged}" == True ]]; then
   case "$*" in
-    *"get platformagent"*) echo platformagent.kubeagents.x-k8s.io/agent ;;
+    *"get platformagent"*) echo platformagent.kubeagents.x-k8s.io/{agent_name} ;;
     *"delete platformagent"*) exit 1 ;;
   esac
 fi
@@ -1155,9 +1552,72 @@ exit 0
         proc, _ = self._run_delete(wedged=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         calls = self.kubectl_args.splitlines()
-        self.assertEqual(len(calls), 5, self.kubectl_args)
+        self.assertEqual(len(calls), 7, self.kubectl_args)
         for call in calls:
             self.assertTrue(call.startswith("--context gke_test-project_us-central1_test-cluster "), call)
+
+    def test_wedged_finalizer_cleans_tokenreview_callout_rbac_and_jetstream_pvc(self):
+        # When the operator's finalizer fails to clear in time, the script strips
+        # the finalizer and manually cleans cluster-scoped RBAC (minimal,
+        # tokenreview, callout tokenreview) and the next-mode JetStream PVC (#2795).
+        # PVC deletion uses --wait=false to avoid blocking teardown, and both the
+        # A2A callout ClusterRoleBinding and JetStream PVC filter on the instance
+        # label to mirror the controller's ownership checks.
+        proc, _ = self._run_delete(wedged=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(
+            "delete clusterrolebinding kubeagents:minimal:kubeagents-system:agent kubeagents:tokenreview:kubeagents-system:agent --ignore-not-found",
+            self.kubectl_args,
+        )
+        self.assertIn(
+            "delete clusterrolebinding -l app.kubernetes.io/instance=kubeagents-system-agent --field-selector metadata.name=kubeagents:a2a-callout-tokenreview:kubeagents-system:agent --ignore-not-found",
+            self.kubectl_args,
+        )
+        self.assertIn(
+            "delete clusterrole kubeagents:minimal:kubeagents-system:agent kubeagents:tokenreview:kubeagents-system:agent --ignore-not-found",
+            self.kubectl_args,
+        )
+        self.assertIn(
+            "delete pvc -n kubeagents-system -l app.kubernetes.io/instance=kubeagents-system-agent --field-selector metadata.name=data-agent-a2a-nats-0 --ignore-not-found --wait=false",
+            self.kubectl_args,
+        )
+
+    def test_wedged_finalizer_truncates_long_instance_label_for_pvc(self):
+        # Ensure that instanceLabel (>63 chars) is properly truncated to 63 chars
+        # and trailing dashes/dots/underscores are trimmed as instanceLabel does.
+        cases = [
+            (
+                "alphanumeric_cut_only",
+                "a" * 60 + "-xyz",
+                "kubeagents-system-" + ("a" * 45),
+                63,
+            ),
+            (
+                "trailing_dash_trimmed",
+                "a" * 44 + "-" + "b" * 20,
+                "kubeagents-system-" + ("a" * 44),
+                62,
+            ),
+            (
+                "multiple_trailing_punctuation_trimmed",
+                "a" * 42 + "-.-" + "b" * 20,
+                "kubeagents-system-" + ("a" * 42),
+                60,
+            ),
+        ]
+        for name, long_agent, expected_label, expected_len in cases:
+            with self.subTest(name=name):
+                proc, _ = self._run_delete(wedged=True, agent_name=long_agent)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(len(expected_label), expected_len)
+                self.assertIn(
+                    f"delete clusterrolebinding -l app.kubernetes.io/instance={expected_label} --field-selector metadata.name=kubeagents:a2a-callout-tokenreview:kubeagents-system:{long_agent} --ignore-not-found",
+                    self.kubectl_args,
+                )
+                self.assertIn(
+                    f"delete pvc -n kubeagents-system -l app.kubernetes.io/instance={expected_label} --field-selector metadata.name=data-{long_agent}-a2a-nats-0 --ignore-not-found --wait=false",
+                    self.kubectl_args,
+                )
 
     def test_it_uses_the_dns_endpoint_when_one_accepts_external_traffic(self):
         proc, args = self._run_delete()

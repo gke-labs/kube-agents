@@ -1,4 +1,4 @@
-"""Lead a failure reply with its fact in bold, and offer its closing question as a button.
+"""Lead a failure reply with its fact in bold, and offer its closing question as a Try again button.
 
 Installed into the image at ``/opt/hermes/gateway/slack_ux_failure.py``.
 ``apply_slack_ux_failure.py`` wires five calls: the kanban notifier's
@@ -21,7 +21,8 @@ only when it ends on a yes/no question.
 
 With the flag on, the Slack reply to such a wake is drawn with its first
 sentence in bold and, when it ends on one short yes/no question, a choice button
-carrying that question ("check it there"). An open question ("Which namespace
+reading :data:`OFFER_LABEL` ("Try again"), whatever the question's words; the
+question stays in the reply above it. An open question ("Which namespace
 should it use?"), a request ("Could you share the namespace?") or an either/or
 stays text, since it needs a word, not a click. A click is the clicker answering in the thread with the button's text
 (``gateway/slack_ux_clicks.py``), so the Planning Agent reads it as the user
@@ -54,6 +55,13 @@ A reply that arrives as edits to a streamed message, rather than through
 ``send_final_ledgered``, is drawn as upstream draws it, and its claim is
 dropped as an unsent one is.
 
+Under ``spec.mode: next`` a wake's reply in an alert's thread is sent by the
+kanban notifier's chat.notify stand-in (``kanban_chat_notify``), which has no
+blocks to hand :func:`maybe_blocks`. It asks :func:`chat_for` instead, under
+the same mark: the reply's first sentence as the headline, the rest as the
+detail, and Try again as a choice when :func:`present` finds the offer
+(``agents/platform/scripts/chat_message.py``).
+
 Fail-soft: anything that raises is logged and the reply goes out as upstream
 renders it.
 """
@@ -74,6 +82,10 @@ try:
     import slack_presenter as _presenter
 except ImportError:  # the scripts directory is not on PYTHONPATH
     _presenter = None
+try:
+    import chat_message as _chat
+except ImportError:  # the scripts directory is not on PYTHONPATH, or predates it
+    _chat = None
 
 SLACK_PLATFORM = "slack"
 
@@ -88,6 +100,9 @@ MARKS_MAX = 256
 #: The action id prefix of the offer button; ``slack_ux_clicks`` answers any
 #: ``<prefix>.choice.<n>``.
 ACTION_ID_PREFIX = "kage_failure"
+#: What the offer button reads, and so what a click answers in the thread. The
+#: reply above it keeps the agent's question, which this says yes to.
+OFFER_LABEL = "Try again"
 
 #: What the button is cut from: the reply's last sentence, when it is one
 #: question with no markup, after a sentence end or on a line of its own.
@@ -410,18 +425,37 @@ def _continues(line: str) -> bool:
     )
 
 
+def chat_for(content: str) -> Optional[dict]:
+    """The ``kube-agents.chat/v1`` layout of a marked failure reply, or None for any other.
+
+    :func:`maybe_blocks` for the chat.notify stand-in: the offer only in a thread,
+    since a click answers in the thread it was clicked in.
+    """
+    thread = _marked.get()
+    if thread is None or _chat is None:
+        return None
+    try:
+        _bolded, offer = present(content)
+        return _chat.failure_message(content, bool(offer and thread))
+    except Exception:
+        logger.warning("slack_ux_failure: laying out the failure reply failed", exc_info=True)
+        return None
+
+
 def maybe_blocks(content: str, render: Callable[[str], Optional[list]]) -> Optional[list]:
-    """``render(content)``, or for a marked reply its :func:`present` form plus the offer."""
+    """``render(content)``, or for a marked reply its :func:`present` form plus the Try again offer."""
     thread = _marked.get()
     if thread is None:
         return render(content)
     try:
-        bolded, label = present(content)
+        bolded, offer = present(content)
         blocks = render(bolded)
         if blocks is None:
             return render(content)
-        if label and thread and len(blocks) < MESSAGE_BLOCKS_MAX:
-            blocks = list(blocks) + _presenter.blocks_answer("", choices=[label], action_id_prefix=ACTION_ID_PREFIX)
+        if offer and thread and len(blocks) < MESSAGE_BLOCKS_MAX:
+            blocks = list(blocks) + _presenter.blocks_answer(
+                "", choices=[OFFER_LABEL], action_id_prefix=ACTION_ID_PREFIX,
+            )
         return blocks
     except Exception:
         logger.warning("slack_ux_failure: drawing the failure reply failed", exc_info=True)

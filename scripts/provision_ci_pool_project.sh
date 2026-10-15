@@ -40,8 +40,8 @@ LEDGER_INSTALLATION_ID="157029058"
 # a Prow periodic on main). Step 4 grants it signer on this project's copy of
 # the App key, which is the whole reach it has here.
 PULL_SWEEP_SA="serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
-# The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, two
-# Prow periodics on main). The IAM step before 1.3 grants it what re-applying
+# The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, a
+# postsubmit and a daily on main). The IAM step before 1.3 grants it what re-applying
 # bench/tf/fleet needs on the project; step 2 grants it the state bucket.
 FLEET_RECONCILER_SA="serviceAccount:seeded-fleet-reconciler@kube-agents-prow.iam.gserviceaccount.com"
 PEM_FILE=""
@@ -403,6 +403,8 @@ done
 # managers on refresh, which no other role here carries (seen live 2026-09-28).
 echo "Granting the seeded-fleet reconciler access to ${PROJECT_ID}..."
 for role in \
+  roles/compute.instanceAdmin.v1 \
+  roles/compute.securityAdmin \
   roles/compute.storageAdmin \
   roles/compute.viewer \
   roles/container.admin \
@@ -605,12 +607,52 @@ if [ "${SKIP_HOST_CLUSTER}" != "true" ]; then
     # its fixed paid-tier-3 quota redded every smoke run on 2026-09-02
     # (#1097; diagnosis on #1184). verify_ci_pool_project.py checks the
     # binding, so a project provisioned before this line reports the gap.
+    #
+    # enable_drift_pubsub provisions the drift detector's input and nothing
+    # else: the Log Router sink over the project's GKE clusters, the drift-audit
+    # topic, the pull subscription, and subscriber and viewer on that
+    # subscription for kubeagents-platform-gsa. It is on here because the eval
+    # installs have no other path to it -- hack/ci-deploy.sh is helm over the
+    # release this apply created, with no Terraform in the lease, and a case
+    # that exercises the detector cannot build its own ingress without becoming
+    # the second engine AGENTS.md forbids. Deliberately not enable_drift_detector,
+    # which is the consumer: whether a given lease runs the detector is that
+    # lease's helm upgrade to decide, and pinning it true here would be
+    # overwritten by the next one anyway. This line turns the ingress on for a
+    # project this script onboards; it repairs no project already registered,
+    # because verify_ci_pool_project.py does not check the ingress and section
+    # 8 of docs/ci-pool-projects.md forbids re-running this script on one. The registered
+    # projects were repaired out of band rather than by this line, and section
+    # 3 of that page carries the reading, the two mechanisms that did it, and
+    # the projects still without it. A project this line never reached fails a
+    # drift case as broken rather than reporting the gap, and with no verifier
+    # check there is nothing between leases that would say so.
+    #
+    # drift_pubsub_topic_publishers is the pool's one departure from what an
+    # install provisions, and it is confined to the pool for the reason the
+    # variable's own description gives: anything that can publish to this topic
+    # can make the detector report a change nobody made, so on a real install
+    # the Log Router sink is the only publisher. A drift case has no other way
+    # to reach the classifier. It cannot make a real write and wait for the
+    # sink -- the export lag is minutes on top of the run's budget, and every
+    # identity a bench run can authenticate as is a *.gserviceaccount.com one
+    # the classifier is right to drop, so the record would never reach the
+    # human tier the case grades. Publishing a synthetic record is what puts
+    # Classify itself under test rather than bypassing it.
+    #
+    # The two runners, same pair and same reason as the project-level grants
+    # above: the presubmit and the nightly run the same script, so a project
+    # granting one leases fine and dies the first night the other draws it.
+    # Topic-scoped, so this is publish on one topic rather than a Pub/Sub role
+    # on the project.
     cat > "${TFVARS}" <<EOF
-project_id     = "${PROJECT_ID}"
-cluster_name   = "${HOST_CLUSTER_NAME}"
-location       = "${REGION}"
-api_server_key = "$(openssl rand -hex 16)"
-model_provider = "vertex_ai"
+project_id          = "${PROJECT_ID}"
+cluster_name        = "${HOST_CLUSTER_NAME}"
+location            = "${REGION}"
+api_server_key      = "$(openssl rand -hex 16)"
+model_provider      = "vertex_ai"
+enable_drift_pubsub = true
+drift_pubsub_topic_publishers = ["${PROW_RUNNER_SA}", "${NIGHTLY_RUNNER_SA}"]
 EOF
 
     KUBE_AGENTS_STATE_BUCKET="${STATE_BUCKET}" \

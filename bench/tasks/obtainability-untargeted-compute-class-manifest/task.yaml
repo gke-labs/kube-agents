@@ -1,0 +1,77 @@
+# FIXTURE NOT READY -- an entry in scripts/validate_bench_cases.py
+# FIXTURE_NOT_READY (#2540), in no roster file under hack/eval/ until its
+# fixture exists in the pool.
+#
+# Merge order dependency: per .agents/rules/eval_driven_development.md
+# ("where the behaviour genuinely cannot be observed until a sibling lands,
+# the answer is merge order rather than a hand-off. Wait for the sibling, then run
+# the loop... The reviewer's thread stays open until this pull request carries its
+# own red"), observing the positive arm of §3.24 requires #2540 to land first to
+# provision the ComputeClass node pool fixture in evaluation pool projects.
+# Maintainer @bnaylor reviewed and scoped this PR at commit 7f2e7001; the review
+# thread remains open until #2540 merges and the red against main and three greens
+# on the branch are observed and recorded against a cluster carrying the #2540 fixture.
+# The non-finding collector paths (command recording, CRD inspection, clean run on
+# standard node pools) are verified live on kyber-test.
+#
+# Domain: reliability (obtainability-audit).
+# Journey: Workload reliability inspection flags planted untargeted workload
+# missing cloud.google.com/compute-class selector on ComputeClass-backed cluster.
+#
+# Planted defect required: untargeted workload (untargeted-worker) on ComputeClass-backed cluster
+# without default ComputeClass.
+# Isolation class: read-only.
+id: obtainability-untargeted-compute-class-manifest
+name: Reliability audit flags workload missing compute-class selector on ComputeClass cluster
+prompt: >-
+  Run the workload reliability audit against the fleet, following the
+  obtainability-audit SOP.
+expected_output: >-
+  The ledger issue carries an untargeted-compute-class-workload finding against
+  the untargeted-worker deployment on the ComputeClass-backed cluster, noting the
+  missing selector for the cluster's custom ComputeClass. The closing response is
+  the SOP's one line, carrying the ledger URL in full.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: reliability
+
+owner: maintainers
+
+fixtures:
+  - untargeted-compute-class-workload
+
+verification_spec:
+  # scope: finding_ids -- the planted noun is an OBJECT name, so it belongs in
+  # the id audit_report.py derives ("<check>.<cluster>.<namespace>.<object>").
+  # Against the id it says a finding was filed on untargeted-worker; against
+  # the body it would also pass on a passing mention in an inventory table.
+  - name: a-finding-was-filed-against-the-planted-workload
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: obtainability-audit
+      scope: finding_ids
+      required_phrases: ["untargeted-worker"]
+  - name: the-untargeted-compute-class-check-filed-it
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: obtainability-audit
+      scope: finding_ids
+      required_phrases: ["untargeted-compute-class-workload"]
+  # Cluster-state safeguard: the audit is read-only. The planted workload's
+  # nodeSelector must remain untouched during the run.
+  - name: the-planted-workload-survived-the-audit
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: resource_property
+      kind: deployment
+      resource_name: untargeted-worker
+      namespace: default
+      path: "spec.template.spec.nodeSelector"
+      op: absent

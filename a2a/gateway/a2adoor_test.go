@@ -51,6 +51,30 @@ func startA2ARig(t *testing.T) *a2aRig {
 // itself, or the door under the composite the shipped gateway builds.
 func startA2ARigWith(t *testing.T, stack func(*A2ADoor) Adapter) *a2aRig {
 	t.Helper()
+	return startA2ARigTuned(t, stack, a2aRigTuning{})
+}
+
+// startA2ARigOpts is startA2ARigWith with a session spawner (nil: none) and
+// a hook into the Config before New sees it.
+func startA2ARigOpts(t *testing.T, stack func(*A2ADoor) Adapter, spawn *fakeSpawner, tweak func(*Config)) *a2aRig {
+	t.Helper()
+	return startA2ARigTuned(t, stack, a2aRigTuning{spawn: spawn, config: tweak})
+}
+
+// a2aRigTuning holds startA2ARigTuned's hooks. Each runs at its point in
+// the build, before the gateway starts serving, so what it writes needs no
+// lock; nil leaves the default.
+type a2aRigTuning struct {
+	doorOptions func(*A2ADoorOptions)
+	builtDoor   func(*A2ADoor)
+	config      func(*Config)
+	// spawn, when set, is the gateway's session spawner.
+	spawn *fakeSpawner
+}
+
+// startA2ARigTuned is startA2ARigWith with a2aRigTuning's hooks.
+func startA2ARigTuned(t *testing.T, stack func(*A2ADoor) Adapter, tune a2aRigTuning) *a2aRig {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -82,14 +106,21 @@ func startA2ARigWith(t *testing.T, stack func(*A2ADoor) Adapter) *a2aRig {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	door, err := NewA2ADoor(ln.Addr().String(), a2aTestToken, A2ADoorOptions{
+	doorOpts := A2ADoorOptions{
 		PublicURL:        a2aTestPublicURL,
 		DefaultAddressee: "platform",
-	})
+	}
+	if tune.doorOptions != nil {
+		tune.doorOptions(&doorOpts)
+	}
+	door, err := NewA2ADoor(ln.Addr().String(), a2aTestToken, doorOpts)
 	if err != nil {
 		t.Fatalf("NewA2ADoor: %v", err)
 	}
 	door.listener = ln
+	if tune.builtDoor != nil {
+		tune.builtDoor(door)
+	}
 
 	salt := []byte("test-salt")
 	cfg := &Config{
@@ -103,7 +134,14 @@ func startA2ARigWith(t *testing.T, stack func(*A2ADoor) Adapter) *a2aRig {
 		FirstEventGrace:         a2aTestGrace,
 		AttributionSalt:         salt,
 	}
-	g, err := New(Options{Client: client, Adapter: stack(door), Config: cfg})
+	if tune.config != nil {
+		tune.config(cfg)
+	}
+	opts := Options{Client: client, Adapter: stack(door), Config: cfg}
+	if tune.spawn != nil {
+		opts.Spawner = tune.spawn
+	}
+	g, err := New(opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -1201,8 +1239,8 @@ func TestA2AFollowUpOnARunningTaskReturnsTheGatewaysReply(t *testing.T) {
 	if err := json.Unmarshal(raw, &reply); err != nil || reply.Kind != a2aKindMessage || reply.Role != a2aRoleAgent {
 		t.Fatalf("result = %s, want an agent Message", raw)
 	}
-	if text := joinTextParts(reply.Parts); !strings.Contains(text, "steer") {
-		t.Errorf("reply text = %q, want the gateway's steering notice", text)
+	if text := joinTextParts(reply.Parts); !strings.Contains(text, ackSteerQueued) {
+		t.Errorf("reply text = %q, want the gateway's steer acknowledgement %q", text, ackSteerQueued)
 	}
 	// The steer reached the bus as a second message on the task.
 	waitFor(t, "the steer on the in subject", func() bool {
@@ -1217,7 +1255,7 @@ func TestA2AFollowUpOnARunningTaskReturnsTheGatewaysReply(t *testing.T) {
 	// And the task's history carries the notice too.
 	got := r.getUntil(t, a2aTestCaller, task.ID, "the notice in the task history", func(task a2aTaskObject) bool {
 		for _, m := range task.History {
-			if strings.Contains(joinTextParts(m.Parts), "steer") {
+			if strings.Contains(joinTextParts(m.Parts), ackSteerQueued) {
 				return true
 			}
 		}

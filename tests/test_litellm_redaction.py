@@ -37,6 +37,10 @@ _CALLBACK_INSTANCE = "litellm_redaction_callback.proxy_handler_instance"
 _CONFIG_ENV_VAR = "KUBE_AGENTS_REDACTION_CONFIG"
 _SALT_ENV_VAR = "SESSION_KV_SALT"
 _CONFIGMAP_KEYS = ("redaction.yaml", "redactor.py", "litellm_redaction_callback.py")
+# What every render carries whether redaction is on or off: the config and the
+# thinking-replay hook (tests/test_litellm_thinking_replay.py).
+_ALWAYS_KEYS = ("config.yaml", "litellm_thinking_replay_callback.py")
+_ALWAYS_CALLBACKS = ["prometheus", "litellm_thinking_replay_callback.proxy_handler_instance"]
 _MOUNT_DIR = "/app"
 # The ConfigMap volume. The container also mounts an emptyDir scratch
 # directory that carries no subPath, so mounts are read by volume, not by
@@ -389,10 +393,10 @@ class TestChartRender(unittest.TestCase):
 
     def test_disabled_renders_none_of_it(self) -> None:
         configmap, deployment = self._documents()
-        self.assertEqual(sorted(configmap["data"]), ["config.yaml"])
+        self.assertEqual(sorted(configmap["data"]), sorted(_ALWAYS_KEYS))
         self.assertNotIn(_CALLBACK_INSTANCE, configmap["data"]["config.yaml"])
         container = deployment["spec"]["template"]["spec"]["containers"][0]
-        self.assertEqual(list(_configmap_mounts(container)), ["config.yaml"])
+        self.assertEqual(sorted(_configmap_mounts(container)), sorted(_ALWAYS_KEYS))
         env_names = [e["name"] for e in container["env"]]
         self.assertNotIn(_CONFIG_ENV_VAR, env_names)
         self.assertNotIn(_SALT_ENV_VAR, env_names)
@@ -402,13 +406,13 @@ class TestChartRender(unittest.TestCase):
             {"litellm": {"redaction": {"enabled": True, **_RULES_CONFIG}}}
         )
         data = configmap["data"]
-        self.assertEqual(sorted(data), sorted(("config.yaml",) + _CONFIGMAP_KEYS))
+        self.assertEqual(sorted(data), sorted(_ALWAYS_KEYS + _CONFIGMAP_KEYS))
         # The mounted modules are the checked-in files, not a re-indented copy.
         self.assertEqual(data["redactor.py"], _CHART_REDACTOR.read_text())
         self.assertEqual(data["litellm_redaction_callback.py"], _CALLBACK.read_text())
         self.assertEqual(yaml.safe_load(data["redaction.yaml"]), _RULES_CONFIG)
         settings = yaml.safe_load(data["config.yaml"])["litellm_settings"]
-        self.assertEqual(settings["callbacks"], ["prometheus", _CALLBACK_INSTANCE])
+        self.assertEqual(settings["callbacks"], _ALWAYS_CALLBACKS + [_CALLBACK_INSTANCE])
 
         container = deployment["spec"]["template"]["spec"]["containers"][0]
         mounts = _configmap_mounts(container)

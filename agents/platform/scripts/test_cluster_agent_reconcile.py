@@ -869,6 +869,8 @@ class ScopeTest(HomesMixin):
         snap = self._snapshot()
         self.assertEqual([p["id"] for p in snap["projects"]], sorted([self.MGMT, "team-prod"]))
         self.assertEqual(snap["ignoredExcludes"], [{"project": self.MGMT, "pattern": "mgmt-*"}])
+        self.assertEqual(self._snapshot()[rec.SCOPE_EXCLUDED_KEY], ["legacy", "team-sandbox"],
+                         "the explicit projects an exclude entry dropped are written for the audits' reader")
 
     def test_exclude_clusters_by_triple_skips_create_and_prunes_the_existing_profile(self):
         scope = {"projects": ["other"],
@@ -1047,7 +1049,8 @@ class ScopeTest(HomesMixin):
         declared = {"projects": ["p2"], "exclude": {"projects": ["*-scratch"], "clusters": [
             {"projectId": self.MGMT, "location": "us-central1", "clusterName": "kept-out"}]}}
         (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
-            {"projects": [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}], "declared": declared}),
+            {"projects": [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}], "declared": declared,
+             rec.SCOPE_EXCLUDED_KEY: ["team-a"]}),
             encoding="utf-8")
         os.environ.pop(rec.SCOPE_FILE_ENV, None)
         for _ in range(2):
@@ -1056,6 +1059,14 @@ class ScopeTest(HomesMixin):
             self.assertEqual(deleted, [])
             self.assertEqual(self._snapshot()["declared"], rec._normalize_scope(declared))
             self.assertEqual([p["id"] for p in self._snapshot()["projects"]], [self.MGMT])
+            # The carried tick keeps the boundary: the previous snapshot predates
+            # the key and names p2, so the audits must not widen to the listing.
+            self.assertTrue(self._snapshot()[rec.SCOPE_BOUNDARY_KEY], "a carried declaration is a boundary in force")
+            self.assertFalse(self._snapshot()[rec.SCOPE_PRESENT_KEY])
+            # The carried tick resolves no explicit project, so it drops none
+            # itself; the projects the last readable tick dropped by id or by
+            # number ride on, or the audits' reader would carry them as unresolved.
+            self.assertEqual(self._snapshot()[rec.SCOPE_EXCLUDED_KEY], ["team-a"], "the carried tick repeats the last readable tick's dropped projects")
 
     def test_a_declaration_with_scalar_fields_is_read_as_absent_fields(self):
         # A hand-edited file or snapshot must not abort the run or come apart into characters.
@@ -1133,6 +1144,8 @@ class ScopeTest(HomesMixin):
         report, created, _ = self._run(None, {self.MGMT: [(self.MGMT, "m1", "us-central1")]})
         self.assertEqual(created, [(self.MGMT, "m1", "us-central1")])
         self.assertEqual(self._snapshot()["declared"], rec._empty_scope())
+        self.assertFalse(self._snapshot()[rec.SCOPE_PRESENT_KEY], "no scope block declared this run")
+        self.assertFalse(self._snapshot()[rec.SCOPE_BOUNDARY_KEY], "with no previous snapshot nothing is carried: an install that never declared a scope has no boundary on an unreadable tick")
 
     def test_projects_are_listed_concurrently_and_created_in_the_fixed_order(self):
         # The three explicit listings meet at a barrier, so each is held until all three are
@@ -1347,6 +1360,8 @@ class ScopeTest(HomesMixin):
         snap = self._snapshot()
         self.assertEqual(snap[rec.SCOPE_MAX_PROJECTS_KEY], 3)
         self.assertEqual(snap["declared"][rec.SCOPE_MAX_PROJECTS_KEY], 3)
+        self.assertTrue(snap[rec.SCOPE_PRESENT_KEY], "a declared block is recorded as present, beside what it declares")
+        self.assertTrue(snap[rec.SCOPE_BOUNDARY_KEY], "a read block is a boundary in force")
 
     def test_a_declaration_without_a_cap_or_with_a_bad_one_reads_the_default(self):
         # A render from an operator that predates the field carries no key; a value that is
@@ -1360,24 +1375,22 @@ class ScopeTest(HomesMixin):
                 self.assertEqual(report["maxProjects"], rec.RESOLVED_SET_CAP)
                 self.assertEqual(self._snapshot()[rec.SCOPE_MAX_PROJECTS_KEY], rec.RESOLVED_SET_CAP)
 
-    def test_the_workers_and_the_budget_scale_with_the_cap(self):
-        # Workers first, up to their ceiling, then the budget: a cap of 200 lists with twice
-        # the workers in the same budget; past 400 the workers are capped and the budget
-        # grows a round at a time.
-        per_default = rec.LIST_WORKERS
-        self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP), per_default)
-        self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP // 2), per_default)
-        self.assertEqual(rec._list_workers(2 * rec.RESOLVED_SET_CAP), 2 * per_default)
-        self.assertEqual(2 * per_default, rec.LIST_WORKERS_MAX, "the ceiling is twice the default until #1913 measures the sandbox")
-        self.assertEqual(rec._list_workers(4 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
-        self.assertEqual(rec._list_workers(50 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
+    def test_the_workers_are_fixed_and_the_budget_scales_with_the_cap(self):
+        # The pool is the credential proxy's admitted count at every cap, so a larger cap
+        # lists with the same workers and the budget grows per default cap's worth of
+        # projects; a smaller cap keeps the default budget.
+        self.assertEqual(rec.LIST_WORKERS, 4)
         budget = rec.LIST_BUDGET_SECONDS
+        self.assertEqual(budget, 300)
+        self.assertEqual(rec._list_budget_seconds(1), budget)
+        self.assertEqual(rec._list_budget_seconds(rec.RESOLVED_SET_CAP // 2), budget)
         self.assertEqual(rec._list_budget_seconds(rec.RESOLVED_SET_CAP), budget)
-        self.assertEqual(rec._list_budget_seconds(2 * rec.RESOLVED_SET_CAP), budget)
-        self.assertEqual(rec._list_budget_seconds(4 * rec.RESOLVED_SET_CAP), 2 * budget)
-        self.assertEqual(rec._list_budget_seconds(5 * rec.RESOLVED_SET_CAP), 3 * budget)
-        self.assertEqual(rec._list_budget_seconds(10 * rec.RESOLVED_SET_CAP), 5 * budget)
-        self.assertEqual(rec._prune_budget_seconds(5 * rec.RESOLVED_SET_CAP), 3 * rec.PRUNE_BUDGET_SECONDS)
+        self.assertEqual(rec._list_budget_seconds(rec.RESOLVED_SET_CAP + 1), 2 * budget)
+        self.assertEqual(rec._list_budget_seconds(2 * rec.RESOLVED_SET_CAP), 2 * budget)
+        self.assertEqual(rec._list_budget_seconds(5 * rec.RESOLVED_SET_CAP), 5 * budget)
+        self.assertEqual(rec._list_budget_seconds(50 * rec.RESOLVED_SET_CAP), 50 * budget)
+        self.assertEqual(rec._prune_budget_seconds(rec.RESOLVED_SET_CAP), rec.PRUNE_BUDGET_SECONDS)
+        self.assertEqual(rec._prune_budget_seconds(5 * rec.RESOLVED_SET_CAP), 5 * rec.PRUNE_BUDGET_SECONDS, "the prune floor scales with the list budget")
         # The prune's budget follows the profiles too, per describe rather than per round
         # of workers: the sandbox's CPU serialises the describes, so 120 profiles get the
         # sequential walk's time whatever the worker count, and eight stay on the floor.

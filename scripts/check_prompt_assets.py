@@ -249,7 +249,7 @@ CRON_PROMPT_PATH = re.compile(
 #
 # `chat` is this repository's own platform, not a synonym for Google Chat:
 # `deploy/docker/plugins/chat/` relays the report to the Session KV server,
-# which runs one Chat Agent turn over it and posts the result. It is enabled
+# which posts it as written. It is enabled
 # only inside a cron child, because `profile_cron_tick.py` is the sole setter of
 # its `CHAT_HOME_CHANNEL`, so probing for it anywhere else -- a `kubectl exec`,
 # the gateway process -- finds it unset and reads like a dead value. It is not.
@@ -561,8 +561,7 @@ def instruction_files() -> list[Path]:
         # `docs` is not a profile-home item and the layer does not take the
         # directory: the Dockerfile bakes named files out of it into
         # /opt/defaults/docs and leaves the rest. Those others are design docs
-        # -- docs/README.md calls them "not baked into the image despite its
-        # location" -- whose only reader is a human in a checkout, where their
+        # whose only reader is a human in a checkout, where their
         # `agents/<profile>/...` citations resolve exactly as written. Globbing
         # the directory swept them in and demanded the in-profile spelling for
         # a profile they never reach, which rewrites a working citation into

@@ -293,6 +293,21 @@ class IsAgentPullRequestTest(unittest.TestCase):
     def test_our_own_pull_request_qualifies(self):
         self.assertTrue(self._ours(self._pr()))
 
+    def test_a_host_qualified_name_matches_the_path_the_forge_reports(self):
+        # Review: the forge reports `sourceRepo` as its own path, and the
+        # managed list spells repositories `host/path` once a second forge is
+        # registered, so every proposal read as "not ours".
+        for repo, head in (
+            ("github.com/acme/toolkit", "acme/toolkit"),
+            ("gitlab.com/acme/platform/infra", "acme/platform/infra"),
+        ):
+            with self.subTest(repo=repo):
+                pr = self._pr(head_repo=head)
+                self.assertTrue(forge.is_agent_pull_request(pr, repo, VIEWER))
+        self.assertFalse(
+            forge.is_agent_pull_request(self._pr(head_repo="other/infra"), "gitlab.com/acme/infra", VIEWER)
+        )
+
     def test_a_human_branch_does_not(self):
         self.assertFalse(self._ours(self._pr(head_ref="feat/whatever")))
 

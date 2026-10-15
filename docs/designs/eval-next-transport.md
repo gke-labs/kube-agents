@@ -3,7 +3,7 @@
 > **STATUS — design of record; stage 1 built, off by default.** The gateway has the inject adapter
 > and the bench harness selects it with `AGENT_TRANSPORT=inject`; the operator renders the door
 > only under its eval flag; `EVAL_MODE_NEXT=1` on the presubmit scripts builds the bridge image,
-> flips the install, declares the sidecar and runs the matrix through the door (The CI flag). The
+> flips the install, hands the operator the bridge's settings and runs the matrix through the door (The CI flag). The
 > presubmit still runs `today` unless a job sets the flag, and stage 2's operator wiring is
 > rendered and its eval-install half is not started.
 > The measurement that motivates the document is on
@@ -168,8 +168,9 @@ from inside the pod's network namespace, so they are not what keeps the door shu
 bearer token the operator renders into a Secret beside the adapter's env, under the eval flag
 only, which the harness reads the way the presubmit reads `API_SERVER_KEY` today. The door it
 replaces admits key holders, and this one admits the same population rather than everyone
-holding `pods/portforward` in the namespace; that matters because the task it starts runs on the
-platform persona with the install's cluster and GitHub credentials, under an `authority` block
+holding `pods/portforward` in the namespace; that matters because the task it starts reaches the
+platform persona with the install's cluster and GitHub credentials (directly under the bridge's
+`cli` executor, through a card the default profile files under `api`), under an `authority` block
 the gateway mints for a synthetic principal, past the allowed-users gate.
 
 **The adapter cannot assert a real principal (decided 2026-09-17).** The gateway spec's test-backend
@@ -337,9 +338,9 @@ webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation wit
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
 `progress` heartbeat. `worker_commands` reads
 the kanban worker logs by card id; on
-this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
-signals), and until then a case that gates on it has no data on stage 1 either. Neither is graded
-as a failure meanwhile: on this transport's record the scorer sets every `worker_commands` and
+this path it has data when the case runner's delegation wait finds the cards in the session store
+(Completion signals), and none when the wait falls back. Neither is graded
+as a failure here: on this transport's record the scorer sets every `worker_commands` and
 `worker_agents` entry aside as not applicable, and every `tool_called` entry too when the record
 carries no `a2a.activity` marker or a marker that reports a loss (calls the door's cap or the
 executor's budget dropped, a count or part it could not read, an input truncated with its nested
@@ -354,40 +355,50 @@ the worker checks
 ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
 cannot show"). A case whose premise
 needs the front door — `agent-kanban-smoke`, which grades
-the chat profile's `kanban_create` — is a different matter: the door addresses `platform`,
-and the bridge's `cli` executor answers it with the platform profile, so
-`hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the reason, and the
-api lane's roster is untouched. The lane pins that executor: `hack/ci-deploy.sh` sets
-`BRIDGE_EXECUTOR=cli` on the sidecar and its start-line wait requires `"executor":"cli"`. The
-bridge's default `api` executor runs the turn under the pod's API server, whose profile is the
-chat path's own (`default` on a stock install), so it changes which agent answers every case on
-the lane; the pin, and the exclusion, stay until cases have been graded on that executor.
+the chat profile's `kanban_create` — is a different matter:
+`hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the reason below, and the
+api lane's roster is untouched. The lane runs the bridge's shipped default executor, `api`, the
+one a customer install runs: `hack/ci-deploy.sh` leaves the operator's `A2A_BRIDGE_EXECUTOR`
+unset, so the rendered bridge carries no `BRIDGE_EXECUTOR` and picks `api` from the
+`API_SERVER_KEY` the operator sets on it, and the deploy's start-line wait requires
+`"executor":"api"`, which a bridge that fell back to `cli` for want of the key fails. Under `api`
+the turn runs under the pod's API server, whose profile is the chat path's own (`default` on a
+stock install), so the agent that answers a case on this lane is the one the chat path reaches
+("What the lane grades" below). That does not return the exclusion's premise: the default
+profile may file the card, but the card's completion never reaches the A2A thread
+([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Executors"). The delegation
+wait appends the card's result to the graded answer (Completion signals), but it reads that from
+the pod, not from the thread, so the exclusion stays.
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
 it works on any transport that maps a result into the final message, which both new transports
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
-worker's card result, which today's wait folds into the final message, so on this path it has
-the URL only once the rebuilt wait appends the delivered card results the same way, and until
-then it fails as a graded failure with no issue URL in the report, not as an error.
+worker's card result, which the delegation wait folds into the final message. On this path it
+has the URL when the wait finds the cards in the session store; when it does not (a door that
+reports no `contextId`, or a store whose first read fails three times running), it fails as a
+graded failure with no
+issue URL in the report, not as an error.
 
 **The executor is the Hermes persona through the bridge sidecar (decided 2026-09-17).** The
 session worker carries only the tool-less `chat` profile; running the platform persona as a
 session pod waits on the profile and dispatcher work, which has no date, and the A2A owner set
 none for the bridge's retirement: it goes when profiles land and the retirement ordering is
 written. Stage 1 builds against the bridge
-([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md)), a sidecar declared on the CR
-through `spec.deployment.sidecars` whose image `a2a/Dockerfile.hermes-bridge` builds. A
+([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md)), a container in the agent pod
+that the operator renders under `next` (a CR may declare its own on `spec.deployment.sidecars`
+instead) and whose image `a2a/Dockerfile.hermes-bridge` builds. A
 case addresses `platform` and does not care who answers; when the persona moves to a worker the
 addressee stays `platform`, which is what the addressee token is for. An install under `next`
-with no sidecar declared has a bus with nobody consuming `platform` tasks, and every case on the
+with no bridge in the pod - before the bus is provisioned, or with the bridge failing - has a bus
+with nobody consuming `platform` tasks, and every case on the
 inject transport ends as infrastructure. That is the correct reading of that install, and it is
 why a task nobody took is infrastructure rather than a failed case. The bridge accepts a task by
 publishing `submitted` and queues it behind `BRIDGE_CONCURRENCY` workers, default 2, and
-publishes `working` only when a worker spawns the subprocess; the presubmit fans units out at
+publishes `working` only when a worker starts the task's turn; the presubmit fans units out at
 `EVAL_TASK_PARALLELISM`, default 4, the nightly at 8. At those defaults two of every four
-concurrent units wait in the bridge's queue carrying an executor event and no subprocess, for as
-long as the two ahead of them run. The eval install's sidecar therefore sets
-`BRIDGE_CONCURRENCY` to at least `EVAL_TASK_PARALLELISM`, declared with the sidecar on the CR,
-and the `submitted`-only classification above is the backstop rather than the fix: a queued
+concurrent units wait in the bridge's queue carrying an executor event and no turn, for as
+long as the two ahead of them run. The eval install's bridge therefore runs
+`BRIDGE_CONCURRENCY` of at least `EVAL_TASK_PARALLELISM`, set through the operator's
+`A2A_BRIDGE_CONCURRENCY`, and the `submitted`-only classification above is the backstop rather than the fix: a queued
 repetition that reaches the deadline is infrastructure, not a failed case, but it has still
 spent its budget waiting. Two pieces of stage-1 work follow from building against the bridge,
 and both are the CI flag's (decided 2026-09-18 by the A2A owner on gke-labs/kube-agents#1661,
@@ -400,33 +411,30 @@ registry default, so the sidecar and the agent container it shares a pod with ar
 The bridge was CI-only until the executor question was settled; the release workflow
 publishes it as `hermes-bridge`, on the same `FROM`-the-same-commit rule, and `images.json`
 carries it (the bridge doc's provenance paragraph says the same). `hack/ci-deploy.sh` under the flag
-declares the sidecar on the CR through `spec.deployment.sidecars` once the bus is up (a bridge
-that starts before NATS resolves crash-loops the agent's pod), with that image, the bus URL and
-the `bridge` user's password from the operator's creds Secret as the bridge doc lists its env,
-and `BRIDGE_CONCURRENCY` set to `EVAL_TASK_PARALLELISM`, sized against the bridge's fixed queue
-as well: the queue behind the workers holds 1024 accepted tasks before the bridge finalizes one
+hands that image to the operator as `A2A_BRIDGE_IMAGE`, with `A2A_BRIDGE_CONCURRENCY` set to
+`EVAL_TASK_PARALLELISM`, through the chart's `operator.extraEnv`; the operator renders the bridge
+with the bus URL and the `bridge` user's password from its creds Secret as the bridge doc lists
+its env, and withholds it from the agent pod until the bus is provisioned (a bridge that starts
+before the bus exists crash-loops the agent's pod). The worker count is sized against the
+bridge's fixed queue as well: the queue behind the workers holds 1024 accepted tasks before the bridge finalizes one
 as `bridge-queue-overflow`, over a hundred times any fan-out the job runs. The operator
-sizes the `TASKS` consumer reserve from that `BRIDGE_CONCURRENCY` too, and provisioning
-never edits a stream that exists, so a bus provisioned before the sidecar is declared would
-hold a `TASKS` narrower than the CR then asks for, and the second provision Job would refuse
-it. The deploy therefore sizes the first provision for the sidecar (decided 2026-09-30 on
-gke-labs/kube-agents#2077): its mode patch also sets `spec.harness.tuning.maxSessions` to the
+sizes the `TASKS` consumer reserve from that `A2A_BRIDGE_CONCURRENCY` too, from the first `next`
+render, and provisioning never edits a stream that exists, so the first provision has to fit
+the bridge's workers. The deploy therefore sizes the first provision for the bridge (decided
+2026-09-30 on gke-labs/kube-agents#2077): its mode change also sets `spec.harness.tuning.maxSessions` to the
 largest value whose budget at the lane's worker count fits the 64-consumer floor the first
 run creates (6 at 4 workers, 2 at 6; at 8 or more the floor cannot hold the reserve and the
 value clamps to 1), computed from four constants the script copies from the operator and
-pins against it, and after the sidecar patch it waits for the re-run provision Job and reads
-the CR's phase, so a refusal reds the lane rather than parking the CR `Degraded` over a
-working bus. The
-sidecar also carries the agent container's own environment, mounts, security context and
-resources, derived from the rendered Deployment at deploy time rather than copied into the
-script: the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
+pins against it. The mode change is the only change, so no later render re-measures the budget
+against the stream the Job created. The rendered bridge carries the agent container's own
+environment, mounts and security context, copied by the operator from the agent
+container it renders (its resources are its own, sized for the `api` executor the lane runs, gke-labs/kube-agents#2748): the bridge's `cli` subprocess stands in for the `hermes chat -q` a kanban worker spawns
 inside the agent container, and that is the environment such a worker inherits; under the
-default `api` executor the same copy is what carries `API_SERVER_KEY` into the sidecar, which is
-why the patch pins `BRIDGE_EXECUTOR=cli` rather than leaving the choice to the key. The
-patch adds one more variable of its own, `A2A_ACTIVITY_SECRET` from the creds Secret's
-`bridge-activity-key`, because the agent container gains that entry only when the operator
-renders the sidecar the patch is declaring. The one mount not
-carried is the projected bus token, which the webhook reserves for the agent container. The
+default `api` executor the operator sets `API_SERVER_KEY` on the bridge itself (the loopback
+bearer, not a copy, gke-labs/kube-agents#2753), which is how the lane gets `api` without setting
+`A2A_BRIDGE_EXECUTOR`. The
+operator adds `A2A_ACTIVITY_SECRET` from the creds Secret's `bridge-activity-key` itself. The one
+mount not carried is the projected bus token, the agent principal's credential. The
 third piece was decided the same day and is built: a look-ahead in the bridge's worker that
 before it spawns replays the task's `in` subject for a trailing `cancel` and finalizes
 `canceled-before-start` when it finds one, so a cancel already in the stream is honoured without
@@ -435,28 +443,46 @@ cancel"; its "Sizing against the eval harness" is the canonical statement of
 `BRIDGE_CONCURRENCY` against the fan-out and the bridge's queue capacity, which this paragraph
 summarises).
 
-**What the lane grades (decided 2026-09-28 on gke-labs/kube-agents#2037).** Through the inject
-door the eval addresses the platform persona directly, with the `platform_toolsets.cli` bundle:
-`terminal`, `read_file`, `patch`, `process_manage`, `execute_code`, `delegate_task` and every
-MCP tool the install carries. That is a different agent from the one today's evals reach. The api transport posts to
-the API server, which runs the default profile, the Planning Agent: its model-facing tools are the
-kanban set, it delegates fleet work to the platform persona over a card, and it relays the
-worker's report. Same prompt, two agents reading it: `obtainability-remediation-proposal` is 12
-of 12 on the first, where the Planning Agent inlines a manifest, and was 0 of 3 on the second,
-where the persona followed its own rule and opened a pull request (the rule has since been
-scoped, in `agents/platform/SOUL.md` §3: a request to investigate or report is answered in the
-reply, and a pull request is opened only when the request asks for one or for a change to be
-submitted or fixed; the unattended case is `fleet-audit`'s own path). The lane's record is therefore
-the platform persona's, and parity in [#2007](https://github.com/gke-labs/kube-agents/issues/2007)
-(phase 2) is that persona's record being acceptable per case and stable across the on-demand
-runs, not the api lane's numbers; the first run's 94.4% against 77.8% is withdrawn as a
-like-for-like comparison. Two things follow for the lane. A case that grades the delegation
+**What the lane grades (decided 2026-09-28 on gke-labs/kube-agents#2037, for the `cli` executor
+the lane then ran).** Under `cli` the inject door's task reaches the platform persona directly,
+with the `platform_toolsets.cli` bundle: `terminal`, `read_file`, `patch`, `process_manage`,
+`execute_code`, `delegate_task` and every MCP tool the install carries. That is a different agent
+from the one today's evals reach. The api transport posts to the API server, which runs the
+default profile, the Planning Agent: its model-facing tools are the kanban set, it delegates fleet
+work to the platform persona over a card, and it relays the worker's report. Same prompt, two
+agents reading it: `obtainability-remediation-proposal` is 12 of 12 on the first, where the
+Planning Agent inlines a manifest, and was 0 of 3 on the second, where the persona followed its own
+rule and opened a pull request (the rule has since been scoped, in `agents/platform/SOUL.md` §3: a
+request to investigate or report is answered in the reply, and a pull request is opened only when
+the request asks for one or for a change to be submitted or fixed; the unattended case is
+`fleet-audit`'s own path); the first run's 94.4% against 77.8% is withdrawn as a like-for-like
+comparison. The lane now runs the bridge's `api` executor, the default a customer install runs,
+so the turn is the API server's and the agent that answers is the Planning Agent, the one the api
+transport reaches. The delegation wait reads the cards the turn filed from the Planning Agent's
+session store rather than from the trajectory (Completion signals), so a case whose answer is a
+delegated worker's report is graded on that report, as on the api lane. Two differences from the
+api lane remain, and both are the transport's rather than the agent's. A router-scope
+`tool_called` reads the Planning Agent's calls through the door's trace, which carries no worker's
+calls. And the GitHub-write safeguard dates a
+write rather than signing it, and keeps by-design writes apart by running requesting cases one at a
+time. The delegation wait holds a case until the cards it filed are terminal, so a pull request
+the card's worker opens lands in its own case's window. What the wait does not follow is a
+worker's own fan-out, the child cards a worker files, nor a card still running when the case
+reaches the delegation ceiling or when the wait falls back; a write from one of those can land in
+the next unit's window and charge the next unit for it. Attributing each write to its case is
+[#2611](https://github.com/gke-labs/kube-agents/issues/2611)'s fix. Until it lands, read a block
+on a requesting case's later repetitions as transport when the earlier case fanned out or ended
+at the ceiling. Parity in
+[#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on
+`api` being acceptable per case and stable across the on-demand runs, not the api lane's numbers.
+Two things follow for the lane. A case that grades the delegation
 composition rather than the executor's answer gets a persona-aware check or leaves the lane
 through the exclusion list with its reason. And the lane carries a safeguard of its own, applied
 by the CI flag's script to every case it runs (`hack/eval/inject-lane-safeguards.yaml`, a
 none-wrapped `github_writes` at catastrophic severity over the leased project's GitOps
-repository), because the persona can open a pull request where the cluster safeguards see
-nothing, and the first run left several on the pool repository that no case had asked for. The
+repository), because the platform persona can open a pull request where the cluster safeguards
+see nothing (in the turn under `cli`, from a card the Planning Agent files under `api`), and the
+first run left several on the pool repository that no case had asked for. The
 lane moves to the session agent's front door when the delegation primitive lands, and the
 classification says which cases regain their delegation checks then.
 
@@ -560,23 +586,41 @@ ended and the card was filed, not that the work is done.
 
 Stage 1 handles that in three parts. The transport awaits the terminal of a named task id,
 "await the terminal of task X" rather than "await the task I submitted", for everything the
-executor does itself, which is most cases and removes the store reads and the collecting turn. For a terminal whose result
-names card ids, the case runner waits for the cards one hop further in, with the time cost above
+executor does itself, which is most cases and removes the store reads and the collecting turn. For a turn that
+filed cards, the case runner waits for the cards one hop further in, with the time cost above
 moved with it. Today's wait cannot be re-entered as it is: it is a method of the api transport
 that re-posts `/v1/responses`, takes card ids from `kanban_create` tool results and statuses from
 the kanban store or from `kanban_show` payloads in the trajectory, and gives up after three status
 turns that report nothing, and
 on this path the trajectory holds no tool results (the door's trace carries calls without their
-results), so no card id can be read from it. Stage 1
-writes the wait again for the inject path: card ids and statuses read from the `result` text, the
-status question sent as a new turn on the same conversation key with its own backend message
-id, `<run>/<case>/<rep>/status-<n>`, so the dedupe does not answer it with the opening task,
-the delivered card results appended to the graded answer as
-today's wait appends them, so `ledger_issue_contains` and `report_contains` see what the worker
-returned, and the worker logs read by those ids for `worker_commands`. It
+results), so no card id can be read from it. The reply text does not carry one either: the
+Planning Agent's acknowledgement names no task id (`agents/chat/SOUL.md`). Stage 1 writes the wait
+again for the inject path and reads the cards from the pod
+([#2619](https://github.com/gke-labs/kube-agents/issues/2619)). The door's read route reports the
+conversation's A2A `contextId`, and under the bridge's `api` executor the turn ran in the Hermes
+session `a2a-<contextId>` (`apiSessionID` in `a2a/hermes-bridge/api.go`). The case runner reads
+that session's `kanban_create` tool results from the platform agent's `state.db`, or, when the
+store kept none, the `kanban_notify_subs` rows addressed to the session, through the same
+`kubectl exec` the board read uses. It caps the cards at the harness's one cap, pending first,
+and polls `kanban.db` for their statuses until every card is terminal or the delegation timeout
+passes; a card the board has no row for on three reads in a row is dropped from the wait with a
+line on the record's errors, and nothing is graded for it. Then it reads `tasks.result` and the
+newest `task_runs.summary` of the cards the board shows terminal. No status turn is sent, because
+none could carry a result back through the door. Only a terminal card reaches the settle step,
+shaped as a `kanban_show` result, so the delivered card results are appended to the graded answer
+as today's wait appends them, `ledger_issue_contains` and `report_contains` see what the worker
+returned, and the worker logs are read by those ids for `worker_commands`. A card still running at
+the ceiling delivers nothing: whatever text it carries (an earlier run's summary, a stashed
+result) is not its answer, so the repetition is recorded at the ceiling and the card is only
+archived and purged. A door that reports no `contextId`, a session the store does not hold (the
+`cli` executor), or a first read of the store that fails three times running, before any card is
+found, falls back to the status-turn wait. That wait takes its card ids from the trajectory, which
+holds none on this path, so it settles at once on the reply and sends no status turn; the last of
+the three cases also puts a line on the record's errors. Once the wait has found the cards and is
+polling, three failed reads in a row end it differently: the repetition is classed as
+infrastructure, the awaited cards' state is purged, and nothing is graded. It
 lives in the case runner and not in the transport, so it can be deleted without touching the
-transport. Reading card ids out of `result` text is interim: a structured artifact for them is
-a bridge change outside this document, and the text read is the first thing child tasks delete.
+transport, and it is the first thing child tasks delete.
 When child tasks exist, the parent's events name the child's task id, the same await code awaits
 it, and the wait goes.
 
@@ -584,8 +628,9 @@ it, and the wait goes.
 
 `EVAL_MODE_NEXT=1` in `hack/ci-deploy.sh` flips the presubmit's eval install to `next` after the
 today-mode install has passed its own readiness and connectivity checks. It records the agent
-Deployment's generation, merge-patches the CR (the mode, and the `maxSessions` sized for the
-sidecar to come), and waits for the generation to move before
+Deployment's generation, sets the mode through the chart's `platformAgent.mode` in a `helm
+upgrade --reuse-values` of its own release (with the `maxSessions` sized for the bridge's
+workers, so the first render sees both), and waits for the generation to move before
 asking any workload for status, because the flip is a rollout and a status read before it lands
 describes the old pods. It then gates, in order, on the NATS StatefulSet, the callout Deployment,
 the provisioning Job reaching `complete` (the Job depends on the callout; before the operator
@@ -593,17 +638,14 @@ ordered its creation after a serving callout replica it was measured at 19.5 min
 conditions, so its bound is generous), and the agent Deployment. Then
 the door and the executor. The deploy arms the gateway's inject door on the operator under the
 same flag (`A2A_INJECT_BACKEND=true` through the chart's `operator.extraEnv`, beside the A2A
-image overrides) and waits for the door's Service and token Secret; it then declares the bridge
-sidecar on the CR through `spec.deployment.sidecars` (the executor paragraph in stage 1 says
-what the sidecar carries), waits for the agent Deployment to roll once more and for the
-provisioning Job's re-run (the sidecar's `BRIDGE_CONCURRENCY` is an input to the `TASKS`
-budget, so the patch re-renders the Job; the mode patch carried the `maxSessions` that makes
-that run fit, and a refusal now fails the deploy on the CR's `Degraded` phase rather than
-being read past; the one `Degraded` it waits out, for up to five minutes, is a pod waiting
-for CPU or memory while Autopilot adds a node, in practice the rolled agent pod, #2414; when
-the pod is the agent's, it reads that pod as it waits (or, once that pod is gone or finished, the agent's live pods) and
-hands off to the agent Deployment's rollout gate once the pod is bound to a node, because the operator watches no Pods and the CR keeps the scheduler's
-message until its next pass), and ends on the
+image overrides) and waits for the door's Service and token Secret. The bridge is the
+operator's: it renders it with the image and `BRIDGE_CONCURRENCY` the deploy sets on it the same
+way (`A2A_BRIDGE_IMAGE`, `A2A_BRIDGE_CONCURRENCY`) and the bridge's default `api` executor, and
+the TASKS budget counts its workers from the first `next` render, so the mode change is the only
+change and the one provisioning Job is already sized for the bridge. The bridge enters the agent
+pod only once the bus is provisioned (the CR's `BusProvisioned` condition), so the agent
+Deployment rolls twice, once for the mode change and once after the Job for the bridge, and the
+step gates both rolls. The step ends on the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
 bridge leaves a bus on which nobody answers. It reports the A2A gateway's state and last log
 lines and does not gate on it: the door gives the gateway the backend it lacked, so it now
@@ -633,6 +675,20 @@ fan-out the script lists in the job log what the run left on that repository, cl
 With the flag unset both scripts are byte for byte what
 they were, and the presubmit's own tests hold that.
 
+Under the flag the run also checks the rollback path once the suite verdict is computed and
+before the final line announces it: `hack/rollback-roundtrip.sh` flips the install to `today`
+and back to `next`, with any CR-declared `spec.deployment.sidecars` unset before the first flip
+and declared again after the second (the lane declares none: the bridge the operator renders
+leaves and returns with the mode), and asserts that the JetStream PVC and the bus creds Secret keep their
+UIDs, that the agent answers a turn under `today`, and that a task completes over the bus
+afterwards. It is reported, not gated: its own section of the log and two artifacts
+(`rollback-roundtrip.log`, `rollback-roundtrip.txt`), no case in the matrix, and no effect
+on the job's exit status. It is skipped when the job is too old for its one-hour bound to end
+inside the job's deadline, counted from its Prow `BUILD_ID` or, when that gives no start, from
+the eval script's own start plus an allowance for the deploy in front of it. The eval's gateway
+log and pod diagnostics are collected before it starts, because the flip replaces the pods
+they come from.
+
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.
 The next stack still has holes independent of any case (images in a private registry, and
@@ -642,8 +698,9 @@ running it: a scheduled lane on `main` under the flag, with a record of its own,
 presubmit. The flag admits that lane by name and nothing else without a pull request: section 2b
 of the deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME`
 is one of the next lane's jobs (`EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh`, the on-demand
-presubmit and the periodic on main), and refuses it on any other Prow run, so the flag mis-set
-on the nightly or a postsubmit still stops the deploy before anything is built. The record of its
+presubmit, the periodic on main, and the full-catalog nightly that runs beside a today-mode nightly
+on the same agent model), and refuses it on any other Prow run, so the flag mis-set on the today
+nightly or a postsubmit still stops the deploy before anything is built. The record of its
 own does not exist yet: the baseline key has no mode field, so a next-mode sample appended to the
 store would be today's once written, and the dashboard has no next lane to file a run under. Until
 both exist, `hack/ci-eval-pr.sh` keeps every flagged run out of the baseline recorder and the

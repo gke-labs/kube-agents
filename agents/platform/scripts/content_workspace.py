@@ -65,9 +65,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
+import repo_ref
 import workspace_paths
+from providers import pinned_base, tls_refusal as _tls_refusal
 
 LOGGER = logging.getLogger("credential-proxy")
 
@@ -136,8 +138,15 @@ WORKSPACE_GIT_SUBCOMMANDS = frozenset(
         "clean",
         "check-ref-format",
         "symbolic-ref",
+        "ls-remote",
     }
 )
+
+# `git ls-remote --exit-code` exits 2 when the remote has no ref matching the
+# pattern, and with another non-zero code when it could not ask at all.
+LS_REMOTE_NO_MATCH_EXIT_CODE = 2
+# The fully qualified spelling of a branch, which is what `ls-remote` is asked for.
+BRANCH_REF_PREFIX = "refs/heads/"
 
 _HANDLE_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 # The same grammar unanchored, for taking handles back out of git's stderr.
@@ -205,6 +214,39 @@ class Conflict(ContentWorkspaceError):
 class GitFailed(ContentWorkspaceError):
     status = 502
     code = "workspace.git-failed"
+
+
+class TlsUntrusted(ContentWorkspaceError):
+    """git could not verify the forge's TLS certificate, or load its CA.
+
+    Its own code rather than `workspace.git-failed`: no retry fixes it, and the
+    action is an administrator's, which the message names by its cause -- a CA
+    to name in caBundleRef, a certificate to renew or reissue, or a CA
+    Secret to create or correct.
+    """
+
+    status = 502
+    code = "FORGE_TLS_UNTRUSTED"
+
+
+class BaseBranchMissing(ContentWorkspaceError):
+    """The repository's pinned base is not a branch on its remote.
+
+    409 rather than the 502 a failed `rev-parse` would reach the caller as: the
+    configuration names a branch the remote does not have, and every retry
+    gets the same answer until one of the two changes.
+    """
+
+    status = 409
+    code = "workspace.base-branch-missing"
+
+
+def _base_branch_missing(repo: str, pinned: str) -> BaseBranchMissing:
+    return BaseBranchMissing(
+        f"{repo} has no branch '{pinned}', the base branch this install is "
+        "configured with; proposals onto this repository can only target that "
+        "branch, so it has to exist on the remote first"
+    )
 
 
 def _limit(name: str, default: int) -> int:
@@ -505,7 +547,9 @@ def check_expected_sha(value: object, field: str) -> str:
     return sha
 
 
-def check_branch(name: object, base_branch: str = "") -> str:
+def check_branch(
+    name: object, base_branch: str = "", pinned: Iterable[str] = ()
+) -> str:
     """A branch name the broker is willing to *author*.
 
     `check_branch_name` first, then the protected set, so a suggestion can never
@@ -513,6 +557,11 @@ def check_branch(name: object, base_branch: str = "") -> str:
     workspace on `main` is the ordinary case and goes through
     `check_branch_name` alone — refusing to read the branch everything is cut
     from would make the feature useless, and reading is not authoring.
+
+    `pinned` is every pinned base this install configures, each protected on
+    every repository like `base_branch`. A pin is already in its one canonical
+    spelling (`credential_proxy.parse_pinned_bases`), so it is protected under
+    exactly that name rather than read again here.
     """
     branch = check_branch_name(name)
     protected = set(PROTECTED_BRANCHES)
@@ -522,12 +571,13 @@ def check_branch(name: object, base_branch: str = "") -> str:
         or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
     )
     if override:
-        norm_override = override.strip()
+        norm_override = override
         if norm_override.startswith("refs/heads/"):
             norm_override = norm_override[len("refs/heads/"):]
         elif norm_override.startswith("heads/"):
             norm_override = norm_override[len("heads/"):]
         protected.add(norm_override.casefold())
+    protected.update(configured.casefold() for configured in pinned if configured)
 
     norm_branch = branch.strip()
     if norm_branch.startswith("refs/heads/"):
@@ -622,6 +672,11 @@ GitRunner = Callable[..., object]
 # repository registration, which is the property `require_managed_workspace`
 # in the broker relies on.
 CredentialFor = Callable[[str], object]
+#: A repository on another forge, to its canonical name and the clone URL its
+#: forge composes -- or a `ContentWorkspaceError` when no forge this install
+#: serves owns it. Injected rather than imported, so this module never learns
+#: what a forge is and stays testable without one.
+Locate = Callable[[str], "tuple[str, str]"]
 
 
 class ContentWorkspaceStore:
@@ -647,6 +702,10 @@ class ContentWorkspaceStore:
         base_branch: str = "",
         credential_for: CredentialFor | None = None,
         clock: Callable[[], float] = time.monotonic,
+        locate: Locate | None = None,
+        pinned_bases: Mapping[tuple[str, str], str] | None = None,
+        tls_refusal: Callable[[str], object] | None = None,
+        github_host: Callable[[], str] | None = None,
     ) -> None:
         # Resolved, because `assert_disjoint_roots` resolves both sides and
         # `_redact` matches this value against paths git prints -- which git
@@ -669,12 +728,24 @@ class ContentWorkspaceStore:
             # the `git_hooks_dir` chmod in the executor already warns.
             LOGGER.warning("could not restrict the content workspace root %s", self.tree_root)
         self._runner = runner
+        # git's output to the FORGE_TLS_UNTRUSTED refusal it stands for, or
+        # None. The broker hands its own, which names a forge's CA Secret;
+        # without one, the shared reading names the cause alone.
+        self._tls_refusal = tls_refusal or _tls_refusal
         self.base_branch = (
             base_branch.strip()
             or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
             or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
         )
+        # (forge host, path) -> its pinned base: the default base `open` gives
+        # that repository, and a branch no workspace may author, as `base_branch`
+        # is. See `providers.pinned_base`.
+        self.pinned_bases = dict(pinned_bases or {})
         self._credential_for = credential_for
+        self._locate = locate
+        # The install's one GitHub host, asked per `open`: github.com, or a
+        # GitHub Enterprise Server host. None is github.com.
+        self._github_host = github_host
         # Monotonic, and injected so a test can drive the idle clock.
         self._clock = clock
         self._workspaces: dict[str, Workspace] = {}
@@ -710,7 +781,11 @@ class ContentWorkspaceStore:
         # serialises them, so they cannot multiply, and a wait for a slot while
         # holding the lock would stall every verb behind it -- reads that need
         # no subprocess included -- for the whole of the wait. So the timeout
-        # above really is the bound.
+        # above really is the bound. The same holds for the broker's child
+        # memory budget: the store's git takes no reservation either. This
+        # lock is what sizes the budget's fixed term for the store
+        # (`CONTENT_WORKSPACE_RESERVE_BYTES` in credential_proxy.py): one
+        # process tree at a time, so one request's worth.
         #
         # Still the right trade for a single agent Pod publishing one pull
         # request at a time, and a per-workspace lock would still need this one
@@ -877,7 +952,7 @@ class ContentWorkspaceStore:
             if isinstance(workspace_or_dir, Workspace)
             else Path(workspace_or_dir)
         )
-        # `config` is handed on only when there is something in it. The two
+        # `config` is handed on only when there is something in it. The three
         # verbs that talk to the remote are the only ones that ever have any,
         # and a runner that takes `(argv, cwd)` -- every recorded one in the
         # tests, and the executor before it learned the argument -- keeps
@@ -888,6 +963,10 @@ class ContentWorkspaceStore:
             result = self._runner(["git", *argv], cwd=cwd)
         exit_code = getattr(result, "exit_code", 1)
         if check and exit_code != 0:
+            refusal = self._tls_refusal(getattr(result, "stderr", ""))
+            if refusal is not None:
+                detail = getattr(refusal, "fields", {}).get("detail", "")
+                raise TlsUntrusted(f"`git {argv[0]}` failed: {refusal} ({self._redact(detail)})")
             raise GitFailed(
                 f"`git {argv[0]}` failed with exit code {exit_code}: "
                 f"{self._redact(getattr(result, 'stderr', ''))}"
@@ -913,9 +992,14 @@ class ContentWorkspaceStore:
         credential.ensure(repo)
         return credential
 
-    @staticmethod
-    def _remote_config(workspace: Workspace) -> tuple[tuple[str, str], ...]:
+    def _remote_config(self, workspace: Workspace) -> tuple[tuple[str, str], ...]:
         """The git config a fetch of this workspace carries.
+
+        A stored token -- a forge's long-lived credential, not a mint -- is
+        asked for again rather than reused: the repository may have been
+        unregistered since `open`, and a token presented for the handle's whole
+        lifetime would outlive the role that earned it. What the selector
+        answers now is what is presented, and nothing when it answers nothing.
 
         Made current again first rather than replayed from the clone: the
         clone-time token may have expired over the workspace's lifetime, and a
@@ -928,8 +1012,50 @@ class ContentWorkspaceStore:
         """
         if workspace.credential is None:
             return ()
+        if getattr(workspace.credential, "stored_token", False):
+            current = self._credential(workspace.repo)
+            return tuple(current.git_config(workspace.repo)) if current is not None else ()
         workspace.credential.ensure(workspace.repo)
         return tuple(workspace.credential.git_config(workspace.repo))
+
+    def _push_config(self, workspace: Workspace) -> tuple[tuple[str, str], ...]:
+        """The git config a push carries: a stored token's, and nothing else.
+
+        A GitHub repository this install manages pushes on the write credential
+        the GitHub CLI installed in the broker, exactly as it always has, and a
+        GitHub handle opened as context holds a read mint whose layer clears
+        that helper -- carrying it would leave a repository promoted to managed
+        since `open` pushing with no credential at all. Only a stored token,
+        with nothing ambient behind it, is presented on the push.
+        """
+        if not getattr(workspace.credential, "stored_token", False):
+            return ()
+        return self._remote_config(workspace)
+
+    def _where(self, repo: object) -> tuple[str, str]:
+        """`repo`'s canonical name and the URL its clone is made from.
+
+        A bare `owner/name` is GitHub's, as it has always been, and its URL is
+        composed here, on the install's GitHub host. On github.com the name
+        stays bare. On a GitHub Enterprise Server host it becomes
+        `<host>/owner/name`, the name every other forge's repository has, so
+        the pins, the managed-repository check and the credential all see the
+        host it was cloned from. Anything else is handed to `locate`, which answers for
+        the forges this install serves: the forge parses the name -- nesting,
+        allowed paths -- and composes the URL. With no `locate`, or a name no
+        served forge owns, the open is refused: the caller names a repository,
+        never a host or a URL.
+        """
+        if isinstance(repo, str) and is_bare_github_name(repo):
+            host = (self._github_host() if self._github_host else "") or repo_ref.GITHUB_CANONICAL_HOST
+            if host == repo_ref.GITHUB_CANONICAL_HOST:
+                return repo, f"https://github.com/{repo}.git"
+            return f"{host}/{repo}", f"https://{host}/{repo}.git"
+        if self._locate is not None and isinstance(repo, str) and repo.strip():
+            return self._locate(repo)
+        raise ContentWorkspaceError(
+            "repo must be owner/name, or a repository on a forge this install serves"
+        )
 
     # -- lifecycle -------------------------------------------------------
 
@@ -963,9 +1089,13 @@ class ContentWorkspaceStore:
         `branch`, because a single-branch clone cannot see whether the working
         branch exists on the remote and would answer from the base instead
         while reporting that it had looked.
+
+        With no `base` named, a repository with a pinned base opens on that
+        base rather than on the remote's default, since the base is the only
+        branch a proposal from this workspace will be accepted onto. A pinned
+        base the remote does not have is refused by name.
         """
-        if not isinstance(repo, str) or not is_owner_name(repo):
-            raise ContentWorkspaceError("repo must be owner/name")
+        repo, url = self._where(repo)
         depth = check_depth(depth)
         if depth is not None and branch is not None:
             raise ContentWorkspaceError(
@@ -982,6 +1112,18 @@ class ContentWorkspaceStore:
         # symmetric, and one day a caller will thread it somewhere unprefixed.
         if base is not None:
             base = check_branch_name(base)
+        pinned = None
+        if base is None:
+            # The pin is asked about the pair it was stored under: the forge's
+            # canonical host and that forge's reading of the path. A bare
+            # owner/name is GitHub's; any other name `_where` answered is
+            # already canonical, `<host>/<path>` on the forge that serves it.
+            pin_host, pin_path = _pin_key(repo)
+            pinned = pinned_base(self.pinned_bases, pin_host, pin_path)
+            if pinned is not None:
+                # Configuration rather than the caller's, but it reaches the
+                # same argv, so it takes the same check.
+                base = pinned = check_branch_name(pinned)
         caller = check_caller_label(caller)
         with self._lock:
             # Reclaim before counting: the entries a dead worker left are what
@@ -1018,16 +1160,18 @@ class ContentWorkspaceStore:
             handle = os.urandom(16).hex()
             tree = self.tree_root / handle
             tree.mkdir(parents=True, exist_ok=False)
-            url = f"https://github.com/{repo}.git"
             # Which credential, if any, this clone presents is decided by the
-            # broker from the repository's registered role: a read-only token
-            # for a context repository, nothing added for anything else. It is
-            # applied to this clone and to the fetch in `commit`, and to no
-            # other git this store runs -- everything else is local.
+            # broker from the repository's registered role and forge: a
+            # read-only token for a context repository, a stored token for a
+            # managed one on a forge that has no ambient helper, nothing added
+            # for anything else. It is applied to this clone, the probe before
+            # it and the fetch in `commit` and, for a stored token, to `push` --
+            # and to no other git this store runs; everything else is local.
             credential = self._credential(repo)
             remote_config = tuple(credential.git_config(repo)) if credential else ()
-            # The URL is composed here from a validated `owner/name`, never taken
-            # from the caller: a caller-supplied URL is `url.<host>.insteadOf` by
+            # The URL was composed by `_where` -- from a validated `owner/name`,
+            # or by the forge that owns the repository -- and never taken from
+            # the caller: a caller-supplied URL is `url.<host>.insteadOf` by
             # another route, and the whole point of this module is that the agent
             # does not choose where the credentials go.
             # Everything from here to the registration is undone on failure. The
@@ -1037,6 +1181,23 @@ class ContentWorkspaceStore:
             # container. Observed against a real install: a private repository with
             # no credential available left one directory per attempt.
             try:
+                # A shallow clone fetches the pinned base by name, and git fails
+                # that clone for a branch the remote lacks before the check
+                # after it can say so. A full clone would fetch the whole
+                # repository only to be thrown away. Asked first either way, so
+                # the answer is the 409 and costs one round trip.
+                if pinned is not None:
+                    probe = self._git(
+                        tree,
+                        [
+                            "ls-remote", "--exit-code", "--heads", url,
+                            f"{BRANCH_REF_PREFIX}{pinned}",
+                        ],
+                        check=False,
+                        config=remote_config,
+                    )
+                    if getattr(probe, "exit_code", 1) == LS_REMOTE_NO_MATCH_EXIT_CODE:
+                        raise _base_branch_missing(repo, pinned)
                 argv = ["clone", "--quiet"]
                 if depth is not None:
                     argv += ["--depth", str(depth), "--single-branch"]
@@ -1064,6 +1225,8 @@ class ContentWorkspaceStore:
                     caller=caller,
                 )
                 workspace.default_branch = self._default_branch(workspace)
+                if pinned is not None and not self._remote_branch_exists(workspace, pinned):
+                    raise _base_branch_missing(repo, pinned)
                 workspace.base = base or workspace.default_branch
                 workspace.base_sha = self._sha(workspace, f"origin/{workspace.base}")
                 workspace.started_from = f"origin/{workspace.base}"
@@ -1079,6 +1242,16 @@ class ContentWorkspaceStore:
                     workspace.started_from = f"origin/{branch}"
                     workspace.opened_branch = branch
                     workspace.branch_sha = self._sha(workspace, f"origin/{branch}")
+                elif depth is None and workspace.base != workspace.default_branch:
+                    # A full clone comes down on the remote's default, and
+                    # `read`, `list` and `grep` read the tree, so a base other
+                    # than the default (named, or pinned) is checked out here.
+                    # After the clone rather than as its `--branch`, so a base
+                    # the probe could not ask about still gets the 409 above.
+                    self._git(
+                        workspace,
+                        ["checkout", "--force", "-B", workspace.base, workspace.started_from],
+                    )
             except BaseException:
                 _remove_tree(tree)
                 raise
@@ -1430,7 +1603,9 @@ class ContentWorkspaceStore:
                     "this workspace was opened shallow, which makes it "
                     "read-only; reopen it without a depth to author a change"
                 )
-            branch = check_branch(branch, base_branch=self.base_branch)
+            branch = check_branch(
+                branch, base_branch=self.base_branch, pinned=self.pinned_bases.values()
+            )
             norm_branch = branch.strip()
             if norm_branch.startswith("refs/heads/"):
                 norm_branch = norm_branch[len("refs/heads/"):]
@@ -1628,7 +1803,9 @@ class ContentWorkspaceStore:
         lease then compares that value against itself.
         """
         with self._use(handle) as workspace:
-            branch = check_branch(branch, base_branch=self.base_branch)
+            branch = check_branch(
+                branch, base_branch=self.base_branch, pinned=self.pinned_bases.values()
+            )
             norm_branch = branch.strip()
             if norm_branch.startswith("refs/heads/"):
                 norm_branch = norm_branch[len("refs/heads/"):]
@@ -1667,12 +1844,24 @@ class ContentWorkspaceStore:
                 raise ContentWorkspaceError(
                     f"nothing has been committed on '{branch}' in this workspace"
                 )
+            # The clone's own credential, made current: nothing for a GitHub
+            # repository this install manages, which pushes on the write
+            # credential the GitHub CLI installed in the broker, as it always
+            # has; the forge's token helper for a repository on a forge whose
+            # credential is a stored token, since nothing ambient answers there.
             result = self._git(
                 workspace,
                 ["push", "--force-with-lease", "origin", branch],
                 check=False,
+                config=self._push_config(workspace),
             )
             if getattr(result, "exit_code", 1) != 0:
+                # Read as `_git` reads a checked failure: a certificate is
+                # answered by its cause, not as "push failed".
+                refusal = self._tls_refusal(getattr(result, "stderr", ""))
+                if refusal is not None:
+                    detail = getattr(refusal, "fields", {}).get("detail", "")
+                    raise TlsUntrusted(f"`git push` failed: {refusal} ({self._redact(detail)})")
                 stderr = (getattr(result, "stderr", "") or "").lower()
                 if "stale info" in stderr or "rejected" in stderr:
                     raise Conflict(
@@ -1700,6 +1889,26 @@ def is_owner_name(value: str) -> bool:
     if len(parts) != 2:
         return False
     return all(re.fullmatch(r"[A-Za-z0-9._-]{1,100}", part) and part not in (".", "..") for part in parts)
+
+
+def _pin_key(repo: str) -> tuple[str, str | None]:
+    """`(host, path)` for a canonical workspace name, as the pins are keyed."""
+    if is_bare_github_name(repo):
+        return repo_ref.GITHUB_CANONICAL_HOST, repo_ref.try_github_slug(repo)
+    host, _, path = repo.partition("/")
+    return host, path or None
+
+
+def is_bare_github_name(value: str) -> bool:
+    """A bare GitHub `owner/name`: `is_owner_name`, with no dot in the owner.
+
+    A GitHub owner never carries a dot and a host always does, so this is what
+    tells `github.com/acme` -- a host and one segment, which no forge serves --
+    from a slug. Read as a slug it would be cloned from
+    `https://github.com/github.com/acme.git` on the ambient credential; read as
+    a host-qualified name it goes to the forge locator, which refuses it.
+    """
+    return is_owner_name(value) and "." not in value.split("/", 1)[0]
 
 
 def _remove_tree(path: Path) -> int:

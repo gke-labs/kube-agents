@@ -29,7 +29,7 @@ SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -119,23 +119,24 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # or carries a `# shellcheck disable=SCnnnn # reason` on the line above, so widening this
 # list is how a real finding gets silenced.
 #
-# The scripts under agents/platform/skills/gke-*/ are left out. Those trees are
-# copies of google/skills that scripts/sync-upstream-skills.py deletes and
-# re-copies wholesale (AGENTS.md, Skills Guidelines), and its substitution
-# hooks rewrite SKILL.md only, so a directive or fix written into one of their
-# .sh files lasts until the next sync and the target goes red on a tree nobody
-# edited by hand. A warning in one of them is fixed upstream, not here.
+# The scripts under agents/platform/skills/gke-*/ are linted like the rest. They
+# are generated from google/skills plus a patch overlay (scripts/skill_overlay.py;
+# AGENTS.md, Skills Guidelines), so a fix, or for a false positive a
+# `# shellcheck disable=SCnnnn # reason`, is recorded as a patch and survives
+# every sync.
 SHELLCHECK_PATHSPEC := *.sh
-SHELLCHECK_SKIP_PATHSPEC := :!agents/platform/skills/gke-*
+# third_party/google-skills/ holds byte-identical copies of upstream's skills, which
+# are never edited; the generated skills in agents/platform/skills/gke-*/ carry any fix.
+SHELLCHECK_SKIP_PATHSPEC := :!third_party/google-skills/*
 SHELLCHECK_SEVERITY := warning
 SHELLCHECK_EXCLUDE := SC1090,SC1091
 
-shellcheck: ## Run shellcheck over every tracked .sh file (upstream-synced gke-* skills excepted) at warning severity.
+shellcheck: ## Run shellcheck over every tracked .sh file (the upstream copies in third_party/ excepted) at warning severity.
 	@command -v shellcheck >/dev/null 2>&1 || { \
 		echo "shellcheck needs the shellcheck binary; install the release .github/workflows/validate.yml pins (https://github.com/koalaman/shellcheck/releases) so local and CI findings match"; \
 		exit 1; \
 	}
-	@git ls-files -z '$(SHELLCHECK_PATHSPEC)' '$(SHELLCHECK_SKIP_PATHSPEC)' | xargs -0 shellcheck -x -S $(SHELLCHECK_SEVERITY) -e $(SHELLCHECK_EXCLUDE)
+	@git ls-files -z '$(SHELLCHECK_PATHSPEC)' $(foreach p,$(SHELLCHECK_SKIP_PATHSPEC),'$(p)') | xargs -0 shellcheck -x -S $(SHELLCHECK_SEVERITY) -e $(SHELLCHECK_EXCLUDE)
 
 # ruff's error-only rules: syntax errors (E9), comparisons that are always
 # wrong (F63), misplaced control flow (F7) and undefined names (F82) -- the
@@ -648,17 +649,45 @@ test-integration: ## Run just the integration seam tests; CI reaches them throug
 # error. This is the compiler for that layer.
 #
 # Not folded into docs-check: these files are runtime assets rather than
-# documents (the docs map does not inventory them), and the resolution rules are
-# not the same either -- a path here resolves against a profile home and the
-# /opt/defaults layer the entrypoint copies over it, not against the file that
-# cites them. CI runs it as its own job in validate.yml, alongside the other
-# repository-structure invariants.
+# documents, and the resolution rules are not the same either -- a path here
+# resolves against a profile home and the /opt/defaults layer the entrypoint
+# copies over it, not against the file that cites them. CI runs it as its own
+# job in validate.yml, alongside the other repository-structure invariants.
 prompt-check: ## Verify the agent's instructions cite skills and files that exist.
 	@python3 scripts/check_prompt_assets.py
 
+# Mirrored gke-* skills: an exact copy of google/skills at a pinned commit, this repository's
+# changes as patch files, and the generated skill the image ships
+# (docs/designs/upstream-skill-overlays.md). Each target wraps scripts/skill_overlay.py.
+SKILL_OVERLAY := python3 scripts/skill_overlay.py
+
+skills-sync: ## Sync one mirrored skill to google/skills (SKILL=name [REF=commit]); adopts a skill not yet mirrored.
+	@$(SKILL_OVERLAY) sync $(SKILL) $(if $(REF),--ref $(REF))
+
+skills-continue: ## Resume a skill sync that stopped on a conflict (SKILL=name).
+	@$(SKILL_OVERLAY) continue $(SKILL)
+
+skills-import: ## Start mirroring a skill this repository already ships (SKILL=name REF=commit); the shipped skill is unchanged.
+	@$(SKILL_OVERLAY) import $(SKILL) --ref $(REF)
+
+skills-refresh: ## Record edits to a mirrored skill as a patch (SKILL=name [MSG="..."] [PATCH=nnnn to fold]).
+	@$(SKILL_OVERLAY) refresh $(SKILL) $(if $(PATCH),--patch $(PATCH)) $(if $(MSG),--message "$(MSG)")
+
+skills-generate: ## Rebuild a mirrored skill from its upstream copy and overlay (SKILL=name).
+	@$(SKILL_OVERLAY) generate $(SKILL)
+
+skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, offline.
+	@$(SKILL_OVERLAY) check
+
+skills-status: ## List mirrored skills google/skills has moved past, and upstream skills not mirrored.
+	@$(SKILL_OVERLAY) status
+
+skills-verify-upstream: ## Compare each upstream copy with google/skills at its locked commit ([BASE=ref] skips when no copy or lock changed).
+	@$(SKILL_OVERLAY) verify-upstream $(if $(BASE),--changed-since $(BASE))
+
 # Documentation that mirrors a machine-readable source is generated rather than
 # hand-kept: the cron jobs, the skill catalogue and the image inventory as
-# <!-- BEGIN GENERATED --> regions, plus docs/family-roster.txt written whole.
+# <!-- BEGIN GENERATED --> regions.
 # The SOP line numbers each governance cron prompt cites are recomputed first,
 # so the cron-job-example regions below render the prompt with them current.
 docs-generate: ## Regenerate the generated doc regions and files from their sources.
@@ -666,7 +695,7 @@ docs-generate: ## Regenerate the generated doc regions and files from their sour
 	@python3 scripts/generate_docs.py
 
 # Everything CI enforces about the docs, in one command.
-docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget ## Run every documentation check CI runs.
+docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-context-budget ## Run every documentation check CI runs.
 
 docs-check-generated:
 	@python3 scripts/generate_sop_geography.py --check
@@ -677,9 +706,6 @@ docs-check-links:
 
 docs-check-terminology:
 	@./hack/check-docs-terminology.sh
-
-docs-check-map:
-	@python3 scripts/check_docs_map.py
 
 docs-check-audience: ## Fail when a published site page carries a maintainer identifier (shapes: scripts/docs_audience_denylist.txt).
 	@python3 scripts/check_docs_audience.py
@@ -706,10 +732,15 @@ iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy c
 tfvar-check: ## Run lifecycle.sh's tfvar() against a real terraform console for every variable it reads and fail on any unnormalised shape (CI runs this).
 	@./hack/check-tfvar-console.sh
 
-# The version mock_provider needs; the install floor the modules declare is
-# lower, and a binary below this reads two green suites as a parse error, so
+# The version the suites need; the install floor the modules declare is
+# lower, and a binary below this reads a green suite as a parse error, so
 # it is named up front, the way test-python names a missing import.
-TERRAFORM_TEST_MIN_VERSION := 1.7.0
+#
+# mock_provider put this at 1.7. drift-pubsub's suite raised it to 1.11, for
+# `override_during = plan`: a postcondition on a computed attribute is
+# unreachable without it, since the attribute is unknown at plan time and an
+# apply run leaves state behind that the runs after it silently reuse.
+TERRAFORM_TEST_MIN_VERSION := 1.11.0
 
 # Every module and composition that carries a tests/ directory -- the set
 # the validate job initialises -- against mocked providers, so a plan-time
@@ -722,14 +753,14 @@ TERRAFORM_TEST_MIN_VERSION := 1.7.0
 # fails and the failures are named again at the end, for the reason
 # test-python gives: a red run that hides the next suite's result costs a CI
 # round trip to discover.
-terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.7 for mock_provider).
-	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider); none on PATH" >&2; exit 1; }; \
+terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.11, see TERRAFORM_TEST_MIN_VERSION).
+	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider and override_during); none on PATH" >&2; exit 1; }; \
 	version="$$(terraform version 2>/dev/null | sed -n '1s/^Terraform v//p')"; \
 	if [ -z "$$version" ]; then \
 	  echo "terraform-test: could not read a Terraform version from \`terraform version\` (first line is not 'Terraform vX.Y.Z'); is PATH's terraform a shim or another binary?" >&2; exit 1; \
 	fi; \
 	if [ "$$(printf '%s\n' "$(TERRAFORM_TEST_MIN_VERSION)" "$$version" | sort -V | head -n1)" != "$(TERRAFORM_TEST_MIN_VERSION)" ]; then \
-	  echo "terraform-test: terraform $$version is too old; mock_provider needs >= $(TERRAFORM_TEST_MIN_VERSION) (the install floor is lower, the suites are not)" >&2; exit 1; \
+	  echo "terraform-test: terraform $$version is too old; the suites need >= $(TERRAFORM_TEST_MIN_VERSION) for mock_provider and override_during (the install floor is lower, the suites are not)" >&2; exit 1; \
 	fi; \
 	failed=""; for dir in terraform/modules/*/ terraform/examples/*/; do \
 	  if [ -d "$$dir/tests" ]; then \
@@ -744,7 +775,7 @@ terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `te
 	done; \
 	if [ -n "$$failed" ]; then echo "Failing Terraform test directories:$$failed"; exit 1; fi
 
-tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind.
+tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind; an approved apply (ARGS=-auto-approve) retries past Cloud KMS's first-enablement 403.
 	@./terraform/examples/full-install/lifecycle.sh apply $(ARGS)
 
 tf-destroy: ## Destroy terraform/examples/full-install, clearing the finalizer, backups, and deletion protection first.

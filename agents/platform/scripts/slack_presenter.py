@@ -9,7 +9,8 @@ gateway. Its callers include the gateway patches for reactions
 (``slack_ux_reactions``, which the kanban notifier also reaches), plan and
 session status (``slack_ux_status``, which reads only :func:`enabled`), moments
 (``slack_ux_moments``, which reads :func:`enabled` and lays out through
-``slack_moments``), incident triage (``slack_ux_incident``), button clicks
+``slack_moments``), incident triage (``slack_ux_incident``), a finished card's
+answer (``slack_ux_answer``, through :func:`split_lead`), button clicks
 (``slack_ux_clicks``), failure replies (``slack_ux_failure``, which bolds
 with ``_first_sentence`` and adds its offer with :func:`blocks_answer`) and
 the harness-message patch (``slack_boilerplate``, which reads only :func:`enabled`);
@@ -21,13 +22,14 @@ Every caller reaches it through ``PYTHONPATH=/opt/defaults/scripts``, which the
 operator sets on the agent container.
 
 Everything a caller changes on screen is gated on :func:`enabled`, the
-``KAGE_SLACK_UX`` environment variable, off by default. With it off, callers
+``KAGE_SLACK_UX`` environment variable, on by default. With it off, callers
 take their upstream path unchanged; this module only answers questions.
 
 Layout: :func:`split_answer` takes the headline off an agent's markdown
-answer; link buttons, none for a url :func:`_safe_link_url` refuses, and choice
-buttons, whose value the caller sets, are built by ``_button`` and wrapped into
-rows by ``_actions``; :func:`fallback_text`
+answer, and :func:`split_lead` the same first sentence as written; link
+buttons, none for a url :func:`_safe_link_url` refuses, and choice buttons,
+whose value the caller sets, are built by ``_button`` and wrapped into rows by
+``_actions``; :func:`fallback_text`
 is the headline, links and choices as plain mrkdwn, for the message's ``text``
 field, with any report rows led by their severity as inline code (a bullet when
 they have none).
@@ -46,8 +48,8 @@ can draw, so the dividers stand in for a border. :func:`names_gap` and
 
 Reactions (:func:`arrival_reaction`, :func:`settle_reaction`): the first
 reaction says what kind of ask arrived, chosen by keyword before any model
-call; a second joins it when the work settles. The first is never removed; the
-credential proxy refuses every Slack method ending in ``remove``.
+call, and comes off when the answer posts. ⏸️ stands while the work waits on
+the user, and ❌ marks work that failed; work that succeeded is left with none.
 """
 
 from __future__ import annotations
@@ -60,7 +62,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlsplit
 
-#: The flag, and the values that turn it on. Anything else (unset included) is off.
+#: The flag, and the values that keep it on once it is set. Unset is on; any
+#: other value (``false``, ``0``, empty) turns it off.
 FLAG_ENV = "KAGE_SLACK_UX"
 FLAG_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 
@@ -68,19 +71,23 @@ FLAG_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 
 #: Slack emoji names (``reactions.add`` takes the name, not the glyph).
 REACTION_QUESTION = "eyes"  # 👀
+REACTION_INVESTIGATE = "mag"  # 🔍
+REACTION_FLEET = "globe_with_meridians"  # 🌐
+REACTION_UPGRADE = "arrow_up"  # ⬆️
+REACTION_COST = "moneybag"  # 💰
+REACTION_SECURITY = "shield"  # 🛡️
 REACTION_CHANGE = "hammer_and_wrench"  # 🛠️
 REACTION_BOARD = "clipboard"  # 📋
 REACTION_INCIDENT = "rotating_light"  # 🚨
-REACTION_DONE = "white_check_mark"  # ✅
 REACTION_BLOCKED = "double_vertical_bar"  # ⏸️
 REACTION_FAILED = "x"  # ❌
 
-#: How work can settle, as the callers name it.
+#: How work can settle, as the callers name it, and the reaction each leaves.
+#: Done leaves none: the answer in the thread says it.
 SETTLE_DONE = "done"
 SETTLE_BLOCKED = "blocked"
 SETTLE_FAILED = "failed"
 SETTLE_REACTIONS = {
-    SETTLE_DONE: REACTION_DONE,
     SETTLE_BLOCKED: REACTION_BLOCKED,
     SETTLE_FAILED: REACTION_FAILED,
 }
@@ -103,17 +110,38 @@ SETTLE_BY_KANBAN_KIND = {
 #: a blocked card is answered and runs on to done.
 PROVISIONAL_SETTLES = frozenset({SETTLE_BLOCKED})
 
-#: Keyword classes, tried in this order; the first match wins. A change request
-#: outranks everything because it is the ask with consequences. A question
-#: outranks the incident words, so "is checkout crashlooping?" is 👀 (a check),
-#: while "checkout is down" is 🚨.
+#: Keyword classes, tried in this order; the first match wins (see
+#: :func:`arrival_reaction`). A change request outranks everything because it
+#: is the ask with consequences. A question outranks the incident words, so
+#: "is checkout crashlooping?" is 🔍 (a check), while "checkout is down" is 🚨.
 CHANGE_WORDS = re.compile(
     r"\bfix(es|ing)?\b"
     r"|\bbump\b"
     r"|\broll(ing)?[\s-]*back\b|\brollback\b"
     r"|\bopen\s+(a\s+|the\s+|an\s+)?(pr|pull\s+request)\b"
-    r"|\bscale\b"
-    r"|\bupgrade\b",
+    r"|\bscale\b",
+    re.IGNORECASE,
+)
+UPGRADE_WORDS = re.compile(
+    r"\bupgrad(e|es|ed|ing)\b|\bversions?\b|\brelease\s+channels?\b|\boutdated\b|\bout\s+of\s+date\b",
+    re.IGNORECASE,
+)
+COST_WORDS = re.compile(
+    r"\bcosts?\b|\bcosting\b|\bspend(s|ing)?\b|\bbill(s|ing)?\b|\bbudgets?\b|\bpric(e|es|ing)\b",
+    re.IGNORECASE,
+)
+SECURITY_WORDS = re.compile(
+    r"\bsecurity\b|\baudit(s|ing)?\b|\bcves?\b|\bvulnerab|\brbac\b|\biam\b|\bpermissions?\b|\bexposed\b",
+    re.IGNORECASE,
+)
+FLEET_WORDS = re.compile(
+    r"\b(all|every|which|each)\s+(of\s+(the|my|our)\s+)?(my\s+|our\s+|the\s+)?clusters?\b"
+    r"|\bacross\s+(the\s+|my\s+|our\s+)?(fleet|clusters)\b|\bfleet[\s-]*wide\b",
+    re.IGNORECASE,
+)
+INVESTIGATE_WORDS = re.compile(
+    r"\bwhy\b|\brestart|\berrors?\b|\bfail|\bcrash|\boom(killed|kill|ed)?\b|\bpending\b|\bslow\b"
+    r"|\bdebug|\bdiagnos|\binvestigat|\bbroken\b",
     re.IGNORECASE,
 )
 BOARD_WORDS = re.compile(
@@ -188,6 +216,10 @@ BACKTICK = "`"
 #: Characters per report row.
 ROW_TEXT_MAX = 300
 PRIMARY_STYLE = "primary"
+#: A report's fold: Slack's collapsible container, its title capped as a
+#: ``kube-agents.chat/v1`` fold title is.
+FOLD_BLOCK = "container"
+FOLD_TITLE_MAX = 40
 
 #: A code fence line; nothing between an opener and its closer is a heading, a bullet or markup.
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
@@ -262,6 +294,9 @@ SAFE_URL = re.compile(
 )
 #: A space-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
 CLIP_MIN_SHARE = 2
+#: Stands in for each character of a code span while :func:`sentence_starts` looks for sentence
+#: ends, keeping offsets: :func:`_hold_code`'s placeholder character, so it reads as that does.
+CODE_FILLER = "\x00"
 INLINE_CODE = re.compile(r"`[^`]*`")
 #: :func:`to_mrkdwn` holds a code span's place with this; :data:`CODE_PLACEHOLDER` finds it again.
 CODE_HOLD = "\x00{}\x00"
@@ -351,8 +386,9 @@ LOWER_WORD = re.compile(r"[a-z]+(?![\w-])")
 
 
 def enabled() -> bool:
-    """Whether ``KAGE_SLACK_UX`` is on in this process's environment."""
-    return os.environ.get(FLAG_ENV, "").strip().lower() in FLAG_ON_VALUES
+    """Whether ``KAGE_SLACK_UX`` is on in this process's environment: unset, or an on value."""
+    value = os.environ.get(FLAG_ENV)
+    return value is None or value.strip().lower() in FLAG_ON_VALUES
 
 
 # --- reactions -------------------------------------------------------------
@@ -366,21 +402,32 @@ def _is_question(text: str) -> bool:
 
 
 def arrival_reaction(text: str | None) -> str:
-    """The emoji name for an ask, from its words alone (no model call)."""
+    """The emoji name for an ask, from its words alone (no model call).
+
+    🛠️ a change, ⬆️ an upgrade or version, 📋 the board, 💰 cost, 🛡️ security,
+    🌐 the whole fleet, 🚨 an incident told rather than asked about, 🔍
+    something to investigate, and 👀 for anything else.
+    """
     clean = MENTION.sub(" ", text or "").strip()
-    if CHANGE_WORDS.search(clean):
-        return REACTION_CHANGE
-    if BOARD_WORDS.search(clean):
-        return REACTION_BOARD
-    if _is_question(clean):
-        return REACTION_QUESTION
-    if INCIDENT_WORDS.search(clean):
+    for words, emoji in (
+        (CHANGE_WORDS, REACTION_CHANGE),
+        (UPGRADE_WORDS, REACTION_UPGRADE),
+        (BOARD_WORDS, REACTION_BOARD),
+        (COST_WORDS, REACTION_COST),
+        (SECURITY_WORDS, REACTION_SECURITY),
+        (FLEET_WORDS, REACTION_FLEET),
+    ):
+        if words.search(clean):
+            return emoji
+    if not _is_question(clean) and INCIDENT_WORDS.search(clean):
         return REACTION_INCIDENT
+    if INVESTIGATE_WORDS.search(clean) or INCIDENT_WORDS.search(clean):
+        return REACTION_INVESTIGATE
     return REACTION_QUESTION
 
 
 def settle_reaction(outcome: str) -> str | None:
-    """The emoji name for ``done``/``blocked``/``failed``; None for anything else."""
+    """The emoji name for ``blocked``/``failed``; None for ``done`` or anything else."""
     return SETTLE_REACTIONS.get(outcome)
 
 
@@ -617,14 +664,42 @@ def _link_url(url: str) -> str:
     return url.replace("&", "&amp;").translate(MRKDWN_URL_ESCAPES)
 
 
+def _closes_own_run(stem: str, closer: str) -> bool:
+    """Whether ``closer``, the emphasis markers after ``stem``'s stop, closes a run ``stem`` opened."""
+    if closer in BOLD_EDGES:
+        return stem.count(closer) % 2 == 1
+    if closer in ITALIC_EDGES:
+        return stem.replace(closer * 2, "").count(closer) % 2 == 1
+    return False
+
+
+def _ends_sentence(line: str, match: re.Match) -> bool:
+    """Whether ``match``, a :data:`SENTENCE_END` in ``line``, ends a sentence rather than an abbreviation."""
+    sentence = line[: match.start()]
+    stem = sentence.rstrip("*_")
+    tail = max(0, len(stem) - ABBREVIATION_TAIL)
+    numbered = NUMBER_ABBREVIATION_END.search(stem, tail) and NUMBER_NEXT.match(line, match.end())
+    # An emphasis run this sentence opened and closes right after the stop ends it, whatever
+    # word it ends on.
+    return _closes_own_run(stem, sentence[len(stem) :]) or not (numbered or ABBREVIATION_END.search(stem, tail))
+
+
+def sentence_starts(line: str) -> list[int]:
+    """The offsets in ``line`` where a sentence after the first starts, by :func:`_first_sentence`'s rules.
+
+    A stop inside a code span ends nothing, and neither does one after an abbreviation.
+    """
+    masked = line
+    for start, end, _opener in _code_spans(line):
+        masked = masked[:start] + CODE_FILLER * (end - start) + masked[end:]
+    return [match.end() for match in SENTENCE_END.finditer(masked) if _ends_sentence(masked, match)]
+
+
 def _first_sentence(line: str) -> tuple[str, str]:
     """``(first sentence, the rest)`` of ``line``, not cut after an abbreviation."""
     for match in SENTENCE_END.finditer(line):
-        sentence = line[: match.start()]
-        stem = sentence.rstrip("*_")
-        tail = max(0, len(stem) - ABBREVIATION_TAIL)
-        numbered = NUMBER_ABBREVIATION_END.search(stem, tail) and NUMBER_NEXT.match(line, match.end())
-        if not (numbered or ABBREVIATION_END.search(stem, tail)):
+        if _ends_sentence(line, match):
+            sentence = line[: match.start()]
             rest = line[match.end() :].strip()
             # "**One. Two.**" splits inside the bold, which would leave both halves unpaired.
             for marker, (opener, closer) in BOLD_EDGES.items():
@@ -648,6 +723,12 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
     gives ``("", [])``, and an answer that opens with a code fence has no
     headline: ``("", paragraphs)``.
     """
+    lead, body = split_lead(markdown)
+    return (_clip(_plain(lead), HEADLINE_MAX) if lead else ""), body
+
+
+def split_lead(markdown: str) -> tuple[str, list[str]]:
+    """:func:`split_answer` with the first sentence as it was written: markdown, unclipped."""
     paragraphs = _paragraphs((markdown or "").replace("\x00", ""))
     if not paragraphs:
         return "", []
@@ -668,10 +749,9 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
     # A period inside a code span does not end the sentence.
     held, spans = _hold_code(LIST_MARKER.sub("", joined))
     sentence, remainder = (_restore_code(part, spans) for part in _first_sentence(held))
-    headline = _clip(_plain(sentence), HEADLINE_MAX)
     tail = "\n".join(part for part in (remainder, more_lines.strip("\n")) if part)
     body = ([tail] if tail.strip() else []) + rest
-    return headline, body
+    return sentence, body
 
 
 # --- blocks ----------------------------------------------------------------
@@ -993,8 +1073,14 @@ def blocks_report(
     action_id_prefix: str = "kage",
     detail: str = "",
     after_rows: str = "",
+    fold_title: str = "",
+    fold_rows: Sequence[Any] = (),
 ) -> list[dict]:
     """Block Kit for a report: headline, the top rows between dividers, buttons.
+
+    ``fold_rows``, laid out like ``rows``, go in a collapsed container titled
+    ``fold_title`` under the lines after the rows, above the buttons; with none
+    there is no fold.
 
     ``headline`` is bold and ``note`` follows it plain, both one line;
     ``detail``, when given, is one more plain line under them, clipped like a
@@ -1031,6 +1117,15 @@ def blocks_report(
     if after_lines:
         blocks.append({"type": "rich_text", "elements": [
             {"type": "rich_text_section", "elements": [{"type": "text", "text": line}]} for line in after_lines]})
+    folded = _shown(fold_rows)
+    if folded:
+        blocks.append({
+            "type": FOLD_BLOCK,
+            "title": {"type": "plain_text", "text": _clip(_plain(fold_title), FOLD_TITLE_MAX)},
+            "is_collapsible": True,
+            "default_collapsed": True,
+            "child_blocks": [{"type": "rich_text", "elements": [_rich_row(row) for row in folded]}],
+        })
     choice_buttons = [
         _button(label, f"{action_id_prefix}.{CHOICE_ACTION}.{i}", value=label)
         for i, label in enumerate(_choice_labels(choices))

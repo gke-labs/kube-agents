@@ -1,22 +1,27 @@
 """Tests for hack/boskos_heartbeat.sh against a fake Boskos /update endpoint.
 
-Behavioural, not timing-based: every assertion waits for a condition with a
-generous deadline instead of demanding N beats in T seconds, so a loaded or
-slow machine cannot fail a healthy daemon. What is pinned: beats carry the
-right identity and keep coming; stdout stays quiet while the detail log
-records; a 401 is reported once per transition and does not stop the loop,
-and the stop summary then carries one WARNING naming the lost lease; beats
-resume after a hang; missing env disables the daemon with one line; a
-caller that dies without its EXIT trap (SIGKILL) takes the daemon with it
-at the next beat, so it never holds the job's log pipe open.
+Behavioural, not timing-based: every assertion on the running daemon waits
+for a condition with a generous deadline instead of demanding N beats in T
+seconds, so a loaded or slow machine cannot fail a healthy daemon. What is
+pinned: beats carry the right identity and keep coming; stdout stays quiet
+while the detail log records; a 401 is reported once per transition and does
+not stop the loop, and the stop summary then carries one WARNING naming the
+lost lease; beats resume after a hang; missing env disables the daemon with
+one line; a caller that dies without its EXIT trap (SIGKILL) takes the daemon
+with it at the next beat, so it never holds the job's log pipe open; detail
+lines carry a well-formed UTC stamp. One check is static: the script holds no
+command substitution, because bash 5.2 can run the TERM trap from inside the
+parser (the script's header says how).
 """
 
 import os
+import re
 import signal
 import subprocess
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -38,6 +43,23 @@ PRODUCTION_EXPIRY_SECONDS = 5 * 60
 LEASE_OWNER = "pull-kube-agents-smoke-test"
 LEASE_NAME = "kube-agents-evals-4"
 LEASE_STATE = "busy"
+# A command or process substitution, which bash re-parses at expansion time
+# (see test_no_command_substitution_while_the_trap_is_armed). `$((` is
+# arithmetic and does not re-enter the parser, so it is allowed -- but only
+# when the same line closes it with `))`: bash reads a `$((` that does not,
+# as in `$((cd "$d" && ls) 2>&1)`, as a command substitution holding a
+# subshell.
+SUBSTITUTION_RE = re.compile(r"\$\((?!\()|`|<\(|>\(")
+UNCLOSED_ARITHMETIC_RE = re.compile(r"\$\(\((?!.*\)\))")
+# One beat in the detail log; curl's stderr shares the file, so only lines
+# that carry a status are held to it.
+DETAIL_LINE_RE = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) (ok|fail) http=\d{3}")
+DETAIL_STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# A POSIX TZ rule, UTC+14 (the sign is inverted in that syntax), so the test
+# needs no tzdata: a stamp written in local time but labelled Z is 14h off.
+FAR_FROM_UTC_TZ = "XYZ-14"
+# Slack between the daemon writing a stamp and the test reading the clock.
+STAMP_TOLERANCE_SECONDS = 300
 
 
 def wait_until(condition, deadline=WAIT_DEADLINE_SECONDS):
@@ -143,6 +165,12 @@ class BoskosHeartbeatTest(unittest.TestCase):
             proc.kill()
             return proc.communicate()[0]
 
+    def _logged_beats(self):
+        """Detail-log lines that record a beat; curl's stderr shares the file."""
+        if not self.beat_log.exists():
+            return []
+        return [ln for ln in self.beat_log.read_text().splitlines() if " http=" in ln]
+
     def _await_beats(self, n):
         count = wait_until(lambda: len(_FakeBoskos.updates) >= n)
         self.assertGreaterEqual(
@@ -169,6 +197,23 @@ class BoskosHeartbeatTest(unittest.TestCase):
         detail = wait_until(lambda: self.beat_log.read_text().splitlines())
         self.assertGreaterEqual(len(detail), 3)
         self.assertTrue(any(" ok http=200" in ln for ln in detail), detail)
+
+    def test_detail_log_stamps_are_utc(self):
+        proc = self._spawn(TZ=FAR_FROM_UTC_TZ)
+        # Wait on the log itself, not the server's count: the daemon appends
+        # a line only after curl returns, and a SIGTERM in between stops it
+        # before the line lands.
+        wait_until(lambda: len(self._logged_beats()) >= 2)
+        self._stop(proc)
+        beat_lines = self._logged_beats()
+        self.assertGreaterEqual(len(beat_lines), 2, beat_lines)
+        now = datetime.now(timezone.utc)
+        for line in beat_lines:
+            match = DETAIL_LINE_RE.fullmatch(line)
+            self.assertIsNotNone(match, f"malformed detail line: {line!r}")
+            stamped = datetime.strptime(match.group(1), DETAIL_STAMP_FORMAT).replace(tzinfo=timezone.utc)
+            self.assertLess(abs((now - stamped).total_seconds()), STAMP_TOLERANCE_SECONDS,
+                            f"stamp is not UTC: {line!r}")
 
     def test_owner_mismatch_logs_one_transition_and_loop_survives(self):
         _FakeBoskos.owner = "someone-else"  # every beat now 401s
@@ -212,9 +257,17 @@ class BoskosHeartbeatTest(unittest.TestCase):
         # on its own, because it holds the job's stdout pipe and Prow's
         # entrypoint waits on that pipe until the decoration timeout.
         pid_file = Path(self.tmp.name) / "daemon.pid"
+        # The caller dies only once two beats are on record (bounded at the
+        # wait_until ceiling, 600 polls of 50ms): the daemon stops itself at
+        # its first beat after the caller is gone, so a caller on a fixed
+        # timer leaves _await_beats(2) unsatisfiable on a machine slow enough
+        # to land a single beat in that time.
         caller = (
             f'bash "{HEARTBEAT_SCRIPT}" & echo $! >"{pid_file}"; disown; '
-            "sleep 1; kill -9 $$"
+            "for _ in $(seq 600); do "
+            f'[ -f "{self.beat_log}" ] && [ "$(wc -l <"{self.beat_log}")" -ge 2 ] && break; '
+            "sleep 0.05; done; "
+            "kill -9 $$"
         )
         proc = self._spawn_caller(caller)
         self._await_beats(2)
@@ -235,6 +288,24 @@ class BoskosHeartbeatTest(unittest.TestCase):
         daemon_pid = int(pid_file.read_text().strip())
         self.assertTrue(wait_until(lambda: _has_exited(daemon_pid)),
                         "the daemon is still running after its caller died")
+
+    def test_no_command_substitution_while_the_trap_is_armed(self):
+        # bash 5.2 runs a pending trap from inside the parser when a signal
+        # lands while it re-parses a $(...) or <(...) for expansion; the
+        # script's header has the failure and the versions. The window is
+        # microseconds per beat, so no behavioural test reaches it on purpose
+        # and the construct is kept out of the script instead. Only full-line
+        # comments are skipped: a trailing comment is not told apart from a
+        # quoted "#", so it stays subject to the check.
+        offenders = []
+        lines = HEARTBEAT_SCRIPT.read_text(encoding="utf-8").splitlines()
+        for number, line in enumerate(lines, 1):
+            if line.lstrip().startswith("#"):
+                continue
+            if SUBSTITUTION_RE.search(line) or UNCLOSED_ARITHMETIC_RE.search(line):
+                offenders.append(f"{number}: {line.strip()}")
+        self.assertEqual(offenders, [], "command substitution under an armed trap:\n"
+                         + "\n".join(offenders))
 
     def test_disabled_without_boskos_env(self):
         proc = self._spawn(BOSKOS_HOST="")

@@ -37,6 +37,10 @@ if [ "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" = "true" ]; then
     echo -e "[ ] 2. Direct DM Link to Bot on Google Chat:"
     echo -e "       ${C_WHITE}https://chat.google.com/dm/${PROJECT_NUMBER}${C_RESET}"
     echo -e "       Type: ${C_WHITE}\"Hi Platform Agent\"${C_RESET}"
+    if [ -z "${GOOGLE_CHAT_HOME_CHANNEL:-}" ]; then
+      echo -e "       With no home channel configured, the install's first chat message makes its space the home channel for scheduled reports."
+      echo -e "       To use a team space instead, send the first message there, or run ${C_WHITE}/sethome${C_RESET} there afterwards."
+    fi
     echo -e ""
   else
     print_warning "PROJECT_NUMBER is unavailable; open the configured app from Google Chat instead of using a generated DM link."

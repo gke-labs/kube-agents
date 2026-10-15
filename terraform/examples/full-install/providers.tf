@@ -32,9 +32,13 @@ provider "google" {
   project = var.project_id
 }
 
-# The chat-pubsub module's service-identity resources (Workspace Add-ons and
-# the Chat API) require the google-beta provider; it inherits this default
-# configuration.
+# Several modules' service-identity resources require the google-beta
+# provider; each inherits this default configuration. chat-pubsub (Workspace
+# Add-ons and the Chat API), gke-cluster (the GKE service agent, minted so it
+# can be granted on the etcd CMEK key, whenever the cluster is created with
+# enable_database_encryption) and drift-pubsub (the Logging agent, which has
+# to exist before the sink's publish grant can name it) all use one, so gating
+# any single module does not make this block removable.
 provider "google-beta" {
   project = var.project_id
 }

@@ -401,8 +401,25 @@ def is_agent_pull_request(pr: PullRequest, repo: str, viewer: str) -> bool:
     return (
         normalise_login(pr.author) == normalise_login(viewer)
         and pr.head_ref.startswith(AGENT_BRANCH_PREFIX)
-        and pr.head_repo.lower() == repo.lower()
+        and pr.head_repo.lower() == repository_path(repo).lower()
     )
+
+
+def repository_path(repo: str) -> str:
+    """``repo`` without its host: what a forge reports as a proposal's `head_repo`.
+
+    The forge names the repository a proposal came from by its path on that
+    forge (`acme/toolkit`, `group/sub/project`), never with a host, while the
+    managed list spells a repository on another forge, and now and then a
+    GitHub one, as `host/path`. Comparing the two as written would make every
+    such repository's proposals "not ours". The rule is
+    `gitops_workspace.split_host`'s, restated because this module imports none
+    of that one: a hostname followed by at least two more segments.
+    """
+    first, _, rest = str(repo).partition("/")
+    if "/" in rest and "." in first:
+        return rest
+    return str(repo)
 
 
 @contextmanager

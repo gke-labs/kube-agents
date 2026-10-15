@@ -814,7 +814,10 @@ echo '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"ran
 }
 
 // TestLifecycle_RejectedNoTextParts: a submission with no text parts is
-// refused before any harness spawn - terminal rejected.
+// refused before any harness spawn - terminal rejected, with the reason
+// token the bridge writes for the same refusal (`no-text-parts`). The token
+// is the first word after `reason: `, which is all the gateway's terminal
+// log line and the eval harness keep, so a prose reason would log as `no`.
 func TestLifecycle_RejectedNoTextParts(t *testing.T) {
 	url := startServer(t)
 	c := testClient(t, url)
@@ -830,6 +833,9 @@ func TestLifecycle_RejectedNoTextParts(t *testing.T) {
 	task := foldTask(t, c, session, taskID)
 	if task.State != lib.StateRejected || !task.Final {
 		t.Fatalf("folded %+v", task)
+	}
+	if text := terminalText(t, url, session, taskID); !strings.HasPrefix(text, "reason: no-text-parts ") {
+		t.Fatalf("terminal message %q, want the token `reason: no-text-parts` then detail", text)
 	}
 }
 

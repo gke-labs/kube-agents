@@ -174,10 +174,16 @@ def usable_records(store: dict | None) -> list[dict]:
 # nights: the store's records joined to the collector's nightly runs
 
 
-def night_id(record: dict) -> str:
+def night_id(record: dict, anchors: dict[str, str] | None = None) -> str:
     """One nightly job's records share its build; a record without one (a
-    laptop run, a name outside the layout) stands alone under its stamp."""
+    laptop run, a name outside the layout) stands alone under its stamp.
+    ``anchors`` (nightly.night_builds) puts the builds of a night split
+    across two jobs under the one build the report files that night by, so
+    the night is one night here too, and a domain's point that night pools
+    the cases of both parts."""
     build = record.get("build")
+    if isinstance(build, str) and build and anchors:
+        build = anchors.get(build, build)
     return f"build:{build}" if isinstance(build, str) and build else f"at:{record['recorded_at']}"
 
 
@@ -194,14 +200,17 @@ def night_documents(records: list[dict], data: dict) -> list[dict]:
     with the collector's start time and Spyglass link when its build is a
     nightly run on record. The page dates every night by ``at`` (the newest
     ``recorded_at`` of the night), the same stamp its points are placed by;
-    ``started`` and ``log_url`` only serve the link to the report."""
+    ``started`` and ``log_url`` only serve the link to the report. A split
+    night's records are one night, under the build the report files it by."""
     runs = nightly_runs_by_build(data)
+    anchors = nightly.night_builds(data)
     nights: dict[str, dict] = {}
     for record in records:
-        nid = night_id(record)
+        nid = night_id(record, anchors)
         night = nights.get(nid)
         if night is None:
             build = record.get("build") if isinstance(record.get("build"), str) else None
+            build = anchors.get(build, build) if build else None
             run = runs.get(build) if build else None
             started = nightly.parse_iso(run.get("started")) if run else None
             night = nights[nid] = {
@@ -274,14 +283,15 @@ def trailing_spread(points: list[dict], index: int, metric: str) -> dict | None:
     return {"low": min(means), "high": max(means), "nights": len(means)}
 
 
-def case_points(records: list[dict], older: dict[str, int] | None = None) -> list[dict]:
+def case_points(records: list[dict], older: dict[str, int] | None = None, anchors: dict[str, str] | None = None) -> list[dict]:
     """One case's records as points, oldest first, each with its trailing
     window and, per metric, its trailing spread. ``older`` is what the
-    listing left behind at each of the case's keys (``trailing_window``)."""
+    listing left behind at each of the case's keys (``trailing_window``);
+    ``anchors`` names each point's night (``night_id``)."""
     points = []
     for record in records:
         points.append({
-            "night": night_id(record),
+            "night": night_id(record, anchors),
             "at": record["recorded_at"],
             "build": record.get("build") if isinstance(record.get("build"), str) else None,
             "commit": record.get("commit") if isinstance(record.get("commit"), str) else None,
@@ -353,7 +363,8 @@ def domain_points(cases: dict[str, dict]) -> list[dict]:
     night with the range of their means (``low``, ``high``, ``cases``).
     A night mixes keys only if its cases do; the page marks the key
     changes, it does not pool across them here because a domain's cases
-    share one nightly job and therefore one key."""
+    share one nightly job and therefore one key (a night split across two
+    jobs pools both, and lists both keys under ``keys`` if they differ)."""
     by_night: dict[str, dict] = {}
     for doc in cases.values():
         for point in doc["points"]:
@@ -446,6 +457,7 @@ def trend_document(store: dict | None, data: dict) -> dict:
     in_window = lambda at: drawn_since_ms is None or (at is not None and at >= drawn_since_ms)
     records = [r for r in every if in_window(at_ms({"at": r["recorded_at"]}))]
     domain_of = nightly.domains(data)
+    anchors = nightly.night_builds(data)
     keys: dict[str, dict] = {}
     by_case: dict[str, list[dict]] = {}
     metrics: set[str] = set()
@@ -462,7 +474,7 @@ def trend_document(store: dict | None, data: dict) -> dict:
         # through the paths the writer files them under.
         left = older_paths.get(path_segment(name)) or {}
         older = {kid: left[paths[kid]] for kid in {key_id(r["key"]) for r in by_case[name]} if paths[kid] in left}
-        points = case_points(by_case[name], older)
+        points = case_points(by_case[name], older, anchors)
         drawn = [p for p in points if in_window(at_ms(p))]
         if not drawn:
             continue  # recorded in the lead-in only: outside the page's window

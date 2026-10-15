@@ -486,6 +486,9 @@
         "name": {
           "type": "string"
         },
+        "mode": {
+          "enum": [null, "", "today", "next"]
+        },
         "annotations": {
           "type": "object"
         },
@@ -578,6 +581,11 @@
                 "maxInProgress": {
                   "type": "integer"
                 },
+                "maxSessions": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10000
+                },
                 "default": {
                   "type": "object"
                 },
@@ -627,6 +635,24 @@
               "type": "array",
               "items": {
                 "type": "object"
+              }
+            },
+            "credentialProxy": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "resources": {
+                  "type": "object"
+                }
+              }
+            },
+            "agentAPIAuth": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "resources": {
+                  "type": "object"
+                }
               }
             }
           }
@@ -832,6 +858,18 @@
                         "type": "string"
                       }
                     }
+                  },
+                  "caBundleRef": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "key": {
+                        "type": "string"
+                      }
+                    }
                   }
                 }
               }
@@ -855,6 +893,14 @@
                   "role": {
                     "type": "string",
                     "enum": ["gitops", "managed", "context"]
+                  },
+                  "baseBranch": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+                    "not": {
+                      "pattern": "^heads/|^refs/heads/(refs/heads/|heads/)"
+                    }
                   }
                 }
               }

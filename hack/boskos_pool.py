@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Walk the pool's free projects through Boskos, holding each for one visit.
 
-Shared by the periodics that touch every pool project from outside any run:
-the pull-request sweep (ci_sweep_agent_pulls.py) and the fleet reconcile
-(fleet_reconcile.py). Each acquires a project out of `free` into its own hold
+Shared by the out-of-band jobs and periodics that touch every pool project
+from outside any run: the pull-request sweep (ci_sweep_agent_pulls.py),
+the compute plants sweep (ci_sweep_compute_plants.py), and the fleet reconcile
+(fleet_reconcile.py). Each acquires a project out of `free` into a hold
 state, visits it, and releases it back, so a project a run holds is never
 touched and a run arriving mid-visit waits at its own acquire. No listing
 endpoint is needed and no run's state is read.
@@ -132,6 +133,8 @@ def acquire(server, owner, hold_state, name=None):
     With `name`, that project and only that one (Boskos's /acquirebystate);
     None then means it is not free.
     """
+    if name is not None and "," in name:
+        raise BoskosError("acquire by name expects a single project name, got %r" % (name,))
     try:
         if name is None:
             resource = _call(
@@ -150,7 +153,14 @@ def acquire(server, owner, hold_state, name=None):
         if exc.code == NO_RESOURCE_CODE:
             return None
         raise
-    return (resource or {}).get("name") or None
+    ret_name = (resource or {}).get("name") or None
+    if name is not None and ret_name is not None and ret_name != name:
+        try:
+            release_settled(server, owner, ret_name, clock())
+        except (BoskosError,) + REACH_ERRORS as exc:
+            print("  %s: release of the unexpected resource failed (%s); the next run's reset returns it" % (ret_name, describe(exc)), file=sys.stderr)
+        raise BoskosError("acquire requested %r but Boskos returned %r" % (name, ret_name))
+    return ret_name
 
 
 def release(server, owner, name):
@@ -229,6 +239,12 @@ def _defer_terminations():
 
 def _hold_signals(block):
     global _HOLD_DEPTH
+    # Signal handlers are the main thread's: Python delivers signals there
+    # alone and refuses signal.signal() elsewhere. A worker thread's hold has
+    # nothing to defer, and the main thread forwards a termination to its
+    # children itself (hack/fleet_reconcile.py, _run_workers).
+    if threading.current_thread() is not threading.main_thread():
+        return
     if block:
         if _HOLD_DEPTH == 0:
             # Swapped before counted: a termination raised out of the swap
@@ -247,6 +263,7 @@ def _hold_signals(block):
     if _DEFERRED:
         signum = _DEFERRED[0]
         _DEFERRED.clear()
+        _defer_terminations()
         raise Terminated("signal %d" % signum)
 
 

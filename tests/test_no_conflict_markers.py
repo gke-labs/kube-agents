@@ -8,9 +8,9 @@ A botched rebase resolution reached INSTALL.md: the conflict markers and both
 halves of the conflict were committed, so the published install guide told a
 reader that re-runs rebuild `k8s-operator/scripts/vars.sh` and, seven lines
 below, that they load `install.env`. Nothing in the suite noticed. `make
-docs-check` passes over conflict markers — it checks generated regions, links,
-terminology, map coverage and the context budget, none of which look at the
-line. The only thing that caught it was CI's prettier job, which reformats the
+docs-check` passes over conflict markers — it checks generated regions, links
+and that a reader reaches every document, terminology, and the context budget,
+none of which look at the line. The only thing that caught it was CI's prettier job, which reformats the
 stray `=======` rather than naming it, and which does not run on `.sh`, `.py`
 or `.go` at all.
 

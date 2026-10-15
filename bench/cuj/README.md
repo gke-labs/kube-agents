@@ -28,6 +28,12 @@ criteria determine the pytest result. Backend-specific milestones report
 diagnostic progress but do not pass or fail the test. Both report the required
 proof and observed evidence.
 
+The `obtainability/` journeys (CUJ1, Day-0 cluster design; CUJ3, Day-2 batch
+window planning; CUJ4 and CUJ5, the scheduled and reactive re-checks) are designed in
+[`docs/designs/obtainability-journeys.md`](../../docs/designs/obtainability-journeys.md),
+whose Scope table also says which of their evidence-scored criteria fail against
+a stock install and why.
+
 ## Adding a journey
 
 Add a normal pytest module at:

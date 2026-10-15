@@ -112,7 +112,9 @@ checkout the credential holder runs `git` in.
 `spec.deployment.env` is applied to the credential runtime because it may
 contain credentials. A short allowlist may also be copied to the sandbox — the
 OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` alert ceilings, the
-`FEEDBACK_PROMPT_*` switch and delay, and the `KAGE_SLACK_UX` flag —
+`FEEDBACK_PROMPT_*` switch and delay, the four findings pacing limits
+(`FINDINGS_DAILY_CRITICALS`, `FINDINGS_FIRST_REPORT_CRITICALS`,
+`FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), and the `KAGE_SLACK_UX` flag —
 but only as literal values; all `valueFrom` sources are rejected. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
 grant access, or run code the image does not already ship. The list is
@@ -215,7 +217,7 @@ Envoy is the only listener for credentialed tool and chat requests. The
 credential runtime listens on a Unix socket mounted only in its own Pod, so no
 caller can bypass Envoy by reaching the runtime directly. The runtime's one TCP
 listener is the metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
-set by the operator): it serves Prometheus counters whose label values are
+set by the operator): it serves Prometheus series whose label values are
 static enums and closed vocabularies, holds no route, credential or policy,
 answers at most sixteen connections at a time and cuts each off ten seconds
 after it opened whatever the peer sends (the credentialed handler shares the
@@ -351,10 +353,11 @@ including:
 - file paths that refer to sandbox-only files;
 - background processes or commands that outlive the request;
 - commands exceeding request, output, or timeout limits; and
-- more commands at once than the broker's concurrency cap admits
-  (`CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS`, 8 by default): a request waits
-  up to 60 seconds for a slot and is then refused with `503
-CREDENTIAL_PROXY_BUSY`.
+- more commands at once than the broker admits: at most
+  `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (8 by default), and within that only as many
+  as fit the child memory budget it derives from its container's memory limit (four at
+  the operator's defaults); a request waits up to 60 seconds for admission and is then
+  refused with `503 CREDENTIAL_PROXY_BUSY`.
 
 Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.
@@ -508,13 +511,13 @@ conservative than git. The cost is a refusal the argument's position would
 otherwise excuse — a commit message that is the bare word `foreach` or `help`,
 or `git clean -x` — which is the direction this is meant to fail in.
 
-Matching the subcommand by position instead would remove that last cost, and it
-is deliberately not done. Resolving the subcommand slot means knowing which of
-git's global options take a separated value, and the list is not one this
-runtime can keep complete: `git --attr-source HEAD help -m <page>` runs the
-configured viewer while a position-aware reading of the same argument vector
-sees the subcommand as `HEAD`. Scanning every argument cannot disagree with git
-about where the subcommand is.
+For the refused subcommand tokens and flags above, the check scans every
+argument rather than only the global-option or subcommand slot so that a flag
+or subcommand token cannot slip past a parser disagreement (`--attr-source`,
+`--config-env`, and `--shallow-file` are also included in
+`_GIT_GLOBAL_WITH_VALUE` and refused outright, so `_git_plan` and
+`git_argument_violation` resolve the subcommand slot after global value options
+and enforce `ALLOWED_GIT_SUBCOMMANDS` and `_git_config_violation` on that slot).
 
 Refusals are reported as `SECURITY_POLICY_BLOCKED` with rule
 `git.argument.refused`. No shipped skill uses any of them; every skill clone,
@@ -601,10 +604,14 @@ layer and reinstating the runtime's own helper immediately after it discards a
 repository's helper while leaving authenticated push working — but that couples
 the runtime to the value `gh auth setup-git` writes, and it has not been done.
 
-The refused-subcommand list is likewise a denylist over a set that is not closed:
-git holds a command in configuration for several tools, and a future release may
-add another. Allowlisting the subcommands the product issues, and failing closed
-on the rest, is the structurally correct form and is the recommended follow-up.
+As a latent defence-in-depth layer behind `/v1/exec` (which currently refuses
+`git` at `EXEC_ROUTE_EXECUTABLES`, while broker-internal git uses
+`WORKSPACE_GIT_SUBCOMMANDS` and `VCS_GIT_SUBCOMMANDS`), `git_argument_violation`
+enforces an explicit allowlist of subcommands (`ALLOWED_GIT_SUBCOMMANDS`)
+alongside the denylist, failing closed on unknown or custom verbs if `git` is
+ever re-admitted to `/v1/exec`. Writing configuration via repository-local
+`git config` on that path is restricted to author identity keys (`user.name`,
+`user.email`), with non-query mutations to other keys refused.
 
 Reducing both is the motivation for having the runtime receive file content from
 the sandbox rather than operate inside a directory the sandbox controls. The
@@ -755,13 +762,21 @@ Consequences:
   `current-context`, a non-GKE context name, or a merged `path1:path2` list — is
   rejected with `400` rather than honored.
 - A cache miss costs one `get-credentials`, preceded by one
-  `clusters describe` to decide whether the control plane should be reached
-  over its DNS endpoint. The common paths warm the cache themselves, since
-  profile scaffolding and context switching both begin with that command. That
-  describe is memoised per cluster for a minute rather than for the life of the
-  broker: the endpoint can be opened or closed on a running cluster, and the
-  proxy is a daemon that would otherwise keep acting on the configuration it
-  first saw.
+  `clusters describe` to decide which control-plane endpoint to reach (DNS,
+  private, or gcloud's default), plus a describe of the agent's own cluster
+  when the private endpoint is a candidate. A caller's
+  own `get-credentials` that names no endpoint flag, and names its cluster
+  and location (the project may come from the broker's own), gets the same
+  decision spliced in, since its output
+  becomes the managed kubeconfig for that cluster;
+  `docs/designs/private-endpoint-selection.md` has the rule. The common paths
+  warm the cache themselves, since profile scaffolding and context switching
+  both begin with that command. The target describe is memoised per cluster
+  for a minute rather than for the life of the broker: the endpoint can be
+  opened or closed on a running cluster, and the proxy is a daemon that would
+  otherwise keep acting on the configuration it first saw. The own-cluster
+  describe is kept for the life of the broker once it has answered, because
+  the install's VPC does not move; a failed one is retried after a minute.
 - `current-context` is read with a real YAML parser, so a valid kubeconfig in
   any legal spelling is recognized, but deliberately with PyYAML's pure-Python
   `safe_load`. The C loader recurses in C and terminates the broker with
@@ -836,26 +851,53 @@ Consequences:
   the wire, because everything a request costs lives that long: a child
   process plus about six times the output cap of transient copies in the
   broker (the captured streams, their decoded text, the JSON body and its
-  encoding). The two caps together are therefore what the broker container's
-  memory limit is sized against, and they move with that limit in the
-  operator rather than through the CR. The exec and vcs routes hold a slot;
-  the vcs route reads its body, which may carry a bundle of tens of MiB, only
-  once admitted, while the exec route's body (at most 1 MiB) is read before.
-  The forge refresh (a short call to the minter), the content workspace's git
-  (serialised by the store's own lock) and the Cloud API relay (a bounded read
-  of its own) take none. A request that waits more than 60 seconds for a slot
-  is answered `503 CREDENTIAL_PROXY_BUSY`, which the sandbox CLIs print as
-  `the credential proxy is at its limit of 8 concurrent commands and this request waited 60s without reaching a free slot; retry shortly`.
-  A long-running command holds its slot for as long as it runs, and a caller
-  that stops reading its response is given up on after 60 seconds so that it
-  cannot keep one.
+  encoding).
+  The children a request spawns are charged separately: every request that runs
+  commands reserves 128 MiB for them at admission, and the sum of reservations plus
+  the output allowance of the slots in use has to fit the budget the broker derives
+  from its container's memory limit (`CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES`, a Downward
+  API `resourceFieldRef` the operator renders; the cgroup's `memory.max` when it is
+  absent or not a positive integer; no budget when neither is readable) less 192 MiB for the broker and Envoy and
+  128 MiB for the content workspace's one process tree at a time. At the operator's
+  defaults (a 2Gi limit, raised from 1Gi when the kanban slot default rose to six) that admits nine
+  requests at once, whatever executable fills them; the slot cap of eight is the upper
+  bound. The container's limit moves through the CR,
+  `spec.deployment.credentialProxy.resources`, which merges over the operator's
+  defaults per key; raising it raises the admitted count. The caps stay the
+  operator's, because a CR override of a cap would detach it from the limit. A limit under which the budget would admit fewer than two
+  requests at once (672 MiB at the 8 MiB output cap) is treated as no budget, with a
+  startup WARNING naming the limit read and that floor: GKE Autopilot without bursting
+  sets limits equal to requests, so the proxy's limit there is its memory request, and a
+  budget that serialised every command would cost more than the out-of-memory exposure
+  it prevents. The operator declares that request at 1Gi, above the floor, so that the
+  budget engages there too, admitting four; the floor remains for a CR override that
+  sets a smaller request.
+  The exec and vcs routes hold a slot and a reservation; the vcs route reads its
+  body, which may carry a bundle of tens of MiB, only once admitted, while the
+  exec route's body (at most 1 MiB) is read before.
+  The content workspace's git (serialised by the store's own lock, which is what sizes
+  the budget's fixed term) and the Cloud API relay (a bounded read of its own) take no
+  slot and no reservation; the forge refresh takes no slot and reserves only when it
+  will run its helper, which a coalesced refresh does not.
+  A request that waits more than 60 seconds for admission is answered
+  `503 CREDENTIAL_PROXY_BUSY`, naming the slot cap
+  (`the credential proxy is at its limit of 8 concurrent commands …`) or the budget
+  (`the credential proxy is at its child memory budget (… MiB in use of … MiB: … MiB reserved for children, … MiB of output allowance for … requests) …`),
+  whichever held it, or, when the request itself fits and only requests ahead of it that
+  are waiting for the budget kept it queued, the queue
+  (`the credential proxy's admission queue is held by requests waiting for its child memory budget (…) …`).
+  The queue is in arrival order, except that a forge refresh that fits the budget passes
+  requests the slot cap alone holds, since it takes no slot.
+  A long-running command holds its slot and reservation for as long as it runs,
+  and a caller that stops reading its response is given up on after 60 seconds
+  so that it cannot keep them.
 - An exec command whose caller disconnects while it runs is ended rather than
   left to run to its deadline for nobody: `SIGTERM`, then `SIGKILL` two
   seconds later, to the whole process group it started. The same two-step end
-  applies at the deadline. On both the exec and vcs routes, a caller that
-  disconnects while queued for a slot is dropped without anything being
-  started; a vcs verb's own git commands, once started, run to completion
-  unwatched. Slots go in arrival order, so the caller refused after the wait
+  applies at the deadline. On the exec, vcs and forge refresh routes, a caller
+  that disconnects while queued for admission (a slot, the child memory budget,
+  or both) is dropped without anything being started; a vcs verb's own git commands, once started, run to completion
+  unwatched. Admission goes in arrival order, so the caller refused after the wait
   is the one that waited longest. Disconnecting means the peer closed for good
   (`POLLHUP` on the broker's Unix socket); a peer that only shut its writing
   half is still answered, and a broker spoken to over TCP, where a closed peer

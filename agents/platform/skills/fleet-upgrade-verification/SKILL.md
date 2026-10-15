@@ -1,6 +1,6 @@
 ---
 name: fleet-upgrade-verification
-description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, maintenance exclusions and windows, and node-pool version skew. Scans the linked GitOps repositories' manifests for apiVersions the target removes, with each hit's replacement. Read-only against GCP, the clusters and Git, from gcloud container, kubectl get and repository reads, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
+description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, fail-closed admission webhooks in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public) with an unreachable backend, maintenance exclusions and windows, and node-pool version skew. Scans the linked GitOps repositories' manifests for apiVersions the target removes, with each hit's replacement. Read-only against GCP, the clusters and Git, from gcloud container, kubectl get and repository reads, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
 ---
 
 # Fleet upgrade verification
@@ -13,8 +13,9 @@ fleet is from a release-channel default, or whether the repositories are ready f
 version. Run the version report again during a rollout and it also says, per member, what changed
 since the previous run and which members have stopped moving (see "Track a rollout across runs").
 With `--readiness` it also says, per member, what would stop the upgrade: a PodDisruptionBudget
-that blocks every node drain, a maintenance exclusion or window, or node pools too far below the
-target (see "Check upgrade readiness"). For upgrade plans, runbooks and checklists, use the
+that blocks every node drain, a fail-closed admission webhook with an unreachable backend in the upgrade's path or able to
+refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), a maintenance exclusion or window, or node pools too far below the target
+(see "Check upgrade readiness"). For upgrade plans, runbooks and checklists, use the
 `gke-upgrades` skill; it links back here when the question is one these two scripts answer.
 
 "Version skew" here is the gap between a member's versions and the target. It is not
@@ -26,16 +27,38 @@ Neither reads versions against a target.
 
 ```bash
 ./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py \
-  [--project <project>]... [--target-version <version>] [--rollout-in-progress] \
+  <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> \
+  [--project <project>]... [--cluster <location>/<name>... | --rollout-in-progress] [--target-version <version>] \
   [--readiness [--at <RFC 3339>] [--kubeconfig-dir <dir>]] \
   --output /opt/data/scratch/fleet_versions.json
 ```
 
-- `--project` is repeatable and, when given, is the whole scope. Without it the script takes the
-  union of `GCP_PROJECT_ID`, `GKE_PROJECT_ID` and `PROJECT_ID` with `MONITORED_PROJECT_IDS`
-  (comma- or whitespace-separated) when set, or with every project visible to
-  `gcloud projects list` plus gcloud's configured project when `MONITORED_PROJECT_IDS` is unset
-  or blank.
+The path is relative to the profile home, `/opt/data/profiles/platform`; from any other working
+directory use the absolute path, `/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py`.
+
+- `--cluster` is repeatable and, when given, restricts the report to those clusters, as
+  `<location>/<name>` or a bare name and in no other form: each half is a GKE name, lowercase
+  letters, digits and hyphens, so an empty half (`/prod`, `prod/`), whitespace or an uppercase
+  letter is a usage error (exit 2), not a bare name and not a miss. Every other member of the projects is
+  skipped, reads included, and the rollout record is neither read nor written, since a narrowed
+  read would file every member it did not name as gone. A spec that matches no cluster in the
+  projects is an error line and exit 1, not an empty table, and when a project's listing failed
+  the line says so rather than claiming no match; one cluster named in both forms is one request,
+  not a hit and a miss. `--rollout-in-progress` beside `--cluster` is a usage error (exit 2): the
+  flag speaks to the rollout record, which a narrowed run does not touch. The JSON
+  names the specs under `narrowed_to`, so a reader can tell the narrowed `members[]` from the
+  fleet; the deprecation scan refuses such a file. The fleet-audit collector passes the clusters
+  it found behind, and reads back only a report marked as narrowed to that cluster.
+- `--project` is repeatable and, when given, is the whole scope; on an install with a declared scope each one must be a
+  project the `fleet_scope` tool lists and the `collector_args` must be passed beside it, or the script refuses. Otherwise `--scope-projects`, passed once as one
+  comma-separated list, is the whole scope: the install's declared scope as the platform_control `fleet_scope`
+  tool reports it. Call that tool first and paste its `collector_args`, which spells each flag once
+  (`declared: false` means the fallback that follows). `--scope-unread` sets no scope: it names the declared
+  projects the install could not read, recorded as a coverage gap, and alone it means a declared scope with
+  nothing readable, which the script reports instead of enumerating. Without `--project` or a declared scope the script
+  takes the union of `GCP_PROJECT_ID`, `GKE_PROJECT_ID` and `PROJECT_ID` with `MONITORED_PROJECT_IDS`
+  (comma- or whitespace-separated) when set, otherwise with every project visible to `gcloud projects list`
+  plus gcloud's configured project when it is unset or blank.
 - `--target-version` sets one target for every member, in the `MAJOR.MINOR.PATCH-gke.BUILD` form
   the fleet reports (`1.31.4-gke.1183000`); the `-gke.BUILD` suffix is optional and reads as build
   0 without it. Without the flag, each member is measured against its own release channel's
@@ -43,21 +66,31 @@ Neither reads versions against a target.
   location, and the target column says which baseline was used, for example
   `1.31.4-gke.1183000 channel default (REGULAR)`.
 - `--output` writes the same data as JSON: `members[]`, `errors[]`, a `summary` count per
-  status, and the `rollout` block described below.
+  status, `narrowed_to` (the `--cluster` specs of a narrowed run, `null` on a full one) and, on a
+  full run only, the `rollout` block and the per-member `progress` fields described below. A
+  `--cluster` run writes neither, since it neither reads nor compares the record; it prints a
+  note where the progress section would be.
+  The file is written whole (a temp file, then a rename) when the run finishes and never
+  before, so a reader never meets a partial document and a run that dies leaves the path as it found
+  it. `/opt/data/scratch` is shared by every card, so a run that must tell its own file from an
+  earlier one gives it a name of its own (the Delegation bullet in `AGENTS.md` adds a timestamp and the shell's PID, since a timestamp alone is second-resolution).
 - `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
   `--at` and `--kubeconfig-dir` to the readiness check, below that.
 
-The script runs `gcloud container clusters list`, `gcloud container get-server-config`,
-`gcloud projects list` and `gcloud config get-value project` (plus `gcloud projects describe` for a
+The script runs `gcloud container clusters list`, `gcloud container get-server-config` and, when neither
+`--project` nor a declared scope is passed, `gcloud config get-value project` and `gcloud projects list` (plus `gcloud projects describe` for a
 project whose `clusters list` was refused as API-disabled or whose configured identifier is a
 project number), each with a 60-second timeout, and
-with `--readiness` one `gcloud container clusters get-credentials` and one `kubectl get` per member.
+with `--readiness` one `gcloud container clusters get-credentials` and two `kubectl get` per member.
 It changes nothing in GCP or in any cluster; the only things it writes are its own record under
 `/opt/data/state/fleet-upgrade-verification/`, the per-member kubeconfig files `--readiness`
 needs, and the `--output` file. A failed or timed-out read is listed under the table and sets
 exit code 1; the other projects, locations and members are still reported. A project whose own Kubernetes
 Engine API is off holds no cluster and is not a failed read; a refusal naming another project,
-such as a quota project, is one.
+such as a quota project, is one. The weekly upgrade audit's collector also runs the script, with
+`--readiness --cluster <location>/<name>`, once per behind cluster: that run writes
+`upgrade-readiness_<project>_<location>_<name>.json` under `/opt/data/scratch/`, and a `--cluster` run
+neither reads nor writes the rollout record, so the record above is untouched by it.
 
 ## Read the table
 
@@ -89,8 +122,11 @@ the pools that do parse. A note reading `upgrade in flight` means the cluster or
 
 ## Track a rollout across runs
 
-Every run records its per-member result and compares itself with the previous run for the same
-target, so two runs during a rollout show what moved between them. The record lives at
+Every full run records its per-member result and compares itself with the previous run for the
+same target, so two runs during a rollout show what moved between them. A `--cluster` run does
+neither: it prints a note in place of the progress section, and its JSON carries no `rollout`
+block and no per-member `progress`, `unchanged_since` or `unchanged_for_seconds`. The record
+lives at
 `/opt/data/state/fleet-upgrade-verification/<target>.json` (`channel-default.json` for a run
 without `--target-version`), on the persistent volume the shell sandbox keeps between turns;
 `--state-dir` points it elsewhere. Each target has its own record, so a run against a different
@@ -133,7 +169,7 @@ from the record when its project was read cleanly (the cluster is gone), carried
 its project failed to read or was not in this run's `--project` scope, so a failed read never
 loses a record or manufactures a stall. A record the script cannot read is reported on stderr and
 replaced by a new baseline; a record it cannot write sets exit code 1 with the table still
-printed. In the JSON, each member carries `progress`, `unchanged_since` and
+printed. In a full run's JSON, each member carries `progress`, `unchanged_since` and
 `unchanged_for_seconds`, and the top-level `rollout` block has the record path, both run
 timestamps, whether the rollout counted as active and why, a count per progress value, and the
 members missing this run.
@@ -143,9 +179,12 @@ members missing this run.
 `--readiness` adds a second table after the version table, one row per member, graded against
 the same target as the member's version row, and a `readiness` object per member in the JSON
 (`members[].readiness`, with a top-level `readiness` block holding the instant evaluated and a
-count per verdict). Without the flag nothing changes. Three rules, each derived from a governance
-SOP check and named beside it; the maintenance rule departs from its SOP where the two differ,
-and says so below:
+count per verdict). Without the flag nothing changes. The rules below each name the governance
+SOP check they derive from, except the webhook rule, which has no SOP check yet; the maintenance
+rule departs from its SOP where the two differ, and says so. Run it once, from this profile, for
+every cluster the question covers; a readiness question fanned out to the Cluster Agents loses the
+maintenance read and the grading below, and a hand survey in their place reports every fail-closed
+webhook without a visible backend, GKE's own URL-backed ones included, as a blocker.
 
 - **Drain-blocking PDBs** (`obtainability_audit_sop.md` §3.4). For each member the script runs
   `gcloud container clusters get-credentials` into a kubeconfig of its own under
@@ -168,6 +207,56 @@ and says so below:
   does not include (a bare ReplicaSet, a custom controller), which is noted so it is never
   silently `ready`. DaemonSets are never matched: a drain deletes their pods rather than evicting
   them.
+- **Fail-closed webhooks**, from a second read with the same kubeconfig: `kubectl get
+validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces -A -o json`.
+  It is a read of its own so that a failure there grades only this rule `unknown` and never costs
+  the PDB result. In the agent sandbox the credential proxy cuts a list past its output cap on the
+  largest clusters; the error row names the cap, and the rule is `unknown` there. A webhook is graded when its `failurePolicy` is `Fail` (or absent, which
+  `admissionregistration.k8s.io/v1` defaults to `Fail`) and its backend is a Service the API
+  server cannot reach: the Service does not exist, no Service port equals the webhook's port (443
+  when unset), or no ready endpoint sits behind that port in the Service's EndpointSlices (an
+  endpoint without a `ready` condition counts as ready, as the API requires). Such a webhook
+  rejects every request its rules match, and what it matches decides the grade. When a rule can
+  match a write the node drain or the node join makes through the API server — `UPGRADE_PATH_TARGETS` in `scripts/upgrade_readiness.py` is the list, grouped by phase with the kubelet or controller package behind each write — the
+  member is `blocked`: the workloads it gates lose their pods on the drain and cannot get them
+  back, a budget over one of them also stalls the drain, and a gate on evictions or nodes stops
+  the drain itself. When no rule matches any of those, the webhook is still a current outage for
+  what it does match and the cell names it, but it does not grade the member; that list is what
+  the rule knows of the upgrade's path, not a proof the upgrade is unaffected, which is why the
+  cell names what the webhook does match. Rules are matched on
+  API group, API version, operation, resource (with the API's `*`, `*/*` and `pods/*` semantics)
+  and scope, as the API server matches them: a rule's `apiVersions` must carry `*` or the version
+  the server serves the write at (`v1` for every write on the list), so a rule pinned to a version
+  the server no longer serves (`policy/v1beta1`, `certificates.k8s.io/v1beta1`) matches nothing. Each
+  rule of a dead off-path webhook is then classed by what the server serves it, on the resources it
+  names and not on its operations: a rule at `*` or `v1` fails now every request the server sends it (whether the server serves an off-list resource at all is not the reader's to say, and the cell claims no more); a rule naming graded
+  resources only, at an unserved version, is sent nothing (whatever the operation; the cell then names
+  the resource, and a group-resource pair the rule spells that the server serves at no version, such as
+  `policy/pods`, is said so rather than served at `v1`); a rule at an unserved version on a resource, group or wildcard off the lists is one
+  whose served versions the reader does not know. The cell says each for the rules the webhook has: a
+  webhook whose every rule is pinned is told the server sends it no request at a served version rather
+  than that its requests fail now; otherwise the live rules are named as failing now every request the server sends them,
+  the pinned rules as sent nothing, and the unknown rules as failing only if the server still serves
+  their version, so a failure now is asserted for the live rules alone; `objectSelector` and
+  `matchConditions` are not evaluated, and `namespaceSelector`
+  is read only for the `kube-system` reach, so a webhook they narrow is otherwise reported as
+  able to match. A dead webhook off the node path is graded `blocked` all the same when its rules match a
+  bootstrap RBAC write a new master's start-up reconciles and fatals without, so the
+  control-plane upgrade cannot complete: a ClusterRole or ClusterRoleBinding write, whatever the
+  `namespaceSelector` says, because admission matches a cluster-scoped object before it reads the
+  selector (`CONTROL_PLANE_CLUSTER_WRITES` in the script); or a Role or RoleBinding write when the
+  `namespaceSelector` admits `kube-system` or `kube-public` (absent or empty admits every
+  namespace; a requirement the reader cannot evaluate counts as admitting; the two namespaces
+  are judged on the labels the read returns for them, so an exemption label an operator put on
+  them reads as admission reads it; `CONTROL_PLANE_KUBE_SYSTEM_WRITES`). Its cell names the write and, for the namespaced rows, the
+  namespaces admitted. A ConfigMap gate is
+  not on that list: the start-up ConfigMap write the Jetstack outage deadlocked on left the
+  start-up path in Kubernetes 1.17, and its successor retries. The cell names the
+  configuration, the webhook, the reason and what it matches (an outage cell lists the webhook's
+  own rules, with their `apiVersions` when a rule pins any); each JSON finding carries
+  `reason`, `upgrade_path` and `rules`, split into `blocking` and `outage`. A fail-closed webhook with a URL backend is counted in the
+  JSON (`url_backends`) and never graded, because nothing read here says whether the URL answers;
+  GKE installs two on every cluster. Fail-open webhooks are counted in the JSON (`fail_open`), and so is a fail-closed webhook with no `rules` (`no_rules`): it matches no request, so the server never calls it and a dead backend behind it fails nothing now.
 - **Maintenance** (`security_patch_orchestrator_sop.md` §3.7 and §3.8), evaluated at `--at`, an
   RFC 3339 instant, by default now. An exclusion in effect blocks when its scope covers the upgrade
   the target needs: `NO_UPGRADES` (the default when the record carries no scope) always;
@@ -205,15 +294,21 @@ error (exit 2).
 ```bash
 ./skills/fleet-upgrade-verification/scripts/api_deprecation_scan.py \
   --versions /opt/data/scratch/fleet_versions.json --target-version <version> \
-  [--repo <owner/name>]... [--manifests-dir <path>] --output /opt/data/scratch/api_deprecations.json
+  [--repo <owner/name | host/path>]... [--manifests-dir <path>] --output /opt/data/scratch/api_deprecations.json
 ```
 
 - `--versions` is the version report's `--output`. The scan's floor is its lowest control-plane
   minor: the API server is what stops serving a removed version, so node-pool versions do not
-  enter into it. `--current-version <version>` replaces the file when there is none.
+  enter into it. A file from a `--cluster` run (`narrowed_to` set) is refused: its floor is one
+  cluster's, not the fleet's; rerun the report without `--cluster`, or replace `--versions` with
+  `--current-version <version>` (the two flags together are refused before the file is read).
+  `--current-version <version>` replaces the file when there is none.
   `--target-version` defaults to the file's `target_version` when the report was run with one.
-- Without `--repo` the script scans every GitHub repository under `managed_repos`, the same
-  list the GitOps skills write to; `--repo` is repeatable and, when given, is the whole scope.
+- Without `--repo` the script scans every repository under `managed_repos`, on every forge, the
+  same list the GitOps skills write to; `--repo` is repeatable and, when given, is the whole scope.
+  A repository on another forge than GitHub is named `host/path`, as the list names it, and is read
+  through the content workspace only: on a broker not armed for content-passing it is listed under
+  errors, because the leased checkout reaches GitHub alone.
   `--manifests-dir` scans a local tree instead of, or as well as, repositories.
 - It reads each repository the way `inspect-repository` does: through the credential broker's
   content workspaces as a shallow read-only clone, or, on an install whose broker is not armed
@@ -262,7 +357,18 @@ as one that is stuck, and the elapsed time is what lets the user tell them apart
 baseline line means there is nothing to compare yet; say when to run again. When the run printed
 a readiness table, paste it too and name each `blocked` member with what blocks it as the table
 states it: the PDB by `namespace/name` with its field and workload, the exclusion by name with
-its scope and end time and that it holds back automatic upgrades only, the pool with its skew.
+its scope and end time and that it holds back automatic upgrades only, the webhook as
+`configuration/webhook` with its configuration kind, why its backend is unreachable and what it
+matches, the pool with its skew. A webhook the cell lists as matching none of the upgrade's path
+is an outage to report, not a blocker, with what it does match named so the operator can judge it.
+When the user asks for a verdict per object — does this budget, exclusion or webhook block the
+upgrade — take it from the table: an entry under `blocking` (or a blocking exclusion or pool) is
+yes, a webhook under `outage` is no, with the outage named; do not re-grade by hand. An exclusion
+in effect whose scope covers the target is `yes` whatever the aside says about automatic versus
+manual upgrades: the table graded the member `blocked` on it, and that is the verdict; the
+automatic-only qualification belongs in the prose beside the line, never in the yes/no. Name a
+webhook by its configuration, the part of the table's `configuration/webhook` cell before the
+slash; the webhook's own name may follow it after a slash, never stand in for it.
 Say what the operator has to change before the upgrade can proceed; do not change it, and do not
 propose deleting an exclusion. When the question is a target version's readiness, paste each
 repository's deprecation section too, with its source line, and state the floor and target the

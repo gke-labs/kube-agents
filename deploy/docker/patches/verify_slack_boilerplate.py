@@ -65,6 +65,8 @@ from types import SimpleNamespace
 import patchlib
 
 FLAG_ENV = "KAGE_SLACK_UX"
+#: Unset is on, so the flag-off path needs a value.
+FLAG_OFF = "false"
 ALIAS = "_kage_slack_boilerplate"
 RUNTIME = "gateway/slack_boilerplate.py"
 
@@ -687,12 +689,12 @@ def drive(module, notices: list[str], replies: list[str]) -> None:
     def source(platform):
         return SimpleNamespace(platform=SimpleNamespace(value=platform))
 
-    for flag in (None, "1"):
+    for flag in (FLAG_OFF, None, "1"):
         if flag is None:
             os.environ.pop(FLAG_ENV, None)
         else:
             os.environ[FLAG_ENV] = flag
-        on = flag is not None
+        on = flag != FLAG_OFF
         for platform in ("slack", "chat", "google_chat"):
             reworded = on and platform == "slack"
             text = module.cron_delivery_text(target(platform), REPORT, WRAPPED, extract_media)

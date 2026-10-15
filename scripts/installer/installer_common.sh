@@ -80,6 +80,10 @@ unset _gke_dns_endpoint_helper
 
 # Request timeout for kubectl probes against live clusters in the installer.
 readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
+# The GitHub token minter's Deployment, and the Secret its App ID is read from
+# (refuse_apply_dropping_live_gitops, live_github_app_id).
+readonly GITHUB_MINTER_DEPLOYMENT="github-token-minter"
+readonly GITHUB_APP_CREDENTIALS_SECRET="github-app-credentials"
 
 # ─── Scope cap ─────────────────────────────────────
 # The bounds the PlatformAgent puts on spec.scope.maxProjects (SCOPE_MAX_PROJECTS),
@@ -144,6 +148,34 @@ readonly LITELLM_DEPLOYMENT="litellm"
 readonly PLATFORM_AGENT_SHELL_STATEFULSET="platform-agent-shell"
 # shellcheck disable=SC2034
 readonly PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT="platform-agent-credential-proxy"
+# The design document a spec.mode switch points the operator at.
+readonly PLATFORM_AGENT_MODE_SWITCH_DOC="docs/designs/spec-mode-switch.md"
+# The Slack app setup page's allowlist section, which says how to find a
+# member ID; refuse_next_slack_gateway_settings points at it.
+readonly SLACK_ALLOWLIST_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users"
+# A Slack home channel the A2A gateway arms its notify route on: a public
+# (C...) or private (G...) channel id, the prefix letter then two or more of
+# A-Z0-9. This mirrors the gateway's slackIsHomeChannelID and
+# slackMinChannelIDLen (a2a/gateway/slack.go). The operator's
+# a2aSlackHomeChannel (k8s-operator platformagent_a2a_manifests.go) holds
+# the same rule. Keep the three in step (docs/README.md lists them; a test
+# checks all three agree).
+readonly SLACK_HOME_CHANNEL_ID_RE='^[CG][A-Z0-9]{2,}$'
+# What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
+# a field that is not there: a record that carries no platformAgent.mode, or a
+# CR with no spec.mode. Told apart from printing nothing, which means there is
+# no CR.
+readonly PLATFORM_AGENT_MODE_UNSET="unset"
+# How each of read_platform_agent_install_state's reads came out.
+readonly PLATFORM_AGENT_READ_OK="ok"
+readonly PLATFORM_AGENT_READ_NONE="none"
+readonly PLATFORM_AGENT_READ_FAILED="failed"
+readonly PLATFORM_AGENT_READ_NO_CONTEXT="no-context"
+# The front doors pass this to announce_platform_agent_mode_for_apply when
+# no confirmation stands between the notice and the apply (upgrade.sh's full
+# arm, the Day-2 menu's apply, install.sh -y), so the notice does not offer
+# "run again" as a way out of a run that will not wait for one.
+readonly PLATFORM_AGENT_MODE_NOTICE_UNGATED="ungated"
 # The composition's two Helm releases, by their Terraform type and name: the
 # front doors ask the state whether it manages one before deciding what a
 # cert-manager or kube-agents release already on the cluster means.
@@ -344,6 +376,451 @@ is_non_negative_integer() {
 # chart's litellm.redaction.ip.action.
 is_valid_redaction_ip_action() {
   [[ "${1:-}" =~ ^(mask|pseudonym|off)$ ]]
+}
+
+# PLATFORM_AGENT_MODE: the PlatformAgent CRD's spec.mode enum, which the
+# chart's platformAgent.mode and the composition's platform_agent_mode take too.
+is_valid_platform_agent_mode() {
+  [[ "${1:-}" =~ ^(today|next)$ ]]
+}
+
+# The PlatformAgent and its release, read once for the scope check and the
+# mode notice beside it. Each front door calls refuse_apply_over_undeclared_scope
+# and then announce_platform_agent_mode_for_apply against the same namespace,
+# with nothing applied in between, so the reads this fills are held for the
+# notice (PLATFORM_AGENT_READS_HELD_FOR) and the notice takes and clears them
+# instead of asking the cluster again. A run whose scope check did not run
+# (an install.sh --dry-run, a first install) has the notice read for itself.
+#
+# Fills, for $1 namespace:
+#   PLATFORM_AGENT_CR_READ      PLATFORM_AGENT_READ_OK, _NONE (no PlatformAgent
+#                               type served: a cluster this chart never
+#                               reached), _FAILED, or _NO_CONTEXT (the
+#                               kubeconfig has no context for this cluster:
+#                               nothing was asked)
+#   PLATFORM_AGENT_CR_JSON      the `kubectl get platformagents -o json` list
+#   PLATFORM_AGENT_RECORD_READ  _OK, _NONE (no release) or _FAILED; empty when
+#                               the CR read did not answer, or $2 is "cr-only"
+#   PLATFORM_AGENT_RECORD_JSON  the latest revision's values ({} with no release)
+#   PLATFORM_AGENT_SERVED_JSON  the last served revision's values, only when
+#                               the latest did not serve (a failed or pending
+#                               upgrade); {} otherwise
+#   PLATFORM_AGENT_SERVED_REVISION  that revision's number, else empty
+#   PLATFORM_AGENT_SERVED_READ  _FAILED when the release history, or that
+#                               revision's values, could not be read, else
+#                               empty
+#   PLATFORM_AGENT_READ_ERROR   the failed read's stderr, on one line
+# A missing type and a missing release are answers, told apart from a read
+# that failed by kubectl's and helm's exit status and their own error text,
+# never by empty output. Caller has PROJECT_ID, REGION and CLUSTER_NAME set
+# (gke_context_name).
+read_platform_agent_install_state() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" scope="${2:-}" expected_ctx err_file served_rev history_json
+  PLATFORM_AGENT_READS_HELD_FOR="$namespace"
+  PLATFORM_AGENT_CR_READ="" PLATFORM_AGENT_CR_JSON="" PLATFORM_AGENT_RECORD_READ=""
+  PLATFORM_AGENT_RECORD_JSON="{}" PLATFORM_AGENT_SERVED_JSON="{}" PLATFORM_AGENT_SERVED_READ=""
+  PLATFORM_AGENT_SERVED_REVISION=""
+  PLATFORM_AGENT_READ_ERROR=""
+  expected_ctx="$(gke_context_name)"
+  if ! kubectl config get-contexts "$expected_ctx" >/dev/null 2>&1; then
+    PLATFORM_AGENT_CR_READ="$PLATFORM_AGENT_READ_NO_CONTEXT"
+    return 0
+  fi
+  err_file="$(mktemp)"
+  # `trap - ERR` for the bash 3.2 reason write_tfvars_from_state gives: the
+  # misses classified below are ordinary answers, not aborts.
+  if ! PLATFORM_AGENT_CR_JSON="$(trap - ERR; kubectl --context "$expected_ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o json 2>"$err_file")"; then
+    if grep -qiE "$KUBECTL_NO_RESOURCE_TYPE_PATTERN" "$err_file"; then
+      PLATFORM_AGENT_CR_READ="$PLATFORM_AGENT_READ_NONE"
+    else
+      PLATFORM_AGENT_CR_READ="$PLATFORM_AGENT_READ_FAILED"
+      PLATFORM_AGENT_READ_ERROR="$(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
+    fi
+    rm -f "$err_file"
+    return 0
+  fi
+  PLATFORM_AGENT_CR_READ="$PLATFORM_AGENT_READ_OK"
+  if [ "$scope" = "cr-only" ]; then
+    rm -f "$err_file"
+    return 0
+  fi
+  if ! PLATFORM_AGENT_RECORD_JSON="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>"$err_file")"; then
+    if grep -qiE "$HELM_RELEASE_NOT_FOUND_PATTERN" "$err_file"; then
+      PLATFORM_AGENT_RECORD_READ="$PLATFORM_AGENT_READ_NONE"
+    else
+      PLATFORM_AGENT_RECORD_READ="$PLATFORM_AGENT_READ_FAILED"
+      PLATFORM_AGENT_READ_ERROR="$(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
+    fi
+    PLATFORM_AGENT_RECORD_JSON="{}"
+    rm -f "$err_file"
+    return 0
+  fi
+  PLATFORM_AGENT_RECORD_READ="$PLATFORM_AGENT_READ_OK"
+  # The last revision that served, and only when the latest did not (a
+  # failed or pending upgrade): its values are what the CR still holds, and
+  # what Helm diffs the next render against. On a healthy release the latest
+  # revision is the one record, so a hand edit that happens to restore an
+  # earlier scope is still a hand edit. A history that cannot be read, or
+  # parsed, is PLATFORM_AGENT_SERVED_READ failed: the scope check compares
+  # against the latest revision alone, but the mode notice, which picks one
+  # record, says it did not run rather than guess the latest served.
+  if ! history_json="$(trap - ERR; helm history "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>"$err_file")" \
+    || ! served_rev="$(trap - ERR; printf '%s' "$history_json" | python3 -c '
+import json, sys
+statuses = sys.argv[1].split()
+revisions = json.load(sys.stdin) or []
+latest = max(revisions, key=lambda r: r["revision"], default=None)
+served = [] if latest is None or latest.get("status") in statuses else [
+    r["revision"] for r in revisions if r.get("status") in statuses
+]
+print(max(served) if served else "")
+' "$HELM_SERVED_REVISION_STATUSES" 2>>"$err_file")"; then
+    PLATFORM_AGENT_SERVED_READ="$PLATFORM_AGENT_READ_FAILED"
+    PLATFORM_AGENT_READ_ERROR="the release history did not answer: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
+    rm -f "$err_file"
+    return 0
+  fi
+  rm -f "$err_file"
+  PLATFORM_AGENT_SERVED_REVISION="$served_rev"
+  if [ -n "$served_rev" ]; then
+    if ! PLATFORM_AGENT_SERVED_JSON="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" --revision "$served_rev" -o json 2>/dev/null)"; then
+      PLATFORM_AGENT_SERVED_JSON="{}"
+      PLATFORM_AGENT_SERVED_READ="$PLATFORM_AGENT_READ_FAILED"
+      PLATFORM_AGENT_READ_ERROR="revision ${served_rev}, the last one that served, did not answer"
+    fi
+  fi
+}
+
+# The held reads for $1 namespace when the scope check just made them, or
+# fresh ones; either way none are held afterwards, so a later call (the
+# menu's next apply) reads again.
+take_platform_agent_install_state() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}"
+  if [ -z "${PLATFORM_AGENT_READS_HELD_FOR:-}" ] || [ "$PLATFORM_AGENT_READS_HELD_FOR" != "$namespace" ]; then
+    read_platform_agent_install_state "$namespace" "${2:-}"
+  fi
+  PLATFORM_AGENT_READS_HELD_FOR=""
+}
+
+# The spec.mode of the one PlatformAgent in $1 (a `kubectl get -o json`
+# list), PLATFORM_AGENT_MODE_UNSET when it carries none, nothing when the
+# list is empty. The CR, not the record, is the mode the install runs: a mode
+# set by hand with kubectl is on the CR and in no record.
+platform_agent_mode_on_cr() {
+  printf '%s' "${1:-}" | (trap - ERR; python3 -c '
+import json, sys
+items = (json.load(sys.stdin) or {}).get("items") or []
+if items:
+    sys.stdout.write((items[0].get("spec") or {}).get("mode") or sys.argv[1])
+' "$PLATFORM_AGENT_MODE_UNSET" 2>/dev/null) || true
+}
+
+# The platformAgent.mode of $1 (a release's values as JSON),
+# PLATFORM_AGENT_MODE_UNSET when it records none.
+platform_agent_mode_in_values() {
+  printf '%s' "${1:-}" | (trap - ERR; python3 -c '
+import json, sys
+values = json.load(sys.stdin) or {}
+sys.stdout.write((values.get("platformAgent") or {}).get("mode") or sys.argv[1])
+' "$PLATFORM_AGENT_MODE_UNSET" 2>/dev/null) || true
+}
+
+# A mode as the operator reads it: an absent one is today.
+effective_platform_agent_mode() {
+  if [ "${1:-}" = "$PLATFORM_AGENT_MODE_UNSET" ]; then
+    printf '%s' "$DEFAULT_PLATFORM_AGENT_MODE"
+  else
+    printf '%s' "${1:-}"
+  fi
+}
+
+# The spec.mode the CR carries after a full apply of PLATFORM_AGENT_MODE: $1
+# the record's (the served revision's platformAgent.mode), $2 the live CR's,
+# $3 the key.
+# The composition renders "next" as mode: next and "today" as no field, and
+# Helm patches a custom resource from the difference between the served
+# render and the new one. So a render that changes the mode sets it, one
+# that drops a recorded mode removes it, and one the record already matches
+# changes nothing, leaving whatever the CR carries, a mode set by hand
+# included. The render is modelled from the key alone: a platformAgent.mode
+# in the composition's extra_helm_values is merged over it and wins, and is
+# not seen here (platform_agent_mode_extra_values_caveat says so).
+platform_agent_mode_after_apply() {
+  local record="${1:-}" live="${2:-}" key="${3:-}" rendered="$PLATFORM_AGENT_MODE_UNSET"
+  [ "$key" = "next" ] && rendered="$key"
+  if [ "$rendered" = "$record" ]; then
+    printf '%s' "$live"
+  else
+    printf '%s' "$rendered"
+  fi
+}
+
+# Said under every mode notice that names what an apply does: the
+# composition merges extra_helm_values over the document it computes from
+# PLATFORM_AGENT_MODE, so a platformAgent.mode set there decides, and the
+# installer cannot read it (it lives in a *.auto.tfvars or
+# TF_VAR_extra_helm_values, beside the tfvars the generator writes).
+platform_agent_mode_extra_values_caveat() {
+  print_info "This compares PLATFORM_AGENT_MODE in install.env with the cluster. A platformAgent.mode set through the composition's extra_helm_values wins over the key, and this check does not see it."
+}
+
+# Says what a full apply does to the install's spec.mode: $1 the record's
+# mode, $2 the live CR's, $3 what PLATFORM_AGENT_MODE resolves to now, $4
+# PLATFORM_AGENT_MODE_NOTICE_UNGATED when no confirmation follows. A
+# switch is a rollout of a different component stack, not a setting, and the
+# only trace of it in install.env is the one key someone edited, so the run
+# that applies it names it first. A key the apply cannot bring the CR to,
+# because the CR carries a mode set outside this installer, is named too.
+# Silent when either value is empty (no CR, no release: a first install),
+# and on a re-apply of the same mode. A read that failed is not empty: the
+# front-door call says so itself (announce_platform_agent_mode_for_apply).
+# Caller defines print_warning / print_info.
+announce_platform_agent_mode_switch() {
+  local record="${1:-}" live="${2:-}" key="${3:-}" route="${4:-}" from to
+  [ -n "$record" ] && [ -n "$live" ] || return 0
+  from="$(effective_platform_agent_mode "$live")"
+  to="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
+  if [ "$from" = "$to" ]; then
+    if [ "$to" != "$key" ]; then
+      print_warning "install.env sets PLATFORM_AGENT_MODE=${key}, but the PlatformAgent carries spec.mode ${to}, set outside this installer, and this apply leaves it there: the release already renders ${key}, so Helm has no change to send."
+      print_info "To switch it, patch spec.mode on the CR, or apply once with PLATFORM_AGENT_MODE=${to} and then with ${key} (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
+      platform_agent_mode_extra_values_caveat
+    fi
+    return 0
+  fi
+  print_warning "This apply switches the install from spec.mode ${from} to ${to} (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change."
+  if [ "$to" = "next" ]; then
+    print_info "The operator renders the NATS bus and the A2A gateway beside today's stack and rolls the agent onto them. Under next, Google Chat moves from the agent to the A2A gateway."
+  else
+    print_info "The operator retires the A2A stack and rolls the agent back onto today's path."
+  fi
+  if [ "$route" = "$PLATFORM_AGENT_MODE_NOTICE_UNGATED" ]; then
+    print_info "What a switch does, either way: ${PLATFORM_AGENT_MODE_SWITCH_DOC}. This run applies it without asking first: to keep spec.mode ${from}, stop it now (Ctrl-C) and set PLATFORM_AGENT_MODE=${from} in install.env. ./upgrade.sh --plan previews an apply without making it."
+  else
+    print_info "What a switch does, either way: ${PLATFORM_AGENT_MODE_SWITCH_DOC}. To keep spec.mode ${from}, set PLATFORM_AGENT_MODE=${from} in install.env and run again."
+  fi
+  platform_agent_mode_extra_values_caveat
+}
+
+# The retag modes' half: upgrade.sh --upgrade-mode=harness or operator moves
+# image tags on the release's recorded values and applies no tfvars, so the
+# CR keeps the mode it has whatever PLATFORM_AGENT_MODE says. Said when a full
+# upgrade would move it, rather than left for that upgrade to switch the
+# install without a word from this run. $1 the record's mode, $2 the live
+# CR's, $3 the key, $4 the upgrade mode. Silent when either is empty.
+note_platform_agent_mode_not_applied() {
+  local record="${1:-}" live="${2:-}" key="${3:-}" upgrade_mode="${4:-}" running full
+  [ -n "$record" ] && [ -n "$live" ] || return 0
+  running="$(effective_platform_agent_mode "$live")"
+  full="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
+  [ "$running" != "$full" ] || return 0
+  print_warning "install.env sets PLATFORM_AGENT_MODE=${key}, but this --upgrade-mode=${upgrade_mode} run re-tags the release's recorded values and leaves it at spec.mode ${running}."
+  print_info "A full upgrade applies the switch to ${full} (${PLATFORM_AGENT_MODE_SWITCH_DOC}). To stay on ${running}, set PLATFORM_AGENT_MODE=${running} in install.env."
+  platform_agent_mode_extra_values_caveat
+}
+
+# Whether Slack is consumed by the A2A gateway after this apply: the
+# operator's a2aSlackArmed (k8s-operator platformagent_a2a_manifests.go),
+# which is spec.mode next, Slack enabled and Google Chat not armed. Chat holds
+# the gateway when both are on, and Slack stays on the today path. $1 the
+# mode the apply renders, $2 SLACK_ENABLED, $3 GOOGLE_CHAT_ENABLED.
+slack_moves_to_a2a_gateway() {
+  [ "${1:-}" = "next" ] && is_truthy "${2:-}" && ! is_truthy "${3:-}"
+}
+
+# The three checks behind refuse_next_slack_gateway_settings, one per
+# setting, which the install.sh interview also uses to re-ask. Each prints
+# nothing for a setting that passes.
+#
+# The entries of a Slack allowlist ($1) that look like emails (contain @),
+# comma-joined. The list is split the way hcl_csv_list renders it.
+slack_allowlist_emails() {
+  local item emails=""
+  while IFS= read -r item; do
+    case "$item" in *@*) emails="${emails:+${emails}, }${item}" ;; esac
+  done <<< "$(csv_list_items "${1:-}")"
+  printf '%s' "$emails"
+}
+
+# A Slack home channel ($1), trimmed, when it is set and is not a channel id
+# (SLACK_HOME_CHANNEL_ID_RE).
+slack_home_channel_not_an_id() {
+  # The C locale: under a legacy collation (glibc before 2.28) the range
+  # A-Z also matches lowercase, which the gateway's rune comparison refuses.
+  local LC_ALL=C
+  local home="${1:-}"
+  home="${home#"${home%%[![:space:]]*}"}"
+  home="${home%"${home##*[![:space:]]}"}"
+  if [ -n "$home" ] && ! [[ "$home" =~ $SLACK_HOME_CHANNEL_ID_RE ]]; then
+    printf '%s' "$home"
+  fi
+}
+
+# The number of tokens a Slack bot token ($1) holds, when it is more than
+# one. The token itself is never printed.
+slack_bot_token_list_count() {
+  local item count=0
+  while IFS= read -r item; do
+    [ -n "$item" ] && count=$((count + 1))
+  done <<< "$(csv_list_items "${1:-}")"
+  if [ "$count" -gt 1 ]; then printf '%s' "$count"; fi
+}
+
+# True when a Slack bot token ($1), trimmed, still holds a separator: one
+# token with a stray comma or space, as hand-trimming a list leaves it. The
+# legacy broker drops the empty piece; the gateway takes the string whole.
+slack_bot_token_has_separator() {
+  local token="${1:-}"
+  token="${token#"${token%%[![:space:]]*}"}"
+  token="${token%"${token##*[![:space:]]}"}"
+  case "$token" in *[,[:space:]]*) return 0 ;; esac
+  return 1
+}
+
+# Three Slack settings that the today path accepts and the A2A gateway does
+# not. They are refused before the front door applies anything (#2812), and
+# only when Slack moves to the gateway (slack_moves_to_a2a_gateway). Every
+# failing setting is reported in one run. There is no email-to-ID lookup.
+#
+# - SLACK_ALLOWED_USERS is matched against member IDs (U.../W...) exactly.
+#   The installer's prompt in 0.7 and 0.8 asked for "User IDs / Emails", and
+#   an email matches nobody, so that person is refused after the switch. A
+#   list of only emails is non-empty, so it does not fall back to allow-all.
+#   The today path (Hermes) never matched an email either.
+# - SLACK_HOME_CHANNEL, when set, must be a channel id
+#   (SLACK_HOME_CHANNEL_ID_RE). With anything else, a DM (D...) or a user
+#   (U...), the gateway leaves its notify route unarmed, so proactive posts
+#   and board-card reports stop.
+# - SLACK_BOT_TOKEN must be one token. The legacy broker takes a
+#   comma-separated list for several workspaces; the gateway takes the
+#   string whole, Slack refuses it at auth.test, and the Slack backend
+#   retries on a backoff without ever connecting. One token with a stray
+#   comma or space left in it fails the same way. Only the
+#   count is printed, never the value. An empty token is skipped: it is
+#   recovered from the live Secret later, so the front doors call again
+#   after recovery.
+#
+# $1 the mode the apply renders, $2 SLACK_ENABLED, $3 GOOGLE_CHAT_ENABLED,
+# $4 the allowlist, $5 the home channel, $6 the bot token. $7 is "flags"
+# when install.sh's flags can set them too, so the remedy names each flag.
+# $8 is SCOPE_CHECK_MODE_WARN for a run that applies nothing (upgrade.sh
+# --plan, install.sh --dry-run): it warns, as the scope check does, and
+# returns 0.
+refuse_next_slack_gateway_settings() {
+  local allowlist="${4:-}" home="${5:-}" token="${6:-}" flags="${7:-}" mode="${8:-}"
+  local emails bad_home count refused=false via say=print_error lead=""
+  slack_moves_to_a2a_gateway "${1:-}" "${2:-}" "${3:-}" || return 0
+  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+    say=print_warning
+    lead="An applying run would be refused: "
+  fi
+  emails="$(slack_allowlist_emails "$allowlist")"
+  if [ -n "$emails" ]; then
+    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-allowed-users"
+    "$say" "${lead}SLACK_ALLOWED_USERS holds entries that look like emails: ${emails}. Under spec.mode next the A2A gateway matches this allowlist against Slack member IDs exactly (such as U0123ABCD), so an email matches nobody and the person it names would be locked out after this apply."
+    print_info "Find each person's member ID in Slack: open their profile, choose ⋮ (More), then Copy member ID. Replace the emails with those IDs in ${via} and run again. Slack app setup for next: ${SLACK_ALLOWLIST_DOC}"
+    refused=true
+  fi
+  bad_home="$(slack_home_channel_not_an_id "$home")"
+  if [ -n "$bad_home" ]; then
+    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-home-channel"
+    "$say" "${lead}SLACK_HOME_CHANNEL is '${bad_home}', which is not a Slack channel id (C... or G...). Under spec.mode next the A2A gateway does not arm its notify route with it, so the agent's proactive posts and every board card's report back stop."
+    print_info "Use the channel's id: in Slack, open the channel's details; the id is at the bottom of the About tab. Set it in ${via} and run again."
+    refused=true
+  fi
+  count="$(slack_bot_token_list_count "$token")"
+  if [ -n "$count" ]; then
+    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
+    "$say" "${lead}SLACK_BOT_TOKEN holds ${count} tokens, a list for several workspaces. Under spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, and Slack refuses a list, so that backend retries without end and nothing answers on Slack."
+    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on PLATFORM_AGENT_MODE=today."
+    refused=true
+  elif slack_bot_token_has_separator "$token"; then
+    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
+    "$say" "${lead}SLACK_BOT_TOKEN holds one token with a comma or space left in it. Under spec.mode next the A2A gateway's Slack backend takes the value whole, and Slack refuses it, so that backend retries without end and nothing answers on Slack."
+    print_info "Remove the comma or space from SLACK_BOT_TOKEN in ${via} and run again."
+    refused=true
+  fi
+  if $refused && [ "$mode" != "$SCOPE_CHECK_MODE_WARN" ]; then return 1; fi
+  return 0
+}
+
+# refuse_next_slack_gateway_settings on the exported keys: what install.env
+# loaded, or what install.sh exported, plus a token the tfvars generator
+# recovered from the live Secret. $1 and $2 are the other's $7 and $8.
+refuse_next_slack_gateway_settings_from_env() {
+  refuse_next_slack_gateway_settings "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" \
+    "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
+    "${SLACK_ALLOWED_USERS:-}" "${SLACK_HOME_CHANNEL:-}" "${SLACK_BOT_TOKEN:-}" "${1:-}" "${2:-}"
+}
+
+# Said when a read the notice needs failed, so the run does not go on as if
+# the notice had been weighed and found nothing to say. $1 what could not be
+# read, $2 the key, $3 namespace.
+_platform_agent_mode_unread() {
+  print_warning "The mode-switch check did not run: ${1}. This apply renders spec.mode from PLATFORM_AGENT_MODE=${2} in install.env whatever the PlatformAgent carries now, so if that differs it is a mode switch (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
+  print_info "Check before confirming: kubectl get platformagents -n ${3} --context $(gke_context_name) -o jsonpath='{.items[*].spec.mode}' (empty is today)."
+}
+
+# The front door's call, after the scope check beside it: $1 namespace, $2
+# the key, $3 PLATFORM_AGENT_MODE_NOTICE_UNGATED on a route with no
+# confirmation after the notice. Quiet where there is nothing to switch (a cluster the tfvars
+# generator found NOT_FOUND, so TFVARS_CLUSTER_EXISTS=false, which is every
+# first install: nothing is read, since a kubeconfig context left by an
+# earlier install of the same name points at an endpoint that is gone; no
+# PlatformAgent type, no CR, no release), loud where a read failed. Past that
+# guard the cluster exists, so a kubeconfig with no context for it (kubectl
+# absent, or a get-credentials that did not land on the --dry-run and
+# --generate-only routes the scope check skips) is a read that did not
+# happen, and is said with the scope check's remedy.
+announce_platform_agent_mode_for_apply() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" key="${2:-}" live record
+  if [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ]; then
+    PLATFORM_AGENT_READS_HELD_FOR=""
+    return 0
+  fi
+  take_platform_agent_install_state "$namespace"
+  case "$PLATFORM_AGENT_CR_READ" in
+    "$PLATFORM_AGENT_READ_FAILED")
+      _platform_agent_mode_unread "the PlatformAgent in namespace '${namespace}' could not be read (${PLATFORM_AGENT_READ_ERROR})" "$key" "$namespace"
+      return 0
+      ;;
+    "$PLATFORM_AGENT_READ_NO_CONTEXT")
+      _platform_agent_mode_unread "the kubeconfig has no context '$(gke_context_name)' to read the PlatformAgent through (run: gcloud container clusters get-credentials ${CLUSTER_NAME} --location ${REGION} --project ${PROJECT_ID})" "$key" "$namespace"
+      return 0
+      ;;
+    "$PLATFORM_AGENT_READ_OK") ;;
+    *) return 0 ;;
+  esac
+  live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
+  [ -n "$live" ] || return 0
+  if [ "$PLATFORM_AGENT_RECORD_READ" = "$PLATFORM_AGENT_READ_FAILED" ] || [ "$PLATFORM_AGENT_SERVED_READ" = "$PLATFORM_AGENT_READ_FAILED" ]; then
+    _platform_agent_mode_unread "the values of release '${KUBE_AGENTS_HELM_RELEASE}' in namespace '${namespace}' could not be read (${PLATFORM_AGENT_READ_ERROR})" "$key" "$namespace"
+    return 0
+  fi
+  [ "$PLATFORM_AGENT_RECORD_READ" = "$PLATFORM_AGENT_READ_OK" ] || return 0
+  if [ -n "$PLATFORM_AGENT_SERVED_REVISION" ]; then
+    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_SERVED_JSON")"
+  else
+    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
+  fi
+  announce_platform_agent_mode_switch "$record" "$live" "$key" "${3:-}"
+}
+
+# upgrade.sh's retag arms, after retag_values: $1 namespace, $2 the key, $3
+# the upgrade mode, $4 RETAG_VALUES_JSON, the values the retag re-applies and
+# so the record a later full upgrade diffs against. Only the CR is read here.
+note_platform_agent_mode_for_retag() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" live
+  read_platform_agent_install_state "$namespace" cr-only
+  PLATFORM_AGENT_READS_HELD_FOR=""
+  if [ "$PLATFORM_AGENT_CR_READ" = "$PLATFORM_AGENT_READ_FAILED" ]; then
+    print_info "Whether a full upgrade would switch spec.mode was not checked: the PlatformAgent in namespace '${namespace}' could not be read (${PLATFORM_AGENT_READ_ERROR}). This run leaves the mode where it is either way."
+    return 0
+  fi
+  [ "$PLATFORM_AGENT_CR_READ" = "$PLATFORM_AGENT_READ_OK" ] || return 0
+  live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
+  note_platform_agent_mode_not_applied "$(platform_agent_mode_in_values "${4:-}")" "$live" "${2:-}" "${3:-}"
 }
 
 # The GCP IAM role bundles the install knows how to grant. Kubernetes RBAC is
@@ -569,6 +1046,14 @@ load_install_env() {
   # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
   # accounts the next run from a clean shell deletes again.
   unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
+  # The PlatformAgent's mode too: an inherited PLATFORM_AGENT_MODE=next would
+  # switch the install's component stack for one run, and the next run from a
+  # clean shell would switch it back and retire the A2A stack.
+  unset PLATFORM_AGENT_MODE
+  # The GitOps forge keys too: an inherited GITOPS_FORGE=gitlab would render a
+  # GitLab forge, and drop the GitHub alias and minter, for one run of an
+  # install the file records as GitHub. --gitops-forge is the per-run way in.
+  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -589,10 +1074,12 @@ load_install_env() {
 # operator's comments and ordering -- exactly as it was. INSTALL_ENV_FILE must
 # be set by the caller.
 #
-# The Day-2 control panel is the only caller, and it is the one place that may
-# write here: "Save & Apply Configuration Changes" is an explicit instruction
+# The Day-2 control panel is the only caller, and the one place that may edit
+# any key here: "Save & Apply Configuration Changes" is an explicit instruction
 # to record a change, not the installer quietly overwriting an input. install.sh
-# itself only ever creates the file when there is none.
+# itself writes only as scripts/installer/README.md ("install.env") lists: the
+# file on a first install, a chat key or PLATFORM_AGENT_MODE it lacks, and the
+# GitOps keys a run applies differently.
 #
 # No `export` keyword in the output: install.env is a dotenv, loaded with
 # `set -a`. The value is still %q-quoted, so spaces and quotes survive.
@@ -853,6 +1340,8 @@ github_account_type() {
 check_github_org_is_organization() {
   local org="${1:-}"
   [ -z "$org" ] && return 0
+  # A GitLab install has no token minter, so no GitHub account to check.
+  [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "gitlab" ] && return 0
 
   if is_truthy "${SKIP_GITHUB_ORG_CHECK:-false}"; then
     print_warning "SKIP_GITHUB_ORG_CHECK=true is set; not verifying that '${org}' is an organization."
@@ -931,11 +1420,12 @@ hcl_bool() {
   if is_truthy "${1:-}"; then printf 'true'; else printf 'false'; fi
 }
 
-# Comma- or space-separated string → HCL list of strings, dropping empty
-# items. Both separators, because --custom-roles documents "space- or
-# comma-separated".
-hcl_csv_list() {
-  local csv="${1:-}" out="[" first=true item had_noglob=false
+# Comma- or space-separated string → its items, one per line, trimmed, empty
+# items dropped. Both separators, because --custom-roles documents "space- or
+# comma-separated". hcl_csv_list renders every list key through this, so a
+# check that reads a list sees the items the tfvars carry.
+csv_list_items() {
+  local csv="${1:-}" item had_noglob=false
   local IFS=$', \t\n'
   # Globbing off around the unquoted split: an entry such as *-sandbox (a
   # scope exclusion) would otherwise be replaced by whatever files match it
@@ -947,11 +1437,20 @@ hcl_csv_list() {
     item="${item#"${item%%[![:space:]]*}"}"
     item="${item%"${item##*[![:space:]]}"}"
     [ -n "$item" ] || continue
+    printf '%s\n' "$item"
+  done
+  $had_noglob || set +f
+}
+
+# Comma- or space-separated string → HCL list of strings (csv_list_items).
+hcl_csv_list() {
+  local out="[" first=true item
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
     $first || out+=", "
     out+="$(hcl_str "$item")"
     first=false
-  done
-  $had_noglob || set +f
+  done <<< "$(csv_list_items "${1:-}")"
   printf '%s]' "$out"
 }
 
@@ -1130,6 +1629,203 @@ require_scope_cluster_triples() {
   $had_noglob || set +f
 }
 
+# A GitHub App ID is the number on the App's settings page ("App ID" under
+# General), not its name or slug. The token minter builds
+# gha://<id>?kms_id=... from it and refuses anything else at startup, which
+# surfaces only as a crash-looping minter behind Helm's rollout wait (#3076),
+# so it is checked here, before anything is planned or applied. $1 the value,
+# $2 where it came from (a flag or an install.env key).
+validate_github_app_id() {
+  local value="${1:-}" source="${2:-GITHUB_APP_ID}"
+  [ -n "$value" ] || return 0
+  [[ "$value" =~ ^[0-9]+$ ]] && return 0
+  print_error "${source}: '${value}' is not a GitHub App ID. It must be the App's number, not its name or slug."
+  print_info "Find it on GitHub: the App's settings, General, \"App ID\" (a number such as 1234567). Set it and re-run."
+  return 1
+}
+
+# The GitHub App ID the live token minter runs with, or nothing. It sits in the
+# github-app-credentials Secret under app-id; the ID is not a credential (it is
+# printed on the App's public settings page), and only that key is read. $1
+# namespace.
+live_github_app_id() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" value
+  value="$( (trap - ERR; kubectl --context "$(gke_context_name)" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+    get secret "$GITHUB_APP_CREDENTIALS_SECRET" -n "$namespace" -o jsonpath='{.data.app-id}' 2>/dev/null | base64 --decode 2>/dev/null) || true)"
+  [[ "$value" =~ ^[0-9]+$ ]] && printf '%s' "$value"
+  return 0
+}
+
+# A live install whose PlatformAgent opens pull requests through the GitHub
+# token minter (spec.integration.github) but whose configuration this run
+# renders with GitOps off: the apply would destroy the minter -- its Cloud KMS
+# key and key ring, its service account and their bindings -- and the agent
+# would stop opening pull requests (#3075). The usual cause is an install whose
+# GitOps came from install.sh's flags, which earlier releases did not record
+# in install.env, so the next upgrade.sh rendered from the file alone. Run
+# after the generator (TFVARS_ENABLE_GITHUB_MINTER). Prints the exact lines to
+# append, with the live values filled in, so the fix needs no docs.
+# $1 namespace, $2 the install.env path, $3 SCOPE_CHECK_MODE_WARN for a run
+# that applies nothing (it warns and returns 0).
+refuse_apply_dropping_live_gitops() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" file="${2:-install.env}" mode="${3:-}"
+  local ctx cr_json minter="" live_repo live_org repo_name app_id say=print_error lead="Refusing to apply: "
+  local minter_stays_on="false"
+  [ "${TFVARS_ENABLE_GITHUB_MINTER:-false}" = "true" ] && minter_stays_on="true"
+  [ "${GITOPS_FORGE:-github}" = "github" ] || return 0
+  # Removing GitOps on purpose is the one case this is not.
+  is_truthy "${KUBE_AGENTS_REMOVE_GITOPS:-false}" && return 0
+  # gke_context_name needs the coordinates; every real front door has them by
+  # now, and a caller without them has no cluster to protect.
+  [ -n "${PROJECT_ID:-}" ] && [ -n "${CLUSTER_NAME:-}" ] && [ -n "${REGION:-}" ] || return 0
+  ctx="$(gke_context_name)"
+  if ! kubectl config get-contexts "$ctx" >/dev/null 2>&1; then
+    # With the minter rendered on there is nothing to destroy; the re-point
+    # notice below is best-effort.
+    [ "$minter_stays_on" = "true" ] && return 0
+    # Like an unreadable Deployment below: a preview says the check did not
+    # run; a run that applies or hands off (--generate-only, whose context
+    # comes only from the generator's best-effort fetch) is refused.
+    if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+      print_warning "The GitOps check did not run: the kubeconfig has no context '${ctx}'. An applying run refuses until it can check for a running GitHub token minter."
+      return 0
+    fi
+    print_error "Refusing to apply: the kubeconfig has no context '${ctx}', so this run cannot tell whether the apply would destroy a running GitHub token minter."
+    print_info "Fetch it (gcloud container clusters get-credentials ${CLUSTER_NAME} --location ${REGION} --project ${PROJECT_ID}) and re-run the same command."
+    return 1
+  fi
+  # The minter's own Deployment is what the apply would destroy, whichever
+  # spelling the PlatformAgent declares its repository in: the deprecated
+  # spec.integration.github alias, or spec.integration.forges/repositories
+  # (the chart renders the alias only for a plain single GitHub repository).
+  # --ignore-not-found makes absence an empty answer with exit 0, so a read
+  # that failed (a timeout, an expired token, no permission on apps/v1) is told
+  # apart from "no minter" and is not read as a pass.
+  local minter_out=""
+  if ! minter_out="$( (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+    get deployment "$GITHUB_MINTER_DEPLOYMENT" -n "$namespace" -o name --ignore-not-found 2>/dev/null) )"; then
+    [ "$minter_stays_on" = "true" ] && return 0
+    if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+      print_warning "The GitOps check did not run: the ${GITHUB_MINTER_DEPLOYMENT} Deployment in namespace '${namespace}' could not be read. An applying run refuses until it can be."
+      return 0
+    fi
+    print_error "Refusing to apply: the ${GITHUB_MINTER_DEPLOYMENT} Deployment in namespace '${namespace}' could not be read, so this run cannot tell whether the apply would destroy a running GitHub token minter."
+    print_info "Fix the read (kubectl get deployment ${GITHUB_MINTER_DEPLOYMENT} -n ${namespace} --context ${ctx}) and re-run the same command."
+    return 1
+  fi
+  [ -z "$minter_out" ] || minter="present"
+  cr_json="$( (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o json 2>/dev/null) || true)"
+  # "<org> <owner/repo or repo>" of the GitOps repository, from either spelling.
+  IFS=$'\t' read -r live_org live_repo <<<"$(printf '%s' "$cr_json" | (trap - ERR; python3 -c '
+import json, sys
+try:
+    items = (json.load(sys.stdin) or {}).get("items") or []
+except ValueError:
+    items = []
+integ = ((items[0].get("spec") or {}).get("integration") or {}) if items else {}
+gh = integ.get("github") or {}
+repo, org = gh.get("gitRepo") or "", gh.get("org") or ""
+ns = ""
+if repo.strip() in ("None", "none"):
+    # The sentinel the alias validator reads as "no repository".
+    repo = ""
+if not repo:
+    forges = {f.get("name"): f for f in integ.get("forges") or []}
+    for r in integ.get("repositories") or []:
+        forge = forges.get(r.get("forge")) or {}
+        if r.get("role") == "gitops" and (forge.get("provider") or "github") == "github":
+            repo = r.get("repository") or ""
+            # The namespace qualifies a bare name only; a path with an owner
+            # names its own (as the operator resolves it).
+            ns = r.get("namespace") or forge.get("namespace") or ""
+            break
+def path_of(ref):
+    # As the operator reads a reference (ParseRepoRef): a clone URL or an scp
+    # remote reduced to its owner/name path, surrounding slashes and a .git
+    # suffix trimmed.
+    ref = ref.strip()
+    if "://" in ref:
+        ref = ref.split("://", 1)[1].split("/", 1)[1] if "/" in ref.split("://", 1)[1] else ""
+    elif "@" in ref.split("/", 1)[0] and ":" in ref:
+        ref = ref.split(":", 1)[1]
+    ref = ref.strip("/")
+    if ref.endswith(".git"):
+        ref = ref[:-4]
+    return ref.strip("/")
+path = path_of(repo)
+parts = [p for p in path.split("/") if p]
+name = parts[-1] if parts else ""
+if len(parts) >= 2:
+    org = parts[-2]
+elif not org:
+    org = ns
+# One field each, so a value with a space in it cannot split; a value the
+# operator would refuse (anything but A-Za-z0-9_.-) is printed as unknown.
+import re
+ok = re.compile(r"^[A-Za-z0-9_.-]+$")
+print((org if ok.match(org or "") else "-") + "\t" + (name if ok.match(name or "") else "-"))
+' 2>/dev/null) || printf '%s\t%s' - -)"
+  [ "$live_org" = "-" ] && live_org=""
+  [ "$live_repo" = "-" ] && live_repo=""
+  # Only a running minter is something the apply destroys. A GitOps repository
+  # with no minter (the App ID left blank, or the minter deferred) renders the
+  # same either way, so there is nothing here to protect.
+  [ -n "$minter" ] || return 0
+  repo_name="$live_repo"
+  [ -z "$live_org" ] || [ -z "$live_repo" ] || live_repo="${live_org}/${live_repo}"
+  # The minter stays on, so nothing is destroyed; but a run that fell back to
+  # an auto-selected organisation or the default repository name would point
+  # the running minter at another repository, and record it. Said before the
+  # confirmation, so an unintended re-point is caught there.
+  if [ "$minter_stays_on" = "true" ]; then
+    if [ -n "$live_org" ] && [ -n "$repo_name" ] &&
+      { [ "${GITOPS_ORG:-}" != "$live_org" ] || [ "${GITOPS_REPO:-}" != "$repo_name" ]; }; then
+      print_warning "This run points the GitHub token minter at ${GITOPS_ORG:-}/${GITOPS_REPO:-}, but it serves ${live_repo} now. If that is not intended, set GITOPS_ORG=${live_org} and GITOPS_REPO=${repo_name} in ${file} (or pass --gitops-org/--gitops-repo) before applying."
+    fi
+    return 0
+  fi
+  app_id="$(live_github_app_id "$namespace")"
+  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+    say=print_warning
+    lead="An applying run would be refused: "
+  fi
+  # All three keys set and matching what runs: the keys are right, and the
+  # generator left the minter off because its Cloud KMS key check found no
+  # ENABLED key version (or could not list them). Say that, not "set these".
+  if [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ] &&
+    { [ -z "$live_org" ] || [ "$GITOPS_ORG" = "$live_org" ]; } &&
+    { [ -z "$repo_name" ] || [ "$GITOPS_REPO" = "$repo_name" ]; } &&
+    { [ -z "$app_id" ] || [ "$GITHUB_APP_ID" = "$app_id" ]; }; then
+    "$say" "${lead}the GitHub token minter is running, and ${file} names it correctly, but this run renders it off because the installer found no ENABLED version of its Cloud KMS key (or could not list the key's versions). The apply would destroy the minter (its Cloud KMS key, key ring and service account)."
+    print_info "Check that this identity can list the key's versions (cloudkms.cryptoKeyVersions.list on ${KMS_KEYRING:-the minter key ring}/${KMS_KEY:-its key}) and that the Cloud KMS API answers, then re-run the same command. Nothing in ${file} needs to change."
+    [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+    return 1
+  fi
+  "$say" "${lead}the PlatformAgent opens pull requests${live_repo:+ on ${live_repo}} through the GitHub token minter, but this run's GITOPS_ORG, GITOPS_REPO and GITHUB_APP_ID (from ${file}, or the installer's defaults where it sets none) do not carry it, so this run renders GitOps off. The apply would destroy the minter (its Cloud KMS key, key ring and service account) and the agent would stop opening pull requests."
+  print_info "Set these lines in ${file} (add them, or replace the ones it has), then re-run the same command:"
+  # Every key this run's value for does not match the live one: an empty key,
+  # and a default the run fell back to, alike.
+  if [ -z "$live_org" ]; then
+    [ -n "${GITOPS_ORG:-}" ] || print_info "  GITOPS_ORG=<the GitHub organization that owns the GitOps repository>"
+  elif [ "${GITOPS_ORG:-}" != "$live_org" ]; then
+    print_info "  GITOPS_ORG=${live_org}"
+  fi
+  if [ -z "$repo_name" ]; then
+    [ -n "${GITOPS_REPO:-}" ] || print_info "  GITOPS_REPO=<the GitOps repository's name>"
+  elif [ "${GITOPS_REPO:-}" != "$repo_name" ]; then
+    print_info "  GITOPS_REPO=${repo_name}"
+  fi
+  if [ -n "$app_id" ]; then
+    [ "${GITHUB_APP_ID:-}" = "$app_id" ] || print_info "  GITHUB_APP_ID=${app_id}"
+  elif [ -z "${GITHUB_APP_ID:-}" ]; then
+    print_info "  GITHUB_APP_ID=<the number under \"App ID\" on the GitHub App's General settings page>"
+  fi
+  print_info "To remove GitOps from this install on purpose, re-run with KUBE_AGENTS_REMOVE_GITOPS=true in the environment instead."
+  [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+  return 1
+}
+
 # Refuses a full apply that would replace a scope the live PlatformAgent
 # carries and nothing this install wrote accounts for.
 #
@@ -1174,57 +1870,31 @@ require_scope_cluster_triples() {
 # print_warning.
 refuse_apply_over_undeclared_scope() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" mode="${2:-$SCOPE_CHECK_MODE_REFUSE}"
-  local expected_ctx cr_json record_json err_file verdict first_line
+  local expected_ctx cr_json record_json served_json err_file verdict first_line
   expected_ctx="$(gke_context_name)"
-  if ! kubectl config get-contexts "$expected_ctx" >/dev/null 2>&1; then
-    _scope_check_failed "$mode" "the kubeconfig has no context '${expected_ctx}' to read the PlatformAgent through (run: gcloud container clusters get-credentials ${CLUSTER_NAME} --location ${REGION} --project ${PROJECT_ID})"
+  # The reads stay held for the mode notice each front door calls next
+  # (announce_platform_agent_mode_for_apply), which takes them rather than
+  # asking the cluster the same questions again.
+  read_platform_agent_install_state "$namespace"
+  case "$PLATFORM_AGENT_CR_READ" in
+    "$PLATFORM_AGENT_READ_NO_CONTEXT")
+      _scope_check_failed "$mode" "the kubeconfig has no context '${expected_ctx}' to read the PlatformAgent through (run: gcloud container clusters get-credentials ${CLUSTER_NAME} --location ${REGION} --project ${PROJECT_ID})"
+      return $?
+      ;;
+    "$PLATFORM_AGENT_READ_NONE") return 0 ;;
+    "$PLATFORM_AGENT_READ_FAILED")
+      _scope_check_failed "$mode" "the PlatformAgent in namespace '${namespace}' could not be read through context '${expected_ctx}': ${PLATFORM_AGENT_READ_ERROR}"
+      return $?
+      ;;
+  esac
+  if [ "$PLATFORM_AGENT_RECORD_READ" = "$PLATFORM_AGENT_READ_FAILED" ]; then
+    _scope_check_failed "$mode" "the values of release '${KUBE_AGENTS_HELM_RELEASE}' in namespace '${namespace}' could not be read: ${PLATFORM_AGENT_READ_ERROR}"
     return $?
   fi
+  cr_json="$PLATFORM_AGENT_CR_JSON"
+  record_json="$PLATFORM_AGENT_RECORD_JSON"
+  served_json="$PLATFORM_AGENT_SERVED_JSON"
   err_file="$(mktemp)"
-  # `trap - ERR` for the bash 3.2 reason write_tfvars_from_state gives: the
-  # misses classified below are ordinary answers, not aborts.
-  if ! cr_json="$(trap - ERR; kubectl --context "$expected_ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
-    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o json 2>"$err_file")"; then
-    if grep -qiE "$KUBECTL_NO_RESOURCE_TYPE_PATTERN" "$err_file"; then
-      rm -f "$err_file"
-      return 0
-    fi
-    _scope_check_failed "$mode" "the PlatformAgent in namespace '${namespace}' could not be read through context '${expected_ctx}': $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
-    local rc=$?
-    rm -f "$err_file"
-    return $rc
-  fi
-  local served_json="{}" served_rev=""
-  if ! record_json="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>"$err_file")"; then
-    if grep -qiE "$HELM_RELEASE_NOT_FOUND_PATTERN" "$err_file"; then
-      record_json="{}"
-    else
-      _scope_check_failed "$mode" "the values of release '${KUBE_AGENTS_HELM_RELEASE}' in namespace '${namespace}' could not be read: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
-      local rc=$?
-      rm -f "$err_file"
-      return $rc
-    fi
-  else
-    # The last revision that served, and only when the latest did not (a
-    # failed or pending upgrade): its values are what the CR still holds. On a
-    # healthy release the latest revision is the one record, so a hand edit
-    # that happens to restore an earlier scope is still a hand edit. A history
-    # that cannot be read leaves only the latest revision to compare against.
-    served_rev="$(trap - ERR; helm history "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>/dev/null \
-      | python3 -c '
-import json, sys
-statuses = sys.argv[1].split()
-revisions = json.load(sys.stdin) or []
-latest = max(revisions, key=lambda r: r["revision"], default=None)
-served = [] if latest is None or latest.get("status") in statuses else [
-    r["revision"] for r in revisions if r.get("status") in statuses
-]
-print(max(served) if served else "")
-' "$HELM_SERVED_REVISION_STATUSES" 2>/dev/null || true)"
-    if [ -n "$served_rev" ]; then
-      served_json="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" --revision "$served_rev" -o json 2>/dev/null || echo '{}')"
-    fi
-  fi
   # Normalises L, R and K to sorted lists and rules. Values arrive as argv and
   # on stdin, never interpolated into the program text. stderr goes to the
   # file, not into the verdict: an interpreter that warns at startup and exits
@@ -2953,7 +3623,11 @@ write_tfvars_from_state() {
   # import mutating anything before the confirmation (or on a dry run).
   # With no key and no PEM, defer the minter loudly rather than wedge.
   local enable_github_minter="false"
-  if [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ]; then
+  # A GitLab install has no GitHub App: the GitOps repository is on GitLab and
+  # the composition refuses the minter beside it.
+  if [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "gitlab" ]; then
+    :
+  elif [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ]; then
     local minter_key_version=""
     minter_key_version="$(kms_key_enabled_version "${KMS_KEY:-$DEFAULT_KMS_KEY}" \
       "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" "$(derive_kms_location "${REGION}")" "${PROJECT_ID}")"
@@ -3086,6 +3760,15 @@ write_tfvars_from_state() {
     return 1
   fi
   require_scoped_sa_pool_max_accounts "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}" || return 1
+  # The mode, for the MODEL_MAX_TOKENS reason: upgrade.sh and the Day-2 menu
+  # regenerate from install.env without install.sh's check, and the variable's
+  # validation would otherwise refuse it at plan, naming neither the key nor
+  # the file.
+  local platform_agent_mode="${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+  if ! is_valid_platform_agent_mode "$platform_agent_mode"; then
+    print_error "PLATFORM_AGENT_MODE='${platform_agent_mode}' is not one of today, next. Fix it in install.env."
+    return 1
+  fi
 
   local old_umask
   old_umask="$(umask)"
@@ -3138,6 +3821,10 @@ write_tfvars_from_state() {
     echo "vertex_project_id  = $(hcl_str "${VERTEX_PROJECT_ID:-}")"
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"
+    echo ""
+    echo "# The PlatformAgent's spec.mode (PLATFORM_AGENT_MODE in install.env). The"
+    echo "# composition passes the chart nothing for \"today\", so its CR carries no mode."
+    echo "platform_agent_mode = $(hcl_str "$platform_agent_mode")"
     echo ""
     echo "# Gateway redaction (LITELLM_REDACTION_* in install.env). The composition"
     echo "# renders nothing into the chart while enabled is false."
@@ -3224,7 +3911,19 @@ write_tfvars_from_state() {
     echo "slack_home_channel      = $(hcl_str "${SLACK_HOME_CHANNEL:-}")"
     echo "slack_home_channel_name = $(hcl_str "${SLACK_HOME_CHANNEL_NAME:-}")"
     echo ""
-    if [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ]; then
+    # Written only for a GitLab install, so a GitHub one renders the exact
+    # lines it always has. GITOPS_REPO is the project's full path there.
+    if [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "gitlab" ]; then
+      echo "gitops_forge              = \"gitlab\""
+      echo "gitops_host               = $(hcl_str "${GITOPS_HOST:-}")"
+      echo "gitlab_repo               = $(hcl_str "${GITOPS_REPO:-}")"
+      echo "gitlab_token_secret_name  = $(hcl_str "${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}")"
+      # Only when a CA was given, so an install without one renders the lines
+      # it always has.
+      if [ -n "${GITOPS_CA_SECRET:-}" ]; then
+        echo "gitlab_ca_secret_name     = $(hcl_str "${GITOPS_CA_SECRET}")"
+      fi
+    elif [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ]; then
       echo "github_repo = $(hcl_str "${GITOPS_ORG}/${GITOPS_REPO}")"
     fi
     echo "enable_github_minter = ${enable_github_minter}"

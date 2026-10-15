@@ -46,9 +46,20 @@ type TriageEvent struct {
 	// They also give the agent what it needs to build a gke_<project>_<location>_<cluster>
 	// context and actually reach the cluster the event came from. Empty for the
 	// direct --in-cluster cluster, which is the one the agent already points at.
-	Cluster       string
-	Project       string
-	Location      string
+	Cluster  string
+	Project  string
+	Location string
+	// Autopilot says the cluster above is a GKE Autopilot cluster, carried on
+	// the event because one filter serves every cluster's dispatcher and so
+	// cannot ask which one it is looking at. Read by the FailedScheduling
+	// gate alone: an Autopilot cluster with no user workloads scales itself
+	// to zero nodes by design, where a Standard cluster at zero nodes is a
+	// fault, and the two are indistinguishable from the event otherwise.
+	// Carried from the describe call cluster discovery already makes. A
+	// direct --in-cluster entry that no profile covers has no describe behind
+	// it and reads false; see targetCluster.Autopilot for why that costs
+	// nothing, and for the covered case, which does carry the bit.
+	Autopilot     bool
 	Namespace     string
 	KindOfObject  string
 	Name          string

@@ -169,6 +169,7 @@ class DelegationCeilingTest(unittest.TestCase):
             "upgrade-readiness-lagging-cluster",
             "consistency-drift-outlier",
             "fleet-cost-idle-pool",
+            "upgrades-audit-reports-upgrade-blocked",
         ):
             with self.subTest(unit=name):
                 self.assertEqual(self.ceiling(name, "2700"), "3000")
@@ -208,9 +209,10 @@ class DelegationCeilingTest(unittest.TestCase):
         # task lock while queued on lock-infra. The in-flight grace a
         # ledger-writing unit may spend before its run is in the per-case
         # figure too, so a holder that spends it does not push its waiter past
-        # the deadline.
+        # the deadline, and so is the wait for a run the install started on
+        # the unit's streams (wait_platform_runs).
         unit = lifted("run_one_unit")
-        deadline = 'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"'
+        deadline = 'lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}" "${streams}")"'
         ledgerless_stack = (
             'if [ -z "${audit_id}" ] && [ -n "${has_stack}" ]; then\n'
             "    lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))\n"
@@ -220,24 +222,31 @@ class DelegationCeilingTest(unittest.TestCase):
         self.assertIn(ledgerless_stack, unit)
         grace = re.search(r"^readonly EVAL_INFLIGHT_GRACE_SECONDS=\d+$", SCRIPT.read_text(encoding="utf-8"), re.M)
         self.assertIsNotNone(grace)
+        allowance = re.search(r"^readonly UNIT_LOCK_ALLOWANCE_SECONDS=\d+$", SCRIPT.read_text(encoding="utf-8"), re.M)
+        self.assertIsNotNone(allowance)
+        run_wait = re.search(r"^readonly EVAL_PLATFORM_RUN_WAIT_SECONDS=\d+$", SCRIPT.read_text(encoding="utf-8"), re.M)
+        self.assertIsNotNone(run_wait)
         self.assertIn('lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"', unit)
         computed = deadline + "; " + ledgerless_stack + '; echo "${lock_deadline}"'
         body = "\n".join(
             [
                 lifted("unit_delegation_timeout"),
+                lifted("stream_lock_deadline"),
                 grace.group(0),
+                allowance.group(0),
+                run_wait.group(0),
                 'export AGENT_DELEGATION_TIMEOUT="2700"',
                 "INFRA_LOCK_DEADLINE=900",
                 'stream_case_count() { echo "${CASES_ON_STREAM}"; }',
                 'stream_stack_wait() { echo "${STACK_WAIT:-0}"; }',
-                "CASES_ON_STREAM=1 STACK_WAIT=0 name=compliance-rbac-overgrant audit_id=compliance-audit has_stack=\n" + computed,
-                "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= has_stack=\n" + computed,
-                "CASES_ON_STREAM=2 STACK_WAIT=0 name=consistency-drift-outlier audit_id=fleet-consistency-drift has_stack=\n" + computed,
-                "CASES_ON_STREAM=1 STACK_WAIT=900 name=compliance-rbac-overgrant audit_id=compliance-audit has_stack=1\n" + computed,
-                "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= has_stack=1\n" + computed,
+                "CASES_ON_STREAM=1 STACK_WAIT=0 name=compliance-rbac-overgrant audit_id=compliance-audit streams=compliance-audit has_stack=\n" + computed,
+                "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= streams= has_stack=\n" + computed,
+                "CASES_ON_STREAM=2 STACK_WAIT=0 name=consistency-drift-outlier audit_id=fleet-consistency-drift streams=fleet-consistency-drift has_stack=\n" + computed,
+                "CASES_ON_STREAM=1 STACK_WAIT=900 name=compliance-rbac-overgrant audit_id=compliance-audit streams=compliance-audit has_stack=1\n" + computed,
+                "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= streams= has_stack=1\n" + computed,
             ]
         )
-        self.assertEqual(run_bash(body).stdout.split(), ["3900", "3600", "7800", "4800", "4500"])
+        self.assertEqual(run_bash(body).stdout.split(), ["11100", "3600", "22200", "12000", "4500"])
 
 
 class PerCaseGradingTest(unittest.TestCase):
@@ -259,6 +268,9 @@ lock_release() { rmdir "$1" 2>/dev/null || true; }
 mint_ledger_token() { return 0; }
 unit_delegation_timeout() { echo 1800; }
 ledger_audit_id_for_task() { echo ""; }
+task_streams() { ledger_audit_id_for_task "$1"; }
+stream_lock_deadline() { echo 1; }
+release_streams() { local s; for s in $1; do lock_release "${STATE_DIR}/lock-stream-${s}"; done; }
 stream_case_count() { echo 1; }
 stream_stack_wait() { echo 0; }
 _ts_lines() { cat; }
@@ -270,20 +282,27 @@ release_inflight_note() { :; }
 EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_LOCATION=
 """
 
-    def run_reps(self, extra: str = "") -> subprocess.CompletedProcess:
+    def run_reps(self, extra: str = "", after: str = "") -> subprocess.CompletedProcess:
         body = "\n".join([
             # The one constant the unit reads from the script's top: the base
             # of its per-unit inject port.
             lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+            # The name the opening turn's timing is copied in under.
+            lifted_constant("EVAL_TIMING_FILE"),
             # The unit resolves the task file it hands the bench through
             # this helper (the inject lane's copy, or the file under
             # bench/tasks/); with no lane directory set it is the identity.
             lifted("unit_task_path"),
+            # The count of finished repetitions the unit reads under its
+            # task lock, and the unwinding its skip paths share.
+            lifted("finished_rep_count"),
+            lifted("skip_unit"),
             lifted("run_one_unit"),
             self.UNIT_STUBS,
             extra,
             'for rep in 1 2 3; do run_one_unit ./tasks/x/task.yaml case-x "${rep}" "" "" "${rep}"; done',
             'ls "${STATE_DIR}" | sort | tr "\\n" " "; echo',
+            after,
         ])
         return run_bash(body)
 
@@ -294,6 +313,23 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
         self.assertIn("case-x.rep1.end case-x.rep1.start case-x.rep2.dir", result.stdout)
         # Graded after its own `finished` line, so the log keeps its markers timely.
         self.assertLess(result.stdout.index("finished case-x rep 3"), result.stdout.index("FINISH_CASE"))
+
+    def test_the_opening_turns_timing_lands_beside_each_repetitions_results(self):
+        """Run, not read: the bench stub writes the file the unit names in
+        KUBE_AGENTS_TIMING_FILE for reps 1 and 3 only, and rep 2's state
+        directory holds a stale file from an earlier lease, which must not
+        reach rep 2's run directory."""
+        runs = 'RUNS="$(mktemp -d)"; : > "${STATE_DIR}/case-x.rep2.timing.json"\n'
+        bench = (
+            'uv() { mkdir -p "${RUNS}/run_${rep}"; '
+            '[ "${rep}" = 2 ] || echo "{\\"turn1_s\\": ${rep}.5}" > "${KUBE_AGENTS_TIMING_FILE}"; '
+            'echo "ran 1 task(s); results: ${RUNS}/run_${rep}/results.json"; }\n'
+        )
+        check = 'for r in 1 2 3; do echo "rep ${r}: $(cat "${RUNS}/run_${r}/timing.json" 2>/dev/null || echo none)"; done'
+        result = self.run_reps(runs + bench, check)
+        self.assertIn('rep 1: {"turn1_s": 1.5}', result.stdout, result.stdout + result.stderr)
+        self.assertIn("rep 2: none", result.stdout)
+        self.assertIn('rep 3: {"turn1_s": 3.5}', result.stdout)
 
     def test_a_repetition_that_gave_up_on_its_lock_leaves_the_case_to_the_loop(self):
         # Rep 2 never gets the task lock: no state file, so the count stops at
@@ -382,12 +418,18 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
     def test_the_state_files_are_written_under_the_task_lock(self):
         unit = lifted("run_one_unit")
         written = unit.index('> "${STATE_DIR}/${name}.rep${rep}.end"')
-        counted = unit.index("finished_reps=$((finished_reps + 1))")
+        counted = unit.index('finished_reps="$(finished_rep_count "${name}")"')
         # The last release: the early ones are the give-up paths.
         released = unit.rindex('lock_release "${STATE_DIR}/lock-task-${name}"')
         self.assertLess(written, counted)
         self.assertLess(counted, released)
         self.assertLess(released, unit.index('finish_case "${task}" "${name}"'))
+        # A repetition the launcher could not start writes its record and is
+        # counted the same way, under the lock, before it lets go.
+        skip = lifted("skip_unit")
+        self.assertLess(skip.index('record_unit_not_run "${name}"'), skip.index("finished_rep_count"))
+        self.assertLess(skip.index("finished_rep_count"), skip.index('lock_release "${STATE_DIR}/lock-task-${name}"'))
+        self.assertLess(skip.index('lock_release "${STATE_DIR}/lock-task-${name}"'), skip.index('finish_case "${task}" "${name}"'))
 
     FINISH_STUBS = """
 lock_acquire() { echo "lock $(basename "$1")"; }

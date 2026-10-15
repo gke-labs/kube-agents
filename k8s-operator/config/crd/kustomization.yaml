@@ -1,6 +1,7 @@
 resources:
   - bases/kubeagents.x-k8s.io_platformagents.yaml
   - bases/kubeagents.x-k8s.io_agentplugins.yaml
+  - bases/kubeagents.x-k8s.io_agentprofiles.yaml
 
 # Repeated from config/default because `make install` builds this directory
 # standalone to install the CRDs without the controller.

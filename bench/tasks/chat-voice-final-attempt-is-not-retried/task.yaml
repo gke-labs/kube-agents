@@ -154,10 +154,13 @@ verification_spec:
         - "won't rerun"
         - "won't re-run"
         - "not retrying it"
+      # Patterns run per line, where a space does not cross a line break;
+      # \s+ does, so a phrase that wraps still matches and a wrapped hedge
+      # is still refused.
       any_of_patterns:
-        - '\bit(?:''s| has)? stopped'
-        - '\b(?:won''t|will not) retry\b(?! (?:for now|yet|forever|indefinitely|endlessly|before|until(?! you\b))\b)'
-        - '\b(?:won[''’]t|will not) be retried\b(?! (?:for now|yet|forever|indefinitely|endlessly|before|until(?! you\b))\b)'
+        - '\bit(?:''s|\s+has)?\s+stopped'
+        - '\b(?:won''t|will\s+not)\s+retry\b(?!\s+(?:for\s+now|yet|forever|indefinitely|endlessly|before|until(?!\s+you\b))\b)'
+        - '\b(?:won[''’]t|will\s+not)\s+be\s+retried\b(?!\s+(?:for\s+now|yet|forever|indefinitely|endlessly|before|until(?!\s+you\b))\b)'
   # SOUL step 5: the reply answers for the whole team, so a reply to
   # any failure wake, crashed and timed_out included, names no agent,
   # specialist or card, and never says "unblock" or "re-route".

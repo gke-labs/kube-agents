@@ -19,6 +19,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
 // The inject backend, end to end against a real nats-server: a POST is an
@@ -1373,7 +1374,7 @@ func TestInjectCancelDoesNotGoThroughTheStopText(t *testing.T) {
 		if err := json.Unmarshal(env.Payload, &message); err != nil {
 			continue
 		}
-		if isStop(joinTextParts(message.Parts)) {
+		if chattext.IsStop(joinTextParts(message.Parts)) {
 			t.Fatalf("the cancel route sent the stop text as a message: %q", joinTextParts(message.Parts))
 		}
 	}
@@ -3241,6 +3242,28 @@ func TestInjectProbeDescribesTheInstantTheWaitEnded(t *testing.T) {
 	}
 	if out.Probe == nil || out.Probe.ExecutorState != string(lib.StateWorking) {
 		t.Fatalf("probe = %+v, want executorState working: the probe predates the entry beside it", out.Probe)
+	}
+}
+
+// TestInjectProbeCarriesTheConversationsContextID: the read route reports
+// the A2A contextId the conversation's record carries, the one every task it
+// publishes carries, so a harness can find what an executor keyed on it (the
+// bridge's api executor's Hermes session, and the kanban cards that session
+// filed) without a turn. A conversation with no record has no contextId and
+// the key is absent rather than empty.
+func TestInjectProbeCarriesTheConversationsContextID(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-probe-context", injectTestAuthor, "answer me")
+	origin := r.awaitTask(t, "platform")
+	if origin.ContextID == "" {
+		t.Fatal("the published task carries no contextId; the rig is not exercising the record")
+	}
+	got := r.probe(t, reply.Conversation, reply.TaskID)
+	if got.Probe.ContextID != origin.ContextID {
+		t.Fatalf("probe contextId = %q, want the published task's %q", got.Probe.ContextID, origin.ContextID)
+	}
+	if raw := r.probeRaw(t, injectKeyPrefix+"case-probe-context-none", ""); raw["contextId"] != nil {
+		t.Fatalf("a conversation with no record reported contextId %s, want the key absent", raw["contextId"])
 	}
 }
 

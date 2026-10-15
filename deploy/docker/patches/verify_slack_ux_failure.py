@@ -18,7 +18,7 @@ Two things are checked:
    names bound where it runs (``patchlib.unbound``).
 2. The module, loaded by path: flag off a failure wake marks nothing; flag on,
    mock 06's reply to a ``gave_up`` wake's turn is drawn with its first
-   sentence in bold and one choice button reading "check it there", a second
+   sentence in bold and one choice button reading "Try again", a second
    reply in the thread is drawn as upstream draws it, a user's turn starting
    after a wake's claim is never marked, a user message that arrived after the
    mark clears it, and the reply a wake's turn sends under a queued follow-up's
@@ -41,6 +41,8 @@ import patchlib
 
 RUNTIME = "gateway/slack_ux_failure.py"
 FLAG_ENV = "KAGE_SLACK_UX"
+#: Unset is on, so the flag-off path needs a value.
+FLAG_OFF = "false"
 IMPORT_MODULE = "gateway"
 IMPORT_NAME = "slack_ux_failure"
 ALIAS = "_kage_slack_failure"
@@ -94,7 +96,7 @@ REPLY = (
     "I couldn't find seeded-z. The fleet has seeded-a, -b and -c. checkout-gateway runs on seeded-a. Check it there?"
 )
 LEAD = "**I couldn't find seeded-z.**"
-LABEL = "check it there"
+LABEL = "Try again"
 USER_MESSAGE_ID = "1700000001.000200"
 #: How much later than the mark a user's message arrives, so the two never tie.
 LATER = timedelta(seconds=1)
@@ -224,10 +226,13 @@ def _draw(module, event) -> list:
 
 
 def drive(module) -> None:
-    os.environ.pop(FLAG_ENV, None)
+    os.environ[FLAG_ENV] = FLAG_OFF
     module.note_wake(SUB, {"gave_up"}, "wake")
     if module._marks:
-        raise _fail(f"a failure wake marked its thread with {FLAG_ENV} unset")
+        raise _fail(f"a failure wake marked its thread with {FLAG_ENV}={FLAG_OFF}")
+    os.environ.pop(FLAG_ENV, None)
+    if not module.enabled():
+        raise _fail(f"enabled() is false with {FLAG_ENV} unset, which is on")
     os.environ[FLAG_ENV] = "1"
     try:
         module.note_wake(SUB, {"gave_up"}, "wake")

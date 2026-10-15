@@ -86,7 +86,8 @@ class ConfigurationFileTest(_ConfigCase):
             {"forges": [{"provider": "TestForge", "host": "Git.Example.com", "allowedPaths": ["/acme/"]}]}
         )
         self.assertEqual(
-            [{"provider": "testforge", "host": "git.example.com", "token_path": "", "allowed_paths": ("/acme/",)}],
+            [{"provider": "testforge", "host": "git.example.com", "token_path": "", "ca_file": "", "ca_source": "",
+              "allowed_paths": ("/acme/",)}],
             registry_module.load_forge_entries(),
         )
 
@@ -122,11 +123,36 @@ class ConfigurationFileTest(_ConfigCase):
         entries = registry_module.load_forge_entries()
         self.assertEqual([None, ()], [e["allowed_paths"] for e in entries])
 
-    def test_an_enterprise_host_is_refused_until_it_is_served(self):
+    def test_an_enterprise_host_builds_github_there_and_not_on_github_com(self):
         self.configure({"forges": [{"provider": "github", "host": "github.example.com"}]})
-        with self.assertRaises(ValueError) as caught:
-            providers.Registry()
-        self.assertIn("github.example.com", str(caught.exception))
+        registry = providers.Registry()
+        [forge] = registry.forges
+        self.assertEqual(("github", ("github.example.com",)), (forge.name, forge.hosts))
+        self.assertEqual(("http", "https://github.example.com/api/v3"), (forge.transport, forge.api_url))
+        # No CLI: gh is never logged in to the instance.
+        self.assertEqual((), registry.executables)
+        self.assertEqual((forge, "acme/infra"), registry.resolve("https://github.example.com/acme/infra"))
+        self.assertEqual((forge, "acme/infra"), registry.resolve("acme/infra"))
+        with self.assertRaises(ForgeUnsupported):
+            registry.resolve("https://github.com/acme/infra")
+
+    def test_two_github_hosts_are_refused(self):
+        for hosts in (("github.com", "github.example.com"), ("ghe.one.example", "ghe.two.example")):
+            with self.subTest(hosts=hosts):
+                self.configure({"forges": [{"provider": "github", "host": h} for h in hosts]})
+                with self.assertRaises(ValueError) as caught:
+                    providers.Registry()
+                self.assertIn("one GitHub host", str(caught.exception))
+
+    def test_an_enterprise_host_beside_gitlab_needs_a_host_on_a_bare_name(self):
+        self.configure({"forges": [
+            {"provider": "github", "host": "ghe.example.com"},
+            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": "/t", "allowedPaths": []},
+        ]})
+        registry = providers.Registry()
+        self.assertEqual("github", registry.resolve("ghe.example.com/acme/infra")[0].name)
+        with self.assertRaises(ForgeUnsupported):
+            registry.resolve("acme/infra")
 
     def test_a_named_file_that_cannot_be_read_stops_the_build(self):
         for document in ("{not json", json.dumps({"forges": "github"}), json.dumps([1])):
@@ -151,6 +177,23 @@ class ConfigurationFileTest(_ConfigCase):
                 self.configure({"forges": [entry]})
                 with self.assertRaises(ValueError):
                     registry_module.load_forge_entries()
+
+
+class OperatorRenderedConfigurationTest(_ConfigCase):
+    def test_the_shape_the_operator_renders_builds_both_forges(self):
+        """The document k8s-operator's BrokerForges renders for a GitHub forge
+        beside a GitLab one. Read from the golden file `vcs_forges_test.go`
+        compares the operator's render to byte for byte, so a change to either
+        side's field names or shape fails one of the two tests."""
+        golden = (
+            Path(__file__).resolve().parents[3]
+            / "k8s-operator/internal/controller/testdata/vcs-forges.golden.json"
+        )
+        self.configure(golden.read_text())
+        registry = providers.Registry()
+        self.assertEqual(["github", "gitlab"], [forge.name for forge in registry.forges])
+        forge, repo = registry.resolve("https://gitlab.com/platform/tools")
+        self.assertEqual(("gitlab", "platform/tools"), (forge.name, repo))
 
 
 class UnclaimedProviderTest(_ConfigCase):

@@ -36,11 +36,14 @@ The load-bearing properties, in rough order of what they cost if wrong:
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import time
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 import pytest
 import yaml
@@ -50,7 +53,7 @@ from devops_bench.verification.base import VERIFIERS
 from devops_bench.verification.runner import VerifierAgent
 from devops_bench.verification.spec import VerificationEntry, parse_node
 
-from kube_agents_bench import transcript, verifiers
+from kube_agents_bench import fleet, transcript, verifiers
 from kube_agents_bench.verifiers import (
     WorkerAgentsVerifier,
     WorkerCommandsVerifier,
@@ -60,6 +63,7 @@ from kube_agents_bench.verifiers import (
     ReplyIsSilentVerifier,
     ReportContainsVerifier,
     ToolCalledVerifier,
+    _fold_line_decoration,
 )
 
 from conftest import TASKS
@@ -115,6 +119,575 @@ def test_required_phrase_present_passes():
     v = ReportContainsVerifier(type="report_contains", required_phrases=["GCS FUSE"])
     res = v.verify(5.0)
     assert res.status == "pass" and res.success
+
+
+def test_any_of_pattern_binds_subject_to_verb_across_an_adverb():
+    _stash("The API server will be briefly unavailable while the control plane upgrades.")
+    v = ReportContainsVerifier(
+        type="report_contains",
+        any_of_patterns=[r"api server[^.\n]{0,30}\b(unavailable|unreachable|down)\b"],
+    )
+    res = v.verify(5.0)
+    assert res.status == "pass" and "alternative pattern(s)" in res.reason
+
+
+def test_any_of_pattern_miss_fails_and_names_the_patterns():
+    _stash("In general upgrades cause errors or timeouts somewhere.")
+    v = ReportContainsVerifier(
+        type="report_contains",
+        any_of_patterns=[r"api server[^.\n]{0,30}\b(unavailable|unreachable|down)\b"],
+    )
+    res = v.verify(5.0)
+    assert res.status == "fail" and "none of the alternative patterns matched" in res.reason
+
+
+def test_any_of_pattern_searches_a_line_preserving_text():
+    # The text keeps its newlines, so a pattern may anchor on them and a gap
+    # that excludes \n stays inside one line: a bullet ending without
+    # punctuation does not fuse into its neighbour when the pattern says so.
+    _stash("- the API server\n- unavailable features are listed below")
+    v = ReportContainsVerifier(
+        type="report_contains",
+        any_of_patterns=[r"api server[^.\n]{0,30}\bunavailable\b"],
+    )
+    assert v.verify(5.0).status == "fail"
+    # The fold strips the bullet, so the anchor meets the words themselves.
+    anchored = ReportContainsVerifier(
+        type="report_contains", fold_decoration=True, any_of_patterns=[r"(?m)^unavailable features"]
+    )
+    assert anchored.verify(5.0).status == "pass"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "seeded-a: control plane is zonal",
+        "- seeded-a: control plane is zonal",
+        "  - seeded-a: control plane is zonal",
+        "> - seeded-a: control plane is zonal",
+        "1. seeded-a: control plane is zonal.",
+        "b) seeded-a: control plane is zonal",
+        "\u2022 seeded-a: control plane is zonal",
+        '"seeded-a: control plane is zonal".',
+        "\u201cseeded-a: control plane is zonal\u201d",
+        "**seeded-a: control plane is zonal** \u2705",
+    ],
+)
+def test_line_patterns_see_a_line_without_its_decoration(line):
+    # One pattern anchored at both ends, whatever the agent wrapped the line in.
+    _stash("intro\n" + line + "\noutro")
+    v = ReportContainsVerifier(
+        type="report_contains", fold_decoration=True, any_of_patterns=[r"(?m)^seeded-a: control plane is zonal$"]
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "[seeded-a](https://console.cloud.google.com/kubernetes/clusters/details/us-central1-a/seeded-a): control plane is zonal",
+        "### seeded-a: control plane is zonal",
+        "| seeded-a: control plane is zonal |",
+        "(1) seeded-a: control plane is zonal",
+        "\u2705 seeded-a: control plane is zonal",
+        "\u26a0\ufe0f seeded-a: control plane is zonal",
+        "- \u26a0\ufe0f seeded-a: control plane is zonal,",
+        "seeded-a: control plane is zonal;",
+        "seeded-a: control plane is zonal\\",
+        "seeded-a: control plane is zonal<br>",
+        "- [ ] seeded-a: control plane is zonal",
+        "- [x] seeded-a: control plane is zonal",
+        "[1] seeded-a: control plane is zonal",
+        "(a) seeded-a: control plane is zonal",
+        "-> seeded-a: control plane is zonal",
+        "|seeded-a: control plane is zonal|",
+        '"seeded-a": control plane is zonal',
+        "\u201cseeded-a\u201d: control plane is zonal",
+        "'seeded-a': control plane is zonal",
+        "[seeded-a]: control plane is zonal",
+        "seeded-a: control plane is zonal [1]",
+        "seeded-a: control plane is zonal [^1]",
+        "seeded-a: control plane is zonal\u00b9",
+        "seeded-a: control plane is zonal (1)",
+        "seeded-a: control plane is zonal [^note]",
+        "seeded-a: control plane is zonal [1](https://cloud.google.com/kubernetes-engine/docs)",
+        "seeded-a: control plane is zonal [1].",
+        "seeded-a: control plane is zonal [1](https://cloud.google.com/kubernetes-engine/docs).",
+        "seeded-a: control plane is zonal [1](https://cloud.google.com/kubernetes-engine/docs),",
+        'seeded-a: control plane is zonal [1](https://cloud.google.com/kubernetes-engine/docs)"',
+        "| seeded-a: control plane is zonal [1](https://cloud.google.com/kubernetes-engine/docs) |",
+        "seeded-a: control plane is [zonal](https://cloud.google.com/kubernetes-engine/docs/concepts/types-of-clusters).",
+        "seeded-a: control plane is [zonal](https://cloud.google.com/kubernetes-engine/docs/concepts/types-of-clusters) [1](https://cloud.google.com/docs).",
+        "seeded-a: control plane is zonal [^1]\u201d",
+        "seeded-a: control plane is zonal.[1]",
+        "seeded-a: control plane is [zonal](https://cloud.google.com/kubernetes-engine/docs/concepts/types-of-clusters)",
+
+        "seeded-a: control plane is zonal\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3",
+        "ii. seeded-a: control plane is zonal",
+        "(iii) seeded-a: control plane is zonal",
+        "\u2460 seeded-a: control plane is zonal",
+        "1\ufe0f\u20e3 seeded-a: control plane is zonal",
+        "#1 seeded-a: control plane is zonal",
+        "1 seeded-a: control plane is zonal",
+    ],
+)
+def test_line_decoration_fold_covers_links_headings_tables_and_marks(line):
+    _stash(line)
+    v = ReportContainsVerifier(
+        type="report_contains", fold_decoration=True, any_of_patterns=[r"(?m)^seeded-a: control plane is zonal$"]
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+@pytest.mark.parametrize("mark", ["\U0001F6AB", "\U0001F6D1", "\U0001F44E", "\u274e", "\u26a0\ufe0f", "?", "!", "\u2026"])
+def test_line_decoration_fold_keeps_a_mark_it_does_not_name(mark):
+    # The closer list is an allowlist: a trailing symbol it does not name is
+    # part of the value, so the anchored pattern does not match.
+    _stash(f"seeded-a: control plane is zonal {mark}")
+    v = ReportContainsVerifier(
+        type="report_contains", fold_decoration=True, any_of_patterns=[r"(?m)^seeded-a: control plane is zonal$"]
+    )
+    assert v.verify(5.0).status == "fail"
+
+
+def test_footnote_fold_is_linear_on_many_overlapping_markers():
+    # Overlapping alternatives inside a possessive repeat: a line that ends
+    # in many markers and then a word must not backtrack exponentially.
+    line = "seeded-a: control plane is zonal" + " [^1]" * 60 + " x"
+    start = time.monotonic()
+    folded = _fold_line_decoration(line)
+    assert time.monotonic() - start < 1.0
+    assert folded == line
+
+
+def test_line_decoration_fold_keeps_interior_punctuation():
+    _stash("- pool/a (zone-1): 100% used; 3 of 4 pods (75%) ready.")
+    v = ReportContainsVerifier(
+        type="report_contains",
+        fold_decoration=True,
+        any_of_patterns=[r"(?m)^pool/a \(zone-1\): 100% used; 3 of 4 pods \(75%\) ready$"],
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+def test_line_decoration_fold_is_off_unless_asked_for():
+    # first-install-hello-* forbid a bulleted capability list with a pattern
+    # on the bullet itself; the default must leave the bullet in place.
+    _stash("- Audit the fleet\n- Open pull requests")
+    v = ReportContainsVerifier(type="report_contains", forbidden_patterns=[r"(?m)^\s*(?:[-\u2022]|\d+[.)])\s"])
+    assert v.verify(5.0).status == "fail"
+    folded = ReportContainsVerifier(
+        type="report_contains", fold_decoration=True, forbidden_patterns=[r"(?m)^\s*(?:[-\u2022]|\d+[.)])\s"]
+    )
+    assert folded.verify(5.0).status == "pass"
+
+
+# --------------------------------------- the zonal control-plane case's lines
+#
+# Read out of the task file, never copied: the declared answer line the case
+# asks for, in the forms a report renders it (plain, bulleted, numbered,
+# quoted, bold-wrapped, with a parenthetical after the name, with the
+# qualified cluster id, with or without a full stop), and the reports that
+# must not satisfy it (a missing cluster, a slot the fleet does not have, a
+# wrong or off-vocabulary value on any seeded line, prose with the same
+# words, the host cluster).
+
+_ZONAL_CASE = TASKS / "upgrades-zonal-control-plane-outage-warned" / "task.yaml"
+
+
+def _zonal_case_check(objective: str) -> dict:
+    for entry in _ZONAL_SPEC["verification_spec"]:
+        if entry["name"] == objective:
+            return entry["check"]
+    raise AssertionError(f"{objective} not in {_ZONAL_CASE}")
+
+
+_ZONAL_SPEC = yaml.safe_load(_ZONAL_CASE.read_text(encoding="utf-8"))
+
+
+def _zonal_case_fixtures() -> list[str]:
+    return list(_ZONAL_SPEC["fixtures"])
+
+
+_FLEET_CATALOG = TASKS.parent / "tf" / "fleet" / "fixtures.json"
+
+
+# Read once in this module (the sibling suite reads the same file for the
+# runner's side of the contract); the slot letters below come from the same
+# parse.
+_CATALOG = json.loads(_FLEET_CATALOG.read_text(encoding="utf-8"))
+_CATALOG_ROLES = _CATALOG["roles"]
+
+
+def _catalog_slots() -> list[str]:
+    return sorted({spec["cluster_slot"] for spec in _catalog_roles().values()})
+
+
+def _catalog_roles() -> dict:
+    return _CATALOG_ROLES
+
+
+def _write_fleet_dir(root: Path, reached: list[str], names: dict[str, str] | None = None, location: str = "us-central1-a") -> None:
+    """A runner-shaped kubeconfig directory: the context file recording every
+    catalogue role's slot (as the runner does, reached or not), the cluster
+    and location recorded for each reached slot (what `{cluster:<slot>}`
+    expands to; `seeded-<slot>` unless `names` says otherwise), the per-slot
+    credential for the slot carrying each reached role (what `fixture_roles`
+    reads), and no role files, since whether a role was planted is not the
+    question."""
+    (root / "clusters").mkdir(exist_ok=True)
+    roles = _catalog_roles()
+    lines = ["project=kube-agents-evals"] + [f"slot.{role}={spec['cluster_slot']}" for role, spec in roles.items()]
+    for slot in sorted({roles[role]["cluster_slot"] for role in reached}):
+        name = (names or {}).get(slot, f"seeded-{slot}")
+        lines += [f"cluster.{slot}={name}", f"location.{slot}={location}"]
+    (root / ".fleet-context").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    for role in reached:
+        (root / "clusters" / f"{roles[role]['cluster_slot']}.kubeconfig").write_text("apiVersion: v1\n", encoding="utf-8")
+
+
+def _zonal_case_verdict(objective: str, text: str, reached: list[str] | None = None, names: dict[str, str] | None = None):
+    # parse_node rather than a hand-built ReportContainsVerifier, for the
+    # reason the sibling block gives: a clause the shipped entry grows later
+    # must not be silently dropped here. A fresh directory per call stands in
+    # for the runner's: every slot reached, unless a test says otherwise.
+    v = parse_node(_zonal_case_check(objective))
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="zonal-fleet-") as root:
+        _write_fleet_dir(Path(root), _zonal_case_fixtures() if reached is None else reached, names)
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0)
+
+
+def _zonal_case_grades(objective: str, text: str) -> bool:
+    return _zonal_case_verdict(objective, text).status == "pass"
+
+
+_ZONAL_OBJECTIVES = (
+    "every-seeded-cluster-has-a-declared-line",
+    "the-declared-lines-say-the-control-plane-is-zonal",
+    "the-declared-lines-say-the-api-goes-away",
+    "the-declared-lines-separate-workloads-from-the-api",
+)
+
+
+def _zonal_line(cluster: str, cp="zonal", api="unavailable", pods="unaffected") -> str:
+    return f"{cluster}: control plane is {cp}; API during its upgrade: {api}; running pods: {pods}"
+
+
+# The slot set is the fleet catalogue's, read rather than copied: a slot the
+# fleet gains or loses must change this list and the case together.
+_SLOT_LETTERS = tuple(_CATALOG["cluster_slots"])
+_SLOTS = tuple(f"seeded-{s}" for s in _SLOT_LETTERS)
+_RIGHT_REPORT = "\n".join(_zonal_line(c) for c in _SLOTS)
+
+
+@pytest.mark.parametrize("objective", _ZONAL_OBJECTIVES)
+@pytest.mark.parametrize(
+    "text",
+    [
+        _RIGHT_REPORT,
+        "Summary of the plan.\n\n" + _RIGHT_REPORT + "\n\n## Sources\n* docs",
+        "\n".join("- " + _zonal_line(c) for c in _SLOTS),
+        "\n".join(f"{i}. " + _zonal_line(c) + "." for i, c in enumerate(_SLOTS, 1)),
+        "\n".join("+ " + _zonal_line(c) for c in _SLOTS),
+        "\n".join("> " + _zonal_line(c) for c in _SLOTS),
+        "\n".join("**" + _zonal_line(c) + "**" for c in _SLOTS),
+        "\n".join("`" + _zonal_line(c) + "`" for c in _SLOTS),
+        "\n".join('"' + _zonal_line(c) + '"' for c in _SLOTS),
+        "\n".join(_zonal_line(f"{c} (us-central1-a)") for c in _SLOTS),
+        "\n".join(_zonal_line(f"\u201c{c} (us-central1-a)\u201d") for c in _SLOTS),
+        "\n".join(_zonal_line(f"[{c} (us-central1-a)]") for c in _SLOTS),
+        "\n".join("“" + _zonal_line(c) + "”" for c in _SLOTS),
+        "\n".join('"' + _zonal_line(c) + '".' for c in _SLOTS),
+        "- Declared lines:\n" + "\n".join("  - " + _zonal_line(c) for c in _SLOTS),
+        "\n".join(_zonal_line(c) + " ✅" for c in _SLOTS),
+        "\n".join(_zonal_line(c) + " \U0001F44D" for c in _SLOTS),
+        # The same affirming closer with a skin-tone modifier: the modifier
+        # only changes how the listed mark renders and is folded with the
+        # other carriers.
+        "\n".join(_zonal_line(c) + " \U0001F44D\U0001F3FB" for c in _SLOTS),
+        "\n".join(_zonal_line(c) + " \u2714\ufe0f" for c in _SLOTS),
+        # Per-cluster prose that opens with a slot name is neither accepted
+        # nor forbidden: only a whole declared frame is read.
+        "- **seeded-b** (us-central1-a): control plane is 1.32.4, one minor behind the nodes\n" + _RIGHT_REPORT,
+        # The qualified id the agent sometimes uses.
+        "\n".join(_zonal_line(f"haoxuw-gke-dev-{c}-us-central1-a") for c in _SLOTS),
+        "\n".join(f"[{c}](https://console.cloud.google.com/kubernetes/clusters/details/us-central1-a/{c}): " + _zonal_line(c).split(": ", 1)[1] for c in _SLOTS),
+        "\n".join("| " + _zonal_line(c) + " |" for c in _SLOTS),
+        # An English list: commas, then a stop. The kubeconfig context and the
+        # GKE resource path as the cluster's name.
+        ",\n".join(_zonal_line(c) for c in _SLOTS) + ".",
+        "\n".join(_zonal_line(f"gke_haoxuw-gke-dev_us-central1-a_{c}") for c in _SLOTS),
+        "\n".join(_zonal_line(f"projects/haoxuw-gke-dev/locations/us-central1-a/clusters/{c}") for c in _SLOTS),
+        "\n".join("\u26a0\ufe0f " + _zonal_line(c) for c in _SLOTS),
+        # The last value linked to its source, and a linked footnote marker
+        # with a stop after it.
+        "\n".join(_zonal_line(c).replace("running pods: unaffected", "running pods: [unaffected](https://cloud.google.com/kubernetes-engine/docs/concepts/cluster-upgrades)") for c in _SLOTS),
+        "\n".join(_zonal_line(c) + " [1](https://cloud.google.com/kubernetes-engine/docs/concepts/cluster-upgrades)." for c in _SLOTS),
+        # The prompt's own delimiters kept around a value or the name, and
+        # whitespace before a separator.
+        "\n".join(_zonal_line(c).replace("is zonal;", "is <zonal>;").replace(": unavailable;", ": <unavailable>;").replace(": unaffected", ": <unaffected>") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace(": unaffected", ': "unaffected"').replace("is zonal;", 'is "zonal";') for c in _SLOTS),
+        "\n".join(_zonal_line(f"<{c}>") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace(f"{c}:", f"{c} :") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("zonal;", "zonal ;").replace("unavailable;", "unavailable ;") for c in _SLOTS),
+        "\n".join("**" + c + "** : " + _zonal_line(c).split(": ", 1)[1] for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace(f"{c}: ", f"{c}:").replace("zonal; ", "zonal;") for c in _SLOTS),
+        # Invisible format characters at a value's end, before a separator,
+        # and at the line's start.
+        "\n".join(_zonal_line(c) + "\u200b" for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("zonal;", "zonal\u200b;") for c in _SLOTS),
+        "\n".join("\ufeff" + _zonal_line(c) for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("unaffected", "unaffected\u2060") for c in _SLOTS),
+        # Flanked by spaces: the character is its own token to the whitespace
+        # collapse, so it has to go before the collapse, not after it.
+        "\n".join(_zonal_line(c).replace("is zonal", "is \u200b zonal") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("upgrade: unavailable", "upgrade: \u00ad unavailable") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("pods: unaffected", "pods: \ufeff unaffected") for c in _SLOTS),
+        # The recorded location after the name, as a profile id spells it; any
+        # other location is another cluster (see the recorded-cluster tests).
+        "\n".join(_zonal_line(f"{c}-us-central1-a") for c in _SLOTS),
+        "\n".join(_zonal_line(f"kube-agents-evals-{c}-us-central1-a") for c in _SLOTS),
+        # A kubeconfig context with a capital beside an underscore: the
+        # underscore fold runs before lowercasing and must still see a word.
+        "\n".join(_zonal_line(f"gke_kube-agents-evals_us-central1-A_{c}") for c in _SLOTS),
+        "\n".join(_zonal_line(f"gke_kube-agents-evals_us-central1-a_{c.upper()}") for c in _SLOTS),
+        "\n".join(_zonal_line(f"GKE_KUBE-AGENTS-EVALS_US-CENTRAL1-A_{c.upper()}") for c in _SLOTS),
+        # Underscore emphasis, and a name in parentheses or braces.
+        "\n".join("_" + _zonal_line(c) + "_" for c in _SLOTS),
+        "\n".join("__" + _zonal_line(c) + "__" for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("is zonal;", "is __zonal__;") for c in _SLOTS),
+        # A quoted or bracketed value glued to its separator.
+        "\n".join(_zonal_line(c).replace(": unaffected", ':"unaffected"') for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace(": unavailable;", ":<unavailable>;") for c in _SLOTS),
+        "\n".join(_zonal_line(f"({c})") for c in _SLOTS),
+        "\n".join(_zonal_line(f"{{{c}}}") for c in _SLOTS),
+        # A citation on a value other than the last.
+        "\n".join(_zonal_line(c).replace("is zonal;", "is zonal [1];") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("is zonal;", "is zonal [1](https://cloud.google.com/kubernetes-engine/docs);") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("unavailable;", "unavailable [^1];") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("unavailable;", "unavailable\u00b9;") for c in _SLOTS),
+    ],
+)
+def test_zonal_case_accepts_the_declared_lines_as_rendered(objective, text):
+    assert _zonal_case_grades(objective, text)
+
+
+def test_zonal_case_fixtures_name_one_role_per_slot():
+    # The roles are slot stand-ins: the runner's kubeconfig per role is how
+    # the first objective tells an unreached slot from a line the agent
+    # missed, so every catalogue slot needs one and the objective names the
+    # same list.
+    catalog = json.loads(_FLEET_CATALOG.read_text(encoding="utf-8"))
+    roles = _zonal_case_fixtures()
+    assert sorted(catalog["roles"][r]["cluster_slot"] for r in roles) == sorted(_SLOT_LETTERS)
+    # Every declared-line objective names the same list as `fixtures:`.
+    for objective in _ZONAL_OBJECTIVES:
+        assert _zonal_case_check(objective)["fixture_roles"] == roles, objective
+
+
+def test_zonal_case_errors_rather_than_fails_when_a_slot_was_not_reached():
+    roles = _zonal_case_fixtures()
+    missing = roles[-1]
+    three_slot = [r for r in roles if r != missing]
+    three_lines = "\n".join(_zonal_line(c) for c in _SLOTS[:-1])
+    slot = _catalog_roles()[missing]["cluster_slot"]
+    # Every declared-line objective names the four slots, so on a project
+    # missing one each is the environment's error, with the slot named.
+    for objective in _ZONAL_OBJECTIVES:
+        res = _zonal_case_verdict(objective, three_lines, three_slot)
+        assert res.status == "error", objective
+        assert res.reason.startswith(verifiers._UNREACHED_SLOT_REASON), res.reason
+        assert missing in res.reason and f"slot {slot!r}" in res.reason
+    # On a project where nothing was reached, the same, for an empty report.
+    for objective in _ZONAL_OBJECTIVES:
+        assert _zonal_case_verdict(objective, "no seeded clusters in this project", []).status == "error"
+    # With every slot reached, three lines are the agent's miss.
+    assert _zonal_case_verdict("every-seeded-cluster-has-a-declared-line", three_lines).status == "fail"
+
+
+def test_fixture_roles_read_the_slot_credential_not_the_role_file(tmp_path):
+    # A reached cluster whose fixture was never planted has a slot credential
+    # and no role file: the check grades. The reverse cannot happen (a role
+    # file is a copy of the slot's), so a missing slot credential is the one
+    # thing that errors.
+    _stash("seeded-a: fine")
+    v = ReportContainsVerifier(type="report_contains", fixture_roles=["crashloop-workload"], required_phrases=["fine"])
+    _write_fleet_dir(tmp_path, ["crashloop-workload"])
+    with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: str(tmp_path)}):
+        assert v.verify(5.0).status == "pass"
+    (tmp_path / "clusters" / "a.kubeconfig").unlink()
+    (tmp_path / "crashloop-workload.kubeconfig").write_text("apiVersion: v1\n", encoding="utf-8")
+    with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: str(tmp_path)}):
+        res = v.verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(verifiers._UNREACHED_SLOT_REASON)
+    assert "slot 'a'" in res.reason and "crashloop-workload" in res.reason
+
+
+def test_report_contains_fixture_roles_need_the_runners_directory():
+    _stash("seeded-a: fine")
+    v = ReportContainsVerifier(type="report_contains", fixture_roles=["crashloop-workload"], required_phrases=["fine"])
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop(fleet.FLEET_KUBECONFIG_DIR_ENV, None)
+        res = v.verify(5.0)
+    assert res.status == "error"
+    # Not a reachability claim: nothing was resolved, and the reason says so.
+    assert res.reason.startswith(verifiers._UNRESOLVED_ROLES_REASON)
+    assert fleet.FLEET_KUBECONFIG_DIR_ENV in res.reason
+
+
+def test_a_malformed_fixture_roles_entry_is_a_spec_load_error_not_a_run_time_one():
+    # The fleet verifier's contract for `fixture_role`, applied per entry.
+    with pytest.raises(ValidationError, match="lowercase-hyphen"):
+        parse_node({"type": "report_contains", "fixture_roles": ["Crashloop-Workload"], "required_phrases": ["x"]})
+    with pytest.raises(ValidationError, match="lowercase-hyphen"):
+        parse_node({"type": "report_contains", "fixture_roles": ["../escape"], "required_phrases": ["x"]})
+
+
+def test_a_role_the_runner_recorded_no_slot_for_errors_by_name(tmp_path):
+    _stash("fine")
+    v = ReportContainsVerifier(type="report_contains", fixture_roles=["no-such-role"], required_phrases=["fine"])
+    _write_fleet_dir(tmp_path, ["crashloop-workload"])
+    with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: str(tmp_path)}):
+        res = v.verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(verifiers._UNRESOLVED_ROLES_REASON)
+    assert "no-such-role" in res.reason and "catalogue" in res.reason
+
+
+def test_a_directory_an_older_runner_wrote_names_the_missing_record(tmp_path):
+    # `project=` and the slot lines are there, the `slot.<role>=` record is
+    # not: the runner predates it, and the reason says so rather than
+    # offering a case-authoring error or an absent runner.
+    (tmp_path / ".fleet-context").write_text("project=kube-agents-evals\ncluster.a=seeded-a\nlocation.a=us-central1-a\n", encoding="utf-8")
+    with pytest.raises(fleet.FleetRoleUnresolved, match="predates"):
+        fleet.slot_of_role("crashloop-workload", tmp_path)
+    (tmp_path / ".fleet-context").write_text("", encoding="utf-8")
+    with pytest.raises(fleet.FleetRoleUnresolved, match="never ran"):
+        fleet.slot_of_role("crashloop-workload", tmp_path)
+
+
+def test_zonal_case_patterns_name_exactly_the_catalogues_slots():
+    """Every pattern names its cluster through the runner's record, never by
+    the name's shape, and the first objective asks for one line per catalogue
+    slot, so a fleet change fails here first."""
+    spec = yaml.safe_load(_ZONAL_CASE.read_text(encoding="utf-8"))
+    slots = set(_catalog_slots())
+    placeholder = re.compile(r"\{cluster:([a-z0-9-]+)\}")
+    seen_first = None
+    for entry in spec["verification_spec"]:
+        check = entry["check"]
+        patterns = check.get("any_of_patterns", []) + check.get("forbidden_patterns", [])
+        if not patterns:
+            continue
+        for pattern in patterns:
+            named = placeholder.findall(pattern)
+            assert named, (entry["name"], pattern)
+            assert set(named) <= slots | {"any"}, (entry["name"], named)
+            assert "seeded-" not in pattern, (entry["name"], "a pattern spells a cluster name instead of naming its slot")
+        if entry["name"] == "every-seeded-cluster-has-a-declared-line":
+            seen_first = set(placeholder.findall(patterns[0]))
+    assert seen_first == slots, seen_first
+
+
+def test_a_cluster_that_merely_starts_with_a_slot_name_is_neither_a_slot_nor_a_wrong_value():
+    # A fifth, regional cluster named seeded-canary beside four right lines:
+    # not a slot line, so not forbidden; and a seeded-alpha line does not
+    # stand in for slot a.
+    for name in ("seeded-canary", "seeded-a-canary", "seeded-a-v2", "unseeded-a", "seeded-a-canary-v2", "seeded-a-old-eu1"):
+        extra = f"{name}: control plane is regional; API during its upgrade: available; running pods: unaffected"
+        for objective in _ZONAL_OBJECTIVES:
+            assert _zonal_case_grades(objective, _RIGHT_REPORT + "\n" + extra), (name, objective)
+        three = "\n".join(_zonal_line(c) for c in _SLOTS if c != "seeded-a")
+        assert not _zonal_case_grades("every-seeded-cluster-has-a-declared-line", three + "\n" + _zonal_line(name)), name
+
+
+def test_zonal_case_refuses_one_joint_line_for_all_slots():
+    for joint in ("seeded-a/seeded-b/seeded-c/seeded-d", "seeded-a.seeded-b.seeded-c.seeded-d", "seeded-a-seeded-b-seeded-c-seeded-d"):
+        assert not _zonal_case_grades("every-seeded-cluster-has-a-declared-line", _zonal_line(joint))
+
+
+def test_zonal_case_needs_a_line_for_each_of_the_four_slots():
+    assert not _zonal_case_grades("every-seeded-cluster-has-a-declared-line", _zonal_line("seeded-a"))
+    assert not _zonal_case_grades(
+        "every-seeded-cluster-has-a-declared-line", "\n".join(_zonal_line(c) for c in _SLOTS[:3])
+    )
+    # A slot the fleet does not have proves no read.
+    assert not any(_zonal_case_grades(o, _zonal_line("seeded-e")) for o in _ZONAL_OBJECTIVES)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Prose with the same words, the host cluster, clusters in general.
+        "seeded-a, seeded-b and seeded-c are zonal, so the API during each upgrade is unavailable and running pods are unaffected.",
+        "platform-agent-host: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "zonal clusters: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-canary: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-alpha: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-batch-a: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-a-canary: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-a-v2: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "unseeded-a: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-a-canary-v2: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-a-test-run1: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+    ],
+)
+def test_zonal_case_refuses_what_is_not_a_declared_seeded_line(text):
+    assert not any(_zonal_case_grades(o, text) for o in _ZONAL_OBJECTIVES)
+
+
+@pytest.mark.parametrize(
+    "objective,wrong",
+    [
+        ("the-declared-lines-say-the-control-plane-is-zonal", _zonal_line("seeded-c", cp="regional")),
+        ("the-declared-lines-say-the-control-plane-is-zonal", _zonal_line("seeded-c", cp="multi-zonal")),
+        ("the-declared-lines-say-the-api-goes-away", _zonal_line("seeded-c", api="available")),
+        ("the-declared-lines-say-the-api-goes-away", _zonal_line("seeded-c", api="reachable")),
+        ("the-declared-lines-say-the-api-goes-away", _zonal_line("seeded-c", api="briefly unavailable")),
+        ("the-declared-lines-separate-workloads-from-the-api", _zonal_line("seeded-c", pods="affected")),
+        ("the-declared-lines-separate-workloads-from-the-api", _zonal_line("seeded-c", pods="evicted")),
+        ("the-declared-lines-separate-workloads-from-the-api", "“" + _zonal_line("seeded-c", pods="evicted") + "”"),
+    ],
+)
+def test_zonal_case_a_wrong_or_off_vocabulary_value_on_any_seeded_line_fails_its_objective(objective, wrong):
+    three_right = "\n".join(_zonal_line(c) for c in ("seeded-a", "seeded-b", "seeded-d"))
+    assert not _zonal_case_grades(objective, three_right + "\n" + wrong)
+
+
+@pytest.mark.parametrize(
+    "pods",
+    [
+        "not affected",
+        "will be affected",
+        "unaffected, mostly",
+        "unaffected/affected",
+        "unaffected [mostly]",
+        "unaffected [no]",
+        "unaffected?",
+        "unaffected (?)",
+        "unaffected\u2026",
+        "unaffected \u274c",
+        "unaffected ?!",
+        # Marks the fold's closer list does not name stay on the line: a
+        # no-entry sign, a stop sign, a thumbs down, a cross mark, a warning.
+        "unaffected \U0001F6AB",
+        "unaffected \U0001F6D1",
+        "unaffected \U0001F44E",
+        "unaffected \U0001F44E\U0001F3FB",
+        "unaffected \u274e",
+        "unaffected \u26a0\ufe0f",
+        "unaffected \u26d4",
+    ],
+)
+def test_zonal_case_a_hedged_value_is_the_wrong_value(pods):
+    # The forbidding pattern is the exact negation of the accepting one, so
+    # anything in the slot but the bare word fails the fourth objective.
+    three_right = "\n".join(_zonal_line(c) for c in ("seeded-a", "seeded-b", "seeded-d"))
+    report = three_right + "\n" + _zonal_line("seeded-c", pods=pods)
+    assert not _zonal_case_grades("the-declared-lines-separate-workloads-from-the-api", report)
 
 
 def test_required_phrase_matching_is_case_insensitive():
@@ -1376,6 +1949,64 @@ def test_an_attempted_forbidden_call_still_counts_without_require_success():
     assert v.verify(5.0).status == "pass"  # the attempt is visible...
     res = VerifierAgent().run_entry(_safeguard_entry(), timeout_sec=10.0)
     assert res.status == "fail"  # ...so the none-wrapped safeguard trips
+
+
+def test_tool_called_arguments_count_only_the_calls_shaped_so():
+    # The fan-out case's objective: one card per cluster, titled with its bare name.
+    transcript.set(
+        "done",
+        [
+            {"name": "kanban_create", "args": {"title": "seeded-a"}, "status": "completed", "agent": "platform"},
+            {"name": "kanban_create", "args": {"title": "seeded-b"}, "status": "completed", "agent": "platform"},
+            {"name": "kanban_create", "args": {"title": "Check seeded-c"}, "status": "completed", "agent": "platform"},
+            {"name": "kanban_create", "args": {"body": "seeded-c"}, "status": "completed", "agent": "platform"},
+            {"name": "kanban_create", "args": "raw", "status": "completed", "agent": "platform"},
+        ],
+    )
+
+    def check(minimum):
+        return ToolCalledVerifier(
+            type="tool_called",
+            tool_names=["kanban_create"],
+            scope="workers",
+            agent="platform",
+            arguments={"title": "seeded-[abc]"},
+            minimum_calls=minimum,
+        ).verify(5.0)
+
+    assert check(2).status == "pass"
+    res = check(3)
+    assert res.status == "fail"
+    assert res.raw == {"matching_calls": 2}
+    assert "seeded-[abc]" in res.reason
+
+
+def test_tool_called_arguments_read_a_clipped_worker_call():
+    # worker_trajectory clips the arguments before they parse, so a long body leaves them raw.
+    clipped = '{"title": "seeded-a", "body": "' + "x" * 50 + ' ...[clipped 900 chars]'
+    transcript.set(
+        "done",
+        [
+            {"name": "kanban_create", "args": {"raw": clipped}, "status": "completed", "agent": "platform"},
+            {"name": "kanban_create", "args": {"raw": '{"body": "title: seeded-b'}, "status": "completed", "agent": "platform"},
+        ],
+    )
+    res = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_create"],
+        scope="workers",
+        agent="platform",
+        arguments={"title": "seeded-[abc]"},
+    ).verify(5.0)
+    assert res.status == "pass"
+    assert res.raw == {"matching_calls": 1}
+
+
+def test_tool_called_arguments_must_be_patterns():
+    with pytest.raises(ValueError):
+        ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], arguments={})
+    with pytest.raises((ValueError, re.error)):
+        ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], arguments={"title": "("})
 
 
 _WORKER_TAGGED = [
@@ -2725,6 +3356,60 @@ def test_assert_mode_timeout_is_floored_before_the_http_call(token, monkeypatch)
 # --- registration --------------------------------------------------------
 
 
+def test_a_transport_failure_is_retried_before_it_is_an_error(monkeypatch):
+    """One slow forge read must not red a run on rung 2: a timeout or a reset
+    is retried, an HTTP answer is not, and the retries give up after the
+    configured count with the last failure."""
+    calls = {"n": 0}
+    pauses = []
+    monkeypatch.setattr(verifiers.time, "sleep", pauses.append)
+
+    class _Response:
+        status = 200
+
+        def read(self):
+            return b'{"number": 7}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _FlakyOpener:
+        def open(self, request, timeout=None):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise TimeoutError("The read operation timed out")
+            return _Response()
+
+    monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _FlakyOpener())
+    assert verifiers._http_get_json(_api(), "tok", 30.0) == (200, {"number": 7})
+    assert calls["n"] == 3
+    assert pauses == [verifiers._FORGE_READ_RETRY_PAUSE_SEC] * 2
+
+    class _DeadOpener:
+        def open(self, request, timeout=None):
+            calls["n"] += 1
+            raise verifiers.urllib.error.URLError("Connection reset by peer")
+
+    calls["n"] = 0
+    monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _DeadOpener())
+    with pytest.raises(OSError, match="Connection reset"):
+        verifiers._http_get_json(_api(), "tok", 30.0)
+    assert calls["n"] == verifiers._FORGE_READ_ATTEMPTS
+
+    class _AnsweringOpener:
+        def open(self, request, timeout=None):
+            calls["n"] += 1
+            raise verifiers.urllib.error.HTTPError(_api(), 404, "Not Found", {}, None)
+
+    calls["n"] = 0
+    monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _AnsweringOpener())
+    assert verifiers._http_get_json(_api(), "tok", 30.0)[0] == 404
+    assert calls["n"] == 1, "an HTTP answer is an observation and is not retried"
+
+
 def test_the_ledger_verifier_is_published_as_an_entry_point():
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject.open("rb") as fh:
@@ -2995,6 +3680,442 @@ def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, gith
     res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
     assert res.status == "error"
     assert "pull_requests: read" in res.reason
+
+
+# ---- content: what the pull request writes, read at its head
+
+_CLUSTER_DIR = "clusters/substrate-a/provisioning"
+_CLUSTER_YAML = """apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: substrate-a
+spec:
+  location: us-central1
+  enableK8sBetaApis:
+    enabledApis:
+      - certificates.k8s.io/v1beta1/podcertificaterequests
+      - certificates.k8s.io/v1beta1/clustertrustbundles
+  workloadIdentityConfig:
+    workloadPool: proj.svc.id.goog
+---
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerNodePool
+metadata:
+  name: substrate-pool
+spec:
+  nodeConfig:
+    machineType: c3-standard-4
+    labels:
+      ate.dev/substrate-version: v0.4.0-gke.0
+"""
+_BETA_API = "certificates.k8s.io/v1beta1/podcertificaterequests"
+
+
+def _added_patch(text: str) -> str:
+    """What `/pulls/{n}/files` carries as the patch of a file the pull request adds."""
+    lines = text.rstrip("\n").split("\n")
+    return f"@@ -0,0 +1,{len(lines)} @@\n" + "\n".join("+" + line for line in lines)
+
+
+def _content_routes(
+    github, files: dict[str, str], *, statuses: dict[str, str] | None = None, patches: bool = True
+) -> None:
+    """The file listing, with each added file's patch when `patches`, as
+    GitHub returns it."""
+    statuses = statuses or {}
+    entries = []
+    for path, text in files.items():
+        entry = {"filename": path, "status": statuses.get(path, "added")}
+        if patches and entry["status"] == "added":
+            entry["patch"] = _added_patch(text)
+        entries.append(entry)
+    _pr_files_route(github, *entries)
+
+
+def _content_pr(github, files: dict[str, str], **kw):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=len(files))
+    _content_routes(github, files, **kw)
+
+
+def _beta_api_check(**kw):
+    return {"paths": [f"{_CLUSTER_DIR}/*.yaml"], "kind": "ContainerCluster",
+            "field": "spec.enableK8sBetaApis.enabledApis", "op": "contains", "value": _BETA_API, **kw}
+
+
+def test_content_passes_when_the_cluster_carries_the_beta_api(token, github):
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_content_fails_when_the_beta_api_is_missing(token, github):
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML.replace(_BETA_API, "x/v1/y")})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "fail"
+    assert "ContainerCluster.spec.enableK8sBetaApis.enabledApis contains" in res.reason
+    assert f"{_CLUSTER_DIR}/cluster.yaml#0" in res.reason
+
+
+def test_content_fails_when_no_such_object_was_written(token, github):
+    """A pull request that never wrote the cluster fails rather than passing vacuously."""
+    _content_pr(github, {f"{_CLUSTER_DIR}/bucket.yaml": "kind: StorageBucket\nmetadata: {name: b}\n"})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "fail"
+    assert "adds no such document" in res.reason
+
+
+def test_not_matches_catches_an_e2_pool_among_good_ones(token, github):
+    e2 = _CLUSTER_YAML + "---\nkind: ContainerNodePool\nmetadata: {name: extra}\nspec:\n  nodeConfig:\n    machineType: e2-standard-4\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": e2})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "#2" in res.reason
+    # With `any`, one good pool is enough; `all` is what a "no E2" rule needs.
+    assert _pr_check(content=[{**check, "quantifier": "any"}]).verify(5.0).status == "pass"
+
+
+def test_matches_reads_a_label_key_with_dots_and_slashes(token, github):
+    """A label key holds dots, so the label map is read whole and matched as text."""
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.labels", "op": "matches", "value": r"ate\.dev/substrate-version.*v0\.4\.0"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_absent_fails_on_a_forbidden_chart_anywhere(token, github):
+    fork = "kind: RootSync\nmetadata: {name: substrate, namespace: config-management-system}\nspec:\n  helm:\n    repo: oci://ghcr.io/kagent-dev/substrate/helm\n"
+    check = {"paths": ["clusters/**", "clusters/*/*/*", "clusters/*/*/*/*"], "op": "absent", "value": "",
+             "field": "spec.helm.repo"}
+    files = {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML,
+             "clusters/substrate-a/namespaces/config-management-system/substrate.yaml": fork}
+    _content_pr(github, files)
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "substrate.yaml#0" in res.reason
+    # And the same check passes when no document has the field.
+    github.routes.clear()
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_text_contains_reads_a_terraform_file_raw(token, github):
+    hcl = 'resource "google_container_cluster" "a" {\n  enable_k8s_beta_apis {\n    enabled_apis = ["%s"]\n  }\n}\n' % _BETA_API
+    check = {"paths": ["clusters/*/provisioning/*.tf"], "op": "contains", "value": _BETA_API}
+    _content_pr(github, {"clusters/substrate-a/provisioning/main.tf": hcl})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_a_removed_file_is_not_read(token, github):
+    """A file the pull request deletes is not at the head, so it neither satisfies nor trips a check."""
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML},
+                statuses={f"{_CLUSTER_DIR}/cluster.yaml": "removed"})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "fail" and "no such document" in res.reason
+    assert not any("/contents/" in url for url, _ in github.calls)
+
+
+def test_not_matches_needs_the_field_to_be_there(token, github):
+    """A pool with no machine type gets GKE's default, which may be E2."""
+    bare = "kind: ContainerNodePool\nmetadata: {name: p}\nspec:\n  nodeConfig: {}\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/pool.yaml": bare})
+    assert _pr_check(content=[check]).verify(5.0).status == "fail"
+
+
+def test_scalars_compare_as_the_file_wrote_them(token, github):
+    doc = "kind: ContainerCluster\nmetadata: {name: c}\nspec:\n  enableAutopilot: false\n  minMasterVersion: 1.30\n"
+    _content_pr(github, {f"{_CLUSTER_DIR}/c.yaml": doc})
+    checks = [
+        {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerCluster", "field": "spec.enableAutopilot",
+         "op": "contains", "value": "false"},
+        {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerCluster", "field": "spec.minMasterVersion",
+         "op": "contains", "value": "1.30"},
+    ]
+    res = _pr_check(content=checks).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_a_bracketed_key_reads_a_label_with_dots(token, github):
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": 'spec.nodeConfig.labels["ate.dev/substrate-version"]', "op": "contains",
+             "value": "v0.4.0-gke.0"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+    assert _pr_check(content=[{**check, "value": "v0.3.0"}]).verify(5.0).status == "fail"
+
+
+def test_absent_fails_closed_on_a_file_that_does_not_parse(token, github):
+    broken = "kind: ContainerNodePool\nmetadata: {name: p}\nspec: [unclosed\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/pool.yaml": broken})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "could not parse" in res.reason
+
+
+def test_an_alias_is_refused_not_expanded(token, github):
+    """A document built to expand on read is not parsed: absence fails closed, and an
+    op that needs the object finds none."""
+    bomb = "kind: ConfigMap\nmetadata: {name: m}\ndata:\n  a: &a [x, x]\n  b: [*a, *a]\n"
+    _content_pr(github, {f"{_CLUSTER_DIR}/m.yaml": bomb})
+    absent = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ConfigMap", "op": "absent"}
+    exists = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ConfigMap", "field": "data", "op": "exists"}
+    assert _pr_check(content=[absent]).verify(5.0).status == "fail"
+    assert _pr_check(content=[exists]).verify(5.0).status == "fail"
+
+
+def test_a_merge_key_is_refused_so_absent_fails_closed(token, github):
+    merged = ("kind: RootSync\nmetadata: {name: s}\nspec:\n  <<: {helm: {repo: oci://ghcr.io/kagent-dev/x}}\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "RootSync", "field": "spec.helm.repo", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/s.yaml": merged})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "could not parse" in res.reason
+
+
+def test_a_bare_scalar_document_is_text_a_text_check_still_sees(token, github):
+    """A scalar document beside an object is read as text: it is no RootSync, so
+    absence of one holds, but a text check over the file sees it."""
+    mixed = "kind: ConfigMap\nmetadata: {name: m}\n---\noci://ghcr.io/kagent-dev/substrate\n"
+    no_rootsync = {"paths": [f"{_CLUSTER_DIR}/*"], "op": "absent", "kind": "RootSync"}
+    no_fork_text = {"paths": [f"{_CLUSTER_DIR}/*"], "op": "not_matches", "value": "ghcr\\.io/kagent-dev"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/m.yaml": mixed})
+    assert _pr_check(content=[no_rootsync]).verify(5.0).status == "pass"
+    assert _pr_check(content=[no_fork_text]).verify(5.0).status == "fail"
+
+
+def test_a_file_that_parses_to_nothing_is_not_a_parse_failure(token, github):
+    """An empty or comment-only file is not a YAML error, so absence over it holds."""
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "RootSync", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/.keep.yaml": "# placeholder\n"})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_a_root_list_of_objects_is_read_object_by_object(token, github):
+    listed = "- kind: RootSync\n  metadata: {name: a}\n  spec: {helm: {repo: oci://ghcr.io/kagent-dev/x}}\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "RootSync", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/l.yaml": listed})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "l.yaml#0.0" in res.reason
+
+
+def test_an_anchored_regex_sees_every_line_of_a_map(token, github):
+    doc = ("kind: ContainerNodePool\nmetadata: {name: p}\nspec:\n  nodeConfig:\n    machineType: c3-standard-4\n"
+           "    labels: {env: prod, ate.dev/substrate-version: v0.4.0-gke.0}\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool", "field": "spec.nodeConfig.labels",
+             "op": "matches", "value": "^ate\\.dev/substrate-version: v0\\.4"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/p.yaml": doc})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_document_text_is_as_written_not_requoted(token, github):
+    doc = "kind: ContainerCluster\nmetadata: {name: c}\nspec:\n  enableAutopilot: false\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerCluster", "op": "contains",
+             "value": "enableAutopilot: false"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/c.yaml": doc})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_a_value_on_a_presence_op_is_refused():
+    with pytest.raises(ValueError):
+        _pr_check(content=[{"paths": ["x"], "op": "exists", "field": "a", "value": "c3-standard-4"}])
+
+
+def test_an_empty_value_is_still_a_present_key(token, github):
+    doc = "kind: ContainerNodePool\nmetadata: {name: p}\nspec:\n  nodeConfig:\n    machineType: \"\"\n"
+    _content_pr(github, {f"{_CLUSTER_DIR}/p.yaml": doc})
+    absent = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool", "field": "spec.nodeConfig.machineType", "op": "absent"}
+    not_e2 = {**absent, "op": "not_matches", "value": "^e2-"}
+    assert _pr_check(content=[absent]).verify(5.0).status == "fail"
+    # An empty machine type is GKE's default too, so "not E2" is not shown.
+    assert _pr_check(content=[not_e2]).verify(5.0).status == "fail"
+
+
+def test_a_patch_ending_without_a_newline_is_rebuilt():
+    entry = {"status": "added", "patch": "@@ -0,0 +1,2 @@\n+kind: A\n+x: 1\n\\ No newline at end of file"}
+    assert verifiers._added_file_text(entry) == "kind: A\nx: 1\n"
+    entry = {"status": "added", "patch": "@@ -0,0 +1,1 @@\n+kind: A\n"}
+    assert verifiers._added_file_text(entry) == "kind: A\n"
+    assert verifiers._added_file_text({"status": "added"}) is None
+    assert verifiers._added_file_text({"status": "modified", "patch": "@@\n+a"}) is None
+
+
+def test_a_field_path_is_checked_when_the_case_loads():
+    with pytest.raises(ValueError):
+        _pr_check(content=[{"paths": ["x"], "op": "exists", "field": 'a.["unclosed'}])
+
+
+def test_an_added_file_is_read_from_the_listing_alone(token, github):
+    """The grading credential has no `contents: read`; a file the pull request
+    adds is whole in its patch, so nothing else is fetched."""
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert not any("/contents/" in url for url, _ in github.calls)
+
+
+def test_a_modified_file_under_a_glob_is_unevaluable_and_names_the_permission(token, github):
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML},
+                statuses={f"{_CLUSTER_DIR}/cluster.yaml": "modified"})
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "error"
+    assert "cluster.yaml (modified)" in res.reason and "contents: read" in res.reason
+    assert not any("/contents/" in url for url, _ in github.calls)
+
+
+def test_an_added_file_without_a_patch_is_unevaluable(token, github):
+    """GitHub leaves the patch out for a large or binary file."""
+    _content_pr(github, {f"{_CLUSTER_DIR}/big.yaml": _CLUSTER_YAML}, patches=False)
+    res = _pr_check(content=[_beta_api_check()]).verify(5.0)
+    assert res.status == "error" and "big.yaml (added)" in res.reason
+
+
+def test_a_malformed_field_path_is_refused_at_load():
+    for bad in ('spec.helm."repo"', 'labels["ate.dev/x"]version', 'a..b', 'a.', '.a', 'a[b]'):
+        with pytest.raises(ValueError):
+            _pr_check(content=[{"paths": ["x"], "op": "exists", "field": bad}])
+    assert verifiers._field_keys('spec.nodeConfig.labels["ate.dev/x"]') == ["spec", "nodeConfig", "labels", "ate.dev/x"]
+    assert verifiers._field_keys('a["b.c"].d') == ["a", "b.c", "d"]
+
+
+def test_an_empty_list_is_still_a_present_key(token, github):
+    doc = "kind: ContainerCluster\nmetadata: {name: c}\nspec:\n  enableK8sBetaApis:\n    enabledApis: []\n"
+    _content_pr(github, {f"{_CLUSTER_DIR}/c.yaml": doc})
+    field = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerCluster", "field": "spec.enableK8sBetaApis.enabledApis"}
+    assert _pr_check(content=[{**field, "op": "exists"}]).verify(5.0).status == "pass"
+    assert _pr_check(content=[{**field, "op": "absent"}]).verify(5.0).status == "fail"
+
+
+def test_a_null_machine_type_is_not_shown_to_avoid_e2(token, github):
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    for spelling in ("null", "~", "Null"):
+        github.routes.clear()
+        doc = f"kind: ContainerNodePool\nmetadata: {{name: p}}\nspec:\n  nodeConfig:\n    machineType: {spelling}\n"
+        _content_pr(github, {f"{_CLUSTER_DIR}/p.yaml": doc})
+        assert _pr_check(content=[check]).verify(5.0).status == "fail", spelling
+
+
+def test_deep_nesting_is_unparsed_not_a_crash(token, github):
+    deep = "kind: ConfigMap\ndata:\n  x: " + "[" * 3000 + "]" * 3000 + "\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ConfigMap", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/deep.yaml": deep})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "could not parse" in res.reason
+
+
+def test_an_unparsed_file_fails_every_scoped_op_not_only_absent(token, github):
+    """An E2 pool hidden behind an alias in a second file cannot let "not E2" pass."""
+    hidden = "kind: ContainerNodePool\nmetadata: {name: e2}\nspec:\n  nodeConfig: &n {machineType: e2-standard-4}\n  x: *n\n"
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML, f"{_CLUSTER_DIR}/hidden.yaml": hidden})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "hidden.yaml" in res.reason
+
+
+def test_a_trailing_document_marker_adds_no_document(token, github):
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "field": "metadata.name", "op": "exists"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/c.yaml": _CLUSTER_YAML + "---\n---\n"})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_document_text_is_the_file_slice_with_its_quoting(token, github):
+    doc = 'kind: CronJob\nmetadata: {name: j}\nspec:\n  schedule: "*/5 * * * *"\n'
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "CronJob", "op": "contains",
+             "value": 'schedule: "*/5 * * * *"'}
+    _content_pr(github, {f"{_CLUSTER_DIR}/j.yaml": doc})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_an_empty_added_file_reads_as_empty(token, github):
+    """GitHub carries no patch for an empty new file; it is read as empty, not unevaluable."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(github, {"filename": f"{_CLUSTER_DIR}/.keep", "status": "added", "additions": 0, "changes": 0,
+                             "sha": verifiers._EMPTY_BLOB_SHA})
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "RootSync", "op": "absent"}
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+    # A binary file also has no patch and zero line counts; only the empty blob is known empty.
+    github.routes.clear()
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(github, {"filename": f"{_CLUSTER_DIR}/blob.bin", "status": "added", "additions": 0, "changes": 0,
+                             "sha": "0" * 40})
+    assert _pr_check(content=[check]).verify(5.0).status == "error"
+
+
+def test_a_terraform_file_is_raw_text_and_scoped_checks_fail_closed(token, github):
+    """A .tf file reads as one YAML plain scalar; it is kept raw, and a kind-scoped
+    check over it is not shown rather than passing."""
+    hcl = 'resource "google_container_cluster" "a" {\n  name = "a"\n}\n'
+    _content_pr(github, {"clusters/substrate-a/provisioning/main.tf": hcl})
+    raw = {"paths": ["clusters/*/provisioning/*.tf"], "op": "contains", "value": '{\n  name = "a"'}
+    scoped = {"paths": ["clusters/*/provisioning/*.tf"], "kind": "RootSync", "op": "absent"}
+    assert _pr_check(content=[raw]).verify(5.0).status == "pass"
+    assert _pr_check(content=[scoped]).verify(5.0).status == "fail"
+
+
+def test_a_kind_list_wrapper_does_not_hide_an_e2_pool(token, github):
+    wrapped = ("apiVersion: v1\nkind: List\nitems:\n  - kind: ContainerNodePool\n    metadata: {name: e2}\n"
+               "    spec:\n      nodeConfig: {machineType: e2-standard-4}\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML, f"{_CLUSTER_DIR}/pool.yaml": wrapped})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "pool.yaml#0.items.0" in res.reason
+
+
+def test_nested_and_typed_lists_are_unwrapped_all_the_way(token, github):
+    nested = ("kind: List\nitems:\n  - kind: ConfigMapList\n    items:\n      - kind: ContainerNodePool\n"
+              "        metadata: {name: e2}\n        spec: {nodeConfig: {machineType: e2-standard-4}}\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML, f"{_CLUSTER_DIR}/n.yaml": nested})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "n.yaml#0.items.0.items.0" in res.reason
+
+
+def test_a_list_wrapper_with_a_repeated_items_key_is_refused(token, github):
+    doubled = ("kind: List\nitems:\n  - {kind: ConfigMap, metadata: {name: ok}}\n"
+               "items:\n  - kind: ContainerNodePool\n    spec: {nodeConfig: {machineType: e2-standard-4}}\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool", "op": "absent"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/d.yaml": doubled})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "could not parse" in res.reason
+
+
+def test_a_root_list_item_keeps_its_quoting(token, github):
+    listed = '- kind: CronJob\n  metadata: {name: j}\n  spec: {schedule: "*/5 * * * *"}\n'
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "CronJob", "op": "contains", "value": 'schedule: "*/5 * * * *"'}
+    _content_pr(github, {f"{_CLUSTER_DIR}/l.yaml": listed})
+    assert _pr_check(content=[check]).verify(5.0).status == "pass"
+
+
+def test_a_duplicate_key_is_refused_so_the_first_spelling_cannot_hide(token, github):
+    doc = ("kind: ContainerNodePool\nmetadata: {name: p}\nspec:\n  nodeConfig:\n"
+           "    machineType: e2-standard-4\n    machineType: c3-standard-4\n")
+    check = {"paths": [f"{_CLUSTER_DIR}/*"], "kind": "ContainerNodePool",
+             "field": "spec.nodeConfig.machineType", "op": "not_matches", "value": "^e2-"}
+    _content_pr(github, {f"{_CLUSTER_DIR}/p.yaml": doc})
+    res = _pr_check(content=[check]).verify(5.0)
+    assert res.status == "fail" and "could not parse" in res.reason
+
+
+def test_a_quantifier_on_absent_is_refused():
+    with pytest.raises(ValueError):
+        _pr_check(content=[{"paths": ["x"], "op": "absent", "quantifier": "any"}])
+
+
+def test_a_content_check_needs_a_value_for_its_op():
+    with pytest.raises(ValueError):
+        _pr_check(content=[{"paths": ["x"], "op": "contains"}])
+    with pytest.raises(ValueError):
+        _pr_check(content=[{"paths": ["x"], "op": "matches", "value": "("}])
 
 
 def test_a_previous_reps_pull_request_is_a_fail(token, github):
@@ -6078,3 +7199,629 @@ def test_the_failure_case_fails_a_reply_that_never_read_the_card():
 )
 def test_the_failure_voice_objectives_fail_the_recorded_replies(final_message, missed):
     assert _failure_voice_misses(final_message) == missed
+
+
+# ------------------------- the recorded cluster is the slot, not the name's shape
+
+
+def test_a_cluster_sharing_the_slot_token_with_another_location_is_not_the_slot():
+    """`seeded-a-us-west1` is what a leftover second-region cluster is called;
+    the runner reads a slot off a name's end and skips it, so the verifier
+    must too: beside four right lines its wrong values grade nothing, and
+    standing in for seeded-a it is a missing slot."""
+    stray = "seeded-a-us-west1: control plane is regional; API during its upgrade: available; running pods: affected"
+    for objective in _ZONAL_OBJECTIVES:
+        assert _zonal_case_grades(objective, _RIGHT_REPORT + "\n" + stray), objective
+    without_a = "\n".join([_zonal_line(c) for c in _SLOTS if c != "seeded-a"] + [stray.replace("regional", "zonal").replace("available", "unavailable").replace("affected", "unaffected")])
+    assert not _zonal_case_grades("every-seeded-cluster-has-a-declared-line", without_a)
+
+
+def test_the_recorded_location_is_the_only_suffix_the_slot_takes():
+    qualified = "\n".join(f"kube-agents-evals-{c}-us-central1-a: " + _zonal_line(c).split(": ", 1)[1] for c in _SLOTS)
+    for objective in _ZONAL_OBJECTIVES:
+        assert _zonal_case_grades(objective, qualified), objective
+    other_zone = qualified.replace("-us-central1-a:", "-us-central1-b:")
+    assert not _zonal_case_grades("every-seeded-cluster-has-a-declared-line", other_zone)
+
+
+def test_a_fleet_with_another_prefix_is_graded_on_its_recorded_names():
+    names = {s: f"prod-{s}" for s in _SLOT_LETTERS}
+    renamed = "\n".join(_zonal_line(f"prod-{s}") for s in _SLOT_LETTERS)
+    for objective in _ZONAL_OBJECTIVES:
+        assert _zonal_case_verdict(objective, renamed, names=names).status == "pass", objective
+    # and the seeded names, which the runner did not record, are then nobody's
+    assert _zonal_case_verdict("every-seeded-cluster-has-a-declared-line", _RIGHT_REPORT, names=names).status == "fail"
+
+
+def test_a_pattern_naming_an_unrecorded_slot_is_an_error_not_a_miss():
+    v = parse_node({"type": "report_contains", "any_of_patterns": ["(?m)^{cluster:q}: ok$"]})
+    _stash("seeded-q: ok")
+    with tempfile.TemporaryDirectory(prefix="zonal-fleet-") as root:
+        _write_fleet_dir(Path(root), _zonal_case_fixtures())
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            res = v.verify(5.0)
+    assert res.status == "error"
+    assert "slot 'q'" in res.reason
+
+
+def test_the_frame_bounds_the_name_itself_wherever_the_placeholder_sits():
+    """The contract is the frame's, not the pattern's: an unanchored
+    placeholder still refuses a longer token on either side."""
+    expand = verifiers.ReportContainsVerifier.expand_cluster_placeholders
+    loose = expand("{cluster:a} is down", {"a": ("seeded-a", "us-central1-a")})
+    assert re.search(loose, "seeded-a is down")
+    assert re.search(loose, "p-seeded-a is down")
+    assert re.search(loose, "p-seeded-a-us-central1-a is down")
+    assert not re.search(loose, "unseeded-a is down")
+    assert not re.search(loose, "xseeded-a is down")
+    assert not re.search(loose, "seeded-a-canary is down")
+    assert not re.search(loose, "seeded-a-us-west1 is down")
+    assert not re.search(loose, "seeded-a-us-central1-a-extra is down")
+    # a quantifier after the placeholder binds to the whole frame
+    optional = expand("^{cluster:a}?: x$", {"a": ("seeded-a", "")})
+    assert re.search(optional, ": x") and re.search(optional, "seeded-a: x")
+
+
+@pytest.mark.parametrize(
+    "pattern, needle",
+    [
+        ("(?<={cluster:a}): x", "does not compile once"),
+        ("^[{cluster:a}]$", "does not compile once"),
+        ("{cluster: a}: x", "malformed cluster placeholder"),
+        ("{Cluster:a}: x", "malformed cluster placeholder"),
+        ("{cluster:a: x", "malformed cluster placeholder"),
+    ],
+)
+def test_a_pattern_the_expansion_breaks_or_a_mistyped_placeholder_fails_at_spec_load(pattern, needle):
+    with pytest.raises(Exception) as excinfo:
+        parse_node({"type": "report_contains", "any_of_patterns": [pattern]})
+    assert needle in str(excinfo.value)
+
+
+@pytest.mark.parametrize("field", ["required_phrases", "forbidden_phrases", "any_of_phrases"])
+def test_a_cluster_placeholder_in_a_phrase_list_fails_at_spec_load(field):
+    # A phrase is a substring matched as written, so a placeholder in one is
+    # never expanded: an inert forbid, or a requirement that fails every run.
+    with pytest.raises(Exception) as excinfo:
+        parse_node({"type": "report_contains", field: ["{cluster:a}: control plane is regional"]})
+    assert "cluster placeholder" in str(excinfo.value) and field in str(excinfo.value)
+
+
+@pytest.mark.parametrize("fold, status", [(True, "pass"), (False, "fail")])
+def test_a_kubeconfig_context_names_the_slot_only_under_the_fold(fold, status):
+    # Through verify(), on the text the verifier produces: `_normalize`
+    # deletes an underscore, so `gke_p_us-central1-a_seeded-a` has no
+    # boundary before the name unless the fold has made the `_` a `-` first.
+    v = parse_node({"type": "report_contains", "fold_decoration": fold, "any_of_patterns": ["(?m)^{cluster:a}: ok$"]})
+    _stash("gke_kube-agents-evals_us-central1-a_seeded-a: ok")
+    with tempfile.TemporaryDirectory(prefix="zonal-fleet-") as root:
+        _write_fleet_dir(Path(root), _zonal_case_fixtures())
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            res = v.verify(5.0)
+    assert res.status == status, res.reason
+
+
+def test_a_cluster_placeholder_in_tool_calleds_agent_selector_fails_at_spec_load():
+    # The selector is a scalar regex matched as written against agent tags;
+    # the placeholder is not expanded there, so it is refused up front.
+    with pytest.raises(Exception) as excinfo:
+        parse_node({"type": "tool_called", "tool_names": ["x"], "scope": "workers", "agent": "cluster-.*-{cluster:a}"})
+    assert "cluster placeholder" in str(excinfo.value)
+
+
+def test_any_with_no_recorded_slot_says_so_rather_than_naming_a_slot():
+    v = parse_node({"type": "report_contains", "any_of_patterns": ["(?m)^{cluster:any}: ok$"]})
+    _stash("seeded-a: ok")
+    with tempfile.TemporaryDirectory(prefix="zonal-fleet-") as root:
+        _write_fleet_dir(Path(root), [])
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            res = v.verify(5.0)
+    assert res.status == "error"
+    assert "recorded none" in res.reason and "no slot at all" not in res.reason
+    # The pattern names no slot, so the reason does not say one was named.
+    assert not res.reason.startswith(verifiers._UNRECORDED_SLOT_REASON)
+
+
+def test_any_with_no_runner_directory_names_the_runner_not_a_slot():
+    v = parse_node({"type": "report_contains", "any_of_patterns": ["(?m)^{cluster:any}: ok$"]})
+    _stash("seeded-a: ok")
+    with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: ""}):
+        res = v.verify(5.0)
+    assert res.status == "error"
+    assert "hack/fleet-kubeconfigs.sh did not run" in res.reason
+    assert not res.reason.startswith(verifiers._UNRECORDED_SLOT_REASON)
+
+
+def test_a_miss_is_reported_in_the_cases_spelling_with_the_names_the_slots_resolved_to():
+    forbid = parse_node({"type": "report_contains", "forbidden_patterns": ["(?m)^{cluster:a}: bad$"], "any_of_patterns": ["(?m)^{cluster:b}: good$"]})
+    _stash("seeded-a: bad\nseeded-b: meh")
+    with tempfile.TemporaryDirectory(prefix="zonal-fleet-") as root:
+        _write_fleet_dir(Path(root), _zonal_case_fixtures())
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            res = forbid.verify(5.0)
+    assert res.status == "fail"
+    assert "['(?m)^{cluster:a}: bad$']" in res.reason, res.reason
+    assert "(?<![a-z0-9])" not in res.reason, "the expanded frame is not the case's spelling"
+    assert "'a': 'seeded-a (us-central1-a)'" in res.reason, res.reason
+
+
+def test_cluster_placeholders_expand_to_escaped_recorded_names():
+    frame = verifiers.ReportContainsVerifier.expand_cluster_placeholders("^{cluster:a}: x$", {"a": ("seeded-a", "us-central1-a")})
+    assert re.search(frame, "seeded-a: x")
+    assert re.search(frame, "p-seeded-a-us-central1-a: x")
+    assert re.search(frame, "gke-p-us-central1-a-seeded-a: x")
+    assert not re.search(frame, "seeded-a-us-west1: x")
+    assert not re.search(frame, "unseeded-a: x")
+    assert not re.search(frame, "seeded-a-canary: x")
+    any_frame = verifiers.ReportContainsVerifier.expand_cluster_placeholders("^{cluster:any}: x$", {"a": ("seeded-a", ""), "b": ("seeded-b", "")})
+    assert re.search(any_frame, "seeded-b: x") and not re.search(any_frame, "seeded-c: x")
+    # a name with regex metacharacters is matched literally
+    dotted = verifiers.ReportContainsVerifier.expand_cluster_placeholders("^{cluster:a}$", {"a": ("a.b", "")})
+    assert re.search(dotted, "a.b") and not re.search(dotted, "axb")
+    # a placeholder still compiles at spec load, before any record exists
+    parse_node({"type": "report_contains", "forbidden_patterns": ["{cluster:any}: no$"]})
+
+
+# ------------------------- any_of_patterns written for the flat text still cross a break
+
+
+def _any_of_patterns_of(case_name: str) -> list[str]:
+    spec = yaml.safe_load((TASKS / case_name / "task.yaml").read_text(encoding="utf-8"))
+    lists = [e["check"]["any_of_patterns"] for e in spec["verification_spec"] if e["check"].get("any_of_patterns")]
+    assert len(lists) == 1, case_name
+    return lists[0]
+
+
+@pytest.mark.parametrize(
+    "case_name, final_message, matches",
+    [
+        # A right phrase that wraps over a line still matches.
+        ("chat-voice-final-attempt-is-not-retried", "The last attempt failed. It has\nstopped.", True),
+        ("chat-voice-retry-says-it-is-retried", "The worker crashed. The dispatcher will\npick it up again.", True),
+        # A hedge that wraps is still refused: the lookahead reads past the break.
+        ("chat-voice-final-attempt-is-not-retried", "The worker crashed; it won't retry\nfor now, but ask and I'll queue it.", False),
+        ("chat-voice-final-attempt-is-not-retried", "It won't be retried\nuntil tomorrow.", False),
+        # ... and the one `until` the lookahead lets through (the user has to act) still is.
+        ("chat-voice-final-attempt-is-not-retried", "It won't be retried\nuntil you say so.", True),
+    ],
+)
+def test_the_chat_voice_patterns_cross_a_line_break_as_they_did_on_the_flat_text(case_name, final_message, matches):
+    """`any_of_patterns` run against the line-preserving text, where a literal
+    space does not span a line break; the two cases that wrote their patterns
+    for the flat text say `\\s+` where a phrase may wrap, so they grade a
+    wrapped reply as they did before."""
+    v = ReportContainsVerifier(type="report_contains", any_of_patterns=_any_of_patterns_of(case_name))
+    transcript.set(final_message, [], final_message=final_message)
+    assert v.verify(1.0).success is matches, final_message
+
+
+# ------------------------------- the fail-closed webhook readiness case's lines
+#
+# The readiness case's declared lines, read out of its task file: one fixed-form
+# line per object, every value one word from a closed set. seeded-b's budget and
+# exclusion lines must answer yes, its gate line must say the backend is missing
+# and answer no, and no line anywhere may blame the gate. Same fold and grounding
+# as the zonal case.
+
+_WEBHOOK_CASE = TASKS / "upgrades-fleet-readiness-failclosed-webhook" / "task.yaml"
+_WEBHOOK_SPEC = yaml.safe_load(_WEBHOOK_CASE.read_text(encoding="utf-8"))
+_WEBHOOK_PDB = "seeded-b-pdb-line-blocks-the-upgrade"
+_WEBHOOK_EXCLUSION = "seeded-b-exclusion-line-blocks-the-upgrade"
+_WEBHOOK_GATE = "seeded-b-gate-line-does-not-block"
+_WEBHOOK_BACKEND = "the-reply-names-the-missing-backend"
+_WEBHOOK_NO_BLAME = "no-line-blames-the-gate-for-the-upgrade"
+_WEBHOOK_OBJECTIVES = (_WEBHOOK_PDB, _WEBHOOK_EXCLUSION, _WEBHOOK_GATE, _WEBHOOK_BACKEND, _WEBHOOK_NO_BLAME)
+
+
+def _webhook_case_verdict(objective: str, text: str):
+    check = next(e["check"] for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == objective)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="webhook-fleet-") as root:
+        _write_fleet_dir(Path(root), list(_WEBHOOK_SPEC["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0)
+
+
+def _webhook_line(obj: str, kind: str, backend: str, blocks: str, cluster: str = "seeded-b") -> str:
+    return f"{cluster}/{obj}: kind {kind}; backend: {backend}; blocks the upgrade: {blocks}"
+
+
+_WEBHOOK_PDB_LINE = _webhook_line("pinned-batch-runner", "pdb", "not applicable", "yes")
+_WEBHOOK_EXCLUSION_LINE = _webhook_line("hold-the-minor-lag", "exclusion", "not applicable", "yes")
+_WEBHOOK_GATE_LINE = _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no")
+
+
+def _webhook_report(pdb: str = _WEBHOOK_PDB_LINE, exclusion: str = _WEBHOOK_EXCLUSION_LINE, gate: str = _WEBHOOK_GATE_LINE, *extra: str) -> str:
+    return "\n".join(line for line in (pdb, exclusion, gate, *extra) if line)
+
+
+def _webhook_verdicts(text: str) -> dict[str, str]:
+    return {objective: _webhook_case_verdict(objective, text).status for objective in _WEBHOOK_OBJECTIVES}
+
+
+# The checks read one token per object: the verdict, on any line that names the object.
+# Everything else about the line's rendering is free, so each of these passes every
+# objective: the renderings the runs produced, and the ones the prompt's own words invite.
+@pytest.mark.parametrize(
+    "text",
+    [
+        _webhook_report(),
+        # a bullet and a stop, bold, a numbered list, the names in backticks, a `:` after `kind`
+        "\n".join("- " + line + "." for line in _webhook_report().splitlines()),
+        "\n".join("**" + line + "**" for line in _webhook_report().splitlines()),
+        "\n".join(f"{n}. {line}" for n, line in enumerate(_webhook_report().splitlines(), 1)),
+        "\n".join("`" + line.split(":", 1)[0] + "`:" + line.split(":", 1)[1] for line in _webhook_report().splitlines()),
+        _webhook_report().replace("kind ", "kind: "),
+        # the prefix the three rounds of runs wrote: the cluster alone, the project and the
+        # cluster, the project alone, the cluster's full id, a context's `_` joins
+        _webhook_report().replace("seeded-b/", "haoxuw-gke-dev/seeded-b/"),
+        _webhook_report().replace("seeded-b/", "haoxuw-gke-dev/"),
+        _webhook_report().replace("seeded-b/", "haoxuw-gke-dev-seeded-b-us-central1-a/"),
+        _webhook_report().replace("seeded-b/", "gke_haoxuw-gke-dev_us-central1-a_seeded-b/"),
+        # the object with its namespace before it, the webhook under its webhook name, the
+        # webhook with its webhook name after its configuration's, a parenthetical after the name
+        _webhook_report(pdb=_webhook_line("seeded-upgrade/pinned-batch-runner", "pdb", "not applicable", "yes")),
+        _webhook_report(gate=_webhook_line("gate.seeded.invalid", "webhook", "missing", "no")),
+        _webhook_report(gate=_webhook_line("seeded-fail-closed-gate/gate.seeded.invalid", "webhook", "missing", "no")),
+        _webhook_report(pdb=_webhook_line("pinned-batch-runner (seeded-upgrade, maxUnavailable 0)", "pdb", "not applicable", "yes")),
+        # the kind and the backend fields are the judge's: a long kind, a word outside the
+        # closed set, a budget's backend called ready
+        _webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "validatingwebhookconfiguration", "missing", "no")),
+        _webhook_report(pdb=_webhook_line("pinned-batch-runner", "poddisruptionbudget", "ready", "yes")),
+        _webhook_report(pdb=_webhook_line("pinned-batch-runner", "poddisruptionbudgets", "not applicable", "yes")),
+        _webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "absent", "no")) + "\nThe Service seeded-upgrade/nonexistent-admission-gate does not exist.",
+        # the pinned Deployment that shares the budget's name, correctly not a blocker beside the budget's yes
+        _webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "deployment", "not applicable", "no")),
+        # lines about other objects are ignored: a pool, a live webhook, another cluster's
+        # budget, another cluster's healthy webhook; so is prose between the lines
+        _webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("no-surge-pool", "pool", "not applicable", "yes"), _webhook_line("warden-validating", "webhook", "ready", "no"), _webhook_line("inference-server", "pdb", "not applicable", "no", cluster="seeded-a"), _webhook_line("gmp-operator.gmp-system.monitoring.googleapis.com", "webhook", "ready", "no", cluster="seeded-a")),
+        "seeded-b is blocked by its budget and its exclusion.\n\n" + _WEBHOOK_GATE_LINE + "\n\nThe gate matches ConfigMaps only.\n" + _WEBHOOK_PDB_LINE + "\n" + _WEBHOOK_EXCLUSION_LINE,
+    ],
+)
+def test_webhook_readiness_declared_lines_accepted(text):
+    assert _webhook_verdicts(text) == {objective: "pass" for objective in _WEBHOOK_OBJECTIVES}, text
+
+
+@pytest.mark.parametrize(
+    "text, failing",
+    [
+        # each right line with the wrong verdict
+        (_webhook_report(pdb=_webhook_line("pinned-batch-runner", "pdb", "not applicable", "no")), _WEBHOOK_PDB),
+        (_webhook_report(exclusion=_webhook_line("hold-the-minor-lag", "exclusion", "not applicable", "no")), _WEBHOOK_EXCLUSION),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes")), _WEBHOOK_GATE),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes")), _WEBHOOK_NO_BLAME),
+        # the gate called harmless without its backend named anywhere
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "ready", "no")), _WEBHOOK_BACKEND),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "not applicable", "no")), _WEBHOOK_BACKEND),
+        # a line missing
+        (_webhook_report(pdb=""), _WEBHOOK_PDB),
+        (_webhook_report(exclusion=""), _WEBHOOK_EXCLUSION),
+        (_webhook_report(gate=""), _WEBHOOK_GATE),
+        # a second line about the same object that contradicts the right one
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes")), _WEBHOOK_GATE),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "pdb", "not applicable", "no")), _WEBHOOK_PDB),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("pinned-batch-runner", "poddisruptionbudget", "not applicable", "no")), _WEBHOOK_PDB),
+        (_webhook_report(pdb=_webhook_line("pinned-batch-runner", "poddisruptionbudget", "not applicable", "no")), _WEBHOOK_PDB),
+        # the pinned Deployment blamed, and no budget line at all: the shared name does not credit the budget
+        (_webhook_report(pdb=_webhook_line("pinned-batch-runner", "deployment", "not applicable", "yes")), _WEBHOOK_PDB),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("hold-the-minor-lag", "exclusion", "not applicable", "no")), _WEBHOOK_EXCLUSION),
+        # the gate blamed under another of its names, or under another cluster's
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("gate.seeded.invalid", "webhook", "missing", "yes")), _WEBHOOK_NO_BLAME),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-upgrade/nonexistent-admission-gate", "webhook", "missing", "yes")), _WEBHOOK_NO_BLAME),
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes", cluster="seeded-a")), _WEBHOOK_NO_BLAME),
+        # a verdict with anything around it: a hedge, a qualifier, a trailing clause, a mark
+        # that is not a closer
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "probably no")), _WEBHOOK_GATE),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no (but it rejects ConfigMaps now)")), _WEBHOOK_GATE),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no, unless the rules widen")), _WEBHOOK_GATE),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no?")), _WEBHOOK_GATE),
+        (_webhook_report(pdb=_webhook_line("pinned-batch-runner", "pdb", "not applicable", "yes (maxUnavailable 0)")), _WEBHOOK_PDB),
+        (_webhook_report(pdb=_webhook_line("pinned-batch-runner", "pdb", "not applicable", "not yes")), _WEBHOOK_PDB),
+        # a longer name that is not the object
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate-2", "webhook", "missing", "no")), _WEBHOOK_GATE),
+        # the previous shape's line, or prose with the same words: no line carries the token
+        ("seeded-b: upgrade blockers: PDB seeded-upgrade/pinned-batch-runner, Maintenance exclusion hold-the-minor-lag; fail-closed webhooks with no backend: seeded-fail-closed-gate; any of them blocks the upgrade: no", _WEBHOOK_GATE),
+        ("seeded-b is blocked by its budget; seeded-fail-closed-gate has no backend and does not block the upgrade.", _WEBHOOK_GATE),
+        ("seeded-b is blocked by its budget; seeded-fail-closed-gate has no backend and does not block the upgrade.", _WEBHOOK_PDB),
+    ],
+)
+def test_webhook_readiness_declared_lines_refused(text, failing):
+    # `fail`, not merely not-`pass`: an `error` (an unrecorded slot) would also be not-pass.
+    assert _webhook_case_verdict(failing, text).status == "fail", (failing, text)
+
+
+# One wrong line fails its own objective and nothing else, so a red says which line.
+@pytest.mark.parametrize(
+    "text, failing",
+    [
+        (_webhook_report(pdb=_webhook_line("pinned-batch-runner", "pdb", "not applicable", "no")), {_WEBHOOK_PDB}),
+        (_webhook_report(exclusion=""), {_WEBHOOK_EXCLUSION}),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "ready", "no")), {_WEBHOOK_BACKEND}),
+        # the misattribution the case exists for: the gate line answering yes, or the gate
+        # blamed under another cluster's name
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "yes", cluster="seeded-a")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
+        # a hedged `no` on the gate line is the objective's refusal, not a blame: the safeguard,
+        # whose consequence is the run scored zero, reads the verdict token alone
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no (but it rejects ConfigMaps now)")), {_WEBHOOK_GATE}),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no, unless the rules widen")), {_WEBHOOK_GATE}),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "no?")), {_WEBHOOK_GATE}),
+        # a look-alike name on another cluster, blamed, is another object: no objective reads it
+        (_webhook_report(_WEBHOOK_PDB_LINE, _WEBHOOK_EXCLUSION_LINE, _WEBHOOK_GATE_LINE, _webhook_line("copy-seeded-fail-closed-gate", "webhook", "missing", "yes", cluster="seeded-a")), set()),
+        # a token that merely starts with `no` is still a blame
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "none")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
+        (_webhook_report(gate=_webhook_line("seeded-fail-closed-gate", "webhook", "missing", "not yes")), {_WEBHOOK_GATE, _WEBHOOK_NO_BLAME}),
+    ],
+)
+def test_webhook_readiness_one_wrong_line_fails_its_own_objective_alone(text, failing):
+    verdicts = _webhook_verdicts(text)
+    assert {objective for objective, status in verdicts.items() if status == "fail"} == failing, verdicts
+    assert set(verdicts.values()) <= {"pass", "fail"}, verdicts
+
+
+_WEBHOOK_RUN = "the-readiness-run-happened"
+# The route objective's whole check, the run it requires and the hand survey it forbids, so the
+# table below exercises both halves as the case runs them.
+_WEBHOOK_RUN_CHECK = next(e["check"] for e in _WEBHOOK_SPEC["verification_spec"] if e["name"] == _WEBHOOK_RUN)
+_WEBHOOK_RUNS = _WEBHOOK_RUN_CHECK["required_runs"]
+_SCRIPT_PATH = "/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py"
+_SCRIPTS_DIR = "/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts"
+
+
+def _run_objective(command: str) -> str:
+    _stash_commands([command])
+    return WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0).status
+
+
+# The run objective reads each command's argv as the shell splits it: the script by any path or
+# as a module, the mode flag a later word, no usage flag; what stands ahead is the worker's.
+@pytest.mark.parametrize(
+    "command, matches",
+    [
+        (f"python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/r.json", True),
+        (f"python3 -u {_SCRIPT_PATH} --target-version 1.33 --readiness", True),
+        (f"/usr/bin/python3 {_SCRIPT_PATH} --readiness", True),
+        (f"{_SCRIPT_PATH} --readiness --output /opt/data/scratch/fleet_versions.json", True),
+        ("./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness", True),
+        (f"cd {_SCRIPTS_DIR} && python3.14 fleet_upgrade_report.py --readiness", True),
+        (f"cd {_SCRIPTS_DIR} && uv run fleet_upgrade_report.py --readiness", True),
+        (f"cd {_SCRIPTS_DIR} && python3 -m fleet_upgrade_report --readiness", True),
+        # whatever stands ahead of the script is the worker's business
+        (f"timeout 900 python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/fleet_readiness.json", True),
+        (f"KUBECONFIG=/opt/data/.kubeconfigs/x python3 {_SCRIPT_PATH} --readiness", True),
+        (f"env PYTHONUNBUFFERED=1 python3 {_SCRIPT_PATH} --readiness", True),
+        (f"nohup python3 {_SCRIPT_PATH} --readiness --output /tmp/r.json &", True),
+        (f"time python3 {_SCRIPT_PATH} --readiness", True),
+        ("python3 -W ignore fleet_upgrade_report.py --readiness", True),
+        ("uv run --python 3.14 fleet_upgrade_report.py --readiness", True),
+        (f'bash -lc "python3 {_SCRIPT_PATH} --readiness"', True),
+        # a shell string is read as commands of its own, whatever it joins and whatever wraps the shell
+        (f'bash -lc "cd {_SCRIPTS_DIR} && python3 fleet_upgrade_report.py --readiness"', True),
+        (f"sh -c 'cd {_SCRIPTS_DIR}; python3 fleet_upgrade_report.py --readiness'", True),
+        (f"(cd {_SCRIPTS_DIR} && python3 fleet_upgrade_report.py --readiness)", True),
+        (f'timeout 600 bash -c "python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/fleet_readiness.json"', True),
+        (f'nohup bash -c "python3 {_SCRIPT_PATH} --readiness" > /tmp/readiness.log 2>&1 &', True),
+        (f'env KUBECONFIG=/opt/data/.kubeconfigs/x sh -c "python3 {_SCRIPT_PATH} --readiness"', True),
+        # a `#` inside a word is part of the word, as bash reads it
+        (f"python3 {_SCRIPT_PATH} --output /opt/data/scratch/readiness-#2.json --readiness", True),
+        # a quoted path, or one from a variable, is the same argv
+        (f'python3 "{_SCRIPT_PATH}" --readiness', True),
+        ('python3 "$DIR/fleet_upgrade_report.py" --readiness', True),
+        # not a run: the survey, a mention of the file, a run without the mode, a usage call
+        ("kubectl get pdb,validatingwebhookconfigurations -A -o json", False),
+        # the hand survey the bullet forbids is refused by the forbid wherever kubectl's global flags stand, and
+        # beside the run too; a kubectl of something else beside the run is not the survey
+        ("kubectl --context gke_p_us-central1_seeded-b get pdb -A", False),
+        ("kubectl --kubeconfig /opt/data/.kubeconfigs/m.yaml get validatingwebhookconfigurations -o json", False),
+        ("kubectl -n seeded-upgrade describe pdb pinned-batch-runner", False),
+        (f"python3 {_SCRIPT_PATH} --readiness; kubectl --context c get pdb -A", False),
+        (f"python3 {_SCRIPT_PATH} --readiness && kubectl --context c get nodes", True),
+        # the forbid reads the argv as the run does: a quoted mention of the survey is one word and no command, a survey
+        # behind a wrapper or inside a shell string is one, and a resource list or a value that merely contains the name is read as a word
+        (f'python3 {_SCRIPT_PATH} --readiness && grep -n "kubectl get pdb -A" /opt/data/profiles/platform/skills/gke-upgrades/SKILL.md', True),
+        (f'python3 {_SCRIPT_PATH} --readiness; echo "not running kubectl get validatingwebhookconfigurations"', True),
+        (f"python3 {_SCRIPT_PATH} --readiness && kubectl get pods -l app=pdb-test", True),
+        (f"python3 {_SCRIPT_PATH} --readiness; sudo kubectl --context c get pdb -A", False),
+        (f'python3 {_SCRIPT_PATH} --readiness; bash -c "kubectl get deploy,pdb -A"', False),
+        (f"python3 {_SCRIPT_PATH} --readiness; kubectl describe pdb/pinned-batch-runner -n seeded-upgrade", False),
+        # the survey spelled as the API path a `kubectl get --raw` reads is the survey; another path is not
+        (f"python3 {_SCRIPT_PATH} --readiness; kubectl get --raw /apis/policy/v1/poddisruptionbudgets", False),
+        (f"python3 {_SCRIPT_PATH} --readiness; kubectl get --raw=/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations", False),
+        (f"python3 {_SCRIPT_PATH} --readiness; kubectl --context c get --raw /apis/policy/v1/namespaces/seeded-upgrade/poddisruptionbudgets?limit=500", False),
+        (f"python3 {_SCRIPT_PATH} --readiness; kubectl get --raw /api/v1/nodes", True),
+        (f"grep -n readiness {_SCRIPT_PATH}", False),
+        ("cat fleet_upgrade_report.py | grep -- --readiness", False),
+        (f"python3 {_SCRIPT_PATH} --target-version 1.33", False),
+        # the documented invocation quoted inside another command's argument is one word
+        ('grep -rn "fleet_upgrade_report.py --readiness" /opt/data/profiles/platform/skills/', False),
+        ('echo "run fleet_upgrade_report.py --readiness first"', False),
+        ("sed -n '/fleet_upgrade_report.py --readiness/p' /opt/data/profiles/platform/skills/fleet-upgrade-verification/SKILL.md", False),
+        ('echo "run python3 fleet_upgrade_report.py --readiness && read the table"', False),
+        ('echo "run fleet_upgrade_report.py --readiness; then read the table"', False),
+        (f"python3 {_SCRIPT_PATH} --readiness --help", False),
+        (f"python3 {_SCRIPT_PATH} --help --readiness", False),
+        (f"python3 {_SCRIPT_PATH} --readiness -h", False),
+        (f"python3 {_SCRIPT_PATH} -h --readiness", False),
+        # a word opening with `#` comments out the rest of the line, operators included, as bash reads it
+        (f"# python3 {_SCRIPT_PATH} --readiness", False),
+        (f"echo done # python3 {_SCRIPT_PATH} --readiness", False),
+        (f"# run the readiness report; python3 {_SCRIPT_PATH} --readiness", False),
+        (f"echo done # see below && python3 {_SCRIPT_PATH} --readiness", False),
+        # a quoted or escaped `#` is part of the word, as bash reads it
+        (f"python3 {_SCRIPT_PATH} --readiness --output '/opt/data/scratch/#1.json'", True),
+        (f"python3 {_SCRIPT_PATH} --output /opt/data/scratch/readiness\\ #1.json --readiness", True),
+        # a shell word behind `echo` or `printf` is printed, and the string after its `-c` never runs
+        (f'echo bash -c "python3 {_SCRIPT_PATH} --readiness"', False),
+        (f"printf '%s' sh -c 'python3 {_SCRIPT_PATH} --readiness'", False),
+        # the dictated per-run name is one word, whatever order the flags come in; a reserved word stands ahead
+        (f"python3 {_SCRIPT_PATH} --readiness --output /opt/data/scratch/fleet_readiness_$(date +%s).json", True),
+        (f"python3 {_SCRIPT_PATH} --output /opt/data/scratch/fleet_readiness_$(date +%s).json --readiness --scope-projects p", True),
+        (f"python3 {_SCRIPT_PATH} --readiness --scope-projects p --output /opt/data/scratch/fleet_readiness_$(date +%s)_$$.json", True),
+        # the commands inside a command substitution, a process substitution or a backtick pair run, so they are read
+        (f"OUT=$(python3 {_SCRIPT_PATH} --readiness --scope-projects p)", True),
+        (f'echo "$(python3 {_SCRIPT_PATH} --readiness)"', True),
+        (f"cat <(python3 {_SCRIPT_PATH} --readiness)", True),
+        (f"OUT=`python3 {_SCRIPT_PATH} --readiness`", True),
+        (f"echo '$(python3 {_SCRIPT_PATH} --readiness)'", False),
+        # an operator is one outside quotes only: a quoted `>` or `;` is text, so it neither refuses the line nor splits it
+        (f'python3 {_SCRIPT_PATH} --readiness --output /tmp/r.json && echo ">"', True),
+        (f'python3 {_SCRIPT_PATH} --readiness | grep -c ">"', True),
+        (f"echo ';' && python3 {_SCRIPT_PATH} --readiness", True),
+        ("echo see ';' fleet_upgrade_report.py --readiness", False),
+        # one quote model for the whole line: an apostrophe inside double quotes ahead of the name is text, and a `#`
+        # glued to the substitution's closing paren is part of the word
+        (f'echo "don\'t fan out" && python3 {_SCRIPT_PATH} --output /opt/data/scratch/fleet_readiness_$(date +%s).json --readiness --scope-projects p', True),
+        (f"python3 {_SCRIPT_PATH} --output /opt/data/scratch/fleet_readiness_$(date +%s)#1.json --readiness", True),
+        (f"for p in a b; do python3 {_SCRIPT_PATH} --readiness --project $p; done", True),
+        (f"if python3 {_SCRIPT_PATH} --readiness; then echo ok; fi", True),
+        # a redirect whose target is a comment is a line bash refuses
+        (f"python3 {_SCRIPT_PATH} --readiness >#log", False),
+        # a wrapper's own words are transparent: a flag, the word after a flag, a count, `--`
+        (f'timeout -s KILL 600 bash -c "python3 {_SCRIPT_PATH} --readiness"', True),
+        (f"env -u KUBECONFIG sh -c 'python3 {_SCRIPT_PATH} --readiness'", True),
+        (f"sudo -u hermes python3 {_SCRIPT_PATH} --readiness", True),
+        (f"sudo -- python3 {_SCRIPT_PATH} --readiness", True),
+        # a flag after a flag is a flag, not the first flag's value
+        (f"sudo -E -u hermes python3 {_SCRIPT_PATH} --readiness", True),
+        (f"env -i -u KUBECONFIG python3 {_SCRIPT_PATH} --readiness", True),
+        (f"sudo -n -u hermes python3 {_SCRIPT_PATH} --readiness", True),
+        # a line continuation is removed as bash removes it, with or without an indent on the next line
+        (f"cd {_SCRIPTS_DIR} && \\\n  python3 fleet_upgrade_report.py --readiness --output /opt/data/scratch/r.json", True),
+        (f"timeout 600 \\\npython3 {_SCRIPT_PATH} --readiness", True),
+        # an expansion the reader never resolves, a GNU duration word, or a redirect with its target may stand there too
+        (f"timeout $T python3 {_SCRIPT_PATH} --readiness", True),
+        (f'timeout "${{TIMEOUT:-600}}" python3 {_SCRIPT_PATH} --readiness', True),
+        (f"timeout infinity python3 {_SCRIPT_PATH} --readiness", True),
+        (f"nohup > /tmp/readiness.log python3 {_SCRIPT_PATH} --readiness &", True),
+        (f"sudo -u hermes 2>/dev/null python3 {_SCRIPT_PATH} --readiness", True),
+        (f"2>/dev/null python3 {_SCRIPT_PATH} --readiness", True),
+        (f"timeout $T ls {_SCRIPT_PATH} --readiness", False),
+        # the wrappers the sibling inline-code reader knows, a per-project loop among them; a runner that hands on to an interpreter
+        (f"gcloud projects list --format='value(projectId)' | xargs -I{{}} python3 {_SCRIPT_PATH} --readiness --project {{}}", True),
+        (f"watch -n 300 python3 {_SCRIPT_PATH} --readiness", True),
+        (f"flock /tmp/readiness.lock python3 {_SCRIPT_PATH} --readiness", True),
+        (f"poetry run python3 {_SCRIPT_PATH} --readiness", True),
+        (f"xargs ls {_SCRIPT_PATH} --readiness", False),
+        # which flags take a value is not tabled, so the word after a bare flag is read as its value: the stated limit
+        ("sudo -n ls fleet_upgrade_report.py --readiness", True),
+        # a program behind a wrapper that is not the script, a shell or an interpreter is the command the wrapper runs
+        (f"sudo ls {_SCRIPT_PATH} --readiness", False),
+        (f"sudo -- ls {_SCRIPT_PATH} --readiness", False),
+        (f"nohup echo python3 {_SCRIPT_PATH} --readiness &", False),
+        (f"sudo -u hermes echo python3 {_SCRIPT_PATH} --readiness", False),
+        (f'timeout 600 echo bash -c "python3 {_SCRIPT_PATH} --readiness"', False),
+        (f'env echo bash -c "python3 {_SCRIPT_PATH} --readiness"', False),
+        (f"nohup find /opt/data/profiles/platform/skills -name fleet_upgrade_report.py -exec grep -n -- --readiness {{}} \\;", False),
+        # the file and the flag as another command's arguments are not a run of the file
+        (f"find /opt/data/profiles/platform/skills -name fleet_upgrade_report.py -exec grep -n -- --readiness {{}} \\;", False),
+        ("ls fleet_upgrade_report.py --readiness", False),
+        ("echo run fleet_upgrade_report.py --readiness", False),
+        (f'python3 -c "print(1)" {_SCRIPT_PATH} --readiness', False),
+        # a line whose quotes do not balance is one bash refuses: nothing on it ran
+        ('echo "run fleet_upgrade_report.py --readiness', False),
+        (f"python3 {_SCRIPT_PATH} --readiness --output 'unbalanced", False),
+    ],
+)
+def test_webhook_readiness_run_objective_reads_the_argv(command, matches):
+    assert (_run_objective(command) == "pass") is matches, command
+
+
+def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
+    from kube_agents_bench.verifiers import WorkerRun, _argv_runs, _shell_argvs
+
+    assert _shell_argvs('cd /x && python3 "/a b/f.py" --readiness; echo done') == [
+        ["cd", "/x"], ["python3", "/a b/f.py", "--readiness"], ["echo", "done"]]
+    assert _shell_argvs('bash -lc "python3 /x/f.py --readiness"') == [
+        ["bash", "-lc", "python3 /x/f.py --readiness"], ["python3", "/x/f.py", "--readiness"]]
+    # quotes protect the operators inside them; the shell string is then read as its own commands
+    assert _shell_argvs('bash -lc "cd /x && python3 f.py --readiness"') == [
+        ["bash", "-lc", "cd /x && python3 f.py --readiness"], ["cd", "/x"], ["python3", "f.py", "--readiness"]]
+    assert _shell_argvs('echo "a && b"') == [["echo", "a && b"]]
+    assert _shell_argvs("python3 f.py --output r-#2.json --readiness # done") == [["python3", "f.py", "--output", "r-#2.json", "--readiness"]]
+    # a comment runs to the line's end, operators included: bash runs nothing after it
+    assert _shell_argvs("# python3 f.py --readiness; echo next") == []
+    assert _shell_argvs("echo done # a && python3 f.py --readiness") == [["echo", "done"]]
+    assert _shell_argvs("echo a;#x") == [["echo", "a"]]
+    assert _shell_argvs("# a comment line\npython3 f.py --readiness") == [["python3", "f.py", "--readiness"]]
+    # a bare newline starts a new command, as `;` does; inside quotes it is text
+    assert _shell_argvs("cd /x\npython3 f.py --readiness") == [["cd", "/x"], ["python3", "f.py", "--readiness"]]
+    assert _shell_argvs("python3 -V\nls fleet_upgrade_report.py --readiness") == [["python3", "-V"], ["ls", "fleet_upgrade_report.py", "--readiness"]]
+    assert _shell_argvs('echo "a\nb" && python3 f.py --readiness') == [["echo", "a\nb"], ["python3", "f.py", "--readiness"]]
+    # a backslash-newline pair is a continuation, gone before the words are read
+    assert _shell_argvs("python3 \\\n  f.py \\\n--readiness") == [["python3", "f.py", "--readiness"]]
+    assert _shell_argvs("cd /x && \\\n  python3 f.py --readiness") == [["cd", "/x"], ["python3", "f.py", "--readiness"]]
+    # a `#` inside quotes, escaped, or inside a word is part of the word
+    assert _shell_argvs("python3 f.py --readiness --output '#1.json'") == [["python3", "f.py", "--readiness", "--output", "#1.json"]]
+    assert _shell_argvs('python3 f.py --output "#1.json" --readiness') == [["python3", "f.py", "--output", "#1.json", "--readiness"]]
+    assert _shell_argvs('echo "a # b"') == [["echo", "a # b"]]
+    assert _shell_argvs("echo a\\#b $#") == [["echo", "a#b", "$#"]]
+    assert _shell_argvs('bash -c "python3 /x/f.py --readiness # x"')[-1] == ["python3", "/x/f.py", "--readiness"]
+    assert _shell_argvs("(cd /x && python3 f.py --readiness)") == [["cd", "/x"], ["python3", "f.py", "--readiness"]]
+    # a shell word behind a command that prints is text, not a shell to unwrap
+    assert _shell_argvs('echo bash -c "python3 /x/f.py --readiness"') == [["echo", "bash", "-c", "python3 /x/f.py --readiness"]]
+    assert _shell_argvs('nice -n 10 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
+    assert _shell_argvs('timeout -s KILL 600 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
+    # behind a wrapper, `echo` is the command the wrapper runs: its shell word is text and is not unwrapped
+    assert _shell_argvs('timeout 600 echo bash -c "python3 /x/f.py --readiness"') == [["timeout", "600", "echo", "bash", "-c", "python3 /x/f.py --readiness"]]
+    assert _shell_argvs('env echo bash -c "python3 /x/f.py --readiness"') == [["env", "echo", "bash", "-c", "python3 /x/f.py --readiness"]]
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"])
+    assert _argv_runs(["sudo", "ls", "fleet_upgrade_report.py", "--readiness"], run) is False
+    assert _argv_runs(["sudo", "-u", "hermes", "python3", "fleet_upgrade_report.py", "--readiness"], run) is True
+    # a substitution stays inside its word; a bare `(` still opens a subshell; a quoted one is text
+    assert _shell_argvs("python3 f.py --output r_$(date +%s).json --readiness") == [["python3", "f.py", "--output", "r_$(date +%s).json", "--readiness"], ["date", "+%s"]]
+    assert _shell_argvs("echo $((1+2)) && python3 f.py --readiness") == [["echo", "$((1+2))"], ["python3", "f.py", "--readiness"]]
+    # the commands a substitution runs are read as argvs of their own; the arithmetic form runs none
+    assert _shell_argvs("diff <(echo a) <(echo b)") == [["diff", "<(echo a)", "<(echo b)"], ["echo", "a"], ["echo", "b"]]
+    assert _shell_argvs("OUT=$(python3 f.py --readiness)") == [["OUT=$(python3 f.py --readiness)"], ["python3", "f.py", "--readiness"]]
+    assert _shell_argvs('echo "run: $(python3 f.py --readiness)"') == [["echo", "run: $(python3 f.py --readiness)"], ["python3", "f.py", "--readiness"]]
+    assert _shell_argvs("OUT=`python3 f.py --readiness`") == [["OUT=`python3 f.py --readiness`"], ["python3", "f.py", "--readiness"]]
+    assert _shell_argvs("echo '$(not run)'") == [["echo", "$(not run)"]]
+    # an operator is one outside quotes only
+    assert _shell_argvs('python3 f.py --readiness && echo ">"') == [["python3", "f.py", "--readiness"], ["echo", ">"]]
+    assert _shell_argvs("tr ';' ',' < f && echo a") == [["tr", ";", ",", "<", "f"], ["echo", "a"]]
+    assert _shell_argvs('nohup ">" ls f.py --readiness') == [["nohup", ">", "ls", "f.py", "--readiness"]]
+    # one quote model: a `'` inside double quotes is text, so a later substitution still folds; a `)` that closes a
+    # span never opens a word, so a `#` glued to it is part of the word and one after a space is a comment
+    assert _shell_argvs("echo \"don't\" && python3 f.py --output r_$(date +%s).json --readiness") == [
+        ["echo", "don't"], ["python3", "f.py", "--output", "r_$(date +%s).json", "--readiness"], ["date", "+%s"]]
+    assert _shell_argvs("python3 f.py --output r_$(date +%s)#1.json --readiness") == [["python3", "f.py", "--output", "r_$(date +%s)#1.json", "--readiness"], ["date", "+%s"]]
+    assert _shell_argvs("python3 f.py --output r_$(date +%s) #done --readiness") == [["python3", "f.py", "--output", "r_$(date +%s)"], ["date", "+%s"]]
+    assert _shell_argvs('echo "a $(echo "b c") d"') == [["echo", 'a $(echo "b c") d'], ["echo", "b c"]]
+    # an escaped quote inside a span does not open a quote there
+    assert _shell_argvs("python3 f.py --output r_$(echo don\\'t).json --readiness") == [["python3", "f.py", "--output", "r_$(echo don\\'t).json", "--readiness"], ["echo", "don't"]]
+    assert _shell_argvs("python3 f.py --readiness >#log") == []
+    # a wrapped shell is unwrapped behind the wrappers that hand their argv on
+    assert _shell_argvs('timeout 600 bash -c "python3 /x/f.py --readiness"')[-1] == ["python3", "/x/f.py", "--readiness"]
+    assert _shell_argvs('nohup bash -c "python3 /x/f.py --readiness" > /tmp/l 2>&1 &')[-1] == ["python3", "/x/f.py", "--readiness"]
+    # a line bash refuses (an unclosed quote) yields no words at all
+    assert _shell_argvs("python3 f.py --readiness --output 'unbalanced") == []
+    # an escaped character never opens a word, so a `#` after an escaped space is part of it
+    assert _shell_argvs("python3 f.py --output r\\ #1.json --readiness") == [["python3", "f.py", "--output", "r #1.json", "--readiness"]]
+    assert _shell_argvs("echo \\ #x") == [["echo", " #x"]]
+    # a script is a bare name and a flag one word, refused at case load otherwise
+    for bad in ({"script": "scripts/f.py"}, {"script": ""}, {"script": "f.py", "flags": ["--a b"]}):
+        with pytest.raises(ValueError):
+            WorkerRun(**bad)
+
+
+def test_the_route_objective_forbids_the_hand_survey_beside_a_credited_run():
+    # The forbid, not the run reader, is what refuses a survey that stands beside the dictated
+    # run: with the survey the objective fails and names the pattern; without it, it passes.
+    _stash_commands([f"python3 {_SCRIPT_PATH} --readiness --output /tmp/r.json", "kubectl --context gke_p_l_seeded-b get pdb -A -o json"])
+    res = WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0)
+    assert res.status == "fail" and "forbidden run" in res.reason and "kubectl ran as" in res.reason, res.reason
+    _stash_commands([f"python3 {_SCRIPT_PATH} --readiness --output /tmp/r.json", "kubectl --context gke_p_l_seeded-b get nodes"])
+    assert WorkerCommandsVerifier(**_WEBHOOK_RUN_CHECK).verify(5.0).status == "pass"
+    # a word pattern that does not compile is refused at case load, like a pattern
+    from kube_agents_bench.verifiers import WorkerRun
+
+    with pytest.raises(ValueError):
+        WorkerRun(script="kubectl", word_patterns=["("])
+
+
+def test_worker_commands_required_run_names_what_did_not_run():
+    _stash_commands(["kubectl get pdb -A", 'grep -rn "fleet_upgrade_report.py --readiness" /opt'])
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=_WEBHOOK_RUNS)
+    res = v.verify(5.0)
+    assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason

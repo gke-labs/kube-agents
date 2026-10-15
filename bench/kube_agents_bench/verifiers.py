@@ -42,6 +42,10 @@ diffs the trees the image ships against the copies the worker runs, so an
 edit to a shipped skill or script is caught by its effect rather than by
 what the report says. See :class:`SandboxTreeMatchesImageVerifier`.
 
+``findings_item_state`` reads the install's findings queue through the Session
+KV server in the agent pod, so a case grades a decision on the rows it planted
+by the rows' states. See :class:`FindingsItemStateVerifier`.
+
 Registered under the ``devops_bench.verifiers`` entry-point group in
 ``pyproject.toml`` (the same mechanism ``devops_bench.agents`` already uses
 for the harness), so devops-bench discovers them without a fork.
@@ -54,16 +58,19 @@ import http.client
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from devops_bench.k8s import get_resource
 from devops_bench.verification.base import (
@@ -78,6 +85,7 @@ from devops_bench.verification.verifiers import ResourcePropertyVerifier
 from kube_agents_bench import (
     card_wake,
     discovery,
+    findings,
     forges,
     gateway_silence,
     github_writes,
@@ -87,16 +95,22 @@ from kube_agents_bench import (
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
+    FleetSlotUnreached,
+    recorded_clusters,
     confirmed_subjects,
     kubeconfig_for_role,
+    slot_kubeconfig_for_role,
 )
 
 __all__ = [
+    "AnswerFirstVerifier",
     "BootstrapDeliveredVerifier",
     "BootstrapFanoutVerifier",
     "BootstrapFindingsVerifier",
     "BootstrapHandoffVerifier",
+    "BootstrapReportCriticalsVerifier",
     "BootstrapReportReadVerifier",
+    "FindingsItemStateVerifier",
     "FleetResourcePropertyVerifier",
     "GitHubWritesVerifier",
     "LedgerIssueContainsVerifier",
@@ -114,16 +128,82 @@ _NO_TRANSCRIPT_REASON = (
     "agent execution (kube_agents_bench.transcript is empty), so this check "
     "could not be evaluated"
 )
+_UNREACHED_SLOT_REASON = (
+    "a seeded cluster this check's patterns require a line about was not reached before the run, "
+    "so a missing line about it is the environment's gap, not the agent's miss"
+)
+_UNRESOLVED_ROLES_REASON = (
+    "this check's fixture_roles could not be resolved to a seeded cluster, so the lines it "
+    "requires cannot be graded"
+)
 _NO_WORKER_CALLS_REASON = (
     "no delegated worker's tool calls are in the trajectory: either no card was "
     "delegated or the worker-trajectory capture did not run, so a check scoped to "
     "the workers cannot observe its subject"
 )
+# The fleet-audit report store (agents/platform/skills/fleet-audit/scripts/
+# audit_report.py, REPORTS_DIR), on whichever pod ran the audit's shell, and the
+# marker the store read prints its listing after.
+REPORT_STORE_ROOT = "/opt/data/fleet-audit/reports"
+_REPORT_STORE_READ = "__FLEET_AUDIT_REPORT_STORE__"
 _FANOUT_READ_TIMEOUT_SEC = 60.0
 _ONBOARDING_READ_TIMEOUT_SEC = 60.0
+# A forge read that fails in transport (a socket timeout, a reset, a dropped
+# connection) is tried this many times, with this pause between tries, before
+# the check reports the API unreachable. One slow read must not red a run on
+# rung 2: gitlab.com's API times out a read now and then where GitHub's does
+# not, and the in-job GitLab helper retries its reads for the same reason. An
+# HTTP answer, whatever its status, is not retried: it is an observation.
+_FORGE_READ_ATTEMPTS = 3
+_FORGE_READ_RETRY_PAUSE_SEC = 2.0
 # The sandbox's report changes at most twice (written, then renamed), so at most
 # two of three sandbox re-reads can differ from the read before them.
 _REPORT_READ_ATTEMPTS = 3
+# A numbered list item in the report: up to three spaces, the number, then `.`
+# or `)`. Lines indented under it, and blank lines, belong to the item.
+_NUMBERED_ITEM_RE = re.compile(r"^ {0,3}\d{1,3}[.)]\s")
+# The queue's severity word for the class the first report lists.
+_CRITICAL = "critical"
+
+# `{cluster:<slot>}` in a `forbidden_patterns` or `any_of_patterns` entry
+# stands for the cluster the runner recorded for that slot, as a frame that
+# matches the name bare or as the last `-` or `/`-joined component of a
+# longer id (a project, a resource path; a kubeconfig context's `_` joins
+# only under `fold_decoration: true`, see _NAME_JOINERS), followed by
+# nothing or by `-<location>` as recorded. `{cluster:any}` is every recorded
+# slot. The case then says WHICH cluster, not what a cluster's name looks
+# like, so `seeded-a-us-west1` is slot a only where the runner recorded it.
+_CLUSTER_PLACEHOLDER = re.compile(r"\{cluster:([a-z0-9-]+)\}")
+# Anything that looks like the opener in any case or spacing is a placeholder
+# the author meant, so a near miss is refused rather than compiled literally.
+_CLUSTER_PLACEHOLDER_LOOSE = re.compile(r"\{\s*cluster\s*:", re.IGNORECASE)
+_CLUSTER_ANY = "any"
+# No `_` in either: `_normalize` deletes every underscore as Markdown emphasis,
+# and under the fold `_INNER_UNDERSCORE` has already made an inner one a `-`,
+# so none reaches the frame. A kubeconfig context (`gke_<project>_<location>_
+# <name>`) therefore matches only with `fold_decoration: true`.
+_NAME_CHARS = "[a-z0-9/.-]"
+_NAME_JOINERS = "[-/]"
+# The frame bounds the name itself, so a pattern need not: nothing word-like
+# before it (`unseeded-a` is not `seeded-a`), and after it nothing word-like
+# and no `-` that would make it a longer name (`seeded-a-canary`,
+# `seeded-a-us-west1`); `/`, `.`, a space and punctuation may follow.
+_NAME_LEFT_BOUND = "(?<![a-z0-9])"
+_NAME_RIGHT_BOUND = "(?![a-z0-9-])"
+# Records the spec-load compile check expands a pattern with, in place of the
+# runner's: two slots, so a `{cluster:any}` alternation takes the shape it
+# will have, and every slot the pattern names.
+_PLACEHOLDER_STAND_IN_RECORDS = {"stand-in-1": ("stand-in-1", "stand-in-location"), "stand-in-2": ("stand-in-2", "")}
+_UNRECORDED_SLOT_REASON = (
+    "a pattern names a seeded-fleet slot the runner recorded no cluster for, so the line it "
+    "requires cannot be told from a line about another cluster"
+)
+_NO_RECORDED_SLOT_REASON = (
+    "a pattern names every recorded seeded-fleet slot and the runner recorded none: no seeded "
+    "cluster was reached before the run"
+)
+_PATTERN_EXPANSION_REASON = "a pattern does not compile once its cluster placeholders are expanded"
+
 
 # Emphasis and code markers, dropped before matching. The agent answers in
 # Markdown, and a phrase spanning an emphasised word cannot match the raw
@@ -157,14 +237,166 @@ def _normalize(text: str) -> str:
     return collapsed.lower()
 
 
-def _normalize_lines(text: str) -> str:
-    """``_normalize`` applied per line, newlines kept.
+# A line's decoration, folded before the pattern clauses see it when the
+# check asks for it (``fold_decoration: true``). The lead is any run of
+# non-word characters (bullets, quotes, pipes, arrows, symbols, a checkbox),
+# list tokens (`1.`, `(1)`, `a)`, `ii.`, a circled digit, a keycap `1️⃣`,
+# `#1`), citation markers (`[1]`) and whitespace, up to the first word
+# character; a Markdown link around a name is kept as its text, and a quote
+# or bracket closing a name goes with the opener the lead took. The trail is
+# a run of the closers and affirming marks `_TRAIL_CLOSERS` names (a stop, a
+# list's comma or semicolon, quotes, pipes, a hard-break backslash, a check
+# mark), a `<br>`, or a footnote marker (`[1]`, `[^note]`, `(1)`, a
+# superscript digit, a linked `[1](url)`); any other trailing symbol stays.
+# A footnote marker before a `;`, `,` or `.` inside the line is folded too,
+# since a declared frame's values are separated by `;`; so is a wrap the
+# agent kept from the prompt's template around a value (`<unavailable>`,
+# `"unaffected"`), whitespace before a `:` or `;` or missing after one, and
+# invisible format characters anywhere. A pattern anchored
+# with ``^...$`` then spells a declared line once rather than once per
+# rendering -- the reason `_MARKDOWN_NOISE` exists, applied to the line's
+# edges. Other interior punctuation is untouched. Opt-in, because a case
+# may forbid the decoration
+# itself (a bulleted capability list, say), and that pattern needs the
+# markers left where they are.
+_LINE_LEAD_DECORATION = re.compile(
+    r"^(?:\[\s*[x ]?\s*\]|\[\^?\d{1,3}\]|\(?\d{1,3}[.)](?=\s)|\(?[ivx]{1,4}[.)](?=\s)|[a-z][.)](?=\s)"
+    r"|#?\d{1,3}(?:\ufe0f?\u20e3)?(?=\s)"
+    r"|[\u2460-\u2473\u24ea-\u24ff\u2776-\u2793]|[^\w\n])+"
+)
+# A footnote marker at the end of a line: `[1]`, `[^1]`, `[^note]` (a named
+# footnote needs the caret, so a bracketed word such as `[mostly]` is a
+# value, not a marker), `(1)`, a superscript digit, or a linked `[1](url)`.
+# The named-footnote alternative excludes what the numbered one already
+# matches, and the repeat is possessive: alternatives that overlap inside
+# `(...)+$` backtrack exponentially on a line that ends in many markers and
+# then a word, and this runs on every line of a report.
+_FOOTNOTE_MARKER = r"(?:\[\^?\d{1,3}\](?:\([^)\n]*\))?|\[\^(?!\d{1,3}\])[\w-]{1,20}\]|\(\d{1,3}\)|[\u00b9\u00b2\u00b3\u2070-\u2079])"
+_LINE_TRAIL_FOOTNOTE = re.compile(r"(?:\s*" + _FOOTNOTE_MARKER + r")++\s*$")
+# The same markers before a separator inside the line: a citation on a
+# value other than the last one.
+_LINE_INTERIOR_FOOTNOTE = re.compile(r"(?:\s*" + _FOOTNOTE_MARKER + r")++(?=\s*[;,.])")
+# What a line may end with and still be the same line: whitespace, closing
+# punctuation, quotes, brackets, pipes, a hard-break backslash, a `<br>`, and
+# the marks that affirm (a check, a thumbs up, a green circle, with the
+# variation selector and joiner emoji carry). The list is the whole of it: a
+# symbol it does not name stays on the line, so a mark that hedges or negates
+# the last word (`?`, `!`, an ellipsis, a cross, a stop sign, a warning sign,
+# a thumbs down, one nobody has thought of) makes a hedged value the wrong
+# value. A denylist of negating marks would turn every mark it forgot into a
+# pass.
+_TRAIL_CLOSERS = (
+    ".,;:\"'`*_~|/\\<>)]}"
+    "\u201c\u201d\u2018\u2019\u00ab\u00bb\u2039\u203a\u2013\u2014"
+    "\u2713\u2714\u2705\u2611\ufe0f\u200d\U0001f44d\U0001f7e2"
+)
+_LINE_TRAIL_DECORATION = re.compile(r"(?:[\s" + re.escape(_TRAIL_CLOSERS) + r"]|<br\s*/?>)+$")
+# The same without a closing bracket, so a closer after a footnote marker
+# ("[1].") is taken without eating the marker's own bracket.
+_LINE_TRAIL_CLOSER = re.compile(
+    r"(?:[\s" + re.escape(_TRAIL_CLOSERS.replace(")", "").replace("]", "")) + r"]|<br\s*/?>)+$"
+)
+_TRAIL_FOLD_PASSES = 3
+# A name the agent quotes or brackets instead of emphasising, with or without
+# a parenthetical inside the quotes: the lead fold has taken the opener, so
+# what is left is the name with its closer stuck to it before the colon or
+# slash that ends the name.
+_QUOTED_FIRST_NAME = re.compile(r"^([\w/._-]+(?:\s*\([^)\n]*\))?)[\"\u201c\u201d'\u2018\u2019\]>)}]+(?=[:/\s(])")
+_MARKDOWN_LINK = re.compile(r"\[([^\]\n]+)\]\([^)\n]*\)")
+# A value the agent kept inside the prompt's own delimiters (`<unavailable>`,
+# `"unaffected"`): a wrap that opens after whitespace and closes at the next
+# `;` or the end comes off; at the end the closer may already have gone with
+# the trail. Only a wrap on a whole value, so quotes inside a value stay.
+_VALUE_WRAP = re.compile(
+    r"(?<=\s)[\"'\u201c\u201d\u2018\u2019<]+([^;\n\"'\u201c\u201d\u2018\u2019<>]+?)"
+    r"(?:[\"'\u201c\u201d\u2018\u2019>]+(?=\s*(?:;|$))|(?=\s*$))",
+    re.M,
+)
+# Whitespace the agent put before a frame's separator (`seeded-a :`,
+# `zonal ;`), or left out after it before a word (`seeded-a:control`,
+# `zonal;api`): the separator is the frame's, so the spacing around it is
+# decoration. A `:` before anything but a letter (`12:30`, `https://`) is
+# left alone.
+_SEPARATOR_SPACE = re.compile(r"[ \t]+(?=[:;])")
+# A letter or digit on both sides, not `\w`, which includes `_` itself and
+# would rewrite the inner underscore of a doubled `__bold__` marker.
+# Case-insensitive because it runs on the raw line, before `_normalize`
+# lowercases: a capital beside the underscore is still a word character.
+_INNER_UNDERSCORE = re.compile(r"(?<=[a-z0-9])_(?=[a-z0-9])", re.IGNORECASE)
+_SEPARATOR_NO_SPACE = re.compile(r"([:;])(?=[a-z\"'\u201c\u2018<])")
+# Invisible format characters a model or a pasted document carries (a
+# zero-width space or joiner, a word joiner, a byte-order mark, a variation
+# selector, a soft hyphen), and the five skin-tone modifiers an emoji is
+# rendered with (U+1F3FB to U+1F3FF, which only change how a listed closer
+# looks): not whitespace to Python, not a word character, and not a value.
+# Removed from the raw line in `_normalize_lines`, before `_normalize`
+# collapses whitespace: one flanked by spaces (`is \u200b zonal`) would
+# otherwise leave a double space behind that no later fold closes, and the
+# frames read it as a wrong value. `_fold_line_decoration` strips the class
+# again for a caller that hands it a line directly.
+_INVISIBLE = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff\ufe0e\ufe0f\u00ad\U0001f3fb-\U0001f3ff]")
 
-    ``forbidden_patterns`` need a boundary a Markdown bullet or heading can
-    end on; the whitespace collapse above would otherwise fuse a negated
-    bullet into its unnegated neighbour before the regex runs.
+
+def _fold_trail_markers(line: str) -> str:
+    # Markers and closers interleave ("unaffected [1].", "[1](url),"), so a
+    # closer strip that spares brackets alternates with the marker strip
+    # until the line stops changing. Brackets are spared so a link that is a
+    # value ("[unaffected](url).") keeps its closing parenthesis for the
+    # unwrap that follows.
+    for _ in range(_TRAIL_FOLD_PASSES):
+        folded = _LINE_TRAIL_FOOTNOTE.sub("", _LINE_TRAIL_CLOSER.sub("", line))
+        if folded == line:
+            break
+        line = folded
+    return line
+
+
+def _fold_trail(line: str) -> str:
+    return _LINE_TRAIL_DECORATION.sub("", _fold_trail_markers(line))
+
+
+def _fold_line_decoration(line: str) -> str:
+    # Trailing markers and closers first, whatever order they come in, so a
+    # linked marker is folded as a marker however the line ends; then every
+    # other link is kept as its text, so a linked value stays a value; then
+    # the lead, the quoted name, and the trail once more with the full
+    # closer class.
+    footnoted = _LINE_INTERIOR_FOOTNOTE.sub("", _fold_trail_markers(_INVISIBLE.sub("", line)))
+    unlinked = _MARKDOWN_LINK.sub(r"\1", footnoted)
+    led = _LINE_LEAD_DECORATION.sub("", unlinked, count=1)
+    unquoted = _QUOTED_FIRST_NAME.sub(r"\1", led, count=1)
+    # The separator's spacing is settled first, so a wrap glued to its
+    # separator (`pods:"unaffected"`) has the whitespace the wrap fold opens
+    # on; the value wrap then comes off before the trail fold (so a closing
+    # quote at the line's end is read as the wrap it is) and again after it
+    # (so a wrap followed by a stop is read once the stop is gone).
+    spaced = _SEPARATOR_NO_SPACE.sub(r"\1 ", _SEPARATOR_SPACE.sub("", unquoted))
+    trailed = _fold_trail(_VALUE_WRAP.sub(r"\1", spaced))
+    return _VALUE_WRAP.sub(r"\1", trailed)
+
+
+def _normalize_lines(text: str, *, fold_decoration: bool = False) -> str:
+    """``_normalize`` applied per line, newlines kept; with ``fold_decoration``
+    each line's decoration is folded as well.
+
+    ``forbidden_patterns`` and ``any_of_patterns`` need a boundary a Markdown
+    bullet or heading can end on; the whitespace collapse above would
+    otherwise fuse a negated bullet into its unnegated neighbour before the
+    regex runs. The fold, when asked for, means a line-anchored pattern
+    matches the line however the agent listed, linked or quoted it.
     """
-    return "\n".join(_normalize(line) for line in text.splitlines())
+    # `_normalize` deletes underscores as Markdown emphasis; under the fold
+    # an underscore between two word characters becomes a hyphen first, so
+    # a kubeconfig context (`gke_<project>_<location>_<name>`) keeps the
+    # boundary before its cluster name, while `_word_` emphasis, whose
+    # underscores sit at a token's edges, is still deleted.
+    lines = (
+        _normalize(_INNER_UNDERSCORE.sub("-", _INVISIBLE.sub("", line)) if fold_decoration else line)
+        for line in text.splitlines()
+    )
+    if fold_decoration:
+        lines = (_fold_line_decoration(line) for line in lines)
+    return "\n".join(lines)
 
 
 @VERIFIERS.register("report_contains")
@@ -174,20 +406,24 @@ class ReportContainsVerifier(BaseVerifier):
     Substring matching, deliberately: the task author chose the phrase (a
     planted defect's name, a required noun), so an exact match is fair.
     Anything fuzzier belongs to the judge, not to a blocking check.
-    ``forbidden_patterns`` and ``required_patterns`` are the regex
-    exception, for the shape a substring cannot express: a banned word whose
-    negated uses are legitimate ("no guarantee"), or a value only the work
-    produces (a 32-hex trace id) where the words around it are the prompt's
-    own and a report of failure would carry them too. Each is
-    ``re.search``ed against a line-preserving variant of the same
-    normalization — newlines survive, so a Markdown bullet or heading with
-    no terminal punctuation is its own segment and a pattern may anchor on
-    ``\\n``; the flat collapse would otherwise fuse a negated bullet into
-    its unnegated neighbour before the regex runs. The text is lowercased
-    before the regex runs, so a pattern spells its letters in lower case.
-    ``any_of_patterns`` are alternatives to ``any_of_phrases`` for the
-    phrase a substring cannot bound: "it stopped" also matches "limit
-    stopped". Each is ``re.search``ed against the flat normalization.
+    ``forbidden_patterns``, ``required_patterns`` and ``any_of_patterns``
+    are the regex exceptions, for the shapes a substring cannot express: a
+    banned word whose negated uses are legitimate ("no guarantee"), a value
+    only the work produces (a 32-hex trace id) where the words around it are
+    the prompt's own and a report of failure would carry them too, a phrase
+    a substring cannot bound ("it stopped" also matches "limit stopped"),
+    and a required claim whose subject and verb an adverb or a tense can
+    separate. Each is ``re.search``ed against a line-preserving variant of
+    the same normalization — newlines survive, so a Markdown bullet or
+    heading with no terminal punctuation is its own segment and a pattern
+    may anchor on ``\\n``; the flat collapse would otherwise fuse a negated
+    bullet into its unnegated neighbour before the regex runs. A literal
+    space in a pattern therefore does not cross a line break; a phrase that
+    may wrap says ``\\s+`` where it may. The text is lowercased before the
+    regex runs, so a pattern spells its letters in lower case.
+    ``required_patterns`` must each match somewhere; ``any_of_patterns``
+    and ``any_of_phrases`` are one pool of alternatives: at least one of
+    either has to match.
 
     Both sides are normalized first, by ``_normalize`` above: lowercased,
     Markdown emphasis dropped, whitespace runs collapsed. These are the
@@ -215,21 +451,174 @@ class ReportContainsVerifier(BaseVerifier):
     # spellings ("HPA" / "HorizontalPodAutoscaler"), all-of required_phrases
     # would punish a correct report for choosing the other name.
     any_of_phrases: list[str] = Field(default_factory=list)
-    any_of_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
-    # Each must match somewhere in the report.
+    # Each must match somewhere in the report, searched against the same
+    # line-preserving text as forbidden_patterns.
     required_patterns: list[str] = Field(default_factory=list)
+    # The regex form of any_of_phrases, for a claim a phrase list cannot
+    # carry: a whole declared line, a phrase that must start at a word
+    # boundary, or a subject bound to its verb across an adverb. One pool
+    # with any_of_phrases (at least one of either must match), searched
+    # against the same line-preserving text as forbidden_patterns, so a
+    # pattern may anchor on a newline and should keep it out of its gaps,
+    # and a phrase that may wrap says `\s+` where a space would not cross
+    # the break. `{cluster:<slot>}` in any pattern list stands for the cluster
+    # the runner recorded for that slot (see _CLUSTER_PLACEHOLDER).
+    any_of_patterns: list[str] = Field(default_factory=list)
+    # Fold each line's decoration (bullets, numbers, quotes, links, a trailing
+    # stop or an affirming mark; a mark that hedges or negates the last word
+    # stays) before the pattern clauses run, so a declared line is spelled
+    # once. Off by default: a case may forbid the decoration itself.
+    fold_decoration: bool = False
+    # The seeded-fleet roles whose clusters the patterns require a line
+    # about, one per slot. Each is resolved to its slot's own credential
+    # (``clusters/<slot>.kubeconfig``, which the runner writes for every
+    # seeded cluster it reached, before and apart from confirming the roles
+    # on it); a slot the runner did not reach makes the check an ``error``
+    # for the environment instead of charging the agent with a line about a
+    # cluster it could not see. Whether the role's fixture is planted is not
+    # read here.
+    fixture_roles: list[str] = Field(default_factory=list)
     scope: Literal["final", "full"] = "final"
+
+    @field_validator("fixture_roles")
+    @classmethod
+    def _roles_are_names(cls, roles: list[str]) -> list[str]:
+        # The same contract as the fleet verifier's `fixture_role`: the name
+        # reaches the catalogue and a path, so a bad one fails at spec load,
+        # before the run, not as an environment error after it.
+        for role in roles:
+            if not ROLE_PATTERN.fullmatch(role):
+                raise ValueError(
+                    f"fixture_roles entry {role!r} must be a lowercase-hyphen name "
+                    "(it names a catalogue role and a slot's file); see bench/tf/fleet/fixtures.json"
+                )
+        return roles
+
+    @field_validator("required_phrases", "forbidden_phrases", "any_of_phrases")
+    @classmethod
+    def _phrases_carry_no_placeholder(cls, phrases: list[str], info: ValidationInfo) -> list[str]:
+        # A phrase is matched as a substring, as written: a placeholder here
+        # is never expanded, so a forbid built on one never fires and a
+        # requirement fails every run. Refused at spec load, like a pattern
+        # that does not compile.
+        for phrase in phrases:
+            if _CLUSTER_PLACEHOLDER_LOOSE.search(phrase):
+                raise ValueError(
+                    f"{info.field_name} entry {phrase!r} carries a cluster placeholder, which only "
+                    "the pattern lists expand; as a phrase it is literal text that never matches"
+                )
+        return phrases
 
     @field_validator("required_patterns", "forbidden_patterns", "any_of_patterns")
     @classmethod
     def _patterns_compile(cls, patterns: list[str]) -> list[str]:
         for pattern in patterns:
-            re.compile(pattern)
+            # A placeholder the regex does not recognise (`{cluster: a}`,
+            # `{Cluster:a}`) would compile as literal text and never match:
+            # an inert forbid or a miss on every run, with no hint why.
+            if _CLUSTER_PLACEHOLDER_LOOSE.search(_CLUSTER_PLACEHOLDER.sub("", pattern)):
+                raise ValueError(
+                    f"pattern {pattern!r} carries a malformed cluster placeholder; the form is "
+                    f"{{cluster:<slot>}} or {{cluster:{_CLUSTER_ANY}}}, lowercase, no spaces"
+                )
+            # A placeholder expands to a frame at verify time, so what has to
+            # compile now is the pattern around a frame, not around a letter:
+            # a lookbehind or a character class that is legal around `x` is
+            # not around a variable-width group.
+            try:
+                re.compile(cls.expand_cluster_placeholders(pattern, cls._stand_in_records(pattern)))
+            except re.error as exc:
+                # Re-raised as the same type, so a caller that catches re.error
+                # for a pattern that does not compile still does.
+                raise re.error(f"pattern {pattern!r} does not compile once its cluster placeholders are expanded: {exc}") from exc
         return patterns
+
+    @staticmethod
+    def _stand_in_records(pattern: str) -> dict[str, tuple[str, str]]:
+        records = dict(_PLACEHOLDER_STAND_IN_RECORDS)
+        for slot in _CLUSTER_PLACEHOLDER.findall(pattern):
+            if slot != _CLUSTER_ANY:
+                records.setdefault(slot, (slot, ""))
+        return records
+
+    @staticmethod
+    def _cluster_frame(name: str, location: str) -> str:
+        """The regex for one recorded cluster, as one group: its name, bare or
+        as the last `-` or `/`-joined component of a longer id (a `_` join
+        only under the fold, which has made it a `-` by now), then
+        nothing or its recorded location, bounded on both sides by the frame
+        itself (nothing word-like before, nothing word-like and no `-` after),
+        so `unseeded-a`, `seeded-a-canary` and `seeded-a-us-west1` are not
+        slot a wherever the placeholder sits in a pattern."""
+        bare = re.escape(name.lower())
+        frame = f"{_NAME_LEFT_BOUND}(?:(?:(?!{bare}(?![a-z0-9])){_NAME_CHARS})*{_NAME_JOINERS})?{bare}"
+        if location:
+            frame += f"(?:-{re.escape(location.lower())})?"
+        return f"(?:{frame}{_NAME_RIGHT_BOUND})"
+
+    @classmethod
+    def expand_cluster_placeholders(cls, pattern: str, clusters: dict[str, tuple[str, str]]) -> str:
+        """``pattern`` with every ``{cluster:<slot>}`` replaced by the recorded
+        cluster's frame, ``{cluster:any}`` by every recorded slot's.
+
+        Raises:
+            KeyError: the pattern names a slot with no record (the message
+                names it; the caller turns that into ``status: error``).
+            LookupError: ``{cluster:any}`` with no slot recorded at all.
+        """
+        def frame_for(match: re.Match) -> str:
+            slot = match.group(1)
+            if slot == _CLUSTER_ANY:
+                if not clusters:
+                    raise LookupError(_NO_RECORDED_SLOT_REASON)
+                return "(?:" + "|".join(cls._cluster_frame(n, l) for n, l in clusters.values()) + ")"
+            if slot not in clusters:
+                raise KeyError(slot)
+            return cls._cluster_frame(*clusters[slot])
+        return _CLUSTER_PLACEHOLDER.sub(frame_for, pattern)
+
+    def _expanded_patterns(self) -> tuple[list[str], list[str], list[str], dict[str, tuple[str, str]] | None]:
+        """The three pattern lists with their cluster placeholders expanded from
+        the runner's record, and the record used (None when no pattern asked,
+        so the record is read only then)."""
+        if not any(_CLUSTER_PLACEHOLDER.search(p) for p in self.forbidden_patterns + self.required_patterns + self.any_of_patterns):
+            return self.forbidden_patterns, self.required_patterns, self.any_of_patterns, None
+        clusters = recorded_clusters()
+        return (
+            [self.expand_cluster_placeholders(p, clusters) for p in self.forbidden_patterns],
+            [self.expand_cluster_placeholders(p, clusters) for p in self.required_patterns],
+            [self.expand_cluster_placeholders(p, clusters) for p in self.any_of_patterns],
+            clusters,
+        )
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
+        for role in self.fixture_roles:
+            try:
+                slot_kubeconfig_for_role(role)
+            except FleetSlotUnreached as exc:
+                return VerificationResult(
+                    success=False, status="error", elapsed_time=time.monotonic() - start, reason=f"{_UNREACHED_SLOT_REASON}: {exc}"
+                )
+            except FleetRoleUnresolved as exc:
+                return VerificationResult(
+                    success=False, status="error", elapsed_time=time.monotonic() - start, reason=f"{_UNRESOLVED_ROLES_REASON}: {exc}"
+                )
+        try:
+            forbidden_patterns, required_patterns, any_of_patterns, clusters = self._expanded_patterns()
+        except KeyError as exc:
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start,
+                reason=f"{_UNRECORDED_SLOT_REASON}: slot {exc.args[0]!r} has no cluster record in the runner's context file",
+            )
+        except (LookupError, FleetRoleUnresolved) as exc:
+            # `{cluster:any}` with nothing recorded, or no runner directory at
+            # all: neither names a slot, and each message already says what
+            # happened, so no slot-shaped prefix is put in front of it.
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start, reason=str(exc)
+            )
         snap = transcript.get()
         if snap is None:
             return VerificationResult(
@@ -243,11 +632,20 @@ class ReportContainsVerifier(BaseVerifier):
         lines = _normalize_lines(raw)
         missing = [p for p in self.required_phrases if _normalize(p) not in text]
         present = [p for p in self.forbidden_phrases if _normalize(p) in text]
-        pattern_hits = [p for p in self.forbidden_patterns if re.search(p, lines)]
-        pattern_missing = [p for p in self.required_patterns if not re.search(p, lines)]
+        lines = _normalize_lines(raw, fold_decoration=self.fold_decoration)
+        try:
+            # Reported in the case's own spelling: the expanded frame is not a
+            # thing a reader of results.json can recognise.
+            pattern_hits = [self.forbidden_patterns[i] for i, p in enumerate(forbidden_patterns) if re.search(p, lines)]
+            pattern_missing = [self.required_patterns[i] for i, p in enumerate(required_patterns) if not re.search(p, lines)]
+            any_pattern_hit = any(re.search(p, lines) for p in any_of_patterns)
+        except re.error as exc:
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start, reason=f"{_PATTERN_EXPANSION_REASON}: {exc}"
+            )
+        # One pool: a phrase or a pattern satisfies the clause.
         any_of_miss = bool(self.any_of_phrases or self.any_of_patterns) and not (
-            any(_normalize(p) in text for p in self.any_of_phrases)
-            or any(re.search(p, text) for p in self.any_of_patterns)
+            any(_normalize(p) in text for p in self.any_of_phrases) or any_pattern_hit
         )
         if missing or present or pattern_hits or pattern_missing or any_of_miss:
             parts = []
@@ -264,10 +662,19 @@ class ReportContainsVerifier(BaseVerifier):
                     f"required patterns absent from the report: {pattern_missing}"
                 )
             if any_of_miss:
-                parts.append(
-                    "none of the alternative phrasings present: "
-                    f"{self.any_of_phrases + self.any_of_patterns}"
-                )
+                if self.any_of_phrases:
+                    parts.append(
+                        f"none of the alternative phrasings present: {self.any_of_phrases}"
+                    )
+                if self.any_of_patterns:
+                    parts.append(
+                        f"none of the alternative patterns matched: {self.any_of_patterns}"
+                    )
+            if clusters is not None and (pattern_hits or pattern_missing or any_of_miss):
+                # Which name each slot stood for in this project, so a miss
+                # can be read against what the agent wrote.
+                resolved = {slot: f"{name} ({location})" if location else name for slot, (name, location) in sorted(clusters.items())}
+                parts.append(f"cluster placeholders resolved to {resolved}")
             return VerificationResult(
                 success=False,
                 elapsed_time=time.monotonic() - start,
@@ -292,14 +699,221 @@ class ReportContainsVerifier(BaseVerifier):
                 f"all {len(self.required_patterns)} required pattern(s)"
             )
         if self.any_of_phrases or self.any_of_patterns:
+            kinds = " or ".join(
+                kind
+                for kind, given in (("phrasing(s)", self.any_of_phrases), ("pattern(s)", self.any_of_patterns))
+                if given
+            )
             satisfied.append(
-                "at least one of "
-                f"{len(self.any_of_phrases) + len(self.any_of_patterns)} alternative phrasing(s)"
+                f"at least one of {len(self.any_of_phrases) + len(self.any_of_patterns)} alternative {kinds}"
             )
         return VerificationResult(
             success=True,
             elapsed_time=time.monotonic() - start,
             reason="report contains " + ", ".join(satisfied),
+        )
+
+
+# The header ``_append_delivered`` opens each card's result with in the final
+# message (harness.py), and the one ``_append_artifacts`` opens a file with. A
+# delivered result runs from its header to the next header of either kind.
+_DELIVERED_HEADER = re.compile(
+    r"^(?:Result of delegated task \S+|Artifact [^\n]* produced by delegated task \S+):\n",
+    re.MULTILINE,
+)
+_RESULT_HEADER_PREFIX = "Result of delegated task "
+# A bold span opening the text, closed on its own line.
+_BOLD_LEAD = re.compile(r"\A\*\*([^\n]+?)\*\*")
+_ATX_HEADING = re.compile(r"^ {0,3}#{1,6} ", re.MULTILINE)
+# A fenced block, dropped before the heading check: a "# comment" in a snippet is no heading
+# (kanban_report_format.py's ``_FENCE``).
+_FENCE = re.compile(r"```.*?```", re.DOTALL)
+# Where the fold ends a sentence: terminal punctuation, an emphasis closer after it allowed,
+# then whitespace and anything but a lowercase letter. Copied from slack_presenter.py's
+# ``SENTENCE_END``; keep the two the same.
+_SENTENCE_END = re.compile(r"(?:(?<=[.!?])|(?<=[.!?][*_])|(?<=[.!?]\*\*)|(?<=[.!?]__))\s+(?=[^\sa-z])")
+# A line break ends a sentence too, so each bullet counts.
+_SENTENCE_BREAK = re.compile(_SENTENCE_END.pattern + r"|\n+")
+_INNER_SENTENCE_BREAK = _SENTENCE_END
+# A line break inside a soft-wrapped sentence: after a line that has not ended (a stop, with or
+# without an emphasis closer, or a colon), before a line that is not blank, a list item or a
+# heading. It joins, as slack_presenter.split_lead does.
+_SOFT_WRAP = re.compile(
+    r"(?<=\S)(?<![.!?:])(?<![.!?][*_])(?<![.!?]\*\*)(?<![.!?]__)"
+    r"[ \t]*\n(?=[ \t]*\S)(?![ \t]*(?:[-*+]|\d+[.)]|#{1,6})\s)"
+)
+# Abbreviations whose dots end no sentence; their dots are dropped before counting. The
+# fold's own tables, copied from slack_presenter.py's ``ABBREVIATION_END`` and
+# ``NUMBER_ABBREVIATION_END`` (no/max/min abbreviate only before a number), plus a.m./p.m.
+_ABBREVIATION = re.compile(
+    r"(?:(?<=^)|(?<=[\s(\[]))(?:e\.g|i\.e|a\.m|p\.m|vs|approx|incl|cf|etc|esp|ex|fig|rev|ver|cont|"
+    r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\.",
+    re.IGNORECASE | re.MULTILINE,
+)
+_NUMBER_ABBREVIATION = re.compile(r"(?:(?<=^)|(?<=[\s(\[#]))(?:no|max|min)\.(?=\s+\d)", re.IGNORECASE | re.MULTILINE)
+# What trails a bold lead whose terminal punctuation sits outside the bold.
+_LEAD_TRAIL = ".!? \t"
+_TERMINAL = ".!?"
+# What may follow a one-word bold answer that leaves its punctuation to the detail:
+# "**No**: ...", "**Yes** \u2014 ...". A longer span before a colon is a label ("**Memory check**:").
+_LEAD_CLAUSE = (":", "\u2014", "\u2013")
+_WHITESPACE = re.compile(r"\s")
+_HEADING_MARK = "#"
+# A later bold span closed without a stop and followed by a colon, a dash or the line's end:
+# a section label. After an unpunctuated lead, it makes the lead one label of several.
+_BOLD_SECTION = re.compile(r"\*\*[^*\n]+?(?<![.!?])\*\*[ \t]*(?:[:\u2014\u2013]|$)", re.MULTILINE)
+# A markdown link; chat shows its text, not its target. Named apart from report_contains'
+# _MARKDOWN_LINK above, whose fold keeps its own rule (non-empty text, one line).
+_ANSWER_LINK = re.compile(r"\[([^\]]*)\]\([^)\s]*\)")
+# Bold and code markers, which chat renders rather than shows.
+_UNSHOWN_MARKUP = re.compile(r"\*\*|`")
+
+
+def _delivered_results(final_message: str) -> list[str]:
+    """Each delivered card result in ``final_message``, artifacts excluded."""
+    headers = list(_DELIVERED_HEADER.finditer(final_message))
+    results = []
+    for i, header in enumerate(headers):
+        if not header.group(0).startswith(_RESULT_HEADER_PREFIX):
+            continue
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(final_message)
+        results.append(final_message[header.end() : end].strip())
+    return results
+
+
+def _unabbreviate(text: str) -> str:
+    def undot(match: re.Match) -> str:
+        return match.group(0).replace(".", "")
+
+    return _NUMBER_ABBREVIATION.sub(undot, _ABBREVIATION.sub(undot, text))
+
+
+def _sentences(text: str) -> list[str]:
+    joined = _SOFT_WRAP.sub(" ", text)
+    return [s.strip() for s in _SENTENCE_BREAK.split(_unabbreviate(joined)) if s.strip()]
+
+
+@VERIFIERS.register("answer_first")
+class AnswerFirstVerifier(BaseVerifier):
+    """Whether each delivered card result opens on its answer and stops.
+
+    The shape a chat answer owes the person who asked: one bold sentence that
+    answers the ask, a sentence or two of the evidence that settles it, an
+    offer if there is a next step, and nothing said twice. It reads the raw
+    result rather than ``report_contains``'s normalized text, because that
+    normalization drops the ``**`` this check is partly about.
+
+    Every delivered result must pass: the lead is a bold span opening the
+    result and holding one whole sentence; no ATX heading anywhere; at most
+    ``max_chars`` characters as chat shows them, a markdown link counting as
+    its text and bold and code markers not at all, and ``max_sentences`` sentences, a bullet counting as one and a
+    soft-wrapped sentence as one; and no sentence
+    after the lead matching any of ``recap_patterns``, regexes searched in each
+    later sentence's normalized text, which name the ways a restated verdict
+    reads ("the cluster is healthy", "in summary"). Restatement in other words
+    is the judge's to notice; this is the part an exact check can hold. Each
+    of ``lead_terms`` must appear in at least one result's lead (matched like
+    ``report_contains`` phrases, so ``memory`` finds ``MemoryPressure``), so an
+    ask the front door split across two cards can be answered in two leads.
+
+    A run that delivered no result fails rather than erroring: the transcript
+    was read, and an answer that never arrived does not have the shape.
+    """
+
+    type: Literal["answer_first"]
+    lead_terms: list[str] = Field(default_factory=list)
+    max_chars: int = Field(default=600, gt=0)
+    max_sentences: int = Field(default=4, gt=0)
+    recap_patterns: list[str] = Field(default_factory=list)
+
+    @field_validator("recap_patterns")
+    @classmethod
+    def _recap_patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as err:
+                raise ValueError(f"recap pattern {pattern!r} does not compile: {err}") from err
+        return patterns
+
+    def _defects(self, result: str) -> tuple[list[str], str]:
+        """The result's defects, and its lead's normalized text (``""`` without one)."""
+        defects = []
+        lead_text = ""
+        lead = _BOLD_LEAD.match(result)
+        if lead is None:
+            defects.append("does not open with a bold sentence")
+            rest = result
+        else:
+            inner = lead.group(1).strip()
+            after = result[lead.end() :]
+            if _INNER_SENTENCE_BREAK.search(_unabbreviate(inner)):
+                defects.append(f"the bold lead is more than one sentence: {inner!r}")
+            elif not (inner.endswith(tuple(_TERMINAL)) or after[:1] in tuple(_TERMINAL)):
+                # A span alone on its line is a sentence missing its stop only when it reads as
+                # one: a single word ("**Memory**") or a heading mark is a label.
+                own_line = not after.split("\n", 1)[0].strip()
+                if not (
+                    (after.lstrip(" ").startswith(_LEAD_CLAUSE) and not _WHITESPACE.search(inner))
+                    or (own_line and _WHITESPACE.search(inner) and not inner.startswith(_HEADING_MARK))
+                ):
+                    defects.append(f"the bold span is not a whole sentence: {inner!r}")
+                elif _BOLD_SECTION.search(after):
+                    defects.append(f"the bold lead is one of several bold labels: {inner!r}")
+            lead_text = _normalize(_ANSWER_LINK.sub(r"\1", inner))
+            rest = after.lstrip(_LEAD_TRAIL)
+        if _ATX_HEADING.search(_FENCE.sub("", result)):
+            defects.append("carries a section heading")
+        shown = len(_UNSHOWN_MARKUP.sub("", _ANSWER_LINK.sub(r"\1", result)))
+        if shown > self.max_chars:
+            defects.append(f"{shown} characters, over {self.max_chars}")
+        later = _sentences(rest)
+        count = len(later) + (lead is not None)
+        if count > self.max_sentences:
+            defects.append(f"{count} sentences, over {self.max_sentences}")
+        recaps = [
+            s for s in later if any(re.search(p, _normalize(s)) for p in self.recap_patterns)
+        ]
+        if recaps:
+            defects.append(f"restates its verdict: {recaps}")
+        return defects, lead_text
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_TRANSCRIPT_REASON,
+            )
+        results = _delivered_results(snap.final_message)
+        if not results:
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason="no delegated card result was delivered, so there is no answer to read",
+            )
+        failures, leads = [], []
+        for i, result in enumerate(results):
+            defects, lead_text = self._defects(result)
+            leads.append(lead_text)
+            if defects:
+                failures.append(f"result {i + 1}: " + "; ".join(defects))
+        missing = [t for t in self.lead_terms if not any(_normalize(t) in lead for lead in leads)]
+        if missing:
+            failures.append(f"no bold lead mentions {missing}")
+        if failures:
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=" | ".join(failures),
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"{len(results)} delivered result(s) open on a bold one-sentence answer and stop",
         )
 
 
@@ -324,6 +938,19 @@ def _wrapped_tool_names(entry: dict[str, Any]) -> set[str]:
             if isinstance(c, dict) and c.get("name"):
                 names.add(str(c["name"]))
     return names
+
+
+def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
+    """The string-valued ``names`` found in JSON arguments clipped past parsing."""
+    found: dict[str, str] = {}
+    for name in names:
+        literal = re.search(rf'"{re.escape(name)}"\s*:\s*("(?:[^"\\]|\\.)*")', text)
+        if literal is not None:
+            try:
+                found[name] = json.loads(literal.group(1))
+            except ValueError:
+                continue
+    return found
 
 
 @VERIFIERS.register("tool_called")
@@ -375,6 +1002,16 @@ class ToolCalledVerifier(BaseVerifier):
     under ``scope: workers`` to discriminate calls made by a specific worker
     profile (e.g. ``platform``) from calls made by other workers (e.g.
     Cluster Agents).
+
+    ``arguments``: optional map of argument name to Python regular expression.
+    When set, a call counts only if each named argument is present and its
+    value, as a string, matches its pattern under ``re.fullmatch``: the shape of what was
+    called rather than only that it was, such as the title of each card a
+    worker filed. Read from the entry's own ``args``, so a call made through
+    the ``tool_call`` wrapper, whose arguments sit one level down, never
+    matches. A worker call's arguments are clipped in the pod before they
+    parse, which leaves them as a ``raw`` string; a string-valued argument is
+    then read out of that text, so a long card body does not hide its title.
     """
 
     type: Literal["tool_called"]
@@ -382,6 +1019,7 @@ class ToolCalledVerifier(BaseVerifier):
     minimum_calls: int = Field(default=1, ge=1)
     scope: Literal["router", "workers", "all"] = "router"
     agent: str | None = None
+    arguments: dict[str, str] | None = None
     # Objectives set this: a call the harness marked status="error" produced
     # no effect (kanban_create that failed filed no card), so counting it
     # would pass a check whose subject never happened. Safeguards leave it
@@ -395,6 +1033,14 @@ class ToolCalledVerifier(BaseVerifier):
         if pattern is not None:
             if not pattern:
                 raise ValueError("agent selector pattern cannot be empty")
+            # The selector is matched as written against the trajectory's
+            # agent tags; a cluster placeholder is never expanded here, so it
+            # would compile as literal braces that match no tag.
+            if _CLUSTER_PLACEHOLDER_LOOSE.search(pattern):
+                raise ValueError(
+                    f"agent selector pattern {pattern!r} carries a cluster placeholder, which only "
+                    "report_contains's forbidden_patterns and any_of_patterns expand"
+                )
             compiled = re.compile(pattern)
             if compiled.fullmatch(""):
                 raise ValueError(
@@ -402,6 +1048,29 @@ class ToolCalledVerifier(BaseVerifier):
                     "(router entries have no agent tag)"
                 )
         return pattern
+
+    @field_validator("arguments")
+    @classmethod
+    def _argument_patterns_compile(cls, patterns: dict[str, str] | None) -> dict[str, str] | None:
+        if patterns is not None:
+            if not patterns:
+                raise ValueError("arguments cannot be empty; omit it to match any arguments")
+            for pattern in patterns.values():
+                re.compile(pattern)
+        return patterns
+
+    def _arguments_match(self, entry: dict[str, Any]) -> bool:
+        if self.arguments is None:
+            return True
+        args = entry.get("args")
+        if not isinstance(args, dict):
+            return False
+        if set(args) == {"raw"} and isinstance(args["raw"], str):
+            args = _clipped_string_args(args["raw"], self.arguments)
+        return all(
+            name in args and re.fullmatch(pattern, str(args[name])) is not None
+            for name, pattern in self.arguments.items()
+        )
 
     @model_validator(mode="after")
     def _validate_agent_scope(self) -> ToolCalledVerifier:
@@ -457,10 +1126,13 @@ class ToolCalledVerifier(BaseVerifier):
             for entry in entries
             if (entry.get("name") in wanted or _wrapped_tool_names(entry) & wanted)
             and not (self.require_success and entry.get("status") == "error")
+            and self._arguments_match(entry)
         ]
         count = len(calls)
         ok = count >= self.minimum_calls
         agent_str = f" for agent {self.agent!r}" if self.agent is not None else ""
+        if self.arguments is not None:
+            agent_str += f" with arguments matching {self.arguments!r}"
         if self.agent is not None and not matched_agent:
             if snap.worker_capture_gaps:
                 return VerificationResult(
@@ -513,6 +1185,24 @@ LEDGER_AUDIT_IDS = frozenset(
         "stockout-prevention",
     }
 )
+
+# The same ids as a type, for a check's `audit` field: a typo fails at
+# spec-load time rather than as an unfindable ledger or store at run time.
+AuditId = Literal[
+    "ai-security-audit",
+    "compliance-audit",
+    "fleet-consistency-drift",
+    "fleet-wide-cost-analysis",
+    "gce-compute-fleet-audit",
+    "gcp-networking-fabric-audit",
+    "obtainability-audit",
+    "security-patch-orchestrator",
+    "stockout-prevention",
+]
+
+# Every `status` a fleet-audit `finish` stores, for `audit_report_stored`:
+# a typo fails at spec-load time, as `AuditId` does for the stream.
+AuditStatus = Literal["OPENED", "UPDATED", "CLEAN", "HELD", "NO_FORGE"]
 
 # Environment names carrying the read credential, in precedence order. See
 # LedgerIssueContainsVerifier's docstring for what it has to be. A literal
@@ -635,6 +1325,12 @@ _PR_COMMITS_MAX_PAGES = 3
 # `/pulls/{n}/files` pages 100 at a time and lists at most 3000 files.
 _PR_FILES_PAGE_SIZE = 100
 _PR_FILES_MAX_PAGES = 30
+# git's blob id for an empty file.
+_EMPTY_BLOB_SHA = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+# `/pulls/{n}/files` statuses whose file is not at the head any more.
+_PR_FILE_GONE_STATUSES = frozenset({"removed"})
+# Offending documents a failed content assertion names before counting the rest.
+_PR_CONTENT_MAX_NAMED = 5
 
 _NO_PR_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
@@ -778,6 +1474,413 @@ _NO_WORKER_COMMANDS_REASON = (
 _MAX_NAMED_COMMANDS = 5
 
 
+# A command line is read as the shell reads it: tokenised first, quotes honoured, so a quoted
+# path is one word and a quoted sentence is one word too (which is what tells a run of a script
+# from a mention of it), and only then split into segments at the operator tokens the shell
+# starts a new command on. A bare token (outside quotes) made of these characters alone is such
+# an operator; a quoted word that spells one (`';'`, `">"`) is text.
+_SHELL_OPERATOR_CHARS = frozenset("&|;()")
+# The characters whose bare runs the shell reads as one operator token (`&&`, `>>`, `2>&1`'s
+# `>&`, `|&`); `(` and `)` are operators of one character each.
+_SHELL_OPERATOR_RUN_CHARS = frozenset("&|;<>")
+_SHELL_PARENS = frozenset("()")
+_OPERATOR_MARK = "\x00O{index}\x00"
+_OPERATOR_MARK_RE = re.compile(r"^\x00O(\d+)\x00$")
+_SHELL_PROGRAMS_WITH_COMMAND_STRING = ("sh", "bash", "zsh", "dash")
+# A shell program is unwrapped only where the shell would run it: as the segment's command word,
+# or behind words that hand their argv on unchanged -- `NAME=value` assignments, these wrappers,
+# their flags and a duration or count such as `timeout 600`'s. A shell word behind `echo` or
+# `printf` is text the command prints, wherever the `echo` stands (`nohup echo bash -c ...` is
+# the wrapper running `echo`), and the string after its `-c` is not run.
+_SHELL_EXEC_WRAPPERS = frozenset(("timeout", "nohup", "env", "time", "nice", "ionice", "stdbuf", "setsid", "sudo", "exec", "command", "xargs", "watch", "flock", "chroot"))
+# A wrapper that takes a positional ahead of the command it runs (`flock <lock> cmd`,
+# `chroot <root> cmd`): that one word is the wrapper's own, whatever it looks like.
+_SHELL_WRAPPER_POSITIONALS = {"flock": 1, "chroot": 1}
+_SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# The interpreters a case's script is run through, and the project runners that hand the words
+# after `run` to one (`uv run`, `poetry run`, `pipenv run`); `-m <stem>` is read after one of these.
+_INTERPRETER_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)?)?|pypy3?|uv|poetry|pipenv)$")
+_INTERPRETER_CODE_FLAG = "-c"
+_SHELL_COMMENT_CHAR = "#"
+_SHELL_QUOTE_CHARS = frozenset("'\"")
+_SHELL_SINGLE_QUOTE = "'"
+_SHELL_DOUBLE_QUOTE = '"'
+_SHELL_ESCAPE_CHAR = "\\"
+_SHELL_LINE_END = "\n"
+# A `#` opens a comment only where a word opens: at the start of the line, after whitespace or
+# after an operator character. Bash then drops the rest of the line, operators included.
+_SHELL_WORD_OPENERS = frozenset(" \t\n\r\f\v<>") | _SHELL_OPERATOR_CHARS
+# Bash's reserved words: a command word stands behind them (`if python3 ...`, `do python3 ...`).
+_SHELL_RESERVED_WORDS = frozenset(("if", "then", "else", "elif", "while", "until", "do", "{", "!"))
+# A redirect operator, as the tokeniser cuts it (`>`, `>>`, `>&`, `&>`, `<<<`; a leading fd number
+# is a word of its own); one with nothing after it (`>#log`, once the comment is off) is a line
+# bash refuses. Matched against bare operator tokens only: a quoted `">"` is text.
+_SHELL_REDIRECT_RE = re.compile(r"^(?:\d*[<>]{1,3}&?|&>>?)$")
+# A substitution opens a span inside a word that the shell runs for its text, not a subshell:
+# `$(`...`)`, `$((`...`))`, `<(`...`)`, `>(`...`)` and a backtick pair. Outside single quotes
+# each is folded into its enclosing word before the line is tokenised, so `r_$(date +%s).json`
+# stays one word while a bare `(` keeps opening a subshell; the commands inside a span (all but
+# the arithmetic `$((`...`))`) are then read as commands of their own, as the shell runs them.
+_SHELL_SUBSTITUTION_OPENERS = ("$((", "$(", "<(", ">(")
+# Inside double quotes bash still runs `$(`...`)`, `$((`...`))` and backticks; `<(` and `>(` are
+# text there.
+_SHELL_QUOTED_SUBSTITUTION_OPENERS = ("$((", "$(")
+_SHELL_ARITHMETIC_OPENER = "$(("
+_SHELL_BACKTICK = "`"
+_SUBSTITUTION_MARK = "\x00S{index}\x00"
+_SUBSTITUTION_MARK_RE = re.compile(r"\x00S(\d+)\x00")
+# After an exec wrapper, only the wrapper's own words are transparent: a flag, the word after a
+# flag (its value, as in `-u hermes` or `-s KILL`, unless that word is a flag itself; which flags take one is not tabled), a
+# duration or count (`timeout 600`, `timeout infinity`), an expansion the reader never resolves
+# (`timeout $T`, `"${TIMEOUT:-600}"`) and `--`, which ends its options. A redirect and its target
+# stand anywhere ahead of the command (`nohup > log python3 ...`). The first other word is the
+# command the wrapper runs.
+_SHELL_FLAG_PREFIX = "-"
+_SHELL_OPTIONS_END = "--"
+_SHELL_EXPANSION_PREFIX = "$"
+_SHELL_COUNT_RE = re.compile(r"^(?:\d+(?:\.\d+)?[smhd]?|infinity)$")
+_USAGE_FLAGS = ("-h", "--help")
+
+
+class WorkerRun(BaseModel):
+    """One program run a case requires of a worker, or forbids: a script by its basename (or its
+    module stem under ``-m``), the flags that have to follow it on the same shell segment as exact
+    words, and ``word_patterns``, regular expressions each of which some later word of the segment
+    must match on its own (``^(?:get|describe)$`` for a verb; a resource list such as
+    ``pdb,validatingwebhookconfigurations`` is one word, so a pattern over the word reads it
+    whole, and a quoted mention of the whole command is one word that is no command)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    script: str
+    flags: list[str] = Field(default_factory=list)
+    word_patterns: list[str] = Field(default_factory=list)
+
+    @field_validator("word_patterns")
+    @classmethod
+    def _word_patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                raise ValueError(f"word pattern {pattern!r} does not compile: {error}") from error
+        return patterns
+
+    @field_validator("script")
+    @classmethod
+    def _script_is_a_bare_name(cls, script: str) -> str:
+        # The argv is matched by basename, so a path never matches and an empty name matches
+        # any word ending in a slash; both are refused at case load, like a pattern that does
+        # not compile.
+        if not script or os.path.basename(script) != script:
+            raise ValueError(f"script must be a bare file name, the basename a worker's argv carries, not {script!r}")
+        return script
+
+    @field_validator("flags")
+    @classmethod
+    def _flags_are_words(cls, flags: list[str]) -> list[str]:
+        for flag in flags:
+            if not flag or any(char.isspace() for char in flag):
+                raise ValueError(f"each flag must be one word, not {flag!r}")
+        return flags
+
+
+def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
+    """The command line with its comments removed, every substitution span the shell would run
+    replaced by a marker inside its word, and every bare operator token replaced by a marker of
+    its own; the spans and the operators in order. One pass over the raw line, with one quote
+    model: a ``'`` or ``"`` outside quotes opens a quoted string that the other character does
+    not close (``"don't"`` is one quoted word), an escaped character is kept with its escape
+    and never opens a word, and a ``\\``-newline pair, a line continuation, is removed as bash
+    removes it. A ``#`` outside quotes that opens a word (at the start of the line,
+    after whitespace or after an operator character) comments out the rest of its line,
+    operators included, so nothing after it runs; a ``#`` inside a word (``readiness-#2.json``,
+    ``$#``), inside quotes (``'#1.json'``) or escaped is part of the word. A substitution
+    (``$(``...``)``, ``$((``...``))``, ``<(``...``)``, ``>(``...``)``, a backtick pair) outside
+    single quotes is consumed whole, quotes and escapes inside it honoured, so
+    ``r_$(date +%s).json`` stays one word and the ``)`` that closes it never opens a word for a
+    ``#`` after it; inside double quotes only the forms bash runs there are folded. An operator
+    (``&&``, ``;``, ``|``, ``>``, ``2>&1``'s ``>&``, ``(``, a bare newline, which starts a new
+    command as ``;`` does) is one only outside quotes, which is
+    known here and not after the quotes come off: a quoted ``">"`` or ``';'`` stays a word of
+    text. A span left open at the line's end is kept as it stands. Read before the quotes come
+    off, because afterwards a quoted ``#1.json`` and a bare one look the same."""
+    spans: list[str] = []
+    operators: list[str] = []
+    out: list[str] = []
+    i = 0
+    quote: str | None = None
+    previous = _SHELL_LINE_END
+    while i < len(command):
+        char = command[i]
+        if quote is None and char == _SHELL_COMMENT_CHAR and previous in _SHELL_WORD_OPENERS:
+            end = command.find(_SHELL_LINE_END, i)
+            if end < 0:
+                break
+            i = end
+            continue
+        if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE and i + 1 < len(command):
+            if command[i + 1] == _SHELL_LINE_END:
+                # A line continuation: bash removes the pair before it reads a word, so a
+                # command typed across continued lines is the same line.
+                i += 2
+                continue
+            out.append(command[i:i + 2])
+            previous = _SHELL_ESCAPE_CHAR
+            i += 2
+            continue
+        if char == quote:
+            quote = None
+        elif quote is None and char in _SHELL_QUOTE_CHARS:
+            quote = char
+        else:
+            openers = () if quote == _SHELL_SINGLE_QUOTE else _SHELL_QUOTED_SUBSTITUTION_OPENERS if quote == _SHELL_DOUBLE_QUOTE else _SHELL_SUBSTITUTION_OPENERS
+            opener = next((o for o in openers if command.startswith(o, i)), None)
+            close = None
+            if opener is not None:
+                close = _substitution_end(command, i + len(opener), opener.count("("))
+            elif char == _SHELL_BACKTICK and quote != _SHELL_SINGLE_QUOTE:
+                close = _backtick_end(command, i + 1)
+            if opener is not None or (char == _SHELL_BACKTICK and quote != _SHELL_SINGLE_QUOTE):
+                if close is None:
+                    out.append(command[i:])
+                    break
+                spans.append(command[i:close])
+                out.append(_SUBSTITUTION_MARK.format(index=len(spans) - 1))
+                previous = _SUBSTITUTION_MARK[-1]
+                i = close
+                continue
+            if quote is None and (char in _SHELL_OPERATOR_RUN_CHARS or char in _SHELL_PARENS or char == _SHELL_LINE_END):
+                # A bare newline starts a new command as `;` does, so it is an operator too.
+                end = i + 1
+                if char in _SHELL_OPERATOR_RUN_CHARS:
+                    while end < len(command) and command[end] in _SHELL_OPERATOR_RUN_CHARS:
+                        end += 1
+                operators.append(command[i:end])
+                out.append(" " + _OPERATOR_MARK.format(index=len(operators) - 1) + " ")
+                previous = command[end - 1]
+                i = end
+                continue
+        out.append(char)
+        previous = char
+        i += 1
+    return "".join(out), spans, operators
+
+
+def _backtick_end(command: str, start: int) -> int | None:
+    """The index just past the backtick that closes a span opened before ``start``, escapes
+    honoured; None when the line ends first."""
+    j = start
+    while j < len(command):
+        if command[j] == _SHELL_ESCAPE_CHAR:
+            j += 2
+            continue
+        if command[j] == _SHELL_BACKTICK:
+            return j + 1
+        j += 1
+    return None
+
+
+def _substitution_commands(span: str) -> str | None:
+    """The command line a substitution span runs: the text inside its opener and closer, or None
+    for the arithmetic form, which runs no command."""
+    if span.startswith(_SHELL_ARITHMETIC_OPENER):
+        return None
+    if span.startswith(_SHELL_BACKTICK):
+        return span[1:-1]
+    opener = next(o for o in _SHELL_SUBSTITUTION_OPENERS if span.startswith(o))
+    return span[len(opener):-1]
+
+
+def _substitution_end(command: str, start: int, depth: int) -> int | None:
+    """The index just past the ``)`` that closes a span opened with ``depth`` parentheses before
+    ``start``, quotes and escapes inside the span honoured; None when the line ends first."""
+    inner_quote: str | None = None
+    j = start
+    while j < len(command) and depth > 0:
+        c = command[j]
+        if c == _SHELL_ESCAPE_CHAR and inner_quote != _SHELL_SINGLE_QUOTE:
+            j += 2
+            continue
+        if inner_quote is not None:
+            if c == inner_quote:
+                inner_quote = None
+        elif c in _SHELL_QUOTE_CHARS:
+            inner_quote = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        j += 1
+    return None if depth > 0 else j
+
+
+def _unfold_substitutions(word: str, spans: list[str]) -> str:
+    return _SUBSTITUTION_MARK_RE.sub(lambda m: spans[int(m.group(1))], word)
+
+
+class _ShellOperator(str):
+    """A bare operator token (``&&``, ``;``, ``|``, ``>``, ``(``): one the scan read outside
+    quotes. It compares equal to its text; a quoted word that spells the same characters is a
+    plain ``str`` and is text."""
+
+
+def _shell_words_and_spans(command: str) -> tuple[list[str], list[str]]:
+    """The command line as the shell's words, quotes honoured and removed, bare operators
+    (``&&``, ``||``, ``;``, ``|``, ``&``, ``(``, ``)``, the redirects) as :class:`_ShellOperator`
+    words of their own, and the substitution spans the line carries; a line whose quotes do not
+    balance is one bash refuses and runs nothing of, so it yields no words and no run is
+    credited from it. Comments come off, substitutions fold into their words and operators are
+    marked first, in one pass (:func:`_read_shell_line`), so the lexer splits on whitespace
+    alone and its own ``#`` commenter is off, as in ``shlex.split``: it would cut a word at a
+    ``#`` inside it (``readiness-#2.json``), which bash does not."""
+    command, spans, operators = _read_shell_line(command)
+    lexer = shlex.shlex(command, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        raw = list(lexer)
+    except ValueError:
+        return [], []
+    words: list[str] = []
+    for word in raw:
+        mark = _OPERATOR_MARK_RE.match(word)
+        words.append(_ShellOperator(operators[int(mark.group(1))]) if mark else _unfold_substitutions(word, spans))
+    # A redirect that ends a segment with no target (`>#log` once its comment is off) is a line
+    # bash refuses, so nothing on it runs.
+    for index, word in enumerate(words):
+        if _is_redirect(word) and (index + 1 == len(words) or isinstance(words[index + 1], _ShellOperator)):
+            return [], []
+    return words, spans
+
+
+def _is_redirect(word: str) -> bool:
+    return isinstance(word, _ShellOperator) and bool(_SHELL_REDIRECT_RE.match(word))
+
+
+def _is_control_operator(word: str) -> bool:
+    return isinstance(word, _ShellOperator) and (word == _SHELL_LINE_END or set(word) <= _SHELL_OPERATOR_CHARS)
+
+
+def _shell_argvs(command: str) -> list[list[str]]:
+    """Each segment of a command line as an argv: comments come off and the line is tokenised
+    first, so a quoted path is one word and a quoted sentence one word whatever it contains,
+    then split where the shell starts a new command. A shell program anywhere on a segment
+    (``bash -c``, under ``timeout``, ``nohup`` or an ``env``) carries a command line in the word
+    after its ``-c``-style flag, which is read the same way and yields its own argvs; so does
+    each command or process substitution and each backtick pair on the line (``OUT=$(python3
+    ... --readiness)``, ``cat <(...)``), whose commands the shell runs."""
+    words, spans = _shell_words_and_spans(command)
+    argvs: list[list[str]] = []
+    argv: list[str] = []
+    for word in [*words, _ShellOperator(";")]:
+        if _is_control_operator(word):
+            if argv:
+                argvs.append(argv)
+            argv = []
+            continue
+        argv.append(word)
+    for argv in list(argvs):
+        index = _command_word_index(argv)
+        if index is None or os.path.basename(argv[index]) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
+            continue
+        for flag_index in range(index + 1, len(argv) - 1):
+            flag = argv[flag_index]
+            if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
+                argvs.extend(_shell_argvs(argv[flag_index + 1]))
+                break
+    for span in spans:
+        inner = _substitution_commands(span)
+        if inner is not None:
+            argvs.extend(_shell_argvs(inner))
+    return argvs
+
+
+def _command_word_index(argv: list[str], script: str | None = None) -> int | None:
+    """The index of the word the shell runs as this argv's command, when it is one the reader
+    knows: a shell program, an interpreter, or ``script`` itself. Leading ``NAME=value``
+    assignments and reserved words are skipped, and so is a redirect with its target, which bash
+    takes anywhere on the line. After an exec wrapper (``timeout``, ``sudo``, ``env`` ...) only
+    the wrapper's own words are transparent: a flag, the word after a flag (its value, ``-u user``
+    or ``-s KILL``, unless that word is a flag itself, ``sudo -E -u``; which flags take one is not tabled, so the word after a bare flag is read as
+    its value even when it is a command, the one over-credit this leaves), a duration or count
+    (``timeout 600``), an expansion the reader never resolves (``timeout $T``), ``--``, which
+    ends its options, and the one positional ``flock`` and ``chroot`` take ahead of their command
+    (``_SHELL_WRAPPER_POSITIONALS``). The first word that is none of those is the command the wrapper runs: a
+    shell, an interpreter or the script is returned, and any other word (``ls``, ``echo``,
+    ``find``, ``grep``) is a command of its own, behind a wrapper as at the front of the argv,
+    and None is returned: nothing it names as an argument runs."""
+    after_wrapper = False
+    takes_value = False
+    positionals = 0
+    for index, word in enumerate(argv):
+        base = os.path.basename(word)
+        if base in _SHELL_PROGRAMS_WITH_COMMAND_STRING or _INTERPRETER_RE.match(base) or (script and base == script):
+            return index
+        if _SHELL_ASSIGNMENT_RE.match(word) or word in _SHELL_RESERVED_WORDS:
+            takes_value = False
+            continue
+        if base in _SHELL_EXEC_WRAPPERS:
+            after_wrapper, takes_value = True, False
+            positionals = _SHELL_WRAPPER_POSITIONALS.get(base, 0)
+            continue
+        if _is_redirect(word) or (word.isdigit() and index + 1 < len(argv) and _is_redirect(argv[index + 1])):
+            # A redirect takes the next word as its target; a bare fd number ahead of one is its own.
+            takes_value = not word.isdigit()
+            continue
+        if after_wrapper and word.startswith(_SHELL_FLAG_PREFIX):
+            # A flag in its own right, never the previous flag's value (`sudo -E -u hermes`); `--`
+            # ends the options and takes nothing.
+            takes_value = word != _SHELL_OPTIONS_END
+            continue
+        if takes_value:
+            takes_value = False
+            continue
+        if not after_wrapper:
+            return None
+        if _SHELL_COUNT_RE.match(word) or word.startswith(_SHELL_EXPANSION_PREFIX):
+            continue
+        if positionals:
+            positionals -= 1
+            continue
+        return None
+    return None
+
+
+def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
+    """Whether one argv runs ``run.script``: the script is the argv's command word by its
+    basename, or follows an interpreter that is (``python3 -m <stem>`` counts, ``python3 -c``
+    does not, since the code string runs and the file is its argument); every one of
+    ``run.flags`` is a later word, and no word is a usage flag, which prints the help and runs
+    nothing. A segment whose command is something else (``find``, ``ls``, an unquoted ``echo``),
+    at the front or behind an exec wrapper, is not a run however it names the file and the
+    flag."""
+    if any(word in _USAGE_FLAGS for word in argv):
+        return False
+    command = _command_word_index(argv, run.script)
+    if command is None:
+        return False
+    stem = run.script.rsplit(".", 1)[0]
+    if os.path.basename(argv[command]) == run.script:
+        return _words_after_carry(argv[command + 1:], run)
+    if not _INTERPRETER_RE.match(os.path.basename(argv[command])):
+        return False
+    for index in range(command + 1, len(argv)):
+        word = argv[index]
+        if _INTERPRETER_CODE_FLAG in argv[command + 1:index]:
+            return False
+        is_script = os.path.basename(word) == run.script or (argv[index - 1] == "-m" and word == stem)
+        if is_script and _words_after_carry(argv[index + 1:], run):
+            return True
+    return False
+
+
+def _words_after_carry(words: list[str], run: WorkerRun) -> bool:
+    """Whether the words after the script carry every flag as an exact word and, for every word
+    pattern, some word that matches it on its own."""
+    return all(flag in words for flag in run.flags) and all(any(re.search(pattern, word) for word in words) for pattern in run.word_patterns)
+
+
 @VERIFIERS.register("worker_commands")
 class WorkerCommandsVerifier(BaseVerifier):
     """Pattern checks against the terminal commands the delegated workers ran.
@@ -819,6 +1922,16 @@ class WorkerCommandsVerifier(BaseVerifier):
     more. A collapsed chain (a line ending `` + N command(s)``) hides what
     followed, so an exemption refuses it and the first command's own words
     are graded.
+    ``required_runs``: each names a script (by basename, or module stem under
+    ``-m``), flags and word patterns; some command's shell segment, read as an
+    argv, must run it with those flags after it, a word matching each pattern,
+    and no ``-h``/``--help`` (:func:`_argv_runs`). ``forbidden_runs``: the same
+    shape, and no segment may run it. An argv tells a quoted mention of the
+    invocation from a run, where a pattern over the text cannot: a forbidden
+    ``kubectl get`` of budgets is not met by ``grep "kubectl get pdb" SKILL.md``
+    or an echoed sentence, where ``forbidden_patterns`` over the text would be.
+    A command an exemption touched is out of the required runs as it is out
+    of the required patterns; the forbidden runs read every command as typed.
 
     Limits, stated so a case is not written against them: only terminal
     commands are visible, not MCP tool calls; only delegated workers' logs
@@ -827,14 +1940,43 @@ class WorkerCommandsVerifier(BaseVerifier):
     so a word the command splits with an empty quote or a backslash inside
     it (``compute''Metadata``) is one word to the shell and none to the
     pattern -- the trajectory read above, splitting the typed command into
-    words, closes this with the chain gap. Fails closed like its siblings --
-    a run with no captured worker commands is ``status="error"``, not a pass.
+    words, closes this with the chain gap. ``required_runs`` reads each flag as the exact
+    word, so a script a case names this way is built with ``allow_abbrev=False``
+    (argparse's default lets ``--readi`` run ``--readiness``), as
+    ``fleet_upgrade_report.py`` is; and a line bash refuses (an unclosed quote)
+    yields no words, so no run is credited from it (``forbidden_patterns``
+    read the text and still match it); and no shell expansion is resolved, so
+    a run spelled through a variable that holds the whole path
+    (``python3 "$SCRIPT" ...``) is not read as one -- the dictated command
+    spells the path in full; a ``$(...)``, ``<(...)``, ``>(...)`` or backtick
+    span is kept inside its word, as the shell keeps it, and the commands inside
+    it are read as commands of their own, as the shell runs them, quoted or not
+    (``$((...))`` runs none); a bare operator is one outside quotes only, so a
+    quoted ``">"`` or ``';'`` is text; and a reserved word (``if``, ``do``,
+    ``!``) stands ahead of the command word; so may an exec wrapper (``timeout``,
+    ``sudo``, ``env``, ``xargs``, ``flock``) with its own words -- a flag, the
+    word after a flag, a count, an unresolved expansion, ``--``, the one positional
+    ``flock`` and ``chroot`` take, and a redirect with its target -- and
+    a program behind one that is not the script, a shell or
+    an interpreter (``sudo ls``, ``nohup echo``) is a command of its own, not a
+    run; which flags take a value is not tabled, so the word after a bare flag
+    is read as its value (``sudo -n ls <script> --readiness`` is still credited); and a run
+    made through a script file or a shell's standard input (``bash run.sh``, ``nohup bash
+    /tmp/run.sh &``, ``echo "<command>" | bash``, ``bash -s < run.sh``) is not read
+    as one, since the argv names the file or the shell and not what was written to it, which
+    no reading of the argv recovers -- a case names a run this way where the persona dictates
+    one typed command, and a worker that runs it through a file is not credited.
+    Fails closed
+    like its siblings -- a run with no captured worker commands is
+    ``status="error"``, not a pass.
     """
 
     type: Literal["worker_commands"]
     required_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
     exempt_patterns: list[str] = Field(default_factory=list)
+    required_runs: list[WorkerRun] = Field(default_factory=list)
+    forbidden_runs: list[WorkerRun] = Field(default_factory=list)
 
     @field_validator("required_patterns", "forbidden_patterns", "exempt_patterns")
     @classmethod
@@ -879,13 +2021,20 @@ class WorkerCommandsVerifier(BaseVerifier):
         hits = [
             (p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)
         ]
-        if missing or hits:
+        argvs = [argv for c in commands for argv in _shell_argvs(c)]
+        typed_argvs = [argv for c in typed for argv in _shell_argvs(c)]
+        unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
+        ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
+        if missing or hits or unrun or ran:
             parts = []
             if missing:
                 parts.append(
                     f"no worker command matched required pattern(s) {missing} "
                     f"across {len(commands)} command(s){exempted}"
                 )
+            if unrun:
+                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun)
+                parts.append(f"no worker command ran {named} across {len(commands)} command(s)")
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:120]!r}"
@@ -897,6 +2046,10 @@ class WorkerCommandsVerifier(BaseVerifier):
                 )
                 more = f" (+{len(hits) - _MAX_NAMED_COMMANDS} more)" if len(hits) > _MAX_NAMED_COMMANDS else ""
                 parts.append(f"forbidden pattern(s) matched worker commands: {shown}{more}")
+            if ran:
+                shown = "; ".join(f"{run.script} ran as {' '.join(argv)[:120]!r}" for run, argv in ran[:_MAX_NAMED_COMMANDS])
+                more = f" (+{len(ran) - _MAX_NAMED_COMMANDS} more)" if len(ran) > _MAX_NAMED_COMMANDS else ""
+                parts.append(f"forbidden run(s) made by worker commands: {shown}{more}")
             return VerificationResult(
                 success=False,
                 elapsed_time=time.monotonic() - start,
@@ -907,7 +2060,9 @@ class WorkerCommandsVerifier(BaseVerifier):
             elapsed_time=time.monotonic() - start,
             reason=(
                 f"{len(commands)} worker command(s){exempted}: all {len(self.required_patterns)} "
-                f"required pattern(s) matched, none of {len(self.forbidden_patterns)} forbidden"
+                f"required pattern(s) matched, all {len(self.required_runs)} required run(s) made, "
+                f"none of {len(self.forbidden_patterns)} forbidden pattern(s) matched, "
+                f"none of {len(self.forbidden_runs)} forbidden run(s) made"
             ),
         )
 
@@ -1254,12 +2409,15 @@ class BootstrapFanoutVerifier(BaseVerifier):
 
 
 def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
-    """One GET against the GitHub REST API. The whole faked surface in tests.
+    """One GET against a forge's REST API. The whole faked surface in tests.
 
     Returns ``(status, decoded_json_or_None)``. Raises :class:`OSError`-family
     exceptions for transport failures, which the caller turns into
     ``status="error"`` rather than a fail — an unreachable API is the absence
-    of an observation, not a violation.
+    of an observation, not a violation. A transport failure is retried
+    ``_FORGE_READ_ATTEMPTS`` times first, so one slow read does not become
+    that error; an HTTP answer is returned on the first try, whatever its
+    status.
 
     Redirects are refused rather than followed. urllib does not strip
     ``Authorization`` across hosts, and a renamed repository answers ``301``;
@@ -1277,22 +2435,29 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
         method="GET",
     )
     opener = urllib.request.build_opener(_NoRedirect)
-    try:
-        with opener.open(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-            return response.status, json.loads(raw)
-    except urllib.error.HTTPError as exc:
-        # 404 and 403 are answers, not transport failures: read the body so the
-        # caller can distinguish "no such issue" from "no such permission".
+    for attempt in range(1, _FORGE_READ_ATTEMPTS + 1):
         try:
-            payload = json.loads(exc.read().decode("utf-8", errors="replace"))
-        except (ValueError, OSError):
-            payload = None
-        return exc.code, payload
-    except json.JSONDecodeError as exc:
-        raise OSError(f"GitHub returned a body that is not JSON: {exc}") from exc
-    except http.client.HTTPException as exc:
-        raise OSError(f"{type(exc).__name__}: {exc}") from exc
+            with opener.open(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+                return response.status, json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            # 404 and 403 are answers, not transport failures: read the body so the
+            # caller can distinguish "no such issue" from "no such permission".
+            try:
+                payload = json.loads(exc.read().decode("utf-8", errors="replace"))
+            except (ValueError, OSError):
+                payload = None
+            return exc.code, payload
+        except json.JSONDecodeError as exc:
+            raise OSError(f"the forge returned a body that is not JSON: {exc}") from exc
+        except (OSError, http.client.HTTPException) as exc:
+            # URLError and a socket timeout are OSErrors; HTTPException is not.
+            if attempt == _FORGE_READ_ATTEMPTS:
+                if isinstance(exc, http.client.HTTPException):
+                    raise OSError(f"{type(exc).__name__}: {exc}") from exc
+                raise
+            time.sleep(_FORGE_READ_RETRY_PAUSE_SEC)
+    raise AssertionError("unreachable")
 
 
 def _parse_footer(body: str) -> tuple[str, datetime] | None:
@@ -1469,17 +2634,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     type: Literal["ledger_issue_contains"]
     # Which stream's ledger. Validated against the registered ids so a typo
     # fails at spec-load time rather than as an unfindable ledger at run time.
-    audit: Literal[
-        "ai-security-audit",
-        "compliance-audit",
-        "fleet-consistency-drift",
-        "fleet-wide-cost-analysis",
-        "gce-compute-fleet-audit",
-        "gcp-networking-fabric-audit",
-        "obtainability-audit",
-        "security-patch-orchestrator",
-        "stockout-prevention",
-    ]
+    audit: AuditId
     required_phrases: list[str] = Field(default_factory=list)
     forbidden_phrases: list[str] = Field(default_factory=list)
     any_of_phrases: list[str] = Field(default_factory=list)
@@ -1849,6 +3004,345 @@ def _stream_started() -> datetime | None:
         return None
 
 
+class PullRequestContentCheck(BaseModel):
+    """One assertion over the files a pull request adds.
+
+    ``paths`` are ``fnmatch`` globs over the files the pull request lists. A
+    removed file is skipped; a file it adds is read; any other file a glob
+    names (modified, renamed) makes the check unevaluable (see
+    ``_head_files``). Each matching file is parsed as multi-document YAML
+    with scalars kept as the text the file holds (``true`` is ``"true"``,
+    ``1.30`` is ``"1.30"``) and aliases refused; a file that does not parse is
+    one text document with no kind, which is how a Terraform file is read, and
+    a root list's mappings are documents of their own, and any other scalar or
+    list is a text document with no kind. Merge keys (``<<``) are refused like
+    aliases. ``kind`` keeps the documents
+    of that ``kind`` ("" for every document). ``field`` is a dotted path into
+    each kept document, stepping through lists element by element, so
+    ``spec.nodeConfig.machineType`` or ``spec.enableK8sBetaApis.enabledApis``
+    resolve to the values found there; a key holding dots is bracketed,
+    ``spec.nodeConfig.labels["ate.dev/substrate-version"]``. A map or list
+    value compares as one-line-per-entry YAML. "" is the document itself, as
+    text: the raw file for a document with no kind, else the document
+    re-serialised as YAML.
+
+    ``op`` is what each kept document must show:
+
+    - ``exists``: the key is there (even with an empty or null value);
+    - ``contains``: one resolved value equals ``value`` exactly (for
+      ``field: ""``, ``value`` occurs in the text);
+    - ``matches``: one resolved value matches the regular expression
+      ``value`` (``re.search``);
+    - ``not_matches``: the field resolves, and none of its values matches
+      (a node pool that leaves its machine type out gets GKE's default, which
+      may be the series the check forbids);
+    - ``absent``: across every matching file, no kept document has the field
+      (with ``field: ""``, no document of that ``kind`` at all). A matching
+      file that does not parse fails it when ``kind`` or ``field`` is set,
+      since the object may be in it.
+
+    Every op but ``absent`` needs at least one kept document, so a pull request
+    that never wrote the object fails rather than passing vacuously, and
+    ``quantifier`` says whether ``all`` kept documents (the default) or ``any``
+    one must satisfy it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    paths: list[str] = Field(min_length=1)
+    kind: str = ""
+    field: str = ""
+    op: Literal["exists", "contains", "matches", "not_matches", "absent"]
+    value: str = ""
+    quantifier: Literal["all", "any"] = "all"
+
+    @model_validator(mode="after")
+    def _value_fits_op(self):
+        if self.op in ("contains", "matches", "not_matches") and not self.value:
+            raise ValueError(f"`{self.op}` needs a `value`")
+        if self.op in ("exists", "absent") and self.value:
+            raise ValueError(f"`{self.op}` compares nothing, so a `value` on it would never be read")
+        if self.op == "absent" and self.quantifier != "all":
+            raise ValueError("`absent` is decided over every document, so a `quantifier` on it would never be read")
+        if self.field:
+            _field_keys(self.field)
+        if self.op in ("matches", "not_matches"):
+            try:
+                re.compile(self.value)
+            except re.error as exc:
+                raise ValueError(f"`value` is not a regular expression: {exc}") from exc
+        return self
+
+    def label(self) -> str:
+        what = self.kind or "document"
+        at = f".{self.field}" if self.field else ""
+        tail = f" {self.value!r}" if self.value else ""
+        return f"{what}{at} {self.op}{tail} in {', '.join(self.paths)}"
+
+
+class _ContentLoader(yaml.BaseLoader):
+    """Reads a document's scalars as the text the file holds, never coerced
+    (``true`` stays ``"true"``, ``1.30`` stays ``"1.30"``), and refuses aliases,
+    which a document written to grade could nest into an expansion the grader
+    cannot afford."""
+
+    def compose_node(self, parent, index):  # noqa: D102 - yaml's own hook
+        if self.check_event(yaml.events.AliasEvent):
+            raise yaml.YAMLError("aliases are not read in graded content")
+        return super().compose_node(parent, index)
+
+    def construct_mapping(self, node, deep=False):  # noqa: D102 - yaml's own hook
+        # A merge key would splice fields in that this loader does not
+        # resolve, so an object could carry a field no assertion sees.
+        seen: set[str] = set()
+        for key_node, _ in node.value:
+            if getattr(key_node, "tag", "") == "tag:yaml.org,2002:merge" or key_node.value == "<<":
+                raise yaml.YAMLError("merge keys are not read in graded content")
+            # A repeated key keeps only its last spelling, so an earlier one
+            # (an E2 machine type before a C3 one) would never be seen.
+            if isinstance(key_node.value, str):
+                if key_node.value in seen:
+                    raise yaml.YAMLError(f"duplicate key {key_node.value!r} in graded content")
+                seen.add(key_node.value)
+        return super().construct_mapping(node, deep=deep)
+
+
+# The spellings of null a text-only loader keeps as text: a field holding one
+# is set to nothing, and GKE fills it with its default, so `not_matches`
+# cannot show it avoids anything.
+_YAML_NULL_SPELLINGS = frozenset({"", "~", "null", "Null", "NULL"})
+
+# A field segment: a bare key, or a bracketed quoted key that may hold dots
+# (`labels["ate.dev/substrate-version"]`).
+_FIELD_PATH = re.compile(r'(?:[^.\["\]]+|\["[^"]+"\])(?:\.[^.\["\]]+|\["[^"]+"\])*')
+_FIELD_SEGMENT = re.compile(r'\.?(?:\["([^"]+)"\]|([^.\["\]]+))')
+
+
+def _field_keys(dotted: str) -> list[str]:
+    """The keys of a dotted path, refusing anything outside its grammar
+    (a quote or bracket outside a bracketed key, text glued to a bracket),
+    which would otherwise name keys no document has."""
+    if not _FIELD_PATH.fullmatch(dotted):
+        raise ValueError(
+            f"`field` {dotted!r} is not a dotted path; a key holding dots is bracketed, "
+            'as labels["ate.dev/substrate-version"]'
+        )
+    # findall gives "" for the alternative that did not match.
+    return [bracketed or bare for bracketed, bare in _FIELD_SEGMENT.findall(dotted)]
+
+
+class _AsWrittenDumper(yaml.SafeDumper):
+    """Resolves no implicit types, so a string that reads like ``false`` or
+    ``1.30`` needs no quotes and is written plain."""
+
+    yaml_implicit_resolvers: dict = {}
+
+
+def _dump_as_written(value: Any) -> str:
+    """YAML for a tree the text-only loader built, with every scalar written
+    as the file had it (``false``, not ``'false'``)."""
+    return yaml.dump(value, Dumper=_AsWrittenDumper, sort_keys=False, width=float("inf"),
+                     allow_unicode=True, default_flow_style=False)
+
+
+def _scalar_text(value: Any) -> str:
+    """A resolved value as text: a scalar as the file wrote it, a map or list
+    as one-line-per-entry YAML."""
+    if isinstance(value, (dict, list)):
+        return _dump_as_written(value).strip()
+    return str(value)
+
+
+def _resolve_field(node: Any, dotted: str) -> list[Any]:
+    """Every value at ``dotted`` under ``node``, stepping into lists."""
+    values = [node]
+    for key in _field_keys(dotted):
+        nxt: list[Any] = []
+        for value in values:
+            items = value if isinstance(value, list) else [value]
+            for item in items:
+                if isinstance(item, dict) and key in item:
+                    nxt.append(item[key])
+        values = nxt
+    flat: list[Any] = []
+    for value in values:
+        # An empty list still says the key is there; it stands in as "".
+        flat += (value or [""]) if isinstance(value, list) else [value]
+    # Kept even when null or empty: the key is there, which is what
+    # `exists` and `absent` ask; the comparing ops skip empty values.
+    return flat
+
+
+def _is_kubernetes_list(node: Any) -> bool:
+    """Whether a mapping node is a ``kind: List`` with a sequence of ``items``."""
+    keys = {k.value: v for k, v in node.value if isinstance(k, yaml.ScalarNode)}
+    kind, items = keys.get("kind"), keys.get("items")
+    # `List` and the typed lists (`PodList`, `ConfigMapList`) kubectl reads
+    # the same way.
+    return (
+        isinstance(kind, yaml.ScalarNode) and kind.value.endswith("List")
+        and isinstance(items, yaml.SequenceNode)
+    )
+
+
+def _list_members(node: Any, label: str, loader: Any) -> list[tuple[str, Any]] | None:
+    """The objects a list-shaped node carries, recursively, or None when the
+    node is not one. A wrapper mapping is constructed first, so a repeated
+    or merged key in it is refused before its ``items`` are trusted."""
+    if isinstance(node, yaml.SequenceNode):
+        members = [(f"{label}.{j}", child) for j, child in enumerate(node.value)]
+    elif isinstance(node, yaml.MappingNode) and _is_kubernetes_list(node):
+        loader.construct_document(node)
+        items = next(v for k, v in node.value if isinstance(k, yaml.ScalarNode) and k.value == "items")
+        members = [(f"{label}.items.{j}", child) for j, child in enumerate(items.value)]
+    else:
+        return None
+    flat: list[tuple[str, Any]] = []
+    for member_label, member in members:
+        nested = _list_members(member, member_label, loader)
+        flat += nested if nested is not None else [(member_label, member)]
+    return flat
+
+
+def _documents(path: str, text: str) -> tuple[list[tuple[str, Any, str]], bool]:
+    """``(documents, parsed)`` for one file: ``(label, mapping or None, text)``
+    per document, and whether the file parsed.
+
+    A document's text is the slice of the file it was read from, so a text
+    check sees the file as written, quoting and all. Only a parse error (or an
+    alias or merge key, refused as one) leaves a file unparsed; it is then one
+    text document with no kind. Empty documents (a trailing or doubled
+    ``---``) are nothing. A file whose only document is a scalar is not YAML in
+    any useful sense (a Terraform file reads as one long plain scalar), so it
+    is one raw text document with no kind, and counts as not parsed. A root
+    list's mappings, and the ``items`` of a Kubernetes ``kind: List``, are
+    documents of their own, each sliced from the file; any other scalar is a
+    text document with no kind. A repeated key is refused like an alias."""
+    docs: list[tuple[str, Any, str]] = []
+    pieces: list[tuple[str, Any, str]] = []
+    top_level: list[Any] = []
+    loader = _ContentLoader(text)
+    try:
+        index = 0
+        while loader.check_node():
+            node = loader.get_node()
+            label = f"{path}#{index}"
+            # A root list, and a Kubernetes `kind: List`, hold their objects
+            # one level down; each is a document of its own, sliced from the
+            # file, so a kind-scoped check sees what the wrapper carries.
+            children = _list_members(node, label, loader)
+            if children is None:
+                doc = loader.construct_document(node)
+                if doc is None or doc == "":
+                    continue
+                top_level.append(doc)
+                pieces.append((label, doc, text[node.start_mark.index:node.end_mark.index]))
+            else:
+                top_level.append([])
+                for child_label, child in children:
+                    doc = loader.construct_document(child)
+                    pieces.append((child_label, doc, text[child.start_mark.index:child.end_mark.index]))
+            index += 1
+    except (yaml.YAMLError, RecursionError):
+        # RecursionError: PyYAML composes recursively, and a few hundred nested
+        # brackets in an added file would otherwise crash the verifier.
+        return [(path, None, text)], False
+    finally:
+        loader.dispose()
+    if len(top_level) == 1 and not isinstance(top_level[0], (dict, list)):
+        return [(path, None, text)], False
+    for label, doc, raw in pieces:
+        docs.append((label, doc if isinstance(doc, dict) else None, raw))
+    return docs, True
+
+
+def _added_file_text(entry: dict) -> str | None:
+    """The whole text of a file the pull request adds, rebuilt from its patch,
+    or None when the listing cannot carry it (not an added file, or GitHub left
+    the patch out because the file is too large)."""
+    patch = entry.get("patch")
+    if entry.get("status") != "added":
+        return None
+    if patch is None and entry.get("sha") == _EMPTY_BLOB_SHA:
+        # An empty file: git emits no hunk for it, so there is no patch to read.
+        # Known by its blob, not by its zero line counts, which a binary file
+        # shares.
+        return ""
+    if not isinstance(patch, str):
+        return None
+    lines = []
+    raw = patch.split("\n")
+    if raw and raw[-1] == "":
+        raw.pop()
+    for line in raw:
+        if line.startswith("@@") or line.startswith("\\"):
+            continue
+        if not line.startswith("+"):
+            return None
+        lines.append(line[1:])
+    return "\n".join(lines) + "\n"
+
+
+def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) -> str | None:
+    """Why ``files`` (path -> text at the head) fail ``check``, or None."""
+    matched = {p: t for p, t in files.items() if any(fnmatch.fnmatchcase(p, g) for g in check.paths)}
+    kept = []
+    unparsed = []
+    for path, text in sorted(matched.items()):
+        docs, parsed = _documents(path, text)
+        if not parsed:
+            unparsed.append(path)
+        for label, doc, doc_text in docs:
+            if check.kind and (not isinstance(doc, dict) or doc.get("kind") != check.kind):
+                continue
+            if check.field:
+                values = _resolve_field(doc, check.field) if isinstance(doc, dict) else []
+            else:
+                values = [doc_text]
+            kept.append((label, values))
+    # A file that could not be read structurally may hold the very object a
+    # kind- or field-scoped check is about (an E2 pool behind an alias, say),
+    # so no such check is shown over it, whatever the op.
+    if unparsed and (check.kind or check.field):
+        return f"{check.label()}: could not parse {', '.join(unparsed)} as YAML, so this is not shown"
+    if check.op == "absent":
+        present = [label for label, values in kept if values]
+        if present:
+            named = ", ".join(present[:_PR_CONTENT_MAX_NAMED])
+            more = len(present) - _PR_CONTENT_MAX_NAMED
+            return f"{check.label()}: found in {named}" + (f" and {more} more" if more > 0 else "")
+        return None
+    if not kept:
+        return f"{check.label()}: the pull request adds no such document"
+
+    def holds(values: list[Any]) -> bool:
+        if check.op == "exists":
+            return bool(values)
+        texts = [_scalar_text(v) for v in values if v is not None]
+        filled = [t for t in texts if t.strip() not in _YAML_NULL_SPELLINGS]
+        if check.op == "contains":
+            if not check.field:
+                return any(check.value in t for t in texts)
+            return any(t == check.value for t in texts)
+        hit = any(re.search(check.value, t, re.MULTILINE) for t in texts)
+        # not_matches needs the field to be there: a pool that leaves its
+        # machine type out gets GKE's default, which may be the very series
+        # the check forbids.
+        return hit if check.op == "matches" else (bool(filled) and not hit)
+
+    failing = [label for label, values in kept if not holds(values)]
+    if check.quantifier == "any" and len(failing) < len(kept):
+        return None
+    if check.quantifier == "all" and not failing:
+        return None
+    named = ", ".join(failing[:_PR_CONTENT_MAX_NAMED])
+    more = len(failing) - _PR_CONTENT_MAX_NAMED
+    return (
+        f"{check.label()} ({check.quantifier}): not so in {named}"
+        + (f" and {more} more" if more > 0 else "")
+    )
+
+
 @VERIFIERS.register("pull_request_opened")
 class PullRequestOpenedVerifier(BaseVerifier):
     """A remediation pull request THIS run opened (or, with
@@ -1957,6 +3451,65 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # meant to protect. Listed from `/pulls/{n}/files`, so the credential needs
     # `pull_requests: read`.
     unchanged_paths: list[str] = Field(default_factory=list)
+    # Assertions over what the pull request writes (see PullRequestContentCheck):
+    # the object a provisioning case expects, with the fields it must carry,
+    # rather than only that some file changed. Read from `/pulls/{n}/files`,
+    # whose patch carries a file the pull request adds whole, so the credential
+    # needs only `pull_requests: read`. A glob that names any other file is an
+    # error (see _head_files).
+    content: list[PullRequestContentCheck] = Field(default_factory=list)
+
+    def _head_files(
+        self, owner: str, repo: str, number: int, token: str, budget: float
+    ) -> tuple[dict[str, str], str | None]:
+        """``(path -> text, unevaluable reason)`` for every file the pull request
+        adds that a :attr:`content` glob names, rebuilt from the listing's patch.
+
+        Only added files are read. Any other file a glob names (modified,
+        renamed, copied), or an added one GitHub left no patch for (large or
+        binary), would have to come from ``/contents``, which needs
+        ``contents: read``; the grading mint (hack/ci-eval-pr.sh) does not ask
+        for it, so such a match is unevaluable rather than graded on half the
+        pull request.
+        """
+        globs = [g for check in self.content for g in check.paths]
+        base = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files"
+        texts: dict[str, str] = {}
+        unread: list[str] = []
+        for page in range(1, _PR_FILES_MAX_PAGES + 1):
+            status, files = _http_get_json(
+                f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
+            )
+            if status != 200 or not isinstance(files, list):
+                return {}, (
+                    f"GitHub answered {status} for the files of {owner}/{repo}#{number}; "
+                    "the token needs `pull_requests: read` to read what the pull request "
+                    "writes, so the content checks could not be evaluated"
+                )
+            for entry in files:
+                if not isinstance(entry, dict) or entry.get("status") in _PR_FILE_GONE_STATUSES:
+                    continue
+                path = str(entry.get("filename") or "")
+                if not path or not any(fnmatch.fnmatchcase(path, g) for g in globs):
+                    continue
+                added = _added_file_text(entry)
+                if added is None:
+                    unread.append(f"{path} ({entry.get('status') or 'unknown'})")
+                else:
+                    texts[path] = added
+            if len(files) < _PR_FILES_PAGE_SIZE:
+                break
+        if unread:
+            named = ", ".join(unread[:_PR_CONTENT_MAX_NAMED])
+            more = len(unread) - _PR_CONTENT_MAX_NAMED
+            return {}, (
+                f"{owner}/{repo}#{number}: the content globs name {named}"
+                + (f" and {more} more" if more > 0 else "")
+                + ", which the files listing does not carry whole; `content` reads only files "
+                "the pull request adds, and reading any other needs `contents: read`, which "
+                "the grading mint does not grant, so the content checks could not be evaluated"
+            )
+        return texts, None
 
     def _changed_paths(
         self, owner: str, repo: str, number: int, token: str, budget: float
@@ -2652,6 +4205,15 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 except OSError as exc:
                     unresolved.append(f"could not reach the GitLab API for {full}!{number}: {exc}")
                     continue
+                if verdict == "pass" and self.content:
+                    # The content assertions read GitHub's file listing; a merge
+                    # request graded on every other clause is not graded on what
+                    # it writes, so it is not a pass either.
+                    unresolved.append(
+                        f"{full}!{number}: the `content` assertions read GitHub's pull request "
+                        "files and are not implemented for GitLab, so this check could not be evaluated"
+                    )
+                    continue
                 if verdict == "pass":
                     return done(True, reason, raw=raw)
                 (rejected if verdict == "reject" else unresolved).append(reason)
@@ -2794,6 +4356,19 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         "remediation written over the workload's own declaration"
                     )
                     continue
+            if self.content:
+                try:
+                    texts, unevaluable = self._head_files(owner, repo, number, token, budget)
+                except OSError as exc:
+                    unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                    continue
+                if unevaluable:
+                    unresolved.append(unevaluable)
+                    continue
+                failures = [r for r in (_content_rejection(c, texts) for c in self.content) if r]
+                if failures:
+                    rejected.append(f"{slug}: " + "; ".join(failures))
+                    continue
             # Within the skew allowance a pull request a hair older than the
             # run is still this run's; "an earlier repetition" only when the
             # widened window is what admitted it.
@@ -2858,8 +4433,10 @@ class GitHubWritesVerifier(BaseVerifier):
     with ``op: exists`` under ``none``. The inject lane appends exactly that
     entry to every case it runs (``hack/eval/inject-lane-safeguards.yaml``,
     applied by ``hack/ci-eval-pr.sh``), because the cluster safeguards say
-    nothing about GitHub and the platform persona the door addresses opens a
-    pull request where the chat path inlined a manifest (#2037).
+    nothing about GitHub and the platform persona the door's task reaches
+    (directly under the bridge's ``cli`` executor, through a card under the
+    bridge's default ``api``) opens a pull request where the chat path
+    inlined a manifest (#2037).
 
     WHAT IT READS. :func:`kube_agents_bench.github_writes.find_writes` over
     the repository ``BENCH_GITOPS_REPO`` names, from
@@ -2900,7 +4477,12 @@ class GitHubWritesVerifier(BaseVerifier):
     ``EVAL_GITHUB_WRITE_SETTLE_SECONDS``, pinned equal by a test), so two
     requesting cases never see each other's by-design pull requests and no
     window reaches back into the unit before; each is graded on the pull
-    requests its own reply names.
+    requests its own reply names. That ordering holds only while a task's
+    writes land before its terminal. On the inject lane under the bridge's
+    ``api`` executor, the Planning Agent can file a kanban card and answer,
+    and the card's worker opens the pull request after the terminal, so the
+    write can land in the next unit's window and be charged to it (#2619,
+    #2611).
     A pull request that was only commented on, labelled or closed in the
     window is not a write: :func:`kube_agents_bench.github_writes.find_writes`
     reads the head commit before it counts an ``updated_at`` that moved.
@@ -3434,7 +5016,7 @@ class ExpectedFinding(BaseModel):
 
 
 class _OnboardingPollVerifier(BaseVerifier):
-    """Polls :meth:`_check` against the agent's own install (onboarding's files, the sandbox trees).
+    """Polls :meth:`_check` against the agent's own install (onboarding's files, the sandbox trees, the findings queue).
 
     A ``fail`` from an earlier poll outranks a final read that errors: a read
     that could not reach a pod does not un-observe what an earlier one saw.
@@ -3620,6 +5202,128 @@ class BootstrapDeliveredVerifier(_OnboardingPollVerifier):
         if status in ("claimed", "running"):
             return "fail", f"the {job} run that claimed the report at {claimed} is still {status}", read
         return "fail", f"the {job} run that claimed the report at {claimed} ended {status}: {run.get('error') or 'no error recorded'}", read
+
+
+def _numbered_items(text: str) -> list[str]:
+    """The report's numbered list items, each with the lines indented under it."""
+    items: list[list[str]] = []
+    current: list[str] | None = None
+    for line in text.splitlines():
+        if _NUMBERED_ITEM_RE.match(line):
+            current = [line]
+            items.append(current)
+        elif current is not None and (not line.strip() or line[:1].isspace()):
+            current.append(line)
+        else:
+            current = None
+    return ["\n".join(item).strip() for item in items]
+
+
+def _names(name: str) -> re.Pattern[str]:
+    """``name`` as a whole word: not part of a longer name such as ``<name>-key``."""
+    return re.compile(rf"(?<![\w-]){re.escape(name)}(?![\w-])", re.IGNORECASE)
+
+
+@VERIFIERS.register("bootstrap_report_criticals")
+class BootstrapReportCriticalsVerifier(_OnboardingPollVerifier):
+    """Checks how many critical findings the onboarding report lists.
+
+    The first report lists the top critical items up to the install's limit
+    (``FINDINGS_FIRST_REPORT_CRITICALS``) and defers the rest to the findings
+    nudge. This reads, off the shell sandbox
+    (:mod:`kube_agents_bench.onboarding`), the report the worker wrote (the
+    delivered copy first) and the worker's ``INVENTORY.scores.json``, scored
+    with the sandbox's own ``inventory_findings.py`` as ``register`` would score
+    it. The critical items are this batch's, not the live queue's, gathered as
+    ``select`` gathers them, by the sandbox's own queue module: rows sharing an
+    ``fq.item_key`` (one check on one project and cluster) are one item, an
+    item is critical when any of its rows is, and a row ``fq.rolled_up`` calls
+    a provider-managed observation is not an item.
+
+    ``limit``: how many critical items the report may list. Passes when the
+    report's numbered items name exactly ``limit`` of the critical items and
+    none of the batch's non-critical findings, an item or finding being named
+    when one of its objects appears as a whole word in a numbered item or the
+    lines indented under it. A posture sentence or the roll-up line naming a
+    deferred critical does not count. A non-critical finding whose object is
+    its cluster (such as a cluster setting), a rolled-up row, and an object
+    that is also a critical row's are not looked for, so a critical item that
+    says which cluster it is on does not read as padding.
+
+    Names are looked for, not counts. The case plants single-row lines, so a
+    gathered line the SOP lets the worker name by count alone ("12
+    Deployments in ``shop``") does not arise, and such a mention is not graded:
+    it would read as not named.
+
+    ``status="error"`` when the worker scored ``limit`` or fewer items
+    critical: a report listing every critical and one capped at ``limit``
+    are then the same report, so the run cannot grade the cap. Also an error:
+    an unreadable sandbox, a scorer the sandbox cannot import, or a batch that
+    cannot be scored. No report, or one that cannot be read, is a fail.
+    """
+
+    type: Literal["bootstrap_report_criticals"]
+    limit: int = Field(ge=0)
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        read = onboarding.read_scored_report(onboarding.sandbox_shell, read_timeout)
+        pod = onboarding.sandbox_pod()
+        if read is None:
+            return "error", f"{pod} could not be read (kubectl exec failed or the command did not run)", None
+        if read.get("error"):
+            return "error", f"{pod}: {read['error']}", read
+        if read.get("rows") is None:
+            return (
+                "error",
+                f"{pod}: the batch cannot be scored, so which findings are critical is unknown: {read.get('errors')}",
+                read,
+            )
+        critical: dict[tuple[str, ...], set[str]] = {}
+        others: set[str] = set()
+        for row in read["rows"]:
+            if row.get("rolled_up"):
+                continue
+            obj = str(row.get("object") or "")
+            if row.get("severity") == _CRITICAL:
+                key = tuple(str(part) for part in row.get("item_key") or ())
+                critical.setdefault(key, set()).add(obj)
+            elif obj and obj.lower() != str(row.get("cluster") or "").lower():
+                others.add(obj)
+        others -= {obj for objects in critical.values() for obj in objects}
+        labels = {key: f"{key[0]} ({', '.join(sorted(objects))})" for key, objects in critical.items()}
+        raw: dict[str, Any] = {"critical": sorted(labels.values()), "report": read.get("report")}
+        if len(critical) <= self.limit:
+            return (
+                "error",
+                f"the worker scored {len(critical)} item(s) critical, not more than the limit of {self.limit}, "
+                f"so listing every critical and listing at most {self.limit} read the same: {raw['critical']}",
+                raw,
+            )
+        report, text = read.get("report"), read.get("text") or ""
+        if report == "absent":
+            return "fail", f"there is no INVENTORY.md or INVENTORY.delivered.md on {pod}: the worker wrote no report", raw
+        if report == "unreadable":
+            return "fail", f"the report on {pod} cannot be read: {text}", raw
+        items = _numbered_items(text)
+        named = sorted(
+            labels[key]
+            for key, objects in critical.items()
+            if any(_names(name).search(item) for name in objects for item in items)
+        )
+        padded = sorted(obj for obj in others if any(_names(obj).search(item) for item in items))
+        raw.update({"named": named, "padded": padded, "items": items})
+        counts = f"name {len(named)} of the {len(critical)} item(s) the worker scored critical"
+        padding = f"; they also name {len(padded)} non-critical finding(s), which the report must not list: {padded}"
+        if len(named) != self.limit:
+            return (
+                "fail",
+                f"the report's {len(items)} numbered item(s) {counts}; expected exactly {self.limit}: {named}"
+                + (padding if padded else ""),
+                raw,
+            )
+        if padded:
+            return "fail", f"the report's {len(items)} numbered item(s) {counts}{padding}", raw
+        return "pass", f"the report's {len(items)} numbered item(s) {counts}, the limit of {self.limit}: {named}", raw
 
 
 @VERIFIERS.register("bootstrap_handoff")
@@ -3995,3 +5699,178 @@ class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
             raw,
         )
 
+
+
+# findings_queue.py: STATES, every state a row can be in.
+FindingState = Literal["queued", "surfaced", "snoozed", "accepted", "dismissed", "resolved", "stale"]
+
+
+@VERIFIERS.register("findings_item_state")
+class FindingsItemStateVerifier(_OnboardingPollVerifier):
+    """Checks the state of findings-queue rows a case planted.
+
+    Reads the rows under ``project`` from the install's findings queue, through
+    the Session KV server's own ``GET /v1/findings`` in the agent container
+    (:mod:`kube_agents_bench.findings`). Passes when every row in
+    ``finding_ids`` is in ``state``; a row in any other state fails, and the
+    reason names the state of each row not in ``state``.
+
+    A listed row the queue does not hold is ``status="error"``: the case's plant
+    is missing, so there is nothing to grade. An unreadable pod or a queue that
+    refused the read is ``status="error"`` too.
+    """
+
+    type: Literal["findings_item_state"]
+    project: str = Field(min_length=1)
+    finding_ids: list[str] = Field(min_length=1)
+    state: FindingState
+
+    @field_validator("finding_ids")
+    @classmethod
+    def _distinct_ids(cls, value: list[str]) -> list[str]:
+        if any(not finding_id.strip() for finding_id in value):
+            raise ValueError("finding_ids carries a blank id")
+        if len(set(value)) != len(value):
+            raise ValueError("finding_ids lists an id twice")
+        return value
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        read = findings.read_project(onboarding.agent_shell, self.project, read_timeout)
+        if read is None:
+            return "error", "the agent pod could not be read (kubectl exec failed or the command did not run)", None
+        if read["error"]:
+            return "error", f"the findings queue could not be read: {read['error']}", None
+        states = {str(row.get("id")): str(row.get("state")) for row in read["findings"]}
+        raw = {"states": {finding_id: states.get(finding_id) for finding_id in self.finding_ids}}
+        missing = [finding_id for finding_id in self.finding_ids if finding_id not in states]
+        if missing:
+            return (
+                "error",
+                f"the findings queue holds no row {missing} under project {self.project!r}: "
+                "the case's plant is missing, so there is nothing to grade",
+                raw,
+            )
+        wrong = {finding_id: states[finding_id] for finding_id in self.finding_ids if states[finding_id] != self.state}
+        if wrong:
+            held = len(self.finding_ids) - len(wrong)
+            return (
+                "fail",
+                f"{held} of {len(self.finding_ids)} row(s) are {self.state}; "
+                + ", ".join(f"{finding_id} is {state}" for finding_id, state in wrong.items()),
+                raw,
+            )
+        return "pass", f"all {len(self.finding_ids)} row(s) are {self.state}", raw
+
+
+def report_store_command(audit: str) -> str:
+    """The ``sh -c`` line that prints every ``latest.json`` of ``audit`` in the store.
+
+    One JSON list after :data:`_REPORT_STORE_READ`: per repository directory,
+    the envelope's ``status``, ``repo`` and ``finished_at``, and the ids of the
+    findings in its ``document`` (this run's own, never ids it only carried),
+    or the ``error`` that kept it unread. The rest stays in the pod.
+    """
+    script = f"""
+import glob, json, os
+out = []
+for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*", "*", "latest.json"))):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            envelope = json.load(handle)
+        entry = {{key: envelope.get(key) for key in ("status", "repo", "finished_at")}}
+        findings = (envelope.get("document") or {{}}).get("findings") or []
+        entry["finding_ids"] = [str(f.get("id", "")) for f in findings if isinstance(f, dict)]
+        out.append(entry)
+    except Exception as exc:
+        out.append({{"path": path, "error": str(exc)}})
+print({_REPORT_STORE_READ!r} + json.dumps(out))
+"""
+    return f"python3 -c {shlex.quote(script)}"
+
+
+def read_report_store(
+    shell: Callable[[str, float], str], audit: str, timeout: float
+) -> list[dict[str, Any]] | None:
+    """The store listing ``report_store_command`` prints, or None when the pod gave none."""
+    reply = shell(report_store_command(audit), timeout)
+    marker = reply.find(_REPORT_STORE_READ)
+    if marker < 0:
+        return None
+    try:
+        listing = json.loads(reply[marker + len(_REPORT_STORE_READ):].strip().splitlines()[0])
+    except (IndexError, json.JSONDecodeError):
+        return None
+    return [entry for entry in listing if isinstance(entry, dict)] if isinstance(listing, list) else None
+
+
+@VERIFIERS.register("audit_report_stored")
+class AuditReportStoredVerifier(_OnboardingPollVerifier):
+    """Checks that a fleet audit kept this run's report in the on-pod report store.
+
+    Reads ``latest.json`` under every repository directory of ``audit`` in the
+    store, in the shell sandbox first and then in the agent container: the
+    store is on whichever pod ran the audit's shell. Passes when one envelope
+    finished at or after the run started (``TranscriptSnapshot.started_at``
+    less ``max_clock_skew_sec``), has ``status`` when the check names one, and
+    has, for each ``required_finding_phrases`` entry, a finding in its
+    ``document`` whose id contains it. ``current_ids`` is not read: it also
+    carries ids a run held without finding them.
+
+    No envelope from this run is a fail: the audit published nothing where the
+    store's readers look. A pod that cannot be read, or a run with no start
+    time, is ``status="error"``.
+    """
+
+    type: Literal["audit_report_stored"]
+    audit: AuditId
+    status: AuditStatus | None = None
+    required_finding_phrases: list[str] = Field(default_factory=list)
+    # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
+    # the agent pod are two clocks.
+    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        snap = transcript.get()
+        if snap is None:
+            return "error", _NO_TRANSCRIPT_REASON, None
+        if not snap.started_at:
+            return "error", _NO_RUN_CLOCK_REASON, None
+        since = datetime.fromtimestamp(snap.started_at, tz=timezone.utc) - timedelta(
+            seconds=self.max_clock_skew_sec
+        )
+        envelopes: list[dict[str, Any]] = []
+        read_any = False
+        for shell in (onboarding.sandbox_shell, onboarding.agent_shell):
+            listing = read_report_store(shell, self.audit, read_timeout)
+            if listing is not None:
+                read_any = True
+                envelopes.extend(listing)
+        if not read_any:
+            return "error", "neither the sandbox nor the agent container could be read", None
+        fresh = []
+        for envelope in envelopes:
+            try:
+                finished = datetime.fromisoformat(str(envelope.get("finished_at")))
+            except ValueError:
+                continue
+            if finished.tzinfo is not None and finished >= since:
+                fresh.append(envelope)
+        raw = {"stored": [{k: e.get(k) for k in ("repo", "status", "finished_at")} for e in envelopes]}
+        if not fresh:
+            return (
+                "fail",
+                f"no {self.audit} report in {REPORT_STORE_ROOT} finished since the run started "
+                f"({len(envelopes)} older or unreadable)",
+                raw,
+            )
+        failures = []
+        for envelope in fresh:
+            ids = [str(fid) for fid in envelope.get("finding_ids") or []]
+            missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
+            if self.status is not None and envelope.get("status") != self.status:
+                failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
+            elif missing:
+                failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
+            else:
+                return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
+        return "fail", "; ".join(failures), raw

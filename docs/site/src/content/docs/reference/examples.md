@@ -23,7 +23,7 @@ A proxy that sits between the Platform Agent and LiteLLM. Requests are keyed by 
 
 [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini)
 
-LiteLLM Deployment + Service + `ConfigMap` fronting Gemini, plus a `Secret`, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. Reads `GEMINI_API_KEY` from the Secret. The default install path (the chart's `litellm.*` values) deploys an equivalent LiteLLM + Gemini config rather than this example directory; the dev copy lives at `k8s-operator/config/integrations/litellm/base`.
+LiteLLM Deployment + Service + `ConfigMap` fronting Gemini, plus a `Secret`, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. Reads `GEMINI_API_KEY` from the Secret. The default install path (the chart's `litellm.*` values) deploys an equivalent LiteLLM + Gemini config rather than this example directory, plus the pre-call hook described under [Replayed thinking on Gemini](/kube-agents/concepts/inference-gateway/#replayed-thinking-on-gemini), which this example does not mount; the dev copy lives at `k8s-operator/config/integrations/litellm/base`.
 
 **When to use:** the default install path; anything except explicit local-inference or subscription-based demos.
 

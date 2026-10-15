@@ -16,14 +16,20 @@ name: A2A Module Tests
 # things this job arms that a test quietly does without.
 #
 # The trigger arrangement is k8s-operator-test.yml's, for the reasons its
-# header comment gives: on a pull request the job always starts and the
-# `Detect changes` step decides whether to test, so the check can be required
-# without blocking unrelated changes; on a push to main the `paths:` filter
-# decides instead, so a run that tested nothing is never recorded as a green
-# run. Keep the `paths:` list and the `a2a:` filter below identical.
+# header comment gives: `Run A2A Module Tests` is a required check, so on a
+# pull request the job always starts and the `Detect changes` step decides
+# whether to test, which lets the check be required without blocking unrelated
+# changes; on a push to main the `paths:` filter decides instead, so a run that
+# tested nothing is never recorded as a green run, which is what lets
+# main-broken-notify.yml read the push history. A merge-queue run takes the
+# pull request's shape: the check is required there too, so it has to start
+# every time and filter in the step. Keep the `paths:` list and the `a2a:`
+# filter below identical.
 on:
   pull_request:
     branches: [main, "release/**"]
+  merge_group:
+    branches: [main]
   push:
     branches: [main]
     paths:
@@ -32,6 +38,16 @@ on:
       # This job runs `make -C k8s-operator envtest-path`, so it depends on
       # that Makefile as surely as on its own sources.
       - "k8s-operator/Makefile"
+      # cmd/session-persona's tests read these from outside the module: the
+      # cluster skills the worker image ships a session copy of, and the
+      # broker policy the session's read tables must stay a subset of. An
+      # edit to either alone has to run those tests.
+      - "agents/cluster/skills/**"
+      - "agents/platform/scripts/command_policy.py"
+      - "agents/platform/scripts/credential_proxy.py"
+      # lib/chatmsg validates every shared chat case, so a case-only change
+      # has to run it.
+      - "tests/conformance/chat/**"
   workflow_dispatch:
 
 # A re-push supersedes this pull request's earlier run instead of stacking a
@@ -60,11 +76,23 @@ jobs:
         id: filter
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
+          # No token: on a pull request the action then diffs the checked-out
+          # merge commit against the base SHA with git, the path it already
+          # takes on push and merge-queue runs, instead of paging the file list
+          # through the GitHub API with no retry. The rule, the day it comes
+          # from, and why the checkout stays at depth one:
+          # .agents/rules/github_actions.md, "Detect changed files with git,
+          # not the API"; tests/test_paths_filter_uses_git_diff.py holds it.
+          token: ""
           filters: |
             a2a:
               - "a2a/**"
               - ".github/workflows/a2a-test.yml"
               - "k8s-operator/Makefile"
+              - "agents/cluster/skills/**"
+              - "agents/platform/scripts/command_policy.py"
+              - "agents/platform/scripts/credential_proxy.py"
+              - "tests/conformance/chat/**"
 
       - name: Set up Go
         if: steps.filter.outputs.a2a == 'true'

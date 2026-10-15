@@ -606,7 +606,7 @@ class Workflow(unittest.TestCase):
             work = pathlib.Path(tmp) / "work"
             work.mkdir()
             document = {
-                "summary": {"checked": 1, "projects": 2, "drifted_projects": 1, "healthy": 3, "drifted": 1, "not_checked": 4},
+                "summary": {"checked": 1, "projects": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 3, "drifted": 1, "absent": 0, "not_checked": 4},
                 "projects": {
                     "p1": {"roles": {"crashloop-workload": {"state": "drifted"}}},
                     "p2": {"roles": {"crashloop-workload": {"state": "not_checked"}}, "error": "cannot read the project"},

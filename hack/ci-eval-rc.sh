@@ -107,11 +107,12 @@ set -euo pipefail
 # The held-out canary (#2013) adds three repetitions serialized on its task
 # lock, a ~50 minute chain at its 1002 s median and ~150 minutes if all three
 # reach the 3000 s delegation ceiling, run beside the other cases; the
-# held-out pdb-remediation-pr (#2016) adds three more on its own task lock, a
-# ~62 minute chain at its 1250 s hint and ~96 minutes at its measured
-# maximum. A graded miss on either leaves the verdict alone, since neither
-# is admitted; an erroring check on either (rungs 1-3) turns the verdict RED
-# like any case's.
+# pdb-remediation-pr (#2016; held out until its roster line on 2026-10-14) adds
+# three more on its own task lock, a ~62 minute chain at its 1250 s hint and
+# ~96 minutes at its measured maximum. A graded miss on the canary leaves the
+# verdict alone, since it is not admitted; one on pdb-remediation-pr counts as
+# any roster case's; an erroring check on either (rungs 1-3) turns the verdict
+# RED like any case's.
 #
 # This read `nightly` from #1230 until now, under a comment saying #1175's
 # switch was not on main so nothing read the export. That was true when it was

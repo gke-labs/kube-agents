@@ -454,7 +454,8 @@ Takes a dict of field name to value.
 
 {{/*
 The LiteLLM gateway config, mirroring
-k8s-operator/config/integrations/litellm/base/config.yaml.
+k8s-operator/config/integrations/litellm/base/config.yaml and its provider
+overlays.
 
 Defined once and consumed twice — as the ConfigMap body and as the input to the
 Deployment's checksum annotation — because those two must not be able to
@@ -470,7 +471,7 @@ absent renders no max_tokens).
 {{- define "kube-agents.litellmConfig" -}}
 {{- /*
   max_tokens on every alias when .maxTokens is above zero, and no key at all
-  otherwise, so the default render stays byte-identical to the kustomize base
+  otherwise, so the default render matches the kustomize base
   (k8s-operator/config/integrations/litellm/base/config.yaml), which carries
   no such key on purpose. One value for all three aliases: they are one
   upstream model, and the budget is the backend's property, not the alias's.
@@ -479,6 +480,23 @@ absent renders no max_tokens).
   ceiling on one that does; values.yaml says what that means for the agent.
 */}}
 {{- $maxTokens := int (.maxTokens | default 0) -}}
+{{- /*
+  Recent Claude models (Opus 5 among them) answer temperature, top_p and top_k
+  with a 400 ("`temperature` is deprecated for this model"), and LiteLLM
+  refuses a temperature other than 1 for them before the request leaves the
+  gateway. A caller does not have to be configured by this chart to send one:
+  Hindsight needed its own opt-out (hindsight.yaml), and Hermes's auxiliary
+  title generator sent temperature until the profiles disabled it. LiteLLM's
+  per-deployment additional_drop_params
+  strips the named keys from a request before the provider sees it, whatever
+  the caller sent, so the gateway covers every caller at once. Every Claude
+  model, not only the ones that refuse: a name test that tracked which do
+  would break on each new release, and an older Claude losing a caller's
+  sampling override is a quieter failure than a 400. Claude only: anthropic
+  serves nothing else, vertex_ai serves Claude under claude-* names, and a
+  Gemini or OpenAI render stays byte-identical.
+*/}}
+{{- $claude := or (eq .provider "anthropic") (and (eq .provider "vertex_ai") (hasPrefix "claude-" .model)) -}}
 model_list:
   - model_name: model-default
     litellm_params:
@@ -486,11 +504,17 @@ model_list:
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
       {{- end }}
+      {{- if $claude }}
+      additional_drop_params: ["temperature", "top_p", "top_k"]
+      {{- end }}
   - model_name: hermes-agent
     litellm_params:
       model: {{ printf "%s/%s" .provider .model }}
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
+      {{- end }}
+      {{- if $claude }}
+      additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
   - model_name: {{ .model }}
     litellm_params:
@@ -498,14 +522,23 @@ model_list:
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
       {{- end }}
+      {{- if $claude }}
+      additional_drop_params: ["temperature", "top_p", "top_k"]
+      {{- end }}
 litellm_settings:
   callbacks: {{ .callbacks }}
 {{- /*
-  Prompt caching. Kept identical to the kustomize base
-  (k8s-operator/config/integrations/litellm/base/config.yaml) — see that file
-  for why the breakpoints live here rather than in the agent's own config, and
-  why non-Anthropic backends are unaffected.
+  Prompt caching, for Anthropic-family models only: the same $claude gate as
+  additional_drop_params above. On Gemini, LiteLLM turns these markers into
+  Vertex explicit context caching: a cachedContents list before every call,
+  and a create whenever the cached prefix is new. A create that Vertex holds
+  past its request credential's life fails the whole turn (a 401 after a
+  ten-minute stall in the incident that found this), and Gemini's
+  implicit caching needs no markers. The kustomize base carries the same block
+  only in its anthropic overlay; see that file for why the breakpoints live
+  here rather than in the agent's own config.
 */}}
+{{- if $claude }}
 router_settings:
   default_litellm_params:
     cache_control_injection_points:
@@ -518,6 +551,7 @@ router_settings:
         index: -3
       - location: message
         index: -1
+{{- end }}
 {{- end }}
 
 {{/*
@@ -600,8 +634,11 @@ this, and the minter guard is the reason it has to be one answer.
 
 It also carries the checks the chart can make before the API server does, so
 the failure names the values key: the two spellings are exclusive, forge names
-are unique, a provider must be registered, a GitHub forge's host must be one GitHub serves and its
-namespace a GitHub organisation or user name, and a repository must name a
+are unique, a provider must be registered, a GitHub forge's host must be github.com or a GitHub
+Enterprise Server hostname and its namespace a GitHub organisation or user name, an install has
+one GitHub host and one host is one forge's, a GitLab forge needs a
+credentialsRef, a host that is a hostname and not GitHub's, and a namespace that
+is a GitLab group path, and a repository must name a
 declared forge, be neither empty nor the alias's `None`, and be qualified by a
 namespace if it is a bare name; and at most one repository has role gitops. The namespace checks matter beyond the error
 text: a single-forge declaration renders as the alias, so without them the
@@ -615,11 +652,12 @@ declares nothing -- reading it as a declaration would make it collide with the
 `forges` list that replaces it, which is the migration every install has to
 make.
 
-The provider list mirrors the CRD's enum on ForgeSpec.Provider, and the host
-list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
+The provider list mirrors the CRD's enum on ForgeSpec.Provider, the host list
+mirrors githubHosts, and the GitLab namespace pattern mirrors
+gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 */}}
 {{- define "kube-agents.forgeProviders" -}}
-{{- $registered := list "github" -}}
+{{- $registered := list "github" "gitlab" -}}
 {{- $githubHosts := list "github.com" "www.github.com" "ssh.github.com" -}}
 {{- $integ := .Values.platformAgent.integration -}}
 {{- $forges := $integ.forges | default list -}}
@@ -633,6 +671,12 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- $names := list -}}
 {{- $providers := list -}}
 {{- $namespaces := dict -}}
+{{- $gitlabHosts := dict -}}
+{{- $hostProviders := dict -}}
+{{- $ghHost := "" -}}
+{{- $ghCA := "" -}}
+{{- /* Mirrors the github provider's ReservedDomains. */ -}}
+{{- $githubReserved := "(^|\\.)(github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com)$" -}}
 {{- range $i, $f := $forges -}}
 {{- if not $f.name -}}
 {{- fail (printf "platformAgent.integration.forges[%d].name is required" $i) -}}
@@ -646,12 +690,97 @@ list mirrors githubHosts, both in k8s-operator/api/v1alpha1.
 {{- end -}}
 {{- $host := $f.host | default "" -}}
 {{- /* ASCII only before `lower`, which is Unicode: `gİthub.com` lowers to github.com, and the operator folds ASCII only, so it is another host. */ -}}
-{{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) -}}
-{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve" $i $f.host) -}}
+{{- /* A github forge is at github.com in one of its spellings, or at a GitHub Enterprise Server host: a hostname, label by label, that is not under a domain where GitHub runs its own services and not GitLab's. */ -}}
+{{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch $githubReserved (lower $host)) (regexMatch "(^|\\.)gitlab\\.com$" (lower $host))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve: name github.com or a GitHub Enterprise Server host" $i $f.host) -}}
+{{- end -}}
+{{- /* A forge at a host other than github.com names its provider, as the CRD's rule: left to the default, a forge written for a GitLab instance would become a GitHub Enterprise Server. */ -}}
+{{- if and (not $f.provider) $host (not (has (lower $host) $githubHosts)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].provider is required: the forge is at %q, not github.com; name it github for a GitHub Enterprise Server or gitlab for a GitLab instance" $i $f.host) -}}
+{{- end -}}
+{{- /* One host per forge, and one GitHub host per install, as the operator's hostConflicts. */ -}}
+{{- $canon := lower ($host | default "") -}}
+{{- if eq $provider "github" -}}
+{{- if or (not $canon) (has $canon $githubHosts) }}{{ $canon = "github.com" }}{{ end -}}
+{{- if and $ghHost (ne $ghHost $canon) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: this install's GitHub host is already %s; an install serves one GitHub host, github.com or one GitHub Enterprise Server" $i $ghHost) -}}
+{{- end -}}
+{{- $ghHost = $canon -}}
+{{- else -}}
+{{- if or (not $canon) (eq $canon "www.gitlab.com") }}{{ $canon = "gitlab.com" }}{{ end -}}
+{{- end -}}
+{{- if and (hasKey $hostProviders $canon) (ne (get $hostProviders $canon) $provider) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: %s is already the host of a %s forge; one host is one forge's" $i $canon (get $hostProviders $canon)) -}}
+{{- end -}}
+{{- $_ := set $hostProviders $canon $provider -}}
+{{- /* On every provider: the CRD's schema refuses the name wherever it is written, so the chart does too, naming the values key. */ -}}
+{{- $secret := ($f.credentialsRef | default dict).name | default "" -}}
+{{- if and $secret (or (gt (len $secret) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $secret))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].credentialsRef.name is %q, which is not a Secret name (a lowercase DNS subdomain of at most 253 characters)" $i $secret) -}}
+{{- end -}}
+{{- $caMap := ($f.caBundleRef | default dict).name | default "" -}}
+{{- /* A caBundleRef with no name renders nothing, so the CA would be silently missing: the CRD requires the name, and so does the chart. */ -}}
+{{- if and $f.caBundleRef (not $caMap) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef needs a name: the Secret that holds the CA" $i) -}}
+{{- end -}}
+{{- if $caMap -}}
+{{- /* gitlab.com and github.com present certificates the public CAs sign: a private CA must never vouch for them. */ -}}
+{{- if or (not $host) (has (lower $host) (concat (list "gitlab.com" "www.gitlab.com") $githubHosts)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef is for a self-managed host; gitlab.com and github.com use the public CAs, so set host to the instance's hostname or drop caBundleRef" $i) -}}
+{{- end -}}
+{{- if or (gt (len $caMap) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $caMap)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.name is %q, which is not a Secret name (a lowercase DNS subdomain of at most 253 characters)" $i $caMap) -}}
+{{- end -}}
+{{- $caKey := ($f.caBundleRef | default dict).key | default "" -}}
+{{- if and $caKey (or (gt (len $caKey) 253) (not (regexMatch "^[-._a-zA-Z0-9]+$" $caKey)) (eq $caKey ".") (hasPrefix ".." $caKey)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.key is %q, which is not a Secret key" $i $caKey) -}}
+{{- end -}}
+{{- /* One CA bundle for the one GitHub host, as the operator's hostConflicts: the broker trusts one bundle per host. */ -}}
+{{- if eq $provider "github" -}}
+{{- $thisCA := printf "%s/%s" $caMap ($caKey | default "ca.crt") -}}
+{{- if and $ghCA (ne $ghCA $thisCA) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: %s already has a CA bundle, %s; the broker trusts one CA bundle per host, so name the same Secret key on both forges or on one" $i $ghHost $ghCA) -}}
+{{- end -}}
+{{- $ghCA = $thisCA -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $provider "gitlab" -}}
+{{- /* Any GitHub name, not only its three spellings: api.github.com or raw.githubusercontent.com would hand GitHub's traffic a GitLab token. */ -}}
+{{- /* Label by label, as the operator's DNS-subdomain check: no empty or dash-edged label. */ -}}
+{{- if and $host (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch $githubReserved (lower $host))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is not a hostname a gitlab forge can be at" $i $f.host) -}}
+{{- end -}}
+{{- if not $secret -}}
+{{- fail (printf "platformAgent.integration.forges[%d] is a gitlab forge with no credentialsRef.name; name the Secret that holds its access token under the key token" $i) -}}
+{{- end -}}
+{{- /* One credential per host in the broker: www.gitlab.com is gitlab.com. */ -}}
+{{- $glHost := lower ($host | default "gitlab.com") -}}
+{{- if eq $glHost "www.gitlab.com" }}{{ $glHost = "gitlab.com" }}{{ end -}}
+{{- if hasKey $gitlabHosts $glHost -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: %s is already served by forges[%s]; the broker holds one credential per host, so declare one gitlab forge there" $i $glHost (get $gitlabHosts $glHost)) -}}
+{{- end -}}
+{{- $_ := set $gitlabHosts $glHost (toString $i) -}}
 {{- end -}}
 {{- $namespace := $f.namespace | default "" -}}
 {{- if and (eq $provider "github") $namespace (not (regexMatch "^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$" $namespace)) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is not a GitHub organisation or user name" $i $namespace) -}}
+{{- end -}}
+{{- if and (eq $provider "gitlab") (gt (len $namespace) 255) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is longer than 255 characters" $i) -}}
+{{- end -}}
+{{- if and (eq $provider "gitlab") $namespace (not (regexMatch "^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?(/[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?)*$" $namespace)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is not a GitLab group path" $i $namespace) -}}
+{{- end -}}
+{{- if and (eq $provider "gitlab") $namespace -}}
+{{- /* As the operator: GitLab refuses a segment ending in .git or .atom, and the broker would read such a prefix with the suffix trimmed. */ -}}
+{{- if regexMatch "(?i)\\.(git|atom)(/|$)" $namespace -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q; a GitLab group segment may not end in .git or .atom" $i $namespace) -}}
+{{- end -}}
+{{- /* A first segment that is a forge host is a host, not a group: the operator refuses it, so the chart does, naming the values key. */ -}}
+{{- $first := lower (first (splitList "/" $namespace)) -}}
+{{- if or (has $first (list "github.com" "www.github.com" "ssh.github.com" "gitlab.com" "www.gitlab.com")) (eq $first (lower ($host | default "gitlab.com"))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which starts with the forge host %q; name the group alone" $i $namespace $first) -}}
+{{- end -}}
 {{- end -}}
 {{- $names = append $names $f.name -}}
 {{- $providers = append $providers $provider -}}
@@ -810,9 +939,27 @@ honest — a quota that large cannot constrain this release either way.
 {{- end -}}
 {{- end }}
 
+{{- /* Saturating int64 add and multiply for the quota sums. Sprig's add and mul are
+       plain int64 and wrap. A sidecar or proxy resource limit the validator admits
+       (any byte count under 2^63; bytesExceedInt64 refuses the rest) can still carry
+       the agent-pod sum or the replica multiply past int64, wrapping a `required`
+       figure negative so the quota check passes every quota -- the exact failure the
+       preflight exists to prevent. These compute in float64 and clamp with clampInt64,
+       so an over-large figure makes `required` read as the MaxInt64 ceiling, which no
+       real quota satisfies, rather than negative. float64 loses integer precision above
+       2^53, which only shifts a figure already far larger than any quota, where the
+       ceiling is the intended answer. Take (dict "a" <int64> "b" <int64>). */ -}}
+{{- define "kube-agents.satAdd" -}}
+{{- include "kube-agents.clampInt64" (addf (float64 .a) (float64 .b)) -}}
+{{- end }}
+{{- define "kube-agents.satMul" -}}
+{{- include "kube-agents.clampInt64" (mulf (float64 .a) (float64 .b)) -}}
+{{- end }}
+
 {{- define "kube-agents.parseCpuMillis" -}}
-{{- $raw := trim (toString .) -}}
+{{- $raw := include "kube-agents.normalizeQuantity" . -}}
 {{- $numeric := "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$" -}}
+{{- $binaryCores := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 -}}
 {{- $decimalCores := dict "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 -}}
 {{- if or (eq $raw "") (eq $raw "<nil>") -}}
 0
@@ -836,6 +983,15 @@ honest — a quota that large cannot constrain this release either way.
 {{- include "kube-agents.clampInt64" (ceil (divf (float64 $n) 1000000.0)) -}}
 {{- else -}}
 {{- $out := "" -}}
+{{- range $unit, $mult := $binaryCores -}}
+{{- if and (eq $out "") (hasSuffix $unit $raw) -}}
+{{- $n := trimSuffix $unit $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse CPU quantity %q — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- $out = include "kube-agents.clampInt64" (mulf (mulf (float64 $n) $mult) 1000.0) -}}
+{{- end -}}
+{{- end -}}
 {{- range $unit, $mult := $decimalCores -}}
 {{- if and (eq $out "") (hasSuffix $unit $raw) -}}
 {{- $n := trimSuffix $unit $raw -}}
@@ -855,8 +1011,20 @@ honest — a quota that large cannot constrain this release either way.
 {{- end -}}
 {{- end }}
 
+{{- /* A quantity in the CRD's grammar rewritten into the one parseCpuMillis and
+       parseBytes read, which both call it first: trimmed, the leading "+" dropped,
+       `.5` written `0.5`, and `1.` written `1`. A "-" is left in place, so a negative
+       still fails the parse. */ -}}
+{{- define "kube-agents.normalizeQuantity" -}}
+{{- $raw := trimPrefix "+" (trim (toString .)) -}}
+{{- if hasPrefix "." $raw -}}
+{{- $raw = printf "0%s" $raw -}}
+{{- end -}}
+{{- regexReplaceAll "^([0-9]+)\\.([^0-9]|$)" $raw "${1}${2}" -}}
+{{- end }}
+
 {{- define "kube-agents.parseBytes" -}}
-{{- $raw := trim (toString .) -}}
+{{- $raw := include "kube-agents.normalizeQuantity" . -}}
 {{- $numeric := "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$" -}}
 {{- $binary := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 -}}
 {{- $decimal := dict "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 -}}
@@ -868,6 +1036,18 @@ honest — a quota that large cannot constrain this release either way.
 {{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
 {{- end -}}
 {{- include "kube-agents.clampInt64" (ceil (divf (float64 $n) 1000.0)) -}}
+{{- else if hasSuffix "u" $raw -}}
+{{- $n := trimSuffix "u" $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- include "kube-agents.clampInt64" (ceil (divf (float64 $n) 1000000.0)) -}}
+{{- else if hasSuffix "n" $raw -}}
+{{- $n := trimSuffix "n" $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- include "kube-agents.clampInt64" (ceil (divf (float64 $n) 1000000000.0)) -}}
 {{- else -}}
 {{- $out := "" -}}
 {{- range $unit, $mult := $binary -}}
@@ -898,6 +1078,113 @@ honest — a quota that large cannot constrain this release either way.
 {{- end -}}
 {{- $out -}}
 {{- end -}}
+{{- end }}
+
+{{- /* "true" when a byte quantity's value is at or past 2^63, which parseBytes saturates
+       to math.MaxInt64 and the operator refuses as unrepresentable. The quota sums want
+       the saturation; the credential-proxy render check wants the refusal, so it asks
+       this first. The arithmetic is parseBytes', so a value float64 rounds up to 2^63
+       from just below it (within 1024 of it) is refused too. Reads only what
+       parseBytes reads; call it after the quantity has passed the CRD's grammar. */ -}}
+{{- define "kube-agents.bytesExceedInt64" -}}
+{{- $raw := include "kube-agents.normalizeQuantity" . -}}
+{{- $scaled := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 -}}
+{{- $divided := dict "m" 1000.0 "u" 1000000.0 "n" 1000000000.0 -}}
+{{- $v := "" -}}
+{{- range $unit, $mult := $scaled -}}
+{{- if and (kindIs "string" $v) (hasSuffix $unit $raw) -}}
+{{- $v = mulf (float64 (trimSuffix $unit $raw)) $mult -}}
+{{- end -}}
+{{- end -}}
+{{- range $unit, $div := $divided -}}
+{{- if and (kindIs "string" $v) (hasSuffix $unit $raw) -}}
+{{- $v = divf (float64 (trimSuffix $unit $raw)) $div -}}
+{{- end -}}
+{{- end -}}
+{{- if kindIs "string" $v -}}
+{{- $v = float64 $raw -}}
+{{- end -}}
+{{- if ge (float64 $v) 9223372036854775808.0 -}}true{{- end -}}
+{{- end }}
+
+{{- /* "true" when a quantity's number is past float64's range. Sprig's float64 answers 0
+       for it rather than failing (strconv reports +Inf with ErrRange, and the cast drops
+       both), so `1e400` would read as zero and pass every check after it. The number
+       reads as 0 for one other reason, an underflow (1e-400), which is a real positive
+       quantity the operator rounds up rather than refuses; the two are told apart by the
+       number's order of magnitude: its integer digits, or minus the zeros leading its
+       fraction, plus its exponent. Call it after the quantity has passed the CRD's
+       grammar. */ -}}
+{{- define "kube-agents.quantityOverflowsFloat64" -}}
+{{- $num := regexReplaceAll "([KMGTPE]i|[numkMGTPE])$" (include "kube-agents.normalizeQuantity" .) "" -}}
+{{- $mantissa := regexReplaceAll "[eE].*$" $num "" -}}
+{{- if and (regexMatch "[1-9]" $mantissa) (eq (float64 $num) 0.0) -}}
+{{- $intDigits := regexReplaceAll "^0+" (regexReplaceAll "\\..*$" $mantissa "") "" -}}
+{{- $magnitude := len $intDigits -}}
+{{- if eq $magnitude 0 -}}
+{{- $fraction := regexReplaceAll "^[^.]*\\.?" $mantissa "" -}}
+{{- $magnitude = sub (len (regexReplaceAll "^0+" $fraction "")) (len $fraction) -}}
+{{- end -}}
+{{- $exponent := regexReplaceAll "^[^eE]*[eE]?" $num "" -}}
+{{- $negative := hasPrefix "-" $exponent -}}
+{{- $digits := regexReplaceAll "^0+" (trimPrefix "+" (trimPrefix "-" $exponent)) "" -}}
+{{- /* An exponent past 18 digits does not fit the int64 below, and decides alone. */ -}}
+{{- if gt (len $digits) 18 -}}
+{{- if not $negative -}}true{{- end -}}
+{{- else -}}
+{{- $e := $digits | default "0" | int64 -}}
+{{- if $negative -}}
+{{- $e = sub 0 $e -}}
+{{- end -}}
+{{- if gt (add $magnitude $e) 0 -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{- /* A quantity's value as a float64, in millicores when "cpu" is true and bytes otherwise,
+       with no rounding of its own: parseCpuMillis and parseBytes truncate a bare or
+       suffixed value and ceil an m, u or n one, which suits the quota sums and would let
+       the credential-proxy crossed-pair check disagree with the operator's exact
+       resource.Quantity comparison (1.0004 against 1 would compare equal). Sprig's mulf
+       and divf compute in decimal and round once to float64, so a decimal quantity of at
+       most 15 significant digits (credentialProxyResourcesCheck refuses more) scales
+       exactly: 1.005 cores and 1005m both read as 1005 millicores, and a strict lt or gt
+       on two figures matches the operator's Quantity.Cmp for every decimal value the
+       chart admits that is a whole number of nano-units. Two residues remain. A binary-suffixed quantity (Ki to Ei) multiplies
+       the digits by a power of two and can land within float64 rounding, about one part
+       in 10^16, of a decimal one: 976562500000459Ki is 16 bytes above 100000000000047e4,
+       yet both read as the same float64, so the chart admits that crossed pair and the
+       operator decides. And the operator rounds a quantity up to whole nano-units, which
+       the chart does not, so two values that differ only below a nano-unit (1.5n against
+       1.2n) can compare differently here than there. A value whose scaled figure is past
+       float64's range (a CPU of 1e308, in millicores) fails the render naming "key"
+       rather than answering "", which a caller would read as zero.
+       Takes (dict "raw" <quantity> "cpu" <bool> "key" <values path>); call it after the
+       quantity has passed the CRD's grammar. */ -}}
+{{- define "kube-agents.quantityExact" -}}
+{{- $raw := include "kube-agents.normalizeQuantity" .raw -}}
+{{- $scale := ternary 1000.0 1.0 (eq .cpu true) -}}
+{{- $scaled := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 -}}
+{{- $divided := dict "m" 1000.0 "u" 1000000.0 "n" 1000000000.0 -}}
+{{- $v := "" -}}
+{{- range $unit, $mult := $scaled -}}
+{{- if and (kindIs "string" $v) (hasSuffix $unit $raw) -}}
+{{- $v = mulf (float64 (trimSuffix $unit $raw)) $mult $scale -}}
+{{- end -}}
+{{- end -}}
+{{- range $unit, $div := $divided -}}
+{{- if and (kindIs "string" $v) (hasSuffix $unit $raw) -}}
+{{- $v = divf (mulf (float64 (trimSuffix $unit $raw)) $scale) $div -}}
+{{- end -}}
+{{- end -}}
+{{- if kindIs "string" $v -}}
+{{- $v = mulf (float64 $raw) $scale -}}
+{{- end -}}
+{{- /* +Inf is the only float64 greater than the largest finite one. */ -}}
+{{- if gt (float64 $v) 1.7976931348623157e308 -}}
+{{- fail (printf "%s is %s, which is not a representable quantity: its value with the suffix applied is past the range of a float64, which the chart would read as zero and so could not check against the operator's rules" .key $raw) -}}
+{{- end -}}
+{{- $v | toJson -}}
 {{- end }}
 
 {{/*
@@ -1088,6 +1375,202 @@ the check needs `get`/`list` on `resourcequotas` in the release namespace, and a
 without it installs with `--set quotaPreflight.enabled=false`. Nothing here can soften that:
 a Go template cannot catch the error `lookup` raises.
 */}}
+{{/*
+The checks on platformAgent.deployment.credentialProxy.resources that need no parsed value:
+the keys under resources, the shape of limits and requests, each resource name, and each
+quantity's sign, grammar, significant digits (at most 15, the most float64 holds exactly, so
+the comparisons after these match the operator's for every decimal value admitted) and range: a byte count
+within an int64, a CPU within an int64 of millicores. Takes the resources map and renders
+nothing; a value that fails one fails the render naming its key. Both readers of the value call it first,
+the CR template (templates/platform-agent-cr.yaml) and kube-agents.credentialProxyFootprint
+for the quota preflight, because Helm renders quota-preflight.yaml before the CR template:
+without it the preflight's parseBytes refused `-1Gi` or `2GB` with a "cannot parse ...
+please report it" message before the CR template could name the key. The checks that
+compare parsed values (zero limit, floor, crossed pair) stay in the CR template, after
+these have passed.
+*/}}
+{{- /* Shape, grammar and representability check for a container's resources override,
+       shared by the credential proxy and the agent-api-auth sidecar. Both the quota
+       preflight and the CR template call it, so a mistyped side key, an unsupported
+       claims, a non-map side, an unknown resource name or a quantity the preflight
+       arithmetic cannot represent (a value float64 reads as zero, a byte count over an
+       int64, a CPU past the millicore range) fails the render naming the key, rather
+       than being pruned silently or reaching the footprint math as garbage. Caller
+       passes resources, prefix, container, pod and consumer (the Downward API reader). */ -}}
+{{- define "kube-agents.containerResourcesCheck" -}}
+{{- $resources := .resources | default dict -}}
+{{- $prefix := .prefix -}}
+{{- $container := .container -}}
+{{- $pod := .pod -}}
+{{- $consumer := .consumer -}}
+{{- $unknown := keys (omit $resources "limits" "requests" "claims") | sortAlpha -}}
+{{- if $unknown -}}
+{{- fail (printf "%s carries %s, which the PlatformAgent CRD does not declare; the accepted keys are requests, limits and claims. The API server would prune it, and the override would be lost silently" $prefix (join ", " $unknown)) -}}
+{{- end -}}
+{{- if index $resources "claims" -}}
+{{- fail (printf "%s.claims is not supported -- the %s declares no resourceClaims, so the operator refuses the key. Remove it." $prefix $pod) -}}
+{{- end -}}
+{{- $names := list "cpu" "memory" "ephemeral-storage" -}}
+{{- /* The CRD's quantity grammar, the sign already stripped, with the
+       exponent narrowed to the integer form resource.ParseQuantity reads.
+       parseCpuMillis and parseBytes read every form this admits. */ -}}
+{{- $quantityPattern := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" -}}
+{{- range $side := list "limits" "requests" -}}
+{{- $quantities := index $resources $side -}}
+{{- /* `--set ...limits=2Gi` hands range a string, which it cannot walk, and a list
+       gives it integer names; either is a shape the CRD refuses. */ -}}
+{{- if not (or (empty $quantities) (kindIs "map" $quantities)) -}}
+{{- fail (printf "%s.%s is %v, which is not a map of resource name to quantity, for example `limits: {memory: 2Gi}`" $prefix $side $quantities) -}}
+{{- end -}}
+{{- range $name, $quantity := $quantities | default dict -}}
+{{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) -}}
+{{- $raw := toString $quantity | trim -}}
+{{- if not (has $name $names) -}}
+{{- fail (printf "%s.%s.%s: the %s container declares cpu, memory and ephemeral-storage only, and the operator refuses any other resource name" $prefix $side $name $container) -}}
+{{- end -}}
+{{- if hasPrefix "-" $raw -}}
+{{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- if not (regexMatch $quantityPattern (trimPrefix "+" $raw)) -}}
+{{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- /* float64 holds 15 significant decimal digits exactly; a 16th lets two quantities
+       within one part in 10^16 of each other, or of a bound, read as equal, and the
+       render would pass what the operator's exact comparison refuses. Counted on the
+       mantissa: sign, exponent, suffix and dot stripped, then leading and trailing
+       zeros. */ -}}
+{{- $significand := regexReplaceAll "([KMGTPE]i|[numkMGTPE])$" (regexReplaceAll "[eE][-+]?[0-9]+$" (trimPrefix "+" $raw) "") "" -}}
+{{- $significand = regexReplaceAll "0+$" (regexReplaceAll "^0+" (replace "." "" $significand) "") "" -}}
+{{- if gt (len $significand) 15 -}}
+{{- fail (printf "%s.%s.%s is %s, which has more than 15 significant digits: the chart compares quantities as float64, which holds 15 exactly, so it cannot check this one against the operator's rules. Write it with a larger unit or fewer digits" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- if include "kube-agents.quantityOverflowsFloat64" $raw -}}
+{{- if eq $name "cpu" -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable quantity: it is past the range of a float64, which the chart would read as zero, and its millicore value exceeds the 9223372036854775807 an int64 holds, so the operator refuses it" $prefix $side $name $raw) -}}
+{{- else -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the %s, and the operator refuses it" $prefix $side $name $raw $consumer) -}}
+{{- end -}}
+{{- end -}}
+{{- if and (ne $name "cpu") (include "kube-agents.bytesExceedInt64" $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the %s, and the operator refuses it" $prefix $side $name $raw $consumer) -}}
+{{- end -}}
+{{- /* The operator reads a CPU quantity in millicores (MilliValue), which wraps past
+       2^63; it refuses one there, so the render does too. A suffix that carries a
+       finite number past float64's range (a 1 and 306 zeros, then k) fails inside
+       quantityExact, naming the key. */ -}}
+{{- if eq $name "cpu" -}}
+{{- $cores := include "kube-agents.quantityExact" (dict "raw" $raw "cpu" false "key" (printf "%s.%s.%s" $prefix $side $name)) | float64 -}}
+{{- if ge (mulf $cores 1000.0) 9223372036854775808.0 -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a CPU count the scheduler can represent in millicores: its millicore value exceeds the 9223372036854775807 an int64 holds, and the operator refuses it" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{- define "kube-agents.credentialProxyResourcesCheck" -}}
+{{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.deployment.credentialProxy.resources" "container" "credential-proxy" "pod" "credential-proxy pod" "consumer" "broker") -}}
+{{- end }}
+
+{{/*
+The credential proxy's footprint entry with platformAgent.deployment.credentialProxy.resources
+merged over it, per key, as resolveCredentialProxyResources does in the operator
+(k8s-operator/internal/controller/credential_proxy_manifests.go): a key the override
+carries replaces that number, a key it omits keeps footprint.yaml's -- with one exception
+that follows the API server rather than the operator. The operator renders a CPU and a
+memory request explicitly, so an override that raises only the limit leaves the request where
+the operator put it. It renders no ephemeral-storage request at all: the 2Gi request in
+footprint.yaml is the API server defaulting an absent request to the limit
+(scripts/generate_chart_footprint.py models the same rule), and that defaulting follows the
+override's limit, so `limits: {ephemeral-storage: 10Gi}` alone is a 10Gi request too. Summing
+it at 2Gi would pass a quota the pod is then refused on. kube-agents.workloadResources
+applies the request-follows-limit rule to every key, which is right for a chart workload
+whose requests the values own and wrong for the two the operator renders, so it is not
+reused here. Takes (dict "workload" <footprint entry> "override" <resources block>) and
+returns the entry's six numbers and pod count as JSON.
+*/}}
+{{- define "kube-agents.credentialProxyFootprint" -}}
+{{- $workload := .workload | default dict -}}
+{{- $override := .override | default dict -}}
+{{- include "kube-agents.credentialProxyResourcesCheck" $override -}}
+{{- $req := (index $override "requests") | default dict -}}
+{{- $lim := (index $override "limits") | default dict -}}
+{{- $cpuReq := $workload.cpuMillisRequest | default 0 | int64 -}}
+{{- $cpuLim := $workload.cpuMillisLimit | default 0 | int64 -}}
+{{- $memReq := $workload.memoryBytesRequest | default 0 | int64 -}}
+{{- $memLim := $workload.memoryBytesLimit | default 0 | int64 -}}
+{{- $ephReq := $workload.ephemeralStorageBytesRequest | default 0 | int64 -}}
+{{- $ephLim := $workload.ephemeralStorageBytesLimit | default 0 | int64 -}}
+{{- /* declaredQuantity with an empty fallback answers "" for an absent or null key, which
+       `with` skips, so `memory: null` keeps the default as it does on the CR. */ -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $req "cpu") "fallback" "") -}}
+{{- $cpuReq = include "kube-agents.parseCpuMillis" . | int64 -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $lim "cpu") "fallback" "") -}}
+{{- $cpuLim = include "kube-agents.parseCpuMillis" . | int64 -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $req "memory") "fallback" "") -}}
+{{- $memReq = include "kube-agents.parseBytes" . | int64 -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $lim "memory") "fallback" "") -}}
+{{- $memLim = include "kube-agents.parseBytes" . | int64 -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $lim "ephemeral-storage") "fallback" "") -}}
+{{- $ephLim = include "kube-agents.parseBytes" . | int64 -}}
+{{- /* No operator-rendered request to keep: the API server sets it to this limit. */ -}}
+{{- $ephReq = $ephLim -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $req "ephemeral-storage") "fallback" "") -}}
+{{- $ephReq = include "kube-agents.parseBytes" . | int64 -}}
+{{- end -}}
+{{- dict
+      "cpuMillisRequest" $cpuReq "cpuMillisLimit" $cpuLim
+      "memoryBytesRequest" $memReq "memoryBytesLimit" $memLim
+      "ephemeralStorageBytesRequest" $ephReq "ephemeralStorageBytesLimit" $ephLim
+      "pods" ($workload.pods | default 1 | int64)
+   | toJson -}}
+{{- end }}
+
+{{/*
+The credential-proxy container's default requests and limits, and the smallest memory limit the
+operator accepts, for the CR template's static check of
+platformAgent.deployment.credentialProxy.resources. Copies of the operator's:
+credentialProxyCPURequest, credentialProxyMemoryRequest, credentialProxyCPULimit,
+credentialProxyMemoryLimit and credentialProxyEphemeralStorageLimit, and
+credentialProxyMemoryFloorBytesAtDefaultCap, credentialProxyMinimumMemoryLimitBytes at the
+default output cap, 672Mi (k8s-operator/internal/controller/credential_proxy_manifests.go).
+tests/test_credential_proxy_sizing_parity.py holds them equal, the floor to the operator's and
+the broker's declared copies; each side's own test holds its copy to its formula. Change all
+sides together.
+The defaults carry no ephemeral-storage request because the operator renders none.
+*/}}
+{{- define "kube-agents.credentialProxyDefaults" -}}
+{{- dict
+      "requests" (dict "cpu" "500m" "memory" "1Gi")
+      "limits" (dict "cpu" "1" "memory" "2Gi" "ephemeral-storage" "2Gi")
+   | toJson -}}
+{{- end }}
+
+{{- /* The agent-api-auth sidecar's defaults, the agentAPIAuth* constants in
+       k8s-operator/internal/controller/platformagent_manifests.go. Declared once so
+       the footprint delta reads them here rather than as scattered literals;
+       tests/test_agent_api_auth_sizing_parity.py holds this equal to the operator. */ -}}
+{{- define "kube-agents.agentAPIAuthDefaults" -}}
+{{- dict
+      "requests" (dict "cpu" "150m" "memory" "384Mi")
+      "limits" (dict "cpu" "1" "memory" "2Gi" "ephemeral-storage" "2Gi")
+   | toJson -}}
+{{- end }}
+
+{{- define "kube-agents.agentAPIAuthResourcesCheck" -}}
+{{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.deployment.agentAPIAuth.resources" "container" "agent-api-auth" "pod" "gateway pod" "consumer" "event watcher") -}}
+{{- end }}
+
+{{- define "kube-agents.credentialProxyMemoryFloorBytes" -}}
+704643072
+{{- end }}
+
 {{- define "kube-agents.quotaRequirements" -}}
 {{- $footprint := .Files.Get "files/footprint.yaml" | fromYaml -}}
 {{- /* The footprint is the only source for the operator-rendered pods, which are most of
@@ -1206,6 +1689,82 @@ a Go template cannot catch the error `lookup` raises.
   {{- $podReqEph := $base.ephemeralStorageBytesRequest | default 0 | int64 -}}
   {{- $podLimEph := $base.ephemeralStorageBytesLimit | default 0 | int64 -}}
 
+  {{- /* The agent-api-auth sidecar is one container of this pod, so its default
+         requests and limits are already in agentPod.base above. A
+         spec.deployment.agentAPIAuth.resources override (resolveAgentAPIAuthResources
+         in the operator) changes them per key, so add the override-minus-default
+         delta here before the pod is multiplied by replicas, the same accounting
+         kube-agents.credentialProxyFootprint does for the proxy's own pod. Without
+         it the preflight passes a quota the raised sidecar will not fit, and the
+         gateway's Recreate rollout then deletes the running Pod before the quota
+         refuses the larger one. The defaults are the agentAPIAuth* constants in
+         k8s-operator/internal/controller/platformagent_manifests.go: 150m and 384Mi
+         requests, 1 CPU, 2Gi memory and 2Gi ephemeral-storage limits; the sidecar
+         declares no ephemeral request, which the API server defaults to the limit,
+         so the base counts 2Gi on both ephemeral sides. */ -}}
+  {{- $aaResources := (((.Values.platformAgent.deployment | default dict).agentAPIAuth | default dict).resources) | default dict -}}
+  {{- include "kube-agents.agentAPIAuthResourcesCheck" $aaResources -}}
+  {{- $aaReq := (index $aaResources "requests") | default dict -}}
+  {{- $aaLim := (index $aaResources "limits") | default dict -}}
+  {{- $aaDefaults := include "kube-agents.agentAPIAuthDefaults" . | fromJson -}}
+  {{- $aaReqDef := index $aaDefaults "requests" -}}
+  {{- $aaLimDef := index $aaDefaults "limits" -}}
+  {{- /* Default sidecar figures as the numbers the footprint uses. */ -}}
+  {{- $defCpuReq := include "kube-agents.parseCpuMillis" (index $aaReqDef "cpu") | int64 -}}
+  {{- $defCpuLim := include "kube-agents.parseCpuMillis" (index $aaLimDef "cpu") | int64 -}}
+  {{- $defMemReq := include "kube-agents.parseBytes" (index $aaReqDef "memory") | int64 -}}
+  {{- $defMemLim := include "kube-agents.parseBytes" (index $aaLimDef "memory") | int64 -}}
+  {{- $defEph := include "kube-agents.parseBytes" (index $aaLimDef "ephemeral-storage") | int64 -}}
+  {{- /* Merged over the defaults, the pod the operator would render. The sidecar declares
+         no ephemeral request, which the API server defaults to the limit, so both ephemeral
+         sides start at the default limit and the request follows an override of the limit
+         unless set explicitly. */ -}}
+  {{- $mCpuReq := $defCpuReq -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "cpu") "fallback" "") -}}{{- $mCpuReq = include "kube-agents.parseCpuMillis" . | int64 -}}{{- end -}}
+  {{- $mCpuLim := $defCpuLim -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "cpu") "fallback" "") -}}{{- $mCpuLim = include "kube-agents.parseCpuMillis" . | int64 -}}{{- end -}}
+  {{- $mMemReq := $defMemReq -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "memory") "fallback" "") -}}{{- $mMemReq = include "kube-agents.parseBytes" . | int64 -}}{{- end -}}
+  {{- $mMemLim := $defMemLim -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "memory") "fallback" "") -}}{{- $mMemLim = include "kube-agents.parseBytes" . | int64 -}}{{- end -}}
+  {{- $mEphLim := $defEph -}}{{- $mEphReq := $defEph -}}
+  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "ephemeral-storage") "fallback" "") -}}{{- $mEphLim = include "kube-agents.parseBytes" . | int64 -}}{{- $mEphReq = $mEphLim -}}{{- end -}}
+  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "ephemeral-storage") "fallback" "") -}}{{- $mEphReq = include "kube-agents.parseBytes" . | int64 -}}{{- end -}}
+  {{- /* The operator refuses a zero limit or a request above its limit (validateContainerResources)
+         and renders the sidecar at its defaults, Degraded. agentAPIAuthResourcesCheck above does not
+         refuse those -- they stay the operator's and the webhook's -- so the preflight must count the
+         override's delta only for an override the operator will actually render, or it under- or
+         over-counts the pod against the quota the operator never asks for. */ -}}
+  {{- /* The refusal is the operator's exact resource.Quantity comparison, so it reads the
+         merged raw quantities through kube-agents.quantityExact rather than the rounded
+         $mMemLim/$mMemReq integers above: parseBytes and parseCpuMillis ceil an m/u/n
+         quantity, so a limit half a byte under a default request rounds up onto it and the
+         integer gate would miss a crossed pair the operator refuses. The proxy's CR block
+         decides the same thing on the same exact figures (platform-agent-cr.yaml). The
+         rounded integers stay the quota-sum arithmetic, which wants the whole-byte figure. */ -}}
+  {{- $mCpuLimRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "cpu") "fallback" (index $aaLimDef "cpu")) -}}
+  {{- $mCpuReqRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "cpu") "fallback" (index $aaReqDef "cpu")) -}}
+  {{- $mMemLimRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "memory") "fallback" (index $aaLimDef "memory")) -}}
+  {{- $mMemReqRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "memory") "fallback" (index $aaReqDef "memory")) -}}
+  {{- $mEphLimRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "ephemeral-storage") "fallback" (index $aaLimDef "ephemeral-storage")) -}}
+  {{- $mEphReqRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "ephemeral-storage") "fallback" $mEphLimRaw) -}}
+  {{- $xCpuLim := include "kube-agents.quantityExact" (dict "raw" $mCpuLimRaw "cpu" true "key" "platformAgent.deployment.agentAPIAuth.resources.limits.cpu") | float64 -}}
+  {{- $xCpuReq := include "kube-agents.quantityExact" (dict "raw" $mCpuReqRaw "cpu" true "key" "platformAgent.deployment.agentAPIAuth.resources.requests.cpu") | float64 -}}
+  {{- $xMemLim := include "kube-agents.quantityExact" (dict "raw" $mMemLimRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.limits.memory") | float64 -}}
+  {{- $xMemReq := include "kube-agents.quantityExact" (dict "raw" $mMemReqRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.requests.memory") | float64 -}}
+  {{- $xEphLim := include "kube-agents.quantityExact" (dict "raw" $mEphLimRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.limits.ephemeral-storage") | float64 -}}
+  {{- $xEphReq := include "kube-agents.quantityExact" (dict "raw" $mEphReqRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.requests.ephemeral-storage") | float64 -}}
+  {{- $aaRefused := false -}}
+  {{- if or (eq $xCpuLim 0.0) (eq $xMemLim 0.0) (eq $xEphLim 0.0) -}}{{- $aaRefused = true -}}{{- end -}}
+  {{- if or (gt $xCpuReq $xCpuLim) (gt $xMemReq $xMemLim) (gt $xEphReq $xEphLim) -}}{{- $aaRefused = true -}}{{- end -}}
+  {{- if not $aaRefused -}}
+  {{- /* satAdd, not add: an admitted sidecar limit near 2^63 carries the pod sum past
+         int64 and would wrap `required` negative. The sub stays plain -- a merged
+         figure minus its default is always below the merged figure and cannot wrap. */ -}}
+  {{- $podReqCpu = include "kube-agents.satAdd" (dict "a" $podReqCpu "b" (sub $mCpuReq $defCpuReq)) | int64 -}}
+  {{- $podLimCpu = include "kube-agents.satAdd" (dict "a" $podLimCpu "b" (sub $mCpuLim $defCpuLim)) | int64 -}}
+  {{- $podReqMem = include "kube-agents.satAdd" (dict "a" $podReqMem "b" (sub $mMemReq $defMemReq)) | int64 -}}
+  {{- $podLimMem = include "kube-agents.satAdd" (dict "a" $podLimMem "b" (sub $mMemLim $defMemLim)) | int64 -}}
+  {{- $podLimEph = include "kube-agents.satAdd" (dict "a" $podLimEph "b" (sub $mEphLim $defEph)) | int64 -}}
+  {{- $podReqEph = include "kube-agents.satAdd" (dict "a" $podReqEph "b" (sub $mEphReq $defEph)) | int64 -}}
+  {{- end -}}
+
   {{- /* The dashboard is another container in the agent pod rather than a pod of its own,
          so it scales with the same replica count and adds no pod. Its flag is
          harness.hermes.dashboardEnabled; reading it one level up at harness.dashboardEnabled
@@ -1218,21 +1777,26 @@ a Go template cannot catch the error `lookup` raises.
   {{- end -}}
   {{- if $dashEnabled -}}
     {{- $dash := (index $op "agentPod" "dashboard") | default dict -}}
-    {{- $podReqCpu = add $podReqCpu ($dash.cpuMillisRequest | default 0 | int64) -}}
-    {{- $podLimCpu = add $podLimCpu ($dash.cpuMillisLimit | default 0 | int64) -}}
-    {{- $podReqMem = add $podReqMem ($dash.memoryBytesRequest | default 0 | int64) -}}
-    {{- $podLimMem = add $podLimMem ($dash.memoryBytesLimit | default 0 | int64) -}}
-    {{- $podReqEph = add $podReqEph ($dash.ephemeralStorageBytesRequest | default 0 | int64) -}}
-    {{- $podLimEph = add $podLimEph ($dash.ephemeralStorageBytesLimit | default 0 | int64) -}}
+    {{- /* satAdd: the pod sum above may already be the saturated ceiling from a huge
+           sidecar override, which a plain add would wrap. */ -}}
+    {{- $podReqCpu = include "kube-agents.satAdd" (dict "a" $podReqCpu "b" ($dash.cpuMillisRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimCpu = include "kube-agents.satAdd" (dict "a" $podLimCpu "b" ($dash.cpuMillisLimit | default 0 | int64)) | int64 -}}
+    {{- $podReqMem = include "kube-agents.satAdd" (dict "a" $podReqMem "b" ($dash.memoryBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimMem = include "kube-agents.satAdd" (dict "a" $podLimMem "b" ($dash.memoryBytesLimit | default 0 | int64)) | int64 -}}
+    {{- $podReqEph = include "kube-agents.satAdd" (dict "a" $podReqEph "b" ($dash.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimEph = include "kube-agents.satAdd" (dict "a" $podLimEph "b" ($dash.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
   {{- end -}}
 
-  {{- $reqPods = add $reqPods (mul ($base.pods | default 1 | int64) $agentReplicas) -}}
-  {{- $reqCpu = add $reqCpu (mul $podReqCpu $agentReplicas) -}}
-  {{- $limCpu = add $limCpu (mul $podLimCpu $agentReplicas) -}}
-  {{- $reqMem = add $reqMem (mul $podReqMem $agentReplicas) -}}
-  {{- $limMem = add $limMem (mul $podLimMem $agentReplicas) -}}
-  {{- $reqEph = add $reqEph (mul $podReqEph $agentReplicas) -}}
-  {{- $limEph = add $limEph (mul $podLimEph $agentReplicas) -}}
+  {{- /* satMul/satAdd: the pod sum times the replica count is where an admitted
+         override most easily passes int64 -- a figure under 2^63 doubles over it at
+         two replicas -- so both the multiply and the accumulation saturate. */ -}}
+  {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.satMul" (dict "a" ($base.pods | default 1 | int64) "b" $agentReplicas))) | int64 -}}
+  {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" (include "kube-agents.satMul" (dict "a" $podReqCpu "b" $agentReplicas))) | int64 -}}
+  {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" (include "kube-agents.satMul" (dict "a" $podLimCpu "b" $agentReplicas))) | int64 -}}
+  {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" (include "kube-agents.satMul" (dict "a" $podReqMem "b" $agentReplicas))) | int64 -}}
+  {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" (include "kube-agents.satMul" (dict "a" $podLimMem "b" $agentReplicas))) | int64 -}}
+  {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.satMul" (dict "a" $podReqEph "b" $agentReplicas))) | int64 -}}
+  {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.satMul" (dict "a" $podLimEph "b" $agentReplicas))) | int64 -}}
   {{- /* Only an HA gateway surges. The operator gives the gateway Deployment a
          RollingUpdate strategy only when availability.replicas is above 1 and renders
          `strategy: Recreate` otherwise (resolveDeploymentReplicasAndStrategy in
@@ -1257,15 +1821,30 @@ a Go template cannot catch the error `lookup` raises.
          generic keys here ensures that any workload summed into extract_footprint is
          automatically counted by the preflight without requiring manual template edits.
          agentPod and storage are handled separately above and below. */ -}}
+  {{- /* The credential proxy is the one operator-rendered workload of its own pod with a
+         sizing override: its footprint entry takes platformAgent.deployment.credentialProxy.resources
+         over it per key (kube-agents.credentialProxyFootprint) before it is summed, so a
+         raised memory limit is counted here as the pod the operator will write, rather than
+         the preflight passing a quota the release will not fit. An ephemeral-storage limit
+         set alone is counted as a request of that size too: the operator renders no
+         ephemeral-storage request and the API server defaults it to the limit. The
+         agent-api-auth sidecar has a sizing override too, but it is a container of the agent
+         pod, so its delta is added to agentPod above rather than counted here. */ -}}
+  {{- $proxyOverride := (((.Values.platformAgent.deployment | default dict).credentialProxy | default dict).resources) | default dict -}}
   {{- range $key, $workload := $op -}}
     {{- if and (ne $key "agentPod") (ne $key "storage") -}}
-      {{- $reqPods = add $reqPods (include "kube-agents.replicaCount" $workload.pods | int64) -}}
-      {{- $reqCpu = add $reqCpu ($workload.cpuMillisRequest | default 0 | int64) -}}
-      {{- $limCpu = add $limCpu ($workload.cpuMillisLimit | default 0 | int64) -}}
-      {{- $reqMem = add $reqMem ($workload.memoryBytesRequest | default 0 | int64) -}}
-      {{- $limMem = add $limMem ($workload.memoryBytesLimit | default 0 | int64) -}}
-      {{- $reqEph = add $reqEph ($workload.ephemeralStorageBytesRequest | default 0 | int64) -}}
-      {{- $limEph = add $limEph ($workload.ephemeralStorageBytesLimit | default 0 | int64) -}}
+      {{- if and (eq $key "credentialProxy") $proxyOverride -}}
+        {{- $workload = include "kube-agents.credentialProxyFootprint" (dict "workload" $workload "override" $proxyOverride) | fromJson -}}
+      {{- end -}}
+      {{- /* satAdd: a total above may already be the saturated ceiling from a huge
+             agent-pod override, which a plain add here would wrap back negative. */ -}}
+      {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.replicaCount" $workload.pods | int64)) | int64 -}}
+      {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" ($workload.cpuMillisRequest | default 0 | int64)) | int64 -}}
+      {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" ($workload.cpuMillisLimit | default 0 | int64)) | int64 -}}
+      {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" ($workload.memoryBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" ($workload.memoryBytesLimit | default 0 | int64)) | int64 -}}
+      {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($workload.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($workload.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
     {{- end -}}
   {{- end -}}
 

@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Request a human reviewer on a pull request, once the AI review is green.
+"""Request a human reviewer on a pull request: once the AI review is green, or at the bot's third round.
 
 `.github/workflows/auto_request_review.yml` used to run
 `necojackarc/auto-request-review` on `pull_request_target`, which pinged a human
 the moment a pull request opened -- minutes before `kube-agents-bot` posted its
 read, and on most pull requests before the author had addressed a single
 finding. The reviewer is now requested from the bot's verdict instead: the
-`AI Review` check run going `success`.
+`AI Review` check run going `success`, or, once per pull request, completing grey after the bot has
+reviewed three distinct commits (`HANDOFF_ROUNDS`; the comment above `AI_REVIEW_BOT_LOGIN` has the
+measurement). The first request the workflow makes on a pull request leaves one hand-off comment, on either of
+its paths; a request run by hand announces nothing, since its comment would land under the
+maintainer's own login and never be recognised as the hand-off.
 
 That trigger is why this script exists rather than the action. The action reads
 `context.payload.pull_request`, which a `check_run` event does not carry, and
@@ -23,17 +27,25 @@ a choice it copies the action, including minimatch's rule that `*` and
 not implement raises rather than guessing -- see `validate_config` and
 `glob_to_regex`.
 
-Three things the action never did. A verdict counts as "already reviewed" only
-from an `OWNERS` approver for the changed files (`applicable_approvers`), since
-only that approval can produce the `approved` label; an approval from anyone
-else used to suppress the auto-assign for good. And `/request-review`
+Six things the action never did. A verdict counts as "already reviewed" only
+from someone whose approval finishes the pull request: an `OWNERS` approver for
+the changed files (`applicable_approvers`), since only that approval can produce
+the `approved` label, or, when the author's own approval already covers every
+changed file (`author_approves`), anyone whose review Prow takes for `lgtm`
+(`applicable_reviewers`); an approval from anyone else used to suppress the
+auto-assign for good. The same test decides who is asked: a pull request the
+author does not self-approve draws an approver alone, so a non-approver in the
+pool is only ever asked for the one label still missing. And `/request-review`
 (`--react-to`) is a person saying "ask someone anyway", so it skips the verdict
 check, and when it still declines -- draft, closed, someone already requested --
 it says so with a 😕 reaction on the comment and a warning annotation on the run,
 where before it exited green having done nothing. And `options.robot_accounts`
 names robots that review under an ordinary user account: their verdicts never
 count, and a review request outstanding to one of them is not a reviewer
-already asked.
+already asked. And the bot's third round: a grey check at its third distinct reviewed
+commit (`HANDOFF_ROUNDS`) requests a reviewer anyway, once, and the first request on a pull
+request leaves one hand-off comment (`HANDOFF_MARKER`), the marker being what stops a later grey
+round asking again.
 
 Run: python3 scripts/request_reviewers.py --pr 728 --dry-run
 Test: cd scripts && python3 -m unittest test_request_reviewers
@@ -99,12 +111,59 @@ GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 OWNERS_FILENAME = "OWNERS"
 OWNERS_ALIASES_FILENAME = "OWNERS_ALIASES"
 DEFAULT_OWNERS_ROOT = "."
+# The two lists an OWNERS file keeps, walked separately as Prow walks them:
+# `approvers` can set `approved`, and both lists can set `lgtm`.
+OWNERS_APPROVERS_KEY = "approvers"
+OWNERS_REVIEWERS_KEY = "reviewers"
 
 # Reactions on the `/request-review` comment: 👀 when a reviewer was requested
 # for it, 😕 when the request was declined. Without the second, a declined
 # override looked identical to the workflow never firing.
 REACTION_ACKNOWLEDGED = "eyes"
 REACTION_DECLINED = "confused"
+
+# The third round summons a human whatever the check's colour. Measured on
+# 2026-10-08 over every pull request the bot reviewed since 2026-09-21
+# (gke-labs/kube-agents-bot#191): 38% of pull requests went five rounds or
+# more, those took 86% of the review spend, the first human review arrived a
+# median 11 hours and two rounds after round three, and once a human had
+# reviewed, two thirds of pull requests saw no further round. The gate that
+# waited for green kept the human away from exactly the pull requests that
+# loop, because on 54% of third rounds the check is grey -- a High on code the
+# last fix added, or the description note -- and an agent author answers a grey
+# check with another fix and another `/review`. So a grey check at the bot's
+# third distinct commit requests a reviewer too, once, and says so on the pull
+# request. Three, not one: nearly half of pull requests finish in two rounds,
+# and the first review is where the defects the author is about to fix sit.
+#
+# What counts as a round is a commit the bot has reviewed -- its reviews
+# listed on the pull request, distinct by `commit_id`, so a `/review` on an
+# unchanged commit (a re-cut) is not one. The deciding entry has to be a read:
+# its summary ends in the bot's `ai-review:` tally with an outcome of
+# `findings` or `clean`. The row a push gets carries the previous title and no
+# tally, and a broken, conflicted or superseded entry carries another outcome;
+# none of those is a round, and none clears the gate at any count.
+AI_REVIEW_BOT_LOGIN = "kube-agents-bot[bot]"
+AI_REVIEW_TALLY_PREFIX = "ai-review:"
+AI_REVIEW_READ_OUTCOMES = frozenset({"findings", "clean"})
+HANDOFF_ROUNDS = 3
+# Every request this workflow makes is announced in one comment carrying this
+# marker, and the marker is what makes the third-round request fire once per
+# pull request: GitHub clears a review request as soon as the reviewer files
+# any review, a `COMMENTED` one included, and `already_reviewed_reason` does
+# not count those, so without it every later grey round would ask again.
+HANDOFF_MARKER = "<!-- auto-request-review:handoff -->"
+# The hand-off is posted with the job's GITHUB_TOKEN, so its author is always
+# this login; a comment anyone else opens with the marker is not a hand-off,
+# or the author's agent pasting one it saw elsewhere would switch the
+# third-round rule off for the pull request.
+HANDOFF_AUTHOR = "github-actions[bot]"
+# Only a run under Actions posts the hand-off: its comment lands under the
+# login above and is recognised later. A maintainer running the script by hand
+# posts under their own login, which `handed_off` would never count, so that
+# run announces nothing and says so, and the workflow's next request posts the
+# comment that counts.
+ACTIONS_ENV = "GITHUB_ACTIONS"
 
 # A declined override is written where the person who typed it will see it:
 # a warning annotation on the workflow run (the `::warning::` command goes to
@@ -205,7 +264,7 @@ def robot_accounts(config):
 
 
 # --------------------------------------------------------------------------- #
-# OWNERS -- who can produce the `approved` label for the changed files
+# OWNERS -- who can produce the `approved` and `lgtm` labels for the changed files
 # --------------------------------------------------------------------------- #
 
 
@@ -239,16 +298,14 @@ def _expand_aliases(names, aliases):
     return expanded
 
 
-def _owners_entries(owners_file, aliases):
-    """The approver rules one OWNERS file declares.
+def _owners_entries(owners_file, aliases, key):
+    """The rules one OWNERS file declares under `key` (`approvers` or `reviewers`).
 
-    Returns `(entries, no_parent_owners)`, each entry a `(regex, approvers)`
-    pair where a `None` regex applies to every path under the directory. As in
+    Returns `(entries, no_parent_owners)`, each entry a `(regex, logins)` pair
+    where a `None` regex applies to every path under the directory. As in
     Prow, a file with `filters:` is read as a filtered file and a top-level
-    `approvers:` beside them is ignored. `reviewers`, `labels` and the rest of
-    Prow's schema are ignored too: a `reviewers` entry's verdict can move `lgtm`,
-    but only an approver's produces `approved`, the label this script exists
-    to get a pull request, so only approvers matter here.
+    list beside them is ignored. `labels` and the rest of Prow's schema are
+    ignored: the two lists are what decide the two merge labels.
     """
     owners = _read_yaml(owners_file)
     entries = []
@@ -256,36 +313,33 @@ def _owners_entries(owners_file, aliases):
     filters = owners.get("filters") or {}
     if filters:
         for pattern, rules in filters.items():
-            approvers = _expand_aliases((rules or {}).get("approvers"), aliases)
-            if approvers:
-                entries.append((re.compile(str(pattern)), approvers))
+            logins = _expand_aliases((rules or {}).get(key), aliases)
+            if logins:
+                entries.append((re.compile(str(pattern)), logins))
     else:
-        approvers = _expand_aliases(owners.get("approvers"), aliases)
-        if approvers:
-            entries.append((None, approvers))
+        logins = _expand_aliases(owners.get(key), aliases)
+        if logins:
+            entries.append((None, logins))
 
     no_parent_owners = bool((owners.get("options") or {}).get("no_parent_owners"))
     return entries, no_parent_owners
 
 
-def applicable_approvers(changed_files, root=DEFAULT_OWNERS_ROOT):
-    """Every login whose approval clears some part of this change, lower-cased.
+def _logins_by_file(changed_files, root, key):
+    """Prow's walk over one OWNERS list, as {changed file: logins}.
 
-    Prow's `approvers` walk (`entriesForFile` in its `repoowners` package), per
-    changed file: from the file's directory up to the repository root,
-    collecting the approvers of each OWNERS file whose rules cover the path,
-    and stopping at a level that sets `no_parent_owners` once the file has
-    collected any approver at that level or below -- so
-    `hack/eval/presubmit-cases.txt` gets eval-crew alone while
-    `hack/eval/nightly-cases.txt`, which matches nothing under `hack/`, falls
-    through to the root. The union across files is the set whose verdict can
-    produce the `approved` label on this pull request; nobody else's approval
-    can, however real their review was.
+    `entriesForFile` in Prow's `repoowners` package: from the file's directory
+    up to the repository root, collecting the logins of each OWNERS file whose
+    rules cover the path, and stopping at a level that sets `no_parent_owners`
+    once the file has collected any login at that level or below. Each list
+    is walked on its own, so the stop applies to the list being read: a
+    filtered file that names approvers and no reviewers stops the approver
+    walk and lets the reviewer walk fall through to the parent.
     """
     root = pathlib.Path(root)
     aliases = load_owners_aliases(root)
     cache = {}
-    approvers = set()
+    by_file = {}
 
     for changed in changed_files:
         path = pathlib.PurePosixPath(changed)
@@ -293,7 +347,7 @@ def applicable_approvers(changed_files, root=DEFAULT_OWNERS_ROOT):
         collected = set()
         while True:
             if directory not in cache:
-                cache[directory] = _owners_entries(root / directory / OWNERS_FILENAME, aliases)
+                cache[directory] = _owners_entries(root / directory / OWNERS_FILENAME, aliases, key)
             entries, no_parent_owners = cache[directory]
 
             relative = str(path.relative_to(directory))
@@ -304,9 +358,62 @@ def applicable_approvers(changed_files, root=DEFAULT_OWNERS_ROOT):
             if (collected and no_parent_owners) or directory == pathlib.PurePosixPath("."):
                 break
             directory = directory.parent
-        approvers.update(collected)
+        by_file[changed] = collected
 
-    return approvers
+    return by_file
+
+
+def _applicable_logins(changed_files, root, key):
+    """The union of `_logins_by_file` over the change."""
+    return set().union(*_logins_by_file(changed_files, root, key).values())
+
+
+def applicable_approvers(changed_files, root=DEFAULT_OWNERS_ROOT):
+    """Every login whose approval clears some part of this change, lower-cased.
+
+    The `approvers` walk: `hack/eval/presubmit-cases.txt` gets eval-crew alone
+    while `hack/eval/nightly-cases.txt`, which matches nothing under `hack/`,
+    falls through to the root. The union across files is the set whose verdict
+    can produce the `approved` label on this pull request; nobody else's
+    approval can, however real their review was.
+    """
+    return _applicable_logins(changed_files, root, OWNERS_APPROVERS_KEY)
+
+
+def applicable_reviewers(changed_files, root=DEFAULT_OWNERS_ROOT):
+    """Every login under `reviewers` for some part of this change, lower-cased.
+
+    With `applicable_approvers`, the set whose "Approve" review Prow turns into
+    `lgtm`; on its own it is nobody's `approved`.
+    """
+    return _applicable_logins(changed_files, root, OWNERS_REVIEWERS_KEY)
+
+
+def approvers_by_file(changed_files, root=DEFAULT_OWNERS_ROOT):
+    """`applicable_approvers` kept per changed file: one walk answers both the
+    union and `self_approval_covers`."""
+    return _logins_by_file(changed_files, root, OWNERS_APPROVERS_KEY)
+
+
+def self_approval_covers(by_file, author):
+    """Whether the author's implicit self-approval covers every changed file.
+
+    Prow's `approved` is per file, so an approver's own pull request opens
+    approved only where they are an approver: a root approver's README change
+    is, the roster half of their mixed change is not. A pull request this
+    returns True for needs `lgtm` alone, which anyone Prow lists as a reviewer
+    can give; any other still needs an approver, so only an approver is asked.
+    No changed files is no coverage: nothing is approved on open.
+    """
+    if not by_file:
+        return False
+    author = author.lower()
+    return all(author in approvers for approvers in by_file.values())
+
+
+def author_approves(changed_files, author, root=DEFAULT_OWNERS_ROOT):
+    """`self_approval_covers` over a fresh walk of `root`."""
+    return self_approval_covers(approvers_by_file(changed_files, root), author)
 
 
 # --------------------------------------------------------------------------- #
@@ -417,14 +524,34 @@ def default_reviewers(config, author):
     return _dedupe(_expand_groups(defaults, config), author)
 
 
-def select_reviewers(config, changed_files, author, rng=random):
-    """The full selection: globs, then defaults as fallback, then sampling."""
+def select_reviewers(config, changed_files, author, rng=random, restrict_to=None):
+    """The full selection: globs, then defaults as fallback, then sampling.
+
+    `restrict_to`, a set of lower-cased logins, narrows the pool before the
+    draw: the OWNERS approvers for the change, when the author's own approval
+    does not cover it, so that a non-approver in the pool is never asked for
+    an `lgtm` that leaves `approved` outstanding with nobody asked. A pool the
+    restriction empties is a config shape rather than a pull-request one --
+    `main` declines before the draw when the approver set itself is empty, as
+    it is for a pull request with no changed files -- and asking someone who
+    can `lgtm` beats asking nobody, so it is kept whole and the log says so.
+    """
     reviewers = reviewers_by_changed_files(config, changed_files, author)
 
     if not reviewers:
         reviewers = default_reviewers(config, author)
         if reviewers:
             log("No glob matched; falling back to the default reviewers")
+
+    if restrict_to is not None and reviewers:
+        narrowed = [name for name in reviewers if name.lower() in restrict_to]
+        if narrowed:
+            dropped = [name for name in reviewers if name not in narrowed]
+            if dropped:
+                log(f"Not drawing {', '.join(dropped)}: not an OWNERS approver for the change")
+            reviewers = narrowed
+        else:
+            log(f"The pool is {', '.join(reviewers)} and none of them is an OWNERS approver for the change; drawing from it anyway")
 
     number = (config.get("options") or {}).get("number_of_reviewers")
     if number is not None and reviewers:
@@ -496,11 +623,14 @@ def already_reviewed_reason(pull_request, reviews, approvers, robots=frozenset()
     approval still means anything. A dismissed review comes back `DISMISSED`
     and so drops out on its own.
 
-    An `APPROVED` counts only from one of `approvers`, the OWNERS approvers for
-    the changed files: theirs is the approval that produces the `approved`
-    label, and anyone else's leaves the pull request unable to merge with
-    nobody asked -- three open pull requests sat that way behind one
-    colleague's approvals. A `CHANGES_REQUESTED` counts from anyone: whoever
+    An `APPROVED` counts only from one of `approvers`, the logins whose
+    approval finishes this pull request: the OWNERS approvers for the changed
+    files, since theirs is the approval that produces the `approved` label,
+    widened by `main` to the OWNERS reviewers as well when the author's own
+    approval already covers the change and `lgtm` is all it still needs.
+    Anyone else's leaves the pull request unable to merge with nobody asked --
+    three open pull requests sat that way behind one colleague's approvals.
+    A `CHANGES_REQUESTED` counts from anyone: whoever
     filed it, the author owes them a reply, and requesting a fresh reviewer
     over an open objection is noise rather than progress. Bot reviews never
     count either way, and neither do reviews from the logins in `robots`: the
@@ -547,12 +677,89 @@ def latest_ai_review(check_runs):
     return max(mine, key=lambda run: (run.get("started_at") or "", run.get("id") or 0))
 
 
-def ai_review_block_reason(check_run, author_is_bot):
+def ai_review_tally(check_run):
+    """The bot's tally on a finished `AI Review` entry, or None when it has none.
+
+    The last non-empty line of the entry's summary, `ai-review: {...}`, as the
+    bot documents it (gke-labs/kube-agents-bot, docs/design.md, "A tally a
+    workflow can read"). An entry with no such line read nothing: the row a
+    push gets, or a spinner. Anything that does not parse reads as no tally
+    rather than as a guess at one.
+    """
+    summary = ((check_run or {}).get("output") or {}).get("summary") or ""
+    lines = [line.strip() for line in summary.splitlines() if line.strip()]
+    if not lines or not lines[-1].startswith(AI_REVIEW_TALLY_PREFIX):
+        return None
+    try:
+        parsed = json.loads(lines[-1][len(AI_REVIEW_TALLY_PREFIX) :])
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("outcome"), str):
+        return None
+    return parsed
+
+
+def reviewed_commits(reviews, *head_shas):
+    """The distinct commits the bot has reviewed on a pull request.
+
+    `reviews` is the pull request's reviews listing; only the bot's own count,
+    by `commit_id`, so a re-cut of a commit already read is the same round. The
+    `head_shas` given are counted too: the deciding entry's commit is a round
+    even when its review has not reached the listing by the time the check
+    completes.
+    """
+    commits = {sha for sha in head_shas if sha}
+    for review in reviews:
+        user = review.get("user") or {}
+        if user.get("login") == AI_REVIEW_BOT_LOGIN and review.get("commit_id"):
+            commits.add(review["commit_id"])
+    return commits
+
+
+def handed_off(comments):
+    """Whether this workflow has already announced a reviewer on the pull request.
+
+    The marker has to open the comment and the comment has to be the
+    workflow's own (`HANDOFF_AUTHOR`): a reply quoting the hand-off carries the
+    same bytes further down, and anyone can type the marker, which renders as
+    nothing.
+    """
+    return any(
+        ((comment.get("user") or {}).get("login") == HANDOFF_AUTHOR)
+        and (comment.get("body") or "").lstrip().startswith(HANDOFF_MARKER)
+        for comment in comments
+    )
+
+
+def handoff_comment(users, teams, head_sha, check_run, why):
+    """The one comment a request leaves behind, for the author and the reviewer.
+
+    No line may start with a slash: Prow reads a command at the start of any
+    line of any comment, and the author's agent reads the whole thing as the
+    rule it is to follow from here.
+    """
+    names = [f"@{login}" for login in users] + [f"team {slug}" for slug in teams]
+    title = ((check_run or {}).get("output") or {}).get("title")
+    verdict = f'; the `{AI_REVIEW_CHECK_NAME}` check reads "{title}"' if title else ""
+    return (
+        f"{HANDOFF_MARKER}\n"
+        f"Handed to {', '.join(names)} at `{head_sha[:7]}`: {why}{verdict}.\n\n"
+        "The reviewer decides from here. Author: if a 🔴 High is open, push the fix and say so in its "
+        "thread; otherwise reply in each thread. Then wait. A further `/review` spends a round nobody "
+        "asked for; the reviewer's reply, or a `/review` they type, is what resumes you."
+    )
+
+
+def ai_review_block_reason(check_run, author_is_bot, rounds=None, already_handed_off=False):
     """Why the AI review does not clear this pull request, or None.
 
     A bot cannot read its own findings and comment `/review`, so a pull request
     Dependabot opened passes on any completed conclusion. A human author has to
-    get it to `success`, or comment `/request-review` to override.
+    get it to `success`, or comment `/request-review` to override -- or reach
+    the bot's third round: with `rounds` given, a grey entry that is a read
+    (`ai_review_tally`) clears the gate once `rounds` is `HANDOFF_ROUNDS` or
+    more and no hand-off has been announced yet. Without `rounds` the rule is
+    the first one alone.
     """
     if check_run is None:
         return f"there is no {AI_REVIEW_CHECK_NAME} check run on the head commit"
@@ -570,7 +777,23 @@ def ai_review_block_reason(check_run, author_is_bot):
 
     title = (check_run.get("output") or {}).get("title")
     detail = f" ({title})" if title else ""
-    return f"{AI_REVIEW_CHECK_NAME} concluded {conclusion}{detail}, not success"
+    reason = f"{AI_REVIEW_CHECK_NAME} concluded {conclusion}{detail}, not success"
+    if rounds is None:
+        return reason
+
+    tally = ai_review_tally(check_run)
+    is_read = tally is not None and tally.get("outcome") in AI_REVIEW_READ_OUTCOMES
+    if is_read and rounds >= HANDOFF_ROUNDS and not already_handed_off:
+        log(
+            f"{AI_REVIEW_CHECK_NAME} concluded {conclusion}{detail} at the bot's round {rounds}; "
+            "requesting a human whatever the colour"
+        )
+        return None
+    if already_handed_off:
+        return f"{reason}, and a reviewer was already handed this pull request"
+    if not is_read:
+        return f"{reason}, and the deciding entry is not a review the bot finished"
+    return f"{reason} (round {rounds} of the {HANDOFF_ROUNDS} before a human is asked anyway)"
 
 
 def resolve_pull_request(api, head_sha):
@@ -671,7 +894,7 @@ def parse_args(argv):
     parser.add_argument(
         "--require-ai-review-pass",
         action="store_true",
-        help="only request a reviewer if the AI Review check passed",
+        help="only request a reviewer once the AI Review check passed, or the bot has reviewed three commits",
     )
     parser.add_argument(
         "--owners-root",
@@ -760,33 +983,78 @@ def main(argv=None):
         entry["filename"] for entry in api.get_all(f"/repos/{args.repo}/pulls/{number}/files")
     ]
 
+    by_file = approvers_by_file(changed_files, args.owners_root)
+    approvers = set().union(*by_file.values())
+    log(f"OWNERS approvers for the changed files: {', '.join(sorted(approvers)) or 'none'}")
+    # Whether the pull request opened with `approved` already on it (#1075)
+    # decides both what counts as reviewed and who is drawn: needing lgtm
+    # alone, anyone Prow takes an lgtm from will do; otherwise only an
+    # approver's review finishes it, so only an approver is asked.
+    self_approved = self_approval_covers(by_file, author)
+    if self_approved:
+        log(f"{author}'s own approval covers every changed file; lgtm is all it needs")
+    else:
+        log(f"{author}'s own approval does not cover the change; only an approver is drawn")
+    # Nobody to narrow to -- a pull request with no changed files, where the
+    # walk returns nothing and nothing is self-approved. Narrowing to an empty
+    # set would fall back to the whole pool and could hand a non-approver an
+    # `approved` nobody can give, so nobody is asked, on either path.
+    if not self_approved and not approvers:
+        decline(api, args, "no OWNERS approver covers the change")
+        return 0
+
+    reviews = None
+    comments = None
+
+    def pull_request_comments():
+        nonlocal comments
+        if comments is None:
+            comments = api.get_all(f"/repos/{args.repo}/issues/{number}/comments")
+        return comments
+
     # `/request-review` is a person who has read the pull request saying "ask
     # someone anyway", so a verdict already on it does not decide for them.
     if not args.react_to:
-        approvers = applicable_approvers(changed_files, args.owners_root)
-        log(f"OWNERS approvers for the changed files: {', '.join(sorted(approvers)) or 'none'}")
+        counting = approvers
+        if self_approved:
+            counting = approvers | applicable_reviewers(changed_files, args.owners_root)
         robots = robot_accounts(config)
         # Named in the run log because the list can only be checked for shape,
         # not identity: a well-formed login that names no account sits inert,
         # and this line is what shows which logins were in effect.
         log(f"Robot accounts, whose reviews never count: {', '.join(sorted(robots)) or 'none'}")
         reviews = api.get_all(f"/repos/{args.repo}/pulls/{number}/reviews")
-        reason = already_reviewed_reason(pull_request, reviews, approvers, robots)
+        reason = already_reviewed_reason(pull_request, reviews, counting, robots)
         if reason:
             decline(api, args, reason)
             return 0
 
+    deciding = None
+    why = "a person asked for a reviewer with /request-review" if args.react_to else "a maintainer ran the request by hand"
     if args.require_ai_review_pass:
-        reason = ai_review_block_reason(
-            gate_check_run(api, pull_request, triggering_check_run),
-            pull_request["user"].get("type") == "Bot",
-        )
+        deciding = gate_check_run(api, pull_request, triggering_check_run)
+        author_is_bot = pull_request["user"].get("type") == "Bot"
+        reason = ai_review_block_reason(deciding, author_is_bot)
+        why = "the check is green" if (deciding or {}).get("conclusion") == "success" else "the author is a bot"
+        if reason and not author_is_bot and deciding is not None and deciding.get("status") == "completed":
+            # Only now, and only on the grey path: the comments listing, which
+            # the green path needs only at the announce (the reviews listing is
+            # already in hand unless `--react-to` skipped it). A spinner or a
+            # head with no entry cannot clear whatever the count. The deciding
+            # entry's own commit counts as reviewed.
+            if reviews is None:
+                reviews = api.get_all(f"/repos/{args.repo}/pulls/{number}/reviews")
+            rounds = len(reviewed_commits(reviews, deciding.get("head_sha")))
+            reason = ai_review_block_reason(
+                deciding, author_is_bot, rounds=rounds, already_handed_off=handed_off(pull_request_comments())
+            )
+            why = f"the bot has reviewed {rounds} commits and the check is still not green"
         if reason:
             decline(api, args, reason)
             return 0
 
     rng = random.Random(args.seed) if args.seed is not None else random
-    reviewers = select_reviewers(config, changed_files, author, rng=rng)
+    reviewers = select_reviewers(config, changed_files, author, rng=rng, restrict_to=None if self_approved else approvers)
 
     if not reviewers:
         decline(api, args, "no reviewer matched")
@@ -795,8 +1063,33 @@ def main(argv=None):
     users, teams = split_teams(reviewers)
     log(f"Requesting review from {', '.join(reviewers)}")
 
+    # The listing decides only decoration here, so it cannot cost the request:
+    # on the grey path it was already read, and fatally, to decide the gate.
+    try:
+        already_announced = handed_off(pull_request_comments())
+    except Exception as exc:  # noqa: BLE001 - any API error; a duplicate comment is the worse-case cost
+        log(f"could not list the comments on #{number} to look for an earlier hand-off: {exc}; announcing anyway")
+        already_announced = False
+    announce = not already_announced
+    if announce and os.environ.get(ACTIONS_ENV) != "true":
+        log(
+            f"not announcing the hand-off on #{number}: not running as the workflow, so the comment "
+            "would land under another login and never be recognised; the workflow's next request posts it"
+        )
+        announce = False
+    if announce and deciding is None:
+        # The override path consulted no entry; the comment still names what
+        # the check reads, if it reads anything, for the reviewer it summons.
+        # Decoration: a failure here costs the clause, never the request.
+        try:
+            deciding = gate_check_run(api, pull_request, triggering_check_run)
+        except Exception as exc:  # noqa: BLE001 - any API error; the request still goes out
+            log(f"could not read the head's {AI_REVIEW_CHECK_NAME} entry for the hand-off: {exc}")
+            deciding = None
     if args.dry_run:
         log(f"--dry-run: would POST reviewers={users} team_reviewers={teams} to #{number}")
+        if announce:
+            log(f"--dry-run: would post the hand-off comment on #{number}")
         react(api, args, REACTION_ACKNOWLEDGED)
         return 0
 
@@ -804,6 +1097,22 @@ def main(argv=None):
         f"/repos/{args.repo}/pulls/{number}/requested_reviewers",
         {"reviewers": users, "team_reviewers": teams},
     )
+    # Once per pull request, whichever path requested: the marker is the
+    # record the third-round rule reads, and the text is the author's stop.
+    if announce:
+        # The commit named is the one the quoted verdict is on: the deciding
+        # entry's, which is the head except in the seconds between a push and
+        # the bot's row for it. The request already went out: a comment that
+        # fails to post is logged, never a red run, and the next request on
+        # the pull request posts it.
+        at = (deciding or {}).get("head_sha") or pull_request["head"]["sha"]
+        try:
+            api.post(
+                f"/repos/{args.repo}/issues/{number}/comments",
+                {"body": handoff_comment(users, teams, at, deciding, why)},
+            )
+        except Exception as exc:  # noqa: BLE001 - any API error; the request stands
+            log(f"{WORKFLOW_WARNING_PREFIX}requested a reviewer on #{number} but could not post the hand-off comment: {exc}")
     react(api, args, REACTION_ACKNOWLEDGED)
 
     return 0

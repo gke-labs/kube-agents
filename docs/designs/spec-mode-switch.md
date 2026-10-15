@@ -25,8 +25,9 @@ Mode *string `json:"mode,omitempty"`
 ```
 
 `mode: next` is a dev toggle, not a supported configuration. Same shape as the other
-opt-in toggles on this CRD: optional pointer field, nil-safe helper, deliberately not
-surfaced in the Helm chart. Naming note: the CRD already has a `mode` field on the
+opt-in toggles on this CRD: optional pointer field, nil-safe helper. The install surfaces
+can set it, and each one's default writes no field at all ("Choosing it at install",
+below). Naming note: the CRD already has a `mode` field on the
 Google Chat integration spec (display verbosity, `spec.integration.googleChat.mode`).
 Different path, no schema collision - named here so nobody conflates them.
 
@@ -87,6 +88,14 @@ rollout does replace the agent pods; what preservation guarantees is that the
 replacements keep the credential and the route, so the bridge reconnects instead of
 hanging at the dial. Found live during stage 1 bring-up (8/26).
 
+A deliberate flip back to `today` is the other half, and it does clean up: the A2A stack
+is torn down, with two objects kept so a later flip forward reuses them. The bus creds
+Secret `<agent>-a2a-nats-creds` stays, because re-enabling `next` must not re-roll the
+credentials. The JetStream PVC `data-<agent>-a2a-nats-0` stays, because flipping a mode
+is not license to destroy the file store. `hack/rollback-roundtrip.sh` checks both
+against a live install: it flips `next` to `today` and back, asserts the two keep their
+UIDs and the agent answers on each side, and the next lane runs it after its matrix.
+
 ## What the operator renders
 
 - `today`: exactly what it renders now. A normal install cannot tell this feature exists
@@ -136,12 +145,30 @@ that writes it and the helper that reads it. A third hit is a review comment.
 "What mode am I in" gets one answer per agent, computed in one place. This also means the
 delivery mechanism can change later without touching call sites.
 
-## Not in the Helm chart
+## Choosing it at install
 
-The chart does not template `mode` until graduation (stage 4, when `next` becomes the
-default posture). Until then, flipping it is a `kubectl patch` on the PlatformAgent CR.
-Helm 3's three-way merge leaves fields the chart never sets alone, so a patched mode
-should survive chart upgrades.
+Every install surface can set the mode, and every one defaults to rendering no field, so
+an install that never asks renders the CR it did before the surfaces knew the field:
+
+- The chart's `platformAgent.mode`, `null` by default, which leaves `mode` out of the CR
+  (`""` does the same). `today` and `next` render as themselves; the values schema refuses
+  anything else.
+- The Terraform composition's `platform_agent_mode`, `"today"` by default, which passes
+  the chart nothing; `"next"` passes `platformAgent.mode: next`.
+- `install.sh --mode=today|next`, recorded in `install.env` as `PLATFORM_AGENT_MODE`.
+
+A mode switch on a running install is made by editing `PLATFORM_AGENT_MODE`, not by
+passing `--mode`, which is refused when it disagrees with the file, and the run that
+applies the edit says it is a mode switch first.
+[`scripts/installer/README.md`](../../scripts/installer/README.md) is canonical for the
+key's rules.
+
+Flipping it with `kubectl patch` on the CR still works, and is how the dev installs that
+predate the chart value run. Helm patches a custom resource from the difference between
+its renders, so while the chart value stays `null` a patched mode survives chart
+upgrades; a value set through the chart and later cleared removes the field again, which
+is `today`. The next lane's eval deploy (`hack/ci-deploy.sh`) sets the mode through the
+chart value, so its smoke exercises that route.
 
 ## Switches inside `next`
 
@@ -175,13 +202,15 @@ between a person and that read is the gateway's ingress allowlist. That differs 
 record ([architecture 02](../architecture/02-agent-personas.md) §2.4,
 [03](../architecture/03-security-model.md) §4a, and "Sessions by default" in
 `spec-chatops-gateway.md`), where a session reaches cluster data only through a gateway-minted
-child task and the gateway checks the target agent's `AllowedUsers` against the requester first.
-Today the two gates admit the same people, because the ingress allowlist is the only human-to-agent
-check the gateway enforces. It is a demo aid with two retirement triggers, whichever lands first:
-declarative profiles carrying a session's identity and tools, and gateway-side `AllowedUsers`
-enforcement ([architecture 07](../architecture/07-implementation-roadmap.md)); once the gateway
-refuses a person for the platform agent, a session with this view would read its clusters anyway,
-so the flag goes before that enforcement ships.
+child task and the gateway checks the target agent's `AllowedUsers` against the requester first -
+built now: a delegation to `platform` is checked against its `AllowedUsers`, but the view bypasses
+that check entirely, so on an install whose CR narrows the platform agent's allowlist the two gates
+no longer admit the same people. The view retires on the default flip (#2371); until then, on an
+install whose operator has turned the flag on and whose CR narrows the platform agent's allowlist,
+a person the gateway refuses a delegation to `platform` can still read its clusters through a
+session's view. The flag stays off by default for that reason. An install with a single user, or
+whose allowed users are the same people the platform agent admits, can turn it on, and gets
+sessions that answer cluster questions themselves instead of delegating each one.
 
 ## Per-feature overrides - sketched, not built
 

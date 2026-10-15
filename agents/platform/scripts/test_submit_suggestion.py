@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import io
+import argparse
 import json
 import os
 import shutil
@@ -39,6 +40,9 @@ sys.path.insert(0, str(HERE))
 
 import gitops_workspace  # noqa: E402
 import vcs_client  # noqa: E402
+
+#: The real `call`, which the setUp replaces with the stub broker; the record tests put it back.
+REAL_CALL = vcs_client.call
 from providers import validate_branch  # noqa: E402
 
 SUBJECT = (
@@ -93,6 +97,10 @@ class FakeBroker:
         # remote's HEAD, and a fleet whose trunk is not `main` is exactly the
         # case the protected-branch list cannot cover.
         self.default_branch = "main"
+        # The base the operator configured for this repository, which the
+        # broker answers as `baseBranch` and holds every new proposal to. None
+        # is an install that configures nothing.
+        self.base_branch: str | None = None
         self.proposals: list[dict] = []
         self.calls: list[tuple[str, dict]] = []
         self.numbers = count(101)
@@ -123,9 +131,30 @@ class FakeBroker:
         git(self.scratch, "clone", "--quiet", str(self.origin), work.name)
         return work
 
+    def _refuse_off_base(self, target: str) -> None:
+        """`vcs_broker._refuse_off_base`: a new proposal goes onto the base or nowhere."""
+        if self.base_branch is not None and target != self.base_branch:
+            raise vcs_client.VcsError(
+                f"acme/infra takes proposals onto {self.base_branch} only, the base "
+                f"branch this install is configured with, and {target} is not it. "
+                f"Use {self.base_branch} as the target.",
+                code="TARGET_NOT_BASE",
+            )
+
     def clone(self, payload):
-        branch = payload.get("branch") or self.default_branch
+        branch = payload.get("branch")
         work = self._serving_copy()
+        if branch is None and self.base_branch is not None:
+            # A clone with no branch named comes down on the configured base,
+            # and a base the remote does not have is refused by name.
+            if not self._tip(self.base_branch):
+                raise vcs_client.VcsError(
+                    f"acme/infra has no branch {self.base_branch}, the base branch "
+                    "this install is configured with.",
+                    code="BASE_BRANCH_MISSING",
+                )
+            branch = self.base_branch
+        branch = branch or self.default_branch
         git(work, "checkout", "--quiet", "-B", branch, f"origin/{branch}")
         bundle = work.parent / f"{work.name}.bundle"
         git(work, "bundle", "create", str(bundle), "HEAD", branch)
@@ -137,6 +166,7 @@ class FakeBroker:
             "revision": git(work, "rev-parse", "HEAD").stdout.strip(),
             "size": len(blob),
             "bundleBase64": base64.b64encode(blob).decode("ascii"),
+            "baseBranch": self.base_branch,
         }
 
     def publish(self, payload):
@@ -159,6 +189,10 @@ class FakeBroker:
                 "repository has it as its source.",
                 code="CLONED_BRANCH",
             )
+        if not payload.get("advance"):
+            # A later round adds to a proposal that already exists, so only the
+            # first publish is held to the base -- before anything is pushed.
+            self._refuse_off_base(payload["target"])
         work = self._serving_copy()
         bundle = work.parent / f"{work.name}.in.bundle"
         bundle.write_bytes(base64.b64decode(payload["bundleBase64"]))
@@ -187,6 +221,7 @@ class FakeBroker:
     def proposal_create(self, payload):
         if self.create_fails_with:
             raise self.create_fails_with
+        self._refuse_off_base(payload["target"])
         number = next(self.numbers)
         proposal = {
             "number": number,
@@ -211,6 +246,8 @@ class FakeBroker:
     def proposal_update(self, payload):
         if self.update_fails_with:
             raise self.update_fails_with
+        if payload.get("target") is not None:
+            self._refuse_off_base(payload["target"])
         for proposal in self.proposals:
             if proposal["number"] == payload["number"]:
                 for field in ("title", "body"):
@@ -298,7 +335,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
 
         for name, value in (
             ("resolve_repo", lambda workspace=None: "acme/infra"),
-            ("get_managed_github_repos", lambda: []),
+            ("get_managed_repos", lambda: []),
         ):
             patch = mock.patch.object(gitops_workspace, name, value)
             patch.start()
@@ -332,9 +369,24 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         return listing.stdout.split()
 
     def existing_proposal(self, branch: str, target: str = "main", **fields) -> dict:
-        return self.broker.proposal_create(
-            {"title": "under review", "body": "somebody else wrote this", "source": branch, "target": target, **fields}
-        )["proposal"]
+        # Opened on the forge, not through the broker, so no configured base
+        # stands in its way: a person can open a pull request onto anything.
+        configured, self.broker.base_branch = self.broker.base_branch, None
+        try:
+            return self.broker.proposal_create(
+                {"title": "under review", "body": "somebody else wrote this", "source": branch, "target": target, **fields}
+            )["proposal"]
+        finally:
+            self.broker.base_branch = configured
+
+    def configure_base(self, base: str = "release") -> None:
+        """Give the repository a `base` ahead of `main` and pin proposals to it."""
+        git(self.origin, "checkout", "--quiet", "-b", base)
+        (self.origin / "release.txt").write_text("only on the base\n")
+        git(self.origin, "add", "-A")
+        git(self.origin, "commit", "--quiet", "-m", "base moves ahead")
+        git(self.origin, "checkout", "--quiet", "main")
+        self.broker.base_branch = base
 
     # -- prepare ----------------------------------------------------------
 
@@ -843,15 +895,14 @@ class SubmitSuggestionTestCase(unittest.TestCase):
                 submit_suggestion.check_branch(branch)
             self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
 
-    def test_check_branch_refuses_the_configured_base_branch(self):
-        # A fleet that renamed its trunk says so in one of these two, and the
-        # list of three would otherwise wave the rename straight through.
-        for variable in ("GITOPS_BASE_BRANCH", "CREDENTIAL_PROXY_BASE_BRANCH"):
-            with mock.patch.dict(os.environ, {variable: "custom-trunk"}):
-                for branch in ("custom-trunk", "refs/heads/custom-trunk", "heads/custom-trunk"):
-                    with self.assertRaises(ValueError) as caught:
-                        submit_suggestion.check_branch(branch)
-                    self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+    def test_check_branch_does_not_read_the_sandbox_environment(self):
+        # The agent owns this environment, so a name in it is the agent's
+        # choice, not the operator's. The trunk a fleet renamed is guarded by
+        # the base the broker reports (`refuse_branch_on_its_own_base`) and by
+        # the broker itself, from configuration the agent cannot reach.
+        exported = {"GITOPS_BASE_BRANCH": "custom-trunk", "CREDENTIAL_PROXY_BASE_BRANCH": "custom-trunk"}
+        with mock.patch.dict(os.environ, exported):
+            self.assertEqual(submit_suggestion.check_branch("custom-trunk"), "custom-trunk")
 
     def test_check_branch_refuses_a_base_branch_passed_in(self):
         with self.assertRaises(ValueError) as caught:
@@ -914,7 +965,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
 
     def test_prepare_refuses_a_repository_outside_the_managed_list(self):
         with mock.patch.object(
-            gitops_workspace, "get_managed_github_repos", lambda: ["acme/infra"]
+            gitops_workspace, "get_managed_repos", lambda: ["acme/infra"]
         ):
             with self.assertRaises(ValueError) as caught:
                 self.run_subject("prepare", "--branch", "b", "--repo", "other/elsewhere")
@@ -927,7 +978,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         # empty allowlist -- after which every `--repo` the model names is
         # accepted whenever that read hiccups, and the suite stays green.
         with mock.patch.object(
-            gitops_workspace, "get_managed_github_repos",
+            gitops_workspace, "get_managed_repos",
             mock.Mock(side_effect=RuntimeError("ConfigMap missing")),
         ):
             with self.assertRaises(RuntimeError):
@@ -992,6 +1043,45 @@ class SubmitSuggestionTestCase(unittest.TestCase):
 
     # -- submit -----------------------------------------------------------
 
+    def test_submit_records_the_proposal_it_opened_on_stderr(self):
+        # The chokepoint: `vcs_client.call` itself, with only the broker under it
+        # stubbed, writes the record the agent pod's pr_opened plugin reads.
+        prepared = self.prepare()
+        self.edit(prepared)
+        stderr = io.StringIO()
+        with mock.patch.object(vcs_client, "call", REAL_CALL), \
+                mock.patch.object(vcs_client, "_call", self.broker), \
+                mock.patch("sys.stderr", stderr):
+            code, out = self.run_subject(
+                "submit",
+                "--branch", "platform-agent/scale-web",
+                "--title", "fix(capacity): raise the replica floor",
+                "--body-file", self.body_file(),
+            )
+        self.assertEqual(code, 0)
+        records = [json.loads(line) for line in stderr.getvalue().splitlines() if "kube-agents.event" in line]
+        self.assertEqual(records, [{
+            "kube-agents.event": "proposal-opened",
+            "proposal": {"url": out, "number": 101, "title": "fix(capacity): raise the replica floor"},
+        }])
+
+    def test_updating_an_open_proposal_records_nothing(self):
+        prepared = self.prepare()
+        self.edit(prepared)
+        self.existing_proposal("platform-agent/scale-web")
+        stderr = io.StringIO()
+        with mock.patch.object(vcs_client, "call", REAL_CALL), \
+                mock.patch.object(vcs_client, "_call", self.broker), \
+                mock.patch("sys.stderr", stderr):
+            code, _ = self.run_subject(
+                "submit",
+                "--branch", "platform-agent/scale-web",
+                "--title", "fix(capacity): raise the replica floor",
+                "--body-file", self.body_file(),
+            )
+        self.assertEqual(code, 0)
+        self.assertNotIn("kube-agents.event", stderr.getvalue())
+
     def test_submit_publishes_the_branch_and_opens_the_proposal(self):
         prepared = self.prepare()
         self.edit(prepared)
@@ -1019,7 +1109,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         prepared = self.prepare()
         self.edit(prepared)
         with mock.patch.object(
-            gitops_workspace, "get_managed_github_repos",
+            gitops_workspace, "get_managed_repos",
             mock.Mock(side_effect=RuntimeError("ConfigMap missing")),
         ):
             with self.assertRaises(RuntimeError):
@@ -1561,6 +1651,88 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertEqual(self.broker.payloads("publish")[-1]["target"], "release")
         self.assertEqual(proposal["target"], "main")
 
+    # -- a configured base -------------------------------------------------
+
+    def test_a_configured_base_is_where_the_proposal_goes_whatever_the_sandbox_exports(self):
+        # The run that exported `GITOPS_BASE_BRANCH=main` to steer its pull
+        # request: the operator's base wins, and the export changes nothing.
+        self.configure_base("release")
+        branch = "platform-agent/scale-web"
+        exported = {"GITOPS_BASE_BRANCH": "main", "CREDENTIAL_PROXY_BASE_BRANCH": "main"}
+        with mock.patch.dict(os.environ, exported):
+            prepared = self.prepare(branch)
+            self.assertEqual(prepared["base"], "release")
+            self.assertEqual(prepared["started_from"], "release")
+            # Cut from the base, so it carries what only the base has.
+            self.assertTrue((Path(prepared["workspace"]) / "release.txt").is_file())
+            self.edit(prepared)
+            code, _ = self.run_subject("submit", "--branch", branch, "--title", "t", "--body", "b")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.broker.payloads("publish")[0]["target"], "release")
+        self.assertEqual(self.broker.payloads("proposal-create")[0]["target"], "release")
+        self.assertEqual(self.broker.proposals[0]["target"], "release")
+
+    def test_with_no_proposal_and_no_base_the_configured_base_beats_the_clone_branch(self):
+        # Every copy `prepare` takes under a configured base comes down on that
+        # base, so the two defaults agree there. Recording another clone branch
+        # separates them: the configured base is the one the proposal goes onto.
+        self.configure_base("release")
+        branch = "platform-agent/scale-web"
+        self.edit(self.prepare(branch))
+        session = vcs_client.resolve_session("acme/infra", key=branch)
+        session["branch"] = "main"
+        vcs_client.save_session(session)
+        code, _ = self.run_subject("submit", "--branch", branch, "--title", "t", "--body", "b")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.broker.payloads("publish")[0]["target"], "release")
+        self.assertEqual(self.broker.proposals[0]["target"], "release")
+
+    def test_a_base_other_than_the_configured_one_is_refused_and_opens_nothing(self):
+        self.configure_base("release")
+        branch = "platform-agent/scale-web"
+        self.edit(self.prepare(branch))
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            self.run_subject(
+                "submit", "--branch", branch, "--title", "t", "--body", "b", "--base", "main",
+            )
+        self.assertEqual(caught.exception.code, "TARGET_NOT_BASE")
+        self.assertIn("release", str(caught.exception))
+        self.assertNotIn(branch, self.remote_branches())
+        self.assertEqual(self.broker.payloads("proposal-create"), [])
+        self.assertEqual(self.broker.proposals, [])
+        # The commit is still in the copy, so dropping `--base` is the whole retry.
+        code, _ = self.run_subject("submit", "--branch", branch, "--title", "t", "--body", "b")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.broker.proposals[0]["target"], "release")
+
+    def test_a_later_round_onto_a_proposal_on_another_branch_still_lands(self):
+        # Opened onto `main` before the base was configured, or by a person.
+        # Its target cannot be moved, and refusing the round would only strand
+        # the review, so the round goes where the proposal already points.
+        self.configure_base("release")
+        branch = "platform-agent/scale-web"
+        git(self.origin, "branch", branch, "main")
+        proposal = self.existing_proposal(branch, target="main")
+        prepared = self.prepare(branch)
+        self.assertEqual(prepared["base"], "main")
+        self.edit(prepared)
+        code, out = self.run_subject("submit", "--branch", branch, "--title", "t", "--body", "b")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, proposal["url"])
+        published = self.broker.payloads("publish")[0]
+        self.assertTrue(published["advance"])
+        self.assertEqual(published["target"], "main")
+        self.assertEqual(self.broker.payloads("proposal-create"), [])
+        self.assertEqual(proposal["target"], "main")
+
+    def test_a_configured_base_the_remote_does_not_have_is_refused_by_name(self):
+        self.broker.base_branch = "release"
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            self.prepare()
+        self.assertEqual(caught.exception.code, "BASE_BRANCH_MISSING")
+        self.assertIn("release", str(caught.exception))
+        self.assertEqual(list(vcs_client.ROOT.glob("*/.git")), [])
+
     # -- the description file ---------------------------------------------
 
     def test_a_body_file_outside_scratch_is_refused(self):
@@ -1702,7 +1874,7 @@ class TestValidateRepo(unittest.TestCase):
 
     def test_an_unreadable_managed_list_is_refused_rather_than_read_as_empty(self):
         with mock.patch.object(
-            gitops_workspace, "get_managed_github_repos",
+            gitops_workspace, "get_managed_repos",
             mock.Mock(side_effect=RuntimeError("kubectl failed: Forbidden")),
         ):
             with self.assertRaises(RuntimeError) as caught:
@@ -1712,17 +1884,76 @@ class TestValidateRepo(unittest.TestCase):
     def test_an_empty_managed_list_means_no_allowlist_is_configured(self):
         # The other reading of an empty list, and the reason the one above
         # matters: "" and "the read failed" must not arrive at the same place.
-        with mock.patch.object(gitops_workspace, "get_managed_github_repos", lambda: []):
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: []):
             with mock.patch.object(gitops_workspace, "validate_repo_org", lambda repo: repo):
                 self.assertEqual(submit_suggestion.validate_repo("acme/any"), "acme/any")
 
     def test_a_repository_outside_a_populated_managed_list_is_refused(self):
         with mock.patch.object(
-            gitops_workspace, "get_managed_github_repos", lambda: ["acme/managed"]
+            gitops_workspace, "get_managed_repos", lambda: ["acme/managed"]
         ):
             with self.assertRaises(ValueError) as caught:
                 submit_suggestion.validate_repo("acme/unmanaged")
         self.assertIn("not in the managed repositories list", str(caught.exception))
+
+    def test_a_bare_name_is_lifted_on_an_install_with_a_second_forge(self):
+        mixed = ["github.com/acme/fleet", "gitlab.com/acme/infra"]
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: mixed):
+            with mock.patch.dict(os.environ, {"GITOPS_ORG": "acme"}):
+                self.assertEqual("github.com/acme/fleet", submit_suggestion.validate_repo("acme/fleet"))
+
+    def test_a_managed_repository_on_another_forge_is_accepted_at_any_depth(self):
+        name = "gitlab.com/acme/platform/infra"
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: [name]):
+            with mock.patch.dict(os.environ, {"GITOPS_ORG": "acme"}):
+                self.assertEqual(submit_suggestion.validate_repo(name), name)
+
+
+
+class LiftedNameReachesTheBrokerTest(unittest.TestCase):
+    """Review: `prepare` validated the lifted name and sent the bare one."""
+
+    def test_prepare_asks_the_broker_with_the_lifted_name(self):
+        mixed = ["github.com/acme/fleet", "gitlab.com/acme/infra"]
+        seen = []
+
+        def stop(repo, branch):
+            seen.append(repo)
+            raise RuntimeError("stop here")
+
+        args = argparse.Namespace(repo="acme/fleet", branch="platform-agent/x")
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: mixed), \
+                mock.patch.dict(os.environ, {"GITOPS_ORG": "acme"}), \
+                mock.patch.object(submit_suggestion, "open_proposal", stop):
+            with self.assertRaises(RuntimeError):
+                submit_suggestion.handle_prepare(args)
+        self.assertEqual(["github.com/acme/fleet"], seen)
+
+    def test_submit_asks_the_broker_with_the_lifted_name(self):
+        # Review: only `prepare` was pinned; reverting `submit`'s
+        # `repo = validate_repo(repo)` left the suite green, and the broker
+        # refuses the bare name once it serves a second forge.
+        mixed = ["github.com/acme/fleet", "gitlab.com/acme/infra"]
+        seen = []
+
+        def stop(repo, branch):
+            seen.append(repo)
+            raise RuntimeError("stop here")
+
+        session = {"spec": "acme/fleet", "path": "/scratch/acme__fleet", "key": "platform-agent/x"}
+        args = argparse.Namespace(
+            repo="acme/fleet", branch="platform-agent/x", title="t", body="b",
+            body_file=None, keep_description=False,
+        )
+        with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: mixed), \
+                mock.patch.dict(os.environ, {"GITOPS_ORG": "acme"}), \
+                mock.patch.object(submit_suggestion.vcs_client, "resolve_session", return_value=session), \
+                mock.patch.object(submit_suggestion.vcs_client, "key_of", return_value="platform-agent/x"), \
+                mock.patch.object(submit_suggestion.vcs_client, "current_branch", return_value="platform-agent/x"), \
+                mock.patch.object(submit_suggestion, "open_proposal", stop):
+            with self.assertRaises(RuntimeError):
+                submit_suggestion.handle_submit(args)
+        self.assertEqual(["github.com/acme/fleet"], seen)
 
 
 if __name__ == "__main__":

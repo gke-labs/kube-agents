@@ -32,7 +32,7 @@ card appears only in the rare case where there is genuine work. What it gives
 up it can afford — the card body names the skill, and ``model``/``max_turns``
 take their defaults — and the one thing it must not give up, an audible
 failure, stays here: this job keeps ``deliver: "chat"``, so anything printed
-to stdout below is a fault report the Chat Agent posts to the room.
+to stdout below is a fault report the relay posts to the room.
 
 One watcher, several sweeps
 ---------------------------
@@ -229,7 +229,7 @@ def run_resolver_poll() -> dict:
         raise FileNotFoundError(f"resolver not found at {script}")
 
     try:
-        managed_count = len(gitops_workspace.get_managed_github_repos())
+        managed_count = len(gitops_workspace.get_managed_repos())
     except Exception:
         managed_count = 1
     timeout = max(1, managed_count) * RESOLVER_TIMEOUT_S
@@ -537,8 +537,8 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     warnings: list[str] = []
 
     try:
-        from gitops_workspace import get_managed_github_repos
-        repos = get_managed_github_repos()
+        from gitops_workspace import get_managed_repos
+        repos = get_managed_repos()
     except Exception as error:
         return SweepResult(warnings=[_forge_warning(error if isinstance(error, forge.ForgeError) else forge.ForgeError("DISCOVERY_FAILED", str(error)))])
     if not repos:

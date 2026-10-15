@@ -31,6 +31,8 @@
 import os
 import sys
 
+import chat_notify
+
 # The platforms this harness ships an egress path for, in the order a message is
 # posted to them. Google Chat leads because it is where every one of these messages
 # already arrives — a dual-platform install should gain Slack, not have the message
@@ -70,8 +72,9 @@ CONFIG_PATH = os.environ.get("PLATFORM_AGENT_CONFIG_PATH", "/opt/data/config.yam
 # consumer, so it answers the question being asked rather than approximating it
 # (platformagent_manifests.go, the `integration.GoogleChat` / `integration.Slack` blocks
 # in buildPodTemplateSpec). Under `mode: next` Google Chat moves to the A2A gateway and
-# the variable is not set here, which this list correctly reads as Chat not being this
-# pod's to post to.
+# the variable is not set here, so this list does not count it; the operator sets
+# `A2A_NOTIFY_PLATFORM` instead, and the platform it names is counted through the
+# gateway's notify route (chat_notify.py).
 #
 # In a deployed pod the relay URL is not merely first, it is the only one of these
 # that arrives. A bot token is a credential, so it lives in the credential-proxy
@@ -175,7 +178,11 @@ def enabled_chat_platforms() -> list[str]:
     An explicit `enabled: false` therefore wins over an environment signal, in either
     file: that combination is an operator or an admin turning a platform off on a pod
     that still has the variables rendered on it, and the file is the more specific
-    statement.
+    statement. The one exception is the platform the operator names in
+    `A2A_NOTIFY_PLATFORM` (chat_notify.py): under `next` the managed scope turns that
+    platform's Hermes consumer off because the A2A gateway holds the backend, and
+    posts reach it through the gateway, so it counts as enabled whatever the files
+    say. The operator renders the variable only then, and reserves it.
 
     Never returns an empty list: an install that resolves to nothing gets
     DEFAULT_PLATFORM, which is what every caller did unconditionally before.
@@ -185,7 +192,13 @@ def enabled_chat_platforms() -> list[str]:
 
     resolved = []
     for name in CHAT_PLATFORMS:
-        if name in from_managed:
+        # Under next the managed scope says the Hermes platform is off, because
+        # the A2A gateway holds the backend; posts to it go through the
+        # gateway's chat.notify route instead (chat_notify.py), so it is
+        # still a platform this install posts to.
+        if chat_notify.routes(name):
+            enabled = True
+        elif name in from_managed:
             enabled = from_managed[name]
         elif name in from_profile:
             enabled = from_profile[name]

@@ -24,7 +24,11 @@ again.
 
 import contextlib
 import errno
+import http.server
 import io
+import json
+import threading
+import urllib.error
 import os
 import shutil
 import re
@@ -43,8 +47,11 @@ sys.path.insert(0, str(Path(__file__).parent.absolute()))
 sys.path.insert(1, str(Path(__file__).resolve().parents[2] / "platform" / "scripts"))
 
 import bootstrap_delivery  # noqa: E402
+import bootstrap_handoff  # noqa: E402
 import bootstrap_scan_gate  # noqa: E402
 import cluster_agent_profile  # noqa: E402
+import findings_queue  # noqa: E402
+import inventory_findings  # noqa: E402
 import profile_scaffold  # noqa: E402
 import sandbox_exec  # noqa: E402
 from cluster_agent_reconcile import SCAFFOLD_ARTIFACTS  # noqa: E402
@@ -54,6 +61,34 @@ DELIVERED = "INVENTORY.delivered.md"
 ALIGNED = ".user_aligned"
 COMPLETED = ".bootstrap_completed"
 SCAN_FILED = ".bootstrap_scan_filed"
+SHOWN = "INVENTORY.shown.json"
+SHOWN_DELIVERED = "INVENTORY.shown.delivered.json"
+SHOWN_RECORD = {
+    "items": [
+        {"class": "critical", "ids": ["sa-key.acme.prod.app.sa1", "sa-key.acme.prod.app.sa2"]},
+        {"class": "critical", "ids": ["crashloop.acme.prod.app.api"]},
+    ]
+}
+ITEMS = "INVENTORY.items.json"
+SCORES = "INVENTORY.scores.json"
+SCORE = {
+    "rubric": {"B": 3, "L": 6, "detect": 3, "recover": 2, "C": 1.0},
+    "recommendation": {"action": "add a readinessProbe", "rationale": "traffic", "risk": "5xx"},
+    "remediation": {"kind": "manifest", "path": "k8s/api.yaml", "note": "add the probe"},
+    "verification": {"kind": "kubectl", "command": "kubectl get deploy api", "still_failing_when": "empty"},
+}
+# Two findings on acme/prod and one on acme/dev, as `extract` writes them, and their scores.
+EXTRACTED = {
+    "items": [
+        {"id": "f001", "check": "probes-readiness", "project": "acme", "cluster": "prod",
+         "namespace": "payments", "object": "api", "title": "no readinessProbe on api", "line": 3},
+        {"id": "f002", "check": "probes-readiness", "project": "acme", "cluster": "prod",
+         "namespace": "payments", "object": "web", "title": "no readinessProbe on web", "line": 4},
+        {"id": "f003", "check": "probes-readiness", "project": "acme", "cluster": "dev",
+         "namespace": "payments", "object": "api", "title": "no readinessProbe on api", "line": 5},
+    ]
+}
+SCORED = {"scores": {"f001": SCORE, "f002": SCORE, "f003": SCORE}, "complete_clusters": ["acme/prod"]}
 
 
 class DeliveryDecisionTest(unittest.TestCase):
@@ -177,6 +212,323 @@ class DeliveryMainTest(unittest.TestCase):
         self.assertEqual(out, report)
 
 
+class DeliveryMarksShownTest(unittest.TestCase):
+    """The report's items are marked shown as the first report, after the claim and before stdout."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+        patcher = mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        self.out = io.StringIO()
+        self.posts = []
+
+        def post(endpoint, finding_id, body):
+            # What had reached stdout when the mark was sent.
+            self.posts.append((finding_id, body, self.out.getvalue()))
+
+        self.post = mock.patch.object(bootstrap_delivery, "_post_surfaced", side_effect=post)
+        self.post.start()
+        self.addCleanup(self.post.stop)
+
+    def _run(self):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(self.out), contextlib.redirect_stderr(err):
+            rc = bootstrap_delivery.main(self.d)
+        return rc, self.out.getvalue(), err.getvalue()
+
+    def _shown(self, record=SHOWN_RECORD):
+        (self.d / SHOWN).write_text(record if isinstance(record, str) else json.dumps(record), encoding="utf-8")
+
+    def test_the_names_are_the_ones_select_writes_and_the_queue_accepts(self):
+        self.assertEqual(bootstrap_delivery.SHOWN_NAME, Path(inventory_findings.DEFAULT_SHOWN_PATH).name)
+        self.assertEqual(
+            (bootstrap_delivery.SHOWN_ITEMS, bootstrap_delivery.SHOWN_CLASS, bootstrap_delivery.SHOWN_IDS),
+            (inventory_findings.SHOWN_ITEMS, inventory_findings.SHOWN_CLASS, inventory_findings.SHOWN_IDS),
+        )
+        self.assertIn(bootstrap_delivery.PUBLISHER, findings_queue.PACED_PUBLISHERS)
+
+    def test_every_row_is_marked_with_one_run_before_the_report_goes_out(self):
+        self._shown()
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual(
+            [finding_id for finding_id, _, _ in self.posts],
+            ["sa-key.acme.prod.app.sa1", "sa-key.acme.prod.app.sa2", "crashloop.acme.prod.app.api"],
+        )
+        bodies = [body for _, body, _ in self.posts]
+        self.assertEqual({body["publisher"] for body in bodies}, {"first_report"})
+        self.assertEqual({body["added_class"] for body in bodies}, {"critical"})
+        self.assertEqual(len({body["run"] for body in bodies}), 1)
+        self.assertEqual({before for _, _, before in self.posts}, {""})
+        self.assertFalse((self.d / SHOWN).exists())
+        self.assertEqual(json.loads((self.d / SHOWN_DELIVERED).read_text(encoding="utf-8")), SHOWN_RECORD)
+
+    def test_a_queue_that_does_not_answer_is_asked_once_and_the_report_still_goes_out(self):
+        self._shown()
+        self.post.stop()
+        with mock.patch.object(
+            bootstrap_delivery, "_post_surfaced", side_effect=urllib.error.URLError("connection refused")
+        ) as post:
+            rc, out, err = self._run()
+        self.post.start()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        post.assert_called_once()
+        self.assertIn("did not answer", err)
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / SHOWN_DELIVERED).exists())
+
+    def test_a_row_the_queue_refuses_does_not_stop_the_others(self):
+        self._shown()
+        self.post.stop()
+        refused = urllib.error.HTTPError("u", 404, "Not Found", {}, io.BytesIO(b'{"error": "not found"}'))
+        with mock.patch.object(bootstrap_delivery, "_post_surfaced", side_effect=[refused, None, None]) as post:
+            rc, out, err = self._run()
+        self.post.start()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual(post.call_count, 3)
+        self.assertIn("could not mark sa-key.acme.prod.app.sa1 shown: 404", err)
+
+    def test_a_refusal_whose_body_cannot_be_read_does_not_stop_the_report(self):
+        self._shown()
+        self.post.stop()
+        refused = urllib.error.HTTPError("u", 503, "Unavailable", {}, io.BytesIO(b""))
+        refused.read = mock.Mock(side_effect=TimeoutError("read timed out"))
+        with mock.patch.object(bootstrap_delivery, "_post_surfaced", side_effect=[refused, None, None]) as post:
+            rc, out, err = self._run()
+        self.post.start()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual(post.call_count, 3)
+        self.assertIn("could not mark sa-key.acme.prod.app.sa1 shown: 503", err)
+
+    def test_no_shown_file_marks_nothing_and_delivers(self):
+        rc, out, err = self._run()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual(self.posts, [])
+        self.assertIn("no INVENTORY.shown.json", err)
+        self.assertFalse((self.d / SHOWN_DELIVERED).exists())
+
+    def test_an_unreadable_shown_file_marks_nothing_and_delivers(self):
+        for record in ("{not json", json.dumps({"items": [{"ids": ["x"]}]}), json.dumps([1])):
+            with self.subTest(record=record):
+                (self.d / COMPLETED).unlink(missing_ok=True)
+                (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+                self.out = io.StringIO()
+                self._shown(record)
+                rc, out, err = self._run()
+                self.assertEqual((rc, out), (0, "# Report\n"))
+                self.assertEqual(self.posts, [])
+                self.assertIn("is not readable", err)
+
+    def test_a_failure_reading_the_shown_file_never_blocks_delivery(self):
+        self._shown()
+        with mock.patch.object(bootstrap_delivery, "_read_shown", side_effect=RuntimeError("boom")):
+            rc, out, err = self._run()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertIn("marking nothing: boom", err)
+        # Set aside all the same, so a later report is not marked with these ids.
+        self.assertFalse((self.d / SHOWN).exists())
+        self.assertTrue((self.d / SHOWN_DELIVERED).exists())
+
+    def test_a_report_listing_no_item_marks_nothing(self):
+        self._shown({"items": []})
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual(self.posts, [])
+        self.assertTrue((self.d / SHOWN_DELIVERED).exists())
+
+    def test_a_racing_run_marks_nothing(self):
+        self._shown()
+        self.assertTrue(bootstrap_delivery._claim_delivery(self.d))
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, ""))
+        self.assertEqual(self.posts, [])
+        self.assertTrue((self.d / SHOWN).exists())
+
+    def test_the_mark_reaches_the_queue_with_the_pods_key(self):
+        received = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                received.append((self.path, self.headers.get("Authorization"), body))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.post.stop()
+        self._shown({"items": [{"class": "critical", "ids": ["a/b"]}]})
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+        with mock.patch.dict(os.environ, {"SESSION_KV_ENDPOINT": endpoint, "SESSION_KV_API_KEY": "k"}):
+            rc, out, _ = self._run()
+        self.post.start()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        [(path, auth, body)] = received
+        self.assertEqual((path, auth), ("/v1/findings/a%2Fb/surfaced", "Bearer k"))
+        self.assertEqual((body["publisher"], body["added_class"]), ("first_report", "critical"))
+
+
+class DeliveryRegistersFindingsTest(unittest.TestCase):
+    """The sweep's findings are registered from this pod before the claim, since the worker's terminal may not reach the queue."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+        patcher = mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        self.sent = []
+
+        def post(endpoint, batch, scope):
+            # Whether the claim had been taken when the batch was sent.
+            self.sent.append(([f["object"] for f in batch], scope, (self.d / COMPLETED).exists()))
+            return {"results": []}
+
+        self.post = mock.patch.object(inventory_findings, "post_batch", side_effect=post)
+        self.post.start()
+        self.addCleanup(self.post.stop)
+        marks = mock.patch.object(bootstrap_delivery, "_post_surfaced")
+        marks.start()
+        self.addCleanup(marks.stop)
+
+    def _write(self, items=EXTRACTED, scores=SCORED):
+        if items is not None:
+            (self.d / ITEMS).write_text(json.dumps(items), encoding="utf-8")
+        if scores is not None:
+            (self.d / SCORES).write_text(json.dumps(scores), encoding="utf-8")
+
+    def _run(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = bootstrap_delivery.main(self.d)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_the_names_are_the_ones_extract_and_the_worker_write(self):
+        self.assertEqual(bootstrap_delivery.ITEMS_NAME, Path(inventory_findings.DEFAULT_ITEMS_PATH).name)
+        self.assertEqual(bootstrap_delivery.SCORES_NAME, Path(inventory_findings.DEFAULT_SCORES_PATH).name)
+
+    def test_every_cluster_is_registered_before_the_claim_with_its_scope(self):
+        self._write()
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual(
+            self.sent,
+            [
+                (["api"], None, False),
+                (["api", "web"], {"project": "acme", "cluster": "prod", "complete": True}, False),
+            ],
+        )
+
+    def test_a_hand_off_that_filed_no_ranking_card_registers_nothing(self):
+        # A no-coverage sweep writes the report itself; the items and scores are the last sweep's.
+        self._write()
+        (self.d / bootstrap_handoff.HANDOFF_MARKER).write_text(
+            f"sweep=t_sweep\ntask_id={bootstrap_handoff.NO_RANKING}\nfiled_at=1\n", encoding="utf-8"
+        )
+        rc, out, err = self._run()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual(self.sent, [])
+        self.assertIn("filed no prioritization card", err)
+
+    def test_a_hand_off_that_filed_a_ranking_card_registers_its_batch(self):
+        self._write()
+        (self.d / bootstrap_handoff.HANDOFF_MARKER).write_text(
+            "sweep=t_sweep\ntask_id=t_rank\nfiled_at=1\n", encoding="utf-8"
+        )
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual([objects for objects, _, _ in self.sent], [["api"], ["api", "web"]])
+
+    def test_a_row_the_queue_reports_suppressed_is_not_marked_shown(self):
+        # Sandboxed, `select` never learned the user dismissed it, so the report lists it.
+        self._write()
+        (self.d / SHOWN).write_text(json.dumps(SHOWN_RECORD), encoding="utf-8")
+        dismissed = "sa-key.acme.prod.app.sa1"
+        self.post.stop()
+        with mock.patch.object(
+            inventory_findings,
+            "post_batch",
+            side_effect=[{"results": [{"id": dismissed, "outcome": "suppressed"}]}, {"results": []}],
+        ), mock.patch.object(bootstrap_delivery, "_post_surfaced") as mark:
+            rc, out, err = self._run()
+        self.post.start()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual(
+            [call.args[1] for call in mark.call_args_list],
+            ["sa-key.acme.prod.app.sa2", "crashloop.acme.prod.app.api"],
+        )
+        self.assertIn(f"not marking {dismissed} shown", err)
+
+    def test_a_clean_fleet_registers_nothing_and_needs_no_scores(self):
+        self._write(items={"items": []}, scores=None)
+        rc, out, err = self._run()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual(self.sent, [])
+        self.assertNotIn("registering nothing", err)
+
+    def test_missing_or_unusable_files_register_nothing_and_deliver(self):
+        cases = (
+            (None, SCORED, "no INVENTORY.items.json"),
+            (EXTRACTED, None, "no INVENTORY.scores.json"),
+            ([1], SCORED, "registering nothing"),
+            (EXTRACTED, {"scores": {"f001": SCORE}}, "unscored: f002, f003"),
+        )
+        for items, scores, expected in cases:
+            with self.subTest(expected=expected):
+                for name in (ITEMS, SCORES, COMPLETED):
+                    (self.d / name).unlink(missing_ok=True)
+                (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+                self._write(items, scores)
+                rc, out, err = self._run()
+                self.assertEqual((rc, out), (0, "# Report\n"))
+                self.assertEqual(self.sent, [])
+                self.assertIn(expected, err)
+
+    def test_a_queue_that_does_not_answer_is_asked_once_and_the_report_still_goes_out(self):
+        self._write()
+        self.post.stop()
+        with mock.patch.object(
+            inventory_findings, "post_batch", side_effect=urllib.error.URLError("connection refused")
+        ) as post:
+            rc, out, err = self._run()
+        self.post.start()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        post.assert_called_once()
+        self.assertIn("did not answer", err)
+
+    def test_a_cluster_the_queue_refuses_does_not_stop_the_others(self):
+        self._write()
+        self.post.stop()
+        refused = urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(b""))
+        with mock.patch.object(inventory_findings, "post_batch", side_effect=[refused, {"results": []}]) as post:
+            rc, out, err = self._run()
+        self.post.start()
+        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual(post.call_count, 2)
+        self.assertIn("refused acme/dev's findings: 400", err)
+
+    def test_a_racing_run_that_loses_the_claim_only_registers_again(self):
+        self._write()
+        self.assertTrue(bootstrap_delivery._claim_delivery(self.d))
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, ""))
+
+
 class RetireRunTest(unittest.TestCase):
     """The onboarding jobs are removed by a run after the one that delivers.
 
@@ -273,6 +625,9 @@ class DeliveryFromSandboxTest(unittest.TestCase):
 
     SANDBOX_REPORT = "/opt/data/INVENTORY.md"
     SANDBOX_DELIVERED = "/opt/data/INVENTORY.delivered.md"
+    SANDBOX_SHOWN = "/opt/data/INVENTORY.shown.json"
+    SANDBOX_ITEMS = "/opt/data/INVENTORY.items.json"
+    SANDBOX_SCORES = "/opt/data/INVENTORY.scores.json"
     _REAL_READ_BYTES = staticmethod(sandbox_exec.read_bytes)
 
     def setUp(self):
@@ -280,11 +635,21 @@ class DeliveryFromSandboxTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.d = Path(self._tmp.name)
         (self.d / ALIGNED).touch()
-        self.read = self._patch("read_bytes", return_value=b"# Sandbox report\n")
+        # The report is the mock's return value; the files beside it are `self.beside`.
+        self.shown = None
+        self.beside = {}
+        self.read = self._patch("read_bytes", return_value=b"# Sandbox report\n", side_effect=self._read)
         self.run_ = self._patch(
             "run", return_value=subprocess.CompletedProcess(["mv"], 0, stdout="", stderr="")
         )
         self._patch("sandbox_enabled", return_value=True)
+
+    def _read(self, path, **_kw):
+        if path == self.SANDBOX_REPORT:
+            return mock.DEFAULT
+        if path == self.SANDBOX_SHOWN:
+            return self.shown
+        return self.beside.get(path)
 
     def _patch(self, name, **kwargs):
         patcher = mock.patch.object(sandbox_exec, name, **kwargs)
@@ -303,12 +668,15 @@ class DeliveryFromSandboxTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(out, "# Sandbox report\n")
         self.assertTrue((self.d / COMPLETED).exists())
-        self.read.assert_called_once()
-        self.assertEqual(self.read.call_args.args, (self.SANDBOX_REPORT,))
-        self.assertEqual(self.read.call_args.kwargs["max_bytes"], bootstrap_delivery.REPORT_MAX_BYTES + 1)
+        report_read, items_read, shown_read = self.read.call_args_list
+        self.assertEqual(report_read.args, (self.SANDBOX_REPORT,))
+        self.assertEqual(report_read.kwargs["max_bytes"], bootstrap_delivery.REPORT_MAX_BYTES + 1)
+        self.assertEqual(items_read.args, (self.SANDBOX_ITEMS,))
+        self.assertEqual(shown_read.args, (self.SANDBOX_SHOWN,))
         # The read runs as read_bytes' own default login; the rename as the
         # terminal's, which owns the sandbox's /opt/data.
-        self.assertNotIn("principal", self.read.call_args.kwargs)
+        self.assertNotIn("principal", report_read.kwargs)
+        # No shown file, so only the report is set aside.
         self.run_.assert_called_once()
         self.assertEqual(
             self.run_.call_args.args[0], ["/bin/mv", "-f", "--", self.SANDBOX_REPORT, self.SANDBOX_DELIVERED]
@@ -317,6 +685,49 @@ class DeliveryFromSandboxTest(unittest.TestCase):
         # The local copy is not the sandbox's to archive.
         self.assertTrue((self.d / INVENTORY).exists())
         self.assertFalse((self.d / DELIVERED).exists())
+
+    def test_the_sandbox_shown_file_is_marked_and_archived_there(self):
+        self.shown = json.dumps(SHOWN_RECORD).encode("utf-8")
+        with mock.patch.object(bootstrap_delivery, "_post_surfaced") as post:
+            rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, "# Sandbox report\n"))
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(
+            [c.args[0] for c in self.run_.call_args_list],
+            [
+                ["/bin/mv", "-f", "--", self.SANDBOX_REPORT, self.SANDBOX_DELIVERED],
+                ["/bin/mv", "-f", "--", self.SANDBOX_SHOWN, "/opt/data/INVENTORY.shown.delivered.json"],
+            ],
+        )
+        self.assertEqual(
+            {c.kwargs["principal"] for c in self.run_.call_args_list}, {sandbox_exec.TERMINAL_PRINCIPAL}
+        )
+
+    def test_the_sweeps_findings_are_read_from_the_sandbox_and_registered(self):
+        self.beside = {
+            self.SANDBOX_ITEMS: json.dumps(EXTRACTED).encode("utf-8"),
+            self.SANDBOX_SCORES: json.dumps(SCORED).encode("utf-8"),
+        }
+        with mock.patch.object(inventory_findings, "post_batch") as post:
+            rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, "# Sandbox report\n"))
+        self.assertEqual(post.call_count, 2)
+        reads = [c.args[0] for c in self.read.call_args_list]
+        self.assertEqual(reads[1:3], [self.SANDBOX_ITEMS, self.SANDBOX_SCORES])
+        self.assertEqual(
+            {c.kwargs["max_bytes"] for c in self.read.call_args_list[1:3]}, {bootstrap_delivery.BATCH_MAX_BYTES + 1}
+        )
+
+    def test_an_unreachable_sandbox_after_the_claim_still_delivers(self):
+        def read(path, **_kw):
+            if path == self.SANDBOX_SHOWN:
+                raise sandbox_exec.SandboxUnavailable("gone")
+            return b"# Sandbox report\n"
+
+        self.read.side_effect = read
+        rc, out, err = self._run()
+        self.assertEqual((rc, out), (0, "# Sandbox report\n"))
+        self.assertIn("could not read INVENTORY.shown.json", err)
 
     def test_no_human_means_no_sandbox_read(self):
         (self.d / ALIGNED).unlink()

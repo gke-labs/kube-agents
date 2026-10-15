@@ -127,7 +127,7 @@ except ImportError:  # the scripts directory is not on PYTHONPATH
 FLAG_ENV = "KAGE_SLACK_UX"
 
 #: ``slack_presenter.FLAG_ON_VALUES``, copied because the warning below fires
-#: exactly when that module cannot be imported.
+#: exactly when that module cannot be imported. Unset is on there too.
 FLAG_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 
 #: What the adapter's authorization log calls each kind of click.
@@ -259,10 +259,11 @@ def enabled() -> bool:
     global _warned_missing
     if _presenter is not None:
         return _presenter.enabled()
-    if os.environ.get(FLAG_ENV, "").strip().lower() in FLAG_ON_VALUES and not _warned_missing:
+    value = os.environ.get(FLAG_ENV)
+    if (value is None or value.strip().lower() in FLAG_ON_VALUES) and not _warned_missing:
         _warned_missing = True
         logger.warning(
-            "slack_ux_clicks: %s is set but slack_presenter is not importable; "
+            "slack_ux_clicks: %s is on but slack_presenter is not importable; "
             "treating the flag as off", FLAG_ENV,
         )
     return False

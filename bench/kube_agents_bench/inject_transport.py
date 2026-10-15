@@ -1099,6 +1099,12 @@ class Probe:
     progress: str = ""
     last_post: str = ""
     error: str = ""
+    # The conversation's A2A contextId, from the gateway's session record;
+    # ``""`` when there is no record or the door predates the field. The
+    # bridge's api executor runs the conversation's turns in the Hermes
+    # session named after it, which is where the harness finds the kanban
+    # cards a delegating turn filed (``harness._await_delegated_cards``).
+    context_id: str = ""
 
     @classmethod
     def from_body(cls, body: dict[str, Any]) -> Probe | None:
@@ -1153,6 +1159,7 @@ class Probe:
             progress=str(raw.get(PROBE_PROGRESS_KEY) or ""),
             last_post=str(last_post.get("text") or "") if isinstance(last_post, dict) else "",
             error=str(raw.get("error") or ""),
+            context_id=str(raw.get("contextId") or ""),
         )
 
     @property

@@ -371,7 +371,7 @@ preflight() {
 }
 
 # Reclaim and archive any active, blocked, or stuck tasks on the kanban board for this route
-# so concurrency slots (max_in_progress = 2) are not starved.
+# so concurrency slots (the board's max_in_progress) are not starved.
 cleanup_kanban() {
     _sync_platform_pod
     [ -n "$PLATFORM_POD" ] || return 0

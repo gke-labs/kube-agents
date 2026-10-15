@@ -337,3 +337,41 @@ func TestTasksGet_CarriesTheTerminalsMessageAndSubject(t *testing.T) {
 		t.Fatalf("a running task carries a terminal attribution: %q %+v", subject, running)
 	}
 }
+
+// TestTasksGetTerminal_TimesTheTerminalByTheServer: the stored time is the
+// server's timestamp on the terminal's message, not the envelope's own ts,
+// which the publisher wrote and can set to anything.
+func TestTasksGetTerminal_TimesTheTerminalByTheServer(t *testing.T) {
+	s := startServer(t)
+	provisionTasksStream(t, clientURL(s))
+	const taskID = "task-final-at"
+	addressee := replayAddressee(taskID)
+	ctx := testCtx(t)
+	c := replayFixture(t, clientURL(s), taskID, []TaskState{StateSubmitted, StateWorking})
+
+	if _, _, at, err := c.TasksGetTerminal(ctx, addressee, taskID); err != nil || !at.IsZero() {
+		t.Fatalf("a running task's stored terminal time = %v (%v), want zero", at, err)
+	}
+	payload, err := json.Marshal(StatusUpdate{TaskID: taskID, ContextID: "ctx-" + taskID,
+		Status: TaskStatus{State: StateCompleted}, Final: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := NewStatusUpdateEnvelope(Party{Session: addressee}, taskID, "ctx-"+taskID, "corr-rp", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.TS = time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+	before := time.Now()
+	if err := c.Publish(ctx, TaskEventsSubject(addressee, taskID), env); err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now()
+	task, subject, at, err := c.TasksGetTerminal(ctx, addressee, taskID)
+	if err != nil || !task.Final || subject != TaskEventsSubject(addressee, taskID) {
+		t.Fatalf("TasksGetTerminal: %+v %q %v", task, subject, err)
+	}
+	if at.Before(before.Add(-time.Second)) || at.After(after.Add(time.Second)) {
+		t.Fatalf("stored terminal time = %v, want the server's, between %v and %v (the envelope said %v)", at, before, after, env.TS)
+	}
+}

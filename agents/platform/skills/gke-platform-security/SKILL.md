@@ -4,13 +4,15 @@ description: >-
   Plans, configures, and hardens platform-level Google Kubernetes Engine (GKE)
   cluster security. Covers cluster add-ons (Secret Manager enablement), RBAC
   hardening (disabling insecure bindings, audit tools), Binary Authorization,
+  Secrets Encryption (--database-encryption-key), Security Posture (--security-posture),
   enabling Shielded Nodes, GKE Sandbox cluster enablement, GKE IAM roles, and
   cross-service authentication IAM patterns. Use when securing cluster control
   planes, hardening GKE RBAC, enabling Shielded Nodes, enabling GKE Sandbox runtime,
   enabling cluster-wide security add-ons, or managing GKE IAM roles. Don't use
-  for workload-level security (Workload Identity, SecretProviderClass, PSS, NetPol,
-  gVisor pod runtimeClassName; use gke-workload-security instead).
+  for Workload Identity (use gke-workload-identity) or workload-level security
+  (SecretProviderClass, PSS, NetPol, gVisor pod runtimeClassName; use gke-workload-security).
 metadata:
+  version: "1.0.1"
   category: Security
 ---
 
@@ -18,9 +20,9 @@ metadata:
 
 This reference covers platform-level security hardening and cluster
 configuration for Google Kubernetes Engine (GKE). For workload-level security
-controls (such as Workload Identity Service Account bindings,
-SecretProviderClass volume mounts, Network Policies, and Pod Security
-Standards), refer to the `gke-workload-security` skill.
+controls (such as SecretProviderClass volume mounts, Network Policies, and Pod
+Security Standards), refer to the `gke-workload-security` skill; for Workload
+Identity Service Account bindings, the `gke-workload-identity` skill.
 
 > **MCP Tools:** `gke:get_cluster`, `k8s:check_k8s_auth`,
 > `k8s:get_k8s_resource`, `k8s:apply_k8s_manifest`, `gke:update_cluster`
@@ -161,7 +163,7 @@ The five most common predefined IAM roles for GKE platform and cluster access:
     `roles/logging.logWriter`) and assign it at node pool creation time.
 -   **Workload Identity**: For binding Google Service Accounts to Kubernetes
     Service Accounts (`roles/iam.workloadIdentityUser`), refer to the
-    `gke-workload-security` skill.
+    `gke-workload-identity` skill.
 
 ## Cross-Service Authentication Patterns
 
@@ -192,8 +194,43 @@ gcloud projects add-iam-policy-binding <PROJECT_ID> \
 
 - [GKE Cluster Hardening Guide](https://cloud.google.com/kubernetes-engine/docs/how-to/hardening-your-cluster)
 - [GKE RBAC Best Practices](https://cloud.google.com/kubernetes-engine/docs/best-practices/rbac)
-- [Secret Manager Add-on for GKE](https://cloud.google.com/kubernetes-engine/docs/how-to/secret-manager)
-- [Binary Authorization on GKE](https://cloud.google.com/binary-authorization/docs/getting-started-gke)
+- [Secret Manager Add-on for GKE](https://cloud.google.com/secret-manager/docs/secret-manager-managed-csi-component)
+- [Binary Authorization on GKE](https://cloud.google.com/binary-authorization/docs/setting-up)
 - [Shielded GKE Nodes](https://cloud.google.com/kubernetes-engine/docs/how-to/shielded-gke-nodes)
-- [GKE Sandbox (gVisor)](https://cloud.google.com/kubernetes-engine/docs/concepts/sandbox)
+- [GKE Sandbox (gVisor)](https://cloud.google.com/kubernetes-engine/docs/how-to/sandbox-pods)
+```
+
+<!-- kube-agents: local addition (auto-injected by sync-upstream-skills.py) -->
+
+## Application-layer secrets encryption and Security Posture
+
+The description and the gke-basics and gke-workload-security routing notes send these two flags
+here.
+
+**Secrets encryption (`--database-encryption-key`)** envelope-encrypts Secrets in etcd with a
+Cloud KMS key. The key must be in the cluster's region (`KMS_LOCATION`; for a zonal cluster, the
+region that contains its zone, since Cloud KMS has no zonal locations), and the GKE service agent
+of the cluster's project (`CLUSTER_PROJECT_NUMBER`, not the key project's number) needs
+`roles/cloudkms.cryptoKeyEncrypterDecrypter` on it before the cluster can use it:
+
+```bash
+gcloud kms keys add-iam-policy-binding KEY_NAME \
+  --keyring KEYRING_NAME --location KMS_LOCATION --project KMS_PROJECT_ID \
+  --member serviceAccount:service-CLUSTER_PROJECT_NUMBER@container-engine-robot.iam.gserviceaccount.com \
+  --role roles/cloudkms.cryptoKeyEncrypterDecrypter
+
+gcloud container clusters update CLUSTER_NAME --location LOCATION \
+  --database-encryption-key projects/KMS_PROJECT_ID/locations/KMS_LOCATION/keyRings/KEYRING_NAME/cryptoKeys/KEY_NAME
+
+# CURRENT_STATE_ENCRYPTED once encryption completes (`state` is the requested setting, not the observed one)
+gcloud container clusters describe CLUSTER_NAME --location LOCATION \
+  --format="value(databaseEncryption.currentState)"
+```
+
+**Security Posture (`--security-posture`)** turns on configuration auditing (`standard`) and,
+with `--workload-vulnerability-scanning`, OS vulnerability scanning of running workloads:
+
+```bash
+gcloud container clusters update CLUSTER_NAME --location LOCATION \
+  --security-posture=standard --workload-vulnerability-scanning=standard
 ```
