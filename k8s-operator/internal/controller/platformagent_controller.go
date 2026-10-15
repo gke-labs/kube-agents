@@ -236,15 +236,15 @@ const (
 	// directly after a full stop.
 	hostPathDroppedRollingClause = " That template is still rolling out, so Pods from an earlier revision may still be " +
 		"running with these volumes mounted."
-	// watcherTokenDroppedEntryFormat and watcherTokenDroppedMessageFormat are
+	// watcherAudienceDroppedEntryFormat and watcherAudienceDroppedMessageFormat are
 	// the same condition's report of the other volumes the render strips:
 	// those that would hand a container the watchers' broker token (see
 	// watcherTokenSourceNames). The webhook refuses the reserved name but not a
 	// projection of the watcher audience under another name, so without this a
 	// sidecar would lose a mount its author wrote with nothing in status to say
 	// why.
-	watcherTokenDroppedEntryFormat   = "%s[%d] %q"
-	watcherTokenDroppedMessageFormat = "Volumes that would deliver the credential proxy's watcher token are left out " +
+	watcherAudienceDroppedEntryFormat   = "%s[%d] %q"
+	watcherAudienceDroppedMessageFormat = "Volumes that would deliver the credential proxy's watcher token are left out " +
 		"of the Pod template the operator renders, along with every volumeMount naming them: %s. That token belongs " +
 		"to the gateway's agent-api-auth container alone; any other container holding it would hold the broker's " +
 		"watcher role on every fleet cluster. Remove the entries from the spec to clear this condition."
@@ -4092,7 +4092,7 @@ func hostPathDroppedMessage(agent *agentv1alpha1.PlatformAgent, oldPods oldPodsP
 		parts = append(parts, fmt.Sprintf(hostPathDroppedMessageFormat, hostPathDroppedEntryList(entries), rolling))
 	}
 	if entries := watcherTokenDroppedEntries(agent); len(entries) > 0 {
-		parts = append(parts, fmt.Sprintf(watcherTokenDroppedMessageFormat, hostPathDroppedEntryList(entries)))
+		parts = append(parts, fmt.Sprintf(watcherAudienceDroppedMessageFormat, hostPathDroppedEntryList(entries)))
 	}
 	return strings.Join(parts, " ")
 }
@@ -4115,7 +4115,7 @@ func watcherTokenDroppedEntries(agent *agentv1alpha1.PlatformAgent) []string {
 	} {
 		for i, v := range list.volumes {
 			if sources[v.Name] {
-				entries = append(entries, fmt.Sprintf(watcherTokenDroppedEntryFormat, list.field, i, v.Name))
+				entries = append(entries, fmt.Sprintf(watcherAudienceDroppedEntryFormat, list.field, i, v.Name))
 			}
 		}
 	}
