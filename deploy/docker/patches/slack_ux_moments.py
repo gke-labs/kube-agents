@@ -12,10 +12,17 @@ Upstream, and why it changes
 ----------------------------
 **A pull request opened.** A worker that opens a PR says so in a progress note
 or its report, so the link sits on a plan row or inside the report, where it
-reads like any other step. With the flag on, :func:`pr_opened` also posts it
-as its own message with "Open PR" and "Files changed" buttons, once per PR per
-thread for the life of the process (a restart forgets), since a note and the
-report often both carry it. A GitLab merge request gets the same message, with
+reads like any other step. With the flag on, the PR also posts as its own
+message with "Open PR" and "Files changed" buttons, once per PR per thread for
+the life of the process (a restart forgets). It posts from the card's
+``pr_opened`` event (:func:`pr_event`): the ``pr_opened`` plugin
+(``agents/platform/plugins/pr_opened``) records one on the worker's card
+whenever the broker's ``proposal-create`` answers with a new proposal and the
+forge confirms the agent's own credential authored it, so the worker's
+wording decides nothing. :func:`pr_opened` reads a note or report
+saying a PR was opened, as the fallback for one opened any other way; the two
+share one record of what each thread was shown, so a PR posts once whichever
+path reaches it first. A GitLab merge request gets the same message, with
 "Open MR" for its first button, when it is on gitlab.com or on the host of a
 GitLab entry in the mounted ``managed_repos`` file (the GitOps repository and
 the managed ones), which is read only for a text holding a merge request url.
@@ -68,15 +75,27 @@ legacy attachment holding every block below the headline. A settle sends the
 attachment again, since ``chat.update`` would otherwise keep the old one, buttons
 and all; a question settled down to its headline alone loses the bar.
 
+Under ``spec.mode: next`` a card reaches the thread through the kanban
+notifier's chat.notify stand-in (``kanban_chat_notify``), which has no Slack
+client. The same moments go out as ``kube-agents.chat/v1`` messages
+(``agents/platform/scripts/chat_message.py``): the PR card once per thread and
+url, and the question with the ``update`` key ``question-<card>-<blocked event id>``, so a
+card that asks again, before or after a restart, posts a new question, whose choices
+reply with the option and the card, as a click does here. Its settle is the
+same key with the choices gone; reading a typed answer back from the thread
+needs a Slack client, so the question settles without the answered line.
+
 Fail-soft: a moment that cannot be posted is logged, and the caller falls back
 to what it did before.
 """
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import re
+import uuid
 from collections import OrderedDict
 from collections.abc import Iterable
 from typing import Any
@@ -89,6 +108,10 @@ try:
 except ImportError:  # the scripts directory is not on PYTHONPATH
     _moments = None
     _presenter = None
+try:
+    import chat_message as _chat
+except ImportError:  # the scripts directory is not on PYTHONPATH, or predates it
+    _chat = None
 
 try:
     import gitops_workspace as _gitops
@@ -104,6 +127,8 @@ GITLAB_REPO_TYPE = "gitlab"
 
 #: The flag, read here only to word the warning when the renderer is missing.
 FLAG_ENV = "KAGE_SLACK_UX"
+#: Hex characters of the per-process nonce in a question's fallback ``update`` key.
+KEY_NONCE_CHARS = 8
 
 #: ``slack_presenter.FLAG_ON_VALUES``, copied because the warning below fires
 #: exactly when that module cannot be imported. Unset is on there too.
@@ -179,6 +204,10 @@ _questions: OrderedDict[tuple, tuple] = OrderedDict()
 _unsettled: OrderedDict[tuple, tuple] = OrderedDict()
 #: ``(channel, ts)`` of a question whose card resumed but whose settle failed: its retry still reads the answer.
 _resumed: OrderedDict[tuple, None] = OrderedDict()
+#: What names a question's update key when its ``blocked`` event id is unknown (0): this process's
+#: nonce, then a count no question in it repeats. A known id names it otherwise.
+_KEY_NONCE = uuid.uuid4().hex[:KEY_NONCE_CHARS]
+_question_serials = itertools.count(1)
 #: ``(channel, thread, reply ts)`` of a typed reply already shown as a question's answer, never credited twice.
 _credited: OrderedDict[tuple, None] = OrderedDict()
 _warned_missing = False
@@ -240,6 +269,36 @@ async def _post(adapter: Any, sub: dict, blocks: list[dict], text: str, color: s
         return ""
 
 
+def _github_host() -> str:
+    """The install's GitHub host, github.com or its GitHub Enterprise Server host,
+    from the gitops-state ConfigMap's ``github_host`` key; github.com without it."""
+    if _gitops is None:
+        return "github.com"
+    try:
+        return _gitops.github_host()
+    except Exception:  # noqa: BLE001 — github.com, as before
+        return "github.com"
+
+
+def _chat_route(adapter: Any) -> bool:
+    """Whether ``adapter`` is the chat.notify stand-in and the chat message composer is importable."""
+    return _chat is not None and callable(getattr(adapter, "send_chat", None))
+
+
+async def _send_chat(adapter: Any, sub: dict, text: str, chat: dict, update: str = "") -> bool:
+    """Send ``chat`` in the card's thread over chat.notify; True when it went out."""
+    chat_id = str(sub.get("chat_id") or "")
+    try:
+        result = await adapter.send_chat(
+            chat_id, text, chat, update, metadata={"thread_id": str(sub.get("thread_id") or "")},
+        )
+    except Exception as exc:  # noqa: BLE001 — the caller falls back
+        logger.warning("slack_ux_moments: posting over chat.notify in %s failed: %s", chat_id, exc)
+        return False
+    if getattr(result, "success", False) is not True:
+        logger.warning("slack_ux_moments: chat.notify refused the post in %s: %s", chat_id, getattr(result, "error", None))
+        return False
+    return True
 def _managed_gitlab_hosts() -> frozenset[str]:
     """The hosts of the install's managed GitLab repositories, read from the
     mounted state file each time (kubelet keeps it current); none without it."""
@@ -253,20 +312,58 @@ def _managed_gitlab_hosts() -> frozenset[str]:
     return frozenset(ref.host for ref in refs if ref and ref.host)
 
 
+async def _announce(adapter: Any, sub: dict, url: str, repo: str, number: str, line: str) -> bool:
+    """Post the PR at ``url`` in the card's thread unless that thread already has it; True when it posted.
+
+    The one place both paths post, so a PR the event announced is never posted
+    again by the prose fallback, nor the other way round.
+    """
+    key = (str(sub.get("chat_id") or ""), str(sub.get("thread_id") or ""), url)
+    if key in _announced:
+        return False
+    if _chat_route(adapter):
+        chat = _chat.pr_message(url, repo, number, line)
+        if not await _send_chat(adapter, sub, _chat.pr_text(url, repo, number, line), chat):
+            return False
+    else:
+        blocks, fallback = _moments.pr_opened(url, repo, number, line)
+        if await _post(adapter, sub, blocks, fallback, _moments.PR_SIDE_BAR) is None:
+            return False
+    _remember(_announced, key, None)
+    return True
+
+
+async def pr_event(adapter: Any, sub: dict, payload: Any, text: str = "") -> bool:
+    """Post the PR a ``pr_opened`` event recorded, once per thread; True when it posted.
+
+    ``payload`` is the event's: the ``url``, ``number`` and ``title`` the forge
+    answered with when the work opened it. No wording is read to decide, and the
+    url must be one :func:`pr_opened` would announce. The evidence line is the
+    first line of ``text`` (the worker's words delivered after the event) naming
+    the PR, else its title.
+    """
+    if not isinstance(payload, dict):
+        return False
+    url = str(payload.get("url") or "")
+    hosts = _managed_gitlab_hosts() if _moments.MR_MARKER in url else frozenset()
+    found = _moments.proposal_ref(url, gitlab_hosts=hosts, github_host=_github_host())
+    if found is None:
+        return False
+    url, repo, number = found
+    line = _moments.evidence_line(text, url, number) or str(payload.get("title") or "").strip()
+    return await _announce(adapter, sub, url, repo, number, line)
+
+
 async def pr_opened(adapter: Any, sub: dict, text: str) -> bool:
-    """Post each PR ``text`` says was opened, once per thread; True when any posted."""
+    """Post each PR ``text`` says was opened, once per thread; True when any posted.
+
+    The fallback for a PR no ``pr_opened`` event recorded (:func:`pr_event`).
+    """
     posted = False
     # The managed list is read only for a text that can hold a merge request.
     hosts = _managed_gitlab_hosts() if _moments.MR_MARKER in str(text or "") else frozenset()
-    for url, repo, number, line in _moments.opened_prs(text, gitlab_hosts=hosts):
-        key = (str(sub.get("chat_id") or ""), str(sub.get("thread_id") or ""), url)
-        if key in _announced:
-            continue
-        blocks, fallback = _moments.pr_opened(url, repo, number, line)
-        if await _post(adapter, sub, blocks, fallback, _moments.PR_SIDE_BAR) is None:
-            continue
-        _remember(_announced, key, None)
-        posted = True
+    for url, repo, number, line in _moments.opened_prs(text, gitlab_hosts=hosts, github_host=_github_host()):
+        posted = await _announce(adapter, sub, url, repo, number, line) or posted
     return posted
 
 
@@ -279,6 +376,8 @@ async def needs_you(adapter: Any, sub: dict, payload: Any, event_id: int = 0) ->
     """
     if not isinstance(payload, dict) or payload.get("kind") != NEEDS_INPUT:
         return False
+    if _chat_route(adapter):
+        return await _needs_you_chat(adapter, sub, str(payload.get("reason") or ""), event_id)
     moment = _moments.needs_you(
         str(payload.get("reason") or ""), buttons=bool(sub.get("thread_id"))
     )
@@ -300,6 +399,32 @@ async def needs_you(adapter: Any, sub: dict, payload: Any, event_id: int = 0) ->
         _remember(_unsettled, (key, earlier[2]), earlier)
     entry = (int(event_id or 0), str(sub.get("chat_id") or ""), ts, blocks, text)
     _remember(_questions, key, entry)
+    return True
+
+
+async def _needs_you_chat(adapter: Any, sub: dict, reason: str, event_id: int) -> bool:
+    """:func:`needs_you` over chat.notify: the question as a chat message keyed by its card.
+
+    Kept in ``_questions`` with its chat message where the blocks would be and
+    its update key where the ts would be, so :func:`settle_question` and
+    :func:`wake_text` read it as they read a posted one.
+    """
+    key = _sub_key(sub)
+    chat = _chat.needs_you_message(reason, key[0], buttons=bool(sub.get("thread_id")))
+    if chat is None:
+        return False
+    if asked(sub, event_id):
+        return True
+    earlier = _questions.get(key)
+    serial = int(event_id or 0) or f"{_KEY_NONCE}{next(_question_serials)}"
+    update = _chat.QUESTION_UPDATE.format(card=key[0], serial=serial)
+    text = f"{reason.strip()}\n{QUESTION_CARD_NOTE.format(card=key[0])}" if key[0] else reason.strip()
+    if not await _send_chat(adapter, sub, text, chat, update):
+        return False
+
+    if earlier is not None:
+        _remember(_unsettled, (key, earlier[2]), earlier)
+    _remember(_questions, key, (int(event_id or 0), str(sub.get("chat_id") or ""), update, chat, text))
     return True
 
 
@@ -492,6 +617,11 @@ async def _settled(adapter: Any, sub: dict, entry: tuple, kind: str = UNBLOCKED_
     ``until`` is the ts of the card's next question, if it asked again: a reply after it answers that one.
     """
     _event_id, channel, ts, blocks, text = entry
+    if isinstance(blocks, dict):
+        # Posted over chat.notify: the same key without the choices. No typed
+        # answer is read back (there is no Slack client); the renderer owns
+        # the answered line.
+        return not ts or await _send_chat(adapter, sub, text, _chat.needs_you_settled(blocks), ts)
     if not ts or _clicked(channel, ts):
         return True
     note, credit, shown = "", None, False

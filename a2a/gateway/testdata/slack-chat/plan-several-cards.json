@@ -1,0 +1,47 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "status": "complete",
+        "task_id": "t_a",
+        "title": "seeded-a · 1.33.4 = default",
+        "type": "task_card"
+      },
+      {
+        "status": "pending",
+        "task_id": "t_b",
+        "title": "seeded-b · waiting on you",
+        "type": "task_card"
+      },
+      {
+        "details": {
+          "elements": [
+            {
+              "elements": [
+                {
+                  "elements": [
+                    {
+                      "text": "◌ reading version",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                }
+              ],
+              "style": "bullet",
+              "type": "rich_text_list"
+            }
+          ],
+          "type": "rich_text"
+        },
+        "status": "in_progress",
+        "task_id": "t_c",
+        "title": "seeded-c · reading version",
+        "type": "task_card"
+      }
+    ],
+    "attachments": []
+  }
+]

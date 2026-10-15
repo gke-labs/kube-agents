@@ -259,6 +259,16 @@ func (d *DiscordAdapter) Edit(conversation, messageID, text string) error {
 	return err
 }
 
+// PostMessage and EditMessage post text only: a chat message falls back to
+// its text (ErrTextOnly), which the gateway chunks under Discord's cap.
+func (d *DiscordAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	return postTextOnly(d.Post, conversation, m)
+}
+
+func (d *DiscordAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	return editTextOnly(d.Edit, conversation, messageID, m)
+}
+
 // Roster reads membership from the backend's membership API: thread members
 // for threads, recipients for DMs. A plain guild channel would need a
 // permission walk over the member list — live-read territory for the LCD
@@ -308,3 +318,8 @@ func (d *DiscordAdapter) OpenDirect(userID string) (string, error) {
 	}
 	return conversationID("", ch.ID), nil
 }
+
+// React and RemoveReaction draw no mark on Discord yet: a nil no-op, as the
+// Adapter contract allows a backend that does not react.
+func (d *DiscordAdapter) React(string, string, string) error          { return nil }
+func (d *DiscordAdapter) RemoveReaction(string, string, string) error { return nil }

@@ -57,7 +57,7 @@ both exit 0. Nothing mechanical flags that conflict, so revisit this entry on ev
 
 Two GitHub Actions workflows:
 
-- **[`.github/workflows/docs-build.yml`](../../.github/workflows/docs-build.yml)** — runs on every PR that touches `docs/site/**`. Builds the site to catch broken links / bad frontmatter. Doesn't publish.
+- **[`.github/workflows/docs-build.yml`](../../.github/workflows/docs-build.yml)** — starts on every PR and builds the site when `docs/site/**` or the workflow itself changed, to catch broken links / bad frontmatter. Doesn't publish.
 - **[`.github/workflows/docs-deploy.yml`](../../.github/workflows/docs-deploy.yml)** — publishes to GitHub Pages on push to `main` (and via `workflow_dispatch`). See below.
 
 ## Publish from your fork

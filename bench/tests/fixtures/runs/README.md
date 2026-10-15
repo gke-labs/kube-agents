@@ -47,10 +47,11 @@ inventory — project name, cluster names, node counts, control-plane version,
 console links. It is replaced by a short placeholder. Nothing else in any of
 the six is altered.
 
-The redaction is safe because `output` is one of the keys on the record that
-no rung reads: the ladder reads `scores`, `status`, `trajectory`, `tokens`,
-`latency`, `verification_report` and `verification_parse_errors`, and nothing
-else (`bench-gate case` quotes `output`'s first 300 characters into the build
+The redaction is safe because no rung reads `kanban_red_1`'s `output`: the
+ladder reads `scores`, `status`, `error`, `errors`, `trajectory`, `tokens`,
+`latency`, `verification_report` and `verification_parse_errors`, and reads `output` only
+for a case that declares `tool_calls_optional`, which `agent-kanban-smoke` does
+not (`bench-gate case` quotes `output`'s first 300 characters into the build
 log for a failing repetition, which the placeholder serves as well as the
 original did). The placeholder is deliberately **non-empty** and deliberately
 does **not** contain the phrase `devops-bench smoke probe`, so it stays

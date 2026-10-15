@@ -21,6 +21,8 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
 // ---- harness ----------------------------------------------------------
@@ -176,6 +178,18 @@ type fakeAdapter struct {
 	// failEdits makes the next N Edit calls fail (and go unrecorded), for
 	// pinning what the relay does when a Chat edit does not land.
 	failEdits int
+	// rendersChat makes the fake a backend that lays chat messages out:
+	// PostMessage and EditMessage with one record it in chatPosts and
+	// chatEdits (the text too, in posts and edits); without it they answer
+	// ErrTextOnly, as every backend but Slack does. refuseChat makes a
+	// rendering fake refuse every chat message, as an API refusal would.
+	rendersChat bool
+	refuseChat  bool
+	// failChatEdits fails the next N laid-out edits with an error that is
+	// no refusal, as a rate limit or an outage would.
+	failChatEdits int
+	chatPosts     []*chatmsg.Message
+	chatEdits     []*chatmsg.Message
 	// stopped is closed when Run returns, so a test can assert that a
 	// backend was actually told to stop rather than left running.
 	stopped  chan struct{}
@@ -183,6 +197,10 @@ type fakeAdapter struct {
 	// stopDelay is how long Run takes to return once told to stop, for
 	// pinning that a caller waits for it rather than exiting on its own.
 	stopDelay time.Duration
+	// reactions records React and RemoveReaction calls (reactionCalls).
+	reactions []string
+	// verified records InboundVerified calls (verifiedCalls).
+	verified []string
 }
 
 func newFakeAdapter() *fakeAdapter {
@@ -227,6 +245,52 @@ func (a *fakeAdapter) Edit(conversation, messageID, text string) error {
 	return nil
 }
 
+func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Chat == nil {
+		return a.Post(conversation, m.Text)
+	}
+	a.mu.Lock()
+	rendersChat, refuseChat := a.rendersChat, a.refuseChat
+	a.mu.Unlock()
+	if !rendersChat {
+		return "", ErrTextOnly
+	}
+	if refuseChat {
+		return "", fmt.Errorf("%w: fake", ErrLayoutRefused)
+	}
+	id, err := a.Post(conversation, m.Text)
+	a.mu.Lock()
+	a.chatPosts = append(a.chatPosts, m.Chat)
+	a.mu.Unlock()
+	return id, err
+}
+
+func (a *fakeAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	a.mu.Lock()
+	rendersChat, refuseChat := a.rendersChat, a.refuseChat
+	transient := m.Chat != nil && a.failChatEdits > 0
+	if transient {
+		a.failChatEdits--
+	}
+	a.mu.Unlock()
+	if transient {
+		return errors.New("fake transient failure")
+	}
+	if m.Chat != nil && !rendersChat {
+		return ErrTextOnly
+	}
+	if m.Chat != nil && refuseChat {
+		return fmt.Errorf("%w: fake", ErrLayoutRefused)
+	}
+	if err := a.Edit(conversation, messageID, m.Text); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.chatEdits = append(a.chatEdits, m.Chat)
+	a.mu.Unlock()
+	return nil
+}
+
 func (a *fakeAdapter) Roster(string) ([]string, bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -235,6 +299,42 @@ func (a *fakeAdapter) Roster(string) ([]string, bool, error) {
 
 func (a *fakeAdapter) OpenDirect(userID string) (string, error) {
 	return "discord:dm/du-" + userID, nil
+}
+
+// React and RemoveReaction record each call as "+token@messageID" or
+// "-token@messageID", per conversation, in call order.
+func (a *fakeAdapter) React(conversation, messageID, token string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reactions = append(a.reactions, conversation+" +"+token+"@"+messageID)
+	return nil
+}
+
+func (a *fakeAdapter) RemoveReaction(conversation, messageID, token string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reactions = append(a.reactions, conversation+" -"+token+"@"+messageID)
+	return nil
+}
+
+// InboundVerified records the gateway's word on each sender as
+// "messageID:true" or "messageID:false" (VerifiedObserver).
+func (a *fakeAdapter) InboundVerified(_, messageID string, verified bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.verified = append(a.verified, fmt.Sprintf("%s:%t", messageID, verified))
+}
+
+func (a *fakeAdapter) verifiedCalls() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.verified...)
+}
+
+func (a *fakeAdapter) reactionCalls() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.reactions...)
 }
 
 func (a *fakeAdapter) postTexts() []string {
@@ -333,16 +433,42 @@ func startRigWithLogger(t *testing.T, tweak func(*Config), logger *slog.Logger) 
 	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url}
 }
 
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
+// pollUntil retries cond for up to ten seconds and reports whether it held.
+func pollUntil(cond func() bool) bool {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if cond() {
-			return
+			return true
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %s", what)
+	return false
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	if !pollUntil(cond) {
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// waitForRecord polls the conversation's session record until cond holds and
+// returns that record. The gateway posts a command's acknowledgement inside
+// the command and writes the record only after it returns, so a test that
+// waited on the post and read the record once could read the old record on a
+// loaded runner. A timeout prints the last record and lookup error, so a
+// record that never changed and a KV that kept failing read differently.
+func waitForRecord(t *testing.T, r *rig, conv, what string, cond func(*SessionRecord) bool) *SessionRecord {
+	t.Helper()
+	var rec *SessionRecord
+	var err error
+	if !pollUntil(func() bool {
+		rec, err = r.g.reg.Get(context.Background(), conv)
+		return err == nil && rec != nil && cond(rec)
+	}) {
+		t.Fatalf("timed out waiting for %s: last record %+v, err %v", what, rec, err)
+	}
+	return rec
 }
 
 // inSubjectEnvelopes replays everything on a task's in subject.
@@ -784,12 +910,12 @@ func TestNormalizePhrases(t *testing.T) {
 		"do the thing":      false,
 	} {
 		// These phrases exercise normalization through the exact set.
-		if got := isStatusQuery(phrase, false); got != want {
-			t.Errorf("isStatusQuery(%q) = %v, want %v", phrase, got, want)
+		if got := chattext.IsStatusQuery(phrase, false); got != want {
+			t.Errorf("chattext.IsStatusQuery(%q) = %v, want %v", phrase, got, want)
 		}
 	}
-	if !isStop("Stop!") || !isStop("cancel") || isStop("stop the deploy") {
-		t.Error("isStop misclassifies")
+	if !chattext.IsStop("Stop!") || !chattext.IsStop("cancel") || chattext.IsStop("stop the deploy") {
+		t.Error("chattext.IsStop misclassifies")
 	}
 }
 
@@ -1806,11 +1932,8 @@ func TestSessionCommandMarksTheRouteAndTheNextMessageSpawns(t *testing.T) {
 	if got := len(spawn.calls()); got != 0 {
 		t.Fatalf("/session spawned %d pods; it must spawn none", got)
 	}
-	rec, err := r.g.reg.Get(context.Background(), conv)
-	if err != nil || rec == nil {
-		t.Fatalf("record: %v %v", rec, err)
-	}
-	if !rec.SessionRouted || rec.Profile != "chat" {
+	rec := waitForRecord(t, r, conv, "route on", func(rec *SessionRecord) bool { return rec.SessionRouted })
+	if rec.Profile != "chat" {
 		t.Fatalf("record not session-routed after /session: %+v", rec)
 	}
 	ctxID := rec.ContextID
@@ -1882,8 +2005,8 @@ func TestSessionOffReleasesThePodAndRehomes(t *testing.T) {
 		d := spawn.deleted()
 		return len(d) == 1 && d[0] == call.Session
 	})
-	rec, _ := r.g.reg.Get(ctx, conv)
-	if rec.SessionRouted || rec.PodName != "" || rec.BusSession != "" || rec.Addressee != "platform" {
+	rec := waitForRecord(t, r, conv, "route cleared", func(rec *SessionRecord) bool { return !rec.SessionRouted })
+	if rec.PodName != "" || rec.BusSession != "" || rec.Addressee != "platform" {
 		t.Fatalf("record after /session off: %+v", rec)
 	}
 
@@ -2048,8 +2171,8 @@ func TestSessionCommandWhileAPlatformTaskRunsSaysSo(t *testing.T) {
 			t.Fatalf("promised the next message opens a pod while a task runs: %q", p)
 		}
 	}
-	rec, _ := r.g.reg.Get(ctx, conv)
-	if !rec.SessionRouted || rec.ActiveTask == nil || rec.ActiveTask.Detached {
+	rec := waitForRecord(t, r, conv, "route on", func(rec *SessionRecord) bool { return rec.SessionRouted })
+	if rec.ActiveTask == nil || rec.ActiveTask.Detached {
 		t.Fatalf("record after /session during a task: %+v", rec)
 	}
 	if len(spawn.calls()) != 0 {
@@ -2077,8 +2200,8 @@ func TestSessionCommandWithTextWhileATaskRunsHoldsTheText(t *testing.T) {
 		}
 		t.Fatalf("the held text reached the platform task as %s", e.Kind)
 	}
-	rec, _ := r.g.reg.Get(ctx, conv)
-	if !rec.SessionRouted || len(spawn.calls()) != 0 {
+	rec := waitForRecord(t, r, conv, "route on", func(rec *SessionRecord) bool { return rec.SessionRouted })
+	if len(spawn.calls()) != 0 {
 		t.Fatalf("record %+v, spawns %d", rec, len(spawn.calls()))
 	}
 }
@@ -2124,19 +2247,12 @@ func TestSessionInfoRepliesStillCountAsActivity(t *testing.T) {
 	waitFor(t, "ack", postedContaining(r, "session route on"))
 	// The ack is persisted; take its clock, then let only an informational
 	// reply move it.
-	rec, _ := r.g.reg.Get(context.Background(), conv)
-	if rec == nil || !rec.SessionRouted {
-		t.Fatalf("record after the ack: %+v", rec)
-	}
+	rec := waitForRecord(t, r, conv, "route on", func(rec *SessionRecord) bool { return rec.SessionRouted })
 	first := rec.LastActivity
 	time.Sleep(30 * time.Millisecond)
 	sessionRigTurn(r, conv, "s-232", "/session")
 	waitFor(t, "already", postedContaining(r, "already on the session route"))
-	time.Sleep(50 * time.Millisecond)
-	rec, _ = r.g.reg.Get(context.Background(), conv)
-	if !rec.LastActivity.After(first) {
-		t.Fatalf("informational reply did not move LastActivity: %s then %s", first, rec.LastActivity)
-	}
+	waitForRecord(t, r, conv, "informational reply to move LastActivity", func(rec *SessionRecord) bool { return rec.LastActivity.After(first) })
 }
 
 // TestSessionStatusIsAFirstTurn: the spec's sentence - "/session status" is
@@ -2170,8 +2286,8 @@ func TestSessionOffWorksWithoutASpawner(t *testing.T) {
 	}
 	sessionRigTurn(r, conv, "s-250", "/session off")
 	waitFor(t, "off ack", postedContaining(r, "session route off"))
-	got, _ := r.g.reg.Get(context.Background(), conv)
-	if got.SessionRouted || got.Addressee != "platform" || got.BusSession != "" {
+	got := waitForRecord(t, r, conv, "route cleared", func(rec *SessionRecord) bool { return !rec.SessionRouted })
+	if got.Addressee != "platform" || got.BusSession != "" {
 		t.Fatalf("record after /session off with no spawner: %+v", got)
 	}
 	sessionRigTurn(r, conv, "s-251", "how is the fleet?")
@@ -2241,8 +2357,8 @@ func TestSessionOffDuringAPlatformTaskRehomesWithoutStopping(t *testing.T) {
 	waitFor(t, "ack", postedContaining(r, "after it opens a session pod"))
 	sessionRigTurn(r, conv, "s-272", "/session off")
 	waitFor(t, "off ack", postedContaining(r, "session route off"))
-	rec, _ := r.g.reg.Get(ctx, conv)
-	if rec.SessionRouted || rec.Addressee != "platform" || rec.ActiveTask == nil || rec.ActiveTask.Detached {
+	rec := waitForRecord(t, r, conv, "route cleared", func(rec *SessionRecord) bool { return !rec.SessionRouted })
+	if rec.Addressee != "platform" || rec.ActiveTask == nil || rec.ActiveTask.Detached {
 		t.Fatalf("record after /session off during a platform task: %+v", rec)
 	}
 	for _, e := range inSubjectEnvelopes(t, r.url, "platform") {

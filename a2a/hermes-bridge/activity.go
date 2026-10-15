@@ -462,6 +462,11 @@ type activityState struct {
 	sessionID string
 	inTurn    atomic.Bool
 
+	// cardsFiled says a kanban_create call of this task's ended without an
+	// error: the turn handed work to cards, so its terminal keeps the ask
+	// marked (cardsMark in bridge.go).
+	cardsFiled atomic.Bool
+
 	// traced says a delivery can reach this task at all: the door is open
 	// and the task has a key, or, on the API executor, the shared secret
 	// to check a session's delivery against.
@@ -631,6 +636,9 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		}
 		a.calls++
 		status := activityStatus(d)
+		if d.ToolName == kanbanCreateTool && status != ActivityStatusError {
+			a.cardsFiled.Store(true)
+		}
 		e := ActivityEntry{
 			Tool:       capRunes(d.ToolName, activityToolNameCap),
 			Input:      redactInput(d.ToolName, d.ToolInput),
@@ -1389,10 +1397,11 @@ func (b *Bridge) publishActivityEntry(run *taskRun, e ActivityEntry) bool {
 	return b.publishArtifactPart(run, lib.ArtifactActivity, lib.Part{Kind: "data", Data: data})
 }
 
-// publishProgress publishes one text part onto the progress artifact.
-// Caller holds run.mu.
+// publishProgress publishes one text part onto the progress artifact, with a
+// chat message beside it that marks the kind of the task's ask (chat.go), so
+// the ask's reaction stands while the turn runs. Caller holds run.mu.
 func (b *Bridge) publishProgress(run *taskRun, text string) {
-	b.publishArtifactPart(run, lib.ArtifactProgress, lib.Part{Kind: "text", Text: text})
+	b.publishArtifactParts(run, lib.ArtifactProgress, progressParts(text, run.askKind())...)
 }
 
 // publishArtifactPart is the worker adapter's publishArtifactChunk: one part
@@ -1401,6 +1410,12 @@ func (b *Bridge) publishProgress(run *taskRun, text string) {
 // the part went out. The result artifact keeps its own publisher because it
 // is chunked and load-bearing.
 func (b *Bridge) publishArtifactPart(run *taskRun, name string, part lib.Part) bool {
+	return b.publishArtifactParts(run, name, part)
+}
+
+// publishArtifactParts is publishArtifactPart for one chunk of several parts:
+// a heartbeat's text and the chat message beside it.
+func (b *Bridge) publishArtifactParts(run *taskRun, name string, parts ...lib.Part) bool {
 	a := run.act.Load()
 	payload, err := json.Marshal(lib.ArtifactUpdate{
 		TaskID:    run.origin.TaskID,
@@ -1408,7 +1423,7 @@ func (b *Bridge) publishArtifactPart(run *taskRun, name string, part lib.Part) b
 		Artifact: lib.Artifact{
 			ArtifactID: "artifact-" + run.origin.TaskID + "-" + name,
 			Name:       name,
-			Parts:      []lib.Part{part},
+			Parts:      parts,
 		},
 		Append: a.appended[name],
 	})

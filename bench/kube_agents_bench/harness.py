@@ -60,6 +60,9 @@ Environment:
         that ran to the delegation ceiling leaves its worker transcript under
         ``<ARTIFACTS>/worker-logs/``; unset, the stderr goes to a temp directory
         and no transcript is kept.
+    KUBE_AGENTS_TIMING_FILE: When set, the opening turn's wall-clock seconds
+        are written there as ``{"turn1_s": ...}`` (best effort; the
+        presubmit sets it per repetition). Unset, nothing is written.
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
 
     AGENT_TRANSPORT: ``api`` (default; everything above) or ``inject``, which
@@ -293,6 +296,11 @@ _MAX_WORKER_LOG_BYTES = 512_000
 # Where a stalled card's transcript is kept. Prow sets ARTIFACTS to the
 # directory it uploads; a local run leaves it unset and nothing is written.
 _ARTIFACTS_ENV = "ARTIFACTS"
+# Where the opening turn's wall clock goes, for the eval dashboard.
+# hack/ci-eval-pr.sh sets it per repetition; unset, nothing is written.
+_TIMING_FILE_ENV = "KUBE_AGENTS_TIMING_FILE"
+_TIMING_TURN1_KEY = "turn1_s"
+_TIMING_DECIMALS = 3
 _WORKER_LOG_SUBDIR = "worker-logs"
 _PF_LOG_SUBDIR = "port-forward"
 # Written at the top of each spawn's stderr in the (appended) port log.
@@ -1298,6 +1306,32 @@ def _connection_dropped(exc: BaseException) -> bool:
     return isinstance(exc, ConnectionError | http.client.IncompleteRead)
 
 
+def _write_turn_timing(turn1_s: float) -> None:
+    """Write the opening turn's seconds to ``KUBE_AGENTS_TIMING_FILE``.
+
+    Best effort, like the worker logs: a file that will not write is logged
+    and never changes the run. The temp file and ``os.replace`` make sure a
+    reader never sees half a file.
+    """
+    path = os.environ.get(_TIMING_FILE_ENV)
+    if not path:
+        return
+    target = Path(path)
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({_TIMING_TURN1_KEY: round(turn1_s, _TIMING_DECIMALS)}, handle)
+        os.replace(tmp, target)
+    except OSError as exc:
+        _log.warning("could not write the turn timing to %s: %s", target, exc)
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def _post_turn(
     url: str, body: dict[str, Any], headers: dict[str, str], timeout: float
 ) -> tuple[AgentResult, str]:
@@ -1614,7 +1648,11 @@ class KubeAgentsHarness(AgentHarness):
         opening_5xx_retries = 0
         while True:
             try:
+                # Only the attempt that succeeds is timed: failed attempts,
+                # their backoff and the tunnel respawns are not the turn.
+                turn_started = time.monotonic()
                 result, session_id = _post_turn(url, body, headers, timeout)
+                turn1_s = time.monotonic() - turn_started
                 break
             except _TransportError as exc:
                 # If the server response carried X-Hermes-Failure-Reason, an
@@ -1677,6 +1715,8 @@ class KubeAgentsHarness(AgentHarness):
                     # Counted, not returned: a forward that will not come back
                     # is the same outage, and the loop's own ceiling ends it.
                     _log.warning("port-forward respawn failed before retry: %s", pf_exc)
+        if opening_turn:
+            _write_turn_timing(turn1_s)
 
         if delegation_timeout > 0:
 

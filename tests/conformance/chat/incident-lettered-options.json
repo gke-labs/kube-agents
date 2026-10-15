@@ -1,0 +1,42 @@
+{
+  "name": "incident-lettered-options",
+  "source": "deploy/docker/patches/test_slack_ux_incident.py::REPORT",
+  "notes": "G2: today the recommended button reads '<title> (recommended)' and posts 'apply Option B: <title>', which does not contain that label. '(recommended)' becomes primary, and every reply is reordered to lead with its label, '<title> — apply Option B'. The containment rule alone would accept today's order once the suffix is primary; the reorder is the decision recorded for G2, and a port of slack_ux_clicks' apply matchers must read it. G4: editing the alert in place needs the event watcher's post to carry an update key; until then this posts as its own message.",
+  "input": {
+    "report": "## What's wrong\n\npayments-api in seeded-debug keeps crashing: secret payments-db-creds has been missing since 14:02. Nothing else changed.\n\n## Why\n\n- The container exits reading `payments-db-creds`, which **no longer exists**.\n\n## What to do\n\n- **Option A (Roll back to 14:02):** Revert the Deployment to revision 7.\n- **Option B (Restore the secret):** Recreate payments-db-creds from the GitOps repo.\n- ✅ **Recommended: Option B** — it fixes the cause rather than hiding it.\n- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, or name one directly with **'apply Option A'** / **'apply Option B'**.\n\n🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview) | [Cloud Logs](https://console.cloud.google.com/logs/query;query=x)\n"
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "payments-api in seeded-debug keeps crashing: secret payments-db-creds has been missing since 14:02.",
+        "fold": {
+          "title": "why · what each option does",
+          "text": "## What's wrong\n\npayments-api in seeded-debug keeps crashing: secret payments-db-creds has been missing since 14:02. Nothing else changed.\n\n## Why\n\n- The container exits reading `payments-db-creds`, which **no longer exists**.\n\n## What to do\n\n- **Option A (Roll back to 14:02):** Revert the Deployment to revision 7.\n- **Option B (Restore the secret):** Recreate payments-db-creds from the GitOps repo.\n- ✅ **Recommended: Option B** — it fixes the cause rather than hiding it.\n- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, or name one directly with **'apply Option A'** / **'apply Option B'**.\n\n🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview) | [Cloud Logs](https://console.cloud.google.com/logs/query;query=x)"
+        },
+        "choices": [
+          {
+            "text": "Roll back to 14:02",
+            "reply": "Roll back to 14:02 — apply Option A"
+          },
+          {
+            "text": "Restore the secret",
+            "reply": "Restore the secret — apply Option B",
+            "primary": true
+          }
+        ],
+        "links": [
+          {
+            "text": "GKE Workloads ↗",
+            "url": "https://console.cloud.google.com/kubernetes/workload/overview"
+          },
+          {
+            "text": "Cloud Logs ↗",
+            "url": "https://console.cloud.google.com/logs/query;query=x"
+          }
+        ]
+      }
+    }
+  ]
+}
