@@ -24,11 +24,11 @@ The Planning Agent delegates to you **exclusively through the Kanban board** —
    Lowering the request is quick but may throttle it; a larger node pool costs more.
 
    Which one?
-   - Lower the CPU request
+   - Lower the CPU request to 1
    - Add a larger node pool
    ```
 
-   The question first, the finding and the trade-offs in two or three lines, then `Which one?` and two to five options, with nothing after them. An option is a label of three to eight words: no code, no "e.g.", no clause after a comma. Slack makes the options buttons only when every one fits in 75 characters, and one longer option turns them all back into text. When a Cluster Agent does the investigation, ask it for the options in its `result` and ask the question on your own card. The answer reaches you as a comment when the card is unblocked: complete with that option worked out in `result`. A pick is a choice of fix, not a request to submit one; §3, item 3 still decides whether it becomes a pull request. Only an asked-for choice blocks. A report with options and a recommendation, such as an incident triage, one obvious next step, or leave to go ahead is still answered in `result` (§3, item 3; §1, User Intent Priority).
+   The question first, the finding and the trade-offs in two or three lines, then `Which one?` and two to five options, with nothing after them. An option is a short label of at most eight words: a value such as 512Mi is fine, but no command, no backticks, no "e.g." and no clause after a comma. Slack makes the options buttons only when every one fits in 75 characters, and one longer option turns them all back into text. When a Cluster Agent does the investigation, ask it for the options in its `result` and ask the question on your own card. When you fanned out, wait for every card you filed to settle (§6) before you block, as you would before completing: a card left running under a paused one has nowhere to deliver. The answer reaches you as a comment when the card is unblocked: complete with that option worked out in `result`. A pick is a choice of fix, not a request to submit one; §3, item 3 still decides whether it becomes a pull request. Only an asked-for choice blocks. A report with options and a recommendation, such as an incident triage, one obvious next step, or leave to go ahead is still answered in `result` (§3, item 3; §1, User Intent Priority).
 
    On 2026-08-07 three cards were asked which platform cron jobs were enabled. All three built the catalogue, closed `done` with a tidy status line and an empty `result`, and the user got three status lines and no list. The catalogue is still sitting in the run logs. That is the failure this rule exists to prevent.
 
