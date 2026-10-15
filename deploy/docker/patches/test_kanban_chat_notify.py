@@ -684,6 +684,23 @@ class FoldFanoutTest(unittest.TestCase):
         self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
         self.assertEqual(self.cursor(), 6, "a hold under the read-only claim writes nothing")
 
+    def test_an_answer_that_folds_into_its_plan_row_delivers_while_the_parent_works(self):
+        # kanban_progress_lines settles the row and posts nothing; a hold would leave the row
+        # running after the parent's answer, since the drop that follows never reaches the plan.
+        claim = self.claim(_Ev(7, "completed", 1900))
+        with mock.patch.object(kanban_chat_notify, "_folds_into_row", return_value=True):
+            self.assertIs(self.fold(claim), claim)
+        self.assertEqual(self.cursor(), 6, "delivered as claimed: the fold writes nothing")
+
+    def test_an_answer_that_folds_into_its_row_is_still_dropped_after_the_parents_posted(self):
+        self.parent("done", completed_event=9, delivered=9)
+        with mock.patch.object(kanban_chat_notify, "_folds_into_row", return_value=True):
+            self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
+
+    def test_no_plan_fold_without_the_slack_flag(self):
+        # This class's thread is Google Chat, which has no plan: the hold stands.
+        self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, dict(self.THREAD, task_id="t_child")))
+
     def test_a_hold_under_the_committed_claim_rewinds(self):
         self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900), committed=True)))
         self.assertEqual(self.cursor(), 6, "a hold under the committed claim rewinds to just before the answer")
