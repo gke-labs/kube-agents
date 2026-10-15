@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import subprocess
 import unittest
 from unittest import mock
@@ -1066,7 +1067,10 @@ class ModesAndArgsTest(unittest.TestCase):
         self.assertIn(f'return agent.Name + "{launch.CREDENTIAL_PROXY_SUFFIX}"', cp)
         a2a = (REPO / "k8s-operator/internal/controller/platformagent_a2a_manifests.go").read_text()
         self.assertIn(f'return agent.Name + "{launch.GATEWAY_SUFFIX}"', a2a)
-        self.assertIn(f'Name:  "{launch.GATEWAY_CONTAINER}",', a2a)
+        # The container name is a constant since the usage poller reads the
+        # gateway by it; pin the constant's value, and that the pod uses it.
+        self.assertRegex(a2a, rf'(?m)^\s*a2aGatewayContainerName\s*=\s*"{re.escape(launch.GATEWAY_CONTAINER)}"$')
+        self.assertIn("Name:  a2aGatewayContainerName,", a2a)
         sandbox = (REPO / "k8s-operator/internal/controller/shell_sandbox_manifests.go").read_text()
         self.assertIn(f'return agent.Name + "{launch.SHELL_SANDBOX_SUFFIX}"', sandbox)
         proxy = (REPO / "agents/platform/scripts/credential_proxy.py").read_text()

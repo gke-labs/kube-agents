@@ -73,12 +73,23 @@ type SessionRecord struct {
 	Addressee    string    `json:"addressee"`
 	Kind         string    `json:"kind"`
 	LastActivity time.Time `json:"lastActivity"`
+	// LastUserMessage is when someone in the conversation last wrote to it:
+	// every verified turn, and nothing an executor or the gateway does. It
+	// is the idle clock the reap and the cap eviction read (idleSince),
+	// which the design of record counts from the last user message; zero on
+	// records written before the field existed.
+	LastUserMessage time.Time `json:"lastUserMessage,omitzero"`
+	// PodReuse marks PodName as a pod spawned to serve every turn of the
+	// conversation (Config.SessionReuse at spawn). Only such a pod is
+	// handed a later task, and only such a pod's running task is held to
+	// the reap scan's overdue bound; a one-task pod has its own deadline.
+	PodReuse bool `json:"podReuse,omitempty"`
 	// LastTaskActivity is when a task last started or, from an executor's
 	// terminal, ended in this session. It is what the Slack adapter's
 	// session-thread rule bounds on (Gateway.hasSession), separately from
 	// LastActivity, which every verified turn moves: a "@bot stop" with
-	// nothing running is activity for the reap but must not re-admit a
-	// thread whose last task ended hours ago. Zero on records written before
+	// nothing running is activity (and, for the reap, a user message) but
+	// must not re-admit a thread whose last task ended hours ago. Zero on records written before
 	// the field existed, which reads as "no task activity": such a thread
 	// needs a fresh mention after the upgrade, once.
 	LastTaskActivity time.Time   `json:"lastTaskActivity,omitempty"`
@@ -111,6 +122,15 @@ type SessionRecord struct {
 	SessionAuthorsFor     string          `json:"sessionAuthorsFor,omitempty"`
 	SessionAuthorsUnknown bool            `json:"sessionAuthorsUnknown,omitempty"`
 	SessionAuthorsSince   time.Time       `json:"sessionAuthorsSince,omitzero"`
+}
+
+// idleSince is when the conversation went quiet: its last user message, or,
+// on a record from before that was kept, its last activity.
+func (rec *SessionRecord) idleSince() time.Time {
+	if !rec.LastUserMessage.IsZero() {
+		return rec.LastUserMessage
+	}
+	return rec.LastActivity
 }
 
 // sessionAuthorCap bounds SessionRecord.SessionAuthors. It holds a turn's

@@ -531,11 +531,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			}
 			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote), rs)
 		}
+		unmarkOnSupervisorTerminal(rec, taskID, source)
 		rec.ActiveTask = nil
-		// An executor's end of a live task is activity. The idle TTL that
-		// bounds the session (the reap, and the Slack adapter's session-
-		// thread rule through hasSession) counts from here, not from the ask
-		// that started the task: a long task's thread must not go quiet the
+		// An executor's end of a live task is activity. The Slack adapter's
+		// session-thread rule (hasSession, through LastTaskActivity) counts
+		// from here, not from the ask that started the task; the reap does
+		// not, it counts from the last user message (idleSince): a long task's thread must not go quiet the
 		// instant its answer posts, and the user's follow-up right after the
 		// result is the most ordinary message a session carries. The
 		// executor's confirmation of a stop is an answer too: a detached

@@ -83,6 +83,12 @@ const (
 	// chatInboundSeries is the chat_metrics plugin's counter of messages the
 	// gateway accepted, by platform; summed over every platform.
 	chatInboundSeries = "kubeagents_chat_messages_inbound_total"
+	// a2aMessagesInboundSeries is the A2A gateway's counter of the chat
+	// messages it accepted as turns, by platform: the same counter on a
+	// next-mode install, where Chat ingress is the A2A gateway's rather than
+	// the Hermes gateway's (a2a/gateway/metrics.go). A body carries one of the
+	// two families; both fold into chatMessagesInboundTotal.
+	a2aMessagesInboundSeries = "kubeagents_a2a_gateway_messages_inbound_total"
 	// clusterUpSeries is the watcher's per-cluster gauge, one series per
 	// cluster it built a client for, 1 once that cluster's informer has
 	// synced and is delivering events. Read from the same body as the
@@ -150,6 +156,17 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 	default:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}
+}
+
+// usageSiblingFamiliesFor is the other families a counter is read from, on
+// pods whose body carries one of them in place of the family usageSeriesFor
+// names: the chat counter comes from the chat_metrics plugin on a gateway pod
+// and from the A2A gateway on its own pod, under the same label set.
+func usageSiblingFamiliesFor(counter string) []string {
+	if counter == usageCounterChatMessagesInbound {
+		return []string{a2aMessagesInboundSeries}
+	}
+	return nil
 }
 
 // usageReading is what one scrape yields: each wanted counter summed over its
@@ -308,6 +325,10 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 		filters[counter] = filter
 		sums[counter] = 0
 		wanted = append(wanted, family)
+		for _, sibling := range usageSiblingFamiliesFor(counter) {
+			counterOf[sibling] = counter
+			wanted = append(wanted, sibling)
+		}
 		if family == eventsInjectedSeries {
 			clusters = &usageClusterGauges{}
 			wanted = append(wanted, clusterUpSeries)

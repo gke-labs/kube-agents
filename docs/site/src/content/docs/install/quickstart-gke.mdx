@@ -198,15 +198,15 @@ Only run the real install after I say yes.
    kubectl get pods -n kubeagents-system -l app.kubernetes.io/part-of=a2a-next
    ```
 
-   | Pod                                     | How many                      | Expected state                                                                           |
-   | --------------------------------------- | ----------------------------- | ---------------------------------------------------------------------------------------- |
-   | `platform-agent-a2a-nats-0`             | 1                             | `Running`                                                                                |
-   | `platform-agent-a2a-callout-…`          | 2                             | `Running`                                                                                |
-   | `platform-agent-a2a-verifier-…`         | 2                             | `Running`                                                                                |
-   | `platform-agent-a2a-console-…`          | 1                             | `Running`                                                                                |
-   | `platform-agent-a2a-gateway-…`          | 1, with a chat backend only   | `Running`                                                                                |
-   | `platform-agent-a2a-provision-<hash>-…` | 1 per run, more if it retries | `Completed`; a failed attempt stays `Error`; all removed 24 hours after the Job finishes |
-   | `<profile>-<animal>-<hex>`              | 1 per session                 | `Running` while the session's task runs                                                  |
+   | Pod                                     | How many                      | Expected state                                                                                                                                                         |
+   | --------------------------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+   | `platform-agent-a2a-nats-0`             | 1                             | `Running`                                                                                                                                                              |
+   | `platform-agent-a2a-callout-…`          | 2                             | `Running`                                                                                                                                                              |
+   | `platform-agent-a2a-verifier-…`         | 2                             | `Running`                                                                                                                                                              |
+   | `platform-agent-a2a-console-…`          | 1                             | `Running`                                                                                                                                                              |
+   | `platform-agent-a2a-gateway-…`          | 1, with a chat backend only   | `Running`                                                                                                                                                              |
+   | `platform-agent-a2a-provision-<hash>-…` | 1 per run, more if it retries | `Completed`; a failed attempt stays `Error`; all removed 24 hours after the Job finishes                                                                               |
+   | `<profile>-<animal>-<hex>`              | 1 per session                 | For a `/session` conversation, `Running` until 30 minutes after its last message, and for 4 hours at most; for a `delegate` message, `Running` while its one task runs |
 
    The A2A gateway creates a session pod only for a conversation switched to `/session` or a message that starts with `delegate`; other tasks run in the agent pod. It runs up to `spec.harness.tuning.maxSessions` (10 by default) at once, and a fresh install has none.
 
