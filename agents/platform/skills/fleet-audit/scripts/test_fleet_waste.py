@@ -6120,6 +6120,8 @@ class GetTargetProjectsTest(unittest.TestCase):
         self.assertIn("excluded by spec.scope.exclude.clusters", unevaluated["orphan-lb"])
         self.assertIn("excluded by spec.scope.exclude.clusters", unevaluated["idle-address"])
         self.assertIn("lane-b in this project are excluded", project["limitations"])
+        self.assertIn("the clusters the install excludes were not read", project["limitations"])
+        self.assertNotIn("the reason each one failed", project["limitations"])
     def test_project_list_failure_falls_back_to_the_base_project(self):
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:

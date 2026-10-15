@@ -1468,6 +1468,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], str | N
         return [], f"clusters list returned non-JSON: {exc}"
     if not isinstance(clusters, list):
         return [], "clusters list returned JSON that is not a list"
+    clusters = declared_scope.drop_excluded(project, clusters)
     for cluster in clusters:
         cluster["project"] = project
         cluster["location"] = cluster.get("location") or cluster.get("zone") or ""
@@ -5531,7 +5532,7 @@ def validate_args(args: argparse.Namespace, now: datetime | None = None) -> None
     # The scope the run was handed, read before anything else: a `--project`
     # override outside a declared scope, a declared scope with nothing
     # readable, or the sandbox's scope guard with no flags is refused here.
-    declared_scope.set(getattr(args, "scope_projects", None), getattr(args, "scope_unread", None))
+    declared_scope.set(getattr(args, "scope_projects", None), getattr(args, "scope_unread", None), getattr(args, "scope_exclude_clusters", None))
     project = project_override(args)
     if not (getattr(args, "probe_lock", False) or getattr(args, "reset_ledger", False)):
         if project is not None and not project:
@@ -6421,7 +6422,7 @@ def reset_ledger(store: Path, now: datetime, ledger_path: Path | None = None, gu
 def main(argv: list[str] | None = None) -> int:
     run_started = time.monotonic()  # the deadline counts the lock wait too
     args = build_parser().parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     try:
         validate_args(args)
     except argparse.ArgumentTypeError as exc:

@@ -6080,14 +6080,24 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         # would turn every load balancer it serves into a false positive. The
         # unreadable clusters are their own manifest entries, carrying the
         # stderr that explains each one.
-        entry["limitations"] = (
-            "orphan-lb was not evaluated for this project: §3.6 compares "
-            "forwarding rules against the Service names of every cluster in "
-            "the project, and at least one of them could not be read, so a "
-            "rule that cluster's Services reference would read as orphaned. "
-            "See this project's cluster "
-            "entries in this manifest for the reason each one failed."
-        )
+        if excluded and set(unread_clusters) <= set(excluded):
+            # Every cluster left unread is one the install excludes: there is no
+            # failed entry to point at, and EXCLUDED_CLUSTERS_NOTE below names them.
+            entry["limitations"] = (
+                "orphan-lb was not evaluated for this project: §3.6 compares "
+                "forwarding rules against the Service names of every cluster in "
+                "the project, and the clusters the install excludes were not "
+                "read, so a rule their Services reference would read as orphaned."
+            )
+        else:
+            entry["limitations"] = (
+                "orphan-lb was not evaluated for this project: §3.6 compares "
+                "forwarding rules against the Service names of every cluster in "
+                "the project, and at least one of them could not be read, so a "
+                "rule that cluster's Services reference would read as orphaned. "
+                "See this project's cluster "
+                "entries in this manifest for the reason each one failed."
+            )
     if not disks_judged and compute_ok:
         disk_gap = (
             "unattached-disk was not evaluated for this project: none of its clusters "

@@ -389,6 +389,9 @@ NARROWED_RUN_NOTE = "Narrowed by --cluster: the rollout record was neither read 
 # A `--cluster` spec that matched nothing is an error with exit 1, like a project that
 # could not be listed: an empty table with exit 0 would read as "nothing to grade".
 UNMATCHED_CLUSTER_SPEC = "no cluster matched --cluster {spec!r} in {projects}"
+# A `--cluster` spec naming a cluster the install excludes (--scope-exclude-clusters,
+# #3081): it exists and was left out on purpose, which is not "no match".
+EXCLUDED_CLUSTER_SPEC = "--cluster {spec!r} names {clusters}, which spec.scope.exclude.clusters excludes; it was not checked"
 # When a project's listing failed, the run cannot say the spec matched nothing
 # there: the line names the projects it did list and the ones it could not,
 # rather than sending the operator after a typo or a deleted cluster.
@@ -1104,9 +1107,16 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
             members.append(member)
     errors.extend(cache.errors)
     listed = [p for p in projects if p not in unlisted]
+    excluded_by_spec: dict[tuple[str, str], list[str]] = {}
+    for project in projects:
+        for name, location in declared_scope.dropped.get(project, []):
+            for hit in _wanted({"name": name, "location": location}, wanted or set()):
+                excluded_by_spec.setdefault(hit, []).append(f"{project}/{location}/{name}")
     for location, name in sorted((wanted or set()) - matched):
         spec = f"{location}/{name}" if location else name
-        if not unlisted:
+        if (location, name) in excluded_by_spec:
+            message = EXCLUDED_CLUSTER_SPEC.format(spec=spec, clusters=", ".join(excluded_by_spec[(location, name)]))
+        elif not unlisted:
             message = UNMATCHED_CLUSTER_SPEC.format(spec=spec, projects=", ".join(projects))
         elif listed:
             message = UNMATCHED_CLUSTER_SPEC_PARTIAL.format(spec=spec, listed=", ".join(listed), unlisted=", ".join(unlisted))

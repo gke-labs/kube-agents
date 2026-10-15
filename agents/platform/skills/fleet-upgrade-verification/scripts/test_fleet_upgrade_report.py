@@ -120,6 +120,18 @@ class ExplicitTargetTest(unittest.TestCase):
                                 cluster("lane-b", "us-central1", "1.30.5-gke.100", pools)])
         self.assertEqual([m["cluster"] for m in result["members"]], ["ka-today"])
 
+    def test_a_cluster_spec_naming_an_excluded_cluster_says_excluded_not_unmatched(self):
+        report.declared_scope.set("p1", None, "p1/us-central1/lane-b")
+        self.addCleanup(report.declared_scope.set, None, None)
+        pools = [("default-pool", "1.30.5-gke.100")]
+        fake = FakeGcloud({"p1": [cluster("ka-today", "us-central1", "1.30.5-gke.100", pools),
+                                  cluster("lane-b", "us-central1", "1.30.5-gke.100", pools)]}, {})
+        with patch.object(report, "run_cmd", fake), patch("sys.stderr"):
+            result = report.build_report(["p1"], self.TARGET, clusters=["lane-b"])
+        self.assertEqual(result["members"], [])
+        self.assertEqual([e["message"] for e in result["errors"]],
+                         [report.EXCLUDED_CLUSTER_SPEC.format(spec="lane-b", clusters="p1/us-central1/lane-b")])
+
     def test_without_the_exclusion_flag_every_cluster_is_a_member(self):
         # The readiness watch passes --project flags and no exclusion: its
         # report covers excluded clusters, the documented exception (#3026).

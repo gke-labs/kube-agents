@@ -181,7 +181,8 @@ Rules:
   by hand, and the Platform Agent's fan-out gives it no card. The one exception is the
   daily upgrade-readiness watch (#3026): it runs the report with `--project` flags and no
   exclusion, so its report covers excluded clusters on purpose. The same report script run by the
-  agent gets the exclusion with `fleet_scope`'s arguments and leaves them out. Output from the third-party `gke` MCP server's `list_clusters` is not filtered.
+  agent gets the exclusion with `fleet_scope`'s arguments and leaves them out. The networking audit still counts its subnet usage (its pods hold real IPs) and the GCE audit
+  still lists its node VMs. Output from the third-party `gke` MCP server's `list_clusters` is not filtered.
   Per-tool result filtering would belong in a brokered MCP relay (#2940).
 - **Resolution is deterministic.** The resolved project set is sorted by ID before it is written
   anywhere (listing follows the fill order above), so two runs against an unchanged fleet produce byte-identical snapshots (§5) and an
