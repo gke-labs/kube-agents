@@ -678,6 +678,7 @@ def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[
         return [], [], f"clusters list returned non-JSON: {exc}"[:ERROR_EXCERPT_CHARS]
     if not isinstance(clusters, list):
         return [], [], "clusters list returned JSON that is not a list"
+    clusters = declared_scope.drop_excluded(project, clusters)
     running = []
     for c in clusters:
         if c.get("status") not in AUDITABLE_STATUSES:
@@ -10031,7 +10032,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     workspace = Path(args.workspace) if args.workspace else None
     if workspace is not None and not workspace.is_dir():
         # Loud, and not fatal. A typo here would otherwise annotate nothing and

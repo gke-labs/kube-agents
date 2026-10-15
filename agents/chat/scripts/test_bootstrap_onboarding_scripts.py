@@ -1481,6 +1481,39 @@ class ScanGateTest(unittest.TestCase):
         self.assertIsNone(parse("kanban create: board unavailable"))
 
 
+class ExcludedClustersParagraphTest(unittest.TestCase):
+    """#3081: the sweep is told which clusters the install excludes, so its
+    "audit every cluster with no Cluster Agent" does not reach exactly those."""
+
+    def _with_snapshot(self, snapshot):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        data_dir = Path(tmp.name)
+        if snapshot is not None:
+            (data_dir / bootstrap_scan_gate.SCOPE_SNAPSHOT_NAME).write_text(snapshot, encoding="utf-8")
+        return data_dir
+
+    def test_the_excluded_clusters_are_named_and_kept_out_of_step_3(self):
+        snap = json.dumps({"declared": {"exclude": {"clusters": [
+            {"projectId": "ka-test", "location": "us-central1", "clusterName": "lane-b"},
+            {"projectId": "ka-test", "location": "us-east1-b", "clusterName": "kyber-test"},
+            {"projectId": "ka-test", "location": "us-central1"},
+        ]}}, "projects": []})
+        data_dir = self._with_snapshot(snap)
+        paragraph = bootstrap_scan_gate._excluded_clusters_paragraph(data_dir)
+        self.assertIn("`ka-test/us-central1/lane-b`, `ka-test/us-east1-b/kyber-test`", paragraph)
+        self.assertIn("do not audit them in Step 3", paragraph)
+        self.assertNotIn("ka-test/us-central1`", paragraph)
+        with mock.patch.object(bootstrap_scan_gate, "_data_dir", return_value=data_dir), \
+                mock.patch.object(bootstrap_scan_gate, "cluster_agents", return_value=[]):
+            self.assertIn(paragraph, bootstrap_scan_gate._task_body())
+
+    def test_no_snapshot_or_no_exclusion_names_nothing(self):
+        self.assertEqual(bootstrap_scan_gate._excluded_clusters_paragraph(self._with_snapshot(None)), "")
+        self.assertEqual(bootstrap_scan_gate._excluded_clusters_paragraph(self._with_snapshot("{nope")), "")
+        self.assertEqual(bootstrap_scan_gate._excluded_clusters_paragraph(self._with_snapshot(json.dumps({"declared": {"exclude": {}}}))), "")
+
+
 class ScopeGapParagraphTest(unittest.TestCase):
     """The sweep is told which projects in scope the reconcile could not list."""
 

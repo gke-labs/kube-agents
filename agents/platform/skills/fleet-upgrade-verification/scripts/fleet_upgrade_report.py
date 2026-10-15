@@ -920,7 +920,7 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
             errors.append({"project": project, "location": None, "message": error or f"{' '.join(cmd)} returned no list"})
             unlisted.append(project)
             continue
-        for cluster in listed:
+        for cluster in declared_scope.drop_excluded(project, listed):
             if not isinstance(cluster, dict):
                 continue
             if wanted is not None:
@@ -1362,7 +1362,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--at", help="RFC 3339 instant to evaluate maintenance exclusions and the window at (default: now). Only with --readiness.")
     parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $HERMES_HOME/.kubeconfigs).")
     args = parser.parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
 
     if args.target_version and parse_version(args.target_version) is None:
         sys.stderr.write(f"--target-version {args.target_version!r} is not MAJOR.MINOR.PATCH[-gke.BUILD]\n")

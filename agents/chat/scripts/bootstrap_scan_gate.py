@@ -371,6 +371,44 @@ def _scope_gap_paragraph(data_dir: Path) -> str:
     )
 
 
+def _excluded_clusters(data_dir: Path) -> list[str]:
+    """The clusters spec.scope.exclude.clusters leaves out, as `project/location/cluster`.
+
+    Read from the declaration the reconcile copies into the snapshot. No snapshot, an
+    unreadable one, or no exclusion all answer empty. The sweep's worker lists the fleet with
+    `gcloud container clusters list`, which names an excluded cluster like any other, and the
+    card's "audit every cluster with no Cluster Agent" would send it to exactly these: the
+    reconcile gives an excluded cluster no profile (#3081).
+    """
+    try:
+        snapshot = json.loads((data_dir / SCOPE_SNAPSHOT_NAME).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - absent or unreadable: nothing to name
+        return []
+    declared = snapshot.get("declared") if isinstance(snapshot, dict) else None
+    exclude = declared.get("exclude") if isinstance(declared, dict) else None
+    entries = exclude.get("clusters") if isinstance(exclude, dict) else None
+    out = set()
+    for entry in entries if isinstance(entries, list) else []:
+        parts = [entry.get(key) for key in ("projectId", "location", "clusterName")] if isinstance(entry, dict) else []
+        if parts and all(isinstance(part, str) and part for part in parts):
+            out.add("/".join(parts))
+    return sorted(out)
+
+
+def _excluded_clusters_paragraph(data_dir: Path) -> str:
+    """The sweep's note on the clusters the install excludes; empty when it excludes none."""
+    excluded = _excluded_clusters(data_dir)
+    if not excluded:
+        return ""
+    return (
+        "**The install excludes these clusters from every fleet read; leave them out entirely:** "
+        + ", ".join(f"`{ref}`" for ref in excluded)
+        + " (`project/location/cluster`, from `spec.scope.exclude.clusters`). They have no Cluster "
+        "Agent because they are excluded, not because one is missing: do not audit them in Step 3, "
+        "do not put them in `fleet` or `gaps`, and do not name them in the report.\n\n"
+    )
+
+
 def _reconcile_attempts(data_dir: Path) -> int:
     try:
         first = (data_dir / RECONCILE_ATTEMPTS_MARKER).read_text(encoding="utf-8").splitlines()[0]
@@ -563,6 +601,7 @@ def _task_body() -> str:
         "onboarding runs once, and a report saying discovery failed is worth more than a thin "
         "one that reads as a clean fleet.\n\n"
         f"{_scope_gap_paragraph(_data_dir())}"
+        f"{_excluded_clusters_paragraph(_data_dir())}"
         "**Step 2 — do not fan out; the gate has.** This gate files one audit card per Cluster "
         "Agent itself, read from the profiles when this card was filed:\n\n"
         f"{roster}\n\n"

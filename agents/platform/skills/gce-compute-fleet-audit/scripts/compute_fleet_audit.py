@@ -1600,7 +1600,7 @@ def main(argv: list[str] | None = None) -> int:
         help="also write the manifest here; it goes to stdout either way",
     )
     args = parser.parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     manifest = collect_fleet(args.project_id)
     text = json.dumps(manifest, indent=2)
     if args.output:

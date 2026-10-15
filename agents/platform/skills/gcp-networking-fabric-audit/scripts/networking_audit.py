@@ -2141,7 +2141,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--check", choices=CHECK_CHOICES, default=CHECK_ALL,
                         help=f"run the subnet sweep, the project-level checks ({PROJECT_CHECKS_CHOICE}), or both")
     args = parser.parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     # A run killed before it writes must not leave the last run's manifest to
     # be read as this one's.
     if args.output:

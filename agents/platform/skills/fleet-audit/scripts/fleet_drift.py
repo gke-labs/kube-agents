@@ -424,6 +424,7 @@ def enumerate_project_clusters(project: str, *, run: RunFn) -> tuple[list[dict],
             return [], None, None
         log(f"{project}: clusters list gate failed (rc={result.rc}); no clusters known from this project")
         return [], None, f"clusters list rc={result.rc}: {result.stderr.strip()[:ERROR_EXCERPT_CHARS] or 'no stderr'}"
+    parsed = declared_scope.drop_excluded(project, parsed)
     for c in parsed:
         c["_project"] = project
     record = _record(shlex.join(argv), result)
@@ -2146,7 +2147,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", help="single project to audit (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else run §1's project discovery")
     fleet_scope_args.add_scope_arguments(parser)
     args = parser.parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     manifest = collect_fleet(args.project)
     print(json.dumps(manifest, indent=2))
     if manifest.get("error"):
