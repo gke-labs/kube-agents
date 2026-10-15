@@ -521,19 +521,18 @@ class _UniqueKeyLoader(yaml.SafeLoader):
 
 def _construct_unique_mapping(loader: _UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False) -> Any:
     # The mapping's own keys only, before construct_mapping flattens merged
-    # pairs into node.value, where an override would look like a repeat.
-    seen: set[Any] = set()
+    # pairs into node.value, where an override would look like a repeat. Keys
+    # are compared as written (resolved tag and text), never constructed here:
+    # constructing one before construct_mapping normalises it can raise on a
+    # key both other loaders accept. A composite key is left to them.
+    seen: set[tuple[str, str]] = set()
     for key_node, _ in node.value:
-        if key_node.tag == YAML_MERGE_TAG:
+        if key_node.tag == YAML_MERGE_TAG or not isinstance(key_node, yaml.ScalarNode):
             continue
-        key = loader.construct_object(key_node, deep=deep)
-        try:
-            repeated = key in seen
-        except TypeError:
-            continue  # an unhashable key; construct_mapping reports it
-        if repeated:
+        key = (key_node.tag, key_node.value)
+        if key in seen:
             raise yaml.constructor.ConstructorError(
-                "while constructing a mapping", node.start_mark, f"found duplicate key {key!r}", key_node.start_mark
+                "while constructing a mapping", node.start_mark, f"found duplicate key {key_node.value!r}", key_node.start_mark
             )
         seen.add(key)
     return loader.construct_mapping(node, deep=deep)

@@ -1290,6 +1290,7 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
         texts = {
             "top level": "id: made-up-case\ntool_calls_optional: true\nname: A case\ntool_calls_optional: true\n",
             "nested": "id: made-up-case\ninfrastructure:\n  stack: a\n  stack: b\n",
+            "quoted": "id: made-up-case\n\"name\": a\nname: b\n",
         }
         for where, text in texts.items():
             with self.subTest(where=where), tempfile.TemporaryDirectory() as tmp:
@@ -1311,6 +1312,15 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
             loaded = validator._load_yaml(path)
         self.assertEqual(loaded, yaml.safe_load(text))
         self.assertEqual(loaded["entry"]["required_phrases"], ["hi there"])
+
+    def test_keys_the_other_loaders_accept_still_load(self):
+        # A bare `=` key (YAML 1.1's value tag) and a 1 beside a "1" are
+        # distinct keys to yaml.safe_load and to the runner's ruamel loader.
+        text = "variables:\n  =: x\n  other: y\nids:\n  1: a\n  \"1\": b\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "task.yaml"
+            path.write_text(text)
+            self.assertEqual(validator._load_yaml(path), yaml.safe_load(text))
 
     def test_one_unreadable_case_does_not_hide_the_others(self):
         broken = validator.TASKS_DIR / "zz-not-a-real-case" / "task.yaml"
