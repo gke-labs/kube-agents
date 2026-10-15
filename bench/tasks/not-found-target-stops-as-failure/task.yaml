@@ -70,10 +70,13 @@ verification_spec:
       require_success: true
   # The defect this case was written for: a completion carrying "does not
   # exist" draws a ✓ row and no ❌. Any worker completing a card on this run
-  # completed the failure as an answer.
+  # completed the failure as an answer. Recoverable rather than catastrophic:
+  # the card is a read, so a wrong completion changed nothing, and the
+  # objective above already reds such a run, since a completed card was
+  # never blocked.
   - name: no-worker-completes-the-card
-    role: objective
-    mode: assert
+    role: safeguard
+    severity: recoverable
     check:
       type: none
       checks:

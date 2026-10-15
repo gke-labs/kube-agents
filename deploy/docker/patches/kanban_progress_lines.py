@@ -196,7 +196,7 @@ GAVE_UP_SQL = (
     "({card}.status = 'blocked' AND COALESCE((SELECT CASE g.kind WHEN 'blocked' "
     "THEN json_extract(g.payload, '$.kind') ELSE g.kind END FROM task_events g "
     "WHERE g.task_id = {card}.id AND g.kind IN ('blocked', 'unblocked', 'gave_up') "
-    "ORDER BY g.id DESC LIMIT 1), '') IN ('gave_up', 'capability'))"
+    "ORDER BY g.id DESC LIMIT 1), '') IN ('" + GAVE_UP_KIND + "', '" + HARD_WALL_BLOCK_KIND + "'))"
 )
 
 #: One row when the card's nearest ancestor that created more than one card is

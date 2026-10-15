@@ -1077,6 +1077,13 @@ class OpenCardsQueryTest(unittest.TestCase):
             sorted(rows), [("j", "blocked", None, 1), ("k", "blocked", None, 0), ("l", "blocked", None, 0)],
         )
 
+    def test_the_parked_kinds_match_the_notifiers(self):
+        # The notifier settles a hard-wall block as a give-up; this read must park the same two.
+        import kanban_progress_lines
+
+        self.assertEqual(runtime.HARD_WALL_BLOCK_KIND, kanban_progress_lines.HARD_WALL_BLOCK_KIND)
+        self.assertEqual(runtime.GAVE_UP_KIND, kanban_progress_lines.GAVE_UP_KIND)
+
     def _fake_hermes(self, paths, rows, reads, broken=()):
         """``hermes_cli`` modules listing ``paths`` as boards, each database returning ``rows``."""
 
