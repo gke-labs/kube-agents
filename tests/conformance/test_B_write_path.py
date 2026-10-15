@@ -821,8 +821,8 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         `workflow_run` gate asserts its own: this test says nothing at all
         about a repository with no `pull_request_target` workflows, or one
         where none of them checks anything out, so it cannot tell "the trigger
-        is gone" from "the parse stopped seeing it". Three workflows carry the
-        trigger today and two of them run a checkout. If either reaches zero
+        is gone" from "the parse stopped seeing it". Several workflows carry
+        the trigger today and most of them run a checkout. If either reaches zero
         the test should be read again, not passed by default.
         """
         consumers = [

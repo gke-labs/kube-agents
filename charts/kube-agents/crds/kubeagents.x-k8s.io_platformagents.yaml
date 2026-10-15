@@ -11461,6 +11461,22 @@ spec:
                         type: string
                       type: array
                       x-kubernetes-list-type: set
+                    chatMessagesInboundTotal:
+                      description: |-
+                        ChatMessagesInboundTotal is the cumulative count of chat messages that
+                        reached the gateway, from every platform it serves: Google Chat, Slack,
+                        Teams and its own API port alike. Counted at the gateway's dispatch
+                        hook, which Hermes runs after dropping its own internal events and
+                        before it checks the sender against the allowlist, so an unlisted
+                        user's message counts and nothing the gateway never hands to the hook
+                        does. Read from the chat_metrics plugin's
+                        kubeagents_chat_messages_inbound_total on the platform-agent container
+                        every five minutes, from the gateway pod that runs Hermes (above one
+                        replica, the leader alone), summed across the pods that have led, and
+                        kept monotonic the same way as ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
+                        brokered command is activity.
+                      format: int64
+                      type: integer
                     clustersMonitored:
                       description: |-
                         ClustersMonitored is how many of ClustersRegistered are delivering
@@ -11509,13 +11525,12 @@ spec:
                     lastActiveTime:
                       description: |-
                         LastActiveTime is the time of the last poll in which a counter above
-                        moved: a brokered command ran, a proposal was opened or merged, or an
-                        event was accepted for triage.
-                        Until SessionsTotal has a source, a chat turn that runs no brokered
-                        command does not move it. Scheduled maintenance jobs that run brokered
-                        commands do move it, though -- the Controller Stall Watch cron runs some
-                        every 30 minutes by default -- so it marks agent activity of any origin,
-                        not human or operator use alone. Advances at most once per five minutes.
+                        moved: a brokered command ran, a proposal was opened or merged, a chat
+                        message reached the gateway, or an event was accepted for triage.
+                        Scheduled maintenance jobs that run brokered commands move it too --
+                        the Controller Stall Watch cron runs some every 30 minutes by default
+                        -- so it marks agent activity of any origin, not human or operator use
+                        alone. Advances at most once per five minutes.
                       format: date-time
                       type: string
                     remediationsAppliedTotal:

@@ -171,12 +171,15 @@ ADDED_AFTER_THE_MOVE = [
     "findings-decision-covers-item",  # the findings queue's item-wide decision
     "upgrades-fleet-readiness-failclosed-webhook",  # the readiness report's fail-closed webhook source
     "upgrades-freeze-runbook-probe",  # the gke-upgrades skill sync
+    "fleet-audit-clean-close-reads-clean",  # the clean close's banner, with close_ledger_reads_clean
     "session-crashloop-question-loads-a-skill",  # the session persona's skills, #2858
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
     "session-cluster-question-wake-answers-once",  # a session's delegated question ends in a wake's answer
     "gitops-drift-noise-filtered-triage",  # the drift detector's principal classifier, #2739's fixture
+    "chat-question-asked-to-choose-pauses",  # an asked-for choice pauses the card on a needs_input question
     "manage-cluster-exclusion-installer-route-probe",  # the exclusion route on an installer-made install
+    "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
@@ -382,6 +385,7 @@ INJECT_LANE_EXCLUDED = [
     "first-install-hello-done",  # the same once the first-look scan has finished
     "chat-voice-answer-first",  # #2039: grades the card result the front door delivers; the inject door files no card
     "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
+    "chat-question-asked-to-choose-pauses",  # #2039: grades the worker's needs_input block under the door's one card; same door
 ]
 # The directives a case's prompt opens with to replay a wake into the chat
 # front door (bench/kube_agents_bench/card_wake.py); the harness errors such
@@ -409,6 +413,7 @@ INJECT_LANE_EXCLUDED_TIER = {
     "first-install-hello-done": "nightly",
     "chat-voice-answer-first": "nightly",
     "chat-fanout-fleet-restarts-rows": "nightly",
+    "chat-question-asked-to-choose-pauses": "nightly",
 }
 
 

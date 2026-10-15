@@ -78,7 +78,7 @@ const (
 	platformAgentImageName = "platform-agent"
 
 	// a2aAgentContainerName is the agent container the bridge is built from.
-	a2aAgentContainerName = "platform-agent"
+	a2aAgentContainerName = platformAgentContainerName
 
 	// a2aBridgeExecutorCLI is the bridge's subprocess executor, the other
 	// value it accepts beside a2aBridgeExecutorAPI.
