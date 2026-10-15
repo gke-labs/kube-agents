@@ -123,6 +123,9 @@ const (
 	slackMemberPrincipalPrefix = "slack:"
 	// slackChannelTypeIM is a direct message's channel_type.
 	slackChannelTypeIM = "im"
+	// slackChannelTypeChannel is a public channel's channel_type; a home
+	// channel is never a DM.
+	slackChannelTypeChannel = "channel"
 	// slackMinChannelIDLen is the shortest id slackIsHomeChannelID takes:
 	// the prefix letter and at least two characters after it.
 	slackMinChannelIDLen = 3
@@ -533,11 +536,12 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				// the three seconds Slack allows before it redelivers and
 				// shows the clicker a timeout, and a click on one of the
 				// choice buttons a chat message's layout carries
-				// (renderSlackChat) becomes a turn (slack_interactive.go). A
-				// click on any other button (one on a message posted under
-				// today, a link) is acked and changes nothing. The notify
-				// route's raw blocks still carry none (the agent sends the
-				// audit card with its buttons removed).
+				// (renderSlackChat), the home-channel cards the notify route
+				// lays out (the fleet audit's, the first inventory's) among
+				// them, becomes a turn (slack_interactive.go). A click on any
+				// other button (one on a message posted under today, a link)
+				// is acked and changes nothing. The route's raw blocks still
+				// carry none.
 				continue
 			}
 			// Ack before parsing, not after: unacked envelopes redeliver in
@@ -731,6 +735,37 @@ func (s *SlackAdapter) PostNotifyBlocks(channel, thread, text string, raw json.R
 	if thread == "" {
 		thread = ts
 	}
+	return ts, thread, nil
+}
+
+// PostNotifyMessage is PostNotify for a message value: a chat message laid
+// out as Block Kit (renderSlackChat), its text as the notification and
+// fallback, link and media previews off. A layout the renderer will not send,
+// or that Slack refuses, is an error wrapped in ErrLayoutRefused and nothing
+// is posted; the Notifier posts the text instead.
+func (s *SlackAdapter) PostNotifyMessage(channel, thread string, m OutMessage) (message, landed string, err error) {
+	if !slackIsHomeChannelID(channel) {
+		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
+	}
+	opts, err := slackMessageOptions(m)
+	if err != nil {
+		return "", "", err
+	}
+	opts = append(opts, slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl())
+	if thread != "" {
+		opts = append(opts, slack.MsgOptionTS(thread))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	if err != nil {
+		return "", "", slackLayoutError(err)
+	}
+	if thread == "" {
+		thread = ts
+	}
+	// A home card with choices is its thread's open question, as a
+	// conversation's is, so a typed answer in the thread settles it and a
+	// later click on it is dropped.
+	s.trackQuestion(slackConversationID(slackChannelTypeChannel, channel, thread), ts, m)
 	return ts, thread, nil
 }
 

@@ -99,7 +99,13 @@ stands in for a null total and nothing else; a null total with no such entry, or
 block on a devops-bench record, so the originally planned `metadata.session_id` does not exist; that mistake
 is why the fixtures are captured rather than hand-written. `output` is deliberately **not** a
 signal: a legitimately failing agent can return an empty report, and rung 3 must not double as a
-quality check. The token and latency floors are `> 0` rather than something realistic because five
+quality check. The exception is a case that declares `tool_calls_optional: true`, one a correct
+agent can answer without a tool call (a first-turn greeting, a reply that names a command). Its
+non-empty `output` stands in for the trajectory; the token, latency and status signals still apply,
+and an empty trajectory with an empty reply still fails the rung. So does an empty trajectory on a
+record that carries an error: the api parser drops a malformed output item with a note on `errors`
+and keeps the reply, so a reply cannot show that no tool call was lost, and a
+`none(tool_called …)` safeguard would otherwise pass on nothing. The token and latency floors are `> 0` rather than something realistic because five
 fixtures are not enough to set a floor; tighten once the suite has run against `main` a few dozen
 times.
 
@@ -125,7 +131,8 @@ the GitOps repository — rather than the record, so a tripped safeguard is
 positive evidence something acted and keeps blocking, whether the worker was still running at the
 deadline or never ran — and both apply only to a record that carries a scores map; a scoreless
 one without the marker still blocks at rung 2. The near-misses still block at rung 3:
-tokens billed with no trajectory is an inconsistent record, and the harness skeleton — an empty
+tokens billed with no trajectory is an inconsistent record (unless the case declares
+`tool_calls_optional` and carries a reply and no error), and the harness skeleton — an empty
 trajectory with every token bucket **null**, not 0 — never billed a model call it can prove, so
 it misses the conjunction too.
 

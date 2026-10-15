@@ -60,6 +60,7 @@ import functools
 import re
 from typing import NamedTuple
 
+import chat_message as _chat
 from slack_presenter import (
     BACKTICK,
     CLAUSE_ENDS,
@@ -74,6 +75,7 @@ from slack_presenter import (
     fallback_text,
     gap_parts,
     severity_row,
+    split_lead,
 )
 
 #: Any link Hermes' text path would post (``SlackAdapter.format_message``): its
@@ -104,6 +106,9 @@ TRAILING_LEDGER_PREFIX = (
 )
 TRAILING_LEDGER_SUFFIX = r">?\)?[\s.]*\Z"
 TRAILING_LEDGER = re.compile(TRAILING_LEDGER_PREFIX + ISSUE_URL + TRAILING_LEDGER_SUFFIX, re.IGNORECASE)
+#: An issue on any forge, anywhere in a report (``failed_line``): GitHub's ``/issues/<n>``,
+#: GitLab's ``/-/issues/<n>`` or ``/-/work_items/<n>``, on any host. Only says a ledger was named.
+ANY_ISSUE_URL = re.compile(r"https?://\S+?/(?:-/)?(?:issues|work_items)/\d{1,9}\b", re.IGNORECASE)
 
 
 @functools.lru_cache(maxsize=8)
@@ -284,6 +289,23 @@ CLOSED_STATE = "closed"
 ACTION_ID_PREFIX = "kage_audit"
 LOOK_FIRST = "Look at the first one"
 LEDGER_BUTTON = "Ledger issue #{number} ↗"
+
+#: The "What's wrong" section of a report written to the Platform Agent's three
+#: sections (``agents/platform/SOUL.md``): a heading (``## What's wrong``) or a
+#: bold label alone on its line, the section's text below it; or the label, a
+#: colon or a dash, a space and the text on the same line (``**What's wrong** —
+#: The audit ...``). Anything else after the label (``## What's wrong?``, ``What's
+#: wrong is that ...``) is not the label, so such a report posts whole.
+WRONG_LABEL = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*|__)?What['’]s[ \t]+wrong"
+    r"(?:(?:[ \t]*[:—–-](?:\*\*|__)?|(?:\*\*|__)[ \t]*[:—–-])[ \t]+(?P<rest>\S.*)"
+    r"|[ \t]*:?(?:\*\*|__)?[ \t]*(?:#+[ \t]*)?)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+#: A line that ends the section's first paragraph: a heading, a list item, or a bold label alone.
+SECTION_BREAK = re.compile(r"^[ \t]*(?:#{1,6}[ \t]|[-*+][ \t]|\d+[.)][ \t]|(?:\*\*|__)[^*_]+(?:\*\*|__)[ \t]*$)")
+#: How far into a report the "What's wrong" label is looked for; the section opens a report.
+WRONG_READ_MAX = 4000
 
 
 class LedgerRef(NamedTuple):
@@ -714,6 +736,81 @@ def blocks_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> tuple[li
         action_id_prefix=ACTION_ID_PREFIX,
     )
     return blocks, fallback_text(card.headline, rows=card.rows, links=links, after_rows=after)
+
+
+def chat_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> tuple[dict, str] | None:
+    """:func:`blocks_from_issue`'s card as a ``kube-agents.chat/v1`` message, for ``spec.mode: next``.
+
+    ``(chat, text)``, or None whenever :func:`blocks_from_issue` is. The same
+    headline, rows, lines under them, "Look at the first one" and ledger link,
+    composed by :func:`chat_message.report_message`. ``text`` is
+    :func:`headline_from_issue`'s markdown, the fallback the gateway posts when
+    it does not lay the message out.
+    """
+    text = headline_from_issue(issue, ref, report)
+    if text is None:
+        return None
+    links = [(LEDGER_BUTTON.format(number=ref.number), ref.url)]
+    clean = _clean_name(issue, report)
+    if clean:
+        return _chat.report_message(CLEAN_CARD.format(name=clean), links=links), text
+    card = _card(_parse_issue(issue, report))
+    chat = _chat.report_message(
+        card.headline,
+        rows=card.rows,
+        after_rows="\n".join(_after_rows(card)),
+        choices=[LOOK_FIRST] if card.rows else [],
+        links=links,
+    )
+    return chat, text
+
+
+def failed_line(report: str) -> str | None:
+    """The one line a fleet-audit report that could not complete posts, or None.
+
+    A report that ends with its ledger link completed (the card is built from
+    the ledger), and so did one that names an issue URL on any forge anywhere: it wrote a
+    ledger, and posts as written. One with no issue URL that opens a "What's
+    wrong" section is a run that could not write its ledger (no GitOps
+    repository registered, say): the line is that section's first sentence, as
+    the agent wrote it, markdown and all. None for a report with no such
+    section, which posts as written.
+    """
+    if ledger_ref(report) is not None or ANY_ISSUE_URL.search(report):
+        return None
+    found = WRONG_LABEL.search(report[:WRONG_READ_MAX])
+    if found is None:
+        return None
+    # Matched again on the whole report, so a line or paragraph past the
+    # search window is read whole rather than cut at it.
+    label = WRONG_LABEL.match(report, found.start())
+    if label is None:
+        return None
+    paragraph = [label.group("rest").strip()] if label.group("rest") else []
+    if not paragraph:
+        for line in report[label.end() :].lstrip("\r\n").splitlines():
+            if not line.strip() or SECTION_BREAK.match(line):
+                break
+            paragraph.append(line.strip())
+    sentence, _rest = split_lead(" ".join(paragraph))
+    return sentence.strip() or None
+
+
+def failed_chat(report: str) -> tuple[dict, str] | None:
+    """:func:`failed_line` as a ``kube-agents.chat/v1`` message for ``spec.mode: next``: ``(chat, text)``, or None.
+
+    The line is the message, and the whole report folds under it ("why"): under
+    next a reply in the thread reaches the gateway, which cannot replay the
+    report the way ``incident_context`` does under today. ``text`` is the
+    report itself, the fallback the gateway posts when it does not lay the
+    message out. None for a report past the fold's cap: the fold would be its only
+    Slack copy, so it goes out whole as text rather than clipped.
+    """
+    line = failed_line(report)
+    if line is None or len(report.strip()) > _chat.FOLD_TEXT_MAX:
+        return None
+    fold = {"title": _chat.FOLD_TITLE_DEFAULT, "text": report.strip()}
+    return _chat.message(detail=_clip(line, _chat.DETAIL_MAX), fold=fold), report
 
 
 def _fallback_line(line: str) -> str:
