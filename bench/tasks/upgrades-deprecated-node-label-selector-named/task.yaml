@@ -24,8 +24,8 @@
 # the name; the kind word is ungraded.
 #
 # The label may carry its value, as the manifest prints the selector entry
-# (`beta.kubernetes.io/arch: amd64`) or as kubectl spells it (`=amd64`); the
-# value is ungraded.
+# (`beta.kubernetes.io/arch: amd64`) or as kubectl spells it (`=amd64`), and so
+# may the replacement; the value is ungraded.
 #
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
@@ -102,9 +102,9 @@ verification_spec:
       fixture_roles:
         - deprecated-label-selector
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: yes(?: \([^)\n;]*\))?; replacement:? ?kubernetes\.io/arch$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: yes(?: \([^)\n;]*\))?; replacement:? ?kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: (?!yes(?: \([^)\n;]*\))?; replacement:? ?kubernetes\.io/arch$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: (?!yes(?: \([^)\n;]*\))?; replacement:? ?kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective
