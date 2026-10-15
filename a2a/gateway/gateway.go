@@ -46,6 +46,10 @@ const (
 	retireRefusalStillOn    = "⚠️ could not close the previous task on the bus; the session route is still on and its pod still there — try `/session off` again in a moment"
 )
 
+// noticeBusUnreachable says a task's publish failed: on its rolling line, or
+// posted when the backend keeps none (StatusShower).
+const noticeBusUnreachable = "❌ could not reach the bus; try again"
+
 // turnTimeout bounds one handler turn — an inbound message or a relay
 // batch — so a stuck bus or backend call frees the conversation's queue
 // slot instead of holding it forever. Where the clock starts relative to
@@ -1781,6 +1785,13 @@ func artifactParts(task *lib.Task, name string) []lib.Part {
 	return parts
 }
 
+// showsTaskStatus reports whether the backend that owns conversation shows
+// a task's status itself (StatusShower), and so wants no rolling line.
+func (g *Gateway) showsTaskStatus(conversation string) bool {
+	shower, ok := g.adapter.(StatusShower)
+	return ok && shower.ShowsTaskStatus(conversation)
+}
+
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements
 // TaskObserver about a task's two ends. Both are no-ops for an adapter that
 // does not implement the interface -- Discord and gchat, for which a human
@@ -2155,9 +2166,14 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 
 	// Placeholder first, so the rolling line exists before the first event
 	// can arrive (the demo posts one while the pod cold-starts; same idea).
-	statusMsgID, err := g.adapter.Post(rec.Key, withLineNote("⏳ submitted…", ts.LineNote))
-	if err != nil {
-		g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
+	// None on a backend that shows the task's status itself (StatusShower).
+	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key)
+	if !lineless {
+		var err error
+		statusMsgID, err = g.adapter.Post(rec.Key, withLineNote("⏳ submitted…", ts.LineNote))
+		if err != nil {
+			g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
+		}
 	}
 
 	// Register the task everywhere the relay looks BEFORE publishing: a fast
@@ -2231,7 +2247,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	if err != nil {
 		g.log.Error("task publish failed", "taskId", taskID, "err", err)
 		if statusMsgID != "" {
-			_ = g.adapter.Edit(rec.Key, statusMsgID, "❌ could not reach the bus; try again")
+			_ = g.adapter.Edit(rec.Key, statusMsgID, noticeBusUnreachable)
+		} else if lineless {
+			// No line to put it on, and nothing else would say the ask
+			// went nowhere.
+			g.post(rec.Key, noticeBusUnreachable)
 		}
 		rec.ActiveTask = nil
 		g.mu.Lock()

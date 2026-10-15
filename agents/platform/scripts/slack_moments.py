@@ -27,6 +27,10 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
   side bar (:data:`NEEDS_YOU_SIDE_BAR`), which stays once it is settled while
   anything is left below the headline.
 
+A finished answer that ends by asking which of its options to take gets the same
+option rules from :func:`answer_choices`, for ``gateway/slack_ux_answer.py`` under today
+and ``chat_message.answer_message`` under next.
+
 Both lay out as one block list; ``slack_presenter.with_side_bar`` splits it
 into the headline and the attachment that carries the bar when it is posted.
 """
@@ -261,6 +265,35 @@ DETAIL_BOLD = re.compile(r"(?<![\w*])\*\*(?=\S)([^*\n]+?)(?<=\S)\*\*(?![\w*])")
 NEEDS_YOU_ACTION_PREFIX = "kage_needs"
 WAITING = "⏸ waiting on you"
 NEEDS_YOU_SIDE_BAR = _presenter.SIDE_BAR_YELLOW
+
+#: A finished answer's options (:func:`answer_choices`): a list item, its indent, marker and text;
+#: the bold lead a label is taken from; the "(Recommended)" that makes an option the primary one
+#: and leaves its label; and an "Option 2:" numbering, which a button does not need.
+ITEM_LINE = re.compile(r"^( {0,3})([-*+•]|\d+[.)]|[A-Za-z][.)])\s+(\S.*?)\s*$")
+BOLD_LEAD = re.compile(r"^\*\*(.+?)\*\*|^__(.+?)__")
+RECOMMENDED = re.compile(r"\s*\(\s*recommended\s*\)", re.IGNORECASE)
+OPTION_NUMBER = re.compile(r"^option\s+(?:\d+|[a-z])\b\s*[:.)\-–—]?\s*", re.IGNORECASE)
+#: A yes/no question's opening word ("Want me to scale it?", "Should I apply it?"): under a finished
+#: answer's list it offers the list as the plan, not as options, unless it also says "which" or "or".
+YES_NO_OPENER = re.compile(
+    r"^(?:shall|should|can|could|may|might|will|would|do|does|did|is|are|am|was|were|want|have|has|ok|okay"
+    r"|sounds?|looks?)\b",
+    re.IGNORECASE,
+)
+#: Words that ask to choose among a list, for a closing question with no "which" or "or":
+#: "How would you like to proceed?", "Do you have a preference?" is a yes/no opener and not one.
+CHOICE_HINT = re.compile(r"\b(?:prefer|preference|options?|choose|pick)\b|^how\s+would\s+you\s+like\b", re.IGNORECASE)
+#: How many item lines :func:`_list_start` reads up from an answer's end before it gives up, nested
+#: items included: well past five options with sub-bullets, and it keeps the scan linear.
+LIST_SCAN_MAX = 50
+#: What may sit between a bold lead and the rest of its line ("**Fix it**: …", "**Fix it** — …").
+LEAD_JOINER = " :-–—"
+#: An option shown under the answer: its marker, its label in bold, and the first sentence
+#: of what the answer said about it.
+SHOWN_OPTION = "{marker} **{label}**"
+SHOWN_SUMMARY = "{line} — {summary}"
+#: A line that is not prose: a quote or a table row, beside the presenter's headings, items and fences.
+NOT_PROSE = re.compile(r"^\s*[>|]")
 
 
 def opened_pr(
@@ -629,3 +662,180 @@ def needs_you_settled(blocks: Sequence[dict], note: str = "") -> list[dict]:
     if note:
         out.append({"type": "context", "elements": [{"type": "mrkdwn", "text": note}]})
     return out
+
+
+# --- a finished answer's options --------------------------------------------
+
+
+def _not_prose(line: str) -> bool:
+    """Whether ``line`` is a heading, a list item, a fence, a quote or a table row."""
+    return bool(
+        _presenter.HEADING.match(line) or _presenter.LIST_MARKER.match(line) or ITEM_LINE.match(line)
+        or _presenter._opens_fence(line) or NOT_PROSE.match(line)
+    )
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _marker_kind(marker: str) -> tuple[bool, bool]:
+    """A numbered, lettered or bulleted marker; one list keeps to one kind."""
+    return marker[0].isdigit(), marker[0].isalpha()
+
+
+def _items(lines: Sequence[str]) -> list[tuple[str, str, list[str]]] | None:
+    """``lines`` as one list's items, each ``(marker, text, continuation lines)``, or None when they are not one.
+
+    The first line is an item. Every later line is blank, an item of the same kind at the same
+    indent, or indented deeper, which continues the item above it (a nested list, a fence).
+    """
+    first = ITEM_LINE.match(lines[0]) if lines else None
+    if not first:
+        return None
+    indent, kind = len(first.group(1)), _marker_kind(first.group(2))
+    items: list[tuple[str, str, list[str]]] = []
+    for line in lines:
+        item = ITEM_LINE.match(line)
+        if item and len(item.group(1)) == indent and _marker_kind(item.group(2)) == kind:
+            items.append((item.group(2), item.group(3), []))
+        elif not line.strip() or _indent(line) > indent:
+            items[-1][2].append(line)
+        else:
+            return None
+    return items
+
+
+def _list_start(lines: Sequence[str]) -> int | None:
+    """Where the longest list that ends ``lines`` starts, or None when they do not end in one or
+    it runs past :data:`LIST_SCAN_MAX` item lines, far more than an offer of options holds."""
+    found, seen = None, 0
+    for start in range(len(lines) - 1, -1, -1):
+        line = lines[start]
+        if ITEM_LINE.match(line):
+            seen += 1
+            if seen > LIST_SCAN_MAX:
+                return None
+            if _items(lines[start:]) is not None:
+                found = start
+        elif line.strip() and not _indent(line):
+            break
+    return found
+
+
+def _asks_choice(question: str) -> bool:
+    """Whether ``question`` asks for one of the options: it ends in a question mark, and its
+    last sentence says "which" or "or", or asks to choose (:data:`CHOICE_HINT`) without being
+    a yes/no ask to go on (:func:`_trailing_options`) or any other yes/no question
+    (:data:`YES_NO_OPENER`). "Anything else?" under a list of findings asks for no choice."""
+    text = _presenter._plain(question)
+    if not text.endswith(QUESTION_END):
+        return False
+    asked = SENTENCE_START.split(text)[-1]
+    if CHOICE_WORD.search(asked):
+        return True
+    return not (PROCEED_QUESTION.search(asked) or YES_NO_OPENER.match(asked)) and bool(CHOICE_HINT.search(asked))
+
+
+def _option(marker: str, text: str, continuation: Sequence[str]) -> tuple[str, bool, str, bool] | None:
+    """``(label, primary, shown line, whole)`` for one option, or None when it cannot be a button.
+
+    The label is the item's bold lead, else its whole first line, which must then fit a
+    button; "(Recommended)" makes it primary and an "Option 2:" numbering is dropped. The
+    shown line is the label in bold and the first sentence the item says after it, or empty
+    when it says nothing more than its label. ``whole`` is whether the label and the shown
+    line carry all the item says.
+    """
+    lead = BOLD_LEAD.match(text)
+    said = text[lead.end():] if lead else ""
+    # "**Fix it** (Recommended): …" marks the option outside its bold as well.
+    marked = RECOMMENDED.match(said)
+    said = said[marked.end():].lstrip(LEAD_JOINER) if marked else said.lstrip(LEAD_JOINER)
+    label = _presenter._plain(lead.group(1) or lead.group(2) if lead else text)
+    primary = bool(marked or RECOMMENDED.search(label))
+    label = " ".join(OPTION_NUMBER.sub("", RECOMMENDED.sub("", label)).split()).rstrip(":").strip()
+    if not label or (not lead and len(label) > _presenter.BUTTON_TEXT_MAX):
+        return None
+    clipped = _presenter._clip(label, _presenter.BUTTON_TEXT_MAX)
+    whole_label, label = clipped == label, clipped
+    if not said:
+        prose = []
+        for line in continuation:
+            if not line.strip() or _not_prose(line.strip()):
+                break
+            prose.append(line.strip())
+        said = " ".join(prose)
+    held, spans = _presenter._hold_code(said)
+    summary = _presenter._restore_code(_presenter._first_sentence(held)[0], spans).strip()
+    shown = SHOWN_SUMMARY.format(line=SHOWN_OPTION.format(marker=marker, label=label), summary=summary)
+    whole = whole_label and not any(line.strip() for line in continuation) and summary == said.strip()
+    return label, primary, shown if summary else "", whole
+
+
+def answer_choices(rest: str, buttons: bool = True) -> tuple[str, str, str, list[tuple[str, bool]]] | None:
+    """A finished answer's options as choices: ``(shown, folded, question, options)``, or None.
+
+    ``rest`` is the answer after its headline, as markdown. It offers choices when it ends with
+    a question over two to five options, as a needs-you reason does (:func:`_question`): the
+    options end it right under the question, or the question is its last paragraph right
+    under them. The question asks for one (:func:`_asks_choice`), and every option makes a
+    label (:func:`_option`), none twice. ``options`` are ``(label, primary)``, the first
+    recommended one primary. ``shown`` is a prose paragraph that opens ``rest``, then each
+    option's shown line when every option has one; ``folded`` is everything else before the options, then the options
+    as written when any says more than its first line, for a fold; ``question`` is the question.
+    With ``buttons`` False, as outside a thread, nothing carries the labels, so ``shown`` holds
+    the options as written and ``folded`` only what came before them.
+    """
+    lines = (rest or "").strip("\n").split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    para = len(lines)
+    while para and lines[para - 1].strip():
+        para -= 1
+    closing = lines[para:]
+    question = " ".join(line.strip() for line in closing)
+    if closing and not any(_not_prose(line) for line in closing) and _asks_choice(question):
+        before = lines[:para]
+        while before and not before[-1].strip():
+            before.pop()
+        start = _list_start(before)
+        region, head = (before[start:], before[:start]) if start is not None else ([], [])
+    else:
+        start = _list_start(lines)
+        asked = (start or 0) - 1
+        while asked >= 0 and not lines[asked].strip():
+            asked -= 1
+        if start is None or asked < 0 or _not_prose(lines[asked]) or not _asks_choice(lines[asked]):
+            return None
+        question, region, head = lines[asked].strip(), lines[start:], lines[:asked]
+    items = _items(region)
+    if not items or not OPTIONS_MIN <= len(items) <= OPTIONS_MAX:
+        return None
+    options = [_option(*item) for item in items]
+    if any(option is None for option in options):
+        return None
+    labels = [label.casefold() for label, _primary, _shown, _whole in options]
+    if len(set(labels)) != len(labels):
+        return None
+    first = next((i for i, (_label, primary, _shown, _whole) in enumerate(options) if primary), None)
+    head = list(head)
+    while head and not head[-1].strip():
+        head.pop()
+    lead_end = next((i for i, line in enumerate(head) if not line.strip()), len(head))
+    lead = head[:lead_end] if head and not _not_prose(head[0]) else []
+    folded = head[len(lead):]
+    if not buttons:
+        shown = "\n\n".join(part for part in ("\n".join(lead).strip(), "\n".join(region).strip()) if part)
+        return shown, "\n".join(folded).strip(), question, [
+            (label, i == first) for i, (label, _primary, _shown, _whole) in enumerate(options)
+        ]
+    # The options' lines show only when each says more than its button does.
+    lines = [line for _label, _primary, line, _whole in options]
+    shown_all = all(lines)
+    # The options fold as written whenever what is in sight does not carry all they say.
+    if any(not whole or (line and not shown_all) for _label, _primary, line, whole in options):
+        folded = [*folded, "", *region]
+    shown = "\n\n".join(part for part in ("\n".join(lead).strip(), "\n".join(lines) if shown_all else "") if part)
+    return shown, "\n".join(folded).strip(), question, [
+        (label, i == first) for i, (label, _primary, _shown, _whole) in enumerate(options)
+    ]

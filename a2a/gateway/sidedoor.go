@@ -259,6 +259,16 @@ func (s *sideDoorAdapter) MarkChanged(conversation, ask, settle string) {
 	}
 }
 
+// ShowsTaskStatus answers for the primary's own conversations; a door keeps
+// its rolling line, which its caller reads.
+func (s *sideDoorAdapter) ShowsTaskStatus(conversation string) bool {
+	if s.doorFor(conversation) != nil {
+		return false
+	}
+	shower, ok := s.primary.(StatusShower)
+	return ok && shower.ShowsTaskStatus(conversation)
+}
+
 func (s *sideDoorAdapter) InboundVerified(conversation, messageID string, verified bool) {
 	if s.doorFor(conversation) != nil {
 		return
