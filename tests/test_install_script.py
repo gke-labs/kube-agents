@@ -4656,6 +4656,21 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
         self.assertEqual(len(k_describes), 0, "keys describe must be skipped after keyring exhaustion")
         self.assertIn("could not be confirmed to exist", proc.stdout)
 
+    def test_import_github_pem_skips_describe_when_key_create_exhausts_retries(self):
+        """When key create exhausts its KMS 403 retries, keys describe is skipped."""
+        proc, calls = self._run(
+            keys_fail_first=5,
+            env_overrides={"KMS_API_PROPAGATION_ATTEMPTS": "2"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        k_creates = [c for c in calls if "kms keys create" in c]
+        k_describes = [c for c in calls if "kms keys describe" in c]
+        self.assertEqual(len(kr_creates), 1, f"expected 1 keyring attempt, got calls: {calls}")
+        self.assertEqual(len(k_creates), 2, f"expected 2 key attempts before exhaustion, got calls: {calls}")
+        self.assertEqual(len(k_describes), 0, "keys describe must be skipped after key exhaustion")
+        self.assertIn("could not be confirmed to exist", proc.stdout)
+
     def test_main_turns_a_failed_import_into_a_hard_exit(self):
         """The two returns above are only fatal because main() makes them so.
 
@@ -4789,7 +4804,7 @@ KMS_API_PROPAGATION_ATTEMPTS=3 retry_kms_create stub
         self.assertIn("Cloud KMS still rejects requests 3 attempts after enabling it", proc.stderr)
 
     def test_retry_kms_create_non_integer_attempts_falls_back_to_default(self):
-        for invalid_val in ["invalid", "99999999999999999999", "-1", "0"]:
+        for invalid_val in ["invalid", "99999999999999999999", "-1", "1.5"]:
             with self.subTest(attempts=invalid_val):
                 script = f"""
 count=0
@@ -4803,6 +4818,25 @@ KMS_API_PROPAGATION_ATTEMPTS="{invalid_val}" retry_kms_create stub
                 proc = self._run_cmd(script)
                 self.assertEqual(proc.returncode, 1)
                 self.assertIn("Cloud KMS still rejects requests 5 attempts after enabling it", proc.stderr)
+
+    def test_retry_kms_create_zero_attempts_runs_single_attempt_without_retry(self):
+        """KMS_API_PROPAGATION_ATTEMPTS=0 makes one attempt and stops without retry, matching lifecycle.sh."""
+        script = f"""
+count=0
+stub() {{
+  count=$((count + 1))
+  echo "stub attempt $count" >&2
+  echo "{self._KMS_403}" >&2
+  exit 1
+}}
+KMS_API_PROPAGATION_ATTEMPTS=0 retry_kms_create stub
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("stub attempt 1", proc.stdout)
+        self.assertNotIn("stub attempt 2", proc.stdout)
+        self.assertIn("Cloud KMS still rejects requests 1 attempts after enabling it", proc.stderr)
+        self.assertNotIn("Waiting", proc.stderr)
 
     def test_sourcing_installer_common_then_lifecycle_does_not_fail_on_readonly_pattern(self):
         """Sourcing installer_common.sh and then lifecycle.sh does not fail on KMS_API_PROPAGATION_PATTERN."""
@@ -4824,13 +4858,15 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{lifecycle_sh}"
 
     def test_sanitize_kms_int_warns_on_invalid_value(self):
         script = """
-_sanitize_kms_int "invalid" 5 1 "TEST_KMS_KNOB"
-_sanitize_kms_int "0" 5 1 "TEST_KMS_KNOB_ZERO"
+_sanitize_kms_int "invalid" 5 0 "TEST_KMS_KNOB"
+_sanitize_kms_int "-1" 5 0 "TEST_KMS_KNOB_NEG"
+_sanitize_kms_int "0" 5 0 "TEST_KMS_KNOB_ZERO"
 """
         proc = self._run_cmd(script)
         self.assertEqual(proc.returncode, 0)
-        self.assertIn("TEST_KMS_KNOB='invalid' is not a whole number >= 1; using default 5", proc.stderr)
-        self.assertIn("TEST_KMS_KNOB_ZERO='0' is not a whole number >= 1; using default 5", proc.stderr)
+        self.assertIn("TEST_KMS_KNOB='invalid' is not a whole number >= 0; using default 5", proc.stderr)
+        self.assertIn("TEST_KMS_KNOB_NEG='-1' is not a whole number >= 0; using default 5", proc.stderr)
+        self.assertNotIn("TEST_KMS_KNOB_ZERO", proc.stderr)
 
 
 class EnsureExistingClusterCmekKmsTest(unittest.TestCase):
@@ -4864,11 +4900,6 @@ case "$*" in
     fi
     exit 0 ;;
   *'kms keys add-iam-policy-binding'*)
-    b_count=$(grep -c "kms keys add-iam-policy-binding" "{log}" || true)
-    if [ "$b_count" -le 1 ]; then
-      echo "Error 403: Google Cloud KMS API has not been used in project p1 before or it is disabled." >&2
-      exit 1
-    fi
     exit 0 ;;
   *)
     exit 0 ;;
@@ -4901,7 +4932,7 @@ ensure_existing_cluster_cmek p1 c1 us-central1-a
         b_creates = [c for c in calls if "kms keys add-iam-policy-binding" in c]
         self.assertEqual(len(kr_creates), 2, f"expected retry on keyring create, got calls: {calls}")
         self.assertEqual(len(k_creates), 2, f"expected retry on key create, got calls: {calls}")
-        self.assertEqual(len(b_creates), 2, f"expected retry on key binding, got calls: {calls}")
+        self.assertEqual(len(b_creates), 1, f"expected single call on key binding, got calls: {calls}")
         self.assertIn("Cloud KMS was enabled minutes ago and has not finished propagating", proc.stderr)
 
     def test_cmek_skips_later_creates_when_keyring_create_exhausts_retries(self):
@@ -4952,6 +4983,57 @@ ensure_existing_cluster_cmek p1 c1 us-central1-a
         self.assertEqual(len(kr_creates), 2)
         self.assertEqual(len(k_creates), 0, "key create should be skipped when keyring create exhausts retry budget")
         self.assertEqual(len(b_creates), 0, "binding should be skipped when keyring create exhausts retry budget")
+
+    def test_cmek_skips_later_creates_when_key_create_exhausts_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            log = pathlib.Path(tmp) / "gcloud.log"
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> '{log}'
+case "$*" in
+  *'container clusters describe'*)
+    echo "UNKNOWN" ;;
+  *'projects describe'*)
+    echo "12345" ;;
+  *'kms keyrings create'*)
+    exit 0 ;;
+  *'kms keys create'*)
+    echo "Error 403: Google Cloud KMS API has not been used in project p1 before or it is disabled." >&2
+    exit 1 ;;
+  *)
+    exit 0 ;;
+esac
+exit 0
+""")
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+source "{_INSTALLER_COMMON}"
+ensure_existing_cluster_cmek p1 c1 us-central1-a
+"""
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(
+                    bin_dir=str(bin_dir),
+                    overrides={"KMS_API_PROPAGATION_WAIT_SECONDS": "0", "KMS_API_PROPAGATION_ATTEMPTS": "2"},
+                    absent=["KMS_API_PROPAGATION_PATTERN"],
+                ),
+                cwd=str(_REPO_ROOT),
+                timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
+            )
+            calls = log.read_text().splitlines() if log.exists() else []
+
+        self.assertEqual(proc.returncode, 1)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        k_creates = [c for c in calls if "kms keys create" in c]
+        b_creates = [c for c in calls if "kms keys add-iam-policy-binding" in c]
+        self.assertEqual(len(kr_creates), 1, "keyring create succeeds on first attempt")
+        self.assertEqual(len(k_creates), 2, "key create retries up to budget")
+        self.assertEqual(len(b_creates), 0, "binding should be skipped when key create exhausts retry budget")
 
 
 class InstallEnvIsCreatedInTheCheckoutTest(unittest.TestCase):

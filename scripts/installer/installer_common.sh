@@ -118,6 +118,16 @@ readonly HELM_LOCK_POLL_INTERVAL_DEFAULT=10
 # Timeout for rolling back a stuck pending release to the last healthy revision.
 readonly HELM_ROLLBACK_TIMEOUT_DEFAULT="2m"
 
+# ─── Cloud KMS Propagation Defaults ───────────────────────────────────────────
+# Defaults for Cloud KMS resource creation retry across the first-enablement
+# propagation window. Matching lifecycle.sh:203-204 without colliding with exported
+# variables or lifecycle.sh re-declarations.
+readonly KMS_API_PROPAGATION_DEFAULT_ATTEMPTS=5
+readonly KMS_API_PROPAGATION_DEFAULT_WAIT_SECONDS=60
+# Cloud KMS answers some requests with 403 for a few minutes after a project's
+# first enablement. Declared without readonly so sourcing lifecycle.sh does not collide.
+KMS_API_PROPAGATION_PATTERN='KMS\)? API has not been used in project'
+
 # ─── Chart contract ───────────────────────────────────────────────────────────
 # Names the kube-agents chart fixes and the front doors address by name: the
 # Helm release, the operator and agent Deployments, and the Secret the agent's
@@ -1423,10 +1433,7 @@ tf_state_prefix() {
 # Cloud KMS answers some requests with 403 "Google Cloud KMS API has not been
 # used in project <n> before or it is disabled" for a few minutes after a
 # project's FIRST enablement -- which is the enablement install.sh performs
-# seconds before creating the key ring and key. An ERE, for grep -E: the API
-# has been named "Google Cloud KMS API" and "Cloud Key Management Service (KMS)
-# API" in this message, and both end the same way. Matching lifecycle.sh.
-KMS_API_PROPAGATION_PATTERN='KMS\)? API has not been used in project'
+# seconds before creating the key ring and key.
 
 _sanitize_kms_int() {
   local val="$1" default_val="$2" min_val="${3:-0}" name="${4:-}"
@@ -1454,9 +1461,9 @@ _sanitize_kms_int() {
 # echoed on completion; retry warnings are printed to stderr.
 retry_kms_create() {
   local max_attempts
-  max_attempts="$(_sanitize_kms_int "${KMS_API_PROPAGATION_ATTEMPTS:-}" 5 1 "KMS_API_PROPAGATION_ATTEMPTS")"
+  max_attempts="$(_sanitize_kms_int "${KMS_API_PROPAGATION_ATTEMPTS:-}" "$KMS_API_PROPAGATION_DEFAULT_ATTEMPTS" 0 "KMS_API_PROPAGATION_ATTEMPTS")"
   local wait_seconds
-  wait_seconds="$(_sanitize_kms_int "${KMS_API_PROPAGATION_WAIT_SECONDS:-}" 60 0 "KMS_API_PROPAGATION_WAIT_SECONDS")"
+  wait_seconds="$(_sanitize_kms_int "${KMS_API_PROPAGATION_WAIT_SECONDS:-}" "$KMS_API_PROPAGATION_DEFAULT_WAIT_SECONDS" 0 "KMS_API_PROPAGATION_WAIT_SECONDS")"
   local attempt=1 status=0 output=""
   while :; do
     output="$(trap - ERR; "$@" 2>&1)" && status=0 || status=$?

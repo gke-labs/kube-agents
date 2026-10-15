@@ -3757,13 +3757,13 @@ ensure_existing_cluster_cmek() {
   print_info "Enabling CMEK database encryption on existing cluster '$cluster_name' (key: $key_resource)..."
   gcloud services enable cloudkms.googleapis.com --project="$project_id"
   local kr_err="" k_err=""
-  kr_err="$(trap - ERR; retry_kms_create gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id" 2>&1)" || true
+  kr_err="$(trap - ERR; retry_kms_create gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id")" || true
   if printf '%s\n' "$kr_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
     print_error "Cloud KMS keyring create failed after propagation retries: $kr_err"
     return 1
   fi
   k_err="$(trap - ERR; retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
-    --purpose="encryption" --project="$project_id" 2>&1)" || true
+    --purpose="encryption" --project="$project_id")" || true
   if printf '%s\n' "$k_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
     print_error "Cloud KMS key create failed after propagation retries: $k_err"
     return 1
