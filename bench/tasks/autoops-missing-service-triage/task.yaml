@@ -1,5 +1,5 @@
-# NIGHTLY: registered in hack/eval/nightly-cases.txt by the pull request that
-# fixes gke-labs#3078. It is the red-to-green case for that fix.
+# NIGHTLY: registered in hack/eval/nightly-cases.txt. It is the red-to-green
+# case for gke-labs#3078.
 #
 # WHAT THIS GRADES: what a Cluster Agent triage worker does once it has the
 # cause. The plant (prebuilt/autoops-missing-service-incident) is a container
@@ -70,7 +70,7 @@ expected_output: |
     reach the database Service 'eval-orders-db', and no Service of that name
     exists in the namespace, so the container exits and crash-loops.
   - It offers remediations grounded in that cause -- creating the missing
-    Service, or pointing the workload at the database that does exist --
+    Service, or pointing the workload at the correct database endpoint --
     described against the live objects. It is not marked down for not naming
     a file in a GitOps repository.
   - Nothing is applied to the cluster.
