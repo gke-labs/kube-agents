@@ -7,12 +7,17 @@ This replays the #3164 shape through the real patched ``kanban_create`` on a
 real board:
 
 - a platform worker's ``kanban_create(assignee="platform")`` with no
-  ``parents`` is refused, names the follow-up instruction, and writes no card;
+  ``parents`` is refused, says to do the work on its own card without
+  offering ``parents`` as a way round, and writes no card;
 - the same worker's follow-up queued with ``parents=[<its card>]`` (platform
   SOUL section 0) is created;
 - the same worker's card for a Cluster Agent is created;
 - a card for ``platform`` filed outside any worker (a person, the chat
-  session) is created.
+  session) is created;
+- a title-cased ``Platform`` is refused like ``platform``;
+- a dependency block on the creator doesn't release the platform follow-up
+  to run alongside it (the scheduling repair skips that edge), and the
+  creator can still complete with it queued.
 
 Before the patch the first call creates a second platform card that runs
 alongside the first.
@@ -77,8 +82,8 @@ before = cards()
 copy = create(assignee="platform", title="Propose PDB manifest for checkout-gateway")
 err = copy.get("error", "")
 check("the platform worker's concurrent platform card is refused", not copy.get("ok") and err, str(copy))
-check("the refusal says how to queue a follow-up",
-      f"create it with parents=[{pid}]" in err, err)
+check("the refusal says to do the work on its own card, with no parents hint",
+      "Do this work on your own card" in err and "parents" not in err, err)
 check("and no card was written", cards() == before, f"{before} -> {cards()}")
 
 follow = create(assignee="platform", title="Open the follow-up issue", parents=[pid])
@@ -86,6 +91,27 @@ check("a follow-up queued with parents=[its card] is created", follow.get("ok"),
 
 cluster = create(assignee=CLUSTER, title="seeded-a")
 check("a card for a Cluster Agent is created", cluster.get("ok"), str(cluster))
+
+cased = create(assignee="Platform", title="Propose it again")
+check("a title-cased `Platform` is refused too (create_task lower-cases it)",
+      not cased.get("ok"), str(cased))
+
+print("the follow-up stays a follow-up:")
+run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (pid,)).fetchone()[0]
+os.environ["HERMES_KANBAN_RUN_ID"] = str(run_id)
+blocked = json.loads(kt._handle_block({"reason": "waiting on the follow-up", "kind": "dependency"}))
+status = conn.execute("SELECT status FROM tasks WHERE id = ?", (follow["task_id"],)).fetchone()[0]
+edge = conn.execute("SELECT COUNT(*) FROM task_links WHERE parent_id = ? AND child_id = ?",
+                    (pid, follow["task_id"])).fetchone()[0]
+check("a dependency block doesn't release the platform follow-up to run alongside",
+      status == "todo" and edge == 1, f"follow-up status={status}, edge={edge}, block={blocked}")
+conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (cluster["task_id"],))
+conn.commit()
+done = json.loads(kt._handle_complete({"summary": "proposed", "result": "PR #276 adds the PDB."}))
+check("and the creator can still complete with its follow-up queued", done.get("ok"), str(done))
+status = conn.execute("SELECT status FROM tasks WHERE id = ?", (follow["task_id"],)).fetchone()[0]
+check("after which the follow-up is free to run", status in ("ready", "todo") and status != "running",
+      f"follow-up status={status}")
 
 print()
 if FAILURES:

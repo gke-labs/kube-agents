@@ -457,6 +457,11 @@ logger = logging.getLogger(__name__)
 SETTLED = "('done', 'archived')"
 
 DEPENDENCY_EVENT_KIND = "dependency_repaired"
+# The Platform Agent's profile. An edge between two of its cards is never
+# inverted: a platform card queued after its creator is a follow-up, and
+# releasing it would start a second Platform Agent worker on the request
+# alongside the first (#3164, kanban_self_copy).
+PLATFORM_PROFILE = "platform"
 
 
 def _reaches(conn, start: str, target: str) -> bool:
@@ -480,8 +485,9 @@ def _reaches(conn, start: str, target: str) -> bool:
 def find_deadlocked_children(conn, task_id: str) -> list[str]:
     """Unsettled cards ``task_id`` fanned out after it started and alone gates.
 
-    Two conditions beyond "is an unsettled child", both explained at length in
-    the module docstring. The run window — the child's ``created`` event is
+    Three conditions beyond "is an unsettled child". The first two are
+    explained at length in the module docstring; the third skips a
+    ``platform`` card queued after a ``platform`` card (:data:`PLATFORM_PROFILE`). The run window — the child's ``created`` event is
     newer than this card's first ``claimed`` event — is what tells a card this
     one fanned out apart from a pipeline successor somebody else planned. The
     ``NOT EXISTS`` is what stops the repair rewriting an edge whose inversion
@@ -498,6 +504,8 @@ def find_deadlocked_children(conn, task_id: str) -> list[str]:
         "      > (SELECT MIN(started.id) FROM task_events started "
         "          WHERE started.task_id = l.parent_id "
         "            AND started.kind = 'claimed') "
+        "  AND NOT (COALESCE(c.assignee, '') = ? AND COALESCE(("
+        "        SELECT p.assignee FROM tasks p WHERE p.id = l.parent_id), '') = ?) "
         "  AND NOT EXISTS ("
         "        SELECT 1 FROM task_links o "
         "        JOIN tasks op ON op.id = o.parent_id "
@@ -506,7 +514,7 @@ def find_deadlocked_children(conn, task_id: str) -> list[str]:
         f"          AND op.status NOT IN {SETTLED}"
         "  ) "
         "ORDER BY l.child_id",
-        (task_id,),
+        (task_id, PLATFORM_PROFILE, PLATFORM_PROFILE),
     ).fetchall()
     return [r["child_id"] for r in rows]
 

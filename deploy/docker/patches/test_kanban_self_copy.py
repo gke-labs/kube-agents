@@ -25,13 +25,18 @@ class TestTheRefusal(unittest.TestCase):
         self.assertIn("kanban_create refused", text)
         self.assertIn("#3164", text)
 
-    def test_the_refusal_gives_the_shared_follow_up_instruction(self):
-        """The same clause the kanban_link guard for #3248 ends with."""
+    def test_the_refusal_does_not_offer_parents_as_a_way_round(self):
+        """Told to queue it after its own card, a model does the job twice in sequence."""
         text = ksc.refuse_self_copy(card(), "platform", [])
-        self.assertIn(f"to queue work to run after yours, create it with parents=[{PARENT}]", text)
+        self.assertNotIn("parents", text)
+        self.assertIn("Do this work on your own card", text)
 
     def test_an_assignee_with_stray_whitespace_is_still_refused(self):
         self.assertIsNotNone(ksc.refuse_self_copy(card(), " platform ", []))
+
+    def test_a_title_cased_assignee_is_still_refused(self):
+        """create_task lower-cases it, so "Platform" lands as `platform`."""
+        self.assertIsNotNone(ksc.refuse_self_copy(card(), "Platform", []))
 
     def test_parents_listing_other_cards_only_is_still_refused(self):
         self.assertIsNotNone(ksc.refuse_self_copy(card(), "platform", ["t_other"]))

@@ -1563,7 +1563,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # "propose the manifest" to its own profile and then did it anyway, and the
 # person got two pull requests (#3164). kanban_create refuses such a card
 # unless the creator's own card is in its parents (platform SOUL section 0's
-# queued follow-up, which runs after the creator finishes).
+# queued follow-up, which runs after the creator finishes), and the
+# kanban_scheduling repair never releases such a follow-up early.
 # See the module docstring in deploy/docker/patches/kanban_self_copy.py.
 #
 # credential-redaction: a kanban worker that pasted a GCP access token into a

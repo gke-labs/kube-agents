@@ -33,10 +33,19 @@ caller's card is not in its ``parents``.
 What this changes
 -----------------
 ``kanban_create`` returns :func:`refusal_text` instead of creating such a
-card. The wording ends with the same follow-up instruction that the
-``kanban_link`` guard for #3248 gives, so the two refusals read as one rule.
-A person's card, a chat session's card, a Cluster Agent's card and a
-platform worker's card for any other profile are untouched.
+card. The text says to do the work on the caller's own card and does not
+mention ``parents``: offered that way out, a model that wanted to delegate
+would queue the same job after itself and do it twice in sequence. A
+person's card, a chat session's card, a Cluster Agent's card and a platform
+worker's card for any other profile are untouched. The image's scheduling
+repair (``kanban_scheduling.find_deadlocked_children``) never releases a
+``platform`` card queued after a ``platform`` card, so a dependency block
+can't turn a follow-up into a concurrent copy either.
+
+What it doesn't stop: a worker that queues the job it is doing as a
+follow-up of its own card, unprompted, still gets it done twice, one after
+the other. Telling that apart from different follow-up work needs to know
+what the cards are for.
 """
 
 from __future__ import annotations
@@ -48,13 +57,14 @@ PLATFORM_PROFILE = "platform"
 
 
 def refusal_text(self_tid: str) -> str:
+    # No hint at `parents`: a model told how to queue the card after its own
+    # would do the job, complete, and let the queued copy do it again.
     return (
         f"kanban_create refused: this card would go to `{PLATFORM_PROFILE}`, your own "
-        f"profile, and start while you are still working {self_tid}. Its worker would "
-        f"start cold and redo the job you are already doing; that is how one request "
-        f"got two pull requests (#3164). Do the work on your own card. A card you want "
-        f"running now needs a Cluster Agent or another specialist; to queue work to run "
-        f"after yours, create it with parents=[{self_tid}]."
+        f"profile, while you are still working {self_tid}. A card for `{PLATFORM_PROFILE}` "
+        f"is a second you: its worker starts cold and redoes the job, which is how one "
+        f"request got two pull requests (#3164). Do this work on your own card, and "
+        f"delegate only to a Cluster Agent or another specialist."
     )
 
 
@@ -67,11 +77,13 @@ def refuse_self_copy(self_task: Any, assignee: Any, parents: Sequence[str]) -> O
     """
     if self_task is None:
         return None
-    own = getattr(self_task, "assignee", None)
+    own = str(getattr(self_task, "assignee", None) or "").strip().lower()
     self_tid = getattr(self_task, "id", None)
     if own != PLATFORM_PROFILE or not self_tid:
         return None
-    if str(assignee or "").strip() != PLATFORM_PROFILE:
+    # create_task lower-cases the assignee (``normalize_profile_name``), so
+    # "Platform" lands as `platform` and must be refused as one.
+    if str(assignee or "").strip().lower() != PLATFORM_PROFILE:
         return None
     if self_tid in tuple(parents or ()):
         return None
