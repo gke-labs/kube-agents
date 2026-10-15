@@ -35,7 +35,6 @@ NOW_SETTLED = FILED_AT + 600
 FALLBACK_SECONDS = oobe.bootstrap_handoff.DEADLINE_SECONDS + oobe.RANKING_ALLOWANCE_SECONDS
 NOW_PAST_FALLBACK = FILED_AT + FALLBACK_SECONDS
 RANKING_ID = "t_rank"
-REPOS = ["acme/gitops"]
 FIRST = [oobe.FIRST_RUN_AUDITS[0]]
 MINUTE = 60
 
@@ -68,7 +67,6 @@ class StageTest(unittest.TestCase):
         self.board = self.d / "kanban.db"
         self.started: list[tuple[list[str], dict]] = []
         self.failing: set[str] = set()
-        self.repos: list[str] | Exception = list(REPOS)
         self._roster([{"id": job_id, "enabled": True, "state": "scheduled"} for job_id in oobe.FIRST_RUN_AUDITS])
         # The scan and delivery stages are their own modules, tested beside them; here they are stubs.
         self.scan = mock.Mock(return_value=0)
@@ -76,7 +74,6 @@ class StageTest(unittest.TestCase):
         patches = [
             mock.patch.object(oobe, "board_path", lambda _d: self.board),
             mock.patch.object(oobe.subprocess, "run", self._run),
-            mock.patch.object(oobe, "managed_repositories", self._repos),
             mock.patch.object(oobe.bootstrap_scan_gate, "main", self.scan),
             mock.patch.object(oobe.bootstrap_delivery, "main", self.deliver),
         ]
@@ -91,11 +88,6 @@ class StageTest(unittest.TestCase):
         self.started.append((argv, env))
         code = 1 if argv[-1] in self.failing else 0
         return subprocess.CompletedProcess(argv, code, stdout="", stderr="no such job" if code else "")
-
-    def _repos(self):
-        if isinstance(self.repos, Exception):
-            raise self.repos
-        return self.repos
 
     def _roster(self, jobs: list[dict]) -> None:
         cron = self.d / "profiles" / "platform" / "cron"
@@ -861,26 +853,17 @@ class StageTest(unittest.TestCase):
 
     # --- no GitOps repository -------------------------------------------------
 
-    def test_no_repository_skips_and_finishes(self):
+    def test_the_audits_start_on_an_install_with_no_repository(self):
+        """With no repository the audits run without a forge, so the chain starts as it would with one."""
         self._file_scan()
         _board(self.board, [_ranking("done")])
-        self.repos = []
-        self._main()
-        self.assertEqual(self.started, [])
-        state = oobe.read_state(self.d)
-        self.assertTrue(state[oobe.STATE_DONE])
-        self.assertEqual(state[oobe.STATE_REASON], oobe.SKIP_NO_REPOSITORY)
-
-    def test_an_unreadable_repository_list_is_retried(self):
-        self._file_scan()
-        _board(self.board, [_ranking("done")])
-        self.repos = RuntimeError("kubectl binary not found in PATH")
-        self._main()
-        self.assertEqual(self.started, [])
-        self.assertFalse((self.d / oobe.AUDITS_MARKER).exists())
-        self.repos = list(REPOS)
-        self._main()
+        empty = types.ModuleType("gitops_workspace")
+        empty.get_managed_github_repos = lambda: []
+        empty.get_managed_repos = lambda: []
+        with mock.patch.dict(sys.modules, {"gitops_workspace": empty}):
+            self._main()
         self.assertEqual(self._started_ids(), FIRST)
+        self.assertFalse(oobe.read_state(self.d).get(oobe.STATE_SKIPPED))
 
     # --- once only ------------------------------------------------------------
 

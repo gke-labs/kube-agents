@@ -175,11 +175,9 @@ are a weak witness at that distance: the API server keeps them for one hour by d
 so (B) leans on pod and node state and uses events as corroboration, not as the only source. The
 first run comes from the Chat Agent's first-run stage, the same place the four fleet audits start
 once the onboarding scan settles, so a fresh install's first report is a baseline of every cluster
-it manages rather than a blank. Two things stand in the way today and the second work item
-removes both. The first-run stage skips every audit when no GitOps repository is configured, and
-the fleet-audit skill's `start` fails outright without one (`INSTALL.md` says so), because the
-streams it serves exist to file a ledger. This stream does not: the collector needs no repository
-and the report on the volume is the record. Where a repository is configured and the run is full,
+it manages rather than a blank. With no GitOps repository the first-run stage still starts the
+audits, and the fleet-audit skill's `start` runs without a forge (`NO_FORGE`). This stream needs
+no repository either: the collector needs none and the report on the volume is the record. Where a repository is configured and the run is full,
 the SOP calls the `fleet_scope` tool (§3.2), probes the collector's lock (§3.6; a probe that
 names a pending reset makes the run the baseline of §3.6, the collector alone with no `start` or
 `finish`), calls `start`, runs the collector, then `finish` with the collector's manifest (`finish`
