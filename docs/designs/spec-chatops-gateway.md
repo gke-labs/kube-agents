@@ -1684,7 +1684,7 @@ mark still carries its ask (card work still open), `suspended` while its settle 
 and `closed` after. When the latest chain's mark holds no open work and an older ask's still
 does (its cards still running, or blocked), the session follows the newest such ask instead,
 so it holds until every chain's cards have settled. Only an older ask a notify `update` key
-is bound to holds it, and for at most four hours after its mark was last drawn, since nothing else can settle an older ask and a lost settle would otherwise hold it for good. `closed` is sent even for a thread this process never opened, since a restarted gateway
+is bound to holds it, and for at most four hours after its mark was last drawn or a keyed notify last repeated it (the latest across every chain that marked the ask, so a click or typed answer continuing it keeps the clock), since nothing else can settle an older ask and a lost settle would otherwise hold it for good. A terminal that draws nothing still tells Slack when that bound alone has moved the session. `closed` is sent even for a thread this process never opened, since a restarted gateway
 otherwise leaves the old process's Working… on it; the thread is renamed once from its first
 verified ask that is not a gateway command, with today's title sanitiser. That state is process
 memory too, so after a restart the next verified ask in a thread may title it again. `assistant_thread_started`, and `app_home_opened` on the Messages tab, get today's
