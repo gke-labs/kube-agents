@@ -323,7 +323,7 @@ resource "null_resource" "deleted_policy" {
       # second entry the API server sorts ahead of the GitOps one -- a
       # controller touching annotations, say -- would make index 0 the wrong
       # manager and hard-exit this plant against a scenario that is in fact
-      # correct. The sibling stacks use this form for the same reason.
+      # correct. The sibling stacks use the same form.
       policy_managers="$(kubectl get networkpolicy "${local.policy}" -n "${local.ns}" \
         -o jsonpath='{range .metadata.managedFields[*]}{.manager}{"\n"}{end}' 2>/dev/null || true)"
       if ! printf '%s\n' "$policy_managers" | grep -qxF "${var.gitops_field_manager}"; then

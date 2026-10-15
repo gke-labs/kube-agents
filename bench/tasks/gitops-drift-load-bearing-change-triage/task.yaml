@@ -94,9 +94,12 @@
 # record bills DRIFT_QUOTA_KEY alongside every other drift case. The failing
 # pods bill the Warning bucket as well -- k8s-event-watcher fires on them, as
 # the collision note above records -- so three repetitions of this case also
-# draw down ALERT_DAILY_LIMIT_WARNING, which autoops-warning-event-triage,
-# incident-triage-oom-event-probe and autoops-crashloop-config-triage depend
-# on. Both are off in CI (hack/ci-deploy.sh zeroes both), so this is a DEV
+# draw down ALERT_DAILY_LIMIT_WARNING, which autoops-warning-event-triage and
+# autoops-crashloop-config-triage depend on: both read a card the watcher
+# filed. (incident-triage-oom-event-probe does not belong on that list -- it
+# is deployer: noop and carries the warning payload as prompt text, so it
+# never reaches the quota.) Both buckets are off in CI
+# (hack/ci-deploy.sh zeroes both), so this is a DEV
 # install concern: run those cases the same day as this one and they can find
 # a bucket this case emptied. Check both if a fixture reports a suppressed
 # record or an event case times out waiting for a card.
