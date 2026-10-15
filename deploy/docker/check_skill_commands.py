@@ -373,7 +373,8 @@ def skill_blocks(repo_dir: str, skills_dir: Path) -> list[Block]:
     documents = []
     for skill_md in sorted(skills_dir.rglob(SKILL_FILE_NAME)):
         documents += [skill_md, *sorted(skill_md.parent.glob(REFERENCES_GLOB))]
-    for skill_file in documents:
+    # A references/SKILL.md matches both globs.
+    for skill_file in dict.fromkeys(documents):
         path = f"{repo_dir}/{skill_file.relative_to(skills_dir).as_posix()}"
         try:
             blocks = list(code_blocks(skill_file.read_text(encoding="utf-8")))

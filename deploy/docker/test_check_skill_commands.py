@@ -160,6 +160,15 @@ class SkillBlocksTest(unittest.TestCase):
             got,
         )
 
+    def test_a_skill_md_under_references_is_read_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            skill = Path(tmp) / "demo" / "SKILL.md"
+            (skill.parent / "references").mkdir(parents=True)
+            skill.write_text("")
+            (skill.parent / "references" / "SKILL.md").write_text("```sh\npwd\n```\n")
+            got = check.skill_blocks("agents/platform/skills", Path(tmp))
+        self.assertEqual([check.Block("agents/platform/skills/demo/references/SKILL.md", 2, "pwd")], got)
+
     def test_a_block_is_scanned_whole(self):
         body = "# apply it\nfoo \\\n  --bar\ncat > cm.yaml <<'END-OF-FILE'\ndescription: don't\nEND-OF-FILE\n$G add cm.yaml"
         with tempfile.TemporaryDirectory() as tmp:
