@@ -590,6 +590,11 @@ INJECT_LANE_SAFEGUARDS = [
 # types that count are lane.REQUESTING_CHECK_TYPES.
 INJECT_LANE_REQUESTING = [
     "cluster-agent-crashloop-fix-request",
+    # The two full obtainability audits: `finish` opens a budget pull request
+    # for checkout-gateway's major no-pdb finding once the pool repositories
+    # declare the workload; listed in `requesting:` with that one.
+    "obtainability-planted-orphan-service",
+    "obtainability-planted-pdb",
     # obtainability-remediation-proposal was listed in the safeguards file's
     # `requesting:` while the persona answered its "propose a manifest" prompt
     # with a pull request; the persona's rule now puts that manifest in the
