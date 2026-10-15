@@ -265,7 +265,10 @@ card for anything else).
 `INVENTORY.raw.md` there, and every cluster the writer's own `finding_lines` lists from the
 completed cluster cards has a block line) or `ranking_card_filed` (the newest unarchived card keyed
 `bootstrap-inventory-prioritize` filed at or after the sweep carries the hand-off's own body and is
-not `blocked`, `triage`, `failed` or `cancelled`).
+not `blocked`, `triage`, `failed` or `cancelled`) or `raw_report_no_first_run_audit_checks` (the
+same parse, and no block line carries a check from the roster of one of the four audits the `oobe`
+stage runs after the scan; an error on an install the gate recorded as having no GitOps repository,
+where the scan runs those checks on purpose).
 
 `bootstrap_findings` reads the shell sandbox of the install under test:
 `INVENTORY.items.json`, which the onboarding prioritization stage's `inventory_findings.py

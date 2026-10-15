@@ -338,9 +338,10 @@
 # the one worth testing before anyone treats removing a case as the lever
 # that bought this headroom.
 #
-# The two drift cases now spend six injects a night between them, above the
-# default ALERT_DAILY_LIMIT_DRIFT of 5 that the sibling's paragraph below
-# reasons from. The eval install runs uncapped (EVAL_ALERT_DAILY_LIMIT_DRIFT=0
+# The two drift cases now spend six injects a night between them, below the
+# default ALERT_DAILY_LIMIT_DRIFT that the sibling's paragraph below reasons
+# from. Other runs against the same install on the same UTC day spend from the
+# same bucket. The eval install runs uncapped (EVAL_ALERT_DAILY_LIMIT_DRIFT=0
 # in hack/ci-deploy.sh), so this is a dev-install note, not a CI one.
 #
 # 2026-10-06 adds upgrades-fleet-readiness-failclosed-webhook (its paragraph
@@ -477,20 +478,22 @@
 ./tasks/consistency-no-environment-label/task.yaml
 
 # The third tofu-provisioned case, and the drift half of incident triage
-# (#1827). It is here for the reason the two above it are, plus one of its
-# own. Cost: its stack takes the infra lock, plants a Deployment whose replica
-# count was taken out of band, hands the Session KV daemon the audit record
-# that change would have produced, and blocks until the resulting triage card
-# is on the board (bounded at 5 minutes) -- then the agent turn waits on the
-# card itself, as autoops does. Hinted at 900s with them, unmeasured.
+# (#1827). It is here for the reason the two above it are. Cost: its stack
+# takes the infra lock, plants a Deployment whose replica count was taken out
+# of band, hands the Session KV daemon the audit record that change would have
+# produced, and blocks until the resulting triage card is on the board
+# (bounded at 5 minutes) -- then the agent turn waits on the card itself, as
+# autoops does. Hinted at 900s with them, unmeasured.
 #
-# Its own reason is a ceiling the other two do not have. The daemon allows
-# ALERT_DAILY_LIMIT_DRIFT drift alerts a day per install (5 by default) and
-# suppresses the rest, and a suppressed record files no card, so the case
-# cannot run more than that many times a day against one install whatever
-# tier it sits in. Three repetitions a night fit; a presubmit seat, at
-# several pull requests a day against the shared install, does not -- so this
-# case has a reason to stay nightly that no measurement will retire.
+# The daemon also has a drift alert ceiling that the other two do not have.
+# It allows ALERT_DAILY_LIMIT_DRIFT drift alerts a day per install and
+# suppresses the rest, and a suppressed record files no card. The ceiling
+# applies to a dev install only. On CI, hack/ci-deploy.sh sets
+# EVAL_ALERT_DAILY_LIMIT_DRIFT="0", which means uncapped, and each lease
+# deploys its own install. So the ceiling is not a reason to keep this case
+# nightly. On a dev install that carries the default, three repetitions fit
+# under the ceiling. Other runs against that install on the same UTC day
+# spend from the same bucket, and together they can spend all of it.
 #
 # `validated: false`, in step with every case in this file -- none sets it
 # true. It has been run: three runs against a dev install, all five

@@ -16,10 +16,23 @@ import streamlit as st
 from admin_console.connection_session import recover_app_shell
 from admin_console.connection_gate import require_connection
 from admin_console.agent_runtime import AgentRuntimeError, AgentRuntimeProvider
+from admin_console.kanban_view import (
+    DONE_STATUS,
+    display_status,
+    matches_status,
+    status_filter_options,
+    waits_on_person,
+)
 from admin_console.ui import paginated_selectable_table
 
 ACTIVE_STATUSES = {"todo", "ready", "running"}
 ATTENTION_STATUSES = {"blocked", "failed", "crashed", "cancelled"}
+WAITING_ON_INPUT_METRIC = "Waiting on input"
+GAVE_UP_METRIC = "Failed"
+DONE_METRIC = "Done"
+# Tasks, Active, Waiting on input, Failed and Done.
+METRIC_COUNT = 5
+DONE_WITH_PR_CAPTION = "{count} with a pull request"
 
 recover_app_shell()
 
@@ -44,7 +57,7 @@ def related_rows(tasks) -> list[dict[str, str]]:
     return [
         {
             "Task": task.task_id,
-            "Status": task.status,
+            "Status": display_status(task),
             "Assignee": task.assignee,
             "Title": task.title,
         }
@@ -82,17 +95,27 @@ except AgentRuntimeError as exc:
     st.stop()
 
 all_tasks = board.tasks
-metrics = st.columns(4)
+metrics = st.columns(METRIC_COUNT)
 metrics[0].metric("Tasks", len(all_tasks))
 metrics[1].metric(
     "Active",
     sum(task.status in ACTIVE_STATUSES for task in all_tasks),
 )
 metrics[2].metric(
-    "Attention",
-    sum(task.status in ATTENTION_STATUSES for task in all_tasks),
+    WAITING_ON_INPUT_METRIC,
+    sum(waits_on_person(task) for task in all_tasks),
 )
-metrics[3].metric("Done", sum(task.status == "done" for task in all_tasks))
+metrics[3].metric(GAVE_UP_METRIC, sum(task.gave_up for task in all_tasks))
+metrics[4].metric(
+    DONE_METRIC, sum(task.status == DONE_STATUS for task in all_tasks)
+)
+metrics[4].caption(
+    DONE_WITH_PR_CAPTION.format(
+        count=sum(
+            task.status == DONE_STATUS and task.has_pr for task in all_tasks
+        )
+    )
+)
 
 if board.truncated:
     st.warning("The 500-task read limit was reached.")
@@ -101,7 +124,7 @@ if not all_tasks:
     st.info("No tasks were found.")
     st.stop()
 
-statuses = sorted({task.status for task in all_tasks})
+statuses = status_filter_options(all_tasks)
 assignees = sorted({task.assignee for task in all_tasks})
 filters = st.columns([1, 1.4, 2])
 requested_status = query_value("kanban_status")
@@ -138,7 +161,7 @@ search = filters[2].text_input(
 tasks = [
     task
     for task in all_tasks
-    if (not selected_status or task.status == selected_status)
+    if (not selected_status or matches_status(task, selected_status))
     and (not selected_assignee or task.assignee == selected_assignee)
     and (
         not search
@@ -167,7 +190,7 @@ selected_task = requested_task if requested_task in task_ids else task_ids[0]
 clicked_task, _ = paginated_selectable_table(
     [
         {
-            "Status": task.status,
+            "Status": display_status(task),
             "Task": task.task_id,
             "Title": task.title,
             "Assignee": task.assignee,
@@ -211,12 +234,15 @@ st.divider()
 heading, state = st.columns([4, 1])
 heading.subheader(task.title or task.task_id)
 heading.caption(task.task_id)
-if task.status == "done":
-    state.success(task.status)
+status_label = display_status(task)
+if task.status == DONE_STATUS:
+    state.success(status_label)
+elif waits_on_person(task):
+    state.warning(status_label)
 elif task.status in ATTENTION_STATUSES:
-    state.error(task.status)
+    state.error(status_label)
 else:
-    state.info(task.status)
+    state.info(status_label)
 
 overview, runs_tab, timeline = st.tabs(["Overview", "Runs", "Timeline"])
 

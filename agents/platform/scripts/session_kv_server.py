@@ -77,6 +77,8 @@ LEDGER_MAX_ROWS = int(os.getenv("SESSION_KV_LEDGER_MAX_ROWS", "200000"))
 # the failing container and the leading predicate, which is more than the
 # reader shows.
 LEDGER_MESSAGE_MAX_CHARS = int(os.getenv("SESSION_KV_LEDGER_MESSAGE_MAX_CHARS", "512"))
+# The GitOpsDrift daily alert ceiling when ALERT_DAILY_LIMIT_DRIFT is not set.
+DEFAULT_ALERT_DAILY_LIMIT_DRIFT = 20
 
 # The read-only activity feed: `GET /v1/intercepted-events`, `GET /v1/tasks`,
 # `GET /v1/tasks/{id}` and `GET /v1/sessions/{id}/tasks`. It exists for an
@@ -462,7 +464,18 @@ ALERT_DAILY_LIMITS = {
     # it displays as. Declared here rather than left to a `.get` miss because a
     # miss is allowed through *uncapped* (see the Info note above), and an
     # uncapped drift stream is exactly the flood this bucket exists to bound.
-    DRIFT_QUOTA_KEY: _alert_daily_limit("ALERT_DAILY_LIMIT_DRIFT", 5),
+    #
+    # The drift default is a judgment, not a measurement. One apply spends one
+    # inject for each object, because the detector does not combine records.
+    # install.sh and upgrade.sh enable the detector by default, so this value
+    # applies to the installs that these scripts manage. Only changes by people
+    # alert, so the default covers a few hand applies a day. A record that the
+    # detector cannot join to a live object still sends a card with less
+    # detail, unless its cluster is outside the install's scope. That card
+    # spends the same budget. Each admitted record starts a triage turn. The
+    # detector also reads the audit logs of each scoped project, so a wider
+    # scope sends more records. These are the reasons not to go higher.
+    DRIFT_QUOTA_KEY: _alert_daily_limit("ALERT_DAILY_LIMIT_DRIFT", DEFAULT_ALERT_DAILY_LIMIT_DRIFT),
 }
 
 # The `kind` a drift record carries, set by the drift detector
