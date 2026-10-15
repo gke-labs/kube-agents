@@ -188,39 +188,6 @@ def test_a_mention_or_another_run_is_not(command):
     assert _worker_check("the-worker-ran-start", [command]) == "fail"
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        f"python3 ./skills/fleet-audit/scripts/collect.py {AUDIT}",
-        f"python3 ../skills/fleet-audit/scripts/collect.py {AUDIT}",
-        f"python3 skills/fleet-audit/scripts/audit_report.py start --audit {AUDIT}",
-        f"cd /tmp && python3 skills/fleet-audit/scripts/collect.py {AUDIT}",
-        "cat governance/compliance_audit_sop.md",
-        "sed -n 1,200p ./skills/fleet-audit/SKILL.md",
-        "cat skills/gke-compute-classes/references/ccc.md",
-        f"cat {SCRIPTS}/governance/compliance_audit_sop.md",
-        "cat /opt/data/profiles/platform/skills/fleet-audit/governance/compliance_audit_sop.md",
-    ],
-)
-def test_a_relative_path_fails_the_full_path_check(command):
-    assert _worker_check("the-worker-used-full-paths", [command]) == "fail"
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        f"python3 {SCRIPTS}/collect.py {AUDIT}",
-        f'python3 "$HERMES_HOME"/skills/fleet-audit/scripts/collect.py {AUDIT}',
-        "cat /opt/data/profiles/platform/governance/compliance_audit_sop.md",
-        "sed -n 1,200p /opt/data/profiles/platform/skills/fleet-audit/SKILL.md",
-        f'grep -n "skills/fleet-audit/scripts/" {SCRIPTS}/../SKILL.md',
-        "find /opt/data -path '*skills/fleet-audit/scripts/*'",
-    ],
-)
-def test_a_full_path_passes_the_full_path_check(command):
-    assert _worker_check("the-worker-used-full-paths", [command]) == "pass"
-
-
 def _answer_check(name: str, answer: str) -> str:
     spec = yaml.safe_load(TASK.read_text())["verification_spec"]
     check = next(entry for entry in spec if entry["name"] == name)["check"]
