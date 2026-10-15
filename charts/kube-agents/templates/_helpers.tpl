@@ -634,8 +634,9 @@ this, and the minter guard is the reason it has to be one answer.
 
 It also carries the checks the chart can make before the API server does, so
 the failure names the values key: the two spellings are exclusive, forge names
-are unique, a provider must be registered, a GitHub forge's host must be one GitHub serves and its
-namespace a GitHub organisation or user name, a GitLab forge needs a
+are unique, a provider must be registered, a GitHub forge's host must be github.com or a GitHub
+Enterprise Server hostname and its namespace a GitHub organisation or user name, an install has
+one GitHub host and one host is one forge's, a GitLab forge needs a
 credentialsRef, a host that is a hostname and not GitHub's, and a namespace that
 is a GitLab group path, and a repository must name a
 declared forge, be neither empty nor the alias's `None`, and be qualified by a
@@ -671,6 +672,11 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- $providers := list -}}
 {{- $namespaces := dict -}}
 {{- $gitlabHosts := dict -}}
+{{- $hostProviders := dict -}}
+{{- $ghHost := "" -}}
+{{- $ghCA := "" -}}
+{{- /* Mirrors the github provider's ReservedDomains. */ -}}
+{{- $githubReserved := "(^|\\.)(github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com)$" -}}
 {{- range $i, $f := $forges -}}
 {{- if not $f.name -}}
 {{- fail (printf "platformAgent.integration.forges[%d].name is required" $i) -}}
@@ -684,9 +690,29 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- end -}}
 {{- $host := $f.host | default "" -}}
 {{- /* ASCII only before `lower`, which is Unicode: `gİthub.com` lowers to github.com, and the operator folds ASCII only, so it is another host. */ -}}
-{{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) -}}
-{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve" $i $f.host) -}}
+{{- /* A github forge is at github.com in one of its spellings, or at a GitHub Enterprise Server host: a hostname, label by label, that is not under a domain where GitHub runs its own services and not GitLab's. */ -}}
+{{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch $githubReserved (lower $host)) (regexMatch "(^|\\.)gitlab\\.com$" (lower $host))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve: name github.com or a GitHub Enterprise Server host" $i $f.host) -}}
 {{- end -}}
+{{- /* A forge at a host other than github.com names its provider, as the CRD's rule: left to the default, a forge written for a GitLab instance would become a GitHub Enterprise Server. */ -}}
+{{- if and (not $f.provider) $host (not (has (lower $host) $githubHosts)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].provider is required: the forge is at %q, not github.com; name it github for a GitHub Enterprise Server or gitlab for a GitLab instance" $i $f.host) -}}
+{{- end -}}
+{{- /* One host per forge, and one GitHub host per install, as the operator's hostConflicts. */ -}}
+{{- $canon := lower ($host | default "") -}}
+{{- if eq $provider "github" -}}
+{{- if or (not $canon) (has $canon $githubHosts) }}{{ $canon = "github.com" }}{{ end -}}
+{{- if and $ghHost (ne $ghHost $canon) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: this install's GitHub host is already %s; an install serves one GitHub host, github.com or one GitHub Enterprise Server" $i $ghHost) -}}
+{{- end -}}
+{{- $ghHost = $canon -}}
+{{- else -}}
+{{- if or (not $canon) (eq $canon "www.gitlab.com") }}{{ $canon = "gitlab.com" }}{{ end -}}
+{{- end -}}
+{{- if and (hasKey $hostProviders $canon) (ne (get $hostProviders $canon) $provider) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: %s is already the host of a %s forge; one host is one forge's" $i $canon (get $hostProviders $canon)) -}}
+{{- end -}}
+{{- $_ := set $hostProviders $canon $provider -}}
 {{- /* On every provider: the CRD's schema refuses the name wherever it is written, so the chart does too, naming the values key. */ -}}
 {{- $secret := ($f.credentialsRef | default dict).name | default "" -}}
 {{- if and $secret (or (gt (len $secret) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $secret))) -}}
@@ -698,12 +724,9 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- fail (printf "platformAgent.integration.forges[%d].caBundleRef needs a name: the Secret that holds the CA" $i) -}}
 {{- end -}}
 {{- if $caMap -}}
-{{- if ne $provider "gitlab" -}}
-{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef is for a gitlab forge; provider %s does not read a CA bundle" $i $provider) -}}
-{{- end -}}
-{{- /* gitlab.com presents a certificate the public CAs sign: a private CA must never vouch for it. */ -}}
-{{- if or (not $host) (has (lower $host) (list "gitlab.com" "www.gitlab.com")) -}}
-{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef is for a self-managed host; gitlab.com uses the public CAs, so set host to the instance's hostname or drop caBundleRef" $i) -}}
+{{- /* gitlab.com and github.com present certificates the public CAs sign: a private CA must never vouch for them. */ -}}
+{{- if or (not $host) (has (lower $host) (concat (list "gitlab.com" "www.gitlab.com") $githubHosts)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef is for a self-managed host; gitlab.com and github.com use the public CAs, so set host to the instance's hostname or drop caBundleRef" $i) -}}
 {{- end -}}
 {{- if or (gt (len $caMap) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $caMap)) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.name is %q, which is not a Secret name (a lowercase DNS subdomain of at most 253 characters)" $i $caMap) -}}
@@ -712,11 +735,19 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- if and $caKey (or (gt (len $caKey) 253) (not (regexMatch "^[-._a-zA-Z0-9]+$" $caKey)) (eq $caKey ".") (hasPrefix ".." $caKey)) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.key is %q, which is not a Secret key" $i $caKey) -}}
 {{- end -}}
+{{- /* One CA bundle for the one GitHub host, as the operator's hostConflicts: the broker trusts one bundle per host. */ -}}
+{{- if eq $provider "github" -}}
+{{- $thisCA := printf "%s/%s" $caMap ($caKey | default "ca.crt") -}}
+{{- if and $ghCA (ne $ghCA $thisCA) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: %s already has a CA bundle, %s; the broker trusts one CA bundle per host, so name the same Secret key on both forges or on one" $i $ghHost $ghCA) -}}
+{{- end -}}
+{{- $ghCA = $thisCA -}}
+{{- end -}}
 {{- end -}}
 {{- if eq $provider "gitlab" -}}
 {{- /* Any GitHub name, not only its three spellings: api.github.com or raw.githubusercontent.com would hand GitHub's traffic a GitLab token. */ -}}
 {{- /* Label by label, as the operator's DNS-subdomain check: no empty or dash-edged label. */ -}}
-{{- if and $host (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch "(^|\\.)(github\\.com|githubusercontent\\.com)$" (lower $host))) -}}
+{{- if and $host (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch $githubReserved (lower $host))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is not a hostname a gitlab forge can be at" $i $f.host) -}}
 {{- end -}}
 {{- if not $secret -}}

@@ -601,7 +601,7 @@ def ledger_repo() -> str | None:
     configured = os.environ.get(LEDGER_REPO_ENV, "").strip()
     if configured:
         return configured
-    repos = sorted(gitops_workspace.get_managed_github_repos())
+    repos = sorted(gitops_workspace.get_managed_github_repo_names())
     if len(repos) > 1:
         raise LedgerRepoAmbiguous(f"{len(repos)} managed repositories ({', '.join(repos)}); set {LEDGER_REPO_ENV}")
     return repos[0] if repos else None
