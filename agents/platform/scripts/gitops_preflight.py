@@ -19,7 +19,7 @@ prints exactly one line:
     STATE_UNREADABLE: stop now. ...                  exit 5
     BROKER_UNAVAILABLE: stop now. ...                exit 6  (with --repo)
 
-Only REGISTERED is exit 0. Every other line tells the reader to stop and
+Only REGISTERED (and --list with a usable managed repository) is exit 0. Every other line tells the reader to stop and
 block, because that is the whole point of having one. A malformed command line
 (an empty --repo, --repo with --list) is argparse's exit 2, with no status line.
 
@@ -43,6 +43,10 @@ gating: `managed_repos` (swept, audited, sent pull requests) and
 
     MANAGED: <repo> ... | none | none usable (<n> registered, unusable: ...)
     CONTEXT: <host/path>[@<ref>] ... | none           exit 0, or 5 if unreadable
+
+With no usable managed repository, a third line follows: the same
+NO_REGISTERED_REPO stop the bare form prints, and the exit is 3. Nothing can
+be proposed then, so reading the list must not look like an answer.
 
 MANAGED uses the names the verbs accept (bare owner/name on a GitHub-only
 install); CONTEXT uses host/path, because context repositories are only ever
@@ -210,7 +214,14 @@ def listing() -> tuple[int, str]:
     if not managed:
         skipped = _unusable_entries()
         managed_text = f"{NONE} usable ({len(skipped)} registered, unusable: {' '.join(skipped)})" if skipped else NONE
-    return EXIT_REGISTERED, f"MANAGED: {managed_text}\nCONTEXT: {' '.join(context) or NONE}"
+    lines = f"MANAGED: {managed_text}\nCONTEXT: {' '.join(context) or NONE}"
+    if not managed:
+        # An empty registry is the stop whichever form a worker runs: a
+        # "MANAGED: none" read as an answer was followed by a direct
+        # `kubectl delete` on #3086's eval (#3077).
+        code, stop = preflight()
+        return code, f"{lines}\n{stop}"
+    return EXIT_REGISTERED, lines
 
 
 def _unusable_entries() -> list[str]:

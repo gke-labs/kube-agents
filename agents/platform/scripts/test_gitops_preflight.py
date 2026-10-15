@@ -1,5 +1,6 @@
 import json
 import os
+import io
 import subprocess
 import sys
 import tempfile
@@ -199,17 +200,31 @@ class PreflightAnswersInOneLine(unittest.TestCase):
 class ListingShowsBothRegistries(unittest.TestCase):
     """`--list` is for SOUL.md's repository resolution: managed versus context."""
 
-    def test_nothing_registered_lists_none_twice_and_exits_zero(self):
+    def test_nothing_registered_lists_none_twice_then_stops(self):
+        # #3077: a worker read "MANAGED: none" at exit 0 as an answer and ran
+        # a direct delete. The empty list now carries the bare form's stop.
         with _StateDir(entries=None):
             code, text = gitops_preflight.listing()
-        self.assertEqual(gitops_preflight.EXIT_REGISTERED, code)
-        self.assertEqual("MANAGED: none\nCONTEXT: none", text)
+            _, stop = gitops_preflight.preflight()
+        self.assertEqual(gitops_preflight.EXIT_NO_REGISTERED_REPO, code)
+        self.assertEqual(f"MANAGED: none\nCONTEXT: none\n{stop}", text)
+        self.assertTrue(stop.startswith("NO_REGISTERED_REPO: "), stop)
 
     def test_unusable_managed_entries_are_listed_as_unusable_not_none(self):
         unusable = [{"type": "github", "url": "https://github.example.com:8443/acme/fleet"}]
         with _StateDir(entries=unusable):
             code, text = gitops_preflight.listing()
         self.assertTrue(text.startswith("MANAGED: none usable (1 registered, unusable: "), text)
+        self.assertEqual(gitops_preflight.EXIT_NO_REGISTERED_REPO, code)
+        self.assertIn("\nNO_REGISTERED_REPO: 1 registered entry is not usable", text)
+
+    def test_the_list_as_a_command_exits_3_on_an_empty_registry(self):
+        with _StateDir(entries=None):
+            out = io.StringIO()
+            with patch("sys.stdout", out):
+                code = gitops_preflight.main(["--list"])
+        self.assertEqual(3, code)
+        self.assertEqual("NO_REGISTERED_REPO", out.getvalue().splitlines()[-1].split(":")[0])
 
     def test_managed_and_context_are_listed_apart(self):
         context = [{"type": "github", "url": "https://github.com/acme/tf-live", "ref": "prod"}]
