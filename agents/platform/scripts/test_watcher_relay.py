@@ -304,13 +304,18 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
     def test_both_routes_log_the_caller_before_the_decision(self):
         # The broker calls on its own credential, so this line is the only
         # record of which ServiceAccount presented the watcher token.
-        for path in ("/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events",
-                     f"/v1/watcher/gcp/pubsub.googleapis.com/v1/{SUB}"):
+        # The whole target too: the object read is what the line is for.
+        for path, target in (
+            ("/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/namespaces/default/configmaps/app",
+             "kagents-dev/us-east4/fleet-a/api/v1/namespaces/default/configmaps/app"),
+            (f"/v1/watcher/gcp/pubsub.googleapis.com/v1/{SUB}", f"pubsub.googleapis.com/v1/{SUB}"),
+        ):
             with self.subTest(path=path):
                 with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
                     self._request("GET", path)
                 self.assertTrue(
-                    any("principal=" in line and CALLER in line for line in logs.output), logs.output
+                    any("principal=" in line and CALLER in line and f"target={target}" in line for line in logs.output),
+                    logs.output,
                 )
 
     # -- who may call it ---------------------------------------------------

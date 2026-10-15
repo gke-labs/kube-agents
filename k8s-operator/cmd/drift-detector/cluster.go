@@ -273,8 +273,9 @@ func identityFromProfile(id clusterprofiles.Identity) clusterIdentity {
 // API's answer like any other.
 //
 // Failure policy is internal/clusterprofiles's, and it is the watcher's: a
-// missing directory is fatal because discovery runs once and a restart fixes
-// it, an unreadable one degrades, and a single bad profile is skipped so that
+// missing directory, or a credential proxy that cannot be reached or answers
+// 5xx for its own reasons, is fatal because discovery runs once and a restart
+// fixes it, an unreadable directory degrades, and a single bad profile is skipped so that
 // one unparseable config.yaml cannot cost the whole fleet. What this adds is
 // the second half of that last rule -- a cluster whose dynamic client will not
 // build is skipped too, for the same reason.

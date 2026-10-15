@@ -210,7 +210,7 @@ var SensitiveEnvVars = map[string]struct{}{
 // source half of this reservation: the audience route, and the creds-Secret
 // route that is cheaper than it.
 //
-// One member so far. `a2a-bus-token` is the projected ServiceAccount token the
+// Two members. The first, `a2a-bus-token`, is the projected ServiceAccount token the
 // platform-agent container presents to the bus under `mode: next`, and it is
 // that container's alone — the auth callout resolves the POD's ServiceAccount,
 // so any other container mounting this token is a second workload wearing the

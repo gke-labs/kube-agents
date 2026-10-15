@@ -9242,7 +9242,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             label,
             request_id,
             _sanitize_for_logging(principal.describe() if principal else "", max_length=PRINCIPAL_LOG_LENGTH),
-            _sanitize_for_logging(target),
+            # The Cloud API relay's path width: the object read on the broker's
+            # credential has to survive on the one line that names the caller.
+            _sanitize_for_logging(target, max_length=API_RELAY_PATH_LOG_LENGTH),
         )
 
     def _watcher_k8s_connection(self, host: str, ca_pem: str) -> http.client.HTTPConnection:

@@ -16,6 +16,7 @@ package controller
 
 import (
 	"sort"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -93,5 +94,32 @@ func TestNoCRSurfaceHandsAContainerTheWatcherToken(t *testing.T) {
 	}
 	if !names["scratch"] || !scratchMounted {
 		t.Errorf("an ordinary user volume and its mount must survive the strip")
+	}
+}
+
+// TestTheWatcherTokenStripIsReportedOnVolumesDropped keeps the source half of
+// the strip from being silent: the webhook does not refuse a projection of the
+// watcher audience under another name, so VolumesDropped is what tells the
+// author their volume was left out. A CR with no such volume, and a hostPath
+// one, gets the hostPath message exactly as before.
+func TestTheWatcherTokenStripIsReportedOnVolumesDropped(t *testing.T) {
+	agent := federatedTestAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		SidecarVolumes: []corev1.Volume{{Name: "scratch"}, watcherAudienceVolume("cache")},
+	}
+	msg := hostPathDroppedMessage(agent, rolloutNotKnownIncomplete)
+	if !strings.Contains(msg, `spec.deployment.sidecarVolumes[1] "cache"`) || !strings.Contains(msg, "watcher token") {
+		t.Errorf("VolumesDropped message = %q, want it to name sidecarVolumes[1] \"cache\" as a watcher-token drop", msg)
+	}
+
+	hostPathOnly := federatedTestAgent()
+	hostPathOnly.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		ExtraVolumes: []corev1.Volume{{Name: "root", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/"}}}},
+	}
+	if got := hostPathDroppedMessage(hostPathOnly, rolloutNotKnownIncomplete); strings.Contains(got, "watcher") || got == "" {
+		t.Errorf("a hostPath-only CR's message changed: %q", got)
+	}
+	if got := hostPathDroppedMessage(federatedTestAgent(), rolloutNotKnownIncomplete); got != "" {
+		t.Errorf("a CR dropping nothing has message %q, want none", got)
 	}
 }

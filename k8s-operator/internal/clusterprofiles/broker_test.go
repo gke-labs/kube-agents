@@ -52,7 +52,11 @@ func (f *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	status := f.status
 	f.mu.Unlock()
 	if status != 0 {
-		http.Error(w, `{"error":{"code":403,"message":"denied"}}`, status)
+		// The broker's own error shape, which is not Google's: googleapi
+		// then takes the code from the HTTP status, as it does in production.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"error":"refused","code":"SECURITY_POLICY_BLOCKED"}`))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -271,6 +275,16 @@ func TestDiscoverFailsWhenTheBrokerCannotBeReached(t *testing.T) {
 	d = Discoverer{Broker: broker, OnSkip: func(p string, err error) { skips[p] = err }}
 	if _, err := d.Discover(context.Background(), dir); err != nil || skips["cluster-a"] == nil {
 		t.Errorf("a 403 from the broker: err = %v, skips = %v; want a skip and no error", err, skips)
+	}
+
+	// The broker's own state: no credential yet (503), or its hop to Google
+	// failed (502, 504). Fatal, like a broker that cannot be reached.
+	for _, code := range []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+		fb.status = code
+		skips = map[string]error{}
+		if _, err := d.Discover(context.Background(), dir); err == nil || len(skips) != 0 {
+			t.Errorf("a %d from the broker: err = %v, skips = %v; want an error and no skip", code, err, skips)
+		}
 	}
 }
 
