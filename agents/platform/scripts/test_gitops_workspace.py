@@ -1086,6 +1086,14 @@ class TestReadersIgnoreWorkerSources(WorkspaceTestCase):
                 gitops_workspace.resolve_repo()
         self.assertIn("cannot use", str(caught.exception))
         self.assertNotIn("no repository is registered", str(caught.exception))
+        # Self-contained: an entry with no type is skipped with no warning at all.
+        self.assertNotIn("warning above", str(caught.exception))
+        (self.mount / "managed_repos").write_text(
+            json.dumps([{"url": "https://github.com/acme/fleet"}]), encoding="utf-8")
+        with patch.dict(sys.modules, {"github_token_refresh": self.cwd_origin}):
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.resolve_repo()
+        self.assertIn("{type, url}", str(caught.exception))
 
     def test_the_ignored_variable_is_logged_once(self):
         self.register("https://github.com/acme/fleet")

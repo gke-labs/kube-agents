@@ -1721,8 +1721,9 @@ def resolve_repo(workspace: str | Path | None = None) -> str:
             raise RuntimeError(
                 "Could not resolve the target repository as owner/name: managed_repos in "
                 "the GitOps state ConfigMap ($GITOPS_STATE_CONFIGMAP) holds a value this "
-                "image cannot use (see the warning above). Fixing the entry is the user's "
-                "call; report that."
+                "image cannot use: it does not parse as a list of {type, url} entries, or "
+                "an entry names a forge type this image does not serve or a URL that is not "
+                "a repository. Fixing the entry is the user's call; report that."
             )
         raise RuntimeError(
             "Could not resolve the target repository as owner/name: no repository "
