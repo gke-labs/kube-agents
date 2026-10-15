@@ -959,7 +959,7 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # do, because cron_jobs_sync.py never prunes: its ledger stops a retired job
 # coming BACK, it never removes one the volume already has.
 #
-# `--cron-retire` deletes the governance ids from this roster outright. They ran
+# `--cron-retire` deletes the listed ids from this roster outright. The governance ids ran
 # here only while the platform profile's store had no ticker; now that
 # `profile-cron-tick` gives it one, they are back on the Platform Agent's own
 # roster where the scheduler can reach their `skills`, `model` and `max_turns`
@@ -988,7 +988,8 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # an id belongs on this list only once no roster in this image ships it.
 #
 # This list shrinks to nothing once no live volume can still be carrying the
-# entries; until then removing a name from it silently restores the double-fire.
+# entries; until then removing a name from it silently restores the double-fire, or for
+# first-run-quick-value-audit an enabled copy nothing can reach.
 #
 # `--home` overlays the default profile in place, because that profile IS
 # $TARGET_DIR and has no entry under profiles/ to name. `--cron-jobs` names the

@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -1121,9 +1122,10 @@ class RosterTest(unittest.TestCase):
         ids = {job["id"] for job in json.loads(roster.read_text(encoding="utf-8"))["jobs"]}
         self.assertNotIn("first-run-quick-value-audit", ids)
         entrypoint = (Path(__file__).resolve().parents[3] / "deploy" / "shared" / "docker-entrypoint.sh").read_text()
-        retire = next(line for line in entrypoint.splitlines() if "--cron-retire" in line and "github-issue-resolver" in line
-                      and "compliance-audit" in line)
-        self.assertIn("first-run-quick-value-audit", retire.split('"')[1].split())
+        # The default profile's call is the one that also forces profile-cron-tick.
+        block = re.search(r'--cron-jobs "profile-cron-tick".*?--cron-retire "([^"]*)"', entrypoint, re.S)
+        self.assertIsNotNone(block, "the default profile's --cron-retire call was not found")
+        self.assertIn("first-run-quick-value-audit", block.group(1).split())
 
 
 class ManagedRepositoriesTest(unittest.TestCase):
