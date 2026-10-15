@@ -1665,34 +1665,78 @@ live_github_app_id() {
 # that applies nothing (it warns and returns 0).
 refuse_apply_dropping_live_gitops() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" file="${2:-install.env}" mode="${3:-}"
-  local live_repo live_org repo_name app_id say=print_error lead="Refusing to apply: "
+  local ctx cr_json minter="" live_repo live_org repo_name app_id say=print_error lead="Refusing to apply: "
   [ "${TFVARS_ENABLE_GITHUB_MINTER:-false}" = "true" ] && return 0
   [ "${GITOPS_FORGE:-github}" = "github" ] || return 0
   # Removing GitOps on purpose is the one case this is not.
   is_truthy "${KUBE_AGENTS_REMOVE_GITOPS:-false}" && return 0
-  kubectl config get-contexts "$(gke_context_name)" >/dev/null 2>&1 || return 0
-  live_repo="$( (trap - ERR; kubectl --context "$(gke_context_name)" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
-    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o jsonpath='{.items[0].spec.integration.github.gitRepo}' 2>/dev/null) || true)"
-  [ -n "$live_repo" ] || return 0
-  live_org="$( (trap - ERR; kubectl --context "$(gke_context_name)" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
-    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o jsonpath='{.items[0].spec.integration.github.org}' 2>/dev/null) || true)"
+  # gke_context_name needs the coordinates; every real front door has them by
+  # now, and a caller without them has no cluster to protect.
+  [ -n "${PROJECT_ID:-}" ] && [ -n "${CLUSTER_NAME:-}" ] && [ -n "${REGION:-}" ] || return 0
+  ctx="$(gke_context_name)"
+  if ! kubectl config get-contexts "$ctx" >/dev/null 2>&1; then
+    # An applying run has already been refused by the scope check for the
+    # same missing context; a preview says this check did not run.
+    if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+      print_warning "The GitOps check did not run: the kubeconfig has no context '${ctx}'. An applying run checks that it would not remove a live token minter."
+    fi
+    return 0
+  fi
+  # The minter's own Deployment is what the apply would destroy, whichever
+  # spelling the PlatformAgent declares its repository in: the deprecated
+  # spec.integration.github alias, or spec.integration.forges/repositories
+  # (the chart renders the alias only for a plain single GitHub repository).
+  if (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+    get deployment github-token-minter -n "$namespace" -o name >/dev/null 2>&1); then
+    minter="present"
+  fi
+  cr_json="$( (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o json 2>/dev/null) || true)"
+  # "<org> <owner/repo or repo>" of the GitOps repository, from either spelling.
+  read -r live_org live_repo <<<"$(printf '%s' "$cr_json" | (trap - ERR; python3 -c '
+import json, sys
+try:
+    items = (json.load(sys.stdin) or {}).get("items") or []
+except ValueError:
+    items = []
+integ = ((items[0].get("spec") or {}).get("integration") or {}) if items else {}
+gh = integ.get("github") or {}
+repo, org = gh.get("gitRepo") or "", gh.get("org") or ""
+if not repo:
+    forges = {f.get("name"): f for f in integ.get("forges") or []}
+    for r in integ.get("repositories") or []:
+        forge = forges.get(r.get("forge")) or {}
+        if r.get("role") == "gitops" and (forge.get("provider") or "github") == "github":
+            repo = r.get("repository") or ""
+            org = r.get("namespace") or forge.get("namespace") or ""
+            break
+if repo and not org and "/" in repo:
+    org = repo.split("/")[-2]
+print(org or "-", repo or "-")
+' 2>/dev/null) || echo "- -")"
+  [ "$live_org" = "-" ] && live_org=""
+  [ "$live_repo" = "-" ] && live_repo=""
+  [ -n "$live_repo" ] || [ -n "$minter" ] || return 0
   repo_name="${live_repo##*/}"
-  [ -n "$live_org" ] || { [ "$repo_name" != "$live_repo" ] && live_org="${live_repo%%/*}"; }
   app_id="$(live_github_app_id "$namespace")"
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
     say=print_warning
     lead="An applying run would be refused: "
   fi
-  "$say" "${lead}the PlatformAgent opens pull requests on ${live_repo} through the GitHub token minter, but this run's GITOPS_ORG, GITOPS_REPO and GITHUB_APP_ID (from ${file}, or the installer's defaults where it sets none) do not carry it, so this run renders GitOps off. The apply would destroy the minter (its Cloud KMS key, key ring and service account) and the agent would stop opening pull requests."
+  "$say" "${lead}the PlatformAgent opens pull requests${live_repo:+ on ${live_repo}} through the GitHub token minter, but this run's GITOPS_ORG, GITOPS_REPO and GITHUB_APP_ID (from ${file}, or the installer's defaults where it sets none) do not carry it, so this run renders GitOps off. The apply would destroy the minter (its Cloud KMS key, key ring and service account) and the agent would stop opening pull requests."
   print_info "Set these lines in ${file} (add them, or replace the ones it has), then re-run the same command:"
   # Every key this run's value for does not match the live one: an empty key,
   # and a default the run fell back to, alike.
   if [ -z "$live_org" ]; then
-    [ -n "${GITOPS_ORG:-}" ] || print_info "  GITOPS_ORG=<the GitHub organization that owns ${live_repo}>"
+    [ -n "${GITOPS_ORG:-}" ] || print_info "  GITOPS_ORG=<the GitHub organization that owns the GitOps repository>"
   elif [ "${GITOPS_ORG:-}" != "$live_org" ]; then
     print_info "  GITOPS_ORG=${live_org}"
   fi
-  [ "${GITOPS_REPO:-}" = "$repo_name" ] || print_info "  GITOPS_REPO=${repo_name}"
+  if [ -z "$repo_name" ]; then
+    [ -n "${GITOPS_REPO:-}" ] || print_info "  GITOPS_REPO=<the GitOps repository's name>"
+  elif [ "${GITOPS_REPO:-}" != "$repo_name" ]; then
+    print_info "  GITOPS_REPO=${repo_name}"
+  fi
   if [ -n "$app_id" ]; then
     [ "${GITHUB_APP_ID:-}" = "$app_id" ] || print_info "  GITHUB_APP_ID=${app_id}"
   elif [ -z "${GITHUB_APP_ID:-}" ]; then

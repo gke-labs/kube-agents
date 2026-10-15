@@ -9,6 +9,7 @@ upgrade, and a GitHub App ID that is not the App's number is refused up front.
 - validate_github_app_id (installer_common.sh) refuses a name or slug.
 """
 
+import json
 import pathlib
 import stat
 import subprocess
@@ -57,13 +58,27 @@ class RecordGithubGitopsKeysTest(unittest.TestCase):
         )
         self.assertIn("org=acme repo=infra app=5319154", proc.stdout, proc.stderr)
 
-    def test_a_value_the_file_records_is_kept(self):
+    def test_a_value_this_run_changes_replaces_the_recorded_one_and_nothing_else(self):
+        # A re-run that points GitOps at a new repository applies it, so the
+        # file must follow or the next upgrade puts the old one back.
         dest = self._tmp / "install.env"
-        dest.write_text("GITOPS_ORG=acme\nGITOPS_REPO=old-infra\n")
+        dest.write_text("# my settings\nGITOPS_ORG=acme\nGITOPS_REPO=old-infra\nMEMORY=file\n")
         proc = self._bash(f'export GITOPS_ORG=acme GITOPS_REPO=new-infra GITHUB_APP_ID=7\n'
                           f'record_github_gitops_keys "{dest}"\n')
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
-        self.assertEqual(dest.read_text(), "GITOPS_ORG=acme\nGITOPS_REPO=old-infra\nGITHUB_APP_ID=7\n")
+        self.assertEqual(dest.read_text(),
+                         "# my settings\nGITOPS_ORG=acme\nMEMORY=file\nGITOPS_REPO=new-infra\nGITHUB_APP_ID=7\n")
+        self.assertIn("Updated GITOPS_REPO=new-infra", proc.stdout)
+        self.assertEqual(oct(dest.stat().st_mode & 0o777), "0o600")
+
+    def test_an_unchanged_file_is_left_byte_for_byte(self):
+        dest = self._tmp / "install.env"
+        original = "GITOPS_ORG=acme\nGITOPS_REPO=infra\nGITHUB_APP_ID=7\n"
+        dest.write_text(original)
+        proc = self._bash(f'export GITOPS_ORG=acme GITOPS_REPO=infra GITHUB_APP_ID=7\nrecord_github_gitops_keys "{dest}"\n')
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertEqual(dest.read_text(), original)
+        self.assertNotIn("Recorded", proc.stdout + proc.stderr)
 
     def test_nothing_is_written_without_a_minter_on_a_dry_run_or_for_gitlab(self):
         for label, exports, dry in (
@@ -88,17 +103,21 @@ class RecordGithubGitopsKeysTest(unittest.TestCase):
 
 class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
     def _run(self, keys, git_repo="sackheads/ka-test-infra", org="sackheads", app_id_b64="NTMxOTE1NA==",
-             mode="", context_present=True):
+             mode="", context_present=True, minter=True, integration=None):
+        if integration is None:
+            integration = {"github": {"gitRepo": git_repo, "org": org}} if git_repo else {}
+        cr = json.dumps({"items": [{"spec": {"integration": integration}}]})
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
+            (bin_dir / "cr.json").write_text(cr)
             kubectl = bin_dir / "kubectl"
             kubectl.write_text(
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
                 f'  *"config get-contexts"*) exit {0 if context_present else 1} ;;\n'
-                f"  *\"spec.integration.github.gitRepo\"*) printf '%s' '{git_repo}' ;;\n"
-                f"  *\"spec.integration.github.org\"*) printf '%s' '{org}' ;;\n"
+                f'  *"get deployment github-token-minter"*) exit {0 if minter else 1} ;;\n'
+                f'  *"get platformagents"*) cat "{bin_dir}/cr.json" ;;\n'
                 f"  *\"github-app-credentials\"*) printf '%s' '{app_id_b64}' ;;\n"
                 "esac\nexit 0\n"
             )
@@ -147,6 +166,28 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
         self.assertIn("rc=1", proc.stdout)
         self.assertIn('GITHUB_APP_ID=<the number under "App ID" on the GitHub App\'s General settings page>', proc.stdout)
 
+    def test_a_repository_declared_through_forges_and_repositories_is_protected_too(self):
+        # The chart renders the github alias only for a plain single repo; the
+        # current schema leaves spec.integration.github empty.
+        integration = {"forges": [{"name": "gh", "provider": "github", "namespace": "acme"}],
+                       "repositories": [{"forge": "gh", "repository": "infra", "role": "gitops"},
+                                        {"forge": "gh", "repository": "docs", "role": "context"}]}
+        proc = self._run({}, integration=integration)
+        self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+        for line in ("INFO:   GITOPS_ORG=acme", "INFO:   GITOPS_REPO=infra", "INFO:   GITHUB_APP_ID=5319154"):
+            self.assertIn(line + "\n", proc.stdout)
+
+    def test_a_running_minter_with_no_readable_repository_is_still_refused(self):
+        proc = self._run({}, git_repo="")
+        self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("INFO:   GITOPS_ORG=<the GitHub organization that owns the GitOps repository>", proc.stdout)
+        self.assertIn("INFO:   GITOPS_REPO=<the GitOps repository's name>", proc.stdout)
+
+    def test_a_preview_with_no_context_says_the_check_did_not_run(self):
+        proc = self._run({}, mode="warn", context_present=False)
+        self.assertIn("rc=0", proc.stdout)
+        self.assertIn("WARN: The GitOps check did not run: the kubeconfig has no context", proc.stdout)
+
     def test_a_plan_warns_and_goes_on(self):
         proc = self._run({}, mode="warn")
         self.assertIn("rc=0", proc.stdout)
@@ -154,15 +195,15 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
         self.assertNotIn("ERROR:", proc.stdout)
 
     def test_the_cases_with_nothing_to_protect_pass_silently(self):
-        for label, keys, git_repo, ctx in (
-            ("the minter stays on", {"TFVARS_ENABLE_GITHUB_MINTER": "true"}, "sackheads/ka-test-infra", True),
-            ("no live GitOps", {}, "", True),
-            ("gitlab", {"GITOPS_FORGE": "gitlab"}, "sackheads/ka-test-infra", True),
-            ("removed on purpose", {"KUBE_AGENTS_REMOVE_GITOPS": "true"}, "sackheads/ka-test-infra", True),
-            ("no context", {}, "sackheads/ka-test-infra", False),
+        for label, keys, git_repo, ctx, minter in (
+            ("the minter stays on", {"TFVARS_ENABLE_GITHUB_MINTER": "true"}, "sackheads/ka-test-infra", True, True),
+            ("no live GitOps", {}, "", True, False),
+            ("gitlab", {"GITOPS_FORGE": "gitlab"}, "sackheads/ka-test-infra", True, True),
+            ("removed on purpose", {"KUBE_AGENTS_REMOVE_GITOPS": "true"}, "sackheads/ka-test-infra", True, True),
+            ("no context, applying run", {}, "sackheads/ka-test-infra", False, True),
         ):
             with self.subTest(label):
-                proc = self._run(keys, git_repo=git_repo, context_present=ctx)
+                proc = self._run(keys, git_repo=git_repo, context_present=ctx, minter=minter)
                 self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
                 self.assertNotIn("ERROR", proc.stdout)
                 self.assertNotIn("WARN", proc.stdout)
@@ -212,6 +253,9 @@ class ValidateGithubAppIdTest(unittest.TestCase):
         self.assertLess(install.index("validate_github_app_id \"${PARAM_GITHUB_APP_ID:-}\""),
                         install.index("check_flags_against_install_env || exit 1"))
         self.assertIn('validate_github_app_id "$github_app_id" "GitHub App ID" || exit 1', install)
+        # The interview asks again at the prompt, before the KMS questions.
+        ask = install.index('while [ -n "$github_app_id" ] && ! validate_github_app_id "$github_app_id" "GitHub App ID"; do')
+        self.assertLess(ask, install.index('prompt_read "Cloud KMS Keyring Name" kms_keyring', ask - 2000))
         upgrade = _UPGRADE_SH.read_text()
         self.assertLess(upgrade.index('validate_github_app_id "${GITHUB_APP_ID:-}"'),
                         upgrade.index('print_step "2. Dry-Run Upgrade Plan Preview"'))

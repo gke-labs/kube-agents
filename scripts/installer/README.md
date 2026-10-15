@@ -142,7 +142,8 @@ standing in, not whichever one that shared checkout belongs to. The one addition
 
 `install.sh` reads it and does not rewrite it. It creates one at the end of a first
 install, when there is nothing there, and after that changes no line of it; the one thing
-it adds is a chat key or `PLATFORM_AGENT_MODE` the file lacks, under the rule below. The Day-2 menu's "Save & Apply"
+it adds is a chat key or `PLATFORM_AGENT_MODE` the file lacks, under the rule below, and the GitOps keys
+covered under [The GitOps forge](#the-gitops-forge). The Day-2 menu's "Save & Apply"
 is the one path that edits a key, one at a time, leaving comments and ordering intact. That
 asymmetry is deliberate: a file the documentation tells you to edit and the next run
 overwrites is what made the old `vars.sh` confusing.
@@ -335,6 +336,19 @@ the host, `install.sh` drops a `GITOPS_CA_FILE` from the environment, but refuse
   GitHub drops the GitLab keys.
 - Once `install.env` exists, `install.sh` ignores a `GITOPS_FORGE`, `GITOPS_HOST`,
   `GITLAB_TOKEN_SECRET` or `GITOPS_CA_SECRET` exported in the shell. Use the flags.
+
+On GitHub with the token minter (`GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID` all set), a run
+that goes on to the apply records each of the three the file lacks, and replaces one it records
+with a different value (that line only). `upgrade.sh` renders from the file alone, so GitOps set
+up with `--gitops-org`, `--gitops-repo` and `--github-app-id` would otherwise be rendered off by
+the next full upgrade, which would destroy the minter's Cloud KMS key and service account. The PEM
+path is never recorded. A declined or `--generate-only` run leaves the file as it was.
+
+Each applying front door (`install.sh`, the Day-2 menu, a full `upgrade.sh`) also refuses an apply
+that would render GitOps off while the minter is running, and prints the lines to set with the
+live values filled in; `--plan`, `--dry-run` and `--generate-only` warn. `KUBE_AGENTS_REMOVE_GITOPS=true`
+in the environment removes GitOps on purpose. `GITHUB_APP_ID` must be the App's number (its
+settings page, **General**, "App ID"); both front doors refuse anything else.
 
 ### Projects, folders, organisations and selectors in scope
 

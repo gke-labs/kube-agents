@@ -2000,10 +2000,12 @@ warn_flag_beats_unrecorded_file_value() {
 # appends a chat flag's key. upgrade.sh renders from the file alone, so GitOps
 # configured with --gitops-org, --gitops-repo and --github-app-id and never
 # recorded was rendered off by the next full upgrade, which planned to
-# destroy the token minter (#3075). Only keys the file lacks are written; a
-# value the file records is kept, and --github-pem-path never is (the key lives
-# in Cloud KMS once imported). Apply-only, like record_gitops_forge_keys: a
-# --generate-only or declined run leaves the file as it was.
+# destroy the token minter (#3075). A key the file lacks is appended, and one
+# it records with a different value is replaced (that line only), since this
+# apply is about to use the new value and the next upgrade would otherwise put
+# the old one back. --github-pem-path never is (the key lives in Cloud KMS once
+# imported). Apply-only, like record_gitops_forge_keys: a --generate-only or
+# declined run leaves the file as it was.
 record_github_gitops_keys() {
   local file="$1" key value
   [ -f "$file" ] || return 0
@@ -2015,11 +2017,22 @@ record_github_gitops_keys() {
   if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
     printf '\n' >> "$file"
   fi
+  local tmp
   for key in GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
-    install_env_records_key "$file" "$key" && continue
     value="${!key}"
-    write_env_var "$file" "$key" "$value"
-    print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}, so upgrade.sh keeps GitOps on."
+    if install_env_records_key "$file" "$key"; then
+      [ "$(recorded_install_env_value "$file" "$key")" != "$value" ] || continue
+      tmp="${file}.tmp.$$"
+      ( umask 077; : >"$tmp" )
+      grep -E -v "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" >"$tmp" || true
+      write_env_var "$tmp" "$key" "$value"
+      chmod 600 "$tmp" 2>/dev/null || true
+      mv "$tmp" "$file"
+      print_info "Updated ${key}=$(printf '%q' "$value") in ${file} to the value this run applies, so upgrade.sh keeps it."
+    else
+      write_env_var "$file" "$key" "$value"
+      print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}, so upgrade.sh keeps GitOps on."
+    fi
   done
   # The cache read_recorded_install_env_values keeps is keyed by path, and the
   # file just changed under it.
@@ -6540,6 +6553,12 @@ main() {
 
       print_info "GitHub access uses the short-lived GitHub App token minter."
       prompt_read "GitHub App ID (optional, press Enter to skip token minter)" github_app_id "${github_app_id}"
+      # Asked again here, rather than refused after the KMS questions: the App's
+      # name in place of its number is the usual slip (#3076).
+      while [ -n "$github_app_id" ] && ! validate_github_app_id "$github_app_id" "GitHub App ID"; do
+        has_controlling_tty && [ "$PARAM_NON_INTERACTIVE" != "true" ] || exit 1
+        prompt_read "GitHub App ID (its number; press Enter to skip token minter)" github_app_id ""
+      done
       if [ -n "$github_app_id" ]; then
         prompt_read "Cloud KMS Keyring Name" kms_keyring "${kms_keyring}"
         prompt_read "Cloud KMS Key Name" kms_key "${kms_key}"
