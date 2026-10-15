@@ -64,7 +64,9 @@ after the run that produced it started.
 
 Scheduled runs start when GitHub's scheduler picks them up, so the minute is a floor, not a
 promise. A scheduled GA release ships unattended each day a new staging-promoted
-candidate exists, or maintainers may dispatch the workflow by hand.
+candidate exists, or maintainers may dispatch the workflow by hand. On other days the run
+publishes nothing. Releases came about once a week up to 0.9.0, and about every two days after it.
+To count the releases between two versions, use the releases page, not the number of days.
 
 Every release from `main` bumps the minor number: a day's range almost always carries a `feat:`,
 and a fix-only range bumps minor too once the previous minor has its release line (see the table
@@ -82,6 +84,10 @@ and a catch-all for anything else. The grouping is the label-to-category map in
 so a pull request's labels decide the heading it appears under. Dependabot's pull requests, and any
 labelled `duplicate`, `invalid` or `wontfix`, are left out. Read them on
 [the releases page](https://github.com/gke-labs/kube-agents/releases) once the release exists.
+
+No workflow applies these labels, so today every pull request appears under "Other Changes". The
+titles follow Conventional Commits, and a `!` before the colon marks a breaking change. The Upgrade
+page lists [the breaking changes in recent releases](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases).
 
 Before it exists, the next release from `main` is whatever has merged since the most recent
 release cut from `main`. [The latest release](https://github.com/gke-labs/kube-agents/releases/latest)

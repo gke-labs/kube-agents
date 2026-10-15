@@ -45,8 +45,22 @@ type fakeBroker struct {
 	// unreachable names clusters whose describe carries no usable endpoint:
 	// no external DNS endpoint, and an IP endpoint with no CA.
 	unreachable map[string]bool
-	status      int // non-zero answers every request with it
+	// answers overrides the describe of one cluster with a status and body,
+	// to tell the broker's own errors from a relayed Google one.
+	answers map[string]fakeAnswer
+	status  int // non-zero answers every request with it
 }
+
+type fakeAnswer struct {
+	status int
+	body   string
+}
+
+// The two shapes an error can arrive in through the broker: one it wrote
+// about itself, and Google's, relayed with Google's status.
+func brokerError(code string) string { return `{"error":"broker failure","code":"` + code + `"}` }
+
+const googleError503 = `{"error":{"code":503,"message":"backend unavailable","status":"UNAVAILABLE"}}`
 
 func (f *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
@@ -66,6 +80,11 @@ func (f *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	const gkePrefix = "/v1/watcher/gcp/container.googleapis.com/v1/projects/"
 	if strings.HasPrefix(r.URL.Path, gkePrefix) {
 		name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		if a, ok := f.answers[name]; ok {
+			w.WriteHeader(a.status)
+			_, _ = w.Write([]byte(a.body))
+			return
+		}
 		cluster := &container.Cluster{
 			Name:      name,
 			Endpoint:  "10.0.0.1", // must be ignored in broker mode
@@ -102,7 +121,7 @@ func (f *fakeBroker) seen() (requests, auths []string) {
 func newFakeBroker(t *testing.T) (*fakeBroker, *Broker) {
 	t.Helper()
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "no-such-adc.json"))
-	fb := &fakeBroker{autopilot: map[string]bool{}, unreachable: map[string]bool{}}
+	fb := &fakeBroker{autopilot: map[string]bool{}, unreachable: map[string]bool{}, answers: map[string]fakeAnswer{}}
 	srv := httptest.NewServer(fb)
 	t.Cleanup(srv.Close)
 	tokenFile := filepath.Join(t.TempDir(), "token")
@@ -279,14 +298,62 @@ func TestDiscoverFailsWhenTheBrokerCannotBeReached(t *testing.T) {
 	if _, err := d.Discover(context.Background(), dir); err != nil || skips["cluster-a"] == nil {
 		t.Errorf("a 403 from the broker: err = %v, skips = %v; want a skip and no error", err, skips)
 	}
+}
 
-	// The broker's own state: no credential yet (503), or its hop to Google
-	// failed (502, 504). Fatal, like a broker that cannot be reached.
-	for _, code := range []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
-		fb.status = code
-		skips = map[string]error{}
-		if _, err := d.Discover(context.Background(), dir); err == nil || len(skips) != 0 {
-			t.Errorf("a %d from the broker: err = %v, skips = %v; want an error and no skip", code, err, skips)
+// TestDiscoverSkipsOnlyTheClusterARelayedGoogleErrorNames is the cluster's
+// side of the line: GKE answering 503 (or 500, or 404) for one cluster's
+// describe is relayed with Google's status and Google's body, and costs that
+// profile alone. The other profile is discovered.
+func TestDiscoverSkipsOnlyTheClusterARelayedGoogleErrorNames(t *testing.T) {
+	for _, answer := range []fakeAnswer{
+		{http.StatusServiceUnavailable, googleError503},
+		{http.StatusInternalServerError, `{"error":{"code":500,"message":"internal","status":"INTERNAL"}}`},
+		{http.StatusUnauthorized, `{"error":{"code":401,"message":"no","status":"UNAUTHENTICATED"}}`},
+		{http.StatusForbidden, brokerError("SECURITY_POLICY_BLOCKED")},
+	} {
+		fb, broker := newFakeBroker(t)
+		fb.answers["sick"] = answer
+		dir := t.TempDir()
+		writeClusterProfile(t, dir, "cluster-sick", "proj", "sick", "us-central1")
+		writeClusterProfile(t, dir, "cluster-ok", "proj", "ok", "us-central1")
+		skips := map[string]error{}
+		d := Discoverer{Broker: broker, OnSkip: func(p string, err error) { skips[p] = err }}
+		clusters, err := d.Discover(context.Background(), dir)
+		if err != nil || len(clusters) != 1 || clusters[0].Profile != "cluster-ok" || skips["cluster-sick"] == nil {
+			t.Errorf("%d %s for one cluster: clusters = %v, err = %v, skips = %v; want cluster-ok discovered and cluster-sick skipped",
+				answer.status, answer.body, clusters, err, skips)
+		}
+	}
+}
+
+// TestDiscoverFailsOnAnAnswerTheBrokerWroteAboutItself is the broker's side:
+// each code it writes for its own state, and its 401 to this process's token,
+// fails discovery even though the other profile would have been fine, because
+// every profile in the pass would get the same answer. The supervisor restarts
+// the process.
+func TestDiscoverFailsOnAnAnswerTheBrokerWroteAboutItself(t *testing.T) {
+	answers := []fakeAnswer{{http.StatusUnauthorized, `{"error":"caller could not be authenticated"}`}}
+	for code, status := range map[string]int{
+		"RELAY_CREDENTIAL_UNAVAILABLE": http.StatusServiceUnavailable,
+		"UPSTREAM_UNAVAILABLE":         http.StatusBadGateway,
+		"UPSTREAM_TIMEOUT":             http.StatusGatewayTimeout,
+		"UPSTREAM_UNRELAYABLE":         http.StatusBadGateway,
+		"API_RELAY_DISABLED":           http.StatusServiceUnavailable,
+	} {
+		answers = append(answers, fakeAnswer{status, brokerError(code)})
+	}
+	for _, answer := range answers {
+		fb, broker := newFakeBroker(t)
+		fb.answers["first"] = answer
+		dir := t.TempDir()
+		writeClusterProfile(t, dir, "cluster-first", "proj", "first", "us-central1")
+		writeClusterProfile(t, dir, "cluster-second", "proj", "second", "us-central1")
+		skips := map[string]error{}
+		d := Discoverer{Broker: broker, OnSkip: func(p string, err error) { skips[p] = err }}
+		clusters, err := d.Discover(context.Background(), dir)
+		if err == nil || len(clusters) != 0 || len(skips) != 0 {
+			t.Errorf("%d %s: clusters = %v, err = %v, skips = %v; want an error, no clusters and no skip",
+				answer.status, answer.body, clusters, err, skips)
 		}
 	}
 }

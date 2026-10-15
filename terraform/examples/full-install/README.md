@@ -859,8 +859,11 @@ parallelism window and, on a first install, the IAM module and the chart
 release behind the cluster — waits for a second apply. The identity applying
 needs `logging.sinks.create`, the
 project's number and the Service Usage call that mints its Logging agent in
-each listed project (`roles/owner` carries them), and nothing probes for that
-before the apply: a number it cannot read fails the plan, or the apply at
+each listed project (`roles/owner` carries them). The installer's front doors
+probe the first in each `SCOPE_PROJECTS` entry the sinks will cover before an apply
+and refuse naming
+the project ([`scripts/installer/README.md`](../../../scripts/installer/README.md));
+a hand-driven apply, and a selector's members on any route, have no probe: a number it cannot read fails the plan, or the apply at
 that read when the plan deferred it (a first install, or any apply that
 enables an API), and an agent or grant it cannot make stops the apply with
 the host's trio untouched and every source sink held back until the next

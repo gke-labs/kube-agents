@@ -147,3 +147,87 @@ jobs:
     with:
       github_environment: "rc"
       rc_tag: ${{ needs.step-1-create-tag.outputs.rc_tag }}
+
+  # ---------------------------------------------------------------------------
+  # The next-mode leg: the same E2E suites against a `spec.mode: next` install,
+  # so a candidate's record says whether it works on the mode the default is
+  # about to flip to. It reuses the `rc` environment rather than a second one:
+  # it starts only after step 5 has destroyed the today install, so the two
+  # never share the cluster, and it needs no project, variables or secrets the
+  # today leg does not already use. `nightly` is the other environment that
+  # accepts `mode: next`, and the staging promotion pipeline drives it end to
+  # end once a day, so a three-hourly caller would rebuild it out from under
+  # that run.
+  #
+  # NON-GATING until the default flips. Step 4 has already tagged the candidate
+  # validated and nothing depends on these jobs, so a next-only failure reds
+  # this run without holding back a release. The run's own conclusion is
+  # therefore the worse of the two legs; the `Next mode` job names say which.
+  # The leg does delay the next candidate: the workflow-level concurrency
+  # group holds a newer dispatch until step 8 ends, roughly doubling a run.
+  # At the flip the legs swap: steps 2 and 3 take `mode: next` and gate, and
+  # this leg installs today as the coverage until today is rollback-only.
+  #
+  # Hung off step 5 and inheriting its success() gate, so the leg runs only for
+  # a candidate that passed on today, and only once the today cluster is gone.
+  # A today failure leaves that cluster standing for diagnosis, and deploying
+  # next here would destroy it. The same rule holds within the leg: step 8
+  # tears down only after steps 6 and 7 passed, and a next failure stays up
+  # until the next run's step 2 replaces it.
+  # ---------------------------------------------------------------------------
+  step-6-deploy-next-env:
+    name: Next mode (non-gating) - Step 6 - Provision RC Environment
+    needs: [step-1-create-tag, step-5-teardown-env]
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-create-tag.outputs.skip_rc != 'true'
+    # `inherit` for the reason step 2 records.
+    uses: ./.github/workflows/deploy-environment.yml # zizmor: ignore[secrets-inherit]
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      github_environment: "rc"
+      rc_tag: ${{ needs.step-1-create-tag.outputs.rc_tag }}
+      mode: "next"
+    secrets: inherit
+
+  step-7-run-e2e-next:
+    name: Next mode (non-gating) - Step 7 - Run E2E Tests
+    needs: [step-1-create-tag, step-6-deploy-next-env]
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-create-tag.outputs.skip_rc != 'true'
+    # `inherit` for the reason step 3 records.
+    uses: ./.github/workflows/e2e-run.yml # zizmor: ignore[secrets-inherit]
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      github_environment: "rc"
+      commit_sha: ${{ needs.step-1-create-tag.outputs.commit_sha }}
+      mode: "next"
+      # Step 3's default plus the readiness gate `next` adds (e2e-run.yml's
+      # `mode` input). SiblingGatewayRolloutGatesTest holds the floor.
+      timeout_minutes: 125
+      # The suites step 3 runs, split the same way, so the two legs' results
+      # read side by side. `gchat` fails this job; `rc` is reported and
+      # tolerated, as it is on today.
+      blocking_suite: "gchat"
+      optional_suites: "rc"
+    secrets: inherit
+
+  step-8-teardown-next-env:
+    name: Next mode (non-gating) - Step 8 - Tear Down RC Environment
+    # Every job of the leg, for the reason step 5 records.
+    needs: [step-1-create-tag, step-6-deploy-next-env, step-7-run-e2e-next]
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-create-tag.outputs.skip_rc != 'true'
+    uses: ./.github/workflows/teardown-environment.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      github_environment: "rc"
+      rc_tag: ${{ needs.step-1-create-tag.outputs.rc_tag }}

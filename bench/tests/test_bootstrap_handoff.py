@@ -41,7 +41,7 @@ import yaml
 from devops_bench.verification.base import VERIFIERS
 from devops_bench.verification.spec import parse_node
 
-from kube_agents_bench import discovery, onboarding
+from kube_agents_bench import discovery, onboarding, verifiers
 from kube_agents_bench.verifiers import BootstrapHandoffVerifier
 
 REPO = Path(__file__).resolve().parents[2]
@@ -322,6 +322,88 @@ def test_a_parser_the_sandbox_cannot_import_is_an_error(install, monkeypatch: py
     assert "cannot import inventory_findings" in result.reason
 
 
+# --- raw_report_no_first_run_audit_checks ---------------------------------
+
+
+def test_a_block_line_under_a_first_run_audits_check_fails_naming_it(install) -> None:
+    # _block files every finding as probes-readiness, an obtainability-audit check.
+    install(RAW_WITHOUT_BLOCK + _block(METADATA))
+    result = _verify("raw_report_no_first_run_audit_checks")
+    assert result.status == "fail", result.reason
+    assert "['probes-readiness (obtainability-audit)']" in result.reason
+
+
+def test_block_lines_under_the_scans_own_checks_pass(install) -> None:
+    block = _block(METADATA).replace('"probes-readiness"', '"probes-startup"')
+    install(RAW_WITHOUT_BLOCK + block)
+    result = _verify("raw_report_no_first_run_audit_checks")
+    assert result.status == "pass", result.reason
+    assert "none of the 5 block line(s)" in result.reason
+
+
+def test_an_empty_block_has_no_first_run_audit_check(install) -> None:
+    install(RAW_WITHOUT_BLOCK + "\n```findings\n```\n")
+    assert _verify("raw_report_no_first_run_audit_checks").status == "pass"
+
+
+def test_a_raw_file_the_parser_rejects_is_not_a_pass(install) -> None:
+    install(RAW_WITHOUT_BLOCK)
+    result = _verify("raw_report_no_first_run_audit_checks")
+    assert result.status == "fail", result.reason
+    assert "exit code 10" in result.reason
+
+
+def _record_no_repository(value: str) -> None:
+    """Rewrite the gate's sweep marker with the no_repository value it records."""
+    marker = Path(onboarding.DATA_ROOT) / discovery.SCAN_MARKER
+    marker.write_text(f"task_id={SWEEP}\nfiled_at={SWEEP_AT}\n{onboarding.NO_REPOSITORY_FIELD}={value}\n")
+
+
+@pytest.mark.parametrize("value", [onboarding.NO_REPOSITORY_YES, onboarding.NO_REPOSITORY_UNKNOWN])
+def test_an_install_whose_cards_ran_the_section_is_an_error_naming_it(install, value: str) -> None:
+    # With no repository, or a list the gate could not read, the cards run the audits' checks on
+    # purpose, so the lines are no regression.
+    install(RAW_WITHOUT_BLOCK + _block(METADATA))
+    _record_no_repository(value)
+    result = _verify("raw_report_no_first_run_audit_checks")
+    assert result.status == "error", result.reason
+    assert f"{onboarding.NO_REPOSITORY_FIELD}={value}" in result.reason
+    assert "no GitOps repository" in result.reason
+    # The other objectives on the raw file are still graded.
+    assert _verify("raw_report_has_findings_block").status == "pass"
+
+
+@pytest.mark.parametrize("value", ["no"])
+def test_an_install_the_gate_did_not_record_as_without_a_repository_is_graded(install, value: str) -> None:
+    install(RAW_WITHOUT_BLOCK + _block(METADATA))
+    _record_no_repository(value)
+    result = _verify("raw_report_no_first_run_audit_checks")
+    assert result.status == "fail", result.reason
+    assert "probes-readiness (obtainability-audit)" in result.reason
+
+
+def test_the_no_repository_field_is_the_one_the_gate_records() -> None:
+    handoff = GATE.parent / "bootstrap_handoff.py"
+    assert onboarding.NO_REPOSITORY_FIELD == _gate_constant("NO_REPOSITORY_FIELD", handoff)
+    assert onboarding.NO_REPOSITORY_YES == _gate_constant("RECORDED_YES", handoff)
+    assert onboarding.NO_REPOSITORY_UNKNOWN == _gate_constant("RECORDED_UNKNOWN", handoff)
+
+
+def test_the_first_run_rosters_are_the_audit_scripts() -> None:
+    """FIRST_RUN_AUDIT_CHECKS copies oobe.FIRST_RUN_AUDITS and each one's
+    audit_report.AUDITS roster, which live in the agent image; re-derive it."""
+    scripts = REPO / "agents" / "platform" / "skills" / "fleet-audit" / "scripts"
+    sys.path.insert(0, str(scripts))
+    try:
+        import audit_report
+    finally:
+        sys.path.remove(str(scripts))
+    # Read, not imported: oobe imports modules that live only in the agent image.
+    assert tuple(verifiers.FIRST_RUN_AUDIT_CHECKS) == _gate_constant("FIRST_RUN_AUDITS", GATE.parent / "oobe.py")
+    for audit, checks in verifiers.FIRST_RUN_AUDIT_CHECKS.items():
+        assert checks == audit_report.AUDITS[audit].checks, audit
+
+
 def test_an_unreadable_sandbox_is_an_error(install, monkeypatch: pytest.MonkeyPatch) -> None:
     install(RAW_WITHOUT_BLOCK + _block(METADATA))
     monkeypatch.setattr(onboarding, "sandbox_shell", lambda s, t: "")
@@ -425,8 +507,8 @@ def test_the_wont_run_statuses_match_the_hand_off() -> None:
 # --- the mirrored names and the case --------------------------------------
 
 
-def _gate_constant(name: str, path: Path = GATE) -> str:
-    """A module-level string constant, following a ``module.NAME`` alias to its sibling module."""
+def _gate_constant(name: str, path: Path = GATE) -> Any:
+    """A module-level literal constant, following a ``module.NAME`` alias to its sibling module."""
     for node in ast.parse(path.read_text()).body:
         if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == name for t in node.targets):
             value = node.value
@@ -461,6 +543,10 @@ def test_the_case_runs_the_hand_off_stack() -> None:
     checks = {e["name"]: e["check"] for e in case["verification_spec"]}
     assert checks["raw-report-has-findings-block"] == {"type": "bootstrap_handoff", "require": "raw_report_has_findings_block"}
     assert checks["ranking-card-keyed"] == {"type": "bootstrap_handoff", "require": "ranking_card_filed"}
+    assert checks["raw-report-no-first-run-audit-checks"] == {
+        "type": "bootstrap_handoff",
+        "require": "raw_report_no_first_run_audit_checks",
+    }
 
 
 def test_the_verifier_is_published_as_an_entry_point() -> None:
