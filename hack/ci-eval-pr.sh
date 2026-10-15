@@ -175,9 +175,14 @@ readonly EVAL_PLATFORM_RUN_POLL_SECONDS=30
 readonly EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS=300
 readonly EVAL_PAUSE_AUDITS_ATTEMPTS=3
 readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=3
-# How long each pause attempt waits for exactly one Ready gateway pod: an
+# How long each pause attempt waits for the gateway to settle (ready_gateway_pod): an
 # autoscaler scale-down at lease time replaced it in about 40s on 2026-10-15.
 readonly EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS=300
+# The resume runs in the EXIT trap, ahead of the artifact dump and inside Prow's
+# five-minute grace, so it waits only briefly; a gateway that is down then keeps
+# the pause, which the next lease's pause repeats anyway.
+readonly EVAL_RESUME_AUDITS_POD_WAIT_SECONDS=20
+readonly EVAL_PAUSE_AUDITS_POD_POLL_SECONDS=5
 # What a unit's lock deadline allows past its delegation timeout, for the
 # stack, the verifier and the state writes around the run.
 readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
@@ -1515,19 +1520,20 @@ scheduled_audits() { # <pause|resume> <label>
   # An exec that fails (a pod rolling, an API blip) is tried again, as wait_platform_runs
   # does; the script skips what is already done. Its exit 3 is a verdict a retry would
   # only repeat (unreadable inputs, a pause Hermes refused), so that one is final.
-  # Each attempt first waits for one Ready gateway pod and execs into it by name:
-  # `deployment/...` can pick a pod that is terminating, and a container that is
-  # still starting runs the entrypoint's cron merge, which can rewrite the store
-  # over a pause (eval-next 2110626938950258691, an autoscaler scale-down at
-  # lease time). Readiness means the entrypoint has finished.
+  # Each attempt first waits for the gateway to settle and execs into one of its pods
+  # by name: `deployment/...` can pick a pod that is terminating, and a container
+  # that is still starting runs the entrypoint's cron merge, which can rewrite the
+  # store over a pause (eval-next 2110626938950258691, an autoscaler scale-down at
+  # lease time). ready_gateway_pod says what "settled" checks.
   local bound=(timeout --foreground "${EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS}")
   command -v timeout >/dev/null 2>&1 || bound=()
-  local attempt pod
+  local attempt pod wait="${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}"
+  [ "${mode}" = "pause" ] || wait="${EVAL_RESUME_AUDITS_POD_WAIT_SECONDS}"
   for attempt in $(seq 1 "${EVAL_PAUSE_AUDITS_ATTEMPTS}"); do
     rc=0
-    pod="$(ready_gateway_pod "${ctx}" "${ns}")" || {
+    pod="$(ready_gateway_pod "${ctx}" "${ns}" "${wait}")" || {
       rc=1
-      out="the ${AGENT_SERVICE_NAME}-gateway Deployment did not settle to its Ready replicas within ${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}s (or is not a Deployment)"
+      out="the ${AGENT_SERVICE_NAME}-gateway workload did not settle within ${wait}s: not all of its replicas Ready and past the entrypoint, or no such Deployment or StatefulSet"
       [ "${attempt}" -lt "${EVAL_PAUSE_AUDITS_ATTEMPTS}" ] && sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
       continue
     }
@@ -1554,31 +1560,54 @@ scheduled_audits() { # <pause|resume> <label>
   return 0
 }
 
-# A Ready, non-terminating pod of the gateway Deployment, once as many are Ready as
-# the Deployment asks for (one on every CI install; more on an HA install, where they
-# share the volume), waited for up to EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS. Prints its
-# pod/<name>, or returns 1. Not a Deployment (an HA install on ReadWriteOnce storage
-# renders a StatefulSet) returns 1 at once.
-ready_gateway_pod() { # <context> <namespace>
-  local ctx="$1" ns="$2" selector deadline=$((SECONDS + EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS)) names want
-  selector="$(kubectl --context "${ctx}" -n "${ns}" get "deployment/${AGENT_SERVICE_NAME}-gateway" \
+# A pod of the gateway, once it has settled: as many Ready, non-terminating pods as
+# the workload asks for (one on every CI install; more on an HA install, where they
+# share the volume), each one past its entrypoint. Waits up to <wait> seconds, prints
+# pod/<name>, or returns 1. The workload is a Deployment, or a StatefulSet of the
+# same name on an HA install with ReadWriteOnce storage.
+#
+# Ready alone is not enough on HA: the probe there passes while nothing listens on
+# 8642 (a standby; agentAPIProbe in platformagent_manifests.go), so a new pod can be
+# Ready while its entrypoint is still merging jobs.json. The entrypoint is the
+# container's PID 1 until `exec "$@"`, so a PID 1 that is no longer
+# agent-entrypoint means the merge is done.
+ready_gateway_pod() { # <context> <namespace> [<wait seconds>]
+  local ctx="$1" ns="$2" deadline=$((SECONDS + ${3:-${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}})) workload="" kind selector names want p cmdline settled
+  for kind in deployment statefulset; do
+    if kubectl --context "${ctx}" -n "${ns}" get "${kind}/${AGENT_SERVICE_NAME}-gateway" -o name >/dev/null 2>&1; then
+      workload="${kind}/${AGENT_SERVICE_NAME}-gateway"
+      break
+    fi
+  done
+  [ -n "${workload}" ] || return 1
+  selector="$(kubectl --context "${ctx}" -n "${ns}" get "${workload}" \
     -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}' 2>/dev/null)" || return 1
   selector="${selector%,}"
   [ -n "${selector}" ] || return 1
-  want="$(kubectl --context "${ctx}" -n "${ns}" get "deployment/${AGENT_SERVICE_NAME}-gateway" \
+  want="$(kubectl --context "${ctx}" -n "${ns}" get "${workload}" \
     -o jsonpath='{.spec.replicas}' 2>/dev/null)" || return 1
   [ -n "${want}" ] || want=1
   while :; do
     names="$(kubectl --context "${ctx}" -n "${ns}" get pods -l "${selector}" \
       -o go-template='{{range $p := .items}}{{if not $p.metadata.deletionTimestamp}}{{range $p.status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}{{"pod/"}}{{$p.metadata.name}}{{"\n"}}{{end}}{{end}}{{end}}{{end}}' 2>/dev/null)" || names=""
-    # As many as the Deployment wants, no more: an extra Ready pod means a rollout is
+    # As many as the workload wants, no more: an extra Ready pod means a rollout is
     # still settling, and a starting container's cron merge can rewrite the store.
     if [ -n "${names}" ] && [ "$(printf '%s\n' "${names}" | grep -c .)" -eq "${want}" ]; then
-      printf '%s\n' "${names}" | head -1
-      return 0
+      settled=1
+      for p in ${names}; do
+        cmdline="$(kubectl --context "${ctx}" -n "${ns}" exec "${p}" -c "${EVAL_GATEWAY_CONTAINER}" \
+          --request-timeout=20s -- cat /proc/1/cmdline 2>/dev/null | tr '\0' ' ')" || cmdline=""
+        case "${cmdline}" in
+          ""|*agent-entrypoint*) settled=0; break ;;
+        esac
+      done
+      if [ "${settled}" -eq 1 ]; then
+        printf '%s\n' "${names}" | head -1
+        return 0
+      fi
     fi
     [ "${SECONDS}" -lt "${deadline}" ] || return 1
-    sleep 5
+    sleep "${EVAL_PAUSE_AUDITS_POD_POLL_SECONDS}"
   done
 }
 

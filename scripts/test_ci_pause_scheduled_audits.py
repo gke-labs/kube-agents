@@ -16,8 +16,8 @@
 
 Pinned: which jobs it pauses and which it leaves (plumbing, the oobe stage's audits, a job
 already off), that it believes the store over Hermes' exit code, its exit codes, that --resume
-undoes exactly what it paused, and that ci-eval-pr.sh pauses once per lease before any unit and
-resumes from the EXIT trap.
+undoes exactly what it paused, and that ci-eval-pr.sh pauses at lease time before any unit and
+again right before the fan-out, and resumes from the EXIT trap.
 """
 
 import ast
@@ -293,22 +293,30 @@ class RestartTest(unittest.TestCase):
 class ReadyGatewayPodTest(unittest.TestCase):
     """ready_gateway_pod, run from the runner's own text against a fake kubectl."""
 
-    def run_helper(self, replicas, ready, wait=0):
+    def run_helper(self, replicas, ready, wait=0, kind="deployment", starting=()):
+        # `starting`: pods whose PID 1 is still the entrypoint (Ready on HA all the same).
+        pids = "".join(
+            f"  *exec\\ pod/{n}\\ *) printf '/bin/bash\\0/usr/local/bin/agent-entrypoint\\0' ;;\n" for n in starting)
         with tempfile.TemporaryDirectory() as tmp:
             fake = pathlib.Path(tmp) / "kubectl"
             fake.write_text(textwrap.dedent(f"""\
                 #!/bin/sh
                 case "$*" in
+                  *get\\ {kind}/platform-agent-gateway\\ -o\\ name*) echo {kind}.apps/platform-agent-gateway ;;
+                  *get\\ *-gateway\\ -o\\ name*) exit 1 ;;
                   *go-template=*matchLabels*) printf 'app=platform-agent-gateway,' ;;
                   *jsonpath=*spec.replicas*) printf '{replicas}' ;;
                   *get\\ pods*) printf '{"".join("pod/" + n + chr(92) + "n" for n in ready)}' ;;
+                """) + pids + textwrap.dedent("""\
+                  *exec\\ pod/*cmdline*) printf 'python3\\0-m\\0hermes_cli.main\\0gateway\\0' ;;
                 esac
                 """))
             fake.chmod(0o755)
             helper = RUNNER.read_text().split("ready_gateway_pod() {", 1)[1].split("\n}\n", 1)[0]
-            script = f"ready_gateway_pod() {{{helper}\n}}\nready_gateway_pod ctx ns"
+            script = f"ready_gateway_pod() {{{helper}\n}}\nready_gateway_pod ctx ns {wait}"
             env = {**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}", "AGENT_SERVICE_NAME": "platform-agent",
-                   "EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS": str(wait)}
+                   "EVAL_GATEWAY_CONTAINER": "platform-agent", "EVAL_PAUSE_AUDITS_POD_POLL_SECONDS": "1",
+                   "EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS": "300"}
             return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
 
     def test_one_replica_one_ready_pod(self):
@@ -324,9 +332,22 @@ class ReadyGatewayPodTest(unittest.TestCase):
         result = self.run_helper(2, ["gw-a", "gw-b"])
         self.assertEqual((result.returncode, result.stdout.strip()), (0, "pod/gw-a"))
 
+    def test_an_ha_pod_ready_but_still_in_its_entrypoint_is_waited_out(self):
+        # HA's probe passes with nothing on 8642, so gw-c is Ready mid-merge.
+        result = self.run_helper(2, ["gw-a", "gw-c"], starting=("gw-c",))
+        self.assertEqual(result.returncode, 1)
+
+    def test_an_ha_gateway_on_rwo_storage_is_a_statefulset(self):
+        result = self.run_helper(2, ["gw-0", "gw-1"], kind="statefulset")
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "pod/gw-0"))
+
+    def test_no_gateway_workload_returns_at_once(self):
+        result = self.run_helper(1, ["gw-a"], wait=300, kind="daemonset")
+        self.assertEqual(result.returncode, 1)
+
 
 class RunnerTest(unittest.TestCase):
-    def test_called_once_per_lease_before_any_unit(self):
+    def test_called_at_lease_and_before_the_fan_out(self):
         text = RUNNER.read_text()
         calls = [m.start() for m in re.finditer(r'^scheduled_audits pause "lease"$', text, re.M)]
         self.assertEqual(len(calls), 1)
@@ -349,7 +370,7 @@ class RunnerTest(unittest.TestCase):
         pause_branch = body.split('if [ "${mode}" = "pause" ]; then', 1)[1].split("\n  fi\n", 1)[0]
         self.assertIn("exit 1", pause_branch)
         # It execs into one Ready pod by name, not deployment/<name>.
-        self.assertIn('pod="$(ready_gateway_pod "${ctx}" "${ns}")"', body)
+        self.assertIn('pod="$(ready_gateway_pod "${ctx}" "${ns}" "${wait}")"', body)
         self.assertNotIn('exec -i "deployment/', body)
         # The script's DECIDED exit ends the retries.
         self.assertIn('"${rc}" -eq "${EVAL_PAUSE_AUDITS_DECIDED_EXIT}" ] && break', body)
@@ -359,6 +380,14 @@ class RunnerTest(unittest.TestCase):
     def test_the_exit_trap_resumes(self):
         trap = RUNNER.read_text().split("profile_and_dump_on_exit() {", 1)[1].split("\n}\n", 1)[0]
         self.assertIn('declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"', trap)
+
+    def test_the_resume_waits_briefly_for_the_gateway(self):
+        # It runs in the EXIT trap, ahead of the artifact dump.
+        text = RUNNER.read_text()
+        body = text.split("scheduled_audits() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('[ "${mode}" = "pause" ] || wait="${EVAL_RESUME_AUDITS_POD_WAIT_SECONDS}"', body)
+        resume = int(re.search(r"^readonly EVAL_RESUME_AUDITS_POD_WAIT_SECONDS=(\d+)$", text, re.M).group(1))
+        self.assertLessEqual(resume, 30)
 
 
 if __name__ == "__main__":
