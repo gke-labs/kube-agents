@@ -43,6 +43,7 @@ watchdog — **not** a prettified form of the audit id:
 | `stockout-prevention`         | `[audit] Fleet Stockout Prevention & Capacity Audit — 7 findings (2 critical)` |
 | `gcp-networking-fabric-audit` | `[audit] GCP Networking Fabric & VPC IPAM Audit — 7 findings (2 critical)`     |
 | `gce-compute-fleet-audit`     | `[audit] GCE Compute Engine and MIG Fleet Audit — 7 findings (2 critical)`     |
+| `upgrade-retrospective`       | `[audit] Upgrade Retrospective — 7 findings (0 critical)`                      |
 
 The mapping lives in `AUDITS` at the top of `audit_report.py` and mirrors `cron/jobs.json`; a test
 fails if the two drift apart. Do not restate a title anywhere else.
@@ -407,9 +408,10 @@ streams `collect.py` covers: compliance (`governance/compliance_audit_sop.md` §
 (`governance/obtainability_audit_sop.md` §2) and AI security (`governance/ai_security_audit_sop.md`
 §3), the cost stream (`fleet_waste.py`, `governance/fleet_wide_cost_analysis_sop.md` §2), the
 stockout stream (`fleet_stockout.py`, `governance/stockout_prevention_sop.md` §3), the GCE
-compute stream (`compute_fleet_audit.py`, `governance/gce_compute_fleet_sop.md` §2) and the networking
-stream (`networking_audit.py`, `governance/gcp_networking_fabric_sop.md` §2).
-The compliance, obtainability, stockout, cost, GCE compute, networking and upgrade collectors may also give a target `checks_unevaluated`,
+compute stream (`compute_fleet_audit.py`, `governance/gce_compute_fleet_sop.md` §2), the networking
+stream (`networking_audit.py`, `governance/gcp_networking_fabric_sop.md` §2) and the upgrade
+retrospective (`upgrade_retrospective.py`, `governance/upgrade_retrospective_sop.md` §2).
+The compliance, obtainability, stockout, cost, GCE compute, networking, patch readiness (`patch_readiness.py`) and upgrade retrospective collectors may also give a target `checks_unevaluated`,
 `{check, reason}` for a check whose own read failed or whose inputs could not decide it: it did not run and is not inapplicable, so it
 goes in neither `checks_run` nor `checks_not_applicable` but in that target's `limitations`, which
 keeps the run partial and leaves open every finding that check filed there. `finish` rejects the

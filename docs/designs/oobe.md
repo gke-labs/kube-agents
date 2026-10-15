@@ -119,15 +119,16 @@ reason it records says what it knows: the scan had settled (`SKIP_NOT_NEW`) or h
 ### 4.2 Which audits
 
 The four audits [#1866](https://github.com/gke-labs/kube-agents/issues/1866) names, in the order it
-chains them (cost, security, reliability, capacity), by their job ids in
-`agents/platform/cron/jobs.json`:
+chains them (cost, security, reliability, capacity), then the upgrade retrospective, by their job
+ids in `agents/platform/cron/jobs.json`:
 
-| Order | Job id                     | Audit                            | Normal schedule (UTC) |
-| ----- | -------------------------- | -------------------------------- | --------------------- |
-| 1     | `fleet-wide-cost-analysis` | Fleet waste                      | Mondays 07:50         |
-| 2     | `compliance-audit`         | Security and RBAC posture        | Daily 06:20           |
-| 3     | `obtainability-audit`      | Workload reliability             | Daily 06:50           |
-| 4     | `stockout-prevention`      | Stockout prevention and capacity | Daily 09:20           |
+| Order | Job id                     | Audit                                                  | Normal schedule (UTC) |
+| ----- | -------------------------- | ------------------------------------------------------ | --------------------- |
+| 1     | `fleet-wide-cost-analysis` | Fleet waste                                            | Mondays 07:50         |
+| 2     | `compliance-audit`         | Security and RBAC posture                              | Daily 06:20           |
+| 3     | `obtainability-audit`      | Workload reliability                                   | Daily 06:50           |
+| 4     | `stockout-prevention`      | Stockout prevention and capacity                       | Daily 09:20           |
+| 5     | `upgrade-retrospective`    | Upgrade retrospective; marked without a repository too | Sundays 18:00         |
 
 The other five governance jobs keep their schedules.
 
@@ -138,7 +139,7 @@ has ended, whatever its outcome. The shipped schedule staggers the audits for th
 (`autonomous-watchdogs.md`: "Stagger start minutes so two audits never contend for the same
 session"). Four started in the same minute put a fresh CI install's gateway pod under memory
 pressure for the best part of an hour and broke the cluster reads of a case running beside them.
-For the same reason the chain waits while any of the four has a run going, whatever started it,
+For the same reason the chain waits while any of the five has a run going, whatever started it,
 before the first mark and between marks; a mark that finds its audit already running counts that
 run as its own, and one the store skipped for any other reason counts as not claimed.
 A mark the scheduler has not claimed after `START_LIMIT_SECONDS` (10 minutes) is made again, as a
@@ -180,8 +181,13 @@ An audit on an install with no GitOps repository runs without a forge: it keeps 
 report store and posts a chat summary, with no ledger issue and no pull request (the `fleet-audit`
 skill's "No forge configured"). `oobe.py` still starts none of the four there. It reads the managed repositories
 from `/etc/gitops/managed_repos`, which the operator mounts into the gateway container
-(`platformagent_manifests.go`, `gitopsStateDir`), through `gitops_workspace.get_managed_github_repos`.
-With none, it writes the marker with the reason and starts nothing.
+(`platformagent_manifests.go`, `gitopsStateDir`), through `gitops_workspace.get_managed_github_repo_names`.
+With none, it records the four as held with that reason and starts none of them (§7 lists starting
+them there as a separate change). The fifth audit in the chain, the upgrade retrospective
+(`REPOSITORY_FREE_AUDITS`), is marked regardless: its collector writes the report to the shell
+volume and its SOP runs the collector alone there, with no audit run or ledger issue, the report on the
+volume being the record, so on such an install it is the whole chain and the first report is still a
+baseline of every cluster.
 
 The onboarding scan reads the same list (`oobe.managed_repositories`) once, when it files the sweep
 card, and records the answer in `.bootstrap_scan_filed` for the Cluster Agents' cards. With none,
@@ -195,12 +201,14 @@ It does not exit non-zero. No repository is a configuration the installer offers
 a failing per-minute job repeats until something changes. The operator is told instead: the
 interactive installer's "GitOps repository connection skipped" line says the scheduled audits run
 without one but write no ledger issue or pull request,
-and the delivered report closes with a note saying the first-run audits did not run, why, and, when a
-cluster was audited, whether the report covers their workload checks instead. That last part follows what
-`.bootstrap_scan_filed` recorded the cards were told, not the skip's reason, since the list can change between the two
+and the delivered report closes with a note saying the four workload audits did not run, why, and, when a
+cluster was audited, whether the report covers their workload checks instead, then that the upgrade retrospective,
+which needs no repository, has started or is still to (`bootstrap_delivery.py`, `_audits_note`; a skip of the
+whole chain, the retrospective with it, keeps the note as it was: the skip sentence and the coverage sentence). The coverage part follows what
+`.bootstrap_scan_filed` recorded the cards were told, not the hold's reason, since the list can change between the two
 reads: it covers them for `yes` or `unknown` (the cards ran the section either way), does not for `no`, and the note hedges for a marker with no answer.
-Delivery can run before the stage has recorded the skip; a recorded `yes` then gives the same note. Beside a Slack Block
-Kit card the note is a second message.
+Delivery can run before the stage has recorded the hold; a recorded `yes` then gives the same note with the
+retrospective still to start. Beside a Slack Block Kit card the note is a second message.
 
 ### 4.5 What the operator sees
 
@@ -209,9 +217,9 @@ repository, a one-line summary in the home channel when one is set, and remediat
 for the findings that auto-promote, at most five per audit run (`audit_report.py`,
 `AUTO_PROMOTION_CAP`): critical findings whose fix is a manifest, and major ones on the checks the
 collector vouches for (`MAJOR_SWEEP_CHECKS`). Each audit's SOP lists its own in §5. A scheduled run with nothing new is silent
-(same section), so the morning after brings no second burst. The four run one after another
-(§4.3), so the last starts once the first three have ended (§9, chain length); each
-takes 9–15 minutes on its own, most of it inside the SOP
+(same section), so the morning after brings no second burst. The five run one after another
+(§4.3), so the last, the retrospective, starts once the first four have ended (§9, chain length);
+each takes 9–15 minutes on its own, most of it inside the SOP
 ([#985 "Fleet audit SOPs cost 9–15 min per run"](https://github.com/gke-labs/kube-agents/issues/985)).
 
 ## 5. Folding in the bootstrap jobs
@@ -278,7 +286,9 @@ times. It rides with the audits stage, whose eval case covers both.
 - **Reaching an install with no home channel.** Audit summaries go to the home channel only.
   Posting the report there at T+0 when one is set is a separate change.
 - **First-run audits without a GitOps repository.** The audits can run with no forge now; starting
-  them from `oobe` on such an install is a separate change.
+  the four from `oobe` on such an install is a separate change. The upgrade retrospective is the one
+  the stage starts there (§4.4): its report is its record and the ledger issue is what a repository
+  adds.
 - **An install self-check.** Not asked for by any issue.
 
 ## 8. Build order and evaluation
@@ -294,7 +304,7 @@ times. It rides with the audits stage, whose eval case covers both.
 
 Eval case `oobe-first-run-audits` (domain `fleet-audits`; parked out of `hack/eval/nightly-cases.txt`
 since 2026-10-09, its `KNOWN_UNREGISTERED` entry in `scripts/validate_bench_cases.py` says why;
-each repetition waits for the previous one's four audits to finish). The stack
+each repetition waits for the previous one's five audits to finish). The stack
 (`bench/tf/prebuilt/oobe-first-run-audits`) first waits for the install's own first-run stage to
 finish, so it never cuts across a fresh install's real scan, then re-arms the stage: it files an
 archived stand-in sweep card and an archived ranking card after it, points `.bootstrap_scan_filed`
@@ -302,9 +312,9 @@ at the sweep and the hand-off's `.bootstrap_handoff_filed` at the ranking card, 
 `.oobe_audits_fired`, and puts back the `oobe` job when the image ships one; the teardown restores
 the markers and the job as it found them.
 The stack then waits, up to an hour, for the stage to finish its chain, so the verifier's two-minute window opens after the last audit has started. The verifier reads the Platform Agent's cron run records and
-passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the stage marked it that got going (running, completed, or ended after its start) (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. An audit the stage recorded as adopted (a run completed since the sweep) counts as had, and stays out of that order; at least one audit must be the stage's own. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the runner's wait for running audits makes rare, reads as no run. Red: on
-an image without the job, no audit runs. Green, from the verifier on a dev install: four, in three repetitions. The case's runs are
-real audit runs on four streams, so it declares them (`audit_streams`) and the runner holds their
+passes when the stage's `.oobe_audits_fired` lists all five audits as marked due and each has a run claimed since the stage marked it that got going (running, completed, or ended after its start) (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. An audit the stage recorded as adopted (a run completed since the sweep) counts as had, and stays out of that order; at least one audit must be the stage's own. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the runner's wait for running audits makes rare, reads as no run. Red: on
+an image without the job, no audit runs. Green, from the verifier on a dev install: four, in three repetitions, before the retrospective joined the stage; the five-audit stage's green is the case's nightly record, not this document's. The case's runs are
+real audit runs on five streams, so it declares them (`audit_streams`) and the runner holds their
 locks for the unit. Every unit on an audit stream first waits, up to two hours, while the install
 has a run of that audit claimed, running or marked due, a stage under way is to mark it next, or a
 stage this case armed and could not disarm has still to run it (`wait_platform_runs` in
@@ -314,15 +324,16 @@ last run ends. A fresh install's chain is waited on only once it has started, an
 it marks next, which costs a case at most about two audit runs (the one before it, then its own): an audit the chain reaches later, after the case's run holds the
 stream's in-flight note, has its `start` refused, and only between two repositories of a run can
 the install's run take the stream and leave the case's run partial. Waiting out the whole chain
-would hold every audit case on those streams for most of an hour on every CI run. The no-repository skip is unit-tested,
+would hold every audit case on those streams for most of an hour on every CI run. The no-repository path (the four held, the retrospective started) is unit-tested,
 not evaluated: the shared install has a repository, and removing it mid-run would break concurrent
 cases.
 
 ## 9. Open questions
 
 - **Chain length.** Each audit took one to eight minutes on a four-cluster install with
-  `gemini-3.1-flash-lite`, so the chain ends within about half an hour of the scan there. On a large
-  fleet the last audit may land an hour or more after the scan.
+  `gemini-3.1-flash-lite`, so with the retrospective fifth the stage is done, the four audits ended
+  and the fifth started, within about forty minutes of the scan there, inside the eval stack's
+  hour-long wait. On a large fleet the last audit may land an hour or more after the scan.
 - **Output volume.** How many pull requests and chat lines a first run produces on a real fleet. If
   it reads as noise, day one narrows to fewer audits. The inventory report no longer duplicates any
   of the four (#2386), so the choice is about volume, not overlap.

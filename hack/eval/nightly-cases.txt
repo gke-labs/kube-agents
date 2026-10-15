@@ -360,6 +360,14 @@
 # worker to its retries). It is the last entry below. Counted from the
 # lists: seventy-six cases (228 units) here, of a ninety-case, 270-unit
 # matrix, the paragraphs above included.
+#
+# 2026-10-15 adds upgrades-retrospective-on-demand and
+# upgrades-retrospective-drained-budget: two cases, six units (noop, no infra
+# lock; each holds the `upgrade-retrospective` stream for its unit; one red
+# repetition of each on the dev install took 540 s and 360 s of wall time).
+# They are the last two entries below. Counted from the lists:
+# eighty cases (240 units) here, of a ninety-four-case, 282-unit matrix
+# with the presubmit file's fourteen.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -969,3 +977,18 @@
 # and no delegated worker retries the change another way after it (the
 # order-aware worker_commands check, #2173). deployer: noop, transcript-only.
 ./tasks/stop-on-permission-refusal/task.yaml
+
+# The upgrade retrospective's on-demand route (governance/upgrade_retrospective_sop.md,
+# section 7): a generic question about the last upgrades, answered from the
+# retrospective's saved report or a run made for it, graded on the route (the worker's
+# terminal reached the store or the collector), the report file named, and one declared
+# line per seeded cluster. deployer: noop; a fleet-wide question with a stale report is
+# a full run, so the case holds the `upgrade-retrospective` stream for the unit.
+./tasks/upgrades-retrospective-on-demand/task.yaml
+
+# The retrospective's verdict on the fleet's planted upgrade failure: seeded-b's
+# drain-blocking budget (role readiness-drain-blocked) reported under catalogue
+# entry 1, graded on one declared line, `<cluster>/<namespace>/<kind>/<name>: entry
+# <n>`, plus the route check. deployer: noop; holds the `upgrade-retrospective`
+# stream for the same reason as the case above.
+./tasks/upgrades-retrospective-drained-budget/task.yaml

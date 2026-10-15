@@ -1726,11 +1726,48 @@ class FirstRunAuditsTest(unittest.TestCase):
             with self.subTest(recorded=recorded):
                 self.assertEqual(self._note(recorded=recorded), bootstrap_delivery.AUDITS_RUNNING_NOTE)
 
-    def test_no_marker_and_a_recorded_no_repository_says_the_audits_will_not_run_and_the_report_covers_them(self):
+    def test_no_marker_and_a_recorded_no_repository_says_the_four_will_not_run_and_the_report_covers_them(self):
+        # The stage will hold the four workload audits and start the retrospective alone (oobe.REPOSITORY_FREE_AUDITS).
         self.assertEqual(
             self._note(recorded=bootstrap_handoff.RECORDED_YES),
-            f"The first-run audits did not run: {oobe.SKIP_NO_REPOSITORY}. {bootstrap_delivery.AUDITS_COVERED_NOTE}",
+            f"The cost, security, reliability and capacity audits did not run: {oobe.SKIP_NO_REPOSITORY}. "
+            f"{bootstrap_delivery.AUDITS_COVERED_NOTE} {bootstrap_delivery.RETROSPECTIVE_PENDING_NOTE}",
         )
+
+    def test_the_no_repository_hold_names_the_four_and_the_retrospective(self):
+        four = {a: oobe.SKIP_NO_REPOSITORY for a in bootstrap_delivery._workload_audits()}
+        self.assertEqual(bootstrap_delivery._workload_audits(), oobe.FIRST_RUN_AUDITS[:4])
+        held_note = f"The cost, security, reliability and capacity audits did not run: {oobe.SKIP_NO_REPOSITORY}."
+        for state, tail in (
+            ({oobe.STATE_HELD: four, oobe.STATE_DONE: False}, bootstrap_delivery.RETROSPECTIVE_PENDING_NOTE),
+            ({oobe.STATE_HELD: four, oobe.STATE_FIRED: ["upgrade-retrospective"], oobe.STATE_DONE: False},
+             bootstrap_delivery.RETROSPECTIVE_STARTED_NOTE),
+            ({oobe.STATE_HELD: four, oobe.STATE_FIRED: ["upgrade-retrospective"], oobe.STATE_DONE: True},
+             bootstrap_delivery.RETROSPECTIVE_STARTED_NOTE),
+            ({oobe.STATE_HELD: {**four, "upgrade-retrospective": oobe.HOLD_DISABLED}, oobe.STATE_DONE: True},
+             "Not run: `upgrade-retrospective` (disabled)."),
+            ({oobe.STATE_HELD: four, oobe.STATE_GAVE_UP: ["upgrade-retrospective"], oobe.STATE_DONE: True},
+             f"Not run: `upgrade-retrospective` ({bootstrap_delivery.AUDITS_GAVE_UP_REASON})."),
+        ):
+            with self.subTest(state=state):
+                note = self._note(state, recorded=bootstrap_handoff.RECORDED_YES)
+                self.assertEqual(note, f"{held_note} {bootstrap_delivery.AUDITS_COVERED_NOTE} {tail}")
+                self.assertNotIn("which run one after another", note)
+        # The coverage sentence follows what the gate recorded, as after a skip.
+        note = self._note({oobe.STATE_HELD: four, oobe.STATE_DONE: False}, recorded=bootstrap_handoff.RECORDED_NO)
+        self.assertEqual(
+            note, f"{held_note} {bootstrap_delivery.AUDITS_NOT_COVERED_NOTE} {bootstrap_delivery.RETROSPECTIVE_PENDING_NOTE}"
+        )
+
+    def test_a_held_retrospective_on_an_install_with_a_repository_is_named_as_not_run(self):
+        note = self._note({
+            oobe.STATE_FIRED: list(bootstrap_delivery._workload_audits()),
+            oobe.STATE_HELD: {"upgrade-retrospective": oobe.HOLD_DISABLED},
+            oobe.STATE_DONE: True,
+        })
+        self.assertIn("which have started: `fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, "
+                      "`stockout-prevention`.", note)
+        self.assertTrue(note.endswith("Not run: `upgrade-retrospective` (disabled)."))
 
     def test_a_skip_says_whether_the_report_covers_the_checks_by_what_the_gate_recorded(self):
         # Recorded no with a skip for no repository: the list emptied between the sweep being filed
@@ -1754,15 +1791,20 @@ class FirstRunAuditsTest(unittest.TestCase):
 
     def test_a_no_coverage_report_without_a_repository_says_nothing_checked_them(self):
         # The hand-off's own report when no cluster's audit reached the raw file covers none of them.
+        held = (
+            f"The cost, security, reliability and capacity audits did not run: {oobe.SKIP_NO_REPOSITORY}. "
+            f"{bootstrap_delivery.AUDITS_UNCHECKED_NOTE} {bootstrap_delivery.RETROSPECTIVE_PENDING_NOTE}"
+        )
+        self.assertEqual(self._note(recorded=bootstrap_handoff.RECORDED_YES, no_coverage=True), held)
         unchecked = (
             f"The first-run audits did not run: {oobe.SKIP_NO_REPOSITORY}. {bootstrap_delivery.AUDITS_UNCHECKED_NOTE}"
         )
-        self.assertEqual(self._note(recorded=bootstrap_handoff.RECORDED_YES, no_coverage=True), unchecked)
         self._skipped(oobe.SKIP_NO_REPOSITORY)
         for recorded in (None, *bootstrap_handoff.RECORDED_VALUES):
             with self.subTest(recorded=recorded):
                 self.assertEqual(self._note(recorded=recorded, no_coverage=True), unchecked)
         self.assertNotIn("covers", unchecked)
+        self.assertNotIn("covers", held)
 
     def test_a_no_coverage_report_after_another_skip_points_at_the_schedules(self):
         self._skipped(oobe.SKIP_NOT_NEW)
@@ -1790,8 +1832,8 @@ class FirstRunAuditsTest(unittest.TestCase):
             self.assertEqual(bootstrap_delivery.main(self.d), 0)
         self.assertEqual(
             out.getvalue(),
-            f"# Report\n\nThe first-run audits did not run: {oobe.SKIP_NO_REPOSITORY}. "
-            f"{bootstrap_delivery.AUDITS_UNCHECKED_NOTE}\n",
+            f"# Report\n\nThe cost, security, reliability and capacity audits did not run: {oobe.SKIP_NO_REPOSITORY}. "
+            f"{bootstrap_delivery.AUDITS_UNCHECKED_NOTE} {bootstrap_delivery.RETROSPECTIVE_PENDING_NOTE}\n",
         )
 
     def test_a_chain_under_way_says_the_audits_are_running(self):

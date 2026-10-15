@@ -1,7 +1,12 @@
 # Upgrade retrospective: what the last upgrade did, and the fix set up before the next one
 
-**Status:** design. Nothing here is built on `main`. The collector it specifies is the first of
-three changes; the schedule and the agent's part follow it. The
+**Status:** the collector (work item 1, §5) and the weekly job (work item 2) are on `main`:
+`agents/platform/skills/fleet-audit/scripts/upgrade_retrospective.py`; the `upgrade-retrospective`
+roster entry and its SOP; the first-run stage's start of it, with or without a repository; the
+on-demand route; and the stream's `AUDITS` and `COLLECTOR_AUDITS` entries. Not built: the
+`upgrade-retrospective-after-upgrade` roster entry and `upgrade_retrospective_watch.py` (§3.1, and
+the SOP's after-upgrade route with them), the readiness watch's `guards.json` reader (§3.5), and
+the proof (work item 3). The
 [upgrade failure catalogue](upgrade-failure-catalogue.md) is the list of failures it classifies
 against, and the [readiness checks](upgrade-readiness-checks.md) are the before-the-upgrade half it
 feeds.
@@ -117,11 +122,13 @@ stays a user's "apply", through the route the agent uses for every other propose
 The [readiness checks](upgrade-readiness-checks.md) end with "a diff after the upgrade", and the
 [catalogue](upgrade-failure-catalogue.md) says post-upgrade detection is one mechanism for every
 entry: watch the operation, then compare pod health against the same measurements taken before.
-Neither is built. The reproductions behind the catalogue measured why it matters: on a surge
+The diff after the upgrade now runs as the `upgrade-retrospective` job; the guards reader is not
+built. The reproductions behind the catalogue measured why it matters: on a surge
 upgrade GKE refused the eviction a budget protected for an hour, force-killed the pod, and reported
 the operation `DONE` two minutes later while the replacement was still Pending. The symptoms of the
 twenty failures sit in pod status, node conditions and `Warning` events that nothing scheduled
-reads, and what one cluster's upgrade broke never reaches the next cluster's readiness report.
+read until the retrospective, and what one cluster's upgrade broke never reaches the next cluster's
+readiness report.
 
 One thing on the roster and one design shape this one. The fleet audits pair a deterministic
 collector (`collect.py`, `patch_readiness.py`) with a governance SOP the Platform Agent follows,
@@ -175,17 +182,20 @@ are a weak witness at that distance: the API server keeps them for one hour by d
 so (B) leans on pod and node state and uses events as corroboration, not as the only source. The
 first run comes from the Chat Agent's first-run stage, the same place the four fleet audits start
 once the onboarding scan settles, so a fresh install's first report is a baseline of every cluster
-it manages rather than a blank. Two things stand in the way today and the second work item
-removes both. The first-run stage skips every audit when no GitOps repository is configured, and
-the fleet-audit skill's `start` fails outright without one (`INSTALL.md` says so), because the
-streams it serves exist to file a ledger. This stream does not: the collector needs no repository
-and the report on the volume is the record. Where a repository is configured and the run is full,
+it manages rather than a blank. Two things stood in the way on an install with no GitOps
+repository. The first-run stage started no audit there, and it still starts none of the four fleet
+audits there (the first-run design, §4.4); the second work item has it start this stream. The
+fleet-audit skill's `start` failed outright without a repository, because the streams it serves
+exist to file a ledger; it now runs them with no forge (the skill's "No forge configured"), and
+this stream needs it less still: the collector needs no repository and the report on the volume is
+the record. Where a repository is configured and the run is full,
 the SOP calls the `fleet_scope` tool (§3.2), probes the collector's lock (§3.6; a probe that
 names a pending reset makes the run the baseline of §3.6, the collector alone with no `start` or
 `finish`), calls `start`, runs the collector, then `finish` with the collector's manifest (`finish`
 refuses a manifest older than the run); without a repository it runs the collector alone, manifest
-included, and the first-run stage marks this job due without one. That is the "chat-only mode" the first-run design lists as an open question,
-scoped to this one stream. An install that onboarded before the job existed gets its baseline from
+included, and the first-run stage marks this job due without one. The first-run design records that
+under "Not in this design" (§7): the stage starts this one stream on such an install. An install
+that onboarded before the job existed gets its baseline from
 the first Sunday tick; the after-upgrade sweep, which on most such installs arrives first, finds no
 full run in the ledger and prints only that (§3.2).
 

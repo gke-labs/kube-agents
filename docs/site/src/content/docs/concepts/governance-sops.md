@@ -9,9 +9,9 @@ Governance SOPs are the fleet-wide playbooks the Platform Agent executes on sche
 
 The SOPs live in [`agents/platform/governance/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/governance).
 
-## The nine audit SOPs
+## The ten audit SOPs
 
-Nine SOPs back the enabled [fleet audits](/kube-agents/concepts/autonomous-watchdogs/). They share one shape: enumerate the fleet, run read-only checks, write a validated findings file, and hand it to the [`fleet-audit`](/kube-agents/skills/) skill, which owns the stream's ledger issue and any remediation pull requests it spawns. Each check in each SOP states how it is read — its exact command, or the collector script that runs it — its flag-when predicate, an explicit **do NOT flag** list, a severity, an impact sentence, a recommendation, and a remediation kind — so a finding is either reproducible or it is dropped.
+Ten SOPs back the enabled [fleet audits](/kube-agents/concepts/autonomous-watchdogs/). They share one shape: enumerate the fleet, run read-only checks, write a validated findings file, and hand it to the [`fleet-audit`](/kube-agents/skills/) skill, which owns the stream's ledger issue and any remediation pull requests it spawns. Each check in each SOP states how it is read — its exact command, or the collector script that runs it — its flag-when predicate, an explicit **do NOT flag** list, a severity, an impact sentence, a recommendation, and a remediation kind — so a finding is either reproducible or it is dropped.
 
 ### `compliance_audit_sop.md`
 
@@ -67,6 +67,12 @@ GCE Compute Engine and MIG fleet, daily. It checks instances, Managed Instance G
 
 Invoked by the `gce-compute-fleet-audit` watchdog.
 
+### `upgrade_retrospective_sop.md`
+
+Upgrade retrospective, Sunday evening and once at onboarding. Looks back rather than ahead: the collector reviews every cluster that is new or was upgraded since the last run, records which `UPGRADE_MASTER` and `UPGRADE_NODES` operations ran and from which version to which, reads pods, nodes, events and budgets for what stayed down, stuck or restarting afterwards, classifies each symptom against the twenty entries of the upgrade failure catalogue with a confidence and its evidence, and lists the catalogue shapes a clean cluster carries today as risks for its next upgrade. Six checks grade the result: an upgrade that broke a workload, an operation GKE reported failed, and a node broken after its pool's rebuild file as Errors; a tentative match, an unclassified symptom and a symptom that predates the upgrade file as Warnings; a failure still present from an earlier review is re-filed under its original check, as a Warning that says since when it has persisted. The SOP copies the collector's grade and never moves it. The report is written to the shell volume with the latest at a fixed path, one chat line per reviewed cluster carries the counts and top finding, and a quiet weekend posts nothing.
+
+Two rules are deliberate. Errors file at `major` and Warnings at `minor`, never `critical`, and every remediation is `manual` naming the manifest and the change, so the stream opens no pull request on its own; a fix is a user's "apply". And the ledger issue is the one thing a GitHub repository adds: without one the SOP runs the collector alone, skips the issue and says so, which is why the first-run stage starts this stream on an install with no repository, where it holds the other four back. The same SOP answers a generic question about the last upgrades from the saved report when it is newer than the last upgrade operation, and runs the collector first when it is not. Invoked by the `upgrade-retrospective` watchdog.
+
 ## The retired SOPs
 
 The SOPs behind the five watchdogs [retired from the roster](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs) — blueprint sync, policy propagation, global capacity orchestration, standardization validation, and lifecycle deprecation — are no longer in the tree or the image; git history has them. As written, each depended on an input a stock install does not provide — a master blueprint, a `/opt/defaults/templates/` directory, a corporate patterns document — or duplicated an audit above, so reviving one means writing a new SOP against what an install actually has, not restoring the old file.
@@ -88,7 +94,7 @@ The cron watchdog invokes the SOP by prompting the agent to read `governance/<so
 - A **skill** is a reusable capability (how to onboard an app, how to submit a PR, how to open and close an audit run).
 - An **SOP** composes skills into a fleet-wide procedure with a policy for when to act.
 
-The division of labour in the audit streams is deliberate: **the SOP decides what is true, the skill decides what happens to it.** The model reasons, runs read-only commands, and emits evidence; `fleet-audit`'s helper owns every forge call, through the version-control broker, and renders every body itself — the stream's ledger issue and the remediation PRs promoted from it. The SOPs forbid hand-writing any of those bodies or invoking git directly, which is what keeps the nine ledgers uniform and their run-to-run deltas computable.
+The division of labour in the audit streams is deliberate: **the SOP decides what is true, the skill decides what happens to it.** The model reasons, runs read-only commands, and emits evidence; `fleet-audit`'s helper owns every forge call, through the version-control broker, and renders every body itself — the stream's ledger issue and the remediation PRs promoted from it. The SOPs forbid hand-writing any of those bodies or invoking git directly, which is what keeps the ten ledgers uniform and their run-to-run deltas computable.
 
 The audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`). An SOP that needs no preloaded skill can omit the key or leave it empty — the run loads what it needs.
 

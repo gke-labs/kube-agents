@@ -10,7 +10,9 @@ The design is ``docs/designs/oobe.md``. Each tick runs three stages in order:
    hand-off's cluster and ranking cards.
 3. The first-run audits, below: once the scan has settled, the four fleet audits that
    would otherwise wait for their schedules (the next 06:20 UTC, the next Monday for
-   cost), one after another.
+   cost), one after another, and then the upgrade retrospective, whose schedule is
+   Sunday evening and whose first run is the baseline of every cluster the install
+   manages.
 
 Delivery's stdout is the report, and the scheduler posts whatever this job prints to
 that chat, and a failed run with its stderr. So the other two stages write to
@@ -35,8 +37,11 @@ run``: that CLI runs the whole job synchronously in the calling process.
 its run, so a run killed partway marks nothing twice: marking an audit due again after it has run
 starts a second full run. An audit that has completed a run since the sweep was filed (a
 scheduled one) is recorded as adopted and not marked: the install already has that run. With no
-GitHub repository the stage records the skip and marks none; the audits themselves run with no
-forge on their own schedules (docs/designs/oobe.md §4.4).
+GitHub repository the stage records the four fleet audits as held with that reason and marks none
+of them; the audits themselves run with no forge on their own schedules (docs/designs/oobe.md
+§4.4). The upgrade retrospective needs no repository (its report is written to the shell volume
+and the ledger issue is the one thing it skips), so it is still marked, and on such an install it
+is the whole chain.
 
 ``trigger_job`` also sets a job's ``enabled`` back to true, so an audit an operator
 has disabled or paused is left alone rather than started.
@@ -79,13 +84,20 @@ MARKER_TASK_ID = "task_id"
 HANDOFF_SWEEP = "sweep"
 
 # The four audits #1866 names, by their ids in agents/platform/cron/jobs.json, in the
-# order it chains them: cost, security, reliability, capacity.
+# order it chains them: cost, security, reliability, capacity; then the upgrade
+# retrospective, last so the four keep #1866's order and the review of every cluster's
+# last upgrade follows the audits whose findings it cites.
 FIRST_RUN_AUDITS = (
     "fleet-wide-cost-analysis",
     "compliance-audit",
     "obtainability-audit",
     "stockout-prevention",
+    "upgrade-retrospective",
 )
+# The audits the stage starts without a GitHub repository: the retrospective's record is its
+# report on the shell volume, and its SOP skips the ledger issue when there is no repository to
+# file it in.
+REPOSITORY_FREE_AUDITS = ("upgrade-retrospective",)
 EXECUTIONS_DB = "executions.db"
 # A run row in either is still going; any other status has ended.
 CLAIMED_STATUS = "claimed"
@@ -492,7 +504,7 @@ def advance_chain(data_dir: Path, state: dict, now: float, since: float | None =
 
     busy = audits_in_flight(runs, now)
     if busy:
-        # One of the four has a run going, whatever started it, including the run a mark found
+        # One of the chain's audits has a run going, whatever started it, including the run a mark found
         # already going; the chain waits its turn, as the schedule does.
         return save()
     holds = audit_holds(data_dir)
@@ -613,8 +625,11 @@ def first_run_audits(data_dir: Path, now: float) -> None:
             _log(f"cannot read the managed repositories: {e}")
             return
         if not repositories:
-            skip(data_dir, SKIP_NO_REPOSITORY, now)
-            return
+            # The four fleet audits are held with the reason (they run with no forge on their
+            # own schedules; starting them from here is a separate change, docs/designs/oobe.md
+            # §4.4), and the chain runs the audits that need no repository.
+            _log(f"holding the fleet audits: {SKIP_NO_REPOSITORY}")
+            state = {STATE_HELD: {job_id: SKIP_NO_REPOSITORY for job_id in FIRST_RUN_AUDITS if job_id not in REPOSITORY_FREE_AUDITS}}
     advance_chain(data_dir, state, now, since=filed[1] if filed is not None else None)
 
 
