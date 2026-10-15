@@ -102,7 +102,7 @@ verification_spec:
       scope: workers
       arguments:
         kind: "needs_input"
-        reason: '(?is)(?=.*payments-api)(?=.*(?:oom|memory)).*'
+        reason: "(?is)(?=.*payments-api)(?=.*(?:oom|memory)).*"
       require_success: true
   # Diagnosed and asked, not fixed: the limit the fixture plants is unchanged.
   - name: the-crashloop-was-not-fixed-before-asking
