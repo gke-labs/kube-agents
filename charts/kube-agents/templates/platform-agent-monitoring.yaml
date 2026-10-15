@@ -112,9 +112,6 @@ spec:
       interval: 30s
 {{- end }}
 {{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentServiceMonitor" .) }}
-{{- if gt (len .Values.platformAgent.name) 35 }}
-{{- fail "platformAgent.name must be at most 35 characters when platformAgent.serviceMonitor is enabled" }}
-{{- end }}
 ---
 {{- /*
 Prometheus Operator ServiceMonitors and headless metrics Services for the agent's
@@ -123,7 +120,7 @@ pods. The headless Services provide the service ports that ServiceMonitor requir
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ .Values.platformAgent.name }}-gateway-monitoring
+  name: {{ .Values.platformAgent.name }}-gateway-metrics
   namespace: {{ .Release.Namespace }}
   labels:
     app: {{ .Values.platformAgent.name }}-gateway-metrics
@@ -140,7 +137,7 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ .Values.platformAgent.name }}-gateway-monitoring
+  name: {{ .Values.platformAgent.name }}-gateway-metrics
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -159,10 +156,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ .Values.platformAgent.name }}-gateway-chat-monitoring
+  name: {{ .Values.platformAgent.name }}-gw-chat-metrics
   namespace: {{ .Release.Namespace }}
   labels:
-    app: {{ .Values.platformAgent.name }}-gateway-chat-metrics
+    app: {{ .Values.platformAgent.name }}-gw-chat-metrics
     {{- include "kube-agents.labels" . | nindent 4 }}
 spec:
   clusterIP: None
@@ -177,7 +174,7 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ .Values.platformAgent.name }}-gateway-chat-monitoring
+  name: {{ .Values.platformAgent.name }}-gw-chat-metrics
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -187,7 +184,7 @@ metadata:
 spec:
   selector:
     matchLabels:
-      app: {{ .Values.platformAgent.name }}-gateway-chat-metrics
+      app: {{ .Values.platformAgent.name }}-gw-chat-metrics
   endpoints:
     - port: chat-metrics
       path: /metrics
@@ -196,10 +193,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ .Values.platformAgent.name }}-credential-proxy-monitoring
+  name: {{ .Values.platformAgent.name }}-cred-metrics
   namespace: {{ .Release.Namespace }}
   labels:
-    app: {{ .Values.platformAgent.name }}-credential-proxy-metrics
+    app: {{ .Values.platformAgent.name }}-cred-metrics
     {{- include "kube-agents.labels" . | nindent 4 }}
 spec:
   clusterIP: None
@@ -214,7 +211,7 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ .Values.platformAgent.name }}-credential-proxy-monitoring
+  name: {{ .Values.platformAgent.name }}-cred-metrics
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -224,7 +221,7 @@ metadata:
 spec:
   selector:
     matchLabels:
-      app: {{ .Values.platformAgent.name }}-credential-proxy-metrics
+      app: {{ .Values.platformAgent.name }}-cred-metrics
   endpoints:
     - port: cred-metrics
       path: /metrics
@@ -233,10 +230,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ .Values.platformAgent.name }}-a2a-gateway-monitoring
+  name: {{ .Values.platformAgent.name }}-a2a-metrics
   namespace: {{ .Release.Namespace }}
   labels:
-    app: {{ .Values.platformAgent.name }}-a2a-gateway-metrics
+    app: {{ .Values.platformAgent.name }}-a2a-metrics
     {{- include "kube-agents.labels" . | nindent 4 }}
 spec:
   clusterIP: None
@@ -250,7 +247,7 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ .Values.platformAgent.name }}-a2a-gateway-monitoring
+  name: {{ .Values.platformAgent.name }}-a2a-metrics
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -260,7 +257,7 @@ metadata:
 spec:
   selector:
     matchLabels:
-      app: {{ .Values.platformAgent.name }}-a2a-gateway-metrics
+      app: {{ .Values.platformAgent.name }}-a2a-metrics
   endpoints:
     - port: a2a-metrics
       path: /metrics
@@ -275,7 +272,7 @@ matching the PodMonitoring selectors.
 apiVersion: operator.victoriametrics.com/v1beta1
 kind: VMPodScrape
 metadata:
-  name: {{ .Values.platformAgent.name }}-gateway-monitoring
+  name: {{ .Values.platformAgent.name }}-gateway-metrics
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -294,7 +291,7 @@ spec:
 apiVersion: operator.victoriametrics.com/v1beta1
 kind: VMPodScrape
 metadata:
-  name: {{ .Values.platformAgent.name }}-gateway-chat-monitoring
+  name: {{ .Values.platformAgent.name }}-gw-chat-metrics
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -314,7 +311,7 @@ spec:
 apiVersion: operator.victoriametrics.com/v1beta1
 kind: VMPodScrape
 metadata:
-  name: {{ .Values.platformAgent.name }}-credential-proxy-monitoring
+  name: {{ .Values.platformAgent.name }}-cred-metrics
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -334,7 +331,7 @@ spec:
 apiVersion: operator.victoriametrics.com/v1beta1
 kind: VMPodScrape
 metadata:
-  name: {{ .Values.platformAgent.name }}-a2a-gateway-monitoring
+  name: {{ .Values.platformAgent.name }}-a2a-metrics
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -360,7 +357,7 @@ The operator's own policies admit metrics ports only from gke-gmp-system.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ .Values.platformAgent.name }}-gateway-metrics-netpol
+  name: {{ .Values.platformAgent.name }}-gw-mon-netpol
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -384,7 +381,7 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ .Values.platformAgent.name }}-credential-proxy-metrics-netpol
+  name: {{ .Values.platformAgent.name }}-cred-mon-netpol
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -406,7 +403,7 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ .Values.platformAgent.name }}-a2a-gateway-metrics-netpol
+  name: {{ .Values.platformAgent.name }}-a2a-mon-netpol
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
