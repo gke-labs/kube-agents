@@ -528,8 +528,9 @@ spec:
   upgraded that way still serves the CRD it was first installed with, and a
   schema without `forges` prunes it: the CR loses its repositories and
   nothing reports it. The alias carries everything such a declaration says
-  except the host, and every host GitHub serves is the same forge, which
-  kube-agents.forgeProviders has already checked.
+  except the host, and every spelling of github.com is the same forge, which
+  kube-agents.forgeProviders has already checked. A GitHub Enterprise Server
+  host is another forge, so a forge declared at one renders as the lists.
 
   Only a repository the operator would accept for GitHub folds: `name`,
   `owner/name`, or an http(s), ssh or git URL, a schemeless host or an scp
@@ -577,7 +578,9 @@ spec:
   {{- $name := trimSuffix ".git" (base $repo) }}
   {{- $plain = and (le (len $repo) 2048) (regexMatch (printf `^(%s%s|/*(%s)?)[A-Za-z0-9_.][A-Za-z0-9_.-]*/*$` $github $owner $owner) $repo) (not (has $name (list "" "." ".." ".git"))) (le (len $name) 100) (not (hasSuffix ".git" $name)) (not (and (hasSuffix "/" $repo) (has (lower (trimAll "/" $repo)) (list "github.com" "www.github.com" "ssh.github.com")))) }}
   {{- end }}
-  {{- $asAlias = and (eq ($f.provider | default "github") "github") (not ($f.credentialsRef | default dict).name) (le (len $repos) 1) $onlyGitOps (not $pinned) $plain (or $f.namespace $repo) }}
+  {{- /* The alias has no host field: a GitHub Enterprise Server forge, and one with a CA bundle, render as the lists. */}}
+  {{- $dotcom := or (not $f.host) (has (lower $f.host) (list "github.com" "www.github.com" "ssh.github.com")) }}
+  {{- $asAlias = and (eq ($f.provider | default "github") "github") (not ($f.credentialsRef | default dict).name) (not ($f.caBundleRef | default dict).name) $dotcom (le (len $repos) 1) $onlyGitOps (not $pinned) $plain (or $f.namespace $repo) }}
   {{- end }}
   {{- $aliasOrg := "" }}
   {{- $aliasRepo := "" }}
@@ -620,6 +623,18 @@ spec:
   {{- end }}
   {{- if and $caBundled (not (hasKey (dig "forges" "items" "properties" (dict) $props) "caBundleRef")) }}
   {{- fail "platformAgent.integration.forges[].caBundleRef needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
+  {{- end }}
+  {{- /* The same for a GitHub Enterprise Server forge: a CRD from before it refuses caBundleRef on a github forge with a CEL rule, after helm has started. The CRD that serves it carries the rule that a forge at another host names its provider. */}}
+  {{- $ghes := false }}
+  {{- range $forges }}
+  {{- if and (eq (.provider | default "github") "github") .host (not (has (lower .host) (list "github.com" "www.github.com" "ssh.github.com"))) }}{{ $ghes = true }}{{ end }}
+  {{- end }}
+  {{- $rules := list }}
+  {{- range (dig "forges" "items" "x-kubernetes-validations" (list) $props) }}
+  {{- $rules = append $rules (.rule | default "") }}
+  {{- end }}
+  {{- if and $ghes (not (contains "has(self.provider) || !has(self.host)" (join "\n" $rules))) }}
+  {{- fail "platformAgent.integration.forges declares a GitHub Enterprise Server forge, but the installed PlatformAgent CRD is older than this chart's GitHub Enterprise Server support, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
   {{- if and $pinned (not (hasKey (dig "repositories" "items" "properties" (dict) $props) "baseBranch")) }}
   {{- fail "platformAgent.integration.repositories[].baseBranch needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}

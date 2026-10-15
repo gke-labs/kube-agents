@@ -246,6 +246,38 @@ class PrOpenedTest(unittest.TestCase):
         self.assertNotIn("<!channel>", text)
 
 
+class ProposalEventTest(unittest.TestCase):
+    """:func:`m.proposal_ref` and :func:`m.evidence_line`, which the ``pr_opened`` event path reads."""
+
+    PR9 = "https://github.com/acme/fleet/pull/9"
+
+    def test_proposal_ref_reads_a_github_pr_and_a_managed_merge_request(self):
+        self.assertEqual(m.proposal_ref(PR + "/files"), (PR, "fleet-config", "412"))
+        self.assertEqual(m.proposal_ref(MR), (MR, "infra", "12"))
+        self.assertIsNone(m.proposal_ref(SELF_MANAGED_MR))
+        self.assertEqual(m.proposal_ref(SELF_MANAGED_MR, {"gitlab.example.com"}), (SELF_MANAGED_MR, "infra", "7"))
+        for url in ("https://github.example.com/acme/fleet/pull/3", "https://github.com/acme/fleet/issues/3", ""):
+            self.assertIsNone(m.proposal_ref(url), url)
+        ghe = "https://github.example.com/acme/fleet/pull/3"
+        self.assertEqual(m.proposal_ref(ghe, github_host="github.example.com"), (ghe, "fleet", "3"))
+
+    def test_evidence_is_the_first_line_naming_the_pr_by_url_or_number(self):
+        text = "Checked seeded-a.\nBoth fixes are up for review in PR #9\nDone."
+        self.assertEqual(m.evidence_line(text, self.PR9, "9"), "Both fixes are up for review in PR #9")
+        self.assertEqual(m.evidence_line(f"Review it at {self.PR9}/files", self.PR9, "9"), f"Review it at {self.PR9}/files")
+        self.assertEqual(m.evidence_line("Waiting on review of MR !12.", MR, "12"), "Waiting on review of MR !12.")
+        self.assertEqual(m.evidence_line("Checked seeded-a.", self.PR9, "9"), "")
+
+    def test_another_pr_whose_number_extends_this_ones_is_not_its_evidence(self):
+        line = "Rebased on https://github.com/acme/fleet/pull/91, which bob opened; see #91 and #900."
+        self.assertEqual(m.evidence_line(line, self.PR9, "9"), "")
+
+    def test_the_url_of_another_pr_is_not_folded_into_this_ones_reference(self):
+        line = f"Opened {self.PR9}, after https://github.com/acme/fleet/pull/91."
+        blocks, _ = m.pr_opened(self.PR9, "fleet", "9", line)
+        self.assertEqual(_contexts(blocks), ["Opened PR #9, after https://github.com/acme/fleet/pull/91."])
+
+
 MR = "https://gitlab.com/acme/platform/infra/-/merge_requests/12"
 SELF_MANAGED_MR = "https://gitlab.example.com/acme/infra/-/merge_requests/7"
 

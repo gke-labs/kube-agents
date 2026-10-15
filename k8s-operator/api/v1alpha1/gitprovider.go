@@ -53,6 +53,9 @@ const (
 	// at the host the forge declares.
 	GitProviderGitLab = "gitlab"
 
+	// DefaultGitHubHost is the github provider's default host.
+	DefaultGitHubHost = "github.com"
+
 	// DefaultGitProvider is assumed when a forge's `provider` is
 	// omitted, and is what the deprecated `spec.integration.github` alias means.
 	DefaultGitProvider = GitProviderGitHub
@@ -88,10 +91,10 @@ const (
 var gitlabNamespaceRegex = regexp.MustCompile(
 	`^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?(/[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?)*$`)
 
-// githubHosts is every spelling of GitHub that can appear in a remote this
-// install produces. `ssh.github.com` is the SSH-over-443 endpoint. An
-// enterprise host is absent on purpose: Minty issues tokens for github.com
-// installations only.
+// githubHosts is every spelling of github.com that can appear in a remote this
+// install produces. `ssh.github.com` is the SSH-over-443 endpoint. A GitHub
+// Enterprise Server host is not a spelling of github.com: it is a declared
+// host of the github provider, which is SelfManaged.
 var githubHosts = map[string]bool{
 	"github.com":     true,
 	"www.github.com": true,
@@ -148,6 +151,13 @@ type GitProvider struct {
 	// administrator names in caBundleRef. A provider without it refuses the
 	// field: a CA that nothing reads would hide a certificate problem.
 	AcceptsCABundle bool
+	// ReservedDomains are domains under which the provider runs its own
+	// services. A host at one of them, or under one, is never a
+	// self-managed instance: `api.github.com` and `acme.ghe.com` are
+	// GitHub's, and a forge declared there would be handed a credential and
+	// a CA for a host the provider operates. Every other provider refuses
+	// them too, as it refuses Hosts.
+	ReservedDomains []string
 }
 
 // gitProviders is the registry. Adding a forge is adding an entry here and the
@@ -155,7 +165,7 @@ type GitProvider struct {
 var gitProviders = map[string]*GitProvider{
 	GitProviderGitHub: {
 		Name:               GitProviderGitHub,
-		DefaultHost:        "github.com",
+		DefaultHost:        DefaultGitHubHost,
 		Hosts:              githubHosts,
 		NamespacePattern:   githubOrgRegex,
 		MaxNamespaceLength: MaxGitHubOrgLength,
@@ -166,6 +176,18 @@ var gitProviders = map[string]*GitProvider{
 		// sit under githubusercontent.com; api.github.com and codeload under
 		// the wildcard.
 		Egress: []string{"github.com", "*.github.com", "*.githubusercontent.com"},
+		// A GitHub Enterprise Server instance at the host the forge declares.
+		// One GitHub host per install: see ResolvedIntegration.hostConflicts.
+		SelfManaged:     true,
+		AcceptsCABundle: true,
+		// github.com and its subdomains, the content and asset domains, the
+		// Pages and Codespaces domains, and GitHub Enterprise Cloud with data
+		// residency (`<name>.ghe.com`), which GitHub operates and which is
+		// not a Server instance.
+		ReservedDomains: []string{
+			"github.com", "githubusercontent.com", "githubassets.com", "githubapp.com",
+			"github.io", "github.dev", "ghe.com",
+		},
 	},
 	GitProviderGitLab: {
 		Name:        GitProviderGitLab,
@@ -240,6 +262,9 @@ func (p *GitProvider) validateHost(host string, table map[string]*GitProvider) e
 	if !p.SelfManaged {
 		return fmt.Errorf("host %q is not a %s host", host, p.Name)
 	}
+	if p.reserves(trimmed) {
+		return fmt.Errorf("host %q is a service %s operates, not a self-managed %s instance", host, p.Name, p.Name)
+	}
 	for _, name := range providerNames(table) {
 		if other := table[name]; other != p && other.serves(trimmed) {
 			return fmt.Errorf("host %q is a %s host, not a %s one", host, other.Name, p.Name)
@@ -260,11 +285,21 @@ func (p *GitProvider) validateHost(host string, table map[string]*GitProvider) e
 // self-managed forge declared at one would be handed GitHub's traffic. A
 // wildcard pattern also covers the domain it is rooted at.
 func (p *GitProvider) serves(host string) bool {
-	if p.Hosts[host] {
+	if p.Hosts[host] || p.reserves(host) {
 		return true
 	}
 	for _, pattern := range p.Egress {
 		domain := strings.TrimPrefix(pattern, "*.")
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
+}
+
+// reserves reports whether host is one of ReservedDomains or under one.
+func (p *GitProvider) reserves(host string) bool {
+	for _, domain := range p.ReservedDomains {
 		if host == domain || strings.HasSuffix(host, "."+domain) {
 			return true
 		}
@@ -371,10 +406,9 @@ func (p *GitProvider) ValidateNamespace(namespace string) error {
 // agree, where before the declared spelling was carried through verbatim and
 // seeded a clone URL git cannot fetch over HTTPS.
 //
-// ValidateHost admits only a host in Hosts, so every host resolves to
-// DefaultHost. A provider for a self-managed forge at a customer-chosen
-// hostname will need its own rule here, and it must not let the declared host
-// replace one the repository names.
+// A self-managed forge's canonical host is the declared host itself, and a
+// repository on it may name that host or none: the declared host never
+// replaces one the repository names.
 //
 // The namespace this produces is checked against the provider's grammar
 // wherever it came from. Checking only the declared `namespace` field would

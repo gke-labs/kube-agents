@@ -3642,6 +3642,18 @@ class TestSlackAuditHeadline(unittest.TestCase):
             self.assertTrue(session_kv_server._is_managed_github_repo("acme/fleet-config"))
             self.assertFalse(session_kv_server._is_managed_github_repo("evil/phish"))
 
+    def test_an_enterprise_repository_is_checked_against_the_managed_list_on_its_host(self):
+        # A ledger on a GitHub Enterprise Server host is named `<host>/owner/name`,
+        # as the managed list names it; another host's is never managed here.
+        host = "ghe.example.com"
+        with patch("gitops_workspace.github_host", return_value=host), \
+                patch("gitops_workspace.get_managed_repos", return_value=[f"{host}/Acme/Infra"]), \
+                patch("gitops_workspace.get_managed_github_repos", return_value=["acme/web"]):
+            self.assertTrue(session_kv_server._is_managed_github_repo(f"{host}/acme/infra"))
+            self.assertFalse(session_kv_server._is_managed_github_repo("ghe.other.example/acme/infra"))
+            self.assertTrue(session_kv_server._is_managed_github_repo("acme/web"))
+            self.assertFalse(session_kv_server._is_managed_github_repo("acme/infra"))
+
     def test_a_forge_failure_reads_as_no_issue(self):
         import forge
 
