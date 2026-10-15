@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 
@@ -251,6 +252,35 @@ class PauseTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertEqual(store["d"]["state"], "paused")
         self.assertIn("paused c, d;", result.stdout)
+
+    def test_a_stale_rewrite_after_the_first_clean_read_is_caught(self):
+        # The incident's writer reads its copy before the pause and writes it after:
+        # the first read-back is clean, and the marker goes a second later.
+        self.write_roster([{"id": "c", "enabled": True}, {"id": "d", "enabled": True}])
+        stale = self.roster.read_text()
+
+        def late_writer():
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                try:
+                    jobs = {j["id"]: j for j in json.loads(self.roster.read_text())["jobs"]}
+                except (OSError, ValueError):
+                    jobs = {}
+                if jobs.get("d", {}).get("state") == "paused":
+                    time.sleep(1)
+                    self.roster.write_text(stale)
+                    return
+                time.sleep(0.05)
+
+        writer = threading.Thread(target=late_writer)
+        writer.start()
+        result, _ = self.run_script()
+        writer.join()
+        # Read after the writer is done: the store the run left is what the cases get.
+        store = {j["id"]: j for j in json.loads(self.roster.read_text())["jobs"]}
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(store["d"].get("state"), "paused", "the late rewrite dropped d's marker")
+        self.assertEqual(store["c"].get("state"), "paused")
 
     def test_an_unreadable_stage_pauses_nothing(self):
         # Without the stage's list it can't tell which audits the stage owns, so it leaves all.

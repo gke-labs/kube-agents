@@ -175,10 +175,13 @@ def pause():
     # entrypoint's cron merge in a container that is still starting, or a
     # scheduler tick. Hermes reports success and the marker is gone
     # (eval-next 2110626938950258691: gcp-networking-fabric-audit, after an
-    # autoscaler scale-down replaced the gateway mid-pause). A few rounds a few
-    # seconds apart outlast that window.
+    # autoscaler scale-down replaced the gateway mid-pause). So the store has to
+    # read clean twice, a round apart, before the pause counts: a writer whose
+    # stale copy lands after the first clean read is caught by the second, and
+    # what it dropped is paused again. A clean read on the last round stands.
     failed, failed_ids, retryable = [], set(), False
     pending = list(targets)
+    clean_reads = 0
     for round_no in range(PAUSE_ROUNDS):
         if round_no:
             time.sleep(PAUSE_ROUND_SLEEP_SECONDS)
@@ -194,7 +197,8 @@ def pause():
             print(f"asked to pause {', '.join(targets) or 'nothing'}, but the roster could not be read back: {exc}")
             return RETRY
         pending = [jid for jid in targets if not paused(after.get(jid, {})) and jid not in failed_ids]
-        if not pending:
+        clean_reads = clean_reads + 1 if not pending else 0
+        if clean_reads == 2 or not targets:
             break
     done = [jid for jid in targets if paused(after.get(jid, {}))]
     failed += [f"{jid} (not paused in the store)" for jid in pending]
