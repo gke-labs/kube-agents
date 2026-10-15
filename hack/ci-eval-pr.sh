@@ -1486,15 +1486,17 @@ wait_platform_runs() { # <label> <space-separated audit ids>
   return 0
 }
 
-# The Platform Agent's clock-started audits, paused once per lease before any unit
-# runs (#3020) and resumed from the EXIT trap. hack/ci_pause_scheduled_audits.py does
-# both in the gateway with Hermes' own `cron pause`/`cron resume`, and its header owns
-# which jobs, why the pause outlives a gateway restart, and its exit codes. A Prow
-# lease's teardown sweeps the volume anyway; the resume is for a run against an
-# install that outlives it. A pause that fails is a warning: the run goes on as it
-# did before this existed, with the audits on their clock. Pinned to
-# AGENT_CLUSTER_CONTEXT and refused for a context that does not name PROJECT_ID, as
-# wait_platform_runs is. Returns 0 whatever happens.
+# The Platform Agent's clock-started audits, paused at lease time and again right
+# before the fan-out (#3020), and resumed from the EXIT trap.
+# hack/ci_pause_scheduled_audits.py does both in the gateway with Hermes' own `cron
+# pause`/`cron resume`, and its header owns which jobs, why the pause outlives a
+# gateway restart, and its exit codes. A Prow lease's teardown sweeps the volume
+# anyway; the resume is for a run against an install that outlives it. A pause that
+# still fails after its attempts stops the run as an infrastructure failure, since a
+# scheduled audit on its clock would charge its writes to the cases; a resume that
+# fails only warns. Pinned to AGENT_CLUSTER_CONTEXT and refused for a context that
+# does not name PROJECT_ID, as wait_platform_runs is; without kubectl, a context or a
+# project it returns 0 and does nothing.
 scheduled_audits() { # <pause|resume> <label>
   local mode="$1" label="$2" ns ctx out rc=0 args=()
   ns="${TARGET_NAMESPACE:-}"
@@ -1525,7 +1527,7 @@ scheduled_audits() { # <pause|resume> <label>
     rc=0
     pod="$(ready_gateway_pod "${ctx}" "${ns}")" || {
       rc=1
-      out="no single Ready ${AGENT_SERVICE_NAME}-gateway pod within ${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}s"
+      out="the ${AGENT_SERVICE_NAME}-gateway Deployment did not settle to its Ready replicas within ${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}s (or is not a Deployment)"
       [ "${attempt}" -lt "${EVAL_PAUSE_AUDITS_ATTEMPTS}" ] && sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
       continue
     }
@@ -1552,21 +1554,27 @@ scheduled_audits() { # <pause|resume> <label>
   return 0
 }
 
-# The one Ready, non-terminating pod of the gateway Deployment, waited for up to
-# EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS; prints its pod/<name>, or returns 1.
+# A Ready, non-terminating pod of the gateway Deployment, once as many are Ready as
+# the Deployment asks for (one on every CI install; more on an HA install, where they
+# share the volume), waited for up to EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS. Prints its
+# pod/<name>, or returns 1. Not a Deployment (an HA install on ReadWriteOnce storage
+# renders a StatefulSet) returns 1 at once.
 ready_gateway_pod() { # <context> <namespace>
-  local ctx="$1" ns="$2" selector deadline=$((SECONDS + EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS)) names
+  local ctx="$1" ns="$2" selector deadline=$((SECONDS + EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS)) names want
   selector="$(kubectl --context "${ctx}" -n "${ns}" get "deployment/${AGENT_SERVICE_NAME}-gateway" \
     -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}' 2>/dev/null)" || return 1
   selector="${selector%,}"
   [ -n "${selector}" ] || return 1
+  want="$(kubectl --context "${ctx}" -n "${ns}" get "deployment/${AGENT_SERVICE_NAME}-gateway" \
+    -o jsonpath='{.spec.replicas}' 2>/dev/null)" || return 1
+  [ -n "${want}" ] || want=1
   while :; do
     names="$(kubectl --context "${ctx}" -n "${ns}" get pods -l "${selector}" \
       -o go-template='{{range $p := .items}}{{if not $p.metadata.deletionTimestamp}}{{range $p.status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}{{"pod/"}}{{$p.metadata.name}}{{"\n"}}{{end}}{{end}}{{end}}{{end}}' 2>/dev/null)" || names=""
-    # Exactly one: two Ready pods mean a rollout is still settling, and the store is
-    # on a volume both can write.
-    if [ -n "${names}" ] && [ "$(printf '%s\n' "${names}" | grep -c .)" -eq 1 ]; then
-      printf '%s\n' "${names}"
+    # As many as the Deployment wants, no more: an extra Ready pod means a rollout is
+    # still settling, and a starting container's cron merge can rewrite the store.
+    if [ -n "${names}" ] && [ "$(printf '%s\n' "${names}" | grep -c .)" -eq "${want}" ]; then
+      printf '%s\n' "${names}" | head -1
       return 0
     fi
     [ "${SECONDS}" -lt "${deadline}" ] || return 1
@@ -3361,15 +3369,15 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   fi
 }
 
+# Again, right before the fan-out: idempotent, and it catches a gateway that an
+# outside event (an autoscaler scale-down) restarted between lease setup and here.
+scheduled_audits pause "fan-out"
+
 # Rep-ascending FIRST, cost-descending within a rep: repetitions of one task
 # serialize on the task lock, so a same-task unit launched early just parks a
 # lane sleeping on it -- the pool run of 2026-08-31 (build 2094432646640701440)
 # spent two of four lanes that way for its first twelve minutes under the
 # cost-first ordering this replaces.
-#
-# Again, right before the fan-out: idempotent, and it catches a gateway that
-# restarted between lease setup and here.
-scheduled_audits pause "fan-out"
 
 # Two phases on the inject lane (#2079), and since #2260 on the api lane too.
 # On the inject lane for the GitHub-write safeguard, which dates a write and

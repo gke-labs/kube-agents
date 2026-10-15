@@ -290,6 +290,41 @@ class RestartTest(unittest.TestCase):
                 self.assertNotIn(key, shipped_job, f"{shipped_job['id']}: the image now ships a pause key; the merge would reset it")
 
 
+class ReadyGatewayPodTest(unittest.TestCase):
+    """ready_gateway_pod, run from the runner's own text against a fake kubectl."""
+
+    def run_helper(self, replicas, ready, wait=0):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = pathlib.Path(tmp) / "kubectl"
+            fake.write_text(textwrap.dedent(f"""\
+                #!/bin/sh
+                case "$*" in
+                  *go-template=*matchLabels*) printf 'app=platform-agent-gateway,' ;;
+                  *jsonpath=*spec.replicas*) printf '{replicas}' ;;
+                  *get\\ pods*) printf '{"".join("pod/" + n + chr(92) + "n" for n in ready)}' ;;
+                esac
+                """))
+            fake.chmod(0o755)
+            helper = RUNNER.read_text().split("ready_gateway_pod() {", 1)[1].split("\n}\n", 1)[0]
+            script = f"ready_gateway_pod() {{{helper}\n}}\nready_gateway_pod ctx ns"
+            env = {**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}", "AGENT_SERVICE_NAME": "platform-agent",
+                   "EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS": str(wait)}
+            return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
+
+    def test_one_replica_one_ready_pod(self):
+        result = self.run_helper(1, ["gw-a"])
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "pod/gw-a"))
+
+    def test_a_rollout_still_settling_is_waited_out(self):
+        # Two Ready pods for a one-replica Deployment: the old one has not gone yet.
+        result = self.run_helper(1, ["gw-a", "gw-b"])
+        self.assertEqual(result.returncode, 1)
+
+    def test_an_ha_gateway_with_all_replicas_ready_is_accepted(self):
+        result = self.run_helper(2, ["gw-a", "gw-b"])
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "pod/gw-a"))
+
+
 class RunnerTest(unittest.TestCase):
     def test_called_once_per_lease_before_any_unit(self):
         text = RUNNER.read_text()
@@ -311,8 +346,8 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("EVAL_PAUSE_AUDITS_ATTEMPTS", body)
         self.assertIn("return 0", body)
         # A pause that does not take stops the run, loudly; a resume only warns.
-        self.assertIn('if [ "${mode}" = "pause" ]; then', body)
-        self.assertIn("exit 1", body)
+        pause_branch = body.split('if [ "${mode}" = "pause" ]; then', 1)[1].split("\n  fi\n", 1)[0]
+        self.assertIn("exit 1", pause_branch)
         # It execs into one Ready pod by name, not deployment/<name>.
         self.assertIn('pod="$(ready_gateway_pod "${ctx}" "${ns}")"', body)
         self.assertNotIn('exec -i "deployment/', body)

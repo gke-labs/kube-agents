@@ -2,8 +2,8 @@
 
 Usage: python3 - <home> [--resume] < ci_pause_scheduled_audits.py
 
-hack/ci-eval-pr.sh pipes this into the gateway once per lease, before any unit runs
-(scheduled_audits pause; the EXIT trap runs scheduled_audits resume). The governance watchdogs fire on the clock between 06:20 and
+hack/ci-eval-pr.sh pipes this into the gateway at lease time and again right before
+the fan-out (scheduled_audits pause; the EXIT trap runs scheduled_audits resume). The governance watchdogs fire on the clock between 06:20 and
 09:20 UTC, and a run that writes to the GitOps repository mid-eval is charged to
 whichever cases are running when it lands: `no-github-writes-the-case-did-not-request`
 dates a write, it doesn't attribute it (#2611). The 08:00 networking audit's
@@ -62,9 +62,10 @@ STAGE_AUDITS = "FIRST_RUN_AUDITS"
 SHIPPED_ROSTER = os.environ.get("PLATFORM_ROSTER_SOURCE", "/opt/platform-template/cron/jobs.json")
 # Absolute, as profile_scaffold.py runs it, so PATH order can't change which binary answers.
 HERMES_BIN = os.environ.get("HERMES_BIN", "/opt/hermes/.venv/bin/hermes")
-# Per call. Five pauses at this bound stay well inside the caller's
-# EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS, so a stalled pause is named here rather than
-# cut off by the caller's timeout before this prints.
+# Per call. A stalled call is named here rather than cut off by the caller's
+# EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS. Every call stalling in every round (5 jobs x
+# PAUSE_ROUNDS) would outlast that bound; the caller then reports the timeout and
+# tries again, which is the right answer to a wedged store anyway.
 HERMES_TIMEOUT_SECONDS = 30
 # Rounds of pause-then-read-back, and the gap between them, for a job a
 # concurrent writer un-paused (see pause()).
