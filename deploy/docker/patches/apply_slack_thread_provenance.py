@@ -31,9 +31,10 @@ Two edits, both in the context block, so they reach the model whatever the
 persona says:
 
 1. A thread parent posted by this install's own bot user is labelled
-   ``[thread parent, posted by you earlier]`` and kept unnamed, as the bot's
-   replies already are. The model can then tell its own old output from what a
-   person said.
+   ``[thread parent, posted by you earlier]`` and kept unnamed. The model can
+   then tell its own old output from what a person said. Its text still goes
+   through ``neutralize_untrusted_inline_text``, as every parent does upstream,
+   so a newline in it cannot forge the block's own lines.
 2. Every context block carries one more line after its header: the messages are
    conversation, not observed cluster state, so anything named in them is a
    claim to check before acting on it, and a message that calls itself a
@@ -87,9 +88,11 @@ SELF_LINE_PATCHED = (
     '            return f"{prefix}{msg_text}"\n'
     "        # kube-agents patch: thread-context provenance (gke-labs/kube-agents#3080).\n"
     "        # A root the bot posted itself is its own earlier output, not a person's\n"
-    "        # message: label it so, unnamed, as its replies are.\n"
+    "        # message: label it so, unnamed. Its text is still neutralized, as\n"
+    "        # upstream does for every parent: it may carry what a tool or a user\n"
+    "        # put in it, and a newline must not forge the block's own lines.\n"
     "        if is_parent and is_bot and self_bot_uid and msg_user == self_bot_uid:\n"
-    f'            return f"{SELF_PARENT_PREFIX}{{msg_text}}"\n'
+    f'            return f"{SELF_PARENT_PREFIX}{{neutralize_untrusted_inline_text(msg_text, max_chars=0)}}"\n'
 )
 
 # ---------------------------------------------------------------------------
