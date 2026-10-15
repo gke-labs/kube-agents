@@ -2824,8 +2824,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     ledger that enumerated the fleet and found nothing. Against the ids it
     passes only when a finding was actually FILED against that cluster.
 
-    A FALSE CLEAN IS NAMED AS ONE. A clean run closes the ledger without
-    rewriting its body, so a ledger the audit retired during this run still
+    A FALSE CLEAN IS NAMED AS ONE. A clean run closes the ledger and only puts
+    a banner above its body, keeping the footer, so a ledger the audit retired during this run still
     carries the previous run's stamp and would read, above, as "a previous
     run's ledger, so this run published nothing" — the one thing that run had
     not done. When the issue is ``closed`` and its ``closed_at`` falls inside
@@ -5559,6 +5559,40 @@ class BootstrapReportCriticalsVerifier(_OnboardingPollVerifier):
         return "pass", f"the report's {len(items)} numbered item(s) {counts}, the limit of {self.limit}: {named}", raw
 
 
+# The check rosters of the four audits the oobe stage runs after the scan
+# (agents/chat/scripts/oobe.py FIRST_RUN_AUDITS; each roster is `AUDITS[<id>].checks` in
+# agents/platform/skills/fleet-audit/scripts/audit_report.py). The cluster inventory SOP
+# leaves these checks to those audits; tests/test_bootstrap_handoff.py re-derives this
+# copy from both files.
+FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
+    "fleet-wide-cost-analysis": (
+        "overrequest", "orphan-pv", "unconsumed-pvc", "unattached-disk", "idle-address", "orphan-lb",
+        "idle-nodepool", "scaledown-blocked", "terminal-pods", "idle-namespace", "underrequest",
+        "unsized-workload", "idle-workload", "registry-no-cleanup",
+    ),
+    "compliance-audit": (
+        "privileged-container", "host-namespace", "hostpath-mount", "cluster-admin-binding", "wildcard-rbac",
+        "netpol-missing", "default-sa-automount", "workload-identity-off", "legacy-metadata",
+        "public-control-plane", "podsecurity-gaps", "kcc-object-wedged", "image-floating-tag",
+        "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding",
+    ),
+    "obtainability-audit": (
+        "no-requests", "no-memory-limit", "no-pdb", "blocking-pdb", "no-hpa", "hpa-cannot-scale",
+        "rigid-scheduling", "no-spread", "probes-readiness", "probes-liveness", "single-replica",
+        "schedule-never-succeeds", "rollout-drops-traffic", "strategy-causes-downtime", "cronjob-runs-overlap",
+        "service-selects-nothing", "service-port-unresolved", "liveness-preempts-readiness",
+        "spread-not-achieved", "prestop-outlives-grace", "rwo-claim-contended", "hpa-floors-at-one",
+        "pdb-overlapping", "untargeted-compute-class-workload",
+    ),
+    "stockout-prevention": (
+        "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",
+        "ccc-mixed-disk-generations", "ccc-hyperdisk-incompatible", "quota-exhaustion-risk",
+        "spot-scarcity-risk", "single-zone-nodepool", "reservation-mismatch-risk",
+        "autoscaler-out-of-resources", "dangling-compute-class",
+    ),
+}
+
+
 @VERIFIERS.register("bootstrap_handoff")
 class BootstrapHandoffVerifier(_OnboardingPollVerifier):
     """Checks the discovery sweep's hand-off to the prioritization stage.
@@ -5584,6 +5618,15 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
       not checked where the module is absent) and is not in a status where it
       will not run (``blocked``, ``triage``, ``failed``, ``cancelled``). A card
       the sweep's worker filed itself fails either way.
+    - ``raw_report_no_first_run_audit_checks``: the sandbox's parser accepts the
+      raw file, and no block line carries a ``check`` from the roster of one of
+      the first-run audits (``FIRST_RUN_AUDIT_CHECKS``), which run after the scan
+      and report those checks themselves. A check reported under a slug of its
+      own is not caught. An install with no GitOps repository is ``error``, not
+      graded: the gate records ``no_repository=yes`` in its sweep marker, the
+      first-run audits do not run, and the cards report these checks on purpose
+      (cluster_inventory_audit_sop.md, "Without a GitOps repository"). A marker
+      with no such field (an older install) is graded.
 
     Fails closed: either pod unreadable, no sweep marker, a sweep the board
     does not know, a board that cannot be queried, or a parser the sandbox
@@ -5591,7 +5634,7 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
     """
 
     type: Literal["bootstrap_handoff"]
-    require: Literal["raw_report_has_findings_block", "ranking_card_filed"]
+    require: Literal["raw_report_has_findings_block", "ranking_card_filed", "raw_report_no_first_run_audit_checks"]
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         board = onboarding.read_handoff_board(onboarding.agent_shell, read_timeout)
@@ -5603,7 +5646,18 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
         where = f"sweep {sweep.get('id')} ({sweep.get('status')})"
         if self.require == "ranking_card_filed":
             return self._ranking(board, where)
-        return self._raw(board, where, read_timeout)
+        recorded = board.get("no_repository")
+        if self.require == "raw_report_no_first_run_audit_checks" and recorded in (
+            onboarding.NO_REPOSITORY_YES, onboarding.NO_REPOSITORY_UNKNOWN
+        ):
+            return (
+                "error",
+                f"{where}: the gate recorded {onboarding.NO_REPOSITORY_FIELD}={recorded} in "
+                f"{discovery.SCAN_MARKER} (no GitOps repository, or a repository list it could not read), so the "
+                "scan's cards ran the first-run audits' checks on purpose; this objective does not apply",
+                board,
+            )
+        return self._raw(board, where, read_timeout, self.require)
 
     @staticmethod
     def _ranking(board: dict[str, Any], where: str) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
@@ -5637,7 +5691,7 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
 
     @staticmethod
     def _raw(
-        board: dict[str, Any], where: str, read_timeout: float
+        board: dict[str, Any], where: str, read_timeout: float, require: str
     ) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         read = onboarding.read_raw_block(onboarding.sandbox_shell, read_timeout)
         pod, raw_file = onboarding.sandbox_pod(), onboarding.RAW_FILE
@@ -5659,9 +5713,19 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
                 f"{where}: the sandbox's parser rejects {raw_file} with exit code {read.get('code')}: {errors}{tail}",
                 raw,
             )
+        items = read["items"]
+        if require == "raw_report_no_first_run_audit_checks":
+            owner = {check: audit for audit, checks in FIRST_RUN_AUDIT_CHECKS.items() for check in checks}
+            owned = sorted({f"{i.get('check')} ({owner[i.get('check')]})" for i in items if i.get("check") in owner})
+            if owned:
+                return (
+                    "fail",
+                    f"{where}: {raw_file} has block line(s) for check(s) a first-run audit owns: {owned}",
+                    raw,
+                )
+            return "pass", f"{where}: none of the {len(items)} block line(s) in {raw_file} is a first-run audit's check", raw
         if board.get("writer_error"):
             return "error", str(board["writer_error"]), raw
-        items = read["items"]
         covered = {i.get("cluster") for i in items}
         # Which clusters the writer lists comes from the writer itself
         # (bootstrap_handoff.finding_lines, run on the agent pod by the board

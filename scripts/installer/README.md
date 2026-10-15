@@ -288,6 +288,10 @@ Loading the input first is also what fixes non-interactive re-runs (#1060). Ever
 file to inherit from makes inheritance the default path rather than something each flag
 has to remember, so the next flag added inherits too.
 
+A key added to `install.env` also needs a row in the Upgrade page's
+[Recovering `install.env`](../../docs/site/src/content/docs/install/upgrade.md#recovering-installenv)
+tables. They map each key back from a live install for an operator who lost the file.
+
 ### What is deliberately not in it
 
 Derived values are recomputed every run rather than stored, because a stored copy can

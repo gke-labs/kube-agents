@@ -638,6 +638,8 @@ if not isinstance(template, dict) or not isinstance(live, dict):
     raise SystemExit(0)
 
 added = []
+PLUGINS_KEY = "plugins"
+ENABLED_KEY = "enabled"
 
 
 def fill(src, dst, path):
@@ -652,6 +654,20 @@ def fill(src, dst, path):
 
 
 fill(template, live, [])
+
+# plugins.enabled is the one list the image owns: a plugin directory the image
+# ships is inert until the profile's list names it, and the fill above never
+# enters a list, so a volume scaffolded before a plugin existed would carry it
+# into every image and never load it. Add the template's names the live list
+# lacks, after the agent's own, and remove none: a name the agent dropped on
+# purpose comes back, which is the price of a plugin that ships enabled.
+template_enabled = (template.get(PLUGINS_KEY) or {}).get(ENABLED_KEY) if isinstance(template.get(PLUGINS_KEY), dict) else None
+live_plugins = live.get(PLUGINS_KEY)
+if isinstance(template_enabled, list) and isinstance(live_plugins, dict) and isinstance(live_plugins.get(ENABLED_KEY), list):
+    for name in template_enabled:
+        if name not in live_plugins[ENABLED_KEY]:
+            live_plugins[ENABLED_KEY].append(name)
+            added.append(".".join([PLUGINS_KEY, ENABLED_KEY, str(name)]))
 
 if added:
     # Atomic, because a truncated config.yaml is worse than a hollow one: os.replace
@@ -1744,16 +1760,18 @@ fi
 #     0400/0755 on root-owned files against RunAsUser 10000 besides (the volume's
 #     DefaultMode in platformagent_manifests.go), so it failed the ownership test too.
 #
-# Step 2d has since made that an ordinary writable file on the PVC, which only makes
-# restoring this worse rather than newly safe: the guard would now pass, and the step would
-# rewrite — non-atomically, over a file step 2d has just staged-and-renamed into place — a
-# config it has nothing to add to. Where the guard did pass before (compose, `docker run`)
-# that is exactly what it did, and yaml.safe_dump round-trips the file: it sorted the keys
-# and dropped every comment in a config people read.
+# Step 2d has since made that an ordinary writable file on the PVC, and step 2d's
+# back-fill is now the one writer that appends the template's plugins.enabled names the
+# live list lacks: a plugin the image ships enabled reaches a volume scaffolded before it
+# existed through that step, on the path that works. What this step was faulted for does
+# not hold there: the back-fill stages the file and renames it into place, so a reader
+# sees all of the old file or all of the new one, and it dumps with sort_keys=False, so
+# the keys keep their order. Comments are still dropped, the price every back-fill in
+# step 2d already pays.
 #
-# Do not restore it as a "belt and braces" measure. If a profile ever needs a plugin the
-# image does not ship enabled, the operator overlay in step 2.7 is the mechanism, and it is
-# one that works on the path this ran on.
+# Do not restore this step beside it: two writers of one list, one of them a plain
+# rewrite over the other's rename. A profile that needs a plugin the image does not ship
+# enabled is the operator overlay in step 2.7.
 
 # 4. Point the hermes_otel plugin at the resolved collector and stamp the service name.
 #

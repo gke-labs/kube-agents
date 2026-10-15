@@ -3,7 +3,8 @@
 #
 # Both the RC pipeline and the nightly pipeline install a full GKE cluster per
 # run and would otherwise leave it idling between runs. This runs as the last
-# step so the cluster exists only for the length of a run. Which environment it
+# step of each install (the RC pipeline installs twice, today then next) so the
+# cluster exists only for the length of a run. Which environment it
 # destroys is whatever GCP_PROJECT_ID / GCP_REGION / GKE_CLUSTER_NAME name —
 # nothing here is RC-specific.
 #

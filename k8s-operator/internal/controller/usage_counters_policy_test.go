@@ -99,9 +99,10 @@ func selectorMatches(sel *metav1.LabelSelector, set labels.Set) bool {
 	return s.Matches(set)
 }
 
-// With the operator's namespace known, the gateway and broker policies each
-// gain one rule admitting the operator's pods, selected by namespace and pod
-// label, on the metrics port and no other; without it, neither does.
+// With the operator's namespace known, the gateway policy gains a rule
+// admitting the operator's pods, selected by namespace and pod label, on each
+// of its two metrics ports (the watcher's and the chat plugin's) and the broker
+// policy one on its metrics port, and no other; without it, neither does.
 func TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "agents"}}
 	profile := defaultTestNetpolProfile()
@@ -109,20 +110,24 @@ func TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly(t *testing.T) {
 
 	gateway := operatorPeerRules(buildNetworkPolicy(agent, nil, profile, false, "", false))
 	broker := operatorPeerRules(credentialProxyNetworkPolicyWithOperatorPeer(agent, policyTestOperatorNamespace))
-	if len(gateway) != 1 || len(broker) != 1 {
-		t.Fatalf("operator peer rules: gateway on ports %v, broker on ports %v; want one each", gateway, broker)
+	if len(gateway) != 2 || len(broker) != 1 {
+		t.Fatalf("operator peer rules: gateway on ports %v, broker on ports %v; want the gateway's two listeners and the broker's one", gateway, broker)
 	}
-	for name, got := range map[string]map[int32]networkingv1.NetworkPolicyPeer{"gateway": gateway, "broker": broker} {
-		port := eventWatcherMetricsPort
-		if name == "broker" {
-			port = credentialProxyMetricsPort
-		}
-		peer, ok := got[port]
-		if !ok {
-			t.Fatalf("%s policy: the operator rule is not on the metrics port %d: %v", name, port, got)
-		}
-		if peer.NamespaceSelector == nil || peer.NamespaceSelector.MatchLabels[labelMetadataName] != policyTestOperatorNamespace {
-			t.Errorf("%s policy: the operator peer is not narrowed to the operator's namespace: %+v", name, peer)
+	for name, want := range map[string]struct {
+		got   map[int32]networkingv1.NetworkPolicyPeer
+		ports []int32
+	}{
+		"gateway": {gateway, []int32{eventWatcherMetricsPort, chatMetricsPort}},
+		"broker":  {broker, []int32{credentialProxyMetricsPort}},
+	} {
+		for _, port := range want.ports {
+			peer, ok := want.got[port]
+			if !ok {
+				t.Fatalf("%s policy: the operator rule is not on the metrics port %d: %v", name, port, want.got)
+			}
+			if peer.NamespaceSelector == nil || peer.NamespaceSelector.MatchLabels[labelMetadataName] != policyTestOperatorNamespace {
+				t.Errorf("%s policy: the operator peer is not narrowed to the operator's namespace: %+v", name, peer)
+			}
 		}
 	}
 
@@ -157,33 +162,37 @@ func TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly(t *testing.T) {
 		"gateway": buildNetworkPolicy(agent, nil, profile, false, "", false),
 		"broker":  credentialProxyNetworkPolicyWithOperatorPeer(agent, policyTestOperatorNamespace),
 	} {
-		port := eventWatcherMetricsPort
+		// One rule per metrics listener, each opening its one port: the gateway
+		// carries the watcher's and the chat plugin's, the broker its own.
+		ports := []int32{eventWatcherMetricsPort, chatMetricsPort}
 		if name == "broker" {
-			port = credentialProxyMetricsPort
+			ports = []int32{credentialProxyMetricsPort}
 		}
 		rules := operatorRules(np, policyTestOperatorNamespace)
-		if len(rules) != 1 {
-			t.Fatalf("%s policy: %d rules admit the operator peer, want exactly 1: %+v", name, len(rules), rules)
+		if len(rules) != len(ports) {
+			t.Fatalf("%s policy: %d rules admit the operator peer, want %d: %+v", name, len(rules), len(ports), rules)
 		}
-		rule := rules[0]
-		if len(rule.Ports) != 1 {
-			t.Errorf("%s policy: the operator rule opens %d ports, want exactly 1: %+v", name, len(rule.Ports), rule.Ports)
-		} else if !equality.Semantic.DeepEqual(rule.Ports[0], tcpPort(port)) {
-			t.Errorf("%s policy: the operator rule's port is not TCP %d: %+v", name, port, rule.Ports[0])
-		}
-		if len(rule.From) != 1 {
-			t.Errorf("%s policy: the operator rule has %d peers, want exactly 1: %+v", name, len(rule.From), rule.From)
-			continue
-		}
-		peer := rule.From[0]
-		if peer.IPBlock != nil {
-			t.Errorf("%s policy: the operator rule carries an IPBlock peer: %+v", name, peer.IPBlock)
-		}
-		if peer.NamespaceSelector == nil || peer.NamespaceSelector.MatchLabels[labelMetadataName] != policyTestOperatorNamespace {
-			t.Errorf("%s policy: the operator peer is not narrowed to the operator namespace: %+v", name, peer.NamespaceSelector)
-		}
-		if peer.PodSelector == nil || peer.PodSelector.MatchLabels[operatorPodNameLabel] != operatorPodNameValue {
-			t.Errorf("%s policy: the operator peer is not narrowed to the operator pod: %+v", name, peer.PodSelector)
+		for i, rule := range rules {
+			port := ports[i]
+			if len(rule.Ports) != 1 {
+				t.Errorf("%s policy: the operator rule opens %d ports, want exactly 1: %+v", name, len(rule.Ports), rule.Ports)
+			} else if !equality.Semantic.DeepEqual(rule.Ports[0], tcpPort(port)) {
+				t.Errorf("%s policy: the operator rule's port is not TCP %d: %+v", name, port, rule.Ports[0])
+			}
+			if len(rule.From) != 1 {
+				t.Errorf("%s policy: the operator rule has %d peers, want exactly 1: %+v", name, len(rule.From), rule.From)
+				continue
+			}
+			peer := rule.From[0]
+			if peer.IPBlock != nil {
+				t.Errorf("%s policy: the operator rule carries an IPBlock peer: %+v", name, peer.IPBlock)
+			}
+			if peer.NamespaceSelector == nil || peer.NamespaceSelector.MatchLabels[labelMetadataName] != policyTestOperatorNamespace {
+				t.Errorf("%s policy: the operator peer is not narrowed to the operator namespace: %+v", name, peer.NamespaceSelector)
+			}
+			if peer.PodSelector == nil || peer.PodSelector.MatchLabels[operatorPodNameLabel] != operatorPodNameValue {
+				t.Errorf("%s policy: the operator peer is not narrowed to the operator pod: %+v", name, peer.PodSelector)
+			}
 		}
 	}
 	// The builder itself is unchanged: no operator rule, whatever the caller knows.
@@ -206,33 +215,51 @@ func TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly(t *testing.T) {
 	if !equality.Semantic.DeepEqual(built.Spec.PodSelector, applied.Spec.PodSelector) || !equality.Semantic.DeepEqual(built.Spec.PolicyTypes, applied.Spec.PolicyTypes) {
 		t.Error("the applied broker policy differs from the builder's beyond the appended rule")
 	}
-	// The same whole-rule-set diff for the gateway, which adds its operator rule
+	// The same whole-rule-set diff for the gateway, which adds its operator rules
 	// inline in the builder when the namespace is known rather than through a
-	// separate wrapper: render it with the namespace unset and set -- the only
-	// field that differs between the two profiles -- and the set rendering has
-	// exactly one more ingress rule, every rule they share is DeepEqual, and the
-	// extra rule is operatorMetricsIngressRule's output. The operatorRules count
-	// check above already pins "exactly one operator rule" for the gateway, but it
-	// projects a rule onto the operator by its pod label or namespace selector and
-	// so cannot see a rule whose only peer is an IPBlock -- a CIDR covering the
-	// operator's pod IP names the operator to a CNI yet carries neither selector.
-	// Only a diff of the full rule set catches an extra rule of any peer shape.
-	gatewayWant, ok := operatorMetricsIngressRule(policyTestOperatorNamespace, eventWatcherMetricsPort)
-	if !ok {
-		t.Fatalf("operatorMetricsIngressRule returned no rule for a valid namespace")
+	// separate wrapper, each beside the collector rule for the same listener:
+	// render it with the namespace unset and set -- the only field that differs
+	// between the two profiles -- and the set rendering is the unset one with
+	// exactly operatorMetricsIngressRule's output for each listener's port
+	// inserted, in listener order, and nothing else added or changed. The
+	// operatorRules count check above already pins the operator rule count for
+	// the gateway, but it projects a rule onto the operator by its pod label or
+	// namespace selector and so cannot see a rule whose only peer is an IPBlock
+	// -- a CIDR covering the operator's pod IP names the operator to a CNI yet
+	// carries neither selector. Only a diff of the full rule set catches an
+	// extra rule of any peer shape.
+	gatewayPorts := []int32{eventWatcherMetricsPort, chatMetricsPort}
+	gatewayWant := make([]networkingv1.NetworkPolicyIngressRule, 0, len(gatewayPorts))
+	for _, port := range gatewayPorts {
+		rule, ok := operatorMetricsIngressRule(policyTestOperatorNamespace, port)
+		if !ok {
+			t.Fatalf("operatorMetricsIngressRule returned no rule for a valid namespace on port %d", port)
+		}
+		gatewayWant = append(gatewayWant, rule)
 	}
 	builtGateway := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 	appliedGateway := buildNetworkPolicy(agent, nil, profile, false, "", false)
-	if len(appliedGateway.Spec.Ingress) != len(builtGateway.Spec.Ingress)+1 {
-		t.Fatalf("the gateway policy with the operator namespace known has %d ingress rules, without it %d; want exactly one more", len(appliedGateway.Spec.Ingress), len(builtGateway.Spec.Ingress))
+	if len(appliedGateway.Spec.Ingress) != len(builtGateway.Spec.Ingress)+len(gatewayWant) {
+		t.Fatalf("the gateway policy with the operator namespace known has %d ingress rules, without it %d; want exactly %d more", len(appliedGateway.Spec.Ingress), len(builtGateway.Spec.Ingress), len(gatewayWant))
+	}
+	// Strip the expected operator rules, in order, from the applied set; what
+	// remains must be the unset rendering rule for rule.
+	remaining := make([]networkingv1.NetworkPolicyIngressRule, 0, len(builtGateway.Spec.Ingress))
+	next := 0
+	for _, rule := range appliedGateway.Spec.Ingress {
+		if next < len(gatewayWant) && equality.Semantic.DeepEqual(rule, gatewayWant[next]) {
+			next++
+			continue
+		}
+		remaining = append(remaining, rule)
+	}
+	if next != len(gatewayWant) {
+		t.Errorf("the gateway policy carries %d of the %d operator metrics rules in listener order:\n got %+v\nwant %+v", next, len(gatewayWant), appliedGateway.Spec.Ingress, gatewayWant)
 	}
 	for i := range builtGateway.Spec.Ingress {
-		if !equality.Semantic.DeepEqual(builtGateway.Spec.Ingress[i], appliedGateway.Spec.Ingress[i]) {
+		if i >= len(remaining) || !equality.Semantic.DeepEqual(builtGateway.Spec.Ingress[i], remaining[i]) {
 			t.Errorf("gateway ingress rule %d changed when the operator namespace became known", i)
 		}
-	}
-	if extra := appliedGateway.Spec.Ingress[len(appliedGateway.Spec.Ingress)-1]; !equality.Semantic.DeepEqual(extra, gatewayWant) {
-		t.Errorf("the gateway's extra rule is not exactly the operator metrics rule:\n got %+v\nwant %+v", extra, gatewayWant)
 	}
 	if !equality.Semantic.DeepEqual(builtGateway.Spec.PodSelector, appliedGateway.Spec.PodSelector) || !equality.Semantic.DeepEqual(builtGateway.Spec.PolicyTypes, appliedGateway.Spec.PolicyTypes) || !equality.Semantic.DeepEqual(builtGateway.Spec.Egress, appliedGateway.Spec.Egress) {
 		t.Error("the gateway policy changed beyond the appended operator rule when the operator namespace became known")
