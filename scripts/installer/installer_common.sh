@@ -1074,12 +1074,12 @@ load_install_env() {
 # operator's comments and ordering -- exactly as it was. INSTALL_ENV_FILE must
 # be set by the caller.
 #
-# The Day-2 control panel is the only caller, and it is the one place that may
-# write here: "Save & Apply Configuration Changes" is an explicit instruction
+# The Day-2 control panel is the only caller, and the one place that may edit
+# any key here: "Save & Apply Configuration Changes" is an explicit instruction
 # to record a change, not the installer quietly overwriting an input. install.sh
-# itself creates the file when there is none, and otherwise only appends a chat
-# key the file does not assign (record_flags_into_install_env); it never
-# rewrites a line.
+# itself writes only as scripts/installer/README.md ("install.env") lists: the
+# file on a first install, a chat key or PLATFORM_AGENT_MODE it lacks, and the
+# GitOps keys a run applies differently.
 #
 # No `export` keyword in the output: install.env is a dotenv, loaded with
 # `set -a`. The value is still %q-quoted, so spaces and quotes survive.
@@ -1679,25 +1679,35 @@ refuse_apply_dropping_live_gitops() {
   [ -n "${PROJECT_ID:-}" ] && [ -n "${CLUSTER_NAME:-}" ] && [ -n "${REGION:-}" ] || return 0
   ctx="$(gke_context_name)"
   if ! kubectl config get-contexts "$ctx" >/dev/null 2>&1; then
-    # An applying run has already been refused by the scope check for the
-    # same missing context; a preview says this check did not run.
-    if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
-      print_warning "The GitOps check did not run: the kubeconfig has no context '${ctx}'. An applying run checks that it would not remove a live token minter."
-    fi
+    # An applying run has already been refused by the scope check for the same
+    # missing context. A preview, and --generate-only (which fetches none),
+    # say this check did not run.
+    print_warning "The GitOps check did not run: the kubeconfig has no context '${ctx}'. Before applying, check it would not remove a running GitHub token minter: kubectl get deployment ${GITHUB_MINTER_DEPLOYMENT} -n ${namespace}."
     return 0
   fi
   # The minter's own Deployment is what the apply would destroy, whichever
   # spelling the PlatformAgent declares its repository in: the deprecated
   # spec.integration.github alias, or spec.integration.forges/repositories
   # (the chart renders the alias only for a plain single GitHub repository).
-  if (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
-    get deployment "$GITHUB_MINTER_DEPLOYMENT" -n "$namespace" -o name >/dev/null 2>&1); then
-    minter="present"
+  # --ignore-not-found makes absence an empty answer with exit 0, so a read
+  # that failed (a timeout, an expired token, no permission on apps/v1) is told
+  # apart from "no minter" and is not read as a pass.
+  local minter_out=""
+  if ! minter_out="$( (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+    get deployment "$GITHUB_MINTER_DEPLOYMENT" -n "$namespace" -o name --ignore-not-found 2>/dev/null) )"; then
+    if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+      print_warning "The GitOps check did not run: the ${GITHUB_MINTER_DEPLOYMENT} Deployment in namespace '${namespace}' could not be read. An applying run refuses until it can be."
+      return 0
+    fi
+    print_error "Refusing to apply: the ${GITHUB_MINTER_DEPLOYMENT} Deployment in namespace '${namespace}' could not be read, so this run cannot tell whether the apply would destroy a running GitHub token minter."
+    print_info "Fix the read (kubectl get deployment ${GITHUB_MINTER_DEPLOYMENT} -n ${namespace} --context ${ctx}) and re-run the same command."
+    return 1
   fi
+  [ -z "$minter_out" ] || minter="present"
   cr_json="$( (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
     get platformagents.kubeagents.x-k8s.io -n "$namespace" -o json 2>/dev/null) || true)"
   # "<org> <owner/repo or repo>" of the GitOps repository, from either spelling.
-  read -r live_org live_repo <<<"$(printf '%s' "$cr_json" | (trap - ERR; python3 -c '
+  IFS=$'\t' read -r live_org live_repo <<<"$(printf '%s' "$cr_json" | (trap - ERR; python3 -c '
 import json, sys
 try:
     items = (json.load(sys.stdin) or {}).get("items") or []
@@ -1706,6 +1716,7 @@ except ValueError:
 integ = ((items[0].get("spec") or {}).get("integration") or {}) if items else {}
 gh = integ.get("github") or {}
 repo, org = gh.get("gitRepo") or "", gh.get("org") or ""
+ns = ""
 if repo.strip() in ("None", "none"):
     # The sentinel the alias validator reads as "no repository".
     repo = ""
@@ -1715,7 +1726,9 @@ if not repo:
         forge = forges.get(r.get("forge")) or {}
         if r.get("role") == "gitops" and (forge.get("provider") or "github") == "github":
             repo = r.get("repository") or ""
-            org = r.get("namespace") or forge.get("namespace") or ""
+            # The namespace qualifies a bare name only; a path with an owner
+            # names its own (as the operator resolves it).
+            ns = r.get("namespace") or forge.get("namespace") or ""
             break
 def path_of(ref):
     # As the operator reads a reference (ParseRepoRef): a clone URL or an scp
@@ -1733,10 +1746,16 @@ def path_of(ref):
 path = path_of(repo)
 parts = [p for p in path.split("/") if p]
 name = parts[-1] if parts else ""
-if not org and len(parts) >= 2:
+if len(parts) >= 2:
     org = parts[-2]
-print(org or "-", name or "-")
-' 2>/dev/null) || echo "- -")"
+elif not org:
+    org = ns
+# One field each, so a value with a space in it cannot split; a value the
+# operator would refuse (anything but A-Za-z0-9_.-) is printed as unknown.
+import re
+ok = re.compile(r"^[A-Za-z0-9_.-]+$")
+print((org if ok.match(org or "") else "-") + "\t" + (name if ok.match(name or "") else "-"))
+' 2>/dev/null) || printf '%s\t%s' - -)"
   [ "$live_org" = "-" ] && live_org=""
   [ "$live_repo" = "-" ] && live_repo=""
   # Only a running minter is something the apply destroys. A GitOps repository

@@ -140,11 +140,17 @@ standing in, not whichever one that shared checkout belongs to. The one addition
 `$HOME/kube-agents/install.env` is skipped unless all three of `--gcp-project-id`,
 `--gke-cluster-name`, and `--gcp-region` are given on the command line and match it.
 
-`install.sh` reads it and does not rewrite it. It creates one at the end of a first
-install, when there is nothing there, and after that changes no line of it; the one thing
-it adds is a chat key or `PLATFORM_AGENT_MODE` the file lacks, under the rule below, and the GitOps keys
-covered under [The GitOps forge](#the-gitops-forge). The Day-2 menu's "Save & Apply"
-is the one path that edits a key, one at a time, leaving comments and ordering intact. That
+`install.sh` reads it and writes to it only in these cases, all when a run commits (the apply, or
+the `--generate-only` handoff; never a declined run or `--dry-run`):
+
+- it creates one at the end of a first install, when there is nothing there;
+- it appends a chat key or `PLATFORM_AGENT_MODE` the file lacks, under the rule below;
+- it records the GitOps keys described under [The GitOps forge](#the-gitops-forge): the forge
+  keys when the run applies a different forge (apply only), and `GITOPS_ORG`, `GITOPS_REPO` and
+  `GITHUB_APP_ID` when one is missing or this run applies a different value (that line only).
+
+Every other line, and the file's comments and ordering, are left as written. The Day-2 menu's
+"Save & Apply" is the path that edits any key, one at a time. That
 asymmetry is deliberate: a file the documentation tells you to edit and the next run
 overwrites is what made the old `vars.sh` confusing.
 
@@ -338,17 +344,21 @@ the host, `install.sh` drops a `GITOPS_CA_FILE` from the environment, but refuse
   `GITLAB_TOKEN_SECRET` or `GITOPS_CA_SECRET` exported in the shell. Use the flags.
 
 On GitHub with the token minter (`GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID` all set), a run
-that goes on to the apply records each of the three the file lacks, and replaces one it records
+that goes on to the apply, or ends with the `--generate-only` handoff, records each of the three
+the file lacks, and replaces one it records
 with a different value (that line only). `upgrade.sh` renders from the file alone, so GitOps set
 up with `--gitops-org`, `--gitops-repo` and `--github-app-id` would otherwise be rendered off by
 the next full upgrade, which would destroy the minter's Cloud KMS key and service account. The PEM
-path is never recorded. A declined or `--generate-only` run leaves the file as it was.
+path is never recorded. A declined run, or `--dry-run`, leaves the file as it was.
 
 Each applying front door (`install.sh`, the Day-2 menu, a full `upgrade.sh`) also refuses an apply
 that would render GitOps off while the minter is running, and prints the lines to set with the
-live values filled in; `--plan`, `--dry-run` and `--generate-only` warn. `KUBE_AGENTS_REMOVE_GITOPS=true`
+live values filled in. `install.sh --generate-only` is refused too, and removes the tfvars it
+wrote, since its handoff is `lifecycle.sh apply`; `--plan` and `--dry-run` warn. A minter
+Deployment that cannot be read is refused rather than read as absent. `KUBE_AGENTS_REMOVE_GITOPS=true`
 in the environment removes GitOps on purpose. `GITHUB_APP_ID` must be the App's number (its
-settings page, **General**, "App ID"); both front doors refuse anything else.
+settings page, **General**, "App ID"); `install.sh`, the Day-2 menu and `upgrade.sh` (on a GitHub
+install) refuse anything else.
 
 ### Projects, folders, organisations and selectors in scope
 

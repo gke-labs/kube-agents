@@ -1666,7 +1666,9 @@ main() {
   # A GITHUB_APP_ID that is a name rather than the App's number leaves the
   # token minter crash-looping behind Helm's rollout wait (#3076); refused here,
   # --dry-run included. Guarded: an older target's helpers lack it.
-  if declare -F validate_github_app_id >/dev/null; then
+  # GitHub only: a GitLab install does not read the key (install.sh drops a
+  # leftover one the same way).
+  if declare -F validate_github_app_id >/dev/null && [ "${GITOPS_FORGE:-github}" = "github" ]; then
     validate_github_app_id "${GITHUB_APP_ID:-}" "GITHUB_APP_ID in ${install_env_file:-install.env}" || exit 1
   fi
 

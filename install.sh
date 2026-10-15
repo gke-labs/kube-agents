@@ -1761,8 +1761,8 @@ install_env_records_key() {
 # Say so when an interactive answer changed something the file still records
 # differently.
 #
-# install.env is an input: install.sh creates one when there is none and never
-# rewrites a line of it. The interview, though, still runs in full on every interactive
+# install.env is an input: install.sh creates one when there is none and writes
+# to it only as scripts/installer/README.md ("install.env") lists. The interview, though, still runs in full on every interactive
 # invocation, and its answers go straight into the environment
 # write_tfvars_from_state reads. So an operator who answers "None" at the chat
 # menu gets the Pub/Sub topic destroyed by this apply and re-created by the
@@ -1774,11 +1774,12 @@ install_env_records_key() {
 # would contradict the contract stated in install.env.example, INSTALL.md and
 # the chart's CI story -- #1117 renders this file on an ephemeral runner and
 # needs the installer not to rewrite it. Naming the drift costs nothing
-# and leaves the decision where it belongs. The one write install.sh does make
-# is narrower: a chat key or PLATFORM_AGENT_MODE the file does not assign,
+# and leaves the decision where it belongs. The writes install.sh does make
+# are narrower: a chat key or PLATFORM_AGENT_MODE the file does not assign,
 # appended from a chat flag or --mode, with the settings a chat toggle recorded
-# true brings (record_flags_into_install_env);
-# it never changes a key the file sets.
+# true brings (record_flags_into_install_env); and the GitOps keys
+# (record_gitops_forge_keys, record_github_gitops_keys). It changes no other key
+# the file sets.
 #
 # The list is the interview's own settings, not everything the file holds:
 # IMAGE_TAG and the recovered secrets legitimately differ on a normal run and
@@ -2004,8 +2005,10 @@ warn_flag_beats_unrecorded_file_value() {
 # it records with a different value is replaced (that line only), since this
 # apply is about to use the new value and the next upgrade would otherwise put
 # the old one back. --github-pem-path never is (the key lives in Cloud KMS once
-# imported). Apply-only, like record_gitops_forge_keys: a --generate-only or
-# declined run leaves the file as it was.
+# imported). Run where the run commits: the apply, and the --generate-only
+# handoff, whose lifecycle.sh apply renders these keys. A declined run leaves
+# the file as it was. (record_gitops_forge_keys stays apply-only: a forge
+# switch is previewed with --generate-only before it is made.)
 record_github_gitops_keys() {
   local file="$1" key value
   [ -f "$file" ] || return 0
@@ -2041,8 +2044,8 @@ record_github_gitops_keys() {
   RECORDED_INSTALL_ENV_FILE=""
 }
 
-# The one exception to "an existing install.env is never rewritten": the
-# GitOps forge. upgrade.sh and the Day-2 menu render from the file alone, so a
+# One of the two GitOps exceptions to "an existing install.env is never
+# rewritten" (record_github_gitops_keys above is the other): the GitOps forge. upgrade.sh and the Day-2 menu render from the file alone, so a
 # forge this run chose and the file does not record would be reverted to
 # GitHub by the next of them -- the alias back in the CR, the GitLab forge
 # gone, nothing saying why. So when the file's forge differs from this run's,
@@ -2364,9 +2367,10 @@ bootstrap_install_env_file() {
     warn_unrecorded_interview_answers "$destination"
     note_unrecorded_network_policy_acceptance "$destination"
     # The flags that override a recorded value for one run. This function
-    # never rewrites an existing file (record_gitops_forge_keys, after the
-    # apply is chosen, is the one writer of an existing file), so only a
-    # first install can record any of them on the operator's behalf.
+    # never rewrites an existing file (record_gitops_forge_keys and
+    # record_github_gitops_keys, once the run commits, are the writers of an
+    # existing file, for the GitOps keys only), so only a first install can
+    # record any of them on the operator's behalf.
     warn_flag_beats_unrecorded_file_value "$destination" NAMESPACE --agent-namespace \
       "${PARAM_AGENT_NAMESPACE:-}" \
       "A later run without it resolves the default namespace, renders tfvars for that one, looks for the recovered Secret there, and is refused by lifecycle.sh's guard_release_namespace." \
@@ -7033,9 +7037,6 @@ main() {
   # GITHUB_*, and normalize_gitops_repo_vars keeps them equal to the GITOPS_*
   # values rather than letting them be a second source of truth.
   normalize_gitops_repo_vars
-  # Again on the value this run settled on, which an interactive answer may
-  # have supplied.
-  validate_github_app_id "$github_app_id" "GitHub App ID" || exit 1
   export GITHUB_APP_ID="$github_app_id"
   export KMS_KEYRING="$kms_keyring"
   export KMS_KEY="$kms_key"
@@ -7136,12 +7137,19 @@ main() {
   fi
   # A live GitHub minter this render would destroy (#3075): an install.env
   # without the GitOps keys, and a run without the flags, renders GitOps off.
-  # Refused for a run that applies; --dry-run and --generate-only warn. The
-  # context is the one the gate above fetched; an applying run without one has
-  # already been refused there, and a preview says the check did not run.
+  # Refused for a run that applies and for --generate-only, which hands its
+  # tfvars to lifecycle.sh apply (as the Slack check treats it); --dry-run
+  # warns. The context is the one the gate above fetched where it ran; without
+  # one, a preview says the check did not run.
   if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
-    if [ "$PARAM_DRY_RUN" != "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ]; then
-      refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" || exit 1
+    if [ "$PARAM_DRY_RUN" != "true" ]; then
+      if ! refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE"; then
+        # The tfvars just written render GitOps off; --generate-only would
+        # hand them to lifecycle.sh apply, so they go.
+        rm -f "$tfvars_file"
+        print_info "Removed ${tfvars_file}, which rendered GitOps off, so nothing applies it."
+        exit 1
+      fi
     else
       refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" "$SCOPE_CHECK_MODE_WARN"
     fi
@@ -7377,7 +7385,9 @@ main() {
     print_info "Generate-only: configuration files written. Running pre-apply validation checks..."
     check_github_org_is_organization "${GITOPS_ORG:-}"
     # Past every gate that can stop this route: a chat flag or --mode whose
-    # key the install.env lacks is recorded for the handoff.
+    # key the install.env lacks is recorded for the handoff, and so are the
+    # GitHub GitOps keys, which the handoff's lifecycle.sh apply renders.
+    record_github_gitops_keys "$INSTALL_ENV_FILE"
     record_flags_into_install_env
     print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
     write_json_report "GENERATE_ONLY_SUCCESS"

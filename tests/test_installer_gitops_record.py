@@ -110,17 +110,20 @@ class RecordGithubGitopsKeysTest(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
                 self.assertEqual(dest.read_text(), "PROJECT_ID=p\n")
 
-    def test_it_runs_at_the_apply_and_nowhere_earlier(self):
+    def test_it_runs_where_the_run_commits_and_nowhere_earlier(self):
+        # The --generate-only handoff (its lifecycle.sh apply renders the keys)
+        # and the apply; never before the step-11 decision.
         source = _INSTALL_SH.read_text()
-        call = source.index('  record_github_gitops_keys "$INSTALL_ENV_FILE"')
-        self.assertEqual(source.count('record_github_gitops_keys "'), 1)
-        self.assertLess(source.index('write_json_report "GENERATE_ONLY_SUCCESS"'), call)
-        self.assertLess(call, source.index('run_lifecycle_apply "$repo_dir" "$provisioning_log"'))
+        self.assertEqual(source.count('record_github_gitops_keys "$INSTALL_ENV_FILE"'), 2)
+        handoff = source.index('    record_github_gitops_keys "$INSTALL_ENV_FILE"\n    record_flags_into_install_env\n    print_generate_only_handoff')
+        self.assertLess(handoff, source.index('write_json_report "GENERATE_ONLY_SUCCESS"'))
+        apply = source.index('  record_github_gitops_keys "$INSTALL_ENV_FILE"\n  record_flags_into_install_env\n  run_lifecycle_apply')
+        self.assertLess(source.index('write_json_report "PAUSED"'), apply)
 
 
 class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
     def _run(self, keys, git_repo="sackheads/ka-test-infra", org="sackheads", app_id_b64="NTMxOTE1NA==",
-             mode="", context_present=True, minter=True, integration=None):
+             mode="", context_present=True, minter=True, integration=None, minter_read_fails=False):
         if integration is None:
             integration = {"github": {"gitRepo": git_repo, "org": org}} if git_repo else {}
         cr = json.dumps({"items": [{"spec": {"integration": integration}}]})
@@ -129,11 +132,17 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
             bin_dir.mkdir()
             (bin_dir / "cr.json").write_text(cr)
             kubectl = bin_dir / "kubectl"
+            if minter_read_fails:
+                deploy_case = "exit 1"
+            elif minter:
+                deploy_case = "echo deployment.apps/github-token-minter; exit 0"
+            else:
+                deploy_case = "exit 0"  # --ignore-not-found: absent is empty output, exit 0
             kubectl.write_text(
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
                 f'  *"config get-contexts"*) exit {0 if context_present else 1} ;;\n'
-                f'  *"get deployment github-token-minter"*) exit {0 if minter else 1} ;;\n'
+                f'  *"get deployment github-token-minter"*) {deploy_case} ;;\n'
                 f'  *"get platformagents"*) cat "{bin_dir}/cr.json" ;;\n'
                 f"  *\"github-app-credentials\"*) printf '%s' '{app_id_b64}' ;;\n"
                 "esac\nexit 0\n"
@@ -230,10 +239,36 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
         self.assertNotIn("Set these lines", proc.stdout)
         self.assertNotIn("KUBE_AGENTS_REMOVE_GITOPS", proc.stdout)
 
-    def test_a_preview_with_no_context_says_the_check_did_not_run(self):
-        proc = self._run({}, mode="warn", context_present=False)
+    def test_an_unreadable_minter_deployment_is_refused_not_read_as_absent(self):
+        proc = self._run({}, minter_read_fails=True)
+        self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("could not be read, so this run cannot tell whether the apply would destroy", proc.stdout)
+        proc = self._run({}, minter_read_fails=True, mode="warn")
         self.assertIn("rc=0", proc.stdout)
-        self.assertIn("WARN: The GitOps check did not run: the kubeconfig has no context", proc.stdout)
+        self.assertIn("WARN: The GitOps check did not run: the github-token-minter Deployment", proc.stdout)
+
+    def test_a_path_with_an_owner_names_its_own_not_the_forge_namespace(self):
+        integration = {"forges": [{"name": "gh", "provider": "github", "namespace": "other"}],
+                       "repositories": [{"forge": "gh", "repository": "acme/infra", "role": "gitops"}]}
+        proc = self._run({}, integration=integration)
+        self.assertIn("INFO:   GITOPS_ORG=acme\n", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("INFO:   GITOPS_REPO=infra\n", proc.stdout)
+
+    def test_a_value_the_operator_would_refuse_is_not_printed_as_a_line_to_paste(self):
+        proc = self._run({}, integration={"github": {"gitRepo": "acme/in fra"}})
+        self.assertIn("rc=1", proc.stdout)
+        self.assertNotIn("in fra", proc.stdout.split("Set these lines", 1)[-1])
+        self.assertIn("INFO:   GITOPS_REPO=<the GitOps repository's name>", proc.stdout)
+
+    def test_no_context_says_the_check_did_not_run_and_passes(self):
+        # An applying run has already been refused by the scope check for the
+        # same context; a preview, and --generate-only, are told what to check.
+        for mode in ("warn", ""):
+            with self.subTest(mode=mode or "refuse"):
+                proc = self._run({}, mode=mode, context_present=False)
+                self.assertIn("rc=0", proc.stdout)
+                self.assertIn("WARN: The GitOps check did not run: the kubeconfig has no context", proc.stdout)
+                self.assertIn("kubectl get deployment github-token-minter -n kubeagents-system", proc.stdout)
 
     def test_a_plan_warns_and_goes_on(self):
         proc = self._run({}, mode="warn")
@@ -247,7 +282,6 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
             ("no live GitOps", {}, "", True, False),
             ("gitlab", {"GITOPS_FORGE": "gitlab"}, "sackheads/ka-test-infra", True, True),
             ("removed on purpose", {"KUBE_AGENTS_REMOVE_GITOPS": "true"}, "sackheads/ka-test-infra", True, True),
-            ("no context, applying run", {}, "sackheads/ka-test-infra", False, True),
             # The App ID left blank, or the minter deferred: a repository and
             # no minter render the same either way.
             ("a repository with no minter", {}, "sackheads/ka-test-infra", True, False),
@@ -262,7 +296,13 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
     def test_every_applying_front_door_calls_it(self):
         install = _INSTALL_SH.read_text()
         # main() refuses on an applying run and warns otherwise, and the menu refuses.
-        self.assertEqual(install.count('refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" || exit 1'), 2)
+        # The menu refuses outright; main() refuses (and removes the tfvars)
+        # for an applying run and for --generate-only, and warns on --dry-run.
+        self.assertEqual(install.count('refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" || exit 1'), 1)
+        self.assertIn('if ! refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE"; then\n'
+                      '        # The tfvars just written render GitOps off; --generate-only would\n'
+                      '        # hand them to lifecycle.sh apply, so they go.\n'
+                      '        rm -f "$tfvars_file"', install)
         self.assertEqual(install.count('"$INSTALL_ENV_FILE" "$SCOPE_CHECK_MODE_WARN"'), 1)
         upgrade = _UPGRADE_SH.read_text()
         self.assertIn('refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}" || exit 1', upgrade)
@@ -303,7 +343,6 @@ class ValidateGithubAppIdTest(unittest.TestCase):
         install = _INSTALL_SH.read_text()
         self.assertLess(install.index("validate_github_app_id \"${PARAM_GITHUB_APP_ID:-}\""),
                         install.index("check_flags_against_install_env || exit 1"))
-        self.assertIn('validate_github_app_id "$github_app_id" "GitHub App ID" || exit 1', install)
         # The interview asks again at the prompt, before the KMS questions.
         ask = install.index('while [ -n "$github_app_id" ] && ! validate_github_app_id "$github_app_id" "GitHub App ID"; do')
         self.assertLess(ask, install.index('prompt_read "Cloud KMS Keyring Name" kms_keyring', ask - 2000))
@@ -312,6 +351,8 @@ class ValidateGithubAppIdTest(unittest.TestCase):
         self.assertLess(menu, install.index('save_env_var GITHUB_APP_ID "$github_app_id"'))
         self.assertLess(install.index("\nrun_menu_system() {"), menu)
         upgrade = _UPGRADE_SH.read_text()
+        # GitHub only: a GitLab install does not read the key.
+        self.assertIn('if declare -F validate_github_app_id >/dev/null && [ "${GITOPS_FORGE:-github}" = "github" ]; then', upgrade)
         self.assertLess(upgrade.index('validate_github_app_id "${GITHUB_APP_ID:-}"'),
                         upgrade.index('print_step "2. Dry-Run Upgrade Plan Preview"'))
 
