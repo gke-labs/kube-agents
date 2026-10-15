@@ -249,11 +249,11 @@ class CronStoreMergeTest(unittest.TestCase):
     def test_cron_pause_during_overlay_not_lost(self):
         """Issue #3179: A cron pause landing while gateway starts must survive the merge."""
         write(self.template / "cron" / "jobs.json", json.dumps({"jobs": [job("audit", prompt="image prompt")]}))
-        write(self.home / "cron" / "jobs.json", json.dumps({"jobs": [job("audit", prompt="old prompt")]}))
+        write(self.home / "cron" / "jobs.json", json.dumps({"jobs": [job("audit", prompt="old prompt", state="running")]}))
 
         lock_file = self.home / "cron" / ".jobs.lock"
         jobs_path = self.home / "cron" / "jobs.json"
-        orig_merge = ps.merge_cron_store
+        orig_merge = ps._merge_after_overlay
         pause_thread = None
 
         def pause_worker():
@@ -280,7 +280,7 @@ class CronStoreMergeTest(unittest.TestCase):
             time.sleep(0.05)
             return orig_merge(*args, **kwargs)
 
-        with unittest.mock.patch.object(ps, "merge_cron_store", side_effect=inject_pause_mid_merge):
+        with unittest.mock.patch.object(ps, "_merge_after_overlay", side_effect=inject_pause_mid_merge):
             ps.overlay_template(self.home, self.template, None, ("cron",))
 
         if pause_thread:

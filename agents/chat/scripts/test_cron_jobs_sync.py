@@ -494,7 +494,7 @@ class SyncFileTests(unittest.TestCase):
     def test_cron_pause_during_sync_not_lost(self):
         """Issue #3179: A cron pause landing while sync runs must survive."""
         self.write(self.image, {"jobs": [job("a", prompt="new prompt")]})
-        self.write(self.runtime, {"jobs": [job("a", prompt="old prompt")]})
+        self.write(self.runtime, {"jobs": [job("a", prompt="old prompt", state="running")]})
 
         lock_file = self.runtime.parent / ".jobs.lock"
         jobs_path = self.runtime
