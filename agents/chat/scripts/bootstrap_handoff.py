@@ -53,46 +53,6 @@ CLUSTER_AUDIT_INSTRUCTIONS_PATHS = (
     "/opt/data/profiles/platform/governance/cluster_inventory_audit_sop.md",
     "/opt/platform-template/governance/cluster_inventory_audit_sop.md",
 )
-# Whether the cards also run that SOP's "Without a GitOps repository" section, which carries the
-# checks the first-run audits own: with no repository the oobe stage skips those audits, and the
-# scan is all that checks workloads. The sweep card says the same (bootstrap_scan_gate._task_body).
-NO_REPOSITORY_RUN = (
-    'Also follow the single-cluster audit SOP\'s "Without a GitOps repository" section: no GitOps '
-    "repository was found for the first-run audits to publish to, so the checks it lists are yours."
-)
-# The same section when the repository list could not be read: whether the audits will run is not known.
-NO_REPOSITORY_UNREAD_RUN = (
-    'Also follow the single-cluster audit SOP\'s "Without a GitOps repository" section: the list of GitOps '
-    "repositories could not be read, so the first-run audits may not run, and the checks it lists are yours."
-)
-NO_REPOSITORY_SKIP = (
-    'Skip the single-cluster audit SOP\'s "Without a GitOps repository" section: this install has a GitOps '
-    "repository, and the first-run audits run the checks it lists."
-)
-# The workload fields only that section records; a raw file whose audits carry any shows its columns.
-NO_REPOSITORY_WORKLOAD_FIELDS = (
-    ("probes", "liveness"), ("resources", "requests"), ("security_context", "run_as_non_root"),
-)
-# The check slugs only that section files; a finding with one shows the checks ran too.
-NO_REPOSITORY_CHECKS = frozenset({
-    "probes-liveness", "probes-readiness", "no-requests", "no-memory-limit", "no-hpa", "hpa-cannot-scale",
-    "netpol-missing", "workload-identity-off", "podsecurity-gaps", "privileged-container", "host-namespace",
-})
-# What the cards were told, decided once when the gate files the sweep card and recorded in its
-# marker (bootstrap_scan_gate._mark_filed) under this field; also the hand-off state's key for it.
-# The cluster cards are told the same, and compose reads it rather than the cards. A marker written
-# before the field existed has none, and both fall back as they did. Unknown is a list that could
-# not be read: the cards run the section, and say why.
-NO_REPOSITORY_FIELD = "no_repository"
-RECORDED_YES = "yes"
-RECORDED_NO = "no"
-RECORDED_UNKNOWN = "unknown"
-RECORDED_VALUES = (RECORDED_YES, RECORDED_NO, RECORDED_UNKNOWN)
-# The raw report's opening sentence when the cards ran that section because the list could not be read.
-UNREAD_POSTURE = (
-    "The list of GitOps repositories could not be read when this scan was filed, so this scan also checked "
-    "liveness and readiness probes, requests and limits, HPA, NetworkPolicy and pod security."
-)
 
 HANDOFF_MARKER = ".bootstrap_handoff_filed"
 MARKER_FIELD = re.compile(r"^(\w+)=(\S+)$")
@@ -220,24 +180,6 @@ def read_scan_marker(marker: Path, now: float | None = None) -> tuple[str, float
         except OSError:
             return None
     return sweep_id, filed_at
-
-
-def no_repository_line(no_repository: str) -> str:
-    """The scan marker's line recording what the cards were told (one of ``RECORDED_VALUES``)."""
-    return f"{NO_REPOSITORY_FIELD}={no_repository}\n"
-
-
-def recorded_no_repository(marker: Path) -> str | None:
-    """What the cards were told, from the gate's marker (one of ``RECORDED_VALUES``); None when it recorded nothing."""
-    value = _read_marker(marker).get(NO_REPOSITORY_FIELD)
-    return value if value in RECORDED_VALUES else None
-
-
-def no_repository_section(no_repository: str) -> str:
-    """The card bodies' line on the SOP's no-repository section, for what was decided."""
-    if no_repository == RECORDED_YES:
-        return NO_REPOSITORY_RUN
-    return NO_REPOSITORY_UNREAD_RUN if no_repository == RECORDED_UNKNOWN else NO_REPOSITORY_SKIP
 
 
 def _metadata(conn: sqlite3.Connection, task_id: str) -> dict:
@@ -461,21 +403,6 @@ def _flag(block: dict, *keys: str) -> str:
     return "/".join(_cell(block.get(k)) for k in keys) if isinstance(block, dict) else NOT_APPLICABLE
 
 
-def _ran_no_repository_checks(audits: list) -> bool:
-    """Whether any audit recorded the workload fields or filed a check of the SOP's no-repository section.
-
-    Only for a sweep whose marker recorded no decision (``NO_REPOSITORY_FIELD``). Read off the cards
-    rather than the repository list, which can change between filing and now.
-    """
-    return any(
-        isinstance(w, dict) and isinstance(w.get(block), dict) and key in w[block]
-        for meta, _ in audits for w in _list(meta.get("workloads")) for block, key in NO_REPOSITORY_WORKLOAD_FIELDS
-    ) or any(
-        isinstance(f, dict) and _text(f.get("check")) in NO_REPOSITORY_CHECKS
-        for meta, _ in audits for f in _list(meta.get("findings"))
-    )
-
-
 def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
     """``INVENTORY.raw.md`` for one sweep, from its cards' metadata.
 
@@ -567,12 +494,7 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         gaps.append(f"the hand-off stopped waiting {deadline(state) // SECONDS_PER_MINUTE} minutes after the sweep was filed")
 
     stamp = time.strftime(STAMP_FORMAT, time.gmtime(now if now is not None else time.time()))
-    recorded = state.get(NO_REPOSITORY_FIELD)
-    wide = _ran_no_repository_checks(audits) if recorded is None else recorded != RECORDED_NO
-    owned = UNREAD_POSTURE if recorded == RECORDED_UNKNOWN else (
-        "With no GitOps repository for the first-run audits to publish to, this scan also checked liveness and "
-        "readiness probes, requests and limits, HPA, NetworkPolicy and pod security."
-        if wide else
+    owned = (
         "Liveness and readiness probes, requests and limits, HPA, NetworkPolicy and pod security are not "
         "checked by this scan: the first-run audits own them."
     )
@@ -629,11 +551,6 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         "",
     ]
     out += [
-        ("| Cluster | Namespace | Workload Name | Kind | Replicas | Probes (Live/Ready/Startup) "
-        "| Requests/Limits/QoS | Telemetry | NonRoot/ReadOnlyFS/Privileged |"),
-        ("| :------ | :-------- | :------------ | :--- | :------- | :-------------------------- "
-        "| :------------------ | :-------- | :---------------------------- |"),
-    ] if wide else [
         "| Cluster | Namespace | Workload Name | Kind | Replicas | Startup Probe | Telemetry | ReadOnlyFS |",
         "| :------ | :-------- | :------------ | :--- | :------- | :------------ | :-------- | :--------- |",
     ]
@@ -643,17 +560,10 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
                 continue
             row = f"| {_cell(meta.get('cluster'))} | {_cell(w.get('namespace'))} | {_cell(w.get('name'))} "
             row += f"| {_cell(w.get('kind'))} | {_cell(w.get('replicas'))} "
-            if wide:
-                row += (
-                    f"| {_flag(w.get('probes'), 'liveness', 'readiness', 'startup')} "
-                    f"| {_flag(w.get('resources'), 'requests', 'limits', 'qos')} | {_cell(w.get('telemetry'))} "
-                    f"| {_flag(w.get('security_context'), 'run_as_non_root', 'read_only_root_fs', 'privileged')} |"
-                )
-            else:
-                row += (
-                    f"| {_flag(w.get('probes'), 'startup')} | {_cell(w.get('telemetry'))} "
-                    f"| {_flag(w.get('security_context'), 'read_only_root_fs')} |"
-                )
+            row += (
+                f"| {_flag(w.get('probes'), 'startup')} | {_cell(w.get('telemetry'))} "
+                f"| {_flag(w.get('security_context'), 'read_only_root_fs')} |"
+            )
             out.append(row)
     lines: list[dict] = []
     out += ["", "## Prioritized SRE Remediation Plan", ""]
@@ -785,28 +695,11 @@ def _prioritize_body() -> str:
     )
 
 
-def no_repository_checks() -> str:
-    """Whether the cards run the SOP's no-repository section: ``RECORDED_YES`` when the oobe stage's
-    repository list is empty, ``RECORDED_NO`` when it names one.
-
-    A list that cannot be read is ``RECORDED_UNKNOWN``, which runs the section too: the stage retries
-    such a read rather than starting the audits, and a check made twice costs less than one nobody makes.
-    """
-    import oobe  # beside this script; it imports this module, so not at the top
-
-    try:
-        return RECORDED_NO if oobe.managed_repositories() else RECORDED_YES
-    except Exception as e:  # noqa: BLE001 - unreadable is not empty, but the cards run the checks alike
-        _log(f"cannot read the managed repositories, so the cards run the no-repository checks: {e}")
-        return RECORDED_UNKNOWN
-
-
-def _cluster_body(agent: dict, no_repository: str) -> str:
+def _cluster_body(agent: dict) -> str:
     paths = "\n".join(f"  - {p}" for p in CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
     return (
         f"Audit {agent['cluster_label']}, the cluster you are pinned to, for first-time onboarding. Follow "
         f"the single-cluster audit SOP, reading whichever of these exists:\n{paths}\n\n"
-        f"{no_repository_section(no_repository)}\n\n"
         "Complete this card with the structured `metadata` that SOP specifies; the onboarding gate reads "
         "it into the inventory report. Never block this card: record anything you could not do in `gaps` "
         "and complete."
@@ -861,8 +754,6 @@ def file_cluster_cards(state: dict, roster: list, parse_task_id) -> tuple[int, l
     have = {c["key"] for c in state["clusters"]} | state.get("archived_keys", set())
     stale = state.get("stale_keys", {})
     filed, unfiled = 0, []
-    # The sweep card's, as the gate recorded it; with none, read once, and only when a card is to be filed.
-    no_repository = state.get(NO_REPOSITORY_FIELD)
     for agent in roster:
         if agent["key"] in have:
             continue
@@ -870,9 +761,7 @@ def file_cluster_cards(state: dict, roster: list, parse_task_id) -> tuple[int, l
         if old and not _archive(old):
             unfiled.append(dict(agent, stale_card=old))
             continue
-        if no_repository is None:
-            no_repository = no_repository_checks()
-        task_id = _create(parse_task_id, agent["name"], agent["key"], agent["title"], _cluster_body(agent, no_repository))
+        task_id = _create(parse_task_id, agent["name"], agent["key"], agent["title"], _cluster_body(agent))
         if old and task_id == old:
             # run_slash reports a failed archive as text rather than raising;
             # the board handing back the old card is the sign it failed.
@@ -919,7 +808,6 @@ def hand_off(data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now:
     state = read_board(_board_path(data_dir), sweep_id)
     if state is None:
         return None
-    state[NO_REPOSITORY_FIELD] = recorded_no_repository(scan_marker)
     # Archiving the sweep, or every one of its cards, is how a person, the
     # re-arm runbook or a bench stack cancels it, often to plant a raw file of
     # their own; writing over that file once the deadline passed would undo

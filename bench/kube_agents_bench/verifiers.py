@@ -5549,11 +5549,7 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
       raw file, and no block line carries a ``check`` from the roster of one of
       the first-run audits (``FIRST_RUN_AUDIT_CHECKS``), which run after the scan
       and report those checks themselves. A check reported under a slug of its
-      own is not caught. An install with no GitOps repository is ``error``, not
-      graded: the gate records ``no_repository=yes`` in its sweep marker, the
-      first-run audits do not run, and the cards report these checks on purpose
-      (cluster_inventory_audit_sop.md, "Without a GitOps repository"). A marker
-      with no such field (an older install) is graded.
+      own is not caught.
 
     Fails closed: either pod unreadable, no sweep marker, a sweep the board
     does not know, a board that cannot be queried, or a parser the sandbox
@@ -5573,17 +5569,6 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
         where = f"sweep {sweep.get('id')} ({sweep.get('status')})"
         if self.require == "ranking_card_filed":
             return self._ranking(board, where)
-        recorded = board.get("no_repository")
-        if self.require == "raw_report_no_first_run_audit_checks" and recorded in (
-            onboarding.NO_REPOSITORY_YES, onboarding.NO_REPOSITORY_UNKNOWN
-        ):
-            return (
-                "error",
-                f"{where}: the gate recorded {onboarding.NO_REPOSITORY_FIELD}={recorded} in "
-                f"{discovery.SCAN_MARKER} (no GitOps repository, or a repository list it could not read), so the "
-                "scan's cards ran the first-run audits' checks on purpose; this objective does not apply",
-                board,
-            )
         return self._raw(board, where, read_timeout, self.require)
 
     @staticmethod
