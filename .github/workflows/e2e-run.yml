@@ -180,7 +180,16 @@ jobs:
           # owner/repo against GITHUB_ORG.
           GITHUB_ORG: ${{ vars.GITOPS_ORG }}
           GITHUB_REPO: ${{ vars.GITOPS_REPO }}
-        run: ./scripts/release/execute_e2e_tests.sh
+        # gchat_agent_test.py's wait for the reply. `next` gets 300s, as
+        # autopush-next-e2e-gchat.yml does, because its readiness gate does not
+        # cover the first turn's cold start. Exported only for `next`: the test
+        # is the candidate's, and one older than the next leg reads an empty
+        # value as int(''), so `today` must not see the key at all.
+        run: |
+          if [ "${{ steps.mode.outputs.next == 'true' }}" = true ]; then
+            export TEST_TIMEOUT_SEC=300
+          fi
+          ./scripts/release/execute_e2e_tests.sh
 
       # The script exits non-zero when any suite in the list failed, so the step
       # goes red-but-tolerated and the job summary names which one. E2E_SUITE is
@@ -201,4 +210,9 @@ jobs:
           E2E_CHAT_REFRESH_TOKEN: ${{ secrets.E2E_CHAT_REFRESH_TOKEN }}
           GITHUB_ORG: ${{ vars.GITOPS_ORG }}
           GITHUB_REPO: ${{ vars.GITOPS_REPO }}
-        run: ./scripts/release/run_optional_e2e_suites.sh
+        # 300s for `next` and nothing for `today`, as the blocking gate does.
+        run: |
+          if [ "${{ steps.mode.outputs.next == 'true' }}" = true ]; then
+            export TEST_TIMEOUT_SEC=300
+          fi
+          ./scripts/release/run_optional_e2e_suites.sh

@@ -77,14 +77,15 @@
 # THE ALERT CEILING, AND WHY IT IS NOT A BLOCKER HERE
 #
 # The daemon allows ALERT_DAILY_LIMIT_DRIFT drift injects a day per install
-# from a bucket keyed DRIFT_QUOTA_KEY (5 by default,
+# from a bucket keyed DRIFT_QUOTA_KEY (the default is in
 # agents/platform/scripts/session_kv_server.py), and a suppressed record files
 # no card at all. This case spends one inject per repetition — eleven of its
-# twelve records are meant to be dropped — and so does the sibling, so two
-# nightly drift cases at three repetitions each would be six injects against a
-# default ceiling of five.
+# twelve records are meant to be dropped — and so does the sibling. Two nightly
+# drift cases at three repetitions each spend six injects, which is below the
+# default ceiling. Other runs against the same install on the same UTC day
+# spend from the same bucket.
 #
-# That does not bite on an eval install, because the ceiling is off there:
+# The ceiling does not bite on an eval install, because it is off there:
 # hack/ci-deploy.sh sets EVAL_ALERT_DAILY_LIMIT_DRIFT="0", _alert_daily_limit
 # clamps at zero and _claim_alert_quota returns early for limit <= 0, so zero
 # means uncapped rather than "no injects". The comment on that constant
@@ -93,14 +94,15 @@
 # first record and is refused the rest, which is indistinguishable from a
 # working filter.
 #
-# It does bite on a dev install carrying the default, and the stack names it
-# directly: a ceiling refusal is a ledger row with notified=0 and an empty
-# delivery_error, which it writes as card-quota-refused. Raise the limit or
-# use a fresh install rather than reading that as a finding. card-turn-failed
-# is the other shape -- a row the daemon accepted whose card never reached a
-# terminal status, whether because the turn filed none or because it was still
-# running when the timeout elapsed -- so on that token the ceiling is precisely
-# what the explanation is not.
+# It can bite on a dev install carrying the default, when other runs spend the
+# bucket first, and the stack names it directly: a ceiling refusal is a ledger
+# row with notified=0 and an empty delivery_error, which it writes as
+# card-quota-refused. Raise the limit or use a fresh install rather than
+# reading that as a finding. card-turn-failed is the other shape -- a row the
+# daemon accepted whose card never reached a terminal status, whether because
+# the turn filed none or because it was still running when the timeout
+# elapsed -- so on that token the ceiling is precisely what the explanation is
+# not.
 #
 # WHY THE WORKLOAD NAMES CARRY A PREFIX
 #
