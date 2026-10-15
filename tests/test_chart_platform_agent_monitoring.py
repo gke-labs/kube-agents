@@ -530,6 +530,28 @@ class MonitoringRenderTest(unittest.TestCase):
                     self.assertIsInstance(val, str)
                     self.assertEqual(val, ns)
 
+    def test_gateway_netpol_omitted_when_operator_network_policy_disabled(self):
+        proc = subprocess.run(
+            [
+                "helm", "template", "test-release", str(_CHART),
+                *_REQUIRED,
+                "--set", "platformAgent.monitoringScraperNamespace=monitoring",
+                "--set", "platformAgent.networkPolicy.enabled=false",
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        netpols = {
+            doc["metadata"]["name"]: doc
+            for doc in yaml.safe_load_all(proc.stdout)
+            if isinstance(doc, dict) and doc.get("kind") == "NetworkPolicy" and "mon-netpol" in doc.get("metadata", {}).get("name", "")
+        }
+        # Gateway policy must NOT render so the unisolated gateway pod is not accidentally default-denied on 8642/8643.
+        self.assertNotIn(f"{_AGENT}-gw-mon-netpol", netpols)
+        # Credential proxy and A2A gateway policies still render because operator guardrails remain active.
+        self.assertIn(f"{_AGENT}-cred-mon-netpol", netpols)
+        self.assertIn(f"{_AGENT}-a2a-mon-netpol", netpols)
+
     def test_max_supported_agent_name_length_succeeds_under_service_monitor(self):
         # 46 chars is the operator's longest 63-character slot bound (63 - len("-credential-proxy")).
         # With shortened suffixes (<= 16 chars), no resource name or label value overflows 63 chars.

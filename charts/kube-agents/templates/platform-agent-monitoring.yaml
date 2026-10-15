@@ -113,10 +113,10 @@ spec:
 {{- end }}
 {{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentServiceMonitor" .) }}
 ---
-{{- /*
+{{/*
 Prometheus Operator ServiceMonitors and headless metrics Services for the agent's
 pods. The headless Services provide the service ports that ServiceMonitor requires.
-*/ -}}
+*/}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -265,10 +265,10 @@ spec:
 {{- end }}
 {{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentVMPodScrape" .) }}
 ---
-{{- /*
+{{/*
 VictoriaMetrics Operator VMPodScrapes for the agent's pods. Scrapes pods directly
 matching the PodMonitoring selectors.
-*/ -}}
+*/}}
 apiVersion: operator.victoriametrics.com/v1beta1
 kind: VMPodScrape
 metadata:
@@ -349,11 +349,15 @@ spec:
 {{- end }}
 
 {{- if and .Values.platformAgent.enabled .Values.platformAgent.monitoringScraperNamespace }}
+{{- if ne (dig "enabled" true (.Values.platformAgent.networkPolicy | default dict)) false }}
 ---
-{{- /*
+{{/*
 NetworkPolicy admitting metrics scrapes from the configured monitoring scraper namespace.
 The operator's own policies admit metrics ports only from gke-gmp-system.
-*/ -}}
+When operator policies are disabled via platformAgent.networkPolicy.enabled: false, the gateway
+pod has no operator Ingress policy and remains open; rendering an Ingress policy here would
+default-deny inbound traffic and isolate the agent API on 8642/8643.
+*/}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -377,6 +381,7 @@ spec:
           port: 9095
         - protocol: TCP
           port: 9097
+{{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
