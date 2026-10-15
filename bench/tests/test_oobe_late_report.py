@@ -319,6 +319,11 @@ def test_finished_waits_for_every_audit_since_the_arm(home: Path) -> None:
     # An audit the deployed stage adds is waited for too.
     stage.write_text(f"FIRST_RUN_AUDITS = {oobe_late.FIRST_RUN_AUDITS + ('upgrade-retrospective',)!r}\n")
     assert _late(home, "finished", env=env).stdout.strip() == "pending"
+    # Unless the stage held it, adopted it or gave up on it: it will get no run of the stage's.
+    for recorded in ({"held": {"upgrade-retrospective": "paused"}}, {"adopted": ["upgrade-retrospective"]},
+                     {"gave_up": ["upgrade-retrospective"]}):
+        (home / ".oobe_audits_fired").write_text(json.dumps(recorded))
+        assert _late(home, "finished", env=env).stdout.strip() == "finished", recorded
 
 
 def test_the_stage_audit_list_late_reads_is_the_stage_s() -> None:

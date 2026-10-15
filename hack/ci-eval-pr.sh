@@ -179,7 +179,7 @@ readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=3
 # stack, the verifier and the state writes around the run.
 readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
 # The longest a unit holding a state lock (unit_state_lock) keeps its stack
-# applied: oobe-late-first-message's own_wait, audits_wait and delivery_wait
+# applied: oobe-late-first-message's own_wait, chain_wait and delivery_wait
 # (bench/tf/prebuilt/oobe-late-first-message/main.tf), the longest of the cases
 # on one.
 readonly STATE_LOCK_HOLD_SECONDS=9600

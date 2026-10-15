@@ -247,7 +247,7 @@ times. It rides with the audits stage, whose eval case covers both.
 | Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                       | Automatic                                                                                             |
 | An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat | As today                                                                                              |
 | No GitOps repository   | Reports stay in the report store; a run that changed something posts a summary saying there is no forge  | None, or for ledger issues, re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md) |
-| No home channel        | Ledger issues and PRs in the repository; the first report names each audit with its ledger issue         | Set one (`/sethome`)                                                                                  |
+| No home channel        | Ledger issues and PRs in the repository; the first report names each unposted audit and its ledger       | Set one (`/sethome`)                                                                                  |
 | Sweep stuck            | Audits start at the fallback                                                                             | As today for the report                                                                               |
 | Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                     | As today for the report                                                                               |
 

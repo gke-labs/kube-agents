@@ -23,8 +23,8 @@ Usage: python3 - <home> <command> < late.py
   this cannot take away, and one whose ``oobe`` job is bound to a chat, which would post the
   report there.
 - ``finished``: print ``finished`` once each first-run audit has a run claimed at or after the
-  stage's arm (``applied_at`` in oobe-first-run-audits/arm.py's state file) that has ended, else
-  ``pending``.
+  stage's arm (``applied_at`` in oobe-first-run-audits/arm.py's state file) that has ended, or the
+  stage recorded it as adopted, held or given up on, else ``pending``.
 - ``open``: touch ``.user_aligned``, as the onboarding plugin does on a person's first message,
   and record when.
 - ``restore``: put back what ``clear`` recorded, byte for byte.
@@ -44,6 +44,10 @@ home, command = sys.argv[1:3]
 STATE = os.path.join(home, ".bench-oobe-late.json")
 # oobe-first-run-audits/arm.py: STATE.
 ARM_STATE = os.path.join(home, ".bench-oobe.json")
+# agents/chat/scripts/oobe.py: AUDITS_MARKER, and the audits it records as having had their turn
+# without a run of the stage's own: adopted (a run completed since the sweep), held, given up on.
+AUDITS_MARKER = os.path.join(home, ".oobe_audits_fired")
+HAD_TURN_KEYS = ("adopted", "gave_up", "held")
 CONFIG = os.path.join(home, "config.yaml")
 ENV_FILE = os.path.join(home, ".env")
 ALIGNED = os.path.join(home, ".user_aligned")
@@ -51,7 +55,8 @@ COMPLETED = os.path.join(home, ".bootstrap_completed")
 EXECUTIONS_DB = os.path.join(home, "profiles", "platform", "cron", "executions.db")
 TMP_SUFFIX = ".tmp"
 # The stage's audit list is read from the image's copy of oobe.py, not run, as
-# hack/ci_platform_runs.py reads it, so the chat opens after every audit the deployed stage starts.
+# hack/ci_platform_runs.py reads it, so the chat opens only once every audit on the deployed
+# stage's list has had its turn.
 STAGE_SOURCE = os.environ.get("OOBE_STAGE_SOURCE", "/opt/defaults/scripts/oobe.py")
 STAGE_AUDITS = "FIRST_RUN_AUDITS"
 IN_FLIGHT = ("claimed", "running")
@@ -164,6 +169,15 @@ def finished():
     with open(ARM_STATE, encoding="utf-8") as fh:
         since = datetime.fromisoformat(json.load(fh)["applied_at"]).timestamp()
     audits = stage_audits()
+    try:
+        with open(AUDITS_MARKER, encoding="utf-8") as fh:
+            recorded = json.load(fh)
+    except (OSError, ValueError):
+        recorded = {}
+    had_turn = set()
+    for key in HAD_TURN_KEYS:
+        value = recorded.get(key) if isinstance(recorded, dict) else None
+        had_turn.update(value if isinstance(value, (list, dict)) else ())
     if not os.path.isfile(EXECUTIONS_DB):
         print("pending")
         return
@@ -182,7 +196,7 @@ def finished():
                 ended.add(job_id)
         except (TypeError, ValueError):
             continue
-    print("finished" if ended >= set(audits) else "pending")
+    print("finished" if ended | had_turn >= set(audits) else "pending")
 
 
 def open_chat():

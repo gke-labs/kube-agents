@@ -1035,10 +1035,12 @@
 # lock.
 ./tasks/not-found-target-stops-as-failure/task.yaml
 
-# A late first message: the four first-run audits end before anyone opens the chat, so each
-# summary finds no home channel; the report sent on the first message names each one with its
-# ledger link (agents/chat/scripts/bootstrap_delivery.py). deployer: tofu, stack-bearing, the
-# four audits one after another before the message (~45-90 minutes per unit, at the 3600s hint). Counted from the lists:
-# eighty cases (240 units) here, of a ninety-four-case, 282-unit matrix
-# with the presubmit file's fourteen.
+# A late first message: the four first-run audits end before anyone opens the
+# chat, so each summary finds no home channel; the report sent on the first
+# message names each summary that was not posted, with its ledger link when it
+# has one (agents/chat/scripts/bootstrap_delivery.py). deployer: tofu,
+# stack-bearing, the four audits one after another before the message (~45-90
+# minutes per unit, at the 3600s hint). Counted from the lists: eighty cases
+# (240 units) here, of a ninety-four-case, 282-unit matrix with the presubmit
+# file's fourteen.
 ./tasks/oobe-late-first-message/task.yaml
