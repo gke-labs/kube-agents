@@ -2690,7 +2690,7 @@ unit_cost_hint() {
     # write (build 2099607409826729984); the crashloop triage takes the
     # incumbent autoops hint (same watcher and card waits) until it passes.
     ai-security-planted-model-audit) echo 1450 ;;
-    autoops-crashloop-config-triage) echo 900 ;;
+    autoops-crashloop-config-triage | autoops-missing-service-triage) echo 900 ;;
     consistency-authorized-networks-probe) echo 300 ;;
     # Median of its 1155 presubmit repetitions 2026-09-04 to 09-15 (p10 248s,
     # p90 1318s); the 200s default under-packed it by 2.7x (#1023).
