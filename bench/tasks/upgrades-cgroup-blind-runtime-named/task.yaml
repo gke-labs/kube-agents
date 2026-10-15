@@ -22,6 +22,10 @@
 # minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
 # alphabet. A sibling's name (`-canary`) is another object and is refused.
 #
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the image. A runtime at 8u372 or later in its place is
@@ -78,11 +82,12 @@ verification_spec:
       fixture_roles:
         - cgroup-blind-runtime
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^\n]*$'
 
   # The runtime slot is the planted image with its literal tag, with or without
   # `image ` and a registry path before it (`docker.io/library/`, `docker.io/`, a
-  # mirror), the way the stale-client slot reads its image; another tag reads wrong.
+  # mirror), the way the stale-client slot reads its image, and with or without
+  # the digest after the tag; another tag reads wrong.
   - name: the-declared-line-names-the-pre-cgroup-v2-runtime
     role: objective
     mode: assert
@@ -92,9 +97,9 @@ verification_spec:
       fixture_roles:
         - cgroup-blind-runtime
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?(?:image )?(?:[a-z0-9.-]+/)*eclipse-temurin:8u302-b08-jre(?: \([^)\n;]*\))?; reads cgroup v2 limits: (?:yes|no)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?(?:image )?(?:[a-z0-9.-]+/)*eclipse-temurin:8u302-b08-jre(?:@sha256: ?[0-9a-f]{64})?(?: \([^)\n;]*\))?; reads cgroup v2 limits: (?:yes|no)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?(?!(?:image )?(?:[a-z0-9.-]+/)*eclipse-temurin:8u302-b08-jre(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?(?!(?:image )?(?:[a-z0-9.-]+/)*eclipse-temurin:8u302-b08-jre(?:@sha256: ?[0-9a-f]{64})?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-says-the-runtime-is-blind-to-cgroup-v2
     role: objective
@@ -105,9 +110,9 @@ verification_spec:
       fixture_roles:
         - cgroup-blind-runtime
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: no(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: no(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?!no(?: \([^)\n;]*\))?;)[^;\n]+; memory limit:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?!no(?: \([^)\n;]*\))?;)[^;\n]+; memory limit:? ?[^ :;\n][^\n]*$'
 
   # The limit is what the misread heap is killed at; the fold lowercases the
   # quantity, and a space or a MiB spelling is the same number.
@@ -120,9 +125,9 @@ verification_spec:
       fixture_roles:
         - cgroup-blind-runtime
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no)(?: \([^)\n;]*\))?; memory limit:? ?192 ?mib?$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no)(?: \([^)\n;]*\))?; memory limit:? ?192 ?mib?$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no)(?: \([^)\n;]*\))?; memory limit:? ?(?!192 ?mib?$)[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no)(?: \([^)\n;]*\))?; memory limit:? ?(?!192 ?mib?$)[^ :;\n][^\n]*$'
 
   - name: no-invented-cves
     role: objective

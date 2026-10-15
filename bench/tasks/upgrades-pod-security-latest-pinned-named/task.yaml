@@ -16,6 +16,10 @@
 # A parenthetical after a graded value is ungraded: the judge reads it. It
 # may not carry the line's own separator, `;`.
 #
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the enforce-version label. Pinning it to a named minor
@@ -72,7 +76,7 @@ verification_spec:
       fixture_roles:
         - moving-admission-default
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
 
   - name: the-declared-line-says-the-level-is-baseline
     role: objective
@@ -83,9 +87,9 @@ verification_spec:
       fixture_roles:
         - moving-admission-default
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?baseline(?: \([^)\n;]*\))?; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?baseline(?: \([^)\n;]*\))?; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?(?!baseline(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?(?!baseline(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
 
   - name: the-declared-line-says-the-version-is-latest
     role: objective
@@ -96,9 +100,9 @@ verification_spec:
       fixture_roles:
         - moving-admission-default
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?latest(?: \([^)\n;]*\))?; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?latest(?: \([^)\n;]*\))?; rule set changes at the next minor: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?(?!latest(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?(?!latest(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
 
   - name: the-declared-line-says-the-rule-set-moves
     role: objective
@@ -109,9 +113,9 @@ verification_spec:
       fixture_roles:
         - moving-admission-default
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: yes$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?!yes$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?!yes$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

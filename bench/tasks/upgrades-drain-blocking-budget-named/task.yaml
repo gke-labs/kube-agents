@@ -24,6 +24,10 @@
 # A parenthetical after a graded value is ungraded: the judge reads it. It
 # may not carry the line's own separator, `;`.
 #
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the budget's maxUnavailable. Widening it to 1 is the
@@ -89,7 +93,7 @@ verification_spec:
       fixture_roles:
         - readiness-drain-blocked
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/pinned-batch-runner(?:\s*\([^)\n]*\))?: maxunavailable:? ?[^ :;\n][^;\n]*; minavailable:? ?[^ :;\n][^;\n]*; disruptionsallowed:? ?\d+(?: \([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: maxunavailable:? ?[^ :;\n][^;\n]*; minavailable:? ?[^ :;\n][^;\n]*; disruptionsallowed:? ?\d+(?: \([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
 
   - name: the-declared-line-carries-the-budgets-evidence
     role: objective
@@ -100,10 +104,10 @@ verification_spec:
       fixture_roles:
         - readiness-drain-blocked
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/pinned-batch-runner(?:\s*\([^)\n]*\))?: maxunavailable:? ?0%?(?: \([^)\n;]*\))?; minavailable:? ?[^ :;\n][^;\n]*; disruptionsallowed:? ?0(?: \([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: maxunavailable:? ?0%?(?: \([^)\n;]*\))?; minavailable:? ?[^ :;\n][^;\n]*; disruptionsallowed:? ?0(?: \([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/pinned-batch-runner(?:\s*\([^)\n]*\))?: maxunavailable:? ?(?!0%?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; minavailable:? ?[^ :;\n][^;\n]*; disruptionsallowed:? ?\d+(?: \([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/pinned-batch-runner(?:\s*\([^)\n]*\))?: maxunavailable:? ?[^ :;\n][^;\n]*; minavailable:? ?[^ :;\n][^;\n]*; disruptionsallowed:? ?(?!0(?: \([^)\n;]*\))?;)\d+(?: \([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: maxunavailable:? ?(?!0%?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; minavailable:? ?[^ :;\n][^;\n]*; disruptionsallowed:? ?\d+(?: \([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: maxunavailable:? ?[^ :;\n][^;\n]*; minavailable:? ?[^ :;\n][^;\n]*; disruptionsallowed:? ?(?!0(?: \([^)\n;]*\))?;)\d+(?: \([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
 
   - name: the-declared-line-says-the-budget-blocks-a-drain
     role: objective
@@ -114,9 +118,9 @@ verification_spec:
       fixture_roles:
         - readiness-drain-blocked
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/pinned-batch-runner(?:\s*\([^)\n]*\))?: maxunavailable:? ?[^ :;\n][^;\n]*; minavailable:? ?[^ :;\n][^;\n]*; disruptionsallowed:? ?\d+(?: \([^)\n;]*\))?; blocks a drain: yes$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: maxunavailable:? ?[^ :;\n][^;\n]*; minavailable:? ?[^ :;\n][^;\n]*; disruptionsallowed:? ?\d+(?: \([^)\n;]*\))?; blocks a drain: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/pinned-batch-runner(?:\s*\([^)\n]*\))?: maxunavailable:? ?[^ :;\n][^;\n]*; minavailable:? ?[^ :;\n][^;\n]*; disruptionsallowed:? ?\d+(?: \([^)\n;]*\))?; blocks a drain: (?!yes$)[^\n]+$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: maxunavailable:? ?[^ :;\n][^;\n]*; minavailable:? ?[^ :;\n][^;\n]*; disruptionsallowed:? ?\d+(?: \([^)\n;]*\))?; blocks a drain: (?!yes$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective
