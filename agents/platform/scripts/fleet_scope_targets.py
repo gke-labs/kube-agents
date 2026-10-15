@@ -189,10 +189,23 @@ class ScopeTargets:
     # the operator left out from one the declaration never named, as the
     # upgrade-readiness watch does for a roster project the report refused.
     excluded: tuple[str, ...] = ()
+    # The folders, organisations and selectors the declaration names, as the
+    # reconcile keys their lookups (`folders/<id>`, `organizations/<id>`,
+    # `sharedVpcHosts/<host>`, `metricsScopes/<scope>`), sorted. Never in the
+    # sweep and never in the collector flags; carried so a reader that holds a
+    # project's cause across a failed lookup can tell a container the
+    # declaration had, whose failed lookup carries the members it had, from
+    # one it has just gained, whose failed lookup carries none, as the
+    # upgrade-readiness watch does.
+    declared_containers: tuple[str, ...] = ()
 
     def excludes(self, project: str) -> bool:
-        """Whether an exclude entry names the project, by its id: the match the
-        reader makes when it skips a declared project, so the two agree."""
+        """Whether an exclude entry matches the project's id: the match the
+        reader makes when it skips a declared project, so the two agree. Not
+        whether the entry is why the project has no row, which only the
+        reconcile knows: a project under no part of the declaration matches a
+        glob the same way, and a member a Metrics Scope named by number is
+        dropped on the number, which no id matches."""
         return any(fnmatch.fnmatchcase(project, entry) for entry in self.excluded)
 
     def collector_argv(self) -> tuple[str, ...]:
@@ -263,6 +276,17 @@ def _read_render() -> dict | None:
     return parsed
 
 
+def _declared_containers(declared: dict) -> tuple[str, ...]:
+    """The folders, organisations and selectors a declaration names, keyed as
+    the reconcile keys their lookups, sorted."""
+    return tuple(sorted(
+        f"{key}/{entry}"
+        for key in CONTAINER_AND_SELECTOR_KEYS
+        for entry in (declared.get(key) if isinstance(declared.get(key), list) else [])
+        if isinstance(entry, str) and entry
+    ))
+
+
 def _from_render(path: Path) -> ScopeTargets | None:
     """The answer when no snapshot answers: the render's boundary, the host
     swept and a fixed unresolved row plus every project the render declares
@@ -294,6 +318,7 @@ def _from_render(path: Path) -> ScopeTargets | None:
         note=note,
         excluded_clusters=_excluded_clusters(render),
         excluded=tuple(exclude_patterns),
+        declared_containers=_declared_containers(render),
     )
 
 
@@ -378,4 +403,5 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
         path=str(path),
         excluded_clusters=_excluded_clusters(declared),
         excluded=(*exclude_patterns, *(p for p in sorted(dropped) if p not in exclude_patterns)),
+        declared_containers=_declared_containers(declared),
     )
