@@ -324,8 +324,13 @@ resource "null_resource" "deleted_policy" {
       # controller touching annotations, say -- would make index 0 the wrong
       # manager and hard-exit this plant against a scenario that is in fact
       # correct. The sibling stacks use the same form.
+      # Not swallowed with `2>/dev/null || true`: a failing read would then
+      # produce an empty list and send the script into the branch below, which
+      # blames the server-side apply for a transport error that has nothing to
+      # do with it. Under errexit a failing kubectl aborts here with its own
+      # stderr, which is the honest failure.
       policy_managers="$(kubectl get networkpolicy "${local.policy}" -n "${local.ns}" \
-        -o jsonpath='{range .metadata.managedFields[*]}{.manager}{"\n"}{end}' 2>/dev/null || true)"
+        -o jsonpath='{range .metadata.managedFields[*]}{.manager}{"\n"}{end}')"
       if ! printf '%s\n' "$policy_managers" | grep -qxF "${var.gitops_field_manager}"; then
         echo "ERROR: ${local.policy} does not record field manager '${var.gitops_field_manager}', so the policy this run is about to delete was never owned by the GitOps manager and the scenario would be a fiction. Managers found:" >&2
         printf '%s\n' "$policy_managers" >&2
@@ -352,8 +357,12 @@ resource "null_resource" "deleted_policy" {
       # impact sentence -- every pod here now accepts traffic from anywhere in
       # the cluster -- is only true if nothing else is still selecting them, and
       # the task's safeguard asserts the same emptiness at the end of the run.
+      # stderr is kept for the same reason the read above keeps it: kubectl
+      # writes "No resources found" there and exits zero, which is the
+      # expected case, while a transport failure exits non-zero and aborts the
+      # pipeline with a line saying what broke rather than with a bare trap.
       remaining="$(kubectl get networkpolicies -n "${local.ns}" \
-        --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+        --no-headers | wc -l | tr -d ' ')"
       if [ "$remaining" != "0" ]; then
         echo "ERROR: ${local.ns} still holds $remaining NetworkPolicy object(s) after the deletion, so the namespace is not open and the impact the card asks the agent to weigh is not the one this stack planted." >&2
         kubectl get networkpolicies -n "${local.ns}" >&2 || true

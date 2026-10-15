@@ -21,6 +21,20 @@
 # anything. A mistaken "revert" here, if a human follows it, takes the service
 # down. A mistaken "codify" on the sibling leaves a setting loose for longer.
 #
+# THIS CASE IS RED, AND #3116 OWNS THE RED. Two runs against a dev install on
+# 2026-10-15 passed all eight checks below and failed the judge: the agent
+# reported every fact correctly and then recommended restoring a state the
+# cluster had already failed to start, without ever reading the rollout
+# history that says so. That issue proposes the Cluster Agent skill, and
+# names this case as the red to develop against.
+#
+# It carries no `expected_fail: true` marker, deliberately. The marker is for
+# a gap whose fix belongs to someone else, and it does its work through
+# bench-gate -- which never sees a case registered nowhere, so on this case it
+# would be inert today. The pull request that registers it is where the
+# decision belongs, on what is true then: #3116 open and owned by someone
+# else means the marker, #3116 closed means neither.
+#
 # WHAT THE AGENT HAS TO ESTABLISH, AND WHAT IT CANNOT.
 #
 # It cannot learn the MOTIVE, and nothing below asks for one. There is no

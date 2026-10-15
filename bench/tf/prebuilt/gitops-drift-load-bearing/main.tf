@@ -88,11 +88,15 @@ locals {
   # namespace/resource/name).
   resource_path = "${var.drift_namespace}/deployments/${var.workload_name}"
 
-  # The field the out-of-band edit takes, as the ownership block will render
-  # it. One place, because the patch, the assertion and the payload all name
-  # it and a rename reaching two of the three leaves the card describing
-  # ownership the agent cannot find on the live object.
-  drifted_path = ".spec.template.spec.securityContext.runAsNonRoot"
+  # The fields the out-of-band edits take, as the ownership block renders
+  # them. Both are listed because both are taken: steps 3 and 4 patch
+  # runAsUser as well as runAsNonRoot, each under the drift field manager, and
+  # a server-side Update claims every field whose value it changed. The
+  # detector builds `owners` from the live managedFields, so a record naming
+  # only runAsNonRoot would describe ownership the agent contradicts the
+  # moment it does what the card asks and reads the live object.
+  drifted_path      = ".spec.template.spec.securityContext.runAsNonRoot"
+  drifted_user_path = ".spec.template.spec.securityContext.runAsUser"
 
   # Seconds. Hoisted because each bounds a different failure and inline they
   # read as one arbitrary number repeated.
@@ -242,6 +246,33 @@ resource "null_resource" "load_bearing_change" {
           kubectl get namespace "${local.ns}" -o yaml >&2 || true
           exit 1
         fi
+      fi
+
+      # ---- 0c. Refuse a daemon that cannot take the record ------------------
+      # A daemon predating the `gitops-drift` dispatch takes the payload down
+      # its event path instead, grades it as a Warning Pod alert for `default/`,
+      # answers 200, and files a card that has nothing to do with drift. Every
+      # objective would then fail against a card that looks plausible in the
+      # transcript, which is the worst way for a fixture to be wrong.
+      #
+      # BEFORE THE PLANT, unlike the sibling stacks, which probe after theirs.
+      # This reads nothing the plant produces -- only the kubeconfig from step
+      # 0 and four plain variables -- and this stack's plant is the expensive
+      # half of the file: three observed rollouts, two of them waiting out a
+      # failure. Probing afterwards would spend those minutes, tear the
+      # namespace back down and then report a condition that was knowable in
+      # ten seconds. The sibling ordering costs nothing because its plant is
+      # two kubectl calls; here it would cost the whole plant.
+      pod="deployment/${var.agent_deployment}"
+      exec_in_pod=(kubectl exec "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
+      exec_in_pod_stdin=(kubectl exec -i "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
+
+      # jq runs inside the pod rather than on the runner: the agent image
+      # installs it, and the Prow runner has no jq in any of hack/'s scripts.
+      kinds="$("$${exec_in_pod[@]}" sh -c 'curl -sS --max-time 10 "$1/healthz" | jq -r ".inject_kinds[]?"' sh "${var.daemon_url}" || true)"
+      if ! printf '%s\n' "$kinds" | grep -qxF 'gitops-drift'; then
+        echo "ERROR: the Session KV daemon at ${var.daemon_url} does not advertise the 'gitops-drift' inject kind (it advertises: $kinds). This install predates the drift dispatch, so a record sent to it would be graded as a Warning Pod event and reported back as delivered. Redeploy the agent image before running this case." >&2
+        exit 1
       fi
 
       # ---- 1. Apply what git declares (revision 1) --------------------------
@@ -490,25 +521,7 @@ resource "null_resource" "load_bearing_change" {
       fi
       echo "Planted ${local.resource_path}: three revisions -- declared (unrunnable), non-root uid (crash-looped), root (healthy)."
 
-      # ---- 6. Refuse a daemon that cannot take the record -------------------
-      # A daemon predating the `gitops-drift` dispatch takes the payload down
-      # its event path instead, grades it as a Warning Pod alert for `default/`,
-      # answers 200, and files a card that has nothing to do with drift. Every
-      # objective would then fail against a card that looks plausible in the
-      # transcript, which is the worst way for a fixture to be wrong.
-      pod="deployment/${var.agent_deployment}"
-      exec_in_pod=(kubectl exec "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
-      exec_in_pod_stdin=(kubectl exec -i "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
-
-      # jq runs inside the pod rather than on the runner: the agent image
-      # installs it, and the Prow runner has no jq in any of hack/'s scripts.
-      kinds="$("$${exec_in_pod[@]}" sh -c 'curl -sS --max-time 10 "$1/healthz" | jq -r ".inject_kinds[]?"' sh "${var.daemon_url}" || true)"
-      if ! printf '%s\n' "$kinds" | grep -qxF 'gitops-drift'; then
-        echo "ERROR: the Session KV daemon at ${var.daemon_url} does not advertise the 'gitops-drift' inject kind (it advertises: $kinds). This install predates the drift dispatch, so a record sent to it would be graded as a Warning Pod event and reported back as delivered. Redeploy the agent image before running this case." >&2
-        exit 1
-      fi
-
-      # ---- 7. Hand the daemon the record ------------------------------------
+      # ---- 6. Hand the daemon the record ------------------------------------
       # The key is read from the pod's own environment inside the exec, never
       # passed in: SESSION_KV_API_KEY is on this container and a value that
       # crossed the runner would be one argv away from a CI log.
@@ -520,7 +533,7 @@ resource "null_resource" "load_bearing_change" {
         exit 1
       fi
 
-      # Minted per apply, and the card poll in step 8 matches on it. That is
+      # Minted per apply, and the card poll in step 7 matches on it. That is
       # what makes the poll run-scoped without a per-run object name.
       insert_id="eval-drift-privilege-$(date -u +%s)-$RANDOM"
       changed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -560,7 +573,7 @@ resource "null_resource" "load_bearing_change" {
           {
             "manager": "${var.drift_field_manager}",
             "operation": "Update",
-            "paths": ["${local.drifted_path}"]
+            "paths": ["${local.drifted_path}", "${local.drifted_user_path}"]
           }
         ],
         "reconciled": false
@@ -601,7 +614,7 @@ resource "null_resource" "load_bearing_change" {
       fi
       echo "Daemon accepted the drift record (insert_id=$insert_id)."
 
-      # ---- 8. Wait for the card ---------------------------------------------
+      # ---- 7. Wait for the card ---------------------------------------------
       # The inject returns as soon as the daemon has queued the front-door turn,
       # and that turn -- one kanban_create against the cluster agent scoped to
       # ${var.host_cluster_name} -- is what puts the card on the board. Without

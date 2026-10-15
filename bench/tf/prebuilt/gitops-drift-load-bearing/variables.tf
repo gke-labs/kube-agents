@@ -165,6 +165,20 @@ variable "workload_command" {
   type        = string
   description = "Shell command for workload_name. MUST fail as a non-root uid, so the only working state is root."
   default     = "touch /etc/needs-root && sleep 3600"
+
+  # Terraform substitutes this value before bash or the YAML parser sees it,
+  # and it lands in two places that cannot defend themselves: a double-quoted
+  # YAML flow scalar in the step-1 manifest, where a `"` ends the scalar and
+  # the apply dies on a parse error naming no variable, and a double-quoted
+  # bash string in step 3's progress line, where a `$(...)` is a substitution
+  # the RUNNER executes. Neither is reachable from a task.yaml today -- no
+  # case sets this and the default contains neither character -- so this is a
+  # guard for the next person to edit the command, and it fails at plan time
+  # with a sentence instead of at apply time with a YAML error.
+  validation {
+    condition     = !can(regex("[\"$\\\\`]", var.workload_command))
+    error_message = "workload_command must not contain a double quote, dollar sign, backslash or backtick: it is spliced into a YAML flow scalar and into a double-quoted shell string, and either character escapes its context. Rewrite the command without them, or change the rendering in main.tf to a YAML block scalar first."
+  }
 }
 
 # Identify the CI run that planted this, so a janitor can find what a run killed

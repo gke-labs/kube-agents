@@ -297,11 +297,32 @@ verification_spec:
       # and matching is substring on a normalized string that lowercases but
       # leaves hyphens alone, so each spelling needs its own entry.
       #
-      # Separate from the name check above rather than folded into it: the name
-      # proves the report found the right object, this proves it understood
-      # what that object was. A report naming the policy without ever saying it
-      # is a NetworkPolicy cannot have weighed what its absence means.
-      any_of_phrases: ["networkpolicy", "network policy"]
+      # Separate from the name check above rather than folded into it: the
+      # name proves the report found the right object, this proves it said
+      # what kind of object it was.
+      #
+      # BOTH NUMBERS, because the matcher does no stemming and the singular is
+      # not a substring of the plural: "networkpolicies" does not contain
+      # "networkpolicy" (policy/polici), so a report writing "the namespace
+      # now has no NetworkPolicies" would red while saying exactly the right
+      # thing. The sibling's list dodges this by accident -- "replica" IS
+      # inside "replicas" -- and the y/ies pairs here do not get that for
+      # free.
+      #
+      # One consequence worth naming rather than hiding: the plural form is
+      # also what the card's resource path carries
+      # ("eval-drift-policy/networkpolicies/eval-workload-netpol"), so a
+      # verbatim reproduction now satisfies this check. That is the right
+      # trade -- a report quoting the path HAS named the kind -- and it means
+      # this check does not evidence understanding. The impact objective in
+      # expected_output is what does.
+      any_of_phrases:
+        [
+          "networkpolicy",
+          "networkpolicies",
+          "network policy",
+          "network policies",
+        ]
 
   - name: triage-says-the-policy-was-deleted
     role: objective
@@ -313,12 +334,19 @@ verification_spec:
       # summary line -- the payload's `summary` reaches the chat alert and the
       # ledger row, not the body -- and what the body carries is
       # "- **What:** `delete` via `io.k8s.networking.v1.networkpolicies.delete`",
-      # which matches none of the three phrasings below. So this is a check on
-      # the agent's own prose rather than on a transcription, and the failure
-      # it catches is a report describing a policy that was "changed" or
-      # "loosened": every remediation such a report proposes is about editing
-      # an object that does not exist.
-      any_of_phrases: ["deleted", "deletion", "removed"]
+      # which matches none of the phrasings below -- "delete" does not contain
+      # "deleted". So this stays a check on the agent's own prose rather than
+      # on a transcription, and the failure it catches is a report describing
+      # a policy that was "changed" or "loosened": every remediation such a
+      # report proposes is about editing an object that does not exist.
+      #
+      # Four entries, not two, because the matcher does no stemming and these
+      # are the forms a correct report actually reaches for: "was deleted",
+      # "the deletion", "was removed", "its removal". A bare "delet"/"remov"
+      # stem would cover more and would also let the card's own `delete` verb
+      # satisfy the check, which is the one thing this objective is written to
+      # exclude.
+      any_of_phrases: ["deleted", "deletion", "removed", "removal"]
 
   - name: triage-delivers-an-actionable-report
     role: objective
