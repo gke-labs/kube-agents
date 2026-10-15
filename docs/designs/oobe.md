@@ -247,7 +247,7 @@ times. It rides with the audits stage, whose eval case covers both.
 | Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                       | Automatic                                                                                             |
 | An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat | As today                                                                                              |
 | No GitOps repository   | Reports stay in the report store; a run that changed something posts a summary saying there is no forge  | None, or for ledger issues, re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md) |
-| No home channel        | Ledger issues and pull requests appear in the repository with no chat summary                            | Set one (`/sethome`)                                                                                  |
+| No home channel        | Ledger issues in the repository; the report sent on the first message lists each and links its ledger    | Set one (`/sethome`)                                                                                  |
 | Sweep stuck            | Audits start at the fallback                                                                             | As today for the report                                                                               |
 | Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                     | As today for the report                                                                               |
 
@@ -259,8 +259,11 @@ times. It rides with the audits stage, whose eval case covers both.
 - **[#1866](https://github.com/gke-labs/kube-agents/issues/1866)'s 30, 45 and 60 minute targets for cost, security and reliability findings.** The
   chain starts at scan completion in #1866's order, so each audit lands as soon as the ones before
   it end; nothing holds a finding back to meet a target.
-- **Reaching an install with no home channel.** Audit summaries go to the home channel only.
-  Posting the report there at T+0 when one is set is a separate change.
+- **Reaching an install with no home channel.** Audit summaries go to the home channel only. An
+  audit that finishes before anyone opens the chat posts nothing, and nothing posts it later; the
+  onboarding report, sent on the first message, names it and links its ledger issue
+  (`bootstrap_delivery._undelivered_audits`). Posting the report there at T+0 when one is set is a
+  separate change.
 - **An install self-check.** Not asked for by any issue.
 
 ## 8. Build order and evaluation

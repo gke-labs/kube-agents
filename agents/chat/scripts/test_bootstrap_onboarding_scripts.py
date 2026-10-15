@@ -33,11 +33,13 @@ import os
 import shutil
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import types
+from datetime import datetime, timezone
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1726,6 +1728,119 @@ class FirstRunAuditsTest(unittest.TestCase):
                 self.assertIn("Not run: `fleet-wide-cost-analysis` (", note)
                 self.assertNotIn("now running", note)
                 self.assertNotIn("which have started", note)
+
+    def _run(self, audit: str, claimed_at: float, outcome: str | None, columns: bool = True) -> None:
+        """A completed run of ``audit`` in the Platform Agent's cron store, ending a minute after its claim."""
+        cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
+        cron.mkdir(parents=True, exist_ok=True)
+        extra = ", finished_at TEXT, delivery_outcome TEXT" if columns else ""
+        with sqlite3.connect(cron / oobe.EXECUTIONS_DB) as conn:
+            conn.execute(f"CREATE TABLE IF NOT EXISTS executions (job_id TEXT, status TEXT, claimed_at TEXT{extra})")
+            stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()  # noqa: E731
+            if columns:
+                conn.execute("INSERT INTO executions VALUES (?, 'completed', ?, ?, ?)",
+                             (audit, stamp(claimed_at), stamp(claimed_at + 60), outcome))
+            else:
+                conn.execute("INSERT INTO executions VALUES (?, 'completed', ?)", (audit, stamp(claimed_at)))
+
+    def _document(self, audit: str, response: str, saved_at: float) -> None:
+        """The document the scheduler saves for a run, under the profile's cron/output/<job>/."""
+        out = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR / "output" / audit
+        out.mkdir(parents=True, exist_ok=True)
+        doc = out / f"{int(saved_at)}.md"
+        doc.write_text(f"# Cron Job: {audit}\n\n## Prompt\n\nSee https://x.test/o/r/issues/99\n\n## Response\n\n{response}\n",
+                       encoding="utf-8")
+        os.utime(doc, (saved_at, saved_at))
+
+    def _finished_chain(self, outcome: str | None) -> dict:
+        """All four audits marked and completed after their marks, each run's delivery ending ``outcome``."""
+        now = time.time()
+        marks = {a: now - 3600 + i * 600 for i, a in enumerate(oobe.FIRST_RUN_AUDITS)}
+        for i, audit in enumerate(oobe.FIRST_RUN_AUDITS):
+            self._run(audit, marks[audit] + 30, outcome)
+            self._document(
+                audit,
+                f"Let's format the final response.\n- **Ledger Issue:** [Audit #{i + 1}](https://github.com/o/r/issues/{i + 1})",
+                marks[audit] + 90,
+            )
+        return {oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_MARKS: marks, oobe.STATE_DONE: True}
+
+    def test_audits_that_finished_before_a_home_channel_are_listed_with_their_ledgers(self):
+        note = self._note(self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
+        self.assertIn("which have run: `fleet-wide-cost-analysis`", note)
+        self.assertNotIn("have started", note)
+        self.assertIn("so their summaries were not posted: "
+                      "`fleet-wide-cost-analysis` (findings: https://github.com/o/r/issues/1), "
+                      "`compliance-audit` (findings: https://github.com/o/r/issues/2), "
+                      "`obtainability-audit` (findings: https://github.com/o/r/issues/3), "
+                      "`stockout-prevention` (findings: https://github.com/o/r/issues/4).", note)
+        # Only the link is taken from the run's message; its prose and the prompt's links are not.
+        self.assertNotIn("Let's format", note)
+        self.assertNotIn("issues/99", note)
+
+    def test_delivered_summaries_are_not_listed(self):
+        for outcome in ("delivered", "suppressed", None):
+            with self.subTest(outcome=outcome):
+                self._tmp.cleanup()
+                self.d.mkdir()
+                note = self._note(self._finished_chain(outcome))
+                self.assertIn("which have run:", note)
+                self.assertNotIn("not posted", note)
+
+    def test_a_later_run_that_delivered_clears_an_earlier_failure(self):
+        state = self._finished_chain(bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", time.time() - 10, "delivered")
+        note = self._note(state)
+        self.assertNotIn("`compliance-audit` (findings", note)
+        self.assertIn("`stockout-prevention` (findings", note)
+
+    def test_an_undelivered_audit_with_no_document_for_its_run_is_named_without_a_link(self):
+        now = time.time()
+        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
+        # A document from an earlier run: its link may not be this run's ledger.
+        self._document("compliance-audit", "https://github.com/o/r/issues/7", now - 86400)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
+                           oobe.STATE_DONE: True})
+        self.assertTrue(note.endswith("were not posted: `compliance-audit`. Ask me for any of these reports."))
+
+    def test_a_run_from_before_the_mark_is_not_the_first_run(self):
+        now = time.time()
+        self._run("compliance-audit", now - 86400, bootstrap_delivery.DELIVERY_FAILED)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
+                           oobe.STATE_DONE: True})
+        self.assertIn("which have started: `compliance-audit`.", note)
+        self.assertNotIn("not posted", note)
+
+    def test_a_store_without_the_outcome_column_lists_nothing(self):
+        now = time.time()
+        self._run("compliance-audit", now - 600, None, columns=False)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
+                           oobe.STATE_DONE: True})
+        self.assertIn("which have run: `compliance-audit`.", note)
+        self.assertNotIn("not posted", note)
+
+    def test_an_unreadable_store_keeps_the_note_it_had(self):
+        cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
+        cron.mkdir(parents=True)
+        (cron / oobe.EXECUTIONS_DB).write_text("not a database", encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
+        self.assertIn("which have started:", note)
+        self.assertNotIn("not posted", note)
+
+    def test_the_text_delivery_carries_the_undelivered_summaries(self):
+        oobe.write_state(self.d, self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
+        (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n", encoding="utf-8")
+        out = io.StringIO()
+        with (
+            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.assertIn("`stockout-prevention` (findings: https://github.com/o/r/issues/4)", out.getvalue())
 
     def test_a_chain_under_way_names_a_held_audit_as_not_run(self):
         note = self._note({oobe.STATE_FIRED: ["fleet-wide-cost-analysis"],
