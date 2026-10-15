@@ -31,6 +31,10 @@
 # The `suspended` slot is the field `spec.suspend` itself, so it takes the
 # field's boolean (`true`, `false`) beside `yes` and `no`.
 #
+# The accelerator may carry its nodeSelector key before the value
+# (`cloud.google.com/gke-accelerator=nvidia-l4`, or with a colon), and the CUDA
+# pin may read as the image tag (`12.2.0-base-ubuntu22.04`).
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguards: the image and the suspend flag. An image built for
@@ -101,9 +105,9 @@ verification_spec:
       fixture_roles:
         - cuda-pinned-gpu-job
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?nvidia-l4(?: \([^)\n;]*\))?; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|true|no|false)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?(?:cloud\.google\.com/gke-accelerator(?:: ?|=))?nvidia-l4(?: \([^)\n;]*\))?; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|true|no|false)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?(?!nvidia-l4(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|true|no|false)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?(?!(?:cloud\.google\.com/gke-accelerator(?:: ?|=))?nvidia-l4(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|true|no|false)$'
 
   # The CUDA pin, with or without its patch.
   - name: the-declared-line-names-the-cuda-pin
@@ -115,9 +119,9 @@ verification_spec:
       fixture_roles:
         - cuda-pinned-gpu-job
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?12\.2(?:\.0)?(?: \([^)\n;]*\))?; suspended: (?:yes|true|no|false)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?12\.2(?:\.0)?(?:-[a-z0-9.]+)*(?: \([^)\n;]*\))?; suspended: (?:yes|true|no|false)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?(?!12\.2(?:\.0)?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; suspended: (?:yes|true|no|false)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?[^ :;\n][^;\n]*; cuda:? ?(?!12\.2(?:\.0)?(?:-[a-z0-9.]+)*(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; suspended: (?:yes|true|no|false)$'
 
   # The job is suspended: an inventory that saw it saw that, and one that
   # skipped suspended workloads has no line at all.

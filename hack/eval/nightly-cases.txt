@@ -393,8 +393,10 @@
 # postsubmit reconcile that followed #2916 failed on seeded-b's pin (#3025,
 # fixed by #3042); the reconcile report and a scan reading every role healthy
 # on every project are cited here when a clean one exists
-# (docs/designs/bench-case-format.md, Registration). Until then a case that
-# reads an absent role on a project fails there, as the record shows.
+# (docs/designs/bench-case-format.md, Registration). Until then, on a project
+# that lacks a role, a repetition errors as CHECK_DID_NOT_RUN, a broken
+# environment the gate excludes, not a failed case, as the entry-6 comment
+# says.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:

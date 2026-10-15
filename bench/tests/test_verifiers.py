@@ -7824,7 +7824,8 @@ _GROUP3 = {
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: four — seeded-reliability, seeded-debug, seeded-capacity and seeded-deprecation",
             "seeded-a: dataplane legacy (kube-proxy, no Calico); networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-stall, seeded-token, seeded-headroom and seeded-reliability",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 9 (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, seeded-stall, seeded-token, seeded-headroom, seeded-shapes, seeded-defaults)",
-        ],
+                    "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability: default-deny, seeded-debug: default-deny, seeded-capacity: default-deny, seeded-deprecation: apiserver-egress-only",
+],
         [
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, namespace/none",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, zero",
@@ -7943,7 +7944,8 @@ _GROUP5 = {
             "1. seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192 MiB",
         
             "seeded-a/seeded-shapes/deployment.apps/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre@sha256:a1b2cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc; reads cgroup v2 limits: no; memory limit 192Mi",
-            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre@sha256:0f1eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; reads cgroup v2 limits: no; memory limit 192Mi",],
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre@sha256:0f1eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; reads cgroup v2 limits: no; memory limit 192Mi",            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime image: eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192Mi",
+],
         [
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u372-b07-jre@sha256:0f1eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; reads cgroup v2 limits: no; memory limit 192Mi",
             # A gloss may not carry the line's own separator: the slots are read by `;`.
@@ -8003,14 +8005,16 @@ _GROUP5 = {
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator: nvidia-l4; cuda: 12.2; suspended: yes",
             "- `seeded-a/seeded-shapes/cuda-pinned-trainer`: accelerator `nvidia-l4`; CUDA 12.2.0; suspended: yes.",
             "**seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: yes**",
-        ],
+                    "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator cloud.google.com/gke-accelerator=nvidia-l4; cuda 12.2.0-base-ubuntu22.04; suspended: yes",
+],
         [
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: false",
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-tesla-t4; cuda 12.2; suspended: yes",
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.4; suspended: yes",
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: no",
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: yes (not running)",
-        ],
+                    "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.4.1-base-ubuntu22.04; suspended: yes",
+],
         "No running workload on the seeded clusters requests a GPU; there is nothing to check against the target image's driver.",
     ),
 }
@@ -8081,7 +8085,9 @@ _GROUP2 = {
             "**seeded-b/seeded-upgrade/pinned-batch-runner**: maxUnavailable 0%; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
             "1. seeded-b (us-central1-a)/seeded-upgrade/pinned-batch-runner: maxUnavailable 0 (0); minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
         
-            "seeded-b/seeded-upgrade/pdb/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",],
+            "seeded-b/seeded-upgrade/pdb/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",            "seeded-b/seeded-upgrade/pinned-batch-runner: max unavailable 0; min available none; allowed disruptions 0; blocks a drain: yes",
+            "seeded-b/seeded-upgrade/pinned-batch-runner: max-unavailable 0; min-available none; disruptions allowed 0; blocks a drain: yes",
+],
         [
             "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 1; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
             "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 1; blocks a drain: yes",
@@ -8207,13 +8213,15 @@ _GROUP4 = {
             "1. seeded-a (us-central1-a)/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch",
                     "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch: amd64; deprecated: yes; replacement kubernetes.io/arch",
             "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch=amd64; deprecated: yes; replacement kubernetes.io/arch",
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch=amd64; deprecated: yes; replacement kubernetes.io/arch=amd64",
 ],
         [
             "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/os; deprecated: yes; replacement kubernetes.io/arch",
             "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: no; replacement kubernetes.io/arch",
             "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement none",
             "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch (since 1.14)",
-        ],
+                    "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch=amd64; deprecated: yes; replacement kubernetes.io/os=linux",
+],
         "No workload on the seeded clusters selects nodes by a deprecated label; every nodeSelector names a GA key.",
     ),
     "upgrades-containerd-socket-agent-named": (
@@ -8243,6 +8251,8 @@ _GROUP4 = {
             "1. seeded-a (us-central1-a)/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
         
             "seeded-a/pv/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",            "seeded-a/intree-pd: source gcePersistentDisk (in-tree); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree (gcePersistentDisk); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk (in-tree, migrated to pd.csi.storage.gke.io); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
 ],
         [
             "seeded-a/intree-pd: source csi; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
