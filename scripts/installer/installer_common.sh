@@ -1405,13 +1405,27 @@ tf_state_prefix() {
 # API" in this message, and both end the same way. Matching lifecycle.sh.
 KMS_API_PROPAGATION_PATTERN="${KMS_API_PROPAGATION_PATTERN:-KMS\)? API has not been used in project}"
 KMS_API_PROPAGATION_ATTEMPTS="${KMS_API_PROPAGATION_ATTEMPTS:-5}"
+if [[ ! "$KMS_API_PROPAGATION_ATTEMPTS" =~ ^[0-9]+$ ]] || [ "$KMS_API_PROPAGATION_ATTEMPTS" -lt 1 ]; then
+  KMS_API_PROPAGATION_ATTEMPTS=5
+fi
 KMS_API_PROPAGATION_WAIT_SECONDS="${KMS_API_PROPAGATION_WAIT_SECONDS:-60}"
+if [[ ! "$KMS_API_PROPAGATION_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
+  KMS_API_PROPAGATION_WAIT_SECONDS=60
+fi
 
 # Retries a Cloud KMS command on Cloud KMS's first-enablement 403
 # (KMS_API_PROPAGATION_PATTERN). On a fresh GCP project, Cloud KMS can answer 403
 # for a few minutes after being enabled. Output of the command is preserved and
 # echoed on completion; retry warnings are printed to stderr.
 retry_kms_create() {
+  local max_attempts="${KMS_API_PROPAGATION_ATTEMPTS:-5}"
+  if [[ ! "$max_attempts" =~ ^[0-9]+$ ]] || [ "$max_attempts" -lt 1 ]; then
+    max_attempts=5
+  fi
+  local wait_seconds="${KMS_API_PROPAGATION_WAIT_SECONDS:-60}"
+  if [[ ! "$wait_seconds" =~ ^[0-9]+$ ]]; then
+    wait_seconds=60
+  fi
   local attempt=1 status=0 output=""
   while :; do
     output="$(trap - ERR; "$@" 2>&1)" && status=0 || status=$?
@@ -1420,7 +1434,7 @@ retry_kms_create() {
       return 0
     fi
     if printf '%s\n' "$output" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
-      if [ "$attempt" -ge "$KMS_API_PROPAGATION_ATTEMPTS" ]; then
+      if [ "$attempt" -ge "$max_attempts" ]; then
         if type print_warning >/dev/null 2>&1; then
           print_warning "Cloud KMS still rejects requests $attempt attempts after enabling it." >&2
         else
@@ -1432,12 +1446,12 @@ retry_kms_create() {
       attempt=$((attempt + 1))
       if type print_warning >/dev/null 2>&1; then
         print_warning "Cloud KMS was enabled minutes ago and has not finished propagating; it 403s some requests for a few minutes after a project's first enablement." >&2
-        print_warning "Waiting ${KMS_API_PROPAGATION_WAIT_SECONDS}s, then retrying (attempt $attempt of $KMS_API_PROPAGATION_ATTEMPTS)..." >&2
+        print_warning "Waiting ${wait_seconds}s, then retrying (attempt $attempt of $max_attempts)..." >&2
       else
         echo -e "  ⚠ Cloud KMS was enabled minutes ago and has not finished propagating; it 403s some requests for a few minutes after a project's first enablement." >&2
-        echo -e "  ⚠ Waiting ${KMS_API_PROPAGATION_WAIT_SECONDS}s, then retrying (attempt $attempt of $KMS_API_PROPAGATION_ATTEMPTS)..." >&2
+        echo -e "  ⚠ Waiting ${wait_seconds}s, then retrying (attempt $attempt of $max_attempts)..." >&2
       fi
-      sleep "$KMS_API_PROPAGATION_WAIT_SECONDS"
+      sleep "$wait_seconds"
       continue
     fi
     [ -n "$output" ] && printf '%s\n' "$output"
