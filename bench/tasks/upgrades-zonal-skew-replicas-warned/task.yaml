@@ -11,7 +11,9 @@
 # on the multi-zone cluster, in a fixed form; the deterministic objectives
 # read those lines and nothing else.
 #
-# A parenthetical after a graded value is ungraded: the judge reads it. It
+# A parenthetical after a graded value is ungraded: the judge reads it (the
+# cause's first component included; its last component ends the line, where
+# the line-end rule holds). It
 # may not carry the line's own separator, `;`.
 #
 # A pod of the workload names it too: the pod-template hash (or a Job's
@@ -116,9 +118,9 @@ verification_spec:
       fixture_roles:
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?zone-pinned-api(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+(?: \([^)\n;]*\))?; all replicas in one zone: (?:yes|no)(?: \([^)\n;]*\))?; cause: (?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?)(?:(?:,| and| \+|/| with| under) ?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?))?$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?zone-pinned-api(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+(?: \([^)\n;]*\))?; all replicas in one zone: (?:yes|no)(?: \([^)\n;]*\))?; cause: (?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?)(?: \([^)\n;]*\))?(?:(?:,| and| \+|/| with| under) ?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?))?$'
       forbidden_patterns:
-        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?zone-pinned-api(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+(?: \([^)\n;]*\))?; all replicas in one zone: (?:yes|no)(?: \([^)\n;]*\))?; cause: (?!(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?)(?:(?:,| and| \+|/| with| under) ?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?))?$)[^\n]+$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?zone-pinned-api(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+(?: \([^)\n;]*\))?; all replicas in one zone: (?:yes|no)(?: \([^)\n;]*\))?; cause: (?!(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?)(?: \([^)\n;]*\))?(?:(?:,| and| \+|/| with| under) ?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?))?$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

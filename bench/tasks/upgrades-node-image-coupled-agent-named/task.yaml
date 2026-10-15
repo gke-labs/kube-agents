@@ -28,6 +28,9 @@
 # `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
 # the name; the kind word is ungraded.
 #
+# A host path may carry its mount spec after it (`:ro`, `:/host/etc/cni/net.d`),
+# the way a mount is written; the spec is ungraded.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the host-path mount. Dropping it is the heal that
@@ -110,9 +113,9 @@ verification_spec:
       fixture_roles:
         - node-image-coupled-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?(?:/[^ ,;()\n]*(?: \([^)\n;]*\))?, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?: \([^)\n;]*\))?(?:, ?/[^ ,;()\n]*(?: \([^)\n;]*\))?)*; coupled to the node image: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?(?:/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?(?:, ?/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?)*; coupled to the node image: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?(?!(?:/[^ ,;()\n]*(?: \([^)\n;]*\))?, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?: \([^)\n;]*\))?(?:, ?/[^ ,;()\n]*(?: \([^)\n;]*\))?)*;)[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?(?!(?:/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?(?:, ?/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?)*;)[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
 
   - name: the-declared-line-says-the-agent-is-coupled
     role: objective

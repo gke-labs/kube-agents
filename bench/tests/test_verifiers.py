@@ -7975,7 +7975,9 @@ _GROUP5 = {
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths: /etc/cni/net.d; coupled to the node image: yes",
             "- `seeded-a/seeded-shapes/cni-shaped-agent`: host network: yes; host paths `/etc/cni/net.d` (read-only, mounted at /host/etc/cni/net.d); coupled to the node image: yes.",
             "1. seeded-a (us-central1-a)/seeded-shapes/cni-shaped-agent: host network: yes; host paths /host/etc/cni/net.d; coupled to the node image: yes",
-        ],
+                    "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d:ro; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /opt/cni/bin:/host/opt/cni/bin, /etc/cni/net.d:/host/etc/cni/net.d:ro; coupled to the node image: yes",
+],
         [
             "seeded-a/seeded-shapes/cni-shaped-agent-legacy: host network: yes; host paths /etc/cni/net.d; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: no (hostNetwork: false); host paths /etc/cni/net.d; coupled to the node image: yes",
@@ -8125,7 +8127,8 @@ _GROUP2 = {
             "- `seeded-d/seeded-topology/zone-pinned-api`: replicas: 2; zones in use: 1; all replicas in one zone: yes; cause: spread constraint.",
             "**seeded-d/seeded-topology/zone-pinned-api**: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity and spread constraint",
             "1. seeded-d (us-central1)/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: topology spread constraints",
-        ],
+                    "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity (required) and spread constraint",
+],
         [
             "seeded-d/seeded-topology/zone-pinned-api-canary: replicas 2; zones in use 1; all replicas in one zone: yes; cause: topology-spread-constraint",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 2 (us-central1-a, us-central1-b); all replicas in one zone: yes; cause: topology-spread-constraint",
@@ -8168,7 +8171,8 @@ _GROUP4 = {
             "- `seeded-a/seeded-shapes/cache-on-emptydir`: node-local volumes `queue` (emptyDir); survives a node rebuild: no.",
             "**seeded-a/seeded-shapes/cache-on-emptydir**: node-local volumes queue (emptyDir at /var/lib/queue); survives a node rebuild: no",
             "1. seeded-a (us-central1-a)/seeded-shapes/cache-on-emptydir: node-local volumes queue, scratch; survives a node rebuild: no",
-        ],
+                    "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue:/var/cache/queue; survives a node rebuild: no",
+],
         [
             "seeded-a/seeded-shapes/cache-on-emptydir-shadow: node-local volumes queue; survives a node rebuild: no",
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes cache; survives a node rebuild: no",
@@ -8182,7 +8186,8 @@ _GROUP4 = {
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue-data; survives a node rebuild: no",
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue; survives a node rebuild: yes",
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue; survives a node rebuild: no (one replica)",
-        ],
+                    "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue: none; survives a node rebuild: no",
+],
         "No workload on the seeded clusters keeps state on the node; every emptyDir holds scratch the container rebuilds at start.",
     ),
     "upgrades-deprecated-node-label-selector-named": (
