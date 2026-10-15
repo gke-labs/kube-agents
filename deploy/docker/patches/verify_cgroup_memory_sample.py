@@ -10,7 +10,9 @@ so the result does not depend on the build machine's own cgroup.
 - Light use of an 8 GiB limit classifies ``ok``, whatever the node reports.
 - 94% of the limit held classifies ``elevated``, and 98% ``critical``: the
   guard still stops spawning when the container itself is near its limit.
-- Reclaimable page cache (``inactive_file``) does not count as held.
+- Reclaimable memory (file cache on both LRU lists, reclaimable slab) does not
+  count as held.
+- The dispatcher's own ``_memory_pressure_level`` reads the same sample.
 - No limit (``memory.max`` reads ``max``) or no cgroup leaves the node's
   /proc figures, as upstream ships them.
 
@@ -27,23 +29,26 @@ from pathlib import Path
 
 from gateway import lifecycle_ledger
 from gateway.memory_status import classify_pressure
+from hermes_cli import kanban_db_dispatch
 
 GIB = 1024**3
 LIMIT = 8 * GIB
 
-# (case, memory.max, memory.current, inactive_file, expected level)
+# (case, memory.max, memory.current, inactive_file or (inactive_file, active_file), expected level)
 CASES = (
     ("light use", str(LIMIT), int(0.7 * GIB), int(0.1 * GIB), "ok"),
     ("94% held", str(LIMIT), int(0.94 * LIMIT), 0, "elevated"),
     ("98% held", str(LIMIT), int(0.98 * LIMIT), 0, "critical"),
-    ("98% current, mostly reclaimable", str(LIMIT), int(0.98 * LIMIT), int(0.5 * LIMIT), "ok"),
+    ("98% current, mostly inactive cache", str(LIMIT), int(0.98 * LIMIT), (int(0.5 * LIMIT), 0), "ok"),
+    ("98% current, mostly active cache", str(LIMIT), int(0.98 * LIMIT), (0, int(0.5 * LIMIT)), "ok"),
 )
 
 
-def _write(cgroup: Path, limit: str, current: int, inactive: int) -> None:
+def _write(cgroup: Path, limit: str, current: int, cache) -> None:
+    inactive, active = cache if isinstance(cache, tuple) else (cache, 0)
     (cgroup / "memory.max").write_text(limit + "\n")
     (cgroup / "memory.current").write_text(f"{current}\n")
-    (cgroup / "memory.stat").write_text(f"anon 1\nfile 2\ninactive_file {inactive}\nactive_file 3\n")
+    (cgroup / "memory.stat").write_text(f"anon 1\nfile 2\nactive_file {active}\ninactive_file {inactive}\nslab_reclaimable 0\n")
 
 
 def main() -> int:
@@ -58,6 +63,9 @@ def main() -> int:
             got = classify_pressure(sample.get("mem_available_kib"), sample.get("mem_total_kib"))
             if sample.get("mem_total_kib") != LIMIT // 1024 or got != want:
                 failures.append(f"{name}: total={sample.get('mem_total_kib')} level={got}, wanted {want}")
+            dispatch = kanban_db_dispatch._memory_pressure_level()
+            if dispatch != want:
+                failures.append(f"{name}: the dispatcher's _memory_pressure_level said {dispatch}, wanted {want}")
         _write(cgroup, "max", GIB, 0)
         unlimited = lifecycle_ledger.sample_memory()
         if node and unlimited.get("mem_total_kib") != node.get("t"):

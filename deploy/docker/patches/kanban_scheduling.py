@@ -436,7 +436,8 @@ Cost: real process count becomes ``cap + waiting coordinators``, unbounded. A ca
 that counts waiters does not bound memory either — it deadlocks, and the wedged
 coordinator stays resident. The backstop is upstream's ``_memory_pressure_level``
 check in the dispatch tick, reactive where the cap is preventive. It lives in
-Hermes rather than this repository, so nothing here pins it.
+Hermes; apply_cgroup_memory_sample.py points what it measures at the container's
+own cgroup limit, and its verifier pins how a sample there classifies.
 """
 
 from __future__ import annotations

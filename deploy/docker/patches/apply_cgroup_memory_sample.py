@@ -13,10 +13,14 @@ node happened to be full (gke-labs#3237).
 
 The edit adds the container's cgroup v2 figures to the sample when a limit is
 set: ``memory.max`` as the total, and ``memory.max`` minus what the cgroup holds
-that it cannot drop (``memory.current`` less ``inactive_file`` from
-``memory.stat``) as the available. Those are the numbers the kernel OOM-kills
-the container on. Without a limit (``memory.max`` reads ``max``) or without a
-readable cgroup, the sample stays the node's, as upstream ships it.
+that reclaim cannot free as the available. Reclaimable is the file cache
+(``active_file`` and ``inactive_file``) plus ``slab_reclaimable`` from
+``memory.stat``, the same things ``MemAvailable`` counts as available, so
+upstream's 15%/5% thresholds mean what they were set to mean, against the
+container's limit instead of the node. Swap used comes from
+``memory.swap.current`` when the cgroup has it. Without a limit (``memory.max``
+reads ``max``) or without a readable cgroup, the sample stays the node's, as
+upstream ships it.
 
 What changes, deliberately: the guard now protects the container's own limit,
 which is what kills the agent. Pressure on the node as a whole is left to the
@@ -27,6 +31,7 @@ the container too.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -60,17 +65,19 @@ TRAILER = f'''
 _KUBE_CGROUP_DIR = "/sys/fs/cgroup"
 # memory.max's value when no limit is set.
 _KUBE_CGROUP_UNLIMITED = "max"
-# The memory.stat key for page cache the kernel can drop under pressure.
-_KUBE_CGROUP_RECLAIMABLE_KEY = "inactive_file"
+# The memory.stat keys for memory reclaim can free before an OOM kill: the file
+# cache on both LRU lists and reclaimable slab. Not "file", which counts shmem.
+_KUBE_CGROUP_RECLAIMABLE_KEYS = ("active_file", "inactive_file", "slab_reclaimable")
 _KUBE_BYTES_PER_KIB = 1024
 
 
 def {HELPER}() -> Dict[str, int]:
-    """The container's own total and available memory (KiB) under a cgroup v2 limit.
+    """The container's own memory (KiB) under a cgroup v2 limit: total, available, swap used.
 
     ``{{}}`` when ``memory.max`` is ``max`` or any file is unreadable, so the
     caller keeps the node's /proc figures. Available is the limit less what the
-    cgroup holds that it cannot drop: ``memory.current`` minus ``inactive_file``.
+    cgroup holds that reclaim cannot free: ``memory.current`` minus the file
+    cache and reclaimable slab in ``memory.stat``.
     """
     try:
         with open(os.path.join(_KUBE_CGROUP_DIR, "memory.max"), encoding="utf-8") as fh:
@@ -84,18 +91,23 @@ def {HELPER}() -> Dict[str, int]:
         with open(os.path.join(_KUBE_CGROUP_DIR, "memory.stat"), encoding="utf-8") as fh:
             for line in fh:
                 key, _, value = line.partition(" ")
-                if key == _KUBE_CGROUP_RECLAIMABLE_KEY:
-                    reclaimable = int(value)
-                    break
+                if key in _KUBE_CGROUP_RECLAIMABLE_KEYS:
+                    reclaimable += int(value)
     except (OSError, ValueError):
         return {{}}
     if limit <= 0:
         return {{}}
     held = max(0, current - reclaimable)
-    return {{
+    figures = {{
         "mem_total_kib": limit // _KUBE_BYTES_PER_KIB,
         "mem_available_kib": max(0, limit - held) // _KUBE_BYTES_PER_KIB,
     }}
+    try:
+        with open(os.path.join(_KUBE_CGROUP_DIR, "memory.swap.current"), encoding="utf-8") as fh:
+            figures["swap_used_kib"] = int(fh.read().strip()) // _KUBE_BYTES_PER_KIB
+    except (OSError, ValueError):
+        pass
+    return figures
 '''
 
 
@@ -104,16 +116,20 @@ def apply(root: Path) -> None:
     patch.refuse_if_patched(MARKER)
     definition = patch.find_def(SAMPLE_DEF, label="memory sample")
     indent = definition.body_indent
-    body = patch.source[definition.start : definition.end]
+    body = patch.source[definition.start : definition.end] + "\n"
+    # Bounded by line breaks, so "return samples" or "return sample_x" can't
+    # match. The closing break is a lookahead so two returns in a row, which
+    # share it, are both counted.
     anchor = "\n" + indent + RETURN_ANCHOR
-    found = body.count(anchor)
+    matches = list(re.finditer(re.escape(anchor) + r"(?=\n)", body))
+    found = len(matches)
     if found != 1:
         raise SystemExit(
             f"cgroup-memory-sample patch: {LEDGER_RELATIVE}: expected 1 "
             f"'{RETURN_ANCHOR}' in {SAMPLE_DEF}(), found {found}. {patch.note}"
         )
     # Just past the line break, where the return statement's line begins.
-    offset = definition.start + body.index(anchor) + 1
+    offset = definition.start + matches[0].start() + 1
     patch.splice(offset, offset, indent + INSERTED_LINE + "\n")
     patch.append(TRAILER)
     patch.commit("sample_memory reads the container's cgroup limit when one is set")

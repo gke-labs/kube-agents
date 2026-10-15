@@ -65,10 +65,12 @@ def _load(path: Path):
     return module
 
 
-def _cgroup(directory: Path, limit: str, current: int, inactive: int) -> None:
+def _cgroup(directory: Path, limit: str, current: int, inactive: int, active: int = 0, slab: int = 0) -> None:
     (directory / "memory.max").write_text(limit + "\n")
     (directory / "memory.current").write_text(f"{current}\n")
-    (directory / "memory.stat").write_text(f"anon 1\ninactive_file {inactive}\nactive_file 2\n")
+    (directory / "memory.stat").write_text(
+        f"anon 1\nfile 9\nactive_file {active}\ninactive_file {inactive}\nshmem 7\nslab_reclaimable {slab}\n"
+    )
 
 
 class ApplyTest(unittest.TestCase):
@@ -93,6 +95,17 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(sample["mem_total_kib"], 8 * 1024 * 1024)
         self.assertEqual(sample["mem_available_kib"], int(8 * GIB - 0.6 * GIB) // 1024)
         self.assertEqual(sample["rss_kib"], 1)
+
+    def test_active_cache_and_reclaimable_slab_count_as_available(self):
+        _, module = self.patched()
+        _cgroup(self.cgroup, str(8 * GIB), 7 * GIB, inactive=GIB, active=2 * GIB, slab=GIB)
+        self.assertEqual(module.sample_memory()["mem_available_kib"], 5 * GIB // 1024)
+
+    def test_swap_comes_from_the_cgroup_when_it_has_it(self):
+        _, module = self.patched()
+        _cgroup(self.cgroup, str(8 * GIB), GIB, 0)
+        (self.cgroup / "memory.swap.current").write_text(f"{GIB}\n")
+        self.assertEqual(module.sample_memory()["swap_used_kib"], GIB // 1024)
 
     def test_95_percent_held_leaves_5_percent_available(self):
         _, module = self.patched()
@@ -128,6 +141,12 @@ class ApplyTest(unittest.TestCase):
             "    if sample:\n        pass\n    return sample\n    return sample\n\n\ndef other",
         )
         _write_ledger(self.root, twice)
+        with self.assertRaises(SystemExit):
+            apply(self.root)
+
+    def test_a_longer_name_after_return_is_not_the_anchor(self):
+        renamed = LEDGER_STUB.replace("    return sample\n\n\ndef other", "    return samples\n\n\ndef other")
+        _write_ledger(self.root, renamed)
         with self.assertRaises(SystemExit):
             apply(self.root)
 
