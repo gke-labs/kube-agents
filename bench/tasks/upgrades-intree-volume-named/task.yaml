@@ -24,13 +24,15 @@
 # `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
 # the name; the kind word is ungraded.
 #
-# The source slot grades the word `in-tree`: whatever names the plugin after
-# it (`gcePersistentDisk`, `kubernetes.io/gce-pd`, a parenthetical) is the
-# judge's, except a negation, `csi` or `other` as the first word, which reads
-# wrong, as is `gcePersistentDisk (in-tree …)` with the halves reversed. The
+# The source slot grades the word `in-tree`, followed by one plugin token
+# (`gcePersistentDisk`, `kubernetes.io/gce-pd`, optionally `plugin`) and a
+# parenthetical; a negation, `csi` or `other` as that token reads wrong, and
+# a tail after it is not admitted. The halves may be reversed: the plugin
+# (`gcePersistentDisk`, `gce-pd`, `kubernetes.io/gce-pd`) then `in-tree`, bare,
+# after a comma, or anywhere in its parenthetical. The
 # claim may carry its namespace as `seeded-shapes/intree-pd`, as a tail
 # (`intree-pd in seeded-shapes`) or as a parenthetical (`intree-pd
-# (seeded-shapes)`), and its kind as a word or a path segment (`pvc/`).
+# (seeded-shapes)`, `(namespace seeded-shapes)`, `(seeded-shapes, Bound)`), and its kind as a word or a path segment (`pvc/`).
 #
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
@@ -97,9 +99,9 @@ verification_spec:
       fixture_roles:
         - intree-pd-volume
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?(?:in-tree(?![a-z0-9])(?!:? ?(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere|csi|other)(?![a-z0-9/_-]))[^;\n?!]*|gcepersistentdisk ?\(in-tree[^)\n;]*\))(?: ?\([^)\n;]*\))?; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?(?:in-tree(?![a-z0-9])(?::? ?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere|csi|other)(?![a-z0-9/_-]))[a-z][a-z0-9./-]*(?: plugin)?)?|(?:gcepersistentdisk|(?:kubernetes\.io/)?gce-pd)(?:,? in-tree(?![a-z0-9])| ?\([^)\n;]*in-tree[^)\n;]*\)))(?: ?\([^)\n;]*\))?; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?(?!(?:in-tree(?![a-z0-9])(?!:? ?(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere|csi|other)(?![a-z0-9/_-]))[^;\n?!]*|gcepersistentdisk ?\(in-tree[^)\n;]*\))(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?(?!(?:in-tree(?![a-z0-9])(?::? ?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere|csi|other)(?![a-z0-9/_-]))[a-z][a-z0-9./-]*(?: plugin)?)?|(?:gcepersistentdisk|(?:kubernetes\.io/)?gce-pd)(?:,? in-tree(?![a-z0-9])| ?\([^)\n;]*in-tree[^)\n;]*\)))(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
 
   - name: the-declared-line-names-the-claim-and-the-migration
     role: objective
@@ -110,9 +112,9 @@ verification_spec:
       fixture_roles:
         - intree-pd-volume
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?(?:(?:pvc|claim|persistentvolumeclaim)[ /])?(?:seeded-shapes/(?:(?:pvc|claim|persistentvolumeclaim)/)?intree-pd|intree-pd(?: ?\(seeded-shapes\)| (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?seeded-shapes(?: namespace)?))(?: ?\([^)\n;]*\))?; attaches through csi migration: yes$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?(?:(?:pvc|claim|persistentvolumeclaim)[ /])?(?:seeded-shapes/(?:(?:pvc|claim|persistentvolumeclaim)/)?intree-pd|intree-pd(?: ?\((?:(?:in|from|of) )?(?:(?:the )?namespaces? |ns )?seeded-shapes(?: namespace)?(?:[,:] ?[^)\n;]*)?\)| (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?seeded-shapes(?: namespace)?))(?: ?\([^)\n;]*\))?; attaches through csi migration: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?(?!(?:(?:pvc|claim|persistentvolumeclaim)[ /])?(?:seeded-shapes/(?:(?:pvc|claim|persistentvolumeclaim)/)?intree-pd|intree-pd(?: ?\(seeded-shapes\)| (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?seeded-shapes(?: namespace)?))(?: ?\([^)\n;]*\))?; attaches through csi migration: yes$)[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?(?!(?:(?:pvc|claim|persistentvolumeclaim)[ /])?(?:seeded-shapes/(?:(?:pvc|claim|persistentvolumeclaim)/)?intree-pd|intree-pd(?: ?\((?:(?:in|from|of) )?(?:(?:the )?namespaces? |ns )?seeded-shapes(?: namespace)?(?:[,:] ?[^)\n;]*)?\)| (?:in|from|of) (?:(?:the )?namespaces? |ns |the )?seeded-shapes(?: namespace)?))(?: ?\([^)\n;]*\))?; attaches through csi migration: yes$)[^ :;\n][^\n]*$'
 
   - name: no-invented-cves
     role: objective
