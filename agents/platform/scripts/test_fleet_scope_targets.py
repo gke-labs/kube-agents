@@ -232,6 +232,10 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         # Compute and networking ones); denied is a declared project unread.
         self.assertEqual(targets.projects, ("ops-mgmt", "payments-prod", "legacy-api"))
         self.assertEqual(targets.unread, (("payments-staging", "denied"),))
+        # The retiring row is a project the declaration no longer names, kept
+        # until its profiles are pruned: not swept, not unread, and carried by
+        # id for a reader that meets the project under another name.
+        self.assertEqual(targets.retiring, ("payments-legacy",))
         self.assertEqual(targets.collector_args(), "--scope-projects ops-mgmt,payments-prod,legacy-api --scope-unread payments-staging=denied")
         self.assertEqual(targets.resolved_at, "2026-10-09T12:00:00Z")
         self.assertEqual(targets.path, str(self.home / fst.SNAPSHOT_FILE))
@@ -406,9 +410,10 @@ class CollectorArgvTest(unittest.TestCase):
         self.assertEqual(nothing.collector_args(), "--scope-unread declared-scope=unresolved")
         # The exclude entries never reach the collector flags: the sweep and the unread rows are the whole argv.
         self.assertEqual(targets.excluded, ())
-        excluding = fst.ScopeTargets(projects=("ops-mgmt",), unread=(), resolved_at=None, path="x", excluded=("*-sandbox",), declared_containers=("folders/1",))
+        excluding = fst.ScopeTargets(projects=("ops-mgmt",), unread=(), resolved_at=None, path="x", excluded=("*-sandbox",), declared_containers=("folders/1",), retiring=("legacy",))
         self.assertEqual(excluding.collector_argv(), ("--scope-projects", "ops-mgmt"))
         self.assertEqual(targets.declared_containers, ())
+        self.assertEqual(targets.retiring, ())
 
 
 if __name__ == "__main__":
