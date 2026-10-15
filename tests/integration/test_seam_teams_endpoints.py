@@ -34,6 +34,10 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
         self.addCleanup(self.server.shutdown)
         self.url = f"http://127.0.0.1:{self.server.server_port}"
 
+    # The pull route blocks up to 20 s on an empty queue, so the deadline sits
+    # above that; without one a stuck handler hangs this gating tier.
+    CALL_TIMEOUT_SECONDS = 30
+
     def _call(self, path, payload=None, method=None):
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
@@ -43,7 +47,7 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
             method=method or ("POST" if body is not None else "GET"),
         )
         try:
-            with urllib.request.urlopen(request) as response:
+            with urllib.request.urlopen(request, timeout=self.CALL_TIMEOUT_SECONDS) as response:
                 return response.status, json.load(response)
         except urllib.error.HTTPError as exc:
             return exc.status, json.load(exc)
@@ -94,7 +98,7 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
         self.assertEqual(status, 400)
 
     def test_pull_and_settle_ack_and_nack(self):
-        self._call(
+        status, body = self._call(
             "/v1/chat/teams/events",
             {
                 "type": "message",
@@ -103,6 +107,9 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
             },
             method="POST",
         )
+        # Asserted, so a refused enqueue fails here and not twenty seconds
+        # later inside the pull's empty-queue wait.
+        self.assertEqual((status, body), (202, {"status": "accepted"}))
         status, body = self._call("/v1/chat/teams/events", method="GET")
         self.assertEqual(status, 200)
         self.assertEqual(body["event"]["event"]["text"], "audit cluster")

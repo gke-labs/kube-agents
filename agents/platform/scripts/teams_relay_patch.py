@@ -38,6 +38,10 @@ TEAMS_FIT_ATTEMPTS = 8
 DEFAULT_TEAMS_SERVICE_URL = "https://smba.trafficmanager.net/teams/"
 # How much of a broker error body the gateway reads to name the cause.
 TEAMS_RELAY_ERROR_BODY_MAX_BYTES = 4096
+# One relay call can cost the broker an identity-provider round trip (20 s)
+# and then the Bot Framework post (30 s), so the gateway waits longer than
+# their sum; a shorter wait reports a post that then lands as a failure.
+TEAMS_RELAY_REQUEST_TIMEOUT_SECONDS = 60
 TEAMS_TRUSTED_SERVICE_HOSTS = ("smba.trafficmanager.net", "api.botframework.com")
 
 
@@ -364,7 +368,7 @@ def install() -> None:
             method="GET" if body is None else "POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=35) as response:
+            with urllib.request.urlopen(req, timeout=TEAMS_RELAY_REQUEST_TIMEOUT_SECONDS) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             raise relayed_teams_error(exc) from exc
