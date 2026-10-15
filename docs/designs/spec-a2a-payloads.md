@@ -720,7 +720,11 @@ that would turn every follow-up into a steer queued behind hours of idle.
 
 **The emitter.** Two halves, each a port of the `today` presenter run on the shared
 cases. The hermes-bridge emits what its own turn owns: the answer on the `result` (the
-first sentence as `headline`, the rest as `detail`, or under `fold` past `detail`'s cap),
+first sentence as `headline`, cut at a clause when it runs past the headline's cap, the rest
+as `detail`, or under `fold` past `detail`'s cap; an answer that ends by asking which of two
+to five listed options to take carries them as `choices`, its opening paragraph, each
+option's label and first sentence (when every option has one) and the question as `detail`, and the rest under `fold`,
+by the rule `slack_moments.answer_choices` applies under `today`),
 the prompt's `mark.ask` on each `progress` heartbeat, and, when the turn filed a card (a
 `kanban_create` call that did not fail) in a Slack conversation with `KAGE_SLACK_UX` on and its conversation route recorded,
 the terminal's mark-only message; anywhere else nothing settles the ask later, so the

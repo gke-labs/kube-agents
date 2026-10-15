@@ -393,9 +393,11 @@ class WorkflowsCarryTheModeTest(unittest.TestCase):
             steps.index("Provision Environment in GCP"),
         )
 
-    def test_today_keeps_the_deploy_jobs_sixty_minutes(self):
+    def test_today_gives_the_deploy_job_the_stockout_retry_budget(self):
+        """150 for three provision attempts with teardowns and waits between
+        them (deploy-environment.yml says the sum); `next` adds the gate."""
         job = _workflow("deploy-environment.yml")["jobs"]["deploy-environment"]
-        self.assertEqual(job["timeout-minutes"], "${{ inputs.mode == 'next' && 90 || 60 }}")
+        self.assertEqual(job["timeout-minutes"], "${{ inputs.mode == 'next' && 180 || 150 }}")
 
     def test_next_buys_the_deploy_job_the_whole_gate(self):
         """The 30 extra minutes are the gate's single budget, which runs after the install."""
