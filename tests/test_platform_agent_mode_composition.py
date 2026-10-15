@@ -54,6 +54,41 @@ def _crd_enum() -> list:
     return version["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["mode"]["enum"]
 
 
+_OPERATOR_CRD = _REPO_ROOT / "k8s-operator" / "config" / "crd" / "bases" / "kubeagents.x-k8s.io_platformagents.yaml"
+_MODE_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "mode.go"
+
+
+class ExistingInstallsKeepTodayTest(unittest.TestCase):
+    """A new install defaults to next through install.sh alone. The CRD carries
+    no default for spec.mode, and the operator reads an absent one as today.
+
+    The API server applies a structural-schema default every time it reads an
+    object from etcd, not only when the object is created. The composition and
+    the chart render no mode field for today, so every existing today install
+    has none. A CRD default of next would move all of them to next on their
+    next reconcile, with no upgrade step to stop it.
+    """
+
+    def test_neither_crd_copy_defaults_the_mode(self):
+        for path in (_CRD, _OPERATOR_CRD):
+            with self.subTest(crd=path.relative_to(_REPO_ROOT).as_posix()):
+                crd = yaml.safe_load(path.read_text())
+                version = next(v for v in crd["spec"]["versions"] if v["name"] == "v1alpha1")
+                mode = version["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["mode"]
+                self.assertNotIn("default", mode)
+
+    def test_the_example_a_new_user_copies_installs_next(self):
+        # install.sh reads a file with no mode as an existing today install, so
+        # the documented `cp install.env.example install.env` first install has
+        # to name next itself.
+        example = (_REPO_ROOT / "install.env.example").read_text()
+        self.assertIn("\nPLATFORM_AGENT_MODE=next\n", example)
+
+    def test_the_operator_reads_an_absent_mode_as_today(self):
+        text = _MODE_GO.read_text()
+        self.assertIn("if agent == nil || agent.Spec.Mode == nil {\n\t\treturn ModeToday, nil", text)
+
+
 class CompositionTextTest(unittest.TestCase):
     def setUp(self):
         self.variable = _variable_block()
@@ -64,8 +99,9 @@ class CompositionTextTest(unittest.TestCase):
         self.assertIn("nullable    = false", self.variable)
         enum = _crd_enum()
         self.assertIn(f"contains({json.dumps(enum)}, var.platform_agent_mode)".replace('","', '", "'), self.variable)
-        # The front doors' default is the same word.
-        self.assertIn('DEFAULT_PLATFORM_AGENT_MODE="today"', _DEFAULTS.read_text())
+        # The word an install.env with no mode resolves to is the same; a first
+        # install's default (DEFAULT_PLATFORM_AGENT_MODE) is install.sh's alone.
+        self.assertIn('UNRECORDED_PLATFORM_AGENT_MODE="today"', _DEFAULTS.read_text())
 
     def test_platform_agent_is_merged_with_the_mode_only_when_it_is_not_today(self):
         self.assertIn("    platformAgent = merge({\n", self.main_tf)

@@ -529,7 +529,7 @@ sys.stdout.write((values.get("platformAgent") or {}).get("mode") or sys.argv[1])
 # A mode as the operator reads it: an absent one is today.
 effective_platform_agent_mode() {
   if [ "${1:-}" = "$PLATFORM_AGENT_MODE_UNSET" ]; then
-    printf '%s' "$DEFAULT_PLATFORM_AGENT_MODE"
+    printf '%s' "$UNRECORDED_PLATFORM_AGENT_MODE"
   else
     printf '%s' "${1:-}"
   fi
@@ -709,7 +709,7 @@ slack_bot_token_has_separator() {
 # returns 0.
 refuse_next_slack_gateway_settings() {
   local allowlist="${4:-}" home="${5:-}" token="${6:-}" flags="${7:-}" mode="${8:-}"
-  local emails bad_home count refused=false via say=print_error lead=""
+  local emails bad_home count refused=false via keep_today say=print_error lead=""
   slack_moves_to_a2a_gateway "${1:-}" "${2:-}" "${3:-}" || return 0
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
     say=print_warning
@@ -731,9 +731,14 @@ refuse_next_slack_gateway_settings() {
   fi
   count="$(slack_bot_token_list_count "$token")"
   if [ -n "$count" ]; then
-    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
+    via="install.env"; keep_today="PLATFORM_AGENT_MODE=today"
+    if [ "$flags" = "flags" ]; then
+      via="install.env or --slack-bot-token"
+      # A first install is next by default, so the flag is the way to stay on today.
+      keep_today="PLATFORM_AGENT_MODE=today (--mode=today on a first install with no install.env)"
+    fi
     "$say" "${lead}SLACK_BOT_TOKEN holds ${count} tokens, a list for several workspaces. Under spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, and Slack refuses a list, so that backend retries without end and nothing answers on Slack."
-    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on PLATFORM_AGENT_MODE=today."
+    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on ${keep_today}."
     refused=true
   elif slack_bot_token_has_separator "$token"; then
     via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
@@ -749,7 +754,7 @@ refuse_next_slack_gateway_settings() {
 # loaded, or what install.sh exported, plus a token the tfvars generator
 # recovered from the live Secret. $1 and $2 are the other's $7 and $8.
 refuse_next_slack_gateway_settings_from_env() {
-  refuse_next_slack_gateway_settings "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" \
+  refuse_next_slack_gateway_settings "${PLATFORM_AGENT_MODE:-$UNRECORDED_PLATFORM_AGENT_MODE}" \
     "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
     "${SLACK_ALLOWED_USERS:-}" "${SLACK_HOME_CHANNEL:-}" "${SLACK_BOT_TOKEN:-}" "${1:-}" "${2:-}"
 }
@@ -3764,7 +3769,7 @@ write_tfvars_from_state() {
   # regenerate from install.env without install.sh's check, and the variable's
   # validation would otherwise refuse it at plan, naming neither the key nor
   # the file.
-  local platform_agent_mode="${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+  local platform_agent_mode="${PLATFORM_AGENT_MODE:-$UNRECORDED_PLATFORM_AGENT_MODE}"
   if ! is_valid_platform_agent_mode "$platform_agent_mode"; then
     print_error "PLATFORM_AGENT_MODE='${platform_agent_mode}' is not one of today, next. Fix it in install.env."
     return 1

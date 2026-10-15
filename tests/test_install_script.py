@@ -5352,7 +5352,7 @@ class PlatformAgentModeTest(unittest.TestCase):
     def test_a_rerun_without_the_flag_keeps_the_recorded_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             proc = self._run(
-                'validate_platform_agent_mode && echo "MODE=[${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}]"',
+                'validate_platform_agent_mode && echo "MODE=[${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}]"',
                 install_env=self._file(tmp, "PLATFORM_AGENT_MODE=next\n"),
             )
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -5703,10 +5703,35 @@ class PlatformAgentModeTest(unittest.TestCase):
             self.assertIn("PARAM=[next]", out)
             self.assertIn("EXPORTED=[next]", out)
 
-    def test_an_unset_mode_is_recorded_as_the_default(self):
+    def test_an_unset_mode_on_a_first_install_is_recorded_as_next(self):
+        # No install.env when the run started: the new-install default.
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, "INSTALL_ENV_FOUND_AT_START=false; resolve_platform_agent_mode_fallback")
+            self.assertIn("PLATFORM_AGENT_MODE=next\n", dest.read_text())
+
+    def test_an_unset_mode_over_a_file_recording_none_stays_today(self):
+        # An install.env from before install.sh recorded the mode is an install
+        # that has only run today; a re-run must not move it to the new default.
         with tempfile.TemporaryDirectory() as tmp:
             dest = self._bootstrap_with_export(tmp, ":")
             self.assertIn("PLATFORM_AGENT_MODE=today\n", dest.read_text())
+
+    def test_the_fallback_is_next_for_a_first_install_and_today_over_an_unrecorded_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, body, expected in (
+                (None, "INSTALL_ENV_FOUND_AT_START=false; resolve_shared_defaults", "next"),
+                ("PROJECT_ID=p\n", "resolve_shared_defaults", "today"),
+                ("PLATFORM_AGENT_MODE=next\n", "resolve_shared_defaults", "next"),
+                ("PLATFORM_AGENT_MODE=today\n", "INSTALL_ENV_FOUND_AT_START=false; resolve_shared_defaults", "today"),
+            ):
+                with self.subTest(content=content, body=body):
+                    install_env = self._file(tmp, content) if content is not None else None
+                    proc = self._run(
+                        f'{body}; validate_platform_agent_mode && echo "MODE=[${{PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}}]"',
+                        install_env=install_env,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn(f"MODE=[{expected}]", proc.stdout)
 
     def test_the_menu_refuses_the_flag_it_would_drop(self):
         # --menu applies the mode install.env records; a --mode there would be
@@ -5726,7 +5751,10 @@ class PlatformAgentModeTest(unittest.TestCase):
         summary = text.index('print_step "11. Pre-Flight Configuration Summary"')
         block = text[summary : text.index('print_step "12.', summary)]
         self.assertIn('if [ "$platform_agent_mode" = "next" ]; then', block)
-        self.assertIn("Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (unsupported development stack", block)
+        self.assertIn("Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (the NATS bus and the A2A gateway", block)
+        # A Slack-only next install is told what it gives up, and how to keep it.
+        self.assertIn('if slack_moves_to_a2a_gateway "$platform_agent_mode" "$slack_enabled" "$google_chat_enabled"; then', block)
+        self.assertIn("Today's stack keeps the plan card.", block)
         self.assertIn("Component Stack (spec.mode):${C_RESET} ${platform_agent_mode}", block)
 
     def test_a_mirrored_next_install_is_told_the_bus_images_are_not_mirrored(self):
@@ -5796,7 +5824,7 @@ class PlatformAgentModeTest(unittest.TestCase):
             block,
         )
         self.assertIn(
-            'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"\n'
+            'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "${PLATFORM_AGENT_MODE:-$UNRECORDED_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"\n'
             "        check_scope_container_access || exit 1\n",
             text[:main_start],
         )
@@ -5816,7 +5844,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
     refuse_next_slack_gateway_settings (tests/test_installer_common.py)."""
 
     _CALL = (
-        'refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" '
+        'refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" '
         '"$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" '
         'flags || exit 1'
     )
@@ -6138,10 +6166,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         text = _INSTALL_SH.read_text()
         start = text.index(self._MENU_ARM) + len("      6)\n")
         end = text.index("\n        ;;\n", start)
-        names = ("allowed_users anthropic_api_key chat_sub_name chat_topic_name cluster_name custom_roles "
-                 "enable_gvisor enable_webui gemini_api_key github_app_id github_org github_repo "
-                 "google_chat_home_channel image_tag kms_key kms_keyring model_default_name model_provider "
-                 "openai_api_key permission_set project_id region repo_dir vertex_location vertex_project_id").split()
+        names = ["allowed_users", "anthropic_api_key", "chat_sub_name", "chat_topic_name", "cluster_name", "custom_roles", "enable_gvisor", "enable_webui", "gemini_api_key", "github_app_id", "github_org", "github_repo", "google_chat_home_channel", "image_tag", "kms_key", "kms_keyring", "model_default_name", "model_provider", "openai_api_key", "permission_set", "project_id", "region", "repo_dir", "vertex_location", "vertex_project_id"]
         stubs = (
             "resolve_effective_image_tag() { :; }\nvalidate_immutable_ref() { :; }\nverify_local_source_ref() { :; }\n"
             "tf_compose_dir() { printf '%s' \"$TF_DIR\"; }\n"

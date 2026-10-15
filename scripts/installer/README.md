@@ -23,7 +23,8 @@ their own copies:
 | `DEFAULT_CLUSTER_NAME`                                                    | GKE cluster name (`platform-agent-host`)                                               |
 | `DEFAULT_REGION`                                                          | GCP region (`us-central1`)                                                             |
 | `DEFAULT_CLUSTER_MODE`                                                    | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins |
-| `DEFAULT_PLATFORM_AGENT_MODE`                                             | The PlatformAgent's `spec.mode` (`today`); the composition then renders no mode        |
+| `DEFAULT_PLATFORM_AGENT_MODE`                                             | A first install's `spec.mode` (`next`); `install.sh` alone applies it                  |
+| `UNRECORDED_PLATFORM_AGENT_MODE`                                          | What an `install.env` with no mode, and a CR with none, resolve to (`today`)           |
 | `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                  |
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)            |
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                              |
@@ -473,7 +474,11 @@ cannot refuse a teardown.
 
 `PLATFORM_AGENT_MODE` is the `PlatformAgent`'s `spec.mode`, `today` or `next`
 ([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md) says what each
-renders). The generator writes `platform_agent_mode` on every run, `today` by default, and the
+renders). A first install with no `install.env` records `next` unless `--mode` says otherwise;
+`install.env.example` sets `next` too. A file that assigns no `PLATFORM_AGENT_MODE`, such as one
+written before `install.sh` recorded the key, resolves to `today` in every front door, so a
+re-run or an upgrade of such an install keeps it on `today` rather than moving it to the new
+default. The generator writes `platform_agent_mode` on every run, and the
 composition passes the chart nothing for `today`, so the CR carries no mode field. `install.sh`
 takes `--mode` and records it, or the default, on a first install. Over an existing
 `install.env` it is held to the file by the chat flags' rule above: a `--mode` that disagrees
