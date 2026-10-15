@@ -697,20 +697,23 @@ class StateLockTest(unittest.TestCase):
         self.assertIn("RELEASED", out)
 
     def test_the_hold_covers_the_exempt_stacks_waits(self):
-        # STATE_LOCK_HOLD_SECONDS is the longest an exempt case keeps its stack
-        # applied: its own_wait plus its chain_wait. A stack whose waits grow
-        # past it makes a waiter's deadline undercount the holder.
+        # STATE_LOCK_HOLD_SECONDS stands for the time an exempt stack's apply
+        # can wait: its own_wait plus its chain_wait. The turn and teardown on
+        # top fit in the INFRA_LOCK_DEADLINE term state_lock_deadline adds.
         hold = int(lifted_constant("STATE_LOCK_HOLD_SECONDS").split("=")[1])
-        for case in ("oobe-first-run-audits",):
+        exempt = [t.parent.name for t in sorted(TASKS_DIR.glob("*/task.yaml")) if self.exempt(t.parent.name)]
+        self.assertIn("oobe-first-run-audits", exempt)
+        for case in exempt:
             with self.subTest(case=case):
-                self.assertTrue(self.exempt(case))
                 main = (TF_ROOT / task_stack(case) / "main.tf").read_text(encoding="utf-8")
-                waits = [int(re.search(rf"^\s*{name}\s*=\s*(\d+)\s*$", main, re.M).group(1)) for name in ("own_wait", "chain_wait")]
+                waits = []
+                for name in ("own_wait", "chain_wait"):
+                    match = re.search(rf"^\s*{name}\s*=\s*(\d+)\s*$", main, re.M)
+                    self.assertIsNotNone(match, f"{case}: no {name} local in its stack's main.tf")
+                    waits.append(int(match.group(1)))
                 self.assertLessEqual(sum(waits), hold)
 
-    def test_a_stack_unit_that_gives_up_on_the_state_lock_keeps_no_stream(self):
-        # The give-up path gives back the streams the unit already holds;
-        # without that, every later unit on them waits out its own deadline.
+    def give_up_on_busy_state_lock(self, has_stack: str) -> str:
         body = "\n".join(
             [
                 lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
@@ -721,19 +724,29 @@ class StateLockTest(unittest.TestCase):
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,
                 lifted("release_state_lock"),
-                "rm -f /tmp/eval_case-x_rep1.log",
-                'lock_acquire() { mkdir "$1" 2>/dev/null; }',
+                lifted("release_streams"),
+                'ACQ_LOG="$(mktemp)"; rm -f /tmp/eval_case-x_rep1.log',
+                'lock_acquire() { mkdir "$1" 2>/dev/null && echo "$(basename "$1")" >> "${ACQ_LOG}"; }',
                 "unit_state_lock() { echo onboarding; }",
                 "state_lock_deadline() { echo 0; }",
                 "INFRA_LOCK_DEADLINE=3; STATE_LOCK_RETRY_SECONDS=1",
                 'mkdir "${STATE_DIR}/lock-state-onboarding"',
-                'run_one_unit ./tasks/x/task.yaml case-x 1 "" true 1 "s-one s-two" 2>&1 | tail -1',
+                f'run_one_unit ./tasks/x/task.yaml case-x 1 "" "{has_stack}" 1 "s-one s-two" 2>&1 | tail -1',
+                'echo "HELD=$(grep -c "^lock-stream-" "${ACQ_LOG}")"',
                 'ls "${STATE_DIR}" | grep "^lock-" | tr "\\n" " "; echo',
             ]
         )
-        out = run_bash(body).stdout
-        self.assertIn("gave up on the infra lock with the onboarding state lock", out)
-        self.assertEqual(out.splitlines()[-1].split(), ["lock-state-onboarding"])
+        return run_bash(body).stdout
+
+    def test_a_unit_that_gives_up_on_the_state_lock_keeps_no_stream(self):
+        # Both give-up paths hand back the streams the unit already holds;
+        # without that, every later unit on them waits out its own deadline.
+        for has_stack, said in (("true", "gave up on the infra lock with the onboarding state lock"), ("", "gave up on the onboarding state lock")):
+            with self.subTest(has_stack=has_stack):
+                out = self.give_up_on_busy_state_lock(has_stack)
+                self.assertIn(said, out)
+                self.assertIn("HELD=2", out)
+                self.assertEqual(out.splitlines()[-1].split(), ["lock-state-onboarding"])
 
     def test_the_state_lock_deadline_outlasts_every_holder(self):
         # Each case on the lock keeps its stack applied while it holds it, and a
