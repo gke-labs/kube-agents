@@ -231,7 +231,8 @@ record's active task; a new turn in that conversation replaces it. At or above
 `A2A_BUSY_NOTICE_AT` the gateway edits the turn's "⏳ submitted…" placeholder, the message
 the relay's rolling-line edits target, to a queued state: "⏳ **queued** — 3 requests are
 ahead of yours; I'll start on it as soon as there's room" ("1 request is" for one). It posts
-nothing of its own. The relay's first edit past submitted (working, or the terminal)
+nothing of its own, except on a backend that keeps no rolling line (`StatusShower`, Slack with
+Agent Sessions), where the notice is a post of its own that no later edit replaces. The relay's first edit past submitted (working, or the terminal)
 replaces the queued text as it would the placeholder, so the notice is never left under a
 "completed" header, where a separate post read as the output of some earlier command; the
 executor's own submitted event (the bridge publishes one on accept, before it has a worker)
@@ -1765,8 +1766,9 @@ the label check included; anything else shows as written. Every field goes out a
 `refuseSlackChat` still refuses a layout carrying a mention in a mrkdwn text object
 (`blocksMention`, the notify route's check), which the renderer no longer writes. The blocks go on
 the wire as the renderer wrote them, not through slack-go's types.
-The live message shows the newest progress chat message under every display mode, and keeps it
-when the task ends, its text turning to the terminal line; a progress artifact without one turns
+With Agent Sessions wired (every Slack adapter the gateway builds) there is no live message on
+Slack, since the adapter is a `StatusShower`; where a backend keeps one, the live message shows
+the newest progress chat message under every display mode, and keeps it when the task ends, its text turning to the terminal line; a progress artifact without one turns
 the message back to text. A layout the backend refuses is not offered again until the progress
 chat message changes, and the Slack adapter's text `Edit` sends the blocks and side bar cleared,
 so a live message laid out before a gateway restart does not keep a stale plan. A post or edit

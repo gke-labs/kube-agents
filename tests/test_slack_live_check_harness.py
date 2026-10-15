@@ -1484,5 +1484,24 @@ class UnitTest(unittest.TestCase):
         self.assertEqual(harness.parse_args(["--checks", "dm", "--bot-user-id", BOT_ID]).bot_user_id, BOT_ID)
 
 
+
+class NoStatusLineTest(unittest.TestCase):
+    """--no-status-line: a gateway that keeps no status line on Slack (Agent Sessions)."""
+
+    def test_the_first_answer_is_the_reply_and_a_failure_ends_the_turn(self):
+        answer = {"text": "*payments-api is CrashLooping.*", "ts": "2"}
+        self.assertIsNone(harness.read_turn([answer], harness.WAIT_ANSWER))
+        self.assertEqual(harness.read_turn([answer], harness.WAIT_ANSWER, lineless=True), (answer, harness.KIND_ANSWER))
+        failed = {"text": "❌ failed: reason: spawn-failed", "ts": "3"}
+        self.assertEqual(harness.read_turn([answer, failed], harness.WAIT_ANSWER, lineless=True), (failed, harness.KIND_FAILURE))
+
+    def test_a_steer_still_ends_the_turn_first(self):
+        steer = {"text": harness.STEER_QUEUED_ACK, "ts": "2"}
+        self.assertEqual(harness.read_turn([steer], harness.WAIT_ANSWER, lineless=True), (steer, harness.KIND_STEER))
+
+    def test_the_flag_parses(self):
+        self.assertTrue(harness.parse_args(["--checks", "dm", "--bot-user-id", BOT_ID, "--no-status-line"]).no_status_line)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1780,6 +1780,13 @@ func artifactParts(task *lib.Task, name string) []lib.Part {
 	return parts
 }
 
+// showsTaskStatus reports whether the backend that owns conversation shows
+// a task's status itself (StatusShower), and so wants no rolling line.
+func (g *Gateway) showsTaskStatus(conversation string) bool {
+	shower, ok := g.adapter.(StatusShower)
+	return ok && shower.ShowsTaskStatus(conversation)
+}
+
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements
 // TaskObserver about a task's two ends. Both are no-ops for an adapter that
 // does not implement the interface -- Discord and gchat, for which a human
@@ -1787,13 +1794,6 @@ func artifactParts(task *lib.Task, name string) []lib.Part {
 // adapter implements it for TaskStarted and TaskTerminal: a task starting in a thread is
 // what makes that thread a session thread, and the adapter learns it here
 // rather than inferring it from a mention it has not yet seen verified.
-// showsTaskStatus reports whether the adapter shows a task's status itself
-// (StatusShower), and so wants no rolling line.
-func (g *Gateway) showsTaskStatus() bool {
-	shower, ok := g.adapter.(StatusShower)
-	return ok && shower.ShowsTaskStatus()
-}
-
 func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 	if observer, ok := g.adapter.(TaskObserver); ok {
 		observer.TaskStarted(conversation, taskID)
@@ -2162,7 +2162,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// Placeholder first, so the rolling line exists before the first event
 	// can arrive (the demo posts one while the pod cold-starts; same idea).
 	// None on a backend that shows the task's status itself (StatusShower).
-	statusMsgID, lineless := "", g.showsTaskStatus()
+	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key)
 	if !lineless {
 		var err error
 		statusMsgID, err = g.adapter.Post(rec.Key, withLineNote("⏳ submitted…", ts.LineNote))

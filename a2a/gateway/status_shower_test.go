@@ -12,7 +12,7 @@ import (
 // itself (StatusShower), as the Slack adapter does with Agent Sessions.
 type statusShowingAdapter struct{ *fakeAdapter }
 
-func (statusShowingAdapter) ShowsTaskStatus() bool { return true }
+func (statusShowingAdapter) ShowsTaskStatus(string) bool { return true }
 
 // A backend that shows a task's status itself gets no rolling line: no
 // "⏳ submitted…" placeholder, no progress edit and no "✅ completed" edit,
@@ -52,13 +52,33 @@ func TestAStatusShowingBackendGetsNoRollingLine(t *testing.T) {
 	}
 }
 
+// Behind the mux, as a real install runs it (Slack beside the console), the
+// answer is the owning backend's: a Slack conversation shows no line, a
+// console one keeps it, and an unknown prefix keeps it.
+func TestTheMuxAnswersStatusShowingForTheOwningBackend(t *testing.T) {
+	mux, err := NewMultiAdapter("slack", "console", map[string]Adapter{
+		"slack":   statusShowingAdapter{newFakeAdapter()},
+		"console": newFakeAdapter(),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mux.ShowsTaskStatus("slack:C1/1.0") {
+		t.Error("a Slack conversation: want the status shown, no rolling line")
+	}
+	if mux.ShowsTaskStatus("console:abc") || mux.ShowsTaskStatus("discord:g/1") {
+		t.Error("a console or unknown conversation: want the rolling line kept")
+	}
+	var _ StatusShower = mux
+}
+
 // The Slack adapter shows the status once Agent Sessions is wired, and keeps
 // the line without it.
 func TestSlackShowsTaskStatusWithAgentSessions(t *testing.T) {
-	if !(&SlackAdapter{sessionsAPI: slackSessionsClient{}}).ShowsTaskStatus() {
+	if !(&SlackAdapter{sessionsAPI: slackSessionsClient{}}).ShowsTaskStatus("slack:C1") {
 		t.Error("with Agent Sessions: want the status shown, no rolling line")
 	}
-	if (&SlackAdapter{}).ShowsTaskStatus() {
+	if (&SlackAdapter{}).ShowsTaskStatus("slack:C1") {
 		t.Error("without Agent Sessions: want the rolling line kept")
 	}
 }

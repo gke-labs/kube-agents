@@ -444,6 +444,18 @@ class SendTest(unittest.TestCase):
         headline = post["blocks"][0]["elements"][0]["elements"]
         self.assertEqual("".join(e["text"] for e in headline), chat["headline"])
 
+    def test_outside_a_thread_the_options_stay_text(self):
+        """A click answers in the thread it was clicked in, so a top-level answer gets no buttons."""
+        case = json.loads((CHAT_CASES / "answer-offers-its-options.json").read_text(encoding="utf-8"))
+        adapter = _Adapter()
+        wrapped = runtime.adapter_for(
+            adapter, "slack", SimpleNamespace(kind="completed"), SimpleNamespace(), {"chat_id": CHANNEL}
+        )
+        asyncio.run(wrapped.send(CHANNEL, case["input"]["markdown"], metadata={}))
+        post = adapter.log[0][1]
+        self.assertNotIn("thread_ts", post)
+        self.assertNotIn("actions", [block["type"] for block in post["blocks"]])
+
     def test_a_closing_question_posts_after_the_fold(self):
         question = "Want me to scale the pool to 6 nodes?"
         adapter = _Adapter()
@@ -599,7 +611,7 @@ class ApplierTest(unittest.TestCase):
             n.value for n in ast.parse(source).body
             if isinstance(n, ast.Assign) and any(getattr(t, "id", None) == "RUNNER_ARGS" for t in n.targets)
         ]
-        runner_args = eval(compile(ast.Expression(node), "RUNNER_ARGS", "eval"), {"re": re})
+        runner_args = eval(compile(ast.Expression(node), "RUNNER_ARGS", "eval"), {"re": re})  # noqa: S307
         incident_applier.apply(self.root)
         applier.apply(self.root)
         self.assertRegex((self.root / applier.RELATIVE).read_text(), runner_args)

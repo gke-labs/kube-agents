@@ -285,9 +285,9 @@ func slackChatAfter(after []string) map[string]any {
 }
 
 // slackChatFold is the fold as Slack's collapsible container, collapsed:
-// its text as mrkdwn sections (toMrkdwn, the text path's escaping and
-// translation), then its table as a native table block whose first row is
-// the column names.
+// its text as rich_text blocks (slackRichBlocks: headings, fences, lists and
+// paragraphs drawn as Slack draws them), then its table as a native table
+// block whose first row is the column names.
 func slackChatFold(f *chatmsg.Fold) (map[string]any, error) {
 	var children []map[string]any
 	if strings.TrimSpace(f.Text) != "" {

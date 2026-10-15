@@ -445,7 +445,7 @@ def classify(text: str) -> str:
     return KIND_ANSWER
 
 
-def read_turn(bot_msgs: list[dict], mode: str) -> Optional[tuple[dict, str]]:
+def read_turn(bot_msgs: list[dict], mode: str, lineless: bool = False) -> Optional[tuple[dict, str]]:
     """The bot's reply to one turn, from its messages since the turn, oldest first.
 
     The status line is the first message in its grammar. Everything before it is
@@ -456,6 +456,11 @@ def read_turn(bot_msgs: list[dict], mode: str) -> Optional[tuple[dict, str]]:
     read by its state: the deliverable
     or the failure notice is posted before the terminal edit, so once the line is
     terminal the last message after it is that post, whatever its first character.
+
+    With lineless (--no-status-line), for a gateway that keeps no status line on
+    Slack, the first post in the failure grammar, else the first post outside the
+    grammar, is the reply: text alone then decides, so a notice the gateway posts
+    outside its grammar reads as an answer.
     """
     status_at = next((i for i, m in enumerate(bot_msgs) if status_state(m.get("text", ""))), None)
     before = bot_msgs if status_at is None else bot_msgs[:status_at]
@@ -466,6 +471,11 @@ def read_turn(bot_msgs: list[dict], mode: str) -> Optional[tuple[dict, str]]:
     if mode == WAIT_ANY and before:
         return before[0], KIND_NOTICE
     if status_at is None:
+        if lineless:
+            for kind in (KIND_FAILURE, KIND_ANSWER):
+                posts = [m for m in before if classify(m.get("text", "")) == kind]
+                if posts:
+                    return posts[0], kind
         return None
     status = bot_msgs[status_at]
     state = status_state(status.get("text", ""))
@@ -569,7 +579,7 @@ def wait_for_bot(session: Session, fetch: Callable[[], list[dict]], mode: str, t
         if not bot_msgs:
             return None
         seen["last"] = bot_msgs[-1]
-        return read_turn(bot_msgs, mode)
+        return read_turn(bot_msgs, mode, session.args.no_status_line)
 
     found = poll(step, timeout, session.args.poll_interval, session.clock, session.sleep)
     if found is None:
@@ -733,7 +743,7 @@ def check_thread(session: Session) -> CheckResult:
     # inbound() in a2a/gateway/slack.go takes an unmentioned reply only in a thread the
     # gateway started a task in (isSessionThread), and startTask posts the status line
     # there. A --thread-ts without one would wait out the settle and blame a steer.
-    if not any(m.get("user") == session.bot_user_id and status_state(m.get("text", ""))
+    if not any(m.get("user") == session.bot_user_id and (session.args.no_status_line or status_state(m.get("text", "")))
                for m in replies_after(session.listed, session.channel_id, root, "0")):
         return CheckResult(CHECK_THREAD, False, f"thread {root} holds no gateway status line, so the gateway never started "
                            "a task in it, and it takes an unmentioned reply only in a thread it started a task in; "
@@ -1050,6 +1060,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--type-timeout", type=positive_seconds, default=DEFAULT_TYPE_TIMEOUT_SECONDS,
                         help="seconds a TYPE line waits for the person to type the turn")
     parser.add_argument("--wait-answer", action="store_true", help="wait past the status line for the answer itself")
+    parser.add_argument("--no-status-line", action="store_true",
+                        help="the gateway keeps no status line on Slack (Agent Sessions): read the first answer or failure post as the reply")
     parser.add_argument("--reply-timeout", type=positive_seconds, default=DEFAULT_REPLY_TIMEOUT_SECONDS)
     parser.add_argument("--poll-interval", type=positive_seconds, default=DEFAULT_POLL_INTERVAL_SECONDS)
     parser.add_argument("--unlisted-via", choices=(UNLISTED_VIA_DM, UNLISTED_VIA_MENTION), default=UNLISTED_VIA_DM)

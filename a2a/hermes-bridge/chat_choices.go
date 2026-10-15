@@ -63,7 +63,10 @@ var (
 	optionNum      = regexp.MustCompile(`(?i)^option` + pySpace + `+(?:\p{Nd}+|[a-z])\b` + pySpace + `*[:.)\-–—]?` + pySpace + `*`)
 	notProse       = regexp.MustCompile(`^` + pySpace + `*[>|]`)
 	choiceWord     = regexp.MustCompile(`(?i)\b(?:which|or)\b`)
-	yesNoOpener    = regexp.MustCompile(`(?i)^(?:shall|should|can|could|may|might|will|would|do|does|did|is|are|am|was|were|want|have|has|ok|okay|sounds?|looks?)\b`)
+	// choiceHint is CHOICE_HINT: words that ask to choose, for a question
+	// with no "which" or "or".
+	choiceHint  = regexp.MustCompile(`(?i)\b(?:prefer|preference|options?|choose|pick)\b|^how` + pySpace + `+would` + pySpace + `+you` + pySpace + `+like\b`)
+	yesNoOpener = regexp.MustCompile(`(?i)^(?:shall|should|can|could|may|might|will|would|do|does|did|is|are|am|was|were|want|have|has|ok|okay|sounds?|looks?)\b`)
 	// proceedQuestion is slack_moments.PROCEED_QUESTION.
 	proceedQuestion = regexp.MustCompile(`(?i)^(?:(?:shall|should|can|may)\s+(?:i|we)|(?:is\s+it\s+)?ok(?:ay)?\s+to)\b.*?\b(?:proceed|continue|go\s+ahead)\b` +
 		`|^do\s+you\s+approve\b` +
@@ -79,6 +82,17 @@ var (
 // false when no break does. The rest's first word is capitalized as
 // as_line capitalizes one.
 func clauseCut(sentence string) (string, string, bool) {
+	// A sentence bold end to end is cut inside the bold, each half kept bold.
+	for _, marker := range []string{"**", "__"} {
+		if len(sentence) > 2*len(marker) && strings.HasPrefix(sentence, marker) && strings.HasSuffix(sentence, marker) &&
+			!strings.Contains(sentence[len(marker):len(sentence)-len(marker)], marker) {
+			head, rest, ok := clauseCut(sentence[len(marker) : len(sentence)-len(marker)])
+			if !ok {
+				return "", "", false
+			}
+			return marker + head + marker, marker + rest + marker, true
+		}
+	}
 	held, spans := holdCode(sentence)
 	masked := []byte(held)
 	depth := 0
@@ -109,6 +123,14 @@ func clauseCut(sentence string) (string, string, bool) {
 			continue
 		}
 		if !connector && clauseRelative.MatchString(r) {
+			continue
+		}
+		italic := false
+		for _, marker := range []string{"*", "_"} {
+			lone := strings.Count(strings.ReplaceAll(h, marker+marker, ""), marker)
+			italic = italic || (lone%2 == 1 && openerIn(h, marker))
+		}
+		if italic {
 			continue
 		}
 		if last, _ := utf8.DecodeLastRuneInString(h); h != "" && !strings.ContainsRune(clauseEnds, last) {
@@ -153,6 +175,8 @@ type answerOption struct {
 	label   string
 	primary bool
 	shown   string
+	// whole is whether the label and the shown line carry all the item says.
+	whole bool
 }
 
 // answerOffer is answer_choices' result: the shown text, the folded text,
@@ -250,7 +274,10 @@ func asksChoice(question string) bool {
 		return false
 	}
 	asked := lastSentence(text)
-	return choiceWord.MatchString(asked) || !(proceedQuestion.MatchString(asked) || yesNoOpener.MatchString(asked))
+	if choiceWord.MatchString(asked) {
+		return true
+	}
+	return !(proceedQuestion.MatchString(asked) || yesNoOpener.MatchString(asked)) && choiceHint.MatchString(asked)
 }
 
 // optionOf is _option: the option an item makes, or false when it cannot be
@@ -293,7 +320,13 @@ func optionOf(item listItem) (answerOption, bool) {
 	if summary != "" {
 		shown = fmt.Sprintf(shownSummary, fmt.Sprintf(shownOption, item.marker, label), summary)
 	}
-	return answerOption{label: label, primary: primary, shown: shown}, true
+	whole := summary == pyStrip(said)
+	for _, line := range item.more {
+		if pyStrip(line) != "" {
+			whole = false
+		}
+	}
+	return answerOption{label: label, primary: primary, shown: shown, whole: whole}, true
 }
 
 func trimBlankTail(lines []string) []string {
@@ -345,7 +378,6 @@ func answerChoices(rest string) (answerOffer, bool) {
 	offer := answerOffer{question: question}
 	seen := map[string]bool{}
 	firstPrimary := -1
-	continued := false
 	for i, item := range items {
 		option, ok := optionOf(item)
 		key := strings.ToLower(option.label)
@@ -358,9 +390,6 @@ func answerChoices(rest string) (answerOffer, bool) {
 		}
 		option.primary = false
 		offer.options = append(offer.options, option)
-		if len(item.more) > 0 {
-			continued = true
-		}
 	}
 	if firstPrimary >= 0 {
 		offer.options[firstPrimary].primary = true
@@ -378,15 +407,20 @@ func answerChoices(rest string) (answerOffer, bool) {
 		lead = head[:leadEnd]
 	}
 	folded := append([]string(nil), head[len(lead):]...)
-	if continued {
-		folded = append(append(folded, ""), region...)
-	}
 	// The options' lines show only when each says more than its button does.
 	shownLines := make([]string, len(offer.options))
 	every := true
 	for i, option := range offer.options {
 		shownLines[i] = option.shown
 		every = every && option.shown != ""
+	}
+	// The options fold as written whenever what is in sight does not carry
+	// all they say.
+	for _, option := range offer.options {
+		if !option.whole || (option.shown != "" && !every) {
+			folded = append(append(folded, ""), region...)
+			break
+		}
 	}
 	optionsShown := ""
 	if every {

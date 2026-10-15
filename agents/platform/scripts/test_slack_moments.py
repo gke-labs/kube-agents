@@ -647,8 +647,26 @@ class AnswerChoicesTest(unittest.TestCase):
         self.assertTrue(options[0][0].endswith(p.ELLIPSIS))
 
     def test_option_lines_show_only_when_each_says_more_than_its_label(self):
-        shown, _folded, _question, _options = m.answer_choices("Two ways.\n\n- **Roll back**\n- **Fix forward**: patch it.\n\nWhich?")
+        options = "- **Roll back**\n- **Fix forward**: patch it."
+        shown, folded, _question, _options = m.answer_choices(f"Two ways.\n\n{options}\n\nWhich?")
         self.assertEqual(shown, "Two ways.")
+        self.assertEqual(folded, options, "what the hidden lines say folds")
+
+    def test_what_a_shown_line_leaves_out_folds(self):
+        options = "- **A**: Do x. Then also y.\n- **B**: Do z."
+        shown, folded, _question, _options = m.answer_choices(f"{options}\n\nWhich?")
+        self.assertEqual(shown, "- **A** — Do x.\n- **B** — Do z.")
+        self.assertEqual(folded, options)
+        _shown, folded, _question, _options = m.answer_choices("- **A**: Do x.\n- **B**: Do z.\n\nWhich?")
+        self.assertEqual(folded, "", "every line in sight whole: nothing to fold")
+
+    def test_a_closing_question_asking_no_choice_offers_none(self):
+        findings = "- pod-a is OOMKilled\n- pod-b is Pending"
+        for question in ("Anything else you want me to look at?", "Need anything else?", "Any questions?"):
+            with self.subTest(question=question):
+                self.assertIsNone(m.answer_choices(f"{findings}\n\n{question}"))
+        self.assertIsNotNone(m.answer_choices(f"{findings}\n\nWhich should I fix first?"))
+        self.assertIsNotNone(m.answer_choices(f"{findings}\n\nWhat would you prefer?"))
 
     def test_only_the_first_recommended_is_primary(self):
         _s, _f, _q, options = m.answer_choices("- **A (recommended)**\n- **B (Recommended)**\n\nWhich one?")

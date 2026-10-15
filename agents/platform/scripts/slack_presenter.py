@@ -738,12 +738,20 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
 def clause_cut(sentence: str) -> tuple[str, str] | None:
     """``(headline, rest)`` for a first sentence longer than ``HEADLINE_MAX``, as markdown, or None.
 
-    The cut is the last :data:`CLAUSE_BREAK` outside a code span, a bracket and a bold run
+    The cut is the last :data:`CLAUSE_BREAK` outside a code span, a bracket and a bold or italic run
     that leaves a headline of :data:`CLAUSE_HEADLINE_MIN` to ``HEADLINE_MAX`` characters once
     plain, a stop added, and no rest opening on a relative word after a comma, semicolon or
     dash (:data:`CLAUSE_RELATIVE`). The rest is the sentence after the cut, as written, its first
-    word capitalized as :func:`as_line` would, so it reads as a sentence of its own.
+    word capitalized as :func:`as_line` would, so it reads as a sentence of its own. A
+    sentence bold from end to end, as the report format asks a worker to write its first
+    one, is cut inside the bold, and each half stays bold.
     """
+    for marker in BOLD_MARKERS:
+        inner = sentence[len(marker) : -len(marker)]
+        if len(sentence) > 2 * len(marker) and sentence.startswith(marker) and sentence.endswith(marker) \
+                and marker not in inner:
+            cut = clause_cut(inner)
+            return (f"{marker}{cut[0]}{marker}", f"{marker}{cut[1]}{marker}") if cut else None
     held, spans = _hold_code(sentence)
     masked, depth = [], 0
     for char in held:
@@ -758,6 +766,10 @@ def clause_cut(sentence: str) -> tuple[str, str] | None:
         connector = match.group("connector") is not None
         rest = held[match.end("connector") if connector else match.end() :].strip()
         if not rest or any(head.count(marker) % 2 for marker in BOLD_MARKERS):
+            continue
+        # A lone italic marker this head opens and does not close, as _first_sentence counts them.
+        if any(head.replace(marker * 2, "").count(marker) % 2 and opener.search(head)
+               for marker, (opener, _closer) in ITALIC_EDGES.items()):
             continue
         if not connector and CLAUSE_RELATIVE.match(rest):
             continue

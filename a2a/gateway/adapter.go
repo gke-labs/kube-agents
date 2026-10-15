@@ -186,8 +186,10 @@ type VerifiedObserver interface {
 // gateway posts no placeholder for a task, so the relay has no line to edit
 // and every line edit is skipped; the notices that stand on their own (the
 // queue notice, a publish failure, a failed or canceled task) still post.
+// Asked per conversation, so a wrapper (the mux, the side door) answers for
+// the backend that owns it.
 type StatusShower interface {
-	ShowsTaskStatus() bool
+	ShowsTaskStatus(conversation string) bool
 }
 
 // OutMessage is one post or edit as a value: the text, and the chat message

@@ -408,7 +408,7 @@ func (s *SlackAdapter) expireMark(key string) {
 // thread's Working… status, the ask's reaction and the plan rows are the
 // task's status, so the relay posts no rolling line. An adapter built
 // without them (a test that fakes no sessions API) keeps the line.
-func (s *SlackAdapter) ShowsTaskStatus() bool { return s.sessionsAPI != nil }
+func (s *SlackAdapter) ShowsTaskStatus(string) bool { return s.sessionsAPI != nil }
 
 func (s *SlackAdapter) TaskAccepted(conversation, _ string) {
 	s.updateSession(conversation, func(st *slackSession) { st.running = true })

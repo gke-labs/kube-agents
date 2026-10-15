@@ -119,7 +119,7 @@ LAUNCHER_OWNED_HARNESS_FLAGS = (CHECKS_FLAG, RUN_ID_FLAG, PROJECT_FLAG, KEEP_GOI
 # the pod's Workload Identity token, to whatever host the workstation names.
 FORWARDABLE_HARNESS_FLAGS = frozenset({
     "--listed-secret", "--unlisted-secret", "--bot-user-id", "--bot-name", "--channel",
-    "--thread-ts", "--prompt", "--followup", "--type-timeout", "--wait-answer", "--reply-timeout",
+    "--thread-ts", "--prompt", "--followup", "--type-timeout", "--wait-answer", "--no-status-line", "--reply-timeout",
     "--poll-interval", "--unlisted-via", "--unlisted-repeat", "--quiet-window", "--refusal-silence-ok",
     "--home-channel", "--home-since", "--home-timeout", "--home-match",
 })

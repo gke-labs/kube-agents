@@ -38,7 +38,7 @@ the fold, unfolded, so an offer is never hidden. An answer that ends by asking w
 two to five options to take (``slack_moments.answer_choices``, the rule next's emitter
 applies too) keeps its opening paragraph and the options' shown lines above the fold, the
 question below it, and the options as choice buttons (``kage_answer.choice.<n>``, value
-the label), which ``slack_ux_clicks`` answers as the clicker's reply. The folded post
+the label) in a thread, which ``slack_ux_clicks`` answers as the clicker's reply; outside one the options stay text. The folded post
 carries what upstream's adds: link-preview settings, ``reply_broadcast``, the
 feedback buttons, the status clear and the reply tracking for the thread. An incident report
 that edits its alert never reaches this send, and a report a reply can act on
@@ -337,7 +337,9 @@ class _AnswerFolder:
         headline, rest = parts
         adapter = self._adapter
         mrkdwn_fn = getattr(adapter, "format_message", None)
-        offered = _moments.answer_choices(rest)
+        # A click answers in the thread it was clicked in, so outside a thread the options
+        # stay text, as a needs-you question's and a failure reply's offer do.
+        offered = _moments.answer_choices(rest) if adapter._resolve_thread_ts(None, metadata) else None
         if offered is not None:
             # An answer asking which of its options to take: the opening paragraph and the
             # options' shown lines stay in sight, the rest folds, and the options are buttons.

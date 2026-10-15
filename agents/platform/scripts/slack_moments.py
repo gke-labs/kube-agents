@@ -252,6 +252,9 @@ YES_NO_OPENER = re.compile(
     r"|sounds?|looks?)\b",
     re.IGNORECASE,
 )
+#: Words that ask to choose among a list, for a closing question with no "which" or "or":
+#: "How would you like to proceed?", "Do you have a preference?" is a yes/no opener and not one.
+CHOICE_HINT = re.compile(r"\b(?:prefer|preference|options?|choose|pick)\b|^how\s+would\s+you\s+like\b", re.IGNORECASE)
 #: How many item lines :func:`_list_start` reads up from an answer's end before it gives up, nested
 #: items included: well past five options with sub-bullets, and it keeps the scan linear.
 LIST_SCAN_MAX = 50
@@ -654,22 +657,26 @@ def _list_start(lines: Sequence[str]) -> int | None:
 
 def _asks_choice(question: str) -> bool:
     """Whether ``question`` asks for one of the options: it ends in a question mark, and its
-    last sentence says "which" or "or", or is neither a yes/no ask to go on
-    (:func:`_trailing_options`) nor any other yes/no question (:data:`YES_NO_OPENER`)."""
+    last sentence says "which" or "or", or asks to choose (:data:`CHOICE_HINT`) without being
+    a yes/no ask to go on (:func:`_trailing_options`) or any other yes/no question
+    (:data:`YES_NO_OPENER`). "Anything else?" under a list of findings asks for no choice."""
     text = _presenter._plain(question)
     if not text.endswith(QUESTION_END):
         return False
     asked = SENTENCE_START.split(text)[-1]
-    return bool(CHOICE_WORD.search(asked)) or not (PROCEED_QUESTION.search(asked) or YES_NO_OPENER.match(asked))
+    if CHOICE_WORD.search(asked):
+        return True
+    return not (PROCEED_QUESTION.search(asked) or YES_NO_OPENER.match(asked)) and bool(CHOICE_HINT.search(asked))
 
 
-def _option(marker: str, text: str, continuation: Sequence[str]) -> tuple[str, bool, str] | None:
-    """``(label, primary, shown line)`` for one option, or None when it cannot be a button.
+def _option(marker: str, text: str, continuation: Sequence[str]) -> tuple[str, bool, str, bool] | None:
+    """``(label, primary, shown line, whole)`` for one option, or None when it cannot be a button.
 
     The label is the item's bold lead, else its whole first line, which must then fit a
     button; "(Recommended)" makes it primary and an "Option 2:" numbering is dropped. The
     shown line is the label in bold and the first sentence the item says after it, or empty
-    when it says nothing more than its label.
+    when it says nothing more than its label. ``whole`` is whether the label and the shown
+    line carry all the item says.
     """
     lead = BOLD_LEAD.match(text)
     said = text[lead.end():].lstrip(LEAD_JOINER) if lead else ""
@@ -689,7 +696,8 @@ def _option(marker: str, text: str, continuation: Sequence[str]) -> tuple[str, b
     held, spans = _presenter._hold_code(said)
     summary = _presenter._restore_code(_presenter._first_sentence(held)[0], spans).strip()
     shown = SHOWN_SUMMARY.format(line=SHOWN_OPTION.format(marker=marker, label=label), summary=summary)
-    return label, primary, shown if summary else ""
+    whole = not any(line.strip() for line in continuation) and summary == said.strip()
+    return label, primary, shown if summary else "", whole
 
 
 def answer_choices(rest: str) -> tuple[str, str, str, list[tuple[str, bool]]] | None:
@@ -732,21 +740,23 @@ def answer_choices(rest: str) -> tuple[str, str, str, list[tuple[str, bool]]] | 
     options = [_option(*item) for item in items]
     if any(option is None for option in options):
         return None
-    labels = [label.casefold() for label, _primary, _shown in options]
+    labels = [label.casefold() for label, _primary, _shown, _whole in options]
     if len(set(labels)) != len(labels):
         return None
-    first = next((i for i, (_label, primary, _shown) in enumerate(options) if primary), None)
+    first = next((i for i, (_label, primary, _shown, _whole) in enumerate(options) if primary), None)
     head = list(head)
     while head and not head[-1].strip():
         head.pop()
     lead_end = next((i for i, line in enumerate(head) if not line.strip()), len(head))
     lead = head[:lead_end] if head and not _not_prose(head[0]) else []
     folded = head[len(lead):]
-    if any(continuation for _marker, _text, continuation in items):
-        folded = [*folded, "", *region]
     # The options' lines show only when each says more than its button does.
-    lines = [line for _label, _primary, line in options]
-    shown = "\n\n".join(part for part in ("\n".join(lead).strip(), "\n".join(lines) if all(lines) else "") if part)
+    lines = [line for _label, _primary, line, _whole in options]
+    shown_all = all(lines)
+    # The options fold as written whenever what is in sight does not carry all they say.
+    if any(not whole or (line and not shown_all) for _label, _primary, line, whole in options):
+        folded = [*folded, "", *region]
+    shown = "\n\n".join(part for part in ("\n".join(lead).strip(), "\n".join(lines) if shown_all else "") if part)
     return shown, "\n".join(folded).strip(), question, [
-        (label, i == first) for i, (label, _primary, _shown) in enumerate(options)
+        (label, i == first) for i, (label, _primary, _shown, _whole) in enumerate(options)
     ]

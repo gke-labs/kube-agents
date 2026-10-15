@@ -471,6 +471,18 @@ class ClauseCutTest(unittest.TestCase):
         self.assertIsNone(sp.clause_cut("Three pods (" + "x, " * 60 + ") restarted overnight and stayed down."))
         self.assertIsNone(sp.clause_cut("**" + "bold, " * 30 + "** is all of this sentence and nothing else."))
 
+    def test_a_sentence_bold_end_to_end_is_cut_inside_the_bold(self):
+        head, rest = sp.clause_cut("**payments-api is CrashLooping due to an OOMKill " + "y " * 70 + "end.**")
+        self.assertEqual(head, "**payments-api is CrashLooping.**")
+        self.assertTrue(rest.startswith("**Due to an OOMKill") and rest.endswith("end.**"))
+
+    def test_no_cut_inside_an_italic_run(self):
+        head, _rest = sp.clause_cut(
+            "The ingress on seeded-c drops long-lived connections at startup, *because the pool has no headroom, "
+            "none at all* today, so the HPA cannot add a replica and the queue keeps growing."
+        )
+        self.assertEqual(head.count("*") % 2, 0)
+
     def test_too_short_a_headline_is_no_cut(self):
         self.assertIsNone(sp.clause_cut("In seeded-a, " + "z " * 80))
 
