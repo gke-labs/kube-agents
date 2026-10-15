@@ -183,13 +183,17 @@ because the report script's own fallback is every project the credential can
 list. Within those projects the report script
 enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
 Cluster Agent from is still read here. That read is `gcloud` cluster metadata
-for the version table and, on a report day, one `get-credentials` and two
-`kubectl get` per cluster for the readiness grade, one of
-`pdb,deploy,statefulset -A` and one of
-`validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces -A`;
-the budget names those objects, and a fail-closed webhook with no reachable
-backend names its configuration and its Service, in the saved report, which is
-tenant-written text, so the entry declares `risk: high` as `stall-watch` does. A project
+for the version table and, on a report day, the readiness report's read set,
+the same as a run on request: one `get-credentials` and six `kubectl get`s
+per cluster (budgets, Deployments and StatefulSets; webhook configurations
+with their Services, EndpointSlices and Namespaces; DaemonSets, CronJobs,
+claims, NetworkPolicies and Namespaces; every pod; the nodes through a
+jsonpath projection; StorageClasses and PersistentVolumes), plus
+`gcloud logging read` over the Admin Activity log when a registered rule reads
+it; the saved report names those objects, pods and nodes among them, and a
+fail-closed webhook with no reachable backend names its configuration and its
+Service, which is tenant-written text, so the entry declares `risk: high` as
+`stall-watch` does. A project
 spelled by its number is keyed by the id `gcloud projects describe` resolves,
 learned on its first table run. A number the credential cannot resolve is
 never a key, so its clusters earn no report until it resolves: when nothing
@@ -204,10 +208,11 @@ without it is a custom grant) or the project id in place of the number
 (`spec.harness.projectId` has to be the id; `UPGRADE_READINESS_PROJECTS` for a
 hand run).
 
-It runs the skill the way `stall-watch` runs `stall_report.py`: the two scripts
-are read from the agent image's `/opt/platform-template/skills/` copy and
-handed to `python3 -I -` in the sandbox on stdin, behind a loader that
-registers `upgrade_readiness` before running `fleet_upgrade_report.main`. The
+It runs the skill the way `stall-watch` runs `stall_report.py`: every module
+under the skill's `scripts/` except its tests, with the data files beside them,
+is read from the agent image's `/opt/platform-template/skills/` copy and handed
+to `python3 -I -` in the sandbox on stdin, behind a loader (a meta-path finder
+serving the shipped set) before running `fleet_upgrade_report.main`. The
 loader gives the report a private `tempfile.mkdtemp` directory for its JSON
 output and rollout record, so nothing the model can write to is on the path
 the result crosses, and removes it afterwards; the sandbox's `/opt/data` is

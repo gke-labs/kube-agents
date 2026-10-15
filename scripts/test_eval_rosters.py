@@ -179,6 +179,7 @@ ADDED_AFTER_THE_MOVE = [
     "gitops-drift-noise-filtered-triage",  # the drift detector's principal classifier, #2739's fixture
     "chat-question-asked-to-choose-pauses",  # an asked-for choice pauses the card on a needs_input question
     "manage-cluster-exclusion-installer-route-probe",  # the exclusion route on an installer-made install
+    "upgrades-readiness-zonal-control-plane",  # catalogue entry 11 through the readiness report's per-entry rules
     "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
     "not-found-target-stops-as-failure",  # a missing target stops its card on a hard wall, mock 06
 ]
