@@ -39,6 +39,7 @@ const (
 	gchatEventsReceivedName = "gchat_events_received_total"
 	gchatPullsName          = "gchat_pulls_total"
 	chatMessagesName        = "chat_messages_total"
+	notifyMarksDroppedName  = "notify_marks_dropped_total"
 
 	// The label names. Every value under them comes from a closed list
 	// below, never from a task, a conversation or an executor's text, so
@@ -123,6 +124,7 @@ type Metrics struct {
 	gchatEventsReceived prometheus.Counter
 	gchatPulls          *prometheus.CounterVec
 	chatMessages        *prometheus.CounterVec
+	notifyMarksDropped  prometheus.Counter
 }
 
 // NewMetrics builds the counters on a fresh registry.
@@ -153,8 +155,14 @@ func NewMetrics() *Metrics {
 			Name:      chatMessagesName,
 			Help:      "kube-agents.chat/v1 messages the gateway handed a chat adapter or dropped, counted per hand-over, by outcome: rendered (laid out by the backend), text_only (a backend that renders none posted the fallback), refused (the backend could not hold it or its API refused it; the fallback posted), invalid (it broke a rule and was dropped; the fallback posted, or for a bad mark alone the mark was dropped).",
 		}, []string{labelOutcome}),
+		notifyMarksDropped: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      notifyMarksDroppedName,
+			Help:      "Conversation notify marks dropped because no chain could be named for them (the notify carried no update key bound to one) while a chain was running in the conversation.",
+		}),
 	}
-	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages)
+	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped)
 	for _, outcome := range metricsChatOutcomes {
 		m.chatMessages.WithLabelValues(outcome)
 	}
@@ -205,6 +213,15 @@ func (m *Metrics) chatMessage(outcome string) {
 		return
 	}
 	m.chatMessages.WithLabelValues(outcome).Inc()
+}
+
+// notifyMarkDropped counts one conversation notify mark dropped for want of
+// a chain to name (applyNotifyMark).
+func (m *Metrics) notifyMarkDropped() {
+	if m == nil {
+		return
+	}
+	m.notifyMarksDropped.Inc()
 }
 
 // metricsTerminalStateLabel is state if the closed list has it, else other.

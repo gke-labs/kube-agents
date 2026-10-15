@@ -413,8 +413,8 @@ func slackChatPlan(p *chatmsg.Plan) map[string]any {
 }
 
 // slackChatActions is the buttons, choices before links, five to a row. A
-// choice's value is what a click will send (its reply, else its text;
-// nothing answers a click yet); a link button opens its url. The one primary entry is
+// choice's value is what a click sends as the clicker's message (its reply,
+// else its text; slack_interactive.go); a link button opens its url. The one primary entry is
 // drawn as Slack's primary button.
 func slackChatActions(choices []chatmsg.Choice, links []chatmsg.Link) []map[string]any {
 	var buttons []map[string]any

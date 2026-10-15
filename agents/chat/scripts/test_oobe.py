@@ -1103,5 +1103,17 @@ class RosterTest(unittest.TestCase):
         self.assertEqual(job["deliver"], "local")
 
 
+class ManagedRepositoriesTest(unittest.TestCase):
+    def test_a_github_enterprise_server_repository_is_named_with_its_host(self):
+        # The bare-slug reader is empty on such an install, so the first-run
+        # audits would skip with no repository.
+        import gitops_workspace
+
+        with mock.patch.object(gitops_workspace, "get_managed_github_repo_names",
+                               return_value=["ghe.example.com/acme/infra"]), \
+                mock.patch.object(gitops_workspace, "get_managed_github_repos", return_value=[]):
+            self.assertEqual(["ghe.example.com/acme/infra"], oobe.managed_repositories())
+
+
 if __name__ == "__main__":
     unittest.main()

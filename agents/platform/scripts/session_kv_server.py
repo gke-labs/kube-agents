@@ -2940,11 +2940,22 @@ def _is_fleet_audit_job(profile: str, job_id: str) -> bool:
 
 
 def _is_managed_github_repo(repo: str) -> bool:
-    """Whether `repo` is a managed GitHub repository; False when the list cannot be read."""
-    try:
-        from gitops_workspace import get_managed_github_repos
+    """Whether `repo` is a managed GitHub repository; False when the list cannot be read.
 
-        managed = {slug.lower() for slug in get_managed_github_repos()}
+    A bare `owner/name` is a github.com one. A `<host>/owner/name` is one on
+    the install's GitHub Enterprise Server host, named as the managed list
+    names it.
+    """
+    try:
+        from gitops_workspace import get_managed_github_repos, get_managed_repos, github_host
+
+        if repo.count("/") == 2:
+            host = repo.split("/", 1)[0].lower()
+            if host != github_host():
+                return False
+            managed = {name.lower() for name in get_managed_repos()}
+        else:
+            managed = {slug.lower() for slug in get_managed_github_repos()}
     except Exception as exc:
         logger.warning(f"Audit headline skipped: managed repositories unreadable: {exc}")
         return False

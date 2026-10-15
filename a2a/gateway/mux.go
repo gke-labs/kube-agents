@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
-	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 const (
@@ -185,18 +184,6 @@ func (m *MultiAdapter) EditMessage(conversation, messageID string, msg OutMessag
 	return a.EditMessage(conversation, messageID, msg)
 }
 
-// ChatMark reaches the backend that owns the conversation, when it
-// implements ChatMarker.
-func (m *MultiAdapter) ChatMark(conversation, taskID string, mark chatmsg.Mark) {
-	a, err := m.pick(conversation)
-	if err != nil {
-		return
-	}
-	if marker, ok := a.(ChatMarker); ok {
-		marker.ChatMark(conversation, taskID, mark)
-	}
-}
-
 func (m *MultiAdapter) Roster(conversation string) ([]string, bool, error) {
 	a, err := m.pick(conversation)
 	if err != nil {
@@ -207,6 +194,40 @@ func (m *MultiAdapter) Roster(conversation string) ([]string, bool, error) {
 
 func (m *MultiAdapter) OpenDirect(userID string) (string, error) {
 	return m.byPrefix[m.primary].OpenDirect(userID)
+}
+
+func (m *MultiAdapter) React(conversation, messageID, token string) error {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return err
+	}
+	return a.React(conversation, messageID, token)
+}
+
+func (m *MultiAdapter) RemoveReaction(conversation, messageID, token string) error {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return err
+	}
+	return a.RemoveReaction(conversation, messageID, token)
+}
+
+// MarkChanged and InboundVerified route like the observer calls below: to
+// the backend that owns the conversation, when it implements the interface.
+func (m *MultiAdapter) MarkChanged(conversation, ask, settle string) {
+	if a, err := m.pick(conversation); err == nil {
+		if observer, ok := a.(MarkObserver); ok {
+			observer.MarkChanged(conversation, ask, settle)
+		}
+	}
+}
+
+func (m *MultiAdapter) InboundVerified(conversation, messageID string, verified bool) {
+	if a, err := m.pick(conversation); err == nil {
+		if observer, ok := a.(VerifiedObserver); ok {
+			observer.InboundVerified(conversation, messageID, verified)
+		}
+	}
 }
 
 // The gateway finds TaskObserver and SessionLookupSink by type assertion on

@@ -54,6 +54,7 @@ A top-level `toolsets: [kanban]` key additionally exposes the kanban orchestrato
 - `hermes_otel` — OpenTelemetry export to the GKE Managed OTel collector.
 - `tool_call_audit` — appends every tool call and approval decision as a structured audit record to the profile's `logs/audit.jsonl`, which the fluent-bit sidecar ships to Cloud Logging as fields ([Concepts → Observability](/kube-agents/concepts/observability/#tool-call-audit)).
 - `incident_context` — injects Kubernetes incident context into known chat threads on reply.
+- `pr_opened` — records each pull or merge request the Platform Agent's kanban workers open on their card, so a Slack thread gets it as a message of its own when `KAGE_SLACK_UX` is on ([ChatOps](/kube-agents/concepts/chatops/)).
 
 The chat-ingress plugins (`session_store`, `session_otel_bridge`) run on the Planning Agent profile, which owns chat ingress — see [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml).
 
