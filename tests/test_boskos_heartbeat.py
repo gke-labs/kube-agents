@@ -314,6 +314,24 @@ class BoskosHeartbeatTest(unittest.TestCase):
         self.assertIn("disabled", stdout)
         self.assertEqual(_FakeBoskos.updates, [])
 
+    def test_the_first_beats_code_lands_in_the_named_file(self):
+        # ci-teardown.sh reads this file before Step 1: a 401 there means the
+        # project is another run's and the cluster steps are skipped (#3129).
+        first = Path(self.tmp.name) / "first-beat"
+        proc = self._spawn(BOSKOS_HEARTBEAT_FIRST_BEAT_FILE=str(first))
+        wait_until(lambda: first.exists() and first.read_text().strip())
+        self._await_beats(3)
+        self._stop(proc)
+        self.assertEqual(first.read_text().strip(), "200")
+
+    def test_the_first_beat_file_says_401_when_the_lease_is_anothers(self):
+        _FakeBoskos.owner = "pull-kube-agents-smoke-test-2110536740778283008"
+        first = Path(self.tmp.name) / "first-beat"
+        proc = self._spawn(BOSKOS_HEARTBEAT_FIRST_BEAT_FILE=str(first))
+        wait_until(lambda: first.exists() and first.read_text().strip())
+        self._stop(proc)
+        self.assertEqual(first.read_text().strip(), "401")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

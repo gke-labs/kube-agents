@@ -297,6 +297,10 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
             # task lock, and the unwinding its skip paths share.
             lifted("finished_rep_count"),
             lifted("skip_unit"),
+            # What the unit does when the install is gone (#3129): the code
+            # wait_platform_runs returns for it and the marker that latches it.
+            lifted_constant("EVAL_GATEWAY_GONE_RC"),
+            lifted_constant("EVAL_INSTALL_GONE_MARKER"),
             lifted("run_one_unit"),
             self.UNIT_STUBS,
             extra,
@@ -339,6 +343,29 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
         self.assertNotIn("FINISH_CASE", result.stdout)
         self.assertIn("case-x rep 2 gave up on its task lock", result.stderr)
         self.assertNotIn("case-x.rep2.end", result.stdout)
+
+    def test_a_gateway_that_is_gone_records_every_repetition_as_infrastructure_and_never_launches(self):
+        """#3129: when wait_platform_runs reports the gateway Deployment gone,
+        the unit records its repetition as infrastructure instead of running
+        the bench against a missing install, and latches the state for the
+        run, so later units, streams or none, skip the exec and record the
+        same way; the last one grades the case."""
+        gone = "\n".join(
+            [
+                lifted_constant("EVAL_INFRA_FAILURE_MARKER"),
+                lifted_constant("EVAL_NOT_RUN_DIR"),
+                lifted_constant("EVAL_NOT_RUN_STATUS"),
+                lifted("record_unit_not_run"),
+                'wait_platform_runs() { echo "WAIT ${rep}"; return "${EVAL_GATEWAY_GONE_RC}"; }',
+            ]
+        )
+        result = self.run_reps(gone)
+        out = result.stdout + result.stderr
+        self.assertEqual(result.stdout.count("WAIT"), 1, out)
+        self.assertEqual(result.stderr.count("recorded as infrastructure"), 3, out)
+        self.assertNotIn("ran 1 task(s)", result.stdout, "the bench must not launch against a missing install")
+        self.assertIn("FINISH_CASE case-x after rep 3", result.stdout, out)
+        self.assertIn("install-gone", result.stdout, out)
 
     def test_every_repetition_gets_its_own_tunnels(self):
         """The harness owns one port-forward per process and its atexit
