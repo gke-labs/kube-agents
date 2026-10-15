@@ -389,6 +389,20 @@ class PrEventTest(unittest.TestCase):
         self.assertFalse(_run(runtime.pr_opened(adapter, SUB, f"{self.EVENT['url']} is up for review")))
         self.assertEqual(adapter.posts, [])
 
+    def test_under_next_the_event_posts_a_chat_message_and_the_prose_after_it_posts_nothing(self):
+        sent = []
+
+        class StandIn:
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                sent.append((chat_id, chat, metadata))
+                return SimpleNamespace(success=True)
+
+        self.assertTrue(_run(runtime.pr_event(StandIn(), SUB, self.EVENT, self.NOTE)))
+        self.assertFalse(_run(runtime.pr_opened(StandIn(), SUB, f"Opened {self.EVENT['url']}")))
+        (chat_id, chat, metadata), = sent
+        self.assertEqual((chat_id, metadata), ("C0KAGE", {"thread_id": SUB["thread_id"]}))
+        self.assertEqual(chat["links"][0], {"text": "Open PR ↗", "url": self.EVENT["url"], "primary": True})
+
     def test_a_failed_post_is_retried_by_the_next_path(self):
         adapter = _Adapter(fail=True)
         self.assertFalse(_run(runtime.pr_event(adapter, SUB, self.EVENT)))
