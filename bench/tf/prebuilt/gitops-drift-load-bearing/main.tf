@@ -580,11 +580,17 @@ resource "null_resource" "load_bearing_change" {
         sh "${var.daemon_url}/sessions/$session_id/inject" < "$envelope_file" || true)"
 
       # `suppressed` is a 200. The daemon accepted the record, spent nothing on
-      # it and told nobody, because the day's drift alert ceiling
-      # (ALERT_DAILY_LIMIT_DRIFT, 5 by default) is already gone -- so no card is
-      # ever filed and the case would time out looking for one. This case
-      # shares that bucket with every other drift case on the install, which
-      # three repetitions of several drift cases can exhaust in one night.
+      # it and told nobody, because the day's drift alert ceiling is already
+      # gone -- so no card is ever filed and the case would time out looking
+      # for one.
+      #
+      # This does NOT bite in CI: hack/ci-deploy.sh sets
+      # EVAL_ALERT_DAILY_LIMIT_DRIFT=0 and _alert_daily_limit treats 0 as off,
+      # so an eval install has no drift ceiling at all (the sibling case
+      # gitops-drift-noise-filtered-triage carries the same note). It bites on
+      # a DEV install carrying the shipped default of 5, where this case shares
+      # the bucket with every other drift case -- which is the install the
+      # eval-driven loop runs against, and the one the message below is for.
       if [ "$inject_status" = "suppressed" ]; then
         echo "ERROR: the daemon suppressed this record against its daily drift alert ceiling, so no triage card will be filed. This install has already taken its drift alerts for the day -- the other gitops-drift cases spend from the same bucket. Raise ALERT_DAILY_LIMIT_DRIFT or run against a fresh install." >&2
         exit 1

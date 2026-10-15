@@ -317,11 +317,18 @@ resource "null_resource" "deleted_policy" {
       # A server-side apply that silently fell back to a different manager
       # would leave the scenario claiming a GitOps-owned policy was removed when
       # no GitOps manager ever owned one.
-      policy_owner="$(kubectl get networkpolicy "${local.policy}" -n "${local.ns}" \
-        -o jsonpath='{.metadata.managedFields[0].manager}' 2>/dev/null || true)"
-      if [ "$policy_owner" != "${var.gitops_field_manager}" ]; then
-        echo "ERROR: ${local.policy} records field manager '$policy_owner', not ${var.gitops_field_manager}, so the policy this run is about to delete was never owned by the GitOps manager and the scenario would be a fiction." >&2
-        kubectl get networkpolicy "${local.policy}" -n "${local.ns}" -o yaml --show-managed-fields >&2 || true
+      #
+      # Every manager is listed and matched rather than reading
+      # managedFields[0]: the array is not ordered by who matters, so any
+      # second entry the API server sorts ahead of the GitOps one -- a
+      # controller touching annotations, say -- would make index 0 the wrong
+      # manager and hard-exit this plant against a scenario that is in fact
+      # correct. The sibling stacks use this form for the same reason.
+      policy_managers="$(kubectl get networkpolicy "${local.policy}" -n "${local.ns}" \
+        -o jsonpath='{range .metadata.managedFields[*]}{.manager}{"\n"}{end}' 2>/dev/null || true)"
+      if ! printf '%s\n' "$policy_managers" | grep -qxF "${var.gitops_field_manager}"; then
+        echo "ERROR: ${local.policy} does not record field manager '${var.gitops_field_manager}', so the policy this run is about to delete was never owned by the GitOps manager and the scenario would be a fiction. Managers found:" >&2
+        printf '%s\n' "$policy_managers" >&2
         exit 1
       fi
 
@@ -455,14 +462,17 @@ resource "null_resource" "deleted_policy" {
         sh "${var.daemon_url}/sessions/$session_id/inject" < "$envelope_file" || true)"
 
       # `suppressed` is a 200. The daemon accepted the record, spent nothing on
-      # it and told nobody, because the day's drift alert ceiling
-      # (ALERT_DAILY_LIMIT_DRIFT, 5 by default) is already gone -- so no card is
-      # ever filed and the case would time out looking for one.
+      # it and told nobody, because the day's drift alert ceiling is already
+      # gone -- so no card is ever filed and the case would time out looking
+      # for one.
       #
-      # This case shares that ceiling with every other drift case on the same
-      # install, which three repetitions of two drift cases can exhaust in a
-      # single nightly. That is the first thing to check when this message
-      # appears.
+      # This does NOT bite in CI: hack/ci-deploy.sh sets
+      # EVAL_ALERT_DAILY_LIMIT_DRIFT=0 and _alert_daily_limit treats 0 as off,
+      # so an eval install has no drift ceiling at all (the sibling case
+      # gitops-drift-noise-filtered-triage carries the same note). It bites on
+      # a DEV install carrying the shipped default of 5, where this case shares
+      # the bucket with every other drift case -- which is the install the
+      # eval-driven loop runs against, and the one the message below is for.
       if [ "$inject_status" = "suppressed" ]; then
         echo "ERROR: the daemon suppressed this record against its daily drift alert ceiling, so no triage card will be filed. This install has already taken its drift alerts for the day -- the other gitops-drift cases spend from the same bucket. Raise ALERT_DAILY_LIMIT_DRIFT or run against a fresh install." >&2
         exit 1

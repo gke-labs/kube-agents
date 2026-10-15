@@ -88,10 +88,18 @@
 # because the daemon binds loopback inside that pod and the planted workload
 # has to be somewhere the agent can read it.
 #
-# It shares no planted defect with any other case: the namespace is its own. It
-# does NOT have its own alert quota bucket -- it spends from DRIFT_QUOTA_KEY
-# alongside every other drift case, which is the first thing to check if the
-# fixture reports a suppressed record.
+# It shares no planted defect with any other case: the namespace is its own.
+#
+# It spends from TWO shared alert buckets, and neither is its own. The drift
+# record bills DRIFT_QUOTA_KEY alongside every other drift case. The failing
+# pods bill the Warning bucket as well -- k8s-event-watcher fires on them, as
+# the collision note above records -- so three repetitions of this case also
+# draw down ALERT_DAILY_LIMIT_WARNING, which autoops-warning-event-triage,
+# incident-triage-oom-event-probe and autoops-crashloop-config-triage depend
+# on. Both are off in CI (hack/ci-deploy.sh zeroes both), so this is a DEV
+# install concern: run those cases the same day as this one and they can find
+# a bucket this case emptied. Check both if a fixture reports a suppressed
+# record or an event case times out waiting for a card.
 #
 # This case mutates, which is why it is namespace-scoped rather than read-only:
 # the namespace is created by the stack's apply and deleted by its destroy
@@ -333,10 +341,12 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # CUJ 1's first clause, graded. See the long note on the objective of the
-      # same name in gitops-drift-deleted-policy-triage: a red here is a
-      # finding about _drift_task_body's "Done when" clause rather than a flaky
-      # check, and the fix is to that template first and this objective never.
+      # CUJ 1's first clause, graded. The long note on the objective of the
+      # same name in gitops-drift-deleted-policy-triage carries the argument:
+      # why the sibling leaves this judged, the five-run measurement that says
+      # asserting it is safe, and the order to diagnose a red in -- the drift
+      # card versus a neighbouring event card first, the template's "Done when"
+      # clause second, and never this objective.
       required_phrases: ["eval-operator@example.com"]
 
   - name: triage-names-the-loosened-setting
@@ -358,9 +368,22 @@ verification_spec:
       type: report_contains
       # Unlike the deleted-policy sibling, this record IS enriched -- the
       # object still exists, so the detector's join read its managedFields and
-      # the card carries an ownership block. A report that does not name the
-      # manager that took the field has dropped the one piece of evidence that
-      # distinguishes an out-of-band edit from a recent GitOps sync.
+      # the card carries an ownership block.
+      #
+      # ASSERTED HERE, WHERE gitops-drift-out-of-band-triage LEAVES THE FIELD
+      # MANAGER TO THE JUDGE, and the difference is the scenario rather than a
+      # stricter mood. In that case the drift is a replica count and the
+      # manager name is corroboration: the report has already said what
+      # changed, and the number changing is itself the evidence. Here the
+      # setting's current value is not evidence of anything -- plenty of
+      # workloads legitimately declare runAsNonRoot false in git -- so the
+      # handover is the ONLY thing in the report distinguishing an out-of-band
+      # edit from a GitOps sync that landed recently, which is the first
+      # clause of the journey. A report that drops it has not established
+      # there was drift at all.
+      #
+      # Measured alongside the principal check above: present in all three
+      # runs that read the drift card.
       required_phrases: ["kubectl-edit"]
 
   - name: triage-delivers-an-actionable-report
