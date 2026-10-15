@@ -2978,3 +2978,42 @@ func TestSlackParentUserIDFromTheEventsAPIPayload(t *testing.T) {
 		}
 	}
 }
+
+// TestSlackPumpPassesTheRootAuthorThrough: the pump reads parent_user_id from
+// the envelope's raw payload and hands it to inboundEvent. Without that
+// wiring the reply-under-our-post rule never fires on a real delivery, and
+// the unit tests above would still pass. A reply with no payload behind it
+// stays dropped; a DM after both is the sentinel that the pump got that far.
+func TestSlackPumpPassesTheRootAuthorThrough(t *testing.T) {
+	srv, unblock := stalledSlackStub(t)
+	defer unblock()
+
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.sessions = noSessions
+	a.sm = socketmode.New(slack.New("xoxb-stub", slack.OptionAPIURL(srv.URL+"/")))
+
+	withRoot := slackEnvelope("Env-root", slackMsg("channel", "C1", "U1", "why is it OOMing?", "700.1", "650.0"))
+	withRoot.Request.Payload = json.RawMessage(`{"type":"event_callback","event":{"type":"message",` +
+		`"channel":"C1","user":"U1","text":"why is it OOMing?","ts":"700.1","thread_ts":"650.0","parent_user_id":"UBOT"}}`)
+	a.sm.Events <- withRoot
+	a.sm.Events <- slackEnvelope("Env-bare", slackMsg("channel", "C1", "U1", "and now?", "700.2", "660.0"))
+	a.sm.Events <- slackEnvelope("Env-dm", slackMsg("im", "D1", "U1", "sentinel", "700.3", ""))
+
+	delivered := make(chan InboundMessage, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Run(ctx, func(m InboundMessage) { delivered <- m }) }()
+
+	var got []string
+	for len(got) < 2 {
+		select {
+		case m := <-delivered:
+			got = append(got, m.MessageID)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("delivered %v, want the reply under our post and the sentinel", got)
+		}
+	}
+	if got[0] != "700.1" || got[1] != "700.3" {
+		t.Errorf("delivered %v, want [700.1 700.3]: the reply under our post, not the reply with no root author", got)
+	}
+}

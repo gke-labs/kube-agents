@@ -1532,8 +1532,9 @@ The agent could already post the same text to the same channel or conversation t
 `hermes send` under `today`, so the route moves the post to the process holding the credential rather than adding
 a reach. A reply a human types in a notify's thread arrives at the gateway as an ordinary
 message from that human, through the usual ingress checks, and starts a conversation of its
-own: nothing binds it to the investigation that raised the alert. (On Slack a notify thread
-is not a session thread, so the reply needs to mention the bot to be a turn at all.)
+own: nothing binds it to the investigation that raised the alert. (On Slack the bot rooted
+a notify thread, so a reply there is a turn with or without a mention; see "Which messages
+become turns" below and #3246.)
 
 ## The Slack adapter (added 9/4)
 
@@ -1626,15 +1627,18 @@ message; a reply under it roots its own conversation.
 **Which messages become turns.** DMs carry every message, in a thread or not; a DM
 thread needs no task started in it to carry a reply. A channel message must
 mention the bot, and the ask's own ts is the thread the session will live in. A thread
-reply is a turn when it mentions the bot or the thread is a session thread - one the
-gateway has started a task in. That is what lets a session thread carry every message
+reply is a turn when it mentions the bot, when the thread's root is the bot's own post
+(a `chat.notify` alert or report: Slack sends the root's author as `parent_user_id` on every
+reply, the same rule as the today path's Slack adapter, #3246), or when the thread is a
+session thread - one the gateway has started a task in. That is what lets a session thread carry every message
 (the Discord parity) without making every thread in a joined channel a session. A
 thread becomes a session thread only when the gateway starts a task in it - a verified
 sender's mentioned ask, in the channel or in someone else's thread - and the adapter
 learns that from the gateway's `TaskStarted` and, on a cache miss, from the session
 registry, which it asks whether a task has started in that thread (a record alone is
 not enough, since one is minted for any verified turn, a "stop" with nothing running
-included). Nothing is derived from the root message. A mention on its own starts
+included). Apart from the bot-rooted rule above, nothing is derived from the root
+message. A mention on its own starts
 nothing and makes nothing a session thread, whoever typed it, so a channel mention from
 a sender the gateway refuses (another workspace's member, or one the allowlist does not
 admit) roots nothing. A session thread stays one while a

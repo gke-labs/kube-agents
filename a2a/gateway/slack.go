@@ -1266,8 +1266,10 @@ func (s *SlackAdapter) otherWorkspace(team string) bool {
 // conversation; a channel
 // message must mention the bot, and the ask's own ts becomes the session
 // thread's root (Slack threads are implicit); a thread reply is a turn when
-// it mentions the bot or the thread is already a session thread — one the
-// gateway has started a task in, which a mention alone does not make it,
+// it mentions the bot, the thread's root is the bot's own post (an alert or
+// a card's report; read from the event, see inboundEvent), or the thread is
+// already a session thread — one the gateway has started a task in, which a
+// mention alone does not make it,
 // the channel ask's own thread included: the gateway starting the task
 // there does (TaskStarted), the same as for any other thread, and a channel
 // mention from an unverified sender roots nothing. Everything else — bots,
