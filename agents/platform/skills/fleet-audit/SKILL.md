@@ -60,7 +60,7 @@ When you are delegated a task or kanban card to execute an audit stream followin
   1. `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit <stream> [--repo "<owner>/<repo>"]`
   2. Read the SOP in full — `start` prints its path as `sop` — then enumerate clusters and run the checks as it says. Do not work the audit out from this skill and a script's `--help`: where the SOP runs a collector, it is the SOP that says how to invoke it and that every candidate in the manifest is a verified finding. A candidate your document leaves out is not published: `finish` reports it under `unpublished_candidates`, and holds it on the ledger if an earlier run already carried it.
   3. `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit <stream> ...`
-- **Run `start` first, by its full path, and read the SOP at the full path it prints as `sop`. Do not search for the SOP.** On a kanban card your working directory is the card's own workspace, not the profile home, so a relative path such as `governance/…` or `./skills/…`, or a `search_files`, finds nothing there.
+- **Run `start` first, by its full path, and read the SOP at the full path it prints as `sop`. Do not search for the SOP.** Neither a kanban card nor a cron run starts you in the profile home (a card starts in its own workspace, a cron run in a directory of its own), so a relative path such as `governance/…` or `./skills/…`, or a `search_files`, finds nothing there.
 - **Do not reach for `hermes cron run` or say "queued for the next cron tick":** This request is an explicit on-demand audit execution, not a request to trigger the scheduled cron job. Execute the SOP directly and report the ledger issue URL in your result.
 - **`start` refuses while a run of that stream is in flight, a scheduled tick's or another session's:**
   it exits 2 with a `START REFUSED` line that names the run (not a `FINDINGS REJECTED` line; there is
@@ -149,8 +149,8 @@ or a GitHub call. Do not re-run a stream to answer a question its last report al
 ## The two-command lifecycle
 
 Run both commands by their full path, `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py`.
-A cron run starts in the profile directory, where `./skills/...` also resolves; a kanban worker starts
-in its card's workspace, where it does not. **You are not in a git checkout, and you do not need to
+A cron run starts in a directory of its own (`<profile>/cron/runs/<job>_<run>`) and a kanban worker
+in its card's workspace, so `./skills/...` resolves in neither. **You are not in a git checkout, and you do not need to
 be.** The harness establishes its own workspace at
 `/opt/data/gitops/<audit-id>/<owner>__<name>` and resolves every `remediation.path` against it. The
 workspace is keyed by audit id because the audit streams share the volume with each other and with

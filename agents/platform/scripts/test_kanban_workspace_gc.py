@@ -10,6 +10,8 @@ delete set.
 Run:  python3 agents/platform/scripts/test_kanban_workspace_gc.py
 """
 
+import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -625,3 +627,98 @@ class HomeInventoryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class CronRunsTest(unittest.TestCase):
+    """#2989 (a): each cron agent run's directory is pruned after CRON_RUNS_MAX_AGE_DAYS."""
+
+    NOW = 1_800_000_000.0
+    OLD = NOW - (gc.CRON_RUNS_MAX_AGE_DAYS + 1) * 86400
+    NEW = NOW - 3600
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.profiles = Path(self.tmp.name) / "profiles"
+        self.runs = self.profiles.joinpath("platform", *gc.CRON_RUNS_PARTS)
+        self.runs.mkdir(parents=True)
+
+    def make_run(self, name, mtime):
+        path = self.runs / name
+        path.mkdir()
+        (path / "probe.py").write_text("print(1)\n")
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def sweep(self, remote=None, fake=None):
+        sweep = gc.Sweep()
+        with patch.object(sandbox_exec, "run", side_effect=fake or (lambda *a, **k: None)):
+            gc.sweep_cron_runs(self.profiles, remote, sweep, now=self.NOW)
+        return sweep
+
+    def test_old_runs_go_and_recent_ones_stay(self):
+        old = self.make_run("compliance-audit_ex1", self.OLD)
+        new = self.make_run("compliance-audit_ex2", self.NEW)
+        sweep = self.sweep()
+        self.assertFalse(old.exists())
+        self.assertTrue(new.exists())
+        self.assertEqual(sweep.cron_runs_removed, ["platform/compliance-audit_ex1"])
+        self.assertEqual(sweep.local_removed, [], "cron runs are not reported as kanban workspaces")
+
+    def test_a_symlinked_runs_root_is_not_followed(self):
+        # The model owns the volume: a runs root swapped for a link to somewhere
+        # it wants emptied must not be pruned through.
+        target = Path(self.tmp.name) / "precious"
+        target.mkdir()
+        keep = target / "old-but-not-ours"
+        keep.mkdir()
+        os.utime(keep, (self.OLD, self.OLD))
+        shutil.rmtree(self.runs)
+        self.runs.symlink_to(target)
+        sweep = self.sweep()
+        self.assertTrue(keep.exists())
+        self.assertTrue(any("symlink" in w for w in sweep.warnings), sweep.warnings)
+
+    def test_a_symlinked_cron_dir_is_not_followed(self):
+        target = Path(self.tmp.name) / "elsewhere"
+        (target / "runs" / "x").mkdir(parents=True)
+        os.utime(target / "runs" / "x", (self.OLD, self.OLD))
+        shutil.rmtree(self.runs.parent)
+        self.runs.parent.symlink_to(target)
+        self.sweep()
+        self.assertTrue((target / "runs" / "x").exists())
+
+    def test_a_homes_cron_dir_is_expected_by_the_inventory(self):
+        # session-command.sh creates <home>/cron/runs in the sandbox; the nightly
+        # inventory must not report it as residue every night.
+        self.assertEqual(gc.expected_entries("platform").get("cron"), "d")
+        self.assertEqual(gc.expected_entries("cluster-a").get("cron"), "d")
+
+    def test_the_sandbox_half_removes_old_names_only_under_a_real_root(self):
+        remote = Path("/sandbox-root")
+        rruns = remote.joinpath("profiles", "platform", *gc.CRON_RUNS_PARTS)
+        calls = []
+        kinds = {"real": "d\nd\nd\n", "linked": "d\nl\nd\n"}
+        state = {"kinds": "real"}
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            if argv[1] == "-P":
+                return subprocess.CompletedProcess(argv, 0, kinds[state["kinds"]], "")
+            if argv[0] == gc.REMOTE_FIND:
+                return subprocess.CompletedProcess(argv, 0, _find_output(
+                    ("cron-a_ex1", str(self.OLD), "4096", "d"),
+                    ("cron-a_ex2", str(self.NEW), "4096", "d"),
+                    ("..", str(self.OLD), "4096", "d")), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sweep = self.sweep(remote, fake)
+        rms = [a for a in calls if a[0] == gc.REMOTE_RM]
+        self.assertEqual(rms, [[gc.REMOTE_RM, "-rf", "--", str(rruns / "cron-a_ex1")]])
+        self.assertEqual(sweep.cron_runs_removed, ["sandbox platform/cron-a_ex1"])
+
+        calls.clear()
+        state["kinds"] = "linked"
+        sweep = self.sweep(remote, fake)
+        self.assertEqual([a for a in calls if a[0] == gc.REMOTE_RM], [])
+        self.assertTrue(any("symlink" in w for w in sweep.warnings), sweep.warnings)
