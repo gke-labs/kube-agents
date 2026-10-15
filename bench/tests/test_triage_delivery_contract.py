@@ -213,9 +213,11 @@ def _literal_parts(node: ast.AST) -> str:
     """The string literals of an expression, in source order.
 
     Both templates return one expression built entirely out of string literals
-    and interpolations. The interpolations are dropped rather than rendered —
-    every one of them is a record detail (namespace, object name, project id,
-    principal), and none carries any part of the report template.
+    and interpolations. The interpolations are dropped rather than rendered.
+    All but one are record details (namespace, object name, project id,
+    principal). The exception is ``TRIAGE_FIX_AGAINST_LIVE_OBJECT``, a shared
+    sentence on how to describe the fix, which carries none of the delivery
+    contract this module pins (the headings and the call to action).
 
     The recursion exists because the two return expressions are not the same
     shape. ``_triage_task_body`` returns a single implicitly-concatenated
