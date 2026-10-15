@@ -876,7 +876,7 @@ def pool_cause_text(pool: dict) -> str:
         # keeps the cause once the pool has drained, so the header says "was"
         # over a reading with projects free rather than calling them leased.
         queuing = " and runs are queuing" if pool.get("waiting_now") else ""
-        held = f", {pool['held_by_hand']} held by hand" if pool.get("held_by_hand") else ""
+        held = f", {pool['no_build_id']} with no build ID in the owner" if pool.get("no_build_id") else ""
         free = pool.get("free")
         if isinstance(free, int) and free > 0:
             return (
@@ -962,16 +962,20 @@ def render_pool(health: dict) -> str:
             ]
         )
     # The agent view, not a scoped one: rule 8 rides beside the state and can
-    # start mid-incident, so there is no window to scope to. A breach the
-    # refusals alone carry has no stretch and no queue for the page to show,
-    # and its Brief reads healthy, so that one links the job's history.
-    refusals_only = not pool_span(pool) and not pool.get("over_threshold") and pool.get("lease_failures")
+    # start mid-incident, so there is no window to scope to.
+    # A queued run starts late and passes; a refused run died at the acquire,
+    # so the closing line says which.
+    tail = (
+        "A refused run did not start; retest once the pool has room."
+        if pool.get("lease_failures")
+        else "Runs still pass; /retest makes the queue longer."
+    )
     return "\n".join(
         [
             f"⏳ {pool_cause_text(pool)}",
             *pool_numbers(pool),
-            "Runs still pass; /retest makes the queue longer.",
-            POOL_JOB_HISTORY_URL if refusals_only else dashboard_link(DASHBOARD_VIEW_AGENT),
+            tail,
+            dashboard_link(DASHBOARD_VIEW_AGENT),
         ]
     )
 
@@ -1195,7 +1199,7 @@ def _is_dated(finished: datetime, now: datetime | None) -> bool:
 
 def dated_clock(finished: datetime | None, now: datetime | None) -> str:
     """A finish time for the digest: the clock alone within a day, the
-    weekday and date before it past that, so last month's on-merge run does
+    weekday and date before it past that, so last month's postsubmit run does
     not read as this morning's."""
     if finished is None:
         return "?"
@@ -1420,7 +1424,8 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     """The 24h numbers, the stale note while a stall lasts, and -- when
     data.json was given -- one line on last night's nightly run with a link
     to its report: the counts, what is newly failing against the night
-    before and the wall clock, or that the night was truncated or missing."""
+    before, the opening chat turn's p50 and p95 when the reps carried it,
+    and the wall clock, or that the night was truncated or missing."""
     metrics = health.get("metrics") or {}
     p50 = metrics.get("wall_clock_p50_s")
     typical = f"{int(p50 // 60)} min" if p50 is not None else "n/a"

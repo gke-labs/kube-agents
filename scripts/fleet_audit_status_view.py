@@ -152,10 +152,12 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 #: Every outcome `finish` stores. Anything else is styled as a warning rather
 #: than as a success -- an outcome this view has never heard of is exactly the
 #: one a reader should look at, and green would hide it. HELD is a clean run
-#: the ledger stayed open over, which is a reason to look, not a success.
+#: the ledger stayed open over, which is a reason to look, not a success, and
+#: NO_FORGE a run with nowhere to publish, whose findings only the store holds.
 STATUS_STYLE = {
     "CLEAN": "green",
     "HELD": "yellow",
+    "NO_FORGE": "yellow",
     "OPENED": "cyan",
     "UPDATED": "cyan",
     "never ran": "dim",

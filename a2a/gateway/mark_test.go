@@ -337,3 +337,59 @@ func TestMarkAnOlderChainsLateTerminalDoesNotTellTheObserver(t *testing.T) {
 		t.Errorf("changes = %v, want %v (the latest ask's end)", obs.changes, want)
 	}
 }
+
+// A chain continuing an ask (a typed answer or a click) copies its mark but
+// not its MarkedAt; the ask's hold clock is the latest across every chain
+// that marked it, so a newer ask's end keeps the session on the question
+// still blocked on the person.
+func TestMarkContinuedAskKeepsItsHoldClock(t *testing.T) {
+	g, obs := markRig()
+	blocked := MarkState{Ask: "investigate", Settle: "blocked"}
+	copied := blocked
+	rec := &SessionRecord{Key: "slack:C1/10.0", Tasks: []TaskRef{
+		{ID: "a", RootTaskID: "a", AskMessageID: "10.0", Mark: &blocked, MarkedAt: time.Now().UTC(), NotifyKeys: []string{"card-1"}},
+		{ID: "c", RootTaskID: "c", AskMessageID: "10.0", Mark: &copied},
+		{ID: "b", RootTaskID: "b", AskMessageID: "20.0", Mark: &MarkState{Ask: "fleet"}},
+	}}
+	g.applyTerminalMark(rec, "b", lib.StateCompleted)
+	if want := []string{"slack:C1/10.0 investigate/blocked"}; !slices.Equal(obs.changes, want) {
+		t.Errorf("MarkChanged = %v, want %v (the continued ask still holds)", obs.changes, want)
+	}
+}
+
+// A keyed notify repeating what is already drawn restarts the ask's hold
+// clock: the card is alive, so its question keeps holding the session past
+// markOlderAskHold from when the mark was first drawn.
+func TestMarkUnchangedKeyedNotifyRefreshesTheHold(t *testing.T) {
+	g, obs := markRig()
+	blocked := MarkState{Ask: "investigate", Settle: "blocked"}
+	rec := &SessionRecord{Key: "slack:C1/10.0", Tasks: []TaskRef{
+		{ID: "a", RootTaskID: "a", AskMessageID: "10.0", Mark: &blocked, MarkedAt: time.Now().Add(-5 * time.Hour).UTC(), NotifyKeys: []string{"card-1"}},
+	}}
+	if !g.applyNotifyMark(rec, "card-1", blocked) {
+		t.Fatal("applyNotifyMark reported no change; the refreshed clock must be written")
+	}
+	if time.Since(rec.Tasks[0].MarkedAt) > time.Minute {
+		t.Fatalf("MarkedAt = %v, want refreshed", rec.Tasks[0].MarkedAt)
+	}
+	rec.Tasks = append(rec.Tasks, TaskRef{ID: "b", RootTaskID: "b", AskMessageID: "20.0", Mark: &MarkState{Ask: "fleet"}})
+	g.applyTerminalMark(rec, "b", lib.StateCompleted)
+	if want := []string{"slack:C1/10.0 investigate/blocked"}; !slices.Equal(obs.changes, want) {
+		t.Errorf("MarkChanged = %v, want %v (the refreshed question holds)", obs.changes, want)
+	}
+}
+
+// An older ask's hold aging out moves the session with nothing drawn; a
+// terminal that draws nothing still tells the observer, so the bound
+// reaches Slack.
+func TestMarkExpiredHoldIsToldWithoutAChangingDraw(t *testing.T) {
+	g, obs := markRig()
+	rec := &SessionRecord{Key: "slack:C1/10.0", Tasks: []TaskRef{
+		{ID: "a", RootTaskID: "a", AskMessageID: "10.0", Mark: &MarkState{Ask: "investigate"}, MarkedAt: time.Now().Add(-5 * time.Hour).UTC(), NotifyKeys: []string{"card-1"}},
+		{ID: "b", RootTaskID: "b", AskMessageID: "20.0"},
+	}}
+	g.applyTerminalMark(rec, "b", lib.StateCompleted)
+	if want := []string{"slack:C1/10.0 /"}; !slices.Equal(obs.changes, want) {
+		t.Errorf("MarkChanged = %v, want %v (the expired hold told)", obs.changes, want)
+	}
+}

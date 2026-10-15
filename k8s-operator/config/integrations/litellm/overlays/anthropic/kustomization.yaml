@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The base config plus the prompt-caching breakpoints, which only an
+# Anthropic-family backend should get (see the base config.yaml). The merge
+# replaces the config.yaml key and keeps the base's other keys.
+resources:
+  - ../../base
+
+configMapGenerator:
+  - name: litellm-config
+    behavior: merge
+    files:
+      - config.yaml

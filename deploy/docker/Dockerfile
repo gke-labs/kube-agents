@@ -1694,7 +1694,17 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
 # shipped chunk. Without this line the transport baked into the image is
 # whatever was latest on build day, so two builds of this same Dockerfile can
 # ship different error semantics (1.24.0 changed the thrown class).
-COPY deploy/docker/patches/apply_mcp_remote_forward_errors.py /tmp/apply_mcp_remote_forward_errors.py
+#
+# The second patch points the auth path at the credential proxy: with
+# MCP_REMOTE_BEARER_FILE set (every config here sets it), the bearer is the
+# gateway's projected ServiceAccount token and the Google ADC path above is not
+# reached. The agent configs send these servers to the proxy's MCP relay, which
+# holds the credential and the tool allowlist; the patch says why. Its marker is
+# grepped in the bundle like the first one's, so a pin advance that drops it
+# fails the build rather than shipping a child that would try ADC.
+COPY deploy/docker/patches/apply_mcp_remote_forward_errors.py \
+     deploy/docker/patches/apply_mcp_remote_bearer_file.py \
+     /tmp/
 RUN apt-get update && apt-get install -y --no-install-recommends git && \
     git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && \
     cd /opt/mcp-remote && \
@@ -1702,11 +1712,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && \
     npm pkg set devDependencies.@modelcontextprotocol/sdk=1.30.0 && \
     npm install && \
     /opt/hermes/.venv/bin/python3 /tmp/apply_mcp_remote_forward_errors.py /opt/mcp-remote && \
+    /opt/hermes/.venv/bin/python3 /tmp/apply_mcp_remote_bearer_file.py /opt/mcp-remote && \
     npm run build && \
     grep -q 'Failed to forward message to remote server' dist/*.js && \
+    grep -q 'MCP_REMOTE_BEARER_FILE' dist/*.js && \
     npm prune --production && \
     npm cache clean --force && \
-    rm -rf .git /tmp/apply_mcp_remote_forward_errors.py /tmp/patchlib.py
+    rm -rf .git /tmp/apply_mcp_remote_forward_errors.py /tmp/apply_mcp_remote_bearer_file.py /tmp/patchlib.py
 
 # 5. Create base defaults directory and copy shared defaults
 RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults

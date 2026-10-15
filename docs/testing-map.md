@@ -58,8 +58,8 @@ Rule of thumb: if you would have to break something on purpose for the test to b
 a `bench/tasks/` case. If you would run it against production to check the deploy landed, it is a
 `bench/cuj/` journey.
 
-**The two paths-filtered workflows report `success` on a pull request that ran nothing.**
-`k8s-operator-test.yml` and `a2a-test.yml` both run `dorny/paths-filter` and then gate
+**The paths-filtered workflows report `success` on a pull request that ran nothing.**
+`k8s-operator-test.yml`, `a2a-test.yml` and `docs-build.yml` run `dorny/paths-filter` and then gate
 every subsequent step on the result, so the job always completes and the check always goes green.
 `k8s-operator-test.yml`'s own header comment says it: the job "reports `success` on a pull request
 that ran no tests". A change that breaks an operator contract from outside `k8s-operator/**` gets a

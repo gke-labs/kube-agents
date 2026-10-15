@@ -35,32 +35,19 @@ _WORKFLOWS = sorted(
 # The hosted GKE MCP server. Matched by host anywhere in the mcp-remote argv or
 # in a native `url:` transport, rather than by the `gke` key or the exact URL,
 # so a copy under another name, with a trailing slash, another scheme or a
-# `--url=` spelling is still found.
+# `--url=` spelling is still found. The shipped entries reach it through the
+# credential proxy's relay, so the relay's gke route counts too; a direct
+# entry still matches the host, and the relay test below refuses it.
 _GKE_MCP_HOST = "container.googleapis.com"
+_GKE_MCP_TARGETS = (_GKE_MCP_HOST, "${KUBE_AGENTS_MCP_RELAY_URL}/gke")
 
 # The server's tools that it annotates `readOnlyHint: true`, from its
 # `tools/list` on 2026-10-13: 15 of 23. The other eight are create_cluster,
 # create_node_pool, update_cluster, update_node_pool, apply_k8s_manifest,
-# patch_k8s_resource, delete_k8s_resource and cancel_operation.
-_GKE_MCP_READ_TOOLS = frozenset(
-    {
-        "check_k8s_auth",
-        "describe_k8s_resource",
-        "get_cluster",
-        "get_k8s_cluster_info",
-        "get_k8s_logs",
-        "get_k8s_resource",
-        "get_k8s_rollout_status",
-        "get_k8s_version",
-        "get_node_pool",
-        "get_operation",
-        "list_clusters",
-        "list_k8s_api_resources",
-        "list_k8s_events",
-        "list_node_pools",
-        "list_operations",
-    }
-)
+# patch_k8s_resource, delete_k8s_resource and cancel_operation. One source:
+# the set the credential proxy enforces, so the offer and the refusal cannot
+# drift apart.
+_GKE_MCP_READ_TOOLS = h.mcp_policy.GKE_READ_TOOLS
 
 # A registered MCP tool name whose verb changes something. Hermes registers a
 # server's tool as `mcp__<server>__<tool>` (tools/mcp_tool_schema.py
@@ -91,8 +78,8 @@ def _profile_configs():
     }
 
 
-def _servers_reaching(config, host):
-    """The `mcp_servers` entries in one parsed config that name `host`.
+def _servers_reaching(config, targets):
+    """The `mcp_servers` entries in one parsed config that name any of `targets`.
 
     Either through mcp-remote, where the URL is an argv entry, or through
     Hermes' native HTTP transport, where it is the `url` key
@@ -103,7 +90,10 @@ def _servers_reaching(config, host):
         name: server
         for name, server in (config.get("mcp_servers") or {}).items()
         if isinstance(server, dict)
-        and any(isinstance(value, str) and host in value for value in [*(server.get("args") or []), server.get("url")])
+        and any(
+            isinstance(value, str) and any(target in value for target in targets)
+            for value in [*(server.get("args") or []), server.get("url")]
+        )
     }
 
 
@@ -249,17 +239,14 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
                 self.assertFalse(decision.allowed, f"{argv} reached the project")
 
     def test_B1_the_gke_mcp_server_offers_no_write_tool(self) -> None:
-        """The one cloud write path the broker never sees.
+        """The offer half of the gke MCP server's read-only posture.
 
-        The `gke` MCP server runs in the agent container on the pod's Workload
-        Identity credential, so the gcloud allowlist above does not apply to
-        it. With a `custom` permission set that grants a write role, an
-        unfiltered server hands the model create_cluster and
-        patch_k8s_resource, and both have been used.
-
-        The filter is a declaration rather than enforcement: the credential is
-        unchanged, and only the tool list stands between the model and the
-        write. So this reads the list from the config each profile actually
+        With a `custom` permission set that grants a write role, an unfiltered
+        server hands the model create_cluster and patch_k8s_resource, and both
+        have been used. The refusal half is the credential proxy's relay
+        (`test_B1_the_broker_refuses_every_gke_mcp_write_tool`); this is the
+        declaration that keeps the write tools out of the model's offer, so a
+        refused call is never attempted in the first place. So this reads the list from the config each profile actually
         runs with, not from the source files. It requires a `tools.include`
         allowlist, since `exclude` offers a tool the day the server ships it,
         and requires every name on it to be one the server marks read-only.
@@ -270,7 +257,7 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
         declaring = {
             path.relative_to(h.REPO_ROOT).as_posix()
             for path in (h.path_of("shared_defaults_config"), *sorted((h.REPO_ROOT / "agents").glob("*/config.yaml")))
-            if _servers_reaching(yaml.safe_load(path.read_text()) or {}, _GKE_MCP_HOST)
+            if _servers_reaching(yaml.safe_load(path.read_text()) or {}, _GKE_MCP_TARGETS)
         }
         modelled = {h.SOURCES[name].path for name in ("shared_defaults_config", "platform_config", "cluster_config")}
         self.assertEqual(
@@ -280,7 +267,7 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
         )
 
         for profile, config in _profile_configs().items():
-            servers = _servers_reaching(config, _GKE_MCP_HOST)
+            servers = _servers_reaching(config, _GKE_MCP_TARGETS)
             with self.subTest(profile=profile):
                 self.assertTrue(servers, f"the {profile} profile declares no {_GKE_MCP_HOST} server")
             for name, server in servers.items():
@@ -504,6 +491,98 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
             h.credential_proxy.SLACK_REMOVE_ALLOWLIST,
             "a second Slack remove or delete method reaches the bot token",
         )
+
+    # The gke MCP server's own write tools: the eight of its 23 that it does
+    # not annotate `readOnlyHint`, from a live `tools/list` on 2026-10-13.
+    # Literal here and not read from mcp_policy, so a widened table cannot
+    # also widen what this test expects.
+    _GKE_MCP_WRITE_TOOLS = (
+        "apply_k8s_manifest",
+        "cancel_operation",
+        "create_cluster",
+        "create_node_pool",
+        "delete_k8s_resource",
+        "patch_k8s_resource",
+        "update_cluster",
+        "update_node_pool",
+    )
+    # A name with one of these prefixes mutates. The server's eight are above;
+    # this is what a tool added upstream would most likely be called.
+    _WRITE_SHAPED_PREFIXES = ("apply_", "cancel_", "create_", "delete_", "patch_", "scale_", "update_")
+
+    def test_B1_the_broker_refuses_every_gke_mcp_write_tool(self) -> None:
+        """`mcp__gke__patch_k8s_resource` is refused by the broker, not just not offered.
+
+        The gke MCP server runs on the broker's credential, which can create
+        clusters. What the model is offered can drift (a warm schema cache, a
+        config edit); this is the check that refuses the call regardless.
+        """
+        policy = h.mcp_policy
+        for name in self._GKE_MCP_WRITE_TOOLS + ("a_tool_added_upstream_tomorrow",):
+            message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name}}
+            decision = policy.evaluate("gke", message)
+            self.assertFalse(decision.allowed, f"the broker relays gke {name}")
+            self.assertEqual(decision.rule_id, "gcp.mcp.read-only")
+        for name in sorted(policy.GKE_READ_TOOLS):
+            self.assertFalse(
+                name.startswith(self._WRITE_SHAPED_PREFIXES),
+                f"gke {name} is in the broker's read set but is named like a write",
+            )
+            self.assertNotIn(name, self._GKE_MCP_WRITE_TOOLS)
+
+    def test_B1_no_remote_mcp_server_is_reached_on_the_agents_own_credential(self) -> None:
+        """Every remote MCP server in every profile goes through the broker's relay.
+
+        A server pointed straight at `*.googleapis.com` runs on whatever Google
+        credential the agent container can get, and no policy sees its calls.
+        So each mcp-remote entry, and any native `url:` entry, must target the
+        relay, and name a server the relay has a table for.
+        """
+        relay = "${KUBE_AGENTS_MCP_RELAY_URL}/"
+        checked = 0
+        for source in ("shared_defaults_config", "platform_config", "cluster_config"):
+            servers = (yaml.safe_load(h.text(source)) or {}).get("mcp_servers") or {}
+            for alias, spec in servers.items():
+                spec = spec or {}
+                strings = [spec.get("url") or ""] + [str(arg) for arg in spec.get("args") or []]
+                remote = [value for value in strings if "://" in value or value.startswith(relay)]
+                if not remote:
+                    continue  # a local stdio server, like platform_control
+                where = f"{alias} in {h.SOURCES[source].path}"
+                for value in remote:
+                    self.assertTrue(
+                        value.startswith(relay),
+                        f"{where} reaches {value!r} directly, outside the broker",
+                    )
+                    self.assertIsNotNone(
+                        h.mcp_policy.server(value[len(relay):]),
+                        f"{where} targets a relay server the broker has no table for",
+                    )
+                self.assertEqual(
+                    (spec.get("env") or {}).get("MCP_REMOTE_BEARER_FILE"),
+                    "${CREDENTIAL_PROXY_TOKEN_FILE}",
+                    f"{where} does not present the broker token",
+                )
+                checked += 1
+        self.assertGreaterEqual(checked, 5, "the scan matched fewer remote servers than ship")
+
+    def test_B1_only_the_gateway_reaches_the_mcp_relay(self) -> None:
+        """The relay is the gateway's: the sandbox and session pods get no new read path."""
+        prefix = h.mcp_policy.MCP_RELAY_PREFIX
+        self.assertEqual(
+            h.credential_proxy.required_roles(prefix + "gke"),
+            (h.credential_proxy.CALLER_ROLE_CHAT,),
+        )
+
+    def test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route(self) -> None:
+        """The URL the configs interpolate is the route mcp_policy guards."""
+        split = h.text("broker_split_go")
+        match = re.search(r'mcpRelayPath = "([^"]+)"', split)
+        self.assertIsNotNone(match, "mcpRelayPath is no longer a string constant")
+        self.assertEqual(match.group(1) + "/", h.mcp_policy.MCP_RELAY_PREFIX)
+        self.assertIn('mcpRelayURLEnvVar = "KUBE_AGENTS_MCP_RELAY_URL"', split)
+        body = h.go_function_body(h.text("manifests_go"), "buildPodTemplateSpec")
+        self.assertIn("Name:  mcpRelayURLEnvVar", body)
 
 
 class B2AssentIsHumanOrPolicy(unittest.TestCase):

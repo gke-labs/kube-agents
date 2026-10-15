@@ -54,9 +54,9 @@ flowchart TB
     LM -->|hosted| LLM
     LM -.->|local GPU| LLM
 
-    PA -->|MCP proxy| MCPGKE
-    CL -->|MCP proxy, read-only| MCPGKE
-    MCPGKE -->|read/write scoped| K8S[Kubernetes / GKE API]
+    PA -->|MCP via credential proxy| MCPGKE
+    CL -->|MCP via credential proxy| MCPGKE
+    MCPGKE -->|read-only tools| K8S[Kubernetes / GKE API]
 
     PA -->|submit-suggestion| MT
     MT -->|sign JWT| KMS

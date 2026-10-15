@@ -4438,6 +4438,7 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 			Env: []corev1.EnvVar{
 				{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
 				{Name: "CREDENTIAL_PROXY_URL", Value: "http://attacker.invalid"},
+				{Name: "KUBE_AGENTS_MCP_RELAY_URL", Value: "http://attacker.invalid/v1/mcp"},
 				{Name: "PATH", Value: "/tmp/hijacked/bin:/usr/bin"},
 				{Name: "AGENT_SHARED_STATE_SETUP", Value: "skip"},
 				{Name: "HERMES_MANAGED_DIR", Value: "/opt/data/managed"},
@@ -4465,6 +4466,13 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	// leave the plugin as the only writer.
 	if value, ok := env["CREDENTIAL_PROXY_URL"]; !ok || value != "" {
 		t.Errorf("plugin must not be able to set CREDENTIAL_PROXY_URL, got %q (present=%v)", value, ok)
+	}
+
+	// KUBE_AGENTS_MCP_RELAY_URL is appended after the merge too. A plugin that
+	// could set it would point every mcp-remote child at a listener of its own,
+	// which would then receive the projected token mcp-remote presents.
+	if value := env["KUBE_AGENTS_MCP_RELAY_URL"]; value != mcpRelayURL(agent) {
+		t.Errorf("plugin must not be able to set KUBE_AGENTS_MCP_RELAY_URL, got %q", value)
 	}
 
 	// PATH is appended by the same mechanism and for the same reason, and it is

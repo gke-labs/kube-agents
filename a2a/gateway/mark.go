@@ -171,7 +171,43 @@ func (g *Gateway) applyTerminalMark(rec *SessionRecord, taskID string, state lib
 	if state == lib.StateFailed {
 		next.Settle = markSettleFailed
 	}
-	g.drawMark(rec, i, next)
+	if !g.drawMark(rec, i, next) {
+		g.tellExpiredHold(rec)
+	}
+}
+
+// tellExpiredHold tells a MarkObserver the session mark when only
+// markOlderAskHold has moved it: an older ask's hold aged out with nothing
+// drawn since, which drawMark's before-and-after comparison cannot see.
+// Repeating a state the observer already holds is harmless; the Slack
+// adapter sends only what differs from what last landed.
+func (g *Gateway) tellExpiredHold(rec *SessionRecord) {
+	observer, ok := g.adapter.(MarkObserver)
+	if !ok {
+		return
+	}
+	if now := rec.sessionMark(); now != rec.sessionMarkHeld(false) {
+		observer.MarkChanged(rec.Key, now.Ask, now.Settle)
+	}
+}
+
+// refreshHold restarts the hold clock of rec.Tasks[i]'s open mark, for a
+// keyed notify that repeats what is already drawn: the card is still alive,
+// so its ask keeps holding the session (sessionMark), and a hold that had
+// aged out is told to a MarkObserver again. It reports whether the record
+// changed.
+func (g *Gateway) refreshHold(rec *SessionRecord, i int) bool {
+	if i < 0 || i >= len(rec.Tasks) || rec.Tasks[i].Mark == nil {
+		return false
+	}
+	session := rec.sessionMark()
+	rec.Tasks[i].MarkedAt = time.Now().UTC()
+	if observer, ok := g.adapter.(MarkObserver); ok {
+		if now := rec.sessionMark(); now != session {
+			observer.MarkChanged(rec.Key, now.Ask, now.Settle)
+		}
+	}
+	return true
 }
 
 // notifyChainIndex is the index of the chain root a notify update key is
@@ -260,7 +296,11 @@ func (g *Gateway) applyNotifyMark(rec *SessionRecord, update string, next MarkSt
 		g.log.Info("notify: mark dropped while its chain's ask has a chain running", "conversation", rec.Key)
 		return bound
 	}
-	return g.drawMark(rec, rec.askIndex(ask), next) || bound
+	j := rec.askIndex(ask)
+	if g.drawMark(rec, j, next) {
+		return true
+	}
+	return g.refreshHold(rec, j) || bound
 }
 
 // sessionMark is the mark the conversation's Agent Session follows: the
@@ -272,15 +312,30 @@ func (g *Gateway) applyNotifyMark(rec *SessionRecord, update string, next MarkSt
 // notify reaches an older ask, so one no key reaches (a keyless card's, or
 // one marked before keys were bound), or whose settle was lost, would hold
 // Working… for good. Each ask counts once, by the chain holding what is
-// drawn there now.
+// drawn there now. An ask's hold clock is the latest MarkedAt across every
+// chain that marked it, so a chain continuing the ask (a click or a typed
+// answer) does not read as an expired hold.
 func (rec *SessionRecord) sessionMark() MarkState {
+	return rec.sessionMarkHeld(true)
+}
+
+// sessionMarkHeld is sessionMark; bounded false ignores markOlderAskHold,
+// which tells whether the bound alone moved the session (tellExpiredHold).
+func (rec *SessionRecord) sessionMarkHeld(bounded bool) MarkState {
 	now := time.Now()
 	open := func(m MarkState) bool { return m.Ask != "" || m.Settle == markSettleBlocked }
 	keyed := map[string]bool{}
+	markedAt := map[string]time.Time{}
 	for _, ref := range rec.Tasks {
 		if len(ref.NotifyKeys) > 0 {
 			keyed[ref.AskMessageID] = true
 		}
+		if ref.MarkedAt.After(markedAt[ref.AskMessageID]) {
+			markedAt[ref.AskMessageID] = ref.MarkedAt
+		}
+	}
+	held := func(ask string) bool {
+		return keyed[ask] && (!bounded || now.Sub(markedAt[ask]) < markOlderAskHold)
 	}
 	latest := MarkState{}
 	seen := map[string]bool{}
@@ -298,7 +353,7 @@ func (rec *SessionRecord) sessionMark() MarkState {
 			latest = m
 		}
 		seen[ref.AskMessageID] = true
-		if open(m) && (first || keyed[ref.AskMessageID] && now.Sub(ref.MarkedAt) < markOlderAskHold) {
+		if open(m) && (first || held(ref.AskMessageID)) {
 			return m
 		}
 	}

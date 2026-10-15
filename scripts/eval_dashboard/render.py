@@ -212,6 +212,9 @@ DAY_MS = 24 * 3600 * 1000
 # of a case's record on main (what that record is for:
 # docs/eval-gate-roster.md).
 TIER_RATE_WINDOWS_DAYS = (7, 30)
+# The keys of data.json's cases[].latency (nightly.latency_rollup) the Cases
+# page shows: the presubmit reps' opening chat turn and agent wall clock.
+CASE_LATENCY_KEYS = ("n_turn1", "turn1_p50_s", "turn1_p95_s", "n_agent", "agent_p50_s")
 
 # --- the roster: what blocks, what is held out, what was demoted when ------
 # Admission is hack/eval/blocking-roster.txt (classify.py reads it). The
@@ -230,7 +233,7 @@ DEMOTED_RE = re.compile(r"\bdemoted (\d{4}-\d{2}-\d{2})")
 # A case's roster status on the Cases page (the pill) and on the Grid (which
 # rows are blocking). The words the pages print for each live in pages.js.
 STATUS_BLOCKING = "blocking"  # active and in hack/eval/blocking-roster.txt
-STATUS_HELD_OUT = "held_out"  # active, never admitted (or no date on record): pdb-remediation-pr, seat opened 2026-09-28, #2016
+STATUS_HELD_OUT = "held_out"  # active, never admitted (or no date on record): pdb-remediation-pr while seated, 2026-09-28 to 10-14, #2016
 # Off the roster with a demotion date on the roster page -- nightly-only
 # since 2026-09-22 (#1023: the presubmit runs the roster only), or active as
 # a held-out presubmit seat (the compliance canary since 2026-09-29, #2013).
@@ -589,6 +592,12 @@ def normalize_health(raw) -> dict | None:
             "over_threshold": pool.get("over_threshold") if is_count(pool.get("over_threshold")) else None,
             "threshold_p50_s": pool.get("threshold_p50_s") if is_count(pool.get("threshold_p50_s")) else None,
             "threshold_p95_s": pool.get("threshold_p95_s") if is_count(pool.get("threshold_p95_s")) else None,
+            # The periodic's third trigger: runs refused a project in its
+            # recent window, which a breach can rest on alone, with nothing
+            # queued and no stretch to quote. Without these the Brief read
+            # "healthy" under a chat alert saying the pool was full.
+            "lease_failures": pool.get("lease_failures") if is_count(pool.get("lease_failures")) else None,
+            "lease_failures_hours": pool.get("lease_failures_hours") if is_count(pool.get("lease_failures_hours")) else None,
         } if pool else None,
         "tick": raw["tick"] if iso_ms(raw.get("tick")) is not None else None,
     }
@@ -943,10 +952,20 @@ def rate_pair(counts: tuple[int, int] | None) -> list[int] | None:
     return [counts[0], counts[1]]
 
 
+def case_latency(case: dict) -> dict | None:
+    """``cases[].latency`` for the Cases page: its known keys whose values
+    are finite numbers, or None when it has none."""
+    raw = case.get("latency")
+    if not isinstance(raw, dict):
+        return None
+    out = {key: raw[key] for key in CASE_LATENCY_KEYS if is_number(raw.get(key))}
+    return out or None
+
+
 def case_documents(data: dict, notes: dict, admitted: frozenset | None, demoted: dict[str, str], classified: dict[str, dict]) -> dict[str, dict]:
     """``brief.json``'s ``cases{}``: per case, what the Cases page and the
     Grid need beyond the runs -- roster status, domain, notes, the per-tier
-    7- and 30-day rates, the strip and the last failure."""
+    7- and 30-day rates, the strip, the last failure and the reps' timing."""
     gate = appearances_by_case(gate_runs(data))
     nights = nightly.joined_night_runs(nightly_runs(data))
     nightly_rows = appearances_by_case(nightly_runs(data))
@@ -977,6 +996,7 @@ def case_documents(data: dict, notes: dict, admitted: frozenset | None, demoted:
             },
             "strip": case_strip(gate.get(name, [])),
             "last_failure": last_failure(name, gate.get(name, []), nightly_rows.get(name, []), classified, nights),
+            "latency": case_latency(case),
         }
     return cases
 

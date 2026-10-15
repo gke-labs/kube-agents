@@ -61,8 +61,10 @@ BROKEN_MAIN_WATCHED_WORKFLOWS = (
 )
 # The flaky-check reporter's contract is the inverse of the broken-main one:
 # not a fixed list it must contain, but that every pull-request check is
-# either watched or named here as left out on purpose. The reasons are in the
-# workflow's header comment; this tuple is the machine-readable copy of it.
+# either watched or named here as left out on purpose. The watched list is
+# `WATCHED_WORKFLOWS` in `scripts/notify_flaky_check.py`, which the sweep
+# reads; the reasons for the exclusions are beside it, and this tuple is the
+# machine-readable copy of them.
 FLAKY_CHECK_NOTIFIER = "flaky-check-notify.yml"
 FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
     # A title edit legitimately turns it green without a commit.
@@ -87,6 +89,15 @@ def _yaml():
     import yaml
 
     return yaml
+
+
+def _flaky_check_reporter():
+    sys.path.insert(0, str(REPO_SCRIPTS))
+    try:
+        import notify_flaky_check
+    finally:
+        sys.path.remove(str(REPO_SCRIPTS))
+    return notify_flaky_check
 
 
 class SpecToolRegistryTest(unittest.TestCase):
@@ -573,8 +584,7 @@ class WorkflowNameJoinTest(unittest.TestCase):
         new check has to choose. The reverse holds too: an exclusion that no
         longer names a workflow is stale."""
         documents = self._workflows()
-        triggers = documents[FLAKY_CHECK_NOTIFIER].get("on") or documents[FLAKY_CHECK_NOTIFIER].get(True) or {}
-        watched = set((triggers.get("workflow_run") or {}).get("workflows") or [])
+        watched = set(_flaky_check_reporter().WATCHED_WORKFLOWS)
         pull_request_checks = set()
         for filename, document in documents.items():
             if filename == FLAKY_CHECK_NOTIFIER:
@@ -663,7 +673,7 @@ class WorkflowNameJoinTest(unittest.TestCase):
 class PoolPressureJobOwnersContractTest(unittest.TestCase):
     """pool_pressure.py's BOSKOS_JOB_OWNERS copies the fixed Boskos owners the
     hack/ scripts lease under. A rename there and not here would move that
-    job's leases under "held by hand" with nothing red."""
+    job's leases under "no build ID in the owner" with nothing red."""
 
     @staticmethod
     def _script(name):
@@ -683,7 +693,7 @@ class PoolPressureJobOwnersContractTest(unittest.TestCase):
     def test_the_fixed_job_owners_are_the_scripts_defaults(self):
         # Discovered, not enumerated: every hack/ script that leases through
         # boskos_pool and names a default owner is in the tuple, so the next
-        # such script goes red here rather than into "held by hand".
+        # such script goes red here rather than into "no build ID in the owner".
         sys.path.insert(0, str(REPO_SCRIPTS))
         import pool_pressure
 
@@ -796,7 +806,7 @@ class PoolPressureArtifactContractTest(unittest.TestCase):
                 "total": doc["pool"]["total"],
                 "lease_failures": doc["recent"]["lease_failures"],
                 "lease_failures_hours": doc["recent"]["hours"],
-                "held_by_hand": sum(doc["held_by_hand"].values()),
+                "no_build_id": sum(doc["no_build_id"].values()),
                 "max_concurrency": doc["max_concurrency"],
             },
             {key: note[key] for key in note if key not in ("since", "measured_at")},

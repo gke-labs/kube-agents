@@ -3238,6 +3238,60 @@ def test_assert_mode_timeout_is_floored_before_the_http_call(token, monkeypatch)
 # --- registration --------------------------------------------------------
 
 
+def test_a_transport_failure_is_retried_before_it_is_an_error(monkeypatch):
+    """One slow forge read must not red a run on rung 2: a timeout or a reset
+    is retried, an HTTP answer is not, and the retries give up after the
+    configured count with the last failure."""
+    calls = {"n": 0}
+    pauses = []
+    monkeypatch.setattr(verifiers.time, "sleep", pauses.append)
+
+    class _Response:
+        status = 200
+
+        def read(self):
+            return b'{"number": 7}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _FlakyOpener:
+        def open(self, request, timeout=None):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise TimeoutError("The read operation timed out")
+            return _Response()
+
+    monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _FlakyOpener())
+    assert verifiers._http_get_json(_api(), "tok", 30.0) == (200, {"number": 7})
+    assert calls["n"] == 3
+    assert pauses == [verifiers._FORGE_READ_RETRY_PAUSE_SEC] * 2
+
+    class _DeadOpener:
+        def open(self, request, timeout=None):
+            calls["n"] += 1
+            raise verifiers.urllib.error.URLError("Connection reset by peer")
+
+    calls["n"] = 0
+    monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _DeadOpener())
+    with pytest.raises(OSError, match="Connection reset"):
+        verifiers._http_get_json(_api(), "tok", 30.0)
+    assert calls["n"] == verifiers._FORGE_READ_ATTEMPTS
+
+    class _AnsweringOpener:
+        def open(self, request, timeout=None):
+            calls["n"] += 1
+            raise verifiers.urllib.error.HTTPError(_api(), 404, "Not Found", {}, None)
+
+    calls["n"] = 0
+    monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _AnsweringOpener())
+    assert verifiers._http_get_json(_api(), "tok", 30.0)[0] == 404
+    assert calls["n"] == 1, "an HTTP answer is an observation and is not retried"
+
+
 def test_the_ledger_verifier_is_published_as_an_entry_point():
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject.open("rb") as fh:

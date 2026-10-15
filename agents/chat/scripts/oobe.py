@@ -35,8 +35,8 @@ run``: that CLI runs the whole job synchronously in the calling process.
 its run, so a run killed partway marks nothing twice: marking an audit due again after it has run
 starts a second full run. An audit that has completed a run since the sweep was filed (a
 scheduled one) is recorded as adopted and not marked: the install already has that run. With no
-GitHub repository for the audits to publish to every audit fails before it reads anything, so the
-stage records the skip and marks none.
+GitHub repository the stage records the skip and marks none; the audits themselves run with no
+forge on their own schedules (docs/designs/oobe.md §4.4).
 
 ``trigger_job`` also sets a job's ``enabled`` back to true, so an audit an operator
 has disabled or paused is left alone rather than started.

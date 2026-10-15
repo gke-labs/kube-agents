@@ -1241,14 +1241,13 @@ type SecuritySpec struct {
 	//
 	// The allowlist covers DNS, the credential broker, LiteLLM, the namespace
 	// of the OpenTelemetry collector the agent resolved, the Hindsight memory
-	// API, and whatever egressAllowlist adds. Everything else the agent
-	// container reaches on its own would go away:
+	// API, and whatever egressAllowlist adds. The gke and developer_knowledge
+	// MCP servers go through the broker and are unaffected. Everything else the
+	// agent container reaches on its own would go away:
 	//
 	//   - DuckDuckGo web search, which the shared default config turns on for
 	//     every profile, and the "browser" toolset, which only the Chat Agent
 	//     disables;
-	//   - the gke and developer_knowledge MCP servers, which proxy
-	//     container.googleapis.com and developerknowledge.googleapis.com;
 	//   - github.com reached directly from the sandbox, though not the gh and
 	//     git wrappers, which go through the broker;
 	//   - the metadata lookup in cluster_agent_reconcile.py, which finds that
