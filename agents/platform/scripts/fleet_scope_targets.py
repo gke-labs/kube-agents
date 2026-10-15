@@ -169,6 +169,19 @@ class ScopeTargets:
     path: str
     # Set when the render answered instead of a snapshot.
     note: str | None = None
+    # The `exclude.projects` entries the declaration carries (a project id or
+    # a glob against ids), with the explicit projects the reconcile dropped on
+    # one by number (`excludedProjects`): what `declared_scope_targets` skips
+    # on the way into `unread`. Never in the sweep and never in the collector
+    # flags; carried so a reader that meets a project with no row can tell one
+    # the operator left out from one the declaration never named, as the
+    # upgrade-readiness watch does for a roster project the report refused.
+    excluded: tuple[str, ...] = ()
+
+    def excludes(self, project: str) -> bool:
+        """Whether an exclude entry names the project, by its id: the match the
+        reader makes when it skips a declared project, so the two agree."""
+        return any(fnmatch.fnmatchcase(project, entry) for entry in self.excluded)
 
     def collector_argv(self) -> tuple[str, ...]:
         """The arguments that hand this scope to a collector, as an argument
@@ -248,6 +261,7 @@ def _from_render(path: Path) -> ScopeTargets | None:
         resolved_at=None,
         path=os.environ.get(SCOPE_FILE_ENV) or str(path),
         note=note,
+        excluded=tuple(exclude_patterns),
     )
 
 
@@ -301,7 +315,8 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
     # declared project with no cluster (the GCE and networking streams'
     # ordinary target) would otherwise vanish from a complete-looking sweep.
     # An explicit project an exclude pattern matches gets no row on any tick
-    # and is not unread: the operator left it out on purpose.
+    # and is not unread: the operator left it out on purpose. The entries ride
+    # on `excluded` for a reader that meets such a project under another name.
     exclude_patterns = [p for p in ((declared.get("exclude") or {}).get("projects") or []) if isinstance(p, str)]
     dropped = {p for p in (parsed.get(EXCLUDED_KEY) or []) if isinstance(p, str)}
     seen = set(projects) | {project for project, _ in unread}
@@ -329,4 +344,5 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
         unread=tuple(unread),
         resolved_at=str(resolved_at) if isinstance(resolved_at, str) else None,
         path=str(path),
+        excluded=(*exclude_patterns, *(p for p in sorted(dropped) if p not in exclude_patterns)),
     )

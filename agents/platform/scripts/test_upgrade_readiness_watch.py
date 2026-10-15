@@ -43,18 +43,26 @@ def loader_argv(stdin: str) -> list[str]:
     return json.loads(line[len(ARGV_LINE_PREFIX):])
 
 
-def scope_targets(*projects: str, unread: tuple[tuple[str, str], ...] = ()) -> fleet_scope_targets.ScopeTargets:
-    return fleet_scope_targets.ScopeTargets(projects=projects, unread=unread, resolved_at=None, path="fleet_scope.json")
+def scope_targets(*projects: str, unread: tuple[tuple[str, str], ...] = (), excluded: tuple[str, ...] = ()) -> fleet_scope_targets.ScopeTargets:
+    return fleet_scope_targets.ScopeTargets(projects=projects, unread=unread, resolved_at=None, path="fleet_scope.json", excluded=excluded)
 
 
-def declared_snapshot(projects: list[str], unread: list[str] | None = None) -> dict:
+def declared_snapshot(projects: list[str], unread: list[str] | None = None, exclude: list[str] | None = None, containers: list[dict] | None = None) -> dict:
     """The reconcile's snapshot for an install whose ``spec.scope`` resolved to
     ``projects`` (the first the management project), with ``unread`` declared
-    projects the install could not read."""
+    projects the install could not read, ``exclude`` the declaration's
+    ``exclude.projects`` entries, and ``containers`` the reconcile's record of
+    each folder lookup this run, which puts the folder in the declaration."""
     rows = [{"id": p, "outcome": "ok", "state": "in-scope", "via": ["management"] if i == 0 else ["projects"]} for i, p in enumerate(projects)]
     rows += [{"id": p, "outcome": "denied", "state": "in-scope", "via": ["projects"]} for p in unread or []]
-    declared = {"projects": projects[1:] + list(unread or []), "folders": [], "organizations": [], "sharedVpcHosts": [], "metricsScopes": [], "exclude": {}}
-    return {"resolvedAt": "2026-10-09T12:00:00Z", "present": True, "boundary": True, "declared": declared, "projects": rows}
+    declared = {
+        "projects": projects[1:] + list(unread or []), "folders": [c["id"].split("/")[-1] for c in containers or []],
+        "organizations": [], "sharedVpcHosts": [], "metricsScopes": [], "exclude": {"projects": list(exclude or [])},
+    }
+    snapshot = {"resolvedAt": "2026-10-09T12:00:00Z", "present": True, "boundary": True, "declared": declared, "projects": rows}
+    if containers is not None:
+        snapshot["containers"] = containers
+    return snapshot
 
 
 class FakeSandbox:
@@ -163,8 +171,8 @@ class Base(unittest.TestCase):
         self.clock = mock.patch.object(watch, "now_utc", return_value=NOW)
         self.clock.start()
 
-    def declare_scope(self, projects: list[str], unread: list[str] | None = None) -> None:
-        (Path(self.tmp.name) / fleet_scope_targets.SNAPSHOT_FILE).write_text(json.dumps(declared_snapshot(projects, unread)), encoding="utf-8")
+    def declare_scope(self, projects: list[str], unread: list[str] | None = None, exclude: list[str] | None = None, containers: list[dict] | None = None) -> None:
+        (Path(self.tmp.name) / fleet_scope_targets.SNAPSHOT_FILE).write_text(json.dumps(declared_snapshot(projects, unread, exclude, containers)), encoding="utf-8")
 
     def tearDown(self) -> None:
         self.clock.stop()
@@ -1660,6 +1668,27 @@ class DeclaredScope(Base):
             ),
         )
         self.assertIn("a lookup that keeps failing needs the install's read access", watch.REMEDY_OUTSIDE_UNRESOLVED)
+        # The last tick filed the project as outside the resolved scope: a lookup that fails this tick carries the
+        # members it had, so the cause (and the signature) holds; the scope resolving is the news, not this.
+        self.assertEqual(
+            watch.refusal_detail(label + outside.format(project="p2", projects="p1"), carried, outside_stands=True),
+            (
+                "refused by the report script: the install's declared scope does not list p2; it lists p1; "
+                f"the remedy is on the install, not this job: name the project in spec.scope, {roster}",
+                "outside the resolved scope",
+            ),
+        )
+        # A project an exclude entry names has no row, so the script's message is the outside one; the scope the
+        # pod holds says which, whatever the scope resolved, and the remedy is the entry or the roster.
+        for scope in (scope_targets("p1", excluded=("legacy-*",)), scope_targets("p1", unread=(("declared-scope", "unresolved"),), excluded=("legacy-01",))):
+            self.assertEqual(
+                watch.refusal_detail(label + outside.format(project="legacy-01", projects="p1"), scope),
+                (
+                    "refused by the report script: the install's declared scope excludes legacy-01 (a spec.scope.exclude.projects entry names it); "
+                    f"the remedy is on the install, not this job: drop its spec.scope.exclude.projects entry, {roster}",
+                    "excluded by spec.scope.exclude",
+                ),
+            )
         for detail, _ in (
             watch.refusal_detail(label + m, resolved) for m in (
                 outside.format(project="p2", projects="p1"),
@@ -1705,6 +1734,79 @@ class DeclaredScope(Base):
             self.assertIn("p4: version table for p4 refused", out)
             code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2", "p4"}))
             self.assertEqual((code, out.strip()), (0, ""))
+
+    def test_a_standing_outside_refusal_is_not_re_posted_when_a_container_lookup_fails_for_a_tick(self) -> None:
+        """A folder-scoped install whose roster holds p2, in no part of the
+        declaration. The first tick's folder lookup failed, so the line names
+        both ways out; the scope resolving is news, and the line returns with
+        the declaration remedy; a lookup that fails again carries the members
+        it had, so p2 is no more inside than it was, and the line stays quiet
+        on the way out and on the way back."""
+        versions = envelope([member("a", "current")])
+        resolved = {"id": "folders/123456789012", "outcome": "ok", "projects": 0}
+        failed = dict(resolved, outcome="unreachable")
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            self.declare_scope(["p1"], containers=[failed])
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertIn("p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; the declaration is not fully resolved", out)
+            self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: outside a scope not yet resolved"])
+            self.declare_scope(["p1"], containers=[resolved])
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertIn("p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; the remedy is on the install, not this job: name the project in spec.scope", out)
+            self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: outside the resolved scope"])
+            for containers in ([failed], [resolved]):
+                self.declare_scope(["p1"], containers=containers)
+                code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+                self.assertEqual((code, out.strip()), (0, ""))
+                self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: outside the resolved scope"])
+
+    def test_the_readiness_hop_keeps_a_standing_outside_refusal_s_signature_across_a_failed_lookup(self) -> None:
+        self.seed(OLDER_TARGET, None, ["p2/us-central1-a/c"])
+        versions = envelope([member("a", "current")])
+        resolved = {"id": "folders/123456789012", "outcome": "ok", "projects": 0}
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            self.declare_scope(["p1"], containers=[resolved])
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertIn("none graded (readiness run for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; the remedy is on the install, not this job: name the project in spec.scope", out)
+            self.assertEqual(self.ledger()["announced"]["ungraded"][OLDER_TARGET]["signature"], [["p2", "readiness run refused: outside the resolved scope"]])
+            self.declare_scope(["p1"], containers=[dict(resolved, outcome="unreachable")])
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertEqual((code, out.strip()), (0, ""))
+            self.assertEqual(self.ledger()["announced"]["ungraded"][OLDER_TARGET]["signature"], [["p2", "readiness run refused: outside the resolved scope"]])
+
+    def test_the_standing_outside_set_reads_the_record_of_both_hops(self) -> None:
+        ledger = watch.empty_ledger()
+        ledger["table_errors"] = [
+            {"project": "p2", "location": None, "kind": "refused by the report script: outside the resolved scope"},
+            {"project": "p3", "location": None, "kind": "refused by the report script: outside a scope not yet resolved"},
+            {"project": "p4", "location": None, "kind": "table failed"},
+        ]
+        ledger["announced"]["ungraded"] = {
+            OLDER_TARGET: {"detail": "d", "attempts": 1, "parked": False, "signature": [["p5", "readiness run refused: outside the resolved scope"], ["p6", "readiness run failed"]]},
+            TARGET: {"detail": "d", "attempts": 1, "parked": False},
+        }
+        self.assertEqual(watch.standing_outside(ledger), frozenset({"p2", "p5"}))
+        self.assertEqual(watch.standing_outside(watch.empty_ledger()), frozenset())
+
+    def test_a_roster_project_an_exclude_entry_names_is_told_to_drop_the_entry_not_to_declare_it(self) -> None:
+        """The project is in spec.scope already, under exclude: its profile is
+        retiring, or was onboarded by hand and the scope never produced it. An
+        excluded project has no row, so the script's message is the outside
+        one; the scope the pod holds says which, and the remedy is the entry
+        or the roster, never "name it in spec.scope"."""
+        versions = envelope([member("a", "current")])
+        self.declare_scope(["p1"], exclude=["legacy-*"])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,legacy-01"}):
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"legacy-01"}))
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "legacy-01: version table for legacy-01 refused by the report script: the install's declared scope excludes legacy-01 "
+            "(a spec.scope.exclude.projects entry names it); the remedy is on the install, not this job: drop its spec.scope.exclude.projects entry, "
+            "or take it out of the roster (its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)",
+            out,
+        )
+        self.assertNotIn("name the project in spec.scope", out)
+        self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: excluded by spec.scope.exclude"])
 
     def test_an_unreadable_render_fails_the_tick_before_any_sandbox_call(self) -> None:
         """With no roster and no project variable the projects come from a
