@@ -314,23 +314,25 @@ class BoskosHeartbeatTest(unittest.TestCase):
         self.assertIn("disabled", stdout)
         self.assertEqual(_FakeBoskos.updates, [])
 
-    def test_the_first_beats_code_lands_in_the_named_file(self):
+    def test_every_beats_code_lands_in_the_named_file(self):
         # ci-teardown.sh reads this file before Step 1: a 401 there means the
-        # project is another run's and the cluster steps are skipped (#3129).
-        first = Path(self.tmp.name) / "first-beat"
-        proc = self._spawn(BOSKOS_HEARTBEAT_FIRST_BEAT_FILE=str(first))
-        wait_until(lambda: first.exists() and first.read_text().strip())
-        self._await_beats(3)
+        # project is another run's and the cluster steps are skipped, and
+        # only a 200 lets them run (#3129).
+        codes = Path(self.tmp.name) / "beat-codes"
+        proc = self._spawn(BOSKOS_HEARTBEAT_CODES_FILE=str(codes))
+        wait_until(lambda: codes.exists() and len(codes.read_text().split()) >= 3)
         self._stop(proc)
-        self.assertEqual(first.read_text().strip(), "200")
+        lines = codes.read_text().split()
+        self.assertGreaterEqual(len(lines), 3, lines)
+        self.assertEqual(set(lines), {"200"})
 
-    def test_the_first_beat_file_says_401_when_the_lease_is_anothers(self):
+    def test_the_codes_file_says_401_when_the_lease_is_anothers(self):
         _FakeBoskos.owner = "pull-kube-agents-smoke-test-2110536740778283008"
-        first = Path(self.tmp.name) / "first-beat"
-        proc = self._spawn(BOSKOS_HEARTBEAT_FIRST_BEAT_FILE=str(first))
-        wait_until(lambda: first.exists() and first.read_text().strip())
+        codes = Path(self.tmp.name) / "beat-codes"
+        proc = self._spawn(BOSKOS_HEARTBEAT_CODES_FILE=str(codes))
+        wait_until(lambda: codes.exists() and codes.read_text().strip())
         self._stop(proc)
-        self.assertEqual(first.read_text().strip(), "401")
+        self.assertEqual(codes.read_text().split()[0], "401")
 
 
 if __name__ == "__main__":

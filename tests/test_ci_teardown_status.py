@@ -58,14 +58,21 @@ class _FakeBoskos(BaseHTTPRequestHandler):
     # every other owner, which is what a project re-leased to another run
     # tells the first run's teardown (#3129).
     owner = None
+    # Codes to answer before the owner check decides, one per beat: 503 is
+    # what a restarting Boskos answers, and the daemon reads it like a
+    # timed-out curl, an indeterminate beat.
+    scripted = []
 
     def do_POST(self):
         parsed = urlparse(self.path)
         q = parse_qs(parsed.query)
         owner = q.get("owner", [""])[0]
         _FakeBoskos.updates.append((q.get("name", [""])[0], owner))
-        ours = _FakeBoskos.owner is None or owner == _FakeBoskos.owner
-        self.send_response(200 if ours else 401)
+        if _FakeBoskos.scripted:
+            self.send_response(_FakeBoskos.scripted.pop(0))
+        else:
+            ours = _FakeBoskos.owner is None or owner == _FakeBoskos.owner
+            self.send_response(200 if ours else 401)
         self.end_headers()
 
     def log_message(self, *args):
@@ -86,6 +93,7 @@ class CiTeardownStatusTest(unittest.TestCase):
     def setUp(self):
         _FakeBoskos.updates.clear()
         _FakeBoskos.owner = None
+        _FakeBoskos.scripted = []
         self.tmp = TemporaryDirectory()
         bin_dir = Path(self.tmp.name) / "bin"
         bin_dir.mkdir()
@@ -227,6 +235,43 @@ class CiTeardownStatusTest(unittest.TestCase):
         self.assertNotIn("Cleanup Complete", result.stdout)
         self.assertNotIn("helm uninstall", self._calls())
         self.assertNotIn("kubectl delete", self._calls())
+
+    def _prow_env(self, **extra):
+        return {
+            "BOSKOS_HOST": self.boskos_host,
+            "JOB_NAME": "pull-kube-agents-smoke-test",
+            "BUILD_ID": "2110452492650156032",
+            "BOSKOS_HEARTBEAT_INTERVAL_SECONDS": "0.2",
+            **extra,
+        }
+
+    def test_an_indeterminate_first_beat_then_a_401_still_refuses(self):
+        # The bot's walk of the incident with one blip: the first beat is not
+        # an answer, the second is the 401 that must still refuse.
+        _FakeBoskos.owner = "pull-kube-agents-smoke-test-2110536740778283008"
+        _FakeBoskos.scripted = [503]
+        result = self._run("ok", self._prow_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("beats: 503 401", result.stdout)
+        self.assertNotIn("Step 1: Uninstalling", result.stdout)
+        self.assertNotIn("helm uninstall", self._calls())
+        self.assertNotIn("kubectl delete", self._calls())
+
+    def test_an_indeterminate_first_beat_then_a_200_runs_the_cluster_steps(self):
+        _FakeBoskos.owner = "pull-kube-agents-smoke-test-2110452492650156032"
+        _FakeBoskos.scripted = [503]
+        result = self._run("ok", self._prow_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Step 1: Uninstalling", result.stdout)
+        self.assertIn("helm uninstall", self._calls())
+
+    def test_no_definitive_answer_within_the_budget_refuses(self):
+        _FakeBoskos.scripted = [503] * 50
+        result = self._run("ok", self._prow_env(CI_TEARDOWN_LEASE_CHECK_WAIT_SECONDS="2"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("no definitive answer", result.stdout)
+        self.assertNotIn("Step 1: Uninstalling", result.stdout)
+        self.assertNotIn("helm uninstall", self._calls())
 
     def test_a_200_on_the_first_beat_runs_the_cluster_steps(self):
         _FakeBoskos.owner = "pull-kube-agents-smoke-test-2110452492650156032"

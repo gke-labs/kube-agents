@@ -21,10 +21,10 @@
 # If the caller dies without running that trap, the daemon notices at its
 # next beat and stops itself (see the loop), so it cannot outlive the job.
 #
-# With BOSKOS_HEARTBEAT_FIRST_BEAT_FILE set, the first beat's HTTP code is
-# written there as well, once: ci-teardown.sh reads it before it touches the
+# With BOSKOS_HEARTBEAT_CODES_FILE set, every beat's HTTP code is appended
+# there as well, one per line: ci-teardown.sh reads them before it touches the
 # cluster, because a 401 (owner mismatch) means the project has been leased to
-# another run since (#3129).
+# another run since, and only a 200 proves it has not (#3129).
 #
 # Disabled (single notice, exit 0) unless BOSKOS_HOST, BOSKOS_RESOURCE_NAME,
 # and BOSKOS_OWNER_NAME are all set. Pool resource names are DNS-safe, so
@@ -59,9 +59,9 @@ BOSKOS_HEARTBEAT_LOG="${BOSKOS_HEARTBEAT_LOG:-${ARTIFACTS:-/tmp}/boskos-heartbea
 # Where an external command's output lands to be read back (see the header
 # on why not a $(...)). Removed by the stop summary; a SIGKILL leaves it.
 readonly CAPTURE_FILE="${BOSKOS_HEARTBEAT_LOG}.capture"
-# Where the first beat's HTTP code goes for a caller that needs the answer
-# before it acts (ci-teardown.sh); empty writes nothing.
-BOSKOS_HEARTBEAT_FIRST_BEAT_FILE="${BOSKOS_HEARTBEAT_FIRST_BEAT_FILE:-}"
+# Where each beat's HTTP code goes for a caller that needs the answer before
+# it acts (ci-teardown.sh); empty writes nothing.
+BOSKOS_HEARTBEAT_CODES_FILE="${BOSKOS_HEARTBEAT_CODES_FILE:-}"
 # A beat must never wedge the loop behind a slow server: cap each call well
 # under the interval so a timed-out beat still leaves room for the next one.
 CURL_MAX_TIME_SECONDS=10
@@ -144,8 +144,8 @@ while true; do
   http_code="${http_code:(-3)}"
   [ -n "${http_code}" ] || http_code="000"
   beats_sent=$((beats_sent + 1))
-  if [ "${beats_sent}" -eq 1 ] && [ -n "${BOSKOS_HEARTBEAT_FIRST_BEAT_FILE}" ]; then
-    echo "${http_code}" >"${BOSKOS_HEARTBEAT_FIRST_BEAT_FILE}"
+  if [ -n "${BOSKOS_HEARTBEAT_CODES_FILE}" ]; then
+    echo "${http_code}" >>"${BOSKOS_HEARTBEAT_CODES_FILE}"
   fi
   if [ "${http_code}" = "200" ]; then
     status="ok"

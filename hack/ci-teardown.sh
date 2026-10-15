@@ -75,12 +75,16 @@ readonly KUBECTL_REQUEST_TIMEOUT="${CI_TEARDOWN_KUBECTL_REQUEST_TIMEOUT:-30s}"
 # itself with no wrapper change. If the convention ever changes, every beat
 # is a 401 and Step 0 refuses every teardown; the convention is what to fix.
 readonly PROW_BOSKOS_DEFAULT_HOST="http://boskos.boskos.svc.cluster.local"
-# Step 0: how long to wait for the heartbeat's first answer (one beat is one
-# curl of at most ten seconds, CURL_MAX_TIME_SECONDS in boskos_heartbeat.sh),
-# and the answer that means the lease is another run's: ranch's
-# OwnerNotMatch. Only that code refuses; a timeout or a network error runs
-# the teardown as before, since refusing on a blip would strand resources.
-readonly FIRST_BEAT_WAIT_SECONDS="${CI_TEARDOWN_FIRST_BEAT_WAIT_SECONDS:-30}"
+# Step 0: how long to wait for a definitive answer from the heartbeat, and the
+# two answers that are one. A 200 proves the lease is still this run's; a 401
+# is ranch's OwnerNotMatch, the lease is not. Anything else (000 when the curl
+# times out, a 5xx while Boskos restarts) is asked again at the next beat. The
+# budget spans three beats at the daemon's 30 s cadence, so one or two blips
+# still reach an answer; without one, a Prow teardown refuses, because a
+# refusal costs one lease's tidiness (the next job's opening sweep takes what
+# is left) and a wrong proceed costs another run's install.
+readonly LEASE_CHECK_WAIT_SECONDS="${CI_TEARDOWN_LEASE_CHECK_WAIT_SECONDS:-100}"
+readonly BOSKOS_OWNED_HTTP="200"
 readonly BOSKOS_OWNER_MISMATCH_HTTP="401"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -129,13 +133,13 @@ if [ -n "${JOB_NAME:-}" ] && [ -n "${BUILD_ID:-}" ]; then
   export BOSKOS_RESOURCE_NAME="${BOSKOS_RESOURCE_NAME:-${PROJECT_ID}}"
   export BOSKOS_OWNER_NAME="${BOSKOS_OWNER_NAME:-${JOB_NAME}-${BUILD_ID}}"
 fi
-FIRST_BEAT_DIR="$(mktemp -d)"
-export BOSKOS_HEARTBEAT_FIRST_BEAT_FILE="${FIRST_BEAT_DIR}/first-beat"
+BEAT_CODES_DIR="$(mktemp -d)"
+export BOSKOS_HEARTBEAT_CODES_FILE="${BEAT_CODES_DIR}/beat-codes"
 "${SCRIPT_DIR}/boskos_heartbeat.sh" &
 HEARTBEAT_PID=$!
-trap 'kill "${HEARTBEAT_PID}" 2>/dev/null || true; rm -rf "${FIRST_BEAT_DIR}"' EXIT
+trap 'kill "${HEARTBEAT_PID}" 2>/dev/null || true; rm -rf "${BEAT_CODES_DIR}"' EXIT
 
-# Step 0: is the project still this run's? The daemon's first beat says. On
+# Step 0: is the project still this run's? The daemon's beats say. On
 # 2026-10-15 four runs held six hours in their image build outlived the
 # wrapper heartbeat's default 5h timeout; Boskos's reaper freed their
 # projects, other runs leased two of them and installed, and at the ceiling
@@ -143,20 +147,36 @@ trap 'kill "${HEARTBEAT_PID}" 2>/dev/null || true; rm -rf "${FIRST_BEAT_DIR}"' E
 # uninstalled the new tenants' releases, CRDs and volumes (#3129). A 401 here
 # is that signal: the project is another run's now, and the next tenant's own
 # pre-deploy teardown has already swept whatever this run left, so refusing
-# costs nothing. Only the daemon's answer is read; nothing here is a second
+# costs nothing. Only the daemon's answers are read; nothing here is a second
 # Boskos client.
-FIRST_BEAT=""
-for ((tick = 0; tick < FIRST_BEAT_WAIT_SECONDS; tick++)); do
-  if [ -s "${BOSKOS_HEARTBEAT_FIRST_BEAT_FILE}" ]; then
-    read -r FIRST_BEAT <"${BOSKOS_HEARTBEAT_FIRST_BEAT_FILE}" || true
+LEASE_ANSWER=""
+LEASE_CODES_SEEN=""
+for ((tick = 0; tick < LEASE_CHECK_WAIT_SECONDS; tick++)); do
+  LEASE_CODES_SEEN=""
+  if [ -s "${BOSKOS_HEARTBEAT_CODES_FILE}" ]; then
+    while read -r code; do
+      LEASE_CODES_SEEN="${LEASE_CODES_SEEN}${LEASE_CODES_SEEN:+ }${code}"
+      if [ "${code}" = "${BOSKOS_OWNED_HTTP}" ] || [ "${code}" = "${BOSKOS_OWNER_MISMATCH_HTTP}" ]; then
+        LEASE_ANSWER="${code}"
+        break
+      fi
+    done <"${BOSKOS_HEARTBEAT_CODES_FILE}"
+  fi
+  [ -n "${LEASE_ANSWER}" ] && break
+  # A daemon that exited without a beat was disabled (outside Prow, where
+  # there is no lease to check): run the teardown as before.
+  if ! kill -0 "${HEARTBEAT_PID}" 2>/dev/null && [ -z "${LEASE_CODES_SEEN}" ]; then
+    LEASE_ANSWER="disabled"
     break
   fi
-  # A disabled daemon (outside Prow) has already exited: nothing to wait for.
-  kill -0 "${HEARTBEAT_PID}" 2>/dev/null || break
   sleep 1
 done
-if [ "${FIRST_BEAT}" = "${BOSKOS_OWNER_MISMATCH_HTTP}" ]; then
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Teardown skipped: Boskos answered ${FIRST_BEAT} (owner mismatch) on the first beat, so ${PROJECT_ID} is no longer this run's lease (free, or leased to another run) and whatever is installed there is not this run's to remove (#3129) ==="
+if [ "${LEASE_ANSWER}" = "${BOSKOS_OWNER_MISMATCH_HTTP}" ]; then
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Teardown skipped: Boskos answered ${LEASE_ANSWER} (owner mismatch; beats: ${LEASE_CODES_SEEN}), so ${PROJECT_ID} is no longer this run's lease (free, or leased to another run) and whatever is installed there is not this run's to remove (#3129) ==="
+  exit 0
+fi
+if [ -z "${LEASE_ANSWER}" ]; then
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Teardown skipped: Boskos gave no definitive answer on ${PROJECT_ID} within ${LEASE_CHECK_WAIT_SECONDS}s (beats: ${LEASE_CODES_SEEN:-none}); refusing rather than risk removing another run's install, and the next job's opening sweep takes what this run left (#3129) ==="
   exit 0
 fi
 
