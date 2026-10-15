@@ -252,14 +252,19 @@ LEDGER_BUTTON = "Ledger issue #{number} ↗"
 
 #: The "What's wrong" section of a report written to the Platform Agent's three
 #: sections (``agents/platform/SOUL.md``): a heading (``## What's wrong``) or a
-#: bold label, the section's text after it on the same line or below it.
+#: bold label alone on its line, the section's text below it; or the label, a
+#: colon or a dash, a space and the text on the same line (``**What's wrong** —
+#: The audit ...``). Anything else after the label (``## What's wrong?``, ``What's
+#: wrong is that ...``) is not the label, so such a report posts whole.
 WRONG_LABEL = re.compile(
-    r"^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*|__)?What['’]s[ \t]+wrong[ \t]*:?(?:\*\*|__)?[ \t]*(?:[:—–-][ \t]*)?(?P<rest>.*)$",
+    r"^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*|__)?What['’]s[ \t]+wrong"
+    r"(?:(?:[ \t]*[:—–-](?:\*\*|__)?|(?:\*\*|__)[ \t]*[:—–-])[ \t]+(?P<rest>\S.*)"
+    r"|[ \t]*:?(?:\*\*|__)?[ \t]*(?:#+[ \t]*)?)$",
     re.IGNORECASE | re.MULTILINE,
 )
 #: A line that ends the section's first paragraph: a heading, a list item, or a bold label alone.
 SECTION_BREAK = re.compile(r"^[ \t]*(?:#{1,6}[ \t]|[-*+][ \t]|\d+[.)][ \t]|(?:\*\*|__)[^*_]+(?:\*\*|__)[ \t]*$)")
-#: The most of a report read for its "What's wrong" section; the section opens a report.
+#: How far into a report the "What's wrong" label is looked for; the section opens a report.
 WRONG_READ_MAX = 4000
 
 
@@ -727,13 +732,17 @@ def failed_line(report: str) -> str | None:
     """
     if ledger_ref(report) is not None:
         return None
-    head = report[:WRONG_READ_MAX]
-    label = WRONG_LABEL.search(head)
+    found = WRONG_LABEL.search(report[:WRONG_READ_MAX])
+    if found is None:
+        return None
+    # Matched again on the whole report, so a line or paragraph past the
+    # search window is read whole rather than cut at it.
+    label = WRONG_LABEL.match(report, found.start())
     if label is None:
         return None
-    paragraph = [label.group("rest").strip()] if label.group("rest").strip() else []
+    paragraph = [label.group("rest").strip()] if label.group("rest") else []
     if not paragraph:
-        for line in head[label.end() :].lstrip("\r\n").splitlines():
+        for line in report[label.end() :].lstrip("\r\n").splitlines():
             if not line.strip() or SECTION_BREAK.match(line):
                 break
             paragraph.append(line.strip())

@@ -1122,6 +1122,37 @@ class FailedLineTest(unittest.TestCase):
         self.assertEqual(text, WALL_LABEL)
         self.assertIsNone(sar.failed_chat(REPORT))
 
+    def test_only_a_label_is_read_as_the_section(self):
+        # Text after the label that no colon or dash introduces is not the section's: the report posts whole.
+        for report in (
+            "## What's wrong?\nThe audit could not run.\n",
+            "**What's wrong?**\nThe audit could not run.\n",
+            "## What's wrong (2 critical)\nThe audit could not run.\n",
+            "## What's wrong with the fleet\nThe audit could not run.\n",
+            "What's wrong is that no GitOps repository is registered.\n",
+        ):
+            with self.subTest(report=report[:30]):
+                self.assertIsNone(sar.failed_line(report))
+
+    def test_the_label_shapes_the_soul_allows(self):
+        line = "The audit could not run."
+        for report in (
+            "## What's wrong ##\nThe audit could not run. It retries.\n",
+            "**What's wrong:** The audit could not run.\n",
+            "**What's wrong —** The audit could not run.\n",
+            "What's wrong: The audit could not run.\n",
+            "__What's wrong__ - The audit could not run.\n",
+        ):
+            with self.subTest(report=report[:30]):
+                self.assertEqual(sar.failed_line(report), line)
+
+    def test_a_section_past_the_search_window_is_read_whole(self):
+        sentence = "The GCE fleet audit cannot publish its ledger issue because no GitOps repository is registered."
+        label = "## What's wrong\n"
+        pad = "x" * (sar.WRONG_READ_MAX - len(label) - 10) + "\n\n"
+        self.assertEqual(sar.failed_line(pad + label + sentence + "\n"), sentence)
+        self.assertEqual(sar.failed_line(pad + "**What's wrong** — " + sentence + "\n"), sentence)
+
     def test_a_long_report_is_read_quickly(self):
         start = time.monotonic()
         sar.failed_line("x " * LONG_INPUT * 10 + "\n## What's wrong\n" + "y " * LONG_INPUT)
