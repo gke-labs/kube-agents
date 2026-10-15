@@ -445,17 +445,26 @@
 # eval crew if the main part's nights leave no room for a batch. Counted
 # from the lists: eighty-two cases (246 units) here, of a ninety-six-case,
 # 288-unit matrix with the presubmit file's fourteen. Entries 12 and 20
-# read fixtures #2916 plants and enter on the author's decision of
-# 2026-10-14, with their fixture scan on record: 2026-10-14 18:12 UTC, each
-# role healthy on 38 of 40 pool projects and absent on kube-agents-evals-12
-# and -24. The postsubmit reconcile that followed #2916 failed on seeded-b's
-# pin (#3025, with #3042 as its fix); the reconcile report and a scan
-# reading every role healthy on every project are cited here when a clean
-# one exists (docs/designs/bench-case-format.md, Registration). Until then,
-# on a project that lacks a role, a repetition errors as CHECK_DID_NOT_RUN,
-# a broken environment rather than a wrong answer; the gate reads that rung
-# as a blocking verdict on the case, not as the infrastructure class it
-# excludes from the rate.
+# read fixtures #2916 plants, the roles deprecated-label-selector and
+# retired-registry-image, and enter with the citation the Registration
+# rule asks for per role (docs/designs/bench-case-format.md). The
+# postsubmit reconcile that followed #2916 failed on seeded-b's pin
+# (#3025, with #3042 as its fix); #3042's own postsubmit,
+# post-kube-agents-fleet-reconcile job 2110720877149556736 on its merge
+# commit 2d3d4399f, finished clean at 16:10:30 UTC on 2026-10-15 with all
+# 40 pool projects mapped, visited and applied (failed, refused,
+# interrupted and not reached: 0), and the fixture scan of 17:08:57 UTC
+# the same day reads each of the two roles healthy on 40 of 40 pool
+# projects. Before that reconcile the scan of 2026-10-14 18:12 UTC read
+# each role absent on two projects, and a night on that state would have
+# met what the rule guards against: on a project that lacks a role, a
+# repetition errors as CHECK_DID_NOT_RUN, a broken environment rather
+# than a wrong answer, which the gate reads as a blocking verdict on the
+# case, not as the infrastructure class it excludes from the rate. The
+# same 17:08:57 UTC scan reads containerd-socket-agent, entry 13's role,
+# drifted on kube-agents-evals-11 (the probe DaemonSet's rolling update
+# halted on one node); entry 13 is not in this batch, and that drift is
+# left to the eval crew's fixture scan.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
