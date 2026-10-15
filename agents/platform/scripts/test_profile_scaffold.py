@@ -252,31 +252,86 @@ class CronStoreMergeTest(unittest.TestCase):
         write(self.home / "cron" / "jobs.json", json.dumps({"jobs": [job("audit", prompt="old prompt")]}))
 
         lock_file = self.home / "cron" / ".jobs.lock"
-        (self.home / "cron").mkdir(parents=True, exist_ok=True)
+        jobs_path = self.home / "cron" / "jobs.json"
+        orig_merge = ps.merge_cron_store
+        pause_thread = None
 
-        lock_fd = open(lock_file, "a+")
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        def pause_worker():
+            fd = open(lock_file, "a+", encoding="utf-8")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                try:
+                    data = json.loads(jobs_path.read_text(encoding="utf-8"))
+                    data["jobs"][0]["state"] = "paused"
+                    data["jobs"][0]["paused_at"] = "2026-10-15T07:23:22Z"
+                    jobs_path.write_text(json.dumps(data), encoding="utf-8")
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                fd.close()
 
-        def background_pause():
+        def inject_pause_mid_merge(*args, **kwargs):
+            nonlocal pause_thread
+            pause_thread = threading.Thread(target=pause_worker)
+            pause_thread.start()
+            # Give pause_worker time to attempt acquisition. Without cron_jobs_lock in
+            # overlay_template, it acquires immediately and writes mid-merge, which os.replace
+            # clobbers. With cron_jobs_lock, it blocks until overlay_template finishes.
             time.sleep(0.05)
-            jobs_path = self.home / "cron" / "jobs.json"
-            data = json.loads(jobs_path.read_text(encoding="utf-8"))
-            data["jobs"][0]["state"] = "paused"
-            data["jobs"][0]["paused_at"] = "2026-10-15T07:23:22Z"
-            jobs_path.write_text(json.dumps(data), encoding="utf-8")
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            lock_fd.close()
+            return orig_merge(*args, **kwargs)
 
-        t = threading.Thread(target=background_pause)
-        t.start()
+        with unittest.mock.patch.object(ps, "merge_cron_store", side_effect=inject_pause_mid_merge):
+            ps.overlay_template(self.home, self.template, None, ("cron",))
 
-        ps.overlay_template(self.home, self.template, None, ("cron",))
-        t.join()
+        if pause_thread:
+            pause_thread.join()
 
         merged = json.loads((self.home / "cron" / "jobs.json").read_text())["jobs"]
         self.assertEqual(merged[0]["state"], "paused", "pause state was lost during startup merge")
         self.assertEqual(merged[0]["paused_at"], "2026-10-15T07:23:22Z")
         self.assertEqual(merged[0]["prompt"], "image prompt", "image prompt was not updated")
+
+    def test_overlay_template_copies_non_cron_outside_lock(self):
+        """Non-cron template items (skills, governance) must be copied outside .jobs.lock."""
+        write(self.template / "skills" / "foo.md", "skill content")
+        write(self.template / "cron" / "jobs.json", json.dumps({"jobs": [job("audit")]}))
+        write(self.home / "cron" / "jobs.json", json.dumps({"jobs": [job("audit")]}))
+
+        lock_path = self.home / "cron" / ".jobs.lock"
+        copied_skills_during_lock = False
+        orig_copytree = shutil.copytree
+
+        def probe_copytree(src, dst, *args, **kwargs):
+            nonlocal copied_skills_during_lock
+            if "skills" in str(src):
+                if lock_path.is_file():
+                    try:
+                        with open(lock_path, "a+") as probe_fd:
+                            try:
+                                fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                fcntl.flock(probe_fd, fcntl.LOCK_UN)
+                            except (BlockingIOError, OSError):
+                                copied_skills_during_lock = True
+                    except OSError:
+                        pass
+            return orig_copytree(src, dst, *args, **kwargs)
+
+        with unittest.mock.patch("shutil.copytree", side_effect=probe_copytree):
+            ps.overlay_template(self.home, self.template, None, ("skills", "cron"))
+
+        self.assertFalse(copied_skills_during_lock, "shutil.copytree on skills was called while .jobs.lock was held")
+
+    def test_cron_jobs_lock_non_contention_oserror_fails_open_immediately(self):
+        """Non-BlockingIOError OSError (e.g. ENOLCK/EOPNOTSUPP) fails open immediately without 15s wait."""
+        import errno
+        lock_dir = self.home / "cron"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        t0 = time.monotonic()
+        with unittest.mock.patch("fcntl.flock", side_effect=OSError(errno.ENOLCK, "No record locks available")):
+            with ps.cron_jobs_lock(lock_dir, timeout=5.0):
+                pass
+        duration = time.monotonic() - t0
+        self.assertLess(duration, 1.0, f"lock waited {duration}s on permanent OSError instead of failing open immediately")
 
     def test_cron_jobs_lock_timeout_fallback(self):
         """When .jobs.lock is held and times out, overlay_template still completes."""
@@ -561,6 +616,32 @@ class BackfillCronStoreTest(unittest.TestCase):
 
     def test_backfill_cron_file_handles_nonexistent_file(self):
         self.assertFalse(ps.backfill_cron_file(self.root / "absent.json"))
+
+    def test_backfill_cron_file_holds_cron_jobs_lock(self):
+        cron_file = self.root / "jobs.json"
+        cron_file.write_text(json.dumps({"jobs": [{"id": "job1"}]}))
+        lock_held = False
+        orig_backfill = ps.backfill_cron_store
+
+        def probe_backfill(*args, **kwargs):
+            nonlocal lock_held
+            lock_path = self.root / ".jobs.lock"
+            if lock_path.is_file():
+                try:
+                    with open(lock_path, "a+") as probe_fd:
+                        try:
+                            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            fcntl.flock(probe_fd, fcntl.LOCK_UN)
+                        except (BlockingIOError, OSError):
+                            lock_held = True
+                except OSError:
+                    pass
+            return orig_backfill(*args, **kwargs)
+
+        with unittest.mock.patch.object(ps, "backfill_cron_store", side_effect=probe_backfill):
+            ps.backfill_cron_file(cron_file)
+
+        self.assertTrue(lock_held, ".jobs.lock was NOT held exclusively during backfill_cron_file")
 
 
 if __name__ == "__main__":

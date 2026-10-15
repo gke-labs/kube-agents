@@ -65,14 +65,16 @@ on an install with no ``oobe`` job, where both scripts check
 
 Concurrency
 -----------
-Within one pod there is one writer, and it takes two separate facts to say so.
-This runs from the entrypoint ahead of ``exec "$@"``, so the scheduler in that
-container has not started; and step 1.5 of the entrypoint hands the shared tree to
-a single owning container, so the dashboard — which runs the same image over the
-same PVC, and has no scheduler of its own — never reaches the step that calls this.
+Hermes serializes its own cron store mutations (``hermes cron pause|resume|add|remove``)
+under an exclusive advisory flock on ``<cron_dir>/.jobs.lock`` (see ``cron/jobs.py``).
+This script acquires that same lock via ``cron_jobs_lock`` around the entire
+read-reconcile-write-ledger sequence, preventing an in-pod cron command issued during
+gateway restart from racing the startup merge and having its mutation clobbered (#3179).
+Both the ``jobs.json`` write and the ledger write sit inside the critical section, so a
+concurrent mutation under ``.jobs.lock`` cannot land between them.
 
-**Both facts are scoped to one pod, and that is the limit of the guarantee.** Step
-1.5 elects an owner per pod, not per volume: the operator sets
+**This lock coordinates writers that honour .jobs.lock, but cross-pod limits remain.**
+Step 1.5 of the entrypoint elects an owner per pod, not per volume: the operator sets
 ``AGENT_SHARED_STATE_SETUP=owner`` on the gateway container of the pod *template*
 (``platformagent_manifests.go``), so every replica's gateway is an owner. At
 ``availability.replicas > 1`` the operator gives those replicas one shared volume —
@@ -84,31 +86,20 @@ rolling update then runs this in a new pod while an old pod is still up
 before the last old one is gone; ``maxUnavailable`` is an absolute 1, so one
 old pod also stays while it starts).
 
-What that costs is bounded but real, and stating it precisely matters more than
-naming a mechanism:
+What that costs across pods on a shared volume:
 
-* Concurrent runs of this script cannot tear ``jobs.json`` — ``write_json`` names
-  its temp file per *pod* (see ``writer_tag``; the pid alone is not distinct
-  across replicas), so every ``os.replace`` publishes a whole file — but two of
-  them can still lose one merge to the other. The loser retries next boot.
-* A merge racing a live scheduler's own write is the case that does not
-  self-correct. If a tick's write lands between this script's ``jobs.json`` write
-  and its ledger write, the job is absent from the volume with its id recorded as
-  installed, which ``reconcile`` reads as "removed on purpose" on that boot and
-  every boot after it.
+* On filesystems supporting advisory locking, ``.jobs.lock`` serializes concurrent runs
+  across pods. If the filesystem does not support ``flock`` or lock manager fails,
+  ``cron_jobs_lock`` fails open immediately, and ``write_json`` names its temp file
+  per *pod* (see ``writer_tag``) so ``os.replace`` publishes a whole file, though
+  one merge could overwrite another until the next boot.
+* A merge racing a remote scheduler in another pod that ticks without taking ``.jobs.lock``
+  remains possible on multi-replica shared storage.
 
-How wide that second window is depends on whether Hermes' ``mark_job_run``
-re-reads the store or writes back a list cached at tick time. This module does not
-know, and neither did the comment that used to assert the latter here. It is
-recorded as unverified because nobody has read ``/opt/hermes/cron/jobs.py`` to
-settle it, and an unverified premise stated as fact is what put the wrong claim
-here in the first place.
-
-Neither is fixable from inside this script: the competing writer is a scheduler in
-another pod that takes no lock this one could hold. Running the reconcile once per
+Eliminating the cross-pod race entirely requires running the reconcile once per
 volume — behind leader election, or from an init container or per-rollout Job —
-is the fix, and it is a change to the deployment topology rather than to this file.
-Single-replica installs, which are the default, are unaffected.
+which is a change to the deployment topology. Single-replica installs, which are
+the default, are completely protected by ``.jobs.lock``.
 """
 
 import argparse
@@ -200,11 +191,14 @@ def cron_jobs_lock(cron_dir: Path, timeout: float | None = None):
                     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     acquired = True
                     break
-                except (OSError, IOError):
+                except BlockingIOError:
                     if time.monotonic() >= deadline:
                         log(f"WARN: timed out after {timeout}s waiting for {lock_path}; proceeding without lock")
                         break
                     time.sleep(0.05)
+                except OSError as exc:
+                    log(f"WARN: could not acquire cron jobs lock {lock_path} ({exc}); proceeding without lock")
+                    break
         else:
             acquired = True
 

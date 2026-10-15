@@ -84,11 +84,14 @@ def cron_jobs_lock(cron_dir: Path, timeout: float | None = None):
                     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     acquired = True
                     break
-                except (OSError, IOError):
+                except BlockingIOError:
                     if time.monotonic() >= deadline:
                         log(f"WARN: timed out after {timeout}s waiting for {lock_path}; proceeding without lock")
                         break
                     time.sleep(0.05)
+                except OSError as exc:
+                    log(f"WARN: could not acquire cron jobs lock {lock_path} ({exc}); proceeding without lock")
+                    break
         else:
             acquired = True
 
@@ -425,10 +428,6 @@ def _merge_after_overlay(
         source = template_dir.joinpath(*parts)
         if not source.is_file():
             continue
-        merged = retire_cron_jobs(
-            merge_cron_store(read_json(source), previous, cron_job_ids),
-            cron_retire_ids,
-        )
         destination = home.joinpath(*parts)
         with cron_jobs_lock(destination.parent) if parts[0] == "cron" else contextlib.nullcontext():
             merged = retire_cron_jobs(
@@ -472,22 +471,33 @@ def overlay_template(
     if not template_dir.is_dir():
         raise SystemExit(f"ERROR: template dir not found: {template_dir}")
     names = tuple(items) if items is not None else tuple(p.name for p in template_dir.iterdir())
-    with cron_jobs_lock(home / "cron") if "cron" in names else contextlib.nullcontext():
-        prior = {
-            relative: contents
-            for relative in MERGE_PATHS
-            if (contents := read_json(home.joinpath(*relative.split("/")))) is not None
-        }
-        for item_name in names:
-            src = template_dir / item_name
-            if not src.exists():
-                continue
-            dest = home / item_name
-            if src.is_dir():
-                shutil.copytree(src, dest, dirs_exist_ok=True)
-            else:
-                shutil.copy2(src, dest)
-        _merge_after_overlay(home, template_dir, names, prior, cron_job_ids, cron_retire_ids)
+    for item_name in names:
+        if item_name == "cron":
+            continue
+        src = template_dir / item_name
+        if not src.exists():
+            continue
+        dest = home / item_name
+        if src.is_dir():
+            shutil.copytree(src, dest, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dest)
+
+    if "cron" in names:
+        with cron_jobs_lock(home / "cron"):
+            prior = {
+                relative: contents
+                for relative in MERGE_PATHS
+                if (contents := read_json(home.joinpath(*relative.split("/")))) is not None
+            }
+            src = template_dir / "cron"
+            if src.exists():
+                dest = home / "cron"
+                if src.is_dir():
+                    shutil.copytree(src, dest, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(src, dest)
+            _merge_after_overlay(home, template_dir, names, prior, cron_job_ids, cron_retire_ids)
     if plugins_dir and plugins_dir.is_dir():
         try:
             shutil.copytree(plugins_dir, home / "plugins", dirs_exist_ok=True)

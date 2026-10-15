@@ -497,28 +497,55 @@ class SyncFileTests(unittest.TestCase):
         self.write(self.runtime, {"jobs": [job("a", prompt="old prompt")]})
 
         lock_file = self.runtime.parent / ".jobs.lock"
-        lock_fd = open(lock_file, "a+")
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        jobs_path = self.runtime
+        orig_reconcile = cron_jobs_sync.reconcile
+        pause_thread = None
 
-        def background_pause():
+        def pause_worker():
+            fd = open(lock_file, "a+", encoding="utf-8")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                try:
+                    data = json.loads(jobs_path.read_text(encoding="utf-8"))
+                    data["jobs"][0]["state"] = "paused"
+                    data["jobs"][0]["paused_at"] = "2026-10-15T07:23:22Z"
+                    jobs_path.write_text(json.dumps(data), encoding="utf-8")
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                fd.close()
+
+        def inject_pause_mid_sync(*args, **kwargs):
+            nonlocal pause_thread
+            pause_thread = threading.Thread(target=pause_worker)
+            pause_thread.start()
+            # Give pause_worker time to attempt acquisition. Without cron_jobs_lock in sync,
+            # it acquires immediately and writes mid-sync, which sync's write_json clobbers.
+            # With cron_jobs_lock, it blocks until sync finishes.
             time.sleep(0.05)
-            data = json.loads(self.runtime.read_text(encoding="utf-8"))
-            data["jobs"][0]["state"] = "paused"
-            data["jobs"][0]["paused_at"] = "2026-10-15T07:23:22Z"
-            self.runtime.write_text(json.dumps(data), encoding="utf-8")
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            lock_fd.close()
+            return orig_reconcile(*args, **kwargs)
 
-        t = threading.Thread(target=background_pause)
-        t.start()
+        with mock.patch.object(cron_jobs_sync, "reconcile", side_effect=inject_pause_mid_sync):
+            cron_jobs_sync.sync(self.image, self.runtime, self.ledger)
 
-        cron_jobs_sync.sync(self.image, self.runtime, self.ledger)
-        t.join()
+        if pause_thread:
+            pause_thread.join()
 
         merged = json.loads(self.runtime.read_text())["jobs"]
         self.assertEqual(merged[0]["state"], "paused", "pause state was lost during sync")
         self.assertEqual(merged[0]["paused_at"], "2026-10-15T07:23:22Z")
         self.assertEqual(merged[0]["prompt"], "new prompt", "image prompt was not updated")
+
+    def test_cron_jobs_lock_non_contention_oserror_fails_open_immediately(self):
+        """Non-BlockingIOError OSError (e.g. ENOLCK/EOPNOTSUPP) fails open immediately without 15s wait."""
+        import errno
+        lock_dir = self.runtime.parent
+        t0 = time.monotonic()
+        with mock.patch("fcntl.flock", side_effect=OSError(errno.ENOLCK, "No record locks available")):
+            with cron_jobs_sync.cron_jobs_lock(lock_dir, timeout=5.0):
+                pass
+        duration = time.monotonic() - t0
+        self.assertLess(duration, 1.0, f"lock waited {duration}s on permanent OSError instead of failing open immediately")
 
     def test_cron_jobs_lock_timeout_fallback(self):
         """When .jobs.lock is held and times out, sync still completes."""
