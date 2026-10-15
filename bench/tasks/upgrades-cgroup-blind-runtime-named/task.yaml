@@ -80,8 +80,9 @@ verification_spec:
       any_of_patterns:
         - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^\n]*$'
 
-  # The image reference as the manifest spells it, with or without the
-  # docker.io/library/ prefix kubectl shows.
+  # The runtime slot is the planted image with its literal tag, with or without
+  # `image ` and a registry path before it (`docker.io/library/`, `docker.io/`, a
+  # mirror), the way the stale-client slot reads its image; another tag reads wrong.
   - name: the-declared-line-names-the-pre-cgroup-v2-runtime
     role: objective
     mode: assert
@@ -91,9 +92,9 @@ verification_spec:
       fixture_roles:
         - cgroup-blind-runtime
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?(?:docker\.io/library/)?eclipse-temurin:8u302-b08-jre(?: \([^)\n;]*\))?; reads cgroup v2 limits: (?:yes|no)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?(?:image )?(?:[a-z0-9.-]+/)*eclipse-temurin:8u302-b08-jre(?: \([^)\n;]*\))?; reads cgroup v2 limits: (?:yes|no)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?(?!(?:docker\.io/library/)?eclipse-temurin:8u302-b08-jre(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?(?!(?:image )?(?:[a-z0-9.-]+/)*eclipse-temurin:8u302-b08-jre(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no)(?: \([^)\n;]*\))?; memory limit:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-says-the-runtime-is-blind-to-cgroup-v2
     role: objective

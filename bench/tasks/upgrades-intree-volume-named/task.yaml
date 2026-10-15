@@ -17,6 +17,9 @@
 # A parenthetical after a graded value is ungraded: the judge reads it. It
 # may not carry the line's own separator, `;`.
 #
+# The claim may carry its kind (`pvc`, `claim`, `persistentvolumeclaim`) before
+# `seeded-shapes/intree-pd`, as the list slots admit a kind before a name.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the volume source. A CSI volume in its place is the
@@ -95,9 +98,9 @@ verification_spec:
       fixture_roles:
         - intree-pd-volume
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?seeded-shapes/intree-pd(?: \([^)\n;]*\))?; attaches through csi migration: yes$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?(?:(?:pvc|claim|persistentvolumeclaim) )?seeded-shapes/intree-pd(?: \([^)\n;]*\))?; attaches through csi migration: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?(?!seeded-shapes/intree-pd(?: \([^)\n;]*\))?; attaches through csi migration: yes$)[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/intree-pd(?:\s*\([^)\n]*\))?: source:? ?[^ :;\n][^;\n]*; bound by:? ?(?!(?:(?:pvc|claim|persistentvolumeclaim) )?seeded-shapes/intree-pd(?: \([^)\n;]*\))?; attaches through csi migration: yes$)[^ :;\n][^\n]*$'
 
   - name: no-invented-cves
     role: objective
