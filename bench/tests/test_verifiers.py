@@ -7775,6 +7775,8 @@ _GROUP3 = {
                     "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: endpoints v1 api",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: endpoints api v1",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: endpoints (core/v1) api",
+            "seeded-a: next minor 1.36; removed apis still called: (none); deprecated but still served: v1 endpoints",
+            "seeded-a: next minor 1.36; removed apis still called: none found; deprecated but still served: v1 endpoints",
 ],
         [
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, v1",
@@ -7908,6 +7910,7 @@ _GROUP5 = {
                     "seeded-a/seeded-defaults: enforce pod-security.kubernetes.io/enforce=baseline; enforce-version pod-security.kubernetes.io/enforce-version=latest; rule set changes at the next minor: yes",
             "seeded-a/seeded-defaults: enforce=baseline; enforce-version=latest; rule set changes at the next minor: yes",
             "seeded-a/seeded-defaults: enforce baseline, warn baseline; enforce-version latest; rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce baseline, warn baseline; enforce-version latest, warn-version latest; rule set changes at the next minor: yes",
 ],
         [
             "seeded-a/seeded-defaults: enforce restricted; enforce-version latest; rule set changes at the next minor: yes",
@@ -7932,6 +7935,7 @@ _GROUP5 = {
                     "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (v1.29.0, image registry.k8s.io/kubectl:v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (registry.k8s.io/kubectl:v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client registry.k8s.io/kubectl:v1.29.0@sha256:0f1eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; server v1.34.1-gke.1234000; within supported skew: no",
 ],
         [
             "seeded-a/seeded-shapes/stale-kubectl-client-apiserver-egress: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
@@ -7996,6 +8000,8 @@ _GROUP5 = {
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: true; host paths /etc/cni/net.d; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: hostNetwork: true; host paths /etc/cni/net.d; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host-network: yes; host paths /etc/cni/net.d; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths hostPath /etc/cni/net.d; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths hostPath: /opt/cni/bin, hostPath: /etc/cni/net.d; coupled to the node image: yes",
 ],
         [
             "seeded-a/seeded-shapes/cni-shaped-agent-legacy: host network: yes; host paths /etc/cni/net.d; coupled to the node image: yes",
@@ -8160,6 +8166,7 @@ _GROUP2 = {
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity and ScheduleAnyway spread constraint",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity plus spread constraint",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: both node affinity and spread constraint",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity & spread constraint",
 ],
         [
             "seeded-d/seeded-topology/zone-pinned-api-canary: replicas 2; zones in use 1; all replicas in one zone: yes; cause: topology-spread-constraint",
@@ -8205,6 +8212,7 @@ _GROUP4 = {
             "1. seeded-a (us-central1-a)/seeded-shapes/cache-on-emptydir: node-local volumes queue, scratch; survives a node rebuild: no",
                     "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue:/var/cache/queue; survives a node rebuild: no",
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue(emptyDir); survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes emptyDir: queue; survives a node rebuild: no",
 ],
         [
             "seeded-a/seeded-shapes/cache-on-emptydir-shadow: node-local volumes queue; survives a node rebuild: no",
@@ -8297,6 +8305,10 @@ _GROUP4 = {
             "seeded-a/intree-pd: source in-tree no longer, now csi; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
             "seeded-a/intree-pd: source in-tree gcePersistentDisk, now csi; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
             "seeded-a/intree-pd: source in-tree gcePersistentDisk migrated to csi; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk (not in-tree); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk (in-tree: no); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gce-pd (csi, formerly in-tree); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk (in-tree?); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
 ],
         "No PersistentVolume on the seeded clusters uses an in-tree plugin; a CSI driver provisioned every volume.",
     ),

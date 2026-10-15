@@ -24,7 +24,8 @@
 # may not carry the line's own separator, `;`.
 #
 # The token's version and the word `api` compose in either order
-# (`endpoints v1 api`, `endpoints api v1`, `endpoints (core/v1) api`).
+# (`endpoints v1 api`, `endpoints api v1`, `endpoints (core/v1) api`). The
+# removed-API slot's `none` may stand in parentheses or read `none found`.
 #
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
@@ -108,9 +109,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: none(?: ?\([^)\n;]*\))?; deprecated but still served: [^\n]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: \(?none\)?(?: (?:found|detected))?(?: ?\([^)\n;]*\))?; deprecated but still served: [^\n]+$'
       forbidden_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: (?!none(?: ?\([^)\n;]*\))?;)[^;\n]+; deprecated but still served: [^\n]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: (?!\(?none\)?(?: (?:found|detected))?(?: ?\([^)\n;]*\))?;)[^;\n]+; deprecated but still served: [^\n]+$'
 
   - name: seeded-a-keeps-the-endpoints-writer-under-deprecated
     role: objective
