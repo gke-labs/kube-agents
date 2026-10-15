@@ -173,6 +173,8 @@ class CiDeployImageBuildTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(len(self._calls("builds describe")), 3, self.calls.read_text())
         self.assertIn("3 times in a row", result.stdout + result.stderr)
+        # The warning names the call's real exit status, not the counter's.
+        self.assertIn("describe 2110451680007950336 exited 1 (", result.stdout)
         self.assertIn(_BUILD_ID, result.stdout + result.stderr)
         self.assertEqual(len(self._calls("builds log")), 1)
 

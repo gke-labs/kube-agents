@@ -1420,8 +1420,9 @@ else
       --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} --format="value(status)" 2>"${CLOUD_BUILD_DESCRIBE_ERR}")"; then
       CLOUD_BUILD_DESCRIBE_ERRORS=0
     else
+      CLOUD_BUILD_DESCRIBE_RC=$?
       CLOUD_BUILD_DESCRIBE_ERRORS=$((CLOUD_BUILD_DESCRIBE_ERRORS + 1))
-      echo "WARNING: gcloud builds describe ${CLOUD_BUILD_ID} exited $? ($(tr '\n' ' ' <"${CLOUD_BUILD_DESCRIBE_ERR}")); polling again (${CLOUD_BUILD_DESCRIBE_ERRORS}/${BUILD_DESCRIBE_MAX_CONSECUTIVE_ERRORS} in a row)"
+      echo "WARNING: gcloud builds describe ${CLOUD_BUILD_ID} exited ${CLOUD_BUILD_DESCRIBE_RC} ($(tr '\n' ' ' <"${CLOUD_BUILD_DESCRIBE_ERR}")); polling again (${CLOUD_BUILD_DESCRIBE_ERRORS}/${BUILD_DESCRIBE_MAX_CONSECUTIVE_ERRORS} in a row)"
       CLOUD_BUILD_STATUS=""
       if [ "${CLOUD_BUILD_DESCRIBE_ERRORS}" -ge "${BUILD_DESCRIBE_MAX_CONSECUTIVE_ERRORS}" ]; then
         CLOUD_BUILD_OUTCOME="could not be described ${CLOUD_BUILD_DESCRIBE_ERRORS} times in a row"

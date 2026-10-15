@@ -300,7 +300,7 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 3: Sweeping cluster-scoped kub
 # stay reachable on every path through the script — steps before it end in
 # `|| true`, run as `if` conditions, or feed finish_step, and there is no
 # `set -e`; the only early exits are the two must-not-delete-the-wrong-cluster
-# guards above. A failed kind is real, though: on 2026-09-01 the VAP delete
+# guards and Step 0's not-our-lease refusal above. A failed kind is real, though: on 2026-09-01 the VAP delete
 # was skipped because API discovery failed against a down control plane, and
 # the old unconditional ✓ hid it.
 SWEEP_SELECTOR="app.kubernetes.io/part-of=kube-agents"
