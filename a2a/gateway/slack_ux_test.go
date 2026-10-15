@@ -512,6 +512,33 @@ func TestSlackSessionRenameRetriesUntilItLands(t *testing.T) {
 	}
 }
 
+// A typed answer to an open question is not the thread's ask: after a
+// restart, or when the first ask sanitised to nothing, it must not become
+// the title.
+func TestSlackTypedAnswerDoesNotTitleTheThread(t *testing.T) {
+	api := &fakeSlackAPI{users: map[string]*slack.User{"U1": {RealName: "Jay P"}}}
+	a, _ := newUXSlackAdapter(api)
+	conv := "slack:C1/40.0"
+	a.noteQuestion(conv, slackQuestion{channel: "C1", ts: "50.0", text: "Which one?", blocks: json.RawMessage(uxQuestionBlocks)})
+	reply := InboundMessage{Conversation: conv, AuthorID: "U1", MessageID: "81.0", Text: "option B"}
+	a.notePending(reply)
+	a.InboundVerified(reply.Conversation, reply.MessageID, true)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if st := a.sessionStates[conv]; st != nil && st.askText != "" {
+		t.Errorf("the typed answer was kept as the thread's ask: %q", st.askText)
+	}
+}
+
+// A typed answer's line shows a link by its label, a bare link by its url,
+// a channel by its name, and no raw mention.
+func TestSlackTypedWordsReduceSlackEntities(t *testing.T) {
+	got := slackTypedWords("<@U123> go with <https://x.io/a|option B>, see <https://x.io/b> in <#C1|ops>")
+	if want := "go with option B, see https://x.io/b in ops"; got != want {
+		t.Errorf("slackTypedWords = %q, want %q", got, want)
+	}
+}
+
 // A first ask that sanitises to nothing gives way to the next one.
 func TestSlackSessionUntitleableAskGivesWay(t *testing.T) {
 	a, sessions := newUXSlackAdapter(&fakeSlackAPI{})

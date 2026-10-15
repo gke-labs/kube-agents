@@ -430,10 +430,16 @@ plugins:
     - incident_context
     - bootstrap_onboarding
     - legacy_slash_commands
+    # Counts every inbound message on pre_gateway_dispatch and serves the count on
+    # the listener the operator reads into status.usage.chatMessagesInboundTotal.
+    # Rewrites nothing, so its place in the order does not matter.
+    - chat_metrics
     # Injects the routable-specialist roster into every turn, so choosing an
     # `assignee` costs no tool call. See defaults/plugins/agent_roster/README.md.
-    # The operator writes the deployed copy of this list; keep the two in sync
-    # (k8s-operator/internal/controller/platformagent_manifests.go).
+    # This list is the deployed list: the image seeds it onto a fresh volume
+    # and the entrypoint back-fills an existing one from it. The operator's
+    # DefaultBuiltInPlugins (platformagent_manifests.go) is only the roster an
+    # AgentPlugin may not shadow; keep the two in step.
     - agent_roster
 
 # Per-file character cap on context files (SOUL.md, AGENTS.md) in the system

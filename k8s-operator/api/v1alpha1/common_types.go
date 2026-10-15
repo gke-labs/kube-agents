@@ -2054,9 +2054,10 @@ type AgentStatus struct {
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
 // update, and ToolExecutionsTotal, EventsIngestedTotal,
-// RemediationsProposedTotal, RemediationsMergedTotal, LastActiveTime,
-// ClustersRegistered and ClustersMonitored from the broker's and the event
-// watcher's metrics
+// RemediationsProposedTotal, RemediationsMergedTotal,
+// ChatMessagesInboundTotal, LastActiveTime, ClustersRegistered and
+// ClustersMonitored from the broker's, the event watcher's and the chat
+// plugin's metrics
 // listeners, which it reads every five minutes on the leader; the agent's own
 // ServiceAccount holds no write verb on this status. SessionsTotal and
 // RemediationsAppliedTotal are declared so that the schema names them, but
@@ -2121,6 +2122,21 @@ type AgentUsageStatus struct {
 	// +optional
 	RemediationsMergedTotal int64 `json:"remediationsMergedTotal,omitempty"`
 
+	// ChatMessagesInboundTotal is the cumulative count of chat messages that
+	// reached the gateway, from every platform it serves: Google Chat, Slack,
+	// Teams and its own API port alike. Counted at the gateway's dispatch
+	// hook, which Hermes runs after dropping its own internal events and
+	// before it checks the sender against the allowlist, so an unlisted
+	// user's message counts and nothing the gateway never hands to the hook
+	// does. Read from the chat_metrics plugin's
+	// kubeagents_chat_messages_inbound_total on the platform-agent container
+	// every five minutes, from the gateway pod that runs Hermes (above one
+	// replica, the leader alone), summed across the pods that have led, and
+	// kept monotonic the same way as ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
+	// brokered command is activity.
+	// +optional
+	ChatMessagesInboundTotal int64 `json:"chatMessagesInboundTotal,omitempty"`
+
 	// ClustersRegistered is the number of clusters the event watcher built a
 	// client for at its last start: the management cluster and the Cluster
 	// Agent profiles the GKE API would describe, the management cluster
@@ -2164,13 +2180,12 @@ type AgentUsageStatus struct {
 	ActiveInterfaces []string `json:"activeInterfaces,omitempty"`
 
 	// LastActiveTime is the time of the last poll in which a counter above
-	// moved: a brokered command ran, a proposal was opened or merged, or an
-	// event was accepted for triage.
-	// Until SessionsTotal has a source, a chat turn that runs no brokered
-	// command does not move it. Scheduled maintenance jobs that run brokered
-	// commands do move it, though -- the Controller Stall Watch cron runs some
-	// every 30 minutes by default -- so it marks agent activity of any origin,
-	// not human or operator use alone. Advances at most once per five minutes.
+	// moved: a brokered command ran, a proposal was opened or merged, a chat
+	// message reached the gateway, or an event was accepted for triage.
+	// Scheduled maintenance jobs that run brokered commands move it too --
+	// the Controller Stall Watch cron runs some every 30 minutes by default
+	// -- so it marks agent activity of any origin, not human or operator use
+	// alone. Advances at most once per five minutes.
 	// +optional
 	LastActiveTime *metav1.Time `json:"lastActiveTime,omitempty"`
 }

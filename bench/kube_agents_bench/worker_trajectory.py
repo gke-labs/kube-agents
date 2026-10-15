@@ -162,6 +162,12 @@ roots = [a for a in sys.argv[8:] if a]
 # Seconds a read waits on a locked store before reporting the card unread. A
 # hermes writer holds a WAL lock for milliseconds; anything longer is stuck.
 SQLITE_BUSY_TIMEOUT = 10
+# The reply is written in flushed pieces no larger than this. Under GKE Sandbox
+# (gVisor) a single write of more than 64 KiB to an exec session's stdout is
+# cut at 64 KiB (measured 2026-10-09: one print of 200,000 bytes arrived as
+# 65,537; 32 KiB flushed writes arrived whole), and one print of the JSON lost
+# every capture longer than that to a parse error.
+WRITE_CHUNK = 32768
 out = {"cards": [], "calls": [], "errors": [], "unread": [], "truncated": False, "clipped": []}
 
 
@@ -576,9 +582,14 @@ while kb is not None and queue:
             "FROM task_runs WHERE task_id = ? ORDER BY id",
             (tid,),
         ).fetchall()
-        children = []
+        # Two kinds of edge, kept apart: ``fanned_out`` is the cards this
+        # card's worker filed (the creator-of table the image adds), the
+        # rest of ``children`` are predecessor links, which also gate cards
+        # nobody here filed. The walk follows both; a lineage follows the
+        # first alone.
+        fanned_out = []
         if has_table(kb, "kanban_worker_children"):
-            children += [
+            fanned_out = [
                 r["child_id"]
                 for r in kb.execute(
                     "SELECT child_id FROM kanban_worker_children WHERE creator_id = ? "
@@ -586,7 +597,7 @@ while kb is not None and queue:
                     (tid,),
                 )
             ]
-        children += [
+        children = list(fanned_out) + [
             r["child_id"]
             for r in kb.execute(
                 "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
@@ -603,6 +614,7 @@ while kb is not None and queue:
         "status": row["status"],
         "runs": len(runs),
         "children": list(dict.fromkeys(children)),
+        "fanned_out": list(dict.fromkeys(fanned_out)),
         "sessions": [],
     }
     cards[tid] = card
@@ -632,7 +644,10 @@ out["cards"] = [c for c in cards.values() if c is not None]
 for entry in out["calls"]:
     entry.pop("_id", None)
 print(SENTINEL)
-print(json.dumps(out, default=str))
+reply = json.dumps(out, default=str) + "\n"
+for start in range(0, len(reply), WRITE_CHUNK):
+    sys.stdout.write(reply[start:start + WRITE_CHUNK])
+    sys.stdout.flush()
 """
 
 
@@ -684,6 +699,30 @@ def gaps(summary: dict[str, Any] | None) -> list[str] | None:
     problems = [str(e) for e in summary.get("unread") or []]
     problems += [CLIP_GAPS[c] for c in summary.get("clipped") or [] if c in CLIP_GAPS]
     return problems
+
+
+def parents(summary: dict[str, Any] | None) -> dict[str, str] | None:
+    """Child card to parent card, from the capture's card walk.
+
+    ``None`` when the read did not run. A card the front agent filed has no
+    entry; a card a worker fanned out (``kanban_worker_children``) maps to
+    the card whose worker filed it. Predecessor links (``task_links``) are
+    not lineage: a card gated on another was not necessarily filed by it.
+    The ordered checks use the map to treat a card and the cards its worker
+    spawned as one worker's work.
+    """
+    if not isinstance(summary, dict):
+        return None
+    found: dict[str, str] = {}
+    for card in summary.get("cards") or []:
+        # A summary that lists card ids rather than card records (the inject
+        # transport's) carries no edges.
+        if not isinstance(card, dict):
+            continue
+        for child in card.get("fanned_out") or []:
+            found.setdefault(str(child), str(card.get("task") or ""))
+    return found
+
 
 
 def _entry(call: dict[str, Any]) -> dict[str, Any]:
