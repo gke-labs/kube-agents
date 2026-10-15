@@ -383,6 +383,18 @@
 # they failed (one run each, 2026-10-07 and 10-08). Entry 5's follow-up
 # takes 600s (one maintenance-policy read per cluster, 257-571s measured).
 # About 750 serial minutes at three repetitions, none of it on a lock.
+# Priced against the deadline: all seventeen are read-only, so
+# EVAL_NIGHTLY_PART puts them in the main part, which ran 370, 379, 381, 391
+# and 401 minutes on its five clear nights of 10-15 October (builds
+# 2108709248731975680 to 2110521084615856128 on the dashboard) and was killed
+# at the 480m deadline on 9 and 14 October (485 minutes, 37 and 49 tasks
+# recorded). At parallelism 8 the 750 serial minutes are ~95 more at 8x and
+# ~100-110 at the 5.4-5.8x-over-6 the September nights realised, so a clear
+# night projects to 465-510 minutes against 480: the seventeen do not fit
+# the main part's current nights with margin. Whether they run as a third
+# part on their own project or enter in batches is the author's call with
+# the eval crew, on the first nights' record; a deadline kill truncates the
+# units in flight and the EXIT trap records what completed.
 # Counted from the lists: ninety-two cases (276 units) here, of a
 # one-hundred-and-six-case, 318-unit matrix with the presubmit file's
 # fourteen. The eleven on the
