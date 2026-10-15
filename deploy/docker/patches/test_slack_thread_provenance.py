@@ -139,14 +139,17 @@ class ThreadProvenancePatchTest(unittest.TestCase):
             apply(self.root)
         self.assertIn(BUILD_MARKER, str(caught.exception))
 
-    def test_the_labelled_case_carries_the_shipped_wording(self):
-        """The labelled eval case replays the block this patch produces; if the
-        note or the label changes here, the case must change with it."""
+    def test_the_cases_that_replay_the_block_carry_the_shipped_wording(self):
+        """Two eval cases replay the block this patch produces; if the note or
+        the label changes here, both must change with it."""
         import apply_slack_thread_provenance as patch
-        case = (Path(__file__).resolve().parents[3] / "bench" / "tasks"
-                / "chat-sample-report-is-not-cluster-state-labelled" / "task.yaml").read_text(encoding="utf-8")
-        self.assertIn(patch.PROVENANCE_NOTE, case)
-        self.assertIn(patch.SELF_PARENT_PREFIX + "## Headline findings", case)
+        tasks = Path(__file__).resolve().parents[3] / "bench" / "tasks"
+        for case_id in ("chat-sample-report-is-not-cluster-state-labelled",
+                        "chat-real-report-fix-files-confirm-first"):
+            with self.subTest(case=case_id):
+                case = (tasks / case_id / "task.yaml").read_text(encoding="utf-8")
+                self.assertIn(patch.PROVENANCE_NOTE, case)
+                self.assertIn(patch.SELF_PARENT_PREFIX + "## ", case)
 
     def test_a_moved_anchor_fails_the_build(self):
         target = self.root / RELATIVE
