@@ -935,3 +935,10 @@
 # cases, so a busy board pushes this case's card wait toward its 1800s
 # ceiling. The dated paragraph above carries the budget arithmetic.
 ./tasks/gitops-drift-noise-filtered-triage/task.yaml
+
+# Asked for options to choose from, the card pauses on the question:
+# kanban_block(kind="needs_input") with a reason ending on two to five
+# options, which Slack posts as the needs-you message with a button per option
+# (agents/platform/SOUL.md §0 step 3). deployer: noop, one front-door turn and
+# the card round trip; reads the seeded fleet's crashloop-workload role.
+./tasks/chat-question-asked-to-choose-pauses/task.yaml
