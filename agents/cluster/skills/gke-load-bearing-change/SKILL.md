@@ -23,12 +23,16 @@ Skip it when the live object already matches the declared state: a GitOps contro
 
 Four steps, and they do not depend on what kind of object changed. Step 3 is where the evidence location varies, and the table below is for that step.
 
-**1. Establish what the revert would actually put back.** Not the one field the card names — the whole declared state as it would land. Two fields are often taken together (a `runAsNonRoot` and the `runAsUser` beside it), and a revert that restores one without the other produces a third state nobody has ever run. Read the live object's `managedFields` to see which fields the out-of-band manager took:
+**1. Establish what the revert would actually put back.** Not the one field the card names — the whole declared state as it would land. Two fields are often taken together (a `runAsNonRoot` and the `runAsUser` beside it), and a revert that restores one without the other produces a third state nobody has ever run.
+
+**You have no GitOps repository to read, and you are not meant to find one.** You hold a read-only view of one cluster and nothing else — no checkout, no clone, no forge access. Do not go looking: the declared state is reconstructed from the cluster, out of the field managers on the live object and the pod templates on retired revisions. Read `managedFields` to see which fields the out-of-band manager took and which the GitOps manager still owns:
 
 ```bash
 gcloud container clusters get-credentials <cluster_name> --region <cluster_location>
 kubectl get <kind> <name> -n <namespace> --show-managed-fields -o yaml
 ```
+
+Narrow that read when the object can hold a credential. A Secret, and a ConfigMap you have not checked, go through `-o jsonpath` for the fields you need or `--show-managed-fields -o jsonpath='{.metadata.managedFields}'` for ownership alone: your report is posted verbatim into a chat thread, and a dumped value is a leaked one.
 
 **2. Ask whether the declared state has ever been observed running.** This is the question. It is answered either by a recorded failure (something tried it and it did not work) or by a derivation from the spec (it cannot work, and here is why). Both are good answers; a derivation does not expire and a recording is more persuasive, so take both when both are there.
 
@@ -100,6 +104,8 @@ Two qualifications on the first one.
 
 You are a Cluster Agent under a strict read-only boundary: no patches applied, no Pull Requests opened, nothing written to the cluster. The fix ships as a Pull Request against the GitOps repository and somebody else opens it — undoing an out-of-band write with another out-of-band write leaves the cluster no closer to git.
 
-A card that gives a report format wins: format `result` exactly as the card says. A drift card raised through the Session KV server's `gitops-drift` inject arrives as such a card, with the `What's wrong` / `Why` / `What to do` template, lettered options, a `Recommended:` line and a `To authorize:` line; that shape is what gets the report saved so a reply of "apply" can act on it. The evidence from this skill belongs in `Why`, quoted — the revision that carries the declared template, the kubelet's own sentence, the container's command, the consumer that would break — and the conclusion above decides which option carries the `Recommended:` mark.
+A card that gives a report format wins: format `result` exactly as the card says, including the parts of its shape it makes conditional — a drift card from the Session KV server's `gitops-drift` inject asks for lettered options and a `Recommended:` line only where there are two or more options, and drops the `To authorize:` bullet entirely where the change was already reconciled away. Follow the card on all of that.
+
+What this skill decides is the content, not the shape. The evidence belongs in `Why`, quoted — the revision that carries the declared template, the kubelet's own sentence, the container's command, the consumer that would break — and the conclusion above decides which option is recommended where the card asks for one.
 
 Without a format from the card, follow the shape in `gke-workload-troubleshooting`, with the classification and its evidence in `metadata.root_cause` and `metadata.evidence`.
