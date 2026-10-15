@@ -504,6 +504,36 @@ def _title(conn: Any, child: str, claim: dict) -> str:
     return (row[0] if row else "") or ""
 
 
+def _folds_into_row(conn: Any, sub: dict) -> bool:
+    """Whether ``kanban_progress_lines.deliver`` folds this card's completion into its plan row.
+
+    True when ``KAGE_SLACK_UX`` is on for the subscription's platform and the
+    card's nearest fanned-out ancestor is still open on the same thread, the
+    two things that delivery reads (its ``_slack_quiet`` and
+    ``FANNED_OUT_ANCESTOR_SQL``). Delivered then, the completion settles the
+    card's row and posts nothing, so it needs no hold; held, its row would
+    stay running after the answer posts, since the drop that follows never
+    reaches the plan. Anything that goes wrong reads as no, which holds as
+    before.
+    """
+    try:
+        try:
+            from gateway import kanban_notifier, kanban_progress_lines
+        except ImportError:  # Unit tests import the patch modules flat.
+            import kanban_notifier
+            import kanban_progress_lines
+        if not kanban_notifier.slack_ux_on(sub.get("platform")):
+            return False
+        params = (
+            sub["task_id"], kanban_progress_lines.FOLD_ANCESTOR_DEPTH,
+            str(sub.get("platform") or "").lower(), sub["chat_id"], sub.get("thread_id") or "",
+        )
+        return conn.execute(kanban_progress_lines.FANNED_OUT_ANCESTOR_SQL, params).fetchone() is not None
+    except Exception as exc:  # noqa: BLE001 — fail towards the hold
+        logger.debug("kanban notifier: reading %s's plan fold failed: %s", sub.get("task_id"), exc)
+        return False
+
+
 def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -> Optional[dict]:
     """``claim`` with a fanned-out child's answer folded into its parent's.
 
@@ -521,6 +551,9 @@ def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -
     - the parent's own ``completed`` (a later event) has been delivered on that
       thread: the child's event is dropped, and its cursor moved past it, so
       neither its post nor its wake runs;
+    - the parent is still working and the child's completion folds into its
+      plan row (:func:`_folds_into_row`): it delivers, so its row settles, and
+      ``kanban_progress_lines`` posts nothing for it;
     - the parent is still working, or has completed but its answer has not
       posted yet, for under FOLD_HOLD_SECONDS: the child's event is held.
       Events before it deliver, and the claim stops just before it, so the
@@ -567,6 +600,9 @@ def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -
             dropped = True
             continue
         waiting = status in FOLD_WAITING_STATUSES or (status in FOLD_DONE_STATUSES and later)
+        if status in FOLD_WAITING_STATUSES and _folds_into_row(conn, sub):
+            kept.append(ev)
+            continue
         if waiting and now - (getattr(ev, "created_at", 0) or 0) < FOLD_HOLD_SECONDS:
             committed = _durable_cursor(conn, child, sub) == int(claim.get("cursor") or 0) != int(claim.get("old_cursor") or 0)
             if committed:

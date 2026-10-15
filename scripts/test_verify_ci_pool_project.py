@@ -3968,8 +3968,10 @@ FLEET_RESOURCE_ROLES = {
     "google_service_account_iam_member": {"roles/iam.serviceAccountAdmin"},
     "google_project_iam_member": {"roles/resourcemanager.projectIamAdmin"},
     "terraform_data": set(),
-    # Data sources: reads the plan makes before anything is created.
-    "google_container_engine_versions": {"roles/container.admin"},
+    # Data sources: reads the plan makes before anything is created. external
+    # runs bench/tf/fleet/seeded_b_pin.py, whose reads are `gcloud container
+    # get-server-config` and `clusters describe` as the reconciler.
+    "external": {"roles/container.admin"},
     "google_client_config": set(),
 }
 # Every kubernetes_* resource is an in-cluster write, which container.admin
@@ -3992,7 +3994,9 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     # to load no provider, and a read block whose header the scan cannot read.
     # The names tofu's loader skips are skipped here too, so a parked file
     # neither demands a role nor keeps one accounted for.
-    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json"}
+    # seeded_b_pin.py is the program data.external runs, not something tofu
+    # loads; its reads are accounted for on the external type above.
+    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py"}
     _READ_BLOCKS = {"resource", "data"}
     # moved renames a state address and declares no resource: the type it
     # names is read from the resource block it points at.

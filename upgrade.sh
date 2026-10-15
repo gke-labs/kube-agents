@@ -1663,6 +1663,14 @@ main() {
   # the chart and the generator read. Derived here, after the load and before
   # anything reads it.
   normalize_memory_vars
+  # A GITHUB_APP_ID that is a name rather than the App's number leaves the
+  # token minter crash-looping behind Helm's rollout wait (#3076); refused here,
+  # --dry-run included. Guarded: an older target's helpers lack it.
+  # GitHub only: a GitLab install does not read the key (install.sh drops a
+  # leftover one the same way).
+  if declare -F validate_github_app_id >/dev/null && [ "${GITOPS_FORGE:-github}" = "github" ]; then
+    validate_github_app_id "${GITHUB_APP_ID:-}" "GITHUB_APP_ID in ${install_env_file:-install.env}" || exit 1
+  fi
 
   local target_project="${PARAM_PROJECT_ID:-${PROJECT_ID:-}}"
   local target_cluster="${PARAM_CLUSTER_NAME:-${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}}"
@@ -1896,6 +1904,11 @@ main() {
     # a policy that forbids the Asset API).
     refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"
     check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
+    # A live GitHub minter this render would destroy (#3075), warned here as
+    # the scope check is. Guarded: an older target's helpers lack it.
+    if declare -F refuse_apply_dropping_live_gitops >/dev/null; then
+      refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}" "$SCOPE_CHECK_MODE_WARN"
+    fi
     # Each mode call is guarded: installer_common.sh is the target tree's,
     # and one from before spec.mode support (this script piped, or run with
     # --image-tag onto an older release) defines neither the notice nor
@@ -2002,6 +2015,17 @@ main() {
       # the live CR, and a scope the CR carries that neither the release
       # record nor the keys account for is refused here rather than replaced.
       refuse_apply_over_undeclared_scope "$target_namespace" || exit 1
+      # And a live GitHub minter this render would destroy: an install.env
+      # that lacks the GitOps keys (install.sh's flags were not recorded
+      # before #3075) renders GitOps off. Guarded as above.
+      if declare -F refuse_apply_dropping_live_gitops >/dev/null; then
+        # A refusal removes the tfvars the generator just wrote, which render
+        # the minter off, as install.sh does and the Slack check below does.
+        if ! refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}"; then
+          rm -f "$tfvars_file"
+          exit 1
+        fi
+      fi
       # install.env's next onto a chart that predates platformAgent.mode is
       # refused, not dropped, as retag_values does on the other two arms. Ahead
       # of the notice below, which an older target's helpers cannot print.

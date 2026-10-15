@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -1597,6 +1598,140 @@ class BlocksDeliveryTest(unittest.TestCase):
         self.assertEqual(self._run(lambda *a: "9.9", origin={"platform": "slack"}), PRESENTED)
         self.assertEqual(self.posts, [])
 
+
+
+#: A report listing five findings: the card shows two and folds three (mock 15).
+FIVE = """# GKE Environment Scan
+
+I scanned 3 clusters and 41 workloads.
+
+1. **[critical] seeded-b and seeded-c admit privileged pods**
+   Enforce baseline Pod Security.
+2. **[major] seeded-c is a minor version behind its channel**
+   Upgrade the control plane.
+3. **No PDB on payments-api**
+   Add one.
+4. **[minor] Default namespace holds workloads**
+   Move them.
+5. **Workload Identity is off on one node pool**
+   Turn it on.
+
+Also found: 18 more items, tracked in the findings queue.
+"""
+
+
+class FoldTest(unittest.TestCase):
+    """The card shows the top two findings and folds the rest the report lists, in both modes."""
+
+    def test_the_card_folds_past_two(self):
+        blocks, text = inventory_presenter.blocks(FIVE)
+        self.assertEqual(
+            [b["type"] for b in blocks], ["rich_text", "divider", "rich_text", "divider", "container", "actions"]
+        )
+        self.assertEqual(blocks[0]["elements"][0]["elements"][1]["text"], " Two are worth fixing first:")
+        self.assertEqual(len(blocks[2]["elements"]), 2)
+        fold = blocks[4]
+        self.assertEqual(fold["title"], {"type": "plain_text", "text": "3 more worth a look"})
+        self.assertTrue(fold["is_collapsible"] and fold["default_collapsed"])
+        folded = fold["child_blocks"][0]["elements"]
+        self.assertEqual([row["elements"][0]["text"] for row in folded], ["No PDB on payments-api", "minor", "Workload Identity is off on one node pool"])
+        self.assertEqual([b["text"]["text"] for b in blocks[-1]["elements"]], ["Fix the first one", "See all 23"])
+        # The fallback still carries every finding the report lists.
+        for name in ("privileged pods", "payments-api", "Workload Identity"):
+            self.assertIn(name, text)
+
+    def test_two_or_fewer_have_no_fold(self):
+        blocks, _ = inventory_presenter.blocks(REPORT)
+        self.assertNotIn("container", [b["type"] for b in blocks])
+        chat, _ = inventory_presenter.chat(REPORT)
+        self.assertNotIn("fold", chat)
+
+    def test_the_text_layout_still_lists_every_finding(self):
+        out = inventory_presenter.present(FIVE)
+        self.assertIn("Five are worth fixing first:", out)
+        self.assertNotIn("more worth a look", out)
+        self.assertIn("Workload Identity is off on one node pool", out)
+
+    def test_the_chat_message_folds_the_same_rows(self):
+        chat, text = inventory_presenter.chat(FIVE)
+        self.assertEqual(chat, {
+            "schema": "kube-agents.chat/v1",
+            "headline": "I scanned 3 clusters and 41 workloads and found 23 things to look at.",
+            "note": "Two are worth fixing first:",
+            "rows": [
+                {"text": "seeded-b and seeded-c admit privileged pods", "severity": "critical", "detail": "Enforce baseline Pod Security."},
+                {"text": "seeded-c is a minor version behind its channel", "severity": "major", "detail": "Upgrade the control plane."},
+            ],
+            "fold": {
+                "title": "3 more worth a look",
+                "text": "No PDB on payments-api\nAdd one.\n`minor` Default namespace holds workloads\nMove them.\n"
+                "Workload Identity is off on one node pool\nTurn it on.",
+            },
+            "choices": [{"text": "Fix the first one", "primary": True}, {"text": "See all 23"}],
+        })
+        self.assertEqual(text, inventory_presenter.present(FIVE))
+
+    def test_a_report_that_does_not_parse_has_no_chat_message(self):
+        self.assertIsNone(inventory_presenter.chat("# Report\n\n| Cluster | ... |\n"))
+
+
+class GatewayDeliveryTest(unittest.TestCase):
+    """Under spec.mode: next the card goes through the gateway as a chat message."""
+
+    ORIGIN = {"platform": "slack", "chat_id": "C1", "thread_id": "1.5"}
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+        (self.d / "INVENTORY.md").write_text(REPORT, encoding="utf-8")
+        (self.d / ".user_aligned").touch()
+
+    def _run(self, returncode=0, origin=ORIGIN):
+        import slack_blocks_post
+
+        env = {k: v for k, v in os.environ.items() if k != "KAGE_SLACK_UX"}
+        env.update({"KAGE_SLACK_UX": "1", "A2A_NOTIFY_PLATFORM": "slack"})
+        seen = {}
+
+        def run(argv, **_kwargs):
+            path = argv[argv.index("--chat-file") + 1]
+            with open(path, encoding="utf-8") as handle:
+                seen["chat"] = json.load(handle)
+            seen["argv"], seen["path"] = argv, path
+            return types.SimpleNamespace(returncode=returncode, stdout="{}", stderr="refused")
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
+            mock.patch.object(bootstrap_delivery.sandbox_exec, "sandbox_enabled", return_value=False),
+            mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run),
+            mock.patch.object(slack_blocks_post, "post") as relay,
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        relay.assert_not_called()
+        return out.getvalue(), seen
+
+    def test_posts_the_card_into_the_origin_thread_and_prints_nothing(self):
+        out, seen = self._run()
+        self.assertEqual(out, "")
+        self.assertEqual(seen["argv"][:6], ["a2a", "notify", "--platform", "slack", "--chat-file", seen["path"]])
+        self.assertEqual(seen["argv"][seen["argv"].index("--thread") + 1], "C1/1.5")
+        self.assertEqual(seen["argv"][-1], PRESENTED)
+        self.assertEqual(seen["chat"]["choices"][0], {"text": "Fix the first one", "primary": True})
+        self.assertFalse(os.path.exists(seen["path"]))
+
+    def test_a_refusal_prints_the_text(self):
+        out, _ = self._run(returncode=1)
+        self.assertEqual(out, PRESENTED)
+
+    def test_no_thread_prints_the_text(self):
+        out, seen = self._run(origin={"platform": "slack", "chat_id": "C1"})
+        self.assertEqual(out, PRESENTED)
+        self.assertEqual(seen, {})
 
 if __name__ == "__main__":
     unittest.main()

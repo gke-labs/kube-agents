@@ -53,6 +53,7 @@ chat roster: profile-cron-tick  (no_agent, * * * * *)
                           ├── hermes send                     → the report, as written
                           │   or slack_blocks_post            → a fleet-audit headline as Block Kit
                           │                                     (Slack, KAGE_SLACK_UX on; below)
+                          │   or a2a notify --chat-file       → the same card under spec.mode: next
                           │
                           └── INSERT INTO incidents (chat_id, thread_id, report)
                                        │
@@ -117,8 +118,19 @@ thread, but the incident row stores the full report, so a reply in the thread is
 answered with the whole report. Under a fallback headline, that reply is the only
 way to what the report said beyond its line, such as lines above it or the link
 targets the bold line drops.
+
+A fleet-audit report that ends with no ledger link and opens a "What's wrong" section
+(the Platform Agent's three sections, as a `##` heading or a bold label) is a run that
+could not write its ledger, most often because no GitOps repository is registered. With
+the flag on, its Slack leg posts that section's first sentence alone, as the agent wrote
+it (`slack_audit_report.failed_line`), and the incident row still stores the whole report
+for a reply in the thread. Under `spec.mode: next`, where a reply does not bring the
+report back, the line goes to the gateway as a chat message with the whole report folded
+under it (`slack_audit_report.failed_chat`), and the leg posts the report whole when that
+message did not post. A truncated report, or one with no such section, posts unchanged.
+
 Every other report (Google Chat, one that does not end with
-a managed-repository issue link, a job the scheduler already delivered to Slack
+a managed-repository issue link and is not such a failed run, a job the scheduler already delivered to Slack
 itself when it also left another platform to the relay, or any report with the
 flag off) is posted unchanged. A job whose `deliver` value claims
 every platform is relayed to all of them anyway, so its Slack leg gets the
@@ -148,6 +160,13 @@ the Block Kit post share a budget of half that timeout from the route's start,
 which leaves the other half for the sends to every platform: the Block Kit post
 stops short of it with room left for the text send, and when too little is left to
 read the ledger the report goes out as text in one send.
+
+Under `spec.mode: next` the gateway holds Slack and the broker's relay is gone, so the
+same card goes to the gateway as a `kube-agents.chat/v1` message instead
+(`slack_audit_report.chat_from_issue`, posted with `a2a notify --chat-file`), and the
+gateway lays it out, buttons included, as it lays out a card's post in a conversation.
+The text headline rides beside it as the fallback the gateway posts when the message
+breaks a rule or Slack refuses it; the leg's own fallbacks above are unchanged.
 
 ## Why no agent turn runs over the report
 

@@ -276,9 +276,9 @@ async def _drive(module) -> None:
     if kinds != ["post", "setStatus", "update", "update", "setStatus"]:
         raise _fail(f"the plan made calls {kinds!r}")
     posted, settled = adapter.calls[0][1], adapter.calls[3][1]
-    if len(posted) != 1 or posted[0].get("type") != "plan":
+    if len(posted) != 1 or posted[0].get("type") != "task_card":
         raise _fail(f"the plan posted {posted!r}")
-    if len(settled) != 1 or settled[0]["tasks"][0]["status"] != "complete":
+    if len(settled) != 1 or settled[0]["status"] != "complete":
         raise _fail(f"the settled plan was {settled!r}")
     if adapter.calls[1] != ("setStatus", "processing") or adapter.calls[4] != ("setStatus", "closed"):
         raise _fail(f"the plan's session went {adapter.calls[1]!r} then {adapter.calls[4]!r}")
@@ -289,7 +289,7 @@ async def _drive(module) -> None:
     await module.settle_row(adapter, sub, "completed", RESULT, QUIET_TITLE)
     if [call[0] for call in adapter.calls][:1] != ["post"]:
         raise _fail(f"a card with no note opened no row: {adapter.calls!r}")
-    task = adapter.calls[0][1][0]["tasks"][0]
+    task = adapter.calls[0][1][0]
     if (task["status"], task["title"]) != ("complete", RESULT):
         raise _fail(f"a card with no note settled as {task!r}")
 
@@ -304,7 +304,7 @@ async def _drive(module) -> None:
         raise _fail(f"a card that started opened no row: {adapter.calls!r}")
     if [call[0] for call in adapter.calls] != ["setStatus", "post"] or adapter.calls[0] != ("setStatus", "processing"):
         raise _fail(f"an expected card that started made calls {adapter.calls!r}")
-    task = adapter.calls[1][1][0]["tasks"][0]
+    task = adapter.calls[1][1][0]
     if (task["status"], task["title"]) != ("in_progress", STARTED_TITLE):
         raise _fail(f"a card that started showed {task!r}")
     os.environ.pop(FLAG_ENV, None)

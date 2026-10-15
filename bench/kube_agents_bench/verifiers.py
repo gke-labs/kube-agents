@@ -4538,6 +4538,16 @@ class GitHubWritesVerifier(BaseVerifier):
         left_out = []
         if excused:
             left_out.append(f"requested and left out: {'; '.join(excused)}")
+        # The reply may link one of these writes under another repository, a
+        # mistyped one most likely (#3048). That names nothing for the
+        # allowance, and saying so saves the reader chasing the wrong write.
+        elsewhere = github_writes.proposal_refs_elsewhere(snap.final_message, repo, forge)
+        for write in unrequested:
+            if write.number in elsewhere:
+                left_out.append(
+                    f"the reply links #{write.number} on {', '.join(elsewhere[write.number])}, "
+                    f"not on {repo}, so it does not name this write"
+                )
         tail = ("; " + "; ".join(left_out) if left_out else "") + (
             f" ({'; '.join(report.notes)})" if report.notes else ""
         )

@@ -49,6 +49,12 @@ RefreshOperation = Callable[[str, str], None]
 # performs it decides from the repository's registered role whether to.
 MintOperation = Callable[[str, str], str]
 
+# The privileged operation a MintedWriteCredential names: (provider, repository)
+# -> a write token whose scope includes that repository. The executor that
+# performs it refuses a repository the install does not manage, and may answer
+# from a token it minted for the same host moments before.
+WriteMintOperation = Callable[[str, str], str]
+
 # How an installation token is presented to git over HTTPS: basic auth with
 # this fixed username and the token as the password, on the
 # `http.<url>.extraheader` key so the token never becomes part of a URL git
@@ -64,6 +70,17 @@ EXTRAHEADER_USERNAME = "x-access-token"
 # write credential, the fallback this credential exists to make impossible.
 # So a MintedReadCredential presents it whether or not a token was minted.
 CREDENTIAL_HELPER_KEY = "credential.helper"
+# `http.<url>.followRedirects` set to false for the forge's host, on the git
+# invocations a minted token rides, unless the forge keeps git's own redirect
+# handling for its host (`pin_redirects=False`). A redirect is an answer, not
+# a hop: the token is presented on the host it was minted for, and on no host
+# a redirect names. The API client refuses redirects for the same reason.
+FOLLOW_REDIRECTS_KEY = "http.https://{host}/.followRedirects"
+
+
+def _redirect_pin(host: str, pin: bool) -> tuple[tuple[str, str], ...]:
+    """The followRedirects pin for `host`, or none when the forge keeps redirects."""
+    return ((FOLLOW_REDIRECTS_KEY.format(host=host), "false"),) if pin else ()
 
 
 class Credential(Protocol):
@@ -163,10 +180,13 @@ class MintedReadCredential:
       write gate's business.
     """
 
-    def __init__(self, provider: str, mint: MintOperation | None, host: str) -> None:
+    def __init__(
+        self, provider: str, mint: MintOperation | None, host: str, pin_redirects: bool = True
+    ) -> None:
         self.provider = provider
         self._mint = mint
         self._host = host
+        self._pin_redirects = pin_redirects
         self._token: str | None = None
 
     def ensure(self, repo: str) -> None:
@@ -197,6 +217,118 @@ class MintedReadCredential:
         ).decode("ascii")
         return (
             (HTTP_EXTRAHEADER_KEY.format(host=self._host), f"AUTHORIZATION: basic {basic}"),
+            *_redirect_pin(self._host, self._pin_redirects),
+            helper_cleared,
+        )
+
+
+class MintedWriteCredential:
+    """A write token minted for a managed repository, held in memory, shown to both clients.
+
+    What a forge presents when its write token is minted by the install but
+    no forge CLI stands behind it -- a self-managed instance of a forge whose
+    public host uses `BrokeredCredential`. There the write token lives in the
+    CLI's store and a credential helper the CLI installs; here nothing
+    installs anything. `ensure` asks the executor for a token, which keeps it
+    in memory and nowhere else, and this object hands it to the two places
+    that spend it: the API transport as an `Authorization` header, and the one
+    git invocation about to run as an `extraheader` on this forge's host. It is
+    in the environment of the one git process that spends it
+    (`GIT_CONFIG_VALUE_n`), never in argv, a file, a CLI's store or the
+    sandbox.
+
+    `stored_token` is set for the content workspace's reason: no ambient
+    helper stands behind this token, so a managed clone presents it on its own
+    fetch and push, and the workspace asks again before each presentation
+    whether the repository still earns it.
+
+    A refused mint (`PermissionError`) propagates: the repository is not one
+    the install manages. Any other failure is raised as
+    FORGE_CREDENTIAL_UNAVAILABLE rather than swallowed: there is no ambient
+    token to fall back on, and a call without one would reach the forge as an
+    anonymous read, which answers a private repository with 404.
+    """
+
+    stored_token = True
+
+    def __init__(
+        self,
+        provider: str,
+        mint: WriteMintOperation | None,
+        host: str,
+        drop: Callable[[str], None] | None = None,
+    ) -> None:
+        if not _HOST_RE.fullmatch(host or ""):
+            raise ValueError(f"the host {host!r} is not a hostname")
+        self.provider = provider
+        self._mint = mint
+        self._drop = drop
+        self._pin_redirects = True
+        self._host = host
+        # repository -> the token its last `ensure` was answered with. Bounded
+        # by the managed list, since the executor mints for nothing else.
+        self._tokens: dict[str, str] = {}
+
+    def ensure(self, repo: str) -> None:
+        if self._mint is None:
+            raise WorkspaceError(
+                f"no write credential can be minted for {self._host}: this broker has no minter",
+                status=503,
+                code="FORGE_CREDENTIAL_UNAVAILABLE",
+            )
+        try:
+            token = self._mint(self.provider, repo).strip()
+        except (PermissionError, WorkspaceError):
+            self._tokens.pop(repo, None)
+            raise
+        except Exception as exc:  # noqa: BLE001 - named, not swallowed
+            self._tokens.pop(repo, None)
+            raise WorkspaceError(
+                f"the forge credential for {self._host} could not be minted: {type(exc).__name__}",
+                status=503,
+                code="FORGE_CREDENTIAL_UNAVAILABLE",
+            ) from exc
+        if not is_token(token):
+            self._tokens.pop(repo, None)
+            raise WorkspaceError(
+                f"the forge credential minted for {self._host} is empty or is not one line of printable ASCII",
+                status=503,
+                code="FORGE_CREDENTIAL_UNAVAILABLE",
+            )
+        self._tokens[repo] = token
+
+    def invalidate(self, repo: str) -> None:
+        """The forge refused the token (401): the next `ensure` mints anew.
+
+        Only the minter's cached token is dropped. The token a concurrent
+        request on the same repository is still presenting stays where it is:
+        taking it away would fail that request for a reason it cannot see,
+        and the next `ensure` replaces it with a fresh one.
+        """
+        if self._drop is not None:
+            self._drop(self.provider)
+
+    def headers(self, repo: str) -> dict[str, str]:
+        token = self._tokens.get(repo)
+        if not token:
+            raise WorkspaceError(
+                f"no forge credential for {self._host} is current; it is minted before each verb",
+                status=503,
+                code="FORGE_CREDENTIAL_UNAVAILABLE",
+            )
+        return {"Authorization": f"Bearer {token}"}
+
+    def git_config(self, repo: str) -> tuple[tuple[str, str], ...]:
+        # The ambient helper is cleared whether or not a token is current, for
+        # MintedReadCredential's reason: no fallback to another credential.
+        helper_cleared = (CREDENTIAL_HELPER_KEY, "")
+        token = self._tokens.get(repo)
+        if not token:
+            return (helper_cleared,)
+        basic = base64.b64encode(f"{EXTRAHEADER_USERNAME}:{token}".encode("utf-8")).decode("ascii")
+        return (
+            (HTTP_EXTRAHEADER_KEY.format(host=self._host), f"AUTHORIZATION: basic {basic}"),
+            *_redirect_pin(self._host, self._pin_redirects),
             helper_cleared,
         )
 

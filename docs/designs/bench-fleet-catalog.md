@@ -320,16 +320,20 @@ documented background ones, and nothing else — that is what lets a case assert
 finding set rather than a substring. One fixture used to break it, and the upgrade SOP's
 rule now keeps it intact.
 
-The pin in `bench/tf/fleet/main.tf` is drawn from the location-wide `valid_master_versions`
-rather than REGULAR's own list, so `seeded-b` can sit on a version absent from REGULAR's
-`validVersions` — for example `1.34.10-gke.1106000`, on RAPID's roster as measured 2026-09-23. The check once read
+The pin in `bench/tf/fleet/main.tf` is drawn from REGULAR's own `validVersions` by
+`seeded_b_pin.py`, so in steady state `seeded-b` sits on a version its channel carries. It
+can still sit on one absent from REGULAR's roster: a patch REGULAR dropped between reconciles,
+or the hold the pin keeps while the running patch is one REGULAR does not carry (on 2026-10-14,
+`1.34.12-gke.1011000` from RAPID's roster; the pin used to be drawn from the location-wide
+`valid_master_versions`, which is how it got there). The check once read
 that absence as branch (a) of upgrade SOP check 3.1 and graded the cluster critical. Branch
 (a) now fires only when a version is offered by no route at the location: not by the
 cluster's channel, not by any other channel, and not by `validMasterVersions`. The pin stays
 offered for as long as `validMasterVersions` or any channel's roster carries it, so branch
-(a) does not fire and `seeded-b` carries the intended branch (b) at major. If GKE drops the
-pinned version from all of them before the next reconcile re-draws it, branch (a) fires, and
-correctly.
+(a) does not fire and `seeded-b` carries the intended branch (b) at major. A held pin is not
+re-drawn: each reconcile returns the running version until REGULAR ships a patch above it, so
+if every roster drops that version meanwhile, branch (a) fires on every project, and correctly,
+until REGULAR catches up or the cluster is destroyed and re-created.
 
 A case touching `version-laggard` may assert that branch (a) is absent, and
 `upgrades-master-behind-offered-elsewhere` does: slot `b` graded critical is the defect it

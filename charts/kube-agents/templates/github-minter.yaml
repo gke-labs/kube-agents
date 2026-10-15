@@ -41,6 +41,26 @@ the module README, which links the upstream guide for doing it by hand).
        the same ring. */}}
 {{- $kmsLocation := $m.kms.location | default (regexReplaceAll "-[a-z]$" $location "") }}
 {{- $allowedSa := $m.allowedServiceAccount | default (printf "kubeagents-platform-gsa@%s.iam.gserviceaccount.com" $projectId) }}
+{{- /*
+  A GitHub forge at a GitHub Enterprise Server host moves the minter there:
+  minty calls the REST API at SOURCE_SYSTEM_API_BASE_URL instead of
+  api.github.com (github-token-minter pkg/server/config.go). The install
+  serves one GitHub host, which kube-agents.forgeProviders has checked, so the
+  first GitHub forge at another host is the host. The CA bundle is the one a
+  GitHub forge names in caBundleRef, as the credential broker reads it.
+*/}}
+{{- $gheHost := "" }}
+{{- $gheCA := dict }}
+{{- range ((.Values.platformAgent.integration).forges | default list) }}
+{{- if eq (.provider | default "github") "github" }}
+{{- if and .host (not $gheHost) (not (has (lower .host) (list "github.com" "www.github.com" "ssh.github.com"))) }}
+{{- $gheHost = lower .host }}
+{{- end }}
+{{- if and (.caBundleRef | default dict).name (not $gheCA.name) }}
+{{- $gheCA = dict "name" .caBundleRef.name "key" (.caBundleRef.key | default "ca.crt") }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if $m.appId }}
 ---
 # The App identity the minter signs as. Rendered only when appId is set, so
@@ -199,6 +219,21 @@ spec:
               value: "projects/{{ $projectId }}/locations/{{ $kmsLocation }}/keyRings/{{ $m.kms.keyring }}/cryptoKeys/{{ $m.kms.key }}/cryptoKeyVersions/{{ $m.kms.keyVersion }}"
             - name: SOURCE_SYSTEM_AUTH
               value: "gha://$(GITHUB_APP_ID)?kms_id=$(KMS_KEY_NAME)"
+            {{- if $gheHost }}
+            # The GitHub Enterprise Server REST API root; minty adds the
+            # /app/installations paths to it, as it does to api.github.com.
+            - name: SOURCE_SYSTEM_API_BASE_URL
+              value: "https://{{ $gheHost }}/api/v3"
+            {{- end }}
+            {{- if and $gheHost $gheCA.name }}
+            # minty's HTTP client is Go's default transport, which reads the
+            # system roots: the bundle file in the image, and every certificate
+            # file in the directories SSL_CERT_DIR lists. So the instance's CA
+            # is trusted beside the image's bundle, for all of minty's outbound
+            # calls. The customer installs a CA that they trust.
+            - name: SSL_CERT_DIR
+              value: /etc/kube-agents/minter-ca
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /version
@@ -216,10 +251,32 @@ spec:
           volumeMounts:
             - name: config-volume
               mountPath: /etc/minty/{{ $org }}
+            {{- if and $gheHost $gheCA.name }}
+            # A directory, not a SubPath: kubelet updates a projected Secret
+            # in place, and a SubPath mount never sees the update.
+            - name: ghes-ca
+              mountPath: /etc/kube-agents/minter-ca
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config-volume
           configMap:
             name: github-token-minter-config
+        {{- if and $gheHost $gheCA.name }}
+        # The one key, as ca.crt, from the Secret the GitHub forge's
+        # caBundleRef names: the same Secret the operator mounts into the
+        # credential broker. Optional, as there: a missing Secret does not
+        # stop the minter, and its calls to the instance fail on TLS until
+        # the Secret exists.
+        - name: ghes-ca
+          secret:
+            secretName: {{ $gheCA.name }}
+            items:
+              - key: {{ $gheCA.key }}
+                path: ca.crt
+            defaultMode: 0444
+            optional: true
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -321,6 +378,7 @@ spec:
       ports:
         - protocol: TCP
           port: 988
+    {{- /* Any address on port 443, private ranges included, so a GitHub Enterprise Server on a private network is reachable too; an instance on another port is not. */}}
     # Allow HTTPS outbound connection to GitHub and KMS APIs
     - to:
         - ipBlock:

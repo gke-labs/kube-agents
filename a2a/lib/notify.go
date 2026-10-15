@@ -64,7 +64,8 @@ type NotifyRequest struct {
 	// its fallback, laid out by a backend that renders it (Slack) and posted
 	// as Text by any other; Update a sender-chosen key whose later request
 	// edits the message the first posted in the same conversation. A home
-	// channel request carrying them is posted as its Text.
+	// channel request may carry Chat too (the fleet-audit or first-inventory card), laid
+	// out the same way; it ignores Update.
 	Chat   json.RawMessage `json:"chat,omitempty"`
 	Update string          `json:"update,omitempty"`
 }

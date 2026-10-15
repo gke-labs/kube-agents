@@ -705,6 +705,7 @@ class ContentWorkspaceStore:
         locate: Locate | None = None,
         pinned_bases: Mapping[tuple[str, str], str] | None = None,
         tls_refusal: Callable[[str], object] | None = None,
+        github_host: Callable[[], str] | None = None,
     ) -> None:
         # Resolved, because `assert_disjoint_roots` resolves both sides and
         # `_redact` matches this value against paths git prints -- which git
@@ -742,6 +743,9 @@ class ContentWorkspaceStore:
         self.pinned_bases = dict(pinned_bases or {})
         self._credential_for = credential_for
         self._locate = locate
+        # The install's one GitHub host, asked per `open`: github.com, or a
+        # GitHub Enterprise Server host. None is github.com.
+        self._github_host = github_host
         # Monotonic, and injected so a test can drive the idle clock.
         self._clock = clock
         self._workspaces: dict[str, Workspace] = {}
@@ -1032,14 +1036,21 @@ class ContentWorkspaceStore:
         """`repo`'s canonical name and the URL its clone is made from.
 
         A bare `owner/name` is GitHub's, as it has always been, and its URL is
-        composed here. Anything else is handed to `locate`, which answers for
+        composed here, on the install's GitHub host. On github.com the name
+        stays bare. On a GitHub Enterprise Server host it becomes
+        `<host>/owner/name`, the name every other forge's repository has, so
+        the pins, the managed-repository check and the credential all see the
+        host it was cloned from. Anything else is handed to `locate`, which answers for
         the forges this install serves: the forge parses the name -- nesting,
         allowed paths -- and composes the URL. With no `locate`, or a name no
         served forge owns, the open is refused: the caller names a repository,
         never a host or a URL.
         """
         if isinstance(repo, str) and is_bare_github_name(repo):
-            return repo, f"https://github.com/{repo}.git"
+            host = (self._github_host() if self._github_host else "") or repo_ref.GITHUB_CANONICAL_HOST
+            if host == repo_ref.GITHUB_CANONICAL_HOST:
+                return repo, f"https://github.com/{repo}.git"
+            return f"{host}/{repo}", f"https://{host}/{repo}.git"
         if self._locate is not None and isinstance(repo, str) and repo.strip():
             return self._locate(repo)
         raise ContentWorkspaceError(
