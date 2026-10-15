@@ -218,10 +218,26 @@ def listing() -> tuple[int, str]:
     if not managed:
         # An empty registry is the stop whichever form a worker runs: a
         # "MANAGED: none" read as an answer was followed by a direct
-        # `kubectl delete` on #3086's eval (#3077).
-        code, stop = preflight()
-        return code, f"{lines}\n{stop}"
+        # `kubectl delete` on #3086's eval (#3077). Built from the read
+        # above, so the stop cannot disagree with the MANAGED line.
+        return EXIT_NO_REGISTERED_REPO, f"{lines}\n{_empty_registry_line(skipped)}"
     return EXIT_REGISTERED, lines
+
+
+def _empty_registry_line(skipped: list[str]) -> str:
+    """The NO_REGISTERED_REPO line for a registry with no usable entry."""
+    if skipped:
+        return (
+            f"NO_REGISTERED_REPO: {len(skipped)} registered entr"
+            f"{'y is' if len(skipped) == 1 else 'ies are'} not usable "
+            f"({' '.join(skipped)}): an unsupported type, a port, or a host the "
+            f"forges do not serve; {STOP} Fix the entry in the PlatformAgent's "
+            "spec.integration.repositories, then ask again."
+        )
+    return (
+        f"NO_REGISTERED_REPO: this install has no registered GitOps repository; "
+        f"{STOP} {REGISTRATION_STEPS}"
+    )
 
 
 def _unusable_entries() -> list[str]:
@@ -242,19 +258,7 @@ def preflight(repo: str | None = None) -> tuple[int, str]:
             f"STATE_UNREADABLE: the registry could not be read ({_one_line(str(exc))}); {STOP}"
         )
     if not repos:
-        skipped = _unusable_entries()
-        if skipped:
-            return EXIT_NO_REGISTERED_REPO, (
-                f"NO_REGISTERED_REPO: {len(skipped)} registered entr"
-                f"{'y is' if len(skipped) == 1 else 'ies are'} not usable "
-                f"({' '.join(skipped)}): an unsupported type, a port, or a host the "
-                f"forges do not serve; {STOP} Fix the entry in the PlatformAgent's "
-                "spec.integration.repositories, then ask again."
-            )
-        return EXIT_NO_REGISTERED_REPO, (
-            f"NO_REGISTERED_REPO: this install has no registered GitOps repository; "
-            f"{STOP} {REGISTRATION_STEPS}"
-        )
+        return EXIT_NO_REGISTERED_REPO, _empty_registry_line(_unusable_entries())
     if repo is None:
         return EXIT_REGISTERED, "REGISTERED: " + " ".join(repos)
     asked = _display_name(repo)
