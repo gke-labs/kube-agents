@@ -1,0 +1,142 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "I scanned 3 clusters and 41 workloads and found 23 things to look at.",
+                "type": "text"
+              },
+              {
+                "text": " Two are worth fixing first:",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "type": "divider"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "critical",
+                "type": "text"
+              },
+              {
+                "text": " ",
+                "type": "text"
+              },
+              {
+                "text": "seeded-b and -c admit privileged pods",
+                "type": "text"
+              },
+              {
+                "text": "\n",
+                "type": "text"
+              },
+              {
+                "text": "Any workload can escape to the node; enforce baseline Pod Security.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          },
+          {
+            "elements": [
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "major",
+                "type": "text"
+              },
+              {
+                "text": " ",
+                "type": "text"
+              },
+              {
+                "text": "seeded-c is a minor version behind its channel",
+                "type": "text"
+              },
+              {
+                "text": "\n",
+                "type": "text"
+              },
+              {
+                "text": "Upgrade the control plane before the channel's end of support.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "type": "divider"
+      },
+      {
+        "child_blocks": [
+          {
+            "text": {
+              "text": "No PDB on payments-api\nA node drain takes every replica down at once.\n`minor` Default namespace holds workloads\nMove them into a namespace of their own.\nWorkload Identity is off on one node pool\nPods there use the node's service account.",
+              "type": "mrkdwn",
+              "verbatim": true
+            },
+            "type": "section"
+          }
+        ],
+        "default_collapsed": true,
+        "is_collapsible": true,
+        "title": {
+          "text": "3 more worth a look",
+          "type": "plain_text"
+        },
+        "type": "container"
+      },
+      {
+        "elements": [
+          {
+            "action_id": "kage.choice.0",
+            "style": "primary",
+            "text": {
+              "emoji": true,
+              "text": "Fix the first one",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "Fix the first one"
+          },
+          {
+            "action_id": "kage.choice.1",
+            "text": {
+              "emoji": true,
+              "text": "See all 23",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "See all 23"
+          }
+        ],
+        "type": "actions"
+      }
+    ],
+    "attachments": []
+  }
+]

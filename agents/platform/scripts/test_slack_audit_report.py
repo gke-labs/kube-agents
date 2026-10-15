@@ -1013,5 +1013,119 @@ class BlocksFromIssueTest(unittest.TestCase):
         self.assertIsNone(sar.blocks_from_issue({"title": "something else"}, REF, REPORT))
 
 
+
+class ChatFromIssueTest(unittest.TestCase):
+    """The same card as a kube-agents.chat/v1 message, for spec.mode: next."""
+
+    def test_the_card_as_a_chat_message(self):
+        chat, text = sar.chat_from_issue(ISSUE, REF, REPORT)
+        self.assertEqual(chat, {
+            "schema": "kube-agents.chat/v1",
+            "headline": "Security & RBAC Posture Audit: 2 critical findings",
+            "rows": [
+                {"text": "seeded-b, seeded-c: `cluster-admin` bound to the default service account", "severity": "critical"},
+                {"text": "seeded-c: a ClusterRole grants `*` on secrets", "severity": "critical"},
+            ],
+            "after": ["5 more (1 major, 4 minor) are in the ledger issue."],
+            "choices": [{"text": sar.LOOK_FIRST, "primary": True}],
+            "links": [{"text": "Ledger issue #231 ↗", "url": LEDGER}],
+        })
+        self.assertEqual(text, sar.headline_from_issue(ISSUE, REF, REPORT))
+
+    def test_the_gap_line_follows_the_more_line(self):
+        chat, _ = sar.chat_from_issue(dict(ISSUE, body=skipped("seeded-c")), REF, REPORT)
+        self.assertEqual(chat["after"][1], "⚠️ Couldn't reach seeded-c, so this run didn't check it.")
+
+    def test_the_clean_card_is_its_headline_and_the_ledger(self):
+        chat, text = sar.chat_from_issue(dict(ISSUE, state="closed"), REF, "")
+        self.assertEqual(chat, {
+            "schema": "kube-agents.chat/v1",
+            "headline": "Security & RBAC Posture Audit: clean. Ledger closed.",
+            "links": [{"text": "Ledger issue #231 ↗", "url": LEDGER}],
+        })
+        self.assertEqual(text, f"**Security & RBAC Posture Audit: clean. Ledger closed.**\n{LINK}")
+
+    def test_none_wherever_the_blocks_are_none(self):
+        for issue in (dict(ISSUE, labels=[]), dict(ISSUE, title="not a ledger"), dict(ISSUE, body="no findings")):
+            with self.subTest(title=issue["title"][:20]):
+                self.assertIsNone(sar.blocks_from_issue(issue, REF, REPORT))
+                self.assertIsNone(sar.chat_from_issue(issue, REF, REPORT))
+
+
+#: The three no-GitOps relays the parity check saw (2026-10-14), as the agent wrote them.
+WALL_HEADING = (
+    "Here is the latest scheduled GCP networking fabric and VPC IPAM audit report from the platform agent.\n\n"
+    "## What's wrong\n"
+    "The GCP networking fabric and VPC IPAM audit ran and identified 2 critical firewall issues in project "
+    "`jayantid-gkedemos-3`, but could not publish its findings because no GitOps repository is registered in "
+    "the `platform-agent-gitops-state` ConfigMap.\n\n"
+    "## Why\n- **FirewallRule/default-allow-rdp** — `sourceRanges 0.0.0.0/0` allows `tcp:3389`.\n\n"
+    "## What to do\n- **Register a GitOps repository** — add one to the ConfigMap.\n"
+)
+WALL_LABEL = (
+    "Here is the scheduled workload reliability audit report from the platform agent:\n\n"
+    "**What's wrong** — The daily workload reliability audit could not run because no GitOps repository is "
+    "registered.\n**Why**\n- The `$GITOPS_STATE_CONFIGMAP` contains no `managed_repos` entries.\n"
+)
+WALL_LABEL_ALONE = (
+    "Here is the latest GCE Compute Engine fleet audit report from the platform agent:\n\n"
+    "**What's wrong**\nThe GCE Compute Engine fleet audit cannot publish its ledger issue or remediation pull "
+    "requests because no GitOps repository is registered.\n\n**Why**\n* **No GitOps repository configured**\n"
+)
+
+
+class FailedLineTest(unittest.TestCase):
+    """A fleet-audit report that could not write its ledger posts the first sentence of its "What's wrong"."""
+
+    def test_the_first_sentence_of_whats_wrong_in_each_shape_seen(self):
+        cases = {
+            WALL_HEADING: (
+                "The GCP networking fabric and VPC IPAM audit ran and identified 2 critical firewall issues in "
+                "project `jayantid-gkedemos-3`, but could not publish its findings because no GitOps repository "
+                "is registered in the `platform-agent-gitops-state` ConfigMap."
+            ),
+            WALL_LABEL: "The daily workload reliability audit could not run because no GitOps repository is registered.",
+            WALL_LABEL_ALONE: (
+                "The GCE Compute Engine fleet audit cannot publish its ledger issue or remediation pull requests "
+                "because no GitOps repository is registered."
+            ),
+        }
+        for report, line in cases.items():
+            with self.subTest(report=report[:40]):
+                self.assertEqual(sar.failed_line(report), line)
+
+    def test_a_soft_wrapped_section_is_one_sentence(self):
+        report = "## What's wrong\nThe audit could not run\nbecause no repository is registered. It will retry.\n"
+        self.assertEqual(sar.failed_line(report), "The audit could not run because no repository is registered.")
+
+    def test_a_report_with_its_ledger_link_is_not_failed(self):
+        self.assertIsNone(sar.failed_line(WALL_HEADING + f"\nSecurity audit: 2 new — {LEDGER}"))
+        self.assertIsNone(sar.failed_line(REPORT))
+
+    def test_a_report_without_the_section_posts_as_written(self):
+        for report in (
+            "Compliance audit: 3 findings (1 critical) across 2 cluster(s); the change since the last run is unknown.",
+            "## Why\n- something\n",
+            "## What's wrong\n\n## Why\n- the section is empty\n",
+            "## What's wrong\n- a list, not a sentence\n",
+        ):
+            with self.subTest(report=report[:30]):
+                self.assertIsNone(sar.failed_line(report))
+
+    def test_the_chat_message_is_the_line_with_the_report_folded(self):
+        chat, text = sar.failed_chat(WALL_LABEL)
+        self.assertEqual(chat, {
+            "schema": "kube-agents.chat/v1",
+            "detail": "The daily workload reliability audit could not run because no GitOps repository is registered.",
+            "fold": {"title": "why", "text": WALL_LABEL.strip()},
+        })
+        self.assertEqual(text, WALL_LABEL)
+        self.assertIsNone(sar.failed_chat(REPORT))
+
+    def test_a_long_report_is_read_quickly(self):
+        start = time.monotonic()
+        sar.failed_line("x " * LONG_INPUT * 10 + "\n## What's wrong\n" + "y " * LONG_INPUT)
+        self.assertLess(time.monotonic() - start, FAST_SECONDS)
+
 if __name__ == "__main__":
     unittest.main()

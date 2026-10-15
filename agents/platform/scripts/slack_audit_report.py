@@ -59,6 +59,7 @@ from __future__ import annotations
 import re
 from typing import NamedTuple
 
+import chat_message as _chat
 from slack_presenter import (
     BACKTICK,
     CLAUSE_ENDS,
@@ -73,6 +74,7 @@ from slack_presenter import (
     fallback_text,
     gap_parts,
     severity_row,
+    split_lead,
 )
 
 #: Any link Hermes' text path would post (``SlackAdapter.format_message``): its
@@ -247,6 +249,18 @@ CLOSED_STATE = "closed"
 ACTION_ID_PREFIX = "kage_audit"
 LOOK_FIRST = "Look at the first one"
 LEDGER_BUTTON = "Ledger issue #{number} ↗"
+
+#: The "What's wrong" section of a report written to the Platform Agent's three
+#: sections (``agents/platform/SOUL.md``): a heading (``## What's wrong``) or a
+#: bold label, the section's text after it on the same line or below it.
+WRONG_LABEL = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*|__)?What['’]s[ \t]+wrong[ \t]*:?(?:\*\*|__)?[ \t]*(?:[:—–-][ \t]*)?(?P<rest>.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+#: A line that ends the section's first paragraph: a heading, a list item, or a bold label alone.
+SECTION_BREAK = re.compile(r"^[ \t]*(?:#{1,6}[ \t]|[-*+][ \t]|\d+[.)][ \t]|(?:\*\*|__)[^*_]+(?:\*\*|__)[ \t]*$)")
+#: The most of a report read for its "What's wrong" section; the section opens a report.
+WRONG_READ_MAX = 4000
 
 
 class LedgerRef(NamedTuple):
@@ -673,6 +687,74 @@ def blocks_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> tuple[li
         action_id_prefix=ACTION_ID_PREFIX,
     )
     return blocks, fallback_text(card.headline, rows=card.rows, links=links, after_rows=after)
+
+
+def chat_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> tuple[dict, str] | None:
+    """:func:`blocks_from_issue`'s card as a ``kube-agents.chat/v1`` message, for ``spec.mode: next``.
+
+    ``(chat, text)``, or None whenever :func:`blocks_from_issue` is. The same
+    headline, rows, lines under them, "Look at the first one" and ledger link,
+    composed by :func:`chat_message.report_message`. ``text`` is
+    :func:`headline_from_issue`'s markdown, the fallback the gateway posts when
+    it does not lay the message out.
+    """
+    text = headline_from_issue(issue, ref, report)
+    if text is None:
+        return None
+    links = [(LEDGER_BUTTON.format(number=ref.number), ref.url)]
+    clean = _clean_name(issue, report)
+    if clean:
+        return _chat.report_message(CLEAN_CARD.format(name=clean), links=links), text
+    card = _card(_parse_issue(issue, report))
+    chat = _chat.report_message(
+        card.headline,
+        rows=card.rows,
+        after_rows="\n".join(_after_rows(card)),
+        choices=[LOOK_FIRST] if card.rows else [],
+        links=links,
+    )
+    return chat, text
+
+
+def failed_line(report: str) -> str | None:
+    """The one line a fleet-audit report that could not complete posts, or None.
+
+    A report that ends with its ledger link completed (the card is built from
+    the ledger). One that does not, and opens a "What's wrong" section, is a run
+    that could not write its ledger (no GitOps repository registered, say): the
+    line is that section's first sentence, as the agent wrote it, markdown and
+    all. None for a report with no such section, which posts as written.
+    """
+    if ledger_ref(report) is not None:
+        return None
+    head = report[:WRONG_READ_MAX]
+    label = WRONG_LABEL.search(head)
+    if label is None:
+        return None
+    paragraph = [label.group("rest").strip()] if label.group("rest").strip() else []
+    if not paragraph:
+        for line in head[label.end() :].lstrip("\r\n").splitlines():
+            if not line.strip() or SECTION_BREAK.match(line):
+                break
+            paragraph.append(line.strip())
+    sentence, _rest = split_lead(" ".join(paragraph))
+    return sentence.strip() or None
+
+
+def failed_chat(report: str) -> tuple[dict, str] | None:
+    """:func:`failed_line` as a ``kube-agents.chat/v1`` message for ``spec.mode: next``: ``(chat, text)``, or None.
+
+    The line is the message, and the whole report folds under it ("why"): under
+    next a reply in the thread reaches the gateway, which cannot replay the
+    report the way ``incident_context`` does under today. ``text`` is the
+    report itself, the fallback the gateway posts when it does not lay the
+    message out.
+    """
+    line = failed_line(report)
+    if line is None:
+        return None
+    fold = {"title": _chat.FOLD_TITLE_DEFAULT, "text": _clip(report.strip(), _chat.FOLD_TEXT_MAX)}
+    return _chat.message(detail=_clip(line, _chat.DETAIL_MAX), fold=fold), report
 
 
 def _fallback_line(line: str) -> str:

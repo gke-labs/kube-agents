@@ -1425,17 +1425,18 @@ shape and posts it into the home channel: a `ts` from elsewhere can only ever th
 thread) there. The kanban notifier sends the qualified form, with the card's own channel, so a
 card filed under `today` in a DM or another channel and delivered after the switch to `next` is
 refused rather than reported into home; a Slack subscription with no channel is not sent. Slack
-also takes Block Kit: a request may carry `blocks`, a JSON array posted as one message with
-`text` as its notification and fallback (the fleet audit's report card,
-`a2a notify --blocks-file`). A backend without blocks, Chat today, refuses such a request
+lays out a home-channel request's `chat` message as it lays out a conversation's (the fleet
+audit's report card, `a2a notify --chat-file`): one that breaks a rule, or that Slack refuses,
+is dropped and its `text` posted, and the request's `update` and `mark` are not read. Chat posts
+the `text`. Slack also takes Block Kit: a request may carry `blocks`, a JSON array posted as one message with
+`text` as its notification and fallback (`a2a notify --blocks-file`). A backend without blocks, Chat today, refuses such a request
 rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back as the
 `error`, so the caller falls back to text. Blocks cannot be escaped the way text is, so the
 gateway refuses any block that carries a mention (`<!channel>`, `<!here>`, `<!subteam^…>`,
 `<@U…>`, a bare `@here`, `@channel` or `@everyone`, which a mrkdwn text object may parse into one, or a rich_text `broadcast`, `user` or `usergroup` element), and the caller posts the
 escaped text instead. The gateway acks no Slack interaction, so a button on such a card would
 be clicked into a timeout: the gateway refuses any interactive block or element in raw blocks (an `actions`
-or `input` block, a button, a select, a date or time picker, a text input), and the agent sends
-the card without its buttons, a link button turned into a plain link. The blocks are decoded into slack-go's types and sent again,
+or `input` block, a button, a select, a date or time picker, a text input). The blocks are decoded into slack-go's types and sent again,
 so a block type it does not know travels as written and a field it does not model may not. A
 home channel that is not a channel id leaves the route unarmed; the gateway logs
 "chat.notify route not armed" at start.
