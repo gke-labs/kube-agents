@@ -21,7 +21,7 @@
 # 2. oobe-first-run-audits/arm.py (shared, not copied) arms the `oobe` stage the way that case
 #    does, rewriting .bootstrap_scan_filed, .bootstrap_handoff_filed and .oobe_audits_fired, and
 #    the stage starts the four audits one after another.
-# 3. The apply waits, up to `audits_wait`, until each audit has a run since the arm that ended.
+# 3. The apply waits, up to `chain_wait`, until each audit has a run since the arm that ended.
 # 4. It plants a stand-in INVENTORY.md on the shell sandbox, where the delivery stage reads the
 #    report, and late.py `open` touches `.user_aligned` as the onboarding plugin does on a first
 #    message. The next `oobe` tick delivers the report; the apply waits, up to `delivery_wait`,
@@ -66,8 +66,9 @@ locals {
   # As in oobe-first-run-audits: the install's own onboarding must be over before the arm.
   own_wait = 3600
   # Run 1 of #1866 on a five-cluster fleet ran the four audits in 42 minutes; each audit's own
-  # limit is 45.
-  audits_wait = 5400
+  # limit is 45. own_wait, chain_wait and delivery_wait together are the longest this stack holds
+  # the onboarding state lock (hack/ci-eval-pr.sh: STATE_LOCK_HOLD_SECONDS).
+  chain_wait = 5400
   # The delivery stage runs first in each `oobe` tick, every minute.
   delivery_wait = 600
   poll          = 30
@@ -181,7 +182,7 @@ resource "null_resource" "oobe_late" {
       # ---- 4. Wait for every audit to end ----------------------------------
       elapsed=0
       until done_="$(late finished)" && [ "$done_" = finished ]; do
-        if [ "$elapsed" -ge ${local.audits_wait} ]; then
+        if [ "$elapsed" -ge ${local.chain_wait} ]; then
           echo "ERROR: the four first-run audits have not all ended $${elapsed}s after the arm; the first message would not come after them." >&2
           exit 1
         fi

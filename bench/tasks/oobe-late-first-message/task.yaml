@@ -22,7 +22,10 @@
 # home channel for the run and puts both back byte for byte, with `.user_aligned`,
 # `.bootstrap_completed`, the oobe markers and the sandbox's INVENTORY.delivered.md. A change
 # another writer makes to config.yaml or .env during the run is lost at the restore. It refuses an
-# install whose CR sets a homeChannel, and one whose oobe job is bound to a chat. The four audits
+# install whose CR sets a homeChannel, and one whose oobe job is bound to a chat. While the home
+# channel is away, every other job that delivers to chat (github-repo-watcher, stall-watch) fails
+# its delivery too, and two in a row can make chat-delivery-watch open an agent:delivery-watch
+# issue on the install. The four audits
 # are real runs: each writes its ledger issue in the install's GitOps repository, and none posts
 # to chat. The runner holds their streams' locks for the unit (`audit_streams` below). It does not
 # hold the infra lock (hack/ci-eval-pr.sh, infra_lock_exempt): the stack touches no task cluster

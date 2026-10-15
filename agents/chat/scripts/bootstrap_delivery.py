@@ -45,9 +45,9 @@ report twice; see ``_posted_as_blocks``.
 
 Every delivery closes with a short note on the first-run audits, read off the ``oobe`` stage's
 marker by ``_audits_note``: the report's scan leaves the workload checks to those audits, and a
-short report would otherwise read as a healthy fleet. An audit that finished before anyone opened
-the chat had no home channel to post its summary to, so the note names it with its ledger link
-(``_undelivered_audits``). The text path appends it to the report; the
+short report would otherwise read as a healthy fleet. An audit whose summary failed to deliver,
+as every one that finished before anyone opened the chat does for want of a home channel, is named
+with its ledger link (``_undelivered_audits``). The text path appends it to the report; the
 card paths print it on their own, since the card leaves closing lines out.
 
 Just before the claim, the run registers the sweep's findings in the
@@ -214,10 +214,11 @@ AUDITS_FINISHED_NOTE = (
     "from the first-run audits, which have run: {audits}. Each posts a summary to the home channel "
     "when it finds something new."
 )
-# An audit that finished before anyone opened the chat had no home channel to post to, and the
-# scheduler does not post it again (_undelivered_audits).
+# Said of every failed delivery, whatever refused it: usually no home channel yet, which an audit
+# that ends before anyone opens the chat always meets, and the scheduler does not post it again
+# (_undelivered_audits).
 AUDITS_UNDELIVERED_NOTE = (
-    "These finished before this chat had a home channel, so their summaries were not posted: {audits}. "
+    "These finished, but their summaries were not posted to the chat: {audits}. "
     "Ask me for any of these reports."
 )
 AUDITS_LEDGER_NOTE = "`{audit}` (findings: {url})"
@@ -232,8 +233,10 @@ CRON_OUTPUT_SUFFIX = ".md"
 RESPONSE_HEADING = "## Response"
 # A document is the run's when it was saved no earlier than this before the run's finish time.
 OUTPUT_SLACK_SECONDS = 300
-# The ledger issue a fleet audit links in its summary (fleet-audit skill, `finish`).
+# The ledger issue a fleet audit links in its summary (fleet-audit skill, `finish`). The summary is
+# the model's prose and can cite other issues, so a link on a line that names the ledger wins.
 LEDGER_URL_RE = re.compile(r"https://[^\s()<>\[\]]+/issues/\d+")
+LEDGER_WORD = "ledger"
 
 # The delivery job's ``origin`` and the keys the plugin writes into it.
 ORIGIN_KEY = "origin"
@@ -700,7 +703,8 @@ def _undelivered_audits(
     """The audits whose latest completed run could not post its summary, each with its ledger link when it has one.
 
     A run that ends before anyone has opened the chat finds no home channel, the relay refuses
-    it, and nothing posts it later; this delivery is the first message that user reads.
+    it, and nothing posts it later; this delivery is the first message that user reads. Any other
+    failed delivery is listed too, since its summary is just as missing.
     """
     out = []
     for audit in audits:
@@ -728,7 +732,9 @@ def _ledger_url(data_dir: Path, audit: str, finished_at: float | None) -> str | 
         text = newest.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    match = LEDGER_URL_RE.search(text.rpartition(RESPONSE_HEADING)[2])
+    response = text.rpartition(RESPONSE_HEADING)[2]
+    named = [line for line in response.splitlines() if LEDGER_WORD in line.lower() and LEDGER_URL_RE.search(line)]
+    match = LEDGER_URL_RE.search(named[0] if named else response)
     return match.group(0) if match else None
 
 

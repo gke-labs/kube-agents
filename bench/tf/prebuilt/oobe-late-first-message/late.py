@@ -33,6 +33,7 @@ The state file is written before anything changes, so ``restore`` undoes a ``cle
 stopped part-way.
 """
 
+import ast
 import json
 import os
 import sqlite3
@@ -49,9 +50,13 @@ ALIGNED = os.path.join(home, ".user_aligned")
 COMPLETED = os.path.join(home, ".bootstrap_completed")
 EXECUTIONS_DB = os.path.join(home, "profiles", "platform", "cron", "executions.db")
 TMP_SUFFIX = ".tmp"
-# agents/chat/scripts/oobe.py: FIRST_RUN_AUDITS.
-FIRST_RUN_AUDITS = ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention")
+# The stage's audit list is read from the image's copy of oobe.py, not run, as
+# hack/ci_platform_runs.py reads it, so the chat opens after every audit the deployed stage starts.
+STAGE_SOURCE = os.environ.get("OOBE_STAGE_SOURCE", "/opt/defaults/scripts/oobe.py")
+STAGE_AUDITS = "FIRST_RUN_AUDITS"
 IN_FLIGHT = ("claimed", "running")
+# A skipped row ran nothing: the stage marks the audit again, or the skip found a run still going.
+SKIPPED = "skipped"
 # Hermes' home-channel variables, as persist_home_channel's .env mirror writes them
 # (bootstrap_onboarding plugin: HOME_CHANNEL_ENV_FORMAT and HOME_THREAD_ENV_SUFFIX).
 HOME_CHANNEL_VARS = ("GOOGLE_CHAT_HOME_CHANNEL", "SLACK_HOME_CHANNEL")
@@ -146,28 +151,38 @@ def clear():
     print(f"cleared the home channel and the delivery markers at {state['cleared_at']}")
 
 
+def stage_audits():
+    with open(STAGE_SOURCE, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == STAGE_AUDITS for t in node.targets):
+            return tuple(ast.literal_eval(node.value))
+    sys.exit(f"no {STAGE_AUDITS} in {STAGE_SOURCE}")
+
+
 def finished():
     with open(ARM_STATE, encoding="utf-8") as fh:
         since = datetime.fromisoformat(json.load(fh)["applied_at"]).timestamp()
+    audits = stage_audits()
     if not os.path.isfile(EXECUTIONS_DB):
         print("pending")
         return
     conn = sqlite3.connect(f"file:{EXECUTIONS_DB}?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT)
     try:
         rows = conn.execute(
-            f"SELECT job_id, status, claimed_at FROM executions WHERE job_id IN ({','.join('?' * len(FIRST_RUN_AUDITS))})",
-            FIRST_RUN_AUDITS,
+            f"SELECT job_id, status, claimed_at FROM executions WHERE job_id IN ({','.join('?' * len(audits))})",
+            audits,
         ).fetchall()
     finally:
         conn.close()
     ended = set()
     for job_id, status, claimed in rows:
         try:
-            if datetime.fromisoformat(claimed).timestamp() >= since and status not in IN_FLIGHT:
+            if datetime.fromisoformat(claimed).timestamp() >= since and status not in IN_FLIGHT + (SKIPPED,):
                 ended.add(job_id)
         except (TypeError, ValueError):
             continue
-    print("finished" if ended >= set(FIRST_RUN_AUDITS) else "pending")
+    print("finished" if ended >= set(audits) else "pending")
 
 
 def open_chat():

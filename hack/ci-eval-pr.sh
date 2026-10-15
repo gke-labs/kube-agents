@@ -2661,8 +2661,8 @@ unit_cost_hint() {
     # the previous repetition's audits to finish (wait_platform_runs), then the
     # stack waits for the stage to run the four one after another (1-15 min
     # each, #985; up to its chain_wait, 3600s). 2530-3144s a repetition on the
-    # nightly of 2026-10-09; the top of the list, so it launches first in each
-    # repetition round.
+    # nightly of 2026-10-09; near the top of the list, so it launches early in
+    # each repetition round.
     oobe-first-run-audits) echo 3000 ;;
     # The same chain, then the delivery of a report on the late first message
     # (up to its delivery_wait, 600s). Off the infra lock with it. Unmeasured on CI.

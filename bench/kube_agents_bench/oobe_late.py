@@ -49,6 +49,7 @@ SQLITE_BUSY_TIMEOUT = 10
 SLACK_SECONDS = 300
 HEADING = "## Response"
 LEDGER = re.compile(r"https://[^\s()<>\[\]]+/issues/\d+")
+LEDGER_WORD = "ledger"
 out = {"applied_at": None, "opened_at": None, "runs": {}, "report": None, "error": None}
 
 def ts(value):
@@ -87,7 +88,9 @@ if out["applied_at"] and not out["error"] and os.path.exists(db):
                 since = ts(last["finished_at"]) - SLACK_SECONDS if last["finished_at"] else armed
                 docs = newest(os.path.join(out_dir, audit), since)
                 if docs:
-                    match = LEDGER.search(response(docs[0]))
+                    text = response(docs[0])
+                    named = [l for l in text.splitlines() if LEDGER_WORD in l.lower() and LEDGER.search(l)]
+                    match = LEDGER.search(named[0] if named else text)
                     last["ledger"] = match.group(0) if match else None
                 out["runs"][audit] = last
     except (sqlite3.Error, ValueError, TypeError, OSError) as exc:

@@ -202,6 +202,14 @@ def test_no_delivered_report_fails(install: Install) -> None:
     assert "nothing was delivered" in result.reason
 
 
+def test_a_link_on_the_ledger_line_wins(install: Install) -> None:
+    install.run("compliance-audit", ARMED, "failed", None)
+    _doc(install.out / "compliance-audit", "z", "See https://github.com/k/k/issues/5\nLedger: https://github.com/o/r/issues/3",
+         ARMED + timedelta(minutes=6))
+    install.deliver("https://github.com/k/k/issues/5")
+    assert _verify().status == "fail"
+
+
 def test_the_prompt_links_in_a_saved_run_are_not_its_ledger(install: Install) -> None:
     install.run("compliance-audit", ARMED, "failed", None)
     install.deliver("https://github.com/o/r/issues/99")
@@ -287,6 +295,8 @@ def test_clear_refuses_an_oobe_job_bound_to_a_chat(home: Path) -> None:
 
 def test_finished_waits_for_every_audit_since_the_arm(home: Path) -> None:
     (home / ".bench-oobe.json").write_text(json.dumps({"applied_at": ARMED.isoformat()}))
+    stage = home.parent / "oobe.py"
+    stage.write_text(f"FIRST_RUN_AUDITS = {oobe_late.FIRST_RUN_AUDITS!r}\n")
     db = home / "profiles" / "platform" / "cron" / "executions.db"
     db.parent.mkdir(parents=True)
     with sqlite3.connect(db) as con:
@@ -297,7 +307,22 @@ def test_finished_waits_for_every_audit_since_the_arm(home: Path) -> None:
                 "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at) VALUES (?,?,?,?,?,?,?)",
                 (str(i), audit, "builtin", "p", 1, status, (ARMED + timedelta(minutes=i)).isoformat()),
             )
-    assert _late(home, "finished").stdout.strip() == "pending"
+    env = {"OOBE_STAGE_SOURCE": str(stage)}
+    assert _late(home, "finished", env=env).stdout.strip() == "pending"
+    # A skipped row ran nothing.
+    with sqlite3.connect(db) as con:
+        con.execute("UPDATE executions SET status = 'skipped' WHERE id = '3'")
+    assert _late(home, "finished", env=env).stdout.strip() == "pending"
     with sqlite3.connect(db) as con:
         con.execute("UPDATE executions SET status = 'completed' WHERE id = '3'")
-    assert _late(home, "finished").stdout.strip() == "finished"
+    assert _late(home, "finished", env=env).stdout.strip() == "finished"
+    # An audit the deployed stage adds is waited for too.
+    stage.write_text(f"FIRST_RUN_AUDITS = {oobe_late.FIRST_RUN_AUDITS + ('upgrade-retrospective',)!r}\n")
+    assert _late(home, "finished", env=env).stdout.strip() == "pending"
+
+
+def test_the_stage_audit_list_late_reads_is_the_stage_s() -> None:
+    import ast
+    tree = ast.parse((REPO / "agents" / "chat" / "scripts" / "oobe.py").read_text())
+    node = next(n for n in tree.body if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "FIRST_RUN_AUDITS")
+    assert tuple(ast.literal_eval(node.value)) == oobe_late.FIRST_RUN_AUDITS

@@ -1769,7 +1769,7 @@ class FirstRunAuditsTest(unittest.TestCase):
         note = self._note(self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
         self.assertIn("which have run: `fleet-wide-cost-analysis`", note)
         self.assertNotIn("have started", note)
-        self.assertIn("so their summaries were not posted: "
+        self.assertIn("but their summaries were not posted to the chat: "
                       "`fleet-wide-cost-analysis` (findings: https://github.com/o/r/issues/1), "
                       "`compliance-audit` (findings: https://github.com/o/r/issues/2), "
                       "`obtainability-audit` (findings: https://github.com/o/r/issues/3), "
@@ -1777,6 +1777,15 @@ class FirstRunAuditsTest(unittest.TestCase):
         # Only the link is taken from the run's message; its prose and the prompt's links are not.
         self.assertNotIn("Let's format", note)
         self.assertNotIn("issues/99", note)
+
+    def test_a_link_on_the_ledger_line_wins_over_an_earlier_one(self):
+        now = time.time()
+        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
+        self._document("compliance-audit", "Upstream bug https://github.com/k/k/issues/5 applies.\n"
+                       "- **Ledger Issue:** https://github.com/o/r/issues/3", now - 500)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
+                           oobe.STATE_DONE: True})
+        self.assertIn("`compliance-audit` (findings: https://github.com/o/r/issues/3)", note)
 
     def test_delivered_summaries_are_not_listed(self):
         for outcome in ("delivered", "suppressed", None):
@@ -1801,7 +1810,7 @@ class FirstRunAuditsTest(unittest.TestCase):
         self._document("compliance-audit", "https://github.com/o/r/issues/7", now - 86400)
         note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
                            oobe.STATE_DONE: True})
-        self.assertTrue(note.endswith("were not posted: `compliance-audit`. Ask me for any of these reports."))
+        self.assertTrue(note.endswith("were not posted to the chat: `compliance-audit`. Ask me for any of these reports."))
 
     def test_a_run_from_before_the_mark_is_not_the_first_run(self):
         now = time.time()

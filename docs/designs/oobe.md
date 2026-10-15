@@ -247,7 +247,7 @@ times. It rides with the audits stage, whose eval case covers both.
 | Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                       | Automatic                                                                                             |
 | An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat | As today                                                                                              |
 | No GitOps repository   | Reports stay in the report store; a run that changed something posts a summary saying there is no forge  | None, or for ledger issues, re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md) |
-| No home channel        | Ledger issues in the repository; the report sent on the first message lists each and links its ledger    | Set one (`/sethome`)                                                                                  |
+| No home channel        | Ledger issues and PRs in the repository; the first report names each audit with its ledger issue         | Set one (`/sethome`)                                                                                  |
 | Sweep stuck            | Audits start at the fallback                                                                             | As today for the report                                                                               |
 | Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                     | As today for the report                                                                               |
 
@@ -261,8 +261,8 @@ times. It rides with the audits stage, whose eval case covers both.
   it end; nothing holds a finding back to meet a target.
 - **Reaching an install with no home channel.** Audit summaries go to the home channel only. An
   audit that finishes before anyone opens the chat posts nothing, and nothing posts it later; the
-  onboarding report, sent on the first message, names it and links its ledger issue
-  (`bootstrap_delivery._undelivered_audits`). Posting the report there at T+0 when one is set is a
+  onboarding report, sent on the first message, names every audit whose summary failed to deliver,
+  with its ledger issue when its final message links one (`bootstrap_delivery._undelivered_audits`). Posting the report there at T+0 when one is set is a
   separate change.
 - **An install self-check.** Not asked for by any issue.
 
@@ -276,6 +276,10 @@ times. It rides with the audits stage, whose eval case covers both.
    within seconds of that), and the old entries ship disabled. The bench stacks for the
    onboarding cases drive `oobe`.
 3. **Later:** drop the disabled ids; T+0 delivery to the home channel.
+
+Eval case `oobe-late-first-message` (nightly, `bench/tf/prebuilt/oobe-late-first-message`) covers a
+first message that arrives after the four audits end: its stack takes the home channel away, and the
+`oobe_late_report` verifier checks that the report names each audit whose summary failed to deliver.
 
 Eval case `oobe-first-run-audits` (domain `fleet-audits`; nightly, in `hack/eval/nightly-cases.txt`,
 off the infra lock; each repetition waits for the previous one's four audits to finish). The stack
