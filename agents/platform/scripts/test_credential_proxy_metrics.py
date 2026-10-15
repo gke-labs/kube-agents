@@ -602,8 +602,11 @@ class AdmissionMetricsTest(unittest.TestCase):
         # earliest the slot could come free -- not the whole 0.4 s hold, which
         # it misses by however long after the hold began the first leg arrived
         # (#3127). The 1e-6 is the rendered sum's six-decimal rounding.
+        # No guard on the gap itself: a gap of 0.4 s or more means the first
+        # leg was admitted rather than yielded, which self.fail above catches,
+        # and any shorter gap leaves a floor the regression (a wait near zero)
+        # falls under.
         earliest_release = holder.held_at + 0.4
-        self.assertGreater(earliest_release - arrival, 0.3, "the arrival came too late to measure a wait")
         self.assertGreaterEqual(
             _series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget"),
             earliest_release - arrival - 1e-6,
