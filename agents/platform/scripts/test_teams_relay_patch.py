@@ -505,6 +505,27 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(late.check_fn())
         self.assertEqual(late.max_message_length, 16000)
 
+    async def test_standalone_send_returns_the_cause_and_never_raises(self):
+        """The registry's cron path expects ``success`` or ``error`` back; the
+        broker's ``teams`` object is what names the cause."""
+        import io
+        from gateway.platform_registry import platform_registry
+
+        teams_relay_patch.install()
+        sender = platform_registry.get("teams").standalone_sender_fn
+        body = json.dumps({"error": "Teams operation failed", "detail": "HTTP 403: BotNotInConversationRoster",
+                           "teams": {"status": 403, "code": "BotNotInConversationRoster", "message": "not in roster"}}).encode()
+        err = urllib.error.HTTPError("http://127.0.0.1:8642/v1/chat/teams/api", 502, "Bad Gateway", {}, io.BytesIO(body))
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            res = await sender(None, "conv-1", "hello")
+        self.assertIn("BotNotInConversationRoster", res["error"])
+        self.assertNotIn("success", res)
+
+        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+            self.assertEqual(await sender(None, "conv-1", "   "), {"success": True, "platform": "teams", "skipped": "empty_text"})
+            self.assertIn("error", await sender(None, "conv-1", "report", media_files=["/tmp/a.png"]))
+            mock_urlopen.assert_not_called()
+
     async def test_send_drops_to_plain_text_when_the_card_is_over_the_byte_cap(self):
         from gateway.platform_registry import PlatformRegistry
 

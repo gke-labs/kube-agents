@@ -14,6 +14,7 @@ from collections.abc import Callable
 from typing import Any
 
 from credential_proxy_client import authorization_headers
+from slack_relay_patch import is_silent_text
 
 LOGGER = logging.getLogger("teams-relay-patch")
 DEFAULT_RELAY_READY_TIMEOUT = 120.0
@@ -31,8 +32,12 @@ TEAMS_TRUNCATION_MARKER = "\n… (message truncated to fit Teams' size limit)"
 # one serialized byte, so two passes are the norm; the bound is a safety stop.
 TEAMS_FIT_ATTEMPTS = 8
 # Where the bot posts when an activity did not say: the public Bot Framework
-# endpoint. A regional tenant sets TEAMS_DEFAULT_SERVICE_URL.
+# endpoint. TEAMS_DEFAULT_SERVICE_URL overrides it in a hand-run gateway only;
+# the operator renders no setter for it today, so a tenant homed on a regional
+# endpoint needs a CR field, which belongs with the inbound work.
 DEFAULT_TEAMS_SERVICE_URL = "https://smba.trafficmanager.net/teams/"
+# How much of a broker error body the gateway reads to name the cause.
+TEAMS_RELAY_ERROR_BODY_MAX_BYTES = 4096
 TEAMS_TRUSTED_SERVICE_HOSTS = ("smba.trafficmanager.net", "api.botframework.com")
 
 
@@ -216,6 +221,38 @@ def markdown_to_adaptive_card(text: str, title: str | None = None) -> dict[str, 
     }
 
 
+class TeamsRelayError(RuntimeError):
+    """The broker refused or Microsoft rejected a relayed call.
+
+    Carries the broker's answer so the gateway log and a cron delivery record
+    name the cause (``BotNotInConversationRoster``, ``ConversationNotFound``,
+    ``invalid_client``) instead of the bare ``HTTP Error 502`` ``urlopen``
+    raises with the body unread. ``fields`` is the broker's ``teams`` object
+    when Microsoft was the one refusing, else its ``error``/``detail``.
+    """
+
+    def __init__(self, message: str, status: int, fields: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.status = status
+        self.fields = fields
+
+
+def relayed_teams_error(exc: urllib.error.HTTPError) -> TeamsRelayError:
+    """Read the broker's error body once and turn it into a ``TeamsRelayError``."""
+    body: Any = {}
+    try:
+        raw = exc.read(TEAMS_RELAY_ERROR_BODY_MAX_BYTES)
+        body = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+    except Exception:
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    fields = body.get("teams") if isinstance(body.get("teams"), dict) else {}
+    if not fields:
+        fields = {k: str(body[k])[:256] for k in ("error", "detail") if body.get(k)}
+    detail = " ".join(str(v) for v in fields.values() if v) or str(exc.reason)
+    return TeamsRelayError(f"HTTP {exc.code}: {detail}", exc.code, fields)
+
+
 def activity_size_bytes(payload: dict[str, Any]) -> int:
     """The bytes the broker puts on the wire for ``payload`` (UTF-8 JSON)."""
     return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
@@ -326,8 +363,11 @@ def install() -> None:
             headers=headers,
             method="GET" if body is None else "POST",
         )
-        with urllib.request.urlopen(req, timeout=35) as response:
-            return json.load(response)
+        try:
+            with urllib.request.urlopen(req, timeout=35) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            raise relayed_teams_error(exc) from exc
 
     async def bootstrap_relay() -> None:
         """Wait for the credential-proxy sidecar Teams relay to become reachable."""
@@ -350,11 +390,11 @@ def install() -> None:
                     request, "/v1/chat/teams/events/ack", {"receipt": ""}
                 )
                 return
-            except urllib.error.HTTPError as exc:
-                if exc.code == 404:
+            except TeamsRelayError as exc:
+                if exc.status == 404:
                     # 404 from /events/ack means TeamsRelay is initialized and answered.
                     return
-                if exc.code != 503:
+                if exc.status != 503:
                     raise
             except (urllib.error.URLError, OSError):
                 pass
@@ -692,15 +732,33 @@ def install() -> None:
         metadata: dict[str, Any] | None = None,
         **_kwargs: Any,
     ) -> dict[str, Any]:
-        """Out-of-process delivery (cron); the registry expects a dict back."""
-        del media_files, force_document, caption
-        adapter = TeamsRelayAdapter(pconfig)
-        result = await adapter.send(
-            chat_id,
-            message,
-            thread_id=thread_id,
-            metadata=metadata,
-        )
+        """Out-of-process delivery (cron): a ``success`` or ``error`` dict, never a raise.
+
+        Same contract as the Slack sender: a file cannot ride the relay and
+        says so; a silent cron tick (the dressed ``[SILENT]`` marker upstream
+        lets through) is a logged success with nothing posted; a failure
+        returns the cause so the scheduler's delivery record names it.
+        """
+        del force_document, caption
+        if media_files:
+            return {"error": "Teams media delivery is not supported through the credential relay"}
+        if is_silent_text(message):
+            LOGGER.info(
+                "teams relay: dropped a %d-character message as a silent tick",
+                len(str(message or "")),
+            )
+            return {"success": True, "platform": "teams", "skipped": "empty_text"}
+        try:
+            adapter = TeamsRelayAdapter(pconfig)
+            result = await adapter.send(
+                chat_id,
+                message,
+                thread_id=thread_id,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            LOGGER.warning("teams relay: standalone send failed: %s", exc)
+            return {"error": f"Teams send failed: {exc}"}
         return {"success": result.success, "message_id": result.message_id}
 
     import gateway.platform_registry as registry_module

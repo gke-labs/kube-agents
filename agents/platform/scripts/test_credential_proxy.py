@@ -14257,6 +14257,19 @@ class TeamsRelayTest(unittest.TestCase):
         self.assertEqual(caught.exception.fields["code"], "BotNotInConversationRoster")
         self.assertIn("BotNotInConversationRoster", str(caught.exception))
 
+    def test_teams_relay_identity_faults_are_upstream_errors(self):
+        """A non-JSON identity body or a non-numeric expires_in is an upstream
+        fault (502 with its reason logged), not a ValueError the route answers
+        400 and logs nothing for."""
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        for raw in (b"<html>captive portal</html>", json.dumps({"access_token": "t", "expires_in": "soon"}).encode()):
+            resp = mock.MagicMock()
+            resp.read.return_value = raw
+            resp.__enter__.return_value = resp
+            with mock.patch.object(credential_proxy._TEAMS_OPENER, "open", return_value=resp):
+                with self.assertRaises(credential_proxy.TeamsUpstreamError, msg=raw):
+                    relay._get_access_token()
+
     def test_teams_relay_redirect_handler_refuses_redirects(self):
         # api_call goes through the module's one opener, and that opener
         # carries the refusing handler.
