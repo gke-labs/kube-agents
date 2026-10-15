@@ -62,6 +62,7 @@ _install_hermes_stubs()
 
 import apply_kanban_chat_notify  # noqa: E402
 import kanban_chat_notify  # noqa: E402
+import kanban_notifier  # noqa: E402
 from gateway.config import Platform  # noqa: E402
 
 ROUTED = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}
@@ -605,6 +606,42 @@ class _Ev:
 @dataclass
 class _Task:
     result: str
+
+
+class FoldsIntoRowTest(unittest.TestCase):
+    """``_folds_into_row`` through its own query, against a board with the ``payload`` column it reads."""
+
+    SUB = {"platform": "slack", "chat_id": "a2a-ctx-1", "thread_id": "slack:C1/1.2", "task_id": "t_c1"}
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.executescript(
+            "CREATE TABLE tasks (id TEXT, status TEXT);"
+            "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
+            "CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT);"
+            "INSERT INTO tasks VALUES ('t_parent', 'running'), ('t_c1', 'done'), ('t_c2', 'running');"
+            "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_c1', 'created', '{\"creator_task_id\": \"t_parent\"}');"
+            "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_c2', 'created', '{\"creator_task_id\": \"t_parent\"}');"
+        )
+        self.conn.execute("INSERT INTO kanban_notify_subs VALUES ('t_parent', 'slack', ?, ?)",
+                          (self.SUB["chat_id"], self.SUB["thread_id"]))
+        flag = mock.patch.object(kanban_notifier, "slack_ux_on", side_effect=lambda p: str(p).lower() == "slack")
+        flag.start()
+        self.addCleanup(flag.stop)
+
+    def test_a_child_beneath_an_open_fan_out_on_slack_folds(self):
+        self.assertTrue(kanban_chat_notify._folds_into_row(self.conn, self.SUB))
+
+    def test_not_once_the_parent_is_done(self):
+        self.conn.execute("UPDATE tasks SET status = 'done' WHERE id = 't_parent'")
+        self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, self.SUB))
+
+    def test_not_on_another_thread(self):
+        self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, dict(self.SUB, thread_id="slack:C1/9.9")))
+
+    def test_not_with_the_flag_off(self):
+        with mock.patch.object(kanban_notifier, "slack_ux_on", return_value=False):
+            self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, self.SUB))
 
 
 class FoldFanoutTest(unittest.TestCase):
