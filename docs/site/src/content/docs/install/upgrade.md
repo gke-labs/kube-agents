@@ -16,6 +16,12 @@ the checkout to the new release (change a pinned `image_tag` in `terraform.tfvar
 `terraform/examples/full-install`, with the forge kept in `ghes.auto.tfvars`: see
 [GitHub Enterprise Server in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#upgrade-switch-and-teardown).
 
+This site describes `main`, not a release. It changes each time a docs change merges to `main`. For
+the release you upgrade to, read the same pages at that release's tag, for example
+`https://github.com/gke-labs/kube-agents/tree/<RELEASE_VERSION>/docs/site/src/content/docs/install/upgrade.md`.
+If this site and the page at the tag do not agree, the page at the tag describes the release. On
+GitHub, the links between pages do not work: open each linked page at the same tag.
+
 ## Before you start
 
 A GitLab install needs nothing extra for an upgrade: no token and no flag. See
@@ -205,6 +211,49 @@ cp /path/to/your/install/install.env .
 ./upgrade.sh --non-interactive --gcp-project-id="my-gcp-project"
 ```
 
+## Moving across more than one release
+
+`upgrade.sh` does not check which release the install runs now. A full run applies the target
+release's CRDs, chart and Terraform composition to the install as it is. An operator run applies
+the CRDs and the chart, and a harness run applies only the chart.
+
+- No step depends on the release that the install came from. The Secret backfills add only the
+  keys that are missing. The checks that can refuse a run read the target chart and the live
+  install.
+- Every release serves one version of each CRD, `v1alpha1`, so no CRD conversion is necessary.
+- The composition's only `moved` block, in the `gke-cluster` module, is in every release since
+  0.1.0. The composition has no `removed` blocks.
+- Some retired inputs still work for a time, with a warning, for example `GITHUB_REPO` and
+  `TF_VAR_agent_service_account_id`. If a run prints such a warning, change `install.env` before
+  the next upgrade. A later release can remove them.
+
+The release pipeline moves the newest release to the candidate in the operator and harness modes.
+Staging does a full upgrade between consecutive candidates. No CI job moves an install across
+several releases, and no policy says whether such a move is supported.
+
+Before a move across several releases:
+
+1. Read the release notes of each release in between, and the breaking changes below.
+2. Use `--upgrade-mode=full`, so that the CRDs, the chart and the Terraform composition all move.
+3. Run `--plan` with the target release's `upgrade.sh`, and read the whole plan. `--plan` compares
+   the target composition with the install's Terraform state. It does not know which releases you
+   skipped.
+4. Run the upgrade.
+
+### Breaking changes in recent releases
+
+The release notes list pull request titles only. A `!` before the colon marks a breaking change.
+0.10.0 and 0.11.0 have none.
+
+| Release | Change                                                      | What an existing install meets                                                                                                                                                                                                                                                                                                                                       |
+| ------- | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0.9.0   | #2264: the drift detector is on by default                  | If `install.env` does not set `ENABLE_DRIFT_DETECTOR`, a full upgrade creates a Log Router sink, a Pub/Sub topic and a subscription, and starts the detector. To keep it off, write `ENABLE_DRIFT_DETECTOR=false`. In a project where another install has the drift resources, the upgrade stops until you write that line or set the `TF_VAR_drift_pubsub_*` names. |
+| 0.9.0   | #2350: the scoped service account pool is keyed per project | The upgrade turns off a pool armed under the old per-cluster field. See [the scoped service account pool](/kube-agents/reference/security-and-iam/#the-scoped-service-account-pool).                                                                                                                                                                                 |
+| 0.8.0   | #2065: the `litellm` Service is renamed `inference-gateway` | Model calls can fail for a short time during the upgrade. See the chart README's [upgrade note](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#upgrade-notes-inference-gateway-service-rename).                                                                                                                                      |
+| 0.8.0   | #2070: forges and repositories in `spec.integration`        | The operator refuses some repository spellings that worked before. See the upgrade notes under [`spec.integration`](/kube-agents/operator/platformagent-crd/#specintegration).                                                                                                                                                                                       |
+| 0.8.0   | #2010, #2042: the A2A bus reserves more consumers           | `spec.mode: next` only. If 0.7.0 or earlier created the TASKS stream, the provision Job can stop the upgrade. Do what its message says.                                                                                                                                                                                                                              |
+| 0.8.0   | #1756: the upgrade follows the release-pinned contract      | The upgrade refuses an install with only `k8s-operator/scripts/vars.sh`. See [When an upgrade is refused](#when-an-upgrade-is-refused).                                                                                                                                                                                                                              |
+
 ## Upgrade modes
 
 - `--upgrade-mode=harness` re-tags the Platform Agent image, the sandbox image it reaches over
@@ -381,6 +430,42 @@ skips those — but still before any CRD, chart or Terraform change of the new r
   was set up by a release that did not record them in `install.env`. The run prints the lines to
   set, with the live values filled in where it can read them; set them and re-run the same command. To remove GitOps on purpose, re-run with `KUBE_AGENTS_REMOVE_GITOPS=true` in the
   environment. `--plan` warns instead.
+
+## What stops during an upgrade
+
+This section describes `spec.mode: today`, the default.
+
+At the default of one replica, the agent gateway and the credential broker each run one pod with
+the `Recreate` strategy. Kubernetes stops the old pod before it starts the new one, so chat stops
+until the new pods are ready. The operator and LiteLLM keep serving. The operator starts its new
+pod first, and LiteLLM runs two replicas and keeps one serving.
+
+| Mode       | What restarts                                                                                                                                                                                                         |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `operator` | The operator. The agent gateway also restarts if the run added keys to `platform-agent-secrets`. The agent gateway, the credential broker and the shell sandbox restart if the new operator renders them differently. |
+| `harness`  | The agent gateway, the credential broker, whose image tag follows the agent's, and the shell sandbox.                                                                                                                 |
+| `full`     | The workloads of both other modes, and each object that a changed setting touches.                                                                                                                                    |
+
+In each mode, a chart workload such as LiteLLM also restarts if the target release's chart changed
+it. In CI runs, a harness upgrade made the agent unavailable for 41 seconds to about 3 minutes. A
+full upgrade on staging took about 8 minutes. These are examples, not limits. In the harness and full modes, and in an
+operator run that added Secret keys, the script waits up to 25 minutes for the agent gateway. That
+allows for a cold image pull. An operator run that re-renders the gateway does not wait for it, so
+the script can end before chat is back.
+
+During the restart:
+
+- **Slack.** The broker confirms each Slack event to Slack when it arrives, and keeps it in memory
+  until the agent takes it. If the broker restarts, the events it holds are lost. If only the agent
+  restarts, the broker gives its events to the new agent. The sender must send an event again in
+  two cases: the old agent took it but did not finish it, or it arrived up to 20 seconds after
+  the old agent stopped.
+- **Google Chat.** A message stays in the Pub/Sub subscription until the agent confirms it. If the
+  agent took a message but did not confirm it, Pub/Sub delivers it again after 60 seconds.
+- **Board cards.** The board is on the agent's volume, so the cards stay. A card that was running
+  usually goes back to `ready` soon after the new pod starts, and runs again from the start. This
+  does not count against the card's retries. If the old worker's process ID is in use in the new
+  pod, the card waits until its claim times out.
 
 ## Where to go next
 

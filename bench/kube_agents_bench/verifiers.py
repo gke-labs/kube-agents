@@ -2751,8 +2751,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     ledger that enumerated the fleet and found nothing. Against the ids it
     passes only when a finding was actually FILED against that cluster.
 
-    A FALSE CLEAN IS NAMED AS ONE. A clean run closes the ledger without
-    rewriting its body, so a ledger the audit retired during this run still
+    A FALSE CLEAN IS NAMED AS ONE. A clean run closes the ledger and only puts
+    a banner above its body, keeping the footer, so a ledger the audit retired during this run still
     carries the previous run's stamp and would read, above, as "a previous
     run's ledger, so this run published nothing" — the one thing that run had
     not done. When the issue is ``closed`` and its ``closed_at`` falls inside

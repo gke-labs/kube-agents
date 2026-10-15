@@ -52,10 +52,19 @@ A [`controller-stall` inject](#the-third-producer-controller-stall) claims no al
 | `Critical`    | `ALERT_DAILY_LIMIT_CRITICAL` | `10`    |
 | `Warning`     | `ALERT_DAILY_LIMIT_WARNING`  | `5`     |
 | `Info`        | `ALERT_DAILY_LIMIT_INFO`     | `5`     |
-| `GitOpsDrift` | `ALERT_DAILY_LIMIT_DRIFT`    | `5`     |
+| `GitOpsDrift` | `ALERT_DAILY_LIMIT_DRIFT`    | `20`    |
 
 Three of the four are severities and the fourth is not; `GitOpsDrift` is what drift records bill,
 whatever they display as.
+
+The `GitOpsDrift` default of 20 is a judgment, not a measurement. One apply spends one inject for
+each object, because the detector does not combine records. `install.sh` and `upgrade.sh` enable the
+detector by default, so this value applies to the installs that these scripts manage. Only changes by
+people alert, so 20 covers a few hand applies a day. A record that the detector cannot join to a live
+object still sends a card with less detail, unless its cluster is outside the install's scope. That
+card spends the same budget. Each admitted record starts a triage turn. The detector also reads the
+audit logs of each scoped project, so a wider scope sends more records. These are the reasons not to
+go higher.
 
 `Info` events do arrive — nothing on the path from the kubelet to `inject_message` filters on `Event.Type`, and `BackOff` is on the watcher's default reason list emitted as `type: Normal` for image-pull back-off — but none of them ever bills this bucket, because the [severity gate](#severity-gate) drops every `Info` event before the claim. The `Info` row is kept regardless: deleting it would turn the entry into a `.get(severity, 0)` miss, and `_claim_alert_quota` treats that miss exactly as it treats a limit of `0` — allowed through, uncapped. Narrowing that gate afterwards would therefore send an unbounded `Info` stream to chat rather than restore a ceiling. Setting a limit to `0` turns that severity's cap off entirely, by the same branch.
 
