@@ -25,14 +25,25 @@ Four steps, and they do not depend on what kind of object changed. Step 3 is whe
 
 **1. Establish what the revert would actually put back.** Not the one field the card names — the whole declared state as it would land. Two fields are often taken together (a `runAsNonRoot` and the `runAsUser` beside it), and a revert that restores one without the other produces a third state nobody has ever run.
 
-**You have no GitOps repository to read, and you are not meant to find one.** You hold a read-only view of one cluster and nothing else — no checkout, no clone, no forge access. Do not go looking: the declared state is reconstructed from the cluster, out of the field managers on the live object and the pod templates on retired revisions. Read `managedFields` to see which fields the out-of-band manager took and which the GitOps manager still owns:
+**You have no GitOps repository to read, and you are not meant to find one.** You hold a read-only view of one cluster — no checkout, no clone, no forge access. Do not go looking for one.
+
+**Read `managedFields` for ownership, and know what it cannot give you.** It records which paths each manager owns and never the value they held, so it tells you which fields the out-of-band manager took and which the GitOps manager still owns, and nothing about what the revert would restore:
 
 ```bash
 gcloud container clusters get-credentials <cluster_name> --region <cluster_location>
 kubectl get <kind> <name> -n <namespace> --show-managed-fields -o yaml
 ```
 
-Narrow that read when the object can hold a credential. A Secret, and a ConfigMap you have not checked, go through `-o jsonpath` for the fields you need or `--show-managed-fields -o jsonpath='{.metadata.managedFields}'` for ownership alone: your report is posted verbatim into a chat thread, and a dumped value is a leaked one.
+Narrow that read when the object can hold a credential. A Secret, and a ConfigMap you have not checked, go through `-o jsonpath` for the fields you need, or `-o jsonpath='{.metadata.managedFields}'` for ownership alone: your report is posted verbatim into a chat thread, and a dumped value is a leaked one.
+
+**Whether the declared value itself is readable depends on what changed:**
+
+| What changed | The declared value, from this cluster |
+| --- | --- |
+| A pod-template field | Readable. A retired ReplicaSet or ControllerRevision still carries the template. |
+| Anything outside the pod template — `spec.replicas`, a ConfigMap or Secret value, a NetworkPolicy, PDB, quota, RBAC binding, webhook | Not readable. No revision is cut for these, and `managedFields` gives the owner and the path, not the value. One possible exception: `kubectl.kubernetes.io/last-applied-configuration`, which a GitOps manager doing a client-side apply leaves on the object. A server-side apply writes none, and that is Argo CD's default — look for it, do not count on it. |
+
+**When the declared value is not readable, report that; do not guess it.** "What the revert would put back could not be read from this cluster — `managedFields` shows `<manager>` owns `<path>`, and no revision or annotation carries its value" is a complete answer to this step, and it does not stop the rest. The reader's decision is still revert-or-codify, and neither option needs the number: one restores whatever git declares, the other writes what is live. What you lose is the revert's *cost*, so name that as the gap rather than inventing a figure to fill it.
 
 **2. Ask whether the declared state has ever been observed running.** This is the question. It is answered either by a recorded failure (something tried it and it did not work) or by a derivation from the spec (it cannot work, and here is why). Both are good answers; a derivation does not expire and a recording is more persuasive, so take both when both are there.
 
@@ -46,10 +57,10 @@ Narrow that read when the object can hold a credential. A Secret, and a ConfigMa
 | --- | --- | --- |
 | A pod-template field (securityContext, capabilities, user) | A retired ReplicaSet still carrying the declared value; kubelet refusals on the pods it made (`container has runAsNonRoot and image will run as root`, surfacing as `CreateContainerConfigError`) | The container's own `command`, entrypoint and mounts: a process writing outside its volumes needs a uid that can write there |
 | Resource requests or limits | `lastState.terminated.reason: OOMKilled` on a current pod, restart counts, `OOMKilling` and `Evicted` events, the retired revision's limit value | The workload's steady-state usage against the declared limit (`kubectl top pod`), and the limit's headroom over its own requests |
-| Replica count | What the declared count did before the change — `FailedScheduling` if the cluster could not fit it, saturation or restarts if it could not carry the load | Whether an HPA owns the field (`kubectl get hpa -n <namespace>`); if one does, git declaring a replica count at all is the finding and neither revert nor codify is the answer. Otherwise the running pods' utilisation against the declared count |
+| Replica count | What the pods did before the change — `FailedScheduling` if the cluster could not fit the count, saturation or restarts if it could not carry the load | Whether an HPA owns the field (`kubectl get hpa -n <namespace>`); if one does, git declaring a replica count at all is the finding and neither revert nor codify is the answer. Otherwise the running pods' utilisation and whether the workload has headroom to lose replicas — the declared count itself is usually unreadable here, so reason about direction, not about a number |
 | A probe loosened, lengthened or removed | Restart counts and `Unhealthy` events from before the change; the retired revision's probe values | How long the container actually takes to serve its probe path, against the declared `initialDelaySeconds` and `failureThreshold` |
 | An image tag or digest | The retired revision running the declared image and what it did; `ImagePullBackOff`, `CrashLoopBackOff` with its exit code | Whether the declared tag still resolves at all |
-| A NetworkPolicy, PDB, quota or RBAC object changed or deleted | Consumer-side symptoms before the change: connection timeouts in a client's logs, `FailedCreate` on a controller, evictions blocked by the PDB | Which pods the object selected and what they talk to; a ResourceQuota's `status.used` against the `hard` git declares |
+| A NetworkPolicy, PDB, quota or RBAC object changed or deleted | Consumer-side symptoms before the change: connection timeouts in a client's logs, `FailedCreate` on a controller, evictions blocked by the PDB | Which pods the object selected and what they talk to; a ResourceQuota's `status.used` against the `hard` now live, which says how much room the current limit is giving |
 | A ConfigMap or Secret value | The consuming workload's restart and health history around the change timestamp | What the consumer does with the key — the declared value's effect is readable in the consumer's spec, not in the ConfigMap |
 | A webhook or admission config (`failurePolicy`, a rule removed) | Admission failures on unrelated objects before the change (`failed calling webhook`) | Whether the webhook's backing Service has ready endpoints; `failurePolicy: Fail` against a dead backend blocks every matching admission |
 
