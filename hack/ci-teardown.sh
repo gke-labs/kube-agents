@@ -78,15 +78,17 @@ readonly PROW_BOSKOS_DEFAULT_HOST="http://boskos.boskos.svc.cluster.local"
 # Step 0: how long to wait for a definitive answer from the heartbeat, and the
 # two answers that are one. A 200 proves the lease is still this run's; a 401
 # is ranch's OwnerNotMatch, the lease is not. Anything else (000 when the curl
-# times out, a 5xx while Boskos restarts) is asked again at the next beat. The
-# budget spans three beats at the daemon's 30 s cadence, so one or two blips
-# still reach an answer; without one, a Prow teardown refuses, because a wrong
-# proceed costs another run's install. A refusal is not free: at the ceiling
-# it leaves this run's objects for the next job's opening sweep, and on the
-# opening sweep itself (Boskos silent for the whole budget right after it
-# granted the lease) it leaves a killed predecessor's objects for the deploy,
-# which can fail on them; that run is then a retest.
-readonly LEASE_CHECK_WAIT_SECONDS="${CI_TEARDOWN_LEASE_CHECK_WAIT_SECONDS:-100}"
+# times out, a 5xx while Boskos restarts) is asked again at the next beat.
+# Without an answer a Prow teardown refuses, because a wrong proceed costs
+# another run's install. The budget outlasts the wrapper's own heartbeat
+# (`boskosctl heartbeat --period=30s --retries=8` exits after nine failed
+# beats in a row, about 270 s, and the wrapper then stops the job), so on the
+# opening sweep, where that heartbeat is running, Boskos either answers or the
+# job is stopped: the sweep never skips silently and leaves a killed
+# predecessor's objects for the deploy. At the ceiling the wrapper's heartbeat
+# is already stopped and a refusal leaves this run's objects for the next
+# job's opening sweep.
+readonly LEASE_CHECK_WAIT_SECONDS="${CI_TEARDOWN_LEASE_CHECK_WAIT_SECONDS:-330}"
 readonly BOSKOS_OWNED_HTTP="200"
 readonly BOSKOS_OWNER_MISMATCH_HTTP="401"
 
@@ -178,7 +180,7 @@ if [ "${LEASE_ANSWER}" = "${BOSKOS_OWNER_MISMATCH_HTTP}" ]; then
   exit 0
 fi
 if [ -z "${LEASE_ANSWER}" ]; then
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Teardown skipped: Boskos gave no definitive answer on ${PROJECT_ID} within ${LEASE_CHECK_WAIT_SECONDS}s (beats: ${LEASE_CODES_SEEN:-none}); refusing rather than risk removing another run's install; what is left here waits for the next opening sweep, and a deploy that fails on it is a retest (#3129) ==="
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Teardown skipped: Boskos gave no definitive answer on ${PROJECT_ID} within ${LEASE_CHECK_WAIT_SECONDS}s (beats: ${LEASE_CODES_SEEN:-none}); refusing rather than risk removing another run's install; what is left here waits for the next opening sweep (#3129) ==="
   exit 0
 fi
 

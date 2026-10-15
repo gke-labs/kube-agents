@@ -273,6 +273,18 @@ class CiTeardownStatusTest(unittest.TestCase):
         self.assertNotIn("Step 1: Uninstalling", result.stdout)
         self.assertNotIn("helm uninstall", self._calls())
 
+    def test_the_lease_check_outlasts_the_wrappers_heartbeat(self):
+        # On the opening sweep the wrapper's `boskosctl heartbeat` is running
+        # and stops the job after nine failed beats in a row; Step 0 must wait
+        # longer than that, so a silent Boskos ends in an answer or a stopped
+        # job, never in a skipped sweep the deploy then trips over.
+        import re
+
+        text = TEARDOWN.read_text(encoding="utf-8")
+        default = int(re.search(r'LEASE_CHECK_WAIT_SECONDS:-(\d+)\}', text).group(1))
+        wrapper_period_seconds, wrapper_retries = 30, 8
+        self.assertGreater(default, (wrapper_retries + 1) * wrapper_period_seconds)
+
     def test_a_200_on_the_first_beat_runs_the_cluster_steps(self):
         _FakeBoskos.owner = "pull-kube-agents-smoke-test-2110452492650156032"
         result = self._run(
