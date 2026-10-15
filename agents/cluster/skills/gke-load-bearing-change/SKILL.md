@@ -41,9 +41,16 @@ Narrow that read when the object can hold a credential. A Secret, and a ConfigMa
 | What changed | The declared value, from this cluster |
 | --- | --- |
 | A pod-template field | Readable. A retired ReplicaSet or ControllerRevision still carries the template. |
-| Anything outside the pod template — `spec.replicas`, a ConfigMap or Secret value, a NetworkPolicy, PDB, quota, RBAC binding, webhook | Not readable. No revision is cut for these, and `managedFields` gives the owner and the path, not the value. One possible exception: `kubectl.kubernetes.io/last-applied-configuration`, which a GitOps manager doing a client-side apply leaves on the object. A server-side apply writes none, and that is Argo CD's default — look for it, do not count on it. |
+| Anything outside the pod template — `spec.replicas`, a ConfigMap or Secret value, a NetworkPolicy, PDB, quota, RBAC binding, webhook | Usually readable, from `kubectl.kubernetes.io/last-applied-configuration`. No revision is cut for these and `managedFields` gives the owner and the path rather than the value, but a GitOps manager doing a **client-side** apply writes the whole declared object into that annotation — and client-side is Argo CD's default sync, so this is the common case. A **server-side** apply writes no annotation: that is Flux's kustomize-controller, and Argo CD only with the `ServerSideApply=true` sync option. Check before concluding it is unreadable. |
 
-**When the declared value is not readable, report that; do not guess it.** "What the revert would put back could not be read from this cluster — `managedFields` shows `<manager>` owns `<path>`, and no revision or annotation carries its value" is a complete answer to this step, and it does not stop the rest. The reader's decision is still revert-or-codify, and neither option needs the number: one restores whatever git declares, the other writes what is live. What you lose is the revert's *cost*, so name that as the gap rather than inventing a figure to fill it.
+**The card tells you which apply mode you are in.** Its ownership block renders each manager with an `operation` qualifier: `Apply` is a server-side apply, `Update` is everything else — client-side `kubectl apply` included. A GitOps manager shown as `Update` wrote the annotation; read it before concluding anything:
+
+```bash
+kubectl get <kind> <name> -n <namespace> \
+  -o jsonpath='{.metadata.annotations.kubectl\.kubernetes\.io/last-applied-configuration}'
+```
+
+**Only when it is genuinely not readable, report that; do not guess it.** "What the revert would put back could not be read from this cluster — `managedFields` shows `<manager>` owns `<path>`, no revision carries the value and there is no `last-applied-configuration`" is a complete answer to this step, and it does not stop the rest. Reach it by having looked, not by assuming. The reader's decision is still revert-or-codify, and neither option needs the number: one restores whatever git declares, the other writes what is live. What you lose is the revert's *cost*, so name that as the gap rather than inventing a figure to fill it.
 
 **2. Ask whether the declared state has ever been observed running.** This is the question. It is answered either by a recorded failure (something tried it and it did not work) or by a derivation from the spec (it cannot work, and here is why). Both are good answers; a derivation does not expire and a recording is more persuasive, so take both when both are there.
 
