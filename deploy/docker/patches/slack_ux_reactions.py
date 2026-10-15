@@ -28,7 +28,9 @@ With the flag on:
   failed with ❌. A cancelled turn has its arrival reaction taken off and
   nothing added. There is no ✅.
 * ⏸️ stands while one of the ask's cards waits on the user, and comes off when
-  the card is unblocked or finishes.
+  the card is unblocked or finishes. A card blocked on Hermes's hard-wall kind,
+  ``capability`` (a target that does not exist), waits on no one: the notifier
+  hands it over as a give-up, so it settles the ask with ❌.
 * Slack's ``reactions.remove`` removes only the caller's own reaction, so a
   reaction someone else put on the ask is never touched. A removal that fails
   or is refused leaves the reaction on and is logged; the answer still posts.
@@ -96,17 +98,26 @@ PLATFORM = "slack"
 #: the notifier names none.
 DEFAULT_BOARD = "default"
 
+#: ``kanban_progress_lines.HARD_WALL_BLOCK_KIND`` and ``GAVE_UP_KIND``: a card
+#: whose latest stop is either is parked, as :data:`OPEN_CARDS_SQL` reads it.
+HARD_WALL_BLOCK_KIND = "capability"
+GAVE_UP_KIND = "gave_up"
+
 #: Cards subscribed to one Slack thread that have not reached a final status,
 #: with that status and the card whose worker created it, if one did: Hermes
 #: copies the creator's subscriptions onto the new card, and whether it sits
-#: parked by a give-up: still ``blocked``, with a ``gave_up`` as its latest stop.
-#: An unblock, or any move off ``blocked``, revives it, so either clears that.
+#: parked by a give-up: still ``blocked``, with a ``gave_up`` as its latest
+#: stop, or a block of Hermes's hard-wall kind ``capability``, which settles as
+#: one (``kanban_progress_lines.settles_as``). An unblock, or any move off
+#: ``blocked``, revives it, so either clears that.
 OPEN_CARDS_SQL = (
     "SELECT s.task_id, t.status, "
     "(SELECT json_extract(e.payload, '$.creator_task_id') FROM task_events e "
     "WHERE e.task_id = s.task_id AND e.kind = 'created'), "
-    "t.status = 'blocked' AND (SELECT e.kind FROM task_events e WHERE e.task_id = s.task_id "
-    "AND e.kind IN ('blocked', 'unblocked', 'gave_up') ORDER BY e.id DESC LIMIT 1) = 'gave_up' "
+    "t.status = 'blocked' AND COALESCE((SELECT CASE e.kind WHEN 'blocked' "
+    "THEN json_extract(e.payload, '$.kind') ELSE e.kind END FROM task_events e WHERE e.task_id = s.task_id "
+    "AND e.kind IN ('blocked', 'unblocked', 'gave_up') ORDER BY e.id DESC LIMIT 1), '') "
+    "IN ('" + GAVE_UP_KIND + "', '" + HARD_WALL_BLOCK_KIND + "') "
     "FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
     "WHERE lower(s.platform) = ? AND s.chat_id = ? AND COALESCE(s.thread_id, '') = ? "
     "AND t.status NOT IN ('done', 'archived')"
@@ -177,8 +188,8 @@ class _Card(NamedTuple):
     #: The id of the card on its board whose worker created it, or None when
     #: a chat turn or the CLI did.
     creator: str | None = None
-    #: Whether its latest stop was a give-up rather than a block on the user:
-    #: Hermes parks a card that gave up at ``blocked`` too, waiting for a human.
+    #: Whether its latest stop was a give-up or a hard-wall block rather than a
+    #: block on the user: Hermes parks either at ``blocked``, waiting for a human.
     gave_up: bool = False
 
 
@@ -548,9 +559,9 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
     follow-up still open waits for that follow-up's completion, as it would
     have had the follow-up been on the board at the turn's end. One
     blocked on the user is kept and puts ⏸️ on the ask. One parked by a give-up
-    is not, nor is anything created under it, and it leaves the ask settled
+    or a hard-wall block is not, nor is anything created under it, and it leaves the ask settled
     without ❌ for the work it did: being subscribed to this thread, the follow-up has posted its
-    own "gave up" line in it, which is the failure. A
+    own "gave up" line in it, or the Planning Agent's reply to its block, which is the failure. A
     give-up holds on nothing more: the card is parked, so a follow-up it gates
     cannot start, and the ask is ❌ whatever the rest do. A failed read settles
     as though there were none. A card filed under this one after its

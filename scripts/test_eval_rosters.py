@@ -171,6 +171,7 @@ ADDED_AFTER_THE_MOVE = [
     "findings-decision-covers-item",  # the findings queue's item-wide decision
     "upgrades-fleet-readiness-failclosed-webhook",  # the readiness report's fail-closed webhook source
     "upgrades-freeze-runbook-probe",  # the gke-upgrades skill sync
+    "fleet-audit-clean-close-reads-clean",  # the clean close's banner, with close_ledger_reads_clean
     "session-crashloop-question-loads-a-skill",  # the session persona's skills, #2858
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
@@ -179,6 +180,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-question-asked-to-choose-pauses",  # an asked-for choice pauses the card on a needs_input question
     "manage-cluster-exclusion-installer-route-probe",  # the exclusion route on an installer-made install
     "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
+    "not-found-target-stops-as-failure",  # a missing target stops its card on a hard wall, mock 06
     "delete-namespace-unowned-stops",  # a delete the repository cannot carry ends in a stated stop, #3077
 ]
 # Taken back out of the nightly file after registering there, each with a

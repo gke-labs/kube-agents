@@ -85,6 +85,29 @@ class TestSessionKvServerUtils(unittest.TestCase):
         # Non-pod resource names should not be modified
         self.assertEqual(clean_workload_name("service", "billing-processor-service"), "billing-processor-service")
 
+    def test_clean_workload_name_gives_the_workloads_the_recap_counts(self):
+        """The recap counts withheld alerts per cleaned workload name.
+
+        The design doc says which names fold into one workload. If the
+        cleaner changes, change these cases and the doc together. SOP: "What
+        this recap does not report".
+        """
+        # Pods from two runs of one CronJob fold into one workload.
+        self.assertEqual(clean_workload_name("Pod", "backup-29340180-x7k2p"), "backup")
+        self.assertEqual(clean_workload_name("Pod", "backup-29340240-q9zzm"), "backup")
+        # Each Job keeps the run minute, so it is not the same workload as its pod.
+        self.assertEqual(clean_workload_name("Job", "backup-29340180"), "backup-29340180")
+        # Each StatefulSet pod keeps its ordinal.
+        self.assertEqual(clean_workload_name("Pod", "db-0"), "db-0")
+        self.assertEqual(clean_workload_name("Pod", "db-1"), "db-1")
+        # A Pod name that ends in five lowercase letters or digits loses that
+        # segment. DaemonSet pods fold, and so does a word of five letters.
+        self.assertEqual(clean_workload_name("Pod", "fluentd-x7k2p"), "fluentd")
+        self.assertEqual(clean_workload_name("Pod", "ingest-batch"), "ingest")
+        self.assertEqual(clean_workload_name("Pod", "ingest-queue"), "ingest")
+        # Only Pod names change.
+        self.assertEqual(clean_workload_name("Deployment", "ingest-batch"), "ingest-batch")
+
     def test_clean_reason_label_camel_case(self):
         self.assertEqual(clean_reason_label("FailedToDrainNode"), "Failed to drain node")
         self.assertEqual(clean_reason_label("PodEviction"), "Pod eviction")
@@ -1876,6 +1899,15 @@ class TestAlertDailyQuota(unittest.TestCase):
             # Garbage must not silently disable the cap or block everything.
             self.assertEqual(parse("X_LIMIT", 10), 10)
 
+    def test_drift_ceiling_default_is_twenty(self):
+        # This test pins the literal, not the constant. A change to the value
+        # then needs a change to this test.
+        self.assertEqual(
+            os.environ.get("ALERT_DAILY_LIMIT_DRIFT", ""), "",
+            "ALERT_DAILY_LIMIT_DRIFT is set, so the module did not read the default",
+        )
+        self.assertEqual(session_kv_server.ALERT_DAILY_LIMITS[session_kv_server.DRIFT_QUOTA_KEY], 20)
+
     def test_zero_limit_never_suppresses(self):
         with patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Warning": 0}):
             for _ in range(20):
@@ -3591,7 +3623,8 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertTrue(calls[0].args[1].startswith("**Security & RBAC posture audit: 2 new"))
 
     def test_flag_on_a_closed_ledger_falls_back_to_the_line(self):
-        # A clean run closes the ledger without rewriting its title.
+        # A clean run closes the ledger; the body below its new title still
+        # lists the last run's findings, so the state decides the card.
         os.environ["KAGE_SLACK_UX"] = "1"
         _, calls = self._post(composed=self.ONE_LINE, issue=dict(self.ISSUE, state="closed"))
         self.assertTrue(calls[0].args[1].startswith("**Security & RBAC posture audit: 2 new"))

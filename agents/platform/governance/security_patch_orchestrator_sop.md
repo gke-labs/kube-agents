@@ -13,7 +13,7 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit security-patch-orchestrator [--repo "<owner>/<repo>"]
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit security-patch-orchestrator [--repo "<owner>/<repo>"]
 ```
 
 If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
@@ -98,7 +98,7 @@ A GKE cluster name is unique only inside one project and location, so the collec
 **Run the collector before evaluating any check below by hand.**
 
 ```bash
-python3 ./skills/fleet-audit/scripts/patch_readiness.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> > /opt/data/scratch/manifest_security-patch-orchestrator.json
+python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/patch_readiness.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> > /opt/data/scratch/manifest_security-patch-orchestrator.json
 ```
 
 It reads the whole fleet and, for each cluster found behind, runs the readiness reporter over
@@ -384,7 +384,7 @@ Worked example, for a 3.5 finding on node pool `batch-a`:
 ### 6. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit security-patch-orchestrator \
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit security-patch-orchestrator \
   --findings-file /opt/data/scratch/findings_security-patch-orchestrator.json \
   --manifest-file /opt/data/scratch/manifest_security-patch-orchestrator.json \
   [--repo "<owner>/<repo>"]
@@ -392,15 +392,15 @@ Worked example, for a 3.5 finding on node pool `batch-a`:
 
 Pass `--manifest-file`: it is what lets `finish` check the document against what the collector actually ran. Given a manifest, `finish` rejects a `checks_run` entry on a `"collected"` cluster that names a check the manifest never ran for it, rejects a `"collected"` cluster the document leaves out of `scope.clusters` altogether, rejects a `"gate-failed"` target the document is silent about, and takes each finding's `evidence` from the matching candidate. On a run where §3's collector produced no manifest — every check on every cluster came from the commands below each heading — pass `--no-collector-manifest "<why>"` in its place; that publishes, but reports the reason as a coverage gap, so the run is partial.
 
-One JSON line comes back with `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, `declared` (how many postures §4a kept off the ledger) and `postures_withheld` (the ids of the six §4a checks' findings `finish` held back because the document recorded no complete §4a search). Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. The exception is a `BROKER UNAVAILABLE` line: the document was fine and the broker went away, possibly after the ledger was already rewritten, so do not report that nothing was published; re-run `finish` once the broker answers (`skills/fleet-audit/SKILL.md`, step 3). Exit 1 is fatal. Exit 0 means it published.
+One JSON line comes back with `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, `silent_ok`, `declared` (how many postures §4a kept off the ledger) and `postures_withheld` (the ids of the six §4a checks' findings `finish` held back because the document recorded no complete §4a search). Exit 2 means the validator rejected the document and nothing was published — fix the document, do not retry blind. The exception is a `BROKER UNAVAILABLE` line: the document was fine and the broker went away, possibly after the ledger was already rewritten, so do not report that nothing was published; re-run `finish` once the broker answers (`/opt/data/profiles/platform/skills/fleet-audit/SKILL.md`, step 3). Exit 1 is fatal. Exit 0 means it published.
 
 **`partial` is the coverage flag.** It is `true` when any cluster landed in `scope.skipped`, any audited cluster carries a `limitations` note, or a §4a search the document does not record in full held the six checks' findings back, and `coverage_gaps` lists those gaps as readable sentences. An upgrade audit that could not reach a cluster has no idea whether that cluster's node pools are still behind, so the harness will not let the run act as if it does: `resolved` is forced to `0` with no resolved-delta posted, no remediation PR is closed as stale, and even a findings-free run keeps the ledger open — `status: "CLEAN"`, but the issue stays and gains a comment naming the gaps. A check declared in `checks_not_applicable` is not a gap and does not raise the flag: it left the denominator. This audit declares one: 3.11's `upgrade-blocked`, in the two cases its _Not applicable_ bullet names, copied from the manifest (§1 point 3). It is a coverage flag and nothing more: `true` if and only if `coverage_gaps` is non-empty. The step 5 size budget does not raise it, because a description that could not carry every finding still counted them all in the title and names in the body what it dropped.
 
-**`silent_ok` decides silence. Do not re-derive it.** `finish` returns `silent_ok: true` only when this run moved nothing an operator needs to hear about: nothing new, nothing resolved, no coverage gap, no remediation PR opened or closed. Read the flag rather than reassembling that from `status`, `new`, `resolved`, and `partial` yourself — that arithmetic is where a run talks itself into silence it has not earned. Two rules, and they are the whole rule:
+**`silent_ok` decides silence. Do not re-derive it.** `finish` returns `silent_ok: true` only when this run moved nothing an operator needs to hear about: nothing new, nothing resolved, no new or changed coverage gap, no remediation PR opened or closed. Read the flag rather than reassembling that from `status`, `new`, `resolved`, and `partial` yourself — that arithmetic is where a run talks itself into silence it has not earned. Two rules, and they are the whole rule:
 
 - On a **scheduled** run, `silent_ok: true` → your final response is **exactly** `[SILENT]`. Otherwise report, and every report carries `issue_url` in full, except a `NO_FORGE` run, which has none (below).
 - **An on-demand run is never silent.** If a person dispatched this job — from a kanban card or straight from chat — someone is waiting on the answer, and `[SILENT]` throws it away. Report the outcome and the ledger URL whatever `silent_ok` says.
-- `status == "NO_FORGE"` → no forge is configured, so there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's ["No forge configured"](../skills/fleet-audit/SKILL.md#no-forge-configured)).
+- `status == "NO_FORGE"` → no forge is configured, so there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's "No forge configured" section, `/opt/data/profiles/platform/skills/fleet-audit/SKILL.md`).
 
 What to report in each case:
 
