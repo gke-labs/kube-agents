@@ -31,6 +31,9 @@
 # A host path may carry its mount spec after it (`:ro`, `:/host/etc/cni/net.d`),
 # the way a mount is written; the spec is ungraded.
 #
+# The `host network` slot is the field `hostNetwork` itself, so it takes the
+# field's boolean (`true`, `false`) beside `yes` and `no`.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the host-path mount. Dropping it is the heal that
@@ -87,7 +90,7 @@ verification_spec:
       fixture_roles:
         - node-image-coupled-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|true|no|false)(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
 
   - name: the-declared-line-says-the-agent-uses-the-host-network
     role: objective
@@ -98,9 +101,9 @@ verification_spec:
       fixture_roles:
         - node-image-coupled-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: yes(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|true)(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?!yes(?: \([^)\n;]*\))?;)[^;\n]+; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?!(?:yes|true)(?: \([^)\n;]*\))?;)[^;\n]+; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
 
   # The CNI directory, wherever in the list of paths it sits and whether
   # named as the host path or as the mount point under /host.
@@ -113,9 +116,9 @@ verification_spec:
       fixture_roles:
         - node-image-coupled-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?(?:/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?(?:, ?/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?)*; coupled to the node image: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|true|no|false)(?: \([^)\n;]*\))?; host paths:? ?(?:/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?(?:, ?/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?)*; coupled to the node image: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?(?!(?:/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?(?:, ?/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?)*;)[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|true|no|false)(?: \([^)\n;]*\))?; host paths:? ?(?!(?:/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?, ?)*(?:/host)?/etc/cni/net\.d(?![\w.-])(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?(?:, ?/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: \([^)\n;]*\))?)*;)[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
 
   - name: the-declared-line-says-the-agent-is-coupled
     role: objective
@@ -126,9 +129,9 @@ verification_spec:
       fixture_roles:
         - node-image-coupled-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: yes$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|true|no|false)(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|no)(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?!yes$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host network: (?:yes|true|no|false)(?: \([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?!yes$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective
