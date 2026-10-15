@@ -188,6 +188,9 @@ FOLD_ANCESTOR_DEPTH = 8
 HARD_WALL_BLOCK_KIND = "capability"
 #: The kind a hard-wall block settles as.
 GAVE_UP_KIND = "gave_up"
+#: The most of a hard-wall block's reason its line carries, as
+#: ``slack_ux_moments.needs_you`` clips a question's.
+HARD_WALL_REASON_LIMIT = 2000
 
 #: A card parked by a give-up: still ``blocked``, with a ``gave_up`` or a
 #: hard-wall block as its latest stop, as ``slack_ux_reactions.OPEN_CARDS_SQL``
@@ -828,7 +831,7 @@ def _chat_notify() -> Any:
 
 
 def _with_answer(adapter: Any, quiet: Any, kind: str, message: str, metadata: Optional[dict]) -> Optional[dict]:
-    """``metadata`` with a completed card's report laid out as an answer, for the chat.notify stand-in.
+    """``metadata`` with a completed card's report, or a hard-wall block's reason, laid out as an answer, for the chat.notify stand-in.
 
     Under ``spec.mode: next`` the gateway lays the report out from a
     ``kube-agents.chat/v1`` answer (``chat_message.answer_message``). Only with
@@ -860,7 +863,7 @@ def hard_wall_line(payload: object, message: str) -> str:
     the worker's sentence saying what it could not find or do.
     """
     reason = payload.get("reason") if isinstance(payload, dict) else None
-    return str(reason).strip() if isinstance(reason, str) and reason.strip() else message
+    return clip_handoff(reason, HARD_WALL_REASON_LIMIT) if isinstance(reason, str) and reason.strip() else message
 
 
 def _wake_reply_lost(adapter: Any) -> bool:
@@ -869,7 +872,9 @@ def _wake_reply_lost(adapter: Any) -> bool:
     Under ``spec.mode: next`` a conversation card's wake is self-posted into
     the bridge's session and its reply goes nowhere
     (``kanban_chat_notify.ConversationNotifyAdapter``), so a line held for it
-    would never be told.
+    would never be told. Only a hard-wall block is posted instead (see
+    :func:`deliver`): a give-up or crash on such a card is still held and
+    dropped, a gap this module leaves to the next-mode wake work.
     """
     notify = _chat_notify()
     stand_in = getattr(notify, "ConversationNotifyAdapter", None) if notify is not None else None
@@ -976,7 +981,8 @@ async def deliver(
     ``None``, once the plan shows that row complete (:data:`FOLDED_KIND`).
     Every line it posts, holds or edits keeps
     the ``@assignee`` and drops the board tag and ``Kanban <id>``
-    (:func:`slack_line`). A card blocked on ``needs_input``
+    (:func:`slack_line`), except a hard-wall block's, which is the worker's
+    reason alone. A card blocked on ``needs_input``
     posts its question instead of the blocked line, once however often the
     notifier replays the event, and loses that question's buttons at its next
     event; a note or report saying a PR was opened is

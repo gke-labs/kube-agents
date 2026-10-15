@@ -1021,7 +1021,7 @@ class ChatNotifyAnswerTest(SlackQuietTerminalTest):
         self.assertEqual(adapter.metadata[-1]["kage_chat"],
                          {"schema": "kube-agents.chat/v1", "headline": "Both pods are up.", "detail": "Seeded-a runs two."})
 
-    async def test_an_actionable_report_and_a_failure_post_their_text_alone(self):
+    async def test_an_actionable_report_and_a_non_hard_wall_failure_post_their_text_alone(self):
         adapter = _ChatNotifyStandIn()
         with mock.patch.object(kanban_notifier, "actionable_report", return_value=True):
             await self._run(adapter, SLACK_SUB, "completed", "Down. Reply apply.")
