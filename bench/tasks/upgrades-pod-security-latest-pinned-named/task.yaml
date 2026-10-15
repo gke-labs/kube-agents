@@ -23,7 +23,8 @@
 # The two graded values are namespace labels' values, so each may carry its
 # key before it as the API prints it (`pod-security.kubernetes.io/enforce=baseline`,
 # or with a colon) or the bare `=`, and the level may be followed by the other
-# modes after a comma (`baseline, warn baseline`).
+# modes after a comma (`baseline, warn baseline`), and the version by the other
+# modes' versions (`latest, warn-version latest`).
 #
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
@@ -105,9 +106,9 @@ verification_spec:
       fixture_roles:
         - moving-admission-default
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?(?:pod-security\.kubernetes\.io/enforce-version)?(?:: ?|=)?latest(?: ?\([^)\n;]*\))?; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?(?:pod-security\.kubernetes\.io/enforce-version)?(?:: ?|=)?latest(?:, (?:warn|audit)-version(?:: ?|=| )(?:latest|v?\d+\.\d+))*(?: ?\([^)\n;]*\))?; rule set changes at the next minor: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?(?!(?:pod-security\.kubernetes\.io/enforce-version)?(?:: ?|=)?latest(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?(?!(?:pod-security\.kubernetes\.io/enforce-version)?(?:: ?|=)?latest(?:, (?:warn|audit)-version(?:: ?|=| )(?:latest|v?\d+\.\d+))*(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
 
   - name: the-declared-line-says-the-rule-set-moves
     role: objective
