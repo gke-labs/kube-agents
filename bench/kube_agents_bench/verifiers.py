@@ -935,6 +935,14 @@ def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
     return found
 
 
+def _args_withheld(entry: dict[str, Any]) -> bool:
+    """Whether the pod withheld this call's arguments, so a filter on them cannot decide it."""
+    args = entry.get("args")
+    if isinstance(args, dict) and set(args) == {"raw"}:
+        args = args["raw"]
+    return args == worker_trajectory.WITHHELD
+
+
 @VERIFIERS.register("tool_called")
 class ToolCalledVerifier(BaseVerifier):
     """Count trajectory entries whose tool name is in ``tool_names``.
@@ -1135,12 +1143,13 @@ class ToolCalledVerifier(BaseVerifier):
             and not (self.require_success and entry.get("status") == "error")
         ]
         if self.result is not None:
-            # Read before the arguments filter: a pod that withholds results
-            # withholds arguments too, so that filter would drop the very call
-            # whose result could not be read.
+            # A pod that withholds results withholds arguments too, so the
+            # arguments filter cannot rule out a withheld call; it still rules
+            # out an unread call whose readable arguments name something else.
             unread = [
                 entry for entry in named
-                if entry.get("result") is None or entry.get("result") == worker_trajectory.WITHHELD
+                if (entry.get("result") is None or entry.get("result") == worker_trajectory.WITHHELD)
+                and (_args_withheld(entry) or self._arguments_match(entry))
             ]
             if unread:
                 return VerificationResult(
