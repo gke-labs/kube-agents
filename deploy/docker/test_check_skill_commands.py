@@ -334,6 +334,13 @@ class TriageTest(unittest.TestCase):
         self.assertIn("('agents/platform/skills/demo/SKILL.md', 'gone')", err)
         self.assertNotIn("agents/cluster/skills", err)
 
+    def test_main_does_not_call_an_allowed_entry_that_may_pass_stale(self):
+        key = ("agents/platform/skills/demo/SKILL.md", "pip install x")
+        with mock.patch.object(check, "MAY_PASS", frozenset({key})):
+            code, _, err = self.run_main({key: (frozenset({"analysis_incomplete"}), "reason")}, verdict("allow"))
+        self.assertEqual(0, code)
+        self.assertEqual("", err)
+
     def test_main_fails_on_a_refused_block_and_reports_it(self):
         code, out, err = self.run_main({}, verdict("block", "r"))
         self.assertEqual(1, code)

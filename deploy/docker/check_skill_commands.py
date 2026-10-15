@@ -59,7 +59,9 @@ A finding that cannot be fixed in the skill text yet goes in
 whole block, so an edit anywhere in that block, or a rule a Tirith release adds
 to it, brings it back for review. An entry under a tree the run reads that no
 longer matches a refused block fails the check too, so the list cannot outlive
-what it excuses.
+what it excuses. ``MAY_PASS`` is the exception: an entry whose verdict depends
+on Tirith's online package lookup is never stale, because that lookup sometimes
+finishes in time and allows the block.
 
 A shell block whose raw text and parsed Markdown disagree, such as a fence left
 unclosed inside a list item, fails the check as well: its commands cannot be

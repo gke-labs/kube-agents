@@ -118,7 +118,7 @@ Reproducible and immutable: the skill ships inside the container.
    docker push my-registry/kube-agents/platform-agent:v1.1.0
    ```
 
-   The build fails if a shell command in the copied skill's `SKILL.md` is one the agent's command scanner would refuse, as in step 3 of [Adding a new skill](#adding-a-new-skill).
+   The build fails if a shell command in the copied skill's `SKILL.md` or `references/*.md` is one the agent's command scanner would refuse, as in step 3 of [Adding a new skill](#adding-a-new-skill).
 
 3. Point the `PlatformAgent` CR at the new image and apply it:
 
