@@ -5451,7 +5451,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
             credential_proxy.CommandExecutor
         )
         executor.execute_internal = lambda argv: self.fail("helper was run")
-        brokered = mock.Mock(credential=providers.BrokeredCredential("gitlab", None))
+        brokered = mock.Mock(credential=providers.BrokeredCredential("gitlab", None), hosts=("gitlab.com",))
         with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
                 mock.patch.object(credential_proxy, "_provider_forge", return_value=brokered):
             with self.assertRaises(RuntimeError) as raised:
@@ -6067,7 +6067,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
 
     def test_a_coalesced_refresh_reserves_nothing_and_never_waits(self):
         executor = self._budgeted_executor(admits=1)
-        executor._refresh_cache["github"] = (time.monotonic(), frozenset({"gke-agentic/infra"}))
+        executor._refresh_cache[("github", "github.com")] = (time.monotonic(), frozenset({"gke-agentic/infra"}))
         self._hold_the_budget(executor)
         held = executor.reserved_bytes
         started = time.monotonic()
@@ -6309,7 +6309,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
 
     def test_a_vcs_verb_with_a_current_cache_returns_without_the_lock(self):
         executor = self._budgeted_executor(admits=1)
-        executor._refresh_cache["github"] = (time.monotonic(), frozenset({"gke-agentic/infra"}))
+        executor._refresh_cache[("github", "github.com")] = (time.monotonic(), frozenset({"gke-agentic/infra"}))
         executor._refresh_lock.acquire()
         self.addCleanup(executor._refresh_lock.release)
         helper = mock.patch.object(executor, "_run_forge_helper", side_effect=AssertionError("ran the helper"))

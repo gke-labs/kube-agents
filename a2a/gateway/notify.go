@@ -81,10 +81,10 @@ const (
 	notifyConversationRefused = "not a live conversation with that context"
 	// notifyUpdateKeysMax is the spec's cap on a conversation's live update
 	// keys (spec-a2a-payloads.md, "Card work after the task ends"): past
-	// it the oldest key is forgotten, and a later request with it posts
-	// anew. notifyUpdateConversationsMax bounds the conversations the keys
-	// are kept for, oldest forgotten first, so the store is bounded however
-	// many conversations the agent works in.
+	// it the least recently used key is forgotten, and a later request with
+	// it posts anew. notifyUpdateConversationsMax bounds the conversations
+	// the keys are kept for, the least recently used forgotten first, so
+	// the store is bounded however many conversations the agent works in.
 	notifyUpdateKeysMax          = 16
 	notifyUpdateConversationsMax = 1024
 	// notifyUpdateKeyMax bounds an update key, which the sender picks.
@@ -163,6 +163,21 @@ type Notifier struct {
 	// counts nothing (a Notifier armed without the gateway's
 	// conversations).
 	metrics *Metrics
+	// marks carries conversation marks to their own worker (queueMark),
+	// started on the first one: drawing takes the conversation's session
+	// lock, which a turn or a relay batch can hold for a minute, and the
+	// route's one worker must not wait behind it. One worker, so a
+	// conversation's marks draw in the order their posts landed.
+	marks     chan notifyMarkJob
+	marksOnce sync.Once
+}
+
+// notifyMarkJob is one conversation mark waiting to be drawn.
+type notifyMarkJob struct {
+	conversation string
+	update       string
+	mark         MarkState
+	marker       notifyMarker
 }
 
 // NewGchatNotifier builds the Google Chat notifier. home is the configured
@@ -238,6 +253,10 @@ type notifyJob struct {
 	// deadline is when the requester stops waiting for the answer; zero
 	// when the request did not say.
 	deadline time.Time
+	// mark is the mark a conversation request's chat message carried, nil
+	// when it carried none; reply draws it once the request is answered
+	// with a post, and never for a request that posted nothing.
+	mark *MarkState
 }
 
 // reply answers the job. When the answer says nothing was posted and the
@@ -251,6 +270,33 @@ func (n *Notifier) reply(job notifyJob, r lib.NotifyReply) {
 			"text", firstLine(job.req.Text, notifyLostLineMax))
 	}
 	job.answer(r)
+	// After the answer, so the requester does not wait on the session lock,
+	// and only for a post that landed, so the ask's reaction comes off when
+	// the answer is in the thread and not when it failed to be.
+	if r.Error == "" && job.mark != nil {
+		if marker, ok := n.conv.(notifyMarker); ok {
+			n.queueMark(notifyMarkJob{conversation: job.req.Conversation, update: job.req.Update, mark: *job.mark, marker: marker})
+		}
+	}
+}
+
+// queueMark hands a mark to the mark worker without waiting. A full queue
+// drops it, logged: a mark is state, so the conversation's next one restores
+// it, and the route's worker never blocks on a session lock.
+func (n *Notifier) queueMark(job notifyMarkJob) {
+	n.marksOnce.Do(func() {
+		n.marks = make(chan notifyMarkJob, notifyQueueDepth)
+		go func() {
+			for j := range n.marks {
+				j.marker.MarkConversation(j.conversation, j.update, j.mark)
+			}
+		}()
+	})
+	select {
+	case n.marks <- job:
+	default:
+		n.log.Warn("notify: mark dropped; the mark queue is full", "conversation", job.conversation)
+	}
 }
 
 // firstLine is text's first line, cut to max runes.
@@ -434,7 +480,7 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 			return refuse("blocks carry a mention (" + why + "); the notify route posts no mentions, send them as text")
 		}
 		if kind := blocksInteractive(blocks); kind != "" {
-			return refuse("blocks carry an interactive element (type " + kind + "); the gateway answers no clicks, so strip it")
+			return refuse("blocks carry an interactive element (type " + kind + "); the gateway answers clicks only on the buttons it draws, so strip it")
 		}
 	}
 	return req, nil
@@ -516,6 +562,12 @@ func (n *Notifier) post(job notifyJob) {
 		n.postBlocks(job)
 		return
 	}
+	if job.req.Conversation != "" && len(job.req.Chat) > 0 {
+		// A bad mark drops alone (postConversation logs the rules broken).
+		if mark := chatmsg.ReadNotify(job.req.Text, job.req.Chat).Mark; mark != nil {
+			job.mark = &MarkState{Ask: mark.Ask, Settle: mark.Settle}
+		}
+	}
 	if job.req.Conversation != "" && (len(job.req.Chat) > 0 || job.req.Update != "") && n.postConversation(job) {
 		return
 	}
@@ -564,15 +616,16 @@ func (n *Notifier) post(job notifyJob) {
 // chunk, since an edit reaches one message only. An unkeyed request whose
 // chat message the adapter lays out is one message; otherwise it is not
 // answered here, and post sends its text in chunks as it always has. The
-// mark a chat message carries is not applied on this route yet.
+// mark a chat message carries is drawn on the ask of the chain its update
+// key is bound to once a post answers the request (reply, applyNotifyMark).
 func (n *Notifier) postConversation(job notifyJob) bool {
 	conversation := job.req.Conversation
 	reading := chatmsg.ReadNotify(job.req.Text, job.req.Chat)
 	if len(reading.Problems) > 0 {
 		n.metrics.chatMessage(chatInvalid)
+		what := "notify: " + chatDroppedWhat(chatmsg.Notify, reading)
 		for _, p := range reading.Problems {
-			n.log.Warn("notify: chat message dropped; its text fallback stands",
-				"conversation", conversation, "rule", truncateRunes(p.Error(), chatProblemMax))
+			n.log.Warn(what, "conversation", conversation, "rule", truncateRunes(p.Error(), chatProblemMax))
 		}
 	}
 	m := OutMessage{Text: job.req.Text, Chat: layoutOf(reading)}
@@ -788,9 +841,10 @@ func blocksMention(v any) string {
 }
 
 // notifyInteractiveTypes are the block and element types a click or an
-// entry arrives from. The gateway acks no interactive envelope, so a click
-// on one would time out for the user; validate refuses them rather than
-// trusting the sender to strip them.
+// entry arrives from. The gateway answers clicks only on the choice buttons
+// it draws itself from a chat message, so a click on one of these would do
+// nothing for the user; validate refuses them rather than trusting the
+// sender to strip them.
 var notifyInteractiveTypes = []string{
 	"actions", "input", "button", "overflow", "checkboxes", "radio_buttons",
 	"datepicker", "timepicker", "datetimepicker", "plain_text_input",
@@ -895,6 +949,39 @@ func (c gatewayConversations) PostMessage(conversation string, m OutMessage) (st
 
 func (c gatewayConversations) EditMessage(conversation, messageID string, m OutMessage) error {
 	return c.poster.EditMessage(conversation, messageID, m)
+}
+
+// notifyMarker is the optional half of NotifyConversations that draws the
+// mark a conversation notify carried; gatewayConversations implements it.
+type notifyMarker interface {
+	MarkConversation(conversation, update string, mark MarkState)
+}
+
+// MarkConversation draws a conversation notify's mark under the
+// conversation's session lock, as the relay draws a task's (mark.go,
+// applyNotifyMark), and writes the record when the drawn state changed.
+func (c gatewayConversations) MarkConversation(conversation, update string, mark MarkState) {
+	g := c.g
+	l := g.lockSession(conversation)
+	l.Lock()
+	defer l.Unlock()
+	ctx, cancel := context.WithTimeout(g.runCtx, turnTimeout)
+	defer cancel()
+	rec, err := g.reg.Get(ctx, conversation)
+	if err != nil {
+		g.log.Warn("notify: mark not drawn; session record unreadable", "conversation", conversation, "err", err)
+		return
+	}
+	if rec == nil {
+		g.log.Warn("notify: mark not drawn; no session record", "conversation", conversation)
+		return
+	}
+	if !g.applyNotifyMark(rec, update, mark) {
+		return
+	}
+	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+		g.log.Error("notify: session record write failed after a mark", "conversation", conversation, "err", err)
+	}
 }
 
 // Conversations is what Notifier.SetConversations takes: the gateway's

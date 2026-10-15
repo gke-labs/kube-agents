@@ -5,6 +5,8 @@ description: Install the Platform Agent workspace into an existing Hermes-compat
 
 If you're not using GKE or the shipping automated installation flow, you can install the Platform Agent workspace into an existing Hermes-compatible harness by hand. This page covers the harness-side setup only; you still need to arrange cluster access, chat ingress, an inference gateway, and (for GitOps flows) a token minter separately.
 
+For a token minter on a GitHub Enterprise Server, see [GitHub Enterprise Server](/kube-agents/deploy/token-minter/#github-enterprise-server) in the token minter guide, and the install steps in [INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#github-enterprise-server).
+
 ## Prerequisites
 
 - A harness or platform that runs the Hermes agent runtime (`nousresearch/hermes-agent`) with workspace file access and tool execution.
@@ -30,7 +32,7 @@ platform/
 ├── skills/                  # SKILL.md bundles
 ├── governance/              # SOPs the scheduled governance jobs point at
 ├── cron/jobs.json           # the governance watchdog roster (see below)
-├── plugins/                 # in-tree Hermes plugins (incident_context, memory)
+├── plugins/                 # in-tree Hermes plugins (incident_context, pr_opened, memory)
 ├── docs/                    # workspace docs (glossary, console-link templates)
 └── scripts/                 # in-pod Python MCP servers + kanban helpers
 ```

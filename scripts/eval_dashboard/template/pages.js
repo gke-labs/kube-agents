@@ -119,6 +119,9 @@ const PAGE = {
   // A night split across two jobs names its parts as the digest does
   // (nightly.py's PART_WORDS).
   nightPartWords: { main: "main part", writers: "writers part" },
+  // The chat-turn target the opening turn's p95 is shown beside, as advice
+  // only (nightly.py's TURN1_P95_TARGET_S).
+  turn1P95TargetS: 10,
   // The Trend page (trend.py): a judged metric's name as a URL parameter,
   // the chart geometry (SVG user units; the chart scales to its card), and
   // where "score" is defined once.
@@ -1299,12 +1302,24 @@ function lastFailureHtml(c) {
 // own -- a grader's reason is too long to share a row with eight columns.
 const CASE_COLUMNS = 8;
 
+// Seconds as the timing lines carry them: one decimal.
+const secText = (v) => `${v.toFixed(1)} s`;
+
+// The presubmit reps' timing (SCHEMA.md: cases[].latency), "" when none.
+function caseLatencyHtml(c) {
+  const l = c.latency && typeof c.latency === "object" ? c.latency : {};
+  const parts = [];
+  if (Number.isFinite(l.turn1_p50_s) && Number.isFinite(l.turn1_p95_s)) parts.push(`chat turn 1 p50 ${secText(l.turn1_p50_s)}, p95 ${secText(l.turn1_p95_s)}${Number.isFinite(l.n_turn1) ? ` (${plural(l.n_turn1, "rep")})` : ""}`);
+  if (Number.isFinite(l.agent_p50_s)) parts.push(`agent p50 ${secText(l.agent_p50_s)}${Number.isFinite(l.n_agent) ? ` (${plural(l.n_agent, "rep")})` : ""}`);
+  return parts.length ? `<small class="mut" title="presubmit repetitions not lost to infra">${esc(parts.join(" · "))}</small>` : "";
+}
+
 function caseRow(c, link) {
   const rates = c.rates || {};
   const pre = rates.presubmit || [], night = rates.nightly || [];
   const classes = [link.caseHash === c.name ? "hl" : "", c.status === "retired" ? "dim" : ""].filter(Boolean).join(" ");
   const issues = (c.issues || []).map(issueLink).join(" · ") || `<span class="mut">—</span>`;
-  return `<tr id="case-${esc(c.name)}" class="main ${classes}"><td class="nm">${esc(c.name)}${c.note ? `<small>${esc(c.note)}</small>` : ""}<small><a href="${esc(trendHref([c.name]))}">trend on main →</a></small></td>` +
+  return `<tr id="case-${esc(c.name)}" class="main ${classes}"><td class="nm">${esc(c.name)}${c.note ? `<small>${esc(c.note)}</small>` : ""}${caseLatencyHtml(c)}<small><a href="${esc(trendHref([c.name]))}">trend on main →</a></small></td>` +
     `<td>${stripHtml(c)}</td><td>${rateCell(pre[0])}</td><td>${rateCell(pre[1])}</td><td>${rateCell(night[0])}</td><td>${rateCell(night[1])}</td>` +
     `<td>${statusPill(c)}</td><td class="iss">${issues}</td></tr>` +
     `<tr class="why ${classes}"><td colspan="${CASE_COLUMNS}">${lastFailureHtml(c)}</td></tr>`;
@@ -1636,6 +1651,7 @@ function nightCaseRow(night, c, newly) {
   return `<tr class="${newly.has(c.case) ? "newly" : ""}"><td class="nm">${esc(c.case)}</td>` +
     `<td><span class="pill ${PAGE.nightStateClass[c.state] || "p-infra"}" title="${esc(PAGE.nightStateWords[c.state] || c.state)}">${esc(c.state)}</span></td>` +
     `<td class="num" title="repetitions passed / graded">${esc(repText)}</td>` +
+    `<td class="num tm" title="median opening chat turn / median agent wall clock, then the agent's p90, over the repetitions not lost to infra">${esc(Number.isFinite(c.turn1_p50_s) ? secText(c.turn1_p50_s) : "—")} / ${esc(Number.isFinite(c.agent_p50_s) ? secText(c.agent_p50_s) : "—")}${Number.isFinite(c.agent_p90_s) ? `<br><small class="mut">p90 ${esc(secText(c.agent_p90_s))}</small>` : ""}</td>` +
     `<td>${c.reason ? `<span class="rsn" title="${esc(c.reason)}">${esc(c.reason)}</span>` : `<span class="mut">—</span>`}</td>` +
     `<td class="mut small">${links}</td></tr>`;
 }
@@ -1647,10 +1663,10 @@ function nightCasesTable(night) {
   const rows = [];
   let domain = null;
   for (const c of cases) {
-    if (c.domain !== domain) { domain = c.domain; rows.push(`<tr class="grp"><td colspan="5">${esc(domainWords(domain))}</td></tr>`); }
+    if (c.domain !== domain) { domain = c.domain; rows.push(`<tr class="grp"><td colspan="6">${esc(domainWords(domain))}</td></tr>`); }
     rows.push(nightCaseRow(night, c, newly));
   }
-  return `<table class="rel night"><thead><tr><th>Case</th><th>State</th><th>Reps</th><th>Grader's reason</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+  return `<table class="rel night"><thead><tr><th>Case</th><th>State</th><th>Reps</th><th>Turn 1 / agent</th><th>Grader's reason</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
 }
 
 function nightChangesHtml(night) {
@@ -1711,16 +1727,19 @@ function nightlyHtml(link) {
   const head = `<div class="sec head">${nightPill(night)}<h1>${isLast ? "Last night's run" : `Night of ${esc(nightDay(night))}`}</h1>` +
     `<div class="lede">${esc(when)} · ${jobs}${night.head_sha ? ` at <code>${esc(night.head_sha)}</code>` : ""}${night.project ? ` · project ${esc(projectShort(night.project))}` : ""}${logs}</div>` +
     `<div class="lede">${ledeHow}</div>${isLast ? runningNoteHtml() : ""}</div>`;
-  const tiles = `<div class="sec"><h2>In numbers</h2><div class="tiles">` +
+  // The night's opening chat turn, a sixth tile when its reps carried one.
+  const turn1 = Number.isFinite(night.turn1_p50_s) && Number.isFinite(night.turn1_p95_s);
+  const tiles = `<div class="sec"><h2>In numbers</h2><div class="tiles${turn1 ? " six" : ""}">` +
     tile("Cases", `${c.recorded}`, c.expected ? `of ${c.expected} in the nightly matrix` : "recorded") +
     tile("Passed all reps", `${c.passed}`, c.recorded ? `${pct(c.passed / c.recorded)} of recorded cases` : "no case recorded") +
     tile("Partial", `${c.partial}`, "failed some repetitions") +
     tile("Failed", `${c.failed}`, `failed every graded rep · ${plural(c.infra, "case")} lost to infra`) +
     tile("Newly failing", `${night.previous_build == null || nightLacksMain(night) ? "—" : night.newly_failing.length}`, nightLacksMain(night) ? "no main part on record" : night.previous_build == null ? "first night on record" : "against the night before") +
+    (turn1 ? tile("Chat turn 1", `${night.turn1_p50_s.toFixed(1)}<small>s p50</small>`, `p95 ${secText(night.turn1_p95_s)} · advisory target p95 < ${PAGE.turn1P95TargetS} s`) : "") +
     `</div></div>`;
   return head + tiles +
     `<div class="sec"><h2>Against the night before</h2>${nightChangesHtml(night)}</div>` +
-    `<div class="sec"><h2>Every case, by domain</h2>${nightCasesTable(night)}<p class="mut small">States: pass = every graded rep passed · partial = some reps failed · fail = every graded rep failed · infra = nothing graded (quota or setup losses, never counted against a case). Reps read passed / graded. The transcript is the first repetition's.</p></div>` +
+    `<div class="sec"><h2>Every case, by domain</h2>${nightCasesTable(night)}<p class="mut small">States: pass = every graded rep passed · partial = some reps failed · fail = every graded rep failed · infra = nothing graded (quota or setup losses, never counted against a case). Reps read passed / graded. Turn 1 / agent are medians over the repetitions not lost to infra: the opening chat turn, then the agent's whole run, with the agent's p90 under them. The transcript is the first repetition's.</p></div>` +
     nightsListHtml(night) + footHtml();
 }
 

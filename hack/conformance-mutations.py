@@ -759,8 +759,8 @@ Mutation(
     Mutation(
         "C1-gateway-sa-exemption",
         "charts/kube-agents/files/redactor.py",
-        ('r"[a-zA-Z0-9._%+\\-]+@(?!(?:[a-zA-Z0-9\\-]+\\.)*gserviceaccount\\.com(?!\\.?[\\w\\-]))"',
-         'r"[a-zA-Z0-9._%+\\-]+@"'),
+        ('r"+@(?!(?:[a-zA-Z0-9\\-]+\\.)*gserviceaccount\\.com(?!\\.?[\\w\\-]))"',
+         'r"+@"'),
         "test_C1_the_gateway_redactor_leaves_ordinary_manifest_content_alone",
         "simplify the e-mail pattern by dropping the service-account exemption; "
         "every IAM principal in a tool result then reaches the model as "

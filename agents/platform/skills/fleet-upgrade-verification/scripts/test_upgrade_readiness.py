@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for upgrade_readiness.py: the PDB, maintenance and skew rules on canned objects."""
+"""Unit tests for upgrade_readiness.py: the PDB, webhook, maintenance and skew rules on canned objects."""
 
 import os
 import sys
@@ -379,19 +379,731 @@ class SkewTest(unittest.TestCase):
 class VerdictTest(unittest.TestCase):
     CLEAR = {"blocking_exclusions": [], "undecided_exclusions": []}
     NO_SKEW = {"blocking": [], "unknown": []}
+    NO_WEBHOOKS = {"blocking": []}
 
     def test_ready_needs_every_rule_evaluated(self):
         pdbs = {"blocking": []}
-        self.assertEqual(r.readiness_status(pdbs, self.CLEAR, self.NO_SKEW, True), "ready")
-        self.assertEqual(r.readiness_status(None, self.CLEAR, self.NO_SKEW, True), "unknown")
-        self.assertEqual(r.readiness_status(pdbs, self.CLEAR, self.NO_SKEW, False), "unknown")
-        self.assertEqual(r.readiness_status(pdbs, {"blocking_exclusions": [], "undecided_exclusions": ["x"]}, self.NO_SKEW, True), "unknown")
-        self.assertEqual(r.readiness_status(pdbs, self.CLEAR, {"blocking": [], "unknown": ["p"]}, True), "unknown")
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True), "ready")
+        self.assertEqual(r.readiness_status(None, None, self.CLEAR, self.NO_SKEW, True), "unknown")
+        self.assertEqual(r.readiness_status(pdbs, None, self.CLEAR, self.NO_SKEW, True), "unknown")
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, False), "unknown")
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, {"blocking_exclusions": [], "undecided_exclusions": ["x"]}, self.NO_SKEW, True), "unknown")
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, {"blocking": [], "unknown": ["p"]}, True), "unknown")
 
     def test_blocked_beats_unknown(self):
-        self.assertEqual(r.readiness_status({"blocking": [{"pdb": "a/b"}]}, self.CLEAR, self.NO_SKEW, False), "blocked")
-        self.assertEqual(r.readiness_status(None, {"blocking_exclusions": ["x"], "undecided_exclusions": []}, self.NO_SKEW, True), "blocked")
-        self.assertEqual(r.readiness_status(None, self.CLEAR, {"blocking": ["p"], "unknown": []}, True), "blocked")
+        self.assertEqual(r.readiness_status({"blocking": [{"pdb": "a/b"}]}, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, False), "blocked")
+        self.assertEqual(r.readiness_status(None, None, {"blocking_exclusions": ["x"], "undecided_exclusions": []}, self.NO_SKEW, True), "blocked")
+        self.assertEqual(r.readiness_status(None, None, self.CLEAR, {"blocking": ["p"], "unknown": []}, True), "blocked")
+        self.assertEqual(r.readiness_status({"blocking": []}, {"blocking": [{"webhook": "g/h"}]}, self.CLEAR, self.NO_SKEW, False), "blocked")
+
+
+def webhook_config(kind, name, hooks):
+    return {"kind": kind, "metadata": {"name": name}, "webhooks": hooks}
+
+
+def rule(resources, operations=("CREATE",), groups=("",), scope=None, versions=("*",)):
+    record = {"apiGroups": list(groups), "apiVersions": list(versions), "operations": list(operations), "resources": list(resources)}
+    if scope is not None:
+        record["scope"] = scope
+    return record
+
+
+def hook(name, rules, policy=None, service=("scen", "gate-svc"), port=None, url=None):
+    record = {"name": name, "rules": rules, "clientConfig": {}}
+    if policy is not None:
+        record["failurePolicy"] = policy
+    if url is not None:
+        record["clientConfig"]["url"] = url
+    elif service is not None:
+        record["clientConfig"]["service"] = {"namespace": service[0], "name": service[1]}
+        if port is not None:
+            record["clientConfig"]["service"]["port"] = port
+    return record
+
+
+def service(namespace, name, ports=((443, "https"),)):
+    return {"kind": "Service", "metadata": {"namespace": namespace, "name": name}, "spec": {"ports": [{"port": p, "name": n} for p, n in ports]}}
+
+
+def endpoint_slice(namespace, svc, ready_flags, port_name="https"):
+    return {
+        "kind": "EndpointSlice",
+        "metadata": {"namespace": namespace, "name": f"{svc}-abc", "labels": {"kubernetes.io/service-name": svc}},
+        "ports": [{"name": port_name, "port": 8443}],
+        "endpoints": [{"conditions": {} if flag is None else {"ready": flag}} for flag in ready_flags],
+    }
+
+
+POD_GATE = [rule(["pods"])]
+def scoped(record, namespace_selector):
+    record["namespaceSelector"] = namespace_selector
+    return record
+
+
+def namespace(name, labels=None):
+    return {"kind": "Namespace", "metadata": {"name": name, "labels": {"kubernetes.io/metadata.name": name, **(labels or {})}}}
+LIVE = [service("scen", "gate-svc")], [endpoint_slice("scen", "gate-svc", [True])]
+
+
+def grade(hooks, services=(), slices=(), kind="ValidatingWebhookConfiguration", namespaces=()):
+    return r.grade_webhooks([webhook_config(kind, "gate", hooks)], list(services), list(slices), list(namespaces))
+
+
+class WebhookBackendTest(unittest.TestCase):
+    def test_missing_service_blocks_a_pod_gate(self):
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail")])
+        self.assertEqual(len(graded["blocking"]), 1)
+        finding = graded["blocking"][0]
+        self.assertEqual(finding["webhook"], "gate/g.example.com")
+        self.assertEqual(finding["reason"], "Service scen/gate-svc does not exist")
+        self.assertEqual(finding["upgrade_path"], ["CREATE pods"])
+        self.assertIn("matches CREATE pods", r.describe_webhook_finding(finding))
+
+    def test_absent_failure_policy_is_fail_the_v1_default(self):
+        self.assertEqual(len(grade([hook("d.example.com", POD_GATE)], kind="MutatingWebhookConfiguration")["blocking"]), 1)
+
+    def test_ready_backend_on_the_webhook_port_does_not_block(self):
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail")], *LIVE)
+        self.assertEqual((graded["blocking"], graded["outage"], graded["evaluated"]), ([], [], 1))
+
+    def test_endpoint_without_a_ready_condition_counts_as_ready(self):
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail")], [service("scen", "gate-svc")], [endpoint_slice("scen", "gate-svc", [None])])
+        self.assertEqual(graded["blocking"], [])
+
+    def test_every_endpoint_not_ready_blocks(self):
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail")], [service("scen", "gate-svc")], [endpoint_slice("scen", "gate-svc", [False, False])])
+        self.assertEqual(graded["blocking"][0]["reason"], "Service scen/gate-svc has no ready endpoints on port 443")
+
+    def test_service_without_the_webhook_port_blocks(self):
+        # The API server refuses to resolve the webhook: no Service port equals the webhook's port.
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail", port=9443)], *LIVE)
+        self.assertEqual(graded["blocking"][0]["reason"], "Service scen/gate-svc has no port 9443")
+
+    def test_endpoints_on_another_named_port_do_not_count(self):
+        services = [service("scen", "gate-svc", ports=((443, "https"), (8080, "metrics")))]
+        slices = [endpoint_slice("scen", "gate-svc", [True], port_name="metrics")]
+        self.assertEqual(len(grade([hook("g.example.com", POD_GATE, policy="Fail")], services, slices)["blocking"]), 1)
+
+    def test_unnamed_single_port_matches_an_unnamed_slice_port(self):
+        services = [service("scen", "gate-svc", ports=((443, None),))]
+        slices = [endpoint_slice("scen", "gate-svc", [True], port_name=None)]
+        self.assertEqual(grade([hook("g.example.com", POD_GATE, policy="Fail")], services, slices)["blocking"], [])
+
+    def test_slices_of_another_service_or_namespace_do_not_count(self):
+        services = [service("scen", "gate-svc")]
+        slices = [endpoint_slice("scen", "other-svc", [True]), endpoint_slice("prod", "gate-svc", [True])]
+        self.assertEqual(len(grade([hook("g.example.com", POD_GATE, policy="Fail")], services, slices)["blocking"]), 1)
+
+    def test_an_off_list_rule_at_an_unserved_version_is_not_said_to_fail_now(self):
+        # A leftover PodSecurityPolicy gate pinned to policy/v1beta1: no GKE version in support
+        # sends that request, and the reader cannot tell for a resource off its lists, so the
+        # cell says the requests fail if the server still serves the version, not that they do.
+        rule = {"apiGroups": ["policy"], "apiVersions": ["v1beta1"], "resources": ["podsecuritypolicies"], "operations": ["CREATE", "UPDATE"]}
+        graded = grade([hook("psp.example.com", [rule], policy="Fail")])
+        self.assertEqual(graded["blocking"], [])
+        cell = r.describe_webhook_finding(graded["outage"][0])
+        self.assertNotIn("fails now every request the server sends it", cell)
+        self.assertIn("if the server still serves those versions", cell)
+        # The same resource at a served version, or unversioned, keeps the live-failure sentence.
+        for versions in (["v1"], ["*"]):
+            with self.subTest(versions=versions):
+                live = grade([hook("x.example.com", [dict(rule, apiVersions=versions)], policy="Fail")])
+                self.assertIn("fails now every request the server sends it", r.describe_webhook_finding(live["outage"][0]))
+
+    def test_a_selector_exempting_kube_system_by_a_label_it_carries_keeps_the_gate_an_outage(self):
+        # The policy engine's exemption idiom: `DoesNotExist` or `NotIn` on a label the installer
+        # put on kube-system. The namespaces' labels are read, so the selector is judged as
+        # admission judges it: a Role gate that exempts both bootstrap namespaces by that label
+        # is an outage, not a blocker. Without the Namespace read the name label alone is known
+        # and the exemption cannot be seen, so the gate is named.
+        gate = [rule(["roles"], groups=("rbac.authorization.k8s.io",))]
+        exempt = [namespace("kube-system", {"admission.policy.example/ignore": "true"}), namespace("kube-public", {"admission.policy.example/ignore": "true"})]
+        for selector in (
+            {"matchExpressions": [{"key": "admission.policy.example/ignore", "operator": "DoesNotExist"}]},
+            {"matchExpressions": [{"key": "admission.policy.example/ignore", "operator": "NotIn", "values": ["true"]}]},
+        ):
+            with self.subTest(selector=selector):
+                graded = grade([scoped(hook("opa.example.com", gate, policy="Fail"), selector)], namespaces=exempt)
+                self.assertEqual((graded["blocking"], len(graded["outage"])), ([], 1))
+                self.assertFalse(r.namespace_selector_reaches({"namespaceSelector": selector}, r.bootstrap_namespace_labels(exempt)["kube-system"]))
+                unread = grade([scoped(hook("opa.example.com", gate, policy="Fail"), selector)])
+                self.assertEqual(unread["blocking"][0]["upgrade_path"], ["CREATE roles in kube-system,kube-public"])
+        # Exempting kube-system alone leaves kube-public reached.
+        selector = {"matchExpressions": [{"key": "admission.policy.example/ignore", "operator": "DoesNotExist"}]}
+        graded = grade([scoped(hook("opa.example.com", gate, policy="Fail"), selector)], namespaces=exempt[:1])
+        self.assertEqual(graded["blocking"][0]["upgrade_path"], ["CREATE roles in kube-public"])
+
+    def test_a_webhook_with_no_rules_is_counted_not_graded(self):
+        # `rules` is optional and a webhook with none matches no request, so the server never
+        # calls it: a dead backend behind it fails nothing now and is not an outage to report.
+        for rules in ([], None):
+            with self.subTest(rules=rules):
+                config = webhook_config("ValidatingWebhookConfiguration", "gate", [hook("empty.example.com", rules, policy="Fail")])
+                if rules is None:
+                    del config["webhooks"][0]["rules"]
+                graded = r.grade_webhooks([config], [], [])
+                self.assertEqual((graded["blocking"], graded["outage"]), ([], []))
+                self.assertEqual((graded["no_rules"], graded["evaluated"]), (1, 0))
+
+    def test_fail_open_and_url_backends_are_counted_not_graded(self):
+        graded = grade([hook("a.example.com", POD_GATE, policy="Ignore"), hook("e.example.com", POD_GATE, policy="Fail", service=None, url="https://localhost:5443/v")])
+        self.assertEqual((graded["blocking"], graded["outage"]), ([], []))
+        self.assertEqual((graded["fail_open"], graded["url_backends"], graded["evaluated"]), (1, 1, 0))
+
+
+class KubeSystemReachTest(unittest.TestCase):
+    """A dead gate off the node path that can refuse the bootstrap Role and RoleBinding
+    writes a new master's start-up reconciles in kube-system and kube-public blocks the
+    control-plane upgrade (the Jetstack 2019 shape, on the write that still gates a master)."""
+
+    ROLE_GATE = [rule(["roles"], groups=("rbac.authorization.k8s.io",))]
+    SEEDED_SCOPE = {"matchLabels": {"kubernetes.io/metadata.name": "seeded-upgrade"}}
+
+    def _one(self, hooks):
+        graded = grade(hooks)
+        return graded["blocking"], graded["outage"]
+
+    def test_a_cluster_wide_dead_role_gate_blocks_and_names_the_write(self):
+        blocking, outage = self._one([hook("opa.example.com", self.ROLE_GATE, policy="Fail")])
+        self.assertEqual(outage, [])
+        self.assertEqual(blocking[0]["upgrade_path"], ["CREATE roles in kube-system,kube-public"])
+        self.assertIn("matches CREATE roles in kube-system,kube-public", r.describe_webhook_finding(blocking[0]))
+
+    def test_a_rolebinding_update_gate_blocks_too(self):
+        gate = hook("opa.example.com", [rule(["rolebindings"], operations=("UPDATE",), groups=("rbac.authorization.k8s.io",))], policy="Fail")
+        blocking, _ = self._one([gate])
+        self.assertEqual(blocking[0]["upgrade_path"], ["UPDATE rolebindings in kube-system,kube-public"])
+
+    def test_an_empty_selector_admits_every_namespace(self):
+        blocking, _ = self._one([scoped(hook("opa.example.com", self.ROLE_GATE, policy="Fail"), {})])
+        self.assertEqual(len(blocking), 1)
+
+    def test_a_cluster_wide_dead_configmap_gate_stays_an_outage(self):
+        # The ConfigMap write the Jetstack outage deadlocked on left the master's start-up
+        # path in Kubernetes 1.17; a refused ConfigMap write is retried, not fatal.
+        blocking, outage = self._one([hook("opa.example.com", [rule(["configmaps"])], policy="Fail")])
+        self.assertEqual((blocking, len(outage)), ([], 1))
+
+    def test_a_selector_naming_another_namespace_keeps_the_gate_an_outage(self):
+        blocking, outage = self._one([scoped(hook("gate.seeded.invalid", self.ROLE_GATE, policy="Fail"), self.SEEDED_SCOPE)])
+        self.assertEqual((blocking, len(outage)), ([], 1))
+
+    def test_a_selector_excluding_kube_system_alone_still_reaches_kube_public(self):
+        # The bootstrap-signer Role and RoleBinding are reconciled in kube-public too.
+        gate = scoped(hook("opa.example.com", self.ROLE_GATE, policy="Fail"), {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system"]}]})
+        blocking, _ = self._one([gate])
+        self.assertEqual(blocking[0]["upgrade_path"], ["CREATE roles in kube-public"])
+
+    def test_a_selector_excluding_both_bootstrap_namespaces_keeps_the_gate_an_outage(self):
+        gate = scoped(hook("opa.example.com", self.ROLE_GATE, policy="Fail"), {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system", "kube-public"]}]})
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, len(outage)), ([], 1))
+
+    def test_a_dead_clusterrole_gate_blocks_whatever_its_selector_says(self):
+        # Admission matches a cluster-scoped object before it reads the namespace selector,
+        # and the bootstrap hook reconciles the ClusterRoles first.
+        excluded = {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system", "kube-public"]}]}
+        gate = scoped(hook("kyverno.example.com", [rule(["roles", "rolebindings", "clusterroles", "clusterrolebindings"], operations=("CREATE", "UPDATE"), groups=("rbac.authorization.k8s.io",))], policy="Fail"), excluded)
+        blocking, outage = self._one([gate])
+        self.assertEqual(outage, [])
+        self.assertEqual(blocking[0]["upgrade_path"], ["CREATE clusterroles", "UPDATE clusterroles", "CREATE clusterrolebindings", "UPDATE clusterrolebindings"])
+
+    def test_a_clusterrole_gate_pinned_to_an_unserved_version_is_sent_nothing(self):
+        gate = hook("opa.example.com", [rule(["clusterroles"], groups=("rbac.authorization.k8s.io",), versions=("v1beta1",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual(blocking, [])
+        self.assertEqual(outage[0]["version_pinned"], ["CREATE clusterroles"])
+
+    def test_a_selector_this_reader_cannot_evaluate_errs_toward_blocking(self):
+        gate = scoped(hook("opa.example.com", self.ROLE_GATE, policy="Fail"), {"matchExpressions": [{"key": "tier", "operator": "Gt", "values": ["1"]}]})
+        blocking, _ = self._one([gate])
+        self.assertEqual(len(blocking), 1)
+
+    def test_a_selector_on_an_operator_added_label_reads_as_the_namespace_read_says(self):
+        # `matchLabels` on a label the installer may have put on kube-system: admitting when the
+        # Namespace read shows the label, not admitting when it does not, and not admitting when
+        # the namespace was not read, since its name label is then all the reader has.
+        gate = scoped(hook("opa.example.com", self.ROLE_GATE, policy="Fail"), {"matchLabels": {"gatekeeper": "enabled"}})
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, len(outage)), ([], 1))
+        graded = grade([gate], namespaces=[namespace("kube-system", {"gatekeeper": "enabled"})])
+        self.assertEqual(graded["blocking"][0]["upgrade_path"], ["CREATE roles in kube-system"])
+        graded = grade([gate], namespaces=[namespace("kube-system"), namespace("kube-public")])
+        self.assertEqual((graded["blocking"], len(graded["outage"])), ([], 1))
+
+    def test_bootstrap_namespace_labels_come_from_the_read(self):
+        # The two bootstrap namespaces' labels as read, the name label always present, other
+        # namespaces and junk ignored, and the name label alone for a namespace not read.
+        read = r.bootstrap_namespace_labels([namespace("kube-system", {"a": "b"}), {"kind": "Namespace", "metadata": {"name": "kube-public"}}, namespace("default", {"x": "y"}), "junk"])
+        self.assertEqual(read, {"kube-system": {"kubernetes.io/metadata.name": "kube-system", "a": "b"}, "kube-public": {"kubernetes.io/metadata.name": "kube-public"}})
+        self.assertEqual(r.bootstrap_namespace_labels(None), {"kube-system": {"kubernetes.io/metadata.name": "kube-system"}, "kube-public": {"kubernetes.io/metadata.name": "kube-public"}})
+
+    def test_a_dead_lease_gate_already_blocks_on_the_node_path(self):
+        # Leader-election Leases live in kube-system, but the node path's Lease rows already
+        # make any Lease gate a blocker, so the kube-system list does not repeat them.
+        gate = hook("leases.example.com", [rule(["leases"], operations=("UPDATE",), groups=("coordination.k8s.io",))], policy="Fail")
+        blocking, _ = self._one([gate])
+        self.assertEqual(blocking[0]["upgrade_path"], ["UPDATE leases"])
+
+    def test_a_dead_gate_on_another_resource_stays_an_outage_whatever_its_selector(self):
+        # cert-manager's shape: fail-closed on its own kinds, no namespace selector.
+        gate = hook("webhook.cert-manager.io", [rule(["certificates", "certificaterequests"], operations=("CREATE", "UPDATE"), groups=("cert-manager.io",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, len(outage)), ([], 1))
+
+    def test_a_role_gate_pinned_to_an_unserved_version_is_sent_nothing_and_says_so(self):
+        gate = hook("opa.example.com", [rule(["roles"], groups=("rbac.authorization.k8s.io",), versions=("v1beta1",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual(blocking, [])
+        self.assertEqual(outage[0]["version_pinned"], ["CREATE roles in kube-system,kube-public"])
+        self.assertIn("the server serves CREATE roles in kube-system,kube-public at v1 alone, so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
+
+    def test_a_pinned_role_gate_scoped_off_kube_system_is_sent_nothing_and_says_so_without_a_namespace(self):
+        # The served version is the server's fact: a selector that admits neither bootstrap
+        # namespace changes the label, not the sentence.
+        gate = scoped(hook("opa.example.com", [rule(["roles"], groups=("rbac.authorization.k8s.io",), versions=("v1beta1",))], policy="Fail"), self.SEEDED_SCOPE)
+        blocking, outage = self._one([gate])
+        self.assertEqual(blocking, [])
+        self.assertEqual(outage[0]["version_pinned"], ["CREATE roles"])
+        self.assertIn("the server serves CREATE roles at v1 alone, so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
+
+    def test_a_pinned_rule_is_judged_on_its_resources_however_spelled_and_whatever_its_operations(self):
+        # `pods/` is `pods` here as it is in the matcher.
+        gate = hook("stale.example.com", [rule(["pods/"], versions=("v1beta1",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, outage[0]["version_pinned"]), ([], ["CREATE pods"]))
+        self.assertIn("so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
+        # A graded resource at an unserved version is pinned whatever the operation, since the
+        # served version is the resource's; no graded row carries DELETE rolebindings, so the
+        # label is the resource.
+        gate = hook("old.example.com", [rule(["rolebindings"], operations=("DELETE",), groups=("rbac.authorization.k8s.io",), versions=("v1beta1",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, outage[0]["version_pinned"]), ([], ["rolebindings in rbac.authorization.k8s.io"]))
+        self.assertIn("the server serves rolebindings in rbac.authorization.k8s.io at v1 alone, so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
+        for operations in (("UPDATE",), ("CONNECT",)):
+            with self.subTest(operations=operations):
+                gate = hook("old.example.com", [rule(["pods"], operations=operations, versions=("v1beta1",))], policy="Fail")
+                blocking, outage = self._one([gate])
+                self.assertEqual(blocking, [])
+                self.assertNotIn("fails now every request the server sends it", r.describe_webhook_finding(outage[0]))
+        # The parent of a graded subresource is a graded resource: the pre-1.25 PDB-policy gate,
+        # bare or with every subresource, is sent nothing at policy/v1beta1. The bare spelling
+        # reaches no row and is labelled at the resource; `/*` reaches the status row.
+        gate = hook("pdb.example.com", [rule(["poddisruptionbudgets"], operations=("CREATE", "UPDATE"), groups=("policy",), versions=("v1beta1",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, outage[0]["version_pinned"]), ([], ["poddisruptionbudgets in policy"]))
+        self.assertIn("the server serves poddisruptionbudgets in policy at v1 alone, so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
+        gate = hook("pdb.example.com", [rule(["poddisruptionbudgets/*"], operations=("UPDATE",), groups=("policy",), versions=("v1beta1",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, outage[0]["version_pinned"]), ([], ["UPDATE poddisruptionbudgets/status"]))
+        # A subresource is served under its parent's group-version.
+        gate = hook("exec.example.com", [rule(["pods/exec"], operations=("CONNECT",), versions=("v1beta1",))], policy="Fail")
+        _, outage = self._one([gate])
+        self.assertEqual(outage[0]["version_pinned"], ["pods"])
+        # A rule naming two graded groups and a graded resource from each also names the pairs that
+        # do not exist (policy/pods); the server sends it nothing either way.
+        gate = hook("two.example.com", [rule(["pods", "poddisruptionbudgets"], operations=("CREATE", "UPDATE"), groups=("", "policy"), versions=("v1beta1",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual(blocking, [])
+        self.assertEqual(outage[0]["version_pinned"][0], "CREATE pods")
+        self.assertIn("so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
+        # A pair the server does not serve at all is pinned by the same separation and labelled
+        # apart, as an unserved pair, so the cell says the server serves no such pair rather than
+        # that it serves the pair at v1 alone; the finding's rules and its cell agree.
+        gate = hook("typo.example.com", [rule(["pods"], groups=("policy",), versions=("v1beta1",))], policy="Fail")
+        blocking, outage = self._one([gate])
+        self.assertEqual((blocking, outage[0]["version_pinned"], outage[0]["unserved_pairs"], outage[0]["live_rules"]), ([], [], ["pods in policy"], []))
+        self.assertEqual(outage[0]["pinned_rules"], ["CREATE pods in policy at v1beta1"])
+        cell = r.describe_webhook_finding(outage[0])
+        self.assertIn("(its rules: CREATE pods in policy at v1beta1; the server serves no pods in policy, so it sends this webhook none of them); it is reported, not graded", cell)
+        self.assertNotIn("at v1 alone", cell)
+        # The core group is named on an unserved pair, so the clause is not read as every group.
+        gate = hook("typo.example.com", [rule(["poddisruptionbudgets"], versions=("v1beta1",))], policy="Fail")
+        _, outage = self._one([gate])
+        self.assertEqual(outage[0]["unserved_pairs"], ["poddisruptionbudgets in core"])
+        self.assertIn("the server serves no poddisruptionbudgets in core, so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
+        # A rule spelling a served pair and an unserved one carries both reasons, joined.
+        gate = hook("both.example.com", [rule(["poddisruptionbudgets", "pods"], operations=("DELETE",), groups=("policy",), versions=("v1beta1",))], policy="Fail")
+        _, outage = self._one([gate])
+        self.assertEqual((outage[0]["version_pinned"], outage[0]["unserved_pairs"]), (["poddisruptionbudgets in policy"], ["pods in policy"]))
+        self.assertIn("the server serves poddisruptionbudgets in policy at v1 alone and the server serves no pods in policy, so it sends this webhook none of them", r.describe_webhook_finding(outage[0]))
+        # Beside a live rule, the pinned clause carries the same reasons.
+        gate = hook("mixed.example.com", [rule(["pods"], groups=("policy",), versions=("v1beta1",)), rule(["configmaps"])], policy="Fail")
+        _, outage = self._one([gate])
+        self.assertIn("; the server serves no pods in policy, so it sends the rule CREATE pods in policy at v1beta1 nothing; reported, not graded", r.describe_webhook_finding(outage[0]))
+        # A spelling naming every resource, or a resource off every list, is still not pinned:
+        # their served versions are not this rule's to know.
+        for spec, groups in (("*", ("",)), ("*/*", ("",)), ("*/status", ("",)), ("configmaps", ("",))):
+            with self.subTest(spec=spec):
+                gate = hook("wild.example.com", [rule([spec], groups=groups, versions=("v1beta1",))], policy="Fail")
+                _, outage = self._one([gate])
+                self.assertEqual(outage[0]["version_pinned"], [])
+
+    def test_each_graded_resource_lives_in_one_graded_group(self):
+        # `_rule_version_pinned` judges a rule's groups and resources separately, which is sound
+        # while no graded resource name exists under two graded groups.
+        groups_by_resource: dict[str, set[str]] = {}
+        for group, _, resource, _, _ in r.GRADED_TARGETS:
+            groups_by_resource.setdefault(r._resource_parent(resource), set()).add(group)
+        self.assertEqual({name: groups for name, groups in groups_by_resource.items() if len(groups) > 1}, {})
+
+    def test_the_node_path_match_is_named_ahead_of_the_kube_system_reach(self):
+        gate = hook("opa.example.com", [rule(["pods", "roles"], groups=("", "rbac.authorization.k8s.io"))], policy="Fail")
+        blocking, _ = self._one([gate])
+        self.assertEqual(blocking[0]["upgrade_path"], ["CREATE pods", "CREATE roles in kube-system,kube-public"])
+
+    def test_the_control_plane_write_lists_are_pinned(self):
+        self.assertEqual(
+            r.CONTROL_PLANE_KUBE_SYSTEM_WRITES,
+            (
+                ("rbac.authorization.k8s.io", "v1", "roles", "CREATE", "Namespaced"),
+                ("rbac.authorization.k8s.io", "v1", "roles", "UPDATE", "Namespaced"),
+                ("rbac.authorization.k8s.io", "v1", "rolebindings", "CREATE", "Namespaced"),
+                ("rbac.authorization.k8s.io", "v1", "rolebindings", "UPDATE", "Namespaced"),
+            ),
+        )
+        self.assertEqual(
+            r.CONTROL_PLANE_CLUSTER_WRITES,
+            (
+                ("rbac.authorization.k8s.io", "v1", "clusterroles", "CREATE", "Cluster"),
+                ("rbac.authorization.k8s.io", "v1", "clusterroles", "UPDATE", "Cluster"),
+                ("rbac.authorization.k8s.io", "v1", "clusterrolebindings", "CREATE", "Cluster"),
+                ("rbac.authorization.k8s.io", "v1", "clusterrolebindings", "UPDATE", "Cluster"),
+            ),
+        )
+
+
+class WebhookScopeTest(unittest.TestCase):
+    def _path(self, rules):
+        return r.upgrade_path_matches({"rules": rules})
+
+    def test_a_gate_outside_the_upgrade_path_is_an_outage_not_a_blocker(self):
+        # The seeded fleet's fixture, as bench/tf/fleet/defects-b.tf writes it: a gate on
+        # `CREATE configmaps` in the core group at `v1`, no Service, scoped to its own namespace.
+        # It is an outage because its rule matches ConfigMaps only, which neither graded list
+        # carries; the scope confines the gate; the cell carries the pinned `v1`.
+        gate = scoped(hook("gate.seeded.invalid", [rule(["configmaps"], versions=("v1",))], policy="Fail", service=("seeded-upgrade", "nonexistent-admission-gate")), {"matchLabels": {"kubernetes.io/metadata.name": "seeded-upgrade"}})
+        graded = grade([gate])
+        self.assertEqual(graded["blocking"], [])
+        self.assertEqual(len(graded["outage"]), 1)
+        self.assertIn("matches none of the operations this rule reads as the upgrade's path (its rules: CREATE configmaps at v1); it fails now every request the server sends it; reported, not graded", r.describe_webhook_finding(graded["outage"][0]))
+        self.assertEqual(graded["outage"][0]["rules"], ["CREATE configmaps at v1"])
+
+    def test_an_outage_cell_names_every_rule_with_its_group(self):
+        # GKE's managed Prometheus operator gate, outside the path: the cell says what it does match.
+        hook_rules = [rule(["rules", "clusterrules"], groups=("monitoring.googleapis.com",), operations=("CREATE", "UPDATE")), rule(["configmaps"])]
+        graded = grade([hook("mon.example.com", hook_rules, policy="Fail")])
+        self.assertEqual(graded["outage"][0]["rules"], ["CREATE/UPDATE rules,clusterrules in monitoring.googleapis.com", "CREATE configmaps"])
+        self.assertIn("(its rules: CREATE/UPDATE rules,clusterrules in monitoring.googleapis.com, CREATE configmaps)", r.describe_webhook_finding(graded["outage"][0]))
+
+    def test_an_outage_cell_names_the_core_group_beside_another(self):
+        # A rule on `["", "apps"]` gates core resources too: the cell says `core,apps`, not `apps`.
+        hook_rules = [rule(["configmaps", "deployments"], groups=("", "apps")), rule(["configmaps"], groups=("",)), rule(["rules"], groups=("monitoring.googleapis.com", ""))]
+        graded = grade([hook("policy.example.com", hook_rules, policy="Fail")])
+        self.assertEqual(graded["outage"][0]["rules"], ["CREATE configmaps,deployments in core,apps", "CREATE configmaps", "CREATE rules in monitoring.googleapis.com,core"])
+
+    def test_each_upgrade_path_target(self):
+        self.assertEqual(self._path([rule(["pods"])]), ["CREATE pods"])
+        self.assertEqual(self._path([rule(["pods/binding"])]), ["CREATE pods/binding"])
+        self.assertEqual(self._path([rule(["pods/status"], operations=("UPDATE",))]), ["UPDATE pods/status"])
+        self.assertEqual(self._path([rule(["pods"], operations=("DELETE",))]), ["DELETE pods"])
+        self.assertEqual(self._path([rule(["pods/eviction"])]), ["CREATE pods/eviction"])
+        self.assertEqual(self._path([rule(["nodes"], operations=("CREATE", "UPDATE", "DELETE"))]), ["CREATE nodes", "UPDATE nodes", "DELETE nodes"])
+        self.assertEqual(self._path([rule(["nodes/status"], operations=("UPDATE",))]), ["UPDATE nodes/status"])
+        self.assertEqual(self._path([rule(["leases"], operations=("CREATE", "UPDATE"), groups=("coordination.k8s.io",))]), ["CREATE leases", "UPDATE leases"])
+        # The kubelet's TokenRequest for every projected token, the new node's bootstrap CSR,
+        # and the attach controller's VolumeAttachment for a replacement pod's disk.
+        self.assertEqual(self._path([rule(["serviceaccounts/token"])]), ["CREATE serviceaccounts/token"])
+        self.assertEqual(self._path([rule(["serviceaccounts/*"])]), ["CREATE serviceaccounts/token"])
+        self.assertEqual(self._path([rule(["serviceaccounts"])]), [])  # the object, not its token subresource
+        self.assertEqual(self._path([rule(["certificatesigningrequests"], groups=("certificates.k8s.io",))]), ["CREATE certificatesigningrequests"])
+        # The CSR is useless until approved and signed: both are UPDATEs on its subresources,
+        # which a rule on the bare resource does not reach and a rule on the subresource does.
+        self.assertEqual(self._path([rule(["certificatesigningrequests/approval"], operations=("UPDATE",), groups=("certificates.k8s.io",))]), ["UPDATE certificatesigningrequests/approval"])
+        self.assertEqual(self._path([rule(["certificatesigningrequests/status"], operations=("UPDATE",), groups=("certificates.k8s.io",))]), ["UPDATE certificatesigningrequests/status"])
+        self.assertEqual(self._path([rule(["certificatesigningrequests/*"], operations=("UPDATE",), groups=("certificates.k8s.io",))]), ["UPDATE certificatesigningrequests/approval", "UPDATE certificatesigningrequests/status"])
+        self.assertEqual(self._path([rule(["certificatesigningrequests"], operations=("UPDATE",), groups=("certificates.k8s.io",))]), [])  # the object, not its subresources
+        # The eviction handler's budget-status write: the subresource, not the object.
+        self.assertEqual(self._path([rule(["poddisruptionbudgets/status"], operations=("UPDATE",), groups=("policy",))]), ["UPDATE poddisruptionbudgets/status"])
+        self.assertEqual(self._path([rule(["poddisruptionbudgets"], operations=("UPDATE",), groups=("policy",))]), [])
+        # The CSINode the kubelet creates before it reports Ready and updates as drivers register;
+        # its deletion is the garbage collector's, after the node is gone, and is not in the path.
+        self.assertEqual(self._path([rule(["csinodes"], operations=("CREATE", "UPDATE", "DELETE"), groups=("storage.k8s.io",))]), ["CREATE csinodes", "UPDATE csinodes"])
+        # The attachment's create and delete by the attach-detach controller, the external-attacher's
+        # finalizer and status writes, and its finalizer on the PersistentVolume.
+        self.assertEqual(self._path([rule(["volumeattachments"], operations=("CREATE", "UPDATE", "DELETE"), groups=("storage.k8s.io",))]), ["CREATE volumeattachments", "UPDATE volumeattachments", "DELETE volumeattachments"])
+        self.assertEqual(self._path([rule(["volumeattachments/status"], operations=("UPDATE",), groups=("storage.k8s.io",))]), ["UPDATE volumeattachments/status"])
+        self.assertEqual(self._path([rule(["volumeattachments/*"], operations=("UPDATE",), groups=("storage.k8s.io",))]), ["UPDATE volumeattachments", "UPDATE volumeattachments/status"])
+        self.assertEqual(self._path([rule(["persistentvolumes"], operations=("UPDATE",))]), ["UPDATE persistentvolumes"])
+        self.assertEqual(self._path([rule(["persistentvolumeclaims"], operations=("UPDATE",))]), [])
+        # Weighed and left off: events are dropped when they cannot be written, and Service routing
+        # is nothing the drain or the join waits on.
+        self.assertEqual(self._path([rule(["events"], operations=("CREATE", "UPDATE"))]), [])
+        self.assertEqual(self._path([rule(["events"], operations=("CREATE",), groups=("events.k8s.io",))]), [])
+        self.assertEqual(self._path([rule(["endpoints"], operations=("CREATE", "UPDATE"))]), [])
+        self.assertEqual(self._path([rule(["endpointslices"], operations=("CREATE", "UPDATE", "DELETE"), groups=("discovery.k8s.io",))]), [])
+
+    def test_the_upgrade_path_list_is_pinned(self):
+        # The one home of the list; a change here is a change to what the rule grades, and the
+        # module's comments carry the source of every row.
+        self.assertEqual(r.UPGRADE_PATH_TARGETS, (
+            ("", "v1", "pods/eviction", "CREATE", "Namespaced"),
+            ("policy", "v1", "poddisruptionbudgets/status", "UPDATE", "Namespaced"),
+            ("", "v1", "pods/status", "UPDATE", "Namespaced"),
+            ("", "v1", "pods", "DELETE", "Namespaced"),
+            ("", "v1", "pods", "CREATE", "Namespaced"),
+            ("", "v1", "pods/binding", "CREATE", "Namespaced"),
+            ("", "v1", "serviceaccounts/token", "CREATE", "Namespaced"),
+            ("", "v1", "nodes", "CREATE", "Cluster"),
+            ("", "v1", "nodes", "UPDATE", "Cluster"),
+            ("", "v1", "nodes/status", "UPDATE", "Cluster"),
+            ("", "v1", "nodes", "DELETE", "Cluster"),
+            ("coordination.k8s.io", "v1", "leases", "CREATE", "Namespaced"),
+            ("coordination.k8s.io", "v1", "leases", "UPDATE", "Namespaced"),
+            ("certificates.k8s.io", "v1", "certificatesigningrequests", "CREATE", "Cluster"),
+            ("certificates.k8s.io", "v1", "certificatesigningrequests/approval", "UPDATE", "Cluster"),
+            ("certificates.k8s.io", "v1", "certificatesigningrequests/status", "UPDATE", "Cluster"),
+            ("storage.k8s.io", "v1", "csinodes", "CREATE", "Cluster"),
+            ("storage.k8s.io", "v1", "csinodes", "UPDATE", "Cluster"),
+            ("storage.k8s.io", "v1", "volumeattachments", "CREATE", "Cluster"),
+            ("storage.k8s.io", "v1", "volumeattachments", "UPDATE", "Cluster"),
+            ("storage.k8s.io", "v1", "volumeattachments/status", "UPDATE", "Cluster"),
+            ("storage.k8s.io", "v1", "volumeattachments", "DELETE", "Cluster"),
+            ("", "v1", "persistentvolumes", "UPDATE", "Cluster"),
+        ))
+        self.assertEqual(len(set(r.UPGRADE_PATH_TARGETS)), len(r.UPGRADE_PATH_TARGETS))
+
+    def _each_alone_blocks(self, targets):
+        # A dead fail-closed gate whose one rule names exactly one target: blocked on that
+        # target alone, with nothing in the outage bucket, whether the rule's `apiVersions`
+        # is `*` or the served version on the row.
+        for group, version, resource, operation, scope in targets:
+            for versions in (("*",), (version,)):
+                with self.subTest(group=group, resource=resource, operation=operation, versions=versions):
+                    graded = grade([hook("one.example.com", [rule([resource], operations=(operation,), groups=(group,), scope=scope, versions=versions)], policy="Fail")])
+                    self.assertEqual([f["upgrade_path"] for f in graded["blocking"]], [[f"{operation} {resource}"]])
+                    self.assertEqual(graded["outage"], [])
+
+    def test_a_gate_on_each_drain_write_alone_blocks(self):
+        self._each_alone_blocks(r.UPGRADE_PATH_DRAIN)
+
+    def test_a_gate_on_each_replacement_pod_write_alone_blocks(self):
+        self._each_alone_blocks(r.UPGRADE_PATH_REPLACEMENT_PODS)
+
+    def test_a_gate_on_each_node_write_alone_blocks(self):
+        self._each_alone_blocks(r.UPGRADE_PATH_NODES)
+
+    def test_a_gate_on_each_kubelet_identity_write_alone_blocks(self):
+        self._each_alone_blocks(r.UPGRADE_PATH_KUBELET_IDENTITY)
+
+    def test_a_gate_on_each_storage_write_alone_blocks(self):
+        self._each_alone_blocks(r.UPGRADE_PATH_STORAGE)
+
+    def test_a_gate_on_csinodes_or_csr_approval_alone_blocks(self):
+        # A new node stays NotReady without its CSINode; a bootstrap CSR nobody can approve or
+        # sign leaves it without a client certificate. Each alone grades the member blocked.
+        graded = grade([
+            hook("csinode.example.com", [rule(["csinodes"], groups=("storage.k8s.io",))], policy="Fail"),
+            hook("approve.example.com", [rule(["certificatesigningrequests/approval"], operations=("UPDATE",), groups=("certificates.k8s.io",))], policy="Fail"),
+            hook("sign.example.com", [rule(["certificatesigningrequests/status"], operations=("UPDATE",), groups=("certificates.k8s.io",))], policy="Fail"),
+        ])
+        self.assertEqual([f["upgrade_path"] for f in graded["blocking"]], [["CREATE csinodes"], ["UPDATE certificatesigningrequests/approval"], ["UPDATE certificatesigningrequests/status"]])
+        self.assertEqual(graded["outage"], [])
+
+    def test_a_gate_on_token_requests_or_bootstrap_csrs_alone_blocks(self):
+        # Replacement pods stuck in ContainerCreating without a token; a surge node that never joins without its CSR.
+        graded = grade([hook("tokens.example.com", [rule(["serviceaccounts/token"])], policy="Fail"), hook("csr.example.com", [rule(["certificatesigningrequests"], groups=("certificates.k8s.io",))], policy="Fail")])
+        self.assertEqual([f["upgrade_path"] for f in graded["blocking"]], [["CREATE serviceaccounts/token"], ["CREATE certificatesigningrequests"]])
+        self.assertEqual(graded["outage"], [])
+
+    def test_a_gate_on_scheduling_alone_blocks(self):
+        # A scheduling-policy webhook on pods/binding stops every replacement pod from being placed.
+        graded = grade([hook("bind.example.com", [rule(["pods/binding"])], policy="Fail")])
+        self.assertEqual([f["upgrade_path"] for f in graded["blocking"]], [["CREATE pods/binding"]])
+
+    def test_resource_wildcards(self):
+        self.assertEqual(self._path([rule(["*"])]), ["CREATE pods", "CREATE nodes"])  # `*` covers resources, not subresources
+        self.assertEqual(self._path([rule(["*/*"])]), ["CREATE pods/eviction", "CREATE pods", "CREATE pods/binding", "CREATE serviceaccounts/token", "CREATE nodes"])
+        # `pods/*` is pods and its subresources, as the API server reads a `*` subresource.
+        self.assertEqual(self._path([rule(["pods/*"])]), ["CREATE pods/eviction", "CREATE pods", "CREATE pods/binding"])
+        self.assertEqual(self._path([rule(["pods/*"], operations=("DELETE",))]), ["DELETE pods"])
+        self.assertEqual(self._path([rule(["nodes/*"], operations=("CREATE", "UPDATE", "DELETE"))]), ["CREATE nodes", "UPDATE nodes", "UPDATE nodes/status", "DELETE nodes"])
+        # A gate on `leases/*` with a dead backend refuses every kubelet heartbeat: a blocker, not an outage.
+        self.assertEqual(self._path([rule(["leases/*"], operations=("CREATE", "UPDATE"), groups=("coordination.k8s.io",))]), ["CREATE leases", "UPDATE leases"])
+        self.assertEqual(self._path([rule(["*/eviction"])]), ["CREATE pods/eviction"])
+        # An empty subresource after the slash is the resource itself, as the API server splits it.
+        self.assertEqual(self._path([rule(["pods/"])]), ["CREATE pods"])
+        self.assertEqual(self._path([rule(["*/"])]), ["CREATE pods", "CREATE nodes"])
+
+    def test_resource_matches_is_the_api_servers_split_and_two_comparisons(self):
+        # k8s.io/apiserver's rules.Matcher: splitResource on the first `/` (no `/` is an empty
+        # subresource), then `res == "*" || res == opRes` and `sub == "*" || sub == opSub`.
+        # Each spelling the API admits, against a resource and a subresource request.
+        table = {
+            "*": {"pods": True, "pods/status": False, "nodes": True, "nodes/status": False},
+            "pods": {"pods": True, "pods/status": False, "nodes": False, "nodes/status": False},
+            "pods/*": {"pods": True, "pods/status": True, "nodes": False, "nodes/status": False},
+            "pods/status": {"pods": False, "pods/status": True, "nodes": False, "nodes/status": False},
+            "*/status": {"pods": False, "pods/status": True, "nodes": False, "nodes/status": True},
+            "*/*": {"pods": True, "pods/status": True, "nodes": True, "nodes/status": True},
+            "pods/": {"pods": True, "pods/status": False, "nodes": False, "nodes/status": False},
+            "*/": {"pods": True, "pods/status": False, "nodes": True, "nodes/status": False},
+        }
+        for spec, expected in table.items():
+            for target, want in expected.items():
+                with self.subTest(spec=spec, target=target):
+                    self.assertEqual(r._resource_matches(spec, target), want)
+
+    def test_operation_group_and_scope_must_all_match(self):
+        self.assertEqual(self._path([rule(["pods"], operations=("UPDATE",))]), [])
+        self.assertEqual(self._path([rule(["pods"], operations=("*",))]), ["DELETE pods", "CREATE pods"])
+        self.assertEqual(self._path([rule(["pods"], groups=("apps",))]), [])
+        self.assertEqual(self._path([rule(["*"], groups=("*",), operations=("*",))]), ["DELETE pods", "CREATE pods", "CREATE nodes", "UPDATE nodes", "DELETE nodes", "CREATE leases", "UPDATE leases", "CREATE certificatesigningrequests", "CREATE csinodes", "UPDATE csinodes", "CREATE volumeattachments", "UPDATE volumeattachments", "DELETE volumeattachments", "UPDATE persistentvolumes"])  # `*` is every resource and no subresource
+        self.assertEqual(self._path([rule(["nodes"], scope="Namespaced")]), [])
+        self.assertEqual(self._path([rule(["pods"], scope="Cluster")]), [])
+
+    def test_api_versions_must_match_as_the_api_server_reads_them(self):
+        # k8s.io/apiserver's rules.Matcher also requires `apiVersions` to carry `*` or the
+        # request's version. A rule pinned to a version the server does not serve matches
+        # nothing, so a dead gate left behind by pre-1.19 tooling is an outage, not a blocker.
+        self.assertEqual(self._path([rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1",))]), [])
+        self.assertEqual(self._path([rule(["poddisruptionbudgets/status"], operations=("UPDATE",), groups=("policy",), versions=("v1beta1",))]), [])
+        self.assertEqual(self._path([rule(["csinodes", "volumeattachments"], groups=("storage.k8s.io",), versions=("v1beta1",))]), [])
+        self.assertEqual(self._path([rule(["pods"], versions=())]), [])
+        # `*`, the served version alone, or the served version among others, all match.
+        self.assertEqual(self._path([rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("*",))]), ["CREATE certificatesigningrequests"])
+        self.assertEqual(self._path([rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1",))]), ["CREATE certificatesigningrequests"])
+        self.assertEqual(self._path([rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1", "v1"))]), ["CREATE certificatesigningrequests"])
+        # Every row on the list is served at v1.
+        self.assertEqual({row[1] for row in r.UPGRADE_PATH_TARGETS}, {"v1"})
+
+    def test_a_dead_gate_pinned_to_an_unserved_version_is_an_outage_that_names_the_version(self):
+        graded = grade([hook("stale.example.com", [rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1",))], policy="Fail")])
+        self.assertEqual(graded["blocking"], [])
+        self.assertEqual([f["rules"] for f in graded["outage"]], [["CREATE certificatesigningrequests in certificates.k8s.io at v1beta1"]])
+        # The server serves the write at v1 alone, so it sends this webhook nothing: the cell
+        # says so, and does not report requests failing now.
+        self.assertEqual([f["version_pinned"] for f in graded["outage"]], [["CREATE certificatesigningrequests"]])
+        cell = r.describe_webhook_finding(graded["outage"][0])
+        self.assertIn("matches no request the server sends at a served version (its rules: CREATE certificatesigningrequests in certificates.k8s.io at v1beta1; the server serves CREATE certificatesigningrequests at v1 alone, so it sends this webhook none of them); it is reported, not graded", cell)
+        self.assertNotIn("fails now every request the server sends it", cell)
+        # A dead gate on a resource off the list does fail the requests it matches now.
+        graded = grade([hook("cm.example.com", [rule(["configmaps"])], policy="Fail")])
+        self.assertEqual([f["version_pinned"] for f in graded["outage"]], [[]])
+        self.assertIn("it fails now every request the server sends it", r.describe_webhook_finding(graded["outage"][0]))
+        # A pinned rule beside a served one is a blocker on the served rule. The record classes
+        # each rule by what the server serves it whichever bucket the finding is in, so the
+        # pinned rule is pinned there too, not live by the finding's bucket; the cell names the
+        # path write alone and says nothing of the classes.
+        graded = grade([hook("mixed.example.com", [rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1",)), rule(["pods"])], policy="Fail")])
+        self.assertEqual([f["upgrade_path"] for f in graded["blocking"]], [["CREATE pods"]])
+        self.assertEqual([f["version_pinned"] for f in graded["blocking"]], [["CREATE certificatesigningrequests"]])
+        self.assertEqual([f["pinned_rules"] for f in graded["blocking"]], [["CREATE certificatesigningrequests in certificates.k8s.io at v1beta1"]])
+        self.assertEqual([f["live_rules"] for f in graded["blocking"]], [["CREATE pods"]])
+        self.assertEqual([f["unknown_rules"] for f in graded["blocking"]], [[]])
+        cell = r.describe_webhook_finding(graded["blocking"][0])
+        self.assertIn("matches CREATE pods", cell)
+        self.assertNotIn("sends this webhook none of them", cell)
+        self.assertNotIn("v1beta1", cell.split("matches", 1)[1])
+        # A rule on `*` alone carries no version suffix; one on `v1` alone carries `at v1`.
+        for versions in (("*",), ("v1",)):
+            with self.subTest(versions=versions):
+                graded = grade([hook("live.example.com", [rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=versions)], policy="Fail")])
+                self.assertEqual([f["rules"] for f in graded["blocking"]], [["CREATE certificatesigningrequests in certificates.k8s.io"]] if versions == ("*",) else [["CREATE certificatesigningrequests in certificates.k8s.io at v1"]])
+
+    def test_a_pinned_rule_beside_a_live_off_path_rule_fails_the_live_rule_now(self):
+        # The pin is judged per rule. A webhook pairing a CSR rule at v1beta1 with a ConfigMap
+        # rule at v1 refuses every ConfigMap creation now: the cell names that rule as failing
+        # and the pinned rule alone as sent nothing, rather than saying the server sends the
+        # webhook none of its requests.
+        pinned = rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1",))
+        graded = grade([hook("mixed.example.com", [pinned, rule(["configmaps"], versions=("v1",))], policy="Fail")])
+        self.assertEqual(graded["blocking"], [])
+        finding = graded["outage"][0]
+        self.assertEqual(finding["version_pinned"], ["CREATE certificatesigningrequests"])
+        self.assertEqual(finding["pinned_rules"], ["CREATE certificatesigningrequests in certificates.k8s.io at v1beta1"])
+        self.assertEqual(finding["live_rules"], ["CREATE configmaps at v1"])
+        cell = r.describe_webhook_finding(finding)
+        self.assertIn("matches none of the operations this rule reads as the upgrade's path (its rules: CREATE certificatesigningrequests in certificates.k8s.io at v1beta1, CREATE configmaps at v1); it fails now every request the server sends it that matches CREATE configmaps at v1; the server serves CREATE certificatesigningrequests at v1 alone, so it sends the rule CREATE certificatesigningrequests in certificates.k8s.io at v1beta1 nothing; reported, not graded", cell)
+        self.assertNotIn("sends this webhook none of them", cell)
+        self.assertNotIn("sends it; reported", cell)  # the whole-webhook live clause
+        # The order of the rules does not change which is named as failing.
+        graded = grade([hook("mixed.example.com", [rule(["configmaps"]), pinned], policy="Fail")])
+        self.assertEqual((graded["outage"][0]["live_rules"], graded["outage"][0]["pinned_rules"]), (["CREATE configmaps"], ["CREATE certificatesigningrequests in certificates.k8s.io at v1beta1"]))
+        # Only a rule the list can vouch for is pinned, and only a rule at a served version is
+        # live: a wildcard at v1beta1, a path resource named beside one off the list at v1beta1
+        # and a wildcard group at v1beta1 may or may not still be served, which the reader
+        # cannot say, so each is unknown and the cell asserts no failure now.
+        for rules in (
+            [rule(["*"], groups=("*",), operations=("*",), versions=("v1beta1",))],
+            [rule(["certificatesigningrequests", "clustertrustbundles"], groups=("certificates.k8s.io",), versions=("v1beta1",))],
+            [rule(["certificatesigningrequests"], groups=("certificates.k8s.io", "*"), versions=("v1beta1",))],
+        ):
+            with self.subTest(rules=rules):
+                graded = grade([hook("wide.example.com", rules, policy="Fail")])
+                finding = graded["outage"][0]
+                self.assertEqual((finding["version_pinned"], finding["pinned_rules"], finding["live_rules"]), ([], [], []))
+                self.assertEqual(finding["unknown_rules"], finding["rules"])
+                cell = r.describe_webhook_finding(finding)
+                self.assertNotIn("fails now every request the server sends it", cell)
+                self.assertNotIn("that matches", cell)
+                self.assertIn("its requests fail now if the server still serves those versions", cell)
+
+    def test_each_rule_of_an_outage_is_classed_on_its_own_and_the_cell_says_each(self):
+        # Three spellings of a dead policy engine's leftovers: a failure now is asserted for a
+        # rule the server serves and for no other, whatever stands beside it.
+        csr_pinned = rule(["certificatesigningrequests"], groups=("certificates.k8s.io",), versions=("v1beta1",))
+        psp = rule(["podsecuritypolicies"], operations=("CREATE", "UPDATE"), groups=("policy",), versions=("v1beta1",))
+        # A pinned rule beside an off-list rule at an unserved version: sent nothing, and unknown.
+        finding = grade([hook("psp.example.com", [csr_pinned, psp], policy="Fail")])["outage"][0]
+        self.assertEqual((finding["live_rules"], finding["pinned_rules"], finding["unknown_rules"]),
+                         ([], ["CREATE certificatesigningrequests in certificates.k8s.io at v1beta1"], ["CREATE/UPDATE podsecuritypolicies in policy at v1beta1"]))
+        cell = r.describe_webhook_finding(finding)
+        self.assertIn("matches none of the operations this rule reads as the upgrade's path (its rules: CREATE certificatesigningrequests in certificates.k8s.io at v1beta1, CREATE/UPDATE podsecuritypolicies in policy at v1beta1); the server serves CREATE certificatesigningrequests at v1 alone, so it sends the rule CREATE certificatesigningrequests in certificates.k8s.io at v1beta1 nothing; the requests matched by CREATE/UPDATE podsecuritypolicies in policy at v1beta1 fail now if the server still serves those versions, which this reader does not know for a resource off its lists; reported, not graded", cell)
+        self.assertNotIn("fails now", cell)
+        # One rule naming a graded and an off-list resource, or group, at an unserved version is
+        # unknown: the pre-1.25 policy gate on budgets and PodSecurityPolicies written as one rule.
+        for rules in (
+            [rule(["certificatesigningrequests", "clustertrustbundles"], groups=("certificates.k8s.io",), versions=("v1beta1",))],
+            [rule(["pods"], groups=("", "apps"), versions=("v1beta1",))],
+            [rule(["poddisruptionbudgets", "podsecuritypolicies"], operations=("CREATE", "UPDATE"), groups=("policy",), versions=("v1beta1",))],
+        ):
+            with self.subTest(rules=rules):
+                finding = grade([hook("mixed.example.com", rules, policy="Fail")])["outage"][0]
+                self.assertEqual((finding["live_rules"], finding["pinned_rules"]), ([], []))
+                self.assertEqual(finding["unknown_rules"], finding["rules"])
+                cell = r.describe_webhook_finding(finding)
+                self.assertNotIn("fails now every request the server sends it", cell)
+                self.assertIn("its requests fail now if the server still serves those versions", cell)
+        # A live rule beside an unknown one: the live rule fails now, the unknown one is hedged.
+        finding = grade([hook("cm.example.com", [rule(["configmaps"]), psp], policy="Fail")])["outage"][0]
+        self.assertIn("; it fails now every request the server sends it that matches CREATE configmaps; the requests matched by CREATE/UPDATE podsecuritypolicies in policy at v1beta1 fail now if the server still serves those versions, which this reader does not know for a resource off its lists; reported, not graded", r.describe_webhook_finding(finding))
+        # All three classes in one webhook: one clause each, live, pinned, unknown, in that order.
+        finding = grade([hook("all.example.com", [psp, rule(["configmaps"]), csr_pinned], policy="Fail")])["outage"][0]
+        cell = r.describe_webhook_finding(finding)
+        self.assertIn("; it fails now every request the server sends it that matches CREATE configmaps; the server serves CREATE certificatesigningrequests at v1 alone, so it sends the rule CREATE certificatesigningrequests in certificates.k8s.io at v1beta1 nothing; the requests matched by CREATE/UPDATE podsecuritypolicies in policy at v1beta1 fail now if the server still serves those versions", cell)
+        self.assertEqual(cell.count("fail now if"), 1)
+        # A live rule on a resource the server may not serve at all (a CRD removed with its
+        # controller): the cell claims a failure for every request the server sends, no more.
+        finding = grade([hook("cm.example.com", [rule(["certificates"], operations=("CREATE", "UPDATE"), groups=("cert-manager.io",), versions=("v1",))], policy="Fail")])["outage"][0]
+        cell = r.describe_webhook_finding(finding)
+        self.assertIn("; it fails now every request the server sends it; reported, not graded", cell)
+        self.assertNotIn("its own requests", cell)
+        # The class is read from the versions: `*` or `v1` is live whatever the resource.
+        for versions in (("*",), ("v1",), ("v1beta1", "v1")):
+            with self.subTest(versions=versions):
+                self.assertEqual(r._rule_served_class(dict(psp, apiVersions=list(versions)), r.GRADED_TARGETS), r.RULE_LIVE)
+        self.assertEqual(r._rule_served_class(csr_pinned, r.GRADED_TARGETS), r.RULE_PINNED)
+        self.assertEqual(r._rule_served_class(psp, r.GRADED_TARGETS), r.RULE_UNKNOWN)
+
+    def test_monitoring_resources_are_outside_the_path(self):
+        # GKE's managed Prometheus operator gates its own resources fail-closed.
+        self.assertEqual(self._path([rule(["rules", "clusterrules", "globalrules"], groups=("monitoring.googleapis.com",), operations=("CREATE", "UPDATE"))]), [])
+
+    def test_split_webhook_items(self):
+        items = [webhook_config("ValidatingWebhookConfiguration", "v", []), webhook_config("MutatingWebhookConfiguration", "m", []), service("scen", "s"), endpoint_slice("scen", "s", [True]), namespace("kube-system"), {"kind": "PodDisruptionBudget"}, "junk"]
+        configs, services, slices, namespaces = r.split_webhook_items(items)
+        self.assertEqual(([c["metadata"]["name"] for c in configs], len(services), len(slices), [n["metadata"]["name"] for n in namespaces]), (["v", "m"], 1, 1, ["kube-system"]))
 
 
 if __name__ == "__main__":

@@ -6,7 +6,10 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
 * A pull request the work opened (:func:`pr_opened`), or a GitLab merge
   request: a bold headline naming it, the worker's own line below it as evidence, and "Open PR"
   ("Open MR" for a merge request; the primary button) and "Files changed" url buttons, beside a green side bar
-  (:data:`PR_SIDE_BAR`). :func:`opened_pr` finds it in a progress note or a report, and
+  (:data:`PR_SIDE_BAR`). :func:`proposal_ref` reads one from the url the forge
+  answered with when the work opened it, which no wording decides, and
+  :func:`evidence_line` finds the worker's line naming it. As the fallback for a
+  PR opened any other way, :func:`opened_pr` finds it in a progress note or a report, and
   only where the line says it opened that PR, the verb in front of the url
   with the worker as its subject by the one rule in :func:`_ours`, so a note
   citing someone else's PR ("… pull/300, opened by bob", "Dependabot opened
@@ -39,9 +42,10 @@ import slack_presenter as _presenter
 #: trailing path (``/files``, ``#discussion``) left out of the match. Any other
 #: host is left to the ordinary line: the headline vouches for the url in the
 #: bot's voice and the evidence line hides its host, so a note echoing someone
-#: else's link must not become a button. GitHub alone, as in
-#: ``repo_ref.GITHUB_HOSTS``, which names no enterprise host.
-PR_URL = re.compile(r"https://github\.com/([^\s/<>|]+)/([^\s/<>|]+)/pull/(\d+)")
+#: else's link must not become a button. github.com, and the install's GitHub
+#: Enterprise Server host when it has one (``_pr_url``), and no other host.
+PR_URL_TEMPLATE = r"https://(?:{hosts})/([^\s/<>|]+)/([^\s/<>|]+)/pull/(\d+)"
+PR_URL = re.compile(PR_URL_TEMPLATE.format(hosts=r"github\.com"))
 #: A GitLab merge request url over https: host, the project (the last segment
 #: of its path, groups and subgroups before it) and number, as groups 1 to 3,
 #: so the project and number sit where :data:`PR_URL` has repo and number. A
@@ -54,6 +58,21 @@ MR_URL = re.compile(r"https://([^\s/<>|:@]+)(?::\d+)?/(?:[^\s/<>|]+/)+([^\s/<>|]
 #: ``repo_ref.GITLAB_CANONICAL_HOST``, spelt out: this module imports nothing but
 #: ``slack_presenter``, and the image-build check stages no ``repo_ref`` beside it.
 GITLAB_HOST = "gitlab.com"
+
+
+_PR_URLS: dict[str, re.Pattern] = {}
+
+
+def _pr_url(github_host: str) -> re.Pattern:
+    """:data:`PR_URL` for an install whose GitHub host is ``github_host``."""
+    host = github_host.strip().lower()
+    if not host or host == "github.com":
+        return PR_URL
+    if host not in _PR_URLS:
+        _PR_URLS[host] = re.compile(PR_URL_TEMPLATE.format(hosts=r"github\.com|" + re.escape(host)))
+    return _PR_URLS[host]
+
+
 #: What must sit right before the url for a line to announce the PR as ours:
 #: the verb, then optionally "a"/"the", "new", "PR"/"pull request" with its
 #: number, a colon, dash or "(", and the opening of a ``[label](`` or ``<`` link.
@@ -173,7 +192,12 @@ PR_REF = "PR #{number}"
 #: #412". A Slack ``<url|label>``, markdown ``[label](url)`` or ``(url)``
 #: around it goes too, and so does a tail after the number (``/files``).
 PR_URL_TAIL = r"(?:[/?#][^\s<>|()\[\]]*)?"
-PR_REF_URL = r"(?:<{url}{tail}(?:\|[^>]*)?>|\[[^\]]*\]\({url}{tail}\)|{url}{tail})"
+#: ``(?!\d)`` ends the url at its number, so PR 9's url does not match inside PR 91's.
+URL_NUMBER_END = r"(?!\d)"
+PR_REF_URL = (
+    r"(?:<{url}" + URL_NUMBER_END + r"{tail}(?:\|[^>]*)?>|\[[^\]]*\]\({url}" + URL_NUMBER_END
+    + r"{tail}\)|{url}" + URL_NUMBER_END + r"{tail})"
+)
 PR_REF_SPAN = (
     r"(?:\b{lead}\s*[:—–-]?(?P<mark>[*_`]*)\s*)?(?P<open>[*_`]*)"
     r"(?:\(\s*{ref}\s*\)|{ref})(?P<close>[*_`]*)"
@@ -197,6 +221,10 @@ A_BEFORE_MR = re.compile(r"\b([Aa])(?=\s+[*_`]*MR !)")
 PR_LAYOUT = (PR_HEADLINE, PR_REF, PR_LEAD, OPEN_PR, FILES_PATH)
 MR_LAYOUT = (MR_HEADLINE, MR_REF, MR_LEAD, OPEN_MR, DIFFS_PATH)
 PR_ACTION_PREFIX = "kage_pr"
+#: A line naming a PR or merge request by its number alone ("PR #99", "MR !12"), as
+#: :func:`evidence_line` finds the worker's line about one it opened.
+PR_NUMBER_REF = r"(?<![\w#!])#{number}\b"
+MR_NUMBER_REF = r"(?<![\w#!])!{number}\b"
 
 #: An option line in a block reason: a bullet, a numbered item or a lettered one ("a)", "B.").
 OPTION_LINE = re.compile(r"^\s*(?:[-*•]|\d+[.)]|[A-Za-z][.)])\s+(.+?)\s*$")
@@ -235,21 +263,28 @@ WAITING = "⏸ waiting on you"
 NEEDS_YOU_SIDE_BAR = _presenter.SIDE_BAR_YELLOW
 
 
-def opened_pr(text: str, gitlab_hosts: Collection[str] = frozenset()) -> tuple[str, str, str, str] | None:
+def opened_pr(
+    text: str, gitlab_hosts: Collection[str] = frozenset(), github_host: str | None = None
+) -> tuple[str, str, str, str] | None:
     """``(url, repo, number, line)`` for the first PR ``text`` says was opened, else None."""
-    return next(opened_prs(text, gitlab_hosts), None)
+    return next(opened_prs(text, gitlab_hosts, github_host), None)
 
 
-def opened_prs(text: str, gitlab_hosts: Collection[str] = frozenset()) -> Iterator[tuple[str, str, str, str]]:
+def opened_prs(
+    text: str, gitlab_hosts: Collection[str] = frozenset(), github_host: str | None = None
+) -> Iterator[tuple[str, str, str, str]]:
     """``(url, repo, number, line)`` for each PR ``text`` says was opened, in order.
 
     A GitLab merge request counts too, on :data:`GITLAB_HOST` or one of
     ``gitlab_hosts``, the self-managed hosts the caller vouches for; its
     ``repo`` is the project. :func:`pr_opened` tells the two apart by the url.
+    ``github_host`` is the install's GitHub host, which the caller reads; None
+    is github.com. This module reads nothing but its arguments.
     """
     hosts = {GITLAB_HOST, *(host.lower() for host in gitlab_hosts)}
+    pr_url = _pr_url(github_host or "github.com")
     for line in str(text or "").splitlines():
-        for match, (before_url, then, labels) in _proposals(line, hosts):
+        for match, (before_url, then, labels) in _proposals(line, hosts, pr_url):
             verb = before_url.search(line[: match.start()]) or _opened_pr_then(
                 line[: match.start()], match.group(3), then
             )
@@ -261,9 +296,42 @@ def opened_prs(text: str, gitlab_hosts: Collection[str] = frozenset()) -> Iterat
             yield match.group(0), match.group(2), match.group(3), line.strip()
 
 
-def _proposals(line: str, gitlab_hosts: Collection[str]) -> list[tuple[re.Match, tuple]]:
-    """Each PR url and merge request url on ``gitlab_hosts`` in ``line``, in order, with its rules."""
-    found = [(match, PR_RULES) for match in PR_URL.finditer(line)]
+def proposal_ref(
+    url: str, gitlab_hosts: Collection[str] = frozenset(), github_host: str | None = None
+) -> tuple[str, str, str] | None:
+    """``(url, repo, number)`` for the PR or merge request at ``url``, else None.
+
+    For a url a forge answered with when the work opened it, so no wording is
+    read: a PR on github.com or ``github_host``, or a merge request on
+    :data:`GITLAB_HOST` or one of ``gitlab_hosts``, the hosts :func:`opened_prs`
+    would announce, with any tail left out as it leaves it out.
+    """
+    text = str(url or "").strip()
+    match = _pr_url(github_host or "github.com").match(text)
+    if match is None:
+        match = MR_URL.match(text)
+        hosts = {GITLAB_HOST, *(host.lower() for host in gitlab_hosts)}
+        if match is None or match.group(1).lower() not in hosts:
+            return None
+    return match.group(0), match.group(2), match.group(3)
+
+
+def evidence_line(text: str, url: str, number: str) -> str:
+    """The first line of ``text`` naming the PR at ``url``, by its url or its number, else ""."""
+    ref = re.compile((MR_NUMBER_REF if MR_URL.match(url) else PR_NUMBER_REF).format(number=re.escape(number)))
+    named = re.compile(re.escape(url) + URL_NUMBER_END)
+    for line in str(text or "").splitlines():
+        if named.search(line) or ref.search(line):
+            return line.strip()
+    return ""
+
+
+def _proposals(
+    line: str, gitlab_hosts: Collection[str], pr_url: re.Pattern = PR_URL
+) -> list[tuple[re.Match, tuple]]:
+    """Each PR url (on the hosts ``pr_url`` matches) and merge request url on
+    ``gitlab_hosts`` in ``line``, in order, with its rules."""
+    found = [(match, PR_RULES) for match in pr_url.finditer(line)]
     found += [(match, MR_RULES) for match in MR_URL.finditer(line) if match.group(1).lower() in gitlab_hosts]
     return sorted(found, key=lambda item: item[0].start())
 

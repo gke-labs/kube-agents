@@ -125,6 +125,14 @@ unit on the stream, which waits for it first (`wait_platform_runs`), so an audit
 run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the four it
 starts. devops-bench ignores the key.
 
+The runner pauses most of the Platform Agent's clock-started audits once per lease, before any
+unit (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
+repository in the middle of an eval and be charged to whichever cases are running. It leaves the
+four the `oobe` stage starts (the stage holds a paused audit rather than starting it), the
+`no_agent` jobs, and any job the image doesn't ship. Those four still run on their clock, so a
+write from one of them mid-eval is still possible. An audit case starts its own run from its
+prompt, which a paused schedule doesn't affect.
+
 `verification_spec` is the exact half of the grade, and the rest of this document is
 mostly about it.
 
@@ -230,7 +238,9 @@ passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
 case it runs), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
-purges it), `worker_agents` (regular expressions every one of which must match the
+purges it, or with `required_runs` a script by its basename and the flags that must
+follow it on the same shell segment, read from the command's argv as the shell splits
+it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `replay_card` (the status and comments of the card a
 card-wake replay planted, read before the harness archives it), and `reply_is_silent`
