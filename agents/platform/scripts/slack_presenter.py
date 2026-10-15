@@ -391,6 +391,9 @@ CLAUSE_SUBORDINATE = re.compile(
     r"(?:if|when|whenever|while|although|though|because|since|unless|until|after|before|once|as|whether)\b",
     re.IGNORECASE,
 )
+#: How far into a first sentence :func:`clause_cut` looks for a break: no headline of at most
+#: ``HEADLINE_MAX`` plain characters starts further in, and an answer can be megabytes long.
+CLAUSE_SCAN_MAX = 4096
 #: The shortest headline a clause cut may leave, its stop included: "In seeded-a." names nothing.
 CLAUSE_HEADLINE_MIN = 20
 #: A clause cut never falls inside a parenthetical or a link's label or url.
@@ -758,6 +761,13 @@ def clause_cut(sentence: str) -> tuple[str, str] | None:
                 and marker not in inner:
             cut = clause_cut(inner)
             return (f"{marker}{cut[0]}{marker}", f"{marker}{cut[1]}{marker}") if cut else None
+    if len(sentence) > CLAUSE_SCAN_MAX:
+        # No headline comes from past the scan, so only its prefix is read, up to its last space,
+        # and the rest of the sentence follows the cut's rest as written.
+        end = sentence.rfind(" ", 0, CLAUSE_SCAN_MAX)
+        end = end if end > 0 else CLAUSE_SCAN_MAX
+        cut = clause_cut(sentence[:end])
+        return (cut[0], cut[1] + sentence[end:]) if cut else None
     held, spans = _hold_code(sentence)
     masked, depth = [], 0
     for char in held:

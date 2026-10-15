@@ -428,6 +428,14 @@ func TestCardsSettleTheAsk(t *testing.T) {
 
 func ptr(s string) *string { return &s }
 
+// An invalid UTF-8 byte inside an open bracket at the sentence's end is
+// masked at its own width: no write past the buffer, no panic.
+func TestClauseCutSurvivesAnInvalidByteInABracket(t *testing.T) {
+	sentence := strings.Repeat("word ", 40) + "and more (open \xff"
+	splitAnswer(sentence)
+	clauseCut(sentence)
+}
+
 // The presenter's linear-time cases: nothing here retries a line's end from
 // every marker.
 func TestSplitAnswerStaysLinear(t *testing.T) {

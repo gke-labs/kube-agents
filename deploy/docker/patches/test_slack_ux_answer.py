@@ -454,7 +454,12 @@ class SendTest(unittest.TestCase):
         asyncio.run(wrapped.send(CHANNEL, case["input"]["markdown"], metadata={}))
         post = adapter.log[0][1]
         self.assertNotIn("thread_ts", post)
-        self.assertNotIn("actions", [block["type"] for block in post["blocks"]])
+        types_ = [block["type"] for block in post["blocks"]]
+        self.assertNotIn("actions", types_)
+        chat = case["expected"][0]["chat"]
+        shown = post["blocks"][1:types_.index("container")]
+        self.assertEqual(shown, _render_blocks(chat["detail"].rsplit("\n\n", 1)[0], adapter.format_message),
+                         "the options stay in sight above the fold")
 
     def test_a_closing_question_posts_after_the_fold(self):
         question = "Want me to scale the pool to 6 nodes?"

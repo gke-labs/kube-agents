@@ -337,15 +337,15 @@ class _AnswerFolder:
         headline, rest = parts
         adapter = self._adapter
         mrkdwn_fn = getattr(adapter, "format_message", None)
-        # A click answers in the thread it was clicked in, so outside a thread the options
-        # stay text, as a needs-you question's and a failure reply's offer do.
-        offered = _moments.answer_choices(rest) if adapter._resolve_thread_ts(None, metadata) else None
+        offered = _moments.answer_choices(rest)
         if offered is not None:
             # An answer asking which of its options to take: the opening paragraph and the
             # options' shown lines stay in sight, the rest folds, and the options are buttons.
             shown, rest, question, options = offered
             detail_blocks = render_fold(shown, mrkdwn_fn) if shown else []
-            action_blocks = choice_blocks(options)
+            # A click answers in the thread it was clicked in, so outside a thread the options
+            # stay in sight as text, as a needs-you question's and a failure reply's offer do.
+            action_blocks = choice_blocks(options) if adapter._resolve_thread_ts(None, metadata) else []
         else:
             rest, question = trailing_question(rest)
             detail_blocks, action_blocks = [], []

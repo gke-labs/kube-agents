@@ -18,6 +18,9 @@ import (
 //     asking which of two to five options to take offers them as choices,
 //     with the explanation under "why".
 const (
+	// clauseScanMax is CLAUSE_SCAN_MAX: how many code points into a first
+	// sentence clauseCut looks for a break.
+	clauseScanMax = 4096
 	// clauseHeadlineMin is CLAUSE_HEADLINE_MIN: the shortest headline a
 	// clause cut may leave, its stop included.
 	clauseHeadlineMin = 20
@@ -95,21 +98,41 @@ func clauseCut(sentence string) (string, string, bool) {
 			return marker + head + marker, marker + rest + marker, true
 		}
 	}
+	if rs := []rune(sentence); len(rs) > clauseScanMax {
+		// No headline comes from past the scan: read its prefix, up to its
+		// last space, and let the rest of the sentence follow the cut's rest.
+		end := clauseScanMax
+		for i := clauseScanMax - 1; i > 0; i-- {
+			if rs[i] == ' ' {
+				end = i
+				break
+			}
+		}
+		head, rest, ok := clauseCut(string(rs[:end]))
+		if !ok {
+			return "", "", false
+		}
+		return head, rest + string(rs[end:]), true
+	}
 	held, spans := holdCode(sentence)
 	masked := []byte(held)
 	depth := 0
-	for i, r := range held {
+	for i := 0; i < len(held); {
+		// The width read, not utf8.RuneLen: an invalid byte decodes as
+		// RuneError at width 1, which RuneLen would call 3.
+		r, width := utf8.DecodeRuneInString(held[i:])
 		if strings.ContainsRune(clauseOpeners, r) {
 			depth++
 		}
 		if depth > 0 {
-			for k := 0; k < utf8.RuneLen(r); k++ {
+			for k := 0; k < width; k++ {
 				masked[i+k] = clauseMask
 			}
 		}
 		if strings.ContainsRune(clauseClosers, r) && depth > 0 {
 			depth--
 		}
+		i += width
 	}
 	var head, rest string
 	found := false

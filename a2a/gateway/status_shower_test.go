@@ -53,6 +53,20 @@ func TestAStatusShowingBackendGetsNoRollingLine(t *testing.T) {
 	}
 }
 
+// With no line to put it on, a submission that never reached the bus is
+// posted, so the ask does not go unanswered.
+func TestAStatusShowingBackendGetsTheBusFailurePosted(t *testing.T) {
+	r, _ := startRigWithSpawnerAdapter(t, "platform", 0, nil, func(a *fakeAdapter) Adapter {
+		return statusShowingAdapter{a}
+	})
+	deleteTasksStream(t, r.url)
+	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/no-bus", Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "count me"}
+	waitFor(t, "the bus failure posted", postedContaining(r, noticeBusUnreachable))
+	if edits := r.adapter.editTexts(); len(edits) != 0 {
+		t.Fatalf("edits = %q, want none: there is no line", edits)
+	}
+}
+
 // Behind the mux, as a real install runs it (Slack beside the console), the
 // answer is the owning backend's: a Slack conversation shows no line, a
 // console one keeps it, and an unknown prefix keeps it.
@@ -111,10 +125,13 @@ func TestASessionErrorIsWarnedOnce(t *testing.T) {
 // The Slack adapter shows the status once Agent Sessions is wired, and keeps
 // the line without it.
 func TestSlackShowsTaskStatusWithAgentSessions(t *testing.T) {
-	if !(&SlackAdapter{sessionsAPI: slackSessionsClient{}}).ShowsTaskStatus("slack:C1") {
+	if (&SlackAdapter{sessionsAPI: slackSessionsClient{}}).ShowsTaskStatus("slack:dm/D1") {
+		t.Error("a conversation with no thread gets no Agent Session: want the rolling line kept")
+	}
+	if !(&SlackAdapter{sessionsAPI: slackSessionsClient{}}).ShowsTaskStatus("slack:C1/1700000000.000100") {
 		t.Error("with Agent Sessions: want the status shown, no rolling line")
 	}
-	if (&SlackAdapter{}).ShowsTaskStatus("slack:C1") {
+	if (&SlackAdapter{}).ShowsTaskStatus("slack:C1/1700000000.000100") {
 		t.Error("without Agent Sessions: want the rolling line kept")
 	}
 }
