@@ -145,30 +145,20 @@ class SkillBlocksTest(unittest.TestCase):
             got,
         )
 
-    def test_a_first_party_reference_page_is_scanned_with_its_skill(self):
+    def test_a_reference_page_is_scanned_with_its_skill(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for name in ("fleet-audit", "gke-basics"):
-                skill = Path(tmp) / name / "SKILL.md"
-                (skill.parent / "references").mkdir(parents=True)
-                skill.write_text("```bash\nls\n```\n")
-                (skill.parent / "references" / "step.md").write_text("```sh\npwd\n```\n")
-            got = check.skill_blocks(check.MIRRORED_TREE, Path(tmp))
+            skill = Path(tmp) / "demo" / "SKILL.md"
+            (skill.parent / "references").mkdir(parents=True)
+            skill.write_text("```bash\nls\n```\n")
+            (skill.parent / "references" / "step.md").write_text("```sh\npwd\n```\n")
+            got = check.skill_blocks("agents/platform/skills", Path(tmp))
         self.assertEqual(
             [
-                check.Block("agents/platform/skills/fleet-audit/SKILL.md", 2, "ls"),
-                check.Block("agents/platform/skills/fleet-audit/references/step.md", 2, "pwd"),
-                check.Block("agents/platform/skills/gke-basics/SKILL.md", 2, "ls"),
+                check.Block("agents/platform/skills/demo/SKILL.md", 2, "ls"),
+                check.Block("agents/platform/skills/demo/references/step.md", 2, "pwd"),
             ],
             got,
         )
-
-    def test_the_mirrored_prefix_names_exactly_the_mirrored_skills(self):
-        skills = REPO_ROOT / check.MIRRORED_TREE
-        prefixed = {p.name for p in skills.iterdir() if p.name.startswith(check.MIRRORED_PREFIX)}
-        locked = {
-            p.parent.name for p in (REPO_ROOT / "agents/platform/skill-overlays").glob("*/upstream.lock")
-        }
-        self.assertEqual(locked, prefixed)
 
     def test_a_block_is_scanned_whole(self):
         body = "# apply it\nfoo \\\n  --bar\ncat > cm.yaml <<'END-OF-FILE'\ndescription: don't\nEND-OF-FILE\n$G add cm.yaml"

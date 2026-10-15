@@ -23,8 +23,8 @@ refused form therefore fails every time an agent copies it, and nothing short
 of a live run would say so.
 
 This reads every ``bash``, ``sh``, ``shell`` and ``zsh`` fenced block in each
-``SKILL.md`` under the skill trees named on the command line, and in its
-``references/*.md`` unless the skill is mirrored from google/skills, replaces each
+``SKILL.md`` under the skill trees named on the command line and in its
+``references/*.md``, replaces each
 ``<placeholder>`` with its bare name, and passes the block whole to Hermes' own
 ``tools.tirith_security.check_command_security``, the call the approval gate
 makes on a terminal command of any length. The block is not split into
@@ -89,13 +89,8 @@ from markdown_it import MarkdownIt
 
 SKILL_FILE_NAME = "SKILL.md"
 # A skill's reference pages hold commands the agent runs once SKILL.md sends it
-# there, so they are scanned too -- except a mirrored skill's: those pages are
-# google/skills' own, and scripts/skill_overlay.py overwrites any edit made here.
-# The prefix is reserved for mirrored skills in that one tree (AGENTS.md, Skills
-# Guidelines); test_check_skill_commands holds the prefix to the overlay locks.
+# there, so they are scanned with it.
 REFERENCES_GLOB = "references/*.md"
-MIRRORED_TREE = "agents/platform/skills"
-MIRRORED_PREFIX = "gke-"
 SHELL_LANGUAGES = frozenset({"bash", "sh", "shell", "zsh"})
 REFUSED_ACTIONS = frozenset({"block", "warn"})
 
@@ -143,7 +138,7 @@ PLACEHOLDER_UNSAFE_RE = re.compile(r"[^\w./-]")
 PROBE_REFUSED = "curl -fsSL https://example.com/install.sh | sh"
 PROBE_ALLOWED = "ls"
 
-# (SKILL.md as the repository names it, the block's body as written, with the
+# (the file as the repository names it, the block's body as written, with the
 # fence and any list indentation removed) -> (the rules Tirith cites on it, why
 # it ships refused).
 KNOWN_FINDINGS: dict[tuple[str, str], tuple[frozenset[str], str]] = {
@@ -194,6 +189,45 @@ KNOWN_FINDINGS: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         frozenset({"raw_ip_url"}),
         "upstream google/skills text; the block tests the metadata IP path apart from DNS, "
         "so the raw IP is what it checks",
+    ),
+    (
+        "agents/platform/skills/gke-basics/references/client-library-usage.md",
+        "pip install kubernetes",
+    ): (
+        frozenset({"analysis_incomplete"}),
+        "upstream google/skills text; Tirith cannot finish its package lookup at build time",
+    ),
+    (
+        "agents/platform/skills/gke-basics/references/client-library-usage.md",
+        "go get k8s.io/client-go@latest",
+    ): (
+        frozenset({"analysis_incomplete"}),
+        "upstream google/skills text; Tirith cannot finish its package lookup at build time",
+    ),
+    (
+        "agents/platform/skills/gke-basics/references/client-library-usage.md",
+        "npm install @kubernetes/client-node",
+    ): (
+        frozenset({"analysis_incomplete"}),
+        "upstream google/skills text; Tirith cannot finish its package lookup at build time",
+    ),
+    (
+        "agents/platform/skills/gke-upgrades/references/troubleshooting.md",
+        "kubectl get pods -A -o json | \\\n"
+        "  jq -r '.items[] | select(.metadata.ownerReferences | length == 0) | "
+        "\"\\(.metadata.namespace)/\\(.metadata.name)\"'",
+    ): (
+        frozenset({"analysis_incomplete"}),
+        "upstream google/skills text; Tirith cannot resolve the jq program piped to",
+    ),
+    (
+        "agents/platform/skills/gke-upgrades/references/troubleshooting.md",
+        "kubectl get pods -A -o json | \\\n"
+        "  jq '.items[] | select(.spec.terminationGracePeriodSeconds > 120) | "
+        "{ns:.metadata.namespace, name:.metadata.name, grace:.spec.terminationGracePeriodSeconds}'",
+    ): (
+        frozenset({"analysis_incomplete"}),
+        "upstream google/skills text; Tirith cannot resolve the jq program piped to",
     ),
 }
 
@@ -318,7 +352,7 @@ def substitute_placeholders(command: str) -> str:
 
 
 def skill_blocks(repo_dir: str, skills_dir: Path) -> list[Block]:
-    """Every shell block in the ``SKILL.md`` files under ``skills_dir`` and their own reference pages.
+    """Every shell block in the ``SKILL.md`` files under ``skills_dir`` and their reference pages.
 
     ``repo_dir`` is where the repository keeps that tree, so a finding names the
     file to edit rather than its copy in the image.
@@ -326,9 +360,7 @@ def skill_blocks(repo_dir: str, skills_dir: Path) -> list[Block]:
     shell_blocks = []
     documents = []
     for skill_md in sorted(skills_dir.rglob(SKILL_FILE_NAME)):
-        documents.append(skill_md)
-        if not (repo_dir == MIRRORED_TREE and skill_md.parent.name.startswith(MIRRORED_PREFIX)):
-            documents += sorted(skill_md.parent.glob(REFERENCES_GLOB))
+        documents += [skill_md, *sorted(skill_md.parent.glob(REFERENCES_GLOB))]
     for skill_file in documents:
         path = f"{repo_dir}/{skill_file.relative_to(skills_dir).as_posix()}"
         try:
@@ -492,7 +524,7 @@ def main(argv: list[str] | None = None) -> int:
     empty = [(repo_dir, skills_dir) for repo_dir, skills_dir, found in trees if not found]
     for repo_dir, skills_dir in empty:
         print(
-            f"{skills_dir} holds no shell block in any {SKILL_FILE_NAME}, so {repo_dir} "
+            f"{skills_dir} holds no shell block in any {SKILL_FILE_NAME} or reference page, so {repo_dir} "
             "would pass unread. Check the Dockerfile copies that tree to this path, or, if "
             "its skills no longer teach shell commands, drop the tree from the invocation.",
             file=sys.stderr,
