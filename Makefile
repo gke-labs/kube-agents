@@ -775,7 +775,7 @@ terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `te
 	done; \
 	if [ -n "$$failed" ]; then echo "Failing Terraform test directories:$$failed"; exit 1; fi
 
-tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind.
+tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind; an approved apply (ARGS=-auto-approve) retries past Cloud KMS's first-enablement 403.
 	@./terraform/examples/full-install/lifecycle.sh apply $(ARGS)
 
 tf-destroy: ## Destroy terraform/examples/full-install, clearing the finalizer, backups, and deletion protection first.

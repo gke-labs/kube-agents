@@ -2,9 +2,9 @@
   "schema_version": 2,
   "description": "Role catalog for the seeded fleet. A scenario names a fixture ROLE; the runner (hack/fleet-kubeconfigs.sh) discovers the leased project's seeded clusters by label, matches each to a slot below, confirms every object in the role's `probes` list is present, and only then writes that role's kubeconfig. Nothing outside this file may address a seeded cluster or an eval project directly: each project carries its own set, so a case written against one must run unchanged against all of them. Names, prefix and location are deliberately absent -- they are the Terraform's business and are read back off the discovered clusters. See README.md, 'Addressing a fixture by role'. One sanctioned exception, which discovers by these same labels and the trailing -<slot> name rule: hack/ci-eval-pr.sh section 3b reuses the slot-c cluster as the gpu-stress-test log-fixture subject -- it mutates nothing in-cluster, writes only project-level Cloud Logging entries that name the cluster, and falls back to a per-run cluster when slot c is absent, not RUNNING, or its default namespace is not empty. hack/fleet-fixture-state.py discovers nothing: it reads the slot's cluster name and location back out of the `.fleet-context` file the runner wrote, for the `cluster` state subjects below.",
   "probe_syntax": "Each probe is `<kind>/<name>` or `<kind>?<label-selector>`, read against the role's `namespace` when it has one. A role's namespace is probed implicitly. A probe is the runner's promise that the object was THERE before the agent ran, and it is the only thing that entitles a check to call the same object's later absence a violation rather than an environment that was never ready -- so every subject a task.yaml asserts on must appear here, which bench/tests/test_fleet_verifier.py enforces in both directions. A role with an empty list confirms nothing, and its checks can never blame the run for an absence.",
-  "state_syntax": "Presence is not state (#1278: every probe passed while payments-api sat Pending on 30 projects). Each `state` entry is one assertion about the DESIGNED observable state of a role whose probes passed, evaluated by hack/fleet-fixture-state.py after the runner publishes the role: `subject` is a probe-shaped `<kind>/<name>`, `<kind>?<label-selector>` or bare `<kind>?` (every object of that kind in the role's namespace), or the word `cluster` for the GKE cluster carrying the role, read with `clusters describe` on the name the runner recorded; `path` is a dotted field path with `[*]`, `[N]` or `[?(@.key=='value')]` steps; `op` is `eq`, `ge`, `any_eq`, `any_ge`, `none_eq` (each with a `value`), `absent` (no value, no objects or no values at the path), `after_now` (an RFC 3339 timestamp still ahead), or `minor_behind_channel_default` (cluster subject only: the minor is `value` behind the cluster's own release channel default); `why` says what the cases lose when it fails. A role whose fixture is present but fails any assertion is DRIFTED: scripts/verify_ci_pool_project.py fails the project, and the script writes `<role>.drift` beside the role's kubeconfig, one failed assertion per line with what was observed (#1544). The presubmit does not run this pass and never acts on a drift; a scheduled scan of every pool project from the CI health bot is the follow-up on #1550. A role with an empty list asserts nothing beyond presence.",
+  "state_syntax": "Presence is not state (#1278: every probe passed while payments-api sat Pending on 30 projects). Each `state` entry is one assertion about the DESIGNED observable state of a role whose probes passed, evaluated by hack/fleet-fixture-state.py after the runner publishes the role: `subject` is a probe-shaped `<kind>/<name>`, `<kind>?<label-selector>` or bare `<kind>?` (every object of that kind in the role's namespace), or the word `cluster` for the GKE cluster carrying the role, read with `clusters describe` on the name the runner recorded; `path` is a dotted field path with `[*]`, `[N]`, `[?(@.key=='value')]` or `[\"quoted.key\"]` steps, the last for a label or selector key the bare form cannot carry (`metadata.labels[\"pod-security.kubernetes.io/enforce-version\"]`); `op` is `eq`, `ge`, `any_eq`, `any_ge`, `none_eq` (each with a `value`), `absent` (no value, no objects or no values at the path), `after_now` (an RFC 3339 timestamp still ahead), or `minor_behind_channel_default` (cluster subject only: the minor is `value` behind the cluster's own release channel default); `why` says what the cases lose when it fails. A role whose fixture is present but fails any assertion is DRIFTED: scripts/verify_ci_pool_project.py fails the project, and the script writes `<role>.drift` beside the role's kubeconfig, one failed assertion per line with what was observed (#1544). The presubmit does not run this pass and never acts on a drift; a scheduled scan of every pool project from the CI health bot is the follow-up on #1550. A role with an empty list asserts nothing beyond presence. A `value` may be an object or an empty object; it is compared whole and structurally (key order does not matter), so an `emptyDir` with no fields is `{}`. One key of a label or selector map is asserted through the quoted step, not by comparing the whole map, so a key another owner adds is not drift.",
   "cluster_slots": {
-    "a": "The five seeded workload namespaces, plus the idle and pinned node pools.",
+    "a": "The seeded workload namespaces (each role's `namespace` names its own), plus the idle and pinned node pools.",
     "b": "Control plane held one minor behind the REGULAR channel default, plus the upgrade-readiness drain defects.",
     "c": "The consistency outlier: no master authorized networks.",
     "d": "Multi-zonal: nodes in two zones, carrying the zonal-skew fixtures. The only slot whose shape is the fixture."
@@ -532,6 +532,375 @@
           "op": "eq",
           "value": "128Mi",
           "why": "a resize anyone applies removes the posture the declaration covers, and the case then grades nothing"
+        }
+      ]
+    },
+    "node-local-state": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["deployment/cache-on-emptydir"],
+      "fixture": "cache-on-emptydir Deployment (one replica) whose queue directory is an emptyDir: the stamp it writes at start is state that lives on the node and does not survive the node rebuild an upgrade performs",
+      "state": [
+        {
+          "subject": "deployment/cache-on-emptydir",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the before-state is a running pod holding state on its node; a Pending pod holds nothing a rebuild could lose"
+        },
+        {
+          "subject": "deployment/cache-on-emptydir",
+          "path": "status.unavailableReplicas",
+          "op": "absent",
+          "why": "a rollout that cannot finish keeps the old pod ready, so readyReplicas stays 1 while the new pod waits in ImagePullBackOff or ContainerCreating; the controller counts that pod here and omits the field when every pod is available"
+        },
+        {
+          "subject": "deployment/cache-on-emptydir",
+          "path": "spec.template.spec.volumes[?(@.name=='queue')].emptyDir",
+          "op": "any_eq",
+          "value": {},
+          "why": "the emptyDir is the defect. Move the queue to a PersistentVolumeClaim and the rebuild loses nothing -- the fixture is healed while the pod still runs"
+        }
+      ]
+    },
+    "deprecated-label-selector": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["deployment/arch-pinned-worker"],
+      "fixture": "arch-pinned-worker Deployment (one replica) with a nodeSelector on beta.kubernetes.io/arch, a label deprecated since 1.14 that the kubelet still sets; the pod schedules today and never again once a node image drops the label",
+      "state": [
+        {
+          "subject": "deployment/arch-pinned-worker",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the before-state is a pod that schedules on today's label; a pod already Pending is the after-state, not the fixture"
+        },
+        {
+          "subject": "deployment/arch-pinned-worker",
+          "path": "status.unavailableReplicas",
+          "op": "absent",
+          "why": "a rollout that cannot finish keeps the old pod ready, so readyReplicas stays 1 while the new pod waits in ImagePullBackOff or ContainerCreating; the controller counts that pod here and omits the field when every pod is available"
+        },
+        {
+          "subject": "deployment/arch-pinned-worker",
+          "path": "spec.template.spec.nodeSelector[\"beta.kubernetes.io/arch\"]",
+          "op": "eq",
+          "value": "amd64",
+          "why": "the selector on the beta label is the defect. Replace the key with kubernetes.io/arch, or drop it, and no node image change can strand the pod -- healed while every probe still passes"
+        }
+      ]
+    },
+    "containerd-socket-agent": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["daemonset/node-runtime-probe"],
+      "fixture": "node-runtime-probe DaemonSet mounting the containerd socket from the host, read-only, on the default pool: the agent shape a containerd major change or a CRI API removal breaks",
+      "state": [
+        {
+          "subject": "daemonset/node-runtime-probe",
+          "path": "status.numberReady",
+          "op": "any_ge",
+          "value": 1,
+          "why": "an agent that is not running on any node holds no socket; the before-state needs at least one node where the mount succeeded"
+        },
+        {
+          "subject": "daemonset/node-runtime-probe",
+          "path": "status.numberUnavailable",
+          "op": "absent",
+          "why": "a rolling update that halts on a node where the new pod cannot start leaves the other node's old pod ready, so numberReady stays above zero; the controller counts the halted node here and omits the field when every node's pod is available"
+        },
+        {
+          "subject": "daemonset/node-runtime-probe",
+          "path": "spec.template.spec.volumes[?(@.name=='sock')].hostPath.path",
+          "op": "any_eq",
+          "value": "/run/containerd/containerd.sock",
+          "why": "the socket mount is the defect. An agent reading the CRI through the kubelet's API instead has nothing a runtime change can take away"
+        }
+      ]
+    },
+    "intree-pd-volume": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": [
+        "persistentvolumeclaim/intree-pd",
+        "persistentvolume/intree-pd",
+        "deployment/intree-pd-reader"
+      ],
+      "fixture": "intree-pd PersistentVolume written against the in-tree gcePersistentDisk plugin over the fleet's own disk, bound by the intree-pd claim in seeded-shapes and mounted by the intree-pd-reader Deployment, so the attach goes through CSI migration",
+      "state": [
+        {
+          "subject": "persistentvolumeclaim/intree-pd",
+          "path": "status.phase",
+          "op": "eq",
+          "value": "Bound",
+          "why": "an unbound claim says the disk or the volume is gone, which is the after-state of a different failure; the fixture is a volume that binds today through migration"
+        },
+        {
+          "subject": "persistentvolumeclaim/intree-pd",
+          "path": "spec.volumeName",
+          "op": "eq",
+          "value": "intree-pd",
+          "why": "the claim has to be bound to the in-tree volume, not to a CSI volume a storage class provisioned in its place -- that would be the heal"
+        },
+        {
+          "subject": "persistentvolume/intree-pd",
+          "path": "spec.csi",
+          "op": "absent",
+          "why": "the in-tree source is the defect. A volume recreated on the PD CSI driver carries spec.csi and attaches without migration -- the heal, with the claim still Bound"
+        },
+        {
+          "subject": "deployment/intree-pd-reader",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the attach is the before-state: a ready pod with the claim mounted shows CSI migration still carries the in-tree volume. A pod stuck in ContainerCreating is the after-state the entry describes"
+        },
+        {
+          "subject": "deployment/intree-pd-reader",
+          "path": "status.unavailableReplicas",
+          "op": "absent",
+          "why": "a rollout that cannot finish keeps the old pod ready, so readyReplicas stays 1 while the new pod waits in ImagePullBackOff or ContainerCreating; the controller counts that pod here and omits the field when every pod is available"
+        }
+      ]
+    },
+    "retired-registry-image": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["deployment/legacy-registry-pull"],
+      "fixture": "legacy-registry-pull Deployment (one replica) pulling k8s.gcr.io/pause:3.9 with imagePullPolicy Always: a retired registry hostname that answers by redirect today, so every node rebuild pulls it again from a host that may stop",
+      "state": [
+        {
+          "subject": "deployment/legacy-registry-pull",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the before-state is an image that still pulls; a pod in ImagePullBackOff, whatever its phase, is the after-state the catalogue describes"
+        },
+        {
+          "subject": "deployment/legacy-registry-pull",
+          "path": "status.unavailableReplicas",
+          "op": "absent",
+          "why": "a rollout that cannot finish keeps the old pod ready, so readyReplicas stays 1 while the new pod waits in ImagePullBackOff or ContainerCreating; the controller counts that pod here and omits the field when every pod is available"
+        },
+        {
+          "subject": "deployment/legacy-registry-pull",
+          "path": "spec.template.spec.containers[*].image",
+          "op": "any_eq",
+          "value": "k8s.gcr.io/pause:3.9",
+          "why": "the retired hostname is the defect. Repointing the image at registry.k8s.io heals it while the pod keeps running"
+        }
+      ]
+    },
+    "moving-admission-default": {
+      "cluster_slot": "a",
+      "namespace": "seeded-defaults",
+      "probes": ["deployment/baseline-edge-worker"],
+      "fixture": "seeded-defaults namespace with Pod Security Admission pinned to enforce baseline at version latest, so the rule set applied to its workloads changes at every minor without anyone editing it; baseline-edge-worker (one replica) is admitted by today's baseline",
+      "state": [
+        {
+          "subject": "deployment/baseline-edge-worker",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the before-state is a workload today's rule set admits; a pod refused at admission is the after-state"
+        },
+        {
+          "subject": "deployment/baseline-edge-worker",
+          "path": "status.unavailableReplicas",
+          "op": "absent",
+          "why": "a rollout that cannot finish keeps the old pod ready, so readyReplicas stays 1 while the new pod waits in ImagePullBackOff or ContainerCreating; the controller counts that pod here and omits the field when every pod is available"
+        },
+        {
+          "subject": "namespace/seeded-defaults",
+          "path": "metadata.labels[\"pod-security.kubernetes.io/enforce\"]",
+          "op": "eq",
+          "value": "baseline",
+          "why": "enforcement is what makes the pin matter; a namespace that only warns refuses nothing at the next minor, which is the heal with the pin still written"
+        },
+        {
+          "subject": "namespace/seeded-defaults",
+          "path": "metadata.labels[\"pod-security.kubernetes.io/enforce-version\"]",
+          "op": "eq",
+          "value": "latest",
+          "why": "the latest-version pin is the defect. Pinning the version to a named minor heals it while the pod keeps running"
+        }
+      ]
+    },
+    "stale-client-skew": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["cronjob/stale-kubectl-client"],
+      "fixture": "stale-kubectl-client CronJob running kubectl v1.29.0 against seeded-a's control plane every ten minutes: a client several minors outside the supported skew that still succeeds today, because /version answers any authenticated caller",
+      "state": [
+        {
+          "subject": "cronjob/stale-kubectl-client",
+          "path": "spec.suspend",
+          "op": "none_eq",
+          "value": true,
+          "why": "a suspended CronJob is not a client talking to the cluster; the before-state is a stale client that still calls"
+        },
+        {
+          "subject": "cronjob/stale-kubectl-client",
+          "path": "spec.jobTemplate.spec.template.spec.containers[*].image",
+          "op": "any_eq",
+          "value": "registry.k8s.io/kubectl:v1.29.0",
+          "why": "the pinned old client is the defect. Moving the tag within one minor of the control plane heals it while the job keeps succeeding"
+        },
+        {
+          "subject": "job?app=stale-kubectl-client",
+          "path": "status.conditions[?(@.type=='Failed')].status",
+          "op": "none_eq",
+          "value": "True",
+          "why": "a failing Job means the egress policy or the account broke, not that the skew bit; the fixture is a stale client whose calls still succeed"
+        }
+      ]
+    },
+    "cgroup-blind-runtime": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["deployment/cgroup-blind-jvm"],
+      "fixture": "cgroup-blind-jvm Deployment (one replica) whose image is eclipse-temurin 8u302, a JDK 8 from before cgroup v2 support (8u372), under a memory limit; the image's JDK version is the dependency and the container process is a sleep after `java -version`: a JVM started from this image sizes its heap from the limit on a cgroup v1 node and from the machine's memory on a cgroup v2 node",
+      "state": [
+        {
+          "subject": "deployment/cgroup-blind-jvm",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the before-state is a pod that runs today; a pod an OOM kill keeps down is the after-state"
+        },
+        {
+          "subject": "deployment/cgroup-blind-jvm",
+          "path": "status.unavailableReplicas",
+          "op": "absent",
+          "why": "a rollout that cannot finish keeps the old pod ready, so readyReplicas stays 1 while the new pod waits in ImagePullBackOff or ContainerCreating; the controller counts that pod here and omits the field when every pod is available"
+        },
+        {
+          "subject": "pod?app=cgroup-blind-jvm",
+          "path": "status.containerStatuses[*].lastState.terminated.reason",
+          "op": "none_eq",
+          "value": "OOMKilled",
+          "why": "an OOM-killed container restarts and is ready again between kills; the last termination is where the after-state shows"
+        },
+        {
+          "subject": "deployment/cgroup-blind-jvm",
+          "path": "spec.template.spec.containers[*].image",
+          "op": "any_eq",
+          "value": "docker.io/library/eclipse-temurin:8u302-b08-jre",
+          "why": "the pre-8u372 runtime is the defect. Moving to 8u372 or later heals it while the pod keeps running"
+        },
+        {
+          "subject": "deployment/cgroup-blind-jvm",
+          "path": "spec.template.spec.containers[*].resources.limits.memory",
+          "op": "any_eq",
+          "value": "192Mi",
+          "why": "without a memory limit there is nothing for the runtime to misread"
+        }
+      ]
+    },
+    "multi-process-container": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["deployment/multi-process-worker"],
+      "fixture": "multi-process-worker Deployment (one replica): a shell supervisor forking two workers under one 32Mi memory limit, the shape where a cgroup v2 node with a 1.28+ kubelet OOM-kills the whole container instead of the one process that grew",
+      "state": [
+        {
+          "subject": "deployment/multi-process-worker",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 1,
+          "why": "the before-state is a multi-process container that runs; nothing in it allocates"
+        },
+        {
+          "subject": "deployment/multi-process-worker",
+          "path": "status.unavailableReplicas",
+          "op": "absent",
+          "why": "a rollout that cannot finish keeps the old pod ready, so readyReplicas stays 1 while the new pod waits in ImagePullBackOff or ContainerCreating; the controller counts that pod here and omits the field when every pod is available"
+        },
+        {
+          "subject": "pod?app=multi-process-worker",
+          "path": "status.containerStatuses[*].lastState.terminated.reason",
+          "op": "none_eq",
+          "value": "OOMKilled",
+          "why": "an OOM-killed container restarts and is ready again between kills; the last termination is where the after-state shows"
+        },
+        {
+          "subject": "deployment/multi-process-worker",
+          "path": "spec.template.spec.containers[*].command[2]",
+          "op": "any_eq",
+          "value": "sleep infinity & sleep infinity & wait",
+          "why": "the forked workers are the defect. One process per container heals it while the pod keeps running"
+        },
+        {
+          "subject": "deployment/multi-process-worker",
+          "path": "spec.template.spec.containers[*].resources.limits.memory",
+          "op": "any_eq",
+          "value": "32Mi",
+          "why": "the shared limit is what the group kill applies to; without it there is no group to kill"
+        }
+      ]
+    },
+    "node-image-coupled-agent": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["daemonset/cni-shaped-agent"],
+      "fixture": "cni-shaped-agent DaemonSet on the default pool in the shape of a network plugin: host networking and the node's CNI configuration directory mounted read-only, the coupling a node image change breaks",
+      "state": [
+        {
+          "subject": "daemonset/cni-shaped-agent",
+          "path": "status.numberReady",
+          "op": "any_ge",
+          "value": 1,
+          "why": "an agent running on no node holds no coupling; the before-state needs at least one node where it is up"
+        },
+        {
+          "subject": "daemonset/cni-shaped-agent",
+          "path": "status.numberUnavailable",
+          "op": "absent",
+          "why": "a rolling update that halts on a node where the new pod cannot start leaves the other node's old pod ready, so numberReady stays above zero; the controller counts the halted node here and omits the field when every node's pod is available"
+        },
+        {
+          "subject": "daemonset/cni-shaped-agent",
+          "path": "spec.template.spec.hostNetwork",
+          "op": "eq",
+          "value": true,
+          "why": "the node's network namespace is half the defect. A pod network heals that half while the agent keeps running"
+        },
+        {
+          "subject": "daemonset/cni-shaped-agent",
+          "path": "spec.template.spec.volumes[?(@.name=='cni-conf')].hostPath.path",
+          "op": "any_eq",
+          "value": "/etc/cni/net.d",
+          "why": "the CNI directory mount is the other half; an agent that reads nothing from the node has nothing an image change can move"
+        }
+      ]
+    },
+    "cuda-pinned-gpu-job": {
+      "cluster_slot": "a",
+      "namespace": "seeded-shapes",
+      "probes": ["cronjob/cuda-pinned-trainer"],
+      "fixture": "cuda-pinned-trainer CronJob, suspended: requests one GPU on an nvidia-l4 pool with an image pinned to CUDA 12.2, so its manifest carries the driver dependency without ever running or waiting for an accelerator the fleet does not have",
+      "state": [
+        {
+          "subject": "cronjob/cuda-pinned-trainer",
+          "path": "spec.suspend",
+          "op": "eq",
+          "value": true,
+          "why": "unsuspended, the job would sit Pending on a GPU the fleet has none of, which is a stall and not this fixture"
+        },
+        {
+          "subject": "cronjob/cuda-pinned-trainer",
+          "path": "spec.jobTemplate.spec.template.spec.containers[*].image",
+          "op": "any_eq",
+          "value": "docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04",
+          "why": "the CUDA pin is the defect. An image built for the driver the target node image ships heals it"
+        },
+        {
+          "subject": "cronjob/cuda-pinned-trainer",
+          "path": "spec.jobTemplate.spec.template.spec.nodeSelector[\"cloud.google.com/gke-accelerator\"]",
+          "op": "eq",
+          "value": "nvidia-l4",
+          "why": "the accelerator selector is what ties the image to a node image's driver; without it the pin is just an image"
         }
       ]
     }

@@ -20,10 +20,10 @@ it hands over a model's final turn, so `deliver` behaves here as it does on the 
 
 The entry ships `deliver: "chat"`, as every report-producing entry on the roster does
 bar the two on `"all"`. That routes the report through the
-Chat Agent, which presents it in the channel and can then answer a follow-up about it — the
+relay, which posts it into a thread whose replies reach the Chat Agent with it attached — the
 [relay design](cron-report-relay.md) is canonical. `"all"` is the wrong value
 even though it is audible: it expands to every platform with a home channel, and the relay now has
-one, so a job left on `"all"` reports twice — once flat and once through the Chat Agent. `"local"`
+one, so a job left on `"all"` reports twice — once from the scheduler and once through the relay. `"local"`
 resolves to no target and drops the report. The script still emits a bullet list rather than a
 Markdown table, which wraps badly in chat viewports.
 
@@ -36,7 +36,7 @@ scripts directory. It needs no cluster access.
 The `deliver: "chat"` route does not go through `home_target_env`: `profile_cron_tick.spawn_tick`
 sets `CHAT_HOME_CHANNEL` on every cron child unconditionally, so the target always resolves and the
 relay is always attempted. The home channel is needed one hop later, where the Session KV server
-posts what the Chat Agent composed: `_send_to_chat` runs `hermes send --to <platform>` with no
+posts the report: `_send_to_chat` runs `hermes send --to <platform>` with no
 chat id, and that bare form is the one `hermes send` documents as "platform (home channel)". Where
 there is none the send fails and the roster entry records a `last_delivery_error` that nests three
 layers of wrapping — the relay's own words inside the route's 502 detail inside the plugin's report

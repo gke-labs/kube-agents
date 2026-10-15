@@ -45,6 +45,9 @@ on:
       - "agents/cluster/skills/**"
       - "agents/platform/scripts/command_policy.py"
       - "agents/platform/scripts/credential_proxy.py"
+      # lib/chatmsg validates every shared chat case, so a case-only change
+      # has to run it.
+      - "tests/conformance/chat/**"
   workflow_dispatch:
 
 # A re-push supersedes this pull request's earlier run instead of stacking a
@@ -73,6 +76,14 @@ jobs:
         id: filter
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
+          # No token: on a pull request the action then diffs the checked-out
+          # merge commit against the base SHA with git, the path it already
+          # takes on push and merge-queue runs, instead of paging the file list
+          # through the GitHub API with no retry. The rule, the day it comes
+          # from, and why the checkout stays at depth one:
+          # .agents/rules/github_actions.md, "Detect changed files with git,
+          # not the API"; tests/test_paths_filter_uses_git_diff.py holds it.
+          token: ""
           filters: |
             a2a:
               - "a2a/**"
@@ -81,6 +92,7 @@ jobs:
               - "agents/cluster/skills/**"
               - "agents/platform/scripts/command_policy.py"
               - "agents/platform/scripts/credential_proxy.py"
+              - "tests/conformance/chat/**"
 
       - name: Set up Go
         if: steps.filter.outputs.a2a == 'true'

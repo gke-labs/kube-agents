@@ -76,13 +76,15 @@ the broker's finest identity is one ServiceAccount shared by both pods, and
 of any single credential the broker will hold — a ceiling, not an assignment.
 Per-session assignment arrives with per-caller identity, which is separate work.
 
-And it does not make the broker the only route to a Kubernetes object. The
-`gke` remote MCP server, configured in every profile, proxies to
-container.googleapis.com/mcp from the agent container on the ambient Workload
-Identity credential; it never touches this process. So the pool narrows what
-goes *through* the broker, and the agent's own IAM grant is what narrows what
-goes around it. Neither is sufficient alone, and the second is the one that
-covers the paths nobody has enumerated yet.
+And it does not narrow every route to a Kubernetes object. The `gke` remote
+MCP server, configured in every profile, reaches container.googleapis.com/mcp
+through the broker's `/v1/mcp/` relay on the broker's own credential, not on a
+pool member: `mcp_policy`'s per-tool allowlist bounds which calls it makes, and
+the broker identity's grant bounds what they return. And while the gateway pod
+shares the broker's Workload Identity-annotated ServiceAccount, the agent's own
+IAM grant is what narrows anything that goes around the broker. Neither is
+sufficient alone, and the second is the one that covers the paths nobody has
+enumerated yet.
 """
 
 from __future__ import annotations

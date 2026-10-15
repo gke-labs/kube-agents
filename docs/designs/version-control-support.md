@@ -2618,9 +2618,9 @@ guardrails in
 **An MCP server in the sandbox would hold a token.** MCP servers are spawned as child processes of
 the agent container. A `GITLAB_TOKEN` in that process's environment is precisely what
 `credential-isolation-design.md` guarantees against. The two remote MCP servers that ship today are
-not a counterexample: they authenticate with a forked `mcp-remote` that mints Google ADC tokens per
-call, and ADC is ambient to the pod rather than injected as a secret. A forge PAT has no ambient
-equivalent.
+not a counterexample: their `mcp-remote` presents the gateway's projected ServiceAccount token to
+the credential proxy, which holds the Google credential, so nothing is injected as a secret. A forge
+PAT has no such broker-held equivalent unless the proxy relays the forge's MCP server the same way.
 
 The second is answered by running the MCP server in the broker's pod rather than the sandbox's,
 with the agent reaching it over the same authenticated Service and the server attaching the token —

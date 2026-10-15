@@ -5,7 +5,7 @@ description: Bootstrap a GKE cluster, the kube-agents operator, and the Platform
 
 import { Aside, Steps } from "@astrojs/starlight/components";
 
-The installer (`install.sh`) bootstraps everything you need for a running Platform Agent on GKE: cluster, CRDs, IAM, secrets, Chat integration, inference gateway, and the token minter. It is a front door, not a second provisioner — the engine underneath is the Terraform composition [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install), which owns every GCP resource and installs the [`kube-agents` Helm chart](https://github.com/gke-labs/kube-agents/tree/main/charts/kube-agents), which owns every Kubernetes resource.
+The installer (`install.sh`) bootstraps everything you need for a running Platform Agent on GKE: cluster, CRDs, IAM, secrets, Chat integration, inference gateway, and, for a GitOps repository on GitHub, the token minter. It is a front door, not a second provisioner — the engine underneath is the Terraform composition [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install), which owns every GCP resource and installs the [`kube-agents` Helm chart](https://github.com/gke-labs/kube-agents/tree/main/charts/kube-agents), which owns every Kubernetes resource.
 
 Prefer declarative IaC over the interview? Apply the same composition by hand with your own `terraform.tfvars` — see [the composition README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install) for the hand-driven path. Both paths run the same Terraform, so they create the same resources.
 
@@ -15,13 +15,15 @@ Prefer declarative IaC over the interview? Apply the same composition by hand wi
   for you. You do **not** need to pre-install
   [cert-manager](/kube-agents/install/prerequisites/#cert-manager-on-the-target-cluster)
   — the composition installs it automatically if it isn't already present. If
-  you plan to connect a GitOps repository for automated PRs
+  you plan to connect a GitOps repository on GitHub for automated PRs
   (`submit-suggestion`), you need a GitHub App and a Cloud KMS signing key
   holding its private key: either hand the installer the `.pem` with
   `--github-pem-path` and it imports the key, or pre-provision it Ahead-Of-Time
   (AOT) — see
   [Prerequisites](/kube-agents/install/prerequisites/#gitops-repo--github-token-minter-for-submit-suggestion)
-  and [Token minter](/kube-agents/deploy/token-minter/).
+  and [Token minter](/kube-agents/deploy/token-minter/). A GitOps repository on
+  GitLab needs an access token instead, and no GitHub App, minter or KMS key:
+  see [GitLab as the GitOps forge](/kube-agents/install/gitlab/).
 </Aside>
 
 ## Run the Zero-Friction One-Liner Installer
@@ -31,7 +33,7 @@ Prefer declarative IaC over the interview? Apply the same composition by hand wi
   or AI Agent without cloning the repository manually.
 </Aside>
 
-Run the release-pinned installer (substituting `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), for example `0.4.0`):
+Run the release-pinned installer (substituting `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), for example `0.4.0`; a GitLab install needs `0.9.0` or later):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
@@ -88,7 +90,7 @@ Only run the real install after I say yes.
    cd kube-agents-<RELEASE_VERSION>
    ```
 
-   Alternatively, if you require a Git checkout, clone pinned to an official release tag (for example, `0.4.0`):
+   Alternatively, if you require a Git checkout, clone pinned to an official release tag (for example, `0.4.0`; a GitLab install needs `0.9.0` or later):
 
    ```bash
    git clone --branch <RELEASE_VERSION> https://github.com/gke-labs/kube-agents.git

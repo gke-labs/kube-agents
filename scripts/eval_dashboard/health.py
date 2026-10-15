@@ -419,9 +419,9 @@ RECOVERY_GREEN_RUNS = 3
 # The rule: the median wall clock of the newest SLOW_RUNS full runs -- a
 # concluded run of at least SLOW_MIN_TASKS cases (one fewer than the
 # presubmit file lists, read from hack/eval/presubmit-cases.txt: 13 for the
-# fourteen the presubmit runs since 2026-09-29 (twelve on the roster plus the
-# two held-out seats, the compliance canary, #2013, and pdb-remediation-pr,
-# #2016; twelve from 2026-09-22, when it became the
+# fourteen the presubmit runs since 2026-09-29: thirteen roster cases and the
+# held-out compliance canary (#2013) since 2026-10-14, twelve and two seats
+# before that (#2016); twelve from 2026-09-22, when it became the
 # blocking roster only, #1023, having run 18-19 before); a run Prow cut short
 # at its ceiling recorded fewer and is not one; the floor was a literal 15
 # until the roster shrank under it, which would have made every run since a
@@ -1567,6 +1567,9 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
     day = {} if quotable else (_worst_breached_day(trend, thresholds) or {})
     source = recent if quotable else day
     longest = _longest_wait_s(_section(artifact, "queue"))
+    # The waits count from the moment Deck was read, which a live run stamps
+    # in the queue block; it falls after window_end, the sweep's bound.
+    queue_read_at = parse_iso(_section(artifact, "queue").get("read_at")) or measured
     limit_p50 = _as_seconds(thresholds.get("p50_minutes"))
     backlog = None if longest is None or limit_p50 is None else longest > limit_p50
     return note | {
@@ -1585,18 +1588,19 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         # When this backlog began, not when the episode did: the verdict spans
         # a week, so "waiting since Monday" can stand over a Thursday jam. The
         # oldest queued run dates it, and only while there is one.
-        "waiting_since": iso(measured - timedelta(seconds=longest)) if backlog else None,
+        "waiting_since": iso(queue_read_at - timedelta(seconds=longest)) if backlog else None,
         "over_threshold": _section(artifact, "queue").get("over_threshold") or 0,
         "threshold_p50_s": limit_p50,
         "threshold_p95_s": _as_seconds(thresholds.get("p95_minutes")),
         "free": pool.get("free"),
         "total": pool.get("total"),
         # The periodic's third trigger and what it names: runs refused a
-        # project in its recent window, and the projects a person holds. None
-        # from an artifact written before the fields existed.
+        # project in its recent window, and the projects leased under an owner
+        # that names no build (a person's repair, or a job that forgot the
+        # convention). None from an artifact written before the fields existed.
         "lease_failures": _count(recent.get("lease_failures")),
         "lease_failures_hours": _count(recent.get("hours")),
-        "held_by_hand": _held_count(artifact.get("held_by_hand")),
+        "no_build_id": _held_count(artifact.get("no_build_id")),
         "cause": artifact.get("cause"),
         # The cap the newest run in the window ran under. Only the
         # CONCURRENCY_CAP message quotes it, and without it that message
@@ -1611,7 +1615,7 @@ def _count(value) -> int | None:
 
 
 def _held_count(held) -> int | None:
-    """How many projects `held_by_hand` (owner to count) adds up to."""
+    """How many projects `no_build_id` (owner to count) adds up to."""
     if not isinstance(held, dict):
         return None
     counts = [_count(v) for v in held.values()]
@@ -1669,8 +1673,8 @@ def pool_evidence(pool: dict) -> str:
     # the breach that most wants explaining. Say the wait and stop.
     counted = pool["free"] is not None and pool["total"] is not None
     projects = f"; {pool['free']} of {pool['total']} projects free" if counted else ""
-    if counted and pool.get("held_by_hand"):
-        projects += f", {pool['held_by_hand']} held by hand"
+    if counted and pool.get("no_build_id"):
+        projects += f", {pool['no_build_id']} leased with no build ID in the owner"
     return f"backed-up pool: {pool_measurement(pool)}{projects}"
 
 

@@ -11,7 +11,7 @@ require (
 	github.com/nats-io/nuid v1.0.1
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.3
-	github.com/slack-go/slack v0.29.0
+	github.com/slack-go/slack v0.30.1
 	golang.org/x/net v0.59.0
 	k8s.io/api v0.37.1
 	k8s.io/apimachinery v0.37.1

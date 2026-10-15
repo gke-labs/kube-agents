@@ -1,0 +1,70 @@
+{
+  "name": "plan-several-cards",
+  "source": "agents/platform/scripts/test_slack_status.py::RowTitleTest.test_several_rows_lead_with_the_cards_title",
+  "notes": "Steps are the card's notes, unmarked: the renderer draws today's ✓ and ◌ from the item's status (the last step of an in_progress item is the open one).",
+  "input": {
+    "title": null,
+    "rows": [
+      {
+        "task_id": "t_a",
+        "title": "seeded-a",
+        "lines": [],
+        "status": "complete",
+        "steps": 0,
+        "result": "1.33.4 = default"
+      },
+      {
+        "task_id": "t_b",
+        "title": "seeded-b",
+        "lines": [],
+        "status": "pending",
+        "steps": 0
+      },
+      {
+        "task_id": "t_c",
+        "title": "seeded-c",
+        "lines": [
+          "reading version"
+        ],
+        "status": "in_progress",
+        "note": "reading version",
+        "steps": 1
+      }
+    ]
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "plan": {
+          "title": "3 cards",
+          "items": [
+            {
+              "id": "t_a",
+              "title": "seeded-a · 1.33.4 = default",
+              "status": "complete",
+              "result": "1.33.4 = default"
+            },
+            {
+              "id": "t_b",
+              "title": "seeded-b · waiting on you",
+              "status": "pending"
+            },
+            {
+              "id": "t_c",
+              "title": "seeded-c · reading version",
+              "status": "in_progress",
+              "steps": [
+                "reading version"
+              ],
+              "stepCount": 1,
+              "note": "reading version"
+            }
+          ]
+        }
+      },
+      "update": "plan"
+    }
+  ]
+}

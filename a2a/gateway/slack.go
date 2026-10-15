@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/slack-go/slack"
@@ -268,19 +269,31 @@ func slackChannelThread(conversation string) (channel, threadTS string, ok bool)
 	return channel, threadTS, true
 }
 
-// toMrkdwn escapes Slack's control characters, then translates the two
-// markdown forms the relay emits (bold pairs, links) into mrkdwn. Escaping
-// first, over the whole text, so the only < and > on the wire are the ones
-// our own deterministic link translation writes, and so a prompt-injected
-// <!channel> inside a code span is as inert as one in prose; the two
-// translations then leave code spans as written, since the task's result is
-// executor output of arbitrary shape and a `**kwargs` or a `**/*.yaml` in
-// it is the answer, not bold. The rules are the ones markdown.go holds for
-// both chat surfaces. Narrow on purpose: full markdown fidelity is
-// presentation polish, and the legacy Hermes path's converter is not this
-// code path's to reuse.
+// toMrkdwn rewrites the line-level markdown Slack cannot show (headings,
+// rules, list markers, tables: rewriteSlackBlocks), escapes Slack's control
+// characters, then translates the two inline markdown forms the relay emits
+// (bold pairs, links) into mrkdwn. Escaping first, over the whole text, so
+// the only < and > on the wire are the ones our own deterministic link
+// translation writes or keeps (below), and so a prompt-injected <!channel>
+// inside a code span is as inert as one in prose; the two translations then
+// leave code spans as written, since the task's result is executor output of
+// arbitrary shape and a `**kwargs` or a `**/*.yaml` in it is the answer, not
+// bold. The rules are the ones markdown.go holds for both chat surfaces.
+// Narrow on purpose: full markdown fidelity is presentation polish, and the
+// legacy Hermes path's converter is not this code path's to reuse.
+//
+// One <url|text> the executor wrote is not escaped: a closed one, in prose,
+// whose URL is http(s) with no whitespace, angle bracket or pipe and whose
+// text does not name another host (keepChatLinks), which is the link
+// rewriteLinks would have written from [text](url), refused on the same
+// label-host ground. Its URL and text are escaped as the rest of the text is,
+// and only its own angle brackets stay live. Its URL must start with
+// http(s)://, so a <!channel>, <@U…> or <#C…> is never one, and its text
+// admits no angle bracket, so none rides out inside it.
 func toMrkdwn(text string) string {
-	return rewriteMarkdown(slackEscaper.Replace(text), slackLinkRE)
+	return rewriteMarkdown(keepChatLinks(rewriteSlackBlocks(text), slackEscaper.Replace, func(dest, label string) string {
+		return chatLinkOpen + slackEscaper.Replace(dest) + chatLinkSep + slackEscaper.Replace(label) + chatLinkClose
+	}), slackLinkRE)
 }
 
 var (
@@ -484,14 +497,14 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				//
 				// The same app serves the legacy consumer under today, which
 				// does answer interactions, so an install may well have
-				// interactivity on and these envelopes do arrive. Nothing the
-				// gateway posts carries an interactive element - the agent
-				// sends the audit card through the notify route with its
-				// buttons removed - so the only clicks that land here are on
-				// messages posted under today. Answering interactions means
-				// acking them here first: Slack wants the envelope acked
-				// inside three seconds, and an unacked one redelivers and
-				// shows the user a timeout.
+				// interactivity on and these envelopes do arrive: clicks on
+				// messages posted under today, and on the buttons a chat
+				// message's layout carries (renderSlackChat), which nothing
+				// answers yet. The notify route's raw blocks still carry none
+				// (the agent sends the audit card with its buttons removed).
+				// Answering interactions means acking them here first: Slack
+				// wants the envelope acked inside three seconds, and an
+				// unacked one redelivers and shows the user a timeout.
 				continue
 			}
 			// Ack before parsing, not after: unacked envelopes redeliver in
@@ -606,7 +619,14 @@ func (s *SlackAdapter) Post(conversation, text string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("malformed conversation id %q", conversation)
 	}
-	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false)}
+	// No unfurls: an answer cites console and documentation links, and each
+	// unfurled into a preview card (a console link previews as the Google
+	// sign-in page), three or four under every answer.
+	opts := []slack.MsgOption{
+		slack.MsgOptionText(toMrkdwn(text), false),
+		slack.MsgOptionDisableLinkUnfurl(),
+		slack.MsgOptionDisableMediaUnfurl(),
+	}
 	if threadTS != "" {
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
@@ -707,8 +727,102 @@ func (s *SlackAdapter) Edit(conversation, messageID, text string) error {
 	if !ok {
 		return fmt.Errorf("malformed conversation id %q", conversation)
 	}
-	_, _, _, err := s.api.UpdateMessage(channel, messageID, slack.MsgOptionText(toMrkdwn(text), false))
+	// The whole message, blocks and side bar cleared: the rolling line may
+	// have been laid out by EditMessage before, in this process or one a
+	// restart replaced, and chat.update keeps whatever it is not sent.
+	opts, _ := slackMessageOptions(OutMessage{Text: text})
+	_, _, _, err := s.api.UpdateMessage(channel, messageID, opts...)
 	return err
+}
+
+// PostMessage posts a message value: a chat message laid out as Block Kit
+// (renderSlackChat) with the text, as mrkdwn, as its notification and
+// fallback, into the conversation's thread as Post does, link and media
+// previews off (its links are buttons). Without a chat message it is Post.
+// A chat message the renderer will not send, or that Slack refuses, is an
+// error and nothing is posted; the gateway posts the text instead.
+func (s *SlackAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Chat == nil {
+		return s.Post(conversation, m.Text)
+	}
+	channel, threadTS, ok := slackChannelThread(conversation)
+	if !ok {
+		return "", fmt.Errorf("malformed conversation id %q", conversation)
+	}
+	opts, err := slackMessageOptions(m)
+	if err != nil {
+		return "", err
+	}
+	opts = append(opts, slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl())
+	if threadTS != "" {
+		opts = append(opts, slack.MsgOptionTS(threadTS))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	return ts, slackLayoutError(err)
+}
+
+// slackLayoutRefusals are the chat.postMessage and chat.update errors that
+// refuse what a message carries rather than the call itself.
+var slackLayoutRefusals = map[string]bool{
+	"invalid_blocks": true, "invalid_blocks_format": true, "invalid_attachments": true,
+	"msg_too_long": true, "too_many_attachments": true, "no_text": true,
+}
+
+// slackGoneErrors are the chat.update errors that say the message cannot be
+// edited at all.
+var slackGoneErrors = map[string]bool{
+	"message_not_found": true, "cant_update_message": true, "edit_window_closed": true, "channel_not_found": true,
+}
+
+// slackLayoutError wraps Slack's refusal of a layout in ErrLayoutRefused, and
+// its answer that the message cannot be edited in ErrMessageGone, and leaves
+// any other error (a rate limit, an outage) as it is.
+func slackLayoutError(err error) error {
+	var resp slack.SlackErrorResponse
+	switch {
+	case !errors.As(err, &resp):
+		return err
+	case slackLayoutRefusals[resp.Err]:
+		return fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+	case slackGoneErrors[resp.Err]:
+		return fmt.Errorf("%w: %w", ErrMessageGone, err)
+	}
+	return err
+}
+
+// EditMessage replaces a posted message with a message value. Without a chat
+// message the text replaces the layout too: the blocks and the side bar are
+// sent empty, since chat.update keeps whatever it is not sent.
+func (s *SlackAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	channel, _, ok := slackChannelThread(conversation)
+	if !ok {
+		return fmt.Errorf("malformed conversation id %q", conversation)
+	}
+	opts, err := slackMessageOptions(m)
+	if err != nil {
+		return err
+	}
+	_, _, _, err = s.api.UpdateMessage(channel, messageID, opts...)
+	return slackLayoutError(err)
+}
+
+// slackMessageOptions is a message value as chat.postMessage and
+// chat.update options: the text as mrkdwn, and the chat message's layout, or
+// no blocks and no side bar when there is none.
+func slackMessageOptions(m OutMessage) ([]slack.MsgOption, error) {
+	text := toMrkdwn(m.Text)
+	if m.Chat == nil {
+		return []slack.MsgOption{slack.MsgOptionText(text, false), slack.MsgOptionBlocks(),
+			slack.MsgOptionAttachments([]slack.Attachment{}...)}, nil
+	}
+	if utf8.RuneCountInString(text) > slackChatTextMax {
+		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, errSlackChatTooLarge)
+	}
+	layout, err := renderSlackChat(m.Chat, text)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+	}
+	return slackChatOptions(layout, text)
 }
 
 // Roster is the channel's membership. Slack has no per-thread membership,
@@ -1090,7 +1204,7 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 			MessageID:    m.TimeStamp,
 			TopLevel:     m.ThreadTimeStamp == "",
 			// Decoding also changes what the affordance matchers see. That is
-			// intended, and it is not obvious: normalize (text.go) strips
+			// intended, and it is not obvious: chattext.Normalize strips
 			// every non-alphanumeric, so a typed "<stop>" — on the wire as
 			// "&lt;stop&gt;" — used to normalize to "ltstopgt" and match
 			// nothing, and decoded first it normalizes to "stop" and is a

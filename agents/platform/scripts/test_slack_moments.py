@@ -246,6 +246,92 @@ class PrOpenedTest(unittest.TestCase):
         self.assertNotIn("<!channel>", text)
 
 
+MR = "https://gitlab.com/acme/platform/infra/-/merge_requests/12"
+SELF_MANAGED_MR = "https://gitlab.example.com/acme/infra/-/merge_requests/7"
+
+
+class OpenedMergeRequestTest(unittest.TestCase):
+    def test_finds_a_gitlab_com_merge_request_with_subgroups(self):
+        text = f"Checked the limits.\nOpened {MR} for review."
+        self.assertEqual(m.opened_pr(text), (MR, "infra", "12", f"Opened {MR} for review."))
+
+    def test_a_tail_after_the_number_is_left_out_of_the_url(self):
+        for tail in ("/diffs", "#note_1", "/diffs?view=parallel"):
+            self.assertEqual(m.opened_pr(f"Opened {MR}{tail}")[:3], (MR, "infra", "12"), tail)
+
+    def test_mr_or_merge_request_between_the_verb_and_the_url(self):
+        for line in (
+            f"Opened MR !12: {MR}", f"Opened merge request {MR}", f"Created a new MR {MR}",
+            f"Opened MR !12 in platform/infra: {MR}", f"MR opened: {MR}", f"Opened [MR !12]({MR})",
+        ):
+            self.assertEqual(m.opened_pr(line)[0], MR, line)
+
+    def test_another_merge_request_number_or_a_pr_noun_is_not_this_one(self):
+        self.assertIsNone(m.opened_pr(f"Opened MR !13 in platform/infra: {MR}"))
+        self.assertIsNone(m.opened_pr(f"Opened PR {MR}"))
+        self.assertIsNone(m.opened_pr(f"Opened MR {PR}"))
+
+    def test_a_negated_verb_is_not_an_opened_merge_request(self):
+        for lead in ("I have not opened", "Never opened", "I haven't yet opened an MR:", "didn't create"):
+            self.assertIsNone(m.opened_pr(f"{lead} {MR}"), lead)
+
+    def test_someone_else_as_the_subject_is_not_ours(self):
+        for line in (
+            f"Renovate opened {MR}", f"Dependabot: opened {MR}", f"regression came from {MR}, opened by bob",
+            f"Checked with Bob and he then opened {MR}", f"Bob's MR opened: {MR}",
+        ):
+            self.assertIsNone(m.opened_pr(line), line)
+
+    def test_a_self_managed_host_counts_only_when_the_caller_names_it(self):
+        line = f"Opened {SELF_MANAGED_MR}"
+        self.assertIsNone(m.opened_pr(line))
+        self.assertIsNone(m.opened_pr(line, {"gitlab.other.example"}))
+        self.assertEqual(m.opened_pr(line, {"gitlab.example.com"})[:3], (SELF_MANAGED_MR, "infra", "7"))
+        self.assertEqual(m.opened_pr(line, {"GitLab.Example.com"})[0], SELF_MANAGED_MR)
+        with_port = "https://gitlab.example.com:8443/acme/infra/-/merge_requests/3"
+        self.assertEqual(m.opened_pr(f"Opened {with_port}", {"gitlab.example.com"})[:3], (with_port, "infra", "3"))
+
+    def test_a_lookalike_host_or_plain_http_is_not_announced(self):
+        for url in (
+            "https://gitlab.com.evil.example/acme/infra/-/merge_requests/1",
+            "https://evilgitlab.com/acme/infra/-/merge_requests/1",
+            "https://user@gitlab.com/acme/infra/-/merge_requests/1",
+            "http://gitlab.com/acme/infra/-/merge_requests/1",
+            "https://gitlab.com/acme/-/merge_requests/1",
+        ):
+            self.assertIsNone(m.opened_pr(f"Opened {url}", {"gitlab.example.com"}), url)
+
+    def test_prs_and_merge_requests_are_found_in_order(self):
+        found = list(m.opened_prs(f"- Opened {MR} and opened {PR}\n- Opened {PR}"))
+        self.assertEqual([f[0] for f in found], [MR, PR, PR])
+
+
+class MergeRequestOpenedTest(unittest.TestCase):
+    def test_headline_evidence_and_two_url_buttons(self):
+        blocks, text = m.pr_opened(MR, "infra", "12", f"Opened MR !12: {MR}/diffs raising the limit")
+        self.assertEqual(
+            blocks[0]["text"]["text"], "*I opened merge request !12 in infra. It's yours to review.*"
+        )
+        self.assertEqual(_contexts(blocks), ["Opened MR !12 raising the limit"])
+        buttons = _buttons(blocks)
+        self.assertEqual([b["text"]["text"] for b in buttons], ["Open MR ↗", "Files changed ↗"])
+        self.assertEqual([b["url"] for b in buttons], [MR, MR + "/diffs"])
+        self.assertEqual(text.split("\n")[1], "Opened MR !12 raising the limit")
+
+    def test_merge_request_and_its_number_before_the_url_are_not_repeated(self):
+        for line in (f"Opened merge request {MR}", f"Opened merge request !12: {MR}", f"Opened MR ({MR})", f"Opened {MR}"):
+            blocks, _ = m.pr_opened(MR, "infra", "12", line)
+            self.assertEqual(_contexts(blocks), ["Opened MR !12"], line)
+        for line, shown in (
+            (f"I opened a merge request: {MR}", "I opened an MR !12"),
+            (f"A merge request !12: {MR}", "An MR !12"),
+            (f"Opened a new merge request {MR}", "Opened a new MR !12"),
+            (f"Opened an MR {MR}", "Opened an MR !12"),
+        ):
+            blocks, _ = m.pr_opened(MR, "infra", "12", line)
+            self.assertEqual(_contexts(blocks), [shown], line)
+
+
 class NeedsYouTest(unittest.TestCase):
     def test_listed_options_become_choice_buttons(self):
         reason = "Which checkout-gateway did you mean?\nTwo clusters run one. Which?\n- seeded-reliability\n2) seeded-debug"

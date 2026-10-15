@@ -476,6 +476,43 @@ Mutation(
         "allows every verb beneath it, `delete` included",
     ),
     Mutation(
+        "B1-mcp-write-tool-allowed",
+        "agents/platform/scripts/mcp_policy.py",
+        ('        "list_operations",\n    }\n)\n',
+         '        "list_operations",\n        "patch_k8s_resource",\n    }\n)\n'),
+        "test_B1_the_broker_refuses_every_gke_mcp_write_tool",
+        "add the one write tool a workflow seems to need to the gke read set -- "
+        "every Platform Agent can then patch any workload in the fleet on the "
+        "broker's credential",
+    ),
+    Mutation(
+        "B1-mcp-server-reached-directly",
+        "deploy/shared/defaults/config.yaml",
+        ('      - "${KUBE_AGENTS_MCP_RELAY_URL}/gke"\n',
+         '      - "https://container.googleapis.com/mcp"\n'),
+        "test_B1_no_remote_mcp_server_is_reached_on_the_agents_own_credential",
+        "point the gke server back at Google to debug a relay problem and leave "
+        "it there -- the call then runs on whatever credential the agent "
+        "container has, past every allowlist",
+    ),
+    Mutation(
+        "B1-mcp-relay-opened-to-the-sandbox",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT,)),\n",
+         "    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_SHELL)),\n"),
+        "test_B1_only_the_gateway_reaches_the_mcp_relay",
+        "let the shell sandbox call MCP tools too, for a skill script -- every "
+        "model-authored command then has a GKE read path it never had",
+    ),
+    Mutation(
+        "B1-mcp-relay-path-drift",
+        "k8s-operator/internal/controller/platformagent_broker_split.go",
+        ('\tmcpRelayPath = "/v1/mcp"\n', '\tmcpRelayPath = "/v1/mcp-relay"\n'),
+        "test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route",
+        "rename the route on one side only -- every mcp-remote child then dials "
+        "a 404 and the gke tools stop working with no policy refusal to read",
+    ),
+    Mutation(
         "B1-gke-mcp-allowlist-inverted",
         "agents/cluster/config.yaml",
         ("    tools:\n      include:\n", "    tools:\n      exclude:\n"),
@@ -722,8 +759,8 @@ Mutation(
     Mutation(
         "C1-gateway-sa-exemption",
         "charts/kube-agents/files/redactor.py",
-        ('r"[a-zA-Z0-9._%+\\-]+@(?!(?:[a-zA-Z0-9\\-]+\\.)*gserviceaccount\\.com(?!\\.?[\\w\\-]))"',
-         'r"[a-zA-Z0-9._%+\\-]+@"'),
+        ('r"+@(?!(?:[a-zA-Z0-9\\-]+\\.)*gserviceaccount\\.com(?!\\.?[\\w\\-]))"',
+         'r"+@"'),
         "test_C1_the_gateway_redactor_leaves_ordinary_manifest_content_alone",
         "simplify the e-mail pattern by dropping the service-account exemption; "
         "every IAM principal in a tool result then reaches the model as "

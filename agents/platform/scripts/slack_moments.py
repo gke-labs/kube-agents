@@ -3,9 +3,9 @@
 Pure functions only, like ``slack_presenter``, whose layout this reuses.
 ``gateway/slack_ux_moments.py`` decides when to post them.
 
-* A pull request the work opened (:func:`pr_opened`): a bold headline naming
-  the PR, the worker's own line below it as evidence, and "Open PR" (the
-  primary button) and "Files changed" url buttons, beside a green side bar
+* A pull request the work opened (:func:`pr_opened`), or a GitLab merge
+  request: a bold headline naming it, the worker's own line below it as evidence, and "Open PR"
+  ("Open MR" for a merge request; the primary button) and "Files changed" url buttons, beside a green side bar
   (:data:`PR_SIDE_BAR`). :func:`opened_pr` finds it in a progress note or a report, and
   only where the line says it opened that PR, the verb in front of the url
   with the worker as its subject by the one rule in :func:`_ours`, so a note
@@ -31,7 +31,7 @@ into the headline and the attachment that carries the bar when it is posted.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 
 import slack_presenter as _presenter
 
@@ -42,6 +42,18 @@ import slack_presenter as _presenter
 #: else's link must not become a button. GitHub alone, as in
 #: ``repo_ref.GITHUB_HOSTS``, which names no enterprise host.
 PR_URL = re.compile(r"https://github\.com/([^\s/<>|]+)/([^\s/<>|]+)/pull/(\d+)")
+#: A GitLab merge request url over https: host, the project (the last segment
+#: of its path, groups and subgroups before it) and number, as groups 1 to 3,
+#: so the project and number sit where :data:`PR_URL` has repo and number. A
+#: port is allowed and left out of the host; a tail (``/diffs``, ``#note_1``)
+#: is left out of the match. Only a host in :data:`GITLAB_HOST` or the
+#: caller's own hosts is announced, for :data:`PR_URL`'s reason.
+#: The path that marks a merge request url; a text without it holds none.
+MR_MARKER = "/-/merge_requests/"
+MR_URL = re.compile(r"https://([^\s/<>|:@]+)(?::\d+)?/(?:[^\s/<>|]+/)+([^\s/<>|]+)" + re.escape(MR_MARKER) + r"(\d+)")
+#: ``repo_ref.GITLAB_CANONICAL_HOST``, spelt out: this module imports nothing but
+#: ``slack_presenter``, and the image-build check stages no ``repo_ref`` beside it.
+GITLAB_HOST = "gitlab.com"
 #: What must sit right before the url for a line to announce the PR as ours:
 #: the verb, then optionally "a"/"the", "new", "PR"/"pull request" with its
 #: number, a colon, dash or "(", and the opening of a ``[label](`` or ``<`` link.
@@ -50,16 +62,36 @@ PR_URL = re.compile(r"https://github\.com/([^\s/<>|]+)/([^\s/<>|]+)/pull/(\d+)")
 #: around the url itself ("Opened PR **<url>**"). "draft" may join "new".
 #: What may sit between the verb and "PR": "a"/"the", then "new" and "draft".
 PR_ARTICLE = r"(?:(?:an?|the)\s+)?(?:(?:new|draft)\s+){0,2}"
+OPENED_VERB = r"\b(?:opened|created|raised|filed|submitted)"
+#: A label's colon or markup after the verb, then the space before what follows it.
+VERB_LABEL = r"(?:[*_`]*:)?[*_`]*\s+"
+#: "PR"/"pull request" with its "#412", and "MR"/"merge request" with its "!12".
+PR_NAMED = r"(?:PR|pull\s+request)(?:\s*#\d+)?"
+MR_NAMED = r"(?:MR|merge\s+request)(?:\s*!\d+)?"
+#: A colon, dash or "(" after that name, with any markup round it.
+NAME_LABEL = r"\s*[:(—–-]?[*_`]*\s*"
+#: Markup and the opening of a ``[label](`` or ``<`` link, right before the url.
+URL_OPENING = r"[*_`]*(?:\[[^\]]*\]\(|<)?$"
 OPENED_BEFORE_URL = re.compile(
-    r"\b(?:opened|created|raised|filed|submitted)(?:[*_`]*:)?[*_`]*\s+" + PR_ARTICLE
-    + r"(?:(?:PR|pull\s+request)(?:\s*#\d+)?\s*[:(—–-]?[*_`]*\s*)?[*_`]*(?:\[[^\]]*\]\(|<)?$",
+    OPENED_VERB + VERB_LABEL + PR_ARTICLE + "(?:" + PR_NAMED + NAME_LABEL + ")?" + URL_OPENING,
+    re.IGNORECASE,
+)
+#: The same for a merge request.
+MR_OPENED_BEFORE_URL = re.compile(
+    OPENED_VERB + VERB_LABEL + PR_ARTICLE + "(?:" + MR_NAMED + NAME_LABEL + ")?" + URL_OPENING,
     re.IGNORECASE,
 )
 #: The verb and "PR" with more words before the url, in the same sentence:
 #: "Opened PR #412 in acme/x: <url>", "Opened a PR against main: <url>".
 OPENED_PR_THEN = re.compile(
-    r"\b(?:opened|created|raised|filed|submitted)[*_`]*\s+" + PR_ARTICLE
+    OPENED_VERB + r"[*_`]*\s+" + PR_ARTICLE
     + r"(?:PR|pull\s+request)\b(?:\s*#(\d+))?",
+    re.IGNORECASE,
+)
+#: The same for a merge request: "Opened MR !12 in platform/infra: <url>".
+MR_OPENED_THEN = re.compile(
+    OPENED_VERB + r"[*_`]*\s+" + PR_ARTICLE
+    + r"(?:MR|merge\s+request)\b(?:\s*!(\d+))?",
     re.IGNORECASE,
 )
 #: A sentence end between "PR" and the url; a colon does not end it here.
@@ -92,6 +124,11 @@ OUTCOME_WORD = frozenset({
 })
 #: A label naming the PR with no subject: "PR opened: <url>".
 PR_LABEL = (["pr"], ["pull", "request"])
+MR_LABEL = (["mr"], ["merge", "request"])
+#: How each kind of url is read as opened: the pattern right before it, the
+#: one with more words between, and the label that may stand for the subject.
+PR_RULES = (OPENED_BEFORE_URL, OPENED_PR_THEN, PR_LABEL)
+MR_RULES = (MR_OPENED_BEFORE_URL, MR_OPENED_THEN, MR_LABEL)
 #: Someone else as the subject after the worker's first step: "Checked with Bob
 #: and he then opened", "Confirmed with Alice, who then opened". Not "it", the
 #: object of "Fixed it and opened".
@@ -138,13 +175,27 @@ PR_REF = "PR #{number}"
 PR_URL_TAIL = r"(?:[/?#][^\s<>|()\[\]]*)?"
 PR_REF_URL = r"(?:<{url}{tail}(?:\|[^>]*)?>|\[[^\]]*\]\({url}{tail}\)|{url}{tail})"
 PR_REF_SPAN = (
-    r"(?:\bPR(?:\s+#{number})?\s*[:—–-]?(?P<mark>[*_`]*)\s*)?(?P<open>[*_`]*)"
+    r"(?:\b{lead}\s*[:—–-]?(?P<mark>[*_`]*)\s*)?(?P<open>[*_`]*)"
     r"(?:\(\s*{ref}\s*\)|{ref})(?P<close>[*_`]*)"
 )
+PR_LEAD = r"PR(?:\s+#{number})?"
 OPEN_PR = "Open PR ↗"
 PR_SIDE_BAR = _presenter.SIDE_BAR_GREEN
 FILES_CHANGED = "Files changed ↗"
 FILES_PATH = "/files"
+MR_HEADLINE = "I opened merge request !{number} in {repo}. It's yours to review."
+OPEN_MR = "Open MR ↗"
+MR_REF = "MR !{number}"
+#: Unlike "PR", "merge request" is folded too: "Opened merge request !12: <url>" reads
+#: "Opened MR !12" rather than repeating the number.
+MR_LEAD = r"(?:MR|merge\s+request)(?:\s+!{number})?"
+DIFFS_PATH = "/diffs"
+#: "a" before a folded "MR !12", which reads "an MR !12": "I opened a merge request: <url>".
+A_BEFORE_MR = re.compile(r"\b([Aa])(?=\s+[*_`]*MR !)")
+#: Headline, reference, the reference's lead before the url, the primary
+#: button's label and the files path.
+PR_LAYOUT = (PR_HEADLINE, PR_REF, PR_LEAD, OPEN_PR, FILES_PATH)
+MR_LAYOUT = (MR_HEADLINE, MR_REF, MR_LEAD, OPEN_MR, DIFFS_PATH)
 PR_ACTION_PREFIX = "kage_pr"
 
 #: An option line in a block reason: a bullet, a numbered item or a lettered one ("a)", "B.").
@@ -184,30 +235,43 @@ WAITING = "⏸ waiting on you"
 NEEDS_YOU_SIDE_BAR = _presenter.SIDE_BAR_YELLOW
 
 
-def opened_pr(text: str) -> tuple[str, str, str, str] | None:
+def opened_pr(text: str, gitlab_hosts: Collection[str] = frozenset()) -> tuple[str, str, str, str] | None:
     """``(url, repo, number, line)`` for the first PR ``text`` says was opened, else None."""
-    return next(opened_prs(text), None)
+    return next(opened_prs(text, gitlab_hosts), None)
 
 
-def opened_prs(text: str) -> Iterator[tuple[str, str, str, str]]:
-    """``(url, repo, number, line)`` for each PR ``text`` says was opened, in order."""
+def opened_prs(text: str, gitlab_hosts: Collection[str] = frozenset()) -> Iterator[tuple[str, str, str, str]]:
+    """``(url, repo, number, line)`` for each PR ``text`` says was opened, in order.
+
+    A GitLab merge request counts too, on :data:`GITLAB_HOST` or one of
+    ``gitlab_hosts``, the self-managed hosts the caller vouches for; its
+    ``repo`` is the project. :func:`pr_opened` tells the two apart by the url.
+    """
+    hosts = {GITLAB_HOST, *(host.lower() for host in gitlab_hosts)}
     for line in str(text or "").splitlines():
-        for match in PR_URL.finditer(line):
-            verb = OPENED_BEFORE_URL.search(line[: match.start()]) or _opened_pr_then(
-                line[: match.start()], match.group(3)
+        for match, (before_url, then, labels) in _proposals(line, hosts):
+            verb = before_url.search(line[: match.start()]) or _opened_pr_then(
+                line[: match.start()], match.group(3), then
             )
             if not verb:
                 continue
             before = line[: verb.start()]
-            if NEGATED_VERB.search(before) or not _ours(before):
+            if NEGATED_VERB.search(before) or not _ours(before, labels):
                 continue
             yield match.group(0), match.group(2), match.group(3), line.strip()
 
 
-def _opened_pr_then(before: str, number: str) -> re.Match | None:
+def _proposals(line: str, gitlab_hosts: Collection[str]) -> list[tuple[re.Match, tuple]]:
+    """Each PR url and merge request url on ``gitlab_hosts`` in ``line``, in order, with its rules."""
+    found = [(match, PR_RULES) for match in PR_URL.finditer(line)]
+    found += [(match, MR_RULES) for match in MR_URL.finditer(line) if match.group(1).lower() in gitlab_hosts]
+    return sorted(found, key=lambda item: item[0].start())
+
+
+def _opened_pr_then(before: str, number: str, then: re.Pattern) -> re.Match | None:
     """The last "opened PR" in ``before`` with no sentence end between it and the
     url, a label just before the url, and no other PR number named."""
-    verbs = list(OPENED_PR_THEN.finditer(before))
+    verbs = list(then.finditer(before))
     if not verbs:
         return None
     verb = verbs[-1]
@@ -239,7 +303,7 @@ def _trimmed(words: list[str]) -> list[str]:
     return words[start:end]
 
 
-def _ours(before: str) -> bool:
+def _ours(before: str, labels: tuple) -> bool:
     """Whether the verb after ``before`` is the worker's own.
 
     One rule, read on the sentence the verb is in with :data:`FILLER` words
@@ -264,7 +328,7 @@ def _ours(before: str) -> bool:
         # "Renovate, as usual, opened" names who did it; "Following up <url>, opened" does not.
         return not _a_name(sentence.split(",")[0])
     words = _trimmed([w.lower() for w in CLAUSE_WORD.findall(sentence)])
-    if not words or words in PR_LABEL or words[-1] in OUR_LEAD:
+    if not words or words in labels or words[-1] in OUR_LEAD:
         return True
     if words[-1] not in JOIN:
         return False
@@ -332,13 +396,18 @@ def _ref_markup(match: re.Match) -> str:
 
 
 def pr_opened(url: str, repo: str, number: str, line: str) -> tuple[list[dict], str]:
-    """Blocks and fallback text for an opened PR; ``line`` is the worker's, the url shortened."""
-    headline = PR_HEADLINE.format(number=number, repo=repo)
+    """Blocks and fallback text for an opened PR or merge request; ``line`` is the
+    worker's, the url shortened."""
+    merge_request = MR_URL.match(url) is not None
+    headline_format, ref_format, lead, open_label, files_path = MR_LAYOUT if merge_request else PR_LAYOUT
+    headline = headline_format.format(number=number, repo=repo)
     ref = PR_REF_URL.format(url=re.escape(url), tail=PR_URL_TAIL)
-    span = re.compile(PR_REF_SPAN.format(number=number, ref=ref), re.IGNORECASE)
-    shortened = span.sub(lambda m: PR_REF.format(number=number) + _ref_markup(m), line)
+    span = re.compile(PR_REF_SPAN.format(lead=lead.format(number=number), ref=ref), re.IGNORECASE)
+    shortened = span.sub(lambda m: ref_format.format(number=number) + _ref_markup(m), line)
+    if merge_request:
+        shortened = A_BEFORE_MR.sub(r"\1n", shortened)
     evidence = _presenter._clip(shortened.strip(), EVIDENCE_MAX)
-    links = [(OPEN_PR, url), (FILES_CHANGED, url + FILES_PATH)]
+    links = [(open_label, url), (FILES_CHANGED, url + files_path)]
     blocks = _presenter.blocks_answer(headline, links=links, action_id_prefix=PR_ACTION_PREFIX, primary_link=True)
     first, *rest = _presenter.fallback_text(headline, links=links).split("\n")
     return _with_subline(blocks, evidence), "\n".join([_text(first, evidence), *rest])

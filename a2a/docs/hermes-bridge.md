@@ -377,13 +377,16 @@ no key is refused at start.
 A kanban card the persona creates completes after the turn has answered, and the API server
 has no channel to push that completion back. So before a task's first turn the bridge records the
 conversation its session answers (the platform, the gateway's conversation key from the task's
-`authority.audience.conversation`, and the `contextId`) in the pod's session-kv, with
+`authority.audience.conversation`, the `contextId`, and the kind of the prompt's ask, which the
+cards' posts keep marked while they run) in the pod's session-kv, with
 `PUT /v1/sessions/{id}/route` on `BRIDGE_ROUTE_URL` (default `http://127.0.0.1:8699`) and the
 `SESSION_KV_API_KEY` (inherited from the agent container on a rendered bridge). The card's report then goes back to that conversation through the
 gateway's chat.notify route (`docs/designs/spec-chatops-gateway.md`). The PUT is best effort: the
 turn runs either way, and when it fails the answer ends with a line saying a card's answer cannot
 be posted back. A Google Chat or Slack conversation is posted back. A
 conversation on a door with no notify route (inject, the A2A door, Discord) records nothing. The `cli` executor records no route, so its cards still do not report back.
+
+Hermes can also run a wake turn in the session that filed a card: a synthetic message saying how the card ended, with the worker's result. On a conversation with no notify route, Slack included, a finished card (or one sent for review) wakes the session. On Google Chat only a card that failed, timed out or blocked does, because #2734 posts the finished card's report itself. The wake turn's reply isn't delivered anywhere, since the bridge only reads answers to its own task turns, but it stays in the session's history for the next turn. The wake turn can't file a card: in an `a2a-ctx-*` session, or one descended from it such as its compressed continuation, `kanban_create` refuses on a wake turn and says to wait for the person to ask (#2610, `deploy/docker/patches/kanban_wake_guard.py`). So does `kanban_unblock`: a blocked card's question is for the person, and their reply, a turn of its own, can unblock it.
 
 What the `api` executor does not do. A turn the bridge stops waiting
 for, on cancel or the deadline, may keep running in the server, and the next task on the same
@@ -690,7 +693,18 @@ heartbeat and never the trace. Past the trace's share, calls are counted and one
 part; the relay drops the artifact on purpose (debug and audit views never render to
 chat), and the inject door's probe is where a reader sees it.
 
-The heartbeat is a `progress` text part every `BRIDGE_PROGRESS_INTERVAL_SECONDS` (default
+Each of these also carries a `kube-agents.chat/v1` chat message where the payload spec's
+"Chat messages" section puts one (`chat.go`): a completed `result`'s last chunk holds the
+answer laid out (its first sentence as the headline, the rest as the detail), and is
+published without it if the bus refuses the chunk as too large; every heartbeat holds the
+prompt's kind of ask as `mark.ask`; and the terminal of a completed task that filed a kanban
+card (a `kanban_create` call that did not fail) from a Slack conversation, with
+`KAGE_SLACK_UX` on in the agent environment the bridge inherits and the route recorded (so on
+the `api` executor only), holds that `mark.ask` alone,
+so the ask stays marked until the cards' posts settle it. Anywhere else no card post settles
+it, so the terminal carries no mark and the ask comes off.
+
+The heartbeat is a `progress` text part, with the ask's mark beside it, every `BRIDGE_PROGRESS_INTERVAL_SECONDS` (default
 60; 0 turns it off, and a count a duration cannot hold is refused with a log line and the
 default): `running 1m30s, 3 tool call(s), last mcp__gke__list_clusters`. With the door closed,
 or under `api` with no `A2A_ACTIVITY_SECRET` to check a delivery against, the count has nothing

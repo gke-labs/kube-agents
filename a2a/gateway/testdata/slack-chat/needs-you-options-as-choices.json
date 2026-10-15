@@ -1,0 +1,72 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "Which checkout-gateway did you mean?",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      }
+    ],
+    "attachments": [
+      {
+        "blocks": [
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "text": "Two clusters run one. Which?",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "type": "rich_text"
+          },
+          {
+            "elements": [
+              {
+                "action_id": "kage.choice.0",
+                "text": {
+                  "emoji": true,
+                  "text": "seeded-reliability",
+                  "type": "plain_text"
+                },
+                "type": "button",
+                "value": "seeded-reliability"
+              },
+              {
+                "action_id": "kage.choice.1",
+                "text": {
+                  "emoji": true,
+                  "text": "seeded-debug",
+                  "type": "plain_text"
+                },
+                "type": "button",
+                "value": "seeded-debug"
+              }
+            ],
+            "type": "actions"
+          }
+        ],
+        "color": "#ECB22E",
+        "fallback": "(the text fallback)"
+      }
+    ]
+  }
+]

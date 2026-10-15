@@ -76,12 +76,28 @@ gcloud storage rm -r gs://<project>-kube-agents-tfstate
 
 The service accounts, IAM bindings, the Google Chat Pub/Sub topic and subscription, and the rest of the resources in the Terraform state are destroyed, except the project's APIs, which stay enabled. On a cluster the install did not create, the cluster-level settings it turned on stay: CMEK database encryption, the Workload Identity pool, node pools moved to the GKE metadata server, and Calico NetworkPolicy. Your `install.env` stays too, and so do the Slack app and the Google Chat app, which you configured outside the install.
 
-A cluster the install created is deleted with everything in it. On a cluster it did not create, Helm removes its releases and leaves the namespaces it installed into, `kubeagents-system` and, when the install brought cert-manager, `cert-manager`, along with the kube-agents CRDs, since Helm never deletes a chart's `crds/`. Anything in `kubeagents-system` that Helm did not create is still there: the shell sandbox's two volumes, `data-platform-agent-shell-0` and `sshd-platform-agent-shell-0`, which its StatefulSet keeps on purpose; a registry pull Secret you created, the GitLab token Secret the installer creates after the apply, and, on the unsupported `spec.mode: next`, the gateway's `a2a-slack-principal-map` and `discord-bot` Secrets if you created them. Once the teardown has finished, remove them with the namespace; delete the CRDs only when no other install on the cluster uses them, since that deletes every `PlatformAgent` on it:
+A cluster the install created is deleted with everything in it. On a cluster it did not create, Helm removes its releases and leaves the namespaces it installed into, `kubeagents-system` and, when the install brought cert-manager, `cert-manager`, along with the kube-agents CRDs, since Helm never deletes a chart's `crds/`. Anything in `kubeagents-system` that Helm did not create is still there: the shell sandbox's two volumes, `data-platform-agent-shell-0` and `sshd-platform-agent-shell-0`, which its StatefulSet keeps on purpose; a registry pull Secret you created, the GitLab token Secret and, for a private CA, the GitLab CA Secret that the installer creates after the apply, and, on the unsupported `spec.mode: next`, the gateway's `a2a-slack-principal-map` and `discord-bot` Secrets if you created them. Once the teardown has finished, remove them with the namespace; delete the CRDs only when no other install on the cluster uses them, since that deletes every `PlatformAgent` on it:
 
 ```bash
 kubectl delete namespace kubeagents-system
 kubectl delete crd platformagents.kubeagents.x-k8s.io agentplugins.kubeagents.x-k8s.io agentprofiles.kubeagents.x-k8s.io
 ```
+
+To keep the namespace and remove only the GitLab Secrets, use this command. It reads the Secret names and the namespace from the install's `install.env`, the same way the installer reads that file:
+
+```bash
+# The install's install.env: beside install.sh for an install from an unpacked release or
+# a checkout, or $HOME/kube-agents/install.env under curl | bash.
+ENV_FILE="$HOME/kube-agents/install.env"
+(
+  unset NAMESPACE GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
+  set -a; . "$ENV_FILE"; set +a
+  kubectl delete secret "${GITLAB_TOKEN_SECRET:-gitlab-forge-token}" ${GITOPS_CA_SECRET:+"$GITOPS_CA_SECRET"} \
+    -n "${NAMESPACE:-kubeagents-system}" --ignore-not-found=true
+)
+```
+
+The subshell keeps the file's variables out of your shell. After the teardown, revoke the GitLab token in GitLab.
 
 ### What `spec.mode: next` leaves behind
 

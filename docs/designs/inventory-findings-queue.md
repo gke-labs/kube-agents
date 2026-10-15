@@ -114,9 +114,8 @@ write the table are the cron relay's and `platform_mcp_server.py`'s. The watcher
 second of those — `trigger_agent_troubleshooter` registers session routing, and the troubleshooting
 agent's threaded `send_notification` then POSTs `/v1/incidents` — so `incident_context` is right
 that the watcher is one of two writers. The point survives the correction: what lands is the
-composed chat message, which for the relay's own writes the server describes as "the relay's
-composed output rather than the specialist's finding." Neither writer produces a ranked, stateful
-row for a problem.
+chat message as posted, which for the relay's own writes is the specialist's report. Neither
+writer produces a ranked, stateful row for a problem.
 
 So `findings` is a new table beside `incidents` with a disjoint job: `findings` is the queue,
 `incidents` is the chat-thread transcript. ("Ledger" is reserved throughout this document for the

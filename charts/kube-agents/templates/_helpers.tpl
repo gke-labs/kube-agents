@@ -454,7 +454,8 @@ Takes a dict of field name to value.
 
 {{/*
 The LiteLLM gateway config, mirroring
-k8s-operator/config/integrations/litellm/base/config.yaml.
+k8s-operator/config/integrations/litellm/base/config.yaml and its provider
+overlays.
 
 Defined once and consumed twice — as the ConfigMap body and as the input to the
 Deployment's checksum annotation — because those two must not be able to
@@ -527,11 +528,17 @@ model_list:
 litellm_settings:
   callbacks: {{ .callbacks }}
 {{- /*
-  Prompt caching. Kept identical to the kustomize base
-  (k8s-operator/config/integrations/litellm/base/config.yaml) — see that file
-  for why the breakpoints live here rather than in the agent's own config, and
-  why non-Anthropic backends are unaffected.
+  Prompt caching, for Anthropic-family models only: the same $claude gate as
+  additional_drop_params above. On Gemini, LiteLLM turns these markers into
+  Vertex explicit context caching: a cachedContents list before every call,
+  and a create whenever the cached prefix is new. A create that Vertex holds
+  past its request credential's life fails the whole turn (a 401 after a
+  ten-minute stall in the incident that found this), and Gemini's
+  implicit caching needs no markers. The kustomize base carries the same block
+  only in its anthropic overlay; see that file for why the breakpoints live
+  here rather than in the agent's own config.
 */}}
+{{- if $claude }}
 router_settings:
   default_litellm_params:
     cache_control_injection_points:
@@ -544,6 +551,7 @@ router_settings:
         index: -3
       - location: message
         index: -1
+{{- end }}
 {{- end }}
 
 {{/*

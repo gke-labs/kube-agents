@@ -1100,7 +1100,7 @@ MITIGATIONS = {
     7: {
         "title": "A fail-closed webhook whose backend is not up",
         "before": "A webhook with failurePolicy Fail, a long timeout, a Service with no endpoints and no namespaceSelector exempting kube-system.",
-        "read_today": "nothing before an upgrade; the upgrade skill's stuck-upgrade steps check whether webhooks are rejecting pod creation on new nodes, after the fact",
+        "read_today": "the readiness mode of `fleet-upgrade-verification` grades a fail-closed webhook whose backend the API server cannot reach now, `blocked` when its rules reach the upgrade's path or a bootstrap RBAC write a new master reconciles (ClusterRoles and ClusterRoleBindings always; Roles and RoleBindings in `kube-system` or `kube-public` when its namespace selector admits that namespace), and an outage otherwise; the backend that would fail once drained, and the object selector, are unread ([the readiness checks](upgrade-readiness-checks.md))",
         "mitigate_before": "Exempt kube-system, a timeout of a few seconds, failurePolicy Ignore for webhooks that are not security controls, two backend replicas behind a budget.",
         "mitigate_after": "Set failurePolicy Ignore or remove the configuration to unwedge the cluster, then restore it once the backend is up.",
     },
