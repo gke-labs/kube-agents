@@ -78,7 +78,7 @@ verification_spec:
       fixture_roles:
         - deprecated-label-selector
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: (?:yes|no)(?: \([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: (?:yes|no)(?: ?\([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-names-the-beta-arch-label
     role: objective
@@ -89,9 +89,9 @@ verification_spec:
       fixture_roles:
         - deprecated-label-selector
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?beta\.kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?(?: \([^)\n;]*\))?; deprecated: (?:yes|no)(?: \([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?beta\.kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?(?: ?\([^)\n;]*\))?; deprecated: (?:yes|no)(?: ?\([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?(?!beta\.kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; deprecated: (?:yes|no)(?: \([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?(?!beta\.kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; deprecated: (?:yes|no)(?: ?\([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-says-it-is-deprecated-and-names-the-replacement
     role: objective
@@ -102,9 +102,9 @@ verification_spec:
       fixture_roles:
         - deprecated-label-selector
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: yes(?: \([^)\n;]*\))?; replacement:? ?kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: yes(?: ?\([^)\n;]*\))?; replacement:? ?kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: (?!yes(?: \([^)\n;]*\))?; replacement:? ?kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?$)[^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: (?!yes(?: ?\([^)\n;]*\))?; replacement:? ?kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

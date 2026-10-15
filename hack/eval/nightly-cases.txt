@@ -395,8 +395,9 @@
 # on every project are cited here when a clean one exists
 # (docs/designs/bench-case-format.md, Registration). Until then, on a project
 # that lacks a role, a repetition errors as CHECK_DID_NOT_RUN, a broken
-# environment the gate excludes, not a failed case, as the entry-6 comment
-# says.
+# environment rather than a wrong answer, as the entry-6 comment says; the
+# gate reads that rung as a blocking verdict on the case, not as the
+# infrastructure class it excludes from the rate.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:

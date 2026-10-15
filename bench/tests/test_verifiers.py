@@ -7902,13 +7902,16 @@ _GROUP5 = {
             "- `seeded-a/seeded-defaults`: enforce baseline; enforce-version `latest`; rule set changes at the next minor: yes.",
             "**seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes**",
             "1. seeded-a (us-central1-a)/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes",
-        ],
+                    "seeded-a/seeded-defaults: enforce pod-security.kubernetes.io/enforce=baseline; enforce-version pod-security.kubernetes.io/enforce-version=latest; rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce=baseline; enforce-version=latest; rule set changes at the next minor: yes",
+],
         [
             "seeded-a/seeded-defaults: enforce restricted; enforce-version latest; rule set changes at the next minor: yes",
             "seeded-a/seeded-defaults: enforce baseline; enforce-version v1.33; rule set changes at the next minor: yes",
             "seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: no",
             "seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes?",
-        ],
+                    "seeded-a/seeded-defaults: enforce pod-security.kubernetes.io/enforce=restricted; enforce-version latest; rule set changes at the next minor: yes",
+],
         "No namespace on the seeded clusters pins its Pod Security Admission version to the running minor; every enforce-version label names a minor.",
     ),
     "upgrades-stale-client-skew-named": (
@@ -8142,6 +8145,7 @@ _GROUP2 = {
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: required node affinity",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity and ScheduleAnyway spread constraint",
             "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity plus spread constraint",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: both node affinity and spread constraint",
 ],
         [
             "seeded-d/seeded-topology/zone-pinned-api-canary: replicas 2; zones in use 1; all replicas in one zone: yes; cause: topology-spread-constraint",
@@ -8186,6 +8190,7 @@ _GROUP4 = {
             "**seeded-a/seeded-shapes/cache-on-emptydir**: node-local volumes queue (emptyDir at /var/lib/queue); survives a node rebuild: no",
             "1. seeded-a (us-central1-a)/seeded-shapes/cache-on-emptydir: node-local volumes queue, scratch; survives a node rebuild: no",
                     "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue:/var/cache/queue; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue(emptyDir); survives a node rebuild: no",
 ],
         [
             "seeded-a/seeded-shapes/cache-on-emptydir-shadow: node-local volumes queue; survives a node rebuild: no",
@@ -8253,13 +8258,19 @@ _GROUP4 = {
             "seeded-a/pv/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",            "seeded-a/intree-pd: source gcePersistentDisk (in-tree); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
             "seeded-a/intree-pd: source in-tree (gcePersistentDisk); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
             "seeded-a/intree-pd: source gcePersistentDisk (in-tree, migrated to pd.csi.storage.gke.io); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree kubernetes.io/gce-pd; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree (gcePersistentDisk plugin); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by pvc intree-pd in seeded-shapes; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by intree-pd (seeded-shapes); attaches through CSI migration: yes",
 ],
         [
             "seeded-a/intree-pd: source csi; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
             "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by none; attaches through csi migration: yes",
             "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: no",
             "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes (pd.csi.storage.gke.io)",
-        ],
+                    "seeded-a/intree-pd: source in-tree?; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by other-claim in seeded-shapes; attaches through CSI migration: yes",
+],
         "No PersistentVolume on the seeded clusters uses an in-tree plugin; a CSI driver provisioned every volume.",
     ),
     "upgrades-retired-registry-image-named": (
@@ -8454,9 +8465,10 @@ def test_a_gloss_after_any_mid_line_value_is_admitted(case):
     parts = bare.split("; ")
     assert len(parts) > 1, bare
     for k in range(len(parts) - 1):
-        glossed = "; ".join(parts[: k + 1]) + " (object gloss); " + "; ".join(parts[k + 1 :])
-        verdicts = _verdicts_for_line(case, glossed)
-        assert verdicts and all(s == "pass" for s in verdicts.values()), (k, glossed, verdicts)
+        for gloss in (" (object gloss)", "(object gloss)"):  # a space before the parenthesis, or none
+            glossed = "; ".join(parts[: k + 1]) + gloss + "; " + "; ".join(parts[k + 1 :])
+            verdicts = _verdicts_for_line(case, glossed)
+            assert verdicts and all(s == "pass" for s in verdicts.values()), (k, glossed, verdicts)
 
 
 # The framed cases whose object is a workload, so a pod of it names it: not

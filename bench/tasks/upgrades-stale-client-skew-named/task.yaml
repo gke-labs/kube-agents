@@ -103,9 +103,9 @@ verification_spec:
       fixture_roles:
         - stale-client-skew
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?stale-kubectl-client(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: client:? ?(?:image )?(?:[a-z0-9.-]+/)*kubectl(?: ?\(v?1\.29(?:\.0)?\)|(?:[:/] ?| )?v?1\.29(?:\.0)?)(?: \([^)\n;]*\))?; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?stale-kubectl-client(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: client:? ?(?:image )?(?:[a-z0-9.-]+/)*kubectl(?: ?\(v?1\.29(?:\.0)?\)|(?:[:/] ?| )?v?1\.29(?:\.0)?)(?: ?\([^)\n;]*\))?; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?stale-kubectl-client(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: client:? ?(?!(?:image )?(?:[a-z0-9.-]+/)*kubectl(?: ?\(v?1\.29(?:\.0)?\)|(?:[:/] ?| )?v?1\.29(?:\.0)?)(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?stale-kubectl-client(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: client:? ?(?!(?:image )?(?:[a-z0-9.-]+/)*kubectl(?: ?\(v?1\.29(?:\.0)?\)|(?:[:/] ?| )?v?1\.29(?:\.0)?)(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
 
   - name: the-declared-line-says-the-client-is-outside-the-skew
     role: objective
