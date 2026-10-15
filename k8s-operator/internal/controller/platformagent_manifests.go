@@ -158,6 +158,18 @@ const (
 	eventWatcherMetricsPort     int32 = 9095
 	eventWatcherMetricsPortName       = "event-metrics"
 	eventWatcherMetricsPortEnv        = "EVENT_WATCHER_METRICS_PORT"
+	// chatMetricsPort is where the chat_metrics plugin in the platform-agent
+	// container serves the inbound chat message counter: the CHAT_METRICS_PORT
+	// value the plugin binds, the container port declared beside the API port,
+	// and the port the gateway policy admits the collector and the operator on,
+	// from one constant for the same reason as the watcher's.
+	chatMetricsPort     int32 = 9097
+	chatMetricsPortName       = "chat-metrics"
+	chatMetricsPortEnv        = "CHAT_METRICS_PORT"
+	// platformAgentContainerName is the agent container's name in the gateway
+	// and dashboard pods, the one the poller's Ready gate and the bridge name:
+	// the same word as the app label, under the name for what it is here.
+	platformAgentContainerName = appNamePlatformAgent
 
 	// OperatorNamespaceEnv is the variable both install paths set on the
 	// manager container from the Downward API (the chart's operator
@@ -800,6 +812,7 @@ var DefaultBuiltInPlugins = []string{
 	"incident_context",
 	"bootstrap_onboarding",
 	"pr_opened",
+	"chat_metrics",
 }
 
 // pluginNamePattern mirrors the CEL rule on AgentPlugin.metadata.name. The name becomes
@@ -1219,6 +1232,7 @@ var frontDoorToolsets = []string{
 // session_otel_bridge are what make an inbound chat session persist and trace at all —
 // each hooks ingress, so enabling them on a profile no message reaches does nothing, and
 // NOT enabling them on the profile every message reaches loses the behaviour outright.
+// chat_metrics hooks ingress the same way, to count it, so it follows the message too.
 //
 // agent_roster is left off because it exists only to delegate: it injects the
 // routable-specialist roster into every turn, which a front door that does the work
@@ -1241,6 +1255,7 @@ var frontDoorPlugins = []string{
 	"session_store",
 	"session_otel_bridge",
 	"legacy_slash_commands",
+	"chat_metrics",
 }
 
 // frontDoorBackfillPlugins are plugins agents/platform/config.yaml enables that an existing
@@ -3352,6 +3367,15 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// immutable once created.
 	podLabels := commonLabels(agent)
 	podLabels["app"] = agent.Name + "-gateway"
+	// At one replica the pod is the gateway: no election runs and nothing
+	// would stamp the leader label, so the template carries it, and the one
+	// pod reads as the leader to everything that selects on the label (the
+	// chart's PodMonitoring for the chat listener, the usage poller). Above
+	// one replica the label is leader_elect.py's to stamp and clear, so the
+	// template leaves it off.
+	if replicas <= 1 {
+		podLabels[gatewayLeaderLabel] = gatewayLeaderLabelValue
+	}
 	// No kubeagents.x-k8s.io/has-credential-proxy label. That is what
 	// github-token-minter's NetworkPolicy admits on 8080, and this Pod has no
 	// caller for the minter: the credential runtime is in a Pod of its own and
@@ -5039,6 +5063,14 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		Name:  gatewayProfileEnvVar,
 		Value: frontDoorProfile,
 	})
+	// The port the chat_metrics plugin binds, appended after the merge like the
+	// watcher's metrics port on the sidecar and for the same reason: the
+	// container port above and the policy rule name this one, and a CR that
+	// moved the listener would leave both pointing at a port nothing answers on.
+	gatewayEnvVars = append(gatewayEnvVars, corev1.EnvVar{
+		Name:  chatMetricsPortEnv,
+		Value: strconv.Itoa(int(chatMetricsPort)),
+	})
 
 	// Every "appended after the merge" comment above rests on the kubelet collapsing a
 	// repeated env name last-wins. The pod never reaches a kubelet. `Container.Env`
@@ -5057,7 +5089,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 
 	containers := []corev1.Container{
 		{
-			Name:            "platform-agent",
+			Name:            platformAgentContainerName,
 			Image:           image,
 			ImagePullPolicy: pullPolicy,
 			Args:            args,
@@ -5065,6 +5097,12 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				{
 					Name:          "api",
 					ContainerPort: 8642,
+				},
+				// The chat_metrics plugin's /metrics, for the chart's PodMonitoring
+				// and the usage poller (see chatMetricsPort).
+				{
+					Name:          chatMetricsPortName,
+					ContainerPort: chatMetricsPort,
 				},
 			},
 			Env:          gatewayEnvVars,
@@ -6312,6 +6350,22 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// The operator's own pods on the same port, for the poller that reads the
 	// watcher's counters into status.usage (usage_counters_poller.go).
 	if rule, ok := operatorMetricsIngressRule(profile.OperatorNamespace, eventWatcherMetricsPort); ok {
+		ingressRules = append(ingressRules, rule)
+	}
+	// The chat_metrics plugin's listener on the platform-agent container, for
+	// the same two readers: the collector, and the operator's poller that reads
+	// the inbound chat counter into status.usage.
+	ingressRules = append(ingressRules, networkingv1.NetworkPolicyIngressRule{
+		From: []networkingv1.NetworkPolicyPeer{
+			{
+				NamespaceSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
+				},
+			},
+		},
+		Ports: []networkingv1.NetworkPolicyPort{tcpPort(chatMetricsPort)},
+	})
+	if rule, ok := operatorMetricsIngressRule(profile.OperatorNamespace, chatMetricsPort); ok {
 		ingressRules = append(ingressRules, rule)
 	}
 

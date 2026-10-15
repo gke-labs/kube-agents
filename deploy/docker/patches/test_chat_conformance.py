@@ -4,7 +4,9 @@ Run: python3 -m pytest deploy/docker/patches/test_chat_conformance.py
 
 The cases are ``tests/conformance/chat/`` (``agents/platform/scripts/chat_cases.py``
 reads them). A case with one input runs through the composer that lays it out
-(``agents/platform/scripts/chat_message.py``, or ``slack_ux_incident.chat_triage``).
+(``agents/platform/scripts/chat_message.py``, ``slack_ux_incident.chat_triage``, or the
+fleet-audit and first-inventory cards, ``slack_audit_report.chat_from_issue`` and
+``agents/chat/scripts/inventory_presenter.chat``).
 A case that is a sequence of card events runs through the gateway patches that
 send it, with a stand-in for the chat.notify adapter recording each send:
 ``kanban_progress_lines.deliver`` and ``slack_ux_status`` for the plan (the fold
@@ -19,6 +21,7 @@ the ask kind they carry is the one ``chat_message.ask_kind`` gives.
 
 import asyncio
 import itertools
+import json
 import sys
 import time
 import unittest
@@ -29,13 +32,19 @@ from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 SCRIPTS = HERE.parents[2] / "agents" / "platform" / "scripts"
+#: The Slack renderer's golden files under next, one per shared case it lays out.
+SLACK_GOLDEN = HERE.parents[2] / "a2a" / "gateway" / "testdata" / "slack-chat"
+CHAT_SCRIPTS = HERE.parents[2] / "agents" / "chat" / "scripts"
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(CHAT_SCRIPTS))
 
 import chat_cases
 import chat_message
+import inventory_presenter
 import kanban_notifier
 import kanban_progress_lines
+import slack_audit_report
 import slack_ux_failure
 import slack_ux_incident
 import slack_ux_moments
@@ -149,6 +158,17 @@ class SharedCasesTest(unittest.TestCase):
         """The outputs the emitter gives for ``case``, one per expected entry, as the case spells them."""
         self.reset()
         given = case["input"]
+        if "ledger_issue" in given:
+            # The cron relay's fleet-audit card, on the home-channel chat.notify route.
+            ref = slack_audit_report.ledger_ref(given["relayed"])
+            built = slack_audit_report.chat_from_issue(given["ledger_issue"], ref, given["relayed"])
+            return [_out(built and built[0], NOTIFY)]
+        if "failed_audit_report" in given:
+            built = slack_audit_report.failed_chat(given["failed_audit_report"])
+            return [_out(built and built[0], NOTIFY)]
+        if "inventory_report" in given:
+            built = inventory_presenter.chat(given["inventory_report"])
+            return [_out(built and built[0], NOTIFY)]
         if "markdown" in given:
             return [_out(chat_message.answer_message(given["markdown"]), RESULT)]
         if "reason" in given:
@@ -268,6 +288,23 @@ class SharedCasesTest(unittest.TestCase):
         for case in cases:
             with self.subTest(case=case["name"]):
                 self.assertEqual(_as_case(self.run_case(case), case["expected"]), case["expected"])
+
+
+class PlanDrawnAlikeTest(unittest.TestCase):
+    """Today's plan blocks for a plan case are next's: the Go renderer's golden for the same case."""
+
+    def test_every_plan_case(self):
+        cases = [c for c in chat_cases.load() if "rows" in c["input"] and not ({"events", "headline"} & c["input"].keys())]
+        self.assertGreater(len(cases), 0)
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                given = case["input"]
+                # The window slack_ux_status._prune applies before today draws, as the emitter applies it.
+                rows = chat_message._plan_rows([_row(r) for r in given["rows"]])
+                today = slack_ux_status._status.plan_blocks(given.get("title"), rows)
+                golden = json.loads((SLACK_GOLDEN / f"{case['name']}.json").read_text())
+                self.assertEqual(today, golden[0]["blocks"])
+                self.assertEqual({b["type"] for b in today}, {"task_card"}, "one line per card, no folded plan")
 
 
 class ChatRoutePlanTest(unittest.TestCase):

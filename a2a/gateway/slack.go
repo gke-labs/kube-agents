@@ -123,6 +123,9 @@ const (
 	slackMemberPrincipalPrefix = "slack:"
 	// slackChannelTypeIM is a direct message's channel_type.
 	slackChannelTypeIM = "im"
+	// slackChannelTypeChannel is a public channel's channel_type; a home
+	// channel is never a DM.
+	slackChannelTypeChannel = "channel"
 	// slackMinChannelIDLen is the shortest id slackIsHomeChannelID takes:
 	// the prefix letter and at least two characters after it.
 	slackMinChannelIDLen = 3
@@ -222,6 +225,9 @@ type SlackAdapter struct {
 	sessionStates map[string]*slackSession
 	sessionOrder  []string
 	syncSessions  bool
+	// sessionErrorsSeen is the setStatus error texts already logged at Warn
+	// (firstSessionError), under s.mu.
+	sessionErrorsSeen map[string]bool
 
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.
@@ -319,6 +325,7 @@ var (
 	_ TaskObserver      = (*SlackAdapter)(nil)
 	_ SessionLookupSink = (*SlackAdapter)(nil)
 	_ MarkObserver      = (*SlackAdapter)(nil)
+	_ StatusShower      = (*SlackAdapter)(nil)
 	_ VerifiedObserver  = (*SlackAdapter)(nil)
 )
 
@@ -411,6 +418,17 @@ func (s *SlackAdapter) expireMark(key string) {
 	if s.sessionThreads[key] {
 		s.sessionExpiresAt[key] = s.now()
 	}
+}
+
+// ShowsTaskStatus is the StatusShower answer: with Agent Sessions wired the
+// thread's Working… status, the ask's reaction and the plan rows are the
+// task's status, so the relay posts no rolling line. An adapter built
+// without them (a test that fakes no sessions API) keeps the line, and so
+// does a conversation with no thread (a legacy top-level DM key), which
+// gets no Agent Session.
+func (s *SlackAdapter) ShowsTaskStatus(conversation string) bool {
+	_, thread, ok := slackChannelThread(conversation)
+	return s.sessionsAPI != nil && ok && thread != ""
 }
 
 func (s *SlackAdapter) TaskAccepted(conversation, _ string) {
@@ -533,11 +551,12 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				// the three seconds Slack allows before it redelivers and
 				// shows the clicker a timeout, and a click on one of the
 				// choice buttons a chat message's layout carries
-				// (renderSlackChat) becomes a turn (slack_interactive.go). A
-				// click on any other button (one on a message posted under
-				// today, a link) is acked and changes nothing. The notify
-				// route's raw blocks still carry none (the agent sends the
-				// audit card with its buttons removed).
+				// (renderSlackChat), the home-channel cards the notify route
+				// lays out (the fleet audit's, the first inventory's) among
+				// them, becomes a turn (slack_interactive.go). A click on any
+				// other button (one on a message posted under today, a link)
+				// is acked and changes nothing. The route's raw blocks still
+				// carry none.
 				continue
 			}
 			// Ack before parsing, not after: unacked envelopes redeliver in
@@ -731,6 +750,37 @@ func (s *SlackAdapter) PostNotifyBlocks(channel, thread, text string, raw json.R
 	if thread == "" {
 		thread = ts
 	}
+	return ts, thread, nil
+}
+
+// PostNotifyMessage is PostNotify for a message value: a chat message laid
+// out as Block Kit (renderSlackChat), its text as the notification and
+// fallback, link and media previews off. A layout the renderer will not send,
+// or that Slack refuses, is an error wrapped in ErrLayoutRefused and nothing
+// is posted; the Notifier posts the text instead.
+func (s *SlackAdapter) PostNotifyMessage(channel, thread string, m OutMessage) (message, landed string, err error) {
+	if !slackIsHomeChannelID(channel) {
+		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
+	}
+	opts, err := slackMessageOptions(m)
+	if err != nil {
+		return "", "", err
+	}
+	opts = append(opts, slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl())
+	if thread != "" {
+		opts = append(opts, slack.MsgOptionTS(thread))
+	}
+	_, ts, err := s.api.PostMessage(channel, opts...)
+	if err != nil {
+		return "", "", slackLayoutError(err)
+	}
+	if thread == "" {
+		thread = ts
+	}
+	// A home card with choices is its thread's open question, as a
+	// conversation's is, so a typed answer in the thread settles it and a
+	// later click on it is dropped.
+	s.trackQuestion(slackConversationID(slackChannelTypeChannel, channel, thread), ts, m)
 	return ts, thread, nil
 }
 

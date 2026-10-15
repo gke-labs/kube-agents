@@ -355,6 +355,10 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("labelPartOf",),
     ),
+    "operator_metrics_peer": Source(
+        "k8s-operator/internal/controller/platformagent_manifests.go",
+        ("operatorPodNameLabel", "operatorPodNameValue"),
+    ),
     "a2a_spawner": Source(
         "a2a/gateway/spawn.go",
         ("partOfValue", "sessionRole", "AutomountServiceAccountToken", "credentialProxySessionAudience"),

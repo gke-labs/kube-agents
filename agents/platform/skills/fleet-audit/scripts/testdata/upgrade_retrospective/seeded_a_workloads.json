@@ -1,0 +1,1107 @@
+{
+ "apiVersion": "v1",
+ "items": [
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "name": "inference-server",
+    "namespace": "seeded-capacity"
+   },
+   "spec": {
+    "replicas": 4,
+    "selector": {
+     "matchLabels": {
+      "app": "inference-server"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "app": "inference-server"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "command": [
+         "sh",
+         "-c",
+         "while true; do :; done"
+        ],
+        "image": "busybox:1.36",
+        "name": "server",
+        "resources": {
+         "limits": {
+          "cpu": "500m",
+          "memory": "128Mi"
+         },
+         "requests": {
+          "cpu": "400m",
+          "memory": "64Mi"
+         }
+        }
+       }
+      ],
+      "nodeSelector": {
+       "seeded-role": "pinned-inference"
+      },
+      "restartPolicy": "Always",
+      "shareProcessNamespace": false,
+      "topologySpreadConstraints": [
+       {
+        "labelSelector": {
+         "matchLabels": {
+          "app": "inference-server"
+         }
+        },
+        "maxSkew": 1,
+        "topologyKey": "kubernetes.io/hostname",
+        "whenUnsatisfiable": "ScheduleAnyway"
+       }
+      ],
+      "volumes": []
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-09-25T17:02:07Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     },
+     {
+      "lastTransitionTime": "2026-09-25T17:02:48Z",
+      "reason": "MinimumReplicasUnavailable",
+      "status": "False",
+      "type": "Available"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "name": "payments-api",
+    "namespace": "seeded-debug"
+   },
+   "spec": {
+    "replicas": 1,
+    "selector": {
+     "matchLabels": {
+      "app": "payments-api"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "app": "payments-api"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "command": [
+         "sh",
+         "-c",
+         "tail /dev/zero"
+        ],
+        "image": "busybox:1.36",
+        "name": "api",
+        "resources": {
+         "limits": {
+          "memory": "64Mi"
+         },
+         "requests": {
+          "cpu": "10m",
+          "memory": "32Mi"
+         }
+        }
+       }
+      ],
+      "restartPolicy": "Always",
+      "shareProcessNamespace": false,
+      "volumes": []
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-09-25T17:02:46Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     },
+     {
+      "lastTransitionTime": "2026-10-08T18:00:18Z",
+      "reason": "MinimumReplicasUnavailable",
+      "status": "False",
+      "type": "Available"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "name": "baseline-edge-worker",
+    "namespace": "seeded-defaults"
+   },
+   "spec": {
+    "replicas": 1,
+    "selector": {
+     "matchLabels": {
+      "app": "baseline-edge-worker"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "app": "baseline-edge-worker"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "image": "registry.k8s.io/pause:3.10",
+        "name": "worker",
+        "resources": {
+         "limits": {
+          "memory": "16Mi"
+         },
+         "requests": {
+          "cpu": "5m",
+          "memory": "8Mi"
+         }
+        }
+       }
+      ],
+      "restartPolicy": "Always",
+      "shareProcessNamespace": false,
+      "volumes": []
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-07T18:27:18Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T18:27:15Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "name": "notification-relay",
+    "namespace": "seeded-intent"
+   },
+   "spec": {
+    "replicas": 2,
+    "selector": {
+     "matchLabels": {
+      "app": "notification-relay"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "app": "notification-relay"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "image": "registry.k8s.io/pause:3.9",
+        "name": "relay",
+        "resources": {
+         "limits": {
+          "memory": "32Mi"
+         },
+         "requests": {
+          "cpu": "10m",
+          "memory": "16Mi"
+         }
+        }
+       }
+      ],
+      "restartPolicy": "Always",
+      "shareProcessNamespace": false,
+      "topologySpreadConstraints": [
+       {
+        "labelSelector": {
+         "matchLabels": {
+          "app": "notification-relay"
+         }
+        },
+        "maxSkew": 1,
+        "topologyKey": "kubernetes.io/hostname",
+        "whenUnsatisfiable": "ScheduleAnyway"
+       }
+      ],
+      "volumes": []
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-07T18:27:18Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T18:27:15Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "name": "checkout-gateway",
+    "namespace": "seeded-reliability"
+   },
+   "spec": {
+    "replicas": 2,
+    "selector": {
+     "matchLabels": {
+      "app": "checkout-gateway"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "app": "checkout-gateway"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "image": "registry.k8s.io/pause:3.9",
+        "name": "gateway",
+        "resources": {
+         "limits": {
+          "memory": "32Mi"
+         },
+         "requests": {
+          "cpu": "10m",
+          "memory": "16Mi"
+         }
+        }
+       }
+      ],
+      "restartPolicy": "Always",
+      "shareProcessNamespace": false,
+      "topologySpreadConstraints": [
+       {
+        "labelSelector": {
+         "matchLabels": {
+          "app": "checkout-gateway"
+         }
+        },
+        "maxSkew": 1,
+        "topologyKey": "kubernetes.io/hostname",
+        "whenUnsatisfiable": "ScheduleAnyway"
+       }
+      ],
+      "volumes": []
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-09-25T17:02:46Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T04:10:05Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "name": "arch-pinned-worker",
+    "namespace": "seeded-shapes"
+   },
+   "spec": {
+    "replicas": 1,
+    "selector": {
+     "matchLabels": {
+      "app": "arch-pinned-worker"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "app": "arch-pinned-worker"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "command": [
+         "sh",
+         "-c",
+         "tail -f /dev/null"
+        ],
+        "image": "busybox:1.36",
+        "name": "worker",
+        "resources": {
+         "limits": {
+          "memory": "32Mi"
+         },
+         "requests": {
+          "cpu": "10m",
+          "memory": "16Mi"
+         }
+        }
+       }
+      ],
+      "nodeSelector": {
+       "beta.kubernetes.io/arch": "amd64"
+      },
+      "restartPolicy": "Always",
+      "shareProcessNamespace": false,
+      "volumes": []
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-03T10:31:38Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T04:04:00Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "name": "cache-on-emptydir",
+    "namespace": "seeded-shapes"
+   },
+   "spec": {
+    "replicas": 1,
+    "selector": {
+     "matchLabels": {
+      "app": "cache-on-emptydir"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "app": "cache-on-emptydir"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "command": [
+         "sh",
+         "-c",
+         "date -u > /var/cache/queue/stamp && tail -f /dev/null"
+        ],
+        "image": "busybox:1.36",
+        "name": "queue",
+        "resources": {
+         "limits": {
+          "memory": "32Mi"
+         },
+         "requests": {
+          "cpu": "10m",
+          "memory": "16Mi"
+         }
+        }
+       }
+      ],
+      "restartPolicy": "Always",
+      "shareProcessNamespace": false,
+      "volumes": [
+       {
+        "emptyDir": {},
+        "name": "queue"
+       }
+      ]
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-03T10:31:38Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T04:04:00Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "name": "cgroup-blind-jvm",
+    "namespace": "seeded-shapes"
+   },
+   "spec": {
+    "replicas": 1,
+    "selector": {
+     "matchLabels": {
+      "app": "cgroup-blind-jvm"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "app": "cgroup-blind-jvm"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "command": [
+         "sh",
+         "-c",
+         "java -version && exec sleep infinity"
+        ],
+        "image": "docker.io/library/eclipse-temurin:8u302-b08-jre",
+        "name": "jvm",
+        "resources": {
+         "limits": {
+          "memory": "192Mi"
+         },
+         "requests": {
+          "cpu": "10m",
+          "memory": "64Mi"
+         }
+        }
+       }
+      ],
+      "restartPolicy": "Always",
+      "shareProcessNamespace": false,
+      "volumes": []
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-07T18:27:24Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T18:27:11Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "name": "intree-pd-reader",
+    "namespace": "seeded-shapes"
+   },
+   "spec": {
+    "replicas": 1,
+    "selector": {
+     "matchLabels": {
+      "app": "intree-pd-reader"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "app": "intree-pd-reader"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "command": [
+         "sh",
+         "-c",
+         "tail -f /dev/null"
+        ],
+        "image": "busybox:1.36",
+        "name": "reader",
+        "resources": {
+         "limits": {
+          "memory": "32Mi"
+         },
+         "requests": {
+          "cpu": "10m",
+          "memory": "16Mi"
+         }
+        }
+       }
+      ],
+      "restartPolicy": "Always",
+      "shareProcessNamespace": false,
+      "volumes": [
+       {
+        "name": "data",
+        "persistentVolumeClaim": {
+         "claimName": "intree-pd"
+        }
+       }
+      ]
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-05T14:48:07Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T04:10:22Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "name": "legacy-registry-pull",
+    "namespace": "seeded-shapes"
+   },
+   "spec": {
+    "replicas": 1,
+    "selector": {
+     "matchLabels": {
+      "app": "legacy-registry-pull"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "app": "legacy-registry-pull"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "image": "k8s.gcr.io/pause:3.9",
+        "name": "pause",
+        "resources": {
+         "limits": {
+          "memory": "32Mi"
+         },
+         "requests": {
+          "cpu": "10m",
+          "memory": "16Mi"
+         }
+        }
+       }
+      ],
+      "restartPolicy": "Always",
+      "shareProcessNamespace": false,
+      "volumes": []
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-03T10:31:38Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T04:10:05Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "name": "multi-process-worker",
+    "namespace": "seeded-shapes"
+   },
+   "spec": {
+    "replicas": 1,
+    "selector": {
+     "matchLabels": {
+      "app": "multi-process-worker"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "app": "multi-process-worker"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "command": [
+         "sh",
+         "-c",
+         "sleep infinity & sleep infinity & wait"
+        ],
+        "image": "busybox:1.36",
+        "name": "supervisor",
+        "resources": {
+         "limits": {
+          "memory": "32Mi"
+         },
+         "requests": {
+          "cpu": "10m",
+          "memory": "16Mi"
+         }
+        }
+       }
+      ],
+      "restartPolicy": "Always",
+      "shareProcessNamespace": false,
+      "volumes": []
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-07T18:27:13Z",
+      "reason": "MinimumReplicasAvailable",
+      "status": "True",
+      "type": "Available"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T18:27:11Z",
+      "reason": "NewReplicaSetAvailable",
+      "status": "True",
+      "type": "Progressing"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "Deployment",
+   "metadata": {
+    "name": "inventory-api",
+    "namespace": "seeded-stall"
+   },
+   "spec": {
+    "replicas": 1,
+    "selector": {
+     "matchLabels": {
+      "app": "inventory-api"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "app": "inventory-api"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "envFrom": [
+         {
+          "configMapRef": {
+           "name": "inventory-flags",
+           "optional": false
+          }
+         }
+        ],
+        "image": "registry.k8s.io/pause:3.9",
+        "name": "api",
+        "resources": {
+         "limits": {
+          "memory": "32Mi"
+         },
+         "requests": {
+          "cpu": "10m",
+          "memory": "16Mi"
+         }
+        }
+       }
+      ],
+      "restartPolicy": "Always",
+      "shareProcessNamespace": false,
+      "volumes": []
+     }
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-10-07T18:27:18Z",
+      "reason": "MinimumReplicasUnavailable",
+      "status": "False",
+      "type": "Available"
+     },
+     {
+      "lastTransitionTime": "2026-10-07T18:29:19Z",
+      "reason": "ProgressDeadlineExceeded",
+      "status": "False",
+      "type": "Progressing"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "DaemonSet",
+   "metadata": {
+    "name": "cni-shaped-agent",
+    "namespace": "seeded-shapes"
+   },
+   "spec": {
+    "selector": {
+     "matchLabels": {
+      "app": "cni-shaped-agent"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "app": "cni-shaped-agent"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "image": "registry.k8s.io/pause:3.10",
+        "name": "agent",
+        "resources": {
+         "limits": {
+          "memory": "16Mi"
+         },
+         "requests": {
+          "cpu": "5m",
+          "memory": "8Mi"
+         }
+        }
+       }
+      ],
+      "hostNetwork": true,
+      "restartPolicy": "Always",
+      "shareProcessNamespace": false,
+      "volumes": [
+       {
+        "hostPath": {
+         "path": "/etc/cni/net.d",
+         "type": "Directory"
+        },
+        "name": "cni-conf"
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "DaemonSet",
+   "metadata": {
+    "name": "node-runtime-probe",
+    "namespace": "seeded-shapes"
+   },
+   "spec": {
+    "selector": {
+     "matchLabels": {
+      "app": "node-runtime-probe"
+     }
+    },
+    "template": {
+     "metadata": {
+      "labels": {
+       "app": "node-runtime-probe"
+      }
+     },
+     "spec": {
+      "containers": [
+       {
+        "command": [
+         "sh",
+         "-c",
+         "test -S /run/containerd/containerd.sock; tail -f /dev/null"
+        ],
+        "image": "busybox:1.36",
+        "name": "probe",
+        "resources": {
+         "limits": {
+          "memory": "32Mi"
+         },
+         "requests": {
+          "cpu": "10m",
+          "memory": "16Mi"
+         }
+        }
+       }
+      ],
+      "restartPolicy": "Always",
+      "shareProcessNamespace": false,
+      "volumes": [
+       {
+        "hostPath": {
+         "path": "/run/containerd/containerd.sock",
+         "type": "Socket"
+        },
+        "name": "sock"
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "CronJob",
+   "metadata": {
+    "labels": {
+     "app": "legacy-endpoints-writer"
+    },
+    "name": "legacy-endpoints-writer",
+    "namespace": "seeded-deprecation"
+   },
+   "spec": {
+    "jobTemplate": {
+     "metadata": {
+      "labels": {
+       "app": "legacy-endpoints-writer"
+      }
+     },
+     "spec": {
+      "activeDeadlineSeconds": 300,
+      "backoffLimit": 0,
+      "completions": 1,
+      "manualSelector": false,
+      "parallelism": 1,
+      "template": {
+       "metadata": {
+        "labels": {
+         "app": "legacy-endpoints-writer"
+        }
+       },
+       "spec": {
+        "containers": [
+         {
+          "command": [
+           "python3",
+           "/app/writer.py"
+          ],
+          "image": "docker.io/library/python:3.14-slim",
+          "name": "writer",
+          "resources": {
+           "limits": {
+            "memory": "64Mi"
+           },
+           "requests": {
+            "cpu": "20m",
+            "memory": "32Mi"
+           }
+          }
+         }
+        ],
+        "restartPolicy": "Never",
+        "shareProcessNamespace": false,
+        "volumes": [
+         {
+          "configMap": {
+           "defaultMode": 420,
+           "name": "legacy-endpoints-writer",
+           "optional": false
+          },
+          "name": "script"
+         }
+        ]
+       }
+      },
+      "ttlSecondsAfterFinished": 900
+     }
+    },
+    "schedule": "*/10 * * * *",
+    "startingDeadlineSeconds": 300,
+    "suspend": false
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "CronJob",
+   "metadata": {
+    "name": "cuda-pinned-trainer",
+    "namespace": "seeded-shapes"
+   },
+   "spec": {
+    "jobTemplate": {
+     "metadata": {
+      "labels": {
+       "app": "cuda-pinned-trainer"
+      }
+     },
+     "spec": {
+      "backoffLimit": 0,
+      "completions": 1,
+      "manualSelector": false,
+      "parallelism": 1,
+      "template": {
+       "metadata": {
+        "labels": {
+         "app": "cuda-pinned-trainer"
+        }
+       },
+       "spec": {
+        "containers": [
+         {
+          "command": [
+           "nvidia-smi"
+          ],
+          "image": "docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04",
+          "name": "trainer",
+          "resources": {
+           "limits": {
+            "memory": "512Mi",
+            "nvidia.com/gpu": "1"
+           },
+           "requests": {
+            "cpu": "100m",
+            "memory": "256Mi",
+            "nvidia.com/gpu": "1"
+           }
+          }
+         }
+        ],
+        "nodeSelector": {
+         "cloud.google.com/gke-accelerator": "nvidia-l4"
+        },
+        "restartPolicy": "Never",
+        "shareProcessNamespace": false,
+        "volumes": []
+       }
+      }
+     }
+    },
+    "schedule": "0 3 * * *",
+    "suspend": true
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "CronJob",
+   "metadata": {
+    "name": "stale-kubectl-client",
+    "namespace": "seeded-shapes"
+   },
+   "spec": {
+    "jobTemplate": {
+     "metadata": {
+      "labels": {
+       "app": "stale-kubectl-client"
+      }
+     },
+     "spec": {
+      "activeDeadlineSeconds": 300,
+      "backoffLimit": 0,
+      "completions": 1,
+      "manualSelector": false,
+      "parallelism": 1,
+      "template": {
+       "metadata": {
+        "labels": {
+         "app": "stale-kubectl-client"
+        }
+       },
+       "spec": {
+        "containers": [
+         {
+          "command": [
+           "kubectl",
+           "version"
+          ],
+          "image": "registry.k8s.io/kubectl:v1.29.0",
+          "name": "kubectl",
+          "resources": {
+           "limits": {
+            "memory": "64Mi"
+           },
+           "requests": {
+            "cpu": "10m",
+            "memory": "32Mi"
+           }
+          }
+         }
+        ],
+        "restartPolicy": "Never",
+        "shareProcessNamespace": false,
+        "volumes": []
+       }
+      },
+      "ttlSecondsAfterFinished": 900
+     }
+    },
+    "schedule": "*/10 * * * *",
+    "suspend": false
+   }
+  }
+ ],
+ "kind": "List"
+}

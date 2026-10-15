@@ -9,6 +9,7 @@ runtime is driven with a stub of the SlackAdapter surface it reaches.
 
 import ast
 import asyncio
+import json
 import os
 import re
 import sys
@@ -21,6 +22,7 @@ from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 SCRIPTS = HERE.parents[2] / "agents" / "platform" / "scripts"
+CHAT_CASES = HERE.parents[2] / "tests" / "conformance" / "chat"
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(SCRIPTS))
 
@@ -233,6 +235,13 @@ class SplitTest(unittest.TestCase):
                 self.assertIsNone(runtime.split(answer))
             self.assertIn("fold is refused", logs.output[0])
 
+    def test_an_overlong_first_sentence_is_cut_at_a_clause(self):
+        lead = "The `payments-api` workload is CrashLooping"
+        cause = "due to an OOMKill caused by the container running `tail /dev/zero` " + "in a loop " * 10 + "forever."
+        headline, rest = runtime.split(f"{lead} {cause} Fix the command.")
+        self.assertEqual(headline, [("The ", False), ("payments-api", True), (" workload is CrashLooping.", False)])
+        self.assertEqual(rest, "D" + cause[1:] + " Fix the command.")
+
     def test_a_colon_inside_the_first_sentence_still_folds(self):
         answers = {
             "mid-sentence": ("Two pods restarted: web-1 and web-2.", "- web-1 at 09:58Z\n- web-2 at 10:02Z"),
@@ -406,6 +415,51 @@ class SendTest(unittest.TestCase):
         self.assertTrue(post["reply_broadcast"])
         self.assertIs(post["unfurl_links"], False)
         self.assertEqual([block["type"] for block in post["blocks"]], ["rich_text", "container", "actions"])
+
+    def test_an_answer_asking_which_option_gets_buttons(self):
+        """The payments-api answer from the shared case, under today: the same choices next offers."""
+        case = json.loads((CHAT_CASES / "answer-offers-its-options.json").read_text(encoding="utf-8"))
+        answer = case["input"]["markdown"]
+        chat = case["expected"][0]["chat"]
+        adapter = _Adapter()
+        self.send(adapter, answer)
+        post = adapter.log[0][1]
+        self.assertEqual(post["text"], f"mrkdwn({answer})")
+        types_ = [block["type"] for block in post["blocks"]]
+        self.assertEqual(types_[0], "rich_text")
+        self.assertIn("container", types_)
+        fold = post["blocks"][types_.index("container")]
+        self.assertEqual(fold["child_blocks"], _render_blocks(chat["fold"]["text"], adapter.format_message))
+        actions = post["blocks"][-1]
+        self.assertEqual(actions["type"], "actions")
+        self.assertEqual(
+            [(b["text"]["text"], b["value"], b.get("style"), b["action_id"]) for b in actions["elements"]],
+            [(c["text"], c["text"], "primary" if c.get("primary") else None, f"kage_answer.choice.{i}")
+             for i, c in enumerate(chat["choices"])],
+        )
+        question = post["blocks"][-2]
+        self.assertEqual(question["text"]["text"], "mrkdwn(Which of these options would you like to proceed with?)")
+        shown = post["blocks"][1:types_.index("container")]
+        self.assertEqual(shown, _render_blocks(chat["detail"].rsplit("\n\n", 1)[0], adapter.format_message))
+        headline = post["blocks"][0]["elements"][0]["elements"]
+        self.assertEqual("".join(e["text"] for e in headline), chat["headline"])
+
+    def test_outside_a_thread_the_options_stay_text(self):
+        """A click answers in the thread it was clicked in, so a top-level answer gets no buttons."""
+        case = json.loads((CHAT_CASES / "answer-offers-its-options.json").read_text(encoding="utf-8"))
+        adapter = _Adapter()
+        wrapped = runtime.adapter_for(
+            adapter, "slack", SimpleNamespace(kind="completed"), SimpleNamespace(), {"chat_id": CHANNEL}
+        )
+        asyncio.run(wrapped.send(CHANNEL, case["input"]["markdown"], metadata={}))
+        post = adapter.log[0][1]
+        self.assertNotIn("thread_ts", post)
+        types_ = [block["type"] for block in post["blocks"]]
+        self.assertNotIn("actions", types_)
+        shown = json.dumps(post["blocks"][1:types_.index("container")])
+        # No buttons carry the labels, so the options stay in sight as written, above the fold.
+        for line in ("Option 1 (Recommended): Fix the command", "Option 2: Increase the memory limit", "sleep infinity"):
+            self.assertIn(line, shown)
 
     def test_a_closing_question_posts_after_the_fold(self):
         question = "Want me to scale the pool to 6 nodes?"

@@ -136,15 +136,16 @@ def command(target: str, message: str, json_output: bool = True, hermes_bin: str
     return argv + ["--", message]
 
 
-def blocks_command(platform: str, thread: str, text: str, blocks_path: str, timeout_s: float = 0) -> list[str]:
-    """The argv that posts a Slack Block Kit message through the gateway.
+def chat_command(platform: str, thread: str, text: str, chat_path: str, timeout_s: float = 0) -> list[str]:
+    """The argv that posts a ``kube-agents.chat/v1`` message through the gateway.
 
-    ``blocks_path`` names a file holding the JSON array of blocks; ``text`` is
-    the notification and fallback. Only for a platform :func:`routes` sends
-    through the gateway; the today path posts blocks through the broker's
-    Slack relay (slack_blocks_post.py).
+    ``chat_path`` names a file holding the chat message's JSON object; ``text``
+    is its fallback, which the gateway posts when it does not lay the message
+    out. Only for a platform :func:`routes` sends through the gateway; the
+    today path posts Block Kit through the broker's Slack relay
+    (slack_blocks_post.py).
     """
-    argv = [A2A_CLI, "notify", "--platform", platform, "--blocks-file", blocks_path]
+    argv = [A2A_CLI, "notify", "--platform", platform, "--chat-file", chat_path]
     if thread:
         argv += ["--thread", thread]
     if timeout_s > 0:

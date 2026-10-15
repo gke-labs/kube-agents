@@ -477,6 +477,58 @@ func TestTheHarnessIsHandedTheDelegateTool(t *testing.T) {
 	}
 }
 
+// TestEveryHarnessArgvKeepsOnDiskConfigOut: both argvs a pod holds -- the
+// one with the delegate tool (a human turn, first or follow-up) and the one
+// without (a wake) -- carry --strict-mcp-config and --setting-sources user,
+// with and without the cluster view and under A2A_DELEGATE_TOOL=off. In a
+// reused pod the cwd and the config dir have hosted an earlier turn's
+// harness, which had Write; the wake's argv has no --mcp-config, so without
+// the strict flag it would load an .mcp.json that turn left in /scratch.
+func TestEveryHarnessArgvKeepsOnDiskConfigOut(t *testing.T) {
+	for _, key := range []string{"A2A_ALLOWED_TOOLS", "A2A_HARNESS_CMD", "A2A_HARNESS_EXTRA_ARGS", "A2A_DELEGATE_TOOL", lib.EnvClusterView} {
+		t.Setenv(key, "")
+	}
+	check := func(name string, argv []string, wantMCP bool) {
+		t.Helper()
+		if !slices.Contains(argv, strictMCPConfigFlag) {
+			t.Errorf("%s: no %s in %q", name, strictMCPConfigFlag, argv)
+		}
+		i := slices.Index(argv, settingSourcesFlag)
+		if i < 0 || i+1 >= len(argv) || argv[i+1] != adapterSettingSources {
+			t.Errorf("%s: want %s %s in %q", name, settingSourcesFlag, adapterSettingSources, argv)
+		}
+		if got := slices.Contains(argv, workeradapter.MCPConfigFlag); got != wantMCP {
+			t.Errorf("%s: --mcp-config present = %v, want %v", name, got, wantMCP)
+		}
+	}
+	for _, view := range []string{"", "true"} {
+		t.Setenv(lib.EnvClusterView, view)
+		check("view="+view+" with the tool", harnessCommand(), true)
+		check("view="+view+" a wake", harnessCommandWithoutDelegate(), false)
+	}
+	t.Setenv(lib.EnvClusterView, "")
+	t.Setenv("A2A_DELEGATE_TOOL", "off")
+	check("A2A_DELEGATE_TOOL=off", harnessCommand(), false)
+}
+
+// TestHarnessUserSettingsFollowsTheConfigDir: the file a reused pod removes
+// before each turn is the one the harness reads as its user settings.
+func TestHarnessUserSettingsFollowsTheConfigDir(t *testing.T) {
+	t.Setenv(claudeConfigDirEnv, "/home/node/.claude")
+	if got := harnessUserSettings(); got != "/home/node/.claude/settings.json" {
+		t.Errorf("with CLAUDE_CONFIG_DIR: %q", got)
+	}
+	t.Setenv(claudeConfigDirEnv, "")
+	t.Setenv("HOME", "/home/x")
+	if got := harnessUserSettings(); got != "/home/x/.claude/settings.json" {
+		t.Errorf("from HOME: %q", got)
+	}
+	t.Setenv("HOME", "")
+	if got := harnessUserSettings(); got != "" {
+		t.Errorf("neither set: %q, want empty", got)
+	}
+}
+
 // TestBothPromptsWhenTheViewAndTheToolAreOn: the cluster-view prompt and the
 // delegate prompt are two different features that can both be on for the
 // same pod, and --append-system-prompt only accepts the flag once, so this

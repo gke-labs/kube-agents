@@ -1,7 +1,7 @@
 """The eval fan-out's scheduler is model-free shell, so it is testable here.
 
 `hack/ci-eval-pr.sh` launches one background unit per (task, repetition) and
-serializes the collisions with three mkdir mutexes (task, stream, infra). Three properties carry the
+serializes the collisions with four mkdir mutexes (task, state, stream, infra). Three properties carry the
 correctness of that scheme and each is exercised against the REAL text lifted
 out of the script, in the same style as test_ci_eval_trap.py:
 
@@ -273,6 +273,9 @@ stream_lock_deadline() { echo 1; }
 release_streams() { local s; for s in $1; do lock_release "${STATE_DIR}/lock-stream-${s}"; done; }
 stream_case_count() { echo 1; }
 stream_stack_wait() { echo 0; }
+unit_state_lock() { :; }
+release_state_lock() { :; }
+infra_lock_exempt() { return 1; }
 _ts_lines() { cat; }
 uv() { echo "ran 1 task(s); results: /tmp/fake/run_${rep}/results.json"; }
 finish_case() { echo "FINISH_CASE $2 after rep ${rep}"; }
@@ -524,6 +527,223 @@ class RunDirRecoveryTest(unittest.TestCase):
         result = run_bash(body)
         self.assertIn("DIR=/abs/bench/results/run_20260831_010203_000001", result.stdout)
         self.assertIn("EMPTY=[]", result.stdout)
+
+
+TASKS_DIR = REPO_ROOT / "bench" / "tasks"
+TF_ROOT = REPO_ROOT / "bench" / "tf"
+# The onboarding markers a stack under the onboarding state lock rewrites. The
+# stacks that touch the Planning Agent's `oobe` job all write one of them too.
+ONBOARDING_STATE = re.compile(r"bootstrap_scan_filed|bootstrap_handoff_filed|oobe_audits_fired")
+
+
+def task_stack(case: str) -> str:
+    """The stack the script resolves for a case, through its own task_stack."""
+    out = run_bash(lifted("task_stack") + f' && task_stack "{TASKS_DIR / case / "task.yaml"}"').stdout
+    return out.strip()
+
+
+def stack_text(stack: str) -> str:
+    return "\n".join(p.read_text(encoding="utf-8") for p in sorted((TF_ROOT / stack).rglob("*")) if p.is_file() and p.suffix in {".tf", ".py", ".sh"})
+
+
+def shell_answer(function: str, call: str) -> subprocess.CompletedProcess:
+    return run_bash(lifted(function) + "\n" + call)
+
+
+class StateLockTest(unittest.TestCase):
+    """A stack-bearing case can run off the infra lock (infra_lock_exempt).
+
+    The infra lock kept every stack apart, the onboarding cases included, so
+    an exempt case needs two things in its place: a private kubeconfig, since
+    devops-bench runs get-credentials for the stack's output on the shared one,
+    and a state lock with the cases whose stacks rewrite the same install state.
+    """
+
+    def exempt(self, case: str) -> bool:
+        return shell_answer("infra_lock_exempt", f"infra_lock_exempt {case}").returncode == 0
+
+    def state_lock(self, case: str) -> str:
+        return shell_answer("unit_state_lock", f"unit_state_lock {case}").stdout.strip()
+
+    def test_only_oobe_first_run_audits_is_exempt(self):
+        self.assertTrue(self.exempt("oobe-first-run-audits"))
+        for case in ("bootstrap-discovery-fanout", "gpu-stress-test-diagnosis", "capacity-pinned-pool-probe"):
+            with self.subTest(case=case):
+                self.assertFalse(self.exempt(case))
+
+    def test_an_exempt_case_is_no_infra_contender(self):
+        src = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('if [ -n "${TASK_STACK}" ] && ! infra_lock_exempt "${TASK_NAME}"; then', src)
+        # Defined before the loop that calls it, which runs at top level.
+        self.assertLess(src.index("infra_lock_exempt() {"), src.index('! infra_lock_exempt "${TASK_NAME}"'))
+        self.assertLess(src.index("unit_state_lock() {"), src.index('! infra_lock_exempt "${TASK_NAME}"'))
+
+    def test_every_stack_that_rewrites_onboarding_state_holds_the_onboarding_lock(self):
+        # Against the real files: a new stack that touches the markers without
+        # the lock would race oobe-first-run-audits, which the infra lock no
+        # longer keeps apart from it.
+        rewriters = []
+        for task in sorted(TASKS_DIR.glob("*/task.yaml")):
+            case = task.parent.name
+            stack = task_stack(case)
+            if not stack:
+                continue
+            # A stack the script resolves but this test cannot read would pass
+            # unchecked, so it is a failure, not a skip.
+            self.assertTrue((TF_ROOT / stack).is_dir(), f"{case}: stack {stack!r} is not a directory under bench/tf")
+            if ONBOARDING_STATE.search(stack_text(stack)):
+                rewriters.append(case)
+        self.assertIn("oobe-first-run-audits", rewriters)
+        self.assertIn("bootstrap-discovery-fanout", rewriters)
+        for case in rewriters:
+            with self.subTest(case=case):
+                self.assertEqual(self.state_lock(case), "onboarding")
+        self.assertEqual(self.state_lock("capacity-pinned-pool-probe"), "")
+
+    def test_an_exempt_stack_reaches_its_cluster_through_its_own_kubeconfig(self):
+        for case in ("oobe-first-run-audits",):
+            with self.subTest(case=case):
+                self.assertTrue(self.exempt(case))
+                main = (TF_ROOT / task_stack(case) / "main.tf").read_text(encoding="utf-8")
+                own = main.index('KUBECONFIG="$kubeconfig_dir/config"')
+                self.assertLess(own, main.index("get-credentials"))
+                self.assertLess(own, main.index("kubectl"))
+
+    def test_the_state_lock_is_taken_after_the_stream_waits_or_with_the_infra_lock(self):
+        # Off the infra lock, a unit takes it once its stream locks are held and
+        # wait_platform_runs is over, so it holds the state only while its stack
+        # is in use. A stack-bearing unit takes it only while it holds the infra
+        # lock, so it never holds the state lock while queued for infra.
+        unit = lifted("run_one_unit")
+        task_lock = unit.index('lock_acquire "${STATE_DIR}/lock-task-${name}"')
+        stream_lock = unit.index('lock_acquire "${STATE_DIR}/lock-stream-${s}"')
+        wait = unit.index('wait_platform_runs "${name} rep ${rep}" "${streams}"')
+        blocking = unit.index('lock_acquire "${STATE_DIR}/lock-state-${state_lock}"')
+        infra_lock = unit.index('lock_acquire "${STATE_DIR}/lock-infra"')
+        one_try = unit.index('mkdir "${STATE_DIR}/lock-state-${state_lock}"')
+        self.assertIn('if [ -n "${state_lock}" ] && [ -z "${has_stack}" ]', unit[wait:blocking])
+        self.assertLess(task_lock, stream_lock)
+        self.assertLess(stream_lock, wait)
+        self.assertLess(wait, blocking)
+        self.assertLess(blocking, infra_lock)
+        self.assertLess(infra_lock, one_try)
+        # Given back after the run and in skip_unit, the two places a unit
+        # reaches only holding it; no give-up path before them took it.
+        self.assertEqual(unit.count('release_state_lock "${name}"'), 1)
+        self.assertIn('release_state_lock "${name}"', lifted("skip_unit"))
+
+    def stack_unit(self, hold_state: str, deadline: int) -> subprocess.CompletedProcess:
+        body = "\n".join(
+            [
+                lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+                lifted_constant("EVAL_TIMING_FILE"),
+                lifted("unit_task_path"),
+                lifted("finished_rep_count"),
+                lifted("skip_unit"),
+                lifted("run_one_unit"),
+                PerCaseGradingTest.UNIT_STUBS,
+                lifted("release_state_lock"),
+                'ACQ_LOG="$(mktemp)"; rm -f /tmp/eval_case-x_rep1.log',
+                'lock_acquire() { echo "$(basename "$1")" >> "${ACQ_LOG}"; mkdir "$1" 2>/dev/null; }',
+                "unit_state_lock() { echo onboarding; }",
+                "state_lock_deadline() { echo 0; }",
+                f"INFRA_LOCK_DEADLINE={deadline}; STATE_LOCK_RETRY_SECONDS=1",
+                'mkdir "${STATE_DIR}/lock-state-onboarding"',
+                f'( sleep {hold_state}; rmdir "${{STATE_DIR}}/lock-state-onboarding" ) &' if hold_state else ":",
+                'uv() { [ -d "${STATE_DIR}/lock-state-onboarding" ] && [ -d "${STATE_DIR}/lock-infra" ] && echo "BOTH"; echo "ran 1 task(s); results: /tmp/fake/run_1/results.json"; }',
+                'run_one_unit ./tasks/x/task.yaml case-x 1 "" true 1 2>&1 | tail -1',
+                "cat /tmp/eval_case-x_rep1.log 2>/dev/null",
+                'echo "INFRA_TRIES=$(grep -c lock-infra "${ACQ_LOG}")"',
+                'ls "${STATE_DIR}" | grep "^lock-" | tr "\\n" " "; echo',
+            ]
+        )
+        return run_bash(body)
+
+    def test_a_busy_state_lock_sends_the_infra_lock_back_to_the_queue(self):
+        out = self.stack_unit(hold_state="2.5", deadline=60).stdout
+        self.assertIn("BOTH", out)
+        self.assertGreaterEqual(int(re.search(r"INFRA_TRIES=(\d+)", out).group(1)), 2)
+        self.assertNotIn("lock-", out.splitlines()[-1])
+
+    def test_a_state_lock_that_never_frees_is_a_loud_give_up_that_takes_nothing(self):
+        out = self.stack_unit(hold_state="", deadline=3).stdout
+        self.assertIn("gave up on the infra lock with the onboarding state lock", out)
+        self.assertNotIn("BOTH", out)
+        # The other holder's state lock stays; this unit left neither infra
+        # nor its task lock behind.
+        self.assertEqual(out.splitlines()[-1].split(), ["lock-state-onboarding"])
+
+    def test_the_lock_is_held_and_given_back_by_a_real_unit(self):
+        body = "\n".join(
+            [
+                lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+                lifted_constant("EVAL_TIMING_FILE"),
+                lifted("unit_task_path"),
+                lifted("finished_rep_count"),
+                lifted("skip_unit"),
+                lifted("run_one_unit"),
+                PerCaseGradingTest.UNIT_STUBS,
+                lifted("release_state_lock"),
+                'unit_state_lock() { echo onboarding; }',
+                'state_lock_deadline() { echo 1; }',
+                'uv() { [ -d "${STATE_DIR}/lock-state-onboarding" ] && echo "HELD"; echo "ran 1 task(s); results: /tmp/fake/run_1/results.json"; }',
+                'run_one_unit ./tasks/x/task.yaml case-x 1 "" "" 1 >/dev/null 2>&1',
+                'cat /tmp/eval_case-x_rep1.log',
+                '[ -d "${STATE_DIR}/lock-state-onboarding" ] && echo "LEFT" || echo "RELEASED"',
+            ]
+        )
+        out = run_bash(body).stdout
+        self.assertIn("HELD", out)
+        self.assertIn("RELEASED", out)
+
+    def test_the_state_lock_deadline_outlasts_every_holder(self):
+        # Each case on the lock keeps its stack applied while it holds it, and a
+        # stack-bearing waiter queues for infra between its tries.
+        body = "\n".join(
+            [
+                lifted("unit_state_lock"),
+                lifted("state_lock_deadline"),
+                lifted_constant("STATE_LOCK_HOLD_SECONDS"),
+                "INFRA_LOCK_DEADLINE=100",
+                "TASK_NAMES=(oobe-first-run-audits bootstrap-discovery-fanout capacity-pinned-pool-probe bootstrap-inventory-ranking-delivery)",
+                "state_lock_deadline onboarding",
+                "state_lock_deadline none",
+            ]
+        )
+        hold = int(lifted_constant("STATE_LOCK_HOLD_SECONDS").split("=")[1])
+        self.assertEqual(run_bash(body).stdout.split(), [str(3 * (100 + hold)), "0"])
+
+    def test_the_task_lock_waits_out_a_previous_rep_on_the_state_lock(self):
+        unit = lifted("run_one_unit")
+        term = unit.index('if [ -n "${state_lock}" ]; then')
+        self.assertIn('lock_deadline=$(( lock_deadline + $(state_lock_deadline "${state_lock}") ))', unit[term:])
+        self.assertLess(term, unit.index('lock_acquire "${STATE_DIR}/lock-task-${name}"'))
+
+    def test_only_an_exempt_unit_runs_on_a_private_kubeconfig(self):
+        body_for = lambda exempt: "\n".join(  # noqa: E731
+            [
+                lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+                lifted_constant("EVAL_TIMING_FILE"),
+                lifted("unit_task_path"),
+                lifted("finished_rep_count"),
+                lifted("skip_unit"),
+                lifted("run_one_unit"),
+                PerCaseGradingTest.UNIT_STUBS,
+                f"infra_lock_exempt() {{ return {0 if exempt else 1}; }}",
+                'kubectl() { echo "apiVersion: v1"; }',
+                "export KUBECONFIG=/shared/config",
+                'uv() { echo "KUBECONFIG=${KUBECONFIG}"; echo "ran 1 task(s); results: /tmp/fake/run_1/results.json"; }',
+                'run_one_unit ./tasks/x/task.yaml case-x 1 "" "" 1 >/dev/null 2>&1',
+                "cat /tmp/eval_case-x_rep1.log",
+                'echo "AFTER=${KUBECONFIG}"',
+            ]
+        )
+        exempt = run_bash(body_for(True)).stdout
+        self.assertRegex(exempt, r"KUBECONFIG=\S+/kubeconfig-case-x-rep1\n")
+        # The export stays inside the unit's subshell in the real fan-out; here
+        # it is enough that the shared file is not what the bench saw.
+        self.assertNotIn("KUBECONFIG=/shared/config\n", exempt.split("AFTER=")[0])
+        self.assertIn("KUBECONFIG=/shared/config", run_bash(body_for(False)).stdout)
 
 
 if __name__ == "__main__":

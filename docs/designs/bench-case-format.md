@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail` and `audit_streams`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional` and `audit_streams`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -114,6 +114,13 @@ declared outcome, and passing every repetition reds the job until the marker is 
 defaults to `false`, a case for your own change never carries it, and it must be a bare YAML
 boolean: `"false"` is a string, and truthy, and the validator rejects it.
 `.agents/rules/eval_driven_development.md` has the rule; devops-bench ignores the key.
+
+`tool_calls_optional` is for a case a correct agent can answer without calling a tool: a
+first-turn greeting, a reply that names a command. `bench-gate`'s rung 3 otherwise reads an empty
+trajectory as no agent having run; with the key set, a non-empty reply on a record with no error
+stands in for the trajectory, and the token, latency and status signals still apply
+([`eval-scorer.md`](eval-scorer.md)). It does not forbid tool calls. It defaults to `false`, must be
+a bare YAML boolean, and devops-bench ignores it.
 
 `audit_streams` is for a case whose stack starts real audit runs without grading their
 ledger: a list of the Platform Agent job ids it starts
@@ -240,7 +247,7 @@ case it runs), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
 purges it, or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
-it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades), `worker_agents` (regular expressions every one of which must match the
+it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `replay_card` (the status and comments of the card a
 card-wake replay planted, read before the harness archives it), and `reply_is_silent`
@@ -258,7 +265,9 @@ card for anything else).
 `INVENTORY.raw.md` there, and every cluster the writer's own `finding_lines` lists from the
 completed cluster cards has a block line) or `ranking_card_filed` (the newest unarchived card keyed
 `bootstrap-inventory-prioritize` filed at or after the sweep carries the hand-off's own body and is
-not `blocked`, `triage`, `failed` or `cancelled`).
+not `blocked`, `triage`, `failed` or `cancelled`) or `raw_report_no_first_run_audit_checks` (the
+same parse, and no block line carries a check from the roster of one of the four audits the `oobe`
+stage runs after the scan).
 
 `bootstrap_findings` reads the shell sandbox of the install under test:
 `INVENTORY.items.json`, which the onboarding prioritization stage's `inventory_findings.py
@@ -456,8 +465,8 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 `domains.yaml`, a `fixtures:` role the fleet catalog does not define (outside a `FIXTURE_NOT_READY` case, which names the role its issue plants), a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, a missing `owner:` or one written
-as a mention or as something other than a login, an `expected_fail:` that is not a bare YAML
-boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
+as a mention or as something other than a login, an `expected_fail:` or `tool_calls_optional:`
+that is not a bare YAML boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, and a case that is registered nowhere. It
 also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`
 mode, a positive weight — which devops-bench enforces too, at spec-load time, after the

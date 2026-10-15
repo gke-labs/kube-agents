@@ -222,6 +222,17 @@ func (m *MultiAdapter) MarkChanged(conversation, ask, settle string) {
 	}
 }
 
+// ShowsTaskStatus answers for the backend that owns the conversation
+// (StatusShower); one that does not implement it keeps the rolling line.
+func (m *MultiAdapter) ShowsTaskStatus(conversation string) bool {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return false
+	}
+	shower, ok := a.(StatusShower)
+	return ok && shower.ShowsTaskStatus(conversation)
+}
+
 func (m *MultiAdapter) InboundVerified(conversation, messageID string, verified bool) {
 	if a, err := m.pick(conversation); err == nil {
 		if observer, ok := a.(VerifiedObserver); ok {

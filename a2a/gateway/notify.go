@@ -127,6 +127,14 @@ type notifyBlocksPoster interface {
 	PostNotifyBlocks(home, thread, text string, blocks json.RawMessage) (message, landed string, err error)
 }
 
+// notifyChatPoster is the optional half a backend that lays out a chat
+// message in the home channel adds: one message, the chat message laid out
+// with its text as the fallback. SlackAdapter is the one implementation; a
+// home request with a chat message to any other backend posts its text.
+type notifyChatPoster interface {
+	PostNotifyMessage(home, thread string, m OutMessage) (message, landed string, err error)
+}
+
 // Notifier answers chat.notify requests for one backend.
 type Notifier struct {
 	subject string
@@ -562,6 +570,9 @@ func (n *Notifier) post(job notifyJob) {
 		n.postBlocks(job)
 		return
 	}
+	if job.req.Conversation == "" && len(job.req.Chat) > 0 && n.postHomeChat(job) {
+		return
+	}
 	if job.req.Conversation != "" && len(job.req.Chat) > 0 {
 		// A bad mark drops alone (postConversation logs the rules broken).
 		if mark := chatmsg.ReadNotify(job.req.Text, job.req.Chat).Mark; mark != nil {
@@ -673,6 +684,40 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 	n.updates.put(conversation, key, message)
 	n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: conversation})
 	n.log.Info("notify posted", "conversation", conversation, "message", message, "update", key)
+	return true
+}
+
+// postHomeChat answers a home-channel request that carries a chat message
+// (the cron relay's fleet-audit card, the first inventory's) when the backend lays
+// one out, and reports whether it did. The chat message is read and validated
+// as a conversation request's is; one that breaks a rule is dropped whole,
+// logged and counted, and so is one the backend refuses, and post then sends
+// the text as it always has. The update key and the mark are not read on a
+// home post.
+func (n *Notifier) postHomeChat(job notifyJob) bool {
+	poster, ok := n.poster.(notifyChatPoster)
+	if !ok {
+		n.metrics.chatMessage(chatTextOnly)
+		return false
+	}
+	reading := chatmsg.ReadNotify(job.req.Text, job.req.Chat)
+	if len(reading.Problems) > 0 {
+		n.metrics.chatMessage(chatInvalid)
+		for _, p := range reading.Problems {
+			n.log.Warn("notify: "+chatDroppedWhat(chatmsg.Notify, reading),
+				"home", n.home, "rule", truncateRunes(p.Error(), chatProblemMax))
+		}
+	}
+	m := layoutOf(reading)
+	if m == nil {
+		return false
+	}
+	message, landed, err := poster.PostNotifyMessage(n.home, job.req.Thread, OutMessage{Text: job.req.Text, Chat: m})
+	if !n.chatOutcome(n.home, err) {
+		return false
+	}
+	n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: landed})
+	n.log.Info("notify posted", "home", n.home, "thread", landed, "message", message, "chat", true)
 	return true
 }
 

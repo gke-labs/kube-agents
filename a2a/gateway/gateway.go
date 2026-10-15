@@ -46,6 +46,10 @@ const (
 	retireRefusalStillOn    = "⚠️ could not close the previous task on the bus; the session route is still on and its pod still there — try `/session off` again in a moment"
 )
 
+// noticeBusUnreachable says a task's publish failed: on its rolling line, or
+// posted when the backend keeps none (StatusShower).
+const noticeBusUnreachable = "❌ could not reach the bus; try again"
+
 // turnTimeout bounds one handler turn — an inbound message or a relay
 // batch — so a stuck bus or backend call frees the conversation's queue
 // slot instead of holding it forever. Where the clock starts relative to
@@ -573,12 +577,29 @@ func (h *sessionLockHandle) Lock() {
 	h.entry.mu.Lock()
 }
 
+// TryLock takes the lock only if it is free. On false the handle is spent:
+// its reference is released and a later Unlock is a no-op, so a caller can
+// defer Unlock either way.
+func (h *sessionLockHandle) TryLock() bool {
+	if h.entry.mu.TryLock() {
+		return true
+	}
+	h.unlocked = true
+	h.release()
+	return false
+}
+
 func (h *sessionLockHandle) Unlock() {
 	if h.unlocked {
 		return
 	}
 	h.unlocked = true
 	h.entry.mu.Unlock()
+	h.release()
+}
+
+// release drops the handle's reference, pruning the entry with the last one.
+func (h *sessionLockHandle) release() {
 	h.g.mu.Lock()
 	h.entry.refcount--
 	if h.entry.refcount <= 0 {
@@ -612,6 +633,14 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// a program say "the gateway answered without starting a task" as a fact
 	// rather than as a guess about timing.
 	defer g.observeTurnFinished(msg.Conversation)
+
+	// Counted before the sender is verified, as the chat_metrics plugin
+	// counts the Hermes-side ingress before its allowlist, so the two halves
+	// of chatMessagesInboundTotal mean the same thing: a message a person
+	// sent, whether or not the gateway went on to answer it.
+	if platform, ok := metricsPlatformLabel(g.backendFor(msg)); ok {
+		g.metrics.messageInbound(platform)
+	}
 
 	backend, principal, ok := g.verifySender(msg)
 	g.observeInboundVerified(msg, ok)
@@ -750,6 +779,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		}
 	}
 	rec.LastActivity = time.Now().UTC()
+	rec.LastUserMessage = rec.LastActivity
 
 	rosterIDs, rosterComplete, err := g.adapter.Roster(msg.Conversation)
 	if err != nil {
@@ -912,9 +942,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			// A lingering previous incarnation is not this task's executor,
 			// and its task is already closed (healed or detached). Delete
 			// the pod rather than just untrack it: once PodName clears,
-			// reap can never find it again, and sweep only sees terminal
-			// phases - a wedged Running pod would hold its bus credential
-			// forever. If the task is detached, the gateway is its
+			// reap can never find it again, and the sweep takes a live pod
+			// only when it is a reused one its record no longer names
+			// (sweepUntracked) - a wedged Running one-task pod would hold
+			// its bus credential until its deadline. If the task is detached, the gateway is its
 			// supervisor and owes its terminal `canceled` BEFORE the delete
 			// (the one deletion rule in Session lifecycle); a refusal here
 			// precedes every route mutation, so the record is untouched.
@@ -928,9 +959,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			rec.Addressee = rec.BusSession
 			msg.Text = rest
 		} else if rec.SessionRouted {
-			// Every new task on the session route gets a fresh incarnation;
-			// freshIncarnation says why and holds the cap.
-			if !g.freshIncarnation(ctx, rec) {
+			// A new task on the session route goes to the conversation's
+			// live pod when it can take it, and to a fresh incarnation
+			// otherwise; nextIncarnation says when, and the fresh path
+			// holds the cap.
+			if !g.nextIncarnation(ctx, rec) {
 				return
 			}
 		} else {
@@ -1137,6 +1170,13 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		g.observeEnded(rec, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
 		g.applyTerminalMark(rec, active.TaskID, lib.StateFailed)
 		healed, healedSource = true, TerminalNeverStarted
+		// A pod that never started this task is not handed the next one:
+		// it may yet run the abandoned task first, after the person has
+		// moved on, or never run anything. Unmarked, the next turn retires
+		// it and spawns fresh, as before reuse (reuseLivePod).
+		if addressee == rec.BusSession && rec.PodName == rec.BusSession {
+			rec.PodReuse = false
+		}
 	}
 	if healed {
 		// Notices held for the task's terminal (a delegation refusal)
@@ -1163,10 +1203,12 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		if child {
 			g.retireTaskRoute(ctx, active.TaskID)
 		}
+		unmarkOnSupervisorTerminal(rec, active.TaskID, healedSource)
 		rec.ActiveTask = nil
 		// The same rule as relayTerminal's, for the same terminal reaching
 		// the record by the other route: an executor's end of the task is
-		// activity, and the idle window opens at the answer. Without this a
+		// activity, and the session-thread window opens at the answer (the
+		// reap's opens at the last user message). Without this a
 		// healed thread went quiet the moment its lost answer was posted.
 		if healedSource == TerminalFromExecutor {
 			now := time.Now().UTC()
@@ -1526,9 +1568,10 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 
 // retireIncarnation deletes the record's lingering session pod before a
 // successor is minted or the route is left. Delete rather than just untrack:
-// once PodName clears, reap can never find the pod again, and sweep only
-// sees terminal phases - a wedged Running pod would hold its bus credential
-// forever. A detached task's supervisor terminal is owed BEFORE the delete
+// once PodName clears, reap can never find the pod again, and the sweep takes
+// a live pod only when it is a reused one its record no longer names
+// (sweepUntracked) - a wedged Running one-task pod would hold its bus
+// credential until its deadline. A detached task's supervisor terminal is owed BEFORE the delete
 // (the one deletion rule in Session lifecycle); false means that terminal
 // could not be published, a post has said so, and nothing was touched.
 // Spawner-nil is the W4-rollback shape: the record names a pod nothing can
@@ -1551,13 +1594,14 @@ func (g *Gateway) retireIncarnation(ctx context.Context, rec *SessionRecord, why
 }
 
 // freshIncarnation retires the previous session pod, if any, and mints the
-// next incarnation's name as the record's addressee. The worker adapter is
-// one task per process, so a lingering PodName names an executor that can
-// never serve the next task; publishing toward it wedges the conversation
-// (S9 review finding). Retire it the way Delegate does: supervisor terminal
-// for a detached task first, then the delete, then the successor. The cap
-// holds here too, or Delegate refusals just push the flood one affordance
-// over.
+// next incarnation's name as the record's addressee. It is the path for a
+// conversation whose pod cannot take the next task (reuseLivePod): none is
+// live, it was spawned to serve one task only, or a stopped task is still
+// finishing on it. Publishing toward such a pod wedges the conversation (S9
+// review finding), so it is retired the way Delegate does: supervisor
+// terminal for a detached task first, then the delete, then the successor.
+// The cap holds here too, or Delegate refusals just push the flood one
+// affordance over.
 //
 // False means the turn was refused - at the cap, or because the previous
 // task could not be closed on the bus - and a post has already said so.
@@ -1675,7 +1719,7 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		return true
 	}
 	msg.Text = rest
-	if !g.freshIncarnation(ctx, rec) {
+	if !g.nextIncarnation(ctx, rec) {
 		return false
 	}
 	g.startTask(ctx, rec, msg, backend, principal, authority)
@@ -1783,6 +1827,13 @@ func artifactParts(task *lib.Task, name string) []lib.Part {
 		}
 	}
 	return parts
+}
+
+// showsTaskStatus reports whether the backend that owns conversation shows
+// a task's status itself (StatusShower), and so wants no rolling line.
+func (g *Gateway) showsTaskStatus(conversation string) bool {
+	shower, ok := g.adapter.(StatusShower)
+	return ok && shower.ShowsTaskStatus(conversation)
 }
 
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements
@@ -2163,9 +2214,14 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 
 	// Placeholder first, so the rolling line exists before the first event
 	// can arrive (the demo posts one while the pod cold-starts; same idea).
-	statusMsgID, err := g.adapter.Post(rec.Key, withLineNote("⏳ submitted…", ts.LineNote))
-	if err != nil {
-		g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
+	// None on a backend that shows the task's status itself (StatusShower).
+	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key)
+	if !lineless {
+		var err error
+		statusMsgID, err = g.adapter.Post(rec.Key, withLineNote("⏳ submitted…", ts.LineNote))
+		if err != nil {
+			g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
+		}
 	}
 
 	// Register the task everywhere the relay looks BEFORE publishing: a fast
@@ -2239,7 +2295,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	if err != nil {
 		g.log.Error("task publish failed", "taskId", taskID, "err", err)
 		if statusMsgID != "" {
-			_ = g.adapter.Edit(rec.Key, statusMsgID, "❌ could not reach the bus; try again")
+			_ = g.adapter.Edit(rec.Key, statusMsgID, noticeBusUnreachable)
+		} else if lineless {
+			// No line to put it on, and nothing else would say the ask
+			// went nowhere.
+			g.post(rec.Key, noticeBusUnreachable)
 		}
 		rec.ActiveTask = nil
 		g.mu.Lock()

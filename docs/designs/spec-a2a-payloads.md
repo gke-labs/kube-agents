@@ -688,8 +688,9 @@ carry the same chat message:
 
 - **`chat`** is a `kube-agents.chat/v1` object beside the request's `text`, which is its
   fallback. Every rule in this section applies to it, as on the bus. (On Slack it takes
-  the place of the request's raw `blocks` for a conversation post, and `blocks` stays for
-  home-channel posts.)
+  the place of the request's raw `blocks` for a conversation post. A home-channel request
+  may carry one too: the cron relay's fleet-audit card or the first inventory's, laid out
+  the same way, with its `update` and `mark` not read.)
 - **`update`** is a key the sender picks (eg `plan`, or a card's question). The first
   request with a key posts a message. A later request with the same key edits that
   message in place instead of posting a new one, which is how a plan stays one message
@@ -719,7 +720,11 @@ that would turn every follow-up into a steer queued behind hours of idle.
 
 **The emitter.** Two halves, each a port of the `today` presenter run on the shared
 cases. The hermes-bridge emits what its own turn owns: the answer on the `result` (the
-first sentence as `headline`, the rest as `detail`, or under `fold` past `detail`'s cap),
+first sentence as `headline`, cut at a clause when it runs past the headline's cap, the rest
+as `detail`, or under `fold` past `detail`'s cap; an answer that ends by asking which of two
+to five listed options to take carries them as `choices`, its opening paragraph, each
+option's label and first sentence (when every option has one) and the question as `detail`, and the rest under `fold`,
+by the rule `slack_moments.answer_choices` applies under `today`),
 the prompt's `mark.ask` on each `progress` heartbeat, and, when the turn filed a card (a
 `kanban_create` call that did not fail) in a Slack conversation with `KAGE_SLACK_UX` on and its conversation route recorded,
 the terminal's mark-only message; anywhere else nothing settles the ask later, so the

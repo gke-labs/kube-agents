@@ -1268,7 +1268,7 @@ section describes each stage.
 ### Each morning: the scheduled audits
 
 The Platform Agent runs its fleet audits on a cron schedule in UTC, some daily and some on
-Mondays only. On a new install with a GitOps repository, four of them (security, reliability, cost
+Mondays only. On a new install, four of them (security, reliability, cost
 and capacity) also run once as soon as the first inventory scan finishes, or at a fallback of 90 minutes or more
 after it started if it has not, so their first results do not wait for the schedule. To list every job with its next and last run:
 
@@ -1469,7 +1469,7 @@ When the checks in the entry above pass and a message still gets no reply, follo
 
 ### 7. A Question Gets No Answer Under `spec.mode: next`
 
-The gateway posts a status line for every task ([what a task looks like](docs/site/src/content/docs/concepts/chatops.md#what-a-task-looks-like)); where it stops says what went wrong.
+On Google Chat the gateway posts a status line for every task ([what a task looks like](docs/site/src/content/docs/concepts/chatops.md#what-a-task-looks-like)); where it stops says what went wrong. Slack keeps no status line, so there a task with no answer shows Working… on the thread until it ends; read the checks below by the bridge's and the gateway's logs.
 
 - **It stays at `⏳ submitted…`.** Nothing has taken the task. (A line reading `⏳ **queued** — N requests are ahead of yours` is waiting its turn behind other conversations' tasks, which is not this.) Tasks on the `platform` route are run by the `hermes-bridge` container in the agent's pod, which logs `hermes bridge consuming` when it starts and `task accepted` for each task:
   ```bash
