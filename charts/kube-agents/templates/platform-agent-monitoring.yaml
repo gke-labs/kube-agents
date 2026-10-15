@@ -111,3 +111,215 @@ spec:
       path: /metrics
       interval: 30s
 {{- end }}
+{{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentServiceMonitor" .) }}
+---
+{{- /*
+Prometheus Operator ServiceMonitors and headless metrics Services for the agent's
+pods. The headless Services provide the service ports that ServiceMonitor requires.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.platformAgent.name }}-gateway-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.platformAgent.name }}-gateway-metrics
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app: {{ .Values.platformAgent.name }}-gateway
+  ports:
+    - name: event-metrics
+      port: 9095
+      targetPort: 9095
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Values.platformAgent.name }}-gateway-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-gateway-metrics
+  endpoints:
+    - port: event-metrics
+      path: /metrics
+      interval: 30s
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.platformAgent.name }}-gateway-chat-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.platformAgent.name }}-gateway-chat-metrics
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app: {{ .Values.platformAgent.name }}-gateway
+    kubeagents.io/is-leader: "true"
+  ports:
+    - name: chat-metrics
+      port: 9097
+      targetPort: 9097
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Values.platformAgent.name }}-gateway-chat-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-gateway-chat-metrics
+  endpoints:
+    - port: chat-metrics
+      path: /metrics
+      interval: 30s
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.platformAgent.name }}-credential-proxy-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.platformAgent.name }}-credential-proxy-metrics
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app: {{ .Values.platformAgent.name }}-credential-proxy
+    kubeagents.x-k8s.io/component: credential-proxy
+  ports:
+    - name: cred-metrics
+      port: 8766
+      targetPort: 8766
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Values.platformAgent.name }}-credential-proxy-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-credential-proxy-metrics
+  endpoints:
+    - port: cred-metrics
+      path: /metrics
+      interval: 30s
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.platformAgent.name }}-a2a-gateway-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.platformAgent.name }}-a2a-gateway-metrics
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app: {{ .Values.platformAgent.name }}-a2a-gateway
+  ports:
+    - name: a2a-metrics
+      port: 9096
+      targetPort: 9096
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Values.platformAgent.name }}-a2a-gateway-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-a2a-gateway-metrics
+  endpoints:
+    - port: a2a-metrics
+      path: /metrics
+      interval: 30s
+{{- end }}
+{{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentVMPodScrape" .) }}
+---
+{{- /*
+VictoriaMetrics Operator VMPodScrapes for the agent's pods. Scrapes pods directly
+matching the PodMonitoring selectors.
+*/ -}}
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: {{ .Values.platformAgent.name }}-gateway-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-gateway
+  podMetricsEndpoints:
+    - port: event-metrics
+      path: /metrics
+      interval: 30s
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: {{ .Values.platformAgent.name }}-gateway-chat-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-gateway
+      kubeagents.io/is-leader: "true"
+  podMetricsEndpoints:
+    - port: chat-metrics
+      path: /metrics
+      interval: 30s
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: {{ .Values.platformAgent.name }}-credential-proxy-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-credential-proxy
+      kubeagents.x-k8s.io/component: credential-proxy
+  podMetricsEndpoints:
+    - port: cred-metrics
+      path: /metrics
+      interval: 30s
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: {{ .Values.platformAgent.name }}-a2a-gateway-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-a2a-gateway
+  podMetricsEndpoints:
+    - port: a2a-metrics
+      path: /metrics
+      interval: 30s
+{{- end }}

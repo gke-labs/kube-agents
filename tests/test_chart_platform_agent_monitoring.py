@@ -55,7 +55,13 @@ _GOLDEN_AGENT = "platformagent"
 _GMP_API = "monitoring.googleapis.com/v1/PodMonitoring"
 # What a cluster with GKE Managed Prometheus tells helm it serves.
 _ON_GKE = ["--api-versions", _GMP_API]
+_PROMETHEUS_OPERATOR_API = "monitoring.coreos.com/v1/ServiceMonitor"
+_ON_PROMETHEUS = ["--api-versions", _PROMETHEUS_OPERATOR_API]
+_VICTORIAMETRICS_API = "operator.victoriametrics.com/v1beta1/VMPodScrape"
+_ON_VICTORIAMETRICS = ["--api-versions", _VICTORIAMETRICS_API]
 _GATE = '{{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentPodMonitoring" .) }}'
+_SERVICE_MONITOR_GATE = '{{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentServiceMonitor" .) }}'
+_VM_POD_SCRAPE_GATE = '{{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentVMPodScrape" .) }}'
 
 # One row per scraped pod: the PodMonitoring name suffix, the Deployment and
 # container the golden declares the port on, the port's name there, and the
@@ -173,11 +179,13 @@ class MonitoringShapeTest(unittest.TestCase):
     def test_the_value_defaults_to_null_and_the_schema_admits_the_tri_state(self):
         values = yaml.safe_load((_CHART / "values.yaml").read_text())
         self.assertIsNone(values["platformAgent"]["podMonitoring"])
+        self.assertIsNone(values["platformAgent"]["serviceMonitor"])
+        self.assertIsNone(values["platformAgent"]["vmPodScrape"])
         schema = json.loads((_CHART / "values.schema.json").read_text())
-        self.assertEqual(
-            schema["properties"]["platformAgent"]["properties"]["podMonitoring"],
-            {"type": ["boolean", "null"]},
-        )
+        props = schema["properties"]["platformAgent"]["properties"]
+        self.assertEqual(props["podMonitoring"], {"type": ["boolean", "null"]})
+        self.assertEqual(props["serviceMonitor"], {"type": ["boolean", "null"]})
+        self.assertEqual(props["vmPodScrape"], {"type": ["boolean", "null"]})
 
     def test_the_ports_are_the_ones_the_operator_declares(self):
         # Numbers rather than port names, because the gateway's listener is on
@@ -204,9 +212,15 @@ class MonitoringShapeTest(unittest.TestCase):
 
     def test_the_gate_asks_the_helper_and_the_helper_asks_the_cluster(self):
         self.assertIn(_GATE, self.template)
+        self.assertIn(_SERVICE_MONITOR_GATE, self.template)
+        self.assertIn(_VM_POD_SCRAPE_GATE, self.template)
         helpers = _HELPERS.read_text()
         self.assertIn('{{- define "kube-agents.platformAgentPodMonitoring" -}}', helpers)
         self.assertIn(f'.Capabilities.APIVersions.Has "{_GMP_API}"', helpers)
+        self.assertIn('{{- define "kube-agents.platformAgentServiceMonitor" -}}', helpers)
+        self.assertIn(f'.Capabilities.APIVersions.Has "{_PROMETHEUS_OPERATOR_API}"', helpers)
+        self.assertIn('{{- define "kube-agents.platformAgentVMPodScrape" -}}', helpers)
+        self.assertIn(f'.Capabilities.APIVersions.Has "{_VICTORIAMETRICS_API}"', helpers)
 
     def test_kind_up_leaves_the_default_to_the_cluster(self):
         # kind serves no PodMonitoring API, so the null default renders nothing
@@ -273,6 +287,125 @@ class MonitoringRenderTest(unittest.TestCase):
 
     def test_no_agent_renders_nothing(self):
         self.assertEqual(self._monitorings(*_ON_GKE, "--set", "platformAgent.enabled=false"), {})
+
+    def _service_monitors(self, *extra):
+        proc = subprocess.run(
+            ["helm", "template", "test-release", str(_CHART), *_REQUIRED, *extra],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        suffixes = tuple(scrape["suffix"] for scrape in _SCRAPES)
+        return {
+            document["metadata"]["name"]: document
+            for document in yaml.safe_load_all(proc.stdout)
+            if isinstance(document, dict)
+            and document.get("kind") == "ServiceMonitor"
+            and document["metadata"]["name"].endswith(suffixes)
+        }
+
+    def _headless_services(self, *extra):
+        proc = subprocess.run(
+            ["helm", "template", "test-release", str(_CHART), *_REQUIRED, *extra],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        suffixes = tuple(scrape["suffix"] for scrape in _SCRAPES)
+        return {
+            document["metadata"]["name"]: document
+            for document in yaml.safe_load_all(proc.stdout)
+            if isinstance(document, dict)
+            and document.get("kind") == "Service"
+            and document["metadata"]["name"].endswith(suffixes)
+        }
+
+    def _vm_pod_scrapes(self, *extra):
+        proc = subprocess.run(
+            ["helm", "template", "test-release", str(_CHART), *_REQUIRED, *extra],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        suffixes = tuple(scrape["suffix"] for scrape in _SCRAPES)
+        return {
+            document["metadata"]["name"]: document
+            for document in yaml.safe_load_all(proc.stdout)
+            if isinstance(document, dict)
+            and document.get("kind") == "VMPodScrape"
+            and document["metadata"]["name"].endswith(suffixes)
+        }
+
+    def test_service_monitor_default_follows_the_cluster(self):
+        self.assertEqual(self._service_monitors(), {})
+        self.assertEqual(self._headless_services(), {})
+        rendered = self._service_monitors(*_ON_PROMETHEUS)
+        services = self._headless_services(*_ON_PROMETHEUS)
+        self.assertEqual(sorted(rendered), sorted(_AGENT + s["suffix"] for s in _SCRAPES))
+        self.assertEqual(sorted(services), sorted(_AGENT + s["suffix"] for s in _SCRAPES))
+        for scrape in _SCRAPES:
+            with self.subTest(scrape=scrape["suffix"]):
+                sm = rendered[_AGENT + scrape["suffix"]]
+                svc = services[_AGENT + scrape["suffix"]]
+                self.assertEqual(svc["spec"]["clusterIP"], "None")
+                self.assertEqual(svc["spec"]["selector"], _selector(scrape, _AGENT))
+                self.assertEqual(
+                    svc["spec"]["ports"],
+                    [{
+                        "name": scrape["port_name"],
+                        "port": _scrape_port(scrape),
+                        "targetPort": _scrape_port(scrape),
+                    }],
+                )
+                svc_metrics_label = f"{_AGENT}{scrape['suffix'].replace('-monitoring', '-metrics')}"
+                self.assertEqual(svc["metadata"]["labels"]["app"], svc_metrics_label)
+                self.assertEqual(sm["spec"]["selector"], {"matchLabels": {"app": svc_metrics_label}})
+                self.assertEqual(
+                    sm["spec"]["endpoints"],
+                    [{
+                        "port": scrape["port_name"],
+                        "path": "/metrics",
+                        "interval": "30s",
+                    }],
+                )
+
+    def test_service_monitor_true_renders_them_without_asking_the_cluster(self):
+        rendered = self._service_monitors("--set", "platformAgent.serviceMonitor=true")
+        self.assertEqual(sorted(rendered), sorted(_AGENT + s["suffix"] for s in _SCRAPES))
+        services = self._headless_services("--set", "platformAgent.serviceMonitor=true")
+        self.assertEqual(sorted(services), sorted(_AGENT + s["suffix"] for s in _SCRAPES))
+
+    def test_service_monitor_false_renders_nothing_even_where_the_api_is_served(self):
+        self.assertEqual(self._service_monitors(*_ON_PROMETHEUS, "--set", "platformAgent.serviceMonitor=false"), {})
+        self.assertEqual(self._headless_services(*_ON_PROMETHEUS, "--set", "platformAgent.serviceMonitor=false"), {})
+
+    def test_service_monitor_no_agent_renders_nothing(self):
+        self.assertEqual(self._service_monitors(*_ON_PROMETHEUS, "--set", "platformAgent.enabled=false"), {})
+        self.assertEqual(self._headless_services(*_ON_PROMETHEUS, "--set", "platformAgent.enabled=false"), {})
+
+    def test_vm_pod_scrape_default_follows_the_cluster(self):
+        self.assertEqual(self._vm_pod_scrapes(), {})
+        rendered = self._vm_pod_scrapes(*_ON_VICTORIAMETRICS)
+        self.assertEqual(sorted(rendered), sorted(_AGENT + s["suffix"] for s in _SCRAPES))
+        for scrape in _SCRAPES:
+            with self.subTest(scrape=scrape["suffix"]):
+                vmp = rendered[_AGENT + scrape["suffix"]]
+                self.assertEqual(vmp["spec"]["selector"], {"matchLabels": _selector(scrape, _AGENT)})
+                self.assertEqual(
+                    vmp["spec"]["podMetricsEndpoints"],
+                    [{
+                        "port": scrape["port_name"],
+                        "path": "/metrics",
+                        "interval": "30s",
+                    }],
+                )
+
+    def test_vm_pod_scrape_true_renders_them_without_asking_the_cluster(self):
+        rendered = self._vm_pod_scrapes("--set", "platformAgent.vmPodScrape=true")
+        self.assertEqual(sorted(rendered), sorted(_AGENT + s["suffix"] for s in _SCRAPES))
+
+    def test_vm_pod_scrape_false_renders_nothing_even_where_the_api_is_served(self):
+        self.assertEqual(self._vm_pod_scrapes(*_ON_VICTORIAMETRICS, "--set", "platformAgent.vmPodScrape=false"), {})
+
+    def test_vm_pod_scrape_no_agent_renders_nothing(self):
+        self.assertEqual(self._vm_pod_scrapes(*_ON_VICTORIAMETRICS, "--set", "platformAgent.enabled=false"), {})
 
 
 if __name__ == "__main__":

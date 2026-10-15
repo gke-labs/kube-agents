@@ -416,15 +416,37 @@ collector's namespace, `gke-gmp-system`, on those ports either way, and on the
 first two they admit the operator's own pods as well; the value only decides
 whether a scrape is configured, and the operator's own read of the counters and
 cluster gauges into `status.usage` does not depend on it.
-It is a tri-state: `null`,
-the default, renders them when the cluster serves the `PodMonitoring` API and
-nothing elsewhere, so an install off GKE, or on a GKE cluster with Managed
-Prometheus turned off, upgrades without setting anything; `true` renders them
-regardless and fails at apply time where the CRD is absent, the caveat
-`litellm.podMonitoring` carries; `false` never renders them. `helm template`
-alone has no cluster to ask: pass
-`--api-versions monitoring.googleapis.com/v1/PodMonitoring` to see the default
-render.
+
+Non-GMP clusters scrape these metrics through the corresponding alternative knobs:
+- `platformAgent.serviceMonitor` renders Prometheus Operator `ServiceMonitor` objects and headless metrics `Service`s for the three pods (selects `monitoring.coreos.com/v1/ServiceMonitor`).
+- `platformAgent.vmPodScrape` renders VictoriaMetrics Operator `VMPodScrape` objects for the three pods (selects `operator.victoriametrics.com/v1beta1/VMPodScrape`).
+
+Each monitoring knob (`podMonitoring`, `serviceMonitor`, `vmPodScrape`) is an independent tri-state:
+`null`, the default, renders them when the cluster serves the corresponding API and
+nothing elsewhere, so an install off GKE, or on a cluster without Prometheus Operator or
+VictoriaMetrics Operator, upgrades without setting anything; `true` renders them
+regardless and fails at apply time where the CRD is absent; `false` never renders them.
+`helm template` alone has no cluster to ask: pass `--api-versions monitoring.googleapis.com/v1/PodMonitoring`,
+`--api-versions monitoring.coreos.com/v1/ServiceMonitor`, or `--api-versions operator.victoriametrics.com/v1beta1/VMPodScrape`
+to see the default render.
+
+When deploying via GitOps tools like ArgoCD that render Helm templates client-side (disconnected from the live API server),
+default detection resolves to false because `helm template` sees no cluster capabilities. To enable default detection in
+ArgoCD, configure `helm.apiVersions` in the `Application` manifest:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+spec:
+  source:
+    helm:
+      apiVersions:
+        - operator.victoriametrics.com/v1beta1/VMPodScrape # for VictoriaMetrics
+        # - monitoring.coreos.com/v1/ServiceMonitor        # for Prometheus Operator
+        # - monitoring.googleapis.com/v1/PodMonitoring     # for GKE Managed Prometheus
+```
+
+Alternatively, explicitly set the target monitoring value to `true` in Helm values (for example, `platformAgent.vmPodScrape: true`).
 
 ### Turning telemetry off
 

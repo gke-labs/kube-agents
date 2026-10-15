@@ -207,6 +207,42 @@ true
 {{- end }}
 
 {{/*
+Whether the agent's ServiceMonitors render. platformAgent.serviceMonitor is a
+tri-state: true and false are answers, and null (the default) follows the
+cluster — the ServiceMonitor API is served where Prometheus Operator is
+installed. Pass --api-versions monitoring.coreos.com/v1/ServiceMonitor to helm
+template to see the default render.
+*/}}
+{{- define "kube-agents.platformAgentServiceMonitor" -}}
+{{- $explicit := .Values.platformAgent.serviceMonitor -}}
+{{- if kindIs "invalid" $explicit -}}
+{{- if .Capabilities.APIVersions.Has "monitoring.coreos.com/v1/ServiceMonitor" -}}
+true
+{{- end -}}
+{{- else if $explicit -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether the agent's VMPodScrapes render. platformAgent.vmPodScrape is a
+tri-state: true and false are answers, and null (the default) follows the
+cluster — the VMPodScrape API is served where VictoriaMetrics Operator is
+installed. Pass --api-versions operator.victoriametrics.com/v1beta1/VMPodScrape
+to helm template to see the default render.
+*/}}
+{{- define "kube-agents.platformAgentVMPodScrape" -}}
+{{- $explicit := .Values.platformAgent.vmPodScrape -}}
+{{- if kindIs "invalid" $explicit -}}
+{{- if .Capabilities.APIVersions.Has "operator.victoriametrics.com/v1beta1/VMPodScrape" -}}
+true
+{{- end -}}
+{{- else if $explicit -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
 The OTLP/HTTP collector base URL for the chart's own consumers (the LiteLLM exporter).
 
 Unset means the GKE Managed OpenTelemetry collector, which is what these consumers have
