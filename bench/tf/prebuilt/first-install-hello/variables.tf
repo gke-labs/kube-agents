@@ -58,12 +58,36 @@ variable "case_suffix" {
 
 variable "variant" {
   type        = string
-  description = "Which greeting the plugin injects: in_progress (scan running) or completed (scan done)"
+  description = "Which greeting the plugin injects: in_progress (scan running), completed (scan done), or from_report (the plugin runs its report check on INVENTORY.bench-<case_suffix>.md, which this stack plants on the shell sandbox)"
 
   validation {
-    condition     = contains(["in_progress", "completed"], var.variant)
-    error_message = "variant must be in_progress or completed."
+    condition     = contains(["in_progress", "completed", "from_report"], var.variant)
+    error_message = "variant must be in_progress, completed or from_report."
   }
+}
+
+# from_report plants its file on the shell sandbox, beside where the ranking
+# worker writes the report. The apply refuses unless exactly one pod matches.
+variable "sandbox_selector" {
+  type        = string
+  description = "Label selector for the shell sandbox pods in agent_namespace"
+  default     = "app=platform-agent-shell"
+}
+
+variable "sandbox_container" {
+  type        = string
+  description = "Container inside the shell sandbox pods"
+  default     = "shell"
+}
+
+# The plant and the destroy run as this login, the one the model's terminal
+# uses, not as the container's root: /opt/data is that login's, so nothing the
+# model places there can turn a write by this stack onto anything it could not
+# write itself.
+variable "sandbox_user" {
+  type        = string
+  description = "Login inside the shell sandbox that owns /opt/data (the terminal's ssh_user)"
+  default     = "agent"
 }
 
 variable "home_channel_set" {

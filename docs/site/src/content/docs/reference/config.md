@@ -120,12 +120,15 @@ memory:
 # The Platform Agent is not the chat ingress (the Chat Agent / `default`
 # profile owns that), so the session_store / session_otel_bridge ingress plugins
 # move to the Chat Agent. Keep otel for observability parity and tool_call_audit
-# to audit this privileged specialist's tool calls.
+# to audit this privileged specialist's tool calls. pr_opened records each pull
+# request this profile's kanban workers open on their card, which is what posts
+# the thread's PR message (plugins/pr_opened/__init__.py).
 plugins:
   enabled:
     - hermes_otel
     - tool_call_audit
     - incident_context
+    - pr_opened
 ```
 
 ## Sections
@@ -197,6 +200,7 @@ Hermes plugins enabled:
 - **`hermes_otel`** — OpenTelemetry export. Its trace backend is baked into the image but rewritten at container start to the endpoint the operator resolved; see [Deploy → Telemetry](/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
 - **`tool_call_audit`** — writes per-tool-call records for audit and debug.
 - **`incident_context`** — injects Kubernetes incident context into known chat threads on reply (`pre_gateway_dispatch` hook). The work happens on the Planning Agent, which enables it too: the pod runs a single gateway and it is homed at that profile, so an incident-thread reply is dispatched there and never here. It stands aside for a message that starts with `/`: `legacy_slash_commands` is on the same hook, and prepending the triage report first would move the command off the front of the line where that plugin's anchored pattern can no longer see it.
+- **`pr_opened`** — records each pull or merge request this profile's kanban workers open as a `pr_opened` event on their card (`transform_terminal_output` hook), once the forge confirms the agent's own credential opened it; with `KAGE_SLACK_UX` on, the gateway then posts it as its own message in the card's Slack thread ([ChatOps](/kube-agents/concepts/chatops/)). With [`platformFrontDoor`](/kube-agents/operator/platformagent-crd/#platformfrontdoor) on, the operator's overlay enables it, since the back-fill never adds an entry to a list the live file already holds.
 
 The chat-ingress plugins — `session_store` (durable session state) and `session_otel_bridge` (enriches OTel spans with session context, see [Session metadata](/kube-agents/concepts/observability/#session-metadata-plumbing)) — run on the Planning Agent profile, which owns chat ingress. Their sources live in [`agents/chat/defaults/plugins/`](https://github.com/gke-labs/kube-agents/tree/main/agents/chat/defaults/plugins).
 

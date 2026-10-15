@@ -5,7 +5,7 @@ description: Propose declarative configuration updates securely by committing fi
 
 # submit-suggestion - Secure GitOps Pull Request Orchestrator
 
-This skill equips the Platform Agent to propose declarative file updates, GKE infrastructure adjustments, or configuration changes securely by committing local repository changes and submitting pull requests (PRs; merge requests on GitLab) for human review. The repository is named as `owner/name` on GitHub, or `<host>/<path>` — `gitlab.com/acme/platform/infra` — for one on another forge, exactly as it appears in the managed repository list.
+This skill equips the Platform Agent to propose declarative file updates, GKE infrastructure adjustments, or configuration changes securely by committing local repository changes and submitting pull requests (PRs; merge requests on GitLab) for human review. The repository is named as `owner/name` on github.com, `<host>/owner/name` on a GitHub Enterprise Server, or `<host>/<path>` — `gitlab.com/acme/platform/infra` — for one on another forge, exactly as it appears in the managed repository list.
 
 ## When to Use
 

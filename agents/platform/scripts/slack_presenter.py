@@ -216,6 +216,10 @@ BACKTICK = "`"
 #: Characters per report row.
 ROW_TEXT_MAX = 300
 PRIMARY_STYLE = "primary"
+#: A report's fold: Slack's collapsible container, its title capped as a
+#: ``kube-agents.chat/v1`` fold title is.
+FOLD_BLOCK = "container"
+FOLD_TITLE_MAX = 40
 
 #: A code fence line; nothing between an opener and its closer is a heading, a bullet or markup.
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
@@ -1069,8 +1073,14 @@ def blocks_report(
     action_id_prefix: str = "kage",
     detail: str = "",
     after_rows: str = "",
+    fold_title: str = "",
+    fold_rows: Sequence[Any] = (),
 ) -> list[dict]:
     """Block Kit for a report: headline, the top rows between dividers, buttons.
+
+    ``fold_rows``, laid out like ``rows``, go in a collapsed container titled
+    ``fold_title`` under the lines after the rows, above the buttons; with none
+    there is no fold.
 
     ``headline`` is bold and ``note`` follows it plain, both one line;
     ``detail``, when given, is one more plain line under them, clipped like a
@@ -1107,6 +1117,15 @@ def blocks_report(
     if after_lines:
         blocks.append({"type": "rich_text", "elements": [
             {"type": "rich_text_section", "elements": [{"type": "text", "text": line}]} for line in after_lines]})
+    folded = _shown(fold_rows)
+    if folded:
+        blocks.append({
+            "type": FOLD_BLOCK,
+            "title": {"type": "plain_text", "text": _clip(_plain(fold_title), FOLD_TITLE_MAX)},
+            "is_collapsible": True,
+            "default_collapsed": True,
+            "child_blocks": [{"type": "rich_text", "elements": [_rich_row(row) for row in folded]}],
+        })
     choice_buttons = [
         _button(label, f"{action_id_prefix}.{CHOICE_ACTION}.{i}", value=label)
         for i, label in enumerate(_choice_labels(choices))

@@ -987,7 +987,7 @@ parse_args() {
       --gitlab-token-file=*) PARAM_GITLAB_TOKEN_FILE="${1#*=}"; shift ;;
       --gitlab-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; shift ;;
       --gitops-ca-file=*) PARAM_GITOPS_CA_FILE="${1#*=}"; PARAM_GITOPS_CA_FILE_FROM_FLAG="true"; shift ;;
-      --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
+      --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_APP_ID_FROM_FLAG="true"; shift ;;
       --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
       --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
       --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
@@ -1761,24 +1761,26 @@ install_env_records_key() {
 # Say so when an interactive answer changed something the file still records
 # differently.
 #
-# install.env is an input: install.sh creates one when there is none and never
-# rewrites a line of it. The interview, though, still runs in full on every interactive
+# install.env is an input: install.sh creates one when there is none and writes
+# to it only as scripts/installer/README.md ("install.env") lists. The interview, though, still runs in full on every interactive
 # invocation, and its answers go straight into the environment
 # write_tfvars_from_state reads. So an operator who answers "None" at the chat
 # menu gets the Pub/Sub topic destroyed by this apply and re-created by the
 # next run, because the file still says the integration is on. Nothing else
 # tells them: "Kept your install configuration" reads as reassurance, and the
-# Day-2 menu's Save & Apply is the only path that writes a changed key back.
+# Day-2 menu's Save & Apply is the path that writes a changed key back (the
+# GitOps keys aside: see scripts/installer/README.md, "install.env").
 #
 # A warning rather than a write, deliberately. Making install.sh persist here
 # would contradict the contract stated in install.env.example, INSTALL.md and
 # the chart's CI story -- #1117 renders this file on an ephemeral runner and
 # needs the installer not to rewrite it. Naming the drift costs nothing
-# and leaves the decision where it belongs. The one write install.sh does make
-# is narrower: a chat key or PLATFORM_AGENT_MODE the file does not assign,
+# and leaves the decision where it belongs. The writes install.sh does make
+# are narrower: a chat key or PLATFORM_AGENT_MODE the file does not assign,
 # appended from a chat flag or --mode, with the settings a chat toggle recorded
-# true brings (record_flags_into_install_env);
-# it never changes a key the file sets.
+# true brings (record_flags_into_install_env); and the GitOps keys
+# (record_gitops_forge_keys, record_github_gitops_keys). It changes no other key
+# the file sets.
 #
 # The list is the interview's own settings, not everything the file holds:
 # IMAGE_TAG and the recovered secrets legitimately differ on a normal run and
@@ -1832,12 +1834,22 @@ warn_unrecorded_interview_answers() {
       *) current="${!key:-}" ;;
     esac
     [ "$recorded" != "$current" ] || continue
+    # The GitHub GitOps keys follow the answer when the run commits
+    # (record_github_gitops_keys), so they are not drift to report.
+    case "$key" in
+      GITOPS_ORG | GITOPS_REPO | GITHUB_APP_ID)
+        if [ "${GITOPS_FORGE:-github}" = "github" ] && [ -n "${GITOPS_ORG:-}" ] &&
+          [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ]; then
+          continue
+        fi
+        ;;
+    esac
     drifted="${drifted}${drifted:+ }${key}"
   done
   [ -n "$drifted" ] || return 0
 
   print_warning "This run applied answers that ${file} does not record."
-  print_info "install.env is an input: install.sh reads it and never changes a key it sets, except its GitOps forge keys when an applied run changes them."
+  print_info "install.env is an input: install.sh changes only the keys scripts/installer/README.md (\"install.env\") lists, and these are not among them."
   print_info "The next run -- or upgrade.sh, or the Day-2 menu -- regenerates from"
   print_info "the file, which will revert what you just changed. Update these keys:"
   for key in $drifted; do
@@ -1995,8 +2007,56 @@ warn_flag_beats_unrecorded_file_value() {
   print_info "Set ${key}=$(printf '%q' "$value") in ${file}, or repeat ${repeat_flag} on ${repeat_on}."
 }
 
-# The one exception to "an existing install.env is never rewritten": the
-# GitOps forge. upgrade.sh and the Day-2 menu render from the file alone, so a
+# The GitHub GitOps keys this run applies and install.env does not assign:
+# appended when the run commits to the apply, as record_flags_into_install_env
+# appends a chat flag's key. upgrade.sh renders from the file alone, so GitOps
+# configured with --gitops-org, --gitops-repo and --github-app-id and never
+# recorded was rendered off by the next full upgrade, which planned to
+# destroy the token minter (#3075). A key the file lacks is appended, and one
+# it records with a different value is replaced (that line only), since this
+# apply is about to use the new value and the next upgrade would otherwise put
+# the old one back. --github-pem-path never is (the key lives in Cloud KMS once
+# imported). Run where the run commits: the apply, and the --generate-only
+# handoff, whose lifecycle.sh apply renders these keys. A declined run leaves
+# the file as it was. (record_gitops_forge_keys stays apply-only: a forge
+# switch is previewed with --generate-only before it is made.)
+record_github_gitops_keys() {
+  local file="$1" key value
+  [ -f "$file" ] || return 0
+  [ "${PARAM_DRY_RUN:-false}" = "true" ] && return 0
+  [ "${GITOPS_FORGE:-github}" = "github" ] || return 0
+  [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ] || return 0
+  local tmp
+  for key in GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
+    value="${!key}"
+    # Read afresh for each key: a rewrite below drops a whole line, and a line
+    # that assigned two of these keys takes both with it.
+    RECORDED_INSTALL_ENV_FILE=""
+    if install_env_records_key "$file" "$key"; then
+      [ "$(recorded_install_env_value "$file" "$key")" != "$value" ] || continue
+      tmp="${file}.tmp.$$"
+      ( umask 077; : >"$tmp" )
+      grep -E -v "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" >"$tmp" || true
+      write_env_var "$tmp" "$key" "$value"
+      chmod 600 "$tmp" 2>/dev/null || true
+      mv "$tmp" "$file"
+      print_info "Updated ${key}=$(printf '%q' "$value") in ${file} to the value this run applies, so upgrade.sh keeps it."
+    else
+      # A last line with no newline would run into the appended assignment.
+      if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
+        printf '\n' >> "$file"
+      fi
+      write_env_var "$file" "$key" "$value"
+      print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}, so upgrade.sh keeps GitOps on."
+    fi
+  done
+  # The cache read_recorded_install_env_values keeps is keyed by path, and the
+  # file just changed under it.
+  RECORDED_INSTALL_ENV_FILE=""
+}
+
+# One of the two GitOps exceptions to "an existing install.env is never
+# rewritten" (record_github_gitops_keys above is the other): the GitOps forge. upgrade.sh and the Day-2 menu render from the file alone, so a
 # forge this run chose and the file does not record would be reverted to
 # GitHub by the next of them -- the alias back in the CR, the GitLab forge
 # gone, nothing saying why. So when the file's forge differs from this run's,
@@ -2318,9 +2378,10 @@ bootstrap_install_env_file() {
     warn_unrecorded_interview_answers "$destination"
     note_unrecorded_network_policy_acceptance "$destination"
     # The flags that override a recorded value for one run. This function
-    # never rewrites an existing file (record_gitops_forge_keys, after the
-    # apply is chosen, is the one writer of an existing file), so only a
-    # first install can record any of them on the operator's behalf.
+    # never rewrites an existing file (record_gitops_forge_keys and
+    # record_github_gitops_keys, once the run commits, are the writers of an
+    # existing file, for the GitOps keys only), so only a first install can
+    # record any of them on the operator's behalf.
     warn_flag_beats_unrecorded_file_value "$destination" NAMESPACE --agent-namespace \
       "${PARAM_AGENT_NAMESPACE:-}" \
       "A later run without it resolves the default namespace, renders tfvars for that one, looks for the recovered Secret there, and is refused by lifecycle.sh's guard_release_namespace." \
@@ -2560,7 +2621,7 @@ bootstrap_install_env_file() {
   local tmp="${destination}.tmp"
   {
     printf '%s\n' "# kube-agents install configuration, created by install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
-    printf '%s\n' "# This file is yours now: install.sh reads it and never changes a line of it, except the GitOps forge keys when an applied run changes them."
+    printf '%s\n' "# This file is yours now: install.sh reads it and writes to it only as scripts/installer/README.md (\"install.env\") lists."
     printf '%s\n' "# Edit it and re-run the installer to change the install."
     printf '%s\n' "# See install.env.example for every supported key and what it does."
     printf '%s\n' "#"
@@ -5405,6 +5466,10 @@ run_menu_system() {
         # PROJECT_NUMBER, KMS_LOCATION and NO_CONFIRM are deliberately not
         # written. The first two are derived wherever they are used, and the third
         # describes an invocation rather than the install.
+        # A non-numeric App ID the file already carries (one a pre-#3076 run
+        # took from the App's name) is refused here too, before anything is
+        # saved or applied.
+        validate_github_app_id "$github_app_id" "GITHUB_APP_ID in ${INSTALL_ENV_FILE}" || return 1
         save_env_var PROJECT_ID "$project_id"
         save_env_var CLUSTER_NAME "$cluster_name"
         save_env_var REGION "$region"
@@ -5487,6 +5552,8 @@ run_menu_system() {
         gcloud container clusters get-credentials "$cluster_name" --location "$REGION" \
           --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
         refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+        # A live GitHub minter this render would destroy (#3075).
+        refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" || exit 1
         # The menu edits no mode key, but an install.env edited by hand since
         # the last apply reaches the cluster through this apply too, with no
         # confirmation after the notice.
@@ -5677,6 +5744,10 @@ main() {
   # The mode first: a value the CRD refuses is named as that, not as a
   # disagreement with install.env.
   validate_platform_agent_mode || exit 1
+  # A GitHub App ID that is a name rather than the App's number (#3076), from
+  # the flag or install.env, before the interview and any --dry-run preview.
+  validate_github_app_id "${PARAM_GITHUB_APP_ID:-}" \
+    "$([ "${PARAM_GITHUB_APP_ID_FROM_FLAG:-false}" = "true" ] && echo "--github-app-id" || echo "GITHUB_APP_ID in ${INSTALL_ENV_FILE:-install.env}")" || exit 1
   # The chat flags and --mode against an existing install.env, as soon as
   # is_truthy and the defaults are loaded: a flag that disagrees with the file
   # stops the run here, before the interview and long before anything is
@@ -6503,6 +6574,12 @@ main() {
 
       print_info "GitHub access uses the short-lived GitHub App token minter."
       prompt_read "GitHub App ID (optional, press Enter to skip token minter)" github_app_id "${github_app_id}"
+      # Asked again here, rather than refused after the KMS questions: the App's
+      # name in place of its number is the usual slip (#3076).
+      while [ -n "$github_app_id" ] && ! validate_github_app_id "$github_app_id" "GitHub App ID"; do
+        has_controlling_tty && [ "$PARAM_NON_INTERACTIVE" != "true" ] || exit 1
+        prompt_read "GitHub App ID (its number; press Enter to skip token minter)" github_app_id ""
+      done
       if [ -n "$github_app_id" ]; then
         prompt_read "Cloud KMS Keyring Name" kms_keyring "${kms_keyring}"
         prompt_read "Cloud KMS Key Name" kms_key "${kms_key}"
@@ -7069,6 +7146,25 @@ main() {
       --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
     refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
   fi
+  # A live GitHub minter this render would destroy (#3075): an install.env
+  # without the GitOps keys, and a run without the flags, renders GitOps off.
+  # Refused for a run that applies and for --generate-only, which hands its
+  # tfvars to lifecycle.sh apply (as the Slack check treats it); --dry-run
+  # warns. The context is the one the gate above fetched where it ran; without
+  # one, a preview says the check did not run.
+  if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
+    if [ "$PARAM_DRY_RUN" != "true" ]; then
+      if ! refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE"; then
+        # The tfvars just written render GitOps off; --generate-only would
+        # hand them to lifecycle.sh apply, so they go.
+        rm -f "$tfvars_file"
+        print_info "Removed ${tfvars_file}, which rendered GitOps off, so nothing applies it."
+        exit 1
+      fi
+    else
+      refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" "$SCOPE_CHECK_MODE_WARN"
+    fi
+  fi
   # A PLATFORM_AGENT_MODE that moves the CR's spec.mode is a mode switch, and
   # it is named before the operator confirms the apply. Outside the gate
   # above, so --dry-run and --generate-only say it too; it takes the reads the
@@ -7300,7 +7396,9 @@ main() {
     print_info "Generate-only: configuration files written. Running pre-apply validation checks..."
     check_github_org_is_organization "${GITOPS_ORG:-}"
     # Past every gate that can stop this route: a chat flag or --mode whose
-    # key the install.env lacks is recorded for the handoff.
+    # key the install.env lacks is recorded for the handoff, and so are the
+    # GitHub GitOps keys, which the handoff's lifecycle.sh apply renders.
+    record_github_gitops_keys "$INSTALL_ENV_FILE"
     record_flags_into_install_env
     print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
     write_json_report "GENERATE_ONLY_SUCCESS"
@@ -7381,6 +7479,7 @@ main() {
   # previewed (--generate-only) or declined must leave install.env as it was,
   # or the next upgrade.sh would render the forge nobody applied.
   record_gitops_forge_keys "$INSTALL_ENV_FILE"
+  record_github_gitops_keys "$INSTALL_ENV_FILE"
   record_flags_into_install_env
   run_lifecycle_apply "$repo_dir" "$provisioning_log"
 

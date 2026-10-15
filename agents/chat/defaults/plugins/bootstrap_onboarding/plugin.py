@@ -1,9 +1,12 @@
+import importlib.util
 import json
 import logging
 import math
 import os
+import re
 import time
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Dict, Optional, Tuple
 
 try:
@@ -74,7 +77,12 @@ GREETED_MARKER = ".bootstrap_greeted"
 # written_at (epoch seconds, stamped at apply) is refused with a warning, so
 # one a failed destroy leaves behind disarms on its own.
 # JSON: {"phrase": str, "variant": str, "written_at": number,
-# "home_channel_set": bool (optional; true adds HOME_CHANNEL_INSTRUCTION)}.
+# "home_channel_set": bool (optional; true adds HOME_CHANNEL_INSTRUCTION),
+# "report": str (required with from_report)}.
+# The variant names the greeting, or is EVAL_VARIANT_FROM_REPORT: pick it with
+# the opening turn's report check, run on the file the request's "report" names
+# rather than the real report, so a case never puts a file where onboarding
+# reads one.
 EVAL_GREET_MARKER = ".bootstrap_greet_eval"
 EVAL_KEY_PHRASE = "phrase"
 EVAL_KEY_VARIANT = "variant"
@@ -82,11 +90,27 @@ EVAL_KEY_WRITTEN_AT = "written_at"
 # True tells the plugin to greet as if this turn made the chat the home channel.
 EVAL_KEY_HOME_CHANNEL_SET = "home_channel_set"
 EVAL_VARIANT_COMPLETED = "completed"
+EVAL_VARIANT_FROM_REPORT = "from_report"
+EVAL_KEY_REPORT = "report"
+# A bare file name beside the real report that nothing in onboarding reads.
+EVAL_REPORT_NAME = re.compile(r"\AINVENTORY\.bench-[a-z0-9-]+\.md\Z")
 EVAL_PLATFORM = "api_server"
 # The same floor as the stack's variables.tf and scripts/validate_bench_cases.py.
 EVAL_PHRASE_MIN_LENGTH = 12
 # Longer than one case's apply, run and destroy.
 EVAL_REQUEST_MAX_AGE_SECONDS = 3600
+
+# The ranked report, where bootstrap_delivery.py reads it. With the shell
+# sandbox on it is on the sandbox pod's data volume, which this pod does not
+# mount, so its presence is read across with sandbox_exec, as delivery does.
+REPORT_NAME = "INVENTORY.md"
+SANDBOX_HOME = "/opt/data"
+# The image's copy, not $HERMES_HOME/scripts on the volume.
+SANDBOX_EXEC_PATH = Path("/opt/defaults/scripts/sandbox_exec.py")
+SANDBOX_EXEC_MODULE = "_kube_agents_sandbox_exec"
+# The opening turn waits on this read. A slower sandbox greets as "in progress",
+# which stays true: delivery posts the report once it can read it.
+REPORT_CHECK_TIMEOUT_SECONDS = 5
 
 # The greeting's word ceiling; both bench cases' at-most-sixty-words check holds it.
 GREETING_MAX_WORDS = 60
@@ -227,9 +251,9 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
     """The eval seam's request whose phrase is in this turn's message, if any.
 
     Returns None when no request names this turn. Else it returns two values:
-    whether the greeting is the completed variant, and whether to greet as if
-    this turn set the home channel. The file stays for the stack's destroy
-    step, so a retry of the same turn greets again.
+    whether to give the completed greeting, and whether to greet as if this
+    turn set the home channel. The file stays for the stack's destroy step, so
+    a retry of the same turn greets again.
     """
     for marker in sorted(data_dir.glob(f"{EVAL_GREET_MARKER}*")):
         try:
@@ -238,6 +262,7 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
             variant = str(request.get(EVAL_KEY_VARIANT) or "")
             written_at = request.get(EVAL_KEY_WRITTEN_AT)
             home_channel_set = request.get(EVAL_KEY_HOME_CHANNEL_SET) is True
+            report_name = str(request.get(EVAL_KEY_REPORT) or "")
         except FileNotFoundError:
             continue
         except (OSError, ValueError, AttributeError, RecursionError) as e:
@@ -266,9 +291,52 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
                 EVAL_REQUEST_MAX_AGE_SECONDS,
             )
             continue
+        if variant == EVAL_VARIANT_FROM_REPORT and not EVAL_REPORT_NAME.match(report_name):
+            logger.warning("Ignoring %s: %s names no report file matching %s.", marker, EVAL_KEY_REPORT, EVAL_REPORT_NAME.pattern)
+            continue
         logger.info("Matched %s (variant=%s, home_channel_set=%s).", marker, variant, home_channel_set)
+        if variant == EVAL_VARIANT_FROM_REPORT:
+            return _report_ready(data_dir, report_name), home_channel_set
         return variant == EVAL_VARIANT_COMPLETED, home_channel_set
     return None
+
+
+def _load_sandbox_exec() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(SANDBOX_EXEC_MODULE, SANDBOX_EXEC_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {SANDBOX_EXEC_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _report_ready(data_dir: Path, name: str = REPORT_NAME) -> bool:
+    """Whether the ranked report, or the eval seam's ``name``, is written where
+    delivery reads the report.
+
+    Never raises. A sandbox read that fails or outlasts
+    REPORT_CHECK_TIMEOUT_SECONDS is False, and so is anything that keeps this
+    from telling whether the sandbox is on, after a look at the local path.
+    """
+    try:
+        sandbox_exec = _load_sandbox_exec()
+        in_sandbox = sandbox_exec.sandbox_enabled()
+    except Exception as e:
+        logger.warning("Could not tell whether the shell sandbox is on; checking %s locally: %s", name, e)
+        in_sandbox = False
+    if not in_sandbox:
+        try:
+            return (data_dir / name).exists()
+        except OSError:
+            return False
+    try:
+        report = sandbox_exec.read_bytes(
+            f"{SANDBOX_HOME}/{name}", max_bytes=1, timeout=REPORT_CHECK_TIMEOUT_SECONDS
+        )
+    except Exception as e:
+        logger.warning("Could not read %s in the shell sandbox; greeting as in progress: %s", name, e)
+        return False
+    return report is not None
 
 
 def _greeting(data_dir: Path, completed: bool, home_channel_set: bool = False) -> Dict[str, str]:
@@ -350,6 +418,10 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
 
     home_channel_set = _set_home_channel_if_unset(**kwargs)
 
+    # Before .user_aligned and the trigger: once either is in place, delivery
+    # can claim the report and move it aside before this read lands.
+    report_ready = _report_ready(data_dir)
+
     try:
         (data_dir / ".user_aligned").touch(exist_ok=True)
         logger.info("Marked %s (human connected).", data_dir / ".user_aligned")
@@ -370,7 +442,7 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     except Exception as e:
         logger.warning("Could not touch %s: %s", GREETED_MARKER, e)
 
-    return _greeting(data_dir, (data_dir / "INVENTORY.md").exists(), home_channel_set)
+    return _greeting(data_dir, report_ready, home_channel_set)
 
 
 def register(ctx: Any) -> None:

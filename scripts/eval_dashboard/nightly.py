@@ -146,9 +146,10 @@ DIGEST_NAMED_CASES = 3
 # and the opening chat turn on the api transport.
 REP_AGENT_S = "agent_s"
 REP_TURN1_S = "turn1_s"
-# The slow-run percentile the Nightly page shows beside a case's agent median:
-# the agent run's variation is in its tail, which a median hides.
-AGENT_SLOW_PCT = 90
+# The slow-run percentile the Nightly page shows beside a case's medians, for
+# the agent run and the opening turn: the variation is in the tail, which a
+# median hides.
+SLOW_PCT = 90
 # The end-state target for a chat turn, "p95 < 10 s for read/plan"
 # (docs/architecture/05-system-architecture.md, "Chat turn latency"). The
 # digest and the page show the night's turn-1 p95 beside it as advice only:
@@ -308,6 +309,7 @@ def night_cases(run: dict, domain_of: dict[str, str]) -> list[dict]:
         if state is None:
             continue
         name = task["name"]
+        turn1, agent = rep_seconds(task.get("reps"), REP_TURN1_S), rep_seconds(task.get("reps"), REP_AGENT_S)
         out.append({
             "case": name,
             "domain": domain_of.get(name, DOMAIN_UNKNOWN),
@@ -315,9 +317,10 @@ def night_cases(run: dict, domain_of: dict[str, str]) -> list[dict]:
             "reps": counts,
             "reason": first_reason(task) if state != STATE_PASS else None,
             "transcript_url": transcript_url(run, name),
-            "turn1_p50_s": percentile(rep_seconds(task.get("reps"), REP_TURN1_S), 50),
-            "agent_p50_s": percentile(rep_seconds(task.get("reps"), REP_AGENT_S), 50),
-            "agent_p90_s": percentile(rep_seconds(task.get("reps"), REP_AGENT_S), AGENT_SLOW_PCT),
+            "turn1_p50_s": percentile(turn1, 50),
+            "turn1_p90_s": percentile(turn1, SLOW_PCT),
+            "agent_p50_s": percentile(agent, 50),
+            "agent_p90_s": percentile(agent, SLOW_PCT),
         })
     out.sort(key=lambda c: (c["domain"], c["case"]))
     return out

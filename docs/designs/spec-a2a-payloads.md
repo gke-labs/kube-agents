@@ -688,8 +688,9 @@ carry the same chat message:
 
 - **`chat`** is a `kube-agents.chat/v1` object beside the request's `text`, which is its
   fallback. Every rule in this section applies to it, as on the bus. (On Slack it takes
-  the place of the request's raw `blocks` for a conversation post, and `blocks` stays for
-  home-channel posts.)
+  the place of the request's raw `blocks` for a conversation post. A home-channel request
+  may carry one too: the cron relay's fleet-audit card or the first inventory's, laid out
+  the same way, with its `update` and `mark` not read.)
 - **`update`** is a key the sender picks (eg `plan`, or a card's question). The first
   request with a key posts a message. A later request with the same key edits that
   message in place instead of posting a new one, which is how a plan stays one message
@@ -697,12 +698,20 @@ carry the same chat message:
   only a message the gateway itself posted for that same conversation and key. A key it
   has no message for (another conversation's, one evicted, or one lost to a restart)
   posts a new message and edits nothing. A conversation holds at most 16 live keys, and
-  the oldest is evicted first, so a chatty card can't grow gateway state without bound.
-- **`mark`** on a conversation notify marks the conversation's latest chain message, and
-  counts as that chain's newest writer once every task in it has ended. While a newer
-  chain is running in the conversation, a notify's `mark` is dropped. (A card that
-  settles after a later question has finished marks the later message. That is a known
-  limit of addressing by conversation rather than by task.)
+  the least recently used is evicted first, so a chatty card can't grow gateway state without bound.
+- **`mark`** on a conversation notify marks the message of the chain the card belongs to,
+  and counts as that chain's newest writer once every task in it has ended. A notify names
+  no task, so its `update` key names the chain: the first notify with a key and a `mark`
+  binds the key to the conversation's latest chain, the gateway records the binding on that
+  chain, and every later `mark` with the key marks that chain's message, whether or not a
+  newer chain has started since. A key therefore names one ask: a sender keys each ask's
+  plan afresh, since a key reused for a later ask keeps marking the first one. While a
+  chain marking the same message runs, the `mark` is dropped. A `mark` with no key names
+  no chain: it marks the latest chain message once nothing runs, and is dropped, logged
+  and counted while a chain runs. (A card whose first keyed `mark` arrives after a later
+  question was asked binds to the later message, and a key whose chain has left the
+  conversation's task history binds afresh. Those are the remaining limits of addressing
+  by conversation rather than by task.)
 
 So the Planning Agent's terminal carries a mark-only chat message with `ask` still set, and the terminal no-mark default doesn't fire at the ack. Its cards' notifies
 then carry the plan (under one `update` key per plan), ⏸️ (`settle: blocked`), the one answer per fan-out

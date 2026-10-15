@@ -176,6 +176,7 @@ ADDED_AFTER_THE_MOVE = [
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
     "session-cluster-question-wake-answers-once",  # a session's delegated question ends in a wake's answer
     "gitops-drift-noise-filtered-triage",  # the drift detector's principal classifier, #2739's fixture
+    "manage-cluster-exclusion-installer-route-probe",  # the exclusion route on an installer-made install
     "delete-namespace-unowned-stops",  # a delete the repository cannot carry ends in a stated stop, #3077
 ]
 # Taken back out of the nightly file after registering there, each with a
@@ -360,7 +361,6 @@ class SplitLostNothingTest(unittest.TestCase):
     def test_the_script_parses(self):
         result = subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
-
 
 # The inject lane's exclusions at their introduction (#2039, 2026-09-25): the
 # one presubmit case whose premise needs the chat front door. An edit to the
@@ -575,7 +575,6 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                     self.assertIn(case, eval_rosters.blocking_roster())
                 else:
                     self.assertIn(case, eval_rosters.nightly_cases())
-
 
 # The inject lane's safeguards at their introduction (#2079, 2026-09-28): the
 # one entry every case on the lane carries beside its own. An edit to the
