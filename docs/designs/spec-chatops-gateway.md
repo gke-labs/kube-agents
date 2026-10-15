@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door with its eval and Google sign-in identity classes); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own collector-only NetworkPolicy on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the door's Google sign-in env); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled under `next` and Chat is not, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one child at a time, `A2A_DELEGATION_DEPTH_MAX` 3); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door with its eval and Google sign-in identity classes); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the door's Google sign-in env); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled under `next` and Chat is not, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one child at a time, `A2A_DELEGATION_DEPTH_MAX` 3); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip
 
 ## Purpose
 
@@ -278,8 +278,9 @@ Two rules keep the conversation's route coherent:
   route's contract: incarnations rotate anyway.
 - **The previous incarnation dies at delegation, deliberately.** A lingering pod from
   an earlier incarnation is deleted, not merely untracked: reap walks session records
-  and sweep sees only terminal pod phases, so an untracked Running pod would hold its
-  bus credential with nothing able to reclaim it. The active-task guard above bounds
+  and sweep takes a Running pod only when it is a reused pod its record no longer names,
+  so an untracked Running one-task pod would hold its bus credential with nothing able
+  to reclaim it. The active-task guard above bounds
   which pods this can reach: a delegation is only recognized when no task serializes
   the conversation, so the pod is either idle or running a DETACHED task - and
   detached is not closed, so the deletion rule in Session lifecycle applies and that
@@ -338,7 +339,11 @@ and the same requester.
 shaped as `lib.DelegateRequest` (`{"addressee": "platform", "text": "..."}`), its text bounded at
 `lib.DelegateTextCap` (16 KiB) - the same bound the wake's result is held to in the other
 direction. The worker adapter serves it to the harness as one MCP tool, `mcp__a2a__delegate`,
-over a stdio server the harness is started with via `--mcp-config`; calling it is what ends the
+over a stdio server the harness is started with via `--mcp-config` (every harness argv, with the
+tool or without it, also carries `--strict-mcp-config` and `--setting-sources user`, so no turn
+loads MCP servers or project settings from the scratch directory, which an earlier turn in a
+reused pod could have written; a reused pod also removes the harness's user settings file before
+each turn); calling it is what ends the
 turn - the turn's own result is the one line `delegated to platform` - before the gateway has
 even seen the request. `A2A_DELEGATE_TOOL=off` is the tool's own switch, read wherever the tool
 is advertised or served, and it governs the tool even over an explicit `A2A_ALLOWED_TOOLS`
@@ -378,10 +383,13 @@ the turn, each stored hashed the same way and capped at eight - past the cap the
 refuses rather than silently drop an author; and against every hashed author whose text has
 reached the session's current incarnation, requesters and steerers of every turn alike, capped at
 sixteen and cleared with the requester copy at `A2A_ASK_TTL` - a cleared or overflowed set refuses
-rather than admits. That third check is load-bearing: each turn gets a fresh one-task
-incarnation, but the incarnation reads the transcript primer (below, "Rehydrate"), which carries
-every earlier turn the stream still holds. So when the pod is started, the requesters and steer
-authors of every turn the primer replays join the set. A turn whose requester is no longer on
+rather than admits. That third check is load-bearing: one incarnation serves every turn while
+its pod is live (Session lifecycle, "Stream") and keeps what each turn told it, and an incarnation
+started cold reads the transcript primer (below, "Rehydrate"), which carries every earlier turn
+the stream still holds. So when the pod is started, the requesters and steer authors of every turn
+the primer replays join the set, and each later turn the live pod takes adds its own. The set
+grows for the pod's life; one that overflows or reaches `A2A_ASK_TTL` refuses delegation until
+the next cold start, which fails closed. A turn whose requester is no longer on
 record (cleared at `A2A_ASK_TTL`, with its text) is left out of the primer whole, so the pod never
 reads text whose authors the check can't count. The bound is the conversation as the primer
 carries it, not one incarnation. What else a session carries across incarnations is
@@ -433,21 +441,24 @@ the gateway checks the steer's author against the target's list first, as it che
 delegation's. A session pod
 is therefore busy for seconds per turn, not for the life of the work it delegated, which is also
 what keeps the per-conversation pod cost small. The delegating turn's answer is decided at the
-call, so an eviction that lands before its harness has exited (a fast child's wake retires the
-pod) completes the turn with that answer rather than failing it `worker-evicted`.
+call, so an eviction that lands before its harness has exited (a fast child's wake that could not
+go to this pod retires it) completes the turn with that answer rather than failing it
+`worker-evicted`.
 
 **The wake** is one new turn on the delegating session, `via.session` naming the parent's own
 incarnation, started on the child's `completed`, `failed` or `rejected` terminal - a `canceled`
 the gateway published itself (a human's `stop`) does not wake the session whatever terminal
 follows it, a `canceled` nobody asked for (a supervisor tearing down a dead executor) counts as
 `failed`. It does not run if the delegating turn's requester has aged off the record (a notice
-says so instead) or if another task already holds the conversation (waking would retire that
-task's own pod); otherwise the wake is an ordinary session spawn and counts against
-`A2A_MAX_SESSIONS` like any other - refused at the cap, the child's result still stands as
-already relayed, and the room gets the standard cap notice rather than a second one. The wake
-inherits the child's chain depth, so depth counts delegations, not turns. The wake's pod is a fresh
-incarnation that reads the transcript primer like any other, and its text also opens with what the
-human asked, so the wake is self-contained: a worker image that doesn't read the primer, during a
+says so instead) or if another task already holds the conversation (waking would put a task
+behind that one); otherwise the wake goes where a human turn would (Session lifecycle): to the
+session's live pod, the incarnation that delegated, when it can take it, and otherwise to an
+ordinary session spawn that counts against `A2A_MAX_SESSIONS` like any other - refused at the
+cap, the child's result still stands as already relayed, and the room gets the standard cap
+notice rather than a second one. The wake inherits the child's chain depth, so depth counts
+delegations, not turns. A wake that spawns gets a fresh incarnation that reads the transcript
+primer like any other; one in the live pod resumes the harness session that delegated. Either way
+its text also opens with what the human asked, so the wake is self-contained: a worker image that doesn't read the primer, during a
 mixed rollout, still has the request and the result. The cost is reading them twice. It opens
 with the label `You were asked:` and the human's message that started the chain, fenced. It is the root turn's
 message, carried down a longer chain, never an intermediate wake's gateway-authored text. Then
@@ -482,8 +493,10 @@ link in the mint's own write, the refusal in its own - so neither path runs a re
 child's result is already posted, so it tells the session to reply with what it means rather than
 repeat it; to a program behind a door, which sees only the wake's reply, it asks for the whole
 answer. Either way it says to state plainly when the child failed or reports more work still
-running. The wake's pod has no delegate tool (`A2A_DELEGATE_TOOL=off`, set by the
-spawner for a wake turn): a wake that could delegate read an interim answer such as "still
+running. The wake has no delegate tool: a pod spawned for a wake that serves one task gets
+`A2A_DELEGATE_TOOL=off` from the spawner, and a pod that serves every turn has the tool turned
+off by its adapter for each task whose authority block carries `via`, which only a wake's does
+and only the gateway can publish. A wake that could delegate read an interim answer such as "still
 checking, the results will post here" as a reason to ask again, and each ask woke another pod
 until the depth bound refused, with nothing answered. A message the person sends while the wake
 runs steers the wake like any other running turn, so it is answered without the tool as well. A
@@ -563,7 +576,7 @@ pod has no Workload Identity. **Amended 9/8:** it does now carry a ServiceAccoun
 bus credential of its own. The static `worker` password is gone from the pod entirely; in
 its place is a projected ServiceAccount token, audience-bound to the bus and bound by the
 kubelet to this pod, which the auth callout resolves into grants derived from the attested
-pod name - this task's events, this session's three consumers, this session's inbox. The
+pod name - this incarnation's events (every task it serves), this session's three consumers, this session's inbox. The
 harness can still read that credential, because it runs at the same UID in the same pod;
 what changed is that reading it buys the authority the harness already had (gke-labs#1270).
 The deployment spec owns the reasoning. Direct Vertex via WI
@@ -571,15 +584,44 @@ stays the target, and arming it is a policy change as well as an IAM one: the se
 egress fence encodes the shipped path (no 443, no metadata route), which is where a
 piecemeal flip fails loudly instead of silently widening. Cold start is 5-10s; the
 adapter posts a placeholder to the conversation while the pod comes up, which the demo
-already does.
+already does. **Amended 10/9 (#2825):** the pod is the conversation's, not the turn's. It is
+spawned with `A2A_SESSION_REUSE=true` and the annotation `a2a.kubeagents.dev/session-reuse`,
+and the conversation's later turns go to it (Stream, below). The gateway spawns again only when
+no pod can take the turn: none is live (the first turn, after a reap or an eviction, after the pod
+died), the pod was spawned without the flag (an older gateway's, which exits after one task, or a
+one-shot Delegate's off the session route), a stopped task is still finishing on it, its last task
+never started, its lifetime has no room left for a whole task, or the read that checks all this
+fails. The old pod is retired as before. `A2A_SESSION_REUSE=false` on the gateway turns reuse off,
+for running pods too, and every turn spawns.
 
 **Stream.** The shim consumes envelopes addressed to its session, feeds them to the
 harness, and maps the stream-json output to `status-update` and `artifact-update` events.
 The gateway relays events to the conversation. The gateway never parses harness output;
 that translation lives in the shim, next to the process it translates for.
 
-**Reap.** Idle TTL since the last user message (30 minutes, config-backed). Reaping is
-deleting the pod. Nothing is saved first, because
+A later turn is a new task on the same session. The gateway keeps the bus session name
+and publishes the submission on `a2a.tasks.<session>.<task>.in` once a pod `get` says the pod is
+running, its worker has not exited, it is not being deleted, it carries the reuse annotation, and
+its lifetime has room for a whole task; a failed read spawns fresh instead. The task's capability
+is minted as every task's is, with the session name as its delegate, and the session's author set
+carries on, because the incarnation has not changed. Between tasks the shim waits on one consumer
+filtered `a2a.tasks.<session>.*.in`: the origin consumer's name with the filter the callout
+already grants it, so a later turn asks the bus for nothing the first did not. It takes the first
+submission on a task id it has not run and passes over everything else on those subjects (a late
+steer or cancel for a task that has ended). Each task runs as the first did: the respawn check,
+the capability check, its own consumer on its own `…in` subject for steering and stop, its own
+deadline and its own terminal. The harness is started again for each task with
+`--resume <session id>`, the id the previous run reported, so the model has the conversation
+without a primer; the primer goes to the first harness run only. The delegate tool is decided per
+task as well: off for a wake (see "The wake" above). SIGTERM while the shim is idle exits 0 with
+nothing published; mid-task it is that task's eviction, as before. A harness run that reports no
+session, or a task that ended without its terminal reaching the bus, ends the process instead of
+waiting for the next task: the pod reaches a terminal phase, Sweep closes what is owed, and the
+next turn starts cold with the primer.
+
+**Reap.** Idle TTL since the last user message (30 minutes, config-backed). The record's
+`lastUserMessage` is the clock: every verified turn moves it, and the answer to that turn does
+not. Reaping is deleting the pod. Nothing is saved first, because
 the stream already has everything - that's the whole point of the transcript of record.
 The KV entry stays while active, holding the `contextId`. To bound bucket growth, an
 idle session whose pod has been reaped and whose last activity is older than `A2A_SESSION_TTL`
@@ -597,10 +639,21 @@ live task: an active task that has not detached (see Stop above) exempts the ses
 from the idle TTL. The exemption is safe because the pod's end has owners. The session
 worker's adapter enforces a task deadline (30 minutes default, config-backed): at the
 deadline it kills the harness process group and publishes the terminal event itself,
-and a pod that dies wedged reaches a terminal phase where Sweep takes over. The
-spawner sets the pod-level `activeDeadlineSeconds` above that deadline (the adapter's
-deadline plus a fixed grace for the image pull), so a wedged adapter also lands in
-Sweep's domain instead of holding its bus credential indefinitely. Two ends still have
+and a pod that dies wedged reaches a terminal phase where Sweep takes over. For a pod that
+serves one task the spawner sets the pod-level `activeDeadlineSeconds` above that deadline (the
+adapter's deadline plus a fixed grace for the image pull), so a wedged adapter also lands in
+Sweep's domain instead of holding its bus credential indefinitely. A pod that serves its
+conversation cannot have that bound, so its `activeDeadlineSeconds` is the session's maximum
+lifetime (`A2A_SESSION_MAX_LIFETIME`, 4 hours by default; the gateway refuses to start below the task deadline plus
+twice the grace), and the reap scan holds each of its tasks to the old bound instead: a running
+task older than the task deadline plus the same grace (counted from its submission, or from the
+pod's start when the pod started after it, so a first task's scheduling and image pull do not
+come out of the grace) is closed by the gateway as its supervisor
+(`failed`, on the `…supervisor` subject, unless a final is already on the stream) and the pod is
+deleted. A pod without room left in its lifetime for a whole task is not handed one, so the
+lifetime and that check never fire together. The pod's bus credential still lapses with its
+connection's grant TTL (an hour less jitter) and is renewed by the client's reconnect, which
+re-reads the pod-bound token. Two ends still have
 no terminal to wait for, and the record carries an independent bound for each rather
 than a justification that assumes a terminal that may not come. The `ask` copy is
 cleared by the reap scan once it is `A2A_ASK_TTL` old (24 hours by default,
@@ -629,6 +682,19 @@ guarantees is what deletes the active-task record (and the `ask` copy riding it)
 detached task is the exception on both counts: it does
 not exempt the session, so reap may delete a pod whose harness is still working, and
 the supervisor rule below is what keeps that from being a silent stop.
+
+**The session cap** (`A2A_MAX_SESSIONS`) counts live pods, and with one pod per live
+conversation it fills with conversations nobody is in right now. When it is full and a
+conversation needs a pod, the gateway evicts the one idle longest - a live pod whose conversation
+has no task at all, oldest last user message first - and posts one line in that conversation: its
+session was paused to make room, and its next message starts fresh with the conversation so far.
+Only with no idle pod is the turn refused, with the notice it always had. A conversation running
+anything (a task, a stopped task finishing, a delegated child whose wake will need the pod) is
+never evicted; each candidate is re-checked under its own conversation's lock, and a lock that is
+held means busy. A reused pod that its conversation's record names neither as its pod nor as the
+session of a running task (a retirement whose delete failed, or a turn whose last record write was
+lost and whose task has since ended) never exits on its own, so it goes first, with no notice,
+and Sweep deletes it anyway within a minute.
 
 **One rule for every pod the gateway deletes itself** (stated once here because four
 paths reach it - reap, Sweep, Delegate, and any future one): if the pod is running a
@@ -667,9 +733,10 @@ downward-API file from its own annotation, and the worker puts it ahead of the n
 framed as history rather than instructions. The annotation is readable by anyone who can get
 pods in the install namespace, and the copy of the user's text on it isn't cleared at
 `A2A_ASK_TTL` the way session-state's is; it goes when the pod is reaped. Earlier results were
-already on the same annotation. Moving the primer to a per-pod Secret is tracked separately. If the harness's own session file
-happens to survive (it usually won't), `--resume` is a shortcut - correctness never
-depends on it; session files are cache, the stream is the record. Task-stream retention bounds how far
+already on the same annotation. Moving the primer to a per-pod Secret is tracked separately. Inside
+a live pod the shim resumes the harness's own session from turn to turn (`--resume`, Stream above);
+the session file goes with the pod, and correctness never depends on it - session files are cache,
+the stream is the record. Task-stream retention bounds how far
 back rehydration reaches (72h placeholder in the payload spec). I think that's a
 feature: a three-day-silent thread restarting with fresh context is better than a bot
 that suddenly remembers June. If review disagrees, the fix is a compacted transcript
@@ -685,7 +752,10 @@ task whose executor died mid-work, `canceled` where the task had already detache
 the gateway is finishing a cancel the requester published. Sweep reaches detached
 tasks routinely - a worker that exits or wedges after a `stop` leaves exactly this
 shape - so an unconditional `failed` here would report broken for every task a user
-stopped, which is the distinction the rule exists to keep.
+stopped, which is the distinction the rule exists to keep. A pod that served several turns
+names only its first task in its annotations (the gateway has no `patch` on pods), so Sweep also
+reads the conversation's record and closes the task it holds as active when that task ran on this
+pod: a pod that dies on turn N closes turn N.
 
 ## Requester identity on the bus
 
@@ -1141,8 +1211,8 @@ that treated the three alike is what this value exists to stop.
    it exists so that `kubectl port-forward svc/<cr>-a2a-inject` resolves to the pod and the
    port.
 5. **While it is armed, a NetworkPolicy fences the gateway pod against every pod on the cluster
-   network**: one ingress rule, which admits the managed-Prometheus collector's namespace to
-   the metrics-only port and nothing to the door (see "Metrics" below). The gateway's own fence, which renders on every next gateway whether or not a door is armed, admits the same, so this copy is the door's record of the intent rather than the pod's only fence. It is a second control over the edge the bind already
+   network**: two ingress rules, which admit the managed-Prometheus collector's namespace and the
+   operator's pods to the metrics-only port and nothing to the door (see "Metrics" below). The gateway's own fence, which renders on every next gateway whether or not a door is armed, admits the same, so this copy is the door's record of the intent rather than the pod's only fence. It is a second control over the edge the bind already
    closes, kept so that a reader of the rendered objects sees the intent and so that a later
    change to the bind address does not open the pod network by itself. Neither it nor the bind
    governs the port-forward, which the kubelet serves from inside the pod's network namespace;
@@ -2054,8 +2124,10 @@ constant (`a2aGatewayMetricsPort`), and the chart's `<name>-a2a-gateway-monitori
 `PodMonitoring` scrapes 9096 every 30 seconds behind the `platformAgent.podMonitoring` switch. The
 gateway's own NetworkPolicy, `<name>-a2a-gateway-netpol`, renders wherever the gateway Deployment
 does, door or no door, including a gateway scaled to zero replicas for want of a backend (only the
-stack's teardown removes it), and admits one peer: the `gke-gmp-system` namespace, to 9096 alone, the
-broker's second rule with the gateway's port in it. Each armed door renders a copy under its own
+stack's teardown removes it), and admits two peers, to 9096 alone: the `gke-gmp-system` namespace, the
+broker's second rule with the gateway's port in it, and the operator's pods from the operator's
+namespace, the rule the broker's and the Hermes gateway's policies carry for the usage poller,
+which reads the gateway's inbound-message counter. Each armed door renders a copy under its own
 name, and the doors' ports admit no pod. The gateway's fence used to render only with a door, which
 left the metrics port, bound on every interface, reachable from the whole pod network on an install
 with neither door armed; it renders on every `next` install now so that it is not (decided
@@ -2073,8 +2145,11 @@ text, so nothing a chat user or an executor sends can mint a series:
 | `kubeagents_a2a_gateway_gchat_pulls_total`           | `outcome`: `events`, `empty`, `failed`                                                                                                           | Pulls of the Chat relay: one that returned an event, one that returned nothing, one the relay refused or that never answered. The same counts as the 15-minute `gchat events received` line, without the reset.                                                                                                                                                                                                                                                                                                                                                                              |
 | `kubeagents_a2a_gateway_chat_messages_total`         | `outcome`: `rendered`, `text_only`, `refused`, `invalid`                                                                                         | Each `kube-agents.chat/v1` message the gateway hands an adapter, and each it drops, on the relay and on a conversation notify ("Chat messages" under the Slack adapter): laid out by the backend; posted as its text by a backend that renders none; refused by a backend that does (too large for it, or its API said no) and posted as its text; or, under `invalid`, dropped for a broken rule with the text standing, or a bad `mark` dropped alone with the layout still rendering. Counted per hand-over, so a live message laid out again on each progress artifact counts each time. |
 | `kubeagents_a2a_gateway_notify_marks_dropped_total`  | none                                                                                                                                             | Conversation notify marks dropped because they name no chain (no `update` key bound to one) while a chain runs in the conversation ("Chat messages" under the Slack adapter).                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `kubeagents_a2a_gateway_messages_inbound_total`      | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`                                                                                 | Each chat message the gateway accepted as a turn, counted in `handleInbound` before the sender is verified, so a message from a sender the principal map does not know counts, as the `chat_metrics` plugin counts the Hermes-side ingress before its allowlist; the doors' turns (inject, a2a, a2a-google) are programs' and are not counted. The operator's usage poller reads it into `status.usage.chatMessagesInboundTotal` beside the plugin's series.                                                                                                                                 |
 
-Every series is created at zero, so a `rate()` over a state that has not happened reads 0
+The body also carries `process_start_time_seconds`, captured once at start and never
+re-derived, which the operator's usage poller reads to tell an in-place restart from a counter
+that fell. Every series is created at zero, so a `rate()` over a state that has not happened reads 0
 rather than no data. A pull carries at most one event today, so `gchat_events_received_total`
 equals `gchat_pulls_total{outcome="events"}`; they are separate so the first keeps its meaning if a
 pull ever returns more than one. An install that Chat publishes nothing to shows `empty` rising

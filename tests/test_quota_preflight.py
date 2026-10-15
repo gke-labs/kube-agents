@@ -1721,10 +1721,13 @@ class DocumentedFootprintTest(unittest.TestCase):
         )
         self.assertRegex(page, standing_delta_pattern)
 
-        # Assert a2a-worker session pod requests, limits, and delegate-triggered spawn bound:
+        # Assert a2a-worker session pod requests, limits, and what spawns one (a delegate:,
+        # or a /session conversation, which keeps its pod across turns):
         worker_mem_limit_prose = worker_mem_limit.replace("Gi", " GiB")
         worker_clause = (
-            rf"each `delegate:` from chat \(and nothing else, by default\) spawns an "
+            rf"each `delegate:` from chat, and each conversation moved to `/session` "
+            rf"\(one pod for the whole conversation, kept until it has been idle 30 minutes "
+            rf"or for 4 hours at most\), spawns an "
             rf"`a2a-worker` session pod requesting {re.escape(worker_cpu)} CPU "
             rf"and {re.escape(worker_mem)} memory \(limits {re.escape(worker_cpu_limit)} CPU, "
             rf"(?:{re.escape(worker_mem_limit)}|{re.escape(worker_mem_limit_prose)})\), "

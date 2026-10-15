@@ -57,18 +57,29 @@ const (
 	// session pod whose spawner dropped its session name still fails at
 	// startup rather than publishing as its profile.
 	EnvProfileExecutor = "A2A_PROFILE_EXECUTOR"
-	// EnvDelegateTool turns the session's delegate tool off when it is
-	// "off". The spawner sets it on a wake turn's pod: the wake exists to
-	// report a delegation's outcome, and a wake that delegates again on an
-	// interim answer ("still running, results will post here") loops until
-	// the depth bound refuses, with nothing answered.
-	EnvDelegateTool = "A2A_DELEGATE_TOOL"
 	// EnvPrimerFile names the file the spawner mounts the conversation's
 	// transcript primer at (the pod's rehydration-primer annotation, through
-	// the downward API). Every turn is a fresh pod, so this is how one picks
-	// up the conversation it is continuing. Unset, or an empty file, is a
-	// conversation with nothing before this turn.
+	// the downward API). A pod spawned cold for a conversation that already
+	// has turns (after a reap, or when the gateway could not reuse the live
+	// pod) picks up the conversation it is continuing from it. Unset, or an
+	// empty file, is a conversation with nothing before this turn.
 	EnvPrimerFile = "A2A_PRIMER_FILE"
+	// EnvDelegateTool turns the session's delegate tool off when it is
+	// "off". The spawner sets it off on a one-task pod started for a wake
+	// turn: the wake exists to report a delegation's outcome, and a wake that
+	// delegates again on an interim answer ("still running, results will post
+	// here") loops until the depth bound refuses, with nothing answered. A
+	// reused pod runs wakes and human turns alike, so it is started with the
+	// tool on, and its adapter turns the tool off for each task that is a
+	// wake, from the submission's authority block.
+	EnvDelegateTool = "A2A_DELEGATE_TOOL"
+	// EnvSessionReuse is "true" on a session pod that serves every turn of
+	// its conversation rather than one task: after the task named by
+	// TASK_ID it takes each new task from its own `…in` subjects. The
+	// gateway routes a second task only to a pod it spawned with this set,
+	// so a pod from an older spawner, which exits after one task, is never
+	// sent one.
+	EnvSessionReuse = "A2A_SESSION_REUSE"
 )
 
 const (
