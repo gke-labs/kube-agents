@@ -145,12 +145,13 @@ __INLINE_HEALTH__
 
   /* numbers */
   .tiles { display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin-top:12px; }
+  .tiles.six { grid-template-columns:repeat(6,1fr); }
   .tile { background:var(--surface-1); border:1px solid var(--line); border-radius:12px; padding:14px 16px 12px; box-shadow:var(--shadow); }
   .tile .k { font-size:11px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--text-muted); }
   .tile .v { font:800 26px/1.2 'DM Mono',ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:-.02em; margin-top:6px; font-variant-numeric:tabular-nums; }
   .tile .v small { font-size:12px; color:var(--text-muted); font-weight:600; margin-left:4px; }
   .tile .d2 { font-size:11.5px; color:var(--text-muted); margin-top:6px; font-weight:550; }
-  @media (max-width:720px) { .tiles { grid-template-columns:repeat(2,1fr); } .runrow { grid-template-columns:56px 1fr; } }
+  @media (max-width:720px) { .tiles, .tiles.six { grid-template-columns:repeat(2,1fr); } .runrow { grid-template-columns:56px 1fr; } }
 
   /* PR view cards */
   .case { background:var(--surface-1); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin-bottom:12px; box-shadow:var(--shadow); }
@@ -191,6 +192,7 @@ __INLINE_HEALTH__
   table.cases tr.hl td { background:var(--accent-soft); }
   table.cases tr.dim td { color:var(--text-muted); }
   td.nm { font:500 13px ui-monospace,SFMono-Regular,Menlo,monospace; white-space:nowrap; }
+  td.tm { white-space:nowrap; }
   td.nm small { display:block; font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; color:var(--text-muted); margin-top:2px; }
   .spark { display:flex; gap:2px; align-items:flex-end; height:18px; }
   .spark i { display:block; width:5px; height:100%; border-radius:1px; background:var(--good); opacity:.55; }

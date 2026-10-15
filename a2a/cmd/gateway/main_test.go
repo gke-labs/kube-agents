@@ -231,6 +231,14 @@ func (f *fakePrimary) Edit(conversation, messageID, text string) error {
 	return nil
 }
 
+func (f *fakePrimary) PostMessage(conversation string, m gateway.OutMessage) (string, error) {
+	return f.Post(conversation, m.Text)
+}
+
+func (f *fakePrimary) EditMessage(conversation, messageID string, m gateway.OutMessage) error {
+	return nil
+}
+
 func (f *fakePrimary) Roster(conversation string) ([]string, bool, error) {
 	return nil, true, nil
 }
@@ -238,6 +246,9 @@ func (f *fakePrimary) Roster(conversation string) ([]string, bool, error) {
 func (f *fakePrimary) OpenDirect(userID string) (string, error) {
 	return "", nil
 }
+
+func (f *fakePrimary) React(string, string, string) error          { return nil }
+func (f *fakePrimary) RemoveReaction(string, string, string) error { return nil }
 
 // TestBuildAdaptersIncludesTheConsole proves buildAdapters wires both the
 // configured chat backend and the console adapter behind one mux: a post to
@@ -443,6 +454,8 @@ type stubConversations struct{}
 
 func (stubConversations) ConversationContext(context.Context, string) (string, error) { return "", nil }
 func (stubConversations) Post(string, string) (string, error)                         { return "", nil }
+func (stubConversations) PostMessage(string, gateway.OutMessage) (string, error)      { return "", nil }
+func (stubConversations) EditMessage(string, string, gateway.OutMessage) error        { return nil }
 
 // The chat.notify route arms for a Google Chat or Slack backend with or without a home
 // channel, always with the gateway's conversations behind it (a kanban

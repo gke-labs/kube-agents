@@ -1,0 +1,44 @@
+{
+  "name": "plan-markup-stays-raw",
+  "source": "agents/platform/scripts/test_slack_status.py::PlanTest.test_text_escapes_slack_markup",
+  "notes": "Fields carry the raw text. Escaping is the renderer's, so no field can mention anyone or relabel a link. Steps are the card's notes, unmarked: the renderer draws today's ✓ and ◌ from the item's status (the last step of an in_progress item is the open one).",
+  "input": {
+    "title": null,
+    "rows": [
+      {
+        "task_id": "t_a",
+        "title": "R&D: roll back",
+        "lines": [
+          "see <!here> <https://evil.example|docs>"
+        ],
+        "status": "in_progress",
+        "note": "see <!here> <https://evil.example|docs>",
+        "steps": 1
+      }
+    ]
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "plan": {
+          "title": "R&D: roll back",
+          "items": [
+            {
+              "id": "t_a",
+              "title": "see <!here> <https://evil.example|docs>",
+              "status": "in_progress",
+              "steps": [
+                "see <!here> <https://evil.example|docs>"
+              ],
+              "stepCount": 1,
+              "note": "see <!here> <https://evil.example|docs>"
+            }
+          ]
+        }
+      },
+      "update": "plan"
+    }
+  ]
+}

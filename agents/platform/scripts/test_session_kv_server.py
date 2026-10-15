@@ -228,6 +228,19 @@ class TestSessionKvServerApi(unittest.TestCase):
         self.assertEqual(meta["conversation_route"]["conversation"], "slack:C1/1712.0001")
         self.assertTrue(meta["kept"])
 
+    def test_a_route_keeps_the_asks_kind_when_it_is_a_token(self):
+        # The bridge sends the kind of the turn's ask, which the kanban
+        # notifier's chat messages keep marked while the cards run; anything
+        # but a mark token is dropped, and the route is still recorded.
+        sid = "a2a-ctx-0123abcd"
+        body = {"platform": "slack", "conversation": "slack:dm/D123", "context_id": "ctx-0123abcd", "ask": "fleet"}
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200)
+        self.assertEqual(self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"]["ask"], "fleet")
+        for bad in ("Fleet", "x" * 17, "a b"):
+            body["ask"] = bad
+            self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200, bad)
+            self.assertNotIn("ask", self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"], bad)
+
     def test_a_hashed_session_takes_its_own_context(self):
         # The bridge hashes a context id that is not path-safe
         # (a2a/hermes-bridge/api.go, apiSessionID); the route is accepted for
@@ -998,20 +1011,20 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         return alert
 
     def test_a_slack_thread_gets_the_slack_text_and_the_title(self):
-        alert = self._run(lambda platform, _msg: None if platform == "google_chat" else "1712345678.000100")
+        alert = self._run(lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100")
         self.assertEqual([c.args for c in alert.call_args_list],
-                         [("google_chat", "alert"), ("slack", "slack alert")])
+                         [("google_chat", "alert", "s1"), ("slack", "slack alert", "s1")])
         session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
 
     def test_the_title_is_recorded_before_the_turn_starts(self):
         session_kv_server._start_agent_turn.side_effect = (
             lambda *_args: session_kv_server._record_alert_title.assert_called_once_with("s1", "the title"))
-        self._run(lambda platform, _msg: None if platform == "google_chat" else "1712345678.000100")
+        self._run(lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100")
         session_kv_server._start_agent_turn.assert_called_once()
 
     def test_a_google_chat_thread_gets_neither(self):
-        alert = self._run(lambda _platform, _msg: "spaces/AAA/threads/T1")
-        self.assertEqual([c.args for c in alert.call_args_list], [("google_chat", "alert")])
+        alert = self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
+        self.assertEqual([c.args for c in alert.call_args_list], [("google_chat", "alert", "s1")])
         session_kv_server._record_alert_title.assert_not_called()
 
 
@@ -1701,21 +1714,21 @@ class TestAlertPlatformFallback(unittest.TestCase):
 
     def test_a_dead_first_leg_does_not_cost_the_alert(self):
         alert = self._run(
-            lambda platform, _msg: None if platform == "google_chat" else "1712345678.000100")
+            lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100")
         self.assertEqual([c.args[0] for c in alert.call_args_list], ["google_chat", "slack"])
         session_kv_server._register_session_routing.assert_called_once_with(
             "s1", "slack", "1712345678.000100")
         session_kv_server.mark_delivery_failed.assert_not_called()
 
     def test_the_first_leg_wins_when_it_works(self):
-        alert = self._run(lambda _platform, _msg: "spaces/AAA/threads/T1")
+        alert = self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
         self.assertEqual([c.args[0] for c in alert.call_args_list], ["google_chat"],
                          "a working first leg must not also post to the second")
         session_kv_server._register_session_routing.assert_called_once_with(
             "s1", "google_chat", "spaces/AAA/threads/T1")
 
     def test_every_leg_failing_is_still_recorded_as_undelivered(self):
-        self._run(lambda _platform, _msg: None)
+        self._run(lambda _platform, _msg, _session: None)
         session_kv_server._register_session_routing.assert_not_called()
         session_kv_server.mark_delivery_failed.assert_called_once()
         detail = session_kv_server.mark_delivery_failed.call_args.args[1]
@@ -1731,7 +1744,7 @@ class TestAlertPlatformFallback(unittest.TestCase):
         and taking `platforms[0]` directly would emit nothing at all.
         """
         with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
-            self._run(lambda _platform, _msg: "spaces/AAA/threads/T1")
+            self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
         picked = [line for line in logs.output if "will not receive it" in line]
         self.assertEqual(len(picked), 1, "exactly one warning, on the pick")
         self.assertIn("google_chat", picked[0])
@@ -1745,7 +1758,7 @@ class TestAlertPlatformFallback(unittest.TestCase):
         is recorded as unconfirmed instead.
         """
         alert = self._run(
-            lambda platform, _msg: session_kv_server.ALERT_SENT_WITHOUT_THREAD
+            lambda platform, _msg, _session: session_kv_server.ALERT_SENT_WITHOUT_THREAD
             if platform == "google_chat" else "1712345678.000100")
         self.assertEqual(
             [c.args[0] for c in alert.call_args_list], ["google_chat"],
@@ -3620,6 +3633,80 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual([c.args for c in calls], [("slack", self.ONE_LINE, "", "")])
 
+    #: A fleet-audit report that could not write its ledger, as the agent relayed it (no GitOps repository).
+    FAILED = (
+        "Here is the scheduled workload reliability audit report from the platform agent:\n\n"
+        "**What's wrong** — The daily workload reliability audit could not run because no GitOps repository "
+        "is registered.\n**Why**\n- The ConfigMap contains no `managed_repos` entries.\n"
+        "**What to do**\n- Register your GitOps repository in the ConfigMap.\n"
+    )
+    FAILED_LINE = "The daily workload reliability audit could not run because no GitOps repository is registered."
+
+    def test_flag_on_a_failed_audit_posts_one_line_and_stores_the_report(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        response, calls = self._post(composed=self.FAILED, job_id="reliability")
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual([c.args for c in calls], [("slack", self.FAILED_LINE, "", "")])
+        self.fetch.assert_not_called()
+        # A reply in the thread still gets the whole report.
+        self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.FAILED.strip())])
+
+    def test_under_next_a_failed_audit_is_its_line_with_the_report_folded(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
+        with patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("7.7")
+        ) as via:
+            response, calls = self._post(composed=self.FAILED, job_id="reliability")
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        chat, text = via.call_args.args[2:4]
+        self.assertEqual(chat["detail"], self.FAILED_LINE)
+        self.assertEqual(chat["fold"], {"title": "why", "text": self.FAILED.strip()})
+        self.assertEqual(text, self.FAILED.strip())
+
+    def test_under_next_a_failed_audit_whose_card_did_not_post_goes_out_whole(self):
+        # A reply cannot bring the report back under next, so the line alone would lose it.
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
+        with patch.object(session_kv_server, "_post_audit_chat_via_gateway", return_value=None):
+            _, calls = self._post(composed=self.FAILED, job_id="reliability")
+        self.assertEqual([c.args for c in calls], [("slack", self.FAILED.strip(), "", "")])
+
+    def test_flag_off_a_failed_audit_posts_the_report(self):
+        os.environ["KAGE_SLACK_UX"] = "false"
+        _, calls = self._post(composed=self.FAILED, job_id="reliability")
+        self.assertEqual([c.args for c in calls], [("slack", self.FAILED.strip(), "", "")])
+
+    def test_flag_on_a_failed_report_from_a_job_that_is_not_an_audit_is_unchanged(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        _, calls = self._post(composed=self.FAILED, fleet_audit=False, job_id="drift-fixer")
+        self.assertEqual([c.args for c in calls], [("slack", self.FAILED.strip(), "", "")])
+
+    def test_flag_on_a_failed_audit_is_one_line_on_slack_only(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        _, calls = self._post(composed=self.FAILED, platforms=("slack", "google_chat"), job_id="reliability")
+        self.assertEqual(
+            sorted(c.args[:2] for c in calls),
+            [("google_chat", self.FAILED.strip()), ("slack", self.FAILED_LINE)],
+        )
+
+    def test_flag_on_a_truncated_failed_audit_keeps_its_notice_and_the_report(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        over = self.FAILED + "\n" + "x" * 50
+        with patch.object(session_kv_server, "CRON_REPORT_MAX_CHARS", len(self.FAILED)):
+            _, calls = self._post(composed=over, job_id="reliability")
+        posted = calls[0].args[1]
+        self.assertTrue(posted.startswith("[truncated]"), posted[:40])
+        self.assertIn("**What to do**", posted)
+
+    def test_flag_on_a_failed_line_error_posts_the_report(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        with patch.object(session_kv_server.slack_audit_report, "failed_line", side_effect=ValueError("boom")):
+            response, calls = self._post(composed=self.FAILED, job_id="reliability")
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual([c.args for c in calls], [("slack", self.FAILED.strip(), "", "")])
+
     def test_managed_repositories_unreadable_is_not_managed(self):
         with patch("gitops_workspace.get_managed_github_repos", side_effect=RuntimeError("no kubectl")):
             self.assertFalse(session_kv_server._is_managed_github_repo("acme/fleet-config"))
@@ -3628,6 +3715,18 @@ class TestSlackAuditHeadline(unittest.TestCase):
         with patch("gitops_workspace.get_managed_github_repos", return_value=["Acme/Fleet-Config"]):
             self.assertTrue(session_kv_server._is_managed_github_repo("acme/fleet-config"))
             self.assertFalse(session_kv_server._is_managed_github_repo("evil/phish"))
+
+    def test_an_enterprise_repository_is_checked_against_the_managed_list_on_its_host(self):
+        # A ledger on a GitHub Enterprise Server host is named `<host>/owner/name`,
+        # as the managed list names it; another host's is never managed here.
+        host = "ghe.example.com"
+        with patch("gitops_workspace.github_host", return_value=host), \
+                patch("gitops_workspace.get_managed_repos", return_value=[f"{host}/Acme/Infra"]), \
+                patch("gitops_workspace.get_managed_github_repos", return_value=["acme/web"]):
+            self.assertTrue(session_kv_server._is_managed_github_repo(f"{host}/acme/infra"))
+            self.assertFalse(session_kv_server._is_managed_github_repo("ghe.other.example/acme/infra"))
+            self.assertTrue(session_kv_server._is_managed_github_repo("acme/web"))
+            self.assertFalse(session_kv_server._is_managed_github_repo("acme/infra"))
 
     def test_a_forge_failure_reads_as_no_issue(self):
         import forge
@@ -5542,7 +5641,7 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
                     session_id="k8s-evt-next",
                 )
                 session_kv_server.trigger_agent_troubleshooter("k8s-evt-next", "alert", {}, next_row_id)
-                mock_post.assert_called_once_with("google_chat", "alert")
+                mock_post.assert_called_once_with("google_chat", "alert", "k8s-evt-next")
                 mock_route.assert_called_once_with("k8s-evt-next", "google_chat", "spaces/A/threads/T-next")
 
         # Toggling chat back on later must not flip either historical row's status.

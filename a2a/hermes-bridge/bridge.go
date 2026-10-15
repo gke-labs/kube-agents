@@ -37,6 +37,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 const (
@@ -349,6 +350,11 @@ type taskRun struct {
 	// under b.mu, while the worker writes it under mu - the two locks never
 	// nest, on purpose.
 	act atomic.Pointer[activityState]
+
+	// routeRecorded says this task's conversation route is in session-kv
+	// (route.go), the one way a card it files reports back; set by the api
+	// executor before its first turn, never by the cli one.
+	routeRecorded atomic.Bool
 }
 
 // Bridge is one running instance. Two connections by design: the lib client
@@ -407,8 +413,9 @@ type Bridge struct {
 	// it while a cancel lands, without a bus that misbehaves on cue.
 	publishTurn func(ctx context.Context, run *taskRun, artifactID, text string) error
 	// resultPublish publishes a task's result artifact, publishResult by
-	// default; a field so a test can fail it.
-	resultPublish func(ctx context.Context, run *taskRun, output string) error
+	// default; a field so a test can fail it. chat, when set, is the
+	// kube-agents.chat/v1 DataPart the last chunk carries (chat.go).
+	resultPublish func(ctx context.Context, run *taskRun, output string, chat []byte) error
 
 	// apiClient is the API executor's HTTP client (api.go).
 	apiClient *http.Client
@@ -1645,7 +1652,15 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	run.state = stateDone
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
 	if resultOutput != nil {
-		if err := b.resultPublish(ctx, run, *resultOutput); err != nil && copyOnly {
+		// The answer folded for a chat renderer, on a completed task only:
+		// any other state's result is a copy beside the terminal's reason.
+		var chat []byte
+		if state == lib.StateCompleted {
+			if part, ok := resultChatPart(*resultOutput); ok {
+				chat = part.Data
+			}
+		}
+		if err := b.resultPublish(ctx, run, *resultOutput, chat); err != nil && copyOnly {
 			b.cfg.Logger.Error("result publish failed; the answer is on the stream as a turn, so the terminal keeps its state",
 				"task", run.origin.TaskID, "state", state, "err", err)
 		} else if err != nil {
@@ -1675,9 +1690,46 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 
 func (b *Bridge) publishTerminal(ctx context.Context, run *taskRun, state lib.TaskState, msg string) error {
 	if msg == "" {
+		if part, ok := cardsMark(run, state); ok {
+			return b.publishStatusParts(ctx, run, state, true, []lib.Part{part})
+		}
 		return run.exec.PublishStatus(ctx, state, true)
 	}
 	return b.publishStatusMessage(ctx, run, state, true, msg)
+}
+
+// cardsMark is the terminal's mark-only chat message for a completed turn
+// that filed kanban cards: the ask stays marked, so the terminal's no-mark
+// default does not take it off at the acknowledgement, and the cards'
+// notifies settle it (spec-a2a-payloads, "Card work after the task ends").
+// The one carrier with no text fallback. Only where something settles it:
+// the kanban notifier's Slack plan (deploy/docker/patches/slack_ux_status.py)
+// carries the cards' mark, for a Slack conversation with KAGE_SLACK_UX on,
+// which the bridge reads from the agent environment it inherits, and only
+// when the task's route was recorded, without which no card post reaches the
+// conversation. Anywhere else the terminal keeps the default and takes the
+// ask off.
+func cardsMark(run *taskRun, state lib.TaskState) (lib.Part, bool) {
+	a := run.act.Load()
+	if state != lib.StateCompleted || a == nil || !a.cardsFiled.Load() || !run.routeRecorded.Load() ||
+		!cardsSettleTheAsk(run.origin) {
+		return lib.Part{}, false
+	}
+	part, err := chatmsg.MarkPart(chatmsg.Mark{Ask: run.askKind()})
+	return part, err == nil
+}
+
+// cardsSettleTheAsk reports whether the cards of origin's conversation carry
+// the ask's settle: a Slack conversation, with KAGE_SLACK_UX on.
+func cardsSettleTheAsk(origin *lib.Envelope) bool {
+	route, err := routeFor(origin)
+	return err == nil && route.Platform == lib.NotifyPlatformSlack && slackUXOn()
+}
+
+// askKind is the mark.ask token for the task's prompt (chat.go).
+func (r *taskRun) askKind() string {
+	prompt, _ := promptFromMessage(r.origin.Payload)
+	return askKind(prompt)
 }
 
 // errRunEnded is publishWorking finding the run already finalized: there is
@@ -1745,39 +1797,63 @@ func (b *Bridge) publishStatusParts(ctx context.Context, run *taskRun, state lib
 	return b.c.Publish(ctx, lib.TaskEventsSubject(b.cfg.Profile, origin.TaskID), env)
 }
 
-// publishResult ships stdout as the result artifact.
-func (b *Bridge) publishResult(ctx context.Context, run *taskRun, output string) error {
-	return b.publishTextArtifact(ctx, run, "artifact-"+run.origin.TaskID+"-result", lib.ArtifactResult, output)
+// publishResult ships stdout as the result artifact, with chat, when set, on
+// its last chunk.
+func (b *Bridge) publishResult(ctx context.Context, run *taskRun, output string, chat []byte) error {
+	return b.publishChunks(ctx, run, "artifact-"+run.origin.TaskID+"-result", lib.ArtifactResult, output, chat)
 }
 
 // publishTextArtifact ships text as one artifact, chunked per A2A rules so
 // one huge answer never trips the max-message-size gate.
 func (b *Bridge) publishTextArtifact(ctx context.Context, run *taskRun, artifactID, name, text string) error {
+	return b.publishChunks(ctx, run, artifactID, name, text, nil)
+}
+
+// publishChunks is publishTextArtifact with a chat message's DataPart beside
+// the last chunk's text. A last chunk the bus refuses as too large with it
+// goes out without it: the text is the deliverable (spec-a2a-payloads, "Chat
+// messages", Size).
+func (b *Bridge) publishChunks(ctx context.Context, run *taskRun, artifactID, name, text string, chat []byte) error {
 	chunks := chunkString(text, b.cfg.ResultChunkSize)
 	for i, chunk := range chunks {
-		payload, err := json.Marshal(lib.ArtifactUpdate{
-			TaskID:    run.origin.TaskID,
-			ContextID: run.origin.ContextID,
-			Artifact: lib.Artifact{
-				ArtifactID: artifactID,
-				Name:       name,
-				Parts:      []lib.Part{{Kind: "text", Text: chunk}},
-			},
-			Append:    i > 0,
-			LastChunk: i == len(chunks)-1,
-		})
-		if err != nil {
-			return err
+		last := i == len(chunks)-1
+		parts := []lib.Part{{Kind: "text", Text: chunk}}
+		if last && len(chat) > 0 {
+			parts = append(parts, lib.Part{Kind: "data", Data: chat})
 		}
-		env, err := lib.NewArtifactUpdateEnvelope(b.from, run.origin.TaskID, run.origin.ContextID, run.origin.CorrelationID, payload)
-		if err != nil {
-			return err
+		err := b.publishChunk(ctx, run, artifactID, name, parts, i > 0, last)
+		var refused *lib.A2AError
+		if err != nil && len(parts) > 1 && errors.As(err, &refused) && refused.Code == lib.CodeInvalidParams {
+			b.cfg.Logger.Warn("result too large with its chat message; published as text", "task", run.origin.TaskID, "err", err)
+			err = b.publishChunk(ctx, run, artifactID, name, parts[:1], i > 0, last)
 		}
-		if err := b.c.Publish(ctx, lib.TaskEventsSubject(b.cfg.Profile, run.origin.TaskID), env); err != nil {
+		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (b *Bridge) publishChunk(ctx context.Context, run *taskRun, artifactID, name string, parts []lib.Part, appended, last bool) error {
+	payload, err := json.Marshal(lib.ArtifactUpdate{
+		TaskID:    run.origin.TaskID,
+		ContextID: run.origin.ContextID,
+		Artifact: lib.Artifact{
+			ArtifactID: artifactID,
+			Name:       name,
+			Parts:      parts,
+		},
+		Append:    appended,
+		LastChunk: last,
+	})
+	if err != nil {
+		return err
+	}
+	env, err := lib.NewArtifactUpdateEnvelope(b.from, run.origin.TaskID, run.origin.ContextID, run.origin.CorrelationID, payload)
+	if err != nil {
+		return err
+	}
+	return b.c.Publish(ctx, lib.TaskEventsSubject(b.cfg.Profile, run.origin.TaskID), env)
 }
 
 // killGroup SIGTERMs the subprocess group and arms a SIGKILL for the grace

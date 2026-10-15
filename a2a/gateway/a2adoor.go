@@ -1265,6 +1265,16 @@ func (d *A2ADoor) Edit(conversation, messageID, text string) error {
 	return nil
 }
 
+// PostMessage and EditMessage carry text only: a chat message falls back to
+// its text (ErrTextOnly).
+func (d *A2ADoor) PostMessage(conversation string, m OutMessage) (string, error) {
+	return postTextOnly(d.Post, conversation, m)
+}
+
+func (d *A2ADoor) EditMessage(conversation, messageID string, m OutMessage) error {
+	return editTextOnly(d.Edit, conversation, messageID, m)
+}
+
 // Roster is the caller alone, complete: one participant per conversation,
 // and no membership API behind the door to be incomplete about.
 func (d *A2ADoor) Roster(conversation string) ([]string, bool, error) {
@@ -1276,6 +1286,11 @@ func (d *A2ADoor) Roster(conversation string) ([]string, bool, error) {
 	}
 	return []string{conv.caller}, true, nil
 }
+
+// React and RemoveReaction: a program reads no reactions, so the door draws
+// no mark (Adapter).
+func (d *A2ADoor) React(string, string, string) error          { return nil }
+func (d *A2ADoor) RemoveReaction(string, string, string) error { return nil }
 
 // OpenDirect returns the conversation the caller last spoke on, for the
 // reason the inject door's does: there is no second surface to move to.

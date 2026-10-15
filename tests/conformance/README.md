@@ -360,3 +360,17 @@ suite once at the end: a run that ends red says so and exits non-zero.
 5. If it fails against current code, decorate it `@known_violation` with the
    invariant and the document that records the finding — and give its class a
    `..._precondition_...` test, which the self-check requires.
+
+## `chat/` holds data, not tests
+
+Each file in `chat/` pairs an input, lifted from a `today` presenter test or
+built to show a rule one pins, with the `kube-agents.chat/v1` messages the next-mode emitter owes for it. The payload
+spec gives its chat message assertions (27 and 28) this directory as their
+home, but they are wire-format rules rather than security invariants, so
+`run.py` and the self-check never read these files. The Go tests in
+`a2a/lib/chatmsg` validate every expected message, and
+`agents/platform/scripts/test_chat_cases.py` checks the files' shape under
+`make test-python`. The emitter runs every case: the kanban notifier's half in
+`deploy/docker/patches/test_chat_conformance.py`, and the hermes-bridge's half
+(the answer, and the ask's mark on its heartbeat and terminal) in
+`a2a/hermes-bridge/chat_test.go`.

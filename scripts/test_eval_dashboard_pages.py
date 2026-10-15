@@ -375,8 +375,13 @@ class HealthInputsTest(unittest.TestCase):
             render.normalize_health(health_doc("GREEN", pool=note))["pool"],
             {"verdict": "BREACH", "since": "2026-09-08T12:00:00+00:00", "measured_at": "2026-09-08T13:23:00+00:00",
              "day": "2026-09-07", "window_hours": None, "p50_s": 1320, "p95_s": 3660, "waiting_now": True,
-             "waiting_since": None, "over_threshold": 2, "threshold_p50_s": 900, "threshold_p95_s": 2700},
+             "waiting_since": None, "over_threshold": 2, "threshold_p50_s": 900, "threshold_p95_s": 2700,
+             "lease_failures": None, "lease_failures_hours": None},
         )
+        # The refusal count and its window reach the page as counts; anything
+        # else arrives as null, like the other numbers.
+        refused = render.normalize_health(health_doc("GREEN", pool=note | {"lease_failures": 26, "lease_failures_hours": "three"}))["pool"]
+        self.assertEqual((26, None), (refused["lease_failures"], refused["lease_failures_hours"]))
         # Dated like every other timestamp the page renders: a string that is
         # not one drops rather than reaching `new Date`.
         self.assertEqual("2026-09-08T16:45:00+00:00", render.normalize_health(health_doc("GREEN", pool=note | {"waiting_since": "2026-09-08T16:45:00+00:00"}))["pool"]["waiting_since"])
@@ -1251,6 +1256,20 @@ class BrowserTest(unittest.TestCase):
         live = dom_text(render_to(pathlib.Path(self.tmp.name) / "poollive", self.data,
                                   health=health_doc("GREEN", pool=note | {"day": None, "p50_s": None, "over_threshold": 3})) / "index.html")
         self.assertIn("Runs are waiting to start since Tue 8:00 AM ET: 3 runs queued past the 45 min limit.", live)
+        # A breach the refusals alone carry: no stretch, nothing queued, and
+        # before this the Brief said the gate was healthy while the chat alert
+        # for the same hour said the pool was full. The refusals are the clause.
+        refused = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolrefused", self.data,
+                                     health=health_doc("GREEN", pool=note | {"day": None, "p50_s": None, "waiting_now": False,
+                                                                              "lease_failures": 26, "lease_failures_hours": 3})) / "index.html")
+        self.assertIn("Runs were waiting to start since Tue 8:00 AM ET: 26 runs refused a project in the last 3h."
+                      " No backlog right now. A refused run did not start; retest once the pool has room.", refused)
+        self.assertNotIn("Runs still pass", refused.split("26 runs refused")[1][:200])
+        # Beside a live queue the refusals join it rather than displacing it.
+        both_kinds = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolrefusedqueue", self.data,
+                                        health=health_doc("GREEN", pool=note | {"day": None, "p50_s": None, "over_threshold": 3,
+                                                                                 "lease_failures": 2, "lease_failures_hours": 3})) / "index.html")
+        self.assertIn("3 runs queued past the 45 min limit; 2 runs refused a project in the last 3h.", both_kinds)
         # A `day` that is not a date never reaches the sentence -- render.py
         # drops it on shape, pages.js again on the way in -- and the live queue
         # is what is left to quote.
