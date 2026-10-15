@@ -2,9 +2,8 @@
 
 Run: python3 -m unittest agents/chat/scripts/test_oobe.py
 
-oobe imports gitops_workspace from agents/platform/scripts, which the image copies
-beside the chat scripts; the tests stand in for its repository list rather than
-reading this machine's /etc/gitops.
+The stage reads no repository list; the no-repository test stands in an empty one so a
+check that came back would be seen.
 """
 
 import contextlib
@@ -857,9 +856,12 @@ class StageTest(unittest.TestCase):
         """With no repository the audits run without a forge, so the chain starts as it would with one."""
         self._file_scan()
         _board(self.board, [_ranking("done")])
+        # Every reader the stage has used answers empty, so a repository check that came back
+        # would take its skip branch here rather than fail on a missing name.
         empty = types.ModuleType("gitops_workspace")
-        empty.get_managed_github_repos = lambda: []
-        empty.get_managed_repos = lambda: []
+        for reader in ("get_managed_github_repo_names", "get_managed_github_repos", "get_managed_repos"):
+            setattr(empty, reader, lambda: [])
+        empty.managed_repos_registered = lambda: False
         with mock.patch.dict(sys.modules, {"gitops_workspace": empty}):
             self._main()
         self.assertEqual(self._started_ids(), FIRST)
