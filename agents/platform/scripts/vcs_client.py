@@ -206,8 +206,13 @@ def _say_opened(answer: object) -> None:
         PROPOSAL_OPENED_KEY: PROPOSAL_OPENED_EVENT,
         "proposal": {field: proposal.get(field) for field in PROPOSAL_OPENED_FIELDS},
     }
+    # A process started with fd 2 closed has no `sys.stderr`, and `print` would then
+    # write to stdout, ahead of the one JSON document the callers print there.
+    stream = sys.stderr
+    if stream is None:
+        return
     try:
-        print(json.dumps(record, separators=(",", ":")), file=sys.stderr, flush=True)
+        print(json.dumps(record, separators=(",", ":")), file=stream, flush=True)
     except (OSError, TypeError, ValueError):
         pass
 

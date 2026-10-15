@@ -391,6 +391,13 @@ class ProposalOpenedRecordTest(unittest.TestCase):
                 vcs_client.call("proposal-create", {})
         self.assertEqual(stderr.getvalue(), "")
 
+    def test_with_no_stderr_nothing_reaches_stdout(self):
+        stdout = io.StringIO()
+        with mock.patch.object(vcs_client, "_call", lambda v, p: self.OPENED), \
+                mock.patch("sys.stderr", None), mock.patch("sys.stdout", stdout):
+            self.assertEqual(vcs_client.call("proposal-create", {}), self.OPENED)
+        self.assertEqual(stdout.getvalue(), "")
+
     def test_a_stderr_that_cannot_be_written_still_returns_the_answer(self):
         closed = io.StringIO()
         closed.close()
