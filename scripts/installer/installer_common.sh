@@ -1683,16 +1683,20 @@ refuse_apply_dropping_live_gitops() {
     say=print_warning
     lead="An applying run would be refused: "
   fi
-  "$say" "${lead}the PlatformAgent opens pull requests on ${live_repo} through the GitHub token minter, but ${file} does not set all of GITOPS_ORG, GITOPS_REPO and GITHUB_APP_ID, so this run renders GitOps off. The apply would destroy the minter (its Cloud KMS key, key ring and service account) and the agent would stop opening pull requests."
-  print_info "Append these lines to ${file}, then re-run the same command:"
-  [ -n "${GITOPS_ORG:-}" ] || print_info "  GITOPS_ORG=${live_org:-<the GitHub organization that owns ${live_repo}>}"
-  [ -n "${GITOPS_REPO:-}" ] || print_info "  GITOPS_REPO=${repo_name}"
-  if [ -z "${GITHUB_APP_ID:-}" ]; then
-    if [ -n "$app_id" ]; then
-      print_info "  GITHUB_APP_ID=${app_id}"
-    else
-      print_info "  GITHUB_APP_ID=<the number under \"App ID\" on the GitHub App's General settings page>"
-    fi
+  "$say" "${lead}the PlatformAgent opens pull requests on ${live_repo} through the GitHub token minter, but this run's GITOPS_ORG, GITOPS_REPO and GITHUB_APP_ID (from ${file}, or the installer's defaults where it sets none) do not carry it, so this run renders GitOps off. The apply would destroy the minter (its Cloud KMS key, key ring and service account) and the agent would stop opening pull requests."
+  print_info "Set these lines in ${file} (add them, or replace the ones it has), then re-run the same command:"
+  # Every key this run's value for does not match the live one: an empty key,
+  # and a default the run fell back to, alike.
+  if [ -z "$live_org" ]; then
+    [ -n "${GITOPS_ORG:-}" ] || print_info "  GITOPS_ORG=<the GitHub organization that owns ${live_repo}>"
+  elif [ "${GITOPS_ORG:-}" != "$live_org" ]; then
+    print_info "  GITOPS_ORG=${live_org}"
+  fi
+  [ "${GITOPS_REPO:-}" = "$repo_name" ] || print_info "  GITOPS_REPO=${repo_name}"
+  if [ -n "$app_id" ]; then
+    [ "${GITHUB_APP_ID:-}" = "$app_id" ] || print_info "  GITHUB_APP_ID=${app_id}"
+  elif [ -z "${GITHUB_APP_ID:-}" ]; then
+    print_info "  GITHUB_APP_ID=<the number under \"App ID\" on the GitHub App's General settings page>"
   fi
   print_info "To remove GitOps from this install on purpose, re-run with KUBE_AGENTS_REMOVE_GITOPS=true in the environment instead."
   [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0

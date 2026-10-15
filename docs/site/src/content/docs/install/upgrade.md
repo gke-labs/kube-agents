@@ -233,12 +233,11 @@ skips those — but still before any CRD, chart or Terraform change of the new r
   `--plan` warns of the same three without refusing.
 
 - **The apply would remove GitOps.** The PlatformAgent opens pull requests through the GitHub token
-  minter, but `install.env` does not set all of `GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID`, so
-  the run would render GitOps off and destroy the minter's Cloud KMS key, key ring and service
-  account. This is what an install whose GitOps came from `install.sh`'s flags looks like when it
+  minter, but `install.env` does not carry that repository in `GITOPS_ORG`, `GITOPS_REPO` and
+  `GITHUB_APP_ID`, so the run would render GitOps off and destroy the minter's Cloud KMS key, key
+  ring and service account. This is what an install whose GitOps came from `install.sh`'s flags looks like when it
   was set up by a release that did not record them in `install.env`. The run prints the lines to
-  append, with the live values filled in where it can read them; add them and re-run the same
-  command. To remove GitOps on purpose, re-run with `KUBE_AGENTS_REMOVE_GITOPS=true` in the
+  set, with the live values filled in where it can read them; set them and re-run the same command. To remove GitOps on purpose, re-run with `KUBE_AGENTS_REMOVE_GITOPS=true` in the
   environment. `--plan` warns instead.
 
 ## Where to go next

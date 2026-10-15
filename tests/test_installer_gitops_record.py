@@ -123,7 +123,7 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
         self.assertIn("rc=1", out, out + proc.stderr)
         self.assertIn("ERROR: Refusing to apply: the PlatformAgent opens pull requests on sackheads/ka-test-infra", out)
         self.assertIn("destroy the minter", out)
-        self.assertIn("INFO: Append these lines to /x/install.env, then re-run the same command:", out)
+        self.assertIn("INFO: Set these lines in /x/install.env (add them, or replace the ones it has), then re-run the same command:", out)
         for line in ("INFO:   GITOPS_ORG=sackheads", "INFO:   GITOPS_REPO=ka-test-infra", "INFO:   GITHUB_APP_ID=5319154"):
             self.assertIn(line + "\n", out)
 
@@ -133,6 +133,14 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
         self.assertNotIn("GITOPS_ORG=", proc.stdout)
         self.assertNotIn("GITOPS_REPO=", proc.stdout)
         self.assertIn("INFO:   GITHUB_APP_ID=5319154\n", proc.stdout)
+
+    def test_a_default_the_run_fell_back_to_is_corrected_to_the_live_value(self):
+        # install.sh with no GitOps keys auto-selects an organization and the
+        # default repository name; neither is the live one.
+        proc = self._run({"GITOPS_ORG": "someorg", "GITOPS_REPO": "gke-fleet-iac"})
+        self.assertIn("rc=1", proc.stdout)
+        for line in ("INFO:   GITOPS_ORG=sackheads", "INFO:   GITOPS_REPO=ka-test-infra", "INFO:   GITHUB_APP_ID=5319154"):
+            self.assertIn(line + "\n", proc.stdout)
 
     def test_an_unreadable_app_id_says_where_to_find_it(self):
         proc = self._run({}, app_id_b64="")
