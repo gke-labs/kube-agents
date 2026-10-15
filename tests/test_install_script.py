@@ -4744,6 +4744,22 @@ KMS_API_PROPAGATION_ATTEMPTS=3 retry_kms_create stub
         self.assertEqual(proc.returncode, 1)
         self.assertIn("Cloud KMS still rejects requests 3 attempts after enabling it", proc.stderr)
 
+    def test_sourcing_installer_common_then_lifecycle_does_not_fail_on_readonly_pattern(self):
+        """Sourcing installer_common.sh and then lifecycle.sh does not fail on KMS_API_PROPAGATION_PATTERN."""
+        lifecycle_sh = _REPO_ROOT / "terraform" / "examples" / "full-install" / "lifecycle.sh"
+        script = f"""
+source "{_INSTALLER_COMMON}"
+cd "{lifecycle_sh.parent}"
+KUBE_AGENTS_SOURCE_ONLY=true source "{lifecycle_sh}"
+"""
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
 
 class EnsureExistingClusterCmekKmsTest(unittest.TestCase):
     """ensure_existing_cluster_cmek retries KMS creates on first-enablement 403."""

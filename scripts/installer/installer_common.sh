@@ -1403,7 +1403,7 @@ tf_state_prefix() {
 # seconds before creating the key ring and key. An ERE, for grep -E: the API
 # has been named "Google Cloud KMS API" and "Cloud Key Management Service (KMS)
 # API" in this message, and both end the same way. Matching lifecycle.sh.
-readonly KMS_API_PROPAGATION_PATTERN='KMS\)? API has not been used in project'
+KMS_API_PROPAGATION_PATTERN="${KMS_API_PROPAGATION_PATTERN:-KMS\)? API has not been used in project}"
 KMS_API_PROPAGATION_ATTEMPTS="${KMS_API_PROPAGATION_ATTEMPTS:-5}"
 KMS_API_PROPAGATION_WAIT_SECONDS="${KMS_API_PROPAGATION_WAIT_SECONDS:-60}"
 
