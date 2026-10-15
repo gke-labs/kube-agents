@@ -224,13 +224,14 @@ and a manifest you add declares its object, so merging it keeps the object.
    `kind`, `metadata.name` and, for a namespaced object, `metadata.namespace`
    match. A namespace is also declared without a Namespace manifest: by
    objects placed in it, a `kustomization.yaml` whose `namespace:` names it, a
+   Flux `HelmRelease` or `Kustomization` whose `targetNamespace:` names it, a
    `namespaces/<name>/` directory (Config Sync's hierarchical layout), or an
    Argo CD `Application` with `CreateNamespace=true` deploying into it. Any of
-   those counts as declared.
+   those counts as declared. The search matches the key anywhere on the line,
+   so JSON and flow-style manifests are found too:
 
    ```bash
-   grep -rlE "^\s+name: [\"']?<name>[\"']?\s*(#.*)?$" <workspace>
-   grep -rlE "^\s*namespace: [\"']?<name>[\"']?\s*(#.*)?$" <workspace>
+   grep -rlE "[\"' {,]?(name|namespace|targetNamespace)[\"']?: *[\"']?<name>[\"']?([ ,}#]|$)" <workspace>
    find <workspace> -type d -path "*/namespaces/<name>"
    ```
 
@@ -263,7 +264,10 @@ and a manifest you add declares its object, so merging it keeps the object.
    ```
 
    - Argo CD prunes only with `spec.syncPolicy.automated.prune: true`; without
-     it the Application goes OutOfSync and someone syncs with prune.
+     it the Application goes OutOfSync and someone syncs with prune. A
+     namespace Argo CD created through `CreateNamespace=true` is never pruned,
+     even with the Application deleted: for that shape, say merging leaves the
+     namespace in place.
    - A Flux `Kustomization` prunes only with `spec.prune: true`.
    - Config Sync deletes the objects it applied when their file goes.
 
