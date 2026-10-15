@@ -180,6 +180,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-question-asked-to-choose-pauses",  # an asked-for choice pauses the card on a needs_input question
     "manage-cluster-exclusion-installer-route-probe",  # the exclusion route on an installer-made install
     "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
+    "not-found-target-stops-as-failure",  # a missing target stops its card on a hard wall, mock 06
     "helm-chart-no-reconciler-stops",  # gitops-helm-chart stops where nothing renders charts, #2938
 ]
 # Taken back out of the nightly file after registering there, each with a
