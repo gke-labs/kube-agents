@@ -7977,6 +7977,7 @@ _GROUP5 = {
             "1. seeded-a (us-central1-a)/seeded-shapes/cni-shaped-agent: host network: yes; host paths /host/etc/cni/net.d; coupled to the node image: yes",
                     "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d:ro; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /opt/cni/bin:/host/opt/cni/bin, /etc/cni/net.d:/host/etc/cni/net.d:ro; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: true; host paths /etc/cni/net.d; coupled to the node image: yes",
 ],
         [
             "seeded-a/seeded-shapes/cni-shaped-agent-legacy: host network: yes; host paths /etc/cni/net.d; coupled to the node image: yes",
@@ -7988,7 +7989,8 @@ _GROUP5 = {
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d, never mounted; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /var/run/docker.sock; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d; coupled to the node image: no",
-        ],
+                    "seeded-a/seeded-shapes/cni-shaped-agent: host network: false; host paths /etc/cni/net.d; coupled to the node image: yes",
+],
         "No DaemonSet outside kube-system on the seeded clusters uses host networking or mounts a host path.",
     ),
     "upgrades-cuda-pinned-gpu-job-named": (
@@ -8213,7 +8215,8 @@ _GROUP4 = {
             "- `seeded-a/seeded-shapes/node-runtime-probe`: runtime socket mounted: yes; path `/run/containerd/containerd.sock`.",
             "**seeded-a/seeded-shapes/node-runtime-probe**: runtime socket mounted: yes; path /run/containerd/containerd.sock",
             "1. seeded-a (us-central1-a)/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock",
-        ],
+                    "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock:ro",
+],
         [
             "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: no; path /run/containerd/containerd.sock",
             "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /var/run/docker.sock",
