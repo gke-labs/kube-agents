@@ -487,7 +487,7 @@ func realMain(argv []string) error {
 
 	// Fatal error propagated rather than degraded: internal/clusterprofiles
 	// returns one only for a --profiles-dir that is not there, or a credential
-	// proxy that cannot be reached or answers 5xx for its own reasons, each of
+	// proxy that cannot be reached or answers with an error about itself, each of
 	// which discovery runs once against and a restart fixes. Everything survivable has already
 	// been logged and recorded in the scan by this point.
 	scan, err := discoverProfileClusters(ctx, f.profilesDir, directlyReached)

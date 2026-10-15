@@ -456,8 +456,9 @@ skipped and reported with the API's answer like any other.
 
 Profile discovery follows `internal/clusterprofiles`' failure policy, which is the watcher's: a
 `--profiles-dir` that was given and is not there is fatal, because discovery runs once and a restart
-fixes it, and so is a credential proxy that cannot be reached or answers with a 5xx of its own (no
-credential yet, or its hop to Google failed), for the same reason; an unreadable one degrades to a
+fixes it, and so is a credential proxy that cannot be reached or answers with an error about itself
+(no credential yet, its hop to Google failed, or it refused this process's own token), for the same
+reason. A Google error it relays for one cluster, a 5xx included, is that cluster's and is skipped; an unreadable one degrades to a
 log line; and a single bad profile is skipped so one
 unparseable `config.yaml` cannot cost the whole fleet. A profile whose dynamic client will not build
 is skipped on the same grounds. Every skip is logged by profile name and counted, and the count is

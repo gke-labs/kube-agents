@@ -16,8 +16,10 @@ package clusterprofiles
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -354,11 +356,12 @@ func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]Profi
 //
 // Through a credential proxy there is one more error return, on the same
 // grounds as the missing directory: a broker that cannot be reached, or that
-// answers a describe with a 5xx (no credential of its own yet, or its own hop
-// to Google failed). That is the broker's state, not the cluster's, so it would
-// skip every profile in the pass, and a restart is what fixes it. A 4xx is the
-// cluster's or the policy's answer, and is a skip like any other lookup that
-// fails.
+// answers a describe with an error it wrote about itself (no credential of its
+// own yet, its own hop to Google failed, or it refused this process's token;
+// see brokerOwnFailure). That is the broker's state, not the cluster's, so it
+// would skip every profile in the pass, and a restart is what fixes it. An
+// answer Google wrote, relayed with Google's status, is the cluster's whatever
+// its status, and is a skip like any other lookup that fails.
 //
 // Finding none is not an error either. A freshly installed harness has no
 // Cluster Agent profiles until the first cluster-agent-reconcile tick creates
@@ -424,18 +427,16 @@ func (d Discoverer) Discover(ctx context.Context, dir string) ([]Cluster, error)
 			// broker is a sibling pod that a Recreate rollout leaves without
 			// endpoints for a moment, and the supervisor in start-services.sh
 			// restarts a process that exits, with backoff, so exiting is what
-			// makes the gap self-healing. The same holds for a 5xx: the broker
-			// answers 503 while it has no credential of its own yet, and 502 or
-			// 504 when its own hop to Google fails, and none of those is this
-			// cluster's answer either. A 4xx, a 403 included, is the cluster's
-			// (or the policy's), and is skipped as before.
+			// makes the gap self-healing. The same holds for an answer the broker
+			// wrote about itself rather than relayed; see brokerOwnFailure. A
+			// relayed Google answer, a 5xx included, is this cluster's, and is
+			// skipped as before.
 			var transport *url.Error
-			var status *googleapi.Error
 			if d.Broker != nil && errors.As(err, &transport) {
 				return nil, fmt.Errorf("the credential proxy at %s could not be reached while asking where %s is, so no profile cluster can be: %w", d.Broker.URL, identity, err)
 			}
-			if d.Broker != nil && errors.As(err, &status) && status.Code >= 500 {
-				return nil, fmt.Errorf("the credential proxy at %s answered %d while asking where %s is, which is its own state rather than this cluster's, so no profile cluster can be: %w", d.Broker.URL, status.Code, identity, err)
+			if why, own := brokerOwnFailure(err); d.Broker != nil && own {
+				return nil, fmt.Errorf("the credential proxy at %s answered %s while asking where %s is, which is its own state rather than this cluster's, so no profile cluster can be: %w", d.Broker.URL, why, identity, err)
 			}
 			d.skip(e.Name(), fmt.Errorf("asking %s where %s is: %w", d.describedBy(), identity, err))
 			continue
@@ -455,4 +456,47 @@ func (d Discoverer) Discover(ctx context.Context, dir string) ([]Cluster, error)
 		})
 	}
 	return clusters, nil
+}
+
+// brokerFatalCodes are the codes the credential proxy writes into its own error
+// body when the failure is its state rather than the cluster's: it has no
+// credential of its own yet, its hop to Google failed or timed out, Google's
+// answer could not be relayed, or the relay is off. Every profile in the pass
+// would get the same answer.
+var brokerFatalCodes = map[string]bool{
+	"RELAY_CREDENTIAL_UNAVAILABLE": true,
+	"UPSTREAM_UNAVAILABLE":         true,
+	"UPSTREAM_TIMEOUT":             true,
+	"UPSTREAM_UNRELAYABLE":         true,
+	"API_RELAY_DISABLED":           true,
+}
+
+// brokerOwnFailure reports whether a describe failed with an answer the broker
+// wrote about itself, and names it. The broker's own errors are
+// {"error": "<text>", "code": "<CODE>"}, and its refusal of a caller it cannot
+// authenticate (its TokenReview failing, or an older broker that does not yet
+// take the watcher audience) is a 401 with a string "error" and no code. A
+// relayed Google answer carries Google's shape instead, an object under
+// "error", and is the cluster's: it is decided by who wrote the body, not by
+// the status class, because the broker passes Google's status through.
+func brokerOwnFailure(err error) (string, bool) {
+	var apiErr *googleapi.Error
+	if !errors.As(err, &apiErr) {
+		return "", false
+	}
+	var body struct {
+		Error json.RawMessage `json:"error"`
+		Code  string          `json:"code"`
+	}
+	if json.Unmarshal([]byte(apiErr.Body), &body) != nil {
+		return "", false
+	}
+	if brokerFatalCodes[body.Code] {
+		return fmt.Sprintf("%d %s", apiErr.Code, body.Code), true
+	}
+	var text string
+	if apiErr.Code == http.StatusUnauthorized && json.Unmarshal(body.Error, &text) == nil {
+		return "401 to this process's own token", true
+	}
+	return "", false
 }
