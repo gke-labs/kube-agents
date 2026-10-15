@@ -2961,6 +2961,12 @@ def validate_teams_activity(activity: dict[str, Any]) -> None:
         raise ValueError(f"invalid or untrusted Bot Framework service URL: {service_url}")
 
 
+class TeamsUpstreamError(RuntimeError):
+    """Microsoft's side misbehaved: a redirect, a non-JSON identity response, a
+    token without a usable expiry. Not a ``ValueError``, so the route answers
+    502 and logs the reason instead of a silent 400 the gateway cannot read."""
+
+
 class _TeamsNoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Refuse 3xx redirects so the bot's Bearer token is never forwarded cross-host."""
 
@@ -2973,7 +2979,7 @@ class _TeamsNoRedirectHandler(urllib.request.HTTPRedirectHandler):
         headers: Any,
         newurl: str,
     ) -> Any:
-        raise ValueError(f"Teams API redirect refused (HTTP {code})")
+        raise TeamsUpstreamError(f"Teams API redirect refused (HTTP {code})")
 
 
 # Built once at import so refusing redirects does not depend on what
@@ -3040,12 +3046,22 @@ class TeamsRelay:
                 method="POST",
             )
             with self._open_url(req, timeout=20) as resp:
-                result = json.load(resp)
+                try:
+                    result = json.load(resp)
+                except ValueError as exc:
+                    raise TeamsUpstreamError(
+                        "Microsoft identity provider returned a non-JSON body"
+                    ) from exc
+            if not isinstance(result, dict):
+                raise TeamsUpstreamError("Microsoft identity provider returned a non-object body")
 
             token = result.get("access_token")
             if not token:
                 raise RuntimeError("no access_token returned by Microsoft identity provider")
-            expires_in = int(result.get("expires_in", 3600))
+            try:
+                expires_in = int(result.get("expires_in", 3600))
+            except (TypeError, ValueError) as exc:
+                raise TeamsUpstreamError("Microsoft identity provider returned a bad expires_in") from exc
             self._token = str(token)
             self._token_expires_at = time.time() + expires_in
             return self._token
@@ -3122,7 +3138,9 @@ class TeamsRelay:
 
         token = self._get_access_token()
         url = f"{service_url.rstrip('/')}/{clean_path}"
-        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        # UTF-8, not ``\uXXXX`` escapes: the adapter sizes the activity on the
+        # same serialization, and Bot Framework counts the bytes it receives.
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
         req = urllib.request.Request(
             url,
             data=body,

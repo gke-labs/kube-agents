@@ -310,6 +310,12 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body[0]["type"], "TextBlock")
         self.assertEqual(body[0]["text"], "Audit Results")
         self.assertEqual(body[1]["text"], "Fleet Audit Report")
+        # A hash with no space after it is text, not a header.
+        card = markdown_to_adaptive_card("#1040 at line start\n#!/bin/sh\n## Real")
+        self.assertEqual(
+            [(b["text"], b.get("size")) for b in card["body"]],
+            [("#1040 at line start", None), ("#!/bin/sh", None), ("Real", "Medium")],
+        )
 
     def test_format_teams_activity_payload(self):
         payload = format_teams_activity_payload(
@@ -523,8 +529,35 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         big, small = sent[0]["payload"], sent[1]["payload"]
         self.assertNotIn("attachments", big)
         self.assertEqual(big["text"], long_text)
-        self.assertLessEqual(len(json.dumps(big).encode("utf-8")), 28 * 1024)
+        self.assertLessEqual(len(json.dumps(big, ensure_ascii=False).encode("utf-8")), 28 * 1024)
         self.assertIn("attachments", small)
+
+    async def test_send_truncates_non_ascii_text_that_no_form_can_fit(self):
+        """16,000 CJK characters are 48 KB of UTF-8: over the cap as a card and
+        as plain text, so the text is cut to fit and says so."""
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        sent = []
+
+        def fake_urlopen(req, timeout=35):
+            sent.append(json.loads(req.data))
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({"id": "m"}).encode("utf-8")
+            resp.__enter__.return_value = resp
+            return resp
+
+        cjk = "集群状态报告。" * 2300  # 16,100 characters, 3 bytes each
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            await adapter.send("conv-1", cjk)
+        payload = sent[0]["payload"]
+        self.assertNotIn("attachments", payload)
+        self.assertTrue(payload["text"].endswith(teams_relay_patch.TEAMS_TRUNCATION_MARKER))
+        self.assertTrue(cjk.startswith(payload["text"][: -len(teams_relay_patch.TEAMS_TRUNCATION_MARKER)]))
+        self.assertLessEqual(
+            len(json.dumps(payload, ensure_ascii=False).encode("utf-8")), 28 * 1024
+        )
 
     async def test_unauthorized_tenant_rejected(self):
         from gateway.platform_registry import PlatformRegistry

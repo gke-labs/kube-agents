@@ -20,11 +20,13 @@ DEFAULT_RELAY_READY_TIMEOUT = 120.0
 # Bot Framework caps one activity at about 28 KB of serialized JSON. The send
 # tool chunks text at the registry entry's ``max_message_length`` and the
 # gateway's reply path at the adapter's ``MAX_MESSAGE_LENGTH``, both character
-# counts; an Adaptive Card adds a TextBlock per line, so the character cap
-# stays well under the byte cap and ``send`` drops to plain text for a card
-# that would still exceed it.
+# counts, and a character is one to four bytes once serialized (the broker
+# writes UTF-8, not ``\uXXXX`` escapes). So the character cap is a first cut
+# only: ``send`` measures the activity it is about to post, drops a card to
+# plain text, and truncates the text with a marker when even that is over.
 TEAMS_MAX_MESSAGE_LENGTH = 16000
 TEAMS_MAX_ACTIVITY_BYTES = 28 * 1024
+TEAMS_TRUNCATION_MARKER = "\n… (message truncated to fit Teams' size limit)"
 # Where the bot posts when an activity did not say: the public Bot Framework
 # endpoint. A regional tenant sets TEAMS_DEFAULT_SERVICE_URL.
 DEFAULT_TEAMS_SERVICE_URL = "https://smba.trafficmanager.net/teams/"
@@ -211,6 +213,44 @@ def markdown_to_adaptive_card(text: str, title: str | None = None) -> dict[str, 
     }
 
 
+def activity_size_bytes(payload: dict[str, Any]) -> int:
+    """The bytes the broker puts on the wire for ``payload`` (UTF-8 JSON)."""
+    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+
+def fit_activity_to_cap(
+    message: str,
+    *,
+    use_adaptive_cards: bool,
+    title: str | None,
+    actions: list[dict[str, Any]] | None,
+    cap: int = TEAMS_MAX_ACTIVITY_BYTES,
+) -> dict[str, Any]:
+    """Build the outbound activity and keep it under ``cap`` bytes.
+
+    Order: the card as asked; plain text of the same message (a card adds a
+    TextBlock per line, so short lines inflate it several times); then plain
+    text cut to fit, ending in ``TEAMS_TRUNCATION_MARKER``. Measured on the
+    serialized form rather than on characters, so non-Latin text is bounded
+    the same way as ASCII.
+    """
+    payload = format_teams_activity_payload(
+        message, use_adaptive_cards=use_adaptive_cards, title=title, actions=actions
+    )
+    if activity_size_bytes(payload) <= cap:
+        return payload
+    if use_adaptive_cards:
+        LOGGER.info("Teams card over the activity size cap; sending plain text")
+        payload = format_teams_activity_payload(message, use_adaptive_cards=False)
+        if activity_size_bytes(payload) <= cap:
+            return payload
+    overhead = activity_size_bytes(format_teams_activity_payload("", use_adaptive_cards=False))
+    room = cap - overhead - len(TEAMS_TRUNCATION_MARKER.encode("utf-8"))
+    cut = message.encode("utf-8")[: max(room, 0)].decode("utf-8", errors="ignore")
+    LOGGER.warning("Teams message over the activity size cap; truncated to fit")
+    return format_teams_activity_payload(cut + TEAMS_TRUNCATION_MARKER, use_adaptive_cards=False)
+
+
 def format_teams_activity_payload(
     message: str,
     *,
@@ -389,20 +429,12 @@ def install() -> None:
             )
             conversation_id = str(chat_id or "").strip()
 
-            payload = format_teams_activity_payload(
+            payload = fit_activity_to_cap(
                 message,
                 use_adaptive_cards=self.adaptive_cards,
                 title=meta.get("title"),
                 actions=meta.get("actions"),
             )
-            if (
-                self.adaptive_cards
-                and len(json.dumps(payload).encode("utf-8")) > TEAMS_MAX_ACTIVITY_BYTES
-            ):
-                # Many short lines make a card several times the text's size;
-                # plain text of the same message fits where the card does not.
-                LOGGER.info("Teams card over the activity size cap; sending plain text")
-                payload = format_teams_activity_payload(message, use_adaptive_cards=False)
             effective_thread = (
                 thread_id
                 or reply_to
