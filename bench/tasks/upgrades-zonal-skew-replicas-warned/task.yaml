@@ -58,8 +58,8 @@ expected_output: >-
   zone-bound-store, whose claims bind it to the same zone through its
   StorageClass, and capacity-starved-worker, whose running replicas share the
   second zone for want of room elsewhere, and first-zone-sponge, six replicas
-  pinned to the first zone by affinity and Pending for want of room. It
-  recommends the manifest change
+  pinned to the first zone's pool by a nodeSelector and Pending for want of
+  room. It recommends the manifest change
   (a DoNotSchedule spread, or an affinity that admits both zones) and
   performs no change. It ends with the declared line for every multi-replica
   workload on the cluster, zone-pinned-api's reading "replicas 2; zones in
