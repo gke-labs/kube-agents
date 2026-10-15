@@ -402,15 +402,15 @@ run included. An SOP that mentions neither runs `finish` without them.
 A stream with a collector runs it before Step 2's inspection, not after: the SOP names the script
 and the path to write its manifest to, the manifest's `commands` are that cluster's `checks_run`
 and its `candidates` are the findings the collector vouches for, and Step 3 passes the same file as
-`--manifest-file`. Today that is the drift stream — `governance/fleet_consistency_drift_sop.md` §4
+`--manifest-file`. Today that is the drift stream — `/opt/data/profiles/platform/governance/fleet_consistency_drift_sop.md` §4
 says how to read its manifest and what is still yours to write — the upgrade and patch readiness
-stream, whose `governance/security_patch_orchestrator_sop.md` §3 does the same, and the three
-streams `collect.py` covers: compliance (`governance/compliance_audit_sop.md` §2), obtainability
-(`governance/obtainability_audit_sop.md` §2) and AI security (`governance/ai_security_audit_sop.md`
-§3), the cost stream (`fleet_waste.py`, `governance/fleet_wide_cost_analysis_sop.md` §2), the
-stockout stream (`fleet_stockout.py`, `governance/stockout_prevention_sop.md` §3), the GCE
-compute stream (`compute_fleet_audit.py`, `governance/gce_compute_fleet_sop.md` §2) and the networking
-stream (`networking_audit.py`, `governance/gcp_networking_fabric_sop.md` §2).
+stream, whose `/opt/data/profiles/platform/governance/security_patch_orchestrator_sop.md` §3 does the same, and the three
+streams `collect.py` covers: compliance (`/opt/data/profiles/platform/governance/compliance_audit_sop.md` §2), obtainability
+(`/opt/data/profiles/platform/governance/obtainability_audit_sop.md` §2) and AI security (`/opt/data/profiles/platform/governance/ai_security_audit_sop.md`
+§3), the cost stream (`fleet_waste.py`, `/opt/data/profiles/platform/governance/fleet_wide_cost_analysis_sop.md` §2), the
+stockout stream (`fleet_stockout.py`, `/opt/data/profiles/platform/governance/stockout_prevention_sop.md` §3), the GCE
+compute stream (`compute_fleet_audit.py`, `/opt/data/profiles/platform/governance/gce_compute_fleet_sop.md` §2) and the networking
+stream (`networking_audit.py`, `/opt/data/profiles/platform/governance/gcp_networking_fabric_sop.md` §2).
 The compliance, obtainability, stockout, cost, GCE compute, networking and upgrade collectors may also give a target `checks_unevaluated`,
 `{check, reason}` for a check whose own read failed or whose inputs could not decide it: it did not run and is not inapplicable, so it
 goes in neither `checks_run` nor `checks_not_applicable` but in that target's `limitations`, which
