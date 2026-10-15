@@ -7367,6 +7367,8 @@ _GROUP3 = {
     ),
     "upgrades-network-policy-enforcement-stated": (
         [
+            "seeded-a: dataplane LEGACY_DATAPATH; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, zero-trust",
             "seeded-a: dataplane legacy; network policies enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
             "seeded-a: dataplane legacy; networkpolicy enforced: no (add-on off); namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
@@ -7384,6 +7386,7 @@ _GROUP3 = {
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 9 (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, seeded-stall, seeded-token, seeded-headroom, seeded-shapes, seeded-defaults)",
         ],
         [
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, zero",
             "seeded-a: dataplane legacy no longer, now dataplane v2 (migrated at 1.33); networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
             "seeded-a: dataplane legacy-free; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
             "seeded-a: dataplane GKE Dataplane V2; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
@@ -7635,6 +7638,7 @@ _GROUP2 = {
     ),
     "upgrades-no-surge-pool-recreate-warned": (
         [
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner, no-surge-canary",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no (maxSurge 0); workloads pinned to this pool: pinned-batch-runner",
             "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner",
             "seeded-b/no-surge-pool: nodes 1 (e2-medium, us-central1-a); replacement node first: no; workloads pinned to this pool: pinned-batch-runner",
@@ -7706,6 +7710,7 @@ _GROUP2 = {
 _GROUP4 = {
     "upgrades-node-local-state-named": (
         [
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue, no-cache; survives a node rebuild: no",
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes emptyDir queue; survives a node rebuild: no",
             "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue; survives a node rebuild: no",
             "seeded-a/seeded-shapes/cache-on-emptydir-7c9d4b5f6-k2x8q: node-local volumes: queue; survives a node rebuild: no",

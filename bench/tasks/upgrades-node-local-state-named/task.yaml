@@ -16,8 +16,9 @@
 #
 # An item's parenthetical is ungraded: the judge reads it. A bare name is an
 # item (a volume name has no shape of its own), so the guard is a word
-# class: a negation word in it is refused as an item of its own, and a word
-# outside it is the judge's. The volume's kind may stand before its name
+# class: a negation word in it is refused as an item of its own (not as the
+# first segment of a name such as `no-cache`), and a word outside it is the
+# judge's. The volume's kind may stand before its name
 # (emptyDir queue) or in its parenthetical (queue (emptyDir)).
 #
 # A pod of the workload names it too: the pod-template hash (or a Job's
@@ -89,9 +90,9 @@ verification_spec:
       fixture_roles:
         - node-local-state
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: node-local volumes:? ?(?:(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\b)[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?, ?)*(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?queue(?![/\w-])(?: \([^)\n;]*\))?(?:, ?(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\b)[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?)*; survives a node rebuild: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: node-local volumes:? ?(?:(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?, ?)*(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?queue(?![/\w-])(?: \([^)\n;]*\))?(?:, ?(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?)*; survives a node rebuild: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: node-local volumes:? ?(?!(?:(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\b)[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?, ?)*(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?queue(?![/\w-])(?: \([^)\n;]*\))?(?:, ?(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\b)[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?)*;)[^ :;\n][^;\n]*; survives a node rebuild: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/cache-on-emptydir(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: node-local volumes:? ?(?!(?:(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?, ?)*(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?queue(?![/\w-])(?: \([^)\n;]*\))?(?:, ?(?:(?:emptydir|hostpath|local(?: ssd)?|volume)s? )?(?!(?:none|no|nothing|nil|null|zero|0|n[/.]?a|not|nope|nah|never|neither|false|nowhere)\.?(?![a-z0-9/_-]))[a-z0-9][a-z0-9.-]*(?: \([^)\n;]*\))?)*;)[^ :;\n][^;\n]*; survives a node rebuild: (?:yes|no)$'
 
   - name: the-declared-line-says-the-state-does-not-survive
     role: objective
