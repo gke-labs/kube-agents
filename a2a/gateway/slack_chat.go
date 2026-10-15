@@ -43,17 +43,13 @@ const (
 	// leading blocks stay above the side bar, so the headline is the
 	// message's own and the bar holds the rest.
 	slackChatSideBarFrom = 1
-	// slackChatSectionMax is Slack's cap on a section's text; a fold's text
-	// is cut into sections under it, and a fold that cannot be is a message
-	// Slack cannot hold, which posts as its fallback.
+	// slackChatSectionMax is Slack's cap on a section's text.
 	slackChatSectionMax = 3000
-	// slackChatFoldChunk is the raw-text share of one fold section, under
-	// slackChatSectionMax with room for the escaping toMrkdwn adds.
+	// slackChatFoldChunk is the text one of a fold's rich_text blocks holds
+	// at most, under slackChatSectionMax (slackRichBlocks); a fold past
+	// slackChatContainerChildMax blocks is a message Slack cannot hold, which
+	// posts as its fallback.
 	slackChatFoldChunk = 2500
-	// slackChatFoldChunkMin is the smallest share slackFoldSections cuts a
-	// chunk to before it calls the fold too large: 600 bytes escape to at
-	// most 3,000 runes even if every one is an ampersand.
-	slackChatFoldChunkMin = 600
 	// slackChatContainerChildMax is Slack's cap on a container's children.
 	slackChatContainerChildMax = 10
 	// slackChatBlocksMax is Slack's cap on the blocks in one message, the
@@ -239,12 +235,14 @@ func slackChatHead(m *chatmsg.Message) map[string]any {
 
 // slackChatDetail is the detail, a block of its own under the head, so a
 // message with a tone carries it inside the side bar, as the presenter's
-// subline under a question or an opened PR is.
+// subline under a question or an opened PR is. Its markdown's headings,
+// fenced blocks, lists and paragraphs are drawn as rich text
+// (slackRichDocument).
 func slackChatDetail(detail string) map[string]any {
 	if strings.TrimSpace(detail) == "" {
 		return nil
 	}
-	return slackRichBlock([]map[string]any{slackRichSection(slackRichMarkdown(detail))})
+	return slackRichBlock(slackRichDocument(detail))
 }
 
 // slackChatRows is the rows, one section each: the severity as inline code
@@ -293,20 +291,9 @@ func slackChatAfter(after []string) map[string]any {
 func slackChatFold(f *chatmsg.Fold) (map[string]any, error) {
 	var children []map[string]any
 	if strings.TrimSpace(f.Text) != "" {
-		// chatChunks measures bytes and Slack's cap is characters, so the
-		// budget scales by the text's bytes per character: multibyte text
-		// gets as many characters a section as ASCII does.
-		budget := slackChatFoldChunk * len(f.Text) / max(1, utf8.RuneCountInString(f.Text))
-		texts, err := slackFoldSections(f.Text, budget)
-		if err != nil {
-			return nil, err
-		}
-		for _, text := range texts {
-			children = append(children, map[string]any{
-				"type": "section",
-				"text": map[string]any{"type": slackChatMrkdwn, "text": text, "verbatim": true},
-			})
-		}
+		// Rich text, as the detail is, cut into blocks between its
+		// elements so no one block grows past a section's share.
+		children = append(children, slackRichBlocks(f.Text, slackChatFoldChunk)...)
 	}
 	if f.Table != nil && len(f.Table.Columns) > 0 {
 		rows := [][]map[string]any{slackChatTableRow(f.Table.Columns)}
@@ -334,33 +321,6 @@ func slackChatFold(f *chatmsg.Fold) (map[string]any, error) {
 // slackChatFoldEmpty reports a fold with neither text nor a table.
 func slackChatFoldEmpty(f *chatmsg.Fold) bool {
 	return strings.TrimSpace(f.Text) == "" && (f.Table == nil || len(f.Table.Columns) == 0)
-}
-
-// slackFoldSections cuts text into chunks of at most size bytes and renders
-// each as mrkdwn, cutting a chunk smaller again when its escaping (&amp;,
-// &lt;, &gt;) takes it past a section's cap, so text dense with those
-// characters still fits; past slackChatContainerChildMax sections it is too
-// large.
-func slackFoldSections(text string, size int) ([]string, error) {
-	var out []string
-	for _, chunk := range chatChunks(text, size) {
-		rendered := toMrkdwn(chunk)
-		if utf8.RuneCountInString(rendered) <= slackChatSectionMax {
-			out = append(out, rendered)
-		} else if size <= slackChatFoldChunkMin {
-			return nil, errSlackChatTooLarge
-		} else {
-			smaller, err := slackFoldSections(chunk, size/2)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, smaller...)
-		}
-		if len(out) > slackChatContainerChildMax {
-			return nil, errSlackChatTooLarge
-		}
-	}
-	return out, nil
 }
 
 func slackChatTableRow(cells []string) []map[string]any {

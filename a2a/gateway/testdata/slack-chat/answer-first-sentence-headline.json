@@ -25,7 +25,15 @@
           {
             "elements": [
               {
-                "text": "It hit its 256Mi limit.\n\nRaise it to 512Mi.",
+                "text": "It hit its 256Mi limit.",
+                "type": "text"
+              },
+              {
+                "text": "\n\n",
+                "type": "text"
+              },
+              {
+                "text": "Raise it to 512Mi.",
                 "type": "text"
               }
             ],

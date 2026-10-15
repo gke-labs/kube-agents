@@ -25,11 +25,27 @@
           {
             "elements": [
               {
-                "text": "- one\n- two",
-                "type": "text"
+                "elements": [
+                  {
+                    "text": "one",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "text": "two",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
               }
             ],
-            "type": "rich_text_section"
+            "indent": 0,
+            "style": "bullet",
+            "type": "rich_text_list"
           }
         ],
         "type": "rich_text"

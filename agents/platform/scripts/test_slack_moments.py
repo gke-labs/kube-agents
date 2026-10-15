@@ -599,5 +599,64 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(settled, [{"type": "actions", "elements": [link]}])
 
 
+class AnswerChoicesTest(unittest.TestCase):
+    """A finished answer's closing question over its options: the needs-you rules, both orders."""
+
+    OPTIONS = (
+        "1. **Option 1 (Recommended): Fix the command**\n   Change it to `sleep infinity`. It uses no memory.\n"
+        "2. **Option 2: Raise the limit**\n   Give it 512Mi."
+    )
+
+    def test_options_then_a_closing_question(self):
+        shown, folded, question, options = m.answer_choices(
+            f"It restarted 14 times.\n\n## Root cause\nThe command fills memory.\n\n{self.OPTIONS}\n\nWhich one?"
+        )
+        self.assertEqual(options, [("Fix the command", True), ("Raise the limit", False)])
+        self.assertEqual(question, "Which one?")
+        self.assertEqual(
+            shown,
+            "It restarted 14 times.\n\n1. **Fix the command** — Change it to `sleep infinity`.\n"
+            "2. **Raise the limit** — Give it 512Mi.",
+        )
+        self.assertEqual(folded, f"## Root cause\nThe command fills memory.\n\n{self.OPTIONS}")
+
+    def test_a_question_then_the_options_ending_the_answer(self):
+        shown, folded, question, options = m.answer_choices("It runs twice.\n\nWhich should I check?\n- seeded-a\n- seeded-b")
+        self.assertEqual(options, [("seeded-a", False), ("seeded-b", False)])
+        self.assertEqual((shown, folded, question), ("It runs twice.", "", "Which should I check?"))
+
+    def test_a_yes_no_question_offers_no_choice(self):
+        for question in ("Want me to scale it?", "Shall I proceed?", "Should I go ahead?", "Does this look good?"):
+            with self.subTest(question=question):
+                self.assertIsNone(m.answer_choices(f"{self.OPTIONS}\n\n{question}"))
+        self.assertIsNotNone(m.answer_choices(f"{self.OPTIONS}\n\nShall I fix the command or raise the limit?"))
+        self.assertIsNotNone(m.answer_choices(f"{self.OPTIONS}\n\nHow would you like to proceed?"))
+
+    def test_only_two_to_five_options_that_each_make_a_label(self):
+        six = "\n".join(f"{i}. **Do {i}**" for i in range(1, 7))
+        self.assertIsNone(m.answer_choices(f"{six}\n\nWhich one?"))
+        self.assertIsNone(m.answer_choices("1. **Raise it**\n\nWhich one?"))
+        self.assertIsNone(m.answer_choices("1. **Raise it**\n2. **raise it**: again\n\nWhich one?"), "a label twice")
+        self.assertIsNone(m.answer_choices("Which?\n- " + "x" * (p.BUTTON_TEXT_MAX + 1) + "\n- short"))
+        self.assertIsNone(m.answer_choices("1. **Raise it**\n2. **Fix it**"), "no question")
+
+    def test_a_long_bold_lead_is_clipped_to_a_button(self):
+        lead = "word " * 30
+        _shown, _folded, _question, options = m.answer_choices(f"- **{lead}**\n- **short**\n\nWhich one?")
+        self.assertLessEqual(len(options[0][0]), p.BUTTON_TEXT_MAX)
+        self.assertTrue(options[0][0].endswith(p.ELLIPSIS))
+
+    def test_option_lines_show_only_when_each_says_more_than_its_label(self):
+        shown, _folded, _question, _options = m.answer_choices("Two ways.\n\n- **Roll back**\n- **Fix forward**: patch it.\n\nWhich?")
+        self.assertEqual(shown, "Two ways.")
+
+    def test_only_the_first_recommended_is_primary(self):
+        _s, _f, _q, options = m.answer_choices("- **A (recommended)**\n- **B (Recommended)**\n\nWhich one?")
+        self.assertEqual(options, [("A", True), ("B", False)])
+
+    def test_a_long_list_stays_fast(self):
+        m.answer_choices("- x\n" * 20000 + "\nWhich one?")
+
+
 if __name__ == "__main__":
     unittest.main()

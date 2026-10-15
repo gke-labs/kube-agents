@@ -1787,6 +1787,13 @@ func artifactParts(task *lib.Task, name string) []lib.Part {
 // adapter implements it for TaskStarted and TaskTerminal: a task starting in a thread is
 // what makes that thread a session thread, and the adapter learns it here
 // rather than inferring it from a mention it has not yet seen verified.
+// showsTaskStatus reports whether the adapter shows a task's status itself
+// (StatusShower), and so wants no rolling line.
+func (g *Gateway) showsTaskStatus() bool {
+	shower, ok := g.adapter.(StatusShower)
+	return ok && shower.ShowsTaskStatus()
+}
+
 func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 	if observer, ok := g.adapter.(TaskObserver); ok {
 		observer.TaskStarted(conversation, taskID)
@@ -2154,9 +2161,14 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 
 	// Placeholder first, so the rolling line exists before the first event
 	// can arrive (the demo posts one while the pod cold-starts; same idea).
-	statusMsgID, err := g.adapter.Post(rec.Key, withLineNote("⏳ submitted…", ts.LineNote))
-	if err != nil {
-		g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
+	// None on a backend that shows the task's status itself (StatusShower).
+	statusMsgID, lineless := "", g.showsTaskStatus()
+	if !lineless {
+		var err error
+		statusMsgID, err = g.adapter.Post(rec.Key, withLineNote("⏳ submitted…", ts.LineNote))
+		if err != nil {
+			g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
+		}
 	}
 
 	// Register the task everywhere the relay looks BEFORE publishing: a fast
@@ -2230,7 +2242,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	if err != nil {
 		g.log.Error("task publish failed", "taskId", taskID, "err", err)
 		if statusMsgID != "" {
-			_ = g.adapter.Edit(rec.Key, statusMsgID, "❌ could not reach the bus; try again")
+			_ = g.adapter.Edit(rec.Key, statusMsgID, noticeBusUnreachable)
+		} else if lineless {
+			// No line to put it on, and nothing else would say the ask
+			// went nowhere.
+			g.post(rec.Key, noticeBusUnreachable)
 		}
 		rec.ActiveTask = nil
 		g.mu.Lock()
@@ -2283,6 +2299,10 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 
 // noticeSteerNotSent tells the room a steer did not reach the running task.
 const noticeSteerNotSent = "⚠️ could not send that to the running task; it is still working on the original instruction"
+
+// noticeBusUnreachable says a task's publish failed: on its rolling line, or
+// posted when the backend keeps none (StatusShower).
+const noticeBusUnreachable = "❌ could not reach the bus; try again"
 
 // The steer acknowledgements, one per route (spec-chatops-gateway.md,
 // "Gateway-authored posts"). The fixed-route wording is a product decision:

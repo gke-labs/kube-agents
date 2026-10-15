@@ -160,27 +160,50 @@ func TestSlackChatRendersNoMention(t *testing.T) {
 			}
 		}
 	}
-	fold := chatmsg.Message{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Text: "write <!channel> to ping"}}
-	layout, err := renderSlackChat(&fold, "x")
-	if err != nil {
-		t.Fatal(err)
-	}
-	section := layout.Blocks[0]["child_blocks"].([]map[string]any)[0]["text"].(map[string]any)
-	if section["text"] != "write &lt;!channel&gt; to ping" || section["verbatim"] != true {
-		t.Fatalf("fold section = %v, want the token escaped and sent verbatim", section)
-	}
-	bare := chatmsg.Message{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Text: "hey @here, look"}}
-	if _, err := renderSlackChat(&bare, "x"); err == nil || !strings.Contains(err.Error(), "mention") {
-		t.Fatalf("err = %v, want the bare broadcast word in mrkdwn refused", err)
+	// The fold is rich text too, so a token there is literal text and a
+	// bare broadcast word is inert: neither is mrkdwn.
+	for _, text := range []string{"write <!channel> to ping", "hey @here, look"} {
+		fold := chatmsg.Message{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Text: text}}
+		layout, err := renderSlackChat(&fold, "x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		child := layout.Blocks[0]["child_blocks"].([]map[string]any)[0]
+		span := child["elements"].([]map[string]any)[0]["elements"].([]map[string]any)[0]
+		if child["type"] != "rich_text" || span["text"] != text {
+			t.Fatalf("fold child = %v, want %q as rich text, as written", child, text)
+		}
 	}
 }
 
-// A fold's text is cut into sections under Slack's cap; a chunk that escaping
-// pushes past the section cap is too large, and posts as text.
-func TestSlackChatFoldTooLarge(t *testing.T) {
+// slackFoldRunes is the runes of text in each of a fold's blocks.
+func slackFoldRunes(t *testing.T, layout slackChatLayout) []int {
+	t.Helper()
+	var sizes []int
+	for _, c := range layout.Blocks[0]["child_blocks"].([]map[string]any) {
+		sizes = append(sizes, slackRichLen(map[string]any{"elements": c["elements"]}))
+	}
+	return sizes
+}
+
+// A fold at the spec's cap is cut into blocks under a section's share, each
+// a block of rich text, so text dense with characters mrkdwn would escape
+// fits whole.
+func TestSlackChatFoldAtTheCapIsCut(t *testing.T) {
 	m := chatmsg.Message{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Text: strings.Repeat("&", 12000)}}
-	if _, err := renderSlackChat(&m, "x"); !errors.Is(err, errSlackChatTooLarge) {
-		t.Fatalf("err = %v, want errSlackChatTooLarge (each & escapes to five characters)", err)
+	layout, err := renderSlackChat(&m, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for _, n := range slackFoldRunes(t, layout) {
+		if n > slackChatFoldChunk {
+			t.Fatalf("a block of %d runes, over the share", n)
+		}
+		total += n
+	}
+	if total != 12000 {
+		t.Fatalf("the fold holds %d runes, want all 12000", total)
 	}
 }
 
@@ -227,18 +250,18 @@ func TestSlackChatEmptyFoldIsOmitted(t *testing.T) {
 	}
 }
 
-// Fold text dense with characters escaping lengthens is cut smaller rather
-// than refused: 2,400 '<' escape to 9,600 runes, which fits in four sections.
-func TestSlackChatDenseFoldIsCutSmaller(t *testing.T) {
-	m := chatmsg.Message{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Text: strings.Repeat("<", 2400)}}
+// A fenced block longer than a block's share is cut between its lines into
+// several preformatted blocks, none over the share.
+func TestSlackChatLongFenceInTheFoldIsCut(t *testing.T) {
+	code := strings.Repeat("kubectl get pods -A -o wide\n", 400)
+	m := chatmsg.Message{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Text: "Ran:\n```\n" + code + "```"}}
 	layout, err := renderSlackChat(&m, "t")
 	if err != nil {
-		t.Fatalf("a dense fold well under the cap was refused: %v", err)
+		t.Fatalf("a long fence in the fold was refused: %v", err)
 	}
-	children := layout.Blocks[0]["child_blocks"].([]map[string]any)
-	for _, c := range children {
-		if n := len([]rune(c["text"].(map[string]any)["text"].(string))); n > slackChatSectionMax {
-			t.Fatalf("a section of %d runes, over the cap", n)
+	for _, n := range slackFoldRunes(t, layout) {
+		if n > slackChatFoldChunk {
+			t.Fatalf("a block of %d runes, over the share", n)
 		}
 	}
 }
@@ -282,9 +305,9 @@ func TestSlackChatMultibyteFoldAtTheCapFits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a valid multi-byte fold at the cap was refused: %v", err)
 	}
-	for _, c := range layout.Blocks[0]["child_blocks"].([]map[string]any) {
-		if n := len([]rune(c["text"].(map[string]any)["text"].(string))); n > slackChatSectionMax {
-			t.Fatalf("a section of %d characters, over Slack's cap", n)
+	for _, n := range slackFoldRunes(t, layout) {
+		if n > slackChatSectionMax {
+			t.Fatalf("a block of %d characters, over Slack's cap", n)
 		}
 	}
 }

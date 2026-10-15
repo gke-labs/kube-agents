@@ -178,6 +178,18 @@ type VerifiedObserver interface {
 	InboundVerified(conversation, messageID string, verified bool)
 }
 
+// StatusShower is the optional extension an Adapter implements when its
+// backend shows a task's status itself, so the relay's rolling line ("⏳
+// submitted…" edited on to "✅ completed") would only repeat it. The Slack
+// adapter does, with Agent Sessions' Working… status, the ask's reaction and
+// the plan rows, as the today path shows no receipt either. With it true the
+// gateway posts no placeholder for a task, so the relay has no line to edit
+// and every line edit is skipped; the notices that stand on their own (the
+// queue notice, a publish failure, a failed or canceled task) still post.
+type StatusShower interface {
+	ShowsTaskStatus() bool
+}
+
 // OutMessage is one post or edit as a value: the text, and the chat message
 // that lays the same content out (spec-a2a-payloads.md, "Chat messages").
 type OutMessage struct {

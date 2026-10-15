@@ -29,11 +29,27 @@
               {
                 "elements": [
                   {
-                    "text": "- continue\n- stop",
-                    "type": "text"
+                    "elements": [
+                      {
+                        "text": "continue",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  },
+                  {
+                    "elements": [
+                      {
+                        "text": "stop",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
                   }
                 ],
-                "type": "rich_text_section"
+                "indent": 0,
+                "style": "bullet",
+                "type": "rich_text_list"
               }
             ],
             "type": "rich_text"
