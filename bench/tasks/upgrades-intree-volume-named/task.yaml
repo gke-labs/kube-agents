@@ -24,6 +24,9 @@
 # `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
 # the name; the kind word is ungraded.
 #
+# The source may be written `gcePersistentDisk (in-tree)`, the prompt's menu
+# item reordered with its qualifier as the parenthetical.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the volume source. A CSI volume in its place is the
@@ -89,9 +92,9 @@ verification_spec:
       fixture_roles:
         - intree-pd-volume
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?in-tree gcepersistentdisk(?: \([^)\n;]*\))?; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?(?:in-tree gcepersistentdisk|gcepersistentdisk \(in-tree\))(?: \([^)\n;]*\))?; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?(?!in-tree gcepersistentdisk(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:pv|persistentvolumes?)/)?intree-pd(?:\s*\([^)\n]*\))?: source:? ?(?!(?:in-tree gcepersistentdisk|gcepersistentdisk \(in-tree\))(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; bound by:? ?[^ :;\n][^;\n]*; attaches through csi migration: (?:yes|no)$'
 
   - name: the-declared-line-names-the-claim-and-the-migration
     role: objective

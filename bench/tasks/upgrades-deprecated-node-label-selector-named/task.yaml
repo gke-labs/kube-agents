@@ -23,6 +23,10 @@
 # `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
 # the name; the kind word is ungraded.
 #
+# The label may carry its value, as the manifest prints the selector entry
+# (`beta.kubernetes.io/arch: amd64`) or as kubectl spells it (`=amd64`); the
+# value is ungraded.
+#
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
 # Mutation safeguard: the selector. Replacing the key with kubernetes.io/arch
@@ -85,9 +89,9 @@ verification_spec:
       fixture_roles:
         - deprecated-label-selector
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?beta\.kubernetes\.io/arch(?: \([^)\n;]*\))?; deprecated: (?:yes|no)(?: \([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?beta\.kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?(?: \([^)\n;]*\))?; deprecated: (?:yes|no)(?: \([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?(?!beta\.kubernetes\.io/arch(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; deprecated: (?:yes|no)(?: \([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?(?!beta\.kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; deprecated: (?:yes|no)(?: \([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
 
   - name: the-declared-line-says-it-is-deprecated-and-names-the-replacement
     role: objective

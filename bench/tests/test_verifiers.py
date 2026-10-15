@@ -7772,7 +7772,9 @@ _GROUP3 = {
             "seeded-a: next minor v1.36; removed apis still called: none; deprecated but still served: core/v1 Endpoint",
             "seeded-a: next minor 1.36.4-gke.1391000; removed apis still called: none; deprecated but still served: endpoints (core/v1)",
             "seeded-a: next minor none; removed apis still called: none; deprecated but still served: v1 endpoints",
-        ],
+                    "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: endpoints v1 api",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: endpoints api v1",
+],
         [
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, v1",
             "seeded-a: next minor 1.36; removed apis still called: flowcontrol.apiserver.k8s.io/v1beta3 flowschemas; deprecated but still served: v1 endpoints",
@@ -7797,7 +7799,8 @@ _GROUP3 = {
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, n.a.",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: neither, endpoints is only kube-system's",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints?",
-        ],
+                    "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: endpoints v2 api",
+],
         "seeded-{s}: next minor 1.36; removed apis still called: none; deprecated but still served: none",
     ),
     "upgrades-network-policy-enforcement-stated": (
@@ -8130,6 +8133,9 @@ _GROUP2 = {
             "**seeded-d/seeded-topology/zone-pinned-api**: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity and spread constraint",
             "1. seeded-d (us-central1)/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: topology spread constraints",
                     "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity (required) and spread constraint",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: required node affinity",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity and ScheduleAnyway spread constraint",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity plus spread constraint",
 ],
         [
             "seeded-d/seeded-topology/zone-pinned-api-canary: replicas 2; zones in use 1; all replicas in one zone: yes; cause: topology-spread-constraint",
@@ -8199,7 +8205,9 @@ _GROUP4 = {
             "- `seeded-a/seeded-shapes/arch-pinned-worker`: label `beta.kubernetes.io/arch`; deprecated: yes; replacement `kubernetes.io/arch`.",
             "**seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch**",
             "1. seeded-a (us-central1-a)/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch",
-        ],
+                    "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch: amd64; deprecated: yes; replacement kubernetes.io/arch",
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch=amd64; deprecated: yes; replacement kubernetes.io/arch",
+],
         [
             "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/os; deprecated: yes; replacement kubernetes.io/arch",
             "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: no; replacement kubernetes.io/arch",
@@ -8234,7 +8242,8 @@ _GROUP4 = {
             "**seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes**",
             "1. seeded-a (us-central1-a)/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
         
-            "seeded-a/pv/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",],
+            "seeded-a/pv/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",            "seeded-a/intree-pd: source gcePersistentDisk (in-tree); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+],
         [
             "seeded-a/intree-pd: source csi; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
             "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by none; attaches through csi migration: yes",
