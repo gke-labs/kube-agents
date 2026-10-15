@@ -448,11 +448,13 @@ resource "null_resource" "load_bearing_change" {
       # to kubectl's default, whose name is an implementation detail this
       # stack would then be asserting on.
       #
-      # runAsUser goes back to 0 in the same patch rather than being removed.
-      # A merge patch cannot drop a key, and leaving 1000 in place would mean
-      # the container still runs as 1000 and still cannot write /etc -- the
-      # loosening would not be the thing that fixed it, and the rollout below
-      # would time out.
+      # runAsUser goes back to 0 in the same patch rather than being dropped.
+      # A merge patch could drop it -- `"runAsUser": null` removes the key --
+      # but 0 is the better scenario: an operator who has just watched uid
+      # 1000 fail pins the container to root explicitly, and the live object
+      # then says plainly what it runs as. Leaving 1000 in place is the one
+      # option that does not work: the container would still be uid 1000,
+      # still unable to write /etc, and the rollout below would time out.
       kubectl patch deployment "${local.workload}" -n "${local.ns}" \
         --field-manager="${var.drift_field_manager}" --type=merge \
         -p '{"spec":{"template":{"spec":{"securityContext":{"runAsNonRoot":false,"runAsUser":0}}}}}'

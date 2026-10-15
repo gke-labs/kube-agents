@@ -217,10 +217,19 @@ resource "null_resource" "deleted_policy" {
 
       # ---- 0b. Clear what an earlier run left behind ------------------------
       # Step 1 is idempotent, so against a namespace that already holds this
-      # scenario the applies report no change -- and, worse here than in the
-      # sibling, the policy this run is supposed to delete may ALREADY be gone
-      # from the previous run, so step 2's delete would succeed having removed
-      # nothing and the assertions would pass on the earlier run's state.
+      # scenario the applies report no change and the assertions below pass on
+      # the previous run's objects rather than on anything this one planted.
+      #
+      # The policy itself is not the exposure -- step 1 re-creates it before
+      # step 2 deletes it, so a leftover namespace whose policy is already
+      # gone still gets a fresh one to delete. What survives is everything
+      # step 1 does NOT rewrite: the workload's pods keep their original ages
+      # and restart history, the namespace keeps labels from whichever run
+      # created it, and the ownership assertion reads managedFields written by
+      # a server-side apply that may have happened hours ago. Deleting first
+      # is what makes the case recover on its own, and it is also the only
+      # thing that can: the run that leaked the namespace is over, and nothing
+      # else visits this cluster between runs.
       #
       # Gated on the label step 1 writes, not on the name alone. This is the
       # only unconditional namespace delete in the stack and it runs against the
@@ -426,16 +435,23 @@ resource "null_resource" "deleted_policy" {
       #   from. The daemon renders that as "Field ownership: not read" and tells
       #   the agent to say so;
       #
-      #   `owners` is empty for the same reason. The daemon never reads it on
-      #   this branch (_drift_ownership_block returns before it does), and it is
-      #   sent anyway because the detector sends the field whatever the outcome
-      #   -- a fixture that omitted it would be describing a payload shape that
-      #   does not occur.
+      #   `owners` is ABSENT, not empty, for the same reason. payloadForEvent
+      #   builds it by appending over event.Owners, which a delete leaves nil,
+      #   and the field is `json:"owners,omitempty"` -- so the detector emits
+      #   no key at all. Sending `[]` would be the shape that does not occur.
+      #   (Either way the daemon never reads it on this branch:
+      #   _drift_ownership_block returns before it does.)
+      #
+      #   the summary carries driftSummary's suffix for a non-enriched
+      #   outcome, "(field ownership not read: <outcome>)", which it appends
+      #   ahead of the reconciled and owner-manager clauses. Written out
+      #   rather than left to the daemon's fallback, because a real record
+      #   always carries one and the fallback renders a different sentence.
       payload_file="$kubeconfig_dir/payload.json"
       cat > "$payload_file" <<PAYLOAD
       {
         "kind": "gitops-drift",
-        "summary": "${var.drift_principal} deleted ${local.resource_path} on cluster ${var.host_cluster_name}",
+        "summary": "${var.drift_principal} deleted ${local.resource_path} on cluster ${var.host_cluster_name} (field ownership not read: no_object)",
         "cluster": "${var.host_cluster_name}",
         "project": "$project",
         "location": "${var.host_cluster_location}",
@@ -453,7 +469,6 @@ resource "null_resource" "deleted_policy" {
           "name": "${local.policy}"
         },
         "join": "no_object",
-        "owners": [],
         "reconciled": false
       }
       PAYLOAD
