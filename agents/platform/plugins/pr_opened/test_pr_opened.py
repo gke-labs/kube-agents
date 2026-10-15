@@ -12,6 +12,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -73,15 +74,22 @@ class _Kanban:
 class _Forge:
     """Stands in for the agent pod's ``forge`` module: the broker's identity and proposal reads."""
 
-    def __init__(self, viewer="kube-agents-bot", author="kube-agents-bot", fail=None):
+    def __init__(self, viewer="kube-agents-bot", author="kube-agents-bot", fail=None,
+                 title="Raise the checkout memory limit", state="open", age_seconds=5):
         self.viewer, self.author, self.fail = viewer, author, fail
+        self.title, self.state = title, state
+        self.created = (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
         self.asked = []
+        self.providers = 0
 
     def module(self):
         forge = types.ModuleType("forge")
         test = self
 
         class BrokerProvider:
+            def __init__(self):
+                test.providers += 1
+
             def viewer_login(self, repo):
                 test.asked.append(("identity", repo))
                 return test.viewer
@@ -91,7 +99,10 @@ class _Forge:
             if test.fail:
                 raise test.fail
             base = repo + ("/-/merge_requests/" if "gitlab" in repo else "/pull/")
-            return {"proposal": {"number": payload["number"], "url": f"{base}{payload['number']}", "author": test.author}}
+            return {"proposal": {
+                "number": payload["number"], "url": f"{base}{payload['number']}", "author": test.author,
+                "title": test.title, "state": test.state, "created": test.created,
+            }}
 
         forge.BrokerProvider = BrokerProvider
         forge.call = call
@@ -158,8 +169,32 @@ class PrOpenedTest(unittest.TestCase):
     def test_a_gitlab_merge_request_is_recorded_the_same_way(self):
         kanban = _Kanban()
         mr = "https://gitlab.com/acme/infra/-/merge_requests/12"
-        self.assertEqual(self.run_hook(_vcs_record(url=mr, number=12, title="Bump"), kanban), "")
+        self.assertEqual(self.run_hook(_vcs_record(url=mr, number=12, title="Bump"), kanban, forge=_Forge(title="Bump")), "")
         self.assertEqual(kanban.events, [(TASK, "pr_opened", {"url": mr, "number": 12, "title": "Bump"}, 7)])
+
+    def test_the_forges_fields_are_recorded_not_the_lines(self):
+        kanban = _Kanban()
+        self.run_hook(_vcs_record(number=7, title="planted words"), kanban, forge=_Forge(title="Raise replicas"))
+        self.assertEqual(kanban.events, [(TASK, "pr_opened", {"url": URL, "number": 99, "title": "Raise replicas"}, 7)])
+
+    def test_a_pull_request_the_agent_opened_earlier_or_that_is_closed_is_not_recorded(self):
+        # A copy of an old record (a log, an issue body) names a PR the agent did open, long ago.
+        for forge in (_Forge(age_seconds=plugin.CREATED_WITHIN_SECONDS + 60), _Forge(state="merged")):
+            kanban = _Kanban()
+            with self.subTest(state=forge.state, created=forge.created), self.assertLogs(plugin.logger, "WARNING"):
+                self.assertIsNone(self.run_hook(_vcs_record(), kanban, forge=forge))
+            self.assertEqual(kanban.events, [])
+
+    def test_repeated_records_are_checked_once_per_url_and_at_most_the_cap(self):
+        kanban, forge = _Kanban(), _Forge(author="mallory")
+        urls = [f"https://github.com/acme/fleet-config/pull/{n}" for n in range(plugin.RECORDS_CHECKED_MAX + 3)]
+        flood = _vcs_record() * 50 + "".join(_vcs_record(url=url) for url in urls)
+        with self.assertLogs(plugin.logger, "WARNING"):
+            self.assertIsNone(self.run_hook(flood, kanban, forge=forge))
+        views = [entry for entry in forge.asked if entry[0] == "proposal-view"]
+        self.assertEqual(len(views), plugin.RECORDS_CHECKED_MAX)
+        self.assertEqual(forge.providers, 1, "one provider, so the credential's login is read once per repository")
+        self.assertEqual(kanban.events, [])
 
     def test_output_with_no_record_is_left_alone(self):
         kanban = _Kanban()
@@ -181,7 +216,7 @@ class PrOpenedTest(unittest.TestCase):
 
     def test_the_title_is_bounded(self):
         kanban = _Kanban()
-        self.run_hook(_vcs_record(title="x" * (plugin.TITLE_MAX * 2)), kanban)
+        self.run_hook(_vcs_record(), kanban, forge=_Forge(title="x" * (plugin.TITLE_MAX * 2)))
         self.assertEqual(len(kanban.events[0][2]["title"]), plugin.TITLE_MAX)
 
     def test_registers_the_terminal_output_hook(self):
@@ -191,31 +226,35 @@ class PrOpenedTest(unittest.TestCase):
 
 
 class RealForgeTest(unittest.TestCase):
-    """:func:`plugin.ours` through the real ``forge.py``, with only the broker under ``vcs_client`` stubbed."""
+    """:meth:`plugin.Checker.ours` through the real ``forge.py``, with only the broker under ``vcs_client`` stubbed."""
 
     def check(self, author):
         import forge
         import sandbox_exec
 
         asked = []
+        created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         def broker(verb, payload):
             asked.append((verb, payload.get("repository"), payload.get("number")))
             if verb == "identity":
                 return {"identity": {"login": "kube-agents-bot[bot]"}}
-            return {"proposal": {"number": payload["number"], "url": URL, "author": author}}
+            return {"proposal": {
+                "number": payload["number"], "url": URL, "author": author, "title": "Raise the limit",
+                "state": "open", "created": created,
+            }}
 
         with mock.patch.object(vcs_client, "_call", broker), \
                 mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False), \
                 mock.patch.dict(sys.modules, {"forge": forge}):
-            verdict = plugin.ours({"url": URL, "number": 99, "title": "t"})
+            verdict = plugin.Checker().ours({"url": URL, "number": 99, "title": "t"})
         repository = "https://github.com/acme/fleet-config"
         self.assertEqual(asked, [("identity", repository, None), ("proposal-view", repository, 99)])
         return verdict
 
     def test_the_agents_own_pull_request_is_ours_and_a_strangers_is_not(self):
-        self.assertTrue(self.check("kube-agents-bot"))
-        self.assertFalse(self.check("mallory"))
+        self.assertEqual(self.check("kube-agents-bot"), {"url": URL, "number": 99, "title": "Raise the limit"})
+        self.assertIsNone(self.check("mallory"))
 
 
 def _hermes_importable():
