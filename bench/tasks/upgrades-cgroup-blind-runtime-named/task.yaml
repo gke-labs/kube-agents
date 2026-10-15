@@ -16,7 +16,7 @@
 # Deployment's line and nothing else.
 #
 # A parenthetical after a graded value is ungraded: the judge reads it. It
-# may not carry the line's own separator, `;`.
+# may not carry the line's own separator, `;`. The last value takes one too.
 #
 # A pod of the workload names it too: the pod-template hash (or a Job's
 # minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
@@ -125,9 +125,9 @@ verification_spec:
       fixture_roles:
         - cgroup-blind-runtime
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no)(?: ?\([^)\n;]*\))?; memory limit:? ?192 ?mib?$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no)(?: ?\([^)\n;]*\))?; memory limit:? ?192 ?mib?(?: ?\([^)\n;]*(?:\)|$))?$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no)(?: ?\([^)\n;]*\))?; memory limit:? ?(?!192 ?mib?$)[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cgroup-blind-jvm(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime:? ?[^ :;\n][^;\n]*; reads cgroup v2 limits: (?:yes|no)(?: ?\([^)\n;]*\))?; memory limit:? ?(?!192 ?mib?(?: ?\([^)\n;]*(?:\)|$))?$)[^ :;\n][^\n]*$'
 
   - name: no-invented-cves
     role: objective
