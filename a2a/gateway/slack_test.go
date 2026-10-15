@@ -2933,3 +2933,48 @@ func teamOf(m *slackevents.MessageEvent) string {
 	}
 	return m.Message.Team
 }
+
+// TestSlackReplyUnderTheBotsOwnPostIsAddressed: a chat.notify post (an alert,
+// a card's report) roots a thread no task started, so it is never a session
+// thread. A reply there with no mention used to drop without a log line
+// (gke-labs/kube-agents#3246). The root's author, which Slack sends on every
+// reply, now decides it, without asking the registry.
+func TestSlackReplyUnderTheBotsOwnPostIsAddressed(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	reg := &countingLookup{}
+	a.sessions = reg.lookup
+
+	reply := slackMsg("channel", "C1", "U1", "why is it OOMing?", "1792100300.000100", "1792100240.299609")
+	got, ok := a.inboundEvent(context.Background(), reply, "UBOT")
+	if !ok || got.Conversation != "slack:C1/1792100240.299609" || got.Text != "why is it OOMing?" {
+		t.Fatalf("reply under the bot's post: delivered=%v conv=%q text=%q", ok, got.Conversation, got.Text)
+	}
+	if len(reg.asked) != 0 {
+		t.Errorf("the registry was asked %v; the root's author is the answer", reg.asked)
+	}
+}
+
+func TestSlackReplyUnderSomeoneElsesPostStillNeedsAMention(t *testing.T) {
+	for _, parent := range []string{"", "UALICE"} {
+		a := newTestSlackAdapter(&fakeSlackAPI{})
+		a.sessions = noSessions
+		reply := slackMsg("channel", "C1", "U1", "do option 2", "5.0", "200.1")
+		if _, ok := a.inboundEvent(context.Background(), reply, parent); ok {
+			t.Errorf("parent %q: an unmentioned reply in a thread the bot did not root must not deliver", parent)
+		}
+	}
+}
+
+func TestSlackParentUserIDFromTheEventsAPIPayload(t *testing.T) {
+	payload := json.RawMessage(`{"token":"x","team_id":"T1","type":"event_callback","event":` +
+		`{"type":"message","channel":"C1","user":"U1","text":"do option 2","ts":"1792100300.000100",` +
+		`"thread_ts":"1792100240.299609","parent_user_id":"UBOT","channel_type":"channel"}}`)
+	if got := slackParentUserID(payload); got != "UBOT" {
+		t.Errorf("parent_user_id = %q, want UBOT", got)
+	}
+	for _, p := range []json.RawMessage{nil, json.RawMessage(`{`), json.RawMessage(`{"event":{"type":"message"}}`)} {
+		if got := slackParentUserID(p); got != "" {
+			t.Errorf("payload %s: parent = %q, want empty", p, got)
+		}
+	}
+}

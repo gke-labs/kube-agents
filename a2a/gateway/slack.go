@@ -661,7 +661,11 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			}
 			switch inner := e.InnerEvent.Data.(type) {
 			case *slackevents.MessageEvent:
-				if msg, ok := s.inbound(ctx, inner); ok {
+				var parent string
+				if evt.Request != nil {
+					parent = slackParentUserID(evt.Request.Payload)
+				}
+				if msg, ok := s.inboundEvent(ctx, inner, parent); ok {
 					// Recorded before the handoff, so the gateway's word on
 					// the sender always finds it (InboundVerified).
 					s.notePending(msg)
@@ -1270,6 +1274,28 @@ func (s *SlackAdapter) otherWorkspace(team string) bool {
 // our own posts, edits and other subtypes, redeliveries, and a sender from
 // another workspace — is not a turn.
 func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent) (InboundMessage, bool) {
+	return s.inboundEvent(ctx, m, "")
+}
+
+// slackParentUserID is the thread root's author on a thread reply, from the
+// raw Events API payload: Slack sends it as event.parent_user_id, and
+// slackevents.MessageEvent has no field for it. Empty on anything else, and
+// on a payload that does not parse, which reads as "not known".
+func slackParentUserID(payload json.RawMessage) string {
+	var envelope struct {
+		Event struct {
+			ParentUserID string `json:"parent_user_id"`
+		} `json:"event"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &envelope) != nil {
+		return ""
+	}
+	return envelope.Event.ParentUserID
+}
+
+// inboundEvent is inbound with the thread root's author, when the event
+// carried one (slackParentUserID).
+func (s *SlackAdapter) inboundEvent(ctx context.Context, m *slackevents.MessageEvent, parentUserID string) (InboundMessage, bool) {
 	if !slackTurnSubtypes[m.SubType] || m.BotID != "" || m.User == "" || m.User == s.botUserID ||
 		m.Channel == "" || m.TimeStamp == "" {
 		return InboundMessage{}, false
@@ -1348,7 +1374,15 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 		// bare mention as a reply.
 		return InboundMessage{}, false
 	}
-	if isReply && !mentioned && !s.isSessionThread(ctx, m.Channel, threadTS) {
+	// A reply under one of the bot's own posts is addressed to it, mention or
+	// not: an alert, a card's report or any other chat.notify post roots a
+	// thread no task started, so it is never a session thread, and its
+	// replies used to vanish without a log line (gke-labs/kube-agents#3246).
+	// Same rule as the today path's Slack adapter (_bot_authored_thread_root,
+	// upstream #63530), and like it, durable: Slack says who rooted the
+	// thread on every reply, so a restart or an expired mark changes nothing.
+	botRooted := isReply && parentUserID != "" && parentUserID == s.botUserID
+	if isReply && !mentioned && !botRooted && !s.isSessionThread(ctx, m.Channel, threadTS) {
 		return InboundMessage{}, false
 	}
 	return InboundMessage{
