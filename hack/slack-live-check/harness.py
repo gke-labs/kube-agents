@@ -738,6 +738,14 @@ def check_mention(session: Session) -> CheckResult:
 
 
 def check_thread(session: Session) -> CheckResult:
+    # Without a status line nothing marks which bot post is the follow-up's own: the
+    # mention's task keeps posting progress and its result in the same thread after
+    # its ack, so a gateway that dropped the reply would pass on those. Fail closed.
+    if session.args.no_status_line:
+        return CheckResult(CHECK_THREAD, False, "thread cannot be judged with --no-status-line: without the status "
+                           "line the follow-up's reply cannot be told from the mention task's later posts in the "
+                           "same thread; run thread against a gateway that keeps a status line",
+                           {"channel": session.channel_id})
     root = session.mention_root or session.args.thread_ts or ""
     if not root:
         return CheckResult(CHECK_THREAD, False, "no thread to reply in: the mention check did not pass in this run and --thread-ts is unset",

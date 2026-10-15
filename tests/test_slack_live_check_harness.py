@@ -826,6 +826,15 @@ class ListedChecksTest(HarnessTestCase):
         self.assertEqual(code, harness.EXIT_FAIL)
         self.assertIn("FAIL thread", text)
 
+    def test_thread_fails_closed_without_a_status_line(self):
+        # Lineless, the mention task's later posts in the thread would pass a dropped reply.
+        code, text = self.run_harness("--checks", "mention", "--no-status-line")
+        root = self.evidence(text, "mention")["sent_ts"]
+        self.world.ignore_unmentioned_thread_replies = True
+        code, text = self.run_harness("--checks", "thread", "--thread-ts", root, "--no-status-line")
+        self.assertEqual(code, harness.EXIT_FAIL, text)
+        self.assertIn("cannot be judged with --no-status-line", self.line(text, "FAIL thread"))
+
     def test_thread_is_not_fooled_by_the_mention_answer_landing_late(self):
         # The mention passes on its status line; its answer arrives later. A gateway
         # that drops the unmentioned follow-up must fail the thread check, not pass it
