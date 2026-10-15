@@ -3600,7 +3600,8 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertTrue(calls[0].args[1].startswith("**Security & RBAC posture audit: 2 new"))
 
     def test_flag_on_a_closed_ledger_falls_back_to_the_line(self):
-        # A clean run closes the ledger without rewriting its title.
+        # A clean run closes the ledger; the body below its new title still
+        # lists the last run's findings, so the state decides the card.
         os.environ["KAGE_SLACK_UX"] = "1"
         _, calls = self._post(composed=self.ONE_LINE, issue=dict(self.ISSUE, state="closed"))
         self.assertTrue(calls[0].args[1].startswith("**Security & RBAC posture audit: 2 new"))

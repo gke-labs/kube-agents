@@ -420,7 +420,7 @@ for this stream, rewrites (or opens) the ledger issue, comments the delta, opens
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
 JSON line — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_still_open` (remediation
 pull requests already open on findings this run still carries; empty on a clean run), `prs_closed`,
-`partial`, `coverage_gaps`, `silent_ok`, `declared`, the number of postures a repository
+`partial`, `coverage_gaps`, `unreported_under_gap` (only when not empty), `silent_ok`, `declared`, the number of postures a repository
 declaration kept off the ledger (it never decides silence), `postures_withheld`, the ids of the
 posture findings `finish` held back because the document recorded no complete declared-intent
 search (empty everywhere but on a declaring stream that skipped the step; see
@@ -518,14 +518,16 @@ cluster is not evidence that it was fixed. Over a partial run the harness:
 - reports `resolved: 0` and posts no "resolved" delta, rather than announcing fixes it cannot see;
 - closes **no** remediation pull request as stale, so a fix survives to the next complete run, except the shield's close (SOP 2.7), which rests on the declaration rather than on this run's reading;
 - does **not** close the ledger, even with zero findings — the issue stays open and gains a comment
-  naming the gaps. `status` is `CLEAN` where the run accounted for every finding the previous
+  naming the gaps (not again on the next clean run if the gaps did not change). `status` is `CLEAN` where the run accounted for every finding the previous
   ledger held, and `HELD` where it did not, which is a separate refusal that a gap neither causes
   nor prevents (see [The clean run](#the-clean-run)). A coverage gap self-heals the day the fleet
   is fully readable again; a lost store record does not, and clears only on a run that reports
   findings or when a maintainer who has checked them closes the ledger.
 
-A partial run is never `[SILENT]` — `finish` returns `silent_ok: false` for it. Report the issue URL
-and say which clusters were not covered. See [The clean run](#the-clean-run) for the full rule.
+A partial run with a new or changed gap is never `[SILENT]` — `finish` returns `silent_ok: false`
+for it. A gap that is the same as on the stored previous run does not stop `silent_ok` on its own.
+Report the issue URL and say which clusters were not covered. See [The clean run](#the-clean-run)
+for the full rule.
 
 ### No forge configured
 
@@ -1233,14 +1235,23 @@ closes every remediation pull request still open for the stream. The answers com
 deliberately: a reply posted after the close would land on an issue nobody is watching. The table
 is there because a clean run does not rewrite the body: the comment is the only place the commands
 behind an all-clear are published, and an all-clear nobody can re-run is one nobody can audit
-after the fact.
+after the fact. After the close, the harness changes the title to `0 findings` and puts a banner
+above the old body. The banner says that the run found none of the findings below, so the closed
+issue does not show them as open. The findings below the banner are not rewritten; they stay as the
+record. On a ledger that a coverage gap opened, the banner says that a complete run found no
+findings and no gap. A later run
+with findings opens a new ledger issue; it does not reopen this one.
 
-**Zero findings plus a coverage gap is not a clean run, and it is not silent even on a stream with
-no ledger.** With gaps, the harness opens one — titled `coverage incomplete (n gaps, 0 findings)`
+**Zero findings plus a coverage gap is not a clean run, and a run with a new or changed gap is not
+silent, even on a stream with no ledger.** With gaps, the harness opens one — titled `coverage incomplete (n gaps, 0 findings)`
 rather than the all-clear phrasing — so the run leaves a durable artifact saying what it could not
 see. Without this, a stream that inspected nothing produced no issue, no comment, and nothing to
 notice: four streams did exactly that on 2026-08-03, and the only reason it surfaced is that a fifth
-happened to have a ledger open from the day before.
+happened to have a ledger open from the day before. A later clean run with a gap rewrites the
+title and body of a ledger that a gap opened, so the gap count and the Scope table are this run's.
+It does not rewrite a ledger that a findings run wrote. If the gaps are the same as on the stored
+previous clean run, it posts no second partial all-clear comment, unless it closed a remediation
+pull request. After a stored run that was not `CLEAN`, it posts the comment.
 
 **Zero findings over a finding the run checked again is not a clean run either.** Before it
 closes, `finish` reads the previous run's stored report — the same findings `start` handed you as `carried`. For
@@ -1277,7 +1288,7 @@ not earned — on 2026-08-03 a run with two partially-covered clusters answered 
 ledger URL never reached the operator who had asked for it.
 
 > **`silent_ok` is `true` only when the run moved nothing an operator needs to hear about:** nothing
-> new, nothing resolved, no coverage gap, no held close, no remediation pull request opened or
+> new, nothing resolved, no new or changed coverage gap, no held close, no remediation pull request opened or
 > closed, and — on a stream that passes `--manifest-file` — no collector candidate the document
 > dropped.
 
@@ -1298,8 +1309,17 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
 - **`resolved > 0`** — the fleet was carrying findings yesterday and is not today. Something got
   fixed, and that is the best thing this audit ever gets to say. Reporting `partial` failures while
   swallowing this one would leave the operator hearing only bad news.
-- **`partial: true`** — the ledger stayed open because the fleet was not fully read. "I found
-  nothing" and "I could not look" must not arrive as the same silence.
+- **`partial: true` with a new or changed gap** — the ledger stayed open because the fleet was not
+  fully read. "I found nothing" and "I could not look" must not arrive as the same silence. A gap
+  that is the same as on the stored previous run was said on the run that got it, and is still in
+  the ledger and in `coverage_gaps`; it does not make `silent_ok` false again. With no trusted
+  stored record, every gap counts as new. `finish` cannot tell a scheduled run from an on-demand
+  one, so a gap first seen on an on-demand run is not reported again by the next scheduled run.
+- **`unreported_under_gap` on the JSON line** — a finding that the stored run listed is not in what
+  this run published, and a gap holds `resolved` at 0. The gaps may be the same as before; the run
+  still speaks. Say in your one line that this many findings are no longer reported while a
+  coverage gap stays, with the issue URL. Do not call them resolved. Each id is listed once; a later
+  run with the same gap does not list it again.
 - **`status: "HELD"`** — the ledger stayed open because the run did not account for findings it was
   carrying, or because it could not read the issue's comments, where a `/remediate` may be waiting
   for an answer. "I found nothing" and "I did not write it down" must not arrive as the same
@@ -1317,8 +1337,10 @@ run's findings are unknowable, so the run announces nothing rather than declarin
 new, and logs a line containing `the previous run's findings are unknowable` to stderr. A `finish`
 that rewrites the body deletes the record just before the rewrite, and a clean close deletes it just
 after the close lands, so that a record older than the issue is never trusted; a `finish` that fails
-after either delete leaves the run after it one of these. A held-open run only comments, so a failed
-store write there keeps the record, which still describes the body. It holds nothing it
+after either delete leaves the run after it one of these. A held-open run that only comments keeps
+the record when its store write fails, because the record still describes the body. A held-open run
+that refreshes a coverage ledger rewrites the body: it deletes the record before the edit, and
+stores the body the edit wrote, or the previous body when the edit failed. It holds nothing it
 cannot name: the body is rewritten from this document, and a findings run leaves the next run a
 trusted record. A clean run never closes the ledger (the shield's close of a shared-account pull request aside): the ledger stays open with a coverage gap saying the store
 had no trusted record, `partial: true` and `silent_ok: false`, and it stays open run after run until a

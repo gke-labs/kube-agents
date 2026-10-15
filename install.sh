@@ -5559,6 +5559,7 @@ run_menu_system() {
         # confirmation after the notice.
         announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
         check_scope_container_access || exit 1
+        check_scope_export_sink_access || exit 1
         enable_scope_selector_apis "$PROJECT_ID"
         apply_crd_upgrades "$repo_dir"
         print_info "Re-applying the install to GKE cluster '$cluster_name' (terraform apply)..."
@@ -7190,11 +7191,15 @@ main() {
   # ones at the keyboard. Here the route is known for --generate-only and -y;
   # an interactive run learns it at the (Y/n/g) prompt below and is checked
   # there, so the g answer is the same choice as the flag.
+  # The sink preflight follows the same route: the apply creates a drift
+  # audit-log sink in each project the scope lists with the same identity.
   if [ "$PARAM_DRY_RUN" != "true" ]; then
     if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
       check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
+      check_scope_export_sink_access "$SCOPE_CHECK_MODE_WARN"
     elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
       check_scope_container_access || exit 1
+      check_scope_export_sink_access || exit 1
     fi
   fi
 
@@ -7373,11 +7378,13 @@ main() {
         # The apply is chosen: the container preflight refuses here, before
         # step 12 writes anything, as it does above the summary for -y.
         check_scope_container_access || exit 1
+        check_scope_export_sink_access || exit 1
         ;;
       [Gg])
-        # The handoff is chosen: the same check only warns, as for the flag.
+        # The handoff is chosen: the same checks only warn, as for the flag.
         PARAM_GENERATE_ONLY="true"
         check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
+        check_scope_export_sink_access "$SCOPE_CHECK_MODE_WARN"
         ;;
       *)
         # Not a hand-off like `g`: `n` is also a decline, so nothing is

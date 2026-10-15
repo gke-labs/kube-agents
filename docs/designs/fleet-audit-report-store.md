@@ -76,15 +76,19 @@ ids.
 The write is best-effort: a store that cannot be written logs a warning and never changes the run's
 exit code. A failed write deletes `latest.json` on its way out, because the file left behind
 describes an older run and nothing in it says so — the next run would trust it, and a reader would
-quote it as current. A held-open clean run is the exception: it only comments, so the body is the
-one the file describes, and a failed write keeps the file rather than cost the next run its memory. An absent store is unknowable, and every reader handles that; a stale one
+quote it as current. A held-open clean run that only comments is the exception: the body is the
+one the file describes, and a failed write keeps the file rather than cost the next run its memory.
+A held-open clean run on a coverage ledger rewrites the body (the refresh below), so it is not this
+exception. An absent store is unknowable, and every reader handles that; a stale one
 passes the issue and repository checks, and only the comparison against the live block in §4 tells
 it from a fresh one. For the same reason `finish` deletes `latest.json` just before each call that
-rewrites the ledger: the findings rewrite and the coverage issue a clean run opens. A run killed
+rewrites the ledger: the findings rewrite, the coverage issue a clean run opens, and the refresh of
+an open coverage ledger. A run killed
 between that call and writing the store leaves no envelope rather than one describing the run before.
-The clean close is the exception, and `finish` deletes the file just after it: a close leaves the
+The clean close is the exception, and `finish` deletes the file just after it: the close leaves the
 body as it was, so until it lands the stored memory is still exactly the open ledger, and a close
-that fails leaves the memory in place. A run killed between the close and the delete, or a close that
+that fails leaves the memory in place. After the close, `finish` adds a banner and a new title to
+the closed issue and keeps the id block. A run killed between the close and the delete, or a close that
 lands on GitHub but reports failure, leaves a record naming an issue that is now closed. A later run
 does not trust it while that issue stays closed, since the trust check needs it to be the open
 ledger; a reader quoting it shows the last findings run as latest until the next run rewrites it.
@@ -99,10 +103,14 @@ rather than trust whichever file exists. Pruning runs in its own `try`: a
 failed prune has not damaged the memory the run just wrote.
 
 `issue_number` and `ledger_body` are a claim about the live ledger, so a clean run that leaves the
-ledger open — over a coverage gap or an unaccounted previous finding — only commented on it, and its
-body still renders the previous run's findings. That path stores the previous body and ids forward
-instead of its own empty set; recording `[]` would hand the next run a trusted memory of an empty
-ledger, and every finding the body carries would be announced as new. The document that body renders
+ledger open — over a coverage gap or an unaccounted previous finding — and only comments on it
+leaves a body that still renders the previous run's findings. That path stores the previous body
+and ids forward instead of its own empty set; recording `[]` would hand the next run a trusted memory of an empty
+ledger, and every finding the body carries would be announced as new. A clean run with a gap on a
+coverage ledger (a `coverage incomplete` title and no finding id in its block) rewrites the title
+and body from its own document instead. It then stores the body the edit wrote, with no ids, and
+`ledger_held_open` false; when the edit fails, it stores the previous body as above. The result of
+the edit decides this, never the attempt. The document that body renders
 rides beside it as `ledger_document`, which only `finish` reads, for titles and for the wording carry. It is known only from
 a run that wrote the body; after a seed, whose memory has no document, it is absent until a
 findings run rewrites the body, rather than a held-open run's empty document standing in for it. `document` stays this

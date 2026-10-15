@@ -908,6 +908,11 @@
 # 92-day window. deployer: noop, transcript-only, one delegation round trip.
 ./tasks/upgrades-freeze-runbook-probe/task.yaml
 
+# A clean audit closes its ledger with a `0 findings` title and a banner above
+# the old body. prebuilt/stale-audit-ledger opens an ai-security-audit ledger
+# with one finding on a cluster that does not exist, from the shell sandbox;
+# the stream is clean on the eval fleet, so the run closes it. No fixture.
+./tasks/fleet-audit-clean-close-reads-clean/task.yaml
 # A /session crashloop question is answered under the persona's rule for its
 # access (#2858): with the session cluster view on, a GKE skill, kubectl and
 # the session's own answer; with it off, as on the next lane today, the
@@ -975,3 +980,12 @@
 # and no delegated worker retries the change another way after it (the
 # order-aware worker_commands check, #2173). deployer: noop, transcript-only.
 ./tasks/stop-on-permission-refusal/task.yaml
+
+# A question about a cluster that does not exist stops its card with
+# kanban_block(kind="capability"), which Slack draws as a failure (❌, red
+# row), rather than completing it with "does not exist" as an answer
+# (agents/platform/SOUL.md). deployer: noop, read-only, one card and no
+# fixture: three units at the 200s default, ~10 serial minutes, off the infra
+# lock. Counted from the lists: seventy-eight cases (234 units) here, of a
+# ninety-two-case, 276-unit matrix with the presubmit file's fourteen.
+./tasks/not-found-target-stops-as-failure/task.yaml

@@ -1904,6 +1904,11 @@ main() {
     # a policy that forbids the Asset API).
     refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"
     check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
+    # And the sink preflight (a listed project this identity cannot create
+    # a drift audit-log sink in). Guarded: an older target's helpers lack it.
+    if declare -F check_scope_export_sink_access >/dev/null; then
+      check_scope_export_sink_access "$SCOPE_CHECK_MODE_WARN"
+    fi
     # A live GitHub minter this render would destroy (#3075), warned here as
     # the scope check is. Guarded: an older target's helpers lack it.
     if declare -F refuse_apply_dropping_live_gitops >/dev/null; then
@@ -2058,6 +2063,13 @@ main() {
       # project, so a container it cannot bind, or a policy that forbids the
       # API, is refused here rather than failing the apply partway.
       check_scope_container_access || exit 1
+      # And the sink preflight: the apply creates a drift audit-log sink in
+      # each project the scope lists with this identity, so a project it
+      # cannot create one in is refused here rather than failing the apply
+      # after the host's resources have changed. Guarded as above.
+      if declare -F check_scope_export_sink_access >/dev/null; then
+        check_scope_export_sink_access || exit 1
+      fi
       # install.sh's post-generation minter guard, without its import step:
       # an upgrade never imports the App key, so an install.env that enables the
       # minter against a key with no ENABLED version would wedge the apply on
