@@ -97,7 +97,7 @@ verification_spec:
       fixture_roles:
         - readiness-drain-blocked
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?[^ :;\n][^;\n]*; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?\d+(?: \([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?[^ :;\n][^;\n]*; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?\d+(?: ?\([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
 
   - name: the-declared-line-carries-the-budgets-evidence
     role: objective
@@ -108,10 +108,10 @@ verification_spec:
       fixture_roles:
         - readiness-drain-blocked
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?0%?(?: \([^)\n;]*\))?; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?0(?: \([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?0%?(?: ?\([^)\n;]*\))?; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?0(?: ?\([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?(?!0%?(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?\d+(?: \([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?[^ :;\n][^;\n]*; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?(?!0(?: \([^)\n;]*\))?;)\d+(?: \([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?(?!0%?(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?\d+(?: ?\([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?[^ :;\n][^;\n]*; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?(?!0(?: ?\([^)\n;]*\))?;)\d+(?: ?\([^)\n;]*\))?; blocks a drain: (?:yes|no)$'
 
   - name: the-declared-line-says-the-budget-blocks-a-drain
     role: objective
@@ -122,9 +122,9 @@ verification_spec:
       fixture_roles:
         - readiness-drain-blocked
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?[^ :;\n][^;\n]*; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?\d+(?: \([^)\n;]*\))?; blocks a drain: yes$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?[^ :;\n][^;\n]*; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?\d+(?: ?\([^)\n;]*\))?; blocks a drain: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?[^ :;\n][^;\n]*; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?\d+(?: \([^)\n;]*\))?; blocks a drain: (?!yes$)[^\n]+$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?/seeded-upgrade/(?:(?:pdb|poddisruptionbudgets?)(?:\.policy)?/)?pinned-batch-runner(?:\s*\([^)\n]*\))?: max[ -]?unavailable:? ?[^ :;\n][^;\n]*; min[ -]?available:? ?[^ :;\n][^;\n]*; (?:disruptions[ -]?allowed|allowed[ -]?disruptions):? ?\d+(?: ?\([^)\n;]*\))?; blocks a drain: (?!yes$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

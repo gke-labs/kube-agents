@@ -79,7 +79,7 @@ verification_spec:
       fixture_roles:
         - version-laggard
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: \([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: ?\([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
 
   - name: the-declared-line-states-the-scope
     role: objective
@@ -94,9 +94,9 @@ verification_spec:
       # no_minor_upgrades both arrive as "no-minor-upgrades"; the optional
       # separator also admits a spaced spelling.
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: \([^)\n;]*\))?; scope:? ?no[-_ ]?minor[-_ ]?upgrades(?: \([^)\n;]*\))?; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: ?\([^)\n;]*\))?; scope:? ?no[-_ ]?minor[-_ ]?upgrades(?: ?\([^)\n;]*\))?; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: \([^)\n;]*\))?; scope:? ?(?!no[-_ ]?minor[-_ ]?upgrades(?: \([^)\n;]*\))?;)[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: ?\([^)\n;]*\))?; scope:? ?(?!no[-_ ]?minor[-_ ]?upgrades(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
 
   - name: the-declared-line-states-the-end-date
     role: objective
@@ -107,9 +107,9 @@ verification_spec:
       fixture_roles:
         - version-laggard
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: \([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?20\d\d-\d\d-\d\d[^;\n?!]*; holds the automatic minor upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: ?\([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?20\d\d-\d\d-\d\d[^;\n?!]*; holds the automatic minor upgrade: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: \([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?(?!20\d\d-\d\d-\d\d[^;\n?!]*;)[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: ?\([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?(?!20\d\d-\d\d-\d\d[^;\n?!]*;)[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?:yes|no)$'
 
   - name: the-declared-line-says-it-holds-the-automatic-upgrade
     role: objective
@@ -120,9 +120,9 @@ verification_spec:
       fixture_roles:
         - version-laggard
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: \([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: yes$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: ?\([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: yes$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: \([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?!yes$)[^\n]+$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: exclusion:? ?hold-the-minor-lag(?: ?\([^)\n;]*\))?; scope:? ?[^ :;\n][^;\n]*; ends:? ?[^ :;\n][^;\n]*; holds the automatic minor upgrade: (?!yes$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective
