@@ -232,6 +232,22 @@ toolsets:
 # Agents on the default 90, where nothing has ever approached the ceiling.
 agent:
   max_turns: 250
+  # Toolsets this profile's turns never need, kept out of every model call. Gemini
+  # on Vertex intermittently waits tens of seconds to minutes before its first
+  # token when a request declares the full hermes-cli set (36 tools here), and
+  # not when these are dropped: replaying a captured worker request straight to
+  # Vertex, the first token took p90 13.7s and up to 57s with all 36 declared,
+  # and p90 2.8s, max 5.9s, with browser, tts and vision removed. A fleet
+  # question that took 28 minutes answered in about 2.6 once they were gone.
+  # disabled_toolsets is applied last, on every platform key, so it narrows the
+  # hermes-cli bundle above and the toolsets a kanban worker is spawned with
+  # (_resolve_worker_cli_toolsets reads the same resolution).
+  disabled_toolsets:
+    - browser
+    - computer_use
+    - image_gen
+    - tts
+    - vision
 
 # Per-file character cap Hermes puts on a context file (SOUL.md, AGENTS.md) when it
 # builds the system prompt. Unset, the cap is 6% of the model window, and a flat

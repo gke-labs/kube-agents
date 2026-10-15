@@ -282,11 +282,13 @@ release_inflight_note() { :; }
 EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_LOCATION=
 """
 
-    def run_reps(self, extra: str = "") -> subprocess.CompletedProcess:
+    def run_reps(self, extra: str = "", after: str = "") -> subprocess.CompletedProcess:
         body = "\n".join([
             # The one constant the unit reads from the script's top: the base
             # of its per-unit inject port.
             lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+            # The name the opening turn's timing is copied in under.
+            lifted_constant("EVAL_TIMING_FILE"),
             # The unit resolves the task file it hands the bench through
             # this helper (the inject lane's copy, or the file under
             # bench/tasks/); with no lane directory set it is the identity.
@@ -300,6 +302,7 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
             extra,
             'for rep in 1 2 3; do run_one_unit ./tasks/x/task.yaml case-x "${rep}" "" "" "${rep}"; done',
             'ls "${STATE_DIR}" | sort | tr "\\n" " "; echo',
+            after,
         ])
         return run_bash(body)
 
@@ -310,6 +313,23 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
         self.assertIn("case-x.rep1.end case-x.rep1.start case-x.rep2.dir", result.stdout)
         # Graded after its own `finished` line, so the log keeps its markers timely.
         self.assertLess(result.stdout.index("finished case-x rep 3"), result.stdout.index("FINISH_CASE"))
+
+    def test_the_opening_turns_timing_lands_beside_each_repetitions_results(self):
+        """Run, not read: the bench stub writes the file the unit names in
+        KUBE_AGENTS_TIMING_FILE for reps 1 and 3 only, and rep 2's state
+        directory holds a stale file from an earlier lease, which must not
+        reach rep 2's run directory."""
+        runs = 'RUNS="$(mktemp -d)"; : > "${STATE_DIR}/case-x.rep2.timing.json"\n'
+        bench = (
+            'uv() { mkdir -p "${RUNS}/run_${rep}"; '
+            '[ "${rep}" = 2 ] || echo "{\\"turn1_s\\": ${rep}.5}" > "${KUBE_AGENTS_TIMING_FILE}"; '
+            'echo "ran 1 task(s); results: ${RUNS}/run_${rep}/results.json"; }\n'
+        )
+        check = 'for r in 1 2 3; do echo "rep ${r}: $(cat "${RUNS}/run_${r}/timing.json" 2>/dev/null || echo none)"; done'
+        result = self.run_reps(runs + bench, check)
+        self.assertIn('rep 1: {"turn1_s": 1.5}', result.stdout, result.stdout + result.stderr)
+        self.assertIn("rep 2: none", result.stdout)
+        self.assertIn('rep 3: {"turn1_s": 3.5}', result.stdout)
 
     def test_a_repetition_that_gave_up_on_its_lock_leaves_the_case_to_the_loop(self):
         # Rep 2 never gets the task lock: no state file, so the count stops at

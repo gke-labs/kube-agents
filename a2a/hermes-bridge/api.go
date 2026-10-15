@@ -303,12 +303,15 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// every turn of the task is the same session and conversation. Best
 	// effort: the task runs either way, and a failure is said in the answer.
 	routeLost := false
-	if err := b.recordRoute(taskCtx, sessionID, run.origin); err != nil &&
-		!errors.Is(err, errNoChatConversation) && !errors.Is(err, errRouteDisabled) {
+	routeErr := b.recordRoute(taskCtx, sessionID, run.origin)
+	if routeErr != nil && !errors.Is(routeErr, errNoChatConversation) && !errors.Is(routeErr, errRouteDisabled) {
 		b.cfg.Logger.Warn("conversation route not recorded; a card this task files cannot report back",
-			"task", taskID, "session", sessionID, "err", err)
+			"task", taskID, "session", sessionID, "err", routeErr)
 		routeLost = true
 	}
+	// Only a recorded route lets a card's post reach the conversation, so only
+	// then may the terminal keep the ask for those posts to settle (cardsMark).
+	run.routeRecorded.Store(routeErr == nil)
 
 	// The door's side of this task: attributed by the session id the hook
 	// payload carries, signed with the pod's shared secret, and only while

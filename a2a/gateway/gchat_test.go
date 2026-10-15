@@ -488,18 +488,24 @@ func TestToGchatText(t *testing.T) {
 		// observed Chat rendering <url|text> from a message the app posted,
 		// so one already present in executor output would publish a link
 		// whose visible text names a host it does not open.
+		// One whose text names no host is the link [the doc](url) would
+		// have made, and is kept (TestToGchatTextKeepsAnExecutorsChatLink).
 		"<https://attacker.example/login|https://github.com/gke-labs/kube-agents>": "< https://attacker.example/login|https://github.com/gke-labs/kube-agents>",
-		"see <https://evil.example|the doc>":                                       "see < https://evil.example|the doc>",
+		"see <https://evil.example|the doc>":                                       "see <https://evil.example|the doc>",
 		// A generated link and an injected one in the same message: the
-		// adapter's own survives, the executor's does not.
-		"[real](https://x.example/p) vs <https://evil.example|real>": "<https://x.example/p|real> vs < https://evil.example|real>",
+		// adapter's own survives, and the executor's survives only where
+		// its text names no other host.
+		"[real](https://x.example/p) vs <https://evil.example|https://x.example/p>": "<https://x.example/p|real> vs < https://evil.example|https://x.example/p>",
 		// A mention or an angle pair inside a markdown link's display text
 		// is inside the sequence the adapter generates, so it is defanged
-		// there too rather than riding out on the exemption. The angle pair
-		// also names a host the link does not open, so that link is refused
-		// as well: the markdown stays, defanged, and no <...|...> is made.
-		"[<users/all>](https://x.example/p)":               "<https://x.example/p|< users/all>>",
-		"[<https://evil.example|hi>](https://x.example/p)": "[< https://evil.example|hi>](https://x.example/p)",
+		// there too rather than riding out on the exemption. An angle pair
+		// that names its host in the text gets the label-host refusal on
+		// both links: the markdown stays, defanged, and no <...|...> is
+		// made. One whose text is prose is a kept link of its own, and the
+		// markdown around it is left as written rather than nesting two.
+		"[<users/all>](https://x.example/p)":                              "<https://x.example/p|< users/all>>",
+		"[<https://evil.example|https://x.example>](https://x.example/p)": "[< https://evil.example|https://x.example>](https://x.example/p)",
+		"[<https://evil.example|hi>](https://x.example/p)":                "[<https://evil.example|hi>](https://x.example/p)",
 		// A `|` or an angle bracket in the URL would let a crafted link close
 		// the generated sequence early and choose its own display text. The
 		// URL class refuses them, so the markdown is left as written instead.
@@ -532,6 +538,85 @@ func TestToGchatText(t *testing.T) {
 		// (TestToGchatTextDefangsAfterAChunkedFence), the defang does not
 		// lean on that. The bold and link passes still read it as a fence.
 		"see ``` <https://evil.example|https://good.example>": "see ``` < https://evil.example|https://good.example>",
+	}
+	for in, want := range cases {
+		if got := toGchatText(in); got != want {
+			t.Errorf("toGchatText(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// issue3015Reply is the reply #3015 reported from a next-mode install:
+// the executor wrote the link in Chat's own form, the defang put a space in
+// it, and Chat linkified the URL and `|text` together into a 404.
+const issue3015Reply = "Opened <https://github.com/gke-agentic/kube-agents-autopush-next-infra/pull/3|gke-agentic/kube-agents-autopush-next-infra#3> for review."
+
+// TestToGchatTextKeepsAnExecutorsChatLink: models write Chat's <url|text>
+// as well as markdown links, and the defang used to put a space in every
+// one (#3015). A closed one in prose, with an http(s) URL in the markdown
+// destination class and text that names no other host, is the link the
+// adapter would have made from [text](url), so it is kept as written.
+// Everything else stays defanged: text naming another host (the label-host
+// refusal, whatever the text hides it in), a nested or unclosed opener, a
+// pipe the URL class refuses, a URL that is not http(s), a mention, and
+// anything in code or after a fence that never closes.
+func TestToGchatTextKeepsAnExecutorsChatLink(t *testing.T) {
+	cases := map[string]string{
+		issue3015Reply:                                         issue3015Reply,
+		"<https://x.example/p|the doc>":                        "<https://x.example/p|the doc>",
+		"<https://x.example/p|https://x.example/p>":            "<https://x.example/p|https://x.example/p>",
+		"<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>":        "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>",
+		"<https://x.example/a|a> and [b](https://x.example/b)": "<https://x.example/a|a> and <https://x.example/b|b>",
+		// Text naming another host is refused as the markdown link with
+		// that label is, however it is wrapped, and is defanged.
+		"<https://evil.example/login|https://github.com/x>":        "< https://evil.example/login|https://github.com/x>",
+		"<https://evil.example|**https://good.example**>":          "< https://evil.example|*https://good.example*>",
+		"<https://evil.example|https://good.example@evil.example>": "< https://evil.example|https://good.example@evil.example>",
+		// Markdown link syntax in the text: it is the kept link's text, and
+		// the markdown link it spells overlaps the kept link, so it is not
+		// converted and cannot be joined to a different link; where it
+		// names another host the whole is refused and defanged, and the
+		// markdown link inside converts on its own.
+		"<https://x.example/a|[doc](https://x.example/b)>":                        "<https://x.example/a|[doc](https://x.example/b)>",
+		"<https://x.example/a|x](https://x.example/b) [y>":                        "<https://x.example/a|x](https://x.example/b) [y>",
+		"<https://evil.example|x](https://good.example) [y>":                      "< https://evil.example|x](https://good.example) [y>",
+		"<https://good.example|[x](https://evil.example)>":                        "< https://good.example|<https://evil.example|x>>",
+		"[https://good.example <https://evil.example|doc>](https://evil.example)": "[https://good.example <https://evil.example|doc>](https://evil.example)",
+		// Nested and adjacent sequences: an opener whose text holds another
+		// is not closed, and stays defanged around the inner link.
+		"<https://a.example|<https://b.example|c>>":     "< https://a.example|<https://b.example|c>>",
+		"<https://a.example|a><https://b.example|b>":    "<https://a.example|a><https://b.example|b>",
+		"<https://evil.example|https://good.example|x>": "< https://evil.example|https://good.example|x>",
+		"<https://x.example/a|b|c>":                     "< https://x.example/a|b|c>",
+		// An unclosed opener before a link, Chat's or markdown: the
+		// opener is defanged so the link's `>` cannot close it.
+		"see <https://evil.example|docs: <https://x.example/p|doc>":  "see < https://evil.example|docs: <https://x.example/p|doc>",
+		"see <https://evil.example|docs: [doc](https://x.example/p)": "see < https://evil.example|docs: <https://x.example/p|doc>",
+		// Only an http(s) URL in the markdown destination class.
+		"<ftp://x.example|doc>":           "< ftp://x.example|doc>",
+		"<javascript:alert(1)|doc>":       "< javascript:alert(1)|doc>",
+		"<HTTPS://x.example|doc>":         "< HTTPS://x.example|doc>",
+		"<https://x.example/a)b|doc>":     "< https://x.example/a)b|doc>",
+		"<https://x.example|>":            "< https://x.example|>",
+		"<https://x.example|line\nbreak>": "< https://x.example|line\nbreak>",
+		// A mention in the text is not a kept link's text, and is defanged.
+		"<https://x.example|<users/all>>": "< https://x.example|< users/all>>",
+		// Code is as written; a code span cutting the text short leaves the
+		// opener defanged, and a fence that never closes hides nothing.
+		"`<https://x.example|doc>`":                      "`<https://x.example|doc>`",
+		"```\n<https://x.example|doc>\n```":              "```\n<https://x.example|doc>\n```",
+		"<https://x.example|see `code`>":                 "< https://x.example|see `code`>",
+		"see ``` <https://x.example|doc>":                "see ``` < https://x.example|doc>",
+		"```\nsort <f|uniq\n``` <https://x.example|doc>": "```\nsort <f|uniq\n``` <https://x.example|doc>",
+		// The markdown rules read a kept link as the link it is: a bold
+		// pair around it or in its text converts, a `**` in its URL is not
+		// half of a pair, and a markdown link that overlaps it is refused
+		// rather than nested with it or cut into it.
+		"**<https://x.example|doc>**":                        "*<https://x.example|doc>*",
+		"<https://x.example/p|**doc**>":                      "<https://x.example/p|*doc*>",
+		"**a <https://x.example/**/p|doc> b**":               "*a <https://x.example/**/p|doc> b*",
+		"[see <https://x.example|doc>](https://x.example/p)": "[see <https://x.example|doc>](https://x.example/p)",
+		"<https://x.example|a [b> c](https://x.example/p)":   "<https://x.example|a [b> c](https://x.example/p)",
 	}
 	for in, want := range cases {
 		if got := toGchatText(in); got != want {
@@ -1480,6 +1565,15 @@ func TestGchatDefaultDisplayModeRetriesAFailedStateEdit(t *testing.T) {
 	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
 		t.Fatal(err)
 	}
+	// The artifact goes out only once the state edit has been tried and
+	// failed. Published together, the two could reach the relay as one batch,
+	// whose one coalesced edit is the failed one, leaving nothing to retry on:
+	// the test then timed out on about three runs in ten.
+	waitFor(t, "the state edit to fail", func() bool {
+		r.adapter.mu.Lock()
+		defer r.adapter.mu.Unlock()
+		return r.adapter.failEdits == 0
+	})
 	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactProgress, Parts: []lib.Part{{Kind: "text", Text: "step"}}}); err != nil {
 		t.Fatal(err)
 	}

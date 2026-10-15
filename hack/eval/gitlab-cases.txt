@@ -22,8 +22,9 @@
 # WHAT CAN RED THE LANE. The blocking roster still applies, intersected with
 # this list: a roster case here arms rung 4 on the lane; a held-out case here
 # runs and reports without arming it, as it does on the GitHub presubmit.
-# Rungs 1-3 red the lane like every case. None of the three cases below is
-# on the roster, so the lane cannot red a pull request on a graded failure.
+# Rungs 1-3 red the lane like every case. Since 2026-10-14 pdb-remediation-pr
+# is on the roster (#2016), so its collapse reds the lane's verdict; the other
+# two cases below are held out and report without arming it.
 # The job runs on demand (`/test pull-kube-agents-smoke-test-gitlab`) and
 # nightly, never as a blocking presubmit: the agent goes through the same
 # forge abstraction on both forges, so the GitHub presubmit grades what a

@@ -414,15 +414,15 @@ calls and become properties of the stream:
 Added 8/24, ratified with the subagent framework. `artifact-update` payloads name their
 artifact, and seven names are reserved so renderers and audit tooling can rely on them:
 
-| Name       | Content                                                                                                                                                                                                                                                                                                                                                    |
-| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `result`   | The deliverable, chunked per A2A chunking rules                                                                                                                                                                                                                                                                                                            |
-| `thinking` | Reasoning deltas. Debug views only                                                                                                                                                                                                                                                                                                                         |
-| `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                                                                                                                                                                                                                      |
-| `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation. May carry a chat message (Chat messages, below), the live message's whole state, so `progress` is text plus at most one chat message DataPart (assertion 18's validator owes that change) |
-| `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text"}` on the session's own task events. Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward                                                                                                     |
-| `turn`     | One finished turn's answer on a task with more turns queued (an executor that queues follow-ups). Chunked like `result`, posted by renderers as it completes, never the deliverable; the last turn's answer is the `result`.                                                                                                                               |
-| `notice`   | A message the task posts on its own, beside its live message and its answer (a PR it opened, say): a TextPart, optionally with a chat message. Each `notice` artifact posts once and is never edited. Not the gateway's own notices. A gateway older than 10/8 drops it, so a fact that matters is in the result too; reserved 10/8                        |
+| Name       | Content                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `result`   | The deliverable, chunked per A2A chunking rules                                                                                                                                                                                                                                                                                                                                                           |
+| `thinking` | Reasoning deltas. Debug views only                                                                                                                                                                                                                                                                                                                                                                        |
+| `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                                                                                                                                                                                                                                                                     |
+| `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation. May carry a chat message (Chat messages, below), the live message's whole state, so `progress` is text plus at most one chat message DataPart per chunk; assertion 18's validator takes a data part there only when it is a chat message |
+| `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text"}` on the session's own task events. Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward                                                                                                                                                    |
+| `turn`     | One finished turn's answer on a task with more turns queued (an executor that queues follow-ups). Chunked like `result`, posted by renderers as it completes, never the deliverable; the last turn's answer is the `result`.                                                                                                                                                                              |
+| `notice`   | A message the task posts on its own, beside its live message and its answer (a PR it opened, say): a TextPart, optionally with a chat message. Each `notice` artifact posts once and is never edited. Not the gateway's own notices. A gateway older than 10/8 drops it, so a fact that matters is in the result too; reserved 10/8                                                                       |
 
 Artifact names are data, so the set can grow without touching the envelope; only these
 seven carry reserved semantics. An `activity` entry is one `data` part whose object carries
@@ -705,9 +705,36 @@ carry the same chat message:
   limit of addressing by conversation rather than by task.)
 
 So the Planning Agent's terminal carries a mark-only chat message with `ask` still set, and the terminal no-mark default doesn't fire at the ack. Its cards' notifies
-then carry the plan (`update: "plan"`), ⏸️ (`settle: blocked`), the one answer per fan-out
+then carry the plan (under one `update` key per plan), ⏸️ (`settle: blocked`), the one answer per fan-out
 and the folded answer, and the final settle. The task is not held open for its cards:
 that would turn every follow-up into a steer queued behind hours of idle.
+
+**The emitter.** Two halves, each a port of the `today` presenter run on the shared
+cases. The hermes-bridge emits what its own turn owns: the answer on the `result` (the
+first sentence as `headline`, the rest as `detail`, or under `fold` past `detail`'s cap),
+the prompt's `mark.ask` on each `progress` heartbeat, and, when the turn filed a card (a
+`kanban_create` call that did not fail) in a Slack conversation with `KAGE_SLACK_UX` on and its conversation route recorded,
+the terminal's mark-only message; anywhere else nothing settles the ask later, so the
+terminal keeps its default. The kanban notifier, in the Hermes gateway process where the
+board is, sends a card's work through `a2a notify --chat-file <object> --update <key>`
+with these keys: `plan-<first card>-<serial>` for a plan, `question-<card>-<blocked event>`
+for a card's question and its answered form, and `alert-<event session>` for an incident's
+triage, which edits the
+event watcher's alert because the watcher posts it under that key. A plan's serial is the
+notifier process's random nonce and a count no plan in it repeats (a question with no event
+id takes one too), so no plan takes another's key and edits its message, which the gateway
+still holds: not one its first card reopens after the plan lapsed, and not one opened after
+a restart. The shared cases spell only the stem (`plan`, `question-<card>`); their runner
+matches a key that adds a `-` suffix to it. The alert is a
+home-channel post and its triage a reply in its thread, so the edit asks the gateway to
+keep `update` keys for a home-channel thread as it does for a conversation. The plan
+carries the `mark` when it changes: `ask` while a card runs, `ask` with `settle: blocked`
+while one waits on the user, and `settle: done` or `failed` once all have settled. The
+notifier has not seen the ask, so the bridge records its kind on the conversation route
+(`PUT /v1/sessions/{id}/route`, `ask`) for the notifier to read back. Not yet ported: a
+typed answer read back onto the question it answers, which needs the backend's own
+history. Until the gateway reads `chat` and `update` (`lib.NotifyRequest` says where it
+stands), it posts each notify's text, a later `update` of the same key included.
 
 ### Rules
 

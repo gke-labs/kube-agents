@@ -1,0 +1,86 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "tasks": [
+          {
+            "details": {
+              "elements": [
+                {
+                  "elements": [
+                    {
+                      "elements": [
+                        {
+                          "text": "✓ n4",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "rich_text_section"
+                    },
+                    {
+                      "elements": [
+                        {
+                          "text": "✓ n5",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "rich_text_section"
+                    },
+                    {
+                      "elements": [
+                        {
+                          "text": "✓ n6",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "rich_text_section"
+                    },
+                    {
+                      "elements": [
+                        {
+                          "text": "✓ n7",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "rich_text_section"
+                    },
+                    {
+                      "elements": [
+                        {
+                          "text": "✓ n8",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "rich_text_section"
+                    },
+                    {
+                      "elements": [
+                        {
+                          "text": "◌ n9",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "rich_text_section"
+                    }
+                  ],
+                  "style": "bullet",
+                  "type": "rich_text_list"
+                }
+              ],
+              "type": "rich_text"
+            },
+            "status": "in_progress",
+            "task_id": "t_a",
+            "title": "n9 · step 10 ▸",
+            "type": "task_card"
+          }
+        ],
+        "title": "x",
+        "type": "plan"
+      }
+    ],
+    "attachments": []
+  }
+]
