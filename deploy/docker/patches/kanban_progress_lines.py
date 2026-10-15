@@ -853,6 +853,29 @@ def _with_answer(adapter: Any, quiet: Any, kind: str, message: str, metadata: Op
     return {**(metadata or {}), notify.CHAT_METADATA_KEY: chat}
 
 
+def hard_wall_line(payload: object, message: str) -> str:
+    """What a hard-wall block posts, if anything does: the worker's own reason, else the notifier's line.
+
+    The notifier's line for a ``blocked`` event reads as a pause; the reason is
+    the worker's sentence saying what it could not find or do.
+    """
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    return str(reason).strip() if isinstance(reason, str) and reason.strip() else message
+
+
+def _wake_reply_lost(adapter: Any) -> bool:
+    """Whether a wake for this card is answered where no one sees it.
+
+    Under ``spec.mode: next`` a conversation card's wake is self-posted into
+    the bridge's session and its reply goes nowhere
+    (``kanban_chat_notify.ConversationNotifyAdapter``), so a line held for it
+    would never be told.
+    """
+    notify = _chat_notify()
+    stand_in = getattr(notify, "ConversationNotifyAdapter", None) if notify is not None else None
+    return isinstance(stand_in, type) and isinstance(adapter, stand_in)
+
+
 def _explained_by_wake(quiet: Any, sub: dict, kind: str) -> bool:
     if quiet is None:
         return False
@@ -960,7 +983,10 @@ async def deliver(
     followed by that PR as a message of its own. See
     ``gateway/slack_ux_moments.py``. A card blocked on Hermes's hard-wall kind
     (:data:`HARD_WALL_BLOCK_KIND`) asks nothing: its row and its ask settle as
-    a give-up's, red and ❌ (:func:`settles_as`).
+    a give-up's, red and ❌ (:func:`settles_as`), and the line it holds or posts
+    is the worker's reason (:func:`hard_wall_line`). Under ``spec.mode: next``
+    a conversation card's wake reply is never posted, so that line posts
+    rather than waiting on the wake (:func:`_wake_reply_lost`).
     """
     chat_id = sub["chat_id"]
     tracked = tracked_messages(watcher)
@@ -975,6 +1001,9 @@ async def deliver(
         # The row and the ask settle a hard-wall block as a give-up; the
         # question and the wake's hold still read the event's own kind.
         settled_as = settles_as(kind, getattr(ev, "payload", None))
+        hard_wall = quiet is not None and settled_as != kind
+        if hard_wall:
+            message = hard_wall_line(getattr(ev, "payload", None), message)
         plan = _slack_plan(quiet)
         shown = False
         if plan is not None:
@@ -1011,12 +1040,15 @@ async def deliver(
             await _settle_reaction(adapter, sub, settled_as, board)
             await _pr_opened(moments, adapter, sub, _with_summary(ev, message), None)
             return None
-        if _explained_by_wake(quiet, sub, kind) and _hold(
+        if not (hard_wall and _wake_reply_lost(adapter)) and _explained_by_wake(quiet, sub, kind) and _hold(
             quiet, watcher, sub, kind, event_id, message, metadata,
         ):
             await _settle_reaction(adapter, sub, settled_as, board)
             return None
-        result = await adapter.send(chat_id, message, metadata=_with_answer(adapter, quiet, kind, message, metadata))
+        laid_out = ANSWER_KIND if hard_wall else kind
+        result = await adapter.send(
+            chat_id, message, metadata=_with_answer(adapter, quiet, laid_out, message, metadata),
+        )
         # A failed post raises in the notifier, which rewinds its claim so the
         # next tick posts again, and that post settles. After the notifier's
         # MAX_SEND_FAILURES it drops the subscription instead, and the ask

@@ -902,8 +902,25 @@ class SlackQuietTerminalTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         self.assertEqual(adapter.sent, [])
         self.assertEqual(self.calls, [("t_e0c1", "gave_up")])
+        # Held as the worker's reason, so a wake that fails posts that, not a pause line.
         held = getattr(watcher, kanban_notifier.HELD_ATTR)
-        self.assertEqual(held[sub_key(SLACK_SUB)], {3: ("blocked", SLACK_SUB["chat_id"], "⏸ blocked", {})})
+        self.assertEqual(
+            held[sub_key(SLACK_SUB)], {3: ("blocked", SLACK_SUB["chat_id"], "No cluster named seeded-z.", {})},
+        )
+
+    async def test_a_hard_wall_block_nobody_is_woken_for_posts_its_reason(self):
+        adapter = _Adapter()
+        sub = dict(SLACK_SUB, delivery_mode="notify")
+        block = SimpleNamespace(id=3, kind="blocked", payload={"kind": "capability", "reason": "No cluster named seeded-z."})
+        await deliver(SimpleNamespace(), adapter, sub, "blocked", block, "⏸ blocked", None, HEADER)
+        self.assertEqual(adapter.sent[-1][1], "No cluster named seeded-z.")
+
+    async def test_a_hard_wall_block_without_a_reason_keeps_the_line(self):
+        adapter = _Adapter()
+        sub = dict(SLACK_SUB, delivery_mode="notify")
+        block = SimpleNamespace(id=3, kind="blocked", payload={"kind": "capability"})
+        await deliver(SimpleNamespace(), adapter, sub, "blocked", block, "⏸ blocked", None, HEADER)
+        self.assertEqual(adapter.sent[-1][1], "⏸ blocked")
 
     async def test_any_other_block_still_settles_as_a_block(self):
         for payload in ({"kind": "needs_input"}, {"kind": "transient"}, {}, None):
@@ -1009,6 +1026,29 @@ class ChatNotifyAnswerTest(SlackQuietTerminalTest):
         with mock.patch.object(kanban_notifier, "actionable_report", return_value=True):
             await self._run(adapter, SLACK_SUB, "completed", "Down. Reply apply.")
         self.assertNotIn("kage_chat", adapter.metadata[-1] or {})
+
+    async def test_a_hard_wall_block_on_a_conversation_posts_its_reason_as_an_answer(self):
+        # Under next a conversation card's wake reply goes nowhere, so the line is not held for it.
+        class Conversation(_ChatNotifyStandIn):
+            pass
+
+        sys.modules["gateway.kanban_chat_notify"].ConversationNotifyAdapter = Conversation
+        adapter = Conversation()
+        block = SimpleNamespace(
+            id=3, kind="blocked", payload={"kind": "capability", "reason": "No cluster named seeded-z. It has seeded-a."},
+        )
+        await deliver(SimpleNamespace(), adapter, SLACK_SUB, "blocked", block, "⏸ blocked", None, HEADER)
+        self.assertEqual(adapter.sent[-1][1], "No cluster named seeded-z. It has seeded-a.")
+        self.assertEqual(adapter.metadata[-1]["kage_chat"]["headline"], "No cluster named seeded-z.")
+        self.assertEqual(self.calls, [("t_e0c1", "gave_up")])
+
+    async def test_a_hard_wall_block_on_any_other_stand_in_is_still_held(self):
+        sys.modules["gateway.kanban_chat_notify"].ConversationNotifyAdapter = type("Conversation", (), {})
+        adapter = _ChatNotifyStandIn()
+        block = SimpleNamespace(id=3, kind="blocked", payload={"kind": "capability", "reason": "No cluster named seeded-z."})
+        result = await deliver(SimpleNamespace(), adapter, SLACK_SUB, "blocked", block, "⏸ blocked", None, HEADER)
+        self.assertIsNone(result)
+        self.assertEqual(adapter.sent, [])
 
     async def test_todays_adapter_gets_the_metadata_it_always_got(self):
         adapter = _MetadataAdapter()
