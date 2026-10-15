@@ -173,12 +173,12 @@ Rules:
   `custom` role set to exclude the management cluster by that variable; a scope that silently
   ended the exclusion would recreate the one profile they were told to prevent. The places that
   name the variable as the opt-out (§8) change with it.
-- **`exclude.clusters` bounds fleet answers and the audits that list clusters, not only the roster.** Decided 2026-10-15
+- **`exclude.clusters` bounds fleet answers and the per-cluster audits, not only the roster.** Decided 2026-10-15
   (#3081). An excluded cluster gets no Cluster Agent. The platform MCP server's `fleet_scope` tool
   lists it under `excluded_clusters` and hands the collectors `--scope-exclude-clusters`, which
   drop it from their listing before reading anything. It is not a coverage gap, because the
   operator left it out on purpose. The onboarding sweep card names it so Step 3 does not audit it
-  by hand, and the Platform Agent's fan-out gives it no card. The one exception is the
+  by hand, and the Platform Agent's fan-out gives it no card. Among what still covers it is the
   daily upgrade-readiness watch (#3026): it runs the report with `--project` flags and no
   exclusion, so its report covers excluded clusters on purpose. The same report script run by the
   agent gets the exclusion with `fleet_scope`'s arguments and leaves them out. The networking audit still counts its subnet usage (its pods hold real IPs) and the GCE audit

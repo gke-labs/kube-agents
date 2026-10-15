@@ -1500,9 +1500,22 @@ class ScanGateTest(unittest.TestCase):
 
 class ExcludedClustersParagraphTest(unittest.TestCase):
     """#3081: the sweep is told which clusters the install excludes, so its
-    "audit every cluster with no Cluster Agent" does not reach exactly those."""
+    "audit every cluster with no Cluster Agent" does not reach exactly those.
+    Read as the fleet_scope tool reads them: the snapshot, else the render."""
 
-    def _with_snapshot(self, snapshot):
+    EXCLUDE = {"projects": [], "clusters": [
+        {"projectId": "ka-test", "location": "us-central1", "clusterName": "lane-b"},
+        {"projectId": "ka-test", "location": "us-east1-b", "clusterName": "kyber-test"},
+        {"projectId": "ka-test", "location": "us-central1"},
+    ]}
+
+    def setUp(self):
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KUBEAGENTS_SCOPE_FILE", None)
+
+    def _dir(self, snapshot=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         data_dir = Path(tmp.name)
@@ -1510,13 +1523,14 @@ class ExcludedClustersParagraphTest(unittest.TestCase):
             (data_dir / bootstrap_scan_gate.SCOPE_SNAPSHOT_NAME).write_text(snapshot, encoding="utf-8")
         return data_dir
 
+    def _snapshot(self, exclude):
+        return json.dumps({"declared": {"projects": [], "folders": [], "organizations": [], "sharedVpcHosts": [],
+                                        "metricsScopes": [], "exclude": exclude},
+                           "projects": [{"id": "ka-test", "via": ["management"], "outcome": "ok", "state": "in-scope"}],
+                           "present": True, "boundary": True})
+
     def test_the_excluded_clusters_are_named_and_kept_out_of_step_3(self):
-        snap = json.dumps({"declared": {"exclude": {"clusters": [
-            {"projectId": "ka-test", "location": "us-central1", "clusterName": "lane-b"},
-            {"projectId": "ka-test", "location": "us-east1-b", "clusterName": "kyber-test"},
-            {"projectId": "ka-test", "location": "us-central1"},
-        ]}}, "projects": []})
-        data_dir = self._with_snapshot(snap)
+        data_dir = self._dir(self._snapshot(self.EXCLUDE))
         paragraph = bootstrap_scan_gate._excluded_clusters_paragraph(data_dir)
         self.assertIn("`ka-test/us-central1/lane-b`, `ka-test/us-east1-b/kyber-test`", paragraph)
         self.assertIn("do not audit them in Step 3", paragraph)
@@ -1525,10 +1539,26 @@ class ExcludedClustersParagraphTest(unittest.TestCase):
                 mock.patch.object(bootstrap_scan_gate, "cluster_agents", return_value=[]):
             self.assertIn(paragraph, bootstrap_scan_gate._task_body())
 
-    def test_no_snapshot_or_no_exclusion_names_nothing(self):
-        self.assertEqual(bootstrap_scan_gate._excluded_clusters_paragraph(self._with_snapshot(None)), "")
-        self.assertEqual(bootstrap_scan_gate._excluded_clusters_paragraph(self._with_snapshot("{nope")), "")
-        self.assertEqual(bootstrap_scan_gate._excluded_clusters_paragraph(self._with_snapshot(json.dumps({"declared": {"exclude": {}}}))), "")
+    def test_with_no_snapshot_the_render_s_exclusions_are_named(self):
+        # The gate files the sweep without a snapshot when it gives up on the
+        # reconcile; the operator's render still names the exclusions.
+        data_dir = self._dir()
+        render = data_dir / "scope.json"
+        render.write_text(json.dumps({"present": True, "projects": [], "exclude": self.EXCLUDE}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"KUBEAGENTS_SCOPE_FILE": str(render)}):
+            paragraph = bootstrap_scan_gate._excluded_clusters_paragraph(data_dir)
+        self.assertIn("`ka-test/us-central1/lane-b`", paragraph)
+
+    def test_an_unreadable_render_sends_the_worker_to_the_tool(self):
+        data_dir = self._dir()
+        with mock.patch.dict(os.environ, {"KUBEAGENTS_SCOPE_FILE": str(data_dir / "absent.json")}):
+            paragraph = bootstrap_scan_gate._excluded_clusters_paragraph(data_dir)
+        self.assertIn("could not be read", paragraph)
+        self.assertIn("`fleet_scope`", paragraph)
+
+    def test_no_scope_or_no_exclusion_names_nothing(self):
+        self.assertEqual(bootstrap_scan_gate._excluded_clusters_paragraph(self._dir()), "")
+        self.assertEqual(bootstrap_scan_gate._excluded_clusters_paragraph(self._dir(self._snapshot({"projects": [], "clusters": []}))), "")
 
 
 class ScopeGapParagraphTest(unittest.TestCase):

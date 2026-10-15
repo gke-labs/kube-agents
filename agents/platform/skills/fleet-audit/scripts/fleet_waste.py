@@ -154,7 +154,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 
-# The scope this collector was handed, set by main from the two flags.
+# The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
 
 SCOPED_RUN_NOTE = (
@@ -5586,6 +5586,14 @@ def _unread_names(known: set[tuple[str, str | None]], collected: set[tuple[str, 
     return frozenset(name for name, _ in known - collected)
 
 
+def _only_excluded_unread(known: set[tuple[str, str | None]], collected: set[tuple[str, str | None]], dropped: list[tuple[str, str]]) -> bool:
+    """Whether every cluster this project left unread is one the install
+    excludes (#3081). On (name, location) pairs: a failed read of a cluster
+    that shares an excluded one's name in another location is not an
+    exclusion, and its limitation must keep saying it could not be read."""
+    return bool(dropped) and (known - collected) <= set(dropped)
+
+
 def _unread_labels(known: set[tuple[str, str | None]], collected: set[tuple[str, str | None]]) -> list[str]:
     """The unread clusters as a reader should see them: a name another of the
     project's clusters shares carries its location, so a limitation never
@@ -6469,7 +6477,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         known_pairs = known_pairs_by_project.get(p, set())
         collected = collected_by_project.get(p, set())
 
-        return collect_project_compute(p, all_reachable, fleet_facts, run=replay, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs, collected), clusters_read=len(known_pairs & collected), unread_labels=_unread_labels(known_pairs, collected), excluded=sorted(name for name, _ in declared_scope.dropped.get(p, [])), only_excluded_unread=bool(declared_scope.dropped.get(p)) and (known_pairs - collected) <= set(declared_scope.dropped.get(p, [])))
+        return collect_project_compute(p, all_reachable, fleet_facts, run=replay, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs, collected), clusters_read=len(known_pairs & collected), unread_labels=_unread_labels(known_pairs, collected), excluded=sorted(name for name, _ in declared_scope.dropped.get(p, [])), only_excluded_unread=_only_excluded_unread(known_pairs, collected, declared_scope.dropped.get(p, [])))
 
     cluster_entries: list[dict] = []
     project_entries: list[dict] = []

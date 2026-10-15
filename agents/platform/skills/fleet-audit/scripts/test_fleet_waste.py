@@ -4964,6 +4964,15 @@ class CollectProjectComputeTest(unittest.TestCase):
         self.assertIn("lane-b in this project are excluded", target["limitations"])
         self.assertIn("the clusters the install excludes were not read", target["limitations"])
 
+    def test_only_excluded_unread_is_decided_on_name_and_location(self):
+        excluded = [("lane-b", "us-central1")]
+        known = {("lane-b", "us-central1"), ("ka-today", "us-central1")}
+        self.assertTrue(fw._only_excluded_unread(known, {("ka-today", "us-central1")}, excluded))
+        # A same-named lane-b in us-east1 that was not read is not an exclusion.
+        known_twin = known | {("lane-b", "us-east1")}
+        self.assertFalse(fw._only_excluded_unread(known_twin, {("ka-today", "us-central1")}, excluded))
+        self.assertFalse(fw._only_excluded_unread(known, {("ka-today", "us-central1")}, []))
+
     def test_a_same_named_cluster_that_failed_is_not_read_as_an_exclusion(self):
         # lane-b in us-central1 is excluded; another lane-b in us-east1 was not
         # read. By name the unread set is {lane-b}, which the exclusion covers;

@@ -247,7 +247,7 @@ import fleet_scope_args  # noqa: E402
 
 # The install's declared scope, handed in by the SOP from the platform_control
 # `fleet_scope` tool (`--scope-projects`, `--scope-unread`), one holder per
-# collector module as the siblings keep it: set from the two flags by
+# collector module as the siblings keep it: set from the scope flags by
 # `validate_args`, which `main` and `collect_fleet` both call first.
 declared_scope = fleet_scope_args.DeclaredScope()
 

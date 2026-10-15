@@ -101,7 +101,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 
-# The scope this collector was handed, set by main from the two flags.
+# The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
 
 CONFIG_PROJECT_CMD = (GCLOUD, "config", "get-value", "project")
@@ -1285,8 +1285,8 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
         # Narrowed by --scope-exclude-clusters, which the agent passes with the
         # fleet_scope tool's collector_args (#3081). The daily upgrade-readiness
         # watch (upgrade_readiness_watch.py) builds its own --project flags and
-        # passes no exclusion, so its report still covers excluded clusters, the
-        # one documented exception (#3026).
+        # passes no exclusion, so its report still covers excluded clusters
+        # (#3026), as the CRD field documents.
         for cluster in declared_scope.drop_excluded(project, listed):
             if not isinstance(cluster, dict):
                 continue

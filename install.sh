@@ -710,7 +710,7 @@ Flags for AI Agents & Automation:
                                 unmanaged
   --scope-exclude-clusters=TRIPLES
                                 Clusters to leave unmanaged and out of fleet answers and
-                                the audits that list clusters, each as
+                                the per-cluster audits, each as
                                 project/location/cluster
   --scoped-sa-pool-enabled[=BOOL]
                                 Arm the scoped service account pool: one reader service

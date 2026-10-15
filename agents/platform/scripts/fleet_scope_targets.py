@@ -168,7 +168,7 @@ class ScopeTargets:
     # Set when the render answered instead of a snapshot.
     note: str | None = None
     # The (project, location, cluster) triples spec.scope.exclude.clusters
-    # names: left out of fleet answers and the audits that list clusters, not
+    # names: left out of fleet answers and the per-cluster audits, not
     # a coverage gap.
     excluded_clusters: tuple[tuple[str, str, str], ...] = ()
 

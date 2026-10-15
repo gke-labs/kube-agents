@@ -618,8 +618,8 @@ def envelope_line(stdout: str) -> str | None:
 
 def report_argv(names: list[str], readiness: bool) -> list[str]:
     # No --scope-exclude-clusters, on purpose: the watch's report covers the
-    # clusters spec.scope.exclude.clusters excludes, the one fleet read that
-    # does (#3081, #3026).
+    # clusters spec.scope.exclude.clusters excludes, one of the reads the CRD
+    # field names as still covering them (#3081, #3026).
     argv = project_flags(names)
     if readiness:
         argv += [READINESS_FLAG, KUBECONFIG_DIR_FLAG, SANDBOX_KUBECONFIG_DIR]

@@ -371,33 +371,39 @@ def _scope_gap_paragraph(data_dir: Path) -> str:
     )
 
 
-def _excluded_clusters(data_dir: Path) -> list[str]:
-    """The clusters spec.scope.exclude.clusters leaves out, as `project/location/cluster`.
+def _excluded_clusters(data_dir: Path) -> list[str] | None:
+    """The clusters spec.scope.exclude.clusters leaves out, as `project/location/cluster`;
+    None when they cannot be known.
 
-    Read from the declaration the reconcile copies into the snapshot. No snapshot, an
-    unreadable one, or no exclusion all answer empty. The sweep's worker lists the fleet with
-    `gcloud container clusters list`, which names an excluded cluster like any other, and the
-    card's "audit every cluster with no Cluster Agent" would send it to exactly these: the
-    reconcile gives an excluded cluster no profile (#3081).
+    Read through `fleet_scope_targets`, the fleet_scope tool's own reader: the snapshot the
+    reconcile writes, or the operator's render when there is no snapshot yet (the gate files
+    the sweep without one when it gives up on the reconcile). The sweep's worker lists the
+    fleet with `gcloud container clusters list`, which names an excluded cluster like any
+    other, and the card's "audit every cluster with no Cluster Agent" would send it to exactly
+    these: the reconcile gives an excluded cluster no profile (#3081). No declared scope is an
+    empty list; a render that cannot be read is None, and the card then sends the worker to the
+    tool instead.
     """
     try:
-        snapshot = json.loads((data_dir / SCOPE_SNAPSHOT_NAME).read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001 - absent or unreadable: nothing to name
+        import fleet_scope_targets  # beside this script in the pod, as for the reconcile
+        targets = fleet_scope_targets.declared_scope_targets(data_dir)
+    except Exception:  # noqa: BLE001 - unreadable render or a missing module: unknown, not "none"
+        return None
+    if targets is None:
         return []
-    declared = snapshot.get("declared") if isinstance(snapshot, dict) else None
-    exclude = declared.get("exclude") if isinstance(declared, dict) else None
-    entries = exclude.get("clusters") if isinstance(exclude, dict) else None
-    out = set()
-    for entry in entries if isinstance(entries, list) else []:
-        parts = [entry.get(key) for key in ("projectId", "location", "clusterName")] if isinstance(entry, dict) else []
-        if parts and all(isinstance(part, str) and part for part in parts):
-            out.add("/".join(parts))
-    return sorted(out)
+    return ["/".join(ref) for ref in targets.excluded_clusters]
 
 
 def _excluded_clusters_paragraph(data_dir: Path) -> str:
     """The sweep's note on the clusters the install excludes; empty when it excludes none."""
     excluded = _excluded_clusters(data_dir)
+    if excluded is None:
+        return (
+            "**The install's cluster exclusions could not be read when this card was filed.** Before "
+            "Step 1, call the platform_control `fleet_scope` tool and leave out every cluster it lists "
+            "in `excluded_clusters`: do not audit them in Step 3, do not put them in `fleet` or `gaps`, "
+            "and do not name them in the report.\n\n"
+        )
     if not excluded:
         return ""
     return (
