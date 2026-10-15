@@ -288,6 +288,33 @@ class RealBoardTest(unittest.TestCase):
                     ).fetchall()
         self.assertEqual([(row[0], json.loads(row[1])["url"]) for row in rows], [("pr_opened", URL)])
 
+    def test_hermes_own_terminal_output_seam_calls_the_hook_and_takes_its_answer(self):
+        # The plugin registered through Hermes's plugin manager, and the output transform driven by
+        # Hermes's own terminal-result code: the keyword names it passes and what a returned string does.
+        # lifecycle is imported before the kanban stand-in replaces the hermes_cli package, as the
+        # running gateway has it imported long before any terminal call.
+        from hermes_cli import lifecycle  # noqa: F401
+        from hermes_cli import plugins as hermes_plugins
+        from tools import terminal_tool_result
+
+        manager = hermes_plugins.get_plugin_manager()
+        # Discovery is the gateway's job at start; here it would load every bundled plugin, some of
+        # which need packages a test host lacks, and the seam's own guard would swallow that failure.
+        mock.patch.object(manager, "_discovered", True, create=True).start()
+        self.addCleanup(mock.patch.stopall)
+        hooks = manager._hooks.setdefault("transform_terminal_output", [])
+        plugin.register(types.SimpleNamespace(register_hook=lambda name, fn: hooks.append(fn)))
+        self.addCleanup(hooks.remove, plugin.on_terminal_output)
+        kanban = _Kanban()
+        stdout = json.dumps({"proposal": {"url": URL, "number": 99}}) + "\n"
+        modules = {**kanban.modules(), "forge": _Forge().module()}
+        with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ, {plugin.TASK_ENV: TASK}):
+            out = terminal_tool_result._apply_output_transform_hook(
+                "python3 vcs.py proposal create --title t", _vcs_record() + stdout, 0, "task-1", "ssh",
+            )
+        self.assertEqual(out, stdout)
+        self.assertEqual([event[1] for event in kanban.events], ["pr_opened"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -176,7 +176,12 @@ PR_REF = "PR #{number}"
 #: #412". A Slack ``<url|label>``, markdown ``[label](url)`` or ``(url)``
 #: around it goes too, and so does a tail after the number (``/files``).
 PR_URL_TAIL = r"(?:[/?#][^\s<>|()\[\]]*)?"
-PR_REF_URL = r"(?:<{url}{tail}(?:\|[^>]*)?>|\[[^\]]*\]\({url}{tail}\)|{url}{tail})"
+#: ``(?!\d)`` ends the url at its number, so PR 9's url does not match inside PR 91's.
+URL_NUMBER_END = r"(?!\d)"
+PR_REF_URL = (
+    r"(?:<{url}" + URL_NUMBER_END + r"{tail}(?:\|[^>]*)?>|\[[^\]]*\]\({url}" + URL_NUMBER_END
+    + r"{tail}\)|{url}" + URL_NUMBER_END + r"{tail})"
+)
 PR_REF_SPAN = (
     r"(?:\b{lead}\s*[:—–-]?(?P<mark>[*_`]*)\s*)?(?P<open>[*_`]*)"
     r"(?:\(\s*{ref}\s*\)|{ref})(?P<close>[*_`]*)"
@@ -289,8 +294,9 @@ def proposal_ref(url: str, gitlab_hosts: Collection[str] = frozenset()) -> tuple
 def evidence_line(text: str, url: str, number: str) -> str:
     """The first line of ``text`` naming the PR at ``url``, by its url or its number, else ""."""
     ref = re.compile((MR_NUMBER_REF if MR_URL.match(url) else PR_NUMBER_REF).format(number=re.escape(number)))
+    named = re.compile(re.escape(url) + URL_NUMBER_END)
     for line in str(text or "").splitlines():
-        if url in line or ref.search(line):
+        if named.search(line) or ref.search(line):
             return line.strip()
     return ""
 
