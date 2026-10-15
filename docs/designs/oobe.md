@@ -292,9 +292,8 @@ times. It rides with the audits stage, whose eval case covers both.
    onboarding cases drive `oobe`.
 3. **Later:** drop the disabled ids; T+0 delivery to the home channel.
 
-Eval case `oobe-first-run-audits` (domain `fleet-audits`; parked out of `hack/eval/nightly-cases.txt`
-since 2026-10-09, its `KNOWN_UNREGISTERED` entry in `scripts/validate_bench_cases.py` says why;
-each repetition waits for the previous one's four audits to finish). The stack
+Eval case `oobe-first-run-audits` (domain `fleet-audits`; nightly, in `hack/eval/nightly-cases.txt`,
+off the infra lock; each repetition waits for the previous one's four audits to finish). The stack
 (`bench/tf/prebuilt/oobe-first-run-audits`) first waits for the install's own first-run stage to
 finish, so it never cuts across a fresh install's real scan, then re-arms the stage: it files an
 archived stand-in sweep card and an archived ranking card after it, points `.bootstrap_scan_filed`

@@ -251,6 +251,26 @@
 # this file is now sixty-five cases (195 units) of a seventy-nine-case,
 # 237-unit matrix.
 #
+# 2026-10-15 readmits oobe-first-run-audits (#2806), off the infra-lock chain.
+# The chain had no room for it: the four nights after the park ran it 303-340
+# minutes inside builds of 395-422, and 10-13 ran 485m to the deadline. The
+# writers part had none either: 99-219 minutes against its 240m budget, and a
+# case that requests no pull request runs there before the writers do. So the
+# case takes no infra lock (hack/ci-eval-pr.sh, infra_lock_exempt): its stack
+# touches no task cluster and reaches the install through a kubeconfig of its
+# own, and its unit runs devops-bench on a private copy of the shared one. The
+# onboarding state lock keeps it apart from bootstrap-discovery-fanout and
+# bootstrap-inventory-ranking-delivery, whose stacks rewrite the same markers
+# and `oobe` job. Its unit_cost_hint goes to 3000s, the top of the queue, so its
+# three repetitions (~150 lane-minutes at 2530-3144s each) start first, in one
+# of the eight lanes, beside the chain rather than on it. Its four audit-stream
+# locks still hold the audit cases on those streams back while it runs. #2699
+# made it gradable: tool_calls_optional lets its no-tool reply pass the liveness
+# rung that graded the first night blocked. The first night with it measures
+# whether the main part still fits; if it does not, it is parked again. Counted
+# from the lists, this file is seventy-six cases (228 units) of a
+# ninety-case, 270-unit matrix with the presubmit file's fourteen.
+#
 # 2026-10-09 adds fleet-audit-unchanged-finding-keeps-wording: one case, three
 # units at the 900s audit band (a full drift audit; prebuilt/unchanged-finding-wording
 # plants a previous run in the report store and removes it on destroy). It is
@@ -845,6 +865,16 @@
 # mutate. Nightly from its first merge; a presubmit seat is a later pull
 # request that cites its record.
 ./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
+
+# The oobe job's first-run audits stage (docs/designs/oobe.md): once the
+# onboarding scan settles, four fleet audits start instead of waiting for their
+# schedules, one after another. The stack arms the stage with two archived
+# stand-in cards, the scan marker and the hand-off's record, and puts back the
+# oobe job the image ships;
+# the verifier reads the Platform Agent's cron runs. Nightly rather than presubmit
+# because each repetition runs four real audits back to back. Off the infra
+# lock (the 2026-10-15 paragraph above).
+./tasks/oobe-first-run-audits/task.yaml
 
 # A delegated answer opens on one bold sentence and does not restate it
 # (the report stanza in deploy/docker/patches/kanban_report_format.py).

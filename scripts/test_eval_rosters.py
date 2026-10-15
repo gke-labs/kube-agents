@@ -183,9 +183,7 @@ ADDED_AFTER_THE_MOVE = [
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
-PARKED_AFTER_THE_MOVE = [
-    "oobe-first-run-audits",  # 2026-10-09: truncated the main nightly, graded blocked
-]
+PARKED_AFTER_THE_MOVE: list[str] = []
 
 # Admitted after the split, each by a pull request that cited the record
 # (docs/eval-gate-roster.md, "Admitted on the record since the split"), as
