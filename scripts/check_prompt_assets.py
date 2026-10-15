@@ -338,6 +338,10 @@ def _is_placeholder(ref: str) -> bool:
     absent from a checkout. The rest are references written as templates --
     `$HERMES_HOME/...`, `memory/YYYY-MM-DD.md`, `<cluster>/kustomization.yaml`.
     """
+    if any(ch in ref for ch in "$<>{}*?"):
+        return True
+    if "..." in ref or "YYYY" in ref:
+        return True
     if ref.startswith(PLATFORM_PROFILE_HOME):
         # The items the image gives that home are checked; anything else under
         # it (SETTINGS.md, memories/) is runtime state, as the rest of
@@ -345,10 +349,6 @@ def _is_placeholder(ref: str) -> bool:
         head = ref[len(PLATFORM_PROFILE_HOME) :].split("/", 1)[0]
         return head not in PROFILE_HOME_ITEMS["platform"]
     if ref.startswith("/opt/data/"):
-        return True
-    if any(ch in ref for ch in "$<>{}*?"):
-        return True
-    if "..." in ref or "YYYY" in ref:
         return True
     # Absolute paths that are neither image layout nor repository content:
     # /var/run/docker.sock, /run/containerd/containerd.sock, /etc/...

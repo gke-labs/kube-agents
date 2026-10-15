@@ -901,6 +901,13 @@ class CheckoutPathTests(unittest.TestCase):
         )
         self.assertEqual(len(self._findings()), 1)
 
+    def test_a_template_under_the_profile_home_is_not_reported(self):
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Read `/opt/data/profiles/platform/governance/<stream>_sop.md` first.\n",
+        )
+        self.assertEqual([], self._findings())
+
     def test_runtime_state_under_the_profile_home_is_not_reported(self):
         self.fixture.write(
             "agents/platform/governance/sop.md",

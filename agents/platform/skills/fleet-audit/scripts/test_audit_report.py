@@ -5749,7 +5749,8 @@ class TestDeclaredIntent(BaseTestCase):
                 doc = declaring_doc()
                 doc["declared"] = [make_declared(check=fault)]
                 exc = self.rejects(
-                    doc, "declared[0].check", repr(fault), "fault, not a posture"
+                    doc, "declared[0].check", repr(fault), "fault, not a posture",
+                    audit_report.sop_path(DECLARING_AUDIT),
                 )
                 for slug in audit_report.audit_declarable_checks(DECLARING_AUDIT):
                     self.assertNotIn(slug, str(exc))
@@ -25263,20 +25264,43 @@ class TestSopPath(unittest.TestCase):
                 "/srv/agent/profiles/platform/governance/compliance_audit_sop.md",
             )
 
-    def test_audit_documents_run_skill_scripts_by_full_path(self):
+    # A skill file (script, SKILL.md, reference page) or an SOP named relative to
+    # the profile home, with or without a leading `./` or `../`.
+    RELATIVE = re.compile(r"(?<![\w/.-])(?:\.\.?/)*(?:skills/[\w-]+/|governance/[\w-]+\.md\b)")
+
+    def test_audit_documents_name_skill_files_and_sops_by_full_path(self):
         """A kanban worker starts in its card's workspace, where `./skills/...`
-        names nothing; the SOPs and the audit skills must not send it there."""
+        and `governance/...` name nothing; the SOPs and the audit skills must
+        not send it there."""
         platform = Path(__file__).resolve().parents[3]
         documents = sorted((platform / "governance").glob("*_sop.md")) + [
             platform / "skills" / name / "SKILL.md"
             for name in ("fleet-audit", "gce-compute-fleet-audit", "gcp-networking-fabric-audit")
         ]
-        relative = re.compile(r"(?<![\w/.-])(?:\./)?skills/[\w-]+/scripts/")
         for document in documents:
             with self.subTest(document=document.name):
                 self.assertEqual(
-                    [], relative.findall(document.read_text(encoding="utf-8"))
+                    [], self.RELATIVE.findall(document.read_text(encoding="utf-8"))
                 )
+
+    def test_the_relative_form_is_caught_in_every_spelling(self):
+        for relative in (
+            "./skills/fleet-audit/scripts/collect.py",
+            "../skills/fleet-audit/scripts/collect.py",
+            "`skills/fleet-audit/SKILL.md`",
+            "(../skills/fleet-audit/reference.md)",
+            "`skills/gke-compute-classes/references/ccc.md`",
+            "`governance/compliance_audit_sop.md`",
+        ):
+            with self.subTest(relative=relative):
+                self.assertRegex(relative, self.RELATIVE)
+        for full in (
+            "/opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py",
+            '"$HERMES_HOME"/skills/fleet-audit/scripts/collect.py',
+            "/opt/data/profiles/platform/governance/compliance_audit_sop.md",
+        ):
+            with self.subTest(full=full):
+                self.assertNotRegex(full, self.RELATIVE)
 
     def test_a_rejection_points_at_the_sop_by_full_path(self):
         self.assertIn(audit_report.sop_path(AUDIT), audit_report._sop_pointer(AUDIT))

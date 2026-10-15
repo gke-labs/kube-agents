@@ -69,13 +69,17 @@ verification_spec:
   # The worker reached the audit's own entry point. A kanban worker starts in
   # its card's workspace, so a worker that looks for the SOP there finds
   # nothing and audits by hand; without this check that run grades the same as
-  # a `start` that failed.
+  # a `start` that failed. A run, not a pattern over the text: a worker that
+  # greps the skill for the command has not run it.
   - name: the-worker-ran-start
     role: objective
     mode: assert
     check:
       type: worker_commands
-      required_patterns: ['audit_report\.py\s+start\s+--audit\b']
+      required_runs:
+        - script: audit_report.py
+          flags: [start]
+          word_patterns: ["^--audit(?:=|$)"]
   # No worker command ran a skill script by a path relative to the profile
   # home, and none joined `governance/` to a script directory. From a
   # card's workspace both name nothing, and the worker spends its turns
@@ -86,7 +90,7 @@ verification_spec:
     check:
       type: worker_commands
       forbidden_patterns:
-        ['(?<![\w/.-])(?:\./)?skills/[\w-]+/scripts/', "scripts/governance/"]
+        ['(?<![\w/.-])(?:\.\.?/)*skills/[\w-]+/scripts/', "scripts/governance/"]
   # The answer is the only report an operator on such an install receives, so
   # it names the planted binding and says why no ledger was written.
   - name: the-answer-names-the-binding
