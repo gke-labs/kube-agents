@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import builtins
 import inspect
 import io
 import fnmatch
@@ -2126,6 +2127,31 @@ class GitopsWorkloadManifestTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertIn("Could not read", result.message)
 
+    def test_a_tagged_scalar_the_constructor_raises_on_fails_with_the_replace_command(self):
+        # PyYAML's safe constructors raise KeyError / ValueError, not
+        # YAMLError, on these; the verdict is the file's, not a traceback.
+        for body in ("kind: !!bool maybe\n", "kind: Deployment\nmetadata:\n  name: !!int abc\n"):
+            with self.subTest(body):
+                result, _ = self._check(_ok(self._contents(body, sha="f00d")))
+                self.assertFalse(result.passed)
+                self.assertIn("the parser raises on it", result.message)
+                self.assertIn("-f sha=f00d", result.message)
+
+    def test_without_pyyaml_the_check_is_not_checked(self):
+        real_import = builtins.__import__
+
+        def no_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("No module named 'yaml'")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch.object(builtins, "__import__", side_effect=no_yaml):
+            result, _ = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")))
+        self.assertTrue(result.passed)
+        self.assertIs(result.read, False)
+        self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_UNCHECKED)
+        self.assertIn("PyYAML", result.warnings[0])
+
     def test_a_body_over_the_inline_limit_is_read_raw(self):
         meta = json.dumps({"sha": "abc", "encoding": "none", "content": "", "size": 2_000_000})
         result, run = self._check(_ok(meta), _ok(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"))
@@ -2143,11 +2169,11 @@ class GitopsWorkloadManifestTest(unittest.TestCase):
         ):
             self.assertIn(f'{name}="{value}"', script, name)
         self.assertIn(f"readonly GITOPS_WORKLOAD_MANIFEST_CONTENT='{checker.GITOPS_WORKLOAD_MANIFEST_CONTENT}'", script)
-        # The content the verifier expects is one its own line checks pass,
-        # and it says nothing about the budget: a word about it reads as
-        # declared intent and silences the finding the cases grade.
-        for line in checker.GITOPS_WORKLOAD_MANIFEST_LINES:
-            self.assertTrue(line.search(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT), line.pattern)
+        # The content the verifier expects is one its own read accepts, and it
+        # says nothing about the budget: a word about it reads as declared
+        # intent and silences the finding the cases grade.
+        import yaml
+        self.assertEqual("", checker._workload_manifest_problem(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT, yaml))
         self.assertNotIn("PodDisruptionBudget", checker.GITOPS_WORKLOAD_MANIFEST_CONTENT)
         self.assertNotIn("#", checker.GITOPS_WORKLOAD_MANIFEST_CONTENT)
 

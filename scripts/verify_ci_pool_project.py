@@ -488,14 +488,8 @@ spec:
 # (collect.py workload_declarations: kind, metadata.name, metadata.namespace).
 # Presence alone is not the check: a file at the path that declares another
 # object leaves the finding manual and the cases red with a presence check
-# green. Read with PyYAML when it imports, as the index does; the line
-# patterns stand in where it does not.
+# green. Read with PyYAML, as the index does; without it the check is unread.
 GITOPS_WORKLOAD_MANIFEST_OBJECT = ("Deployment", "seeded-reliability", "checkout-gateway")
-GITOPS_WORKLOAD_MANIFEST_LINES = (
-    re.compile(r"^kind:\s*Deployment\s*$", re.MULTILINE),
-    re.compile(r"^  name:\s*checkout-gateway\s*$", re.MULTILINE),
-    re.compile(r"^  namespace:\s*seeded-reliability\s*$", re.MULTILINE),
-)
 # The cases that fail on a project whose repository lacks the declaration:
 # the roster case, and the #2228 case parked on this fixture
 # (obtainability-refusal-direct-mutation, nightly, only loses its
@@ -2930,7 +2924,17 @@ def check_gitops_workload_manifest(project_id: str) -> CheckResult:
             body = base64.b64decode(payload.get("content") or "").decode("utf-8")
     except Exception as exc:
         return CheckResult(name, False, f"Could not parse the contents of {path} in {repo_slug}: {exc}")
-    problem = _workload_manifest_problem(body)
+    try:
+        import yaml  # noqa: PLC0415 -- optional, as it is for the audit's index
+    except ImportError as exc:
+        return CheckResult(
+            name,
+            True,
+            "Not checked",
+            warnings=[Unread(f"Not checked: could not load PyYAML to read {path}: {type(exc).__name__}: {exc}")],
+            read=False,
+        )
+    problem = _workload_manifest_problem(body, yaml)
     if problem:
         return CheckResult(
             name,
@@ -2942,22 +2946,19 @@ def check_gitops_workload_manifest(project_id: str) -> CheckResult:
     return CheckResult(name, True, f"{repo_slug} declares Deployment/checkout-gateway at {path}")
 
 
-def _workload_manifest_problem(body: str) -> str:
+def _workload_manifest_problem(body: str, yaml) -> str:
     """Why `body` does not declare GITOPS_WORKLOAD_MANIFEST_OBJECT, or "" when it does.
 
-    PyYAML, when it imports, reads the documents the way collect.py's
-    workload_declarations does; without it the line patterns decide.
+    `yaml` is the imported PyYAML module, which reads the documents the way
+    collect.py's workload_declarations does. A raise is the file's fault, not
+    only a YAMLError: the safe constructors raise KeyError, AttributeError or
+    ValueError on a tagged scalar, as the note check's docstring records.
     """
     kind, namespace, name = GITOPS_WORKLOAD_MANIFEST_OBJECT
     try:
-        import yaml  # noqa: PLC0415 -- optional, as it is for the audit's index
-    except ImportError:
-        missing = [line.pattern for line in GITOPS_WORKLOAD_MANIFEST_LINES if not line.search(body)]
-        return f"no line matches {', '.join(missing)}" if missing else ""
-    try:
         docs = list(yaml.safe_load_all(body))
-    except yaml.YAMLError as exc:
-        return f"not YAML: {exc}"
+    except Exception as exc:
+        return f"the parser raises on it ({type(exc).__name__}: {exc})"
     for doc in docs:
         meta = doc.get("metadata") if isinstance(doc, dict) else None
         if isinstance(meta, dict) and str(doc.get("kind") or "") == kind and str(meta.get("name") or "") == name and str(meta.get("namespace") or "") == namespace:
