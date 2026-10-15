@@ -267,6 +267,10 @@ ROSTER_REMEDY = "or take it out of the roster (its Cluster Agent profile, or UPG
 # the install cannot read, one merely over the cap and one an hour from
 # being resolved, and the remedies differ.
 REMEDY_DECLARE = INSTALL_REMEDY_PREFIX + "name the project in spec.scope, " + ROSTER_REMEDY
+# The project is in spec.scope already, under exclude: its profile is retiring
+# until the next clean reconcile run prunes it, or was onboarded by hand and
+# the scope never produced it, which the reconcile never prunes.
+REMEDY_EXCLUDED = INSTALL_REMEDY_PREFIX + "drop its spec.scope.exclude.projects entry, " + ROSTER_REMEDY
 REMEDY_READ_ACCESS = INSTALL_REMEDY_PREFIX + "give the install read access to the project, " + ROSTER_REMEDY
 REMEDY_CAP = INSTALL_REMEDY_PREFIX + "raise spec.scope.maxProjects, " + ROSTER_REMEDY
 REMEDY_UNRESOLVED = "the reconcile has not resolved it yet; the next tick that does reads it, and this line returns with a remedy if it does not"
@@ -275,6 +279,9 @@ REMEDY_UNRESOLVED = "the reconcile has not resolved it yet; the next tick that d
 # a container or selector lookup that keeps failing does not, and the watch
 # cannot tell a member of the unresolved part from a project outside the
 # declaration, so the line names both ways out and returns when it can tell.
+# A project already filed as outside the resolved scope is not refiled here
+# when a lookup fails for a tick (``standing_outside``): a failed lookup
+# carries the members it had, so the project is no more inside than it was.
 REMEDY_OUTSIDE_UNRESOLVED = (
     "the declaration is not fully resolved ({note}); when it resolves, a project inside it is read and one outside it is "
     "named here again with its remedy; a lookup that keeps failing needs the install's read access on that folder, "
@@ -299,9 +306,11 @@ UNREAD_REMEDIES = {
 }
 # The causes a refusal is filed under, each the kind its remedy is chosen by
 # and what the announcements key it on, so a cause that changes (a project
-# declared and then found unread, a scope that resolves) is news.
+# declared and then found unread, a scope that resolves, an exclude entry
+# added or dropped) is news.
 REFUSAL_OUTSIDE = "outside the resolved scope"
 REFUSAL_OUTSIDE_UNRESOLVED = "outside a scope not yet resolved"
+REFUSAL_EXCLUDED = "excluded by spec.scope.exclude"
 REFUSAL_UNREAD = "listed but unread ({outcome})"
 REFUSAL_NUMBER = "project number unresolved"
 REFUSAL_SANDBOX = "sandbox marker stale"
@@ -323,6 +332,9 @@ REFUSAL_REASONS = (
 # With an empty resolved set the script's message lists "none readable"; the
 # pod knows the set is empty from the scope itself and says that instead.
 EMPTY_SCOPE_REASON = "the declared scope resolved to no readable project this tick, so it does not list {project}"
+# The script's outside message covers a project an exclude entry names too,
+# since an excluded project has no row; the scope the pod holds says which.
+EXCLUDED_REASON = "the install's declared scope excludes {project} (a spec.scope.exclude.projects entry names it)"
 REFUSAL_PROJECT_FIELD = "project"
 REFUSAL_PROJECTS_FIELD = "projects"
 REFUSAL_OUTCOME_FIELD = "outcome"
@@ -818,9 +830,14 @@ def report_argv(names: list[str], readiness: bool, scope: fleet_scope_targets.Sc
     return argv
 
 
-def run_report(names: list[str], readiness: bool, *, scope: fleet_scope_targets.ScopeTargets | None, timeout: float | None = None) -> dict:
+def run_report(
+    names: list[str], readiness: bool, *, scope: fleet_scope_targets.ScopeTargets | None, outside_stands: bool, timeout: float | None = None
+) -> dict:
     """Run the skill's report in the sandbox and return the envelope:
-    ``{"exit": int, "tables": str, "report": dict | None}``."""
+    ``{"exit": int, "tables": str, "report": dict | None}``. ``outside_stands``
+    is whether the last tick filed the project asked for as outside the
+    resolved scope, which ``refusal_cause`` keeps while the scope is merely
+    unresolved again."""
     if timeout is None:
         timeout = READINESS_TIMEOUT_SECONDS if readiness else VERSION_TABLE_TIMEOUT_SECONDS
     try:
@@ -842,7 +859,7 @@ def run_report(names: list[str], readiness: bool, *, scope: fleet_scope_targets.
     if not isinstance(envelope.get(ENVELOPE_REPORT_KEY), dict):
         detail = f"report script exited {envelope.get(ENVELOPE_EXIT_KEY)} and wrote no report: {excerpt}"
         if envelope.get(ENVELOPE_EXIT_KEY) == REPORT_USAGE_EXIT:
-            refusal = refusal_detail(completed.stderr or "", scope)
+            refusal = refusal_detail(completed.stderr or "", scope, outside_stands=outside_stands)
             if refusal is not None:
                 raise ReportRefused(*refusal)
         raise RuntimeError(detail)
@@ -871,13 +888,22 @@ def unresolved_note(scope: fleet_scope_targets.ScopeTargets | None) -> str | Non
     return None
 
 
-def refusal_cause(kind: str, fields: dict[str, str], scope: fleet_scope_targets.ScopeTargets | None) -> str:
+def refusal_cause(kind: str, fields: dict[str, str], scope: fleet_scope_targets.ScopeTargets | None, *, outside_stands: bool = False) -> str:
     """What a refusal is filed under: its kind, with the outcome for a project
     the install could not read (a project declared and then found unread, or
-    unread for a new reason, is a new cause) and the scope's state for a
-    project outside it (outside a scope not yet resolved is one cause, outside
-    the resolved scope another)."""
-    if kind == REFUSAL_OUTSIDE and unresolved_note(scope):
+    unread for a new reason, is a new cause) and, for a project outside the
+    scope, the declaration's and the scope's state: one an exclude entry
+    names is excluded, whatever the scope resolved; otherwise outside a scope
+    not yet resolved is one cause and outside the resolved scope another,
+    except that a project the last tick filed as outside the resolved scope
+    (``outside_stands``) keeps that cause while the scope is merely unresolved
+    again, since a failed lookup carries the members it had and the project
+    is no more inside than it was: the scope resolving is the news, not the
+    lookup failing. False where no record exists, the first tick's answer."""
+    project = fields.get(REFUSAL_PROJECT_FIELD, "")
+    if kind == REFUSAL_OUTSIDE and scope is not None and scope.excludes(project):
+        return REFUSAL_EXCLUDED
+    if kind == REFUSAL_OUTSIDE and unresolved_note(scope) and not outside_stands:
         return REFUSAL_OUTSIDE_UNRESOLVED
     if kind == REFUSAL_UNREAD:
         return REFUSAL_UNREAD.format(outcome=fields[REFUSAL_OUTCOME_FIELD])
@@ -886,13 +912,17 @@ def refusal_cause(kind: str, fields: dict[str, str], scope: fleet_scope_targets.
 
 def refusal_remedy(cause: str, fields: dict[str, str], scope: fleet_scope_targets.ScopeTargets | None) -> str:
     """The remedy for a refusal, by its cause: a project outside a scope the
-    reconcile has resolved is declared or dropped from the roster; outside one
-    it has not resolved, the line names both ways out and returns when the
-    scope resolves; a project the install could not read is read access for a
-    denial, the cap, the wait for the reconcile, or, for a listing that did
-    not finish, the next tick that lists it, by the outcome it recorded."""
+    reconcile has resolved is declared or dropped from the roster; one an
+    exclude entry names loses the entry or leaves the roster; outside a scope
+    the reconcile has not resolved, the line names both ways out and returns
+    when the scope resolves; a project the install could not read is read
+    access for a denial, the cap, the wait for the reconcile, or, for a
+    listing that did not finish, the next tick that lists it, by the outcome
+    it recorded."""
     if cause == REFUSAL_OUTSIDE:
         return REMEDY_DECLARE
+    if cause == REFUSAL_EXCLUDED:
+        return REMEDY_EXCLUDED
     if cause == REFUSAL_OUTSIDE_UNRESOLVED:
         return REMEDY_OUTSIDE_UNRESOLVED.format(note=unresolved_note(scope))
     if cause.startswith(REFUSAL_UNREAD.split("{")[0]):
@@ -902,14 +932,16 @@ def refusal_remedy(cause: str, fields: dict[str, str], scope: fleet_scope_target
     return REMEDY_SANDBOX_RESTART
 
 
-def refusal_detail(stderr: str, scope: fleet_scope_targets.ScopeTargets | None) -> tuple[str, str] | None:
+def refusal_detail(stderr: str, scope: fleet_scope_targets.ScopeTargets | None, *, outside_stands: bool = False) -> tuple[str, str] | None:
     """What a refusal by the report script reads as, in the install's terms,
     and the cause it is filed under: the message matched against the script's
     own constants, re-said with what it named (the scope it lists shortened
-    to a few names; an empty resolved set said as such; an unresolved scope
-    with the scope's own note on a project it lists as unresolved) and the
-    remedy for its cause (``refusal_remedy``); None for a usage exit this job
-    does not know, which is reported as the script wrote it."""
+    to a few names; a project an exclude entry names said as excluded; an
+    empty resolved set said as such; an unresolved scope with the scope's own
+    note on a project it lists as unresolved) and the remedy for its cause
+    (``refusal_remedy``); None for a usage exit this job does not know, which
+    is reported as the script wrote it. ``outside_stands`` as for
+    ``refusal_cause``."""
     text = " ".join(stderr.split())
     for template, said, kind in REFUSAL_REASONS:
         found = refusal_pattern(template).search(text)
@@ -919,9 +951,11 @@ def refusal_detail(stderr: str, scope: fleet_scope_targets.ScopeTargets | None) 
         if REFUSAL_PROJECTS_FIELD in fields:
             fields[REFUSAL_PROJECTS_FIELD] = shown_names(fields[REFUSAL_PROJECTS_FIELD].split(fleet_scope_args.OVERRIDE_PROJECTS_SEPARATOR))
         reason = said.format(**fields)
-        if kind == REFUSAL_OUTSIDE and scope is not None and not scope.projects:
+        cause = refusal_cause(kind, fields, scope, outside_stands=outside_stands)
+        if cause == REFUSAL_EXCLUDED:
+            reason = EXCLUDED_REASON.format(project=fields[REFUSAL_PROJECT_FIELD])
+        elif kind == REFUSAL_OUTSIDE and scope is not None and not scope.projects:
             reason = EMPTY_SCOPE_REASON.format(project=fields[REFUSAL_PROJECT_FIELD])
-        cause = refusal_cause(kind, fields, scope)
         note = unresolved_note(scope)
         if note and kind == REFUSAL_UNREAD and fields.get(REFUSAL_OUTCOME_FIELD) == fleet_scope_targets.OUTCOME_UNRESOLVED:
             reason = f"{reason}; {note}"
@@ -1329,7 +1363,9 @@ def merge_envelope(merged: dict, envelope: dict) -> None:
     merge_exit(merged, envelope)
 
 
-def versions_by_project(names: list[str], deadline: float, ledger: dict, now: datetime, scope: fleet_scope_targets.ScopeTargets | None) -> dict:
+def versions_by_project(
+    names: list[str], deadline: float, ledger: dict, now: datetime, scope: fleet_scope_targets.ScopeTargets | None, standing: frozenset[str]
+) -> dict:
     """The version table, one sandbox run per project under its own timeout and
     what is left of the table's share of the budget before ``deadline``, merged
     into one envelope. A project whose run failed, or that the budget did not reach, is a
@@ -1346,7 +1382,8 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
     id, said with the remedy. The ledger's table-run stamps are set for every
     project that ran to completion or to its own cap, so the next table starts
     with the ones it did not, and a run that resolves a project's id teaches
-    the ledger."""
+    the ledger. ``standing`` is ``standing_outside`` of the last tick, by the
+    spelling or the key a project was recorded under."""
     last_runs = ledger[TABLE_RUNS_KEY]
     ids = ledger[PROJECT_IDS_KEY]
     merged = empty_envelope()
@@ -1372,7 +1409,7 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
             continue
         timeout = min(VERSION_TABLE_TIMEOUT_SECONDS, remaining)
         try:
-            envelope = run_report([project], readiness=False, scope=scope, timeout=timeout)
+            envelope = run_report([project], readiness=False, scope=scope, outside_stands=project in standing or keyed(project) in standing, timeout=timeout)
         except SandboxTimedOut as exc:
             if timeout < VERSION_TABLE_TIMEOUT_SECONDS:
                 # Killed by the budget, not by its own cap: not stamped, so it goes first next time.
@@ -1456,6 +1493,7 @@ def readiness_by_project(
     now: datetime,
     ids: dict[str, str],
     scope: fleet_scope_targets.ScopeTargets | None,
+    standing: frozenset[str],
 ) -> tuple[dict, dict[str, str], dict[str, str], dict[str, str]]:
     """One readiness run per project that holds a due version's pending
     clusters, each capped by its own timeout and by what is left of the tick's
@@ -1474,7 +1512,8 @@ def readiness_by_project(
     and a sandbox that then fails is still news. All are read errors in the
     envelope, so the report names them.
     ``last_runs`` is stamped for a run that completed or hit its own cap, so
-    the least recently run projects go first next time."""
+    the least recently run projects go first next time. ``standing`` as for
+    ``versions_by_project``."""
     # Member keys carry the id the report resolved; the run is asked for by the
     # roster's spelling where one is known for that id.
     spelled = {resolved: given for given, resolved in ids.items()}
@@ -1489,8 +1528,9 @@ def readiness_by_project(
             unfinished[project] = PROJECT_NOT_RUN_DETAIL.format(project=project, error=BUDGET_EXHAUSTED_DETAIL.format(project=project))
             continue
         timeout = min(READINESS_TIMEOUT_SECONDS, remaining)
+        asked = spelled.get(project, project)
         try:
-            envelope = run_report([spelled.get(project, project)], readiness=True, scope=scope, timeout=timeout)
+            envelope = run_report([asked], readiness=True, scope=scope, outside_stands=project in standing or asked in standing, timeout=timeout)
         except SandboxTimedOut as exc:
             if timeout < READINESS_TIMEOUT_SECONDS:
                 # Killed by the budget, not by its own cap: not an attempt, not
@@ -1571,6 +1611,21 @@ def announced_as(previous: dict, signature: list[list[str]], detail: str) -> boo
     if SIGNATURE_KEY in previous:
         return previous[SIGNATURE_KEY] == signature
     return previous.get(DETAIL_KEY) == detail
+
+
+def standing_outside(ledger: dict) -> frozenset[str]:
+    """The projects the last tick filed as outside the resolved scope, on
+    either hop: the table's record (``table_errors``) and the ungraded
+    announcements' signatures. ``refusal_cause`` keeps that cause for them
+    while the scope is merely unresolved again, so a container or selector
+    lookup that fails for a tick does not re-post a standing refusal on the
+    way out and again on the way back; a scope that resolves still does."""
+    table_kind = ERROR_KIND_REFUSED.format(cause=REFUSAL_OUTSIDE)
+    readiness_kind = UNGRADED_KIND_REFUSED.format(cause=REFUSAL_OUTSIDE)
+    found = {str(error[MEMBER_ID_KEYS[0]]) for error in ledger[TABLE_ERRORS_KEY] if error.get(MEMBER_ID_KEYS[0]) and error_kind(error) == table_kind}
+    for record in announced(ledger).get(ANNOUNCED_UNGRADED_KEY, {}).values():
+        found.update(project for project, kind in record.get(SIGNATURE_KEY) or [] if kind == readiness_kind)
+    return frozenset(found)
 
 
 def tables_without_the_output_line(tables: str) -> str:
@@ -1694,10 +1749,12 @@ def tick(dry_run: bool = False) -> list[str]:
     home = watch_home()
     ledger_path = home / LEDGER_FILE_NAME
     ledger = load_ledger(ledger_path)
+    # Read before the table overwrites the record it comes from.
+    standing = standing_outside(ledger)
     scope = declared_scope()
     names = projects()
     deadline = started + TICK_BUDGET_SECONDS
-    versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger, now, scope)
+    versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger, now, scope, standing)
     canonicalise_projects(versions[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     # A table is partial when a read failed; the script's exit code alone (it
@@ -1727,7 +1784,7 @@ def tick(dry_run: bool = False) -> list[str]:
     announced(ledger)[ANNOUNCED_PARTIAL_KEY] = signature
     ledger[TABLE_ERRORS_KEY] = read_errors
     if due:
-        readiness, failures, unfinished, refused = readiness_by_project(pending, due, deadline, ledger[READINESS_RUNS_KEY], now, ledger[PROJECT_IDS_KEY], scope)
+        readiness, failures, unfinished, refused = readiness_by_project(pending, due, deadline, ledger[READINESS_RUNS_KEY], now, ledger[PROJECT_IDS_KEY], scope, standing)
         canonicalise_projects(readiness[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
         for version in settle_from_readiness(readiness[ENVELOPE_REPORT_KEY], pending, ledger):
             if version in due and version in ledger[TARGETS_KEY]:

@@ -151,6 +151,7 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "ops-mgmt"}):
             targets = fst.declared_scope_targets(self.home)
             self.assertEqual(targets.unread, (("declared-scope", "unresolved"), ("payments-prod", "unresolved")))
+            self.assertEqual(targets.excluded, ("*-sandbox",))
 
     def test_a_numeric_host_is_not_handed_on_by_the_render_answer(self):
         render = self.home / "scope.json"
@@ -176,6 +177,14 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
                                {"id": "payments-prod", "outcome": "ok", "state": "in-scope"}], declared=declared, present=True))
         targets = fst.declared_scope_targets(self.home)
         self.assertEqual((targets.projects, targets.unread), (("ops-mgmt", "payments-prod"), ()))
+        # The entries ride on the targets, so a reader that meets such a
+        # project under another name (a profile still on the volume) can tell
+        # it from one the declaration never named; the match is the reader's.
+        self.assertEqual(targets.excluded, ("*-sandbox", "legacy"))
+        self.assertTrue(targets.excludes("team-sandbox"))
+        self.assertTrue(targets.excludes("legacy"))
+        self.assertFalse(targets.excludes("payments-prod"))
+        self.assertFalse(targets.excludes("legacy-2"))
         # Excluded by number: only the reconcile can match that, and it writes
         # the dropped ids for the reader.
         declared = dict(DECLARED, projects=["payments-prod", "team-prod"], exclude={"projects": ["123456789012"], "clusters": []})
@@ -183,7 +192,10 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
                           {"id": "payments-prod", "outcome": "ok", "state": "in-scope"}], declared=declared, present=True)
         snap["excludedProjects"] = ["team-prod"]
         self._write(snap)
-        self.assertEqual(fst.declared_scope_targets(self.home).unread, ())
+        targets = fst.declared_scope_targets(self.home)
+        self.assertEqual(targets.unread, ())
+        self.assertEqual(targets.excluded, ("123456789012", "team-prod"))
+        self.assertTrue(targets.excludes("team-prod"))
 
     def test_a_carried_tick_on_a_folder_scoped_install_is_partial(self):
         # A carried tick resolves no folder, organisation or selector; a
@@ -369,6 +381,10 @@ class CollectorArgvTest(unittest.TestCase):
         nothing = fst.ScopeTargets(projects=(), unread=(), resolved_at=None, path="x")
         self.assertEqual(nothing.collector_argv(), ("--scope-unread", "declared-scope=unresolved"))
         self.assertEqual(nothing.collector_args(), "--scope-unread declared-scope=unresolved")
+        # The exclude entries never reach the collector flags: the sweep and the unread rows are the whole argv.
+        self.assertEqual(targets.excluded, ())
+        excluding = fst.ScopeTargets(projects=("ops-mgmt",), unread=(), resolved_at=None, path="x", excluded=("*-sandbox",))
+        self.assertEqual(excluding.collector_argv(), ("--scope-projects", "ops-mgmt"))
 
 
 if __name__ == "__main__":
