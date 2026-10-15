@@ -23,9 +23,11 @@ import (
 // agents/platform/scripts/test_chat_message.py keeps equal to the Python
 // original's answers):
 //
-//   - the answer on the result: its first sentence as the headline and the
-//     rest as the detail, or under "why" when the rest is longer than a
-//     detail holds (split_answer);
+//   - the answer on the result: its first sentence as the headline, cut at
+//     a clause past the cap, and the rest as the detail, or under "why" when
+//     the rest is longer than a detail holds (split_answer); an answer that
+//     ends by asking which of its options to take offers them as choices
+//     (answer_choices, chat_choices.go);
 //   - mark.ask, the kind of ask the prompt is, chosen by keyword
 //     (arrival_reaction), on each heartbeat while the turn runs;
 //   - when the turn filed kanban cards, the terminal's mark-only message

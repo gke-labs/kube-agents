@@ -69,6 +69,19 @@ func TestSlackRichMarkdownCodeInsideBold(t *testing.T) {
 	}
 }
 
+// An executor-written <url|text> link draws as a link, as the mrkdwn fold
+// kept it; one whose label names another host stays text.
+func TestSlackRichMarkdownKeepsANativeLink(t *testing.T) {
+	got, _ := json.Marshal(slackRichMarkdown("See <https://console.cloud.google.com/x|the workload page>."))
+	if !strings.Contains(string(got), `{"text":"the workload page","type":"link","url":"https://console.cloud.google.com/x"}`) {
+		t.Errorf("got %s, want the link", got)
+	}
+	got, _ = json.Marshal(slackRichMarkdown("<https://evil.example|https://console.cloud.google.com>"))
+	if strings.Contains(string(got), `"type":"link"`) {
+		t.Errorf("got %s, want a misnaming label left as text", got)
+	}
+}
+
 // A table is a preformatted block with its columns lined up, and a rule goes.
 func TestSlackRichDocumentTableAndRule(t *testing.T) {
 	got := slackRichDocument("| a | bb |\n|---|---|\n| ccc | d |\n\n---\n\nend")

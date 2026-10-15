@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -119,6 +120,12 @@ func TestASessionErrorIsWarnedOnce(t *testing.T) {
 	}
 	if !s.firstSessionError(other) {
 		t.Error("a different error: want it warned too")
+	}
+	for i := range slackSessionsCap {
+		s.firstSessionError(errors.New("transient " + strconv.Itoa(i)))
+	}
+	if !s.firstSessionError(errors.New("a new one past the bound")) {
+		t.Error("past the bound: want a new error still warned")
 	}
 }
 

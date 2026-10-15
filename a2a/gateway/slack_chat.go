@@ -486,6 +486,15 @@ func slackRichSpan(md string, i int) (span map[string]any, n int, ok bool) {
 			!slackWordBefore(md, i) {
 			return slackRichText(rest[m[4]:m[5]], map[string]any{"bold": true}), m[1], true
 		}
+	case strings.HasPrefix(rest, "<"):
+		// A <url|text> link the executor wrote, as keepChatLinks keeps it on
+		// the text path; one that fails the checks stays text.
+		if m := chatNativeLinkRE.FindStringSubmatchIndex(rest); m != nil && m[0] == 0 {
+			dest, label := rest[m[2]:m[3]], rest[m[4]:m[5]]
+			if chatmsg.SafeURL(dest) == nil && !chattext.LinkLabelMisnamesHost(label, dest) {
+				return map[string]any{"type": "link", "url": dest, "text": label}, m[1], true
+			}
+		}
 	case strings.HasPrefix(rest, "["):
 		if m := slackLinkRE.FindStringSubmatchIndex(rest); m != nil && m[0] == 0 {
 			label, dest := rest[m[2]:m[3]], rest[m[4]:m[5]]

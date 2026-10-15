@@ -477,11 +477,11 @@ class ClauseCutTest(unittest.TestCase):
         self.assertTrue(rest.startswith("**Due to an OOMKill") and rest.endswith("end.**"))
 
     def test_no_cut_inside_an_italic_run(self):
-        head, _rest = sp.clause_cut(
-            "The ingress on seeded-c drops long-lived connections at startup, *because the pool has no headroom, "
-            "none at all* today, so the HPA cannot add a replica and the queue keeps growing."
-        )
-        self.assertEqual(head.count("*") % 2, 0)
+        # The one break whose head fits opens an italic run it does not close, so there is no cut.
+        sentence = ("The ingress on seeded-c drops connections *because the pool has no headroom, "
+                    + "so the HPA " * 12 + "cannot add a replica* and the queue keeps growing.")
+        self.assertIsNone(sp.clause_cut(sentence))
+        self.assertIsNotNone(sp.clause_cut(sentence.replace("*", "")), "without the italic it cuts")
 
     def test_no_leading_subordinate_clause_as_the_headline(self):
         sentence = ("If the pool is full, the HPA cannot add a replica and the queue keeps growing until the "

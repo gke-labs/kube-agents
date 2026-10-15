@@ -57,7 +57,8 @@ var slackSuggestedPrompts = []string{
 
 // firstSessionError reports whether this process has not logged err's text
 // from setStatus before, and records it: a missing scope fails every call,
-// and one Warn line says so. The record is bounded like the session state.
+// and one Warn line says so. The record is bounded like the session state,
+// and starts over when full, so a new error past the bound is still said.
 func (s *SlackAdapter) firstSessionError(err error) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -65,8 +66,12 @@ func (s *SlackAdapter) firstSessionError(err error) bool {
 		s.sessionErrorsSeen = map[string]bool{}
 	}
 	key := err.Error()
-	if s.sessionErrorsSeen[key] || len(s.sessionErrorsSeen) >= slackSessionsCap {
+	if s.sessionErrorsSeen[key] {
 		return false
+	}
+	if len(s.sessionErrorsSeen) >= slackSessionsCap {
+		// Start over rather than go silent on a new error past the bound.
+		clear(s.sessionErrorsSeen)
 	}
 	s.sessionErrorsSeen[key] = true
 	return true
