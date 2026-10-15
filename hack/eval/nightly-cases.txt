@@ -766,6 +766,9 @@
 # bot once posted in the thread (#3080; agents/chat/SOUL.md §2, step 3).
 # deployer: noop, transcript-only, a single front-door turn and no card.
 ./tasks/chat-sample-report-is-not-cluster-state/task.yaml
+# Its labelled twin: the same turn as the patched Slack adapter delivers it,
+# with the bot's own root marked "posted by you earlier" (#3080).
+./tasks/chat-sample-report-is-not-cluster-state-labelled/task.yaml
 
 # The onboarding prioritization stage (#2143): plants a fixed raw inventory
 # report on the install under test's shell sandbox, files the

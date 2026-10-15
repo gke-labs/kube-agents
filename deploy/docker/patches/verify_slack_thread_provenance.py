@@ -36,12 +36,24 @@ THREAD_TS = "1791563247.870259"
 SAMPLE = "## Headline findings This is a sample health report for a demo cluster."
 
 
+IMAGE_ROOT = Path("/opt/hermes")
+
+
 def _ensure_session_helper(root: Path) -> None:
-    """Make ``from gateway.session import neutralize_untrusted_inline_text`` work."""
+    """Make ``from gateway.session import neutralize_untrusted_inline_text`` work.
+
+    In the image the real helper has to load, or the gate would quietly test a
+    stand-in instead of what ships. Elsewhere (the unit tests) a pass-through
+    stands in for it.
+    """
     sys.path.insert(0, str(root))
     try:
         import gateway.session  # noqa: F401
-    except Exception:  # noqa: BLE001 - outside the image: a pass-through stand-in
+    except Exception as exc:  # noqa: BLE001
+        if root.resolve() == IMAGE_ROOT:
+            raise SystemExit(
+                f"verify_slack_thread_provenance: gateway.session did not import from {root}: {exc}"
+            ) from exc
         gateway = types.ModuleType("gateway")
         session = types.ModuleType("gateway.session")
         session.neutralize_untrusted_inline_text = lambda text, max_chars=0: " ".join(str(text).split())
