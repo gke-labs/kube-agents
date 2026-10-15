@@ -12,8 +12,9 @@ install.env key in test_render_install_env.py. This file holds the rest:
 - The workflows that carry the mode: deploy-environment.yml and e2e-run.yml
   take it as a `mode` input defaulting to `today`, hand it to the scripts as
   PLATFORM_AGENT_MODE, and run their extra steps only when it is not `today`.
-  The two pipelines that call them pass no mode, so they install and test
-  `today`, as they did.
+  The two pipelines that call them pass no mode to their gating jobs, so those
+  install and test `today`, as they did; the RC pipeline's next-mode leg runs
+  after them, passes `next`, and gates nothing.
 """
 
 import pathlib
@@ -262,6 +263,12 @@ def _workflow(name):
     return yaml.safe_load((_WORKFLOWS / name).read_text())
 
 
+def _needs(job):
+    """A job's `needs:` as a list: it may be a scalar, and set() of a str is its characters."""
+    needs = job.get("needs") or []
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
 def _step(doc, job, name):
     for step in doc["jobs"][job]["steps"]:
         if step.get("name") == name:
@@ -439,10 +446,10 @@ class WorkflowsCarryTheModeTest(unittest.TestCase):
         leg = {"step-6-deploy-next-env", "step-7-run-e2e-next", "step-8-teardown-next-env"}
         for job_id in ("step-2-deploy-env", "step-3-run-e2e-tests", "step-4-tag-validated", "step-5-teardown-env"):
             with self.subTest(job=job_id):
-                self.assertFalse(leg & set(jobs[job_id].get("needs") or []))
-        self.assertIn("step-5-teardown-env", jobs["step-6-deploy-next-env"]["needs"])
-        self.assertIn("step-6-deploy-next-env", jobs["step-7-run-e2e-next"]["needs"])
-        self.assertIn("step-7-run-e2e-next", jobs["step-8-teardown-next-env"]["needs"])
+                self.assertFalse(leg & set(_needs(jobs[job_id])))
+        self.assertIn("step-5-teardown-env", _needs(jobs["step-6-deploy-next-env"]))
+        self.assertIn("step-6-deploy-next-env", _needs(jobs["step-7-run-e2e-next"]))
+        self.assertIn("step-7-run-e2e-next", _needs(jobs["step-8-teardown-next-env"]))
         for job_id in leg:
             with self.subTest(job=job_id):
                 job = jobs[job_id]
@@ -453,6 +460,53 @@ class WorkflowsCarryTheModeTest(unittest.TestCase):
         # The same suites as the today leg, so the two results read side by side.
         for key in ("blocking_suite", "optional_suites"):
             self.assertEqual(jobs["step-7-run-e2e-next"]["with"][key], jobs["step-3-run-e2e-tests"]["with"][key])
+
+    def test_needs_reads_the_scalar_form_as_one_job(self):
+        """Step 2 writes `needs:` as a scalar; the pin above must see it as a job name."""
+        self.assertEqual(_needs({"needs": "step-7-run-e2e-next"}), ["step-7-run-e2e-next"])
+        self.assertEqual(_needs({"needs": ["a", "b"]}), ["a", "b"])
+        self.assertEqual(_needs({}), [])
+        leg = {"step-7-run-e2e-next"}
+        self.assertTrue(leg & set(_needs({"needs": "step-7-run-e2e-next"})))
+
+    _SUITE_STEPS = (
+        ("Execute Blocking E2E Gate", "execute_e2e_tests.sh"),
+        ("Execute Optional E2E Suites", "run_optional_e2e_suites.sh"),
+    )
+    _NEXT_EXPRESSION = "${{ steps.mode.outputs.next == 'true' }}"
+
+    def _run_suite_step(self, name, script, next_value):
+        """Runs the step's `run:` with the mode expression rendered, against a stub script."""
+        step = _step(_workflow("e2e-run.yml"), "run-e2e", name)
+        self.assertEqual(step["run"].count(self._NEXT_EXPRESSION), 1)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        record = root / "env"
+        stub = root / "scripts" / "release" / script
+        stub.parent.mkdir(parents=True)
+        stub.write_text(f'#!/usr/bin/env bash\nprintf "%s" "${{TEST_TIMEOUT_SEC-unset}}" > "{record}"\n')
+        stub.chmod(0o755)
+        proc = subprocess.run(
+            ["bash", "-e", "-c", step["run"].replace(self._NEXT_EXPRESSION, next_value)],
+            capture_output=True, text=True, cwd=root, env={"PATH": "/usr/bin:/bin"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return step, record.read_text()
+
+    def test_today_hands_the_suites_no_test_timeout(self):
+        """The test is the candidate's, and one older than the next leg reads '' as int('')."""
+        for name, script in self._SUITE_STEPS:
+            with self.subTest(step=name):
+                step, value = self._run_suite_step(name, script, "false")
+                self.assertNotIn("TEST_TIMEOUT_SEC", step.get("env") or {})
+                self.assertEqual(value, "unset")
+
+    def test_next_gives_the_suites_300_seconds(self):
+        for name, script in self._SUITE_STEPS:
+            with self.subTest(step=name):
+                _, value = self._run_suite_step(name, script, "true")
+                self.assertEqual(value, "300")
 
 
 if __name__ == "__main__":

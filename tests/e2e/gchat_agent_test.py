@@ -63,8 +63,7 @@ if "@" not in TEST_USER_EMAIL:
 
 TEST_USER_NAME: str = TEST_USER_EMAIL.split("@")[0]
 
-# Empty means the default, so a workflow can pass '' for the runs that keep it.
-TEST_TIMEOUT_SEC: int = int(os.environ.get("TEST_TIMEOUT_SEC") or "120")
+TEST_TIMEOUT_SEC: int = int(os.environ.get("TEST_TIMEOUT_SEC", "120"))
 POLL_INTERVAL_SEC: int = int(os.environ.get("POLL_INTERVAL_SEC", "5"))
 
 # Normalize CHAT_SPACE_ID format (e.g. AAQAfrKMyng -> spaces/AAQAfrKMyng)
