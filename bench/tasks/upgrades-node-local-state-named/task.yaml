@@ -19,7 +19,7 @@
 # class: a negation word in it is refused as an item of its own (not as the
 # first segment of a name such as `no-cache`), and a word outside it is the
 # judge's. The volume's kind may stand before its name
-# (emptyDir queue) or in its parenthetical (queue (emptyDir)).
+# (`emptyDir queue`, `emptyDir: queue`) or in its parenthetical (queue (emptyDir)).
 #
 # A pod of the workload names it too: the pod-template hash (or a Job's
 # minute stamp) and the five-character suffix, both in Kubernetes' vowel-free

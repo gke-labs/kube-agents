@@ -31,7 +31,8 @@
 # The client's version may follow the name after a space, a colon or a slash,
 # or stand anywhere in a parenthetical as its first version (`kubectl (v1.29.0,
 # image registry.k8s.io/kubectl:v1.29.0)`, `kubectl (registry.k8s.io/kubectl:
-# v1.29.0)`), as the Endpoints token's version may.
+# v1.29.0)`), as the Endpoints token's version may, and a digest may follow the
+# version (`kubectl:v1.29.0@sha256:…`).
 #
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
 #
@@ -104,9 +105,9 @@ verification_spec:
       fixture_roles:
         - stale-client-skew
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?stale-kubectl-client(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: client:? ?(?:image )?(?:[a-z0-9.-]+/)*kubectl(?: ?\((?:(?!v?\d+\.\d+)[^)\n;])*v?1\.29(?:\.0)?(?![\w.])[^)\n;]*\)|(?:[:/] ?| )?v?1\.29(?:\.0)?)(?: ?\([^)\n;]*\))?; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?stale-kubectl-client(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: client:? ?(?:image )?(?:[a-z0-9.-]+/)*kubectl(?: ?\((?:(?!v?\d+\.\d+)[^)\n;])*v?1\.29(?:\.0)?(?![\w.])[^)\n;]*\)|(?:[:/] ?| )?v?1\.29(?:\.0)?)(?:@sha256: ?[0-9a-f]{64})?(?: ?\([^)\n;]*\))?; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?stale-kubectl-client(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: client:? ?(?!(?:image )?(?:[a-z0-9.-]+/)*kubectl(?: ?\((?:(?!v?\d+\.\d+)[^)\n;])*v?1\.29(?:\.0)?(?![\w.])[^)\n;]*\)|(?:[:/] ?| )?v?1\.29(?:\.0)?)(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?stale-kubectl-client(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: client:? ?(?!(?:image )?(?:[a-z0-9.-]+/)*kubectl(?: ?\((?:(?!v?\d+\.\d+)[^)\n;])*v?1\.29(?:\.0)?(?![\w.])[^)\n;]*\)|(?:[:/] ?| )?v?1\.29(?:\.0)?)(?:@sha256: ?[0-9a-f]{64})?(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; server:? ?[^ :;\n][^;\n]*; within supported skew: (?:yes|no)$'
 
   - name: the-declared-line-says-the-client-is-outside-the-skew
     role: objective
