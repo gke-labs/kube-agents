@@ -51,8 +51,9 @@ entries in `oss-test-infra` run `main` only: a postsubmit on every merge that ch
 here, and a daily pass at 08:30 UTC (`docs/ci-pool-projects.md` §6.2, which says which files, and states
 the rule for a fixture pull request and for proving a branch on one leased project). A hand
 run goes through the script too (`--project <id>`), never `tofu apply` from a branch, and
-never from a laptop while a run holds the project. The two recovery replaces below (`seeded_b`'s
-cluster, `inventory_api`) are the exception: the script passes no `-replace`, so they run by hand
+never from a laptop while a run holds the project. The two hand recoveries below (`seeded_b`'s
+cluster, a targeted destroy; `inventory_api`, a replace) are the exception: the script passes neither
+`-target` nor `-replace`, so they run by hand
 from a `main` checkout, under a lease on the project. Its `init` runs with `-lockfile=readonly`, so the
 providers are the ones `.terraform.lock.hcl` pins; to move them, change `versions.tf` if the major
 changes and run `tofu providers lock -platform=linux_amd64 -platform=darwin_arm64 -platform=darwin_amd64`
@@ -80,7 +81,19 @@ provider answers a raised value with an operator-initiated `clusters.update` car
 down). That is what keeps the pin from rotting: a new patch inside the held minor moves
 the master onto it, and the day the REGULAR default rolls a minor, the derived pin
 recomputes and the next apply walks the master to the new default-minus-one, so the lag
-stays exactly one minor without anyone touching the file. `seeded-b`'s node pool is
+stays one minor without anyone touching the file, a hold excepted. The pin is drawn from
+REGULAR's own version list by `seeded_b_pin.py` (the stack's `external` data source),
+never from the provider's all-channel list: GKE lets a cluster running a patch its
+channel does not carry upgrade only within that minor, so a pin from a newer channel
+turns the next minor roll into a refused apply on every project. When `seeded-b` is
+found on such a patch, the script holds the pin instead, at the newest REGULAR patch of
+that minor above the running one if there is one, else at the running version, and the
+apply after that step does the minor bump, one minor per apply (GKE's control-plane
+rule), so a master the hold left two minors behind reaches the target over two applies.
+While a hold lasts the lag is two minors, not one: `hack/fleet-fixture-state.py` reads
+`version-laggard` as drifted until REGULAR ships a patch above the running one, and if
+REGULAR drops the minor first no pin can recover, so the cluster is upgraded by hand off
+the channel or destroyed and re-created (the recovery below). `seeded-b`'s node pool is
 driven from the same derived pin and deliberately **not** `ignore_changes`'d, so it
 moves with the master; freezing it would leave the pool a minor (or, between minor
 rolls, a patch) behind the control plane, which is upgrade SOP 3.2 `pool-skew` and a
@@ -104,8 +117,9 @@ Second, it rolls the exclusion. The lag is held between reconciles by a
 `var.exclusion_window_hours`) is re-stamped from now on every apply — the plan always
 shows that one in-place update, by design; it is the window rolling forward, not
 drift. The exclusion gates GKE's _automatic_ upgrades only; manually initiated upgrades
-(including the provider's) begin immediately and ignore maintenance policy, which is
-why the two mechanisms do not fight. The window has a hard ceiling the API enforces: an
+(including the provider's) begin immediately and ignore maintenance policy. What gates
+those is GKE's channel rule above, which is why the pin stays inside REGULAR's own
+list. The window has a hard ceiling the API enforces: an
 exclusion cannot outlive the held minor's end of life (observed live: 1.34 capped at
 2027-01-25), so as EOL approaches, applies start failing with exactly that 400 — the
 built-in warning to shorten the window variable or plan the re-lag. The exclusion therefore dies in one of
@@ -113,9 +127,11 @@ two ways — reconciles lapse for longer than the window, or the minor reaches E
 either way GKE upgrades the master, the defect self-heals, and the upgrade scenario
 going red is the detection. The pin cannot pull it back — the provider upgrades only
 when the recorded master is below the configured value, and a control plane cannot be
-downgraded — so the recovery is the same in both cases: replace the cluster and let the
-derived pin re-lag it against the then-current default:
-`tofu apply -replace=google_container_cluster.seeded_b`. That replacement costs the
+downgraded — so the recovery is the same in both cases: destroy the cluster under a lease
+(`tofu destroy -target=google_container_cluster.seeded_b`) and let the next apply, the
+daily's or your own, re-create it at the lag target. Not a `-replace` in one apply:
+`seeded_b_pin.py` reads the running cluster at plan time, so a replace plans the new
+cluster at the version the old one is on and re-lags nothing. That re-creation costs the
 drift scenario a day — see the cluster-replacement note under Activation timeline below.
 The other standing hazard is a cleanup sweep — one `orphan-pd-` deletion breaks the cost
 scenario, and recreating a deleted fixture restarts its age gate (below).
@@ -230,9 +246,9 @@ finding, and churning eval clusters would randomize the audit run to run. The la
 value `seeded` is reserved for the clusters in this stack; labeling any other cluster
 with it changes the vote.
 
-`seeded-b`'s lag is derived at apply time (REGULAR channel default minus one minor,
-freshest patch of that minor), so the pin re-computes each reconcile instead of
-rotting — and `seeded-b` is enrolled in the REGULAR channel on purpose: the upgrade
+`seeded-b`'s lag is derived at apply time (the newest patch REGULAR itself offers one
+minor behind its default, read by `seeded_b_pin.py`), so the pin re-computes each
+reconcile instead of rotting — and `seeded-b` is enrolled in the REGULAR channel on purpose: the upgrade
 SOP's master-behind check compares a cluster's master minor against its own channel's
 default, so a channel-less cluster falls out of that comparison entirely and the lag
 would be invisible to the audit it was planted for. The maintenance exclusion above is
@@ -470,7 +486,9 @@ remaining absolute checks are clean by construction: every cluster now has a
 channel and a window, the fleet's minor spread is one (below the two-minor
 threshold — which is also why `seeded-b`'s master is re-pinned forward rather
 than frozen: a frozen master would fall two minors behind at the next REGULAR
-roll and trip 3.3 `fleet-spread`), 3.2 `pool-skew` is clean because
+roll and trip 3.3 `fleet-spread`; a hold is that frozen master, so while one
+lasts and the other clusters follow the default, 3.3 fires on `seeded-b`, a
+finding the background table does not carry and the hold's end clears), 3.2 `pool-skew` is clean because
 `seeded-b`'s pool is driven from the same derived pin as its control plane
 (any skew between them is the transient mid-reconcile lag 3.2 explicitly does
 not flag), the `NO_MINOR_UPGRADES` exclusion is the scope its 3.8 explicitly

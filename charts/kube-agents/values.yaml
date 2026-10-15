@@ -607,14 +607,16 @@ platformAgent:
   annotations: {}
   # GKE managed-Prometheus PodMonitorings for the agent's pods: the gateway,
   # where the k8s-event-watcher serves its metrics on the agent-api-auth
-  # sidecar's event-metrics port (9095), and the credential proxy, where the
+  # sidecar's event-metrics port (9095) and, under its own PodMonitoring that
+  # selects the leader label, the chat_metrics plugin serves its on the
+  # platform-agent container's chat-metrics port (9097), and the credential proxy, where the
   # broker serves its own on the metrics-only cred-metrics port (8766), and
   # the A2A gateway a spec.mode next install runs, which serves its counters on
   # the metrics-only a2a-metrics port (9096). The operator's policies admit the
   # collector's namespace, gke-gmp-system, on those ports whatever this is set
-  # to, and on the first two the operator's own pods as well; this decides
+  # to, and on all but the A2A gateway's the operator's own pods as well; this decides
   # only whether a scrape is configured, and the operator's own read of the
-  # two counters into status.usage does not depend on it.
+  # counters into status.usage does not depend on it.
   # A tri-state: null (the default) renders them when the cluster serves
   # monitoring.googleapis.com/v1/PodMonitoring, which is where Managed
   # Prometheus is installed, and renders nothing elsewhere, so an install on a
@@ -1071,8 +1073,8 @@ platformAgent:
     #
     # forges:
     #   - name: github            # what repositories[].forge refers to
-    #     provider: github        # github or gitlab; default github
-    #     host: ""                # empty is the provider's default (github.com)
+    #     provider: github        # github or gitlab; required when host is not github.com
+    #     host: ""                # empty is github.com; or a GitHub Enterprise Server hostname
     #     namespace: my-org       # default owner for this forge's repositories
     #     credentialsRef:         # Secret for providers that need one; ignored
     #       name: ""              # for github, which uses the GitHub App
@@ -1082,9 +1084,10 @@ platformAgent:
     #     namespace: my-group     # group path; bounds which projects the agent may reach
     #     credentialsRef:         # required for gitlab: a Secret holding an access
     #       name: gitlab-token    # token under the key `token`, created out of band
-    #     caBundleRef:            # optional, self-managed gitlab only: a Secret holding
-    #       name: gitlab-forge-ca # the PEM CA that signed the instance's certificate;
-    #       key: ca.crt           # trusted for this host only, created out of band
+    #     caBundleRef:            # optional, self-managed GitLab or GitHub Enterprise Server only: a Secret holding
+    #       name: gitlab-forge-ca # the PEM CA that signed the instance's certificate, created out of band;
+    #       key: ca.crt           # the broker trusts it for this host only. On a GitHub Enterprise Server
+    #                             # forge, the token minter also gets it and trusts it for all of its calls
     forges: []
     # repositories:
     #   - forge: github

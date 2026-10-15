@@ -496,11 +496,21 @@ class HttpTransport:
         outer_deadline: Callable[[], float | None] | None = None,
         ca_file: str = "",
         ca_source: str = "",
+        whoami_graphql: str = "",
     ) -> None:
         if not base_url.startswith("https://"):
             raise ValueError("a forge API is reached over https only")
         self._base = base_url.rstrip("/")
         self._host = self._base.split("://", 1)[1].split("/", 1)[0]
+        # A GraphQL endpoint that answers `viewer { login }`, for a forge whose
+        # REST "current user" route refuses the credential it is handed. On
+        # the forge's own host only: the credential header goes with the call.
+        if whoami_graphql and (
+            not whoami_graphql.startswith("https://")
+            or whoami_graphql.split("://", 1)[1].split("/", 1)[0] != self._host
+        ):
+            raise ValueError("the identity query must go to the forge's own host over https")
+        self._whoami_graphql = whoami_graphql
         self._ca_file = ca_file
         self._ca_source = ca_source
         self._headers = headers
@@ -557,6 +567,17 @@ class HttpTransport:
                 code="FORGE_CALL_FAILED",
             )
         url = f"{self._base}/{_with_query(path, params).lstrip('/')}"
+        return self._call(method, url, body=body, raw=raw)
+
+    def _call(
+        self,
+        method: str,
+        url: str,
+        *,
+        body: Mapping[str, Any] | None = None,
+        raw: str | None = None,
+    ) -> Any:
+        """One authenticated request to `url`, which the caller composed and checked."""
         data = None if body is None else json.dumps(body).encode("utf-8")
         request = urllib.request.Request(url, data=data, method=method)
         request.add_header("Accept", raw or "application/json")
@@ -721,9 +742,34 @@ class HttpTransport:
         raise forge_error(status, _http_detail(text), self._overrides, message=text)
 
     def whoami(self) -> str:
+        if self._whoami_graphql:
+            return self._graphql_viewer()
         if self._whoami_route is None:
             return ""
         path, field = self._whoami_route
         answer = self.api("GET", path)
         value = answer.get(field) if isinstance(answer, dict) else None
         return str(value).strip() if value else ""
+
+    def _graphql_viewer(self) -> str:
+        """The login the GraphQL `viewer` names, or a refusal.
+
+        Asked of a credential that cannot read the REST current-user route,
+        such as an App installation token, which that route answers with 403.
+        A missing login raises rather than returning "": the callers read ""
+        as "do not compare", and a credential that is known to have a login
+        must not drop the ownership checks because one answer lacked it.
+        """
+        answer = self._call("POST", self._whoami_graphql, body={"query": "query { viewer { login } }"})
+        data = answer.get("data") if isinstance(answer, dict) else None
+        viewer = data.get("viewer") if isinstance(data, dict) else None
+        login = viewer.get("login") if isinstance(viewer, dict) else None
+        if not isinstance(login, str) or not login.strip():
+            errors = answer.get("errors") if isinstance(answer, dict) else None
+            raise WorkspaceError(
+                "the forge did not say which login this credential is"
+                + (f": {_http_detail(json.dumps(errors))}" if errors else ""),
+                status=502,
+                code="FORGE_CALL_FAILED",
+            )
+        return login.strip()

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
@@ -42,6 +43,63 @@ func TestNotifyConversationChatIsLaidOut(t *testing.T) {
 	}
 	if len(conv.posts) != 1 || conv.posts[0].text != testReportText {
 		t.Fatalf("posts = %+v, want one message, the text beside the layout", conv.posts)
+	}
+}
+
+// A conversation request's mark is drawn after its post, and a bad mark is
+// dropped alone with the layout still posted.
+func TestNotifyConversationMarkIsDrawnAfterThePost(t *testing.T) {
+	n, conv := newChatNotifier(t, true)
+	settled := testReport
+	settled.Mark = &chatmsg.Mark{Settle: chatmsg.SettleDone}
+	got := serveJSON(t, n, lib.NotifyRequest{Text: testReportText, Chat: notifyChat(t, settled),
+		Conversation: testConversation, ContextID: testContext, Update: "plan"})
+	if got.Error != "" {
+		t.Fatalf("reply = %+v", got)
+	}
+	// Drawn off the route's worker, so waited for.
+	waitFor(t, "the mark", func() bool {
+		conv.mu.Lock()
+		defer conv.mu.Unlock()
+		return len(conv.marks) == 1
+	})
+	conv.mu.Lock()
+	marks, at := fmt.Sprint(conv.marks), conv.postsAtMark[0]
+	conv.mu.Unlock()
+	if marks != fmt.Sprint([]string{testConversation + " /done@plan"}) || at != 1 {
+		t.Fatalf("marks = %v at posts %v, want the settle drawn after the one post, with its update key", marks, at)
+	}
+	bad := testReport
+	bad.Mark = &chatmsg.Mark{Ask: "Not A Token"}
+	serveJSON(t, n, lib.NotifyRequest{Text: testReportText, Chat: notifyChat(t, bad),
+		Conversation: testConversation, ContextID: testContext})
+	time.Sleep(100 * time.Millisecond)
+	conv.mu.Lock()
+	defer conv.mu.Unlock()
+	if len(conv.marks) != 1 || len(conv.chats) != 2 || conv.chats[1] == nil {
+		t.Fatalf("marks %v, chats %d: a bad mark is dropped alone", conv.marks, len(conv.chats))
+	}
+}
+
+// A notify whose post fails draws no mark: the ask's reaction must not come
+// off, or a settle land, with nothing in the thread.
+func TestNotifyConversationMarkIsNotDrawnWhenThePostFails(t *testing.T) {
+	n, conv := newChatNotifier(t, true)
+	conv.mu.Lock()
+	conv.failPosts = true
+	conv.mu.Unlock()
+	settled := testReport
+	settled.Mark = &chatmsg.Mark{Settle: chatmsg.SettleDone}
+	got := serveJSON(t, n, lib.NotifyRequest{Text: testReportText, Chat: notifyChat(t, settled),
+		Conversation: testConversation, ContextID: testContext, Update: "plan"})
+	if got.Error == "" {
+		t.Fatalf("reply = %+v, want the post failure", got)
+	}
+	time.Sleep(200 * time.Millisecond)
+	conv.mu.Lock()
+	defer conv.mu.Unlock()
+	if len(conv.marks) != 0 {
+		t.Errorf("marks = %v after a failed post", conv.marks)
 	}
 }
 
