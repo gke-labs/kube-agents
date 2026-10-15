@@ -11,6 +11,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
 // The bridge's chat messages (docs/designs/spec-a2a-payloads.md, "Chat
@@ -22,9 +23,11 @@ import (
 // agents/platform/scripts/test_chat_message.py keeps equal to the Python
 // original's answers):
 //
-//   - the answer on the result: its first sentence as the headline and the
-//     rest as the detail, or under "why" when the rest is longer than a
-//     detail holds (split_answer);
+//   - the answer on the result: its first sentence as the headline, cut at
+//     a clause past the cap, and the rest as the detail, or under "why" when
+//     the rest is longer than a detail holds (split_answer); an answer that
+//     ends by asking which of its options to take offers them as choices
+//     (answer_choices, chat_choices.go);
 //   - mark.ask, the kind of ask the prompt is, chosen by keyword
 //     (arrival_reaction), on each heartbeat while the turn runs;
 //   - when the turn filed kanban cards, the terminal's mark-only message
@@ -202,6 +205,11 @@ func answerChat(answer string) (chatmsg.Message, bool) {
 	}
 	rest := pyStrip(strings.Join(body, "\n\n"))
 	msg := chatmsg.Message{Schema: chatmsg.Schema, Headline: headline}
+	if runeLen(rest) <= chatFoldTextMax {
+		if offered, ok := offerChat(msg, rest); ok {
+			return offered, true
+		}
+	}
 	switch n := runeLen(rest); {
 	case n > chatFoldTextMax:
 		return chatmsg.Message{}, false
@@ -209,6 +217,40 @@ func answerChat(answer string) (chatmsg.Message, bool) {
 		msg.Fold = &chatmsg.Fold{Title: chatmsg.DefaultFoldTitle, Text: rest}
 	default:
 		msg.Detail = rest
+	}
+	return msg, true
+}
+
+// offerChat is answer_message's layout for an answer that ends by asking
+// which of its options to take (answerChoices): the detail is its opening
+// paragraph, each option's shown line and the question, the rest goes under
+// "why", and the options are choices. False when it asks none, when a label
+// is one the gateway would act on as a command, or when the detail is past
+// its cap, and the answer keeps the plain layout.
+func offerChat(msg chatmsg.Message, rest string) (chatmsg.Message, bool) {
+	offer, ok := answerChoices(rest)
+	if !ok {
+		return chatmsg.Message{}, false
+	}
+	for _, option := range offer.options {
+		text := clipRunes(strings.Join(strings.Fields(option.label), " "), buttonTextMax)
+		if text == "" || chattext.IsCommand(text) {
+			return chatmsg.Message{}, false
+		}
+		msg.Choices = append(msg.Choices, chatmsg.Choice{Text: text, Primary: option.primary})
+	}
+	var parts []string
+	for _, part := range []string{offer.shown, offer.question} {
+		if part != "" {
+			parts = append(parts, part)
+		}
+	}
+	msg.Detail = strings.Join(parts, "\n\n")
+	if runeLen(msg.Detail) > chatDetailMax {
+		return chatmsg.Message{}, false
+	}
+	if offer.folded != "" {
+		msg.Fold = &chatmsg.Fold{Title: chatmsg.DefaultFoldTitle, Text: offer.folded}
 	}
 	return msg, true
 }
@@ -643,7 +685,8 @@ func clipRunes(text string, limit int) string {
 }
 
 // splitAnswer is the presenter's split_answer: the first sentence of the
-// first paragraph as a plain headline, and the rest as markdown sections.
+// first paragraph as a plain headline, cut at a clause when it runs past the
+// cap (clauseCut), and the rest as markdown sections.
 func splitAnswer(md string) (string, []string) {
 	paras := paragraphs(strings.ReplaceAll(md, "\x00", ""))
 	if len(paras) == 0 {
@@ -671,6 +714,15 @@ func splitAnswer(md string) (string, []string) {
 	held, spans := holdCode(joined)
 	sentence, remainder := firstSentence(held)
 	sentence, remainder = restoreCode(sentence, spans, false), restoreCode(remainder, spans, false)
+	if runeLen(plainLine(sentence)) > chatHeadlineMax {
+		if head, overflow, ok := clauseCut(sentence); ok {
+			sentence = head
+			if remainder != "" {
+				overflow += " " + remainder
+			}
+			remainder = overflow
+		}
+	}
 	headline := clipRunes(plainLine(sentence), chatHeadlineMax)
 	var tailParts []string
 	for _, part := range []string{remainder, strings.Trim(moreLines, "\n")} {

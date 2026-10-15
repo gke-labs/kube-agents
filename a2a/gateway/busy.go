@@ -36,7 +36,9 @@ var errSessionWatchClosed = errors.New("session-state watch closed before its in
 // a dash, the detail). It replaces the "⏳ submitted…" placeholder rather than
 // following it as a post of its own, so the relay's next edit (working, or
 // the terminal) replaces it in turn and it is never left under a "completed"
-// header, where it read as the output of some earlier command. Plain words,
+// header, where it read as the output of some earlier command. On a backend
+// that keeps no line (StatusShower: Slack with Agent Sessions) there is none
+// to replace, and showBusy posts it as a message of its own. Plain words,
 // no task id: it is for the person who just asked, and what they need is
 // that the request is in and roughly how long the line is. "As soon as
 // there's room" rather than "as soon as one finishes", because the count
@@ -72,7 +74,8 @@ func busyNotice(ahead int) string {
 // from replacing it (updateRollingLine); its working and terminal edits
 // replace it as they replace the placeholder.
 //
-// A turn whose placeholder post failed has no line to edit, and gets the
+// A turn whose placeholder post failed, or that never got one because the
+// backend keeps no line (StatusShower), has no line to edit, and gets the
 // notice as a post, the shape before the notice moved onto the line: with no
 // status line there is no "completed" header for it to sit under. An edit
 // that fails is logged and not retried as a post, which would put back the

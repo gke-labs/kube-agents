@@ -140,10 +140,17 @@ standing in, not whichever one that shared checkout belongs to. The one addition
 `$HOME/kube-agents/install.env` is skipped unless all three of `--gcp-project-id`,
 `--gke-cluster-name`, and `--gcp-region` are given on the command line and match it.
 
-`install.sh` reads it and does not rewrite it. It creates one at the end of a first
-install, when there is nothing there, and after that changes no line of it; the one thing
-it adds is a chat key or `PLATFORM_AGENT_MODE` the file lacks, under the rule below. The Day-2 menu's "Save & Apply"
-is the one path that edits a key, one at a time, leaving comments and ordering intact. That
+`install.sh` reads it and writes to it only in these cases. The last two happen only when a run
+commits (the apply, or the `--generate-only` handoff; never a declined run or `--dry-run`):
+
+- it creates one at the end of a first install, when there is nothing there;
+- it appends a chat key or `PLATFORM_AGENT_MODE` the file lacks, under the rule below;
+- it records the GitOps keys described under [The GitOps forge](#the-gitops-forge): the forge
+  keys when the run applies a different forge (apply only), and `GITOPS_ORG`, `GITOPS_REPO` and
+  `GITHUB_APP_ID` when one is missing or this run applies a different value (that line only).
+
+Every other line, and the file's comments and ordering, are left as written. The Day-2 menu's
+"Save & Apply" is the path that edits any key, one at a time. That
 asymmetry is deliberate: a file the documentation tells you to edit and the next run
 overwrites is what made the old `vars.sh` confusing.
 
@@ -281,6 +288,10 @@ Loading the input first is also what fixes non-interactive re-runs (#1060). Ever
 file to inherit from makes inheritance the default path rather than something each flag
 has to remember, so the next flag added inherits too.
 
+A key added to `install.env` also needs a row in the Upgrade page's
+[Recovering `install.env`](../../docs/site/src/content/docs/install/upgrade.md#recovering-installenv)
+tables. They map each key back from a live install for an operator who lost the file.
+
 ### What is deliberately not in it
 
 Derived values are recomputed every run rather than stored, because a stored copy can
@@ -300,6 +311,12 @@ the configured value is discarded — which is what stops a hand-written
 `CLUSTER_MODE=standard` against a live Autopilot cluster from taking its resource count
 to 0 and turning the next apply into a replacement. Nothing writes the probe's answer
 back, so the file never becomes an input and an output at once.
+
+A GitHub Enterprise Server forge is not in it either: no key selects one, and `install.sh`
+writes only the github.com spelling of a GitHub forge. A GitOps repository on a GitHub
+Enterprise Server is installed through the composition, with the forge in its
+`extra_helm_values`: see
+[GitHub Enterprise Server in INSTALL.md](../../INSTALL.md#github-enterprise-server).
 
 ### Credentials
 
@@ -335,6 +352,23 @@ the host, `install.sh` drops a `GITOPS_CA_FILE` from the environment, but refuse
   GitHub drops the GitLab keys.
 - Once `install.env` exists, `install.sh` ignores a `GITOPS_FORGE`, `GITOPS_HOST`,
   `GITLAB_TOKEN_SECRET` or `GITOPS_CA_SECRET` exported in the shell. Use the flags.
+
+On GitHub with the token minter (`GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID` all set), a run
+that goes on to the apply, or ends with the `--generate-only` handoff, records each of the three
+the file lacks, and replaces one it records
+with a different value (that line only). `upgrade.sh` renders from the file alone, so GitOps set
+up with `--gitops-org`, `--gitops-repo` and `--github-app-id` would otherwise be rendered off by
+the next full upgrade, which would destroy the minter's Cloud KMS key and service account. The PEM
+path is never recorded. A declined run, or `--dry-run`, leaves the file as it was.
+
+Each applying front door (`install.sh`, the Day-2 menu, a full `upgrade.sh`) also refuses an apply
+that would render GitOps off while the minter is running, and prints the lines to set with the
+live values filled in. `install.sh --generate-only` is refused too, and removes the tfvars it
+wrote, since its handoff is `lifecycle.sh apply`; `--plan` and `--dry-run` warn. A minter
+Deployment that cannot be read is refused rather than read as absent. `KUBE_AGENTS_REMOVE_GITOPS=true`
+in the environment removes GitOps on purpose. `GITHUB_APP_ID` must be the App's number (its
+settings page, **General**, "App ID"); `install.sh`, the Day-2 menu and `upgrade.sh` (on a GitHub
+install) refuse anything else.
 
 ### Projects, folders, organisations and selectors in scope
 
@@ -653,7 +687,7 @@ is a hand-authored dotenv and a hand may well write `export`.
   the registry prefixes, cluster connection, the step runner. Sources
   `installer_common.sh`, so nothing is defined twice. `hack/ci-deploy.sh` sources
   `scripts/release/common.sh`, not this file.
-- **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. This is the roster the file's own header defers to: `common.sh`, `installer_common.sh`, `install.sh`, `upgrade.sh`, `hack/ci-env.sh`, `scripts/release/common.sh`, `scripts/release/reconcile_environment.sh`, `terraform/examples/full-install/lifecycle.sh`, and the staging-workload scripts all source it. It is kept out of `common.sh` and free of every helper in this directory so that each of them can take the predicate and nothing else — `hack/ci-env.sh` and `lifecycle.sh` want no part of the state file, and `installer_common.sh` is sourced by front doors that load no other helper. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched. `installer_common.sh` and `lifecycle.sh` fall back to a stub setting the same empty value when the file is absent, as `reconcile_environment.sh` does, so a tree without it reaches every cluster with a routable IP endpoint rather than refusing to run.
+- **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. The agent's runtime copy also selects `--internal-ip` for a cluster on its own VPC; this helper does not, for the reason its header gives. This is the roster the file's own header defers to: `common.sh`, `installer_common.sh`, `install.sh`, `upgrade.sh`, `hack/ci-env.sh`, `scripts/release/common.sh`, `scripts/release/reconcile_environment.sh`, `terraform/examples/full-install/lifecycle.sh`, and the staging-workload scripts all source it. It is kept out of `common.sh` and free of every helper in this directory so that each of them can take the predicate and nothing else — `hack/ci-env.sh` and `lifecycle.sh` want no part of the state file, and `installer_common.sh` is sourced by front doors that load no other helper. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched. `installer_common.sh` and `lifecycle.sh` fall back to a stub setting the same empty value when the file is absent, as `reconcile_environment.sh` does, so a tree without it reaches every cluster with a routable IP endpoint rather than refusing to run.
 - **[min_versions.sh](min_versions.sh)**: minimum tool versions, side-effect-free so
   `install.sh` can source it standalone before any checkout exists.
 - **[print_instructions_gchat.sh](print_instructions_gchat.sh)** /

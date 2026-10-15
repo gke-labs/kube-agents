@@ -14,7 +14,7 @@ Pages in this section:
 - [**Token minter (Minty)**](/kube-agents/deploy/token-minter/) — how the GitHub App identity is brokered.
 - [**Release versioning & promotion**](/kube-agents/deploy/release-versioning/) — how candidate builds are promoted to SemVer releases across Docker images, Helm charts, and Terraform modules.
 - [**Telemetry**](/kube-agents/deploy/telemetry/) — OpenTelemetry + Prometheus + Cloud Logging.
-- [**GitOps with ArgoCD**](/kube-agents/deploy/gitops-argocd/) — standing up the reconciler that applies what the agent proposes.
+- [**GitOps with ArgoCD**](/kube-agents/deploy/gitops-argocd/) — standing up ArgoCD as the reconciler that applies what the agent proposes. The reference layout recommends Config Sync when you need charts ([Reconciler](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo#reconciler)).
 - [**Rolling back a release**](/kube-agents/deploy/rollback/) — moving an install from GA release N back to N-1 with the N-1 checkout's `upgrade.sh`, and what that leaves in place.
 - [**Multiple GCP projects**](/kube-agents/deploy/multi-project/) — granting one install access to clusters in other projects, and removing it.
 

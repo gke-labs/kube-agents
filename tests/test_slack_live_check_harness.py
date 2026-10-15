@@ -826,6 +826,19 @@ class ListedChecksTest(HarnessTestCase):
         self.assertEqual(code, harness.EXIT_FAIL)
         self.assertIn("FAIL thread", text)
 
+    def test_thread_is_left_out_without_a_status_line(self):
+        # Lineless, the mention task's later posts in the thread would pass a dropped reply,
+        # so thread is not run, and the checks after it still are.
+        self.world.ignore_unmentioned_thread_replies = True
+        _code, text = self.run_harness("--checks", "mention,thread,unlisted", "--no-status-line")
+        self.assertIn("NOTE thread not run: thread cannot be judged with --no-status-line", text)
+        self.assertNotIn("PASS thread", text)
+        self.assertNotIn("FAIL thread", text)
+        self.assertIn("unlisted", text.split("NOTE thread not run")[1])
+        with self.assertRaises(SystemExit):
+            harness.parse_args(["--checks", "thread", "--bot-user-id", BOT_ID, "--no-status-line"])
+        self.assertNotIn("thread", harness.parse_args(["--bot-user-id", BOT_ID, "--no-status-line"]).checks)
+
     def test_thread_is_not_fooled_by_the_mention_answer_landing_late(self):
         # The mention passes on its status line; its answer arrives later. A gateway
         # that drops the unmentioned follow-up must fail the thread check, not pass it
@@ -1482,6 +1495,30 @@ class UnitTest(unittest.TestCase):
         self.assertIn("pass --bot-name <your bot's name> or --bot-user-id <its member id>", err.getvalue())
         self.assertEqual(harness.parse_args(["--checks", "dm", "--bot-name", "troisbocaux"]).bot_name, "troisbocaux")
         self.assertEqual(harness.parse_args(["--checks", "dm", "--bot-user-id", BOT_ID]).bot_user_id, BOT_ID)
+
+
+
+class NoStatusLineTest(unittest.TestCase):
+    """--no-status-line: a gateway that keeps no status line on Slack (Agent Sessions)."""
+
+    def test_the_first_answer_is_the_reply_and_a_failure_ends_the_turn(self):
+        answer = {"text": "*payments-api is CrashLooping.*", "ts": "2"}
+        self.assertIsNone(harness.read_turn([answer], harness.WAIT_ANSWER))
+        self.assertEqual(harness.read_turn([answer], harness.WAIT_ANSWER, lineless=True), (answer, harness.KIND_ANSWER))
+        failed = {"text": "❌ failed: reason: spawn-failed", "ts": "3"}
+        self.assertEqual(harness.read_turn([answer, failed], harness.WAIT_ANSWER, lineless=True), (failed, harness.KIND_FAILURE))
+
+    def test_a_standalone_queue_notice_is_no_status_line(self):
+        queued = {"text": "⏳ *queued* — 3 requests are ahead of yours; I'll start on it as soon as there's room", "ts": "2"}
+        answer = {"text": "*payments-api is CrashLooping.*", "ts": "3"}
+        self.assertEqual(harness.read_turn([queued, answer], harness.WAIT_ANSWER, lineless=True), (answer, harness.KIND_ANSWER))
+
+    def test_a_steer_still_ends_the_turn_first(self):
+        steer = {"text": harness.STEER_QUEUED_ACK, "ts": "2"}
+        self.assertEqual(harness.read_turn([steer], harness.WAIT_ANSWER, lineless=True), (steer, harness.KIND_STEER))
+
+    def test_the_flag_parses(self):
+        self.assertTrue(harness.parse_args(["--checks", "dm", "--bot-user-id", BOT_ID, "--no-status-line"]).no_status_line)
 
 
 if __name__ == "__main__":

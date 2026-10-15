@@ -16,7 +16,8 @@ import (
 // breaks a rule), and the chat message that survives goes to the adapter
 // beside its text. An adapter that renders it posts one laid-out message; any
 // other posts the text, exactly as before chat messages existed. A terminal's
-// mark-only message is read for its mark alone (ChatMarker).
+// mark-only message is read for its mark alone, and every carrier's mark is
+// drawn by the gateway's mark rules (mark.go).
 
 // chatProblemMax bounds, in runes, the rule a dropped chat message broke as
 // the log line carries it: the rule quotes the offending value for some
@@ -67,10 +68,25 @@ func (g *Gateway) noteChatProblems(conversation, taskID string, c chatmsg.Carrie
 		return
 	}
 	g.metrics.chatMessage(chatInvalid)
+	what := chatDroppedWhat(c, r)
 	for _, p := range r.Problems {
-		g.log.Warn("chat message broke a rule; the part that broke it is dropped (the whole layout, or a bad mark alone) and any text fallback stands",
+		g.log.Warn(what,
 			"conversation", conversation, "taskId", taskID, "carrier", string(c),
 			"rule", truncateRunes(p.Error(), chatProblemMax))
+	}
+}
+
+// chatDroppedWhat says what a reading with problems kept: a bad mark is
+// dropped alone with the layout still posted, and a terminal has no fallback
+// to stand.
+func chatDroppedWhat(c chatmsg.Carrier, r chatmsg.Reading) string {
+	switch {
+	case c == chatmsg.Terminal:
+		return "terminal mark dropped"
+	case r.Message != nil:
+		return "chat message's mark dropped; its layout stands"
+	default:
+		return "chat message dropped; its text fallback stands"
 	}
 }
 
@@ -180,15 +196,16 @@ func lineKey(line string, rs *relayState) string {
 // replayed for it, off the replayed artifact. That one arrives folded, so
 // which chunk carried the chat message is lost and the last-chunk rule
 // (assertion 27) cannot be applied to it: a chat message an executor put on
-// an earlier chunk drops on the live path and is read on this one.
-func (g *Gateway) resultChat(conversation, taskID string, rs *relayState, replayed []lib.Part) *chatmsg.Message {
+// an earlier chunk drops on the live path and is read on this one. The
+// whole reading, for its mark beside its layout (layoutOf).
+func (g *Gateway) resultChat(conversation, taskID string, rs *relayState, replayed []lib.Part) chatmsg.Reading {
 	switch {
 	case replayed != nil:
-		return layoutOf(g.readChat(conversation, taskID, chatmsg.Result, replayed))
+		return g.readChat(conversation, taskID, chatmsg.Result, replayed)
 	case len(rs.resultChunks) > 0:
-		return layoutOf(g.readChatArtifact(conversation, taskID, chatmsg.Result, rs.resultChunks))
+		return g.readChatArtifact(conversation, taskID, chatmsg.Result, rs.resultChunks)
 	}
-	return nil
+	return chatmsg.Reading{}
 }
 
 // lineKeyText is the text half of a lineKey.
@@ -197,14 +214,31 @@ func lineKeyText(key string) string {
 	return text
 }
 
-// relayMark hands a terminal's mark to an adapter that applies marks.
-func (g *Gateway) relayMark(conversation, taskID string, r chatmsg.Reading) {
-	if r.Mark == nil {
+// markFrom draws the mark a task's chat message carried, if it carried one
+// (mark.go): a bad mark was dropped alone by the read, so the layout and the
+// mark stand or fall apart.
+func (g *Gateway) markFrom(rec *SessionRecord, taskID string, r chatmsg.Reading) {
+	if r.Mark != nil {
+		g.applyTaskMark(rec, taskID, MarkState{Ask: r.Mark.Ask, Settle: r.Mark.Settle})
+	}
+}
+
+// terminalMark draws a terminal's mark: the one its mark-only chat message
+// carried, or the default for a terminal with none. A delegated child's end
+// takes no default here: its terminal is relayed before the wake that
+// digests it is minted, so the child still reads as the chain's newest task,
+// and the default would take the ask off (or leave ❌ over a wake that then
+// succeeds) before the chain's answer. The wake's own terminal settles the
+// chain, or observeChildEnd when no wake starts.
+func (g *Gateway) terminalMark(rec *SessionRecord, taskID string, state lib.TaskState, r chatmsg.Reading) {
+	if r.Mark != nil {
+		g.markFrom(rec, taskID, r)
 		return
 	}
-	if marker, ok := g.adapter.(ChatMarker); ok {
-		marker.ChatMark(conversation, taskID, *r.Mark)
+	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild {
+		return
 	}
+	g.applyTerminalMark(rec, taskID, state)
 }
 
 // appendChunk folds one artifact-update into a chunk list the way A2A

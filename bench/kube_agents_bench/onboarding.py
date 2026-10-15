@@ -232,6 +232,13 @@ HANDOFF_READ = "__ONBOARDING_HANDOFF_BOARD__"
 # disagree with the writer about which findings belong in the block.
 HANDOFF_MODULE_DIR = f"{DATA_ROOT}/scripts"
 HANDOFF_MODULE = "bootstrap_handoff"
+# bootstrap_handoff.py: NO_REPOSITORY_FIELD and RECORDED_YES. The gate records
+# in its sweep marker whether the cards were told to run the cluster inventory
+# SOP's "Without a GitOps repository" section; yes is an install without one, and
+# unknown one whose repository list could not be read, where the cards run it too.
+NO_REPOSITORY_FIELD = "no_repository"
+NO_REPOSITORY_YES = "yes"
+NO_REPOSITORY_UNKNOWN = "unknown"
 
 # Runs in the sandbox. Parses the raw report with the sandbox's own parser and
 # prints the items' (cluster, check, object), or the parser's Failure code and
@@ -269,15 +276,17 @@ print(json.dumps(out))
 """
 
 # Runs in the agent container against the board, read-only. Reads the sweep
-# named by the gate's marker; every cluster card created at or after it, with
+# named by the gate's marker, and the no_repository value that marker records
+# (None when it records none); every cluster card created at or after it, with
 # the cluster and findings count from the metadata of its latest completed
 # run; the keyed ranking card; and any ranking-titled platform card without
 # the key, so a fail can say the card was filed unkeyed.
 _HANDOFF_SCRIPT = """
 import json, os, re, sqlite3, sys
-root, board, sentinel, marker, prefix, key, assignee, word, module_dir, module = sys.argv[1:11]
+root, board, sentinel, marker, prefix, key, assignee, word, module_dir, module, no_repository = sys.argv[1:12]
 SQLITE_BUSY_TIMEOUT = 10
-out = {"sweep": None, "clusters": [], "keyed": [], "unkeyed": [], "error": None, "writer_error": None}
+out = {"sweep": None, "clusters": [], "keyed": [], "unkeyed": [], "error": None, "writer_error": None,
+       "no_repository": None}
 
 
 def done(error=None):
@@ -301,9 +310,13 @@ def writer():
 
 try:
     with open(os.path.join(root, marker)) as fh:
-        ids = [m.group(1) for m in (re.search(r"(?:^|\\s)task_id\\s*=\\s*(\\S+)", line) for line in fh) if m]
+        lines = fh.readlines()
 except OSError as exc:
     done("no discovery sweep has been filed: %s" % exc)
+ids = [m.group(1) for m in (re.search(r"(?:^|\\s)task_id\\s*=\\s*(\\S+)", line) for line in lines) if m]
+recorded = [m.group(1) for m in (re.search(r"(?:^|\\s)%s\\s*=\\s*(\\S+)" % re.escape(no_repository), line)
+                                 for line in lines) if m]
+out["no_repository"] = recorded[0] if recorded else None
 if not ids or not ids[0]:
     done("%s names no task_id" % marker)
 try:
@@ -542,6 +555,7 @@ def handoff_command() -> str:
             PRIORITIZE_TITLE_WORD,
             HANDOFF_MODULE_DIR,
             HANDOFF_MODULE,
+            NO_REPOSITORY_FIELD,
         ]
     )
     return (

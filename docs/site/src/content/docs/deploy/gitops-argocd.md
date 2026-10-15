@@ -5,9 +5,9 @@ sidebar:
   order: 6
 ---
 
-kube-agents proposes changes; it never applies them. The [declarative workflow](/kube-agents/concepts/declarative-workflow/) ends at a merged pull request, and something else has to turn that merge into live infrastructure. The [reference GitOps layout](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo) calls that something "the customer's CI/CD" and leaves the choice to you.
+kube-agents proposes changes; it never applies them. The [declarative workflow](/kube-agents/concepts/declarative-workflow/) ends at a merged pull request, and something else has to turn that merge into live infrastructure. The [reference GitOps layout](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo) applies YAML from CI and, when you need Helm charts or workloads on a cluster created in the same pull request, recommends **Config Sync on every cluster, enrolled through Config Connector** ([Reconciler](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo#reconciler)).
 
-This page covers one such choice end to end: **ArgoCD** as the reconciler, with **Config Connector (KCC)** provisioning Google Cloud resources from the same repo. It is not the only option — Flux and Config Sync fit the same contract — but it is the one the agent's own tooling is most often pointed at, and the setup has enough sharp edges to be worth writing down.
+This page covers a different choice end to end: **ArgoCD** as the reconciler, with **Config Connector (KCC)** provisioning Google Cloud resources from the same repo. Flux fits the same contract too. The fleet audit currently traces chart workloads back to their declarations only through an Argo CD `Application` or a Flux `HelmRelease`, not yet through a Config Sync `RootSync` ([#3072](https://github.com/gke-labs/kube-agents/issues/3072)), which is a reason to pick one of those two today. The setup has enough sharp edges to be worth writing down.
 
 Nothing here is required by kube-agents. The agent is indifferent to which reconciler you run; it only needs one to exist.
 
@@ -107,7 +107,7 @@ kubectl -n argocd exec argocd-application-controller-0 -- argocd-k8s-auth gcp
 
 You want an `ExecCredential` containing a token. A `Permission 'iam.serviceAccounts.getAccessToken' denied` immediately after granting the binding is usually propagation lag — check with `gcloud iam service-accounts get-iam-policy` and retry rather than granting more.
 
-The binding is at the **project** level deliberately. That is what lets the Platform Agent oversee _any_ cluster in the project, including clusters that do not exist yet: a cluster created next month is already reachable, with no new IAM. Registering it becomes a single credential-free manifest holding only its API endpoint and public CA:
+The binding is at the **project** level deliberately. That is what lets the Platform Agent oversee _any_ cluster in the project, including clusters that do not exist yet: a cluster created next month needs no new IAM. Registering it becomes a single credential-free manifest holding only its API endpoint and public CA:
 
 ```yaml
 apiVersion: v1
@@ -134,6 +134,31 @@ stringData:
 ```
 
 Both values come from `gcloud container clusters describe CLUSTER_NAME --region REGION --format='value(endpoint)'` and `--format='value(masterAuth.clusterCaCertificate)'`. Because the file carries no credential, it is safe to commit — which means cluster registration itself becomes a reviewable pull request, and an `ApplicationSet` with a cluster generator selecting on `gitops-role: workload` can deploy to each registered cluster automatically.
+
+### A cluster created in the same pull request
+
+The endpoint and CA exist only once the cluster does, so a Secret in this form cannot ride in the pull request that creates its cluster. Workloads for that cluster wait for a second pull request. To register the cluster in the same one, address it through [Connect Gateway](https://docs.cloud.google.com/kubernetes-engine/enterprise/multicluster-management/gateway/using) instead, whose URL is built from values known up front:
+
+1. Register the cluster to the fleet in the same pull request: the cluster's Terraform `fleet` block, or a Config Connector `GKEHubMembership` (the layout README's [Reconciler](https://github.com/gke-labs/kube-agents/blob/main/examples/gitops-repo/README.md#reconciler) section shows one).
+2. Grant the ArgoCD service account `roles/gkehub.gatewayEditor`, alongside the cluster-access role above. ArgoCD applies on every sync, so `roles/gkehub.gatewayReader` is enough only for Applications it never syncs.
+3. Point the Secret's `server` at the gateway and leave `caData` empty, as the kubeconfig `gcloud` generates for the gateway does.
+
+```yaml
+stringData:
+  name: CLUSTER_NAME
+  server: https://connectgateway.googleapis.com/v1/projects/PROJECT_NUMBER/locations/global/gkeMemberships/CLUSTER_NAME
+  config: |
+    {
+      "execProviderConfig": {
+        "command": "argocd-k8s-auth",
+        "args": ["gcp"],
+        "apiVersion": "client.authentication.k8s.io/v1beta1"
+      },
+      "tlsClientConfig": { "insecure": false, "caData": "" }
+    }
+```
+
+The membership name defaults to the cluster name. Build the URL from the membership's actual location, not from this example: a `GKEHubMembership` sets it in `spec.location`, and Terraform reports it as `fleet[0].membership_location`. For a regional membership, both the host and the path carry the region: `https://REGION-connectgateway.googleapis.com/v1/projects/PROJECT_NUMBER/locations/REGION/gkeMemberships/CLUSTER_NAME`. This form is documented in a [Google Cloud blog post](https://cloud.google.com/blog/products/containers-kubernetes/connect-gateway-with-argocd) rather than in the Argo CD or GKE product docs, so test it on one cluster first. The [Connect Gateway page](https://docs.cloud.google.com/kubernetes-engine/enterprise/multicluster-management/gateway/using) also sets a per-project quota on active streams; whether ArgoCD's watches count against it is not documented. Config Sync, the reconciler the reference layout recommends when you need charts, needs neither the gateway nor this Secret.
 
 ## Provision cloud resources from the same repo
 

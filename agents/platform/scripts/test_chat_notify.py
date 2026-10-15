@@ -333,89 +333,86 @@ class SlackRouteTest(unittest.TestCase):
         # The Hermes path names only the message; on Slack its ts is the root.
         self.assertEqual(chat_notify.thread_from_response("slack", {"message_id": "2.2"}), "2.2")
 
-    def test_blocks_command(self):
+    def test_chat_command(self):
         self.assertEqual(
-            chat_notify.blocks_command("slack", "1.1", "3 findings", "/tmp/b.json"),
-            ["a2a", "notify", "--platform", "slack", "--blocks-file", "/tmp/b.json", "--thread", "1.1", "--", "3 findings"],
+            chat_notify.chat_command("slack", "1.1", "3 findings", "/tmp/c.json"),
+            ["a2a", "notify", "--platform", "slack", "--chat-file", "/tmp/c.json", "--thread", "1.1", "--", "3 findings"],
         )
-        self.assertNotIn("--thread", chat_notify.blocks_command("slack", "", "x", "/tmp/b.json"))
+        self.assertNotIn("--thread", chat_notify.chat_command("slack", "", "x", "/tmp/c.json"))
+        argv = chat_notify.chat_command("slack", "", "x", "/tmp/c.json", 27.5)
+        self.assertEqual(argv[argv.index("--timeout") + 1], "27s")
 
-    def _gateway_post(self, returncode, stdout, thread="", blocks=None):
+    CHAT = {"schema": "kube-agents.chat/v1", "headline": "Security audit: 2 critical findings",
+            "choices": [{"text": "Look at the first one", "primary": True}]}
+
+    def _gateway_post(self, returncode, stdout, thread=""):
         seen = {}
 
         def run(argv, **_kwargs):
-            path = argv[argv.index("--blocks-file") + 1]
+            path = argv[argv.index("--chat-file") + 1]
             with open(path, encoding="utf-8") as handle:
-                seen["blocks"] = json.load(handle)
+                seen["chat"] = json.load(handle)
             seen["path"], seen["argv"] = path, argv
             return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr="refused")
 
-        blocks = blocks or [{"type": "section", "text": {"type": "mrkdwn", "text": "*3 findings*"}}]
         with mock.patch.object(self.skv.subprocess, "run", side_effect=run):
-            post = self.skv._post_audit_blocks_via_gateway("platform", "fleet-audit", blocks, "3 findings", thread, 30)
-        return post, seen, blocks
+            post = self.skv._post_audit_chat_via_gateway("platform", "fleet-audit", self.CHAT, "3 findings", thread, 30)
+        return post, seen
 
-    def test_the_gateway_card_carries_nothing_to_click(self):
-        blocks = [
-            {"type": "section", "text": {"type": "mrkdwn", "text": "*3 findings*"},
-             "accessory": {"type": "button", "action_id": "x", "text": {"type": "plain_text", "text": "Act"}}},
-            {"type": "actions", "elements": [
-                {"type": "button", "action_id": "kage_audit.choice.0", "text": {"type": "plain_text", "text": "Look at the first one"}},
-                {"type": "button", "text": {"type": "plain_text", "text": "Ledger issue #7 ↗"}, "url": "https://github.com/o/r/issues/7"},
-            ]},
-        ]
-        out = self.skv._without_interaction(blocks)
-        self.assertNotIn("actions", [b["type"] for b in out])
-        self.assertNotIn("accessory", out[0])
-        self.assertEqual(out[-1]["type"], "context")
-        self.assertIn("<https://github.com/o/r/issues/7|Ledger issue #7 ↗>", out[-1]["elements"][0]["text"])
-        self.assertNotIn("kage_audit.choice.0", json.dumps(out))
-
-    def test_the_gateway_path_sends_the_card_without_its_buttons(self):
-        card = [
-            {"type": "section", "text": {"type": "mrkdwn", "text": "*3 findings*"}},
-            {"type": "actions", "elements": [
-                {"type": "button", "action_id": "kage_audit.choice.0", "text": {"type": "plain_text", "text": "Look"}}]},
-        ]
-        _post, seen, _ = self._gateway_post(0, json.dumps({"message_id": "1.5", "thread_id": "1.5"}), blocks=card)
-        self.assertNotIn("actions", [b["type"] for b in seen["blocks"]])
+    def test_the_gateway_card_keeps_its_buttons(self):
+        # The gateway draws a chat message's choices itself, so nothing is stripped.
+        _post, seen = self._gateway_post(0, json.dumps({"message_id": "1.5", "thread_id": "1.5"}))
+        self.assertEqual(seen["chat"], self.CHAT)
 
     def test_the_cli_gives_up_before_the_subprocess_bound(self):
-        _post, seen, _ = self._gateway_post(0, json.dumps({"message_id": "1.5", "thread_id": "1.5"}))
+        _post, seen = self._gateway_post(0, json.dumps({"message_id": "1.5", "thread_id": "1.5"}))
         argv = seen["argv"]
         self.assertIn("--timeout", argv)
         self.assertLess(int(argv[argv.index("--timeout") + 1].rstrip("s")), 30)
 
-    def test_audit_blocks_go_through_the_gateway_and_thread_on_its_answer(self):
-        post, seen, blocks = self._gateway_post(0, json.dumps({"message_id": "1.5", "thread_id": "1.5"}))
+    def test_the_audit_card_goes_through_the_gateway_and_threads_on_its_answer(self):
+        post, seen = self._gateway_post(0, json.dumps({"message_id": "1.5", "thread_id": "1.5"}))
         self.assertEqual(post, self.skv.AuditPost("1.5"))
-        self.assertEqual(seen["blocks"], self.skv._without_interaction(blocks))
         self.assertEqual(seen["argv"][:4], ["a2a", "notify", "--platform", "slack"])
-        self.assertFalse(os.path.exists(seen["path"]), "the blocks file was left behind")
+        self.assertEqual(seen["argv"][-2:], ["--", "3 findings"])
+        self.assertFalse(os.path.exists(seen["path"]), "the chat file was left behind")
 
-    def test_audit_blocks_reply_on_a_known_thread(self):
-        post, seen, _ = self._gateway_post(0, json.dumps({"message_id": "1.6", "thread_id": "1.1"}), thread="1.1")
+    def test_the_audit_card_replies_on_a_known_thread(self):
+        post, seen = self._gateway_post(0, json.dumps({"message_id": "1.6", "thread_id": "1.1"}), thread="1.1")
         self.assertEqual(post, self.skv.AuditPost("1.1"))
         self.assertIn("--thread", seen["argv"])
 
-    def test_audit_blocks_fall_back_to_text_on_a_refusal_or_an_unknown_outcome(self):
+    def test_the_audit_card_falls_back_to_text_on_a_refusal_or_an_unknown_outcome(self):
         for code in (1, chat_notify.NOTIFY_OUTCOME_UNKNOWN):
-            post, seen, _ = self._gateway_post(code, "")
+            post, seen = self._gateway_post(code, "")
             self.assertIsNone(post, f"exit {code}")
             self.assertFalse(os.path.exists(seen["path"]))
 
-    def test_the_audit_report_takes_the_gateway_when_slack_is_routed(self):
+    def test_the_audit_report_takes_the_gateway_as_a_chat_message_when_slack_is_routed(self):
         # No broker relay under next (slack_blocks_post is not configured),
-        # so without the routed check the report would never try blocks.
+        # so without the routed check the report would never try a card.
         headline = self.skv.AuditHeadline(text="3 findings", issue={"number": 1}, ref=None)
         with mock.patch.dict(os.environ, SLACK_ROUTED), \
                 mock.patch.object(self.skv.slack_blocks_post, "configured", return_value=False), \
-                mock.patch.object(self.skv.slack_audit_report, "blocks_from_issue", return_value=([{"type": "divider"}], "t")), \
-                mock.patch.object(self.skv, "_post_audit_blocks_via_gateway", return_value=self.skv.AuditPost("9.9")) as via:
+                mock.patch.object(self.skv.slack_audit_report, "blocks_from_issue") as blocks, \
+                mock.patch.object(self.skv.slack_audit_report, "chat_from_issue", return_value=(self.CHAT, "t")), \
+                mock.patch.object(self.skv, "_post_audit_chat_via_gateway", return_value=self.skv.AuditPost("9.9")) as via:
             post = self.skv._post_audit_blocks("platform", "fleet-audit", headline, "m", "", "", float("inf"))
         self.assertEqual(post, self.skv.AuditPost("9.9"))
-        via.assert_called_once()
+        self.assertEqual(via.call_args.args[2:4], (self.CHAT, "t"))
+        blocks.assert_not_called()
 
+    def test_the_audit_report_keeps_block_kit_when_slack_is_not_routed(self):
+        headline = self.skv.AuditHeadline(text="3 findings", issue={"number": 1}, ref=None)
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: ""}), \
+                mock.patch.object(self.skv.slack_blocks_post, "configured", return_value=True), \
+                mock.patch.object(self.skv.slack_audit_report, "chat_from_issue") as chat, \
+                mock.patch.object(self.skv.slack_audit_report, "blocks_from_issue", return_value=([{"type": "divider"}], "t")), \
+                mock.patch.object(self.skv.slack_blocks_post, "post", return_value="4.4") as post_blocks:
+            post = self.skv._post_audit_blocks("platform", "fleet-audit", headline, "m", "C1", "", float("inf"))
+        self.assertEqual(post, self.skv.AuditPost("4.4"))
+        self.assertEqual(post_blocks.call_args.args[:3], ("C1", "t", [{"type": "divider"}]))
+        chat.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

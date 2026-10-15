@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -346,33 +346,11 @@ func TestChatProgressRefusedAfterLayoutClearsIt(t *testing.T) {
 	})
 }
 
-// markingAdapter is a fake that applies marks.
-type markingAdapter struct {
-	*fakeAdapter
-	mu    sync.Mutex
-	marks []string
-}
-
-func (m *markingAdapter) ChatMark(conversation, taskID string, mark chatmsg.Mark) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.marks = append(m.marks, fmt.Sprintf("%s %s/%s", conversation, mark.Ask, mark.Settle))
-}
-
-func (m *markingAdapter) seen() []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return append([]string(nil), m.marks...)
-}
-
-// A terminal's mark-only chat message reaches an adapter that applies marks,
-// and posts nothing of its own.
-func TestTerminalMarkReachesAChatMarker(t *testing.T) {
-	var marker *markingAdapter
-	r, _ := startRigWithSpawnerAdapter(t, "platform", 0, nil, func(a *fakeAdapter) Adapter {
-		marker = &markingAdapter{fakeAdapter: a}
-		return marker
-	})
+// A terminal's mark-only chat message draws its mark on the asking message,
+// posts nothing of its own, and is kept on the chain's root entry, so the
+// ask stays marked past the turn's end (card work still open).
+func TestTerminalMarkIsDrawnOnTheAsk(t *testing.T) {
+	r := startRig(t)
 	conv := "discord:g1/chat-mark"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "upgrade prod"}
 	origin := r.awaitTask(t, "platform")
@@ -382,15 +360,185 @@ func TestTerminalMarkReachesAChatMarker(t *testing.T) {
 	}
 	publishArtifactUpdate(t, r, origin, lib.ArtifactResult, []lib.Part{{Kind: "text", Text: "on it"}}, false, true)
 	publishStatusMessage(t, r, origin, lib.StateCompleted, true, []lib.Part{mark})
-	waitFor(t, "the mark", func() bool { return len(marker.seen()) == 1 })
-	if got := marker.seen()[0]; got != conv+" upgrade/" {
-		t.Fatalf("mark = %q", got)
+	want := []string{conv + " +upgrade@d-1"}
+	waitFor(t, "the mark", func() bool { return len(r.adapter.reactionCalls()) == len(want) })
+	if got := r.adapter.reactionCalls(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("reactions = %v, want %v", got, want)
 	}
-	time.Sleep(100 * time.Millisecond)
 	for _, p := range r.adapter.postTexts() {
 		if strings.Contains(p, "upgrade") {
 			t.Fatalf("the mark posted something: %q", p)
 		}
+	}
+	waitFor(t, "the mark on the record", func() bool {
+		rec, err := r.g.reg.Get(context.Background(), conv)
+		return err == nil && rec != nil && len(rec.Tasks) > 0 && rec.Tasks[0].Mark != nil && rec.Tasks[0].Mark.Ask == "upgrade"
+	})
+}
+
+// A delegated child's end is not the chain's: its terminal default waits for
+// the wake, so a failed child leaves no ❌ over a wake that then answers, and
+// the ask's reaction stays on until the wake's answer.
+func TestAChildsEndLeavesTheMarkToTheWake(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-wake-mark"
+	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, "", "how is the fleet?")
+	ask := conv + "-0"
+	mark := chatPart(t, chatmsg.Message{Schema: chatmsg.Schema, Headline: "looking", Mark: &chatmsg.Mark{Ask: "fleet"}})
+	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: "artifact-p", Name: lib.ArtifactProgress,
+		Parts: []lib.Part{{Kind: "text", Text: "looking"}, mark}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the ask's mark", func() bool { return len(r.adapter.reactionCalls()) == 1 })
+	if err := exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "report fleet health")); err != nil {
+		t.Fatal(err)
+	}
+	child := awaitSubmission(t, r, targetPlatform, 0)
+	waitFor(t, "chain on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		pref, _ := rec.TaskRefFor(origin.TaskID)
+		return len(pref.Children) == 1
+	})
+	completeTask(t, exec, "delegated to platform")
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	publishFinal(t, r, child, targetPlatform, lib.StateFailed, "reason: quota - exceeded")
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	wakeSession := spawn.calls()[1].Session
+	wake := r.awaitTask(t, wakeSession)
+	if got := r.adapter.reactionCalls(); fmt.Sprint(got) != fmt.Sprint([]string{conv + " +fleet@" + ask}) {
+		t.Fatalf("reactions before the wake answered = %v; the child's end must not settle the chain", got)
+	}
+	completeTask(t, r.execFor(t, wake, wakeSession), "the quota ran out; the fleet itself is fine")
+	want := []string{conv + " +fleet@" + ask, conv + " -fleet@" + ask}
+	waitFor(t, "the wake's settle", func() bool { return len(r.adapter.reactionCalls()) == len(want) })
+	if got := r.adapter.reactionCalls(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("reactions = %v, want %v (no ❌ over a wake that answered)", got, want)
+	}
+}
+
+// A click, or a typed answer to an open question, that starts a chain marks
+// the ask whose question it answered: a click is no message, and an answer
+// continues that ask's work, so the card's settle must land on the ask.
+func TestAClickChainMarksThePreviousAsk(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  InboundMessage
+	}{
+		{"click", InboundMessage{MessageID: "click-ts", Text: "prod-eu", Click: true}},
+		{"typed answer", InboundMessage{MessageID: "typed-ts", Text: "prod-eu please", Answer: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) { testAnswerChainMarksThePreviousAsk(t, tc.msg) })
+	}
+}
+
+func testAnswerChainMarksThePreviousAsk(t *testing.T, answer InboundMessage) {
+	r := startRig(t)
+	conv := "discord:g1/click-chain"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-5", Text: "which cluster first?"}
+	origin := r.awaitTask(t, "platform")
+	question, err := chatmsg.MarkPart(chatmsg.Mark{Ask: "question", Settle: "blocked"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishArtifactUpdate(t, r, origin, lib.ArtifactResult, []lib.Part{{Kind: "text", Text: "prod-eu or prod-us?"}}, false, true)
+	publishStatusMessage(t, r, origin, lib.StateCompleted, true, []lib.Part{question})
+	waitFor(t, "the question's mark", func() bool { return len(r.adapter.reactionCalls()) == 2 })
+	waitFor(t, "the chain to end", func() bool {
+		rec, err := r.g.reg.Get(context.Background(), conv)
+		return err == nil && rec != nil && rec.ActiveTask == nil
+	})
+	answer.Conversation, answer.Kind, answer.AuthorID = conv, "group", "1001"
+	r.adapter.inbox <- answer
+	second := awaitSubmission(t, r, "platform", 1)
+	completeTask(t, r.execFor(t, second, "platform"), "prod-eu is done")
+	want := []string{conv + " +question@d-5", conv + " +blocked@d-5", conv + " -question@d-5", conv + " -blocked@d-5"}
+	waitFor(t, "the click chain's settle", func() bool { return len(r.adapter.reactionCalls()) == len(want) })
+	if got := r.adapter.reactionCalls(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("reactions = %v, want %v", got, want)
+	}
+}
+
+// A conversation notify's mark lands on its chain's ask once that chain's
+// task has ended, and is written to the record; while the chain runs it is
+// dropped.
+func TestConversationNotifyMarkWaitsForTheChainToEnd(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/notify-mark"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-3", Text: "restart the fleet"}
+	origin := r.awaitTask(t, "platform")
+	marker := r.g.Conversations(r.adapter).(notifyMarker)
+	marker.MarkConversation(conv, "plan-1", MarkState{Ask: "fleet", Settle: "blocked"})
+	if got := r.adapter.reactionCalls(); len(got) != 0 {
+		t.Fatalf("a notify mark drew while the chain ran: %v", got)
+	}
+	mark, err := chatmsg.MarkPart(chatmsg.Mark{Ask: "fleet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishArtifactUpdate(t, r, origin, lib.ArtifactResult, []lib.Part{{Kind: "text", Text: "on it"}}, false, true)
+	publishStatusMessage(t, r, origin, lib.StateCompleted, true, []lib.Part{mark})
+	waitFor(t, "the turn's mark", func() bool { return len(r.adapter.reactionCalls()) == 1 })
+	waitFor(t, "the chain to end", func() bool {
+		rec, err := r.g.reg.Get(context.Background(), conv)
+		return err == nil && rec != nil && rec.ActiveTask == nil
+	})
+	marker.MarkConversation(conv, "plan-1", MarkState{Ask: "fleet", Settle: "blocked"})
+	marker.MarkConversation(conv, "plan-1", MarkState{})
+	want := []string{conv + " +fleet@d-3", conv + " +blocked@d-3", conv + " -fleet@d-3", conv + " -blocked@d-3"}
+	if got := r.adapter.reactionCalls(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("reactions = %v, want %v", got, want)
+	}
+	rec, err := r.g.reg.Get(context.Background(), conv)
+	if err != nil || rec == nil || rec.Tasks[0].Mark != nil {
+		t.Fatalf("record mark = %+v (err %v), want cleared", rec.Tasks[0].Mark, err)
+	}
+	// The key was bound to the chain it was first seen under, while that
+	// chain ran, and the binding is in the stored record.
+	if !slices.Equal(rec.Tasks[0].NotifyKeys, []string{"plan-1"}) {
+		t.Fatalf("stored notify keys = %v, want [plan-1] on the chain's root", rec.Tasks[0].NotifyKeys)
+	}
+}
+
+// A mark a progress message carried is drawn as it arrives; the terminal
+// with none takes the ask off once the answer is posted, and a failed one
+// leaves ❌ and lifts ⏸️.
+func TestTerminalWithoutAMarkSettlesTheAsk(t *testing.T) {
+	cases := []struct {
+		name  string
+		mark  chatmsg.Mark
+		state lib.TaskState
+		want  []string
+	}{
+		{"answered", chatmsg.Mark{Ask: "question"}, lib.StateCompleted, []string{"+question", "-question"}},
+		{"failed while blocked", chatmsg.Mark{Ask: "fleet", Settle: "blocked"}, lib.StateFailed,
+			[]string{"+fleet", "+blocked", "-fleet", "-blocked", "+failed"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := startRig(t)
+			conv := "discord:g1/settle-" + strings.ReplaceAll(c.name, " ", "-")
+			r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-2", Text: "how is the fleet?"}
+			origin := r.awaitTask(t, "platform")
+			mark := c.mark
+			progress := chatPart(t, chatmsg.Message{Schema: chatmsg.Schema, Headline: "looking", Mark: &mark})
+			publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "looking"}, progress}, false, true)
+			drawn := len(MarkState{Ask: mark.Ask, Settle: mark.Settle}.tokens())
+			waitFor(t, "the progress mark", func() bool { return len(r.adapter.reactionCalls()) == drawn })
+			if c.state == lib.StateCompleted {
+				completeTask(t, r.execFor(t, origin, "platform"), "all fine")
+			} else {
+				publishStatusMessage(t, r, origin, c.state, true, []lib.Part{{Kind: "text", Text: "reason: boom"}})
+			}
+			waitFor(t, "the settle", func() bool { return len(r.adapter.reactionCalls()) == len(c.want) })
+			var got []string
+			for _, call := range r.adapter.reactionCalls() {
+				got = append(got, strings.TrimSuffix(strings.TrimPrefix(call, conv+" "), "@d-2"))
+			}
+			if fmt.Sprint(got) != fmt.Sprint(c.want) {
+				t.Fatalf("reactions = %v, want %v", got, c.want)
+			}
+		})
 	}
 }
 

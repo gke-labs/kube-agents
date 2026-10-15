@@ -245,6 +245,59 @@ endif
 # runs in structural too, which is the other half of measuring the same suite.
 PYTHON_TEST_PATH := $(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/pubsub-platform
 
+# The files the sweep hands out first. xargs feeds the workers in list order,
+# and the globs above sort by path, so a long file that sorts late started
+# late: on 2026-10-14 (run 38592675526) every other file had finished at
+# 16:01:24 and tests/test_rollback_roundtrip.py, 182 s on its own and sorted
+# into the last tenth of the list, ran alone until 16:03:32 with three of four
+# workers idle.
+# Longest-first is the schedule that closes that gap, and the simulation over
+# that run's per-file times puts the sweep at its floor, the total divided by
+# the worker count, instead of two minutes above it. These are the files that
+# took over 30 s in that run, longest first; the rest of the sweep is a long
+# tail that no order can move by much. A file named here that no glob reaches
+# fails tests/test_python_test_sweep.py, which is what keeps the list honest
+# when a test moves or is deleted. A file that grows heavy later costs the
+# tail again until someone adds it; the per-file blocks the sweep prints carry
+# the `Ran N tests in S s` line to find it by.
+PYTHON_TEST_HEAVY_FILES := \
+	scripts/test_eval_dashboard_pages.py \
+	tests/test_rollback_roundtrip.py \
+	agents/platform/scripts/test_credential_proxy.py \
+	tests/test_bootstrap_discovery_plant.py \
+	tests/test_fleet_fixture_state.py \
+	scripts/test_task_registration.py \
+	tests/test_install_script.py \
+	tests/test_bootstrap_ranking_plant.py \
+	scripts/test_eval_dashboard_fixture_state.py \
+	tests/test_gitops_fix_cycle_scripts.py \
+	tests/test_python_test_sweep.py \
+	scripts/test_skill_overlay.py \
+	tests/integration/test_seam_injector_kv.py \
+	scripts/test_eval_dashboard_nightly.py \
+	scripts/test_ci_env_agent_pod_diagnostics.py \
+	scripts/test_eval_dashboard_trend.py \
+	scripts/test_eval_dashboard_publish.py \
+	agents/platform/skills/fleet-audit/scripts/test_audit_report.py \
+	tests/test_installer_common.py \
+	agents/platform/scripts/test_credential_proxy_metrics.py
+
+# The order the workers take files in: the heavy files above that are in
+# PYTHON_TEST_FILES, in that order, then every other file in PYTHON_TEST_FILES
+# order. Filtered both ways so it is a permutation of PYTHON_TEST_FILES and
+# nothing more -- a run narrowed with PYTHON_TEST_FILES="..." runs the files
+# it names, not those plus the heavy list. The heavy names are the patterns in
+# both filters and PYTHON_TEST_FILES is only ever the text, because make reads
+# `%` in a pattern word as a wildcard: with the caller's list as the pattern, a
+# typed PYTHON_TEST_FILES='tests/%' pulled every heavy file under tests/ into
+# the feed, where the output loop below, which walks PYTHON_TEST_FILES, would
+# print none of their blocks and read none of their verdicts. This way that
+# word reaches the worker as the literal it is and fails its regular-file
+# check, the same as on any other path that is not a file. Only the feed to
+# xargs reads this; the captured output is still printed in PYTHON_TEST_FILES
+# order, so the blocks read in path order whatever order the files ran in.
+PYTHON_TEST_RUN_ORDER = $(foreach heavy,$(PYTHON_TEST_HEAVY_FILES),$(filter $(heavy),$(PYTHON_TEST_FILES))) $(filter-out $(PYTHON_TEST_HEAVY_FILES),$(PYTHON_TEST_FILES))
+
 # How many of those files `test-python` and `coverage` run at once. They are
 # separate `python3` processes that share nothing -- each cd's into its own
 # directory, servers in the seam tier bind port 0, and fixtures go through
@@ -252,7 +305,8 @@ PYTHON_TEST_PATH := $(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/
 # slowest single directory however many workers there were: on CI's four,
 # tests/ alone took ten of the job's twelve minutes while the other three sat
 # idle. Per file, the shards spread across the workers and the sweep costs
-# about the total divided by this number, down to the slowest single file.
+# about the total divided by this number, down to the slowest single file,
+# provided the long files start first (PYTHON_TEST_RUN_ORDER above).
 #
 # Set it to 1 to serialise. That is for reproducing a failure you suspect is
 # concurrency's doing, or for a machine you need the cores back on -- not for
@@ -282,7 +336,8 @@ PYTHON_TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 # xargs keeps going, and each worker records its own verdict in a file because
 # a variable assigned in a subprocess cannot come back to the parent. And each
 # file's output still arrives as a labelled block, because it is captured to
-# its own file and printed afterwards in PYTHON_TEST_FILES order -- concurrent
+# its own file and printed afterwards in PYTHON_TEST_FILES order, whatever
+# order PYTHON_TEST_RUN_ORDER ran them in -- concurrent
 # writers to one stream interleave mid-line and the "==> file" headers stop
 # meaning anything. What that costs is progress, and a run killed mid-sweep (a
 # CI cancellation, a step timeout) loses the captured output entirely, so each
@@ -309,7 +364,7 @@ define sweep_python_test_files
 work=$$(mktemp -d); \
 trap 'rm -rf "$$work"' EXIT INT TERM; \
 export work; \
-printf '%s\n' $(PYTHON_TEST_FILES) | xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
+printf '%s\n' $(PYTHON_TEST_RUN_ORDER) | xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
 	file="$$1"; \
 	dir="$$(dirname "$$file")"; \
 	name="$$(basename "$$file")"; \

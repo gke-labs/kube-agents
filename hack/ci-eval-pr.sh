@@ -643,6 +643,9 @@ report_partial_verdict() {
 # record are what say why. collect_litellm_log follows those: the
 # thinking-replay hook's per-request line is in the LiteLLM log alone, so a
 # green run without it cannot say whether the hook touched its traffic.
+# collect_credential_proxy_evidence follows for the same reason: the broker's
+# admission queue is in its log and its metrics alone, and a green run that
+# kept neither cannot say whether the queue came back.
 #
 # `set +e` is load-bearing, not tidying. errexit stays in force inside an EXIT
 # trap, so on any failing exit the `(exit "${exit_code}")` below returns
@@ -664,6 +667,7 @@ profile_and_dump_on_exit() {
   collect_gateway_log
   collect_agent_pod_diagnostics
   collect_litellm_log
+  collect_credential_proxy_evidence
   # Defined further down; a run that died before then paused nothing.
   declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"
   profile_report "${exit_code}"
@@ -2723,6 +2727,10 @@ unit_cost_hint() {
     # One delegation and one forge list call. Measured on `dev-vcs3-20261001b`:
     # 173-237s a repetition over three runs, 225s the middle one.
     vcs-forge-cli-request-uses-the-verbs) echo 240 ;;
+    # Measured 13-28 minutes a repetition on a dev install while main runs
+    # the worker to its retries after the refusal (#1948); priced at the
+    # middle so it is not the last tier a deadline cut truncates.
+    stop-on-permission-refusal) echo 1200 ;;
     *) echo 200 ;;
   esac
 }
@@ -3662,7 +3670,11 @@ job_started_epoch() {
 # log is not taken here: the flip patches spec.mode, which leaves
 # deployment/litellm alone (the operator only reads it), so the trap's
 # capture still holds the eval's lines, with the round trip's single-turn
-# requests after them.
+# requests after them. The broker's evidence is taken here: with Google Chat
+# armed the operator re-renders the proxy Deployment on a mode flip (the
+# broker's chat env follows the mode), and a replaced pod starts its log and
+# its counters from zero, which would leave the eval's queue unrecorded. The
+# presubmit install runs with Chat off, so there the capture is defensive.
 #
 # The round trip runs in the background and is waited on, so a SIGTERM (the
 # job's deadline) reaches this script's trap during the wait rather than
@@ -3692,6 +3704,7 @@ run_rollback_roundtrip() {
   echo "the job started ${job_age}s ago (${EVAL_JOB_STARTED_FROM}); inside the ${EVAL_ROLLBACK_START_BY_SECONDS}s start-by bound" | tee -a "${results}"
   collect_gateway_log
   collect_agent_pod_diagnostics --keep-watch
+  collect_credential_proxy_evidence
   # Both read by collect_agent_pod_diagnostics (hack/ci-env.sh).
   # shellcheck disable=SC2034
   AGENT_DIAG_COLLECTED=""

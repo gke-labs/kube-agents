@@ -40,6 +40,7 @@ from admin_console.agent_runtime import (
     KanbanBoardResult,
     KanbanDelivery,
     KanbanEvent,
+    KanbanRelatedTask,
     KanbanRun,
     KanbanTaskDetail,
     KanbanTaskSummary,
@@ -58,6 +59,8 @@ CLUSTER = "test-cluster-01"
 LOCATION = "us-east4"
 NAMESPACE = "kubeagents-system"
 TARGET = DeploymentTarget(PROJECT, CLUSTER, LOCATION, NAMESPACE)
+# The Task Kanban page shows parents and children in tables with these columns.
+RELATED_COLUMNS = ["Task", "Status", "Assignee", "Title"]
 
 
 def query_param(app: AppTest, key: str) -> str:
@@ -405,6 +408,51 @@ class FakePaginatedHistoryProvider(FakeHistoryProvider):
         return replace(detail, task=task, body=f"Details for {task_id}")
 
 
+class FakeCardStateHistoryProvider(FakeHistoryProvider):
+    def list_kanban_tasks(self, agent: str, *, limit: int = 500) -> KanbanBoardResult:
+        base = self.kanban_task()
+        return KanbanBoardResult(
+            (
+                replace(
+                    base,
+                    task_id="t_gaveup01",
+                    status="blocked",
+                    block_kind="needs_input",
+                    gave_up=True,
+                ),
+                replace(
+                    base,
+                    task_id="t_needs001",
+                    status="blocked",
+                    block_kind="needs_input",
+                ),
+                replace(base, task_id="t_donepr01", has_pr=True),
+                replace(base, task_id="t_done0001"),
+            ),
+            False,
+        )
+
+    def get_kanban_task(self, agent: str, task_id: str) -> KanbanTaskDetail:
+        detail = super().get_kanban_task(agent, task_id)
+        task = next(
+            task
+            for task in self.list_kanban_tasks(agent).tasks
+            if task.task_id == task_id
+        )
+        parent = KanbanRelatedTask(
+            "t_parent01", "Parent", "platform", "done", has_pr=True
+        )
+        child = KanbanRelatedTask(
+            "t_child001",
+            "Child",
+            "platform",
+            "blocked",
+            block_kind="needs_input",
+            gave_up=True,
+        )
+        return replace(detail, task=task, parents=(parent,), children=(child,))
+
+
 class FakePortalHistoryProvider(FakeHistoryProvider):
     def list_conversations(self, agent: str, *, cutoff, limit: int = 200) -> HistoryResult:
         conversation = AgentConversation(
@@ -528,6 +576,25 @@ class FakeReviewTaskHistoryProvider(FakeActiveTaskHistoryProvider):
             limit=limit,
         )
         return TaskUpdateResult((replace(result.tasks[0], status="review"),), False)
+
+
+class FakeGaveUpTaskHistoryProvider(FakeActiveTaskHistoryProvider):
+    def get_task_updates(
+        self,
+        agent: str,
+        *,
+        session_id: str,
+        limit: int = 100,
+    ) -> TaskUpdateResult:
+        result = super().get_task_updates(
+            agent,
+            session_id=session_id,
+            limit=limit,
+        )
+        task = replace(
+            result.tasks[0], status="blocked", block_kind="needs_input", gave_up=True
+        )
+        return TaskUpdateResult((task,), False)
 
 
 class FakeChatProvider:
@@ -1468,6 +1535,16 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         )
         self.assertTrue(any("review" in item.value for item in app.markdown))
 
+    def test_chat_task_card_shows_the_kanban_label(self):
+        with patch(
+            "admin_console.agent_runtime.AgentRuntimeProvider",
+            FakeGaveUpTaskHistoryProvider,
+        ):
+            app = self.app(connected=True).run().switch_page("pages/chat.py").run()
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertIn("**platform** · failed after all attempts", [item.value for item in app.markdown])
+
     def test_connected_cluster_survives_navigation_query_reset(self):
         provisioned_default = DeploymentTarget(
             PROJECT,
@@ -1554,6 +1631,95 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         )
         self.assertNotIn("Inspect task", [item.label for item in app.selectbox])
         self.assertIn("selection_mode: SINGLE_ROW", str(app.dataframe[0].proto))
+        self.assertEqual(
+            [item.label for item in app.metric][:5],
+            ["Tasks", "Active", "Waiting on input", "Failed", "Done"],
+        )
+        self.assertIn("0 with a pull request", [item.value for item in app.caption])
+
+    def test_kanban_shows_card_state_labels_counts_and_filter(self):
+        def status_filter(app: AppTest):
+            return next(item for item in app.selectbox if item.label == "Status")
+
+        def board_rows(app: AppTest) -> dict[str, str]:
+            frame = app.dataframe[0].value
+            return dict(zip(frame["Task"], frame["Status"]))
+
+        def open_board() -> AppTest:
+            app = self.app(connected=True).run().switch_page("pages/kanban.py").run()
+            self.assertEqual(len(app.exception), 0)
+            return app
+
+        with patch(
+            "admin_console.agent_runtime.AgentRuntimeProvider",
+            FakeCardStateHistoryProvider,
+        ):
+            app = open_board()
+            self.assertEqual(
+                {item.label: item.value for item in app.metric[:5]},
+                {
+                    "Tasks": "4",
+                    "Active": "0",
+                    "Waiting on input": "1",
+                    "Failed": "1",
+                    "Done": "2",
+                },
+            )
+            self.assertIn("1 with a pull request", [item.value for item in app.caption])
+            self.assertEqual(
+                board_rows(app),
+                {
+                    "t_gaveup01": "failed after all attempts",
+                    "t_needs001": "blocked · needs input",
+                    "t_donepr01": "done · with a pull request",
+                    "t_done0001": "done",
+                },
+            )
+            self.assertEqual(
+                status_filter(app).options,
+                [
+                    "All",
+                    "blocked",
+                    "blocked · needs input",
+                    "done",
+                    "done · with a pull request",
+                    "failed after all attempts",
+                ],
+            )
+            # The first card failed after all attempts. Its detail chip shows red.
+            self.assertIn("failed after all attempts", [item.value for item in app.error])
+            # The Parents and Children tables show the labels too.
+            related = [
+                dict(zip(frame.value["Task"], frame.value["Status"]))
+                for frame in app.dataframe
+                if list(frame.value.columns) == RELATED_COLUMNS
+            ]
+            self.assertEqual(
+                related,
+                [{"t_parent01": "done · with a pull request"}, {"t_child001": "failed after all attempts"}],
+            )
+
+            expected = {
+                "failed after all attempts": ["t_gaveup01"],
+                "blocked · needs input": ["t_needs001"],
+                "done · with a pull request": ["t_donepr01"],
+                "blocked": ["t_gaveup01", "t_needs001"],
+                "done": ["t_donepr01", "t_done0001"],
+            }
+            for selected, task_ids in expected.items():
+                with self.subTest(selected=selected):
+                    # A new session for each pick: the filter's widget
+                    # identity includes the index from the URL.
+                    app = open_board()
+                    status_filter(app).set_value(selected).run()
+                    self.assertEqual(len(app.exception), 0)
+                    self.assertEqual(list(board_rows(app)), task_ids)
+
+            app = open_board()
+            status_filter(app).set_value("blocked · needs input").run()
+            self.assertIn(
+                "blocked · needs input", [item.value for item in app.warning]
+            )
 
     def test_kanban_paginates_tasks_and_selects_page_details(self):
         with patch(
