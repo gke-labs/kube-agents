@@ -17,7 +17,6 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent.parent / "platform" / "scripts"))
 
 import bootstrap_delivery
-import bootstrap_handoff
 import inventory_presenter
 import oobe
 
@@ -1580,14 +1579,12 @@ class BlocksDeliveryTest(unittest.TestCase):
         self.assertEqual((self.d / "INVENTORY.delivered.md").read_text(encoding="utf-8"), REPORT)
 
     def test_a_skip_goes_out_as_its_own_message_after_the_blocks(self):
-        (self.d / oobe.SCAN_FILED_MARKER).write_text(
-            "task_id=t_sweep\n" + bootstrap_handoff.no_repository_line(bootstrap_handoff.RECORDED_YES), encoding="utf-8"
-        )
+        (self.d / oobe.SCAN_FILED_MARKER).write_text("task_id=t_sweep\n", encoding="utf-8")
         with contextlib.redirect_stderr(io.StringIO()):
-            oobe.skip(self.d, oobe.SKIP_NO_REPOSITORY, 1000.0)
+            oobe.skip(self.d, oobe.SKIP_NOT_NEW, 1000.0)
         self.assertEqual(
             self._run(lambda *a: "9.9"),
-            f"The first-run audits did not run: {oobe.SKIP_NO_REPOSITORY}. {bootstrap_delivery.AUDITS_COVERED_NOTE}\n",
+            f"The first-run audits did not run: {oobe.SKIP_NOT_NEW}. {bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}\n",
         )
         self.assertEqual(len(self.posts), 1)
 

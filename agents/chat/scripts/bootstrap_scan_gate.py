@@ -522,10 +522,7 @@ def should_skip(data_dir: Path) -> bool:
     )
 
 
-def _task_body(no_repository: str | None = None) -> str:
-    """The sweep card's body; ``no_repository`` is what file_scan_task decided, read here when not given."""
-    if no_repository is None:
-        no_repository = bootstrap_handoff.no_repository_checks()
+def _task_body() -> str:
     multi = _scope_has_other_projects(_data_dir())
     every_cluster = "every cluster the projects in scope have" if multi else "every cluster the project has"
     cannot_list = "a project's clusters" if multi else "the project's clusters"
@@ -533,7 +530,6 @@ def _task_body(no_repository: str | None = None) -> str:
     instruction_list = "\n".join(f"  - {p}" for p in INSTRUCTIONS_PATHS)
     cluster_audit_list = "\n".join(f"  - {p}" for p in CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
     roster = "\n".join(f"    - `{a['name']}`: {a['cluster_label']}" for a in cluster_agents()) or "    (none)"
-    no_repository_section = bootstrap_handoff.no_repository_section(no_repository)
     return (
         "First-time onboarding discovery sweep. Follow the inventory SOP, reading whichever "
         "of these exists:\n"
@@ -578,7 +574,7 @@ def _task_body(no_repository: str | None = None) -> str:
         "**Step 3 — audit the clusters the list does not cover**, following Steps 2 to 4 of the "
         "single-cluster audit SOP (its own numbering) for each, reading whichever of these "
         f"exists:\n{cluster_audit_list}\n\n"
-        f"and record each in that SOP's `metadata` shape. Usually there are none. {no_repository_section}\n\n"
+        "and record each in that SOP's `metadata` shape. Usually there are none.\n\n"
         "**Step 4 — complete this card now. Do not wait for the per-cluster cards, do not write "
         f"`{RAW_INVENTORY_PATH}` or `{INVENTORY_PATH}`, and do not file a ranking card.** The "
         "onboarding gate waits for the per-cluster cards, writes the raw findings from their "
@@ -631,13 +627,10 @@ def file_scan_task(data_dir: Path) -> str | None:
         sys.stderr.write(f"bootstrap_scan_gate: kanban API unavailable: {e}\n")
         return None
 
-    # Read once and recorded with the card, so the cluster cards and the hand-off's report go by
-    # what this card was told (bootstrap_handoff.NO_REPOSITORY_FIELD).
-    no_repository = bootstrap_handoff.no_repository_checks()
     cmd = (
         f"create --json --assignee {shlex.quote(SCAN_ASSIGNEE)} "
         f"--idempotency-key {shlex.quote(SCAN_IDEMPOTENCY_KEY)} "
-        f"--body {shlex.quote(_task_body(no_repository))} "
+        f"--body {shlex.quote(_task_body())} "
         f"{shlex.quote(SCAN_TASK_TITLE)}"
     )
     try:
@@ -653,25 +646,22 @@ def file_scan_task(data_dir: Path) -> str | None:
         )
         return None
 
-    _mark_filed(data_dir, task_id, no_repository)
+    _mark_filed(data_dir, task_id)
     sys.stderr.write(f"bootstrap_scan_gate: filed sweep card {task_id}\n")
     return task_id
 
 
-def _mark_filed(data_dir: Path, task_id: str, no_repository: str) -> None:
+def _mark_filed(data_dir: Path, task_id: str) -> None:
     """Record the filed card so no later tick files a second one.
 
     Written with the card id and timestamp rather than an empty touch file:
     when someone asks why onboarding is not progressing, this is the file that
-    tells them which card to go and look at. It also records whether the card
-    was told to run the no-repository checks, or that it ran them because the
-    repository list could not be read, for the hand-off and the delivery.
+    tells them which card to go and look at.
     """
     marker = data_dir / SCAN_FILED_MARKER
     try:
         marker.write_text(
-            f"task_id={task_id}\nfiled_at={int(time.time())}\n"
-            + bootstrap_handoff.no_repository_line(no_repository),
+            f"task_id={task_id}\nfiled_at={int(time.time())}\n",
             encoding="utf-8",
         )
     except Exception as e:  # noqa: BLE001 - never fail the cron run

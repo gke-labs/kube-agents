@@ -1,0 +1,79 @@
+Subject: Correct the validator commands and say what the validator checks
+
+Why: The agent runs validate_config.py from the skill's installed path, and upstream's commands use a path relative to the skill directory, pass --cluster-var "${var.cluster_name}" (bash rejects it as a bad substitution and the script never reads the value), and use a --file mode that prints no policy count; the text also credits the script with checks it does not make (PromQL grammar, label scoping) and omits the plan shape it reads, so a pass was read as proof it is not.
+Local-Issue: #2692
+Upstream-Issue: none filed yet
+Retire-When: upstream's commands run as written from an install and its description matches validate_config.py
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -109,9 +109,16 @@ metrics while minimizing alert noise.
+         proposed policy resource names, PromQL expressions, grouping labels, and
+         durations.
+     2.  **Validate**: Run the pre-edit validation script (`python3
+-        scripts/validate_config.py --plan changes.json`) to verify PromQL
+-        grammar, lookback windows, duration rules, and ensure no duplicate
+-        signals exist.
++        "$HERMES_HOME"/skills/gke-alert-configuration/scripts/validate_config.py
++        --plan changes.json`) to check bracket balance, time-window and offset
++        formats, duration rules, and duplicate signals. The duplicate check
++        compares only entries that carry a `signal_type` (for example
++        `saturation_memory`), so give each planned policy one. Write the plan
++        as `{"policies": [{"resource_name": ..., "query": ..., "duration": ...,
++        "signal_type": ...}]}`: the script reads a duration only from the
++        `duration` key and takes a missing one as `0s`, so a duration under
++        any other key passes the duration rule unchecked. It does not
++        parse PromQL, so a pass does not prove the query is valid.
+     3.  **Execute**: After the plan passes validation, apply or merge changes
+         in-place into the target Terraform configuration (`alerts.tf`).
+     4.  *Note*: When answering questions or providing Terraform snippets
+@@ -325,13 +332,38 @@ configurations when working in a repository:
+ 
+ *   **Pre-Edit Plan Validation**: Draft a `changes.json` plan specifying the
+     proposed policies, queries, and durations, and validate it before editing:
+-    *   Command: `python3 scripts/validate_config.py --plan changes.json`
++    *   Command: `python3
++        "$HERMES_HOME"/skills/gke-alert-configuration/scripts/validate_config.py
++        --plan changes.json`
+ *   **Post-Edit and Directory Validation**: Scan existing or modified Terraform
+     files in a directory to ensure no duplicates or syntax errors exist:
+-    *   Command: `python3 scripts/validate_config.py --directory [TARGET_TF_DIR]
+-        --cluster-var "${var.cluster_name}"`
+-    *   Single file validation: `python3 scripts/validate_config.py --file
+-        [PATH_TO_TF_FILE]`
++    *   Command: `python3
++        "$HERMES_HOME"/skills/gke-alert-configuration/scripts/validate_config.py
++        --directory [TARGET_TF_DIR]`
++    *   For a single file, run `--directory` on the absolute path of the
++        directory that holds it. `--file` prints no policy count, so its
++        pass cannot be read against the rules below.
++    *   The script does not check label scoping or hardcoded cluster names:
++        confirm each query's scope yourself. cAdvisor, kube-state-metrics
++        and application series take `cluster="${var.cluster_name}"` and
++        `namespace="${var.namespace}"`; `kubernetes_io:` series take
++        `cluster_name` and `namespace_name`; node-level series take no
++        namespace matcher.
++    *   `"policies_scanned_count"` counts the alert-policy blocks the scan
++        extracted, and `0` never means the files are clean. No `.tf` file
++        sits directly in that path (pass the absolute path of the directory
++        that holds them; the scan does not recurse), the files hold no
++        alert policy, or the scanner could not parse a policy block. If the
++        right path still reports `0` for a file that holds a policy, check
++        that policy by eye. A non-zero count is not a clean bill either. The
++        scanner reads comments as code, so a `{`, `}` or `"` in a comment can
++        drop a policy from the count or cut it short so it is counted but
++        not linted. It lints a `query` written as an inline `EOT` heredoc,
++        and a quoted-string `query` only in a resource with no heredoc one;
++        a `query` from a variable, `local`, `file()`, `templatefile()` or
++        another heredoc delimiter is counted but not linted. Check by eye
++        every policy with a comment inside it and every `query` the scan
++        does not lint.
+ 
+ --------------------------------------------------------------------------------
+ 
+@@ -408,3 +440,4 @@ configurations when working in a repository:
+ *   [Google Cloud Monitoring Pricing](https://docs.cloud.google.com/monitoring/pricing.md.txt)
+ *   [Google SRE Workbook: Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/)
+ *   [Awesome Prometheus Alerts Repository](https://github.com/samber/awesome-prometheus-alerts)
++

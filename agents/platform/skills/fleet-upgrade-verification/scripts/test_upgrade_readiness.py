@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Unit tests for upgrade_readiness.py: the PDB, webhook, maintenance and skew rules on canned objects."""
 
+import collections
+import copy
+import json
 import os
 import sys
+import types
 import unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
+import readiness_rules as shared  # noqa: E402
 import upgrade_readiness as r  # noqa: E402
+from readiness_rules import audit_log  # noqa: E402
 
 AT = datetime(2026, 9, 14, 15, 0, tzinfo=timezone.utc)
 TARGET_TEXT = "1.35.1-gke.1000"
@@ -376,6 +382,819 @@ class SkewTest(unittest.TestCase):
         self.assertEqual(result["unknown"], ["weird"])
 
 
+def rule_module(rule_id, entry=0, can_block=True, evaluate=None, describe=None):
+    """A stand-in for a rule module: a class carrying the contract's attributes."""
+
+    class Rule:
+        RULE_ID = rule_id
+        ENTRY = entry
+        CAN_BLOCK = can_block
+
+    Rule.evaluate = staticmethod(evaluate or (lambda cluster, member, read, target, context: shared.new_result()))
+    Rule.describe = staticmethod(describe or (lambda finding: "described " + str(finding.get("what"))))
+    return Rule
+
+
+def bare_module(name, evaluate=None, **attributes):
+    """A module object, as EXTRA_RULES carries, with the attributes given and nothing else."""
+    module = types.ModuleType(name)
+    module.evaluate = evaluate or (lambda cluster, member, read, target, context: shared.new_result())
+    module.describe = lambda finding: "described " + str(finding.get("what"))
+    for key, value in attributes.items():
+        setattr(module, key, value)
+    return module
+
+
+def returning(**lists):
+    def evaluate(cluster, member, read, target, context):
+        out = shared.new_result()
+        for key, value in lists.items():
+            out[key].extend(value)
+        return out
+
+    return evaluate
+
+
+class ExtraRulesTest(unittest.TestCase):
+    """The fold: every registered rule runs over one member, findings carry their rule and
+    text, an `unknown` carries whether its rule can block, and a rule's defect is its own
+    unknown rather than a crash."""
+
+    READ = {"kubeconfig": "k", "items": [], "error": None, "read_errors": {kind: None for kind in shared.READ_KINDS}}
+
+    def test_findings_are_stamped_and_counted_per_rule(self):
+        blocker = rule_module("blocker", entry=2, evaluate=returning(blocking=[{"what": "no room"}], notes=["pool p has room"]))
+        risky = rule_module("risky", entry=11, can_block=False, evaluate=returning(risks=[{"what": "zonal"}], unknown=["odd location"]))
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[blocker, risky])
+        self.assertEqual(folded["blocking"], [{"what": "no room", "text": "described no room", "rule": "blocker", "entry": 2}])
+        self.assertEqual(folded["risks"], [{"what": "zonal", "text": "described zonal", "rule": "risky", "entry": 11}])
+        self.assertEqual(folded["unknown"], [{"reason": "odd location", "rule": "risky", "entry": 11, "can_block": False, "text": "risky: odd location"}])
+        self.assertEqual(folded["notes"], ["blocker: pool p has room"])
+        self.assertEqual(folded["rules"], {"blocker": {"entry": 2, "can_block": True, "blocking": 1, "risks": 0, "unknown": 0, "notes": 1}, "risky": {"entry": 11, "can_block": False, "blocking": 0, "risks": 1, "unknown": 1, "notes": 0}})
+
+    def test_unknown_entries_keep_their_fields_and_gain_a_reason(self):
+        b_style = {"rule": "x", "entry": 4, "grade": "unknown", "object": None, "detail": "the Node read failed"}
+        c_style = {"rule": "x", "tier": "unknown", "reason": "no runner"}
+        rule = rule_module("x", entry=4, evaluate=returning(unknown=[b_style, c_style, "plain"]))
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[rule])
+        self.assertEqual([u["reason"] for u in folded["unknown"]], ["the Node read failed", "no runner", "plain"])
+        self.assertEqual(folded["unknown"][0]["detail"], "the Node read failed")
+        self.assertEqual(folded["unknown"][1]["tier"], "unknown")
+        self.assertTrue(all(u["can_block"] and u["rule"] == "x" and u["entry"] == 4 for u in folded["unknown"]))
+        self.assertEqual(folded["unknown"][2]["text"], "x: plain")
+
+    def test_a_rule_that_raises_is_unknown_not_a_crash(self):
+        def boom(*args):
+            raise ValueError("boom")
+
+        broken = rule_module("broken", entry=0, evaluate=boom)
+        fine = rule_module("fine", evaluate=returning(risks=[{"what": "ok"}]))
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[broken, fine])
+        self.assertEqual([(u["rule"], u["reason"], u["can_block"]) for u in folded["unknown"]], [("broken", "rule raised ValueError('boom'); not evaluated", True)])
+        # The guard's own rendering never escapes it: an exception whose argument's repr raises
+        # is named by its type, and one carrying a tenant-sized payload is cut.
+        class Unprintable:
+            def __repr__(self):
+                raise RuntimeError("no repr")
+
+        def boom_unprintable(*args):
+            raise ValueError(Unprintable())
+
+        def boom_huge(*args):
+            raise ValueError("bad spec " + "x" * 5000)
+
+        guarded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[rule_module("unprintable", evaluate=boom_unprintable), rule_module("huge", evaluate=boom_huge), fine])
+        self.assertEqual([(u["rule"], u["reason"]) for u in guarded["unknown"]][0], ("unprintable", "rule raised ValueError; not evaluated"))
+        self.assertTrue(guarded["unknown"][1]["reason"].startswith("rule raised ValueError('bad spec xxx"))
+        self.assertLessEqual(len(guarded["unknown"][1]["reason"]), len("rule raised ; not evaluated") + shared.ERROR_EXCERPT_CHARS)
+        self.assertEqual([f["rule"] for f in guarded["risks"]], ["fine"])
+        json.dumps(guarded)
+        self.assertEqual(folded["rules"]["broken"], {"entry": 0, "can_block": True, "blocking": 0, "risks": 0, "unknown": 1, "notes": 0})
+        # `SystemExit` is a rule's defect too: `sys.exit()` in a module ported from a script
+        # is a BaseException, and a guard on `Exception` alone let it end the run after
+        # every member was read. A repr that exits is named by its type like one that
+        # raises. The interpreter's own signals pass through.
+        def boom_exit(*args):
+            sys.exit(2)
+
+        class ExitingRepr:
+            def __repr__(self):
+                raise SystemExit(3)
+
+        def boom_exiting_repr(*args):
+            raise ValueError(ExitingRepr())
+
+        exited = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[rule_module("exiting", evaluate=boom_exit), rule_module("exiting-repr", evaluate=boom_exiting_repr), fine])
+        self.assertEqual([(u["rule"], u["reason"]) for u in exited["unknown"]], [("exiting", "rule raised SystemExit(2); not evaluated"), ("exiting-repr", "rule raised ValueError; not evaluated")])
+        self.assertEqual([f["rule"] for f in exited["risks"]], ["fine"])
+        json.dumps(exited)
+
+        def interrupted(*args):
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[rule_module("interrupted", evaluate=interrupted), fine])
+        self.assertEqual([f["rule"] for f in folded["risks"]], ["fine"])
+        # A describe that raises is the same defect, and a rule returning nothing is empty.
+        bad_describe = rule_module("bad-describe", evaluate=returning(risks=[{"what": "x"}]), describe=boom)
+        empty = rule_module("empty", evaluate=lambda *args: None)
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[bad_describe, empty])
+        self.assertEqual([u["rule"] for u in folded["unknown"]], ["bad-describe"])
+        self.assertEqual(folded["rules"]["empty"], {"entry": 0, "can_block": True, "blocking": 0, "risks": 0, "unknown": 0, "notes": 0})
+
+    def test_a_result_of_the_wrong_shape_is_one_unknown_not_a_crash_or_a_letter_each(self):
+        # A string where a list was owed is the likeliest slip; read letter by letter it
+        # would print one note per character. A dict, a list for the whole result, a finding
+        # that is not a dict, a finding whose text is not a string and a note that is not a
+        # string are the same defect: one unknown naming it, the other rules untouched.
+        class Unlistable(dict):
+            def items(self):
+                raise OSError("no items")
+
+        cases = {
+            "string-unknown": (lambda *a: {"unknown": "no target to grade against"}, "unknown is str, not a list"),
+            "dict-notes": (lambda *a: {**shared.new_result(), "notes": {"a": 1}}, "notes is dict, not a list"),
+            "list-result": (lambda *a: [], "evaluate returned list, not a dict"),
+            "string-finding": (lambda *a: {**shared.new_result(), "risks": ["context"]}, "a risks finding is str, not a dict"),
+            "list-finding": (lambda *a: {**shared.new_result(), "blocking": [["text", 1]]}, "a blocking finding is list, not a dict"),
+            "none-text": (lambda *a: {**shared.new_result(), "risks": [{"what": "x", "text": None}]}, "a risks finding's text is NoneType, not a string"),
+            "int-note": (lambda *a: {**shared.new_result(), "notes": [3]}, "a note is int, not a string"),
+            # A list under a key the contract does not name read as a clean rule; a key left out stays an empty list.
+            "foreign-key": (lambda *a: {**shared.new_result(), "risk": [{"what": "pv"}]}, "the result carries ['risk'], not among ['blocking', 'risks', 'unknown', 'notes']"),
+            "findings-key": (lambda *a: {"findings": [{"what": "pv"}]}, "the result carries ['findings'], not among ['blocking', 'risks', 'unknown', 'notes']"),
+            # An unknown entry with neither a reason nor a detail was rendered as the dict's repr.
+            "unknown-without-reason": (lambda *a: {**shared.new_result(), "unknown": [{"rule": "x", "entry": 4, "grade": "unknown", "object": None, "detail": ""}]}, "an unknown entry carries no reason or detail (keys ['detail', 'entry', 'grade', 'object', 'rule'])"),
+            "unknown-int": (lambda *a: {**shared.new_result(), "unknown": [3]}, "an unknown entry is int, not a string or a dict with a reason"),
+            # An empty or whitespace-only string is named as such, not as "str, not a string".
+            "unknown-empty": (lambda *a: {**shared.new_result(), "unknown": [""]}, "an unknown entry is an empty string"),
+            "unknown-blank": (lambda *a: {**shared.new_result(), "unknown": ["   "]}, "an unknown entry is an empty string"),
+            # A blank finding text or note passes "is a string" and prints as nothing: named as blank.
+            "blank-text": (lambda *a: {**shared.new_result(), "risks": [{"what": "x", "text": ""}]}, "a risks finding's text is blank"),
+            "spaced-text": (lambda *a: {**shared.new_result(), "blocking": [{"what": "x", "text": " \t"}]}, "a blocking finding's text is blank"),
+            "blank-note": (lambda *a: {**shared.new_result(), "notes": ["  "]}, "a note is blank"),
+            # A value whose encoding raises something other than TypeError or ValueError is the
+            # result's JSON defect, named as such rather than as the rule raising.
+            "unlistable-value": (lambda *a: {**shared.new_result(), "risks": [{"what": Unlistable(a=1)}]}, "the result is not JSON-serialisable: OSError('no items')"),
+        }
+        fine = rule_module("fine", evaluate=returning(risks=[{"what": "ok"}]))
+        for name, (evaluate, reason) in cases.items():
+            broken = rule_module(name, evaluate=evaluate)
+            folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[broken, fine])
+            self.assertEqual([(u["rule"], u["reason"]) for u in folded["unknown"]], [(name, reason)], name)
+            self.assertEqual(folded["rules"][name], {"entry": 0, "can_block": True, "blocking": 0, "risks": 0, "unknown": 1, "notes": 0}, name)
+            self.assertEqual([f["rule"] for f in folded["risks"]], ["fine"], name)
+            self.assertEqual(folded["notes"], [], name)
+        # A `describe` that renders empty is the same blank text.
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[rule_module("mute", evaluate=returning(risks=[{"what": "x"}]), describe=lambda finding: ""), fine])
+        self.assertEqual([(u["rule"], u["reason"]) for u in folded["unknown"]], [("mute", "a risks finding's text is blank")])
+        # The bare reason is the fold's own probe's: a TypeError the rule itself raises is still
+        # what it raised, under `rule raised`.
+        def raising_type_error(*args):
+            raise TypeError("mine")
+
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[rule_module("typed", evaluate=raising_type_error), fine])
+        self.assertEqual([(u["rule"], u["reason"]) for u in folded["unknown"]], [("typed", "rule raised TypeError('mine'); not evaluated")])
+
+    def test_a_finding_json_cannot_carry_is_the_rules_defect_not_the_writers(self):
+        # The findings go to `--output` as they are; a set, a datetime or a tuple-keyed dict
+        # would fail json.dump after every member was read, so the fold refuses it here.
+        # A NaN or infinite float is refused too: `json.dumps` would write it as a bare
+        # token (`NaN`, `Infinity`) that no JSON parser reads.
+        for name, value in (("set", {"a", "b"}), ("datetime", AT), ("tuple-keys", {(1, 2): "x"}), ("nan", float("nan")), ("inf", float("inf"))):
+            broken = rule_module(name, evaluate=returning(risks=[{"what": value}]))
+            fine = rule_module("fine", evaluate=returning(risks=[{"what": "ok"}]))
+            folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[broken, fine])
+            self.assertEqual([u["rule"] for u in folded["unknown"]], [name], name)
+            self.assertIn("the result is not JSON-serialisable", folded["unknown"][0]["reason"], name)
+            self.assertEqual([f["rule"] for f in folded["risks"]], ["fine"], name)
+            json.dumps(folded)
+
+    def test_a_rules_bad_audit_log_cache_entry_is_its_unknown_not_the_reports_crash(self):
+        # The report reads the audit-log summaries from the cache the rules fill, after the
+        # fold returns; a rule that wrote another shape there raised out of `assess_readiness`
+        # after every member was read. The fold checks the cache around each rule, so the
+        # defect is that rule's `unknown`, and `summaries` hands the report only what `read`
+        # stored.
+        def context():
+            return {shared.CONTEXT_PROJECT: "p", shared.CONTEXT_LOCATION: "us-central1-a", shared.CONTEXT_CLUSTER_NAME: "c", shared.CONTEXT_RUN_CMD: lambda cmd, timeout=None: (0, "[]", ""), shared.CONTEXT_AT: AT, shared.CONTEXT_CACHE: {}}
+
+        def writing(value):
+            def evaluate(cluster, member, read, target, ctx):
+                ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY] = value
+                return shared.new_result()
+
+            return evaluate
+
+        def reading(cluster, member, read, target, ctx):
+            audit_log.read_removed(ctx)
+            return shared.new_result()
+
+        fine = rule_module("fine", evaluate=returning(risks=[{"what": "ok"}]))
+        clean = audit_log.read_removed(context())
+        caller = audit_log.caller_records([{"protoPayload": {"authenticationInfo": {"principalEmail": "ops@example.com"}}}])[0]
+        summary_only = {key: clean[key] for key in (audit_log.READ_KEY,) + audit_log.SUMMARY_KEYS}
+        cases = {"list": [{"error": "x"}], "none-entry": {"removed": None}, "stranger": {"other": clean}, "nan-entry": {"removed": {**clean, "entries": float("nan")}}, "short": {"removed": {"read": "removed"}}, "summary-only": {"removed": summary_only}, "callers-int": {"removed": {**clean, "callers": 3}}, "caller-int": {"removed": {**clean, "callers": [3]}}, "caller-short": {"removed": {**clean, "callers": [{"principal": "ops@example.com"}]}}, "caller-count-str": {"removed": {**clean, "callers": [{**caller, "count": "9"}]}}}
+        for name, value in cases.items():
+            ctx = context()
+            folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=[rule_module(name, evaluate=writing(value)), fine])
+            self.assertEqual([u["rule"] for u in folded["unknown"]], [name], name)
+            self.assertTrue(folded["unknown"][0]["reason"].startswith("the rule left the audit-log cache unreadable: "), (name, folded["unknown"][0]["reason"]))
+            self.assertEqual([f["rule"] for f in folded["risks"]], ["fine"], name)
+            self.assertEqual(audit_log.summaries(ctx), {}, name)
+            json.dumps(folded)
+        # A read made through `audit_log.read` is kept, a later rule's damage to the other
+        # entry is that rule's, and the damaged entry alone is left out of the summaries.
+        def spoiling(cluster, member, read, target, ctx):
+            ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY]["deprecated"] = 3
+            return shared.new_result()
+
+        ctx = context()
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=[rule_module("reader", evaluate=reading), rule_module("spoiler", evaluate=spoiling)])
+        self.assertEqual([u["rule"] for u in folded["unknown"]], ["spoiler"])
+        self.assertEqual(list(audit_log.summaries(ctx)), ["removed"])
+        self.assertEqual({key: audit_log.summaries(ctx)["removed"][key] for key in ("entries", "pages", "sampled", "error")}, {"entries": 0, "pages": 1, "sampled": False, "error": None})
+        self.assertEqual(set(audit_log.summaries(ctx)["removed"]), set(audit_log.SUMMARY_KEYS))
+        # A defect already in the cache before a rule runs is not that rule's: a list under the
+        # key, or the cache key holding None, which the fold replaces with one dict before the
+        # first rule, so the key holds that dict afterwards (the snapshot tells a key holding
+        # None apart from no key at all).
+        ctx = context()
+        ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY] = [1]
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=[fine])
+        self.assertEqual((folded["unknown"], [f["rule"] for f in folded["risks"]]), ([], ["fine"]))
+        none_cache = {shared.CONTEXT_CACHE: None}
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, none_cache, rules=[fine, rule_module("second", evaluate=returning(risks=[{"what": "s"}]))])
+        self.assertEqual((folded["unknown"], [f["rule"] for f in folded["risks"]]), ([], ["fine", "second"]))
+        # The fold replaces a cache that is not a plain dict once, before the first rule, so the
+        # rules share one dict: a reading rule's result is cached for the next and summarised.
+        self.assertEqual(none_cache, {shared.CONTEXT_CACHE: {}})
+        # A defective entry under a read name (`None` here) is not a stored read: a rule that
+        # replaces it through `read` is not charged with a lost read, so no restore runs and the
+        # read stays for the rule after it, which reads it from the cache, and for the summary.
+        def reading_removed(cluster, member, read, target, ctx):
+            audit_log.read_removed(ctx)
+            out = shared.new_result()
+            out["risks"].append({"what": "rr"})
+            return out
+
+        inherited = context()
+        inherited[shared.CONTEXT_CACHE][audit_log.CACHE_KEY] = {"removed": None}
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, inherited, rules=[rule_module("reader", evaluate=reading_removed), rule_module("second", evaluate=reading_removed)])
+        self.assertEqual((folded["unknown"], [f["rule"] for f in folded["risks"]]), ([], ["reader", "second"]))
+        self.assertEqual(sorted(audit_log.summaries(inherited)), ["removed"])
+        # The same holds one level in and one level out. An inherited entry the probe faults for
+        # a reason `read`'s own test did not see (every stored key but `read` missing) is read afresh, never
+        # handed to a rule as the read; over `cache: None` the first reader's result is cached
+        # for the second and summarised; and a cache of another class, whose `get` raises, is
+        # replaced before the first rule, so no snapshot, probe or summary runs its methods.
+        def reading_callers(cluster, member, read, target, ctx):
+            log = audit_log.read_removed(ctx)
+            out = shared.new_result()
+            out["risks"].append({"what": sum(caller["count"] for caller in log["callers"])})
+            return out
+
+        short = context()
+        short[shared.CONTEXT_CACHE][audit_log.CACHE_KEY] = {"removed": {"read": "removed"}}
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, short, rules=[rule_module("reader", evaluate=reading_callers), rule_module("second", evaluate=reading_callers)])
+        self.assertEqual((folded["unknown"], [f["rule"] for f in folded["risks"]]), ([], ["reader", "second"]))
+        self.assertEqual(sorted(audit_log.summaries(short)), ["removed"])
+        # An entry of the summary's shape alone (`read` and the seven summary keys, no `callers`),
+        # which a probe requiring the summary keys alone passed, and a caller record of another
+        # shape are read afresh too: the `callers` a rule is handed is a list of records whatever
+        # the inherited entry held, and the summary carries what `read` stored.
+        for name, entry in {"summary-only": summary_only, "caller-short": {**clean, "callers": [{"principal": "ops@example.com"}]}}.items():
+            inherited_shape = context()
+            inherited_shape[shared.CONTEXT_CACHE][audit_log.CACHE_KEY] = {"removed": entry}
+            folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, inherited_shape, rules=[rule_module("reader", evaluate=reading_callers), rule_module("second", evaluate=reading_callers)])
+            self.assertEqual((folded["unknown"], [f["rule"] for f in folded["risks"]]), ([], ["reader", "second"]), name)
+            self.assertEqual(sorted(audit_log.summaries(inherited_shape)), ["removed"], name)
+        none_read = context()
+        none_read[shared.CONTEXT_CACHE] = None
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, none_read, rules=[rule_module("reader", evaluate=reading_callers), rule_module("second", evaluate=reading_callers)])
+        self.assertEqual((folded["unknown"], [f["rule"] for f in folded["risks"]]), ([], ["reader", "second"]))
+        self.assertEqual(sorted(audit_log.summaries(none_read)), ["removed"])
+
+        class BadCache(dict):
+            def get(self, *args):
+                raise OSError("no get")
+
+        self.assertEqual(audit_log.cache_snapshot({shared.CONTEXT_CACHE: BadCache()})[1], None)
+        self.assertEqual(audit_log.cache_defect({shared.CONTEXT_CACHE: BadCache()}), "the readiness context's cache is BadCache, not a dict")
+        self.assertEqual(audit_log.summaries({shared.CONTEXT_CACHE: BadCache()}), {})
+        bad = context()
+        bad[shared.CONTEXT_CACHE] = BadCache()
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, bad, rules=[rule_module("reader", evaluate=reading_callers), fine])
+        self.assertEqual((folded["unknown"], [f["rule"] for f in folded["risks"]]), ([], ["reader", "fine"]))
+        self.assertEqual(sorted(audit_log.summaries(bad)), ["removed"])
+        # A mapping of a rule's own class whose `items()` raises, inherited under the key, is a
+        # defect named by its class and not the first rule's: no snapshot, probe or summary runs
+        # its methods, nothing is charged, and a rule that reads replaces it with the plain dict
+        # `read` keeps.
+        class Unlistable(dict):
+            def items(self):
+                raise OSError("no items")
+
+        poisoned = {shared.CONTEXT_CACHE: {audit_log.CACHE_KEY: Unlistable(removed=1)}}
+        self.assertIsInstance(audit_log.cache_snapshot(poisoned)[1], audit_log.ForeignMapping)  # named by its class before its methods run
+        self.assertEqual(audit_log.cache_defect(poisoned), "cache['audit_log'] is Unlistable, not a dict of read results")
+        self.assertEqual(audit_log.summaries(poisoned), {})
+        unlistable = context()
+        unlistable[shared.CONTEXT_CACHE][audit_log.CACHE_KEY] = Unlistable(removed=1)
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, unlistable, rules=[rule_module("reader", evaluate=reading_removed), fine])
+        self.assertEqual((folded["unknown"], [f["rule"] for f in folded["risks"]]), ([], ["reader", "fine"]))
+        # A mapping of another class whose methods behave (an OrderedDict holding a sound read)
+        # is a defect named by its class, not a cache: `read` keeps a plain dict, so the snapshot
+        # agrees with it. Inherited, it is nobody's, and the rule that reads is not charged for
+        # the plain dict `read` put in its place; written by a rule, it is that rule's, and the
+        # reader after it starts from the cache as it stood before the writer.
+        def reading_deprecated_log(cluster, member, read, target, ctx):
+            audit_log.read_deprecated(ctx)
+            out = shared.new_result()
+            out["risks"].append({"what": "d"})
+            return out
+
+        ordered = context()
+        audit_log.read_removed(ordered)
+        ordered[shared.CONTEXT_CACHE][audit_log.CACHE_KEY] = collections.OrderedDict(ordered[shared.CONTEXT_CACHE][audit_log.CACHE_KEY])
+        self.assertEqual(audit_log.cache_defect(ordered), "cache['audit_log'] is OrderedDict, not a dict of read results")
+        self.assertEqual(audit_log.summaries(ordered), {})
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ordered, rules=[rule_module("reader", evaluate=reading_deprecated_log), fine])
+        self.assertEqual((folded["unknown"], [f["rule"] for f in folded["risks"]]), ([], ["reader", "fine"]))
+        self.assertEqual(sorted(audit_log.summaries(ordered)), ["deprecated"])
+
+        def reading_then_reordering(cluster, member, read, target, ctx):
+            audit_log.read_removed(ctx)
+            ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY] = collections.OrderedDict(ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY])
+            out = shared.new_result()
+            out["risks"].append({"what": "w"})
+            return out
+
+        reordered = context()
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, reordered, rules=[rule_module("writer", evaluate=reading_then_reordering), rule_module("reader", evaluate=reading_deprecated_log)])
+        self.assertEqual([u["rule"] for u in folded["unknown"]], ["writer"])
+        self.assertIn("cache['audit_log'] is OrderedDict, not a dict of read results", folded["unknown"][0]["reason"])
+        self.assertEqual([f["rule"] for f in folded["risks"]], ["reader"])
+        self.assertEqual(sorted(audit_log.summaries(reordered)), ["deprecated"])
+        # A writer that leaves, under the cache key, an object of its own class whose
+        # `__deepcopy__` returns a dict of the stored shape: the snapshot names it by its class
+        # and never copies it (a copy would run that method, and the writer would pass as clean
+        # while the reader after it was charged with a read the fabricated snapshot held), so
+        # the writer is charged at its own check, the key is dropped, and the reader after it
+        # reads afresh and keeps its findings.
+        probe = context()
+        audit_log.read_removed(probe)
+        stored = copy.deepcopy(probe[shared.CONTEXT_CACHE][audit_log.CACHE_KEY])
+
+        class Copier:
+            def __deepcopy__(self, memo):
+                return copy.deepcopy(stored)
+
+        def storing_copier(cluster, member, read, target, ctx):
+            ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY] = Copier()
+            out = shared.new_result()
+            out["risks"].append({"what": "w"})
+            return out
+
+        copied = context()
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, copied, rules=[rule_module("writer", evaluate=storing_copier), rule_module("reader", evaluate=reading_deprecated_log)])
+        self.assertEqual([u["rule"] for u in folded["unknown"]], ["writer"])
+        self.assertIn("cache['audit_log'] is Copier, not a dict of read results", folded["unknown"][0]["reason"])
+        self.assertEqual([f["rule"] for f in folded["risks"]], ["reader"])
+        self.assertEqual(sorted(audit_log.summaries(copied)), ["deprecated"])
+        # A value of a JSON type's subclass a writer leaves inside a read it created (its own
+        # snapshot held no read to compare), and a stored entry of a dict subclass whose `get`
+        # raises: both are named at the writer's own check by the exact-type walk, so no
+        # comparison, snapshot or later read runs the object's methods, the rules after the
+        # writer are not charged, and a reader after it reads afresh.
+        class EvilInt(int):
+            def __eq__(self, other):
+                raise ValueError("cmp")
+
+            __hash__ = int.__hash__
+
+        class SubGet(dict):
+            def get(self, *args):
+                raise OSError("no get")
+
+        def reading_then_poisoning_value(cluster, member, read, target, ctx):
+            audit_log.read_removed(ctx)
+            ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY]["removed"]["entries"] = EvilInt(2)
+            out = shared.new_result()
+            out["risks"].append({"what": "w"})
+            return out
+
+        def reading_then_subclassing_entry(cluster, member, read, target, ctx):
+            audit_log.read_removed(ctx)
+            logs = ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY]
+            logs["removed"] = SubGet(logs["removed"])
+            out = shared.new_result()
+            out["risks"].append({"what": "w"})
+            return out
+
+        for name, writer, detail in (("evil-value", reading_then_poisoning_value, "the 'removed' entry holds a value of class EvilInt at the entry['entries'], not a JSON value"), ("subclass-entry", reading_then_subclassing_entry, "the 'removed' entry holds a value of class SubGet at the entry, not a JSON value")):
+            poisoned_ctx = context()
+            folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, poisoned_ctx, rules=[rule_module(name, evaluate=writer), fine, rule_module("reader", evaluate=reading_removed)])
+            self.assertEqual([u["rule"] for u in folded["unknown"]], [name], name)
+            self.assertIn(detail, folded["unknown"][0]["reason"], name)
+            self.assertEqual([f["rule"] for f in folded["risks"]], ["fine", "reader"], name)
+            self.assertEqual(sorted(audit_log.summaries(poisoned_ctx)), ["removed"], name)
+        self.assertEqual((audit_log.summaries(ctx), audit_log.summaries({}), audit_log.summaries({shared.CONTEXT_CACHE: None}), audit_log.cache_defect({})), ({}, {}, {}, None))
+        self.assertIsNotNone(audit_log.cache_defect({shared.CONTEXT_CACHE: None}))
+        # A rule's damage is put back before the next rule runs: the next rule's read works
+        # and is kept, and each later offender is charged on its own, not masked by the first.
+        def reading_with_risk(cluster, member, read, target, ctx):
+            audit_log.read_removed(ctx)
+            out = shared.new_result()
+            out["risks"].append({"what": "r"})
+            return out
+
+        def spoiling_entry(which, value):
+            def evaluate(cluster, member, read, target, ctx):
+                ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY][which] = value
+                return shared.new_result()
+
+            return evaluate
+
+        def nulling(cluster, member, read, target, ctx):
+            ctx[shared.CONTEXT_CACHE] = None
+            return shared.new_result()
+
+        ctx = context()
+        rules = [rule_module("list", evaluate=writing([1])), rule_module("reader", evaluate=reading_with_risk), rule_module("nuller", evaluate=spoiling_entry("removed", None)), rule_module("stranger", evaluate=spoiling_entry("deprecated", 3)), fine]
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=rules)
+        self.assertEqual([u["rule"] for u in folded["unknown"]], ["list", "nuller", "stranger"])
+        self.assertEqual([f["rule"] for f in folded["risks"]], ["reader", "fine"])
+        self.assertEqual(list(audit_log.summaries(ctx)), ["removed"])
+        ctx = context()
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=[rule_module("nulling", evaluate=nulling), rule_module("reader", evaluate=reading_with_risk)])
+        self.assertEqual(([u["rule"] for u in folded["unknown"]], [f["rule"] for f in folded["risks"]], list(audit_log.summaries(ctx))), ([], ["reader"], ["removed"]))
+        # The cache is put back on the raising path too, so the raising rule is the one
+        # charged and the next rule reads what `read` stored; and a well-formed overwrite
+        # that drops or changes a stored read is damage, not a clean cache.
+        def damaging_raiser(cluster, member, read, target, ctx):
+            ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY]["removed"] = None
+            raise ValueError("boom")
+
+        def nulling_raiser(cluster, member, read, target, ctx):
+            ctx[shared.CONTEXT_CACHE] = None
+            raise ValueError("boom")
+
+        def emptying(cluster, member, read, target, ctx):
+            ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY] = {}
+            return shared.new_result()
+
+        def replacing(cluster, member, read, target, ctx):
+            ctx[shared.CONTEXT_CACHE] = {audit_log.CACHE_KEY: dict(ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY])}
+            return shared.new_result()
+
+        def reading_deprecated(cluster, member, read, target, ctx):
+            audit_log.read_deprecated(ctx)
+            out = shared.new_result()
+            out["risks"].append({"what": "d"})
+            return out
+
+        for name, offender in (("damaging-raiser", damaging_raiser), ("nulling-raiser", nulling_raiser)):
+            ctx = context()
+            folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=[rule_module("reader", evaluate=reading_with_risk), rule_module(name, evaluate=offender), rule_module("second", evaluate=reading_deprecated)])
+            self.assertEqual([(u["rule"], u["reason"]) for u in folded["unknown"]], [(name, "rule raised ValueError('boom'); not evaluated")], name)
+            self.assertEqual([f["rule"] for f in folded["risks"]], ["reader", "second"], name)
+            self.assertEqual(sorted(audit_log.summaries(ctx)), ["deprecated", "removed"], name)
+        ctx = context()
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=[rule_module("reader", evaluate=reading_with_risk), rule_module("emptying", evaluate=emptying), rule_module("second", evaluate=reading_deprecated)])
+        self.assertEqual([u["rule"] for u in folded["unknown"]], ["emptying"])
+        self.assertIn("the rule left the audit-log cache unreadable: the 'removed' read stored before the rule is gone or changed", folded["unknown"][0]["reason"])
+        self.assertEqual(sorted(audit_log.summaries(ctx)), ["deprecated", "removed"])
+        # A rule that replaces or nulls the cache *in its own context* reaches nobody: each
+        # rule is handed its own context, and only the shared cache object is held to.
+        for name, offender in (("replacing", replacing), ("nulling", nulling)):
+            ctx = context()
+            folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=[rule_module("reader", evaluate=reading_with_risk), rule_module(name, evaluate=offender), rule_module("second", evaluate=reading_deprecated)])
+            self.assertEqual((folded["unknown"], [f["rule"] for f in folded["risks"]], sorted(audit_log.summaries(ctx))), ([], ["reader", "second"], ["deprecated", "removed"]), name)
+        # An object the snapshot cannot copy (a generator) is the storing rule's damage, named,
+        # and the restore still runs, so the next rule is neither charged nor stopped.
+        def storing_generator(cluster, member, read, target, ctx):
+            ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY]["scratch"] = (e for e in [1, 2])
+            return shared.new_result()
+
+        def poisoning_callers(cluster, member, read, target, ctx):
+            ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY]["removed"]["callers"].append((e for e in [1]))
+            return shared.new_result()
+
+        for name, offender, reason in (("generator", storing_generator, "cache['audit_log'] carries 'scratch', which is not one of the reads"), ("poisoning", poisoning_callers, "the 'removed' entry holds a value of class generator at the entry['callers']")):
+            ctx = context()
+            folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=[rule_module("reader", evaluate=reading_with_risk), rule_module(name, evaluate=offender), rule_module("second", evaluate=reading_deprecated)])
+            self.assertEqual([u["rule"] for u in folded["unknown"]], [name], name)
+            self.assertIn(reason, folded["unknown"][0]["reason"], name)
+            self.assertEqual([f["rule"] for f in folded["risks"]], ["reader", "second"], name)
+            self.assertEqual(sorted(audit_log.summaries(ctx)), ["deprecated", "removed"], name)
+            self.assertEqual(audit_log.cache_defect(ctx), None, name)
+        # A value of a JSON type's subclass whose comparison would raise with an unprintable
+        # argument: the by-class walk names it before any comparison runs, the rule is charged,
+        # and the restore runs for the next rule.
+        class Unprintable:
+            def __repr__(self):
+                raise RuntimeError("no repr")
+
+        class Evil(int):  # an int subclass: the walk names it by class, so its `__eq__` never runs
+            def __eq__(self, other):
+                raise ValueError(Unprintable())
+
+            __hash__ = int.__hash__
+
+        def poisoning_compare(cluster, member, read, target, ctx):
+            ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY]["removed"]["page_limit"] = Evil(1000)
+            return shared.new_result()
+
+        ctx = context()
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=[rule_module("reader", evaluate=reading_with_risk), rule_module("evil", evaluate=poisoning_compare), rule_module("second", evaluate=reading_deprecated)])
+        self.assertEqual([u["rule"] for u in folded["unknown"]], ["evil"])
+        self.assertIn("the 'removed' entry holds a value of class Evil at the entry['page_limit'], not a JSON value", folded["unknown"][0]["reason"])
+        self.assertEqual([f["rule"] for f in folded["risks"]], ["reader", "second"])
+        self.assertEqual(sorted(audit_log.summaries(ctx)), ["deprecated", "removed"])
+        # The same holds when what a rule stored would exit instead of raising: an object whose
+        # copy would raise SystemExit and an int subclass whose comparison would are both named
+        # by class before either method runs, the rule is charged either way, and the run goes on.
+        class ExitingCopy:
+            def __deepcopy__(self, memo):
+                raise SystemExit(4)
+
+        class ExitingCompare(int):
+            def __eq__(self, other):
+                raise SystemExit(5)
+
+            __hash__ = int.__hash__
+
+        def storing_exiting_copy(cluster, member, read, target, ctx):
+            ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY]["removed"]["callers"].append(ExitingCopy())
+            return shared.new_result()
+
+        def storing_exiting_compare(cluster, member, read, target, ctx):
+            ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY]["removed"]["page_limit"] = ExitingCompare(1000)
+            return shared.new_result()
+
+        for name, offender, reason in (("exiting-copy", storing_exiting_copy, "the 'removed' entry holds a value of class ExitingCopy at the entry['callers']"), ("exiting-compare", storing_exiting_compare, "the 'removed' entry holds a value of class ExitingCompare at the entry['page_limit'], not a JSON value")):
+            ctx = context()
+            folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=[rule_module("reader", evaluate=reading_with_risk), rule_module(name, evaluate=offender), rule_module("second", evaluate=reading_deprecated)])
+            self.assertEqual([u["rule"] for u in folded["unknown"]], [name], name)
+            self.assertIn(reason, folded["unknown"][0]["reason"], name)
+            self.assertEqual([f["rule"] for f in folded["risks"]], ["reader", "second"], name)
+            self.assertEqual(sorted(audit_log.summaries(ctx)), ["deprecated", "removed"], name)
+        # A rule that reads a window and then leaves a plain object in the shared copy's
+        # `callers` -- one that copies cleanly and compares by identity -- is charged at its own
+        # cache check as a shape defect; before the probe read the whole result, it passed as
+        # sound and every later rule was charged with a changed read, its findings lost.
+        class Plain:
+            pass
+
+        def reading_then_storing_plain(cluster, member, read, target, ctx):
+            audit_log.read_removed(ctx)
+            ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY]["removed"]["callers"].append(Plain())
+            return shared.new_result()
+
+        ctx = context()
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=[rule_module("writer", evaluate=reading_then_storing_plain), rule_module("second", evaluate=reading_deprecated)])
+        self.assertEqual([u["rule"] for u in folded["unknown"]], ["writer"])
+        self.assertIn("the 'removed' entry holds a value of class Plain at the entry['callers']", folded["unknown"][0]["reason"])
+        self.assertEqual([f["rule"] for f in folded["risks"]], ["second"])
+        self.assertEqual(sorted(audit_log.summaries(ctx)), ["deprecated"])
+        # A generator in the cache before the fold ran is nobody's: the snapshot stands, the
+        # rules run, and the entry is left as it was found.
+        ctx = context()
+        ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY] = {"scratch": (e for e in [1])}
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=[rule_module("reader", evaluate=reading_with_risk), fine])
+        self.assertEqual(([u["rule"] for u in folded["unknown"]], [f["rule"] for f in folded["risks"]]), ([], ["reader", "fine"]))
+        self.assertIn("scratch", ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY])
+        # What `read` returns is the rule's own copy: sorting or filtering it in place is
+        # not damage, and the rule keeps its findings.
+        def sorting_reader(cluster, member, read, target, ctx):
+            log = audit_log.read_removed(ctx)
+            log["callers"].sort(key=lambda c: -c.get("count", 0))
+            log["callers"][:] = []
+            out = shared.new_result()
+            out["blocking"].append({"what": "sorted"})
+            return out
+
+        ctx = context()
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=[rule_module("reader", evaluate=reading_with_risk), rule_module("sorter", evaluate=sorting_reader), rule_module("second", evaluate=reading_deprecated)])
+        self.assertEqual(folded["unknown"], [])
+        self.assertEqual([f["rule"] for f in folded["blocking"]], ["sorter"])
+        self.assertEqual(sorted(audit_log.summaries(ctx)), ["deprecated", "removed"])
+        # A read name that is not one of the reads is the rule's own error, named as the call.
+        def misnamed_reader(cluster, member, read, target, ctx):
+            audit_log.read(ctx, "deprecate")
+            return shared.new_result()
+
+        ctx = context()
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=[rule_module("misnamed", evaluate=misnamed_reader), fine])
+        self.assertEqual([(u["rule"], u["reason"]) for u in folded["unknown"]], [("misnamed", "rule raised ValueError(\"audit_log.read('deprecate'): not one of the reads ('removed', 'deprecated')\"); not evaluated")])
+        self.assertEqual(audit_log.summaries(ctx), {})
+
+    def test_each_rule_is_handed_its_own_copies_so_its_writes_reach_nobody(self):
+        # `cluster`, `member`, `read` and the context's fleet records reached every rule by
+        # reference, and the report read them after the fold: a rule narrowing `read["items"]`
+        # in place emptied the list for every later rule, and one nulling a peer's maintenance
+        # policy changed what every later member was graded from.
+        def clearing(cluster, member, read, target, ctx):
+            read["items"].clear()
+            read["read_errors"]["pods"] = "mine"
+            member["cluster"] = "renamed"
+            cluster["name"] = "renamed"
+            return shared.new_result()
+
+        def nulling_peer(cluster, member, read, target, ctx):
+            for peer in ctx[shared.CONTEXT_CLUSTERS]:
+                peer["maintenancePolicy"] = None
+            ctx[shared.CONTEXT_POOLS].clear()
+            return shared.new_result()
+
+        def counting(cluster, member, read, target, ctx):
+            out = shared.new_result()
+            out["notes"].append(f"{len(read['items'])} item(s); {len(ctx[shared.CONTEXT_CLUSTERS])} peer(s) with policy {[p.get('maintenancePolicy') for p in ctx[shared.CONTEXT_CLUSTERS]]}; {len(ctx[shared.CONTEXT_POOLS])} pool(s); {member['cluster']} {cluster['name']}")
+            return out
+
+        read = {"kubeconfig": "k", "items": [{"kind": "Pod"}, {"kind": "Node"}], "error": None, "read_errors": {kind: None for kind in shared.READ_KINDS}}
+        peers = [{"name": "peer", "maintenancePolicy": {"window": {}}}]
+        ctx = {shared.CONTEXT_CLUSTERS: peers, shared.CONTEXT_POOLS: [{"name": "p"}], shared.CONTEXT_CACHE: {}}
+        cluster, member = {"name": "c"}, {"cluster": "c"}
+        folded = r.evaluate_extra_rules(cluster, member, read, TARGET, ctx, rules=[rule_module("clearing", evaluate=clearing), rule_module("nulling-peer", evaluate=nulling_peer), rule_module("counting", evaluate=counting)])
+        self.assertEqual(folded["unknown"], [])
+        self.assertEqual(folded["notes"], ["counting: 2 item(s); 1 peer(s) with policy [{'window': {}}]; 1 pool(s); c c"])
+        self.assertEqual((read["items"], read["read_errors"]["pods"], member["cluster"], cluster["name"]), ([{"kind": "Pod"}, {"kind": "Node"}], None, "c", "c"))
+        self.assertEqual((peers, ctx[shared.CONTEXT_POOLS]), ([{"name": "peer", "maintenancePolicy": {"window": {}}}], [{"name": "p"}]))
+
+    def test_findings_are_copied_before_they_are_stamped(self):
+        shared_finding = {"what": "pool p"}
+        first = rule_module("first", entry=2, evaluate=lambda *a: {**shared.new_result(), "risks": [shared_finding]}, describe=lambda f: "first's text")
+        second = rule_module("second", entry=12, evaluate=lambda *a: {**shared.new_result(), "risks": [shared_finding, shared_finding]}, describe=lambda f: "second's text")
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[first, second])
+        # The rule's own object is untouched, and each fold copy carries its own rule and text.
+        self.assertEqual(shared_finding, {"what": "pool p"})
+        self.assertEqual([(f["rule"], f["entry"], f["text"]) for f in folded["risks"]], [("first", 2, "first's text"), ("second", 12, "second's text"), ("second", 12, "second's text")])
+        self.assertEqual(len({id(f) for f in folded["risks"]}), 3)
+        self.assertEqual((folded["rules"]["first"]["risks"], folded["rules"]["second"]["risks"]), (1, 2))
+
+    def test_cell_text_is_one_line_and_a_reason_is_cut_while_the_json_keeps_it(self):
+        two_lines = "E1013 memcache.go couldn't get current server API group list\nUnable to connect to the server: dial tcp: i/o timeout\n" + "x" * 300
+        rule = rule_module("multi", evaluate=returning(unknown=[two_lines], risks=[{"what": "x", "text": "line one\nline two"}], notes=["note\nwith a break"]))
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[rule])
+        unknown = folded["unknown"][0]
+        self.assertEqual(unknown["reason"], two_lines)
+        self.assertNotIn("\n", unknown["text"])
+        self.assertTrue(unknown["text"].startswith("multi: E1013 memcache.go couldn't get current server API group list Unable to connect"))
+        self.assertEqual(len(unknown["text"]), len("multi: ") + shared.NOTE_EXCERPT_CHARS)
+        self.assertEqual(folded["risks"][0]["text"], "line one line two")
+        self.assertEqual(folded["notes"], ["multi: note with a break"])
+
+    def test_findings_are_stamped_inside_the_guard(self):
+        # Stamping and rendering happen before the fold returns, so every blocker and risk
+        # the fold emits is a dict with a string text, its rule and its entry.
+        rule = rule_module("stamped", entry=19, evaluate=returning(blocking=[{"what": "pv"}], risks=[{"what": "pv2", "text": "own"}]))
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[rule])
+        for finding in folded["blocking"] + folded["risks"]:
+            self.assertEqual((finding["rule"], finding["entry"]), ("stamped", 19))
+            self.assertIsInstance(finding["text"], str)
+
+    def test_module_attributes_are_checked_before_anything_is_derived_from_them(self):
+        # RULE_ID keys `rules`, so a list raised `unhashable type` outside the guard and
+        # killed the run after every member was read; ENTRY is stamped on the per-rule
+        # record and the unknown entries, which a probe of the result alone never saw, so a
+        # set reached the writer whenever the rule filed no blocker or risk; bool("False")
+        # is True. Each is one unknown under the module's name, unevaluated, the other rules
+        # untouched, and the fold is JSON.
+        fine = rule_module("fine", evaluate=returning(risks=[{"what": "ok"}]))
+        cases = {
+            "surge_capacity": (dict(RULE_ID=["surge", "capacity"], ENTRY=2, CAN_BLOCK=True), None, "RULE_ID is list, not a string; not evaluated"),
+            "quiet_entry": (dict(RULE_ID="quiet", ENTRY={11}, CAN_BLOCK=True), None, "ENTRY is set, not a JSON value; not evaluated"),
+            "loud_entry": (dict(RULE_ID="loud", ENTRY={11}, CAN_BLOCK=True), returning(blocking=[{"what": "b"}]), "ENTRY is set, not a JSON value; not evaluated"),
+            "stringly": (dict(RULE_ID="stringly", ENTRY=5, CAN_BLOCK="False"), None, "CAN_BLOCK is str, not a bool; not evaluated"),
+            "nan_entry": (dict(RULE_ID="nan", ENTRY=float("nan"), CAN_BLOCK=True), None, "ENTRY is float, not a JSON value; not evaluated"),
+            # A blank id passes "is a string" and would key `rules` and print as nothing.
+            "blank_id": (dict(RULE_ID="", ENTRY=2, CAN_BLOCK=True), None, "RULE_ID is blank; not evaluated"),
+            "spaced_id": (dict(RULE_ID="  ", ENTRY=2, CAN_BLOCK=True), None, "RULE_ID is blank; not evaluated"),
+        }
+        for name, (attributes, evaluate, reason) in cases.items():
+            broken = bare_module(name, evaluate=evaluate, **attributes)
+            folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[broken, fine])
+            self.assertEqual([(u["rule"], u["entry"], u["can_block"], u["reason"], u["text"]) for u in folded["unknown"]], [(name, None, True, reason, f"{name}: {reason}")], name)
+            self.assertEqual(folded["rules"][name], {"entry": None, "can_block": True, "blocking": 0, "risks": 0, "unknown": 1, "notes": 0}, name)
+            self.assertEqual(folded["rules"]["fine"], {"entry": 0, "can_block": True, "blocking": 0, "risks": 1, "unknown": 0, "notes": 0}, name)
+            self.assertEqual((folded["blocking"], [f["rule"] for f in folded["risks"]], folded["notes"]), ([], ["fine"], []), name)
+            json.dumps(folded)  # what the writer does with it
+        # An attribute whose read itself raises is the same defect under the fold's guard: a
+        # module that resolves its names through a module-level `__getattr__` (the lazy-import
+        # idiom) and raises there is one unknown under its `__name__`; an ENTRY whose encoding
+        # raises something other than the TypeError or ValueError the probe caught (a dict
+        # subclass whose `items()` raises, as a value nested past the recursion limit does) is
+        # "not a JSON value"; an object nothing can be read from is named by its type. The
+        # interpreter's own interrupt still passes through.
+        def no_backend(name):
+            raise ImportError("no backend")
+
+        lazy = types.ModuleType("lazy")
+        lazy.__getattr__ = no_backend
+
+        class Unlistable(dict):
+            def items(self):
+                raise OSError("no items")
+
+        bottomless = bare_module("bottomless", evaluate=None, RULE_ID="bottomless", ENTRY=Unlistable(entry=2), CAN_BLOCK=True)
+
+        class Unreadable:
+            def __getattr__(self, name):
+                raise KeyError(name)
+
+            def __str__(self):
+                raise RuntimeError("no str")
+
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[lazy, bottomless, Unreadable(), fine])
+        self.assertEqual([(u["rule"], u["entry"], u["can_block"], u["reason"]) for u in folded["unknown"]], [
+            ("lazy", None, True, "reading the module's attributes raised ImportError('no backend'); not evaluated"),
+            ("bottomless", None, True, "ENTRY is Unlistable, not a JSON value; not evaluated"),
+            ("Unreadable", None, True, "reading the module's attributes raised KeyError('__name__'); not evaluated"),
+        ])
+        self.assertEqual([f["rule"] for f in folded["risks"]], ["fine"])
+        self.assertEqual(folded["rules"]["lazy"], {"entry": None, "can_block": True, "blocking": 0, "risks": 0, "unknown": 1, "notes": 0})
+        json.dumps(folded)
+
+        def interrupting(name):
+            raise KeyboardInterrupt
+
+        interrupted = types.ModuleType("interrupted")
+        interrupted.__getattr__ = interrupting
+        with self.assertRaises(KeyboardInterrupt):
+            r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[interrupted, fine])
+        # A `RULE_ID` that is a `str` subclass is keyed and printed as the plain string it spells,
+        # since the id keys `rules` and formats the notes after the guard closes: one whose
+        # `__hash__` raises is evaluated under that string; one whose `__str__` raises is the
+        # module's defect under its module name.
+        class Hashless(str):
+            def __hash__(self):
+                raise TypeError("no hash")
+
+        class Strless(str):
+            def __str__(self):
+                raise RuntimeError("no str")
+
+        hashless = bare_module("hashless", evaluate=returning(risks=[{"what": "h"}]), RULE_ID=Hashless("hash-less"), ENTRY=7, CAN_BLOCK=True)
+        strless = bare_module("strless", evaluate=None, RULE_ID=Strless("str-less"), ENTRY=8, CAN_BLOCK=True)
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[hashless, strless, fine])
+        self.assertEqual(sorted(folded["rules"]), ["fine", "hash-less", "strless"])
+        self.assertTrue(all(type(key) is str for key in folded["rules"]))
+        self.assertEqual([f["rule"] for f in folded["risks"]], ["hash-less", "fine"])
+        self.assertEqual([(u["rule"], u["reason"]) for u in folded["unknown"]], [("strless", "reading the module's attributes raised RuntimeError('no str'); not evaluated")])
+        json.dumps(folded)
+        # A module with no RULE_ID at all is keyed by its module name and evaluated as usual.
+        nameless = bare_module("nameless", evaluate=returning(risks=[{"what": "n"}]), ENTRY=3, CAN_BLOCK=False)
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[nameless])
+        self.assertEqual(folded["rules"], {"nameless": {"entry": 3, "can_block": False, "blocking": 0, "risks": 1, "unknown": 0, "notes": 0}})
+        self.assertEqual(folded["risks"][0]["rule"], "nameless")
+
+    def test_a_second_module_with_a_registered_id_is_not_evaluated(self):
+        first = rule_module("twice", entry=4, evaluate=returning(risks=[{"what": "a"}]))
+        second = rule_module("twice", entry=12, evaluate=returning(blocking=[{"what": "b"}], risks=[{"what": "c"}]))
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[first, second])
+        self.assertEqual(folded["blocking"], [])
+        self.assertEqual([f["what"] for f in folded["risks"]], ["a"])
+        self.assertEqual([(u["rule"], u["entry"], u["can_block"], u["reason"]) for u in folded["unknown"]], [("twice", 4, True, "a second module registers RULE_ID twice; the duplicate was not evaluated")])
+        self.assertEqual(folded["rules"], {"twice": {"entry": 4, "can_block": True, "blocking": 0, "risks": 1, "unknown": 1, "notes": 0}})
+        # The invariant the JSON readers rely on: per-rule counts describe the flat lists.
+        for key in ("blocking", "risks", "unknown", "notes"):
+            self.assertEqual(folded["rules"]["twice"][key], sum(1 for item in folded[key] if (item["rule"] if isinstance(item, dict) else None) == "twice" or (key == "notes" and item.startswith("twice: "))))
+        self.assertEqual(r.readiness_status({"blocking": []}, {"blocking": []}, {"blocking_exclusions": [], "undecided_exclusions": []}, {"blocking": [], "unknown": []}, True, folded), r.READINESS_UNKNOWN)
+        # A duplicate of a rule that cannot block carries that rule's can_block: the per-rule
+        # record and its entries agree, and the member's verdict is untouched.
+        cannot = rule_module("zonal", entry=11, can_block=False, evaluate=returning(risks=[{"what": "z"}]))
+        again = rule_module("zonal", entry=11, can_block=True, evaluate=returning(blocking=[{"what": "b"}]))
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[cannot, again])
+        self.assertEqual([(u["rule"], u["can_block"]) for u in folded["unknown"]], [("zonal", False)])
+        self.assertEqual(folded["rules"]["zonal"]["can_block"], False)
+        self.assertEqual(folded["blocking"], [])
+        self.assertEqual(r.readiness_status({"blocking": []}, {"blocking": []}, {"blocking_exclusions": [], "undecided_exclusions": []}, {"blocking": [], "unknown": []}, True, folded), r.READINESS_READY)
+
+    def test_a_blocker_from_a_rule_that_cannot_block_is_demoted_to_a_risk_with_a_note(self):
+        rule = rule_module("cannot", entry=11, can_block=False, evaluate=returning(blocking=[{"what": "oops"}, {"what": "graded", "grade": "blocking"}, {"what": "tiered", "tier": "blocking"}], risks=[{"what": "fine"}]))
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[rule])
+        self.assertEqual(folded["blocking"], [])
+        self.assertEqual([f["what"] for f in folded["risks"]], ["oops", "graded", "tiered", "fine"])
+        # A demoted finding is re-graded under whichever word it carries: no risk says it blocks.
+        self.assertEqual([(f.get("grade"), f.get("tier")) for f in folded["risks"]], [(None, None), ("risk", None), (None, "risk"), (None, None)])
+        self.assertEqual(folded["notes"], ["cannot: filed a blocker but declares CAN_BLOCK False; reported as a risk"])
+        self.assertEqual(folded["rules"]["cannot"]["risks"], 4)
+
+    def test_the_registry_is_the_default_and_rules_selects(self):
+        registered = r.evaluate_extra_rules({"name": "c", "location": "us-central1-a"}, {}, self.READ, TARGET, {})
+        self.assertEqual(list(registered["rules"]), [m.RULE_ID for m in r.EXTRA_RULES])
+        self.assertIn("zonal-control-plane", [f["rule"] for f in registered["risks"]])
+        only = r.evaluate_extra_rules({"name": "c", "location": "us-central1-a"}, {}, self.READ, TARGET, {}, rules=[rule_module("other")])
+        self.assertEqual(list(only["rules"]), ["other"])
+        self.assertEqual(only["risks"], [])
+
+    def test_text_set_by_the_rule_is_kept(self):
+        rule = rule_module("pre", evaluate=returning(risks=[{"what": "x", "text": "the rule's own"}]))
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[rule])
+        self.assertEqual(folded["risks"][0]["text"], "the rule's own")
+
+
 class VerdictTest(unittest.TestCase):
     CLEAR = {"blocking_exclusions": [], "undecided_exclusions": []}
     NO_SKEW = {"blocking": [], "unknown": []}
@@ -395,6 +1214,27 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual(r.readiness_status(None, None, {"blocking_exclusions": ["x"], "undecided_exclusions": []}, self.NO_SKEW, True), "blocked")
         self.assertEqual(r.readiness_status(None, None, self.CLEAR, {"blocking": ["p"], "unknown": []}, True), "blocked")
         self.assertEqual(r.readiness_status({"blocking": []}, {"blocking": [{"webhook": "g/h"}]}, self.CLEAR, self.NO_SKEW, False), "blocked")
+        rules = {"blocking": [{"rule": "x"}], "risks": [], "unknown": [{"rule": "y", "can_block": True}], "notes": [], "rules": {}}
+        self.assertEqual(r.readiness_status(None, None, self.CLEAR, self.NO_SKEW, False, rules), "blocked")
+
+    def test_extra_rules_fold_into_the_verdict_by_can_block(self):
+        pdbs = {"blocking": []}
+        clean = {"blocking": [], "risks": [], "unknown": [], "notes": [], "rules": {}}
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True, clean), r.READINESS_READY)
+        # Risks and notes never move the verdict.
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True, {**clean, "risks": [{"rule": "zonal-control-plane"}], "notes": ["x: y"]}), r.READINESS_READY)
+        # An unknown from a rule that can block is unknown; from one that cannot, it is not.
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True, {**clean, "unknown": [{"rule": "surge-capacity", "can_block": True, "reason": "no target"}]}), r.READINESS_UNKNOWN)
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True, {**clean, "unknown": [{"rule": "zonal-control-plane", "can_block": False, "reason": "odd"}]}), r.READINESS_READY)
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True, {**clean, "unknown": [{"rule": "a", "can_block": False}, {"rule": "b", "can_block": True}]}), r.READINESS_UNKNOWN)
+        # An unknown of another shape counts, the conservative reading.
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True, {**clean, "unknown": ["why"]}), r.READINESS_UNKNOWN)
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True, {**clean, "unknown": [{"rule": "a"}]}), r.READINESS_UNKNOWN)
+        # Blocked beats an unknown from either kind of rule; the four built-in rules' own unknown still holds.
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True, {**clean, "blocking": [{"rule": "x"}], "unknown": [{"rule": "y", "can_block": False}]}), r.READINESS_BLOCKED)
+        self.assertEqual(r.readiness_status(None, None, self.CLEAR, self.NO_SKEW, True, clean), r.READINESS_UNKNOWN)
+        # None means the per-entry rules did not run; the four built-in rules decide alone.
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True, None), r.READINESS_READY)
 
 
 def webhook_config(kind, name, hooks):
@@ -1104,7 +1944,6 @@ class WebhookScopeTest(unittest.TestCase):
         items = [webhook_config("ValidatingWebhookConfiguration", "v", []), webhook_config("MutatingWebhookConfiguration", "m", []), service("scen", "s"), endpoint_slice("scen", "s", [True]), namespace("kube-system"), {"kind": "PodDisruptionBudget"}, "junk"]
         configs, services, slices, namespaces = r.split_webhook_items(items)
         self.assertEqual(([c["metadata"]["name"] for c in configs], len(services), len(slices), [n["metadata"]["name"] for n in namespaces]), (["v", "m"], 1, 1, ["kube-system"]))
-
 
 if __name__ == "__main__":
     unittest.main()
