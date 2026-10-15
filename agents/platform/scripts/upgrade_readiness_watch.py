@@ -285,6 +285,18 @@ REMEDY_RETIRING = (
     "nothing to do: the project left the declaration, and the reconcile prunes its Cluster Agent profile on its next clean run; "
     "if the removal was a mistake, put the project back under spec.scope, and the next reconcile run that resolves it puts it back in the sweep"
 )
+# The same, where an exclude entry matches the project (``ScopeTargets.excludes``):
+# the reconcile drops an explicit project the entry matches and marks its row
+# retiring as it does a removal, so the project may still be under spec.scope
+# and the undo is the entry; whether the entry alone took it out is the
+# reconcile's knowledge (``REMEDY_EXCLUDED``), so the declaration is named
+# after it. The cause stays retiring: the row is the reconcile's verdict, and
+# the entry is the detail the reason and the undo clause carry.
+REMEDY_RETIRING_EXCLUDED = (
+    "nothing to do: the project left the declaration, and the reconcile prunes its Cluster Agent profile on its next clean run; "
+    "if the entry was a mistake, drop it, name the project in spec.scope if nothing there holds it, and the next reconcile run that "
+    "resolves the project puts it back in the sweep"
+)
 REMEDY_READ_ACCESS = INSTALL_REMEDY_PREFIX + "give the install read access to the project, " + ROSTER_REMEDY
 REMEDY_CAP = INSTALL_REMEDY_PREFIX + "raise spec.scope.maxProjects, " + ROSTER_REMEDY
 # Posted once per cause (``partial_signature`` keys a refusal on the project
@@ -361,8 +373,10 @@ EMPTY_SCOPE_REASON = "the declared scope resolved to no readable project this ti
 # since an excluded project has no row; the scope the pod holds says which.
 EXCLUDED_REASON = "the install's declared scope does not list {project}, and a spec.scope.exclude.projects entry matches it"
 # The same message covers a project the declaration dropped, whose row the
-# reconcile marks retiring until the prune; the scope the pod holds says so.
+# reconcile marks retiring until the prune; the scope the pod holds says so,
+# and names the exclude entry where one matches the project.
 RETIRING_REASON = "the install's declared scope no longer lists {project}; the reconcile has it retiring"
+RETIRING_EXCLUDED_REASON = "the install's declared scope no longer lists {project}, and a spec.scope.exclude.projects entry matches it; the reconcile has it retiring"
 REFUSAL_PROJECT_FIELD = "project"
 REFUSAL_PROJECTS_FIELD = "projects"
 REFUSAL_OUTCOME_FIELD = "outcome"
@@ -438,9 +452,10 @@ TABLE_ERRORS_KEY = "table_errors"
 # project is read or refused under another cause, and kept through anything
 # else; it holds only while the declaration names no container it did not,
 # since a container just gained carries no members when its lookup fails.
-# Saved even when the table fails the tick (``keep_standing``), the one path
-# on which nothing else of the ledger is: the failure line is keyed on the
-# refusal's text, and the hold is what keeps that text the same.
+# Saved even when the tick fails (``keep_standing``), at whichever step after
+# a hop filed it, since a failed tick writes nothing else of the ledger: the
+# failure line is keyed on the refusal's text, and the hold is what keeps that
+# text the same.
 STANDING_OUTSIDE_KEY = "standing_outside"
 # The report script keys members and read errors by the project id it resolved,
 # so a project the roster spells as a number must be keyed the same way in the
@@ -899,7 +914,8 @@ def refusal_remedy(cause: str, fields: dict[str, str], scope: fleet_scope_target
     reconcile has resolved is declared or dropped from the roster, with the
     exclude entry named too where one is a project number; one the reconcile
     has retiring needs nothing, its profile pruned on the next clean run, and
-    is declared again only if the removal was a mistake; one an exclude
+    is declared again only if the removal was a mistake, or loses the exclude
+    entry where one matches it; one an exclude
     entry matches loses the entry or is declared, or leaves the roster;
     outside a scope the reconcile has not resolved, the line names both ways
     out and returns when the scope resolves; a project the install could not
@@ -913,6 +929,8 @@ def refusal_remedy(cause: str, fields: dict[str, str], scope: fleet_scope_target
     if cause == REFUSAL_EXCLUDED:
         return REMEDY_EXCLUDED
     if cause == REFUSAL_RETIRING:
+        if scope is not None and scope.excludes(fields.get(REFUSAL_PROJECT_FIELD, "")):
+            return REMEDY_RETIRING_EXCLUDED
         return REMEDY_RETIRING
     if cause == REFUSAL_OUTSIDE_UNRESOLVED:
         return REMEDY_OUTSIDE_UNRESOLVED.format(note=unresolved_note(scope))
@@ -928,7 +946,8 @@ def refusal_detail(stderr: str, scope: fleet_scope_targets.ScopeTargets | None, 
     and the cause it is filed under: the message matched against the script's
     own constants, re-said with what it named (the scope it lists shortened
     to a few names; a project an exclude entry names said as excluded; one
-    the reconcile has retiring said as such; an empty resolved set said as
+    the reconcile has retiring said as such, with the exclude entry that
+    matches it where one does; an empty resolved set said as
     such; an unresolved scope with the scope's own
     note on a project it lists as unresolved) and the remedy for its cause
     (``refusal_remedy``); None for a usage exit this job does not know, which
@@ -947,7 +966,8 @@ def refusal_detail(stderr: str, scope: fleet_scope_targets.ScopeTargets | None, 
         if cause == REFUSAL_EXCLUDED:
             reason = EXCLUDED_REASON.format(project=fields[REFUSAL_PROJECT_FIELD])
         elif cause == REFUSAL_RETIRING:
-            reason = RETIRING_REASON.format(project=fields[REFUSAL_PROJECT_FIELD])
+            said_retiring = RETIRING_EXCLUDED_REASON if scope is not None and scope.excludes(fields[REFUSAL_PROJECT_FIELD]) else RETIRING_REASON
+            reason = said_retiring.format(project=fields[REFUSAL_PROJECT_FIELD])
         elif kind == REFUSAL_OUTSIDE and scope is not None and not scope.projects:
             reason = EMPTY_SCOPE_REASON.format(project=fields[REFUSAL_PROJECT_FIELD])
         note = unresolved_note(scope)
@@ -1384,8 +1404,8 @@ def versions_by_project(
     the ledger. ``standing`` is the ledger's standing-outside record
     (``STANDING_OUTSIDE_KEY``), read for the hold under the spelling or the key
     a project was recorded by and kept current by this run's verdicts
-    (``file_refusal``), which the caller saves even when this run fails the
-    tick (``keep_standing``)."""
+    (``file_refusal``), which the caller saves even when the tick fails
+    (``keep_standing``)."""
     last_runs = ledger[TABLE_RUNS_KEY]
     ids = ledger[PROJECT_IDS_KEY]
     merged = empty_envelope()
@@ -1649,12 +1669,16 @@ def file_refusal(standing: dict[str, list[str]], project: str, cause: str, scope
 
 def keep_standing(path: Path, standing: dict[str, list[str]], loaded: dict[str, list[str]]) -> None:
     """Save the standing-outside record (``STANDING_OUTSIDE_KEY``) of a tick
-    the version table failed. Such a tick writes nothing else to the ledger
-    (``main`` announces its failure through the marker, keyed on the failure's
-    text), but the refusals its runs filed are the scope's verdicts on those
+    that failed, at whichever step: a table that read nothing, a hop whose
+    sandbox call raised, a report that could not be written. Such a tick
+    writes nothing else to the ledger (``main`` announces its failure through
+    the marker, keyed on the failure's text, or prints the write failure), but
+    the refusals and reads its hops filed are the scope's verdicts on those
     projects, and the hold the next tick reads lives in the record: a roster
     of nothing but outside projects would otherwise see its failure line
-    change cause, and post again, on each lookup that fails for a tick.
+    change cause, and post again, on each lookup that fails for a tick, and a
+    project filed on a tick whose report could not be written would be posted
+    under the lookup's remedy and then the declaration's.
     Written under that key alone into the ledger as it is on disk, and only
     when the record moved from ``loaded``, the one the tick read, so a failed
     tick that filed nothing still leaves no ledger and a standing failure
@@ -1785,26 +1809,38 @@ def clear_failure_marker(home: Path) -> bool:
 
 
 def tick(dry_run: bool = False) -> list[str]:
+    """One tick: the ledger loaded, the sweep run on it, and the standing-outside
+    record kept when the sweep fails (``keep_standing``), at whichever step it
+    failed, since the hops file the record as they go and a failed tick writes
+    nothing else of the ledger. A dry run changes nothing."""
     started = time.monotonic()
-    now = now_utc()
-    days = refresh_days()
     home = watch_home()
     ledger_path = home / LEDGER_FILE_NAME
     ledger = load_ledger(ledger_path)
     standing = ledger[STANDING_OUTSIDE_KEY]
     loaded_standing = {project: list(containers) for project, containers in standing.items()}
-    scope = declared_scope()
-    names = projects()
-    deadline = started + TICK_BUDGET_SECONDS
     try:
-        versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger, now, scope, standing)
+        return sweep(started, home, ledger, dry_run)
     except Exception:
-        # A table that read nothing fails the tick, which writes no ledger;
-        # the standing-outside record its runs filed is kept all the same,
-        # since the next tick's hold reads it. A dry run changes nothing.
         if not dry_run:
             keep_standing(ledger_path, standing, loaded_standing)
         raise
+
+
+def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
+    """The tick's work on the ledger ``tick`` loaded: the version table, what
+    is due, the readiness runs, the reports and the ledger's save. ``started``
+    is the tick's first ``time.monotonic`` instant, which the budget counts
+    from. Raises out with the ledger unsaved when a step fails; ``tick`` keeps
+    the standing-outside record then."""
+    now = now_utc()
+    days = refresh_days()
+    ledger_path = home / LEDGER_FILE_NAME
+    standing = ledger[STANDING_OUTSIDE_KEY]
+    scope = declared_scope()
+    names = projects()
+    deadline = started + TICK_BUDGET_SECONDS
+    versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger, now, scope, standing)
     canonicalise_projects(versions[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     # A table is partial when a read failed; the script's exit code alone (it
