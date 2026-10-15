@@ -143,7 +143,8 @@ first, so what it exercises is the chart in this repository rather than whatever
 to be deployed on the cluster; `SKIP_INSTALL=true` reuses the existing deployment.
 
 CI runs the unit tests only, through `make test-python` (`python-tests.yml`), one discovery
-pass per plugin directory; the rest are run by hand against a deployment.
+pass per test file, rooted at the plugin's `tests/` directory; the rest are run by hand against
+a deployment.
 
 ## Adding a plugin
 
