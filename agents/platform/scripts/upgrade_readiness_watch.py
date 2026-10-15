@@ -265,17 +265,35 @@ REMEDY_DECLARE_OR_NUMBERED = (
 )
 # An exclude entry matches the project, which has no row. Whether the entry is
 # why is the reconcile's knowledge, not the pod's: the project is in spec.scope
-# under exclude (its profile retiring until the next clean reconcile run prunes
-# it, or onboarded by hand and never produced, which the reconcile never
-# prunes), or under no part of the declaration and matched by a glob all the
-# same, where dropping the entry brings in nothing; the line names both ways.
+# under exclude (onboarded by hand and never produced, which the reconcile
+# never prunes; one it produced and then dropped has a ``retiring`` row and
+# its own cause below), or under no part of the declaration and matched by a
+# glob all the same, where dropping the entry brings in nothing; the line
+# names both ways.
 REMEDY_EXCLUDED = (
     INSTALL_REMEDY_PREFIX + "drop the entry if spec.scope names the project or a folder, organisation or selector that holds it, "
     "else name the project in spec.scope, " + ROSTER_REMEDY
 )
+# The declaration no longer names the project and the reconcile has marked its
+# row ``retiring`` (``ScopeTargets.retiring``): its Cluster Agent profile stays
+# in the roster until the next clean reconcile run prunes it, longer while a
+# lookup is unclean or the prune's delete fails, and the declaration remedy
+# would send the operator to undo the removal or to delete a profile about to
+# go. Keyed like the others: a profile onboarded by hand after the prune has no
+# row and is filed as outside, so the line returns with that remedy.
+REMEDY_RETIRING = (
+    "nothing to do: the project left the declaration, and the reconcile prunes its Cluster Agent profile on its next clean run; "
+    "if the removal was a mistake, put the project back under spec.scope, and the next reconcile run that resolves it puts it back in the sweep"
+)
 REMEDY_READ_ACCESS = INSTALL_REMEDY_PREFIX + "give the install read access to the project, " + ROSTER_REMEDY
 REMEDY_CAP = INSTALL_REMEDY_PREFIX + "raise spec.scope.maxProjects, " + ROSTER_REMEDY
-REMEDY_UNRESOLVED = "the reconcile has not resolved it yet; the next tick that does reads it, and this line returns with a remedy if it does not"
+# Posted once per cause (``partial_signature`` keys a refusal on the project
+# and its cause, and the readiness hop's ungraded signature the same), so the
+# text promises a return on another outcome, never on the same one standing.
+REMEDY_UNRESOLVED = (
+    "the reconcile has not resolved it yet; the next tick that does reads it; this line posts once per cause, the project stays "
+    "unread until a reconcile tick lists it, and another outcome the reconcile records for it is named here with its remedy"
+)
 # A project outside what the reconcile resolved while part of the declaration
 # is unresolved: the render window and a carried tick clear on the next tick,
 # a container or selector lookup that keeps failing does not, and the watch
@@ -295,10 +313,12 @@ REMEDY_ID = INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.p
 REMEDY_SANDBOX_RESTART = "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again"
 # The reconcile's listing of the project did not finish on its last run (a
 # timeout, a network or quota error, a gcloud failure it did not classify, or
-# a carried tick): not an access failure, so no grant is asked for.
+# a carried tick): not an access failure, so no grant is asked for. Posted
+# once per cause, as ``REMEDY_UNRESOLVED`` is, and worded the same way.
 REMEDY_LISTING_UNFINISHED = (
     "the reconcile could not list the project on its last run (a timeout, a network or quota error, or a run that carried "
-    "it without resolving it); the next reconcile tick that lists it reads it, and this line returns with a remedy if it does not"
+    "it without resolving it); the next reconcile tick that lists it reads it; this line posts once per cause, the project stays "
+    "unread until a reconcile tick lists it, and another outcome the reconcile records for it is named here with its remedy"
 )
 # A declared project the install could not read, by the outcome the reconcile
 # recorded; a denial, the one outcome that is an access failure, is read access.
@@ -315,6 +335,7 @@ UNREAD_REMEDIES = {
 REFUSAL_OUTSIDE = "outside the resolved scope"
 REFUSAL_OUTSIDE_UNRESOLVED = "outside a scope not yet resolved"
 REFUSAL_EXCLUDED = "excluded by spec.scope.exclude"
+REFUSAL_RETIRING = "retiring from the declaration"
 REFUSAL_UNREAD = "listed but unread ({outcome})"
 REFUSAL_NUMBER = "project number unresolved"
 REFUSAL_SANDBOX = "sandbox marker stale"
@@ -339,6 +360,9 @@ EMPTY_SCOPE_REASON = "the declared scope resolved to no readable project this ti
 # The script's outside message covers a project an exclude entry matches too,
 # since an excluded project has no row; the scope the pod holds says which.
 EXCLUDED_REASON = "the install's declared scope does not list {project}, and a spec.scope.exclude.projects entry matches it"
+# The same message covers a project the declaration dropped, whose row the
+# reconcile marks retiring until the prune; the scope the pod holds says so.
+RETIRING_REASON = "the install's declared scope no longer lists {project}; the reconcile has it retiring"
 REFUSAL_PROJECT_FIELD = "project"
 REFUSAL_PROJECTS_FIELD = "projects"
 REFUSAL_OUTCOME_FIELD = "outcome"
@@ -845,9 +869,12 @@ def refusal_cause(kind: str, fields: dict[str, str], scope: fleet_scope_targets.
     """What a refusal is filed under: its kind, with the outcome for a project
     the install could not read (a project declared and then found unread, or
     unread for a new reason, is a new cause) and, for a project outside the
-    scope, the declaration's and the scope's state: one an exclude entry
-    names is excluded, whatever the scope resolved; otherwise outside a scope
-    not yet resolved is one cause and outside the resolved scope another,
+    scope, the declaration's and the scope's state: one whose row the
+    reconcile marks retiring is retiring from the declaration, whatever else
+    the scope says, since the reconcile has judged it and an unclean run does
+    not unjudge it; one an exclude entry names is excluded, whatever the scope
+    resolved; otherwise outside a scope not yet resolved is one cause and
+    outside the resolved scope another,
     except that a project last filed as outside the resolved scope under a
     declaration that named every container this one does (``outside_stands``,
     from ``stands_outside``) keeps that cause while the scope is merely
@@ -856,6 +883,8 @@ def refusal_cause(kind: str, fields: dict[str, str], scope: fleet_scope_targets.
     news, not the lookup failing. False where no record exists, the first
     tick's answer."""
     project = fields.get(REFUSAL_PROJECT_FIELD, "")
+    if kind == REFUSAL_OUTSIDE and scope is not None and project in scope.retiring:
+        return REFUSAL_RETIRING
     if kind == REFUSAL_OUTSIDE and scope is not None and scope.excludes(project):
         return REFUSAL_EXCLUDED
     if kind == REFUSAL_OUTSIDE and unresolved_note(scope) and not outside_stands:
@@ -868,7 +897,9 @@ def refusal_cause(kind: str, fields: dict[str, str], scope: fleet_scope_targets.
 def refusal_remedy(cause: str, fields: dict[str, str], scope: fleet_scope_targets.ScopeTargets | None) -> str:
     """The remedy for a refusal, by its cause: a project outside a scope the
     reconcile has resolved is declared or dropped from the roster, with the
-    exclude entry named too where one is a project number; one an exclude
+    exclude entry named too where one is a project number; one the reconcile
+    has retiring needs nothing, its profile pruned on the next clean run, and
+    is declared again only if the removal was a mistake; one an exclude
     entry matches loses the entry or is declared, or leaves the roster;
     outside a scope the reconcile has not resolved, the line names both ways
     out and returns when the scope resolves; a project the install could not
@@ -881,6 +912,8 @@ def refusal_remedy(cause: str, fields: dict[str, str], scope: fleet_scope_target
         return REMEDY_DECLARE
     if cause == REFUSAL_EXCLUDED:
         return REMEDY_EXCLUDED
+    if cause == REFUSAL_RETIRING:
+        return REMEDY_RETIRING
     if cause == REFUSAL_OUTSIDE_UNRESOLVED:
         return REMEDY_OUTSIDE_UNRESOLVED.format(note=unresolved_note(scope))
     if cause.startswith(REFUSAL_UNREAD.split("{")[0]):
@@ -894,8 +927,9 @@ def refusal_detail(stderr: str, scope: fleet_scope_targets.ScopeTargets | None, 
     """What a refusal by the report script reads as, in the install's terms,
     and the cause it is filed under: the message matched against the script's
     own constants, re-said with what it named (the scope it lists shortened
-    to a few names; a project an exclude entry names said as excluded; an
-    empty resolved set said as such; an unresolved scope with the scope's own
+    to a few names; a project an exclude entry names said as excluded; one
+    the reconcile has retiring said as such; an empty resolved set said as
+    such; an unresolved scope with the scope's own
     note on a project it lists as unresolved) and the remedy for its cause
     (``refusal_remedy``); None for a usage exit this job does not know, which
     is reported as the script wrote it. ``outside_stands`` as for
@@ -912,6 +946,8 @@ def refusal_detail(stderr: str, scope: fleet_scope_targets.ScopeTargets | None, 
         cause = refusal_cause(kind, fields, scope, outside_stands=outside_stands)
         if cause == REFUSAL_EXCLUDED:
             reason = EXCLUDED_REASON.format(project=fields[REFUSAL_PROJECT_FIELD])
+        elif cause == REFUSAL_RETIRING:
+            reason = RETIRING_REASON.format(project=fields[REFUSAL_PROJECT_FIELD])
         elif kind == REFUSAL_OUTSIDE and scope is not None and not scope.projects:
             reason = EMPTY_SCOPE_REASON.format(project=fields[REFUSAL_PROJECT_FIELD])
         note = unresolved_note(scope)

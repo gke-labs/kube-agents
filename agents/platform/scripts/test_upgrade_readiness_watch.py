@@ -43,20 +43,30 @@ def loader_argv(stdin: str) -> list[str]:
     return json.loads(line[len(ARGV_LINE_PREFIX):])
 
 
-def scope_targets(*projects: str, unread: tuple[tuple[str, str], ...] = (), excluded: tuple[str, ...] = ()) -> fleet_scope_targets.ScopeTargets:
-    return fleet_scope_targets.ScopeTargets(projects=projects, unread=unread, resolved_at=None, path="fleet_scope.json", excluded=excluded)
+def scope_targets(
+    *projects: str, unread: tuple[tuple[str, str], ...] = (), excluded: tuple[str, ...] = (), retiring: tuple[str, ...] = ()
+) -> fleet_scope_targets.ScopeTargets:
+    return fleet_scope_targets.ScopeTargets(projects=projects, unread=unread, resolved_at=None, path="fleet_scope.json", excluded=excluded, retiring=retiring)
 
 
-def declared_snapshot(projects: list[str], unread: list[str] | None = None, exclude: list[str] | None = None, containers: list[dict] | None = None) -> dict:
+def declared_snapshot(
+    projects: list[str], unread: list[str] | None = None, exclude: list[str] | None = None, containers: list[dict] | None = None, retiring: list[str] | None = None
+) -> dict:
     """The reconcile's snapshot for an install whose ``spec.scope`` resolved to
     ``projects`` (the first the management project), with ``unread`` declared
-    projects the install could not read, ``exclude`` the declaration's
-    ``exclude.projects`` entries, and ``containers`` the reconcile's record of
-    each folder lookup this run, which puts the folder in the declaration."""
+    projects the install could not read (``name`` for a denial, else
+    ``name=outcome``; ``unresolved`` is a declared project with no row, as the
+    reconcile leaves one it has not resolved), ``exclude`` the declaration's
+    ``exclude.projects`` entries, ``containers`` the reconcile's record of
+    each folder lookup this run, which puts the folder in the declaration, and
+    ``retiring`` the projects the declaration dropped, whose rows the reconcile
+    marks so until its next clean run prunes their profiles."""
+    outcomes = {name: outcome or "denied" for name, _, outcome in (entry.partition("=") for entry in unread or [])}
     rows = [{"id": p, "outcome": "ok", "state": "in-scope", "via": ["management"] if i == 0 else ["projects"]} for i, p in enumerate(projects)]
-    rows += [{"id": p, "outcome": "denied", "state": "in-scope", "via": ["projects"]} for p in unread or []]
+    rows += [{"id": p, "outcome": outcome, "state": "in-scope", "via": ["projects"]} for p, outcome in outcomes.items() if outcome != "unresolved"]
+    rows += [{"id": p, "outcome": "ok", "state": "retiring", "via": []} for p in retiring or []]
     declared = {
-        "projects": projects[1:] + list(unread or []), "folders": [c["id"].split("/")[-1] for c in containers or []],
+        "projects": projects[1:] + list(outcomes), "folders": [c["id"].split("/")[-1] for c in containers or []],
         "organizations": [], "sharedVpcHosts": [], "metricsScopes": [], "exclude": {"projects": list(exclude or [])},
     }
     snapshot = {"resolvedAt": "2026-10-09T12:00:00Z", "present": True, "boundary": True, "declared": declared, "projects": rows}
@@ -171,8 +181,12 @@ class Base(unittest.TestCase):
         self.clock = mock.patch.object(watch, "now_utc", return_value=NOW)
         self.clock.start()
 
-    def declare_scope(self, projects: list[str], unread: list[str] | None = None, exclude: list[str] | None = None, containers: list[dict] | None = None) -> None:
-        (Path(self.tmp.name) / fleet_scope_targets.SNAPSHOT_FILE).write_text(json.dumps(declared_snapshot(projects, unread, exclude, containers)), encoding="utf-8")
+    def declare_scope(
+        self, projects: list[str], unread: list[str] | None = None, exclude: list[str] | None = None, containers: list[dict] | None = None, retiring: list[str] | None = None
+    ) -> None:
+        (Path(self.tmp.name) / fleet_scope_targets.SNAPSHOT_FILE).write_text(
+            json.dumps(declared_snapshot(projects, unread, exclude, containers, retiring)), encoding="utf-8"
+        )
 
     def tearDown(self) -> None:
         self.clock.stop()
@@ -1762,6 +1776,29 @@ class DeclaredScope(Base):
         )
         detail, _ = watch.refusal_detail(label + outside.format(project="p2", projects="p1"), scope_targets("p1", excluded=("legacy-*",)))
         self.assertTrue(detail.endswith(f"not this job: name the project in spec.scope, {roster}"), detail)
+        # A project the declaration dropped has a retiring row until the prune: the reconcile has judged it, so the
+        # cause is its own whatever the scope's state and whether an exclude entry took it out, and the remedy is
+        # nothing to do, never the declaration or the roster.
+        for scope in (
+            scope_targets("p1", retiring=("p2",)),
+            scope_targets("p1", unread=(("declared-scope", "unresolved"),), retiring=("p2",)),
+            scope_targets("p1", excluded=("p2",), retiring=("p2",)),
+        ):
+            self.assertEqual(
+                watch.refusal_detail(label + outside.format(project="p2", projects="p1"), scope, outside_stands=True),
+                (
+                    "refused by the report script: the install's declared scope no longer lists p2; the reconcile has it retiring; "
+                    "nothing to do: the project left the declaration, and the reconcile prunes its Cluster Agent profile on its next clean run; "
+                    "if the removal was a mistake, put the project back under spec.scope, and the next reconcile run that resolves it puts it back in the sweep",
+                    "retiring from the declaration",
+                ),
+            )
+        self.assertNotIn(roster, watch.REMEDY_RETIRING)
+        # A remedy's closing clause is a promise the signature keeps: a refusal posts once per cause, so neither
+        # unread remedy says the line returns while the same outcome stands.
+        for remedy in (watch.REMEDY_UNRESOLVED, watch.REMEDY_LISTING_UNFINISHED):
+            self.assertIn("this line posts once per cause, the project stays unread until a reconcile tick lists it", remedy)
+            self.assertNotIn("if it does not", remedy)
         for detail, _ in (
             watch.refusal_detail(label + m, resolved) for m in (
                 outside.format(project="p2", projects="p1"),
@@ -1794,6 +1831,94 @@ class DeclaredScope(Base):
             self.assertNotIn("name the project in spec.scope", out)
             code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
             self.assertEqual((code, out.strip()), (0, ""))
+
+    def test_a_declared_project_the_reconcile_cannot_list_is_announced_once_per_outcome_as_its_line_says(self) -> None:
+        """The reconcile's listing of p2 times out every run, so the snapshot
+        records it unreachable on every tick. The partial line posts once,
+        with the listing remedy, and does not return while that outcome
+        stands, which is what the remedy now says; the reconcile recording
+        another outcome (unresolved, then a denial) is a new cause, named with
+        its remedy, and the project being read clears the table."""
+        versions = envelope([member("a", "current")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            self.declare_scope(["p1"], unread=["p2=unreachable"])
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertEqual(code, 0)
+            self.assertIn(
+                "p2: version table for p2 refused by the report script: the install's declared scope lists p2 but the install could not read it (unreachable); "
+                + watch.REMEDY_LISTING_UNFINISHED,
+                out,
+            )
+            self.assertIn("this line posts once per cause, the project stays unread until a reconcile tick lists it", out)
+            self.assertNotIn("if it does not", out)
+            self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: listed but unread (unreachable)"])
+            for _ in range(3):
+                code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+                self.assertEqual((code, out.strip()), (0, ""))
+            self.declare_scope(["p1"], unread=["p2=unresolved"])
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertIn("could not read it (unresolved); " + watch.REMEDY_UNRESOLVED, out)
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertEqual((code, out.strip()), (0, ""))
+            self.declare_scope(["p1"], unread=["p2"])
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertIn("could not read it (denied); the remedy is on the install, not this job: give the install read access to the project", out)
+            self.declare_scope(["p1", "p2"])
+            code, out = self.run_tick(FakeSandbox(versions))
+            self.assertIn("the version table reads every project again", out)
+
+    def test_a_project_the_declaration_dropped_is_retiring_so_the_line_says_nothing_to_do(self) -> None:
+        """The operator takes p2 out of spec.scope. The reconcile's first clean
+        run marks its row retiring and keeps its profile until the next, so
+        the roster still names p2 for one reconcile interval (longer while a
+        lookup is unclean or the prune's delete fails) and the report refuses
+        it as outside. The line says the reconcile has it retiring and that
+        there is nothing to do, on both hops, never the declaration remedy,
+        which would undo the edit or delete a profile about to go; an unclean
+        run in between changes nothing; the prune clears the table; and a
+        profile onboarded by hand after it has no row, so the line returns
+        with the declaration remedy."""
+        self.seed(OLDER_TARGET, None, ["p2/us-central1-a/c"])
+        versions = envelope([member("a", "current")])
+        resolved = {"id": "folders/123456789012", "outcome": "ok", "projects": 0}
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            self.declare_scope(["p1"], containers=[resolved], retiring=["p2"])
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertEqual(code, 0)
+            self.assertIn(
+                "p2: version table for p2 refused by the report script: the install's declared scope no longer lists p2; the reconcile has it retiring; "
+                "nothing to do: the project left the declaration, and the reconcile prunes its Cluster Agent profile on its next clean run; "
+                "if the removal was a mistake, put the project back under spec.scope, and the next reconcile run that resolves it puts it back in the sweep",
+                out,
+            )
+            self.assertIn(
+                "none graded (readiness run for p2 refused by the report script: the install's declared scope no longer lists p2; the reconcile has it retiring; nothing to do",
+                out,
+            )
+            self.assertNotIn("the remedy is on the install", out)
+            self.assertNotIn("take it out of the roster", out)
+            self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: retiring from the declaration"])
+            self.assertEqual(self.ledger()["announced"]["ungraded"][OLDER_TARGET]["signature"], [["p2", "readiness run refused: retiring from the declaration"]])
+            self.assertEqual(self.ledger()["standing_outside"], {})
+            # An unclean run holds the row at retiring and leaves the scope unresolved: the reconcile's verdict stands.
+            self.declare_scope(["p1"], containers=[dict(resolved, outcome="unreachable")], retiring=["p2"])
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertEqual((code, out.strip()), (0, ""))
+            self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: retiring from the declaration"])
+        # The prune lands: the profile is gone, the roster is p1 again, and the table is complete.
+        self.declare_scope(["p1"], containers=[resolved])
+        code, out = self.run_tick(FakeSandbox(versions))
+        self.assertEqual(code, 0)
+        self.assertIn("the version table reads every project again", out)
+        # Onboarded by hand after the prune: no row, so outside the resolved scope, and the line returns with the declaration remedy.
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertIn(
+                "p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; "
+                "the remedy is on the install, not this job: name the project in spec.scope",
+                out,
+            )
+            self.assertEqual(self.ledger()["standing_outside"], {"p2": ["folders/123456789012"]})
 
     def test_a_second_refused_project_is_announced_while_the_first_stands(self) -> None:
         versions = envelope([member("a", "current")])

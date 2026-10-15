@@ -62,7 +62,9 @@ SNAPSHOT_FILE = "fleet_scope.json"
 # §5 is its contract). A row read `ok` holds clusters the install can reach;
 # any other outcome names a project the scope declares and this install could
 # not read this run. A `retiring` row is a project the scope no longer names,
-# kept only until its profiles are pruned, so it is not in the sweep.
+# kept only until its profiles are pruned, so it is not in the sweep; its id
+# rides on `ScopeTargets.retiring` for a reader that meets the project under
+# another name.
 OUTCOME_OK = "ok"
 # A declared project whose Kubernetes Engine API is off holds no GKE cluster
 # and is swept: the GKE collectors count it empty rather than partial (the GCE
@@ -109,6 +111,9 @@ class ScopeRenderUnreadable(Exception):
 SCOPE_PROJECTS_FLAG = fleet_scope_args.SCOPE_PROJECTS_FLAG
 SCOPE_UNREAD_FLAG = fleet_scope_args.SCOPE_UNREAD_FLAG
 STATE_IN_SCOPE = "in-scope"
+# The row's state for a project the declaration no longer names, whose profiles
+# the reconcile keeps until its next clean run prunes them.
+STATE_RETIRING = "retiring"
 # Whether the CR carried a spec.scope block this run, which the reconcile records
 # beside `declared`: a present block with every list empty is the host-only
 # boundary, not the absence of one. A run that could not read the block carries
@@ -186,6 +191,14 @@ class ScopeTargets:
     # one it has just gained, whose failed lookup carries none, as the
     # upgrade-readiness watch does.
     declared_containers: tuple[str, ...] = ()
+    # The projects the snapshot holds at `state: retiring`: ones the declaration
+    # no longer names, whose Cluster Agent profiles the reconcile keeps until
+    # its next clean run prunes them. Never in the sweep and never in the
+    # collector flags; carried so a reader that meets such a project under
+    # another name can tell one the reconcile is about to prune from one the
+    # declaration never named, as the upgrade-readiness watch does for a roster
+    # project the report refused.
+    retiring: tuple[str, ...] = ()
 
     def excludes(self, project: str) -> bool:
         """Whether an exclude entry matches the project's id: the match the
@@ -322,10 +335,13 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
         return _from_render(path)
     projects: list[str] = []
     unread: list[tuple[str, str]] = []
+    retiring: list[str] = []
     for row in parsed["projects"]:
         if not isinstance(row, dict) or not row.get("id"):
             continue
         if row.get("state", STATE_IN_SCOPE) != STATE_IN_SCOPE:
+            if row.get("state") == STATE_RETIRING:
+                retiring.append(str(row["id"]))
             continue
         project = str(row["id"])
         # The install's own project is always swept: the collectors read it
@@ -371,4 +387,5 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
         path=str(path),
         excluded=(*exclude_patterns, *(p for p in sorted(dropped) if p not in exclude_patterns)),
         declared_containers=_declared_containers(declared),
+        retiring=tuple(retiring),
     )
