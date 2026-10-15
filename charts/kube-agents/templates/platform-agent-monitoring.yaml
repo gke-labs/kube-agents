@@ -352,11 +352,12 @@ spec:
 ---
 {{/*
 NetworkPolicy admitting metrics scrapes from the configured monitoring scraper namespace.
-The operator's own policies admit metrics ports only from gke-gmp-system.
-To ensure the gateway pod's inbound agent API (8642/8643) and operator poller metrics
-(9095/9097) are never isolated regardless of whether operator-managed NetworkPolicies
-are active or disabled (spec.networkPolicy.enabled: false), this policy includes the
-same-namespace agent API ingress rule and operator metrics ingress rule as a superset.
+The operator's own policies admit metrics ports only from gke-gmp-system and the operator.
+When operator-managed NetworkPolicies are disabled (spec.networkPolicy.enabled: false), this
+policy serves as a superset admitting the scraper namespace on 9095/9097, the GMP collector
+in gke-gmp-system on 9095/9097, the same-namespace agent API (8642/8643), and the operator
+metrics poller on 9095/9097 (assuming operator.enabled: true in the chart release namespace).
+This isolates inbound traffic on the gateway pod to this explicit peer set.
 */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -395,6 +396,15 @@ spec:
           podSelector:
             matchLabels:
               app.kubernetes.io/name: kube-agents-operator
+      ports:
+        - protocol: TCP
+          port: 9095
+        - protocol: TCP
+          port: 9097
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
       ports:
         - protocol: TCP
           port: 9095

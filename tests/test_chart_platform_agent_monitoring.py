@@ -449,7 +449,7 @@ class MonitoringRenderTest(unittest.TestCase):
 
         gw_np = netpols[f"{_AGENT}-gw-mon-netpol"]
         self.assertEqual(gw_np["spec"]["podSelector"]["matchLabels"]["app"], f"{_AGENT}-gateway")
-        self.assertEqual(len(gw_np["spec"]["ingress"]), 3)
+        self.assertEqual(len(gw_np["spec"]["ingress"]), 4)
         self.assertEqual(
             gw_np["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
             "monitoring",
@@ -476,6 +476,15 @@ class MonitoringRenderTest(unittest.TestCase):
         ports_op = [p["port"] for p in gw_np["spec"]["ingress"][2]["ports"]]
         self.assertIn(9095, ports_op)
         self.assertIn(9097, ports_op)
+
+        # Ingress rule 3: GMP collector on 9095/9097
+        self.assertEqual(
+            gw_np["spec"]["ingress"][3]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "gke-gmp-system",
+        )
+        ports_gmp = [p["port"] for p in gw_np["spec"]["ingress"][3]["ports"]]
+        self.assertIn(9095, ports_gmp)
+        self.assertIn(9097, ports_gmp)
 
         cp_np = netpols[f"{_AGENT}-cred-mon-netpol"]
         self.assertEqual(cp_np["spec"]["podSelector"]["matchLabels"]["app"], f"{_AGENT}-credential-proxy")
@@ -566,12 +575,12 @@ class MonitoringRenderTest(unittest.TestCase):
             for doc in yaml.safe_load_all(proc.stdout)
             if isinstance(doc, dict) and doc.get("kind") == "NetworkPolicy" and "mon-netpol" in doc.get("metadata", {}).get("name", "")
         }
-        # Gateway policy renders as a superset including agent API and operator metrics ingress rules
+        # Gateway policy renders as a superset including agent API, operator metrics, and GMP collector ingress rules
         self.assertIn(f"{_AGENT}-gw-mon-netpol", netpols)
         self.assertIn(f"{_AGENT}-cred-mon-netpol", netpols)
         self.assertIn(f"{_AGENT}-a2a-mon-netpol", netpols)
         gw_np = netpols[f"{_AGENT}-gw-mon-netpol"]
-        self.assertEqual(len(gw_np["spec"]["ingress"]), 3)
+        self.assertEqual(len(gw_np["spec"]["ingress"]), 4)
 
     def test_monitoring_scraper_namespace_pattern_validation(self):
         # Valid DNS-1123 labels succeed

@@ -645,8 +645,10 @@ platformAgent:
   # Namespace where Prometheus Operator or VictoriaMetrics scrapers run.
   # When set, the chart renders NetworkPolicies admitting ingress on the agent's
   # metrics ports (9095, 9097, 8766, 9096) from this namespace. The gateway
-  # admitting policy also carries baseline rules for the agent API (8642/8643) and
-  # operator poller (9095/9097), ensuring inbound traffic is not isolated when
+  # admitting policy also carries baseline rules for the agent API (8642/8643),
+  # the GMP collector in gke-gmp-system (9095/9097), and the operator poller
+  # (9095/9097 assuming operator.enabled: true in the chart release namespace),
+  # isolating inbound traffic on the gateway pod to this explicit peer set when
   # operator network policies are disabled.
   monitoringScraperNamespace: ""
   harness:
