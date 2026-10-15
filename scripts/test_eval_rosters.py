@@ -100,6 +100,7 @@ ADDED_AFTER_THE_SPLIT = [
     "incident-triage-oom-event-probe",  # #1023's incident-triage second case, PR #1625; promoted 2026-09-22
     "ai-security-planted-model-audit",  # #1023's fleet-audits second case, PR #1103
     "autoops-crashloop-config-triage",  # #1023's other incident-triage second case, PR #1103
+    "autoops-missing-service-triage",  # gke-labs#3078: a triage worker reports a found cause, not a source hunt
     "consistency-no-environment-label",  # the drift collector's §4.14 check, with fleet_drift.py
     "gitops-drift-out-of-band-triage",  # the drift half of incident-triage, PR #1827
     "cluster-agent-delegation-profile-lookup",  # #1840's delegation route, PR #1917
@@ -110,7 +111,6 @@ ADDED_AFTER_THE_SPLIT = [
     "compliance-declared-token-shields-siblings",  # the compliance stream's other posture, over the declared-token-workload fixture (#1408)
     "patch-declared-intent-no-finding",  # the patch stream's declared-intent step, over seeded-c's missing upgrade notifications (#1408)
     "cost-declared-intent-no-finding",  # the waste stream's declared-intent step, over the declared-overrequest-workload fixture (#1408)
-    "autoops-missing-service-triage",  # gke-labs#3078: a triage worker reports a found cause, not a source hunt
 ]
 # Appended at the tail of the nightly file.
 ADDED_AT_THE_TAIL = [
