@@ -1276,5 +1276,162 @@ class DeployEnvironmentCarriesTheInstallSettingsTest(unittest.TestCase):
             self.assertNotIn(f"'{env_name}'", expression)
 
 
+class StockoutRetryTest(unittest.TestCase):
+    """A GCE stockout during the install is retried; nothing else is.
+
+    The nightly environment is created from nothing each night, and GKE
+    answers a regional capacity shortage with "does not have enough resources
+    available to fulfill request". The retry is a whole provision again:
+    uninstall.sh, which destroys the cluster the failed create left in state
+    tainted and in GCP in ERROR, then install.sh, which creates afresh. A
+    second install.sh alone would refuse at its scope check, because that
+    cluster has no endpoint to fetch credentials for.
+    """
+
+    STOCKOUT = (
+        "Error: Error waiting for creating GKE cluster: Try a different location, or try "
+        "again later: Google Compute Engine does not have enough resources available to "
+        "fulfill request: us-central1."
+    )
+    EXHAUSTED = "Error: ZONE_RESOURCE_POOL_EXHAUSTED: The zone does not have enough resources."
+
+    def _run(self, failures, message, install_exit=1, overrides=None,
+             with_sequence=False, uninstall_exit_after_first=3,
+             later_failure=None):
+        """install.sh fails `failures` times with `message`, then succeeds.
+
+        `later_failure=(message, exit)` makes every failing call after the
+        first fail that way instead. uninstall.sh answers 3 (nothing to tear
+        down) the first time and `uninstall_exit_after_first` after that.
+        Every call of either script is appended to the calls log, in order."""
+        later_message, later_exit = later_failure or (message, install_exit)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tmp_dir = pathlib.Path(tmp.name)
+        recorded_calls = tmp_dir / MOCK_CALLS_LOG
+        mock_uninstall = tmp_dir / MOCK_UNINSTALL_SCRIPT
+        mock_uninstall.write_text(
+            f"""#!/usr/bin/env bash
+echo "uninstall" >> "{recorded_calls}"
+if [ "$(grep -c '^uninstall$' "{recorded_calls}")" -le 1 ]; then exit 3; fi
+exit {uninstall_exit_after_first}
+"""
+        )
+        mock_uninstall.chmod(0o755)
+        mock_install = tmp_dir / MOCK_INSTALL_SCRIPT
+        mock_install.write_text(
+            f"""#!/usr/bin/env bash
+echo "{MOCK_INSTALL_SUCCESS_SIGNAL}" >> "{recorded_calls}"
+count="$(grep -c '{MOCK_INSTALL_SUCCESS_SIGNAL}' "{recorded_calls}")"
+if [ "$count" -eq 1 ] && [ "$count" -le {failures} ]; then
+  echo "{message}" >&2
+  exit {install_exit}
+fi
+if [ "$count" -le {failures} ]; then
+  echo "{later_message}" >&2
+  exit {later_exit}
+fi
+echo "Apply complete!"
+exit 0
+"""
+        )
+        mock_install.chmod(0o755)
+        base = {
+            "GCP_PROJECT_ID": MOCK_GCP_PROJECT_ID,
+            "GCP_REGION": MOCK_GCP_REGION,
+            "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
+            "IMAGE_TAG": MOCK_IMAGE_TAG_SEMVER,
+            "PROVISION_STOCKOUT_WAIT_SECONDS": "0",
+        }
+        base.update(overrides or {})
+        proc = subprocess.run(
+            ["bash", str(_PROVISION_SCRIPT)],
+            capture_output=True, text=True,
+            env=get_isolated_test_env(overrides=base), cwd=str(tmp_dir),
+        )
+        lines = recorded_calls.read_text().splitlines() if recorded_calls.exists() else []
+        calls = lines.count(MOCK_INSTALL_SUCCESS_SIGNAL)
+        if with_sequence:
+            sequence = ["install" if l == MOCK_INSTALL_SUCCESS_SIGNAL else l for l in lines]
+            return proc, calls, sequence
+        return proc, calls
+
+    def test_a_stockout_is_retried_and_the_second_install_succeeds(self):
+        proc, calls = self._run(failures=1, message=self.STOCKOUT)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(calls, 2, "one retry after the stockout")
+        self.assertIn("::warning", proc.stdout + proc.stderr)
+        self.assertIn("attempt 2 of", proc.stdout + proc.stderr)
+
+    def test_the_retry_tears_down_before_it_installs_again(self):
+        """A second install.sh alone refuses: the failed cluster is in state and
+        in GCP with no endpoint. The retry is a whole provision again."""
+        proc, calls, sequence = self._run(failures=1, message=self.STOCKOUT, with_sequence=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(sequence, ["uninstall", "install", "uninstall", "install"])
+
+    def test_a_strict_teardown_failure_during_the_retry_stops_the_run(self):
+        proc, calls, sequence = self._run(
+            failures=1, message=self.STOCKOUT, with_sequence=True,
+            uninstall_exit_after_first=5, overrides={"TEARDOWN_STRICT": "true"},
+        )
+        self.assertEqual(proc.returncode, 5, "the retry's teardown failed and strict mode stops the run with its code")
+        self.assertEqual(sequence, ["uninstall", "install", "uninstall"])
+
+    def test_the_zone_pool_exhausted_wording_is_retried_too(self):
+        proc, calls = self._run(failures=1, message=self.EXHAUSTED)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(calls, 2)
+
+    def test_another_install_failure_is_not_retried(self):
+        proc, calls = self._run(failures=9, message="Error: Error 409: cluster already exists", install_exit=7)
+        self.assertEqual(proc.returncode, 7, "install.sh's own code comes back unchanged")
+        self.assertEqual(calls, 1)
+        self.assertNotIn("attempt 2 of", proc.stdout + proc.stderr)
+
+    def test_a_different_failure_on_the_retry_returns_its_own_code(self):
+        """The copy is per attempt: attempt one's stockout text must not make a
+        409 on attempt two look retryable."""
+        proc, calls, sequence = self._run(
+            failures=9, message=self.STOCKOUT, with_sequence=True,
+            later_failure=("Error: Error 409: cluster already exists", 7),
+        )
+        self.assertEqual(proc.returncode, 7)
+        self.assertEqual(sequence, ["uninstall", "install", "uninstall", "install"])
+        self.assertNotIn("attempt 3 of", proc.stdout + proc.stderr)
+
+    def test_a_knob_that_is_not_a_plain_decimal_is_refused_before_anything_runs(self):
+        """A word makes `[ -ge ]` exit 2 (read as false: unbounded retries); a
+        leading zero is octal to the arithmetic (09 aborts the loop and the
+        script exits 0 after a failed install); a 20-digit value is "not an
+        integer" to `[` and the budget is never enforced."""
+        for knob, value in (
+            ("PROVISION_STOCKOUT_ATTEMPTS", "three"),
+            ("PROVISION_STOCKOUT_WAIT_SECONDS", "09"),
+            ("PROVISION_STOCKOUT_WAIT_SECONDS", "0600"),
+            ("PROVISION_STOCKOUT_ATTEMPTS", "99999999999999999999"),
+            ("PROVISION_STOCKOUT_ATTEMPTS", "-1"),
+        ):
+            with self.subTest(knob=knob, value=value):
+                proc, calls, sequence = self._run(
+                    failures=0, message=self.STOCKOUT, with_sequence=True,
+                    overrides={knob: value},
+                )
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn(f"{knob}='{value}'", proc.stdout + proc.stderr)
+                self.assertEqual(sequence, [])
+
+    def test_zero_is_a_valid_wait(self):
+        proc, calls = self._run(failures=1, message=self.STOCKOUT)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_the_stockout_retry_budget_is_honoured(self):
+        proc, calls = self._run(failures=9, message=self.STOCKOUT, install_exit=1,
+                                overrides={"PROVISION_STOCKOUT_ATTEMPTS": "2"})
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(calls, 2, "the budget counts attempts, not retries")
+        self.assertIn("still short of capacity", proc.stdout + proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

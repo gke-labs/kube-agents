@@ -121,3 +121,14 @@ verification_spec:
     check:
       type: bootstrap_handoff
       require: ranking_card_filed
+
+  # The four first-run audits run after the scan and report their own checks
+  # (oobe.py FIRST_RUN_AUDITS); a block line under one of their slugs reaches
+  # the user a second time as a separate problem. On an install with no
+  # GitOps repository the scan keeps those checks on purpose, and the verifier
+  # returns an error, read off the gate's no_repository=yes, rather than a grade.
+  - name: raw-report-no-first-run-audit-checks
+    role: objective
+    check:
+      type: bootstrap_handoff
+      require: raw_report_no_first_run_audit_checks

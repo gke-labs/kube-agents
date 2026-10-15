@@ -570,12 +570,14 @@ def no_tool_spec() -> CaseSpec:
 
 
 def test_the_no_tool_cases_declare_it():
-    """The three cases the Claude nightly red on rung 3 on 2026-10-08
-    (#2691) answer without a tool call; each must carry the key."""
+    """The cases the Claude nightly red on rung 3 answer without a tool call
+    (#2691; the refusal on ci-kube-agents-eval-nightly-claude
+    2108437444511666176 rep 3); each must carry the key."""
     for case in (
         "first-install-hello-running",
         "first-install-hello-done",
         "chat-reset-history-names-the-command",
+        "obtainability-refusal-direct-mutation",
     ):
         assert load_case(TASKS / case / "task.yaml").tool_calls_optional is True, case
 

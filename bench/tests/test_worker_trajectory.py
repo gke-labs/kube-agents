@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -316,6 +317,32 @@ def test_the_read_walks_from_the_front_card_to_the_cluster_agent(data_root: Path
     ]
     assert payload["errors"] == []
     assert payload["truncated"] is False
+
+
+def test_parents_maps_each_fanned_out_card_to_the_card_that_filed_it(data_root: Path) -> None:
+    payload = _payload(_run_script(data_root, [FRONT]))
+    assert worker_trajectory.parents(payload) == {CHILD: FRONT}
+    assert worker_trajectory.parents(None) is None
+    assert worker_trajectory.parents({"cards": []}) == {}
+
+
+def test_parents_ignores_a_predecessor_link_when_the_creator_table_is_there(data_root: Path) -> None:
+    # A card gated on another by task_links was not necessarily filed by it:
+    # the walk still follows the link, the lineage does not.
+    with sqlite3.connect(data_root / "kanban.db") as conn:
+        conn.execute("DELETE FROM kanban_worker_children")
+        conn.execute("INSERT INTO task_links VALUES (?, ?)", (FRONT, CHILD))
+    payload = _payload(_run_script(data_root, [FRONT]))
+    cards = {c["task"]: c for c in payload["cards"]}
+    assert cards[FRONT]["children"] == [CHILD] and cards[FRONT]["fanned_out"] == []
+    assert worker_trajectory.parents(payload) == {}
+
+
+def test_parents_reads_only_the_fanned_out_edges() -> None:
+    assert worker_trajectory.parents({"cards": [{"task": "t_a", "children": ["t_b"], "fanned_out": []}]}) == {}
+    assert worker_trajectory.parents({"cards": [{"task": "t_a", "children": ["t_b"], "fanned_out": ["t_b"]}]}) == {"t_b": "t_a"}
+    # The inject transport's summary lists card ids, not records.
+    assert worker_trajectory.parents({"cards": ["t_a", "t_b"]}) == {}
 
 
 def test_each_call_is_paired_with_its_result_and_tagged(data_root: Path) -> None:
@@ -1137,3 +1164,60 @@ def test_tool_called_keeps_counting_only_the_routers_calls() -> None:
     assert router_only.verify(5.0).raw == {"matching_calls": 0}
     board_read = ToolCalledVerifier(type="tool_called", tool_names=["kanban_list"])
     assert board_read.verify(5.0).status == "pass"
+
+
+# Wraps the in-pod script's stdout so a test can see how the reply was written:
+# the largest single write after the sentinel line and whether the last write
+# was flushed. Reported on stderr, which the reply never uses.
+_WRITE_RECORDER = """
+import atexit as _atexit, sys as _sys
+class _Recorder:
+    def __init__(self, inner):
+        self.inner, self.sizes, self.flushed, self.armed = inner, [], True, False
+    def write(self, s):
+        if self.armed:
+            self.sizes.append(len(s))
+        elif s == "\\n":
+            self.armed = True
+        self.flushed = False
+        return self.inner.write(s)
+    def flush(self):
+        self.flushed = True
+        self.inner.flush()
+_sys.stdout = _Recorder(_sys.stdout)
+_atexit.register(lambda: _sys.stderr.write("LARGEST_WRITE=%d LAST_FLUSHED=%s\\n" % (max(_sys.stdout.sizes or [0]), _sys.stdout.flushed)))
+"""
+
+
+def _run_recorded_script(root: Path, script: str) -> tuple[str, int, bool]:
+    """The script's stdout, its largest post-sentinel write, and whether its last write was flushed."""
+    if not REDACTOR.exists():
+        pytest.skip(f"{REDACTOR} is not beside this checkout")
+    proc = subprocess.run(
+        [sys.executable, "-c", _WRITE_RECORDER + script, str(root), worker_trajectory.CAPTURE_PRESENT, str(REDACTOR), "32", "2000", "2000", "2000", FRONT],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    match = re.search(r"LARGEST_WRITE=(\d+) LAST_FLUSHED=(True|False)", proc.stderr)
+    assert match, proc.stderr
+    return proc.stdout, int(match.group(1)), match.group(2) == "True"
+
+
+def test_the_reply_is_written_in_pieces_and_reassembles(data_root: Path) -> None:
+    # Under GKE Sandbox one write above 64 KiB to the exec stdout is cut, so the
+    # script emits the JSON in flushed pieces no larger than WRITE_CHUNK. A tiny
+    # piece size forces many boundaries: every write after the sentinel must be
+    # at most that size, the last one flushed, and the reassembled reply must
+    # parse to what one write gives. A single write of the reply, or a dropped
+    # flush, fails here.
+    assert "WRITE_CHUNK = 32768\n" in worker_trajectory._IN_POD_SCRIPT
+    whole = _payload(_run_script(data_root, [FRONT]))
+    assert len(json.dumps(whole)) > 7
+    tiny = worker_trajectory._IN_POD_SCRIPT.replace("WRITE_CHUNK = 32768\n", "WRITE_CHUNK = 7\n")
+    pieces, largest, flushed = _run_recorded_script(data_root, tiny)
+    assert pieces.endswith("}\n")
+    assert _payload(pieces) == whole
+    assert largest <= 7
+    assert flushed

@@ -338,9 +338,10 @@ A `manual` verification may omit the command; nothing else may.
 
 ### Checks with no owning stream
 
-Three of the checks the sweep emits have no audit stream behind them yet: `probes-startup`,
-`readonly-root-fs`, and `no-resourcequota`. Set `remediation.kind` to `manual` for those even though
-each is a YAML edit — there is no stream to route a pull request through until they get one.
+Five of the checks the sweep emits have no audit stream behind them yet: `probes-startup`,
+`readonly-root-fs`, `no-resourcequota`, `static-sa-key`, and `added-capabilities`. Set `remediation.kind` to `manual` for
+those even though most are a YAML edit — there is no stream to route a pull request through until
+they get one.
 
 The vocabulary the slugs come from is the Cluster Agents' to choose from; it lives in
 [`cluster_inventory_audit_sop.md`](cluster_inventory_audit_sop.md) Step 5 beside the `findings`

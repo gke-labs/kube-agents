@@ -418,8 +418,9 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 		}
 	}
 	s.mu.Unlock()
-	if verified && !p.click && !chattext.IsCommand(p.text) {
-		// A command neither answers nor titles.
+	if verified && !p.click && !chattext.IsCommand(p.text) && q.ts == "" {
+		// A command neither answers nor titles, and an answer to an open
+		// question is no ask to title the thread after.
 		s.noteAsk(conversation, p.text)
 	}
 	if q.ts == "" {
@@ -448,9 +449,21 @@ func (s *SlackAdapter) answeredLine(channel, ts string) string {
 	return s.uxLocked().lines[channel+"/"+ts]
 }
 
-// slackTypedWords is a typed answer's words for its line: whitespace
-// collapsed, clipped to slackTypedAnswerMax code points.
+// slackTypedWords is a typed answer's words for its line: Slack's entities
+// reduced, whitespace collapsed, clipped to slackTypedAnswerMax code points.
 func slackTypedWords(text string) string {
+	// Slack's entities as the line shows them: a mention dropped (the line
+	// is plain text, and a name needs a lookup), a channel by its name, a
+	// link by its label, or its url when it has none.
+	text = slackTitleMention.ReplaceAllString(text, " ")
+	text = slackTitleChannel.ReplaceAllString(text, "$1")
+	text = slackTitleLink.ReplaceAllStringFunc(text, func(m string) string {
+		sub := slackTitleLink.FindStringSubmatch(m)
+		if sub[2] != "" {
+			return sub[2]
+		}
+		return sub[1]
+	})
 	words := strings.Join(strings.Fields(text), " ")
 	if utf8.RuneCountInString(words) <= slackTypedAnswerMax {
 		return words

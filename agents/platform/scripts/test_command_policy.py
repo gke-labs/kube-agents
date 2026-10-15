@@ -3,6 +3,7 @@ import shlex
 import unittest
 from pathlib import Path
 
+import command_policy
 from command_policy import (
     evaluate,
     GCLOUD_READ_COMMANDS,
@@ -1947,6 +1948,49 @@ class RefusalsSayTheBoundaryIsFinal(unittest.TestCase):
                 decision = evaluate(argv)
                 self.assertFalse(decision.allowed)
                 self.assertNotIn(self.BOUNDARY_PHRASE, decision.message)
+
+class LocalRenderTests(unittest.TestCase):
+    def test_client_renders_and_manifest_reads_are_local(self):
+        for argv in (
+            ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client", "-o", "yaml"],
+            ["kubectl", "patch", "--local", "-f", "m.yaml", "-p", "{}", "-o", "yaml"],
+            ["kubectl", "label", "pod", "x", "--list"],
+            ["kubectl", "apply", "view-last-applied", "deploy/x"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=True"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=1"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=T"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=unchanged"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run="],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=Client"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--help=true"],
+            ["kubectl", "patch", "--local=true", "-f", "m.yaml", "-p", "{}", "-o", "yaml"],
+            ["kubectl", "label", "pod", "x", "--list=1"],
+            ["kubectl", "scale", "--help"],
+            ["kubectl", "-n", "kube-system", "patch", "-h"],
+        ):
+            self.assertTrue(command_policy.local_render(argv), argv)
+        # A release track is not part of the verb the shim prints.
+        self.assertEqual(("container", "clusters", "resize"), command_policy.evaluate(["gcloud", "beta", "container", "clusters", "resize", "c", "--size", "3"]).verb_tuple)
+        self.assertEqual(("compute", "disks", "delete"), command_policy.evaluate(["gcloud", "compute", "disks", "delete", "SECRETDISKNAME"]).verb_tuple)
+        self.assertEqual(("compute", "instance-groups", "managed", "resize"), command_policy.evaluate(["gcloud", "compute", "instance-groups", "managed", "resize", "mig-1", "--size", "3", "--zone", "us-central1-a"]).verb_tuple)
+        self.assertEqual(("iam", "service-accounts", "keys", "create"), command_policy.evaluate(["gcloud", "iam", "service-accounts", "keys", "create", "k.json"]).verb_tuple)
+        # kubectl's false dry-run spellings reach the server.
+        for value in ("false", "0", "F", "none", "server"):
+            self.assertFalse(command_policy.local_render(["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=" + value]), value)
+        # The subcommand word counts as apply's subcommand only, not as a resource name.
+        self.assertFalse(command_policy.local_render(["kubectl", "scale", "deployment", "kube-dns", "view-last-applied", "-n", "kube-system", "--replicas=3"]))
+        self.assertFalse(command_policy.local_render(["kubectl", "delete", "deploy", "kube-dns", "view-last-applied"]))
+
+    def test_server_dry_runs_real_writes_and_passthroughs_are_not(self):
+        for argv in (
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=server"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=none"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3"],
+            ["kubectl", "exec", "pod", "--", "kubectl", "apply", "--dry-run=client", "-f", "x"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=client", "--dry-run=none"],
+        ):
+            self.assertFalse(command_policy.local_render(argv), argv)
 
 
 if __name__ == "__main__":
