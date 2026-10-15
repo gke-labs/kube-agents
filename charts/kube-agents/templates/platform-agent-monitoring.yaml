@@ -349,14 +349,26 @@ spec:
 {{- end }}
 
 {{- if and .Values.platformAgent.enabled .Values.platformAgent.monitoringScraperNamespace }}
-{{- if ne (dig "enabled" true (.Values.platformAgent.networkPolicy | default dict)) false }}
+{{- $operatorNetpolEnabled := true -}}
+{{- if hasKey (.Values.platformAgent.networkPolicy | default dict) "enabled" -}}
+  {{- $operatorNetpolEnabled = .Values.platformAgent.networkPolicy.enabled -}}
+{{- else if not .Release.IsInstall -}}
+  {{- $cr := lookup "kubeagents.x-k8s.io/v1alpha1" "PlatformAgent" .Release.Namespace .Values.platformAgent.name -}}
+  {{- if and $cr $cr.spec $cr.spec.networkPolicy (hasKey $cr.spec.networkPolicy "enabled") -}}
+    {{- $operatorNetpolEnabled = $cr.spec.networkPolicy.enabled -}}
+  {{- end -}}
+{{- end -}}
+{{- if $operatorNetpolEnabled }}
 ---
 {{/*
 NetworkPolicy admitting metrics scrapes from the configured monitoring scraper namespace.
 The operator's own policies admit metrics ports only from gke-gmp-system.
-When operator policies are disabled via platformAgent.networkPolicy.enabled: false, the gateway
-pod has no operator Ingress policy and remains open; rendering an Ingress policy here would
-default-deny inbound traffic and isolate the agent API on 8642/8643.
+When operator policies are disabled (via platformAgent.networkPolicy.enabled: false or on the CR),
+the chart omits this gateway policy: without the operator's Ingress policy, rendering an
+Ingress policy here would isolate the gateway pod and default-deny inbound traffic to the
+agent API (8642/8643). The gateway pod remains open only if no other policy selects it.
+Under a namespace default-deny, the operator must admit the scraper namespace on 9095/9097 in
+their own policy.
 */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
