@@ -14251,7 +14251,8 @@ class TeamsRelayTest(unittest.TestCase):
             )
         )
         handler = credential_proxy._TeamsNoRedirectHandler()
-        with self.assertRaises(ValueError):
+        # Not a ValueError: that branch of the route answers 400 and logs nothing.
+        with self.assertRaises(credential_proxy.TeamsUpstreamError):
             handler.redirect_request(
                 req=None,
                 fp=None,

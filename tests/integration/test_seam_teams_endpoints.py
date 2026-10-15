@@ -169,6 +169,30 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
         )
         self.assertEqual(status, 400)
 
+    def test_refused_redirect_is_a_502_with_its_reason_logged(self):
+        """A 3xx from Microsoft is an upstream fault: the route answers 502 and
+        the broker logs the reason, where a 400 would log nothing."""
+        from credential_proxy import TeamsUpstreamError
+
+        self.relay._token = "cached-bot-token"
+        self.relay._token_expires_at = 9999999999.0
+        with mock.patch.object(
+            TeamsRelay, "_open_url", side_effect=TeamsUpstreamError("Teams API redirect refused (HTTP 302)")
+        ), self.assertLogs("credential-proxy", level="WARNING") as logs:
+            status, body = self._call(
+                "/v1/chat/teams/api",
+                {
+                    "serviceUrl": "https://smba.trafficmanager.net/teams/",
+                    "endpoint": "v3/conversations/123/activities",
+                    "method": "POST",
+                    "payload": {"type": "message", "text": "reply"},
+                },
+                method="POST",
+            )
+        self.assertEqual(status, 502)
+        self.assertIn("redirect refused", body["detail"])
+        self.assertTrue(any("TeamsUpstreamError" in line for line in logs.output), logs.output)
+
 
 if __name__ == "__main__":
     unittest.main()
