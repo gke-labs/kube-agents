@@ -56,7 +56,7 @@ A top-level `toolsets: [kanban]` key additionally exposes the kanban orchestrato
 - `incident_context` — injects Kubernetes incident context into known chat threads on reply.
 - `pr_opened` — records each pull or merge request the Platform Agent's kanban workers open on their card, so a Slack thread gets it as a message of its own when `KAGE_SLACK_UX` is on ([ChatOps](/kube-agents/concepts/chatops/)).
 
-The chat-ingress plugins (`session_store`, `session_otel_bridge`) run on the Planning Agent profile, which owns chat ingress — see [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml).
+The chat-ingress plugins (`session_store`, `session_otel_bridge`, `chat_metrics`) run on the Planning Agent profile, which owns chat ingress — see [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml).
 
 ## Behavioral shape
 

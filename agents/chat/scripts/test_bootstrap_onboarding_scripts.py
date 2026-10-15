@@ -45,6 +45,9 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 # The gate imports cluster_agent_profile, which the image copies beside it from here.
 sys.path.insert(1, str(Path(__file__).resolve().parents[2] / "platform" / "scripts"))
+# Where each fleet audit's check roster lives (audit_report.AUDITS).
+FLEET_AUDIT_SCRIPTS = Path(__file__).resolve().parents[2] / "platform" / "skills" / "fleet-audit" / "scripts"
+CLUSTER_INVENTORY_SOP = Path(__file__).resolve().parents[2] / "platform" / "governance" / "cluster_inventory_audit_sop.md"
 
 import bootstrap_delivery  # noqa: E402
 import bootstrap_handoff  # noqa: E402
@@ -52,6 +55,7 @@ import bootstrap_scan_gate  # noqa: E402
 import cluster_agent_profile  # noqa: E402
 import findings_queue  # noqa: E402
 import inventory_findings  # noqa: E402
+import oobe  # noqa: E402
 import profile_scaffold  # noqa: E402
 import sandbox_exec  # noqa: E402
 from cluster_agent_reconcile import SCAFFOLD_ARTIFACTS  # noqa: E402
@@ -89,6 +93,24 @@ EXTRACTED = {
     ]
 }
 SCORED = {"scores": {"f001": SCORE, "f002": SCORE, "f003": SCORE}, "complete_clusters": ["acme/prod"]}
+
+
+# The repository list is read through kubectl in the pod; every test here sees one repository
+# unless it patches the list itself.
+REPOSITORIES = mock.patch.object(oobe, "managed_repositories", return_value=["acme/gitops"])
+
+
+def setUpModule():
+    REPOSITORIES.start()
+
+
+def tearDownModule():
+    REPOSITORIES.stop()
+
+
+def delivered(report: str) -> str:
+    """What delivery prints for a report with no oobe marker beside it: the report, then the audits note."""
+    return report.rstrip("\n") + "\n\n" + bootstrap_delivery.AUDITS_RUNNING_NOTE + "\n"
 
 
 class DeliveryDecisionTest(unittest.TestCase):
@@ -143,8 +165,8 @@ class DeliveryMainTest(unittest.TestCase):
 
         rc, out = self._run()
         self.assertEqual(rc, 0)
-        # Delivered verbatim — byte-for-byte, no reformatting.
-        self.assertEqual(out, report)
+        # The report byte-for-byte, no reformatting, then the audits note.
+        self.assertEqual(out, delivered(report))
         # Concluded: completion marked, report moved out of the scan gate's way.
         self.assertTrue((self.d / COMPLETED).exists())
         self.assertFalse((self.d / INVENTORY).exists())
@@ -209,7 +231,7 @@ class DeliveryMainTest(unittest.TestCase):
         (self.d / ALIGNED).touch()
         rc, out = self._run()
         self.assertEqual(rc, 0)
-        self.assertEqual(out, report)
+        self.assertEqual(out, delivered(report))
 
 
 class DeliveryMarksShownTest(unittest.TestCase):
@@ -255,7 +277,7 @@ class DeliveryMarksShownTest(unittest.TestCase):
     def test_every_row_is_marked_with_one_run_before_the_report_goes_out(self):
         self._shown()
         rc, out, _ = self._run()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         self.assertEqual(
             [finding_id for finding_id, _, _ in self.posts],
             ["sa-key.acme.prod.app.sa1", "sa-key.acme.prod.app.sa2", "crashloop.acme.prod.app.api"],
@@ -276,7 +298,7 @@ class DeliveryMarksShownTest(unittest.TestCase):
         ) as post:
             rc, out, err = self._run()
         self.post.start()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         post.assert_called_once()
         self.assertIn("did not answer", err)
         self.assertTrue((self.d / COMPLETED).exists())
@@ -289,7 +311,7 @@ class DeliveryMarksShownTest(unittest.TestCase):
         with mock.patch.object(bootstrap_delivery, "_post_surfaced", side_effect=[refused, None, None]) as post:
             rc, out, err = self._run()
         self.post.start()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         self.assertEqual(post.call_count, 3)
         self.assertIn("could not mark sa-key.acme.prod.app.sa1 shown: 404", err)
 
@@ -301,13 +323,13 @@ class DeliveryMarksShownTest(unittest.TestCase):
         with mock.patch.object(bootstrap_delivery, "_post_surfaced", side_effect=[refused, None, None]) as post:
             rc, out, err = self._run()
         self.post.start()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         self.assertEqual(post.call_count, 3)
         self.assertIn("could not mark sa-key.acme.prod.app.sa1 shown: 503", err)
 
     def test_no_shown_file_marks_nothing_and_delivers(self):
         rc, out, err = self._run()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         self.assertEqual(self.posts, [])
         self.assertIn("no INVENTORY.shown.json", err)
         self.assertFalse((self.d / SHOWN_DELIVERED).exists())
@@ -320,7 +342,7 @@ class DeliveryMarksShownTest(unittest.TestCase):
                 self.out = io.StringIO()
                 self._shown(record)
                 rc, out, err = self._run()
-                self.assertEqual((rc, out), (0, "# Report\n"))
+                self.assertEqual((rc, out), (0, delivered("# Report\n")))
                 self.assertEqual(self.posts, [])
                 self.assertIn("is not readable", err)
 
@@ -328,7 +350,7 @@ class DeliveryMarksShownTest(unittest.TestCase):
         self._shown()
         with mock.patch.object(bootstrap_delivery, "_read_shown", side_effect=RuntimeError("boom")):
             rc, out, err = self._run()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         self.assertIn("marking nothing: boom", err)
         # Set aside all the same, so a later report is not marked with these ids.
         self.assertFalse((self.d / SHOWN).exists())
@@ -337,7 +359,7 @@ class DeliveryMarksShownTest(unittest.TestCase):
     def test_a_report_listing_no_item_marks_nothing(self):
         self._shown({"items": []})
         rc, out, _ = self._run()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         self.assertEqual(self.posts, [])
         self.assertTrue((self.d / SHOWN_DELIVERED).exists())
 
@@ -374,7 +396,7 @@ class DeliveryMarksShownTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"SESSION_KV_ENDPOINT": endpoint, "SESSION_KV_API_KEY": "k"}):
             rc, out, _ = self._run()
         self.post.start()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         [(path, auth, body)] = received
         self.assertEqual((path, auth), ("/v1/findings/a%2Fb/surfaced", "Bearer k"))
         self.assertEqual((body["publisher"], body["added_class"]), ("first_report", "critical"))
@@ -425,7 +447,7 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
     def test_every_cluster_is_registered_before_the_claim_with_its_scope(self):
         self._write()
         rc, out, _ = self._run()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         self.assertEqual(
             self.sent,
             [
@@ -441,9 +463,17 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
             f"sweep=t_sweep\ntask_id={bootstrap_handoff.NO_RANKING}\nfiled_at=1\n", encoding="utf-8"
         )
         rc, out, err = self._run()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         self.assertEqual(self.sent, [])
         self.assertIn("filed no prioritization card", err)
+
+    def test_an_unreadable_hand_off_marker_registers_nothing(self):
+        self._write()
+        (self.d / bootstrap_handoff.HANDOFF_MARKER).write_bytes(b"sweep=t_sweep\ntask_id=\xff\xfe\n")
+        rc, out, err = self._run()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        self.assertEqual(self.sent, [])
+        self.assertIn("could not be read; registering nothing", err)
 
     def test_a_hand_off_that_filed_a_ranking_card_registers_its_batch(self):
         self._write()
@@ -451,7 +481,7 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
             "sweep=t_sweep\ntask_id=t_rank\nfiled_at=1\n", encoding="utf-8"
         )
         rc, out, _ = self._run()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         self.assertEqual([objects for objects, _, _ in self.sent], [["api"], ["api", "web"]])
 
     def test_a_row_the_queue_reports_suppressed_is_not_marked_shown(self):
@@ -467,7 +497,7 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
         ), mock.patch.object(bootstrap_delivery, "_post_surfaced") as mark:
             rc, out, err = self._run()
         self.post.start()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         self.assertEqual(
             [call.args[1] for call in mark.call_args_list],
             ["sa-key.acme.prod.app.sa2", "crashloop.acme.prod.app.api"],
@@ -477,7 +507,7 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
     def test_a_clean_fleet_registers_nothing_and_needs_no_scores(self):
         self._write(items={"items": []}, scores=None)
         rc, out, err = self._run()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         self.assertEqual(self.sent, [])
         self.assertNotIn("registering nothing", err)
 
@@ -495,7 +525,7 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
                 (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
                 self._write(items, scores)
                 rc, out, err = self._run()
-                self.assertEqual((rc, out), (0, "# Report\n"))
+                self.assertEqual((rc, out), (0, delivered("# Report\n")))
                 self.assertEqual(self.sent, [])
                 self.assertIn(expected, err)
 
@@ -507,7 +537,7 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
         ) as post:
             rc, out, err = self._run()
         self.post.start()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         post.assert_called_once()
         self.assertIn("did not answer", err)
 
@@ -518,7 +548,7 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
         with mock.patch.object(inventory_findings, "post_batch", side_effect=[refused, {"results": []}]) as post:
             rc, out, err = self._run()
         self.post.start()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         self.assertEqual(post.call_count, 2)
         self.assertIn("refused acme/dev's findings: 400", err)
 
@@ -573,7 +603,7 @@ class RetireRunTest(unittest.TestCase):
         (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
         (self.d / ALIGNED).touch()
         rc, out, _ = self._run()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         self.assertTrue((self.d / COMPLETED).exists())
         self.assertEqual(self.removed, [])
 
@@ -666,7 +696,7 @@ class DeliveryFromSandboxTest(unittest.TestCase):
         (self.d / INVENTORY).write_text("# Stale local copy\n", encoding="utf-8")
         rc, out, _ = self._run()
         self.assertEqual(rc, 0)
-        self.assertEqual(out, "# Sandbox report\n")
+        self.assertEqual(out, delivered("# Sandbox report\n"))
         self.assertTrue((self.d / COMPLETED).exists())
         report_read, items_read, shown_read = self.read.call_args_list
         self.assertEqual(report_read.args, (self.SANDBOX_REPORT,))
@@ -690,7 +720,7 @@ class DeliveryFromSandboxTest(unittest.TestCase):
         self.shown = json.dumps(SHOWN_RECORD).encode("utf-8")
         with mock.patch.object(bootstrap_delivery, "_post_surfaced") as post:
             rc, out, _ = self._run()
-        self.assertEqual((rc, out), (0, "# Sandbox report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Sandbox report\n")))
         self.assertEqual(post.call_count, 3)
         self.assertEqual(
             [c.args[0] for c in self.run_.call_args_list],
@@ -710,7 +740,7 @@ class DeliveryFromSandboxTest(unittest.TestCase):
         }
         with mock.patch.object(inventory_findings, "post_batch") as post:
             rc, out, _ = self._run()
-        self.assertEqual((rc, out), (0, "# Sandbox report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Sandbox report\n")))
         self.assertEqual(post.call_count, 2)
         reads = [c.args[0] for c in self.read.call_args_list]
         self.assertEqual(reads[1:3], [self.SANDBOX_ITEMS, self.SANDBOX_SCORES])
@@ -726,7 +756,7 @@ class DeliveryFromSandboxTest(unittest.TestCase):
 
         self.read.side_effect = read
         rc, out, err = self._run()
-        self.assertEqual((rc, out), (0, "# Sandbox report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Sandbox report\n")))
         self.assertIn("could not read INVENTORY.shown.json", err)
 
     def test_no_human_means_no_sandbox_read(self):
@@ -818,7 +848,7 @@ class DeliveryFromSandboxTest(unittest.TestCase):
         self.read.return_value = b"caf\xe9 report\n"
         rc, out, _ = self._run()
         self.assertEqual(rc, 0)
-        self.assertEqual(out, "caf\ufffd report\n")
+        self.assertEqual(out, delivered("caf\ufffd report\n"))
 
     def test_a_failed_rename_still_counts_as_delivered(self):
         for outcome in (
@@ -830,7 +860,7 @@ class DeliveryFromSandboxTest(unittest.TestCase):
                 self.run_.reset_mock(return_value=True, side_effect=True)
                 self.run_.configure_mock(**outcome)
                 rc, out, err = self._run()
-                self.assertEqual((rc, out), (0, "# Sandbox report\n"))
+                self.assertEqual((rc, out), (0, delivered("# Sandbox report\n")))
                 self.assertTrue((self.d / COMPLETED).exists())
                 self.assertIn("could not archive INVENTORY.md in the sandbox", err)
 
@@ -858,7 +888,7 @@ class ScanGateTest(unittest.TestCase):
 
         def _fake_file(data_dir):
             self.filed.append(1)
-            bootstrap_scan_gate._mark_filed(data_dir, "t_test")
+            bootstrap_scan_gate._mark_filed(data_dir, "t_test", False)
             return "t_test"
 
         bootstrap_scan_gate.file_scan_task = _fake_file
@@ -1582,6 +1612,250 @@ class ScopeGapParagraphTest(unittest.TestCase):
         self.assertIn("`locked` (denied)", body)
         # It sits between the roster caveat and Step 2, which lists the roster.
         self.assertLess(body.index("`locked` (denied)"), body.index("**Step 2"))
+
+
+class FirstRunAuditsTest(unittest.TestCase):
+    """The scan leaves the first-run audits' checks to them, and the delivery says so."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+
+    @staticmethod
+    def _slug_table() -> set[str]:
+        """The backticked slugs in the `check slug` column of the cluster inventory SOP's Step 5 table."""
+        text = CLUSTER_INVENTORY_SOP.read_text(encoding="utf-8")
+        rows = [line for line in text[text.index("## Step 5"):].splitlines() if line.startswith("|")]
+        header = next(i for i, line in enumerate(rows) if "check slug" in line)
+        slugs = set()
+        for line in rows[header + 2:]:
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) != 2:
+                break
+            slugs.update(re.findall(r"`([a-z0-9-]+)`", cells[1]))
+        return slugs
+
+    def _note(self, state=None, recorded=None, no_coverage=False) -> str:
+        """The note for oobe's ``state`` and the gate's ``recorded`` no_repository value (None: no field)."""
+        if state is not None:
+            oobe.write_state(self.d, state)
+        marker = "task_id=t_sweep\nfiled_at=1\n"
+        if recorded is not None:
+            marker += bootstrap_handoff.no_repository_line(recorded)
+        (self.d / SCAN_FILED).write_text(marker, encoding="utf-8")
+        # The note goes by what the gate recorded, never by the list as it reads now.
+        with mock.patch.object(oobe, "managed_repositories", side_effect=AssertionError("read the list")):
+            return bootstrap_delivery._audits_note(self.d, no_coverage)
+
+    def _skipped(self, reason: str) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            oobe.skip(self.d, reason, 1000.0)
+
+    def test_the_slug_table_names_no_check_a_first_run_audit_owns(self):
+        sys.path.insert(0, str(FLEET_AUDIT_SCRIPTS))
+        try:
+            import audit_report
+        finally:
+            sys.path.remove(str(FLEET_AUDIT_SCRIPTS))
+        owned = {check for audit in oobe.FIRST_RUN_AUDITS for check in audit_report.AUDITS[audit].checks}
+        slugs = self._slug_table()
+        self.assertIn("probes-startup", slugs)  # the parse found the table
+        self.assertIn("static-sa-key", slugs)  # Step 4's per-pod check; the cluster setting is the audit's
+        self.assertIn("added-capabilities", slugs)  # privileged-container covers only an added SYS_ADMIN
+        self.assertEqual(sorted(slugs & owned), [])
+        # Step 5's checks run on every install, so none of them marks the no-repository section as run.
+        self.assertEqual(sorted(slugs & bootstrap_handoff.NO_REPOSITORY_CHECKS), [])
+
+    def test_the_sop_has_the_section_the_card_bodies_name(self):
+        heading = "## Without a GitOps repository\n"
+        self.assertIn(heading, CLUSTER_INVENTORY_SOP.read_text(encoding="utf-8"))
+        for body in (bootstrap_handoff.NO_REPOSITORY_RUN, bootstrap_handoff.NO_REPOSITORY_UNREAD_RUN,
+                     bootstrap_handoff.NO_REPOSITORY_SKIP):
+            self.assertIn(f'"{heading[3:].strip()}"', body)
+
+    def test_the_sweep_card_runs_the_no_repository_section_only_without_a_repository(self):
+        for repositories, expected in (([], bootstrap_handoff.NO_REPOSITORY_RUN),
+                                       (["acme/gitops"], bootstrap_handoff.NO_REPOSITORY_SKIP)):
+            with self.subTest(repositories=repositories), \
+                    mock.patch.object(oobe, "managed_repositories", return_value=repositories), \
+                    mock.patch.object(bootstrap_scan_gate, "cluster_agents", return_value=[]):
+                body = bootstrap_scan_gate._task_body()
+            self.assertIn(expected, body)
+            other = ({bootstrap_handoff.NO_REPOSITORY_RUN, bootstrap_handoff.NO_REPOSITORY_SKIP} - {expected}).pop()
+            self.assertNotIn(other, body)
+            self.assertLess(body.index("**Step 3"), body.index(expected))
+            self.assertLess(body.index(expected), body.index("**Step 4"))
+
+    def test_an_unreadable_repository_list_runs_the_no_repository_section_and_says_why(self):
+        # The stage retries the read rather than starting the audits, so the scan cannot count on them,
+        # but nothing found that the install has no repository either.
+        with mock.patch.object(oobe, "managed_repositories", side_effect=RuntimeError("no kubectl")), \
+                mock.patch.object(bootstrap_scan_gate, "cluster_agents", return_value=[]), \
+                contextlib.redirect_stderr(io.StringIO()):
+            body = bootstrap_scan_gate._task_body()
+        self.assertIn(bootstrap_handoff.NO_REPOSITORY_UNREAD_RUN, body)
+        self.assertNotIn(bootstrap_handoff.NO_REPOSITORY_RUN, body)
+        self.assertNotIn("was found", bootstrap_handoff.NO_REPOSITORY_UNREAD_RUN)
+
+    def test_the_sweep_card_records_what_it_was_told_for_the_hand_off(self):
+        for read_list, expected, recorded in (
+            (mock.Mock(return_value=[]), bootstrap_handoff.NO_REPOSITORY_RUN, bootstrap_handoff.RECORDED_YES),
+            (mock.Mock(return_value=["acme/gitops"]), bootstrap_handoff.NO_REPOSITORY_SKIP, bootstrap_handoff.RECORDED_NO),
+            (mock.Mock(side_effect=RuntimeError("no kubectl")), bootstrap_handoff.NO_REPOSITORY_UNREAD_RUN,
+             bootstrap_handoff.RECORDED_UNKNOWN),
+        ):
+            with self.subTest(recorded=recorded):
+                filed = []
+                kanban = types.ModuleType("hermes_cli.kanban")
+                kanban.run_slash = lambda cmd: filed.append(cmd) or '{"id": "t_sweep"}'
+                modules = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.kanban": kanban}
+                with mock.patch.dict(sys.modules, modules), \
+                        mock.patch.object(oobe, "managed_repositories", read_list), \
+                        mock.patch.object(bootstrap_scan_gate, "cluster_agents", return_value=[]), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(bootstrap_scan_gate.file_scan_task(self.d), "t_sweep")
+                self.assertEqual(read_list.call_count, 1)
+                args = shlex.split(filed[0])
+                self.assertIn(expected, args[args.index("--body") + 1])
+                self.assertEqual(bootstrap_handoff.recorded_no_repository(self.d / SCAN_FILED), recorded)
+
+    def test_no_marker_says_the_audits_will_run_unless_the_gate_recorded_no_repository(self):
+        # The stage writes its marker on its first tick after the ranking card, which delivery can beat.
+        for recorded in (None, bootstrap_handoff.RECORDED_NO, bootstrap_handoff.RECORDED_UNKNOWN):
+            with self.subTest(recorded=recorded):
+                self.assertEqual(self._note(recorded=recorded), bootstrap_delivery.AUDITS_RUNNING_NOTE)
+
+    def test_no_marker_and_a_recorded_no_repository_says_the_audits_will_not_run_and_the_report_covers_them(self):
+        self.assertEqual(
+            self._note(recorded=bootstrap_handoff.RECORDED_YES),
+            f"The first-run audits did not run: {oobe.SKIP_NO_REPOSITORY}. {bootstrap_delivery.AUDITS_COVERED_NOTE}",
+        )
+
+    def test_a_skip_says_whether_the_report_covers_the_checks_by_what_the_gate_recorded(self):
+        # Recorded no with a skip for no repository: the list emptied between the sweep being filed
+        # and the stage reading it, so neither the scan nor the audits checked them.
+        for recorded, coverage in (
+            (bootstrap_handoff.RECORDED_YES, bootstrap_delivery.AUDITS_COVERED_NOTE),
+            (bootstrap_handoff.RECORDED_NO, bootstrap_delivery.AUDITS_NOT_COVERED_NOTE),
+            (bootstrap_handoff.RECORDED_UNKNOWN, bootstrap_delivery.AUDITS_COVERED_NOTE),
+            (None, bootstrap_delivery.AUDITS_MAYBE_COVERED_NOTE),
+        ):
+            for reason in (oobe.SKIP_NO_REPOSITORY, oobe.SKIP_NOT_NEW, oobe.SKIP_UNSETTLED, oobe.SKIP_NO_SWEEP):
+                with self.subTest(recorded=recorded, reason=reason):
+                    self._skipped(reason)
+                    self.assertEqual(
+                        self._note(recorded=recorded), f"The first-run audits did not run: {reason}. {coverage}"
+                    )
+
+    def test_the_not_covered_note_does_not_say_the_report_covers_them(self):
+        self.assertNotIn("covers", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE)
+        self.assertIn("does not cover", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE)
+
+    def test_a_no_coverage_report_without_a_repository_says_nothing_checked_them(self):
+        # The hand-off's own report when no cluster's audit reached the raw file covers none of them.
+        unchecked = (
+            f"The first-run audits did not run: {oobe.SKIP_NO_REPOSITORY}. {bootstrap_delivery.AUDITS_UNCHECKED_NOTE}"
+        )
+        self.assertEqual(self._note(recorded=bootstrap_handoff.RECORDED_YES, no_coverage=True), unchecked)
+        self._skipped(oobe.SKIP_NO_REPOSITORY)
+        for recorded in (None, *bootstrap_handoff.RECORDED_VALUES):
+            with self.subTest(recorded=recorded):
+                self.assertEqual(self._note(recorded=recorded, no_coverage=True), unchecked)
+        self.assertNotIn("covers", unchecked)
+
+    def test_a_no_coverage_report_after_another_skip_points_at_the_schedules(self):
+        self._skipped(oobe.SKIP_NOT_NEW)
+        self.assertEqual(
+            self._note(no_coverage=True),
+            f"The first-run audits did not run: {oobe.SKIP_NOT_NEW}. {bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE}",
+        )
+
+    def test_the_delivery_reads_no_coverage_off_the_hand_off_marker(self):
+        (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        (self.d / bootstrap_handoff.HANDOFF_MARKER).write_text(
+            f"sweep=t_sweep\ntask_id={bootstrap_handoff.NO_RANKING}\nfiled_at=1\n", encoding="utf-8"
+        )
+        (self.d / SCAN_FILED).write_text(
+            "task_id=t_sweep\nfiled_at=1\n" + bootstrap_handoff.no_repository_line(bootstrap_handoff.RECORDED_YES),
+            encoding="utf-8",
+        )
+        out = io.StringIO()
+        with (
+            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.assertEqual(
+            out.getvalue(),
+            f"# Report\n\nThe first-run audits did not run: {oobe.SKIP_NO_REPOSITORY}. "
+            f"{bootstrap_delivery.AUDITS_UNCHECKED_NOTE}\n",
+        )
+
+    def test_a_chain_under_way_says_the_audits_are_running(self):
+        note = self._note({oobe.STATE_FIRED: ["fleet-wide-cost-analysis"], oobe.STATE_DONE: False})
+        self.assertEqual(note, bootstrap_delivery.AUDITS_RUNNING_NOTE)
+
+    def test_a_finished_chain_says_which_audits_ran(self):
+        note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
+        self.assertIn("which have started: `fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, "
+                      "`stockout-prevention`.", note)
+        self.assertIn("Each posts", note)
+        self.assertNotIn("Not run", note)
+
+    def test_held_and_given_up_audits_are_named_as_not_run(self):
+        note = self._note({
+            oobe.STATE_FIRED: ["fleet-wide-cost-analysis", "stockout-prevention"],
+            oobe.STATE_HELD: {"compliance-audit": oobe.HOLD_DISABLED},
+            oobe.STATE_GAVE_UP: ["obtainability-audit"],
+            oobe.STATE_DONE: True,
+        })
+        self.assertIn("which have started: `fleet-wide-cost-analysis`, `stockout-prevention`.", note)
+        self.assertTrue(note.endswith(
+            f"Not run: `compliance-audit` (disabled), `obtainability-audit` ({bootstrap_delivery.AUDITS_GAVE_UP_REASON})."
+        ))
+
+    def test_a_chain_where_every_audit_was_held_or_given_up_says_none_ran(self):
+        for state in (
+            {oobe.STATE_HELD: {a: oobe.HOLD_PAUSED for a in oobe.FIRST_RUN_AUDITS}, oobe.STATE_DONE: True},
+            {oobe.STATE_GAVE_UP: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True},
+        ):
+            with self.subTest(state=state):
+                note = self._note(state)
+                self.assertTrue(note.startswith(bootstrap_delivery.AUDITS_NONE_RAN_NOTE))
+                self.assertIn("Not run: `fleet-wide-cost-analysis` (", note)
+                self.assertNotIn("now running", note)
+                self.assertNotIn("which have started", note)
+
+    def test_a_chain_under_way_names_a_held_audit_as_not_run(self):
+        note = self._note({oobe.STATE_FIRED: ["fleet-wide-cost-analysis"],
+                           oobe.STATE_HELD: {"compliance-audit": oobe.HOLD_MISSING}, oobe.STATE_DONE: False})
+        self.assertEqual(
+            note, f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} Not run: `compliance-audit` ({oobe.HOLD_MISSING})."
+        )
+
+    def test_the_text_delivery_closes_with_the_skip(self):
+        (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        (self.d / SCAN_FILED).write_text(
+            "task_id=t_sweep\nfiled_at=1\n" + bootstrap_handoff.no_repository_line(bootstrap_handoff.RECORDED_YES),
+            encoding="utf-8",
+        )
+        self._skipped(oobe.SKIP_NO_REPOSITORY)
+        out = io.StringIO()
+        with (
+            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.assertEqual(
+            out.getvalue(),
+            f"# Report\n\nThe first-run audits did not run: {oobe.SKIP_NO_REPOSITORY}. "
+            f"{bootstrap_delivery.AUDITS_COVERED_NOTE}\n",
+        )
 
 
 if __name__ == "__main__":

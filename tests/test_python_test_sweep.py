@@ -20,6 +20,11 @@ interpreters, and paying that six times would add half a minute to the suite
 this sweep exists to shorten. One case does go through the real target, since
 what the macro leaves in `$failed` matters only if the caller turns it into a
 non-zero exit.
+
+RunOrderTest at the end is about a different property of the same macro: the
+order it hands files to the workers. The long files go first, from a list the
+Makefile keeps by hand, and the cases there hold that list to files the globs
+still reach and the feed to a permutation of PYTHON_TEST_FILES.
 """
 
 import contextlib
@@ -150,11 +155,30 @@ sweep-probe:
 \t@$(call sweep_python_test_files,python3 -m unittest discover); echo "{FAILED_MARKER}[$$failed]"
 """
 
+#: Markers for the run-order cases, in the same shape as the two above.
+ORDER_MARKER = "SWEEP-ORDER:"
+HEAVY_MARKER = "SWEEP-HEAVY:"
+
 #: Prints both lists as make expands them, for the derivation case.
 LISTS_MAKEFILE = f"""\
 include Makefile
 sweep-lists:
 \t@echo "{FILES_MARKER}$(PYTHON_TEST_FILES)"; echo "{DIRS_MARKER}$(PYTHON_TEST_DIRS)"
+"""
+
+#: Prints the run order beside the two lists it is built from.
+ORDER_MAKEFILE = f"""\
+include Makefile
+sweep-order:
+\t@echo "{FILES_MARKER}$(PYTHON_TEST_FILES)"; echo "{HEAVY_MARKER}$(PYTHON_TEST_HEAVY_FILES)"; echo "{ORDER_MARKER}$(PYTHON_TEST_RUN_ORDER)"
+"""
+
+#: The verdict probe with the sweep's own output kept, for the case that reads
+#: the order the workers finished in off the per-file `ok` lines.
+ORDER_PROBE_MAKEFILE = f"""\
+include Makefile
+sweep-probe:
+\t@$(call sweep_python_test_files,true); echo "{FAILED_MARKER}[$$failed]"
 """
 
 
@@ -220,6 +244,81 @@ def _block(stdout, path):
     after = stdout.split(f"==> {path}\n", 1)[1]
     block = after.split("\n==> ", 1)[0]
     return block.split(f"\n{FAILED_MARKER}", 1)[0]
+
+
+def _marked(stdout, marker):
+    """The words on the last line that starts with `marker`; [] if none did."""
+    lines = [ln for ln in stdout.splitlines() if ln.startswith(marker)]
+    return lines[-1][len(marker) :].split() if lines else []
+
+
+def _order_lists(args=()):
+    """(PYTHON_TEST_FILES, PYTHON_TEST_HEAVY_FILES, PYTHON_TEST_RUN_ORDER) as make expands them."""
+    done = _with_wrapper(ORDER_MAKEFILE, "sweep-order", list(args))
+    return (
+        _marked(done.stdout, FILES_MARKER),
+        _marked(done.stdout, HEAVY_MARKER),
+        _marked(done.stdout, ORDER_MARKER),
+    )
+
+
+class RunOrderTest(unittest.TestCase):
+    """The workers take the long files first, and the list of them stays true.
+
+    xargs hands files out in feed order, so a 180 s file that sorts late by
+    path ran alone at the end while the other workers idled. The Makefile
+    names the heavy files and feeds them first. What can go wrong from here is
+    quiet: a heavy file that moves or is deleted leaves a name in the list that
+    matches nothing, and the sweep is back to path order for that file with
+    no message; or a change to the feed sends the workers a different list
+    than the one the output loop prints, and a file runs twice or not at all.
+    """
+
+    def test_every_heavy_file_is_a_file_the_sweep_reaches(self):
+        files, heavy, _ = _order_lists()
+        self.assertTrue(heavy, "PYTHON_TEST_HEAVY_FILES expanded to nothing")
+        strays = [path for path in heavy if path not in files]
+        self.assertEqual(
+            strays,
+            [],
+            "PYTHON_TEST_HEAVY_FILES names files no PYTHON_TEST_FILES glob reaches; "
+            "the test moved or was deleted, so fix the path or drop the entry:\n  " + "\n  ".join(strays),
+        )
+
+    def test_the_run_order_is_the_sweep_with_the_heavy_files_first(self):
+        files, heavy, order = _order_lists()
+        self.assertEqual(order[: len(heavy)], heavy, "the run order does not start with the heavy files")
+        self.assertEqual(sorted(order), sorted(files), "the run order is not a permutation of PYTHON_TEST_FILES")
+        self.assertEqual(len(order), len(set(order)), "a file appears twice in the run order")
+
+    def test_a_narrowed_run_order_holds_only_the_files_named(self):
+        # A run narrowed on the command line must not grow back to the whole
+        # heavy list: the filter has to go both ways.
+        _, heavy, _ = _order_lists()
+        with fixture_files() as (green, _red):
+            _, _, order = _order_lists([f"PYTHON_TEST_FILES={green} {heavy[0]}"])
+        self.assertEqual(order, [heavy[0], green])
+
+    def test_a_percent_in_the_override_is_a_word_to_run_not_a_pattern_to_match(self):
+        # make reads `%` in a $(filter) pattern as a wildcard. The caller's
+        # list must only ever be the text, or a typed `tests/%` would pull
+        # every heavy file under tests/ into the feed while the output loop,
+        # which walks PYTHON_TEST_FILES, printed none of their blocks.
+        _, _, order = _order_lists(["PYTHON_TEST_FILES=tests/%"])
+        self.assertEqual(order, ["tests/%"])
+
+    def test_the_workers_take_files_in_run_order_and_the_blocks_stay_in_list_order(self):
+        # One worker, so the `ok` lines come out in feed order. The listed
+        # order puts the fixture first; the feed puts the heavy file first;
+        # the printed blocks follow the list, not the feed.
+        _, heavy, _ = _order_lists()
+        with fixture_files() as (green, _red):
+            done, failed = sweep([green, heavy[0]], jobs=1, makefile=ORDER_PROBE_MAKEFILE)
+            finished = [ln.split()[-1] for ln in done.stdout.splitlines() if ln.strip().startswith("ok ")]
+            headers = [ln[len("==> ") :] for ln in done.stdout.splitlines() if ln.startswith("==> ")]
+        self.assertEqual(failed, "")
+        self.assertEqual(finished, [heavy[0], green])
+        self.assertEqual(headers, [green, heavy[0]])
 
 
 class SweepVerdictTest(unittest.TestCase):

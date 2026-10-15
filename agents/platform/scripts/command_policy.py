@@ -97,6 +97,22 @@ _FLAG_BOUNDARY_NOTICE = (
 # Only these two reach a cluster or a cloud project. Everything else the proxy
 # executes is governed elsewhere.
 _GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
+# kubectl spellings that render or read a manifest without touching the cluster.
+# The policy refuses them like any unlisted verb (the dry-run carve-out was never
+# made, see above); ``local_render`` tells the refusal's readers that nothing was
+# attempted against the cluster, so the agent's runtime does not count it as a
+# refused change. ``--dry-run=server`` and ``--dry-run=none`` are not renders;
+# a help flag is (the verb's usage text, nothing attempted).
+_LOCAL_RENDER_FLAGS = frozenset({"--local", "--list"})
+# kubectl's ``--dry-run`` strategy reaches the server for ``none``, ``server`` and
+# the ParseBool false spellings (``0``, ``f``, ``false``, case-folded); ``client``,
+# the bare flag's ``unchanged``, the true spellings, an empty or unknown value all
+# end on the client (a render, or an error before any request).
+_DRY_RUN_WRITE_VALUES = frozenset({"none", "server", "false", "f", "0"})
+_HELP_FLAGS = frozenset({"-h", "--help"})
+# pflag's true spellings for a boolean flag given a value (``--local=true``), and the bare flag.
+_BOOLEAN_TRUE_SPELLINGS = frozenset({"", "true", "t", "1"})
+_LOCAL_RENDER_SUBCOMMAND = "view-last-applied"
 
 # Verb sequences that only read. Tuples rather than bare strings so a verb whose
 # effect depends on its subcommand can say which subcommand it meant: `rollout
@@ -691,7 +707,7 @@ _NO_HELP_ESCAPE_SURFACES = frozenset({"auth", "components", "config", "init"})
 
 #: The two spellings gcloud accepts for a documentation read; the same pair is in
 #: _GCLOUD_BOOLEAN_FLAGS so the words walker steps over them.
-_GCLOUD_HELP_FLAGS = frozenset({"--help", "-h"})
+_GCLOUD_HELP_FLAGS = _HELP_FLAGS  # the same two words, read by the gcloud surface walk
 
 #: gcloud's release-track words, which precede the surface rather than being one.
 #:
@@ -705,6 +721,18 @@ _GCLOUD_HELP_FLAGS = frozenset({"--help", "-h"})
 #: not cover, so the prefix defeated the exclusion precisely where it was the
 #: only gate.
 _GCLOUD_RELEASE_TRACKS = frozenset({"alpha", "beta"})
+# How many words of a gcloud argv, past a release track, the refusal's verb tuple
+# keeps: three, so a three-word surface's positional (a disk or cluster name)
+# never reaches the log hint or the shim's verb line (a shorter surface's
+# first positional does). The write surfaces whose verb is the fourth word keep
+# it when that word is one of these, which no positional is named.
+_GCLOUD_VERB_WORDS = 3
+_GCLOUD_FOURTH_WORD_VERBS = frozenset(
+    {"create", "delete", "update", "patch", "resize", "set-autoscaling", "rolling-action",
+     "set-iam-policy", "add-iam-policy-binding", "remove-iam-policy-binding"}
+)
+# The one rule whose refusal carries a render flag (``local_render``).
+KUBERNETES_READ_ONLY_RULE = "kubernetes.read-only"
 
 
 def _gcloud_has_flags_file(argv: list[str]) -> str | None:
@@ -761,6 +789,14 @@ def _asset_search_type(argv: list[str]) -> str | None:
         elif token == _ASSET_SEARCH_TYPE_FLAG and i + 1 < len(argv):
             values.append(argv[i + 1])
     return values[0] if len(values) == 1 else None
+
+
+def _gcloud_verb_tuple(words: list[str]) -> tuple[str, ...]:
+    """The surface words a refusal names: three past a release track, a fourth when it is a
+    write verb that sits that deep (``compute instance-groups managed resize``)."""
+    surface = words[1:] if words and words[0] in _GCLOUD_RELEASE_TRACKS else list(words)
+    keep = _GCLOUD_VERB_WORDS + (1 if len(surface) > _GCLOUD_VERB_WORDS and surface[_GCLOUD_VERB_WORDS] in _GCLOUD_FOURTH_WORD_VERBS else 0)
+    return tuple(surface[:keep])
 
 
 def _gcloud_words_and_flag(argv: list[str]) -> tuple[list[str] | None, str | None]:
@@ -1106,6 +1142,27 @@ def _gcloud_refuses_identity_change(argv: list[str]) -> str | None:
     return None
 
 
+def local_render(argv: list[str]) -> bool:
+    """Whether a kubectl ``argv`` only renders or reads a manifest locally.
+
+    kubectl resolves a repeated flag last-wins, so only the last ``--dry-run``
+    counts: ``--dry-run=client --dry-run=none`` is a write. A render flag
+    given as another flag's value (``--field-manager -h``) reads as a render
+    here; the policy refuses the write either way, the runtime appends
+    guidance instead of halting.
+    """
+    own = argv[: argv.index("--")] if "--" in argv else argv
+    dry_runs = [t for t in own if t == "--dry-run" or t.startswith("--dry-run=")]
+    if dry_runs and dry_runs[-1].partition("=")[2].lower() not in _DRY_RUN_WRITE_VALUES:
+        return True
+    for t in own:
+        flag, _, value = t.partition("=")
+        if flag in _LOCAL_RENDER_FLAGS | _HELP_FLAGS and value.lower() in _BOOLEAN_TRUE_SPELLINGS:
+            return True
+    verb, _ = _kubectl_verb_and_flag(argv)
+    return verb is not None and verb[:2] == ("apply", _LOCAL_RENDER_SUBCOMMAND)
+
+
 def evaluate(argv: list[str]) -> Decision:
     """Allow or refuse a command on read-only grounds.
 
@@ -1188,7 +1245,7 @@ def evaluate(argv: list[str]) -> Decision:
         if verb in KUBECTL_REFUSED_SUBCOMMANDS:
             return Decision(
                 allowed=False,
-                rule_id="kubernetes.read-only",
+                rule_id=KUBERNETES_READ_ONLY_RULE,
                 message=(
                     "Agents hold read-only access to Kubernetes. Propose this change "
                     "as a pull request instead. "
@@ -1200,7 +1257,7 @@ def evaluate(argv: list[str]) -> Decision:
             return _ALLOWED
         return Decision(
             allowed=False,
-            rule_id="kubernetes.read-only",
+            rule_id=KUBERNETES_READ_ONLY_RULE,
             message=(
                 "Agents hold read-only access to Kubernetes. Propose this change "
                 "as a pull request instead. "
@@ -1313,7 +1370,7 @@ def evaluate(argv: list[str]) -> Decision:
                     "rather than working around it. "
                     + _ACTION_BOUNDARY_NOTICE
                 ),
-                verb_tuple=tuple(words[:3]),  # Cap at 3 words to exclude positionals
+                verb_tuple=_gcloud_verb_tuple(words),
             )
         return _ALLOWED
 

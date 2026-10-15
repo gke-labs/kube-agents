@@ -742,6 +742,8 @@ class NightlyPageTest(unittest.TestCase):
         data["generated_at"] = NOW
         data["cases"] = copy.deepcopy(CASES)
         data["cases"][0]["latency"] = {"n_turn1": 6, "turn1_p50_s": 5.25, "turn1_p95_s": 9.0, "n_agent": 6, "agent_p50_s": 120.0}
+        # case-c's task.yaml names no domain: the slug "unknown".
+        data["cases"][2]["domain"] = "unknown"
         data["runs"] += copy.deepcopy([FIRST, SECOND])
         # Last night's case-a carries the reps' timing; nothing else does.
         for r, (agent, turn1) in zip(data["runs"][-1]["tasks"][0]["reps"], [(100.0, 4.0), (120.0, 11.5), (110.0, 6.0)]):
@@ -757,6 +759,10 @@ class NightlyPageTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
+
+    def test_the_no_domain_group_row_carries_the_label_and_tooltip(self):
+        tip = 'title="cases with no domain on record"'
+        self.assertIn(f'<tr class="grp"><td colspan="6" {tip}>no domain</td></tr>', dom_text(self.page))
 
     def test_last_nights_report(self):
         app = dom_text(self.page)

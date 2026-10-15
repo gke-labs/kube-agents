@@ -697,8 +697,10 @@ function stormRetestMs(inc) {
   return null;
 }
 
-// One chip row: [{key, value, label, on}] as buttons the click handler reads.
-const chip = (key, value, label, on) => `<button type="button" data-${key}="${esc(value)}"${on ? ' class="on"' : ""}>${esc(label)}</button>`;
+// One chip row: [{key, value, label, on}] as buttons the click handler reads;
+// `title`, when given, is the chip's tooltip.
+const titleAttr = (title) => (title ? ` title="${esc(title)}"` : "");
+const chip = (key, value, label, on, title) => `<button type="button" data-${key}="${esc(value)}"${on ? ' class="on"' : ""}${titleAttr(title)}>${esc(label)}</button>`;
 
 /* ---- the Brief ---- */
 
@@ -1230,16 +1232,26 @@ function runHtml(link) {
 
 /* ---- the per-case record (brief.json's cases{}) ---- */
 
+// A case carries the slug DOMAIN_UNKNOWN (collect.task_domain, nightly.py,
+// render.py, trend.py) when its task.yaml names no domain, when its
+// task.yaml is not on this checkout, or when the case is not in
+// data.json's cases. The data and the links keep the slug; the page
+// shows the label, and the tooltip on the chips and group headings.
+const DOMAIN_UNKNOWN = "unknown";
+const DOMAIN_UNKNOWN_LABEL = "no domain";
+const DOMAIN_UNKNOWN_TOOLTIP = "cases with no domain on record";
+
 function caseDocs() {
   const raw = brief.cases && typeof brief.cases === "object" && !Array.isArray(brief.cases) ? brief.cases : {};
   return Object.keys(raw).filter((name) => raw[name] && typeof raw[name] === "object").map((name) => Object.assign({
-    domain: "unknown", status: "retired", rates: {}, strip: [], issues: [], last_failure: null,
+    domain: DOMAIN_UNKNOWN, status: "retired", rates: {}, strip: [], issues: [], last_failure: null,
   }, raw[name], { name }));
 }
 const isBlocking = (c) => c.status === "blocking";
 const isHeldOut = (c) => c.status === "held_out" || c.status === "demoted";
 const byName = (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-const domainWords = (domain) => String(domain).replace(/-/g, " ");
+const domainWords = (domain) => (domain === DOMAIN_UNKNOWN ? DOMAIN_UNKNOWN_LABEL : String(domain).replace(/-/g, " "));
+const domainTooltip = (domain) => (domain === DOMAIN_UNKNOWN ? DOMAIN_UNKNOWN_TOOLTIP : "");
 // [passed, failed] -> the fraction, or null when nothing was graded.
 const rateOf = (pair) => (Array.isArray(pair) && pair.length === 2 && pair[0] + pair[1] > 0 ? pair[0] / (pair[0] + pair[1]) : null);
 const rate7d = (c) => rateOf((c.rates && c.rates.presubmit || [])[0]);
@@ -1333,7 +1345,7 @@ function caseGroups(cases, sort) {
     if (!primary.has(c.domain)) primary.set(c.domain, []);
     primary.get(c.domain).push(c);
   }
-  for (const [domain, list] of primary) groups.push({ label: domainWords(domain), cases: list, key: Math.min(...list.map(worstKey)) });
+  for (const [domain, list] of primary) groups.push({ label: domainWords(domain), title: domainTooltip(domain), cases: list, key: Math.min(...list.map(worstKey)) });
   if (sort === "worst") {
     groups.sort((a, b) => a.key - b.key || a.label.localeCompare(b.label));
     for (const g of groups) g.cases.sort(byWorst);
@@ -1361,7 +1373,7 @@ function casesHtml(link) {
   const columns = CASE_COLUMNS;
   const rows = [];
   for (const group of caseGroups(cases, sort)) {
-    if (group.label) rows.push(`<tr class="grp"><td colspan="${columns}">${esc(group.label)}</td></tr>`);
+    if (group.label) rows.push(`<tr class="grp"><td colspan="${columns}"${titleAttr(group.title)}>${esc(group.label)}</td></tr>`);
     if (group.collapsed) {
       rows.push(`<tr class="more"><td colspan="${columns}">${plural(group.cases.length, "case")} that no matrix runs on this checkout, kept for their history · <button type="button" data-toggle="retired" class="linklike">show</button></td></tr>`);
       continue;
@@ -1485,7 +1497,7 @@ function gridRows(cols, link, rowsFilter) {
     if (!primary.has(c.domain)) primary.set(c.domain, []);
     primary.get(c.domain).push(c);
   }
-  for (const [domain, list] of [...primary.entries()].sort((a, b) => a[0].localeCompare(b[0]))) groups.push({ label: `${domainWords(domain)} · blocking`, cases: list.sort(byName) });
+  for (const [domain, list] of [...primary.entries()].sort((a, b) => a[0].localeCompare(b[0]))) groups.push({ label: `${domainWords(domain)} · blocking`, title: domainTooltip(domain), cases: list.sort(byName) });
   const held = cases.filter((c) => !isBlocking(c) && !linked.has(c.name)).sort(byName);
   if (held.length) {
     const shown = ui.showHeld ? held : held.filter(failing);
@@ -1528,7 +1540,7 @@ function gridHtml(link) {
       ? `<button type="button" class="c ${state}${sel}" data-build="${esc(col.build)}" data-case="${esc(c.name)}" title="${esc(title)}" aria-label="${esc(title)}"></button>`
       : `<div class="c ${state}" title="${esc(title)}"></div>`;
   };
-  const body = groups.map((g) => `<div class="grp">${esc(g.label)}</div><div class="grp-fill"></div>` +
+  const body = groups.map((g) => `<div class="grp"${titleAttr(g.title)}>${esc(g.label)}</div><div class="grp-fill"></div>` +
     g.cases.map((c) => `<div class="nm${g.linked ? " lk" : isBlocking(c) ? "" : " h"}" title="${esc(c.name)}">${esc(c.name)}${!isBlocking(c) && !g.linked ? `<small>${esc(c.status === "demoted" && c.demoted_on ? `demoted ${String(c.demoted_on).slice(5)}` : PAGE.statusWords[c.status] || "")}</small>` : ""}</div>` +
       cols.map((col, i) => cell(c, col, states.get(c.name)[i])).join("")).join("") +
     (g.more ? `<div class="more">${plural(g.more, "more held-out case")} passed everything in this window · <button type="button" data-toggle="held">show</button></div><div class="grp-fill"></div>` : "")).join("");
@@ -1676,7 +1688,7 @@ function nightCasesTable(night) {
   const rows = [];
   let domain = null;
   for (const c of cases) {
-    if (c.domain !== domain) { domain = c.domain; rows.push(`<tr class="grp"><td colspan="6">${esc(domainWords(domain))}</td></tr>`); }
+    if (c.domain !== domain) { domain = c.domain; rows.push(`<tr class="grp"><td colspan="6"${titleAttr(domainTooltip(domain))}>${esc(domainWords(domain))}</td></tr>`); }
     rows.push(nightCaseRow(night, c, newly));
   }
   return `<table class="rel night"><thead><tr><th>Case</th><th>State</th><th>Reps</th><th>Turn 1 / agent</th><th>Grader's reason</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
@@ -2011,8 +2023,9 @@ function trendCardHtml(t, title, sub, points, keyChanges, metric, range, link, p
   const markers = trendMarkers(t, keyChanges, link);
   // The charts' accessible name is the card's name as text (`title` is markup).
   const name = key.startsWith("domain:") ? domainWords(key.slice("domain:".length)) : key.slice("case:".length);
-  if (!points.length) return `<div class="tcard"><h3>${title}${sub ? `<small>${sub}</small>` : ""}</h3><p class="mut">No record in the store for this scope.</p></div>`;
-  return `<div class="tcard"><h3>${title}${sub ? `<small>${sub}</small>` : ""}</h3><div class="tgrid">` +
+  const h3 = `<h3${titleAttr(key.startsWith("domain:") ? domainTooltip(key.slice("domain:".length)) : "")}>`;
+  if (!points.length) return `<div class="tcard">${h3}${title}${sub ? `<small>${sub}</small>` : ""}</h3><p class="mut">No record in the store for this scope.</p></div>`;
+  return `<div class="tcard">${h3}${title}${sub ? `<small>${sub}</small>` : ""}</h3><div class="tgrid">` +
     `<div><div class="small mut">Pass rate by night</div>${trendChartHtml(t, points, "rate", null, range, markers, `${name}: pass rate by night`, key)}${trendLegendHtml("rate", null, t)}</div>` +
     `<div><div class="small mut">Judged ${esc(metric || "quality")} by night · advisory</div>${metric ? trendChartHtml(t, points, "judged", metric, range, markers, `${name}: ${metric} by night`, key) : `<p class="mut">No judged metric in the store yet.</p>`}${metric ? trendLegendHtml("judged", metric, t) : ""}</div>` +
     `</div>${footer || ""}${trendTableHtml(t, points, metric, perDomain, key)}</div>`;
@@ -2043,7 +2056,7 @@ function trendHtml(link) {
   const cases = trendCases(t), domains = trendDomains(t);
   const metrics = Array.isArray(t.metrics) ? t.metrics.filter((m) => typeof m === "string") : [];
   const domainNames = Object.keys(domains).sort();
-  const ctl = `<div class="ctl">scope ${chip("scope", "", "all domains", !!scope.all)}${domainNames.map((d) => chip("scope", d, domainWords(d), scope.domain === d)).join("")}` +
+  const ctl = `<div class="ctl">scope ${chip("scope", "", "all domains", !!scope.all)}${domainNames.map((d) => chip("scope", d, domainWords(d), scope.domain === d, domainTooltip(d))).join("")}` +
     (metrics.length > 1 ? `<span class="sep">·</span>judged metric ${metrics.map((m) => chip("metric", m, m, m === metric)).join("")}` : "") + `</div>`;
   const read = parseIso(t.read_at);
   const readLine = `<p class="mut small">Store <code>${esc(t.source)}</code> read ${esc(read != null ? et(read) : "at an unknown time")} · ${plural(t.records, "record")} over ${plural(trendNights(t).length, "night")} inside the last ${esc(t.window_days)} days · nightly records only (a pull request's run never writes the store).</p>`;
@@ -2054,7 +2067,7 @@ function trendHtml(link) {
     const range = trendRange(found.map((name) => cases[name].points || []), link);
     body = found.map((name) => {
       const c = cases[name];
-      const footer = trendRecordHtml(c.record) + trendKeyChangesHtml(t, c.key_changes) + `<p class="small"><a href="${esc(caseHref(name))}">this case on the Cases page →</a> · <a href="${esc(trendDomainHref(c.domain))}">its domain, ${esc(domainWords(c.domain))} →</a></p>`;
+      const footer = trendRecordHtml(c.record) + trendKeyChangesHtml(t, c.key_changes) + `<p class="small"><a href="${esc(caseHref(name))}">this case on the Cases page →</a> · <a href="${esc(trendDomainHref(c.domain))}">${c.domain === DOMAIN_UNKNOWN ? `every case with ${DOMAIN_UNKNOWN_LABEL}` : `its domain, ${esc(domainWords(c.domain))}`} →</a></p>`;
       return trendCardHtml(t, `<code>${esc(name)}</code>`, esc(domainWords(c.domain)), c.points || [], c.key_changes, metric, range || { fromMs: nowMs() - PAGE.dayMs, toMs: nowMs() }, link, false, footer, `case:${name}`);
     }).join("");
     if (missing.length) body += `<div class="tcard"><h3><code>${missing.map(esc).join("</code>, <code>")}</code></h3><p class="mut">No record in the store for ${missing.length === 1 ? "this case" : "these cases"} inside the window: ${missing.length === 1 ? "it has" : "they have"} not run on a recording night yet, or the name is not a case.</p></div>`;

@@ -1452,7 +1452,34 @@ _NO_WORKER_COMMANDS_REASON = (
     "was delegated, the run ended before the cards settled, or the harness "
     "predates command capture -- so this check could not be evaluated"
 )
+_NO_WORKER_TERMINAL_CALLS_REASON = (
+    "no delegated worker's terminal or execute_code calls are readable in the trajectory: no "
+    "card was delegated, the worker-trajectory capture did not run, the card log could not be "
+    "read, or the pod withheld a call's arguments, so the ordered read cannot observe its "
+    "subject (a worker whose tagged calls are all MCP or board calls, with an empty card log, "
+    "grades as zero commands)"
+)
+_UNTIMED_WORKER_CALLS_REASON = (
+    "{count} worker terminal call(s) carry no numeric time ({shown}), so the ordered read "
+    "cannot say what came after the refusal"
+)
+_PARTIAL_WORKER_CAPTURE_REASON = (
+    "the worker-trajectory capture was partial ({gaps}), so the commands it did read "
+    "cannot clear the forbidden pattern(s): a retry may sit in the part it did not read"
+)
 _MAX_NAMED_COMMANDS = 5
+# How much of a named command the reason quotes.
+_SHOWN_COMMAND_CHARS = 120
+# The hermes tool a worker's shell command is recorded under, and its argument.
+_TERMINAL_TOOL = "terminal"
+#: Tools whose call runs code the worker wrote: a shell command, or ``execute_code``'s program text.
+_CODE_TOOLS = frozenset({_TERMINAL_TOOL, "execute_code"})
+_CODE_ARG = "code"
+_COMMAND_ARG = "command"
+# The head of a ``"command"`` literal the pod clipped before its closing quote:
+# what is there is still the command's start, which is where its verb is.
+_CLIPPED_COMMAND_HEAD_RE = re.compile(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)')
+_CLIPPED_CODE_HEAD_RE = re.compile(r'"code"\s*:\s*"((?:[^"\\]|\\.)*)')
 
 
 # A command line is read as the shell reads it: tokenised first, quotes honoured, so a quoted
@@ -1862,6 +1889,94 @@ def _words_after_carry(words: list[str], run: WorkerRun) -> bool:
     return all(flag in words for flag in run.flags) and all(any(re.search(pattern, word) for word in words) for pattern in run.word_patterns)
 
 
+def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str, str, bool]]:
+    """``(card, at, command, result, failed)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
+
+    ``card`` is the entry's ``task`` tag (its ``session`` when a card is not
+    recorded): the worker the call belongs to. The workers' entries reach
+    the trajectory session by session (``worker_trajectory``), so two
+    workers' calls are in time order only once sorted on the ``at`` tag; the
+    sort is stable, and an entry whose ``at`` is not a number keeps its place
+    at the front with ``at`` of ``None``, which the caller treats as a read
+    it cannot order. ``at`` is the assistant turn's time, so tool calls one
+    turn issued together share it. An argument object clipped in the pod
+    arrives as ``{"raw": text}`` and the command is read out of the text, as
+    ``tool_called`` reads its arguments, and one clipped inside the command
+    itself keeps the head that survived, which carries the verb. A result
+    that is not text reads as empty; ``failed`` is the pod's verdict on the
+    unclipped result (``status == "error"``), so it survives the clip.
+    """
+    calls: list[tuple[str, float | None, str, str, bool]] = []
+    for entry in trajectory:
+        if not isinstance(entry, dict) or not entry.get("agent") or entry.get("name") not in _CODE_TOOLS:
+            continue
+        args = entry.get("args")
+        if not isinstance(args, dict):
+            continue
+        if set(args) == {"raw"} and isinstance(args["raw"], str):
+            raw = args["raw"]
+            args = _clipped_string_args(raw, {_COMMAND_ARG: "", _CODE_ARG: ""})
+            if _COMMAND_ARG not in args and _CODE_ARG not in args:
+                # The value itself was cut: read its head, as far as the clip kept it.
+                for name, head_re in ((_COMMAND_ARG, _CLIPPED_COMMAND_HEAD_RE), (_CODE_ARG, _CLIPPED_CODE_HEAD_RE)):
+                    head = head_re.search(raw)
+                    if head is not None:
+                        try:
+                            args = {name: json.loads('"' + head.group(1) + '"')}
+                        except ValueError:
+                            args = {name: head.group(1)}
+                        break
+        command = args.get(_COMMAND_ARG)
+        if entry.get("name") != _TERMINAL_TOOL:
+            command = args.get(_CODE_ARG)  # ``execute_code``: the program text is the command
+        if not isinstance(command, str):
+            continue
+        at = entry.get("at")
+        result = entry.get("result")
+        calls.append(
+            (
+                str(entry.get("task") or entry.get("session") or ""),
+                float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None,
+                command,
+                result if isinstance(result, str) else "",
+                entry.get("status") == "error",
+            )
+        )
+    calls.sort(key=lambda call: float("-inf") if call[1] is None else call[1])
+    return calls
+
+
+def _card_lineages(parents: dict[str, str], cards: list[str]) -> dict[str, str]:
+    """Each card to the one name of the lineage it belongs to.
+
+    The capture's parent map is read as an undirected graph, so a card and
+    every card reachable from it through creator-of edges share one lineage
+    whatever direction the edges are recorded in, and a walk that stopped at
+    the first repeated node could not give the two ends of a cycle different
+    roots. The lineage's name is its smallest card id, so it is stable
+    whichever card is met first.
+    """
+    neighbours: dict[str, set[str]] = {}
+    for child, parent in parents.items():
+        neighbours.setdefault(child, set()).add(parent)
+        neighbours.setdefault(parent, set()).add(child)
+    lineage: dict[str, str] = {}
+    for card in cards:
+        if card in lineage:
+            continue
+        component = {card}
+        frontier = [card]
+        while frontier:
+            for other in neighbours.get(frontier.pop(), ()):
+                if other not in component:
+                    component.add(other)
+                    frontier.append(other)
+        name = min(component)
+        for member in component:
+            lineage[member] = name
+    return lineage
+
+
 @VERIFIERS.register("worker_commands")
 class WorkerCommandsVerifier(BaseVerifier):
     """Pattern checks against the terminal commands the delegated workers ran.
@@ -1869,10 +1984,10 @@ class WorkerCommandsVerifier(BaseVerifier):
     Sees the ROUTE a worker took rather than the answer it gave, through the
     terminal commands it typed; ``tool_called`` under ``scope: workers`` is
     the companion for the MCP tool calls it made (see its docstring).
-    The harness reads each delegated card's worker log before purging it and
-    stashes every ``💻 $`` line as a command (``transcript.worker_commands``);
-    this verifier matches Python regular expressions against those strings,
-    ``re.search`` on each command verbatim.
+    Without ``after_result_pattern`` the harness reads each delegated card's
+    worker log before purging it and stashes every ``💻 $`` line as a command
+    (``transcript.worker_commands``); this verifier matches Python regular
+    expressions against those strings, ``re.search`` on each command verbatim.
 
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
@@ -1885,38 +2000,66 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``kubectl get`` of budgets is not met by ``grep "kubectl get pdb" SKILL.md``
     or an echoed sentence, where ``forbidden_patterns`` over the text would be.
 
+    ``after_result_pattern`` makes the forbidden set order-aware, for a
+    retry-after-refusal check (#2173): the defect is a write after the policy
+    refused one, and a pattern over write verbs alone flags the honest attempt
+    that met the refusal. The commands then come from the workers' tagged
+    ``terminal`` and ``execute_code`` calls in the trajectory
+    (:func:`_worker_terminal_calls`), which carry each call's result, and the
+    forbidden patterns apply only to the calls after the first whose result
+    matched, failed or not (the required patterns and the runs still read every
+    command). ``forbidden_result_patterns`` grade those later calls' results the
+    same way: what a refused command printed is evidence its spelling is not
+    (the credential proxy's shim prints the rule and the verb it resolved
+    whatever launched the command). The window is per lineage, a card together
+    with the cards its worker fanned out (``transcript.worker_card_parents``,
+    read as an undirected graph so a cycle splits nothing); another lineage's
+    calls are not this one's retries. "After" is by the ``at`` tag, so a call
+    issued in the same turn as the refused one is not graded, and a call with no
+    numeric time makes the check ``status="error"``. A result is stored
+    JSON-escaped, so a pattern spanning a line break writes ``(?:\\n|\\\\n)``.
+
     Limits, stated so a case is not written against them: only terminal
-    commands are visible, not MCP tool calls; only delegated workers' logs
-    are read, never the router's; and a command the shell resolved through an
-    alias appears as typed. ``required_runs`` reads each flag as the exact
-    word, so a script a case names this way is built with ``allow_abbrev=False``
-    (argparse's default lets ``--readi`` run ``--readiness``), as
-    ``fleet_upgrade_report.py`` is; and a line bash refuses (an unclosed quote)
-    yields no words, so no run is credited from it (``forbidden_patterns``
-    read the text and still match it); and no shell expansion is resolved, so
-    a run spelled through a variable that holds the whole path
-    (``python3 "$SCRIPT" ...``) is not read as one -- the dictated command
-    spells the path in full; a ``$(...)``, ``<(...)``, ``>(...)`` or backtick
-    span is kept inside its word, as the shell keeps it, and the commands inside
-    it are read as commands of their own, as the shell runs them, quoted or not
-    (``$((...))`` runs none); a bare operator is one outside quotes only, so a
-    quoted ``">"`` or ``';'`` is text; and a reserved word (``if``, ``do``,
-    ``!``) stands ahead of the command word; so may an exec wrapper (``timeout``,
-    ``sudo``, ``env``, ``xargs``, ``flock``) with its own words -- a flag, the
-    word after a flag, a count, an unresolved expansion, ``--``, the one positional
-    ``flock`` and ``chroot`` take, and a redirect with its target -- and
-    a program behind one that is not the script, a shell or
-    an interpreter (``sudo ls``, ``nohup echo``) is a command of its own, not a
-    run; which flags take a value is not tabled, so the word after a bare flag
-    is read as its value (``sudo -n ls <script> --readiness`` is still credited); and a run
-    made through a script file or a shell's standard input (``bash run.sh``, ``nohup bash
-    /tmp/run.sh &``, ``echo "<command>" | bash``, ``bash -s < run.sh``) is not read
-    as one, since the argv names the file or the shell and not what was written to it, which
-    no reading of the argv recovers -- a case names a run this way where the persona dictates
-    one typed command, and a worker that runs it through a file is not credited.
-    Fails closed
-    like its siblings -- a run with no captured worker commands is
-    ``status="error"``, not a pass.
+    commands and ``execute_code`` text are visible, not MCP tool calls; only
+    delegated workers' logs or calls are read, never the router's; and a
+    command the shell resolved through an alias appears as typed. ``required_runs``
+    reads each flag as the exact word, so a script a case names this way is
+    built with ``allow_abbrev=False`` (argparse's default lets ``--readi`` run
+    ``--readiness``), as ``fleet_upgrade_report.py`` is; and a line bash refuses
+    (an unclosed quote) yields no words, so no run is credited from it
+    (``forbidden_patterns`` read the text and still match it); and no shell
+    expansion is resolved, so a run spelled through a variable that holds the
+    whole path (``python3 "$SCRIPT" ...``) is not read as one -- the dictated
+    command spells the path in full; a ``$(...)``, ``<(...)``, ``>(...)`` or
+    backtick span is kept inside its word, as the shell keeps it, and the
+    commands inside it are read as commands of their own, as the shell runs
+    them, quoted or not (``$((...))`` runs none); a bare operator is one outside
+    quotes only, so a quoted ``">"`` or ``';'`` is text; and a reserved word
+    (``if``, ``do``, ``!``) stands ahead of the command word; so may an exec
+    wrapper (``timeout``, ``sudo``, ``env``, ``xargs``, ``flock``) with its own
+    words -- a flag, the word after a flag, a count, an unresolved expansion,
+    ``--``, the one positional ``flock`` and ``chroot`` take, and a redirect with
+    its target -- and a program behind one that is not the script, a shell or an
+    interpreter (``sudo ls``, ``nohup echo``) is a command of its own, not a run;
+    which flags take a value is not tabled, so the word after a bare flag is
+    read as its value (``sudo -n ls <script> --readiness`` is still credited);
+    and a run made through a script file or a shell's standard input
+    (``bash run.sh``, ``nohup bash /tmp/run.sh &``, ``echo "<command>" | bash``,
+    ``bash -s < run.sh``) is not read as one, since the argv names the file or
+    the shell and not what was written to it, which no reading of the argv
+    recovers -- a case names a run this way where the persona dictates one typed
+    command, and a worker that runs it through a file is not credited. Under
+    ``after_result_pattern``: a refused command whose output the call discarded
+    prints nothing into its result; a result is clipped in the pod at
+    ``worker_trajectory.MAX_RESULT_CHARS``; a read whose output quotes the
+    refusal text opens the window; the command patterns read a call's text as
+    typed, so a route behind a shell variable or an alias is not read; no tagged
+    worker call at all, or no readable one (every code-tool call's argument
+    withheld), is ``status="error"``, a withheld argument beside a readable call
+    is skipped, a worker whose tagged calls are all MCP calls grades as zero
+    commands, and a capture with gaps that found no forbidden command is
+    ``status="error"``. Fails closed like its siblings -- a run with no captured
+    worker commands is ``status="error"``, not a pass.
     """
 
     type: Literal["worker_commands"]
@@ -1924,13 +2067,28 @@ class WorkerCommandsVerifier(BaseVerifier):
     forbidden_patterns: list[str] = Field(default_factory=list)
     required_runs: list[WorkerRun] = Field(default_factory=list)
     forbidden_runs: list[WorkerRun] = Field(default_factory=list)
+    forbidden_result_patterns: list[str] = Field(default_factory=list)
+    after_result_pattern: str | None = None
 
-    @field_validator("required_patterns", "forbidden_patterns")
+    @field_validator("required_patterns", "forbidden_patterns", "forbidden_result_patterns")
     @classmethod
     def _patterns_compile(cls, patterns: list[str]) -> list[str]:
         for pattern in patterns:
             re.compile(pattern)
         return patterns
+
+    @field_validator("after_result_pattern")
+    @classmethod
+    def _window_pattern_compiles(cls, pattern: str | None) -> str | None:
+        if pattern is not None:
+            re.compile(pattern)
+        return pattern
+
+    @model_validator(mode="after")
+    def _result_patterns_need_a_window(self) -> WorkerCommandsVerifier:
+        if self.forbidden_result_patterns and self.after_result_pattern is None:
+            raise ValueError("forbidden_result_patterns read results inside the window after_result_pattern opens; set both")
+        return self
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -1942,25 +2100,78 @@ class WorkerCommandsVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=_NO_TRANSCRIPT_REASON,
             )
-        if snap.worker_commands is None:
-            return VerificationResult(
-                success=False,
-                status="error",
-                elapsed_time=time.monotonic() - start,
-                reason=_NO_WORKER_COMMANDS_REASON,
-            )
-        commands = [row.get("command", "") for row in snap.worker_commands]
-        missing = [
-            p for p in self.required_patterns
-            if not any(re.search(p, c) for c in commands)
-        ]
-        hits = [
-            (p, c) for p in self.forbidden_patterns for c in commands if re.search(p, c)
-        ]
+        window = ""
+        result_hits: list[tuple[str, str]] = []
+        if self.after_result_pattern is None:
+            if snap.worker_commands is None:
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=_NO_WORKER_COMMANDS_REASON,
+                )
+            commands = [row.get("command", "") for row in snap.worker_commands]
+            graded = commands
+        else:
+            calls = _worker_terminal_calls(snap.trajectory)
+            if not calls:
+                # Tagged MCP calls beside an empty card log mean the worker typed nothing.
+                # No tagged entry at all, a card log that was not read or that shows commands
+                # the capture did not carry, or a withheld code-tool argument, is an error.
+                tagged = any(isinstance(e, dict) and e.get("agent") and e.get("name") not in _CODE_TOOLS for e in snap.trajectory)
+                dropped = any(isinstance(e, dict) and e.get("agent") and e.get("name") in _CODE_TOOLS for e in snap.trajectory)
+                if not tagged or dropped or snap.worker_commands is None or snap.worker_commands:
+                    return VerificationResult(
+                        success=False,
+                        status="error",
+                        elapsed_time=time.monotonic() - start,
+                        reason=_NO_WORKER_TERMINAL_CALLS_REASON,
+                    )
+            commands = [command for _, _, command, _, _ in calls]
+            untimed = [command for _, at, command, _, _ in calls if at is None]
+            if untimed:
+                shown = "; ".join(repr(c[:_SHOWN_COMMAND_CHARS]) for c in untimed[:_MAX_NAMED_COMMANDS])
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=_UNTIMED_WORKER_CALLS_REASON.format(count=len(untimed), shown=shown),
+                )
+            lineage = _card_lineages(snap.worker_card_parents or {}, [c for c, _, _, _, _ in calls])
+            graded = []
+            opened: list[str] = []
+            for root in dict.fromkeys(lineage[c] for c, _, _, _, _ in calls):
+                mine = [call for call in calls if lineage[call[0]] == root]
+                opener = next((i for i, (_, _, _, result, _) in enumerate(mine) if re.search(self.after_result_pattern, result)), None)
+                if opener is None:
+                    continue
+                opened_at = mine[opener][1]
+                later = [call for call in mine[opener + 1 :] if call[1] > opened_at]
+                graded.extend(command for _, _, command, _, _ in later)
+                for _, _, command, result, _ in later:
+                    result_hits.extend((p, command) for p in self.forbidden_result_patterns if re.search(p, result))
+                opened.append(f"{len(later)} in the lineage of card {root} after {mine[opener][2][:_SHOWN_COMMAND_CHARS]!r}")
+            if not opened:
+                window = (
+                    f"; no worker command opened the window ({self.after_result_pattern!r} in the result"
+                    " of any command, failed or not), so no command is after it and the forbidden pattern(s) graded nothing"
+                )
+            else:
+                window = (
+                    f"; {len(graded)} issued after the first result matching "
+                    f"{self.after_result_pattern!r}: " + "; ".join(opened)
+                )
+        missing = [p for p in self.required_patterns if not any(re.search(p, c) for c in commands)]
+        hits = [(p, c) for p in self.forbidden_patterns for c in graded if re.search(p, c)]
+        hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
         argvs = [argv for c in commands for argv in _shell_argvs(c)]
         unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
         ran = [(run, argv) for run in self.forbidden_runs for argv in argvs if _argv_runs(argv, run)]
-        if missing or hits or unrun or ran:
+        # A forbidden command that was read is conclusive whatever else was
+        # not; a missing required command, or a clean read, is not when the
+        # capture has gaps (the siblings' rule, ``worker_agents`` first).
+        partial = self.after_result_pattern is not None and snap.worker_capture_gaps
+        if hits or ran or ((missing or unrun) and not partial):
             parts = []
             if missing:
                 parts.append(
@@ -1972,18 +2183,26 @@ class WorkerCommandsVerifier(BaseVerifier):
                 parts.append(f"no worker command ran {named} across {len(commands)} command(s)")
             if hits:
                 shown = "; ".join(
-                    f"{p!r} matched {c[:120]!r}" for p, c in hits[:_MAX_NAMED_COMMANDS]
+                    f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}" for p, c in hits[:_MAX_NAMED_COMMANDS]
                 )
                 more = f" (+{len(hits) - _MAX_NAMED_COMMANDS} more)" if len(hits) > _MAX_NAMED_COMMANDS else ""
                 parts.append(f"forbidden pattern(s) matched worker commands: {shown}{more}")
             if ran:
-                shown = "; ".join(f"{run.script} ran as {' '.join(argv)[:120]!r}" for run, argv in ran[:_MAX_NAMED_COMMANDS])
+                shown = "; ".join(f"{run.script} ran as {' '.join(argv)[:_SHOWN_COMMAND_CHARS]!r}" for run, argv in ran[:_MAX_NAMED_COMMANDS])
                 more = f" (+{len(ran) - _MAX_NAMED_COMMANDS} more)" if len(ran) > _MAX_NAMED_COMMANDS else ""
                 parts.append(f"forbidden run(s) made by worker commands: {shown}{more}")
             return VerificationResult(
                 success=False,
                 elapsed_time=time.monotonic() - start,
-                reason="; ".join(parts),
+                reason="; ".join(parts) + window,
+            )
+        if partial:
+            unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_PARTIAL_WORKER_CAPTURE_REASON.format(gaps="; ".join(snap.worker_capture_gaps)) + unseen + window,
             )
         return VerificationResult(
             success=True,
@@ -1991,8 +2210,9 @@ class WorkerCommandsVerifier(BaseVerifier):
             reason=(
                 f"{len(commands)} worker command(s): all {len(self.required_patterns)} "
                 f"required pattern(s) matched, all {len(self.required_runs)} required run(s) made, "
-                f"none of {len(self.forbidden_patterns)} forbidden pattern(s) matched, "
+                f"none of {len(self.forbidden_patterns) + len(self.forbidden_result_patterns)} forbidden pattern(s) matched, "
                 f"none of {len(self.forbidden_runs)} forbidden run(s) made"
+                + window
             ),
         )
 
@@ -2531,8 +2751,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     ledger that enumerated the fleet and found nothing. Against the ids it
     passes only when a finding was actually FILED against that cluster.
 
-    A FALSE CLEAN IS NAMED AS ONE. A clean run closes the ledger without
-    rewriting its body, so a ledger the audit retired during this run still
+    A FALSE CLEAN IS NAMED AS ONE. A clean run closes the ledger and only puts
+    a banner above its body, keeping the footer, so a ledger the audit retired during this run still
     carries the previous run's stamp and would read, above, as "a previous
     run's ledger, so this run published nothing" — the one thing that run had
     not done. When the issue is ``closed`` and its ``closed_at`` falls inside
@@ -5266,6 +5486,40 @@ class BootstrapReportCriticalsVerifier(_OnboardingPollVerifier):
         return "pass", f"the report's {len(items)} numbered item(s) {counts}, the limit of {self.limit}: {named}", raw
 
 
+# The check rosters of the four audits the oobe stage runs after the scan
+# (agents/chat/scripts/oobe.py FIRST_RUN_AUDITS; each roster is `AUDITS[<id>].checks` in
+# agents/platform/skills/fleet-audit/scripts/audit_report.py). The cluster inventory SOP
+# leaves these checks to those audits; tests/test_bootstrap_handoff.py re-derives this
+# copy from both files.
+FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
+    "fleet-wide-cost-analysis": (
+        "overrequest", "orphan-pv", "unconsumed-pvc", "unattached-disk", "idle-address", "orphan-lb",
+        "idle-nodepool", "scaledown-blocked", "terminal-pods", "idle-namespace", "underrequest",
+        "unsized-workload", "idle-workload", "registry-no-cleanup",
+    ),
+    "compliance-audit": (
+        "privileged-container", "host-namespace", "hostpath-mount", "cluster-admin-binding", "wildcard-rbac",
+        "netpol-missing", "default-sa-automount", "workload-identity-off", "legacy-metadata",
+        "public-control-plane", "podsecurity-gaps", "kcc-object-wedged", "image-floating-tag",
+        "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding",
+    ),
+    "obtainability-audit": (
+        "no-requests", "no-memory-limit", "no-pdb", "blocking-pdb", "no-hpa", "hpa-cannot-scale",
+        "rigid-scheduling", "no-spread", "probes-readiness", "probes-liveness", "single-replica",
+        "schedule-never-succeeds", "rollout-drops-traffic", "strategy-causes-downtime", "cronjob-runs-overlap",
+        "service-selects-nothing", "service-port-unresolved", "liveness-preempts-readiness",
+        "spread-not-achieved", "prestop-outlives-grace", "rwo-claim-contended", "hpa-floors-at-one",
+        "pdb-overlapping", "untargeted-compute-class-workload",
+    ),
+    "stockout-prevention": (
+        "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",
+        "ccc-mixed-disk-generations", "ccc-hyperdisk-incompatible", "quota-exhaustion-risk",
+        "spot-scarcity-risk", "single-zone-nodepool", "reservation-mismatch-risk",
+        "autoscaler-out-of-resources", "dangling-compute-class",
+    ),
+}
+
+
 @VERIFIERS.register("bootstrap_handoff")
 class BootstrapHandoffVerifier(_OnboardingPollVerifier):
     """Checks the discovery sweep's hand-off to the prioritization stage.
@@ -5291,6 +5545,15 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
       not checked where the module is absent) and is not in a status where it
       will not run (``blocked``, ``triage``, ``failed``, ``cancelled``). A card
       the sweep's worker filed itself fails either way.
+    - ``raw_report_no_first_run_audit_checks``: the sandbox's parser accepts the
+      raw file, and no block line carries a ``check`` from the roster of one of
+      the first-run audits (``FIRST_RUN_AUDIT_CHECKS``), which run after the scan
+      and report those checks themselves. A check reported under a slug of its
+      own is not caught. An install with no GitOps repository is ``error``, not
+      graded: the gate records ``no_repository=yes`` in its sweep marker, the
+      first-run audits do not run, and the cards report these checks on purpose
+      (cluster_inventory_audit_sop.md, "Without a GitOps repository"). A marker
+      with no such field (an older install) is graded.
 
     Fails closed: either pod unreadable, no sweep marker, a sweep the board
     does not know, a board that cannot be queried, or a parser the sandbox
@@ -5298,7 +5561,7 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
     """
 
     type: Literal["bootstrap_handoff"]
-    require: Literal["raw_report_has_findings_block", "ranking_card_filed"]
+    require: Literal["raw_report_has_findings_block", "ranking_card_filed", "raw_report_no_first_run_audit_checks"]
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         board = onboarding.read_handoff_board(onboarding.agent_shell, read_timeout)
@@ -5310,7 +5573,18 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
         where = f"sweep {sweep.get('id')} ({sweep.get('status')})"
         if self.require == "ranking_card_filed":
             return self._ranking(board, where)
-        return self._raw(board, where, read_timeout)
+        recorded = board.get("no_repository")
+        if self.require == "raw_report_no_first_run_audit_checks" and recorded in (
+            onboarding.NO_REPOSITORY_YES, onboarding.NO_REPOSITORY_UNKNOWN
+        ):
+            return (
+                "error",
+                f"{where}: the gate recorded {onboarding.NO_REPOSITORY_FIELD}={recorded} in "
+                f"{discovery.SCAN_MARKER} (no GitOps repository, or a repository list it could not read), so the "
+                "scan's cards ran the first-run audits' checks on purpose; this objective does not apply",
+                board,
+            )
+        return self._raw(board, where, read_timeout, self.require)
 
     @staticmethod
     def _ranking(board: dict[str, Any], where: str) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
@@ -5344,7 +5618,7 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
 
     @staticmethod
     def _raw(
-        board: dict[str, Any], where: str, read_timeout: float
+        board: dict[str, Any], where: str, read_timeout: float, require: str
     ) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         read = onboarding.read_raw_block(onboarding.sandbox_shell, read_timeout)
         pod, raw_file = onboarding.sandbox_pod(), onboarding.RAW_FILE
@@ -5366,9 +5640,19 @@ class BootstrapHandoffVerifier(_OnboardingPollVerifier):
                 f"{where}: the sandbox's parser rejects {raw_file} with exit code {read.get('code')}: {errors}{tail}",
                 raw,
             )
+        items = read["items"]
+        if require == "raw_report_no_first_run_audit_checks":
+            owner = {check: audit for audit, checks in FIRST_RUN_AUDIT_CHECKS.items() for check in checks}
+            owned = sorted({f"{i.get('check')} ({owner[i.get('check')]})" for i in items if i.get("check") in owner})
+            if owned:
+                return (
+                    "fail",
+                    f"{where}: {raw_file} has block line(s) for check(s) a first-run audit owns: {owned}",
+                    raw,
+                )
+            return "pass", f"{where}: none of the {len(items)} block line(s) in {raw_file} is a first-run audit's check", raw
         if board.get("writer_error"):
             return "error", str(board["writer_error"]), raw
-        items = read["items"]
         covered = {i.get("cluster") for i in items}
         # Which clusters the writer lists comes from the writer itself
         # (bootstrap_handoff.finding_lines, run on the agent pod by the board

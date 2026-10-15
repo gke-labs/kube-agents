@@ -1876,6 +1876,15 @@ class TestAlertDailyQuota(unittest.TestCase):
             # Garbage must not silently disable the cap or block everything.
             self.assertEqual(parse("X_LIMIT", 10), 10)
 
+    def test_drift_ceiling_default_is_twenty(self):
+        # This test pins the literal, not the constant. A change to the value
+        # then needs a change to this test.
+        self.assertEqual(
+            os.environ.get("ALERT_DAILY_LIMIT_DRIFT", ""), "",
+            "ALERT_DAILY_LIMIT_DRIFT is set, so the module did not read the default",
+        )
+        self.assertEqual(session_kv_server.ALERT_DAILY_LIMITS[session_kv_server.DRIFT_QUOTA_KEY], 20)
+
     def test_zero_limit_never_suppresses(self):
         with patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Warning": 0}):
             for _ in range(20):
@@ -3591,7 +3600,8 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertTrue(calls[0].args[1].startswith("**Security & RBAC posture audit: 2 new"))
 
     def test_flag_on_a_closed_ledger_falls_back_to_the_line(self):
-        # A clean run closes the ledger without rewriting its title.
+        # A clean run closes the ledger; the body below its new title still
+        # lists the last run's findings, so the state decides the card.
         os.environ["KAGE_SLACK_UX"] = "1"
         _, calls = self._post(composed=self.ONE_LINE, issue=dict(self.ISSUE, state="closed"))
         self.assertTrue(calls[0].args[1].startswith("**Security & RBAC posture audit: 2 new"))
