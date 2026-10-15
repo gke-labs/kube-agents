@@ -1470,6 +1470,12 @@ class Loader(unittest.TestCase):
         )
         self.assertEqual(watch.report_argv(["p1"], readiness=False), ["--project", "p1"])
 
+    def test_the_report_argv_never_carries_the_cluster_exclusion(self) -> None:
+        # #3081: the watch's report is the one fleet read that covers the
+        # clusters spec.scope.exclude.clusters excludes (#3026).
+        for readiness in (False, True):
+            self.assertNotIn("--scope-exclude-clusters", watch.report_argv(["ops-mgmt", "payments-prod"], readiness))
+
     def test_the_loader_runs_the_checkout_copy_of_the_report_script(self) -> None:
         """End to end against the real scripts, with gcloud answering no
         clusters: the envelope arrives and the private directory is gone."""

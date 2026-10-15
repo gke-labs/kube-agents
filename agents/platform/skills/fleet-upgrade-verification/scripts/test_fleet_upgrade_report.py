@@ -108,10 +108,22 @@ class ExplicitTargetTest(unittest.TestCase):
         return result["members"][0]
 
 
-    def test_a_cluster_the_scope_excludes_is_still_a_member(self):
-        # #3081 bounds every fleet read by spec.scope.exclude.clusters except
-        # this report (#3026), which covers excluded clusters on purpose.
+    def test_a_cluster_the_scope_excludes_is_not_a_member(self):
+        # #3081: an agent-run report (collector_args carry the exclusion) leaves
+        # an excluded cluster out; live run 2026-10-15 answered a fleet question
+        # through this script and listed every excluded cluster.
         report.declared_scope.set("p1", None, "p1/us-central1/lane-b")
+        self.addCleanup(report.declared_scope.set, None, None)
+        pools = [("default-pool", "1.30.5-gke.100")]
+        with patch("sys.stderr"):
+            result = self._run([cluster("ka-today", "us-central1", "1.30.5-gke.100", pools),
+                                cluster("lane-b", "us-central1", "1.30.5-gke.100", pools)])
+        self.assertEqual([m["cluster"] for m in result["members"]], ["ka-today"])
+
+    def test_without_the_exclusion_flag_every_cluster_is_a_member(self):
+        # The readiness watch passes --project flags and no exclusion: its
+        # report covers excluded clusters, the documented exception (#3026).
+        report.declared_scope.set("p1", None)
         self.addCleanup(report.declared_scope.set, None, None)
         pools = [("default-pool", "1.30.5-gke.100")]
         result = self._run([cluster("ka-today", "us-central1", "1.30.5-gke.100", pools),

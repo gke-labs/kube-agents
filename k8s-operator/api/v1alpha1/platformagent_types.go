@@ -175,8 +175,8 @@ type ScopeExcludeSpec struct {
 	// RECONCILE_EXCLUDE environment variable, which matched bare names across
 	// every project.
 	// An excluded cluster gets no Cluster Agent and is left out of every
-	// fleet read and audit the agents run, except the upgrade-readiness
-	// report, which enumerates by project and covers it.
+	// fleet read and audit the agents run, except the daily
+	// upgrade-readiness watch, whose report enumerates by project and covers it.
 	// +kubebuilder:validation:MaxItems=100
 	// +listType=map
 	// +listMapKey=projectId

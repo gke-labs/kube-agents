@@ -1075,10 +1075,12 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
             errors.append({"project": project, "location": None, "message": error or f"{' '.join(cmd)} returned no list"})
             unlisted.append(project)
             continue
-        # Not narrowed by --scope-exclude-clusters: the upgrade-readiness report
-        # is the one fleet read that covers an excluded cluster, on purpose
-        # (#3081, #3026), since it enumerates by project.
-        for cluster in listed:
+        # Narrowed by --scope-exclude-clusters, which the agent passes with the
+        # fleet_scope tool's collector_args (#3081). The daily upgrade-readiness
+        # watch (upgrade_readiness_watch.py) builds its own --project flags and
+        # passes no exclusion, so its report still covers excluded clusters, the
+        # one documented exception (#3026).
+        for cluster in declared_scope.drop_excluded(project, listed):
             if not isinstance(cluster, dict):
                 continue
             if wanted is not None:
