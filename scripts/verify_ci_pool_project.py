@@ -115,6 +115,7 @@ CHECK_GITHUB_REPO_AND_APP = "github_repo_and_app"
 # hourly pool-state scan run it (docs/ci-health.md, "The pool-state scan").
 CHECK_GITOPS_DEFAULT_BRANCH = "gitops_default_branch"
 CHECK_GITOPS_DECLARATION = "gitops_declaration"
+CHECK_GITOPS_WORKLOAD_MANIFEST = "gitops_workload_manifest"
 CHECK_LEDGER_READ_CREDENTIAL = "ledger_read_credential"
 CHECK_TOKEN_MINTER = "token_minter"
 # The KMS half of the minter check alone: the key, its versions, its shape,
@@ -134,6 +135,7 @@ CHECK_IDS = (
     CHECK_GITHUB_REPO_AND_APP,
     CHECK_GITOPS_DEFAULT_BRANCH,
     CHECK_GITOPS_DECLARATION,
+    CHECK_GITOPS_WORKLOAD_MANIFEST,
     CHECK_LEDGER_READ_CREDENTIAL,
     CHECK_TOKEN_MINTER,
     CHECK_TOKEN_MINTER_KMS,
@@ -156,6 +158,7 @@ CHECK_DISPLAY_NAMES = {
     CHECK_GITHUB_REPO_AND_APP: "GitOps Repo & GitHub App Installation",
     CHECK_GITOPS_DEFAULT_BRANCH: "GitOps Repo Default Branch",
     CHECK_GITOPS_DECLARATION: "GitOps Declared-Intent Note",
+    CHECK_GITOPS_WORKLOAD_MANIFEST: "GitOps Workload Declaration",
     CHECK_LEDGER_READ_CREDENTIAL: "Ledger Read Credential",
     CHECK_TOKEN_MINTER: "Token Minter KMS & GSA",
     CHECK_TOKEN_MINTER_KMS: "Token Minter KMS & GSA",
@@ -164,7 +167,7 @@ CHECK_DISPLAY_NAMES = {
 # these is selected, so a run without it -- the pool-state scan, or a hand
 # run of the minter or ledger checks, which read GitHub over urllib and KMS
 # over gcloud -- is not stopped at the door for a tool no selected check uses.
-GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION})
+GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION, CHECK_GITOPS_WORKLOAD_MANIFEST})
 # The default-branch read is `gh` too, and is left out of GITHUB_CHECKS on
 # purpose: the pool-state scan selects it, and a toolchain blocker would turn
 # a job without a GitHub credential into "not checked" on all of the scan's
@@ -177,8 +180,8 @@ GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAUL
 # What the hourly pool-state scan runs: every read-only check on the project.
 # Not the fleet fixtures (the seeded-fleet scan already runs those), not the
 # GitHub-reading checks that need a credential the health bot must not hold
-# (an org member's `gh` for github_repo_and_app and gitops_declaration, the
-# ledger App's key for ledger_read_credential), not the minter's signing half
+# (an org member's `gh` for github_repo_and_app, gitops_declaration and
+# gitops_workload_manifest, the ledger App's key for ledger_read_credential), not the minter's signing half
 # (token_minter; the scan runs token_minter_kms), not the mapping (that is
 # about the checkout, not the project), and not the warm-cache check, whose
 # read is in another project the bot holds nothing on. The GitOps
@@ -434,6 +437,68 @@ GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("compliance-audit", {"check": "default-sa-automount", "namespace": "seeded-token", "object": "Deployment/token-reader"}),
     ("security-patch-orchestrator", {"check": "no-notifications", "namespace": "", "object": "Cluster/seeded-c"}),
     ("fleet-wide-cost-analysis", {"check": "overrequest", "namespace": "seeded-headroom", "object": "Deployment/burst-ingest"}),
+)
+# checkout-gateway's declaration, which provisioning seeds beside the note
+# (GITOPS_WORKLOAD_MANIFEST_* in scripts/provision_ci_pool_project.sh). The
+# remediation cases propose a PodDisruptionBudget beside it; in a repository
+# without it the agent finds nothing to fix and refuses the pull request. The
+# path is the one the fleet audit's workload_declarations reads a cluster off
+# (clusters/<cluster>/...), the tie #2228's cases wait for. The script's
+# content, byte for byte, pinned by a test as the note is.
+GITOPS_WORKLOAD_MANIFEST_PATH = "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
+GITOPS_WORKLOAD_MANIFEST_MESSAGE = "Declare seeded-a's checkout-gateway Deployment in seeded-reliability"
+GITOPS_WORKLOAD_MANIFEST_CONTENT = """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-gateway
+  namespace: seeded-reliability
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: checkout-gateway
+  template:
+    metadata:
+      labels:
+        app: checkout-gateway
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: checkout-gateway
+      containers:
+        - name: gateway
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi"""
+# What the body read back must declare for the audit's index to key it:
+# the kind, name and namespace, each on a line of its own. Presence alone is
+# not the check: a file at the path that declares another object leaves the
+# finding manual and the cases red with a presence check green.
+GITOPS_WORKLOAD_MANIFEST_LINES = (
+    re.compile(r"^kind:\s*Deployment\s*$", re.MULTILINE),
+    re.compile(r"^\s+name:\s*checkout-gateway\s*$", re.MULTILINE),
+    re.compile(r"^\s+namespace:\s*seeded-reliability\s*$", re.MULTILINE),
+)
+# The cases that fail on a project whose repository lacks the declaration:
+# the roster case, and the two #2228 holds for it.
+GITOPS_WORKLOAD_MANIFEST_CASES = (
+    "pdb-remediation-pr",
+    "obtainability-major-pdb-auto-pr",
+    "obtainability-refusal-direct-mutation",
 )
 
 # Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /
@@ -2504,6 +2569,16 @@ def gitops_note_seed_command(repo_slug: str, sha: str = "") -> str:
     )
 
 
+def gitops_manifest_seed_command(repo_slug: str, sha: str = "") -> str:
+    """The `gh api` call that writes checkout-gateway's declaration, replacing it when `sha` names the copy there."""
+    replace = f"-f sha={sha} " if sha else ""
+    return (
+        f"gh api -X PUT repos/{repo_slug}/contents/{GITOPS_WORKLOAD_MANIFEST_PATH} "
+        f"-f message=\"{GITOPS_WORKLOAD_MANIFEST_MESSAGE}\" {replace}"
+        f"-f content=\"$(printf '%s\\n' '{GITOPS_WORKLOAD_MANIFEST_CONTENT}' | base64 | tr -d '\\n')\""
+    )
+
+
 def _gitops_repo_slug(project_id: str) -> str:
     """The GitOps repository a pool project owns, `gke-agentic/<project>-infra`, as hack/ci-deploy.sh maps it."""
     return f"{GITOPS_REPO_ORG}/{project_id}{GITOPS_REPO_SUFFIX}"
@@ -2798,6 +2873,69 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
         f"{' and '.join(GITOPS_INTENT_NOTE_CASES)} fail on this project. Add `knowledge/` to that file's "
         f"`paths`, or move the note under one of them.",
     )
+
+
+def check_gitops_workload_manifest(project_id: str) -> CheckResult:
+    """Verify the GitOps repository declares checkout-gateway where the remediation cases expect it.
+
+    The same reader and the same verdicts as check_gitops_declaration: a
+    refusal or a transient leaves the check unverified, a 404 fails it with
+    the seed command (naming both of its readings), and a body at the path
+    that does not declare the Deployment fails it with the replace command.
+    """
+    name = CHECK_DISPLAY_NAMES[CHECK_GITOPS_WORKLOAD_MANIFEST]
+    repo_slug = _gitops_repo_slug(project_id)
+    path = GITOPS_WORKLOAD_MANIFEST_PATH
+    cases = " and ".join(GITOPS_WORKLOAD_MANIFEST_CASES)
+
+    def unread(what: str, reason: str) -> CheckResult:
+        return CheckResult(name, True, "Not checked", warnings=[Unread(f"Not checked: {what} in {repo_slug} could not be read: {reason}")], read=False)
+
+    def failed(what: str, err: str) -> CheckResult:
+        return CheckResult(name, False, f"Could not read {what} in {repo_slug}: {err}")
+
+    def absent() -> CheckResult:
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} has no {path}, or this token cannot read the repository "
+            f"(gh answers 404 to both; the github_repo_and_app check, run alongside or with --checks, says which). If the repository is "
+            f"readable, {cases} find no manifest to propose a budget beside and fail on this project until it "
+            f"is seeded: {gitops_manifest_seed_command(repo_slug)}",
+        )
+
+    state, out = _gitops_path_state(repo_slug, path)
+    if state == GITHUB_PATH_UNREAD:
+        return unread(path, out)
+    if state == GITHUB_PATH_ABSENT:
+        return absent()
+    if state in (GITHUB_PATH_FAILED, GITHUB_PATH_UNDECODABLE):
+        return failed(path, out)
+    try:
+        payload = _load_json(out)
+        sha = str(payload.get("sha") or "")
+        if payload.get("encoding") == GITHUB_CONTENT_ENCODING_NONE:
+            state, body = _gitops_path_state(repo_slug, path, raw=True)
+            if state == GITHUB_PATH_UNREAD:
+                return unread(f"{path} (over the contents API's inline limit, read raw)", body)
+            if state == GITHUB_PATH_ABSENT:
+                return absent()
+            if state in (GITHUB_PATH_FAILED, GITHUB_PATH_UNDECODABLE):
+                return failed(f"{path} (over the contents API's inline limit, read raw)", body)
+        else:
+            body = base64.b64decode(payload.get("content") or "").decode("utf-8")
+    except Exception as exc:
+        return CheckResult(name, False, f"Could not parse the contents of {path} in {repo_slug}: {exc}")
+    missing = [line.pattern for line in GITOPS_WORKLOAD_MANIFEST_LINES if not line.search(body)]
+    if missing:
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} carries {path} but it does not declare Deployment/checkout-gateway in seeded-reliability "
+            f"(no line matches {', '.join(missing)}), so the audit's index does not key it and {cases} fail on this project. "
+            f"Replace it: {gitops_manifest_seed_command(repo_slug, sha)}",
+        )
+    return CheckResult(name, True, f"{repo_slug} declares Deployment/checkout-gateway at {path}")
 
 
 def check_github_repo_and_app(
@@ -3836,6 +3974,7 @@ def run_checks(
     run(CHECK_GITHUB_REPO_AND_APP, lambda: check_github_repo_and_app(project_id, app_id, repo_membership_confirmed))
     run(CHECK_GITOPS_DEFAULT_BRANCH, lambda: check_gitops_default_branch(project_id))
     run(CHECK_GITOPS_DECLARATION, lambda: check_gitops_declaration(project_id))
+    run(CHECK_GITOPS_WORKLOAD_MANIFEST, lambda: check_gitops_workload_manifest(project_id))
     run(CHECK_LEDGER_READ_CREDENTIAL, lambda: check_ledger_read_credential(project_id))
     if CHECK_TOKEN_MINTER in wanted:
         run(CHECK_TOKEN_MINTER, lambda: check_token_minter(project_id, app_id, location))
