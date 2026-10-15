@@ -23,10 +23,10 @@ The **gateway Pod** holds the harness and nothing credentialed:
 3. `fluent-bit`: log forwarding.
 4. `agent-api-auth`: the PlatformAgent API authenticator, the
    `k8s-event-watcher`, which forwards cluster events using a non-secret
-   internal key, and, where enabled, the drift detector. It holds no Google
-   credential: both watchers make their Google calls through the broker's
-   watcher routes with a token for the `watcher` audience, which is mounted
-   here and in no other container.
+   internal key, and, where enabled, the drift detector. Neither calls Google
+   on the pod's own identity: both make their Google calls through the
+   broker's watcher routes with a token for the `watcher` audience, which is
+   mounted here and in no other container.
 
 The **shell sandbox Pod**, `<agent>-shell`, runs `sshd`, the agent's own tools, a
 durable `/opt/data`, the shims that stand in for `gcloud` and `kubectl`, and a
@@ -232,7 +232,7 @@ pods, which read the counters into the `PlatformAgent`'s `status.usage`
 Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
 audience-bound projected ServiceAccount token (one hour; the audience is per
-pod, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-proxy-chat` for
+caller, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-proxy-chat` for
 the gateway, `kubeagents-credential-proxy-watcher` for the gateway's `agent-api-auth` container
 alone (the event watcher and drift detector, whose fleet and Pub/Sub calls go through the
 broker's watcher routes) and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`

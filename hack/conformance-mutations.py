@@ -536,6 +536,16 @@ Mutation(
         "the watcher role and a check keyed on the volume name never sees it",
     ),
     Mutation(
+        "C1-watcher-cluster-read-relays-master-auth",
+        "agents/platform/scripts/watcher_policy.py",
+        ('CLUSTER_MASTER_AUTH_FIELDS = frozenset({"clusterCaCertificate"})\n',
+         'CLUSTER_MASTER_AUTH_FIELDS = frozenset({"clusterCaCertificate", "clientCertificate", "clientKey"})\n'),
+        "test_C1_the_watcher_cluster_read_never_relays_a_client_credential",
+        "keep the client certificate too, in case a future watcher talks to the "
+        "control plane directly -- every watcher-token holder then gets a key "
+        "for each fleet cluster that has client certificate issuance on",
+    ),
+    Mutation(
         "C1-watcher-route-allows-a-list",
         "agents/platform/scripts/watcher_policy.py",
         ('_EVENTS_LIST = re.compile(r"api/v1/events")\n',

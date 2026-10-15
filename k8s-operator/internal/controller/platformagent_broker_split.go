@@ -301,3 +301,50 @@ func buildCredentialBrokerTokenReviewRole(agent *agentv1alpha1.PlatformAgent) *r
 		}},
 	}
 }
+
+// watcherTokenSourceNames is the set of user-authored volume names that would
+// hand a container the watchers' broker token: the reserved name itself, and
+// any volume on either of the CR's volume lists that projects a
+// serviceAccountToken for the watcher audience under another name. The broker
+// confers the `watcher` role on the audience alone -- every fleet cluster's
+// events and named objects, and the drift subscription -- and the operator
+// projects that token into agent-api-auth and nowhere else, so a CR container
+// mounting either kind is a second holder of the role. buildPodTemplateSpec
+// strips those volumes, and every mount naming them, from all five
+// user-authored surfaces: sidecars, initContainers, sidecarVolumes,
+// extraVolumes and (in buildBaseContainers) extraVolumeMounts.
+//
+// The same two halves, name and source, as the A2A bus token's reservation
+// (a2aBusCredentialVolumeNames), and on the same terms: a guard against a
+// misconfiguration by the CR's author, who is the platform operator, not a
+// boundary against a hostile sidecar, since a pod's projected tokens are minted
+// for its ServiceAccount whichever container asks. Unlike that one it is not
+// gated on mode: the watcher token is in every gateway pod.
+func watcherTokenSourceNames(agent *agentv1alpha1.PlatformAgent) map[string]bool {
+	names := map[string]bool{watcherTokenVolume: true}
+	if agent.Spec.Deployment == nil {
+		return names
+	}
+	for _, list := range [][]corev1.Volume{agent.Spec.Deployment.SidecarVolumes, agent.Spec.Deployment.ExtraVolumes} {
+		for _, v := range list {
+			if projectsWatcherToken(v) {
+				names[v.Name] = true
+			}
+		}
+	}
+	return names
+}
+
+// projectsWatcherToken reports whether a volume delivers a token for the
+// watcher audience.
+func projectsWatcherToken(v corev1.Volume) bool {
+	if v.Projected == nil {
+		return false
+	}
+	for _, source := range v.Projected.Sources {
+		if source.ServiceAccountToken != nil && source.ServiceAccountToken.Audience == credentialProxyWatcherAudience {
+			return true
+		}
+	}
+	return false
+}

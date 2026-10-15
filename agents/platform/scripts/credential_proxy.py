@@ -9093,6 +9093,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         request_id = str(uuid.uuid4())
         parts = urllib.parse.urlsplit(self.path)
         host, _, path = parts.path[len(watcher_policy.WATCHER_GCP_PREFIX) :].partition("/")
+        self._log_watcher_request("watcher gcp", request_id, f"{host}/{path}")
         body = b""
         if self.command == watcher_policy.METHOD_POST:
             # The two answers /v1/exec and the MCP relay give: 400 for a length
@@ -9160,19 +9161,31 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
             )
             return
+        relayed = upstream.body
+        if decision.rule_id == watcher_policy.RULE_GCP_CLUSTER_GET and upstream.status == HTTPStatus.OK:
+            # Only the fields the watchers read; never masterAuth's client key.
+            projected = watcher_policy.project_cluster(upstream.body)
+            if projected is None:
+                LOGGER.warning("watcher gcp unparseable cluster request_id=%s", request_id)
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
+                )
+                return
+            relayed = projected
         LOGGER.info(
             "watcher gcp forwarded request_id=%s rule=%s status=%d bytes=%d",
             request_id,
             decision.rule_id,
             upstream.status,
-            len(upstream.body),
+            len(relayed),
         )
         self.send_response(upstream.status)
         if upstream.content_type:
             self.send_header("Content-Type", sanitize_header(upstream.content_type))
-        self.send_header("Content-Length", str(len(upstream.body)))
+        self.send_header("Content-Length", str(len(relayed)))
         self.end_headers()
-        self.wfile.write(upstream.body)
+        self.wfile.write(relayed)
 
     def _watcher_cluster_endpoint(self, target: dict[str, str], request_id: str) -> tuple[str, str] | None:
         """`(host, CA PEM or "")` for a fleet cluster's control plane, or None after answering.
@@ -9217,6 +9230,23 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self.watcher_endpoints[key] = (now + WATCHER_ENDPOINT_TTL_S, resolved[0], resolved[1])
         return resolved
 
+    def _log_watcher_request(self, label: str, request_id: str, target: str) -> None:
+        """The pre-decision audit line, naming the caller, as the other credentialed routes write it.
+
+        The broker makes every watcher call on its own credential, so this line
+        is the record of which ServiceAccount presented the watcher token.
+        """
+        principal = self.principal
+        LOGGER.info(
+            "%s request_id=%s principal=%s target=%s",
+            label,
+            request_id,
+            _sanitize_for_logging(principal.describe() if principal else "", max_length=PRINCIPAL_LOG_LENGTH),
+            # The Cloud API relay's path width: the object read on the broker's
+            # credential has to survive on the one line that names the caller.
+            _sanitize_for_logging(target, max_length=API_RELAY_PATH_LOG_LENGTH),
+        )
+
     def _watcher_k8s_connection(self, host: str, ca_pem: str) -> http.client.HTTPConnection:
         """A TLS connection to a fleet control plane; the seam a test points at a fake.
 
@@ -9243,6 +9273,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             drain_request_body(self, self.max_request_bytes)
         parts = urllib.parse.urlsplit(self.path)
         rest = parts.path[len(watcher_policy.WATCHER_K8S_PREFIX) :]
+        self._log_watcher_request("watcher k8s", request_id, rest)
         if len(parts.query) > API_RELAY_MAX_QUERY_BYTES or not API_RELAY_QUERY_SHAPE.match(parts.query):
             # The same bound the Cloud API relay puts on a query it forwards:
             # bytes http.client will put on a request line, and not too many.
@@ -9285,10 +9316,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         watching = watcher_policy.is_watch(query)
         read_timeout = WATCHER_WATCH_READ_TIMEOUT_S if watching else API_RELAY_DEADLINE_S
-        connection = self._watcher_k8s_connection(host, ca_pem)
+        # Built inside the try: a cached CA that will not load is a TLS failure
+        # like any other, answered 502 and forgotten, not an unanswered request.
+        connection: http.client.HTTPConnection | None = None
         started = time.monotonic()
         answered = False
         try:
+            connection = self._watcher_k8s_connection(host, ca_pem)
             connection.connect()
             connection.sock.settimeout(read_timeout)
             target_path = f"/{k8s_path}?{parts.query}" if parts.query else f"/{k8s_path}"
@@ -9355,7 +9389,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                         {"error": "the API server could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
                     )
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
 
     def _handle_workspace_post(self) -> None:
         """The content-passing routes: bytes in, bytes out, never a path.

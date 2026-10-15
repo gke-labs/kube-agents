@@ -18,12 +18,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"golang.org/x/oauth2"
 	container "google.golang.org/api/container/v1"
+	"google.golang.org/api/googleapi"
 	"k8s.io/client-go/rest"
 )
 
@@ -323,8 +325,9 @@ func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]Profi
 // that change would have been silently missed. Asking the GKE API for the
 // address removes the dependency rather than reinstating it — and it has to be
 // removed rather than reinstated, because anything read back out of the sandbox
-// is writable by the model, and a caller attaches a cloud-platform token to
-// whatever host it is told to talk to.
+// is writable by the model, and a caller attaches a credential to whatever host
+// it is told to talk to (a cloud-platform token without a broker; with one,
+// every request goes to the broker, which resolves the address itself).
 //
 // A profile that looks like a cluster profile but fails to load is skipped, not
 // fatal. Dropping one cluster is bad; the alternative is worse, because these
@@ -349,6 +352,14 @@ func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]Profi
 // fix, so those go to OnSkip and return no clusters rather than crashlooping
 // forever.
 //
+// Through a credential proxy there is one more error return, on the same
+// grounds as the missing directory: a broker that cannot be reached, or that
+// answers a describe with a 5xx (no credential of its own yet, or its own hop
+// to Google failed). That is the broker's state, not the cluster's, so it would
+// skip every profile in the pass, and a restart is what fixes it. A 4xx is the
+// cluster's or the policy's answer, and is a skip like any other lookup that
+// fails.
+//
 // Finding none is not an error either. A freshly installed harness has no
 // Cluster Agent profiles until the first cluster-agent-reconcile tick creates
 // them, so an empty result is a normal startup state rather than a
@@ -364,10 +375,10 @@ func (d Discoverer) Discover(ctx context.Context, dir string) ([]Cluster, error)
 		return nil, nil
 	}
 	var clusters []Cluster
-	// Minted on first use, then shared: every profile authenticates as the same
-	// pod identity, and a process with no cluster profiles at all -- which is
-	// every single-cluster install -- should not pay for a credential it never
-	// uses.
+	// Without a broker: minted on first use, then shared. Every profile
+	// authenticates as the same pod identity, and a process with no cluster
+	// profiles at all -- which is every single-cluster install -- should not pay
+	// for a credential it never uses. With a broker none is minted at all.
 	var tokenSource oauth2.TokenSource
 	// Keyed on the full project/location/cluster triple, not the bare name:
 	// two clusters called "prod" in different locations are two clusters, and
@@ -407,6 +418,25 @@ func (d Discoverer) Discover(ctx context.Context, dir string) ([]Cluster, error)
 		}
 		described, err := d.describe(ctx, *identity)
 		if err != nil {
+			// A broker that cannot be reached at all is not this cluster's
+			// refusal: it would skip every profile, and discovery runs once,
+			// so the process would watch none of the fleet until a restart. The
+			// broker is a sibling pod that a Recreate rollout leaves without
+			// endpoints for a moment, and the supervisor in start-services.sh
+			// restarts a process that exits, with backoff, so exiting is what
+			// makes the gap self-healing. The same holds for a 5xx: the broker
+			// answers 503 while it has no credential of its own yet, and 502 or
+			// 504 when its own hop to Google fails, and none of those is this
+			// cluster's answer either. A 4xx, a 403 included, is the cluster's
+			// (or the policy's), and is skipped as before.
+			var transport *url.Error
+			var status *googleapi.Error
+			if d.Broker != nil && errors.As(err, &transport) {
+				return nil, fmt.Errorf("the credential proxy at %s could not be reached while asking where %s is, so no profile cluster can be: %w", d.Broker.URL, identity, err)
+			}
+			if d.Broker != nil && errors.As(err, &status) && status.Code >= 500 {
+				return nil, fmt.Errorf("the credential proxy at %s answered %d while asking where %s is, which is its own state rather than this cluster's, so no profile cluster can be: %w", d.Broker.URL, status.Code, identity, err)
+			}
 			d.skip(e.Name(), fmt.Errorf("asking %s where %s is: %w", d.describedBy(), identity, err))
 			continue
 		}
