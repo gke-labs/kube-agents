@@ -393,30 +393,41 @@ func startRigWithLogger(t *testing.T, tweak func(*Config), logger *slog.Logger) 
 	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url}
 }
 
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
+// pollUntil retries cond for up to ten seconds and reports whether it held.
+func pollUntil(cond func() bool) bool {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if cond() {
-			return
+			return true
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %s", what)
+	return false
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	if !pollUntil(cond) {
+		t.Fatalf("timed out waiting for %s", what)
+	}
 }
 
 // waitForRecord polls the conversation's session record until cond holds and
 // returns that record. The gateway posts a command's acknowledgement inside
 // the command and writes the record only after it returns, so a test that
 // waited on the post and read the record once could read the old record on a
-// loaded runner.
+// loaded runner. A timeout prints the last record and lookup error, so a
+// record that never changed and a KV that kept failing read differently.
 func waitForRecord(t *testing.T, r *rig, conv, what string, cond func(*SessionRecord) bool) *SessionRecord {
 	t.Helper()
 	var rec *SessionRecord
-	waitFor(t, what, func() bool {
-		rec, _ = r.g.reg.Get(context.Background(), conv)
-		return rec != nil && cond(rec)
-	})
+	var err error
+	if !pollUntil(func() bool {
+		rec, err = r.g.reg.Get(context.Background(), conv)
+		return err == nil && rec != nil && cond(rec)
+	}) {
+		t.Fatalf("timed out waiting for %s: last record %+v, err %v", what, rec, err)
+	}
 	return rec
 }
 
@@ -1881,11 +1892,8 @@ func TestSessionCommandMarksTheRouteAndTheNextMessageSpawns(t *testing.T) {
 	if got := len(spawn.calls()); got != 0 {
 		t.Fatalf("/session spawned %d pods; it must spawn none", got)
 	}
-	rec, err := r.g.reg.Get(context.Background(), conv)
-	if err != nil || rec == nil {
-		t.Fatalf("record: %v %v", rec, err)
-	}
-	if !rec.SessionRouted || rec.Profile != "chat" {
+	rec := waitForRecord(t, r, conv, "route on", func(rec *SessionRecord) bool { return rec.SessionRouted })
+	if rec.Profile != "chat" {
 		t.Fatalf("record not session-routed after /session: %+v", rec)
 	}
 	ctxID := rec.ContextID
@@ -2123,8 +2131,8 @@ func TestSessionCommandWhileAPlatformTaskRunsSaysSo(t *testing.T) {
 			t.Fatalf("promised the next message opens a pod while a task runs: %q", p)
 		}
 	}
-	rec, _ := r.g.reg.Get(ctx, conv)
-	if !rec.SessionRouted || rec.ActiveTask == nil || rec.ActiveTask.Detached {
+	rec := waitForRecord(t, r, conv, "route on", func(rec *SessionRecord) bool { return rec.SessionRouted })
+	if rec.ActiveTask == nil || rec.ActiveTask.Detached {
 		t.Fatalf("record after /session during a task: %+v", rec)
 	}
 	if len(spawn.calls()) != 0 {
@@ -2152,8 +2160,8 @@ func TestSessionCommandWithTextWhileATaskRunsHoldsTheText(t *testing.T) {
 		}
 		t.Fatalf("the held text reached the platform task as %s", e.Kind)
 	}
-	rec, _ := r.g.reg.Get(ctx, conv)
-	if !rec.SessionRouted || len(spawn.calls()) != 0 {
+	rec := waitForRecord(t, r, conv, "route on", func(rec *SessionRecord) bool { return rec.SessionRouted })
+	if len(spawn.calls()) != 0 {
 		t.Fatalf("record %+v, spawns %d", rec, len(spawn.calls()))
 	}
 }
