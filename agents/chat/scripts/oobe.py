@@ -288,7 +288,9 @@ def managed_repositories() -> list[str]:
     """The GitOps repositories audits publish to. Raises when the list cannot be read."""
     import gitops_workspace  # beside this script in the pod
 
-    return gitops_workspace.get_managed_github_repos()
+    # On a GitHub Enterprise Server install the repository is named with its
+    # host; the bare-slug reader would answer none.
+    return gitops_workspace.get_managed_github_repo_names()
 
 
 def trigger(job_id: str, data_dir: Path) -> bool:
