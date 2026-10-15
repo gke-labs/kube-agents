@@ -110,7 +110,7 @@
 # 1002s, p90 2074s, over 903 repetitions 2026-09-04 to 09-15) nearer 150.
 # 2026-09-29: the canary returned to the presubmit file held out (#2013) and
 # pdb-remediation-pr moved there held out beside it (#2016, seat opened
-# 2026-09-28), so this file's share was thirty-eight cases (114 units) of the
+# 2026-09-28; roster line 2026-10-14), so this file's share was thirty-eight cases (114 units) of the
 # fifty-two-case, 156-unit matrix before the declared-intent addition below; the
 # nightly runs both files, so its matrix and its price do not change.
 # fleet-audit-reports-past-run makes it thirty-nine cases (117 units) of a
@@ -341,6 +341,16 @@
 # default ALERT_DAILY_LIMIT_DRIFT of 5 that the sibling's paragraph below
 # reasons from. The eval install runs uncapped (EVAL_ALERT_DAILY_LIMIT_DRIFT=0
 # in hack/ci-deploy.sh), so this is a dev-install note, not a CI one.
+#
+# 2026-10-06 adds upgrades-fleet-readiness-failclosed-webhook (its paragraph
+# is last because its count is the newest): one case, three units, a
+# read-only chat turn that runs the readiness script over every cluster in
+# the project (one red repetition on a dev install with thirty-odd clusters
+# took 29 minutes of agent time; the pool projects hold the seeded fleet and
+# the host). Its entry sits after findings-decision-covers-item below.
+# Counted from the lists on 2026-10-14, after the merges of main to 1f9b84ba:
+# seventy-four cases (222 units) here, of an eighty-eight-case, 264-unit matrix
+# with the presubmit file's fourteen.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -414,12 +424,11 @@
 #      unit_cost_hint. Listed here from 2026-09-15 until 2026-09-28, when
 #      its held-out seat in presubmit-cases.txt opened (#2016 step 2). That
 #      file carries its record under both checks (12/12 under
-#      report_contains on the four graded nights 2026-09-16 to 09-20;
-#      nothing on any graded night under pull_request_opened, #1780) and the
+#      report_contains on the four graded nights 2026-09-16 to 09-20; under
+#      pull_request_opened, #1780, nothing until #2263, then 90 %) and the
 #      miss shape the seat counts as the case's own; this file never lists a
-#      presubmit case twice. With rca-remediation-pr below still nightly,
-#      the remediation domain has no roster case and sits on the
-#      docs/designs/domains.yaml allowlist until #2016 step 4.
+#      presubmit case twice. pdb-remediation-pr took the remediation roster
+#      line on 2026-10-14 (#2016 step 4); rca-remediation-pr below stays nightly.
 ./tasks/chat-routing-board-read/task.yaml
 
 # #1023's incident-triage probe, incident-triage-oom-event-probe, was listed
@@ -858,6 +867,19 @@
 # the rows through the Session KV server's findings routes and resolves them on
 # destroy. No fixture; the host install only.
 ./tasks/findings-decision-covers-item/task.yaml
+# The readiness report's fail-closed webhook source: the fleet-upgrade-verification
+# skill's --readiness table grades a fail-closed admission webhook whose
+# backend the API server cannot reach, as a blocker when its rules reach the
+# upgrade's path or a bootstrap RBAC write a new master reconciles (cluster-scoped
+# always; in kube-system or kube-public when its namespace selector admits that
+# namespace), and as an outage otherwise. The planted gate on seeded-b (role
+# readiness-failclosed-webhook) matches ConfigMaps only, which no graded list
+# carries, so the case grades the gate's line as "blocks the upgrade: no" beside
+# "yes" for the budget and the exclusion, reads the worker's commands for the
+# readiness run, and requires the missing backend named. Read-only chat prompt;
+# nothing to mutate. Nightly from its first merge; a presubmit seat is a later
+# pull request that cites its record.
+./tasks/upgrades-fleet-readiness-failclosed-webhook/task.yaml
 
 # gke-upgrades skill probe: a node-pool upgrade runbook uses
 # clusters upgrade --node-pool, and the no_upgrades limits name the rolling

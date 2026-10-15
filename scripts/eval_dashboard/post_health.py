@@ -1424,7 +1424,8 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     """The 24h numbers, the stale note while a stall lasts, and -- when
     data.json was given -- one line on last night's nightly run with a link
     to its report: the counts, what is newly failing against the night
-    before and the wall clock, or that the night was truncated or missing."""
+    before, the opening chat turn's p50 and p95 when the reps carried it,
+    and the wall clock, or that the night was truncated or missing."""
     metrics = health.get("metrics") or {}
     p50 = metrics.get("wall_clock_p50_s")
     typical = f"{int(p50 // 60)} min" if p50 is not None else "n/a"

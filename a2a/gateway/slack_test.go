@@ -1084,6 +1084,44 @@ func TestToMrkdwn(t *testing.T) {
 	}
 }
 
+// TestToMrkdwnKeepsAnExecutorsSlackLink mirrors
+// TestToGchatTextKeepsAnExecutorsChatLink: <url|text> is Slack's link form
+// too, and escaping turned every one the executor wrote into literal text
+// with a bare URL beside it (#3015 on Chat). A closed one in prose, with an
+// http(s) URL in the markdown destination class and text that names no
+// other host, is kept with its URL and text escaped as the rest of the text
+// is; everything else is escaped as before, Slack's other sequences
+// included.
+func TestToMrkdwnKeepsAnExecutorsSlackLink(t *testing.T) {
+	cases := map[string]string{
+		issue3015Reply:                                              issue3015Reply,
+		"<https://x.example/a?b=1&c=2|R&D>":                         "<https://x.example/a?b=1&amp;c=2|R&amp;D>",
+		"<https://x.example/a|a> and [b](https://x.example/b)":      "<https://x.example/a|a> and <https://x.example/b|b>",
+		"<https://evil.example/login|https://github.com/x>":         "&lt;https://evil.example/login|https://github.com/x&gt;",
+		"<https://evil.example|x](https://good.example) [y>":        "&lt;https://evil.example|x](https://good.example) [y&gt;",
+		"<https://a.example|<https://b.example|c>>":                 "&lt;https://a.example|<https://b.example|c>&gt;",
+		"<https://x.example/a|b|c>":                                 "&lt;https://x.example/a|b|c&gt;",
+		"see <https://evil.example|docs: <https://x.example/p|doc>": "see &lt;https://evil.example|docs: <https://x.example/p|doc>",
+		"<!channel|everyone>":                                       "&lt;!channel|everyone&gt;",
+		"<@U999|bob> and <#C1|chan>":                                "&lt;@U999|bob&gt; and &lt;#C1|chan&gt;",
+		"<mailto:a@x.example|mail>":                                 "&lt;mailto:a@x.example|mail&gt;",
+		"`<https://x.example|doc>`":                                 "`&lt;https://x.example|doc&gt;`",
+		"see ``` <https://x.example|doc>":                           "see ``` &lt;https://x.example|doc&gt;",
+		// The markdown rules read a kept link as the link it is: the bold
+		// a heading becomes wraps it, and a markdown link around it or
+		// inside it is refused rather than nested.
+		"# Opened <https://x.example/p|PR 3>":                "*Opened <https://x.example/p|PR 3>*",
+		"<https://x.example/p|**doc**>":                      "<https://x.example/p|*doc*>",
+		"[t](https://evil.example/<https://good.example|x>)": "[t](https://evil.example/<https://good.example|x>)",
+		"<https://x.example/a|[doc](https://x.example/b)>":   "<https://x.example/a|[doc](https://x.example/b)>",
+	}
+	for in, want := range cases {
+		if got := toMrkdwn(in); got != want {
+			t.Errorf("toMrkdwn(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestToMrkdwnConvertsProseAfterAChunkedFence: Gateway.post splits a result
 // with chatChunks(text, discordChunk) and the adapter translates each chunk
 // on its own, so the chunker closes a fenced block it cuts and reopens it in
