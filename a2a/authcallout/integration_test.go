@@ -84,13 +84,13 @@ type harness struct {
 // and refuses anything else — the shape of a real TokenReview answer, including
 // the audience the validator insists on and the pod-bound Extra fields the
 // authenticator writes for a projected token.
-func tokenReviewer(tokens map[string]Attested, onReview func() func()) *fake.Clientset {
+func tokenReviewer(tokens map[string]Attested, onReview func(token string) func()) *fake.Clientset {
 	c := fake.NewSimpleClientset()
 	c.PrependReactor("create", "tokenreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		if onReview != nil {
-			defer onReview()()
-		}
 		req := action.(k8stesting.CreateAction).GetObject().(*authnv1.TokenReview)
+		if onReview != nil {
+			defer onReview(req.Spec.Token)()
+		}
 		att, ok := tokens[req.Spec.Token]
 		if !ok {
 			req.Status = authnv1.TokenReviewStatus{Authenticated: false, Error: "invalid bearer token"}
@@ -117,14 +117,23 @@ func tokenReviewer(tokens map[string]Attested, onReview func() func()) *fake.Cli
 type harnessOption func(*harnessOptions)
 
 type harnessOptions struct {
-	// onTokenReview is called on entry to every TokenReview the callout makes
-	// and its result on exit, so a test can watch how many are in flight at
-	// once and how long each one takes.
-	onTokenReview func() func()
+	// onTokenReview is called, with the token under review, on entry to
+	// every TokenReview the callout makes and its result on exit, so a test
+	// can watch how many are in flight at once, how long each one takes,
+	// and whose they are.
+	onTokenReview func(token string) func()
+	// grantTTL, when set, replaces the callout's one-hour grant lifetime,
+	// so a test can watch a connection outlive the JWT it was issued.
+	grantTTL time.Duration
+}
+
+// withGrantTTL shortens every grant the callout issues.
+func withGrantTTL(d time.Duration) harnessOption {
+	return func(o *harnessOptions) { o.grantTTL = d }
 }
 
 // watchingTokenReviews wraps every TokenReview the callout performs.
-func watchingTokenReviews(around func() func()) harnessOption {
+func watchingTokenReviews(around func(token string) func()) harnessOption {
 	return func(o *harnessOptions) { o.onTokenReview = around }
 }
 
@@ -229,6 +238,8 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		// The reserved addressees the operator renders, from the fixture it
 		// keeps equal to its render.
 		ReservedAddressees: renderedFixtureAddressees(t),
+
+		GrantTTL: options.grantTTL,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
@@ -534,7 +545,7 @@ func TestTheCalloutAnswersOneAuthorizationAtATime(t *testing.T) {
 	var mu sync.Mutex
 	inFlight, peak, reviews := 0, 0, 0
 
-	h := startHarness(t, twoIdentityMap, defaultTokens(), watchingTokenReviews(func() func() {
+	h := startHarness(t, twoIdentityMap, defaultTokens(), watchingTokenReviews(func(string) func() {
 		mu.Lock()
 		inFlight++
 		reviews++

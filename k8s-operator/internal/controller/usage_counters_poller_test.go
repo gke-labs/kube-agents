@@ -52,6 +52,7 @@ const (
 	usageTestGatewayIP = "10.0.0.10"
 	usageTestBrokerIP  = "10.0.0.20"
 	usageTestGatewayB  = "10.0.0.11"
+	usageTestA2AIP     = "10.0.0.12"
 )
 
 func usageClock(minute int) time.Time {
@@ -103,6 +104,25 @@ func usageGatewayPod(name, uid, ip string, created time.Time) *corev1.Pod {
 		},
 	}
 }
+
+// usageA2AGatewayPod is a running A2A gateway pod, the one a next-mode
+// install runs, with its metrics port on the gateway container.
+func usageA2AGatewayPod(name, uid, ip string, created time.Time) *corev1.Pod {
+	agent := usageTestAgent(created)
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: usageTestNamespace, UID: types.UID(uid),
+			CreationTimestamp: metav1.NewTime(created),
+			Labels:            a2aGatewayPodSelector(agent),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: a2aGatewayContainerName, Ports: []corev1.ContainerPort{{Name: a2aGatewayMetricsPortName, ContainerPort: a2aGatewayMetricsPort}}}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: ip},
+	}
+}
+
+func a2aAddr() string { return usageTestA2AIP + ":9096" }
 
 func usageBrokerPod(name, uid, ip string, created time.Time) *corev1.Pod {
 	agent := usageTestAgent(created)
@@ -1282,6 +1302,48 @@ func TestUsagePoller_AnOldProcessOnANeverReadPodIsBaselined(t *testing.T) {
 	h.poll(10)
 	if got := h.status().ChatMessagesInboundTotal; got != 0 {
 		t.Fatalf("a body without a start time added its whole sample: %d, want 0", got)
+	}
+}
+
+// On a next-mode install the A2A gateway owns Chat ingress and counts the
+// messages it accepts; the poller reads its pod as a fourth target into the
+// same chat counter, with an entry and a streak of its own, beside the
+// plugin's entry on the gateway pod (which counts nothing there: a turn the
+// bridge hands Hermes' API server never reaches the dispatch hook).
+func TestUsagePoller_ChatMessagesCountFromTheA2AGatewayToo(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	a2a := usageA2AGatewayPod("agent-a2a-gateway-ccc", "a2a-c", usageTestA2AIP, created)
+	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), a2a)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(chatAddr(), 1, ptr.To(1.0))
+	h.stub.set(a2aAddr(), 10, ptr.To(1.0))
+	h.stub.set(brokerAddr(), 0, nil)
+	h.poll(5)
+	if doc := h.document(); doc.Pods[usagePodEntryKey("a2a-c", usageCounterChatMessagesInbound)] == nil {
+		t.Fatalf("the A2A gateway's chat entry was not recorded: %v", doc.Pods)
+	}
+	h.stub.set(chatAddr(), 2, ptr.To(1.0))
+	h.stub.set(a2aAddr(), 14, ptr.To(1.0))
+	h.poll(10)
+	if got := h.status().ChatMessagesInboundTotal; got != 5 {
+		t.Fatalf("after 1 API-port message and 4 A2A gateway messages: %d, want 5", got)
+	}
+	// The A2A gateway's listener failing is its own streak and Warning, and
+	// the plugin's reading keeps landing.
+	h.stub.fail(a2aAddr(), usageScrapeKindRefused)
+	h.stub.set(chatAddr(), 3, ptr.To(1.0))
+	h.poll(15)
+	h.poll(20)
+	if got := h.status().ChatMessagesInboundTotal; got != 6 {
+		t.Fatalf("with the A2A gateway unreadable: %d, want 6", got)
+	}
+	select {
+	case ev := <-h.recorder.Events:
+		if !strings.Contains(ev, "agent-a2a-gateway-ccc") || !strings.Contains(ev, "chatMessagesInboundTotal") {
+			t.Fatalf("event = %q, want it to name the A2A gateway pod and the chat field", ev)
+		}
+	default:
+		t.Fatal("no Warning after two failed reads of the A2A gateway")
 	}
 }
 

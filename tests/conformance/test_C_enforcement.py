@@ -482,20 +482,25 @@ class C1IsolationIsStructural(unittest.TestCase):
             "fences no pod: fence requires %r, spawner stamps %r" % (required, stamped),
         )
 
-    def test_C1_the_a2a_gateway_admits_the_collector_to_the_metrics_port_and_nobody_else(self) -> None:
-        """The gateway's fences admit one peer, to one port: the collector, to metrics.
+    def test_C1_the_a2a_gateway_admits_the_collector_and_the_operator_to_the_metrics_port_and_nobody_else(self) -> None:
+        """The gateway's fences admit two peers, to one port: the collector and the
+        operator's pods, to metrics.
 
         The A2A gateway's doors listen on loopback, and its fences deny every
         pod on their ports; a door reached from the pod network is a task
         submission endpoint guarded by a bearer token alone. The metrics
         listener is the one port on that pod the pod network is meant to
         reach, and only from the managed-Prometheus collector's namespace --
-        the credential broker's second rule, copied. A rule that admits any
-        other peer, or admits the collector to any other port, widens the
-        gateway past what the metrics listener needed.
+        the credential broker's second rule, copied -- and from the operator's
+        pods in the operator's namespace, which read the gateway's chat counter
+        into status.usage: the rule the broker's and the Hermes gateway's
+        policies carry on their metrics ports. A rule that admits any other
+        peer, or admits either to any other port, widens the gateway past what
+        the metrics listener needed.
 
         Read from the operator's real render (the fixture its Go test keeps
-        equal to the builder), with both doors armed so all three fences
+        equal to the fences as the reconciler applies them, with the operator
+        in its default namespace), with both doors armed so all three fences
         exist: each door's, and the gateway's own, which renders on every next
         gateway door or no door because the metrics listener binds every
         interface (#2473).
@@ -518,6 +523,18 @@ class C1IsolationIsStructural(unittest.TestCase):
         self.assertTrue(doors, "the fixture renders no door port, so nothing here is fenced")
         self.assertNotIn(metrics[0], doors, "the metrics port is also a door's port")
         collector = {"matchLabels": {"kubernetes.io/metadata.name": "gke-gmp-system"}}
+        # The operator peer, pinned to the operator's own label constants.
+        labels = h.text("operator_metrics_peer")
+
+        def go_const(name: str) -> str:
+            match = re.search(rf"^\s*(?:const\s+)?{name}\s*=\s*\"([^\"]+)\"", labels, re.MULTILINE)
+            self.assertIsNotNone(match, f"{name} is no longer a string constant")
+            return match.group(1)
+
+        operator = [{
+            "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kubeagents-system"}},
+            "podSelector": {"matchLabels": {go_const("operatorPodNameLabel"): go_const("operatorPodNameValue")}},
+        }]
         # The labels the gateway pod carries, not the Deployment's name: a
         # fence requiring a label the pod lacks selects nothing, and the API
         # server reports that as success.
@@ -539,16 +556,20 @@ class C1IsolationIsStructural(unittest.TestCase):
                 )
                 self.assertIn("Ingress", spec.get("policyTypes") or [], "the fence governs no ingress")
                 rules = spec.get("ingress") or []
-                self.assertEqual(len(rules), 1, "the fence admits more than the collector's rule")
-                rule = rules[0]
+                self.assertEqual(len(rules), 2, "the fence admits more than the collector's rule and the operator's")
                 self.assertEqual(
-                    rule.get("from"), [{"namespaceSelector": collector}],
-                    "the fence admits a peer other than the collector's namespace, alone",
+                    rules[0].get("from"), [{"namespaceSelector": collector}],
+                    "the first rule admits a peer other than the collector's namespace, alone",
                 )
                 self.assertEqual(
-                    rule.get("ports"), [{"port": metrics[0], "protocol": "TCP"}],
-                    "the collector is admitted to a port other than the metrics listener's",
+                    rules[1].get("from"), operator,
+                    "the second rule admits a peer other than the operator's pods in the operator's namespace",
                 )
+                for rule in rules:
+                    self.assertEqual(
+                        rule.get("ports"), [{"port": metrics[0], "protocol": "TCP"}],
+                        "a peer is admitted to a port other than the metrics listener's",
+                    )
 
     def test_C1_a_session_pod_carries_no_kubernetes_identity(self) -> None:
         """The premise the fence's rule set rests on.

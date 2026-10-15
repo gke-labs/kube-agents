@@ -11,7 +11,7 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit fleet-consistency-drift [--repo "<owner>/<repo>"]
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit fleet-consistency-drift [--repo "<owner>/<repo>"]
 ```
 
 If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
@@ -123,7 +123,7 @@ wrong about its own evidence.
 **Run the collector before evaluating any facet below by hand.**
 
 ```bash
-python3 ./skills/fleet-audit/scripts/fleet_drift.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> > /opt/data/scratch/manifest_fleet-consistency-drift.json
+python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/fleet_drift.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> > /opt/data/scratch/manifest_fleet-consistency-drift.json
 ```
 
 Once per repository, inside §0's loop, and after that repository's `start`. The path is fixed, so the previous repository's manifest is still sitting at it — and `finish` refuses a manifest whose `finished_at` predates this run's `start`, which is what a carried-over one looks like. The fleet does not change between two repositories of the same loop, so reusing the manifest is the tempting thing to do and costs the second repository its cross-check. Re-running is one `clusters list` per project.
@@ -305,7 +305,7 @@ Worked example, for a 4.4 network-policy outlier:
 ### 7. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit fleet-consistency-drift \
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit fleet-consistency-drift \
   --findings-file /opt/data/scratch/findings_fleet-consistency-drift.json \
   --manifest-file /opt/data/scratch/manifest_fleet-consistency-drift.json \
   [--repo "<owner>/<repo>"]
@@ -317,11 +317,11 @@ Pass `--manifest-file`: it is what lets `finish` check the document against what
 - `partial: true` means the run could not compare the whole fleet — a cluster in `scope.skipped`, or one read but not compared and so carrying a `limitations` string (§1.4, §2.4, §3.1) — and `coverage_gaps` puts each gap in a sentence. On a drift audit that cuts deep, because the majority is what defines normal and a missing peer changes the majority. So the harness declines to infer: `resolved` comes back `0` with no resolved-delta, no remediation PR is closed as stale, and the ledger stays open even with an empty findings array — `status` is still `CLEAN`, the issue simply survives with a comment naming the gaps. A facet declared in `checks_not_applicable` is not a gap and does not raise the flag; it left the denominator. The flag tracks coverage and nothing else, so it is `true` exactly when `coverage_gaps` is non-empty; a body too long to hold every finding is a rendering limit, not a gap in what was compared, and says so in the body itself.
 - **`silent_ok` decides silence. Do not re-derive it.** `finish` returns `silent_ok: true` only when this run moved nothing an operator needs to hear about: nothing new, nothing resolved, no new or changed coverage gap, no remediation PR opened or closed. Read the flag rather than reassembling that from `status`, `new`, `resolved`, and `partial` yourself — that arithmetic is where a run talks itself into silence it has not earned. Two rules, and they are the whole rule: on a **scheduled** run, `silent_ok: true` → your final response is exactly `[SILENT]`, otherwise report with `issue_url` in full (a `NO_FORGE` run has none; see its line below); and **an on-demand run is never silent** — if a person dispatched this job, from a kanban card or straight from chat, someone is waiting on the answer and `[SILENT]` throws it away, so report the outcome and the ledger URL whatever `silent_ok` says, or `summary` on a `NO_FORGE` run.
 - `silent_ok: true` → `[SILENT]` on a scheduled run. Nothing else, no summary, no preamble. On `CLEAN` the ledger issue closed as completed and any remediation PR still open for this stream closed with it; on `UPDATED` the fleet drifted no further and healed nothing. Dispatched on demand, say which in one line and give the issue URL.
-- `status == "NO_FORGE"` → no forge is configured, so there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's ["No forge configured"](../skills/fleet-audit/SKILL.md#no-forge-configured)).
+- `status == "NO_FORGE"` → no forge is configured, so there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's "No forge configured" section, `/opt/data/profiles/platform/skills/fleet-audit/SKILL.md`).
 - `CLEAN` with `resolved: > 0` → the fleet converged. Report the issue URL and how many drifts closed with it: a fleet that came back into line is worth a sentence, and it is the only good news this audit has to give.
 - `CLEAN` with `partial: true` → nothing diverged among the clusters you could compare, and the ledger stayed open because that is not the whole fleet. One line with the result, the `coverage_gaps`, and the issue URL.
 - `OPENED`, or `UPDATED` with a non-zero `new` or `resolved` → one line naming the audit, the `new` and `resolved` counts, the ledger issue URL, and anything in `prs_opened` / `prs_closed`.
-- A schema violation exits 2 and publishes nothing; exit 1 is a fatal error and exit 0 is a publish. Fix the document and re-run `finish`. The exception is a `BROKER UNAVAILABLE` line: the document was fine and the broker went away, possibly after the ledger was already rewritten, so do not report that nothing was published; re-run `finish` once the broker answers (`skills/fleet-audit/SKILL.md`, step 3). Never work around a validation error by deleting the finding that triggered it.
+- A schema violation exits 2 and publishes nothing; exit 1 is a fatal error and exit 0 is a publish. Fix the document and re-run `finish`. The exception is a `BROKER UNAVAILABLE` line: the document was fine and the broker went away, possibly after the ledger was already rewritten, so do not report that nothing was published; re-run `finish` once the broker answers (`/opt/data/profiles/platform/skills/fleet-audit/SKILL.md`, step 3). Never work around a validation error by deleting the finding that triggered it.
 
 ---
 
