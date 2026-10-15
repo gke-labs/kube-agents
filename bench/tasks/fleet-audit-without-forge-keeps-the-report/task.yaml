@@ -66,11 +66,12 @@ verification_spec:
       audit: compliance-audit
       status: NO_FORGE
       required_finding_phrases: ["debug-binding"]
-  # The worker reached the audit's own entry point. A kanban worker starts in
-  # its card's workspace, so a worker that looks for the SOP there finds
-  # nothing and audits by hand; without this check that run grades the same as
-  # a `start` that failed. A run, not a pattern over the text: a worker that
-  # greps the skill for the command has not run it.
+  # The worker typed a run of the audit's entry point. A kanban worker starts
+  # in its card's workspace, so a worker that looks for the SOP there can
+  # audit by hand and never type `start`. A run, not a pattern over the text:
+  # a worker that greps the skill for the command has not run it. The verifier
+  # sees the command, not its exit status, so a `start` that failed is the
+  # report-store check's to catch.
   - name: the-worker-ran-start
     role: objective
     mode: assert
@@ -96,7 +97,7 @@ verification_spec:
       type: report_contains
       any_of_patterns:
         [
-          '(?i)\bno\s+(?:git(?:ops)?\s+)?forge\b',
+          '(?i)\bno\s+(?:[\w-]+\s+){0,2}forge\b',
           '(?i)\bno\s+gitops\s+repositor',
         ]
   - name: the-planted-defect-survived-the-audit

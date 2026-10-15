@@ -205,6 +205,8 @@ def _answer_check(name: str, answer: str) -> str:
         "No forge is configured on this install.",
         "no git forge here",
         "There is no GitOps repository registered.",
+        "No GitHub forge is configured, so no ledger issue was opened.",
+        "There is no GitLab forge on this install.",
     ],
 )
 def test_the_no_forge_answer_is_recognised(answer):

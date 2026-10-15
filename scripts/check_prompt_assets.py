@@ -351,7 +351,7 @@ def _is_placeholder(ref: str) -> bool:
         head = rest.split("/", 1)[0]
         if head in PROFILE_HOME_ITEMS["platform"]:
             return False
-        return not (REPO / PLATFORM_HOME_ANCHOR).parent.joinpath(rest).exists()
+        return not (REPO / PLATFORM_HOME_ANCHOR).parent.joinpath(head).exists()
     if ref.startswith("/opt/data/"):
         return True
     # Absolute paths that are neither image layout nor repository content:
