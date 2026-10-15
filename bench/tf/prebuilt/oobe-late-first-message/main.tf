@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # The scenario driver for bench/tasks/oobe-late-first-message: an install nobody has spoken to
-# runs its first-run audits, and the first chat message arrives only after all four have ended.
+# runs its first-run audits, and the first chat message arrives only after they have ended.
 #
 # 1. late.py `clear` records, then takes away, the home channel (`config.yaml` and `.env`) and the
 #    delivery markers (`.user_aligned`, `.bootstrap_completed`), so each audit's summary finds
@@ -21,7 +21,8 @@
 # 2. oobe-first-run-audits/arm.py (shared, not copied) arms the `oobe` stage the way that case
 #    does, rewriting .bootstrap_scan_filed, .bootstrap_handoff_filed and .oobe_audits_fired, and
 #    the stage starts the four audits one after another.
-# 3. The apply waits, up to `chain_wait`, until each audit has a run since the arm that ended.
+# 3. The apply waits, up to `chain_wait`, until no audit has a run going and each has a run since
+#    the arm that ended, or was adopted, held or given up on by the stage (late.py `finished`).
 # 4. It plants a stand-in INVENTORY.md on the shell sandbox, where the delivery stage reads the
 #    report, and late.py `open` touches `.user_aligned` as the onboarding plugin does on a first
 #    message. The next `oobe` tick delivers the report; the apply waits, up to `delivery_wait`,
@@ -183,7 +184,7 @@ resource "null_resource" "oobe_late" {
       elapsed=0
       until done_="$(late finished)" && [ "$done_" = finished ]; do
         if [ "$elapsed" -ge ${local.chain_wait} ]; then
-          echo "ERROR: the four first-run audits have not all ended $${elapsed}s after the arm; the first message would not come after them." >&2
+          echo "ERROR: the first-run audits have not all had their turn $${elapsed}s after the arm; the first message would not come after them." >&2
           exit 1
         fi
         sleep ${local.poll}

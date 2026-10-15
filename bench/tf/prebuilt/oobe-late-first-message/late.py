@@ -24,7 +24,8 @@ Usage: python3 - <home> <command> < late.py
   report there.
 - ``finished``: print ``finished`` once each first-run audit has a run claimed at or after the
   stage's arm (``applied_at`` in oobe-first-run-audits/arm.py's state file) that has ended, or the
-  stage recorded it as adopted, held or given up on, else ``pending``.
+  stage recorded it as adopted, held or given up on, and none has a run still going, else
+  ``pending``.
 - ``open``: touch ``.user_aligned``, as the onboarding plugin does on a person's first message,
   and record when.
 - ``restore``: put back what ``clear`` recorded, byte for byte.
@@ -189,14 +190,17 @@ def finished():
         ).fetchall()
     finally:
         conn.close()
-    ended = set()
+    ended, going = set(), set()
     for job_id, status, claimed in rows:
         try:
-            if datetime.fromisoformat(claimed).timestamp() >= since and status not in IN_FLIGHT + (SKIPPED,):
-                ended.add(job_id)
+            if datetime.fromisoformat(claimed).timestamp() < since or status == SKIPPED:
+                continue
         except (TypeError, ValueError):
             continue
-    print("finished" if ended | had_turn >= set(audits) else "pending")
+        (going if status in IN_FLIGHT else ended).add(job_id)
+    # A run still going would end after the first message, with a summary the report cannot name,
+    # even for an audit the stage recorded as having had its turn.
+    print("finished" if not going and ended | had_turn >= set(audits) else "pending")
 
 
 def open_chat():

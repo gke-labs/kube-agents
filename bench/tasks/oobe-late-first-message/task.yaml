@@ -12,7 +12,7 @@
 #
 # Nothing in a conversation drives this. bench/tf/prebuilt/oobe-late-first-message takes away the
 # home channel (config.yaml and .env) and the delivery markers, arms the oobe stage with
-# oobe-first-run-audits' arm.py, waits for the four audits to end, plants a stand-in onboarding
+# oobe-first-run-audits' arm.py, waits until every audit on the stage's list has had its turn, plants a stand-in onboarding
 # report on the shell sandbox and touches `.user_aligned` as the plugin does on a first message,
 # then waits for the delivery to claim the report. The verifier reads the saved `oobe` run that
 # delivered it, and each audit's last run since the arm with its delivery outcome and the ledger

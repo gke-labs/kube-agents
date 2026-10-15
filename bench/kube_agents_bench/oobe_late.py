@@ -7,8 +7,8 @@ first message is then the first thing that user reads.
 
 The case's stack (``bench/tf/prebuilt/oobe-late-first-message``) clears the home channel, lets the
 four audits run, then opens the chat. This passes when the delivered report links the ledger issue
-of every audit whose summary failed and named one in its final message, and names every other such
-audit as not posted. It needs at least one failed summary: without one the stack did not take the
+of every audit the stage started whose summary failed and named one in its final message, and names
+every other such audit as not posted. It needs at least one failed summary: without one the stack did not take the
 home channel away, and the case tested nothing.
 
 Its own module, registered through the ``devops_bench.verifiers`` entry-point group.
@@ -24,6 +24,9 @@ from kube_agents_bench.oobe import FIRST_RUN_AUDITS, STATE_FILE, agent_shell
 from kube_agents_bench.verifiers import _OnboardingPollVerifier
 from kube_agents_bench.worker_trajectory import DATA_ROOT, FALLBACK_PYTHON, HERMES_PYTHON
 
+# agents/chat/scripts/oobe.py: AUDITS_MARKER. The report names only audits the stage started
+# (`fired`), so only those are graded.
+AUDITS_MARKER = f"{DATA_ROOT}/.oobe_audits_fired"
 # bench/tf/prebuilt/oobe-late-first-message/late.py: STATE, with the time the chat was opened.
 LATE_STATE_FILE = f"{DATA_ROOT}/.bench-oobe-late.json"
 PLATFORM_EXECUTIONS_DB = f"{DATA_ROOT}/profiles/platform/cron/executions.db"
@@ -43,14 +46,14 @@ LATE_READ = "__OOBE_LATE_READ__"
 _LATE_SCRIPT = r"""
 import json, os, re, sqlite3, sys
 from datetime import datetime
-arm_state, late_state, db, out_dir, oobe_dir, title, sentinel, audits = (
-    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8:])
+arm_state, late_state, marker, db, out_dir, oobe_dir, title, sentinel, audits = (
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9:])
 SQLITE_BUSY_TIMEOUT = 10
 SLACK_SECONDS = 300
 HEADING = "## Response"
 LEDGER = re.compile(r"https://[^\s()<>\[\]]+/issues/\d+")
 LEDGER_WORD = "ledger"
-out = {"applied_at": None, "opened_at": None, "runs": {}, "report": None, "error": None}
+out = {"applied_at": None, "opened_at": None, "fired": [], "runs": {}, "report": None, "error": None}
 
 def ts(value):
     return datetime.fromisoformat(value).timestamp()
@@ -73,6 +76,10 @@ except FileNotFoundError:
     pass
 except (OSError, ValueError, KeyError, TypeError) as exc:
     out["error"] = "state: %s" % exc
+try:
+    out["fired"] = [a for a in json.load(open(marker)).get("fired", []) if isinstance(a, str)]
+except (OSError, ValueError, AttributeError, TypeError):
+    pass
 if out["applied_at"] and not out["error"] and os.path.exists(db):
     try:
         armed = ts(out["applied_at"])
@@ -110,7 +117,7 @@ def late_command() -> str:
     args = " ".join(
         shlex.quote(a)
         for a in [
-            STATE_FILE, LATE_STATE_FILE, PLATFORM_EXECUTIONS_DB, PLATFORM_OUTPUT_DIR, OOBE_OUTPUT_DIR,
+            STATE_FILE, LATE_STATE_FILE, AUDITS_MARKER, PLATFORM_EXECUTIONS_DB, PLATFORM_OUTPUT_DIR, OOBE_OUTPUT_DIR,
             REPORT_TITLE, LATE_READ, *FIRST_RUN_AUDITS,
         ]
     )
@@ -142,7 +149,8 @@ def grade(read: dict[str, Any]) -> tuple[VerificationStatus, str]:
     if not read.get("applied_at") or not read.get("opened_at"):
         return "error", "the stack did not arm the stage and open the chat (no applied_at or opened_at in its state files)"
     runs = read["runs"]
-    failed = [a for a in FIRST_RUN_AUDITS if runs.get(a, {}).get("delivery_outcome") == DELIVERY_FAILED]
+    fired = set(read.get("fired") or [])
+    failed = [a for a in FIRST_RUN_AUDITS if a in fired and runs.get(a, {}).get("delivery_outcome") == DELIVERY_FAILED]
     if not failed:
         outcomes = ", ".join(f"{a} ({runs[a].get('delivery_outcome')})" for a in FIRST_RUN_AUDITS if a in runs) or "none"
         return "error", f"no first-run audit's summary failed to deliver, so the home channel was not taken away; runs: {outcomes}"

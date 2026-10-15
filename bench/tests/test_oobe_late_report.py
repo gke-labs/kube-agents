@@ -81,6 +81,8 @@ class Install:
     def __init__(self, root: Path) -> None:
         self.arm_state = root / ".bench-oobe.json"
         self.late_state = root / ".bench-oobe-late.json"
+        self.marker = root / ".oobe_audits_fired"
+        self.marker.write_text(json.dumps({"fired": list(oobe_late.FIRST_RUN_AUDITS)}))
         self.db = root / "executions.db"
         self.out = root / "platform-output"
         self.oobe = root / "oobe-output"
@@ -116,6 +118,7 @@ def install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Install:
     s = Install(tmp_path)
     monkeypatch.setattr(oobe_late, "STATE_FILE", str(s.arm_state))
     monkeypatch.setattr(oobe_late, "LATE_STATE_FILE", str(s.late_state))
+    monkeypatch.setattr(oobe_late, "AUDITS_MARKER", str(s.marker))
     monkeypatch.setattr(oobe_late, "PLATFORM_EXECUTIONS_DB", str(s.db))
     monkeypatch.setattr(oobe_late, "PLATFORM_OUTPUT_DIR", str(s.out))
     monkeypatch.setattr(oobe_late, "OOBE_OUTPUT_DIR", str(s.oobe))
@@ -175,6 +178,14 @@ def test_delivered_summaries_need_no_mention(install: Install) -> None:
     install.chain()
     install.run("compliance-audit", ARMED + timedelta(minutes=50), "delivered", "https://github.com/o/r/issues/7")
     install.deliver("https://github.com/o/r/issues/1 https://github.com/o/r/issues/3 https://github.com/o/r/issues/4")
+    result = _verify()
+    assert result.status == "pass", result.reason
+
+
+def test_an_audit_the_stage_did_not_start_is_not_graded(install: Install) -> None:
+    install.chain()
+    install.marker.write_text(json.dumps({"fired": ["fleet-wide-cost-analysis"], "gave_up": ["compliance-audit"]}))
+    install.deliver("https://github.com/o/r/issues/1")
     result = _verify()
     assert result.status == "pass", result.reason
 
@@ -324,6 +335,13 @@ def test_finished_waits_for_every_audit_since_the_arm(home: Path) -> None:
                      {"gave_up": ["upgrade-retrospective"]}):
         (home / ".oobe_audits_fired").write_text(json.dumps(recorded))
         assert _late(home, "finished", env=env).stdout.strip() == "finished", recorded
+    # But not while a run of it is still going.
+    with sqlite3.connect(db) as con:
+        con.execute(
+            "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at) VALUES (?,?,?,?,?,?,?)",
+            ("4", "upgrade-retrospective", "builtin", "p", 1, "running", (ARMED + timedelta(minutes=9)).isoformat()),
+        )
+    assert _late(home, "finished", env=env).stdout.strip() == "pending"
 
 
 def test_the_stage_audit_list_late_reads_is_the_stage_s() -> None:
