@@ -106,6 +106,9 @@ TRAILING_LEDGER_PREFIX = (
 )
 TRAILING_LEDGER_SUFFIX = r">?\)?[\s.]*\Z"
 TRAILING_LEDGER = re.compile(TRAILING_LEDGER_PREFIX + ISSUE_URL + TRAILING_LEDGER_SUFFIX, re.IGNORECASE)
+#: An issue on any forge, anywhere in a report (``failed_line``): GitHub's ``/issues/<n>``,
+#: GitLab's ``/-/issues/<n>`` or ``/-/work_items/<n>``, on any host. Only says a ledger was named.
+ANY_ISSUE_URL = re.compile(r"https?://\S+?/(?:-/)?(?:issues|work_items)/\d{1,9}\b", re.IGNORECASE)
 
 
 @functools.lru_cache(maxsize=8)
@@ -123,14 +126,6 @@ def _trailing_ledger_re(github_host: str) -> re.Pattern:
         TRAILING_LEDGER_PREFIX + ISSUE_URL_TEMPLATE.format(hosts=hosts) + TRAILING_LEDGER_SUFFIX,
         re.IGNORECASE,
     )
-
-
-@functools.lru_cache(maxsize=8)
-def _issue_url_re(github_host: str) -> re.Pattern:
-    """An issue URL anywhere in a report, on github.com or the install's GitHub host."""
-    host = github_host.strip().lower()
-    hosts = r"github\.com" if not host or host == "github.com" else r"github\.com|" + re.escape(host)
-    return re.compile(ISSUE_URL_TEMPLATE.format(hosts=hosts), re.IGNORECASE)
 
 
 def _github_host() -> str:
@@ -774,14 +769,14 @@ def failed_line(report: str) -> str | None:
     """The one line a fleet-audit report that could not complete posts, or None.
 
     A report that ends with its ledger link completed (the card is built from
-    the ledger), and so did one that names an issue URL anywhere: it wrote a
+    the ledger), and so did one that names an issue URL on any forge anywhere: it wrote a
     ledger, and posts as written. One with no issue URL that opens a "What's
     wrong" section is a run that could not write its ledger (no GitOps
     repository registered, say): the line is that section's first sentence, as
     the agent wrote it, markdown and all. None for a report with no such
     section, which posts as written.
     """
-    if ledger_ref(report) is not None or _issue_url_re(_github_host()).search(report):
+    if ledger_ref(report) is not None or ANY_ISSUE_URL.search(report):
         return None
     found = WRONG_LABEL.search(report[:WRONG_READ_MAX])
     if found is None:
@@ -808,12 +803,13 @@ def failed_chat(report: str) -> tuple[dict, str] | None:
     next a reply in the thread reaches the gateway, which cannot replay the
     report the way ``incident_context`` does under today. ``text`` is the
     report itself, the fallback the gateway posts when it does not lay the
-    message out.
+    message out. None for a report past the fold's cap: the fold would be its only
+    Slack copy, so it goes out whole as text rather than clipped.
     """
     line = failed_line(report)
-    if line is None:
+    if line is None or len(report.strip()) > _chat.FOLD_TEXT_MAX:
         return None
-    fold = {"title": _chat.FOLD_TITLE_DEFAULT, "text": _clip(report.strip(), _chat.FOLD_TEXT_MAX)}
+    fold = {"title": _chat.FOLD_TITLE_DEFAULT, "text": report.strip()}
     return _chat.message(detail=_clip(line, _chat.DETAIL_MAX), fold=fold), report
 
 

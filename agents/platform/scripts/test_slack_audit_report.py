@@ -1109,6 +1109,19 @@ class FailedLineTest(unittest.TestCase):
             "and merge the fix PR.\n"
         )
         self.assertIsNone(sar.failed_line(report))
+        for url in (
+            "https://gitlab.com/acme/platform/infra/-/issues/12",
+            "https://gitlab.example.com/group/fleet/-/work_items/42",
+            "http://ghe.example.com/acme/fleet/issues/7",
+        ):
+            with self.subTest(url=url):
+                self.assertIsNone(sar.failed_line(WALL_HEADING + f"\n## What to do\n- Review {url} first.\n"))
+
+    def test_a_report_past_the_fold_cap_is_not_folded(self):
+        self.assertIsNotNone(sar.failed_chat(WALL_LABEL))
+        long_report = WALL_LABEL + "\n" + "x" * sar._chat.FOLD_TEXT_MAX
+        self.assertIsNotNone(sar.failed_line(long_report))
+        self.assertIsNone(sar.failed_chat(long_report))
 
     def test_a_report_without_the_section_posts_as_written(self):
         for report in (
