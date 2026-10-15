@@ -123,6 +123,9 @@ const (
 	slackMemberPrincipalPrefix = "slack:"
 	// slackChannelTypeIM is a direct message's channel_type.
 	slackChannelTypeIM = "im"
+	// slackChannelTypeChannel is a public channel's channel_type; a home
+	// channel is never a DM.
+	slackChannelTypeChannel = "channel"
 	// slackMinChannelIDLen is the shortest id slackIsHomeChannelID takes:
 	// the prefix letter and at least two characters after it.
 	slackMinChannelIDLen = 3
@@ -759,6 +762,10 @@ func (s *SlackAdapter) PostNotifyMessage(channel, thread string, m OutMessage) (
 	if thread == "" {
 		thread = ts
 	}
+	// A home card with choices is its thread's open question, as a
+	// conversation's is, so a typed answer in the thread settles it and a
+	// later click on it is dropped.
+	s.trackQuestion(slackConversationID(slackChannelTypeChannel, channel, thread), ts, m)
 	return ts, thread, nil
 }
 

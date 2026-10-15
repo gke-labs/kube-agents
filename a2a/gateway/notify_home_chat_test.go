@@ -68,6 +68,14 @@ func TestSlackNotifyLaysOutAHomeChatMessage(t *testing.T) {
 	if stub.forms[0].Get("unfurl_links") != "false" || stub.forms[0].Get("unfurl_media") != "false" {
 		t.Errorf("a notify card unfurls: unfurl_links=%q unfurl_media=%q", stub.forms[0].Get("unfurl_links"), stub.forms[0].Get("unfurl_media"))
 	}
+	// The card carries a choice, so it is its thread's open question, as a
+	// conversation's card is: a typed answer settles it.
+	adapter.mu.Lock()
+	q, open := adapter.uxLocked().questions["slack:"+testSlackHome+"/1700000000.000200"]
+	adapter.mu.Unlock()
+	if !open || q.ts != "1700000000.000200" {
+		t.Fatalf("open question = %+v, %v; want the home card", q, open)
+	}
 }
 
 func TestSlackNotifyRepliesWithAHomeChatMessageOnAThread(t *testing.T) {

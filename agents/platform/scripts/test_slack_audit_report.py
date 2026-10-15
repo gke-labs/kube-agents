@@ -1102,6 +1102,14 @@ class FailedLineTest(unittest.TestCase):
         self.assertIsNone(sar.failed_line(WALL_HEADING + f"\nSecurity audit: 2 new — {LEDGER}"))
         self.assertIsNone(sar.failed_line(REPORT))
 
+    def test_a_report_naming_its_ledger_mid_text_is_not_failed(self):
+        report = (
+            "## What's wrong\n2 critical firewall rules are open to the internet.\n\n## Why\n- two rules\n\n"
+            "## What to do\n- Review [ledger issue #231](https://github.com/acme/fleet-config/issues/231) "
+            "and merge the fix PR.\n"
+        )
+        self.assertIsNone(sar.failed_line(report))
+
     def test_a_report_without_the_section_posts_as_written(self):
         for report in (
             "Compliance audit: 3 findings (1 critical) across 2 cluster(s); the change since the last run is unknown.",

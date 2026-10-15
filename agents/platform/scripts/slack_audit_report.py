@@ -125,6 +125,14 @@ def _trailing_ledger_re(github_host: str) -> re.Pattern:
     )
 
 
+@functools.lru_cache(maxsize=8)
+def _issue_url_re(github_host: str) -> re.Pattern:
+    """An issue URL anywhere in a report, on github.com or the install's GitHub host."""
+    host = github_host.strip().lower()
+    hosts = r"github\.com" if not host or host == "github.com" else r"github\.com|" + re.escape(host)
+    return re.compile(ISSUE_URL_TEMPLATE.format(hosts=hosts), re.IGNORECASE)
+
+
 def _github_host() -> str:
     """The install's GitHub host, from the mounted repository lists; github.com without them.
 
@@ -766,12 +774,14 @@ def failed_line(report: str) -> str | None:
     """The one line a fleet-audit report that could not complete posts, or None.
 
     A report that ends with its ledger link completed (the card is built from
-    the ledger). One that does not, and opens a "What's wrong" section, is a run
-    that could not write its ledger (no GitOps repository registered, say): the
-    line is that section's first sentence, as the agent wrote it, markdown and
-    all. None for a report with no such section, which posts as written.
+    the ledger), and so did one that names an issue URL anywhere: it wrote a
+    ledger, and posts as written. One with no issue URL that opens a "What's
+    wrong" section is a run that could not write its ledger (no GitOps
+    repository registered, say): the line is that section's first sentence, as
+    the agent wrote it, markdown and all. None for a report with no such
+    section, which posts as written.
     """
-    if ledger_ref(report) is not None:
+    if ledger_ref(report) is not None or _issue_url_re(_github_host()).search(report):
         return None
     found = WRONG_LABEL.search(report[:WRONG_READ_MAX])
     if found is None:

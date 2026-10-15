@@ -704,7 +704,7 @@ func (n *Notifier) postHomeChat(job notifyJob) bool {
 	if len(reading.Problems) > 0 {
 		n.metrics.chatMessage(chatInvalid)
 		for _, p := range reading.Problems {
-			n.log.Warn("notify: chat message dropped; its text fallback stands",
+			n.log.Warn("notify: "+chatDroppedWhat(chatmsg.Notify, reading),
 				"home", n.home, "rule", truncateRunes(p.Error(), chatProblemMax))
 		}
 	}
