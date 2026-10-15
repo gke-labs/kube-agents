@@ -272,8 +272,8 @@
 # made it gradable: tool_calls_optional lets its no-tool reply pass the liveness
 # rung that graded the first night blocked. The first night with it measures
 # whether the main part still fits; if it does not, it is parked again. Counted
-# from the lists, this file is seventy-six cases (228 units) of a
-# ninety-case, 270-unit matrix with the presubmit file's fourteen.
+# from the lists, this file is seventy-nine cases (237 units) of a
+# ninety-three-case, 279-unit matrix with the presubmit file's fourteen.
 #
 # 2026-10-09 adds fleet-audit-unchanged-finding-keeps-wording: one case, three
 # units at the 900s audit band (a full drift audit; prebuilt/unchanged-finding-wording
