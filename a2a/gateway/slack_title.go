@@ -30,10 +30,11 @@ const (
 	// hard cut drops too much, and cuts hard instead.
 	slackTitleClipMinShare = 2
 	// slackTitleClauseEnds and slackTitleClauseBreak end the ask's first
-	// clause (slackFirstClause), as slack_status.py's CLAUSE_ENDS and
-	// CLAUSE_BREAK do.
-	slackTitleClauseEnds  = ".?!"
-	slackTitleClauseBreak = '\n'
+	// clause (slackFirstClause) once it holds slackTitleClauseMinWords words,
+	// as slack_status.py's CLAUSE_ENDS, CLAUSE_BREAK and CLAUSE_MIN_WORDS do.
+	slackTitleClauseEnds     = ".?!"
+	slackTitleClauseBreak    = '\n'
+	slackTitleClauseMinWords = 2
 )
 
 // slackTitleReplacements are the ASCII stand-ins for refused characters an
@@ -67,19 +68,31 @@ var (
 // slackFirstClause is text up to the end of its first sentence or line, or
 // all of it when it has neither. A sentence ends at a run of
 // slackTitleClauseEnds followed by whitespace, which stays with it, and a line
-// at slackTitleClauseBreak; either counts only after a word character, so an
-// ask that opens on "!!" or a blank line is not cut to nothing.
+// at slackTitleClauseBreak; either counts only once the clause holds
+// slackTitleClauseMinWords space-separated words and a word character, so
+// "1. check pods", "e.g. restart" or "Hi! Is it up?" is not cut to its first
+// word.
 func slackFirstClause(text string) string {
 	runes := []rune(text)
-	seenWord := false
+	seenWord, inWord := false, false
+	words := 0
 	for i, r := range runes {
-		if seenWord && r == slackTitleClauseBreak {
-			return string(runes[:i])
-		}
-		if seenWord && strings.ContainsRune(slackTitleClauseEnds, r) && i+1 < len(runes) && unicode.IsSpace(runes[i+1]) {
-			return string(runes[:i+1])
+		if unicode.IsSpace(r) {
+			inWord = false
+		} else if !inWord {
+			inWord = true
+			words++
 		}
 		seenWord = seenWord || slackWordChar(r)
+		if !seenWord || words < slackTitleClauseMinWords {
+			continue
+		}
+		if r == slackTitleClauseBreak {
+			return string(runes[:i])
+		}
+		if strings.ContainsRune(slackTitleClauseEnds, r) && i+1 < len(runes) && unicode.IsSpace(runes[i+1]) {
+			return string(runes[:i+1])
+		}
 	}
 	return text
 }

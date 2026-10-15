@@ -267,15 +267,26 @@ class SessionTest(unittest.TestCase):
             "seeded-b is behind. Ask me before doing anything.": "seeded-b is behind.",
             "check seeded-a\nthen seeded-b": "check seeded-a",
             "is 1.33.4 the default?": "is 1.33.4 the default?",
-            "wait... is it up? yes": "wait...",
+            "wait... is it up? yes": "wait... is it up?",
             "which clusters have pods restarting right now?": "which clusters have pods restarting right now?",
             "!! x now": "!! x now",
-            "\n\nup? ok": "up?",
-            "<@U1> hi. there": "hi.",
+            "\n\nup? ok": "up? ok",
+            "<@U1> hi. there": "hi. there",
+            "1. check seeded-a pods\n2. then seeded-b": "1. check seeded-a pods",
+            "e.g. restart the pods": "e.g. restart the pods",
+            "Hi! Is checkout-gateway crashlooping in prod? It was earlier": "Hi! Is checkout-gateway crashlooping in prod?",
+            "Thanks. Now restart payments-api": "Thanks. Now restart payments-api",
         }
         for ask, title in cases.items():
             with self.subTest(ask=ask):
                 self.assertEqual(s.session_title(ask), title)
+
+    def test_the_clause_cut_stays_linear(self):
+        # It runs on the gateway's event loop, like the markup patterns below.
+        ask = "a. " * (SLACK_MESSAGE_MAX // len("a. "))
+        start = time.monotonic()
+        s.session_title(ask)
+        self.assertLess(time.monotonic() - start, LINEAR_BUDGET_SECONDS)
 
     def test_a_long_word_after_a_short_one_is_cut_not_dropped(self):
         self.assertEqual(s.session_title("Restart " + "n" * 90), "Restart " + "n" * 69 + s.TITLE_ELLIPSIS)

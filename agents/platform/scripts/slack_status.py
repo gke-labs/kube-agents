@@ -103,9 +103,11 @@ ELLIPSIS = "…"
 #: A word-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
 CLIP_MIN_SHARE = 2
 #: The title is the ask's first clause (:func:`_first_clause`): it ends at a run of these
-#: followed by whitespace, or at a line break, once a word has been seen.
+#: followed by whitespace, or at a line break, once it holds this many words, so a list
+#: number, an abbreviation or a greeting ("1.", "e.g.", "Hi!") does not end it.
 CLAUSE_ENDS = frozenset(".?!")
 CLAUSE_BREAK = "\n"
+CLAUSE_MIN_WORDS = 2
 
 #: Slack markup in an ask: a user or channel mention, and a link with or
 #: without its label. Mentions go; a channel keeps its name, a link its label,
@@ -243,17 +245,26 @@ def _first_clause(text: str) -> str:
     """``text`` up to the end of its first sentence or line, or whole when it has neither.
 
     A sentence ends at a run of :data:`CLAUSE_ENDS` followed by whitespace, which stays with
-    it, and a line at :data:`CLAUSE_BREAK`; either counts only after a word character, so an
-    ask that opens on "!!" or a blank line is not cut to nothing. ``1.33.4`` and ``...`` mid-word
-    do not end one.
+    it, and a line at :data:`CLAUSE_BREAK`; either counts only once the clause holds
+    :data:`CLAUSE_MIN_WORDS` space-separated words and a word character, so "1. check pods",
+    "e.g. restart" or "Hi! Is it up?" is not cut to its first word. ``1.33.4`` and ``...``
+    mid-word do not end one. One pass, counting words as it goes, so a long ask stays linear.
     """
-    seen_word = False
+    seen_word = in_word = False
+    words = 0
     for i, char in enumerate(text):
-        if seen_word and char == CLAUSE_BREAK:
-            return text[:i]
-        if seen_word and char in CLAUSE_ENDS and i + 1 < len(text) and text[i + 1].isspace():
-            return text[: i + 1]
+        if char.isspace():
+            in_word = False
+        elif not in_word:
+            in_word = True
+            words += 1
         seen_word = seen_word or _word_char(char)
+        if not seen_word or words < CLAUSE_MIN_WORDS:
+            continue
+        if char == CLAUSE_BREAK:
+            return text[:i]
+        if char in CLAUSE_ENDS and i + 1 < len(text) and text[i + 1].isspace():
+            return text[: i + 1]
     return text
 
 
