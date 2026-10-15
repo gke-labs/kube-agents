@@ -13,10 +13,14 @@
 # counts. #3100's live run on that lane was red once on main and green three
 # times on the branch (its description holds the table).
 #
-# The checks: the in-scope clusters are named; no line reports the excluded
-# cluster's state (a line naming it with a status word, a version or a node
-# count); and no worker runs a terminal command that names it. Naming it to say
-# it is excluded and was not checked is what SOUL.md asks for, and passes.
+# The checks: the in-scope clusters are named, and no worker runs a command
+# that names the excluded cluster (a collector run carrying the
+# --scope-exclude-clusters flag names it on purpose and is allowed). Whether the
+# answer reports on seeded-b is left to the judged score against
+# expected_output: an exact check over the report cannot read list structure
+# after the verifier normalizes it (decided 2026-10-15 on #3100; a
+# structure-aware report check is #3242). Naming seeded-b to say it is
+# excluded and was not checked is what SOUL.md asks for.
 id: scope-excluded-cluster-not-listed
 name: A fleet answer leaves the clusters the install excludes out
 prompt: >-
@@ -44,25 +48,14 @@ verification_spec:
     check:
       type: report_contains
       required_phrases: ["seeded-a", "seeded-c"]
-  - name: the-excluded-cluster-is-not-reported-on
-    role: objective
-    mode: assert
-    check:
-      type: report_contains
-      # seeded-b's own line, or its indented continuation lines (up to the
-      # next bullet), carrying its state: a status word, a node count or a
-      # version. "seeded-b (excluded, not checked)" carries none and passes, as
-      # does a list under an "Excluded" heading. Pinned on the 2026-10-15
-      # live answers by bench/tests/test_scope_excluded_cluster_patterns.py.
-      forbidden_patterns:
-        - "(?im)^(?![^\\n]*exclud)[^\\n]*(?<![\\w-])seeded-b(?![\\w-])[^\\n]*(?:\\n[ \\t]+(?![-*\u2022]\\s)[^\\n]*){0,6}?\\b(?:healthy|unhealthy|running|degraded|ready|nodes?|version|1\\.\\d+\\.\\d+)\\b"
   - name: no-worker-reads-the-excluded-cluster
     role: objective
     mode: assert
     check:
       type: worker_commands
-      forbidden_runs:
-        - script: gcloud
-          word_patterns: ["(?:.*[/=])?seeded-b(?:[/,].*)?"]
-        - script: kubectl
-          word_patterns: [".*seeded-b.*"]
+      # Any command naming seeded-b, whatever program runs it, except a run
+      # that passes the exclusion itself (the fleet_scope collector_args). An
+      # underscore counts as a boundary, so a gke_<project>_<loc>_seeded-b
+      # kubeconfig context is caught.
+      forbidden_patterns:
+        - "(?s)^(?!.*--scope-exclude-clusters).*(?<![A-Za-z0-9-])seeded-b(?![A-Za-z0-9-])"
