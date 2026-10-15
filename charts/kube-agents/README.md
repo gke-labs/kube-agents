@@ -409,11 +409,11 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
 event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_messages_inbound_total` from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
 tool-invocation, request and version-control metrics from its metrics-only port 8766, and the A2A
-gateway pod a `spec.mode: next` install runs, so it scrapes the gateway's task
-terminal and Google Chat pull counters from its metrics-only port 9096 (elsewhere
+gateway pod a `spec.mode: next` install runs, so it scrapes the gateway's inbound-message,
+task terminal and Google Chat pull counters from its metrics-only port 9096 (elsewhere
 that one selects no pod). The operator's policies on all three pods admit the
-collector's namespace, `gke-gmp-system`, on those ports either way, and on the
-first two they admit the operator's own pods as well; the value only decides
+collector's namespace, `gke-gmp-system`, and the operator's own pods on those ports
+either way; the value only decides
 whether a scrape is configured, and the operator's own read of the counters and
 cluster gauges into `status.usage` does not depend on it.
 It is a tri-state: `null`,

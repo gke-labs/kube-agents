@@ -214,11 +214,36 @@ here — no workload, no reason, no message — because the listing has one subj
 informational churn. Each is **counted**, on its own line above the body:
 
 - **Alerts the daily ceiling withheld.** `ALERT_DAILY_LIMITS` stopped them. Reported as
-  `⚠️ *N alerts withheld by the daily ceiling and never reached chat.*` `N` is the number of
+  `⚠️ *N alerts from M workloads withheld by the daily ceiling and never reached chat.*` `N` is the number of
   workload incidents chat lost, counted per pod and reason — not the number of times the ceiling
   refused a post, which is larger because a refusal makes the watcher re-offer the same failure on
   every later sighting. `GET /v1/alert-quota` reports the refusals, and
   `k8s_event_watcher_events_quota_suppressed_total` breaks them down by reason and namespace.
+  `M` is the number of workloads that sent those alerts, keyed on cluster, namespace and workload
+  name. A row with no workload name counts as one workload for each object UID. For `N`, a row with
+  no UID counts by its workload in place of the UID. Thus `N` is not less than `M` while each object
+  keeps one workload name. If one object is stored under two names, for example after the cleaner
+  changes during a day, `M` can exceed `N`. The workload
+  key does not include the object kind, so a Pod event and a Deployment event with the same
+  workload name are one workload. The count has no drift or stall rows, because the recap leaves
+  them out (see [Where the numbers come from](#where-the-numbers-come-from)).
+  `clean_workload_name` in
+  [`session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py) sets the workload
+  name. It changes only Pod names, with two rules, and keeps all other names as they are:
+  - A Pod name that ends in a segment of eight to ten hexadecimal characters and then a segment of
+    five characters loses both segments. Thus, the pods of one Deployment fold into one workload.
+    The pods of all the runs of one CronJob also fold into one workload, because the run minute
+    has eight digits.
+  - If the first rule does not apply, a Pod name that ends in a segment of five lowercase letters
+    or digits loses that segment. Thus, the pods of one DaemonSet (`fluentd-x7k2p`) fold into one
+    workload, and the pod of a one-off Job folds to the Job name. The rule also removes a word of
+    five letters, so the pods `ingest-batch` and `ingest-queue` both become `ingest` and count as
+    one workload.
+  - A StatefulSet ordinal of one to four digits stays, so each StatefulSet pod (`db-0`, `db-1`) is
+    a separate workload.
+  - Each Job that a CronJob starts is a separate workload, because the CronJob puts the minute of
+    the run in the Job name. An event on the Job `backup-29340180` and an event on its pod are two
+    workloads, because the pod name folds to `backup`.
 - **Alerts whose delivery failed.** `notified = 1` is written before the chat post is attempted, so
   on its own it records an intention to deliver rather than a delivery. When the post fails the
   ingestion side clears the flag and records why in `delivery_error`. Reported as

@@ -302,7 +302,7 @@ class TestEODWatcherRecap(unittest.TestCase):
         )
 
         self.assertEqual(summary["cap_dropped"], 12)
-        self.assertIn("*1 alert withheld by the daily ceiling and never reached chat.*", report)
+        self.assertIn("*1 alert from 1 workload withheld by the daily ceiling and never reached chat.*", report)
         # Counted, and still not listed: the breakdown is informational events.
         self.assertNotIn("checkout", report)
 
@@ -324,7 +324,7 @@ class TestEODWatcherRecap(unittest.TestCase):
 
         self.assertEqual(summary["cap_dropped"], 51)
         self.assertEqual(summary["cap_dropped_alerts"], 2)
-        self.assertIn("*2 alerts withheld by the daily ceiling and never reached chat.*", report)
+        self.assertIn("*2 alerts from 2 workloads withheld by the daily ceiling and never reached chat.*", report)
         self.assertNotIn("Nothing was held back from chat in this window", report)
         self.assertNotIn("CrashLoopBackOff", report)
 
@@ -346,7 +346,7 @@ class TestEODWatcherRecap(unittest.TestCase):
         report = generate_markdown_report(summary, cluster_name="test-cluster")
 
         self.assertEqual(summary["cap_dropped_alerts"], 30)
-        self.assertIn("*30 alerts withheld by the daily ceiling and never reached chat.*", report)
+        self.assertIn("*30 alerts from 1 workload withheld by the daily ceiling and never reached chat.*", report)
 
     def test_a_replica_re_offering_is_still_one_withheld_alert(self):
         """The control for the two tests above: both effects at once.
@@ -364,6 +364,161 @@ class TestEODWatcherRecap(unittest.TestCase):
 
         self.assertEqual(summary["cap_dropped"], 30)
         self.assertEqual(summary["cap_dropped_alerts"], 3)
+
+    def test_the_withheld_line_counts_one_workload_for_its_replicas(self):
+        """Thirty withheld replicas of one Deployment are one workload.
+
+        The alert count stays at thirty, because chat lost thirty alerts. The
+        workload count tells the on-call that one rollout caused all of them.
+        """
+        events = [
+            event(workload="payment-api", object_uid=f"pod-{i}", notified=False)
+            for i in range(30)
+        ]
+        summary, report = recap(events)
+
+        self.assertEqual(summary["cap_dropped_alerts"], 30)
+        self.assertEqual(summary["cap_dropped_workloads"], 1)
+        self.assertIn(
+            "*30 alerts from 1 workload withheld by the daily ceiling and never reached chat.*",
+            report,
+        )
+
+    def test_the_withheld_line_counts_each_workload(self):
+        """Two workloads give two, also when one of them has more alerts."""
+        events = [
+            event(workload="payment-api", object_uid=f"pod-{i}", notified=False)
+            for i in range(3)
+        ] + [event(workload="checkout", notified=False)]
+        summary, report = recap(events)
+
+        self.assertEqual(summary["cap_dropped_workloads"], 2)
+        self.assertIn(
+            "*4 alerts from 2 workloads withheld by the daily ceiling and never reached chat.*",
+            report,
+        )
+
+    def test_a_pod_and_its_deployment_are_one_withheld_workload(self):
+        """The workload key does not include the object kind.
+
+        A Pod event and a Deployment event with the same workload name are
+        about one workload. They are two alerts, because each object has its
+        own UID.
+        """
+        events = [
+            event(workload="payment-api", object_kind="Pod", object_uid="pod-0", notified=False),
+            event(
+                workload="payment-api",
+                object_kind="Deployment",
+                object_uid="deploy-0",
+                reason="ProgressDeadlineExceeded",
+                notified=False,
+            ),
+        ]
+        summary, report = recap(events)
+
+        self.assertEqual(summary["cap_dropped_alerts"], 2)
+        self.assertEqual(summary["cap_dropped_workloads"], 1)
+        self.assertIn("*2 alerts from 1 workload withheld", report)
+
+    def test_statefulset_pods_count_as_separate_withheld_workloads(self):
+        """This pins the caveat that the design doc states.
+
+        `clean_workload_name` does not remove the ordinal from a StatefulSet
+        pod, so the ledger stores `db-0` and `db-1`. The recap counts two
+        workloads. This test gives the stored names.
+        `test_clean_workload_name_gives_the_workloads_the_recap_counts` in
+        test_session_kv_server.py pins the cleaner side.
+        """
+        events = [
+            event(workload="db-0", object_uid="pod-0", notified=False),
+            event(workload="db-1", object_uid="pod-1", notified=False),
+        ]
+        summary, report = recap(events)
+
+        self.assertEqual(summary["cap_dropped_workloads"], 2)
+        self.assertIn("*2 alerts from 2 workloads withheld", report)
+
+    def test_the_same_workload_name_in_two_places_is_two_withheld_workloads(self):
+        """The key includes the cluster and the namespace.
+
+        One ledger serves every cluster, and one workload name can occur in
+        many namespaces.
+        """
+        for place in ("cluster", "namespace"):
+            with self.subTest(place=place):
+                events = [
+                    event(object_uid="pod-a", notified=False, **{place: "a"}),
+                    event(object_uid="pod-b", notified=False, **{place: "b"}),
+                ]
+                summary, _ = recap(events)
+
+                self.assertEqual(summary["cap_dropped_workloads"], 2)
+
+    def test_withheld_rows_with_no_uid_count_one_alert_for_each_workload(self):
+        """A row with no UID counts its alert by workload.
+
+        Without this, three workloads with no UIDs and one reason give one
+        alert key and three workload keys: "1 alert from 3 workloads".
+        """
+        events = [
+            event(workload=name, object_uid="", reason="OOMKilled", notified=False)
+            for name in ("payment-api", "checkout", "search")
+        ]
+        summary, report = recap(events)
+
+        self.assertEqual(summary["cap_dropped_alerts"], 3)
+        self.assertEqual(summary["cap_dropped_workloads"], 3)
+        self.assertIn("*3 alerts from 3 workloads withheld", report)
+
+    def test_withheld_rows_with_a_uid_still_count_by_uid(self):
+        """The control: a row with a UID keeps the UID key.
+
+        Two pods of one workload are two alerts, and one pod that re-offers
+        is one alert.
+        """
+        events = [
+            event(object_uid="pod-0", notified=False),
+            event(object_uid="pod-0", notified=False),
+            event(object_uid="pod-1", notified=False),
+        ]
+        summary, report = recap(events)
+
+        self.assertEqual(summary["cap_dropped_alerts"], 2)
+        self.assertEqual(summary["cap_dropped_workloads"], 1)
+        self.assertIn("*2 alerts from 1 workload withheld", report)
+
+    def test_withheld_rows_with_no_workload_name_count_by_uid(self):
+        """Rows with no workload name on different objects are different workloads.
+
+        If they all counted as "unknown-workload", three objects would give
+        "3 alerts from 1 workload".
+        """
+        events = [
+            event(workload="", object_uid=f"obj-{i}", notified=False)
+            for i in range(3)
+        ]
+        summary, report = recap(events)
+
+        self.assertEqual(summary["cap_dropped_alerts"], 3)
+        self.assertEqual(summary["cap_dropped_workloads"], 3)
+        self.assertIn("*3 alerts from 3 workloads withheld", report)
+
+    def test_a_nameless_row_and_an_unknown_workload_row_are_two_alerts(self):
+        """The alert key uses the stored name, as the workload key does.
+
+        If the alert key used the listing label, both rows would be
+        "unknown-workload": "1 alert from 2 workloads".
+        """
+        events = [
+            event(workload=name, object_uid="", reason="OOMKilled", notified=False)
+            for name in ("unknown-workload", "")
+        ]
+        summary, report = recap(events)
+
+        self.assertEqual(summary["cap_dropped_alerts"], 2)
+        self.assertEqual(summary["cap_dropped_workloads"], 2)
+        self.assertIn("*2 alerts from 2 workloads withheld", report)
 
     def test_a_clean_day_is_not_told_about_alerts_it_did_not_lose(self):
         """The control. Without it the assertion above passes on a fixed string."""
@@ -407,7 +562,7 @@ class TestEODWatcherRecap(unittest.TestCase):
         )
 
         self.assertEqual(summary["cap_dropped"], 30)
-        self.assertIn("*1 alert withheld by the daily ceiling and never reached chat.*", report)
+        self.assertIn("*1 alert from 1 workload withheld by the daily ceiling and never reached chat.*", report)
         self.assertNotIn("Nothing was held back from chat in this window", report)
         self.assertNotIn("🟢", report)
         self.assertIn("📊", report)
@@ -1358,6 +1513,9 @@ class TestTheNamespaceFilterDoesNotReachTheAlertVeto(unittest.TestCase):
         self.assertNotIn("Nothing was held back from chat in this window", report)
         self.assertNotIn("🟢", report)
         self.assertNotIn("kube-apiserver", report)
+        # The withheld line counts the excluded workload too. Without it, the
+        # line says "1 alert from 0 workloads".
+        self.assertIn("*1 alert from 1 workload withheld", report)
 
     def test_an_excluded_alert_that_reached_chat_is_not_counted_as_withheld(self):
         """Excluding a namespace drops the row from the counts, not into another one.

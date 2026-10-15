@@ -88,7 +88,9 @@ type Entry struct {
 	// is the point — request ids are not secrets, so naming one is no
 	// barrier and the prefix alone proves nothing about entitlement.
 	//
-	// It holds a per-request principal, not an agent id. 09 §5 says a
+	// It holds a session's principal, not an agent id: per request when a
+	// session pod served one task, per conversation now that one pod serves
+	// every turn of it (#2825; 09 §4 states what that coarsens). 09 §5 says a
 	// per-request caller compared against a per-agent delegate field "buys
 	// nothing", and it is right; both sides move. The session pod name is
 	// the principal, the gateway allocates it and the taskId in the same

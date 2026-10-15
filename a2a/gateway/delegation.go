@@ -684,8 +684,8 @@ func (g *Gateway) flushNotices(conversation string, rs *relayState) {
 }
 
 // wakeSession starts the session's next turn on a delegated child's terminal
-// (spec-chatops-gateway.md, "Sessions by default"): a fresh incarnation and
-// the ordinary spawn, as a human turn gets, with gateway-authored text
+// (spec-chatops-gateway.md, "Sessions by default"): the live pod or a fresh
+// incarnation, as a human turn gets, with gateway-authored text
 // carrying the outcome and the delegating
 // turn's stored attribution, so the wake runs under the requester who asked.
 // Called under the session lock, after the child's result or failure is
@@ -735,19 +735,26 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 	if rec.Profile == "" {
 		rec.Profile = sessionProfile
 	}
-	// The wake's pod is a fresh incarnation (one task per pod). It reads
-	// the transcript primer like any other, and its text also carries
-	// the child's result, and the child's ask was written by the parent's
-	// incarnation. So the wake's incarnation starts from the parent's set,
-	// taken before freshIncarnation rotates it away.
-	inherited, inheritedUnknown, inheritedSince := rec.sessionAuthorsOf()
-	// The cap holds and the previous pod is retired here; a refusal has
-	// posted the standard notice, and the child's result stands as relayed.
-	if !g.freshIncarnation(ctx, rec) {
-		log.Info("no wake: the session could not be started")
-		return false, "the session could not be started"
+	// The wake goes to the parent's pod when it is live and can take it
+	// (reuseLivePod): the same incarnation, so its author set is the
+	// parent's already and nothing is re-seeded. Its adapter runs the wake
+	// with the delegate tool off, from the via above.
+	if !g.reuseLivePod(ctx, rec) {
+		// Otherwise the wake's pod is a fresh incarnation. It reads the
+		// transcript primer like any other, and its text also carries the
+		// child's result, and the child's ask was written by the parent's
+		// incarnation. So the wake's incarnation starts from the parent's
+		// set, taken before freshIncarnation rotates it away.
+		inherited, inheritedUnknown, inheritedSince := rec.sessionAuthorsOf()
+		// The cap holds and the previous pod is retired here; a refusal
+		// has posted the standard notice, and the child's result stands
+		// as relayed.
+		if !g.freshIncarnation(ctx, rec) {
+			log.Info("no wake: the session could not be started")
+			return false, "the session could not be started"
+		}
+		rec.seedSessionAuthors(inherited, inheritedUnknown, inheritedSince)
 	}
-	rec.seedSessionAuthors(inherited, inheritedUnknown, inheritedSince)
 	// The wake is the delegating turn's successor: the chain's correlation
 	// id (a task spawned in service of another inherits it) and the child's
 	// depth, so depth counts delegations rather than turns.

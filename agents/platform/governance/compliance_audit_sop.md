@@ -10,10 +10,10 @@
 
 ### 0. Open the audit run
 
-The lifecycle is the `fleet-audit` skill's (`skills/fleet-audit/SKILL.md`, "The two-command lifecycle" and "Step 1 — `start`"): what `start` prints; what `workspace`, `findings_path`, `pending_remediation_requests` and `carried` oblige you to do; that there is no report branch; and that no issue body, PR body, commit or forge call is ever yours to write. This stream's invocation:
+The lifecycle is the `fleet-audit` skill's (`/opt/data/profiles/platform/skills/fleet-audit/SKILL.md`, "The two-command lifecycle" and "Step 1 — `start`"): what `start` prints; what `workspace`, `findings_path`, `pending_remediation_requests` and `carried` oblige you to do; that there is no report branch; and that no issue body, PR body, commit or forge call is ever yours to write. This stream's invocation:
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit [--repo "<owner>/<repo>"]
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit [--repo "<owner>/<repo>"]
 ```
 
 What the skill does not say:
@@ -92,7 +92,7 @@ kubectl auth can-i list pods --all-namespaces
 **Run the collector before evaluating any check below by hand.**
 
 ```bash
-python3 ./skills/fleet-audit/scripts/collect.py compliance-audit --workspace "<the workspace Step 0 returned>" <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> --out /opt/data/scratch/manifest_compliance-audit.json
+python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py compliance-audit --workspace "<the workspace Step 0 returned>" <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> --out /opt/data/scratch/manifest_compliance-audit.json
 ```
 
 Run it in the foreground, with the terminal tool's `timeout: 600` (the foreground maximum; a larger figure is promoted to a background run), and never in the background: its nine to twelve reads per cluster take minutes on a larger fleet, and the default timeout kills it part-way. `--out` writes the manifest atomically, so a killed run leaves the previous file or none, never two documents spliced together. If it is killed anyway, run it once more in the foreground; if that run is killed too, fall back to §1's manual enumeration for every cluster, and pass `--no-collector-manifest "<why>"` to `finish` in place of `--manifest-file` (§5). Never answer from its partial output.
@@ -412,7 +412,7 @@ The document's schema and every rule the validator enforces — `checks_run`, `c
 ### 5. Close the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit compliance-audit \
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit compliance-audit \
   --findings-file /opt/data/scratch/findings_compliance-audit.json \
   --manifest-file /opt/data/scratch/manifest_compliance-audit.json \
   [--repo "<owner>/<repo>"]
@@ -428,7 +428,7 @@ What `finish` validates, publishes and prints, its exit codes, partial coverage,
 - `status == "CLEAN"` with `partial: true` → the clean result and `coverage_gaps`.
 - `status == "HELD"` → the clean result, the held ids (`unaccounted`) and the issue URL. On the next run, report each one, or list it under `resolved_because` if you re-ran its check and saw it gone.
 - `status == "OPENED"`, or `"UPDATED"` with a non-zero `new` or `resolved` → `Security & RBAC posture audit: <new> new, <resolved> resolved across <count(scope.clusters)> clusters — <issue_url>`
-- `status == "NO_FORGE"` → no forge is configured, so there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's ["No forge configured"](../skills/fleet-audit/SKILL.md#no-forge-configured)).
+- `status == "NO_FORGE"` → no forge is configured, so there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's "No forge configured" section, `/opt/data/profiles/platform/skills/fleet-audit/SKILL.md`).
 
 ## Red Lines
 

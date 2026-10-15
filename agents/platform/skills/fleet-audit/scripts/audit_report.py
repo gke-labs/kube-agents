@@ -763,6 +763,13 @@ DNS_ACCESS_COMMENT = (
 # tested — which is how the clone that never happened survived this long.
 SCRATCH_DIR = os.environ.get("FLEET_AUDIT_SCRATCH_DIR") or "/opt/data/scratch"
 GITOPS_WORKSPACE = os.environ.get("FLEET_AUDIT_GITOPS_ROOT") or "/opt/data/gitops"
+# Where the SOPs live: `<agent home>/profiles/platform/governance`. The worker's
+# commands run in the sandbox, whose agent home is `/opt/data`, where this
+# script runs too. Named in full wherever a worker is sent to one, because a
+# kanban worker starts in its card's workspace, where a path relative to the
+# profile home names nothing.
+PLATFORM_PROFILE_SUBDIR = "profiles/platform"
+GOVERNANCE_DIR_NAME = "governance"
 
 # The report store: what each `finish` published, kept on the PVC beside the
 # run that produced it (docs/designs/fleet-audit-report-store.md). A fixed root
@@ -2313,6 +2320,16 @@ def audit_sop(audit_id: str) -> str:
     return spec.sop if spec else ""
 
 
+def sop_path(audit_id: str) -> str:
+    """The full path of the stream's SOP, under the agent home `gitops_workspace` reads."""
+    import gitops_workspace
+
+    return (
+        f"{gitops_workspace.agent_home()}/{PLATFORM_PROFILE_SUBDIR}/"
+        f"{GOVERNANCE_DIR_NAME}/{audit_sop(audit_id)}"
+    )
+
+
 def checks_ran(cluster: object) -> list[str]:
     """The check slugs a `scope.clusters` entry claims to have run.
 
@@ -3369,7 +3386,7 @@ def _sop_pointer(audit_id: str) -> str:
     published one without a single additional command being issued.
     """
     sop = audit_sop(audit_id)
-    where = f"governance/{sop}" if sop else "the stream's SOP"
+    where = sop_path(audit_id) if sop else "the stream's SOP"
     return (
         f"The roster is the `####` check headings in {where} — read the whole "
         "file, not its first page, and run the checks before naming them. "
@@ -4317,7 +4334,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     f"{where}.check: {check!r} judges a fault, not a posture, so "
                     "no repository declaration justifies it — a declared fault is "
                     "a declared bug and stays a finding. The declared-intent step "
-                    f"of governance/{audit_sop(audit_id)} names the checks it may "
+                    f"of {sop_path(audit_id)} names the checks it may "
                     "move; write this one under `findings`"
                 )
             _require_str(entry.get("title"), f"{where}.title", allow_empty=False)
@@ -15140,7 +15157,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
                 # `finish` rejection is an answer key — it lets a document that
                 # inspected nothing be corrected into a published all-clear.
                 # See `_sop_pointer`.
-                "sop": f"governance/{audit_sop(audit_id)}",
+                "sop": sop_path(audit_id),
                 "checks": list(audit_checks(audit_id)),
                 "checks_contract": (
                     "Run every check above against every cluster you can read. "
