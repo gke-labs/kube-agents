@@ -915,6 +915,17 @@ class SlackQuietTerminalTest(unittest.IsolatedAsyncioTestCase):
         await deliver(SimpleNamespace(), adapter, sub, "blocked", block, "⏸ blocked", None, HEADER)
         self.assertEqual(adapter.sent[-1][1], "No cluster named seeded-z.")
 
+    async def test_a_hard_wall_reason_over_the_limit_is_clipped(self):
+        adapter = _Adapter()
+        sub = dict(SLACK_SUB, delivery_mode="notify")
+        reason = "No cluster named seeded-z. " + "seeded-a " * 300
+        block = SimpleNamespace(id=3, kind="blocked", payload={"kind": "capability", "reason": reason})
+        await deliver(SimpleNamespace(), adapter, sub, "blocked", block, "⏸ blocked", None, HEADER)
+        posted = adapter.sent[-1][1]
+        self.assertLessEqual(len(posted), 2000)
+        self.assertTrue(posted.startswith("No cluster named seeded-z."))
+        self.assertTrue(posted.endswith(ELLIPSIS))
+
     async def test_a_hard_wall_block_without_a_reason_keeps_the_line(self):
         adapter = _Adapter()
         sub = dict(SLACK_SUB, delivery_mode="notify")
