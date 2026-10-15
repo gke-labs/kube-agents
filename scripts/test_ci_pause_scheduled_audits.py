@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -340,6 +341,12 @@ class ReadyGatewayPodTest(unittest.TestCase):
     def test_an_ha_gateway_on_rwo_storage_is_a_statefulset(self):
         result = self.run_helper(2, ["gw-0", "gw-1"], kind="statefulset")
         self.assertEqual((result.returncode, result.stdout.strip()), (0, "pod/gw-0"))
+
+    def test_a_gateway_scaled_to_zero_returns_at_once(self):
+        start = time.monotonic()
+        result = self.run_helper(0, [], wait=300)
+        self.assertEqual(result.returncode, 1)
+        self.assertLess(time.monotonic() - start, 30)
 
     def test_no_gateway_workload_returns_at_once(self):
         result = self.run_helper(1, ["gw-a"], wait=300, kind="daemonset")

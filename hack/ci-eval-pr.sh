@@ -1587,6 +1587,8 @@ ready_gateway_pod() { # <context> <namespace> [<wait seconds>]
   want="$(kubectl --context "${ctx}" -n "${ns}" get "${workload}" \
     -o jsonpath='{.spec.replicas}' 2>/dev/null)" || return 1
   [ -n "${want}" ] || want=1
+  # Scaled to zero (spec.deployment.scaleToZero) has no pod to wait for.
+  [ "${want}" -gt 0 ] || return 1
   while :; do
     names="$(kubectl --context "${ctx}" -n "${ns}" get pods -l "${selector}" \
       -o go-template='{{range $p := .items}}{{if not $p.metadata.deletionTimestamp}}{{range $p.status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}{{"pod/"}}{{$p.metadata.name}}{{"\n"}}{{end}}{{end}}{{end}}{{end}}' 2>/dev/null)" || names=""
