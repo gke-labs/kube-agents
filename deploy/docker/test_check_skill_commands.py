@@ -295,6 +295,16 @@ class TriageTest(unittest.TestCase):
         self.assertEqual([], new)
         self.assertEqual([("a/SKILL.md", "gone")], stale)
 
+
+    def test_an_entry_that_may_pass_is_never_stale(self):
+        key = ("a/s/SKILL.md", "pip install x")
+        new, stale = check.triage([], {key: (frozenset({"analysis_incomplete"}), "r")}, ["a"], frozenset({key}))
+        self.assertEqual(([], []), (new, stale))
+
+    def test_only_the_package_lookup_entries_may_pass(self):
+        self.assertEqual(3, len(check.MAY_PASS))
+        for key in check.MAY_PASS:
+            self.assertIn(key[1].split()[0], {"pip", "go", "npm"})
     def run_main(self, known, skill_verdict):
         """Run ``main`` over one skill block the fake scanner rates ``skill_verdict``."""
         probes = {check.PROBE_REFUSED: verdict("block"), check.PROBE_ALLOWED: verdict("allow")}

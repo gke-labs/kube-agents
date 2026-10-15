@@ -195,21 +195,24 @@ KNOWN_FINDINGS: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         "pip install kubernetes",
     ): (
         frozenset({"analysis_incomplete"}),
-        "upstream google/skills text; Tirith cannot finish its package lookup at build time",
+        "upstream google/skills text; Tirith's online package lookup did not finish in its 500 ms budget, "
+        "and the agent's own Tirith runs the same lookup",
     ),
     (
         "agents/platform/skills/gke-basics/references/client-library-usage.md",
         "go get k8s.io/client-go@latest",
     ): (
         frozenset({"analysis_incomplete"}),
-        "upstream google/skills text; Tirith cannot finish its package lookup at build time",
+        "upstream google/skills text; Tirith's online package lookup did not finish in its 500 ms budget, "
+        "and the agent's own Tirith runs the same lookup",
     ),
     (
         "agents/platform/skills/gke-basics/references/client-library-usage.md",
         "npm install @kubernetes/client-node",
     ): (
         frozenset({"analysis_incomplete"}),
-        "upstream google/skills text; Tirith cannot finish its package lookup at build time",
+        "upstream google/skills text; Tirith's online package lookup did not finish in its 500 ms budget, "
+        "and the agent's own Tirith runs the same lookup",
     ),
     (
         "agents/platform/skills/gke-upgrades/references/troubleshooting.md",
@@ -218,7 +221,7 @@ KNOWN_FINDINGS: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         "\"\\(.metadata.namespace)/\\(.metadata.name)\"'",
     ): (
         frozenset({"analysis_incomplete"}),
-        "upstream google/skills text; Tirith cannot resolve the jq program piped to",
+        "upstream google/skills text; Tirith cannot resolve the jq program in the pipe",
     ),
     (
         "agents/platform/skills/gke-upgrades/references/troubleshooting.md",
@@ -227,9 +230,16 @@ KNOWN_FINDINGS: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         "{ns:.metadata.namespace, name:.metadata.name, grace:.spec.terminationGracePeriodSeconds}'",
     ): (
         frozenset({"analysis_incomplete"}),
-        "upstream google/skills text; Tirith cannot resolve the jq program piped to",
+        "upstream google/skills text; Tirith cannot resolve the jq program in the pipe",
     ),
 }
+
+# Entries whose refusal depends on Tirith's online package lookup finishing in
+# time: a build whose lookup does finish sees the block pass, so the entry is
+# not reported stale for that.
+MAY_PASS: frozenset[tuple[str, str]] = frozenset(
+    key for key, (rules, reason) in KNOWN_FINDINGS.items() if "package lookup" in reason
+)
 
 Scan = Callable[[str], dict]
 
@@ -406,13 +416,15 @@ def triage(
     findings: Iterable[Finding],
     known: dict[tuple[str, str], tuple[frozenset[str], str]],
     repo_dirs: Iterable[str],
+    may_pass: frozenset[tuple[str, str]] = frozenset(),
 ) -> tuple[list[Finding], list[tuple[str, str]]]:
     """Split into findings ``known`` does not excuse and entries that excuse nothing.
 
     An entry excuses its block only while Tirith cites exactly the rules it
     lists: the key is the whole block, so a new rule on another of its lines
     would otherwise pass unseen. Only an entry under one of ``repo_dirs`` can be
-    stale, since a run that did not read a tree cannot say its blocks pass.
+    stale, since a run that did not read a tree cannot say its blocks pass, and
+    an entry in ``may_pass`` is never stale.
     """
     findings = list(findings)
     refused = {finding.block.key for finding in findings}
@@ -421,7 +433,9 @@ def triage(
         if finding.block.key not in known or set(finding.rules) != known[finding.block.key][0]
     ]
     read = tuple(f"{repo_dir}/" for repo_dir in repo_dirs)
-    stale = sorted(key for key in known if key[0].startswith(read) and key not in refused)
+    stale = sorted(
+        key for key in known if key[0].startswith(read) and key not in refused and key not in may_pass
+    )
     return new, stale
 
 
@@ -556,7 +570,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"SKILL COMMAND CHECK COULD NOT RUN: {exc}", file=sys.stderr)
             return 1
 
-    new, stale = triage(findings, KNOWN_FINDINGS, [repo_dir for repo_dir, _ in args.trees])
+    new, stale = triage(findings, KNOWN_FINDINGS, [repo_dir for repo_dir, _ in args.trees], MAY_PASS)
     for finding in new:
         block = finding.block
         print(
