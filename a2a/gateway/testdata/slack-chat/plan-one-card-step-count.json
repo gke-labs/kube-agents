@@ -1,0 +1,44 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "details": {
+          "elements": [
+            {
+              "elements": [
+                {
+                  "elements": [
+                    {
+                      "text": "✓ found it on seeded-a",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "text": "◌ reading pod state in seeded-a",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
+                }
+              ],
+              "style": "bullet",
+              "type": "rich_text_list"
+            }
+          ],
+          "type": "rich_text"
+        },
+        "status": "in_progress",
+        "task_id": "t_a",
+        "title": "reading pod state in seeded-a · step 2 ▸",
+        "type": "task_card"
+      }
+    ],
+    "attachments": []
+  }
+]

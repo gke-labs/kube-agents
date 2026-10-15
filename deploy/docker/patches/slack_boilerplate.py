@@ -21,7 +21,7 @@ every cron delivery in::
 The first message a new Slack user reads is the first-install inventory report,
 and it opened with that header. On Slack the report goes out as
 ``cron.wrap_response: false`` would send it. The switch itself stays on: the
-Chat Agent relay (``deploy/docker/plugins/chat/adapter.py``) reads the job id
+chat relay (``deploy/docker/plugins/chat/adapter.py``) reads the job id
 back out of the header, and it and every non-Slack target keep the wrapper. The
 choice is per target, so one delivery to both Slack and the relay wraps the
 relay's copy only.

@@ -1019,7 +1019,10 @@ func TestForgeEgressPatternsNeverDropGitHub(t *testing.T) {
 		},
 		"unregistered provider":      {Forges: []ForgeSpec{{Name: "bb", Provider: "bitbucket"}}},
 		"gitlab with no credentials": {Forges: []ForgeSpec{{Name: "gl", Provider: "gitlab"}}},
-		"host github does not serve": {Forges: []ForgeSpec{{Name: "gh", Host: "gitlab.example.com"}}},
+		"host github does not serve": {Forges: []ForgeSpec{{Name: "gh", Host: "registry.gitlab.com"}}},
+		"github's own service host":  {Forges: []ForgeSpec{{Name: "gh", Host: "acme.ghe.com"}}},
+		"second github host": {Forges: []ForgeSpec{ghForge("github", "gke-labs"),
+			{Name: "ghe", Provider: "github", Host: "ghe.example.com", Namespace: "gke-labs"}}},
 	}
 	for name, in := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1033,8 +1036,9 @@ func TestForgeEgressPatternsNeverDropGitHub(t *testing.T) {
 
 // TestEgressPatternsAddAForeignHostAsALiteral covers the case derivation exists
 // for: a forge at a customer-chosen hostname, which no pattern could name in
-// advance. GitHub's validation refuses such a host, so this reaches the method
-// directly; a self-managed provider is where a declaration will produce it.
+// advance, such as a GitHub Enterprise Server. This reaches the method
+// directly; TestBrokerForgesPutsGitHubAtTheEnterpriseHostWithItsCA reaches it
+// through a declaration.
 func TestEgressPatternsAddAForeignHostAsALiteral(t *testing.T) {
 	provider, err := LookupGitProvider(GitProviderGitHub)
 	if err != nil {

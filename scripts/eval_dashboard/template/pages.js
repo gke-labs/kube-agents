@@ -119,6 +119,9 @@ const PAGE = {
   // A night split across two jobs names its parts as the digest does
   // (nightly.py's PART_WORDS).
   nightPartWords: { main: "main part", writers: "writers part" },
+  // The chat-turn target the opening turn's p95 is shown beside, as advice
+  // only (nightly.py's TURN1_P95_TARGET_S).
+  turn1P95TargetS: 10,
   // The Trend page (trend.py): a judged metric's name as a URL parameter,
   // the chart geometry (SVG user units; the chart scales to its card), and
   // where "score" is defined once.
@@ -258,6 +261,8 @@ function normalizeHealth(raw) {
       over_threshold: count(pool.over_threshold),
       threshold_p50_s: count(pool.threshold_p50_s),
       threshold_p95_s: count(pool.threshold_p95_s),
+      lease_failures: count(pool.lease_failures),
+      lease_failures_hours: count(pool.lease_failures_hours),
     } : null,
     tick: parseIso(raw.tick) != null ? raw.tick : null,
   };
@@ -288,8 +293,9 @@ function poolSentence(h) {
     return ` No pool numbers${since}: the hourly pool check has stopped reporting.`;
   }
   if (p.verdict === "UNMEASURED") return " The queue wait is unknown: the hourly pool check ran but could not read how long recent runs waited.";
-  // What tripped the verdict, which is a single day's row or the live queue --
-  // never the seven-day window, which one bad day leaves inside its own limit.
+  // What tripped the verdict: a single day's row, the live queue or a refused
+  // acquire -- never the seven-day window, which one bad day leaves inside
+  // its own limit.
   // The backlog's start while there is one, the episode's otherwise: the
   // verdict spans a week, so the episode can have opened days before the jam
   // the present tense below is describing.
@@ -311,6 +317,12 @@ function poolSentence(h) {
   if (p.over_threshold && p.threshold_p95_s != null) {
     found.push(`${p.over_threshold} run${p.over_threshold === 1 ? "" : "s"} queued past the ${Math.floor(p.threshold_p95_s / 60)} min limit`);
   }
+  // The third trigger, as post_health.pool_numbers lists it: a breach can
+  // rest on refusals alone, with nothing queued and no stretch to quote.
+  if (p.lease_failures) {
+    const window = p.lease_failures_hours ? ` in the last ${p.lease_failures_hours}h` : "";
+    found.push(`${p.lease_failures} run${p.lease_failures === 1 ? "" : "s"} refused a project${window}`);
+  }
   if (!found.length) return "";
   // health.pool_note's waiting_now. The verdict lasts a week, so most renders
   // of an episode find the queue already drained, and "are waiting" then sends
@@ -319,7 +331,12 @@ function poolSentence(h) {
   const live = p.waiting_now;
   // False is "nothing has waited past the limit", not "the queue is empty".
   const cleared = live === false ? " No backlog right now." : "";
-  return ` Runs ${live ? "are" : "were"} waiting to start${since}: ${found.join("; ")}.${cleared} Runs still pass; /retest makes the queue longer.`;
+  // A queued run starts late and passes; a refused run died at the acquire,
+  // so the tail says which, as post_health.render_pool does.
+  const tail = p.lease_failures
+    ? "A refused run did not start; retest once the pool has room."
+    : "Runs still pass; /retest makes the queue longer.";
+  return ` Runs ${live ? "are" : "were"} waiting to start${since}: ${found.join("; ")}.${cleared} ${tail}`;
 }
 
 /* ---- URL contract ---- */
@@ -1285,12 +1302,24 @@ function lastFailureHtml(c) {
 // own -- a grader's reason is too long to share a row with eight columns.
 const CASE_COLUMNS = 8;
 
+// Seconds as the timing lines carry them: one decimal.
+const secText = (v) => `${v.toFixed(1)} s`;
+
+// The presubmit reps' timing (SCHEMA.md: cases[].latency), "" when none.
+function caseLatencyHtml(c) {
+  const l = c.latency && typeof c.latency === "object" ? c.latency : {};
+  const parts = [];
+  if (Number.isFinite(l.turn1_p50_s) && Number.isFinite(l.turn1_p95_s)) parts.push(`chat turn 1 p50 ${secText(l.turn1_p50_s)}, p95 ${secText(l.turn1_p95_s)}${Number.isFinite(l.n_turn1) ? ` (${plural(l.n_turn1, "rep")})` : ""}`);
+  if (Number.isFinite(l.agent_p50_s)) parts.push(`agent p50 ${secText(l.agent_p50_s)}${Number.isFinite(l.n_agent) ? ` (${plural(l.n_agent, "rep")})` : ""}`);
+  return parts.length ? `<small class="mut" title="presubmit repetitions not lost to infra">${esc(parts.join(" · "))}</small>` : "";
+}
+
 function caseRow(c, link) {
   const rates = c.rates || {};
   const pre = rates.presubmit || [], night = rates.nightly || [];
   const classes = [link.caseHash === c.name ? "hl" : "", c.status === "retired" ? "dim" : ""].filter(Boolean).join(" ");
   const issues = (c.issues || []).map(issueLink).join(" · ") || `<span class="mut">—</span>`;
-  return `<tr id="case-${esc(c.name)}" class="main ${classes}"><td class="nm">${esc(c.name)}${c.note ? `<small>${esc(c.note)}</small>` : ""}<small><a href="${esc(trendHref([c.name]))}">trend on main →</a></small></td>` +
+  return `<tr id="case-${esc(c.name)}" class="main ${classes}"><td class="nm">${esc(c.name)}${c.note ? `<small>${esc(c.note)}</small>` : ""}${caseLatencyHtml(c)}<small><a href="${esc(trendHref([c.name]))}">trend on main →</a></small></td>` +
     `<td>${stripHtml(c)}</td><td>${rateCell(pre[0])}</td><td>${rateCell(pre[1])}</td><td>${rateCell(night[0])}</td><td>${rateCell(night[1])}</td>` +
     `<td>${statusPill(c)}</td><td class="iss">${issues}</td></tr>` +
     `<tr class="why ${classes}"><td colspan="${CASE_COLUMNS}">${lastFailureHtml(c)}</td></tr>`;
@@ -1539,6 +1568,9 @@ function detailHtml() {
 
 const nights = () => (brief.nightly && Array.isArray(brief.nightly.nights) ? brief.nightly.nights.filter((n) => n && typeof n === "object" && n.counts) : []);
 const nightHref = (night) => `${PAGE.pages.nightly}#build=${enc(night.build)}`;
+// The Nightly page on `night` with the cases' timing night over night
+// (nightTimingHtml), so a link keeps both the night and the cases.
+const nightTimingHref = (night, names) => `${nightHref(night)}&cases=${names.map(enc).join(",")}`;
 const nightParts = (night) => (Array.isArray(night.parts) ? night.parts.filter((p) => p && typeof p === "object") : []);
 // A night is linked by its main part's build; a link to its other part's
 // build opens the same night.
@@ -1614,14 +1646,25 @@ function nightlyBriefHtml() {
   return `<div class="sec" id="nightly"><h2>Last night's run</h2>${body}${runningNoteHtml()}</div>`;
 }
 
-function nightCaseRow(night, c, newly) {
+// A night's case: its state as a pill, its reps as passed / graded, and a
+// time in seconds or a dash when none was recorded.
+const nightStatePill = (c) => `<span class="pill ${PAGE.nightStateClass[c.state] || "p-infra"}" title="${esc(PAGE.nightStateWords[c.state] || c.state)}">${esc(c.state)}</span>`;
+function nightRepText(c) {
   const reps = c.reps || { pass: 0, fail: 0, infra: 0 };
   const total = reps.pass + reps.fail + reps.infra;
-  const repText = c.state === "infra" ? `${plural(total, "rep")} lost` : `${reps.pass}/${reps.pass + reps.fail}${reps.infra ? ` (+${reps.infra} lost)` : ""}`;
-  const links = [c.transcript_url ? `<a href="${esc(c.transcript_url)}">transcript</a>` : "", `<a href="${esc(caseHref(c.case))}">history</a>`].filter(Boolean).join(" · ");
+  return c.state === "infra" ? `${plural(total, "rep")} lost` : `${reps.pass}/${reps.pass + reps.fail}${reps.infra ? ` (+${reps.infra} lost)` : ""}`;
+}
+const secOrDash = (v) => (Number.isFinite(v) ? secText(v) : "—");
+
+function nightCaseRow(night, c, newly) {
+  const links = [c.transcript_url ? `<a href="${esc(c.transcript_url)}">transcript</a>` : "", `<a href="${esc(caseHref(c.case))}">history</a>`,
+    // A name the link grammar refuses could not reach the timing section.
+    linkCaseIds([c.case]).length ? `<a href="${esc(nightTimingHref(night, [c.case]))}">timing</a>` : ""].filter(Boolean).join(" · ");
+  const p90 = Number.isFinite(c.turn1_p90_s) || Number.isFinite(c.agent_p90_s) ? `<br><small class="mut">p90 ${esc(secOrDash(c.turn1_p90_s))} / ${esc(secOrDash(c.agent_p90_s))}</small>` : "";
   return `<tr class="${newly.has(c.case) ? "newly" : ""}"><td class="nm">${esc(c.case)}</td>` +
-    `<td><span class="pill ${PAGE.nightStateClass[c.state] || "p-infra"}" title="${esc(PAGE.nightStateWords[c.state] || c.state)}">${esc(c.state)}</span></td>` +
-    `<td class="num" title="repetitions passed / graded">${esc(repText)}</td>` +
+    `<td>${nightStatePill(c)}</td>` +
+    `<td class="num" title="repetitions passed / graded">${esc(nightRepText(c))}</td>` +
+    `<td class="num tm" title="median opening chat turn / median agent wall clock, then the p90 of each, over the repetitions not lost to infra">${esc(secOrDash(c.turn1_p50_s))} / ${esc(secOrDash(c.agent_p50_s))}${p90}</td>` +
     `<td>${c.reason ? `<span class="rsn" title="${esc(c.reason)}">${esc(c.reason)}</span>` : `<span class="mut">—</span>`}</td>` +
     `<td class="mut small">${links}</td></tr>`;
 }
@@ -1633,10 +1676,10 @@ function nightCasesTable(night) {
   const rows = [];
   let domain = null;
   for (const c of cases) {
-    if (c.domain !== domain) { domain = c.domain; rows.push(`<tr class="grp"><td colspan="5">${esc(domainWords(domain))}</td></tr>`); }
+    if (c.domain !== domain) { domain = c.domain; rows.push(`<tr class="grp"><td colspan="6">${esc(domainWords(domain))}</td></tr>`); }
     rows.push(nightCaseRow(night, c, newly));
   }
-  return `<table class="rel night"><thead><tr><th>Case</th><th>State</th><th>Reps</th><th>Grader's reason</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+  return `<table class="rel night"><thead><tr><th>Case</th><th>State</th><th>Reps</th><th>Turn 1 / agent</th><th>Grader's reason</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
 }
 
 function nightChangesHtml(night) {
@@ -1650,6 +1693,34 @@ function nightChangesHtml(night) {
   if (night.fixed.length) parts.push(`<p><b>Passing again:</b> ${list(night.fixed)} — failed every rep the night before, passed every rep tonight.</p>`);
   if (night.missing.length) parts.push(`<p><b>Not recorded</b> (${plural(night.missing.length, "case")} the nightly matrix on this checkout expects): ${list(night.missing)}.</p>`);
   return parts.join("");
+}
+
+// The timing night over night, from the nights this page carries, newest
+// first: the whole night's opening chat turn, then each case the link
+// names (`#cases=`, a row's "timing" link).
+function nightTimingHtml(link) {
+  const list = nights().slice(0, PAGE.nightsListed);
+  const nightCell = (n) => `<td class="tm"><a href="${esc(link.cases.size ? nightTimingHref(n, [...link.cases]) : nightHref(n))}">${esc(nightDay(n))}</a></td>`;
+  const whole = list.map((n) => `<tr>${nightCell(n)}<td class="num">${esc(secOrDash(n.turn1_p50_s))}</td><td class="num">${esc(secOrDash(n.turn1_p95_s))}</td></tr>`).join("");
+  const parts = [`<h3>The whole night</h3><table class="rel"><thead><tr><th>Night</th><th>Chat turn 1 p50</th><th>Chat turn 1 p95</th></tr></thead><tbody>${whole}</tbody></table>` +
+    `<p class="mut small">Over every repetition of the night not lost to infra; advisory target p95 &lt; ${esc(PAGE.turn1P95TargetS)} s.</p>`];
+  for (const name of link.cases) {
+    const found = list.map((n) => (Array.isArray(n.cases) ? n.cases : []).find((c) => c && typeof c === "object" && c.case === name));
+    if (!found.some(Boolean)) {
+      parts.push(`<p class="mut">No night on this page recorded <code>${esc(name)}</code>.</p>`);
+      continue;
+    }
+    const rows = list.map((n, i) => {
+      const c = found[i];
+      if (!c) return `<tr>${nightCell(n)}<td class="mut" colspan="6">not recorded</td></tr>`;
+      return `<tr>${nightCell(n)}<td>${nightStatePill(c)}</td><td class="num">${esc(nightRepText(c))}</td>` +
+        [c.turn1_p50_s, c.turn1_p90_s, c.agent_p50_s, c.agent_p90_s].map((v) => `<td class="num tm">${esc(secOrDash(v))}</td>`).join("") + "</tr>";
+    }).join("");
+    parts.push(`<h3><code>${esc(name)}</code>, night over night</h3><table class="rel"><thead><tr><th>Night</th><th>State</th><th>Reps</th><th>Turn 1 p50</th><th>Turn 1 p90</th><th>Agent p50</th><th>Agent p90</th></tr></thead><tbody>${rows}</tbody></table>`);
+  }
+  if (!link.cases.size) parts.push(`<p class="mut small">A case's "timing" link in the table above adds its own table here.</p>`);
+  return `<div class="sec" id="timing"><h2>Timing, night over night</h2>${parts.join("")}` +
+    `<p class="mut small">The last ${plural(list.length, "night")} on record, newest first. p50 and p90 are nearest rank over the night's repetitions not lost to infra; with the nightly's few repetitions, p90 is the slowest one. A dash is a night whose reps carried no timing.</p></div>`;
 }
 
 function nightsListHtml(current) {
@@ -1697,17 +1768,20 @@ function nightlyHtml(link) {
   const head = `<div class="sec head">${nightPill(night)}<h1>${isLast ? "Last night's run" : `Night of ${esc(nightDay(night))}`}</h1>` +
     `<div class="lede">${esc(when)} · ${jobs}${night.head_sha ? ` at <code>${esc(night.head_sha)}</code>` : ""}${night.project ? ` · project ${esc(projectShort(night.project))}` : ""}${logs}</div>` +
     `<div class="lede">${ledeHow}</div>${isLast ? runningNoteHtml() : ""}</div>`;
-  const tiles = `<div class="sec"><h2>In numbers</h2><div class="tiles">` +
+  // The night's opening chat turn, a sixth tile when its reps carried one.
+  const turn1 = Number.isFinite(night.turn1_p50_s) && Number.isFinite(night.turn1_p95_s);
+  const tiles = `<div class="sec"><h2>In numbers</h2><div class="tiles${turn1 ? " six" : ""}">` +
     tile("Cases", `${c.recorded}`, c.expected ? `of ${c.expected} in the nightly matrix` : "recorded") +
     tile("Passed all reps", `${c.passed}`, c.recorded ? `${pct(c.passed / c.recorded)} of recorded cases` : "no case recorded") +
     tile("Partial", `${c.partial}`, "failed some repetitions") +
     tile("Failed", `${c.failed}`, `failed every graded rep · ${plural(c.infra, "case")} lost to infra`) +
     tile("Newly failing", `${night.previous_build == null || nightLacksMain(night) ? "—" : night.newly_failing.length}`, nightLacksMain(night) ? "no main part on record" : night.previous_build == null ? "first night on record" : "against the night before") +
+    (turn1 ? tile("Chat turn 1", `${night.turn1_p50_s.toFixed(1)}<small>s p50</small>`, `p95 ${secText(night.turn1_p95_s)} · advisory target p95 < ${PAGE.turn1P95TargetS} s`) : "") +
     `</div></div>`;
   return head + tiles +
     `<div class="sec"><h2>Against the night before</h2>${nightChangesHtml(night)}</div>` +
-    `<div class="sec"><h2>Every case, by domain</h2>${nightCasesTable(night)}<p class="mut small">States: pass = every graded rep passed · partial = some reps failed · fail = every graded rep failed · infra = nothing graded (quota or setup losses, never counted against a case). Reps read passed / graded. The transcript is the first repetition's.</p></div>` +
-    nightsListHtml(night) + footHtml();
+    `<div class="sec"><h2>Every case, by domain</h2>${nightCasesTable(night)}<p class="mut small">States: pass = every graded rep passed · partial = some reps failed · fail = every graded rep failed · infra = nothing graded (quota or setup losses, never counted against a case). Reps read passed / graded. Turn 1 / agent are medians over the repetitions not lost to infra: the opening chat turn, then the agent's whole run, with the p90 of each under them. The transcript is the first repetition's.</p></div>` +
+    nightTimingHtml(link) + nightsListHtml(night) + footHtml();
 }
 
 /* ---- the Trend page (SCHEMA.md: brief.json's trend block; trend.py) ---- */
@@ -2079,7 +2153,8 @@ function renderFreshness() {
 const renderers = { brief: briefHtml, run: runHtml, grid: gridHtml, cases: casesHtml, nightly: nightlyHtml, trend: trendHtml };
 
 // `scroll` is true for a navigation (boot, a hash change): the page then
-// scrolls to the `view=` section or the `#<case>` row it just rendered. The
+// scrolls to the `view=` section, the `#<case>` row or the Nightly page's
+// timing section for `#cases=` it just rendered. The
 // poll and a chip re-render with it false, so a reader who has scrolled on
 // is not pulled back.
 function renderAll(scroll = false) {
@@ -2114,6 +2189,9 @@ function renderAll(scroll = false) {
   } else if (scroll && page === "cases" && link.caseHash) {
     const row = document.getElementById(`case-${link.caseHash}`);
     if (row) row.scrollIntoView({ block: "center" });
+  } else if (scroll && page === "nightly" && link.cases.size) {
+    const section = document.getElementById("timing");
+    if (section) section.scrollIntoView();
   }
   if (page === "grid") {
     // First paint: a live window is read from its newest run, a linked

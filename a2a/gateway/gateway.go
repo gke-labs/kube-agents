@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -187,7 +189,7 @@ type Gateway struct {
 	// gateway was a no-resume refusal - an executor that cannot continue a
 	// session, the bridge's cli executor - under mu, and cleared by a
 	// queued notice from it. routeTurn gives such an addressee the wide
-	// status matcher (isStatusQuery says why). The gateway cannot see the
+	// status matcher (chattext.IsStatusQuery says why). The gateway cannot see the
 	// executor, so the first follow-up to one is acknowledged and refused
 	// before this is learned.
 	steersRefusedBy map[string]bool
@@ -612,6 +614,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	defer g.observeTurnFinished(msg.Conversation)
 
 	backend, principal, ok := g.verifySender(msg)
+	g.observeInboundVerified(msg, ok)
 	if !ok {
 		return
 	}
@@ -812,9 +815,9 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// "Chat entrypoints"): it is not a status ask, not a stop, and never a
 	// steer. Text only - a programmatic cancel keeps its intent whatever
 	// its text says.
-	sessionRest, sessionCmd := isSessionCommand(msg.Text)
+	sessionRest, sessionCmd := chattext.IsSessionCommand(msg.Text)
 	if sessionCmd && g.spawner != nil && g.cfg.DefaultAddressee == RouteSession &&
-		sessionRest != "" && !isSessionOff(sessionRest) {
+		sessionRest != "" && !chattext.IsSessionOff(sessionRest) {
 		// Post-flip, every conversation is a session already, so
 		// "/session <text>" is <text>: the ordinary turn it would have been
 		// without the prefix, not a confirmation that drops the ask.
@@ -824,7 +827,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// the text is read at all: it is not an ask, and a program must never
 	// have to spell "stop" to reach a control path. Read after the strip
 	// above, so a post-flip "/session stop" is the stop it unwraps to.
-	stopping := msg.Intent == IntentCancel || isStop(msg.Text)
+	stopping := msg.Intent == IntentCancel || chattext.IsStop(msg.Text)
 	// A program holds a delegation chain's root id only (observedAs), so a
 	// cancel naming the root while the chain runs is a cancel of the task
 	// that is running: the child, or the wake. Published at the root's own
@@ -851,12 +854,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		if !g.sessionCommand(ctx, rec, msg, backend, sessionRest, principal, authority) {
 			return
 		}
-	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text, wideStatus):
+	case msg.Intent == "" && active != nil && chattext.IsStatusQuery(msg.Text, wideStatus):
 		g.answerStatusByReplay(ctx, rec)
-	case msg.Intent == "" && msg.TopLevel && active == nil && isStatusQuery(msg.Text, false):
+	case msg.Intent == "" && msg.TopLevel && active == nil && chattext.IsStatusQuery(msg.Text, false):
 		// A status question that roots its own conversation has no task to
 		// report on and must not become one that reads "any update?".
-		// isStatusQuery is a phrase set (text.go), so a real question such
+		// chattext.IsStatusQuery is a phrase set, so a real question such
 		// as "how is the deploy doing" still starts a task.
 		g.post(rec.Key, topLevelNothingRunningNotice)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
@@ -887,7 +890,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			"addressee", rec.Addressee, "taskAge", time.Since(active.SubmittedAt).Round(time.Second))
 		g.steerTask(ctx, rec, msg, backend, authority)
 	default:
-		if rest, ok := isDelegate(msg.Text); ok && g.spawner != nil {
+		if rest, ok := chattext.IsDelegate(msg.Text); ok && g.spawner != nil {
 			// The Delegate flow (W4 amendment): this ONE task goes to a
 			// freshly spawned session worker - the addressee is the new
 			// session name, the rest of the text is the task. On a
@@ -1108,6 +1111,12 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// root's end comes from the wake below or, with no wake, from
 		// observeChildEnd.
 		g.observeEnded(rec, active.TaskID, task.State, source, finalMessageText(task))
+		// The terminal's mark, or the default, as relayTerminal draws it.
+		var terminal chatmsg.Reading
+		if task.FinalMessage != nil {
+			terminal = g.readChat(rec.Key, active.TaskID, chatmsg.Terminal, task.FinalMessage.Parts)
+		}
+		g.terminalMark(rec, active.TaskID, task.State, terminal)
 		healed, healedSource, healedTask = true, source, task
 	case noFirstEventPastGrace(active, isTaskNotFound(err), g.cfg.FirstEventGrace, time.Now()):
 		g.log.Info("healing an active task with no first event inside the grace",
@@ -1123,6 +1132,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// says, age is not evidence.
 		g.logTaskTerminal(rec, addressee, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
 		g.observeEnded(rec, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
+		g.applyTerminalMark(rec, active.TaskID, lib.StateFailed)
 		healed, healedSource = true, TerminalNeverStarted
 	}
 	if healed {
@@ -1168,7 +1178,8 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		switch {
 		case child && healedTask != nil:
 			turns, result, reason := healedChildOutcome(healedTask)
-			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason); !woken {
+			// false: the heal's status card above carries no result text.
+			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
 			}
 		case child:
@@ -1572,7 +1583,7 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 // when the turn was refused part-way (the cap, or a previous task that could
 // not be closed) and the in-memory route change must not persist.
 func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, rest, principal string, authority Authority) bool {
-	off := isSessionOff(rest)
+	off := chattext.IsSessionOff(rest)
 	// The way back is answered even with no spawner: a record left
 	// session-routed after A2A_SPAWN_SESSIONS was disarmed (the W4-rollback
 	// shape) would otherwise publish every ask to an addressee nothing
@@ -1627,7 +1638,7 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		g.post(rec.Key, "ℹ️ already on the session route")
 		return true
 	}
-	if isStop(rest) {
+	if chattext.IsStop(rest) {
 		// "/session stop" is almost certainly the way back misspelled. It
 		// must never become a task whose text reads "stop" - the same rule
 		// the stopping case below enforces for a bare "stop".
@@ -1907,6 +1918,14 @@ func (g *Gateway) observeMessageDropped(conversation, authorID string) {
 	}
 }
 
+// observeInboundVerified tells a VerifiedObserver whether a message passed
+// sender verification. See VerifiedObserver.
+func (g *Gateway) observeInboundVerified(msg InboundMessage, verified bool) {
+	if observer, ok := g.adapter.(VerifiedObserver); ok {
+		observer.InboundVerified(msg.Conversation, msg.MessageID, verified)
+	}
+}
+
 // observeTurnFinished tells an InboundObserver that a turn on a conversation
 // has ended. Deferred in handleInbound, so an early return announces it too.
 func (g *Gateway) observeTurnFinished(conversation string) {
@@ -2000,6 +2019,11 @@ type taskStart struct {
 	// gateway starts on its own (a child, a wake) has no backend message.
 	MessageID string
 	Principal string
+	// Click and Answer are InboundMessage's: the turn continues the
+	// conversation's previous ask, whose message its chain marks. A click
+	// names no message of its own; an answer with no earlier chain marks
+	// itself.
+	Click, Answer bool
 	// Requester is stored on the history entry as given — backend and the
 	// already-pseudonymized subject. startTask hashes a human's author id;
 	// a child copies its parent turn's entry.
@@ -2044,6 +2068,8 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	taskID, _ := g.startTaskWith(ctx, rec, taskStart{
 		Text:      msg.Text,
 		MessageID: msg.MessageID,
+		Click:     msg.Click,
+		Answer:    msg.Answer,
 		Principal: principal,
 		Requester: TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)},
 		Authority: authority,
@@ -2156,6 +2182,15 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	}
 	if ts.Role == "" {
 		ref.Request = capAsk(strings.TrimSpace(ts.Text))
+		// The message the chain's mark is drawn on (mark.go).
+		ref.AskMessageID = ts.MessageID
+		if ts.Click || ts.Answer {
+			if ask, mark := rec.continuedAskMessage(); ask != "" {
+				ref.AskMessageID, ref.Mark = ask, mark
+			} else if ts.Click {
+				ref.AskMessageID = ""
+			}
+		}
 	}
 	ref.carrySteerAuthors(TaskRef{SteerAuthors: ts.SteerAuthors, SteerAuthorsOverflow: ts.SteerAuthorsOverflow})
 	rec.Tasks = append(rec.Tasks, ref)

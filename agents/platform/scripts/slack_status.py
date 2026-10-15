@@ -6,8 +6,10 @@ ingress when it leaves the gateway. Its caller is the gateway's status patch
 (``slack_ux_status``), which the kanban notifier and the Slack adapter reach
 with ``KAGE_SLACK_UX`` on. Nothing here reads the flag.
 
-The plan (:func:`plan_blocks`): one message per thread holding a Block Kit
-``plan`` with a ``task_card`` row per kanban card the thread follows. A row's
+The plan (:func:`plan_blocks`): one message per thread holding a top-level
+Block Kit ``task_card`` per kanban card the thread follows, a fanned-out
+card's children included, so each card reads as its own line (Slack folds a
+``plan`` block to its title, and allows one per message). A row's
 ``details`` are the card's progress notes as steps, the last one open while
 the card runs. Slack's task statuses are ``pending``, ``in_progress``,
 ``complete`` and ``error`` and nothing else, so a card waiting on the user is
@@ -24,7 +26,8 @@ parses that field.
 The session (:func:`session_status`, :func:`session_title`):
 ``agents.sessions.setStatus`` accepts ``processing``, ``suspended`` or
 ``closed`` and refuses free text with ``invalid_arguments``, which is what
-Hermes's thread status sends it. ``agents.sessions.rename`` refuses a whole
+Hermes's thread status sends it. The title is the ask up to its first question, so a
+long ask leaves a short title. ``agents.sessions.rename`` refuses a whole
 title with ``invalid_name`` when it runs over 80 characters or holds a single
 character outside a narrow set: letters, digits, combining marks, spaces, a
 little ASCII punctuation and the common emoji blocks. ``:``, ``/``, ``#``,
@@ -99,6 +102,13 @@ TITLE_ELLIPSIS = "..."
 ELLIPSIS = "…"
 #: A word-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
 CLIP_MIN_SHARE = 2
+#: The title is the ask up to its first question (:func:`_first_question`): a run of
+#: :data:`QUESTION_END` that closes a word and is followed by whitespace, once the ask holds
+#: :data:`QUESTION_MIN_WORDS` words. Only ``?``: a ``.`` or ``!`` also closes ``e.g.``,
+#: ``U.S.``, ``1.`` and ``Hi!``, and a line break closes ``Hi team,``, each of which would
+#: leave a title that names nothing, and a thread keeps its first title.
+QUESTION_END = "?"
+QUESTION_MIN_WORDS = 2
 
 #: Slack markup in an ask: a user or channel mention, and a link with or
 #: without its label. Mentions go; a channel keeps its name, a link its label,
@@ -232,18 +242,44 @@ def _title_chars(title: str) -> str:
     return "".join(out)
 
 
-def session_title(text: Any) -> str:
-    """A title ``agents.sessions.rename`` accepts, from the ask's words, or ``""``.
+def _first_question(text: str) -> str:
+    """``text`` up to the end of its first question, or whole when it asks none.
 
-    Mentions and bare links are dropped, a channel keeps its name and a link its label, each
-    refused character is replaced, and the result is clipped on a word to :data:`TITLE_MAX`,
-    ending on :data:`TITLE_ELLIPSIS`. NFKC first, so a compatibility form becomes the plain
-    character Slack accepts and an accent typed as a combining mark joins its letter.
+    A question ends at a run of :data:`QUESTION_END` followed by whitespace, which stays with
+    it, when it closes a word (a run of non-space holding a word character, so punctuation a
+    stripped mention or link left behind does not count) and the text so far holds
+    :data:`QUESTION_MIN_WORDS` such words. One pass, so a long ask stays linear.
+    """
+    words = 0
+    worded = False
+    for i, char in enumerate(text):
+        if char.isspace():
+            worded = False
+            continue
+        if not worded and _word_char(char):
+            worded = True
+            words += 1
+        if (
+            char == QUESTION_END and worded and words >= QUESTION_MIN_WORDS
+            and i + 1 < len(text) and text[i + 1].isspace()
+        ):
+            return text[: i + 1]
+    return text
+
+def session_title(text: Any) -> str:
+    """A short title ``agents.sessions.rename`` accepts, from the ask's words, or ``""``.
+
+    Mentions and bare links are dropped, a channel keeps its name and a link its label, the
+    ask is cut to its first question (:func:`_first_question`), each refused character
+    is replaced, and the result is clipped on a word to :data:`TITLE_MAX`, ending on
+    :data:`TITLE_ELLIPSIS`. NFKC first, so a compatibility form becomes the plain character
+    Slack accepts and an accent typed as a combining mark joins its letter.
     """
     title = MENTION.sub(" ", str(text or ""))
     title = CHANNEL.sub(r"\1", title)
     title = LINK.sub(lambda m: m.group(2) or " ", title)
     title = unicodedata.normalize("NFKC", title)
+    title = _first_question(title)
     title = _title_chars(title)
     title = WHITESPACE.sub(" ", title)
     title = REPEATED_COMMA.sub(", ", title).strip(" ,")
@@ -346,7 +382,7 @@ def running(rows: Iterable[Any]) -> bool:
 
 
 def plan_blocks(title: str | None, rows: Sequence[Any]) -> list[dict]:
-    """The status message's blocks: one ``plan``.
+    """The status message's blocks: one top-level ``task_card`` per row.
 
     ``rows`` are objects with ``task_id``, ``title``, ``lines`` and ``status``,
     and optionally ``result`` (a completed card's one line), ``steps`` (how
@@ -354,16 +390,16 @@ def plan_blocks(title: str | None, rows: Sequence[Any]) -> list[dict]:
     counted) and ``note`` (the line a running or failed row's title shows;
     without it the row shows the card's title), in the
     order the cards first reported; past :data:`ROWS_MAX` the oldest are dropped.
+
+    Not a ``plan`` block: Slack draws a plan as its title alone, folded, so a
+    fan-out read as one "N cards" line and a single card as the plan's title
+    rather than its step. A top-level task card is drawn as its own line, its
+    status and :func:`row_title`, with its steps behind its arrow. ``title`` is
+    accepted for :func:`plan_text`'s sake and draws nothing here.
     """
     rows = list(rows)[-ROWS_MAX:]
     several = len(rows) > 1
-    return [
-        {
-            "type": "plan",
-            "title": plan_title(title, rows),
-            "tasks": [task_card(r.task_id, row_title(r, several), r.lines, r.status) for r in rows],
-        }
-    ]
+    return [task_card(r.task_id, row_title(r, several), r.lines, r.status) for r in rows]
 
 
 def plan_text(title: str | None, rows: Sequence[Any]) -> str:

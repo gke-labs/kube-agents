@@ -28,13 +28,13 @@ The persona runs inside the Platform Agent Deployment on top of the [Hermes runt
 
 ### MCP servers
 
-| Server                | Where                                                             | Purpose                                                                            |
-| --------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| `platform_control`    | In-pod, `agents/platform/scripts/platform_mcp_server.py`          | Session and agent-internal ops (chat ingress now lives with the Planning Agent).   |
-| `developer_knowledge` | Remote via `mcp-remote` → `developerknowledge.googleapis.com/mcp` | Authoritative Google Cloud and GKE documentation, API schemas, and best practices. |
-| `gke`                 | Remote via `mcp-remote` → `container.googleapis.com/mcp`          | Kubernetes/GKE cluster reads; the server's write tools are not offered.            |
+| Server                | Where                                                                                      | Purpose                                                                            |
+| --------------------- | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
+| `platform_control`    | In-pod, `agents/platform/scripts/platform_mcp_server.py`                                   | Session and agent-internal ops (chat ingress now lives with the Planning Agent).   |
+| `developer_knowledge` | Remote via `mcp-remote` and the credential proxy → `developerknowledge.googleapis.com/mcp` | Authoritative Google Cloud and GKE documentation, API schemas, and best practices. |
+| `gke`                 | Remote via `mcp-remote` and the credential proxy → `container.googleapis.com/mcp`          | Kubernetes/GKE cluster reads; the server's write tools are not offered.            |
 
-The `gke` MCP server proxies to Google's remote MCP endpoint for GKE, so cluster reads go through a first-class MCP interface rather than shelling out to `kubectl` or `gcloud`. Only the server's read tools are registered; changes go through a pull request.
+The `gke` MCP server reaches Google's remote MCP endpoint for GKE through the credential proxy, which forwards on its own credential and relays only the server's read-only tools; each profile also registers only those read tools. Cluster reads go through a first-class MCP interface rather than shelling out to `kubectl` or `gcloud`; cluster changes go through a pull request.
 
 ### Toolsets
 
@@ -54,6 +54,7 @@ A top-level `toolsets: [kanban]` key additionally exposes the kanban orchestrato
 - `hermes_otel` — OpenTelemetry export to the GKE Managed OTel collector.
 - `tool_call_audit` — appends every tool call and approval decision as a structured audit record to the profile's `logs/audit.jsonl`, which the fluent-bit sidecar ships to Cloud Logging as fields ([Concepts → Observability](/kube-agents/concepts/observability/#tool-call-audit)).
 - `incident_context` — injects Kubernetes incident context into known chat threads on reply.
+- `pr_opened` — records each pull or merge request the Platform Agent's kanban workers open on their card, so a Slack thread gets it as a message of its own when `KAGE_SLACK_UX` is on ([ChatOps](/kube-agents/concepts/chatops/)).
 
 The chat-ingress plugins (`session_store`, `session_otel_bridge`) run on the Planning Agent profile, which owns chat ingress — see [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml).
 

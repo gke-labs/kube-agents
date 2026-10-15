@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for fleet_upgrade_report.py, with gcloud replaced by canned JSON."""
 
+import errno
 import io
 import json
 import os
@@ -10,7 +11,7 @@ import tempfile
 import unittest
 import subprocess
 from unittest import mock
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -680,9 +681,45 @@ class OutputShapeTest(unittest.TestCase):
         self.assertIn(f"read failed for {report.PROJECTS_LIST_ERROR_SCOPE}", stdout.getvalue())
         self.assertIn("PERMISSION_DENIED", stdout.getvalue())
 
+    def test_write_json_atomically_leaves_the_previous_file_on_failure(self):
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "out.json")
+        report.write_json_atomically(path, {"run": 1}, report.OUTPUT_TMP_PREFIX)
+        with self.assertRaises(TypeError):
+            report.write_json_atomically(path, {"run": object()}, report.OUTPUT_TMP_PREFIX)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"run": 1})
+        self.assertEqual(os.listdir(directory), ["out.json"])
+        report.write_json_atomically(path, {"run": 2}, report.OUTPUT_TMP_PREFIX)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"run": 2})
+
+    def test_main_refuses_an_abbreviated_flag(self):
+        # The bench credits a run by the flag's full word; argparse's prefix matching would run
+        # the report on `--readi` and leave the run uncredited.
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit) as exc:
+            report.main(["--project", "p1", "--target-version", self.target, "--readi"])
+        self.assertEqual(exc.exception.code, report.EXIT_USAGE)
+        self.assertIn("--readi", err.getvalue())
+
+    def test_a_webhook_read_failure_row_is_tagged_and_a_first_read_failure_row_is_not(self):
+        # The readiness watch tells the two apart: a webhook-side row leaves the member graded
+        # `unknown`; a first-read row is a member the server never answered.
+        read_first_failed = {"error": "kubectl get pdb failed", "webhook_error": None, "webhook_skipped": True}
+        read_second_failed = {"error": None, "webhook_error": "kubectl output cut at the cap", "webhook_skipped": False}
+        for read, expect_tag in ((read_first_failed, False), (read_second_failed, True)):
+            with self.subTest(expect_tag=expect_tag):
+                with patch.object(report, "run_cmd", self.fake), patch.object(report, "read_cluster_objects", return_value=read), patch.object(report, "assess_readiness", return_value={"status": "unknown"}):
+                    data = report.build_report(["p1"], self.target, {"at": report.utc_now(), "kubeconfig_dir": tempfile.mkdtemp()})
+                rows = [e for e in data["errors"] if e.get("cluster")]
+                self.assertTrue(rows)
+                self.assertEqual(all(e.get(report.ERROR_READ_KEY) == report.WEBHOOK_READ for e in rows), expect_tag)
+
     def test_main_returns_partial_when_output_cannot_be_written(self):
         out_dir = tempfile.mkdtemp()
-        # A directory where the file should go: open() fails with IsADirectoryError, an OSError.
+        # A directory where the file should go: the temp file is written beside it and the rename
+        # onto it fails with an OSError (IsADirectoryError), which the whole-file write reports.
         with patch.object(report, "run_cmd", self.fake), redirect_stdout(io.StringIO()):
             rc = report.main(["--project", "p1", "--target-version", self.target, "--output", out_dir])
         self.assertEqual(rc, report.EXIT_PARTIAL)
@@ -1040,6 +1077,236 @@ class RolloutTrackingTest(unittest.TestCase):
         self.assertFalse(data["rollout"]["active"])
         self.assertEqual(data["rollout"]["summary"]["new"], 4)
 
+@contextmanager
+def owned_by(path, uid):
+    """`os.stat` and `os.fstat` reporting `uid` as `path`'s owner -- on the path, and on a descriptor
+    opened on it (matched by device and inode) -- the test's own fact rather than the runner's uid, real
+    for every other path: the branch a mocked root takes then does not depend on who runs the suite."""
+    real_stat, real_fstat = os.stat, os.fstat
+    try:
+        identity = os.lstat(path)
+        same = (identity.st_dev, identity.st_ino)
+    except FileNotFoundError:
+        same = None
+
+    def rewrite(result):
+        return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink, uid, result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime))
+
+    def fake(target, *args, **kwargs):
+        result = real_stat(target, *args, **kwargs)
+        return rewrite(result) if isinstance(target, (str, bytes, os.PathLike)) and os.fspath(target) == os.fspath(path) else result
+
+    def fake_fstat(fd):
+        result = real_fstat(fd)
+        return rewrite(result) if same is not None and (result.st_dev, result.st_ino) == same else result
+
+    with patch.object(os, "stat", fake), patch.object(os, "fstat", fake_fstat):
+        yield
+
+
+class PrepareKubeconfigTest(unittest.TestCase):
+    def test_the_default_directory_is_shared_and_a_named_one_keeps_the_umask(self):
+        # The default `$HERMES_HOME/.kubeconfigs` follows the fleet-audit collectors' rule: sticky and
+        # world-writable whatever the umask, widened when this uid made it at another mode, moved aside
+        # and remade when another uid's, a stale kubeconfig this uid cannot write removed (root keeps
+        # it). A directory `--kubeconfig-dir` names is the caller's and keeps the caller's umask.
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
+            shared = report.default_kubeconfig_dir()
+            path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
+            os.mkdir(shared, 0o755)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("stale")
+            os.chmod(path, 0o400)
+            # The keep follows `os.access`, which root alone answers true for a 0400 file: stated as
+            # that answer rather than as the runner's uid, so a mocked euid does not decide it.
+            kept = os.access(path, os.W_OK)
+            mask = os.umask(0o077)
+            try:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            finally:
+                os.umask(mask)
+            self.assertEqual(os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, report.KUBECONFIG_DIR_MODE)
+            self.assertEqual(os.path.exists(path), kept)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("root's")
+            with patch.object(os, "geteuid", return_value=os.stat(shared).st_uid + 1), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            # The move-aside is said, as the shared rule says it.
+            self.assertIn("moved aside to .kubeconfigs.unusable-", err.getvalue())
+            self.assertFalse(os.path.exists(path))
+            self.assertEqual(len([n for n in os.listdir(root) if n.startswith(".kubeconfigs.unusable-")]), 1)
+            self.assertEqual(os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, report.KUBECONFIG_DIR_MODE)
+            named = os.path.join(root, "nested", "kubeconfigs")
+            mask = os.umask(0o077)
+            try:
+                self.assertIsNone(report.prepare_kubeconfig(named, report.kubeconfig_path(named, "p1", "seeded-a", "us-central1-a")))
+            finally:
+                os.umask(mask)
+            self.assertEqual(os.stat(named).st_mode & report.KUBECONFIG_DIR_MODE_MASK, 0o700)
+            # The shared rule's note contract: a directory another uid owns in a parent this uid
+            # cannot rename in is a note naming the owner, which the member's read error carries,
+            # not an OSError reported as a directory creation.
+            other = os.stat(shared).st_uid + 1
+            with patch.object(os, "geteuid", return_value=other), patch.object(os, "rename", side_effect=PermissionError(13, "Permission denied")):
+                note = report.prepare_kubeconfig(shared, path)
+            self.assertIn(f"this run is uid {other}; it could not be moved aside", note)
+            with patch.object(report, "prepare_kubeconfig", return_value=note):
+                read = report.read_cluster_objects({"name": "seeded-a", "location": "us-central1-a"}, "p1", shared)
+            # The rule's refusal is the directory's: both reads fail with it, as a directory that could not be made.
+            self.assertEqual((read["items"], read["error"], read["webhook_error"], read["directory_error"], read["credentials_error"], read["kubeconfig"]), (None, report.KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note), report.KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note), report.KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note), None, path))
+            # A stat the old guard would have caught: a parent this uid cannot search is a note too,
+            # not a traceback out of the run.
+            real_stat = os.stat
+
+            def refusing(target, *args, **kwargs):
+                if str(target) == shared:
+                    raise PermissionError(13, "Permission denied")
+                return real_stat(target, *args, **kwargs)
+
+            with patch.object(os, "stat", side_effect=refusing):
+                note = report.prepare_kubeconfig(shared, path)
+            self.assertEqual(note, report.KUBECONFIG_NOT_READ_FORMAT.format(directory=shared, error="[Errno 13] Permission denied"))
+
+    def test_a_root_run_keeps_the_ticks_directory_and_a_lost_rename_race_is_no_refusal(self):
+        # From root's side the tick's directory is another uid's, and root keeps it rather than moving
+        # it aside; the tick's stale file in it is replaced rather than written through (mocked root
+        # shows both branches). A rename that finds the directory already moved, another run's tick in
+        # the same second having won, reads what stands there now and is no refusal.
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
+            shared = report.default_kubeconfig_dir()
+            path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
+            os.mkdir(shared, 0o755)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("the tick's")
+            # The file's owner is the test's own fact as the directory's is, so the replace branch is the
+            # one exercised whoever runs the suite, root included.
+            with patch.object(os, "geteuid", return_value=report.ROOT_UID), owned_by(shared, report.ROOT_UID + 1), owned_by(path, report.ROOT_UID + 1), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertNotIn("moved aside", err.getvalue())
+            self.assertEqual((os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, os.path.exists(path), sorted(os.listdir(root))), (report.KUBECONFIG_DIR_MODE, False, [".kubeconfigs"]))
+            # A link planted at the file's name is removed, never written through, the target untouched.
+            target = os.path.join(root, "target")
+            with open(target, "w", encoding="utf-8") as f:
+                f.write("root's secret")
+            os.chmod(target, 0o600)
+            os.symlink(target, path)
+            with patch.object(os, "geteuid", return_value=report.ROOT_UID), owned_by(shared, report.ROOT_UID + 1):
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            with open(target, encoding="utf-8") as f:
+                kept = f.read()
+            self.assertEqual((os.path.lexists(path), kept, os.stat(target).st_mode & 0o7777), (False, "root's secret", 0o600))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("the tick's")
+            other = os.stat(shared).st_uid + 1
+            real_rename = os.rename
+
+            def winner_first(src, dst, *args, **kwargs):
+                # The winner moved the directory and remade it between this run's stat and rename.
+                real_rename(src, dst, *args, **kwargs)
+                os.mkdir(src, 0o755)
+                raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+
+            with patch.object(os, "geteuid", return_value=other), patch.object(os, "rename", winner_first), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertNotIn("could not be moved aside", err.getvalue())
+            [aside] = [n for n in os.listdir(root) if n.startswith(".kubeconfigs.unusable-")]
+            self.assertEqual((os.path.exists(os.path.join(root, aside, os.path.basename(path))), os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, os.path.exists(path)), (True, report.KUBECONFIG_DIR_MODE, False))
+
+    def test_a_symlink_at_the_shared_directory_is_refused_not_followed(self):
+        # As the shared rule: a symlink planted at the default directory's name is refused with a
+        # note and never followed, so a root run neither chmods nor writes into its target.
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        elsewhere = os.path.join(root, "elsewhere")
+        os.mkdir(elsewhere, 0o700)
+        with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
+            shared = report.default_kubeconfig_dir()
+            os.symlink(elsewhere, shared)
+            path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
+            for euid in (os.geteuid(), report.ROOT_UID):
+                with self.subTest(euid=euid), patch.object(os, "geteuid", return_value=euid):
+                    note = report.prepare_kubeconfig(shared, path)
+                self.assertEqual(note, report.KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=shared))
+                self.assertEqual((os.stat(elsewhere).st_mode & report.KUBECONFIG_DIR_MODE_MASK, os.path.islink(shared)), (0o700, True))
+
+
+    def test_this_uids_private_directory_whose_mode_cannot_change_is_kept(self):
+        # As the shared rule: a chmod the filesystem refuses keeps a directory this uid owns alone
+        # (owner write and search, no other uid's write) at its mode, said on stderr; any other mode,
+        # and another uid's directory from root's side, stay the note.
+        refused = OSError(errno.EPERM, "Operation not permitted")
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
+            shared = report.default_kubeconfig_dir()
+            os.mkdir(shared)
+            os.chmod(shared, 0o700)
+            path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
+            # The owner is the test's own fact, this run's euid on the path and on the descriptor.
+            with owned_by(shared, os.geteuid()), patch.object(os, "fchmod", side_effect=refused), redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertEqual(os.stat(shared).st_mode & report.KUBECONFIG_DIR_MODE_MASK, 0o700)
+            self.assertIn(report.KUBECONFIG_MODE_KEPT_FORMAT.format(directory=shared, mode="0o700", wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused), err.getvalue())
+            for mode in (0o777, 0o555):
+                with self.subTest(mode=oct(mode)):
+                    os.chmod(shared, mode)
+                    with owned_by(shared, os.geteuid()), patch.object(os, "fchmod", side_effect=refused):
+                        note = report.prepare_kubeconfig(shared, path)
+                    self.assertEqual(note, report.KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=shared, mode=oct(mode), wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused))
+            os.chmod(shared, 0o700)
+            with patch.object(os, "geteuid", return_value=report.ROOT_UID), owned_by(shared, report.ROOT_UID + 1), patch.object(os, "fchmod", side_effect=refused):
+                note = report.prepare_kubeconfig(shared, path)
+            self.assertEqual(note, report.KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=shared, mode="0o700", wanted=oct(report.KUBECONFIG_DIR_MODE), error=refused))
+
+    def test_an_entry_planted_at_the_kubeconfig_name_is_never_used(self):
+        # As the shared rule: a directory planted at the public name is moved aside and said, the note
+        # when it cannot be; another uid's file is removed; this uid's own writable file is kept; a link
+        # to a directory is removed with its target untouched.
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        with patch.dict(os.environ, {report.HERMES_HOME_ENV: root}):
+            shared = report.default_kubeconfig_dir()
+            path = report.kubeconfig_path(shared, "p1", "seeded-a", "us-central1-a")
+            self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            os.mkdir(path, 0o777)
+            with open(os.path.join(path, "inside"), "w", encoding="utf-8") as f:
+                f.write("planted")
+            with redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            [aside] = [n for n in os.listdir(shared) if n.startswith(os.path.basename(path) + ".unusable-")]
+            with open(os.path.join(shared, aside, "inside"), encoding="utf-8") as f:
+                self.assertEqual((os.path.lexists(path), f.read()), (False, "planted"))
+            self.assertIn(report.KUBECONFIG_NOT_A_FILE_MOVED_FORMAT.format(path=path, aside=aside), err.getvalue())
+            os.mkdir(path, 0o777)
+            with patch.object(os, "rename", side_effect=PermissionError(13, "Permission denied")):
+                note = report.prepare_kubeconfig(shared, path)
+            self.assertEqual(note, report.KUBECONFIG_NOT_A_FILE_FORMAT.format(path=path, error="[Errno 13] Permission denied"))
+            with patch.object(report, "prepare_kubeconfig", return_value=note):
+                read = report.read_cluster_objects({"name": "seeded-a", "location": "us-central1-a"}, "p1", shared)
+            self.assertEqual((read["items"], read["error"], read["directory_error"]), (None, report.KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note), report.KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note)))
+            os.rmdir(path)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("another's")
+            os.chmod(path, 0o666)
+            with owned_by(path, os.geteuid() + 1):
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertFalse(os.path.exists(path))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("mine")
+            with owned_by(path, os.geteuid()):
+                self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "mine")
+            elsewhere = os.path.join(root, "elsewhere")
+            os.mkdir(elsewhere, 0o700)
+            os.unlink(path)
+            os.symlink(elsewhere, path)
+            self.assertIsNone(report.prepare_kubeconfig(shared, path))
+            self.assertEqual((os.path.lexists(path), os.path.isdir(elsewhere), os.stat(elsewhere).st_mode & report.KUBECONFIG_DIR_MODE_MASK), (False, True, 0o700))
 
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):
@@ -1184,10 +1451,24 @@ if __name__ == "__main__":
 class FakeReadinessCommands(FakeGcloud):
     """FakeGcloud plus `get-credentials` and `kubectl get`, recording the KUBECONFIG each ran with."""
 
-    def __init__(self, clusters_by_project, config_by_location, objects_by_cluster, failing_kubectl=(), failing_credentials=()):
+    # What each resource name in a `kubectl get` list returns, so a read that stops asking for
+    # a kind stops receiving it, as a real API server would.
+    KINDS = {
+        "pdb": "PodDisruptionBudget",
+        "deploy": "Deployment",
+        "statefulset": "StatefulSet",
+        "validatingwebhookconfigurations": "ValidatingWebhookConfiguration",
+        "mutatingwebhookconfigurations": "MutatingWebhookConfiguration",
+        "services": "Service",
+        "endpointslices": "EndpointSlice",
+        "namespaces": "Namespace",
+    }
+
+    def __init__(self, clusters_by_project, config_by_location, objects_by_cluster, failing_kubectl=(), failing_credentials=(), failing_webhook_read=()):
         super().__init__(clusters_by_project, config_by_location)
         self.objects_by_cluster = objects_by_cluster
         self.failing_kubectl = set(failing_kubectl)
+        self.failing_webhook_read = set(failing_webhook_read)
         self.failing_credentials = set(failing_credentials)
         self.kubeconfigs = []
         self.current_cluster = None
@@ -1205,7 +1486,11 @@ class FakeReadinessCommands(FakeGcloud):
             self.kubeconfigs.append(env.get("KUBECONFIG") if env else None)
             if self.current_cluster in self.failing_kubectl:
                 return 1, "", "Unable to connect to the server: dial tcp: i/o timeout"
-            return 0, json.dumps({"kind": "List", "items": self.objects_by_cluster.get(self.current_cluster, [])}), ""
+            wanted = {self.KINDS[name] for name in cmd[2].split(",")}
+            if "EndpointSlice" in wanted and self.current_cluster in self.failing_webhook_read:
+                return 1, "", "Error from server (Timeout): the server was unable to return a response in the time allotted"
+            items = [o for o in self.objects_by_cluster.get(self.current_cluster, []) if o.get("kind") in wanted]
+            return 0, json.dumps({"kind": "List", "items": items}), ""
         return super().__call__(cmd)
 
 
@@ -1215,6 +1500,23 @@ def k8s_workload(kind, namespace, name, replicas, labels):
 
 def k8s_pdb(namespace, name, spec, expected):
     return {"kind": "PodDisruptionBudget", "metadata": {"namespace": namespace, "name": name}, "spec": spec, "status": {"expectedPods": expected, "disruptionsAllowed": 0}}
+
+
+def k8s_webhook(kind, config, webhook, policy, service, resources, operations=("CREATE",)):
+    rule = {"apiGroups": [""], "apiVersions": ["v1"], "operations": list(operations), "resources": list(resources)}
+    return {"kind": kind, "metadata": {"name": config}, "webhooks": [{"name": webhook, "failurePolicy": policy, "rules": [rule], "clientConfig": {"service": {"namespace": service[0], "name": service[1]}}}]}
+
+
+def k8s_service(namespace, name, port=443, port_name="https"):
+    return {"kind": "Service", "metadata": {"namespace": namespace, "name": name}, "spec": {"ports": [{"name": port_name, "port": port, "targetPort": 8443}]}}
+
+
+def k8s_endpointslice(namespace, service, ready, port_name="https"):
+    return {"kind": "EndpointSlice", "metadata": {"namespace": namespace, "name": f"{service}-x", "labels": {"kubernetes.io/service-name": service}}, "ports": [{"name": port_name, "port": 8443}], "endpoints": [{"conditions": {"ready": ready}}]}
+
+
+def k8s_namespace(name, labels=None):
+    return {"kind": "Namespace", "metadata": {"name": name, "labels": {"kubernetes.io/metadata.name": name, **(labels or {})}}}
 
 
 class ReadinessTest(unittest.TestCase):
@@ -1255,6 +1557,24 @@ class ReadinessTest(unittest.TestCase):
                 k8s_pdb("readiness-1411", "orphan", {"maxUnavailable": 0, "selector": {"matchLabels": {"app": "gone"}}}, 0),
             ],
         }
+        # seeded-b: the seeded fleet's fixture shape, a gate on ConfigMaps only, whose Service does
+        # not exist, scoped to its own namespace as bench/tf/fleet/defects-b.tf scopes it. It is an
+        # outage because ConfigMaps are on neither graded list; the scope confines the gate.
+        seeded_gate = k8s_webhook("ValidatingWebhookConfiguration", "seeded-fail-closed-gate", "gate.seeded.invalid", "Fail", ("seeded-upgrade", "nonexistent-admission-gate"), ["configmaps"])
+        seeded_gate["webhooks"][0]["namespaceSelector"] = {"matchLabels": {"kubernetes.io/metadata.name": "seeded-upgrade"}}
+        self.objects["seeded-b"] = self.objects.get("seeded-b", []) + [seeded_gate]
+        # robot-host: a gate on pod creation whose Service exists but has no endpoints; the drain's replacements need it.
+        self.objects["robot-host"] = self.objects.get("robot-host", []) + [
+            k8s_webhook("ValidatingWebhookConfiguration", "pod-gate", "pods.example.com", "Fail", ("gate", "pod-hook"), ["pods"]),
+            k8s_service("gate", "pod-hook"),
+        ]
+        # seeded-a: a pod gate with a ready backend, and a fail-open one.
+        self.objects["seeded-a"] = self.objects.get("seeded-a", []) + [
+            k8s_webhook("ValidatingWebhookConfiguration", "healthy-gate", "ok.example.com", "Fail", ("kube-system", "live-hook"), ["pods"]),
+            k8s_service("kube-system", "live-hook"),
+            k8s_endpointslice("kube-system", "live-hook", ready=True),
+            k8s_webhook("MutatingWebhookConfiguration", "advisor", "advise.example.com", "Ignore", ("kube-system", "live-hook"), ["pods"]),
+        ]
 
     def _args(self, *extra):
         return ["--state-dir", self.state_dir, "--project", "p1", "--target-version", self.TARGET, *extra]
@@ -1297,15 +1617,26 @@ class ReadinessTest(unittest.TestCase):
         self.assertFalse(host["skew"]["applicable"])
         self.assertIn("1 orphan PDB(s)", host["note"])
 
+        self.assertEqual([f["webhook"] for f in host["webhooks"]["blocking"]], ["pod-gate/pods.example.com"])
+        self.assertEqual(host["webhooks"]["blocking"][0]["upgrade_path"], ["CREATE pods"])
+        self.assertEqual(host["webhooks"]["blocking"][0]["reason"], "Service gate/pod-hook has no ready endpoints on port 443")
+
         b = by_name["seeded-b"]
         self.assertEqual(b["status"], "blocked")
         self.assertEqual(b["pdbs"]["blocking"], [])
+        # The fixture's gate matches ConfigMaps only: an outage for what it matches, not an upgrade blocker.
+        self.assertEqual(b["webhooks"]["blocking"], [])
+        self.assertEqual([f["webhook"] for f in b["webhooks"]["outage"]], ["seeded-fail-closed-gate/gate.seeded.invalid"])
+        self.assertEqual(b["webhooks"]["outage"][0]["reason"], "Service seeded-upgrade/nonexistent-admission-gate does not exist")
         self.assertEqual(b["maintenance"]["blocking_exclusions"], ["hold-the-minor-lag"])
         self.assertEqual(b["maintenance"]["window"]["state"], "closed")
         self.assertEqual(b["maintenance"]["window"]["next_opening"], "2026-09-15T03:00Z")
 
         a = by_name["seeded-a"]
         self.assertEqual(a["status"], "ready")
+        self.assertEqual(a["webhooks"]["blocking"], [])
+        self.assertEqual(a["webhooks"]["evaluated"], 1)
+        self.assertEqual(a["webhooks"]["fail_open"], 1)
         self.assertEqual(a["skew"]["pools"][0]["verdict"], "ok")
         self.assertEqual(data["readiness"]["summary"], {"blocked": 2, "ready": 1, "unknown": 0})
         self.assertEqual(data["readiness"]["evaluated_at"], "2026-09-14T15:00:00Z")
@@ -1317,6 +1648,8 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("no exclusion in effect; no maintenance window", host_row)
         self.assertIn("n/a (Autopilot", host_row)
         b_row = next(l for l in lines if l.startswith("| p1 | seeded-b |") and "| blocked |" in l)
+        self.assertIn("seeded-fail-closed-gate/gate.seeded.invalid (ValidatingWebhookConfiguration): failurePolicy Fail and Service seeded-upgrade/nonexistent-admission-gate does not exist; matches none of the operations this rule reads as the upgrade's path (its rules: CREATE configmaps at v1); it fails now every request the server sends it; reported, not graded", b_row)
+        self.assertIn("pod-gate/pods.example.com (ValidatingWebhookConfiguration): failurePolicy Fail and Service gate/pod-hook has no ready endpoints on port 443; matches CREATE pods", host_row)
         self.assertIn("exclusion hold-the-minor-lag (NO_MINOR_UPGRADES) blocks auto-upgrade to 1.35.1-gke.1000 until 2026-12-11T14:35Z", b_row)
         self.assertIn("window daily at 03:00Z for 4h: closed, next opening 2026-09-15T03:00Z", b_row)
         self.assertIn("Readiness at 2026-09-14T15:00:00Z: 2 blocked, 1 ready, 0 unknown", text)
@@ -1339,7 +1672,15 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(all(k and k.startswith(self.kubeconfig_dir + os.sep) for k in fake.kubeconfigs))
         self.assertTrue(os.path.isdir(self.kubeconfig_dir))
         kubectl = [c for c in fake.calls if c[:1] == ["kubectl"]]
-        self.assertEqual(kubectl, [["kubectl", "get", "pdb,deploy,statefulset", "-A", "-o", "json"]] * 3)
+        # Literal resource lists, not the constants: a list that drops a kind must fail here.
+        self.assertEqual(
+            kubectl,
+            [
+                ["kubectl", "get", "pdb,deploy,statefulset", "-A", "-o", "json"],
+                ["kubectl", "get", "validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces", "-A", "-o", "json"],
+            ]
+            * 3,
+        )
         self.assertEqual(data["readiness"]["kubeconfig_dir"], self.kubeconfig_dir)
         self.assertEqual({m["cluster"]: m["readiness"]["kubeconfig"] for m in data["members"]}["seeded-b"], expected)
 
@@ -1362,9 +1703,20 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("i/o timeout", by_name["seeded-a"]["read_error"])
         self.assertEqual(by_name["robot-host"]["status"], "blocked")
         self.assertEqual(by_name["seeded-b"]["status"], "blocked")
+        self.assertIsNone(by_name["seeded-a"]["webhooks"])
+        # An API server the first read could not reach is not asked a second time: one
+        # kubectl call for seeded-a, two for each of the other members.
+        self.assertEqual(len([c for c in fake.calls if c[:2] == ["kubectl", "get"]]), 5)
+        self.assertTrue(by_name["seeded-a"]["webhook_read_error"].startswith(report.WEBHOOK_READ_SKIPPED))
+        # The skipped read is reported as skipped, not failed: one error row, and a note that says why the webhooks are unread.
         self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-a"])
         self.assertIn("- read failed for p1 (us-central1-a) cluster seeded-a: kubectl get pdb,deploy,statefulset -A -o json failed (1)", text)
-        self.assertIn("| read failed |", text)
+        self.assertEqual([l for l in text.splitlines() if l.startswith("- read failed") and "skipped" in l], [])
+        self.assertIn("PDB read failed; PDBs not graded; webhook read skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the credential proxy unreachable); webhooks not graded", by_name["seeded-a"]["note"])
+        self.assertNotIn("webhook read failed", by_name["seeded-a"]["note"])
+        self.assertTrue(by_name["seeded-a"]["webhook_read_skipped"])
+        self.assertIn("| read failed | read skipped |", text)
+        self.assertNotIn("| read failed | read failed |", text)
         # The version row is unaffected, and the rollout record does not treat the project as unread.
         self.assertEqual({m["cluster"]: m["status"] for m in data["members"]}["seeded-a"], report.STATUS_CURRENT)
         self.assertEqual(data["rollout"]["missing_members"], [])
@@ -1378,7 +1730,138 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(b["status"], "blocked")
         self.assertIsNone(b["pdbs"])
         self.assertIn("forbidden", b["read_error"])
-        self.assertEqual(len([c for c in fake.calls if c[:1] == ["kubectl"]]), 2)
+        self.assertIsNone(b["webhooks"])
+        self.assertEqual(len([c for c in fake.calls if c[:1] == ["kubectl"]]), 4)
+        # One credentials failure is one error row, not one per read, and the note names credentials, not kubectl.
+        self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-b"])
+        self.assertIn("credentials for the cluster could not be fetched", b["note"])
+        self.assertNotIn("read failed", b["note"])
+
+    def test_an_unwritable_kubeconfig_dir_is_a_directory_error_not_a_credentials_error(self):
+        # `--kubeconfig-dir` is operator-chosen, so an unwritable path is ordinary input and
+        # the note has to send the operator to the path, not to IAM.
+        directory = os.path.join(os.devnull, "kubeconfigs")
+        read = report.read_cluster_objects({"name": "c", "location": "l"}, "p", directory)
+        self.assertIsNotNone(read["directory_error"])
+        self.assertIsNone(read["credentials_error"])
+        # The kubeconfig rule's note names the path that could not be made, under the reporter's prefix.
+        self.assertTrue(read["error"].startswith(report.KUBECONFIG_NOT_PREPARED_FORMAT.format(note="")), read["error"])
+        self.assertIn(report.KUBECONFIG_NOT_MADE_FORMAT.format(directory=directory, error="").split("(")[0], read["error"])
+        self.assertEqual(read["error"], read["webhook_error"])
+
+    def test_a_first_read_killed_by_the_deadline_does_not_skip_the_webhook_read(self):
+        # In the sandbox the deadline measures the credential proxy's admission queue as often as
+        # the server, and a second read enters that queue afresh.
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            if cmd[2] == report.KUBECTL_RESOURCES:
+                return -1, "", f"timed out after {report.KUBECTL_TIMEOUT_SECONDS} seconds"
+            return 0, '{"items": []}', ""
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertIn("timed out after", read["error"])
+        self.assertFalse(read["webhook_skipped"])
+        self.assertEqual((read["webhook_items"], read["webhook_error"]), ([], None))
+        self.assertEqual([c[2] for c in calls if c[0] == report.KUBECTL], [report.KUBECTL_RESOURCES, report.KUBECTL_WEBHOOK_RESOURCES])
+
+    def test_a_server_answered_error_quoting_a_dial_failure_does_not_skip_the_webhook_read(self):
+        # kubectl prefixes an error the API server returned with `Error from server (...)`; its
+        # body can quote the server's own dial failure (apiserver to etcd during a control-plane
+        # event), which is an answer, so the second read is made and may be answered.
+        calls = []
+        answered = 'Error from server (InternalError): an error on the server ("rpc error: code = Unavailable desc = dial tcp 10.0.0.2:2379: connect: connection refused") has prevented the request from succeeding'
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            if cmd[2] == report.KUBECTL_RESOURCES:
+                return 1, "", answered
+            return 0, '{"items": []}', ""
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertIn("connection refused", read["error"])
+        self.assertFalse(read["webhook_skipped"])
+        self.assertEqual((read["webhook_items"], read["webhook_error"]), ([], None))
+        self.assertEqual([c[2] for c in calls if c[0] == report.KUBECTL], [report.KUBECTL_RESOURCES, report.KUBECTL_WEBHOOK_RESOURCES])
+        self.assertTrue(report.first_read_failed_before_the_server_answered("Unable to connect to the server: dial tcp 10.0.0.1:443: connect: connection refused"))
+        self.assertFalse(report.first_read_failed_before_the_server_answered(answered))
+
+    def test_the_shims_broker_down_line_skips_the_webhook_read(self):
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            return 1, "", "credential proxy unavailable: [Errno 111] Connection refused\n"
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertTrue(read["webhook_skipped"])
+        self.assertTrue(read["webhook_error"].startswith(report.WEBHOOK_READ_SKIPPED))
+        self.assertEqual([c[2] for c in calls if c[0] == report.KUBECTL], [report.KUBECTL_RESOURCES])
+
+    def test_a_list_cut_at_the_proxy_cap_is_named_as_such(self):
+        def fake_run(cmd, *args, **kwargs):
+            if cmd[0] != report.KUBECTL:
+                return 0, "", ""
+            if cmd[2] == report.KUBECTL_RESOURCES:
+                return 0, '{"items": []}', ""
+            return 0, '{"items": [{"kind": "Service", "metadata": {"na', f"{report.PROXY_TRUNCATION_MARKER}\n"
+
+        with tempfile.TemporaryDirectory() as d, patch.object(report, "run_cmd", side_effect=fake_run):
+            read = report.read_cluster_objects({"name": "big", "location": "us-central1"}, "p1", d)
+        self.assertEqual((read["items"], read["error"]), ([], None))
+        self.assertIsNone(read["webhook_items"])
+        self.assertIn("cut at the credential proxy's output cap", read["webhook_error"])
+        self.assertNotIn("unparsable", read["webhook_error"])
+
+    def test_webhook_read_failure_leaves_the_pdb_rule_graded(self):
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects, failing_webhook_read=["robot-host"])
+        rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+        host = next(m for m in data["members"] if m["cluster"] == "robot-host")["readiness"]
+        self.assertIsNone(host["webhooks"])
+        self.assertIsNotNone(host["pdbs"])
+        self.assertEqual(host["pdbs"]["blocking"][0]["pdb"], "readiness-1411/block-drain")
+        self.assertEqual(host["status"], "blocked")  # the PDB still blocks; the webhook rule alone is unread
+        self.assertIn("webhook read failed; webhooks not graded", host["note"])
+        row = next(l for l in text.splitlines() if l.startswith("| p1 | robot-host |") and "| blocked |" in l)
+        self.assertIn("(2 replicas)) | read failed |", row)
+        self.assertIn("kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces -A -o json failed (1)", text)
+
+    def test_the_namespace_read_feeds_the_selector(self):
+        # A dead Role gate that exempts kube-system and kube-public by a label the installer
+        # put on them is an outage on the cluster whose Namespace read shows the label, and a
+        # blocker on the cluster whose namespaces do not carry it.
+        gate = k8s_webhook("ValidatingWebhookConfiguration", "policy-gate", "roles.example.com", "Fail", ("policy", "absent"), ["roles"])
+        gate["webhooks"][0]["rules"][0]["apiGroups"] = ["rbac.authorization.k8s.io"]
+        gate["webhooks"][0]["namespaceSelector"] = {"matchExpressions": [{"key": "admission.policy.example/ignore", "operator": "DoesNotExist"}]}
+        exempt = [k8s_namespace("kube-system", {"admission.policy.example/ignore": "true"}), k8s_namespace("kube-public", {"admission.policy.example/ignore": "true"})]
+        plain = [k8s_namespace("kube-system"), k8s_namespace("kube-public")]
+        objects = {**self.objects, "seeded-a": self.objects["seeded-a"] + [gate] + exempt, "robot-host": self.objects["robot-host"] + [gate] + plain}
+        _, _, data = self._run(FakeReadinessCommands(self.clusters, {}, objects))
+        webhooks = {m["cluster"]: m["readiness"]["webhooks"] for m in data["members"]}
+        self.assertEqual(([f["webhook"] for f in webhooks["seeded-a"]["outage"]], webhooks["seeded-a"]["blocking"]), (["policy-gate/roles.example.com"], []))
+        blocking = {f["webhook"]: f["upgrade_path"] for f in webhooks["robot-host"]["blocking"]}
+        self.assertEqual(blocking["policy-gate/roles.example.com"], ["CREATE roles in kube-system,kube-public"])
+
+    def test_url_backend_is_counted_in_the_json_and_not_noted(self):
+        url_hook = {"kind": "ValidatingWebhookConfiguration", "metadata": {"name": "warden"}, "webhooks": [{"name": "warden.example.com", "failurePolicy": "Fail", "rules": [{"apiGroups": [""], "operations": ["CREATE"], "resources": ["pods"]}], "clientConfig": {"url": "https://localhost:5443/validate"}}]}
+        objects = {**self.objects, "seeded-a": self.objects["seeded-a"] + [url_hook]}
+        fake = FakeReadinessCommands(self.clusters, {}, objects)
+        _, _, data = self._run(fake)
+        a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        self.assertEqual(a["webhooks"]["url_backends"], 1)
+        self.assertEqual(a["status"], "ready")
+        self.assertNotIn("URL", a["note"])
 
     def test_unknown_target_grades_the_pdb_rule_and_marks_the_rest_unknown(self):
         record = cluster("nochannel", "us-central1", "1.34.0-gke.1", [("p", "1.34.0-gke.1")], channel=None)

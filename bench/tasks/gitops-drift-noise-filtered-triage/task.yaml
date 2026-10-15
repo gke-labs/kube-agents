@@ -29,8 +29,10 @@
 # project.sh sets enable_drift_pubsub, so a pool project carries the sink, the
 # drift-audit topic and the pull subscription, and hack/ci-deploy.sh turns the
 # detector on per lease and fails the deploy if it never reaches its pull loop.
-# A project onboarded before that has no ingress and fails this case as broken
-# rather than red; docs/ci-pool-projects.md section 3 states the limitation.
+# Not every mapped project carries it. Section 3 of docs/ci-pool-projects.md
+# is the one home for which do and which do not, dated, and nothing re-checks
+# the state between leases. A lease of a project without the ingress fails
+# this case as broken rather than red.
 #
 # The sink is the one part of the trio this case does not use, and that matters
 # because the sibling stack's header gives the export lag as a reason the audit

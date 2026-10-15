@@ -245,7 +245,7 @@ COPY deploy/docker/patches/apply_kanban_progress_lines.py \
      /tmp/kanban-progress/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lines.py /opt/hermes && \
     grep -qF 'TERMINAL_KINDS = ' /opt/hermes/gateway/kanban_watchers_notifier.py && \
-    grep -qF '+ ("heartbeat",)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF '+ ("heartbeat", "pr_opened")' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q '^def _fmt_heartbeat(ev, n) -> tuple:' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF '"heartbeat": _fmt_heartbeat,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q 'note = _progress_note(ev.payload)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
@@ -1647,7 +1647,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     test "$(grep -c 'from hermes_cli.kanban_priority import' /opt/hermes/tools/kanban_tools.py)" = "1" && \
     test "$(grep -c '_kanban_saturation_tick(' /opt/hermes/gateway/kanban_watchers.py)" = "1" && \
     grep -q 'kanban dispatcher stuck: ready queue non-empty' /opt/hermes/gateway/kanban_watchers.py && \
-    grep -qF '+ ("heartbeat",) + ("queued",)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF '+ ("heartbeat", "pr_opened") + ("queued",)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF '_EVENT_FORMATTERS["queued"] = _kanban_format_queued' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q '^_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     install -m 0644 /tmp/latency-patches/credential_redaction.py /opt/hermes/agent/credential_redaction.py && \
@@ -1694,7 +1694,17 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
 # shipped chunk. Without this line the transport baked into the image is
 # whatever was latest on build day, so two builds of this same Dockerfile can
 # ship different error semantics (1.24.0 changed the thrown class).
-COPY deploy/docker/patches/apply_mcp_remote_forward_errors.py /tmp/apply_mcp_remote_forward_errors.py
+#
+# The second patch points the auth path at the credential proxy: with
+# MCP_REMOTE_BEARER_FILE set (every config here sets it), the bearer is the
+# gateway's projected ServiceAccount token and the Google ADC path above is not
+# reached. The agent configs send these servers to the proxy's MCP relay, which
+# holds the credential and the tool allowlist; the patch says why. Its marker is
+# grepped in the bundle like the first one's, so a pin advance that drops it
+# fails the build rather than shipping a child that would try ADC.
+COPY deploy/docker/patches/apply_mcp_remote_forward_errors.py \
+     deploy/docker/patches/apply_mcp_remote_bearer_file.py \
+     /tmp/
 RUN apt-get update && apt-get install -y --no-install-recommends git && \
     git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && \
     cd /opt/mcp-remote && \
@@ -1702,11 +1712,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && \
     npm pkg set devDependencies.@modelcontextprotocol/sdk=1.30.0 && \
     npm install && \
     /opt/hermes/.venv/bin/python3 /tmp/apply_mcp_remote_forward_errors.py /opt/mcp-remote && \
+    /opt/hermes/.venv/bin/python3 /tmp/apply_mcp_remote_bearer_file.py /opt/mcp-remote && \
     npm run build && \
     grep -q 'Failed to forward message to remote server' dist/*.js && \
+    grep -q 'MCP_REMOTE_BEARER_FILE' dist/*.js && \
     npm prune --production && \
     npm cache clean --force && \
-    rm -rf .git /tmp/apply_mcp_remote_forward_errors.py /tmp/patchlib.py
+    rm -rf .git /tmp/apply_mcp_remote_forward_errors.py /tmp/apply_mcp_remote_bearer_file.py /tmp/patchlib.py
 
 # 5. Create base defaults directory and copy shared defaults
 RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults

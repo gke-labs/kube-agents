@@ -60,13 +60,22 @@ mcp_servers:
   # execution mode, so the API team serving the endpoint can attribute the traffic;
   # deploy/shared/defaults/config.yaml carries the full rationale. The string is
   # the same one the Platform Agent sends, character for character.
+  #
+  # Both servers are reached through the credential proxy's MCP relay, which
+  # enforces the tool allowlist; deploy/shared/defaults/config.yaml explains
+  # the URL, the flags and the `env` block.
   developer_knowledge:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
       - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
-      - "https://developerknowledge.googleapis.com/mcp"
+      - "${KUBE_AGENTS_MCP_RELAY_URL}/developer_knowledge"
+      - "--allow-http"
+      - "--transport"
+      - "http-only"
+    env:
+      MCP_REMOTE_BEARER_FILE: "${CREDENTIAL_PROXY_TOKEN_FILE}"
     lazy: true
     connect_timeout: 30
     timeout: 60
@@ -76,13 +85,17 @@ mcp_servers:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
       - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
-      - "https://container.googleapis.com/mcp"
+      - "${KUBE_AGENTS_MCP_RELAY_URL}/gke"
+      - "--allow-http"
+      - "--transport"
+      - "http-only"
+    env:
+      MCP_REMOTE_BEARER_FILE: "${CREDENTIAL_PROXY_TOKEN_FILE}"
     lazy: true
     connect_timeout: 30
     timeout: 60
-    # Read tools only, as an allowlist: this server bypasses the credential
-    # broker, so the list is what keeps its write tools out of the model's
-    # reach. deploy/shared/defaults/config.yaml carries the full rationale; the
+    # Read tools only, as an allowlist: the credential proxy's relay refuses
+    # the write tools, and this list keeps them out of the model's offer. deploy/shared/defaults/config.yaml carries the full rationale; the
     # list is the same one, name for name.
     tools:
       include:
@@ -137,6 +150,16 @@ plugins:
 # to publish a Python-toolchain line that is factually wrong on this image.
 agent:
   environment_probe: false
+  # The same five toolsets agents/platform/config.yaml disables, for the same
+  # reason: declaring the full hermes-cli set puts Gemini on Vertex on an
+  # intermittent slow path before its first token, and a Cluster Agent's work
+  # (reading one cluster) uses none of them.
+  disabled_toolsets:
+    - browser
+    - computer_use
+    - image_gen
+    - tts
+    - vision
 
 # Per-file character cap on context files (SOUL.md, AGENTS.md) in the system
 # prompt; rationale lives in agents/platform/config.yaml, which pins the same

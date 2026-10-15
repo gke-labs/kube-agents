@@ -2073,10 +2073,11 @@ the PVC from the moment the card is filed, so the report files it also checks ad
 nothing. Its sweep card still calls `/opt/data/INVENTORY.md` the Chat Agent's home,
 which is wrong about the pod and right about the path the worker must write.
 
-The one agent-pod reader whose behaviour the move changes is the onboarding plugin. It
-picks its first greeting by checking `INVENTORY.md` on the PVC, so with the sandbox on it always greets
-as though the scan were still running. The report still arrives on the next delivery
-tick.
+The one agent-pod reader whose behaviour the move changes is the onboarding plugin, which
+picks its first greeting by whether `INVENTORY.md` is written. It reads the report across with
+`sandbox_exec.read_bytes`, as delivery does, and greets as though the scan were still running
+when the report is not there yet, or when that read fails or takes longer than
+`REPORT_CHECK_TIMEOUT_SECONDS`. The report still arrives on the next delivery tick either way.
 
 #### Nothing collects the sandbox's finished workspaces, so a cron job does
 
@@ -2131,6 +2132,21 @@ as a fact about the cluster, and a `.bashrc` that hijacked its `rm` would be doi
 uid 1000's own files what uid 1000 can already do. The commands are `/bin/ls` and
 `/bin/rm` by absolute path, which that file cannot shadow — a bash function name cannot
 contain a slash, and a non-interactive shell does not expand aliases.
+
+The same job takes an inventory of each sandbox profile home (#2989). Hermes cron runs
+start in the profile home, so a worker's loose files land beside the skills and config
+on a volume nothing sweeps, and a later session that lists the home cannot tell them
+from what the product put there. Every top-level entry the product doesn't create in that
+kind of home (the mirror's skeleton everywhere; the image-staged trees and database
+placeholders in the platform home; the identity and kubeconfig in a cluster home), checked
+by name and type, goes to `logs/kanban_workspace_gc.log` on the
+agent pod with its mtime and size, as does any sandbox profile home the agent pod has no
+profile for: the volume has no owner, so a cluster dropped from scope keeps its home and
+kubeconfig there. Inventory only, no moves: whether to move anything waits for data from
+the test fleet after cron runs get a working directory of their own. The listing runs as
+`hermes`, the default principal, because its output is believed, under the sandbox's own
+`workspace_root` rather than the agent pod's home, and with NUL-terminated records so a
+name cannot forge a row.
 
 #### The agent pod gives up cluster tooling entirely
 

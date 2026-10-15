@@ -377,7 +377,8 @@ no key is refused at start.
 A kanban card the persona creates completes after the turn has answered, and the API server
 has no channel to push that completion back. So before a task's first turn the bridge records the
 conversation its session answers (the platform, the gateway's conversation key from the task's
-`authority.audience.conversation`, and the `contextId`) in the pod's session-kv, with
+`authority.audience.conversation`, the `contextId`, and the kind of the prompt's ask, which the
+cards' posts keep marked while they run) in the pod's session-kv, with
 `PUT /v1/sessions/{id}/route` on `BRIDGE_ROUTE_URL` (default `http://127.0.0.1:8699`) and the
 `SESSION_KV_API_KEY` (inherited from the agent container on a rendered bridge). The card's report then goes back to that conversation through the
 gateway's chat.notify route (`docs/designs/spec-chatops-gateway.md`). The PUT is best effort: the
@@ -692,7 +693,18 @@ heartbeat and never the trace. Past the trace's share, calls are counted and one
 part; the relay drops the artifact on purpose (debug and audit views never render to
 chat), and the inject door's probe is where a reader sees it.
 
-The heartbeat is a `progress` text part every `BRIDGE_PROGRESS_INTERVAL_SECONDS` (default
+Each of these also carries a `kube-agents.chat/v1` chat message where the payload spec's
+"Chat messages" section puts one (`chat.go`): a completed `result`'s last chunk holds the
+answer laid out (its first sentence as the headline, the rest as the detail), and is
+published without it if the bus refuses the chunk as too large; every heartbeat holds the
+prompt's kind of ask as `mark.ask`; and the terminal of a completed task that filed a kanban
+card (a `kanban_create` call that did not fail) from a Slack conversation, with
+`KAGE_SLACK_UX` on in the agent environment the bridge inherits and the route recorded (so on
+the `api` executor only), holds that `mark.ask` alone,
+so the ask stays marked until the cards' posts settle it. Anywhere else no card post settles
+it, so the terminal carries no mark and the ask comes off.
+
+The heartbeat is a `progress` text part, with the ask's mark beside it, every `BRIDGE_PROGRESS_INTERVAL_SECONDS` (default
 60; 0 turns it off, and a count a duration cannot hold is refused with a log line and the
 default): `running 1m30s, 3 tool call(s), last mcp__gke__list_clusters`. With the door closed,
 or under `api` with no `A2A_ACTIVITY_SECRET` to check a delivery against, the count has nothing

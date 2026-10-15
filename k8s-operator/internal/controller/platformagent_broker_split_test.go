@@ -146,6 +146,12 @@ func TestTheBrokerIsNotInTheAgentPod(t *testing.T) {
 	if value, _ := brokerEnvValue(agentContainer.Env, "CREDENTIAL_PROXY_TOKEN_FILE"); value != credentialProxyTokenMountPath+"/token" {
 		t.Errorf("expected the agent to present a projected token, got %q", value)
 	}
+	// The remote MCP servers reach Google through the broker, on every install
+	// and in both modes: the address is set unconditionally, unlike the relay
+	// URLs above, which follow the chat backends.
+	if value, _ := brokerEnvValue(agentContainer.Env, mcpRelayURLEnvVar); value != wantURL+"/v1/mcp" {
+		t.Errorf("expected %s to address the broker's MCP relay, got %q", mcpRelayURLEnvVar, value)
+	}
 
 	var mounted bool
 	for _, mount := range agentContainer.VolumeMounts {

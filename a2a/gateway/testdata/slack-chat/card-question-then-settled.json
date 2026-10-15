@@ -1,0 +1,82 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "Which cluster?",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      }
+    ],
+    "attachments": [
+      {
+        "blocks": [
+          {
+            "elements": [
+              {
+                "action_id": "kage.choice.0",
+                "text": {
+                  "emoji": true,
+                  "text": "seeded-a",
+                  "type": "plain_text"
+                },
+                "type": "button",
+                "value": "seeded-a\n\n(Clicked on the question from card t_e0c1.)"
+              },
+              {
+                "action_id": "kage.choice.1",
+                "text": {
+                  "emoji": true,
+                  "text": "seeded-b",
+                  "type": "plain_text"
+                },
+                "type": "button",
+                "value": "seeded-b\n\n(Clicked on the question from card t_e0c1.)"
+              }
+            ],
+            "type": "actions"
+          }
+        ],
+        "color": "#ECB22E",
+        "fallback": "(the text fallback)"
+      }
+    ]
+  },
+  {
+    "expected": 1,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "Which cluster?",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      }
+    ],
+    "attachments": []
+  }
+]

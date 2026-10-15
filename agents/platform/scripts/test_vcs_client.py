@@ -359,6 +359,52 @@ class ForgeCallTest(unittest.TestCase):
         self.assertIn("RemoteDisconnected", said)
 
 
+class ProposalOpenedRecordTest(unittest.TestCase):
+    """`call()` writes one stderr record per proposal the broker opened, and nothing else."""
+
+    URL = "https://gitlab.com/acme/infra/-/merge_requests/4"
+    OPENED = {"proposal": {"number": 4, "title": "Raise replicas", "url": URL, "state": "open", "body": "long"}}
+
+    def records(self, verb, answer):
+        stderr = io.StringIO()
+        with mock.patch.object(vcs_client, "_call", lambda v, p: answer), mock.patch("sys.stderr", stderr):
+            self.assertEqual(vcs_client.call(verb, {"repository": "acme/infra"}), answer)
+        return [json.loads(line) for line in stderr.getvalue().splitlines()]
+
+    def test_a_created_proposal_is_one_record_with_only_its_url_number_and_title(self):
+        expected = [{"kube-agents.event": "proposal-opened",
+                     "proposal": {"url": self.URL, "number": 4, "title": "Raise replicas"}}]
+        self.assertEqual(self.records("proposal-create", self.OPENED), expected)
+        self.assertEqual(self.records("proposal_create", self.OPENED), expected)
+
+    def test_another_verb_or_an_answer_with_no_url_records_nothing(self):
+        self.assertEqual(self.records("proposal-update", self.OPENED), [])
+        self.assertEqual(self.records("proposal-view", self.OPENED), [])
+        self.assertEqual(self.records("proposal-create", {"proposal": {"number": 4, "url": ""}}), [])
+        self.assertEqual(self.records("proposal-create", {"forge": "github"}), [])
+
+    def test_a_refused_create_records_nothing(self):
+        stderr = io.StringIO()
+        with mock.patch.object(vcs_client, "_call", side_effect=vcs_client.VcsError("refused")), \
+                mock.patch("sys.stderr", stderr):
+            with self.assertRaises(vcs_client.VcsError):
+                vcs_client.call("proposal-create", {})
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_with_no_stderr_nothing_reaches_stdout(self):
+        stdout = io.StringIO()
+        with mock.patch.object(vcs_client, "_call", lambda v, p: self.OPENED), \
+                mock.patch("sys.stderr", None), mock.patch("sys.stdout", stdout):
+            self.assertEqual(vcs_client.call("proposal-create", {}), self.OPENED)
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_a_stderr_that_cannot_be_written_still_returns_the_answer(self):
+        closed = io.StringIO()
+        closed.close()
+        with mock.patch.object(vcs_client, "_call", lambda v, p: self.OPENED), mock.patch("sys.stderr", closed):
+            self.assertEqual(vcs_client.call("proposal-create", {}), self.OPENED)
+
+
 class WorkingCopyTest(unittest.TestCase):
     """clone -> branch -> commit -> publish, driven as a library against a local repository."""
 

@@ -15,7 +15,10 @@ since that run, and flags an unchanged, behind member as `stalled` while a rollo
 active (another member moved, or `--rollout-in-progress` was passed).
 
 With `--readiness`, each member is also graded on whether it can take the upgrade to its
-target: drain-blocking PodDisruptionBudgets (read with one `kubectl get` per member after
+target: drain-blocking PodDisruptionBudgets and fail-closed admission webhooks with an
+unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC
+writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and
+kube-public; read with two `kubectl get` per member after
 `gcloud container clusters get-credentials` into a per-target kubeconfig), a maintenance
 exclusion in effect whose scope covers the upgrade, the maintenance window's state at
 `--at`, and node-pool version skew against the target control plane. The rules live in
@@ -31,9 +34,11 @@ optional `--output` JSON.
 """
 
 import argparse
+import errno
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -176,6 +181,15 @@ STATE_FILE_SUFFIX = ".json"
 # runs against one target at once (a chat turn and a delegated card) cannot truncate
 # each other's half-written file; the last rename wins whole.
 STATE_TMP_PREFIX = ".fleet-upgrade-record-"
+# The `--output` document is written the same way, whole, so a reader never meets a partial
+# one; a run that dies before it writes leaves the path as it found it, and a caller that must
+# tell its own run's file from an earlier one names the file per run (the persona's bullet).
+OUTPUT_TMP_PREFIX = ".fleet-upgrade-output-"
+# An `errors` row for the second, webhook read carries this key, so a reader of the report (the
+# readiness watch) can tell a member whose first read answered, and whose other rules were
+# graded, from one the API server never answered.
+ERROR_READ_KEY = "read"
+WEBHOOK_READ = "webhooks"
 # Bumped when the record's shape changes; a file with another version is reported and
 # treated as no prior run rather than compared field by field.
 STATE_FORMAT_VERSION = 1
@@ -233,9 +247,11 @@ PROGRESS_COLUMNS = (
 )
 VERSION_PAIR_SEPARATOR = " / "
 
-# Readiness (`--readiness`). The PDB check needs one kubectl read per member, which needs
-# credentials for that member: `get-credentials` writes a per-target kubeconfig, passed to
-# both commands as KUBECONFIG in the subprocess environment rather than through a flag,
+# Readiness (`--readiness`). The rules need two kubectl reads per member (PDBs with their
+# Deployments and StatefulSets, then webhook configurations with their Services and
+# EndpointSlices, and the Namespaces), which need credentials for that member: `get-credentials` writes a
+# per-target kubeconfig, passed to all three commands as KUBECONFIG in the subprocess
+# environment rather than through a flag,
 # because the gcloud and kubectl in the agent pod are credential-proxy shims that forward
 # that variable. The directory is `$HERMES_HOME/.kubeconfigs`, the platform AGENTS.md
 # convention, and the file name mirrors `_thread_kubeconfig_path` in
@@ -244,12 +260,98 @@ VERSION_PAIR_SEPARATOR = " / "
 # workspace, which is why the default is not /tmp. `--kubeconfig-dir` overrides it.
 KUBECTL = "kubectl"
 KUBECTL_TIMEOUT_SECONDS = 60
+# Error text from the first `kubectl get` after which the second read, against the same
+# kubeconfig, would fail the same way and only spend a second timeout: kubectl's transport
+# prefix, which a connection failure, a credential-plugin failure (`getting credentials:`) and a
+# certificate failure (`tls:`) all carry, and a dial or resolver failure. run_cmd's own deadline
+# is not one: in the agent sandbox kubectl is the credential-proxy client, whose broker may hold
+# a request in its admission queue for up to its slot wait before kubectl runs, so the deadline
+# measures the queue as often as the server, and a second read enters the queue afresh. The note
+# names the class, not an unreachable server, and kubectl's message stays in the error row. In
+# the sandbox the shim prints its own line when it cannot reach the broker (`credential proxy
+# unavailable: ...`), which the second call would print again. Matched without case: the errno
+# text behind the shim's line is capitalised. An error the server returned never skips, whatever
+# dial words its body quotes: kubectl prefixes one with `Error from server (<reason>):`, and an
+# InternalError quoting the apiserver's own etcd dial failure is an answer, which the second read
+# may still get.
+FIRST_READ_SKIP_MARKERS = ("unable to connect to the server", "i/o timeout", "connection refused", "no such host", "credential proxy unavailable")
+SERVER_ANSWERED_PREFIX = "error from server"
+WEBHOOK_READ_SKIPPED = "skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the credential proxy unreachable)"
+# The credential-proxy shim keeps the first --max-output-bytes of a command's stdout, drains the
+# rest, exits 0 and writes this line to stderr; a list cut there is unparsable JSON, and the
+# error row says so rather than blaming the server.
+PROXY_TRUNCATION_MARKER = "credential proxy output truncated"
+KUBECTL_OUTPUT_CUT = "{cmd} output was cut at the credential proxy's output cap, so the list did not fit in one read"
+# The member's note names the one cause its reads failed for, so an operator goes to the
+# step that failed: the directory, the credentials, the first read, the second read, or the
+# second read skipped because the first failed before the server answered it (the note names
+# the classes that produce that and the error row carries kubectl's message, rather than the
+# note calling the server unreachable). A skipped read is not a failed one: it gets no error
+# row of its own under the table.
+NOTE_DIRECTORY_FAILED = "kubeconfig directory could not be created; PDBs and webhooks not graded"
+NOTE_CREDENTIALS_FAILED = "credentials for the cluster could not be fetched; PDBs and webhooks not graded"
+NOTE_PDB_READ_FAILED = "PDB read failed; PDBs not graded"
+NOTE_WEBHOOK_READ_FAILED = "webhook read failed; webhooks not graded"
+NOTE_WEBHOOK_READ_SKIPPED = f"webhook read {WEBHOOK_READ_SKIPPED}; webhooks not graded"
+# Two reads, so a failure listing the webhook side (a large EndpointSlice list timing out or cut
+# at the proxy's cap, a custom role without webhook-configuration or namespace reads; the
+# installer's roles have both, and the name-label fallback in `bootstrap_namespace_labels` is for
+# a read that returns no Namespace object, not for a refused read) costs the webhook rule
+# only, never the PDBs. The webhook read lists every Service, EndpointSlice and Namespace in the
+# cluster though only the referenced Services and the two bootstrap namespaces (whose labels the
+# `namespaceSelector` is judged on) are consulted; a read proportional to the webhooks (the
+# configurations first, then each referenced Service and its slices, and the two namespaces by
+# name) is the change that removes the cluster-size bound, and is not made here.
 KUBECTL_RESOURCES = "pdb,deploy,statefulset"
+KUBECTL_WEBHOOK_RESOURCES = "validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces"
 KUBECONFIG_ENV = "KUBECONFIG"
 HERMES_HOME_ENV = "HERMES_HOME"
 DEFAULT_HERMES_HOME = "/opt/data"
 KUBECONFIG_SUBDIR = ".kubeconfigs"
 KUBECONFIG_FILE_FORMAT = "kubeconfig_{project}_{cluster}_{location}.yaml"
+# The default, shared directory is this uid's and closed to every other uid
+# (0755), the rule the fleet-audit collectors' `collect.prepare_kubeconfig`
+# applies to the same directory: the file names are public and fixed, so a
+# directory other uids could write would let any login plant an entry at a
+# member's name. A hand run over `kubectl exec` lands as root while the agent
+# runs as uid 1000: root writes into the agent's directory as it is, and a
+# directory another uid made first is moved aside and remade; a wider mode is
+# brought back. A `--kubeconfig-dir` the caller named is made under the
+# caller's umask.
+KUBECONFIG_DIR_MODE = 0o755
+KUBECONFIG_DIR_MODE_MASK = 0o7777
+# A chmod the filesystem refuses keeps a directory this uid owns alone (owner
+# write and search, no other uid's write, 0700 say) at its mode, said on
+# stderr, as the shared rule keeps it; any other mode the chmod cannot reach
+# is the note.
+KUBECONFIG_DIR_OWNER_WRITE_SEARCH = 0o300
+KUBECONFIG_DIR_OTHERS_WRITE = 0o022
+KUBECONFIG_UNUSABLE_FORMAT = "{name}.unusable-{stamp}"
+# The shared rule's notes, as `collect.usable_kubeconfig_dir` words them: the
+# reason a directory or file could not be made usable, with the owner named,
+# and the stderr line for a directory moved aside.
+KUBECONFIG_MOVED_ASIDE_FORMAT = "{directory}: owned by uid {uid}, moved aside to {aside}; this run makes its own"
+KUBECONFIG_NOT_MOVED_FORMAT = "{directory} is owned by uid {uid} and this run is uid {euid}; it could not be moved aside ({error})"
+KUBECONFIG_NOT_MADE_FORMAT = "{directory} could not be made ({error})"
+KUBECONFIG_NOT_READ_FORMAT = "{directory} could not be read ({error})"
+KUBECONFIG_MODE_NOT_CHANGED_FORMAT = "{directory} is at mode {mode}, not {wanted}, and could not be changed ({error})"
+KUBECONFIG_MODE_KEPT_FORMAT = "{directory} stays at mode {mode}, which could not be changed to {wanted} ({error}): this uid's own and closed to other uids, so usable"
+KUBECONFIG_NOT_REPLACED_FORMAT = "{path} is not this uid's writable file and could not be replaced ({error})"
+# What may stand at a kubeconfig's name, as the shared rule reads it: this
+# uid's own writable regular file. A link is removed, a directory or other
+# object moved aside (said on stderr), another uid's or an unwritable file
+# removed; each refusal is the note.
+KUBECONFIG_FILE_NOT_READ_FORMAT = "{path} could not be read ({error})"
+KUBECONFIG_NOT_A_FILE_MOVED_FORMAT = "{path}: not a regular file, moved aside to {aside}; gcloud writes a fresh file"
+KUBECONFIG_NOT_A_FILE_FORMAT = "{path} is not a regular file, which a kubeconfig must be, and could not be moved aside ({error})"
+KUBECONFIG_NOT_PREPARED_FORMAT = "cannot prepare kubeconfig: {note}"
+KUBECONFIG_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+# A rename that finds the directory already moved (another run's tick in the
+# same second won the move-aside): not a refusal, as the shared rule reads it.
+KUBECONFIG_MOVED_BY_ANOTHER_ERRNOS = (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST)
+KUBECONFIG_IS_SYMLINK_FORMAT = "{directory} is a symbolic link, which the shared directory may not be; it was not followed"
+KUBECONFIG_LINK_NOT_REMOVED_FORMAT = "{path} is a symbolic link, which a kubeconfig may not be, and could not be removed ({error})"
+ROOT_UID = 0
 # The same reduction platform_mcp_server._kubeconfig_slug applies: real GKE names are
 # lowercase alphanumerics and hyphens, so this is lossless for them and keeps a value
 # holding `/` or `..` from steering the path out of the directory.
@@ -268,12 +370,14 @@ READINESS_COLUMNS = (
     "location",
     "readiness",
     "drain-blocking PDBs",
+    "fail-closed webhooks",
     "maintenance",
     "node-pool skew",
     "note",
 )
 READINESS_NONE_CELL = "none"
 READINESS_READ_FAILED_CELL = "read failed"
+READINESS_READ_SKIPPED_CELL = "read skipped"
 READINESS_NOT_EVALUATED_CELL = "not evaluated"
 READINESS_NO_OPENING_CELL = f"none within {readiness.DAYS_PER_WEEK} days"
 
@@ -672,51 +776,207 @@ def get_credentials_cmd(cluster: dict, project: str) -> list[str]:
     ]
 
 
-def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> tuple[list | None, str | None, str]:
-    """(items, error, kubeconfig): the PDBs and workloads of one member, read through kubectl.
+def _kubectl_items(resources: str, env: dict) -> tuple[list | None, str | None]:
+    """(items, error) from one `kubectl get <resources> -A -o json` under `env`."""
+    cmd = [KUBECTL, "get", resources, "-A", "-o", "json"]
+    rc, stdout, stderr = run_cmd(cmd, KUBECTL_TIMEOUT_SECONDS, env)
+    if rc != 0:
+        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
+    try:
+        data = json.loads(stdout) if stdout.strip() else {}
+    except ValueError as e:
+        if PROXY_TRUNCATION_MARKER in stderr:
+            return None, KUBECTL_OUTPUT_CUT.format(cmd=" ".join(cmd))
+        return None, f"{' '.join(cmd)} returned unparsable JSON: {e}"
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None, f"{' '.join(cmd)} returned no items list"
+    return items, None
 
-    `get-credentials` writes the member's kubeconfig, then one `kubectl get` reads every
-    PodDisruptionBudget, Deployment and StatefulSet. Either command failing is the error;
-    the member is then graded `unknown` on the PDB rule and the run exits 1.
+
+def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:
+    """The kubeconfig directory usable before `get-credentials` writes `path`
+    into it, and whatever stands at `path` that is not this uid's own
+    writable file out of the way. The default shared directory follows
+    `collect.prepare_kubeconfig`'s rule and its contract: made at
+    `KUBECONFIG_DIR_MODE` whatever the umask, brought to it when this uid
+    owns it at another mode (or kept at that mode, said on stderr, when the
+    chmod fails and it is this uid's alone), moved aside (said on stderr) and
+    remade when another uid's; a link at the file's name removed, a directory
+    moved aside, another uid's or an unwritable file removed; None when it is
+    usable, else why not, with the owner named, which the caller reports as
+    the member's read error. A directory the caller named is made under the
+    caller's umask."""
+    shared = os.path.realpath(kubeconfig_dir) == os.path.realpath(default_kubeconfig_dir())
+    if not shared:
+        try:
+            os.makedirs(kubeconfig_dir, exist_ok=True)
+        except OSError as exc:
+            return KUBECONFIG_NOT_MADE_FORMAT.format(directory=kubeconfig_dir, error=exc)
+    else:
+        euid = os.geteuid()
+        if os.path.islink(kubeconfig_dir):
+            # Never followed, as the shared rule reads it: a root run would
+            # otherwise chmod and write into whatever it points at.
+            return KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=kubeconfig_dir)
+        try:
+            current = os.stat(kubeconfig_dir)
+        except FileNotFoundError:
+            current = None
+        except OSError as exc:
+            # A parent this uid cannot search, or a file where the directory
+            # should be: the member's read error, as the old guard made it.
+            return KUBECONFIG_NOT_READ_FORMAT.format(directory=kubeconfig_dir, error=exc)
+        if current is not None and current.st_uid != euid and euid != ROOT_UID:
+            aside = os.path.join(os.path.dirname(kubeconfig_dir), KUBECONFIG_UNUSABLE_FORMAT.format(name=os.path.basename(kubeconfig_dir), stamp=datetime.now(timezone.utc).strftime(KUBECONFIG_STAMP_FORMAT)))
+            try:
+                os.rename(kubeconfig_dir, aside)
+            except OSError as exc:
+                if exc.errno not in KUBECONFIG_MOVED_BY_ANOTHER_ERRNOS:
+                    return KUBECONFIG_NOT_MOVED_FORMAT.format(directory=kubeconfig_dir, uid=current.st_uid, euid=euid, error=exc)
+                # Another run moved it first: read what stands there now and
+                # go on, as the shared rule does.
+                try:
+                    current = os.stat(kubeconfig_dir)
+                except FileNotFoundError:
+                    current = None
+                except OSError as read_exc:
+                    return KUBECONFIG_NOT_READ_FORMAT.format(directory=kubeconfig_dir, error=read_exc)
+            else:
+                print(KUBECONFIG_MOVED_ASIDE_FORMAT.format(directory=kubeconfig_dir, uid=current.st_uid, aside=os.path.basename(aside)), file=sys.stderr)
+                current = None
+        if current is None:
+            # Made at the caller's umask and chmodded below: the umask is
+            # process-wide, and a toggle here would race the other threads.
+            try:
+                os.makedirs(kubeconfig_dir, exist_ok=True)
+                current = os.stat(kubeconfig_dir)
+            except OSError as exc:
+                return KUBECONFIG_NOT_MADE_FORMAT.format(directory=kubeconfig_dir, error=exc)
+        if (current.st_mode & KUBECONFIG_DIR_MODE_MASK) != KUBECONFIG_DIR_MODE:
+            # Through a descriptor opened without following, as the shared rule.
+            try:
+                opened = os.open(kubeconfig_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except OSError as exc:
+                return KUBECONFIG_NOT_READ_FORMAT.format(directory=kubeconfig_dir, error=exc)
+            try:
+                os.fchmod(opened, KUBECONFIG_DIR_MODE)
+            except OSError as exc:
+                # Judged on the directory the descriptor holds, as the shared rule.
+                actual = os.fstat(opened)
+                mode = actual.st_mode & KUBECONFIG_DIR_MODE_MASK
+                private = actual.st_uid == euid and (mode & KUBECONFIG_DIR_OWNER_WRITE_SEARCH) == KUBECONFIG_DIR_OWNER_WRITE_SEARCH and not mode & KUBECONFIG_DIR_OTHERS_WRITE
+                if not private:
+                    return KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=kubeconfig_dir, mode=oct(mode), wanted=oct(KUBECONFIG_DIR_MODE), error=exc)
+                print(KUBECONFIG_MODE_KEPT_FORMAT.format(directory=kubeconfig_dir, mode=oct(mode), wanted=oct(KUBECONFIG_DIR_MODE), error=exc), file=sys.stderr)
+            finally:
+                os.close(opened)
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return KUBECONFIG_FILE_NOT_READ_FORMAT.format(path=path, error=exc)
+    if stat.S_ISLNK(current.st_mode):
+        # A link planted at the file's name is removed, never written
+        # through, as the shared rule removes it.
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            return KUBECONFIG_LINK_NOT_REMOVED_FORMAT.format(path=path, error=exc)
+    elif not stat.S_ISREG(current.st_mode):
+        # A directory or other object planted at the name: moved aside,
+        # never entered, as the shared rule moves it.
+        aside = os.path.join(os.path.dirname(path), KUBECONFIG_UNUSABLE_FORMAT.format(name=os.path.basename(path), stamp=datetime.now(timezone.utc).strftime(KUBECONFIG_STAMP_FORMAT)))
+        try:
+            os.rename(path, aside)
+        except OSError as exc:
+            return KUBECONFIG_NOT_A_FILE_FORMAT.format(path=path, error=exc)
+        print(KUBECONFIG_NOT_A_FILE_MOVED_FORMAT.format(path=path, aside=os.path.basename(aside)), file=sys.stderr)
+    elif current.st_uid != os.geteuid() or not os.access(path, os.W_OK):
+        # Another uid's file, or one this uid cannot write: replaced.
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            return KUBECONFIG_NOT_REPLACED_FORMAT.format(path=path, error=exc)
+    return None
+
+
+def first_read_failed_before_the_server_answered(error: str) -> bool:
+    """Whether a first read's error is one of FIRST_READ_SKIP_MARKERS' classes and not an answer
+    the API server returned: kubectl prefixes a returned error with `Error from server (...)`, and
+    its body may quote a dial failure of the server's own (an InternalError on the path to etcd),
+    which the second read may still be answered through."""
+    lowered = error.lower()
+    return SERVER_ANSWERED_PREFIX not in lowered and any(marker in lowered for marker in FIRST_READ_SKIP_MARKERS)
+
+
+def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> dict:
+    """The objects of one member the readiness rules read, via kubectl.
+
+    `get-credentials` writes the member's kubeconfig; then one `kubectl get` reads every
+    PodDisruptionBudget, Deployment and StatefulSet, and a second reads the webhook
+    configurations, Services, EndpointSlices and Namespaces. Returns `items`/`error` for the first,
+    `webhook_items`/`webhook_error` for the second, and `kubeconfig`. A failed
+    `get-credentials` fails both, and so does a kubeconfig directory that cannot be created
+    (`directory_error`); a first read that failed before the server answered it (a connection,
+    credential-plugin or certificate failure, or the credential proxy unreachable; not the
+    deadline, which in the sandbox measures the credential proxy's queue, and not an error the
+    server returned, whatever it quotes) skips the second rather
+    than spend a second timeout on it
+    (`webhook_skipped`, with `webhook_error` saying so); otherwise
+    each read fails alone, grading only its own rule `unknown`, and any
+    failure makes the run exit 1.
     """
     path = kubeconfig_path(kubeconfig_dir, project, cluster.get("name", ""), cluster.get("location", ""))
-    try:
-        os.makedirs(kubeconfig_dir, exist_ok=True)
-    except OSError as e:
-        return None, f"cannot create kubeconfig directory {kubeconfig_dir}: {e}", path
+    result = {"items": None, "error": None, "webhook_items": None, "webhook_error": None, "webhook_skipped": False, "credentials_error": None, "directory_error": None, "kubeconfig": path}
+    # The kubeconfig rule makes the directory usable, or says why not: its
+    # refusal is the directory's, failing both reads as a directory that
+    # could not be made does.
+    note = prepare_kubeconfig(kubeconfig_dir, path)
+    if note:
+        result["error"] = result["webhook_error"] = result["directory_error"] = KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note)
+        return result
     env = {**os.environ, KUBECONFIG_ENV: path}
     cmd = get_credentials_cmd(cluster, project)
     rc, _, stderr = run_cmd(cmd, GCLOUD_TIMEOUT_SECONDS, env)
     if rc != 0:
-        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}", path
-    cmd = [KUBECTL, "get", KUBECTL_RESOURCES, "-A", "-o", "json"]
-    rc, stdout, stderr = run_cmd(cmd, KUBECTL_TIMEOUT_SECONDS, env)
-    if rc != 0:
-        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}", path
-    try:
-        data = json.loads(stdout) if stdout.strip() else {}
-    except ValueError as e:
-        return None, f"{' '.join(cmd)} returned unparsable JSON: {e}", path
-    items = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return None, f"{' '.join(cmd)} returned no items list", path
-    return items, None, path
+        result["error"] = result["webhook_error"] = result["credentials_error"] = f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
+        return result
+    result["items"], result["error"] = _kubectl_items(KUBECTL_RESOURCES, env)
+    if result["error"] and first_read_failed_before_the_server_answered(result["error"]):
+        result["webhook_skipped"] = True
+        result["webhook_error"] = f"{WEBHOOK_READ_SKIPPED} ({result['error']})"
+        return result
+    result["webhook_items"], result["webhook_error"] = _kubectl_items(KUBECTL_WEBHOOK_RESOURCES, env)
+    return result
 
 
-def assess_readiness(cluster: dict, member: dict, items: list | None, read_error: str | None, at: datetime, kubeconfig: str) -> dict:
-    """The member's `readiness` object: the three rules against the row's target."""
+def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime) -> dict:
+    """The member's `readiness` object: every rule against the row's target."""
     target = parse_version(member["target_version"]) if member["target_version"] else None
     master = parse_version(member["control_plane_version"])
     pools = [{"name": p["name"], "version": p["version"], "parsed": parse_version(p["version"])} for p in member["node_pools"]]
     autopilot = bool((cluster.get("autopilot") or {}).get("enabled"))
+    items, read_error, webhook_items = read["items"], read["error"], read["webhook_items"]
     pdbs = None if items is None else readiness.grade_pdbs(*readiness.split_items(items))
+    webhooks = None if webhook_items is None else readiness.grade_webhooks(*readiness.split_webhook_items(webhook_items))
     maintenance = readiness.evaluate_maintenance(cluster.get("maintenancePolicy"), at, member["target_version"], target, master, pools)
     skew = readiness.evaluate_skew(target, pools, autopilot)
-    status = readiness.readiness_status(pdbs, maintenance, skew, target is not None)
+    status = readiness.readiness_status(pdbs, webhooks, maintenance, skew, target is not None)
 
     notes = []
-    if read_error:
-        notes.append("cluster read failed; PDBs not graded")
+    if read.get("directory_error"):
+        notes.append(NOTE_DIRECTORY_FAILED)
+    elif read["credentials_error"]:
+        notes.append(NOTE_CREDENTIALS_FAILED)
+    else:
+        if read_error:
+            notes.append(NOTE_PDB_READ_FAILED)
+        if read.get("webhook_skipped"):
+            notes.append(NOTE_WEBHOOK_READ_SKIPPED)
+        elif read["webhook_error"]:
+            notes.append(NOTE_WEBHOOK_READ_FAILED)
     if target is None:
         notes.append("no target; exclusion scope and skew not graded")
     if pdbs:
@@ -738,10 +998,13 @@ def assess_readiness(cluster: dict, member: dict, items: list | None, read_error
     return {
         "status": status,
         "evaluated_at": at.astimezone(timezone.utc).strftime(TIMESTAMP_FORMAT),
-        "kubeconfig": kubeconfig,
+        "kubeconfig": read["kubeconfig"],
         "read_error": read_error,
+        "webhook_read_error": read["webhook_error"],
+        "webhook_read_skipped": bool(read.get("webhook_skipped")),
         "autopilot": autopilot,
         "pdbs": pdbs,
+        "webhooks": webhooks,
         "maintenance": maintenance,
         "skew": skew,
         "note": NOTE_SEPARATOR.join(notes),
@@ -824,10 +1087,15 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
                 matched.update(hits)
             member = grade_member(cluster, project, explicit_target, cache)
             if readiness_options is not None:
-                items, read_error, path = read_cluster_objects(cluster, project, readiness_options["kubeconfig_dir"])
-                if read_error is not None:
-                    errors.append({"project": project, "location": member["location"], "cluster": member["cluster"], "message": read_error})
-                member["readiness"] = assess_readiness(cluster, member, items, read_error, readiness_options["at"], path)
+                read = read_cluster_objects(cluster, project, readiness_options["kubeconfig_dir"])
+                # A credentials failure fills both slots with one message; a skipped second read is not a failure and gets no row.
+                failed = (read["error"], None if read.get("webhook_skipped") else read["webhook_error"])
+                for message in dict.fromkeys(m for m in failed if m):
+                    row = {"project": project, "location": member["location"], "cluster": member["cluster"], "message": message}
+                    if message != read["error"]:
+                        row[ERROR_READ_KEY] = WEBHOOK_READ
+                    errors.append(row)
+                member["readiness"] = assess_readiness(cluster, member, read, readiness_options["at"])
             members.append(member)
     errors.extend(cache.errors)
     listed = [p for p in projects if p not in unlisted]
@@ -923,6 +1191,18 @@ def _pdb_cell(r: dict) -> str:
     return NOTE_SEPARATOR.join(readiness.describe_finding(f) for f in r["pdbs"]["blocking"])
 
 
+def _webhook_cell(r: dict) -> str:
+    """Blocking findings first (the upgrade's path, or the bootstrap-policy writes a dead webhook reaching `kube-system` or `kube-public` would refuse); unreachable-backend webhooks outside both after them,
+    since they are an outage now even though they do not grade the member."""
+    webhooks = r["webhooks"]
+    if webhooks is None:
+        return READINESS_READ_SKIPPED_CELL if r.get("webhook_read_skipped") else READINESS_READ_FAILED_CELL
+    findings = webhooks["blocking"] + webhooks["outage"]
+    if not findings:
+        return READINESS_NONE_CELL
+    return NOTE_SEPARATOR.join(readiness.describe_webhook_finding(f) for f in findings)
+
+
 def _maintenance_cell(r: dict) -> str:
     parts = []
     for e in r["maintenance"]["exclusions"]:
@@ -968,14 +1248,14 @@ def render_readiness(report: dict) -> str:
     ]
     for m in report["members"]:
         r = m["readiness"]
-        row = (m["project"], m["cluster"], m["location"], r["status"], _pdb_cell(r), _maintenance_cell(r), _skew_cell(r), r["note"])
+        row = (m["project"], m["cluster"], m["location"], r["status"], _pdb_cell(r), _webhook_cell(r), _maintenance_cell(r), _skew_cell(r), r["note"])
         lines.append("| " + " | ".join(_cell(v) for v in row) + " |")
     summary = report["readiness"]["summary"]
     lines.append("")
     lines.append(
         f"Readiness at {report['readiness']['evaluated_at']}: "
         + ", ".join(f"{summary[s]} {s}" for s in readiness.READINESS_ORDER)
-        + "; a maintenance exclusion holds back GKE's automatic upgrades only, a drain-blocking PDB or skew any upgrade."
+        + "; a maintenance exclusion holds back GKE's automatic upgrades only, a drain-blocking PDB, a fail-closed webhook with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), or skew any upgrade."
     )
     return "\n".join(lines)
 
@@ -1037,21 +1317,29 @@ def load_state(path: str) -> tuple[dict | None, str | None]:
     return data, None
 
 
-def save_state(path: str, state: dict) -> None:
-    """Writes the record atomically (unique temp file, then rename); raises OSError on failure."""
+def write_json_atomically(path: str, data: dict, tmp_prefix: str) -> None:
+    """Writes `data` as JSON whole: a unique temp file in the same directory, then a rename, so
+    a reader never meets a partial document and a write that fails leaves the previous file or
+    none. Raises what the write raised (OSError, or a serialisation error) after removing the
+    temp file."""
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=STATE_TMP_PREFIX, suffix=STATE_FILE_SUFFIX, dir=directory)
+    fd, tmp = tempfile.mkstemp(prefix=tmp_prefix, suffix=STATE_FILE_SUFFIX, dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=JSON_INDENT)
+            json.dump(data, f, indent=JSON_INDENT)
         os.replace(tmp, path)
-    except OSError:
+    except Exception:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+
+
+def save_state(path: str, state: dict) -> None:
+    """Writes the record atomically (unique temp file, then rename); raises OSError on failure."""
+    write_json_atomically(path, state, STATE_TMP_PREFIX)
 
 
 def _member_record(member: dict, unchanged_since: str, previous: dict | None) -> dict:
@@ -1215,7 +1503,9 @@ def render_progress(report: dict, previous: dict | None) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Per-member GKE version table against a target version.")
+    # Exact flags only: the bench reads a worker's run of this script by the flag's full word,
+    # so argparse's prefix matching (`--readi`) would run a report the reader does not credit.
+    parser = argparse.ArgumentParser(description="Per-member GKE version table against a target version.", allow_abbrev=False)
     parser.add_argument("--project", action="append", help="GCP project to enumerate; repeatable. On an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args; omit to sweep --scope-projects when given, else the fleet's configured projects")
     fleet_scope_args.add_scope_arguments(parser)
     parser.add_argument("--target-version", help="Target for every member, e.g. 1.31.4-gke.1183000. Default: each cluster's channel defaultVersion.")
@@ -1223,7 +1513,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", help="Path to write the report as JSON.")
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help=f"Directory holding one record per target from the previous run (default: {DEFAULT_STATE_DIR}).")
     parser.add_argument("--rollout-in-progress", action="store_true", help="Assert a rollout is under way, so an unchanged, behind member is flagged stalled even when no other member moved.")
-    parser.add_argument("--readiness", action="store_true", help="Also grade each member's readiness for the upgrade: drain-blocking PDBs (one kubectl read per member), maintenance exclusions and window, node-pool skew.")
+    parser.add_argument("--readiness", action="store_true", help="Also grade each member's readiness for the upgrade: drain-blocking PDBs and fail-closed webhooks with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public) (two kubectl reads per member), maintenance exclusions and window, node-pool skew.")
     parser.add_argument("--at", help="RFC 3339 instant to evaluate maintenance exclusions and the window at (default: now). Only with --readiness.")
     parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $HERMES_HOME/.kubeconfigs).")
     args = parser.parse_args(argv)
@@ -1292,9 +1582,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.output:
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-            with open(args.output, "w", encoding="utf-8") as f:
-                json.dump(report, f, indent=JSON_INDENT)
+            write_json_atomically(args.output, report, OUTPUT_TMP_PREFIX)
             print(f"\nWrote {len(report['members'])} member(s) to {args.output}")
         except OSError as e:
             sys.stderr.write(f"failed to write {args.output}: {e}\n")
