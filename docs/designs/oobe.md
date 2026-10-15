@@ -30,7 +30,7 @@ only way to close it today is to know to start an audit by hand inside the pod
 (`agents/platform/AGENTS.md`, "Run the `<x>` cron job now"). Before `oobe`, the inventory report
 covered most of what the compliance and reliability audits check (`inventory-findings-queue.md`
 §10), but cost and capacity waited for the schedule, and no pull request opened until the first
-audit. With `oobe` running the audits, the scan leaves their workload checks to them (§4.4).
+audit. With `oobe` running the audits, the scan leaves their workload checks to them (`cluster_inventory_audit_sop.md`, Step 5).
 
 ## 2. What `oobe` is
 

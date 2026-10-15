@@ -176,7 +176,7 @@ so (B) leans on pod and node state and uses events as corroboration, not as the 
 first run comes from the Chat Agent's first-run stage, the same place the four fleet audits start
 once the onboarding scan settles, so a fresh install's first report is a baseline of every cluster
 it manages rather than a blank. With no GitOps repository the first-run stage still starts the
-audits, and the fleet-audit skill's `start` runs without a forge (`NO_FORGE`). This stream needs
+audits, and the fleet-audit skill's `start` runs without a forge (`"mode": "none"`). This stream needs
 no repository either: the collector needs none and the report on the volume is the record. Where a repository is configured and the run is full,
 the SOP calls the `fleet_scope` tool (§3.2), probes the collector's lock (§3.6; a probe that
 names a pending reset makes the run the baseline of §3.6, the collector alone with no `start` or
