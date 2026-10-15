@@ -182,8 +182,9 @@ and posts a chat summary, with no ledger issue and no pull request (the `fleet-a
 forge configured"). The installer's "GitOps repository connection skipped" line says so too.
 
 A `managed_repos` value the audits cannot use (one that does not parse, or names a forge type the
-image does not serve) is not checked here either. Each audit's `start` refuses it and says how to
-fix it, as the scheduled runs do.
+image does not serve), or one that cannot be read at all, is not checked here either. Each audit's
+`start` refuses it and says why, as on a scheduled run, and the chain moves on to the next audit:
+the stage does not wait for a list it no longer reads.
 
 ### 4.5 What the operator sees
 
@@ -245,7 +246,7 @@ times. It rides with the audits stage, whose eval case covers both.
 | Audits running         | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them      | None needed                                                                                           |
 | Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                       | Automatic                                                                                             |
 | An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat | As today                                                                                              |
-| No GitOps repository   | Each audit's summary says no forge is configured; its report stays in the report store                   | None, or for ledger issues, re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md) |
+| No GitOps repository   | Reports stay in the report store; a run that changed something posts a summary saying there is no forge  | None, or for ledger issues, re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md) |
 | No home channel        | Ledger issues and pull requests appear in the repository with no chat summary                            | Set one (`/sethome`)                                                                                  |
 | Sweep stuck            | Audits start at the fallback                                                                             | As today for the report                                                                               |
 | Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                     | As today for the report                                                                               |
@@ -295,9 +296,9 @@ last run ends. A fresh install's chain is waited on only once it has started, an
 it marks next, which costs a case at most about two audit runs (the one before it, then its own): an audit the chain reaches later, after the case's run holds the
 stream's in-flight note, has its `start` refused, and only between two repositories of a run can
 the install's run take the stream and leave the case's run partial. Waiting out the whole chain
-would hold every audit case on those streams for most of an hour on every CI run. The no-repository skip is unit-tested,
-not evaluated: the shared install has a repository, and removing it mid-run would break concurrent
-cases.
+would hold every audit case on those streams for most of an hour on every CI run. The start with no
+repository is unit-tested, and the case covers it only when run by hand against an install with no
+forge: the shared install has a repository, and removing it mid-run would break concurrent cases.
 
 ## 9. Open questions
 

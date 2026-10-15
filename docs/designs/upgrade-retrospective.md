@@ -1020,7 +1020,7 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
 - `agents/platform/scripts/upgrade_retrospective_watch.py` and its test (the after-upgrade wake),
   and the collector's `--after-upgrade` selection.
 - The Chat Agent's first-run stage (`agents/chat/scripts/oobe.py`: the list of audits it starts
-  after the inventory scan, and its repository skip).
+  after the inventory scan).
 - `agents/platform/scripts/upgrade_readiness_watch.py` and its test: the guards reader (reads
   `guards.json` with `sandbox_exec.read_bytes` as §3.5 states and prints a line per live guard).
 - `docs/site/src/content/docs/reference/cron-jobs.md` (generated), the autonomous-watchdogs and
