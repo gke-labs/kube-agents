@@ -365,6 +365,13 @@ Deployment passes its readiness probe. The chart never imports it;
 `install.sh --github-pem-path` does, or you import it yourself Ahead-Of-Time —
 see the [Token minter guide](https://gke-labs.github.io/kube-agents/deploy/token-minter/).
 
+When the GitHub forge in `platformAgent.integration.forges` is at a GitHub
+Enterprise Server host, the minter mints there, from the forge declaration
+alone: no `githubMinter.*` value repeats the host or the CA. What the chart
+sets, and the restart a new or rotated CA Secret needs, are in
+[GitHub Enterprise Server](https://gke-labs.github.io/kube-agents/deploy/token-minter/#github-enterprise-server)
+in the token minter guide.
+
 ### Telemetry
 
 `telemetry.otlpEndpoint` (default `""`) is the OTLP/HTTP collector base URL.
@@ -400,8 +407,7 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 
 `platformAgent.podMonitoring` renders a `PodMonitoring` for each of the agent's
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
-event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's
-port 9095, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
+event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_messages_inbound_total` from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
 tool-invocation, request and version-control metrics from its metrics-only port 8766, and the A2A
 gateway pod a `spec.mode: next` install runs, so it scrapes the gateway's task
 terminal and Google Chat pull counters from its metrics-only port 9096 (elsewhere
@@ -487,28 +493,38 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `platformAgent.integration.repositories` the repositories on them (`forge`,
   `repository`, optional `namespace`, and `role`: `gitops` for the one the
   agent publishes to, `managed` for others it may change, `context` for
-  read-only reference). `provider` is `github` (the default) or `gitlab`. `credentialsRef` is
+  read-only reference). `provider` is `github` or `gitlab`. If you omit it, it is `github`. A forge at a host other than github.com must name it. `credentialsRef` is
   ignored for `github` and required for `gitlab`: a Secret holding the access
   token under the key `token`, mounted into the credential broker only. A
   `gitlab` forge's `host` is gitlab.com by default or a self-managed instance,
-  never a GitHub name, and one `gitlab` forge per host. A self-managed
+  never a GitHub name, and one `gitlab` forge per host. A `github` forge's
+  `host` is github.com by default or a GitHub Enterprise Server instance,
+  never a host under a domain where GitHub runs its own services (such as
+  `api.github.com` or `<name>.ghe.com`). An install serves one GitHub host:
+  a second `github` forge at another host, or one host for two providers,
+  fails the render. A self-managed
   instance whose certificate a private CA signed also sets `caBundleRef`
   (`name`, and an optional `key` that defaults to `ca.crt`): a Secret that
-  holds the CA, which the broker trusts for that host only. A Secret, so
+  holds the CA, which the broker trusts for that host only. On a GitHub
+  Enterprise Server forge, the token minter also gets the CA, and it trusts
+  the CA for all of its outbound calls (see the token minter guide). A Secret, so
   changing the CA needs the same rights as changing the token. It is for a
-  `gitlab` forge at a self-managed host, never gitlab.com. With a `gitlab` forge
+  forge at a self-managed host, GitLab or GitHub Enterprise Server, never
+  gitlab.com or github.com. With a `gitlab` forge
   declared beside GitHub, a bare `owner/name` still works for a GitHub
   repository that the install registered by URL. Name a GitLab repository, or
   a GitHub repository that the install did not register, by its URL. Apply `crds/` before upgrading
   to a release that adds a provider, since `helm upgrade` does not update CRDs. A GitHub forge's
-  `host` must be a GitHub spelling (`github.com`, `www.github.com`,
-  `ssh.github.com`), and a repository must name a declared forge.
+  `host` is a spelling of github.com (`github.com`, `www.github.com`,
+  `ssh.github.com`) or a GitHub Enterprise Server hostname, as above, and a
+  repository must name a declared forge.
   `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
   alias for one GitHub forge and its gitops repository — set the lists or the
   alias, not both. For a GitHub GitOps repository, the alias is still what
   `install.sh` and the `full-install` Terraform composition write. For a
   GitLab GitOps repository, they write the `forges` and `repositories` lists. One GitHub forge with no
-  `credentialsRef` and at most one repository, the gitops one, with no
+  `credentialsRef`, no `caBundleRef`, no host other than a spelling of
+  github.com, and at most one repository, the gitops one, with no
   namespace of its own, renders as `github`, whichever key set it, because
   `helm upgrade` does not update CRDs — provided the forge declares a
   namespace or the repository, and the repository is one the operator would

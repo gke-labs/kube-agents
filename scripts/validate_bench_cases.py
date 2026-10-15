@@ -407,7 +407,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # may also declare it.
     "github_writes": (),
     "tool_called": ("tool_names",),
-    "worker_commands": ("required_patterns", "forbidden_patterns", "required_runs", "forbidden_runs"),
+    "worker_commands": ("required_patterns", "forbidden_patterns", "required_runs", "forbidden_runs", "forbidden_result_patterns"),
     "worker_agents": ("required_agents",),
     "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
     # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks
@@ -961,6 +961,12 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             f"'expected_fail:' {spec['expected_fail']!r} is not a YAML boolean; "
             "write a bare true or false. A quoted value is a string, which "
             "bench-gate refuses at spec-load time, after the lease"
+        )
+    if "tool_calls_optional" in spec and not isinstance(spec["tool_calls_optional"], bool):
+        problems.append(
+            f"'tool_calls_optional:' {spec['tool_calls_optional']!r} is not a YAML "
+            "boolean; write a bare true or false. bench-gate refuses a quoted "
+            "value at spec-load time, after the lease"
         )
 
     # Fixture roles. Cases address the seeded fleet by role, never by cluster

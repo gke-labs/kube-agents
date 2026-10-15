@@ -245,7 +245,7 @@ COPY deploy/docker/patches/apply_kanban_progress_lines.py \
      /tmp/kanban-progress/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lines.py /opt/hermes && \
     grep -qF 'TERMINAL_KINDS = ' /opt/hermes/gateway/kanban_watchers_notifier.py && \
-    grep -qF '+ ("heartbeat",)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF '+ ("heartbeat", "pr_opened")' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q '^def _fmt_heartbeat(ev, n) -> tuple:' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF '"heartbeat": _fmt_heartbeat,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q 'note = _progress_note(ev.payload)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
@@ -1303,6 +1303,30 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # X-Hermes-Failure-Reason. See the module docstring in
 # deploy/docker/patches/apply_api_failure_reason_header.py.
 #
+# permission_refusal_stop rides it too (#1946, #1943): a worker refused a write
+# by the command policy kept trying the change another way until its step
+# budget ran out; the stock loop guardrails count identical retries and reset on
+# any success, so they never fired. ToolCallGuardrailController.after_call is
+# wrapped (the stock method keeps running first, under a new name) and the
+# wrapper classifies every tool result by the lines the credential-proxy shim
+# printed into it (two word tests over the command's text remain for exit-0
+# calls; the module states them): a definitive policy
+# refusal (kubernetes.read-only, the action boundary notice, a `policy verb:`
+# line naming a mutating kubectl verb, no `policy render: local` line) is
+# counted across the turn and halts on the configured one
+# (tool_loop_guardrails.permission_refusal_halt_after, default 1, read by a
+# second insert in ToolCallGuardrailConfig.from_mapping; below it a refusal
+# only appends guidance). The halt leaves through kanban_guardrail_exit's
+# nudge, which names the refusal and the board call, and a third insert in
+# run_agent.py makes it a chat turn's reply. An API 403, gcp.read-only's
+# refusal, a local render or help read, and kubernetes.read-only's refusal of
+# a read spelling (both rules are allowlists that refuse unlisted reads with
+# the same notice) only warn, so an investigation goes on past a project it
+# may not read or a spelling the list lacks. The verb and render lines come
+# from command_policy.py through the proxy and the shim, so the proxy and
+# sandbox images of the same tree are needed for the halt to fire. See
+# the module docstring in deploy/docker/patches/permission_refusal_stop.py.
+#
 # ssh_shared_master rides it too (#2174): every working environment in the pod
 # shares one ssh ControlMaster, and SSHEnvironment.cleanup() closed it when a
 # worker process that had run a command exited normally, cutting any sibling's
@@ -1324,6 +1348,7 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # deploy/docker/patches/apply_cluster_dns_not_local.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
+     deploy/docker/patches/permission_refusal_stop.py \
      /opt/hermes/hermes_cli/
 COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_kanban_guardrail_exit.py \
@@ -1342,6 +1367,8 @@ COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/apply_cluster_dns_not_local.py \
      deploy/docker/patches/verify_cluster_dns_not_local.py \
      deploy/docker/patches/verify_policy_refusal_hint.py \
+     deploy/docker/patches/apply_permission_refusal_stop.py \
+     deploy/docker/patches/verify_permission_refusal_stop.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-guardrail-exit/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_synchronous_full.py /opt/hermes && \
@@ -1352,8 +1379,12 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_api_failure_reason_header.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_ssh_shared_master.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_cluster_dns_not_local.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_permission_refusal_stop.py /opt/hermes && \
     grep -q 'if sys.platform == "linux":  # kube-agents patch: state-db-synchronous-full' /opt/hermes/hermes_state_wal.py && \
     grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/turn_tool_round.py && \
+    grep -q "_kube_observe_refusal(" /opt/hermes/agent/tool_guardrails.py && \
+    grep -q "kube_permission_refusal_halt_after" /opt/hermes/agent/tool_guardrails.py && \
+    grep -q 'decision.code == "permission_refusal_halt"' /opt/hermes/run_agent.py && \
     grep -q "_kanban_should_record_missing(" /opt/hermes/agent/turn_finalizer.py && \
     grep -q "agent._kube_last_api_failure = (" /opt/hermes/agent/turn_api_error.py && \
     grep -q "_kube_block_rate_limited(result)" /opt/hermes/cli.py && \
@@ -1374,6 +1405,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_ssh_shared_master.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_cluster_dns_not_local.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_policy_refusal_hint.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_permission_refusal_stop.py && \
     rm -rf /tmp/kanban-guardrail-exit
 
 # Perf: let a board mutation wake the kanban watchers instead of waiting out a
@@ -1647,7 +1679,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     test "$(grep -c 'from hermes_cli.kanban_priority import' /opt/hermes/tools/kanban_tools.py)" = "1" && \
     test "$(grep -c '_kanban_saturation_tick(' /opt/hermes/gateway/kanban_watchers.py)" = "1" && \
     grep -q 'kanban dispatcher stuck: ready queue non-empty' /opt/hermes/gateway/kanban_watchers.py && \
-    grep -qF '+ ("heartbeat",) + ("queued",)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF '+ ("heartbeat", "pr_opened") + ("queued",)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF '_EVENT_FORMATTERS["queued"] = _kanban_format_queued' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q '^_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     install -m 0644 /tmp/latency-patches/credential_redaction.py /opt/hermes/agent/credential_redaction.py && \

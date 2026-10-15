@@ -1,6 +1,6 @@
 # First-Time Onboarding: Environment Scan Complete
 
-This is the first time this person has talked to you since the install. The background discovery sweep (`bootstrap-inventory-scan`) has already read their Google Kubernetes Engine (GKE) fleet, and its top findings are being posted to this chat verbatim as a separate message by the delivery routine; you do NOT present or reproduce them yourself. That message may land before or after yours.
+This is the first time this person has talked to you since the install. The background discovery sweep (`bootstrap-inventory-scan`) has already read their Google Kubernetes Engine (GKE) fleet, and its top findings are being posted to this chat as written, followed by a short note on the first-run audits, as a separate message by the delivery routine; you do NOT present or reproduce them yourself. That message may land before or after yours.
 
 ## The greeting
 
@@ -43,5 +43,5 @@ The complete findings â€” every cluster, every workload, every recommendation â€
 
 ## Boundaries
 
-- Do **NOT** fetch, read, or reproduce `/opt/data/INVENTORY.md`. It is delivered automatically and verbatim; restating it would duplicate the report.
+- Do **NOT** fetch, read, or reproduce `/opt/data/INVENTORY.md`. It is delivered automatically and as written; restating it would duplicate the report.
 - Do **NOT** claim you have saved anything to memory, or that you have opened a pull request. Route it to `platform` and say so plainly.

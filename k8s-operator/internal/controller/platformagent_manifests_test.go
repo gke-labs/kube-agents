@@ -6470,6 +6470,23 @@ func TestPlatformFrontDoorOverlayKeepsTargetedPlugins(t *testing.T) {
 	}
 }
 
+// TestPlatformFrontDoorOverlayEnablesBackfillPlugins: an existing front-door volume never
+// gains a list entry from the image's config.yaml, so the overlay is what turns these on.
+func TestPlatformFrontDoorOverlayEnablesBackfillPlugins(t *testing.T) {
+	agent := frontDoorAgent("fd-backfill", 1, true)
+	overlay := map[string]any{}
+	raw := buildConfigMapData(agent, nil)[profileOverlayKey(platformProfileName)]
+	if err := yaml.Unmarshal([]byte(raw), &overlay); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v\n%s", err, raw)
+	}
+	enabled := sortedStrings(t, listAt(t, overlay, []string{"plugins", "enabled"}))
+	for _, want := range append(slices.Clone(frontDoorPlugins), "pr_opened") {
+		if !slices.Contains(enabled, want) {
+			t.Errorf("plugins.enabled = %v, missing %q", enabled, want)
+		}
+	}
+}
+
 // TestPlatformFrontDoorOverlayMergesTargetedPluginToolsets guards the second half of the
 // clobber TestPlatformFrontDoorOverlayKeepsTargetedPlugins covers for plugins.enabled.
 //
@@ -6585,7 +6602,7 @@ func TestFrontDoorKanbanMatchesChatConfig(t *testing.T) {
 // TestFrontDoorPluginsMatchChatConfig is the drift guard frontDoorPlugins names.
 //
 // The list is derived, not chosen: every ingress plugin the chat profile enables, less the
-// two named below, less the three agents/platform/config.yaml already enables. Adding an
+// two named below, less the ones agents/platform/config.yaml already enables. Adding an
 // ingress plugin to the chat profile and not here is the drift that matters — it hooks a
 // message the front door is the one receiving, so the behaviour is simply lost, with
 // nothing logged.

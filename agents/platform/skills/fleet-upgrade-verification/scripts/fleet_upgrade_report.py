@@ -34,9 +34,11 @@ optional `--output` JSON.
 """
 
 import argparse
+import errno
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -307,6 +309,49 @@ HERMES_HOME_ENV = "HERMES_HOME"
 DEFAULT_HERMES_HOME = "/opt/data"
 KUBECONFIG_SUBDIR = ".kubeconfigs"
 KUBECONFIG_FILE_FORMAT = "kubeconfig_{project}_{cluster}_{location}.yaml"
+# The default, shared directory is this uid's and closed to every other uid
+# (0755), the rule the fleet-audit collectors' `collect.prepare_kubeconfig`
+# applies to the same directory: the file names are public and fixed, so a
+# directory other uids could write would let any login plant an entry at a
+# member's name. A hand run over `kubectl exec` lands as root while the agent
+# runs as uid 1000: root writes into the agent's directory as it is, and a
+# directory another uid made first is moved aside and remade; a wider mode is
+# brought back. A `--kubeconfig-dir` the caller named is made under the
+# caller's umask.
+KUBECONFIG_DIR_MODE = 0o755
+KUBECONFIG_DIR_MODE_MASK = 0o7777
+# A chmod the filesystem refuses keeps a directory this uid owns alone (owner
+# write and search, no other uid's write, 0700 say) at its mode, said on
+# stderr, as the shared rule keeps it; any other mode the chmod cannot reach
+# is the note.
+KUBECONFIG_DIR_OWNER_WRITE_SEARCH = 0o300
+KUBECONFIG_DIR_OTHERS_WRITE = 0o022
+KUBECONFIG_UNUSABLE_FORMAT = "{name}.unusable-{stamp}"
+# The shared rule's notes, as `collect.usable_kubeconfig_dir` words them: the
+# reason a directory or file could not be made usable, with the owner named,
+# and the stderr line for a directory moved aside.
+KUBECONFIG_MOVED_ASIDE_FORMAT = "{directory}: owned by uid {uid}, moved aside to {aside}; this run makes its own"
+KUBECONFIG_NOT_MOVED_FORMAT = "{directory} is owned by uid {uid} and this run is uid {euid}; it could not be moved aside ({error})"
+KUBECONFIG_NOT_MADE_FORMAT = "{directory} could not be made ({error})"
+KUBECONFIG_NOT_READ_FORMAT = "{directory} could not be read ({error})"
+KUBECONFIG_MODE_NOT_CHANGED_FORMAT = "{directory} is at mode {mode}, not {wanted}, and could not be changed ({error})"
+KUBECONFIG_MODE_KEPT_FORMAT = "{directory} stays at mode {mode}, which could not be changed to {wanted} ({error}): this uid's own and closed to other uids, so usable"
+KUBECONFIG_NOT_REPLACED_FORMAT = "{path} is not this uid's writable file and could not be replaced ({error})"
+# What may stand at a kubeconfig's name, as the shared rule reads it: this
+# uid's own writable regular file. A link is removed, a directory or other
+# object moved aside (said on stderr), another uid's or an unwritable file
+# removed; each refusal is the note.
+KUBECONFIG_FILE_NOT_READ_FORMAT = "{path} could not be read ({error})"
+KUBECONFIG_NOT_A_FILE_MOVED_FORMAT = "{path}: not a regular file, moved aside to {aside}; gcloud writes a fresh file"
+KUBECONFIG_NOT_A_FILE_FORMAT = "{path} is not a regular file, which a kubeconfig must be, and could not be moved aside ({error})"
+KUBECONFIG_NOT_PREPARED_FORMAT = "cannot prepare kubeconfig: {note}"
+KUBECONFIG_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+# A rename that finds the directory already moved (another run's tick in the
+# same second won the move-aside): not a refusal, as the shared rule reads it.
+KUBECONFIG_MOVED_BY_ANOTHER_ERRNOS = (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST)
+KUBECONFIG_IS_SYMLINK_FORMAT = "{directory} is a symbolic link, which the shared directory may not be; it was not followed"
+KUBECONFIG_LINK_NOT_REMOVED_FORMAT = "{path} is a symbolic link, which a kubeconfig may not be, and could not be removed ({error})"
+ROOT_UID = 0
 # The same reduction platform_mcp_server._kubeconfig_slug applies: real GKE names are
 # lowercase alphanumerics and hyphens, so this is lossless for them and keeps a value
 # holding `/` or `..` from steering the path out of the directory.
@@ -749,6 +794,114 @@ def _kubectl_items(resources: str, env: dict) -> tuple[list | None, str | None]:
     return items, None
 
 
+def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:
+    """The kubeconfig directory usable before `get-credentials` writes `path`
+    into it, and whatever stands at `path` that is not this uid's own
+    writable file out of the way. The default shared directory follows
+    `collect.prepare_kubeconfig`'s rule and its contract: made at
+    `KUBECONFIG_DIR_MODE` whatever the umask, brought to it when this uid
+    owns it at another mode (or kept at that mode, said on stderr, when the
+    chmod fails and it is this uid's alone), moved aside (said on stderr) and
+    remade when another uid's; a link at the file's name removed, a directory
+    moved aside, another uid's or an unwritable file removed; None when it is
+    usable, else why not, with the owner named, which the caller reports as
+    the member's read error. A directory the caller named is made under the
+    caller's umask."""
+    shared = os.path.realpath(kubeconfig_dir) == os.path.realpath(default_kubeconfig_dir())
+    if not shared:
+        try:
+            os.makedirs(kubeconfig_dir, exist_ok=True)
+        except OSError as exc:
+            return KUBECONFIG_NOT_MADE_FORMAT.format(directory=kubeconfig_dir, error=exc)
+    else:
+        euid = os.geteuid()
+        if os.path.islink(kubeconfig_dir):
+            # Never followed, as the shared rule reads it: a root run would
+            # otherwise chmod and write into whatever it points at.
+            return KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=kubeconfig_dir)
+        try:
+            current = os.stat(kubeconfig_dir)
+        except FileNotFoundError:
+            current = None
+        except OSError as exc:
+            # A parent this uid cannot search, or a file where the directory
+            # should be: the member's read error, as the old guard made it.
+            return KUBECONFIG_NOT_READ_FORMAT.format(directory=kubeconfig_dir, error=exc)
+        if current is not None and current.st_uid != euid and euid != ROOT_UID:
+            aside = os.path.join(os.path.dirname(kubeconfig_dir), KUBECONFIG_UNUSABLE_FORMAT.format(name=os.path.basename(kubeconfig_dir), stamp=datetime.now(timezone.utc).strftime(KUBECONFIG_STAMP_FORMAT)))
+            try:
+                os.rename(kubeconfig_dir, aside)
+            except OSError as exc:
+                if exc.errno not in KUBECONFIG_MOVED_BY_ANOTHER_ERRNOS:
+                    return KUBECONFIG_NOT_MOVED_FORMAT.format(directory=kubeconfig_dir, uid=current.st_uid, euid=euid, error=exc)
+                # Another run moved it first: read what stands there now and
+                # go on, as the shared rule does.
+                try:
+                    current = os.stat(kubeconfig_dir)
+                except FileNotFoundError:
+                    current = None
+                except OSError as read_exc:
+                    return KUBECONFIG_NOT_READ_FORMAT.format(directory=kubeconfig_dir, error=read_exc)
+            else:
+                print(KUBECONFIG_MOVED_ASIDE_FORMAT.format(directory=kubeconfig_dir, uid=current.st_uid, aside=os.path.basename(aside)), file=sys.stderr)
+                current = None
+        if current is None:
+            # Made at the caller's umask and chmodded below: the umask is
+            # process-wide, and a toggle here would race the other threads.
+            try:
+                os.makedirs(kubeconfig_dir, exist_ok=True)
+                current = os.stat(kubeconfig_dir)
+            except OSError as exc:
+                return KUBECONFIG_NOT_MADE_FORMAT.format(directory=kubeconfig_dir, error=exc)
+        if (current.st_mode & KUBECONFIG_DIR_MODE_MASK) != KUBECONFIG_DIR_MODE:
+            # Through a descriptor opened without following, as the shared rule.
+            try:
+                opened = os.open(kubeconfig_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except OSError as exc:
+                return KUBECONFIG_NOT_READ_FORMAT.format(directory=kubeconfig_dir, error=exc)
+            try:
+                os.fchmod(opened, KUBECONFIG_DIR_MODE)
+            except OSError as exc:
+                # Judged on the directory the descriptor holds, as the shared rule.
+                actual = os.fstat(opened)
+                mode = actual.st_mode & KUBECONFIG_DIR_MODE_MASK
+                private = actual.st_uid == euid and (mode & KUBECONFIG_DIR_OWNER_WRITE_SEARCH) == KUBECONFIG_DIR_OWNER_WRITE_SEARCH and not mode & KUBECONFIG_DIR_OTHERS_WRITE
+                if not private:
+                    return KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=kubeconfig_dir, mode=oct(mode), wanted=oct(KUBECONFIG_DIR_MODE), error=exc)
+                print(KUBECONFIG_MODE_KEPT_FORMAT.format(directory=kubeconfig_dir, mode=oct(mode), wanted=oct(KUBECONFIG_DIR_MODE), error=exc), file=sys.stderr)
+            finally:
+                os.close(opened)
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return KUBECONFIG_FILE_NOT_READ_FORMAT.format(path=path, error=exc)
+    if stat.S_ISLNK(current.st_mode):
+        # A link planted at the file's name is removed, never written
+        # through, as the shared rule removes it.
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            return KUBECONFIG_LINK_NOT_REMOVED_FORMAT.format(path=path, error=exc)
+    elif not stat.S_ISREG(current.st_mode):
+        # A directory or other object planted at the name: moved aside,
+        # never entered, as the shared rule moves it.
+        aside = os.path.join(os.path.dirname(path), KUBECONFIG_UNUSABLE_FORMAT.format(name=os.path.basename(path), stamp=datetime.now(timezone.utc).strftime(KUBECONFIG_STAMP_FORMAT)))
+        try:
+            os.rename(path, aside)
+        except OSError as exc:
+            return KUBECONFIG_NOT_A_FILE_FORMAT.format(path=path, error=exc)
+        print(KUBECONFIG_NOT_A_FILE_MOVED_FORMAT.format(path=path, aside=os.path.basename(aside)), file=sys.stderr)
+    elif current.st_uid != os.geteuid() or not os.access(path, os.W_OK):
+        # Another uid's file, or one this uid cannot write: replaced.
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            return KUBECONFIG_NOT_REPLACED_FORMAT.format(path=path, error=exc)
+    return None
+
+
 def first_read_failed_before_the_server_answered(error: str) -> bool:
     """Whether a first read's error is one of FIRST_READ_SKIP_MARKERS' classes and not an answer
     the API server returned: kubectl prefixes a returned error with `Error from server (...)`, and
@@ -777,10 +930,12 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
     """
     path = kubeconfig_path(kubeconfig_dir, project, cluster.get("name", ""), cluster.get("location", ""))
     result = {"items": None, "error": None, "webhook_items": None, "webhook_error": None, "webhook_skipped": False, "credentials_error": None, "directory_error": None, "kubeconfig": path}
-    try:
-        os.makedirs(kubeconfig_dir, exist_ok=True)
-    except OSError as e:
-        result["error"] = result["webhook_error"] = result["directory_error"] = f"cannot create kubeconfig directory {kubeconfig_dir}: {e}"
+    # The kubeconfig rule makes the directory usable, or says why not: its
+    # refusal is the directory's, failing both reads as a directory that
+    # could not be made does.
+    note = prepare_kubeconfig(kubeconfig_dir, path)
+    if note:
+        result["error"] = result["webhook_error"] = result["directory_error"] = KUBECONFIG_NOT_PREPARED_FORMAT.format(note=note)
         return result
     env = {**os.environ, KUBECONFIG_ENV: path}
     cmd = get_credentials_cmd(cluster, project)

@@ -1,0 +1,216 @@
+{
+ "apiVersion": "v1",
+ "items": [
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "creationTimestamp": "2026-09-24T17:37:17Z",
+    "name": "kube-dns-68987dd499",
+    "namespace": "kube-system",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "kube-dns"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "creationTimestamp": "2026-09-24T18:03:57Z",
+    "name": "kube-dns-797f658fb6",
+    "namespace": "kube-system",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "kube-dns"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "creationTimestamp": "2026-09-24T18:04:19Z",
+    "name": "kube-dns-autoscaler-59b88c68b4",
+    "namespace": "kube-system",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "kube-dns-autoscaler"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "creationTimestamp": "2026-09-24T17:37:57Z",
+    "name": "kube-dns-autoscaler-68896695b8",
+    "namespace": "kube-system",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "kube-dns-autoscaler"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "apps/v1",
+   "kind": "ReplicaSet",
+   "metadata": {
+    "creationTimestamp": "2026-09-24T17:41:29Z",
+    "name": "vllm-gemma-deployment-959c97bb8",
+    "namespace": "kubeagents-system",
+    "ownerReferences": [
+     {
+      "kind": "Deployment",
+      "name": "vllm-gemma-deployment"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "Job",
+   "metadata": {
+    "creationTimestamp": "2026-09-24T17:50:00Z",
+    "name": "legacy-flowcontrol-tuner-29837870",
+    "namespace": "kubeagents-system",
+    "ownerReferences": [
+     {
+      "kind": "CronJob",
+      "name": "legacy-flowcontrol-tuner"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "Job",
+   "metadata": {
+    "creationTimestamp": "2026-09-24T18:00:00Z",
+    "name": "legacy-flowcontrol-tuner-29837880",
+    "namespace": "kubeagents-system",
+    "ownerReferences": [
+     {
+      "kind": "CronJob",
+      "name": "legacy-flowcontrol-tuner"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "Job",
+   "metadata": {
+    "creationTimestamp": "2026-10-08T17:00:00Z",
+    "name": "legacy-flowcontrol-tuner-29857980",
+    "namespace": "kubeagents-system",
+    "ownerReferences": [
+     {
+      "kind": "CronJob",
+      "name": "legacy-flowcontrol-tuner"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "Job",
+   "metadata": {
+    "creationTimestamp": "2026-10-08T17:10:00Z",
+    "name": "legacy-flowcontrol-tuner-29857990",
+    "namespace": "kubeagents-system",
+    "ownerReferences": [
+     {
+      "kind": "CronJob",
+      "name": "legacy-flowcontrol-tuner"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "Job",
+   "metadata": {
+    "creationTimestamp": "2026-10-08T17:20:00Z",
+    "name": "legacy-flowcontrol-tuner-29858000",
+    "namespace": "kubeagents-system",
+    "ownerReferences": [
+     {
+      "kind": "CronJob",
+      "name": "legacy-flowcontrol-tuner"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "Job",
+   "metadata": {
+    "creationTimestamp": "2026-10-08T17:30:00Z",
+    "name": "legacy-flowcontrol-tuner-29858010",
+    "namespace": "kubeagents-system",
+    "ownerReferences": [
+     {
+      "kind": "CronJob",
+      "name": "legacy-flowcontrol-tuner"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "Job",
+   "metadata": {
+    "creationTimestamp": "2026-10-08T17:40:00Z",
+    "name": "legacy-flowcontrol-tuner-29858020",
+    "namespace": "kubeagents-system",
+    "ownerReferences": [
+     {
+      "kind": "CronJob",
+      "name": "legacy-flowcontrol-tuner"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "Job",
+   "metadata": {
+    "creationTimestamp": "2026-10-08T17:50:00Z",
+    "name": "legacy-flowcontrol-tuner-29858030",
+    "namespace": "kubeagents-system",
+    "ownerReferences": [
+     {
+      "kind": "CronJob",
+      "name": "legacy-flowcontrol-tuner"
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "batch/v1",
+   "kind": "Job",
+   "metadata": {
+    "creationTimestamp": "2026-09-24T17:41:39Z",
+    "name": "tuner-first-run",
+    "namespace": "kubeagents-system",
+    "ownerReferences": [
+     {
+      "kind": "CronJob",
+      "name": "legacy-flowcontrol-tuner"
+     }
+    ]
+   }
+  }
+ ],
+ "kind": "List"
+}

@@ -694,9 +694,13 @@ class ReadCredentialTest(unittest.TestCase):
 
         config = credential.git_config("acme/infra")
         self.assertEqual(
-            ("http.https://acme.example/.extraheader", "credential.helper"),
+            ("http.https://acme.example/.extraheader", "http.https://acme.example/.followRedirects",
+             "credential.helper"),
             tuple(key for key, _ in config),
         )
+        # A redirect is refused on a host other than github.com, so it never
+        # carries the header to a host the redirect names.
+        self.assertEqual("false", dict(config)["http.https://acme.example/.followRedirects"])
         header = dict(config)["http.https://acme.example/.extraheader"]
         self.assertTrue(header.startswith("AUTHORIZATION: basic "), header)
         self.assertEqual(

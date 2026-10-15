@@ -23,6 +23,7 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
      - [AI-Assisted Installation](#ai-assisted-installation)
 4. [Method 1: The Install Engine — Terraform + Helm](#method-1-the-install-engine--terraform--helm)
    - [Step-by-Step Execution](#step-by-step-execution)
+   - [GitHub Enterprise Server](#github-enterprise-server)
 5. [The Shell Sandbox](#the-shell-sandbox)
 6. [Method 2: Manual Kubernetes Cluster Deployment](#method-2-manual-kubernetes-cluster-deployment)
    - [Step 1: Install cert-manager](#step-1-install-cert-manager)
@@ -48,6 +49,8 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 ```
 
 _Substitute `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (for example, `0.4.0`; a GitLab install needs `0.9.0` or later)._
+
+`install.sh` cannot write a GitHub Enterprise Server forge yet. For a GitOps repository on a GitHub Enterprise Server, use Method 1: see [GitHub Enterprise Server](#github-enterprise-server).
 
 When running the official release installer (`<RELEASE_VERSION>/install.sh`) or executing inside an official release checkout or unpacked release archive, the release version is baked in and used automatically without prompting. A checkout of a release line (`release/<X.Y>`) that has moved past its latest release still carries that release's baked version but is not that release: run from that checkout, with the release's tag and full history fetched, `install.sh` defaults to the checkout's own commit, as a `main` checkout does, and says so; a clone that lacks the tag, or whose shallow history stops short of the release, is refused and told which fetch to run.
 
@@ -181,6 +184,8 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 ```
 
 _(If the Cloud KMS key was already imported Ahead-Of-Time, `--github-pem-path` can be omitted; see [Token Minter Guide](docs/site/src/content/docs/deploy/token-minter.md).)_
+
+`--github-app-id` is the App's number (its settings page, **General**, "App ID"), not its name or slug; the installer refuses anything else, `--dry-run` included. An applying run, or a `--generate-only` handoff, records `GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID` in `install.env`, adding the ones the file lacks and replacing any it records with a different value, so `upgrade.sh`, which renders from the file alone, keeps GitOps on. The PEM path is never recorded: once imported, the key lives in Cloud KMS.
 
 To run pre-flight checks and output configuration state (`terraform.tfvars` and
 `/tmp/kube-agents-install-report.json`) without creating cloud resources — the dry run also
@@ -396,6 +401,8 @@ Before beginning installation, ensure your environment meets the requirements fo
 | **OpenSSH (`ssh-keygen`)**      | Standard                                        | `ssh -V`                           | Mints the shell sandbox SSH keypair in Method 2 Step 2 and in `upgrade.sh`'s backfill; `install.sh` and the Terraform composition mint it without it (`tls_private_key`).                                                                               | **Method 2 and `upgrade.sh`**                    |
 | **Go**                          | `1.27+`; `1.21+` for the PEM import             | `go version`                       | Required for bootstrapping development tooling (`controller-gen`, `kustomize`), running tests, building operator binaries, or importing a GitHub App private key (`.pem`) into Cloud KMS via `install.sh` / Minty CLI. A GitLab install imports no key. | **Methods 2 & 3, or Method 0/1 with PEM import** |
 | **Docker / Podman**             | `20.10+`                                        | `docker --version`                 | Required when building operator or agent container images locally (`make docker-build`, `make dev-rebuild-agent`).                                                                                                                                      | **Methods 2 & 3 only**                           |
+
+The GitHub CLI is not needed on the [GitHub Enterprise Server](#github-enterprise-server) path.
 
 A cluster you bring yourself, rather than one the installer creates, also needs Workload Identity,
 NetworkPolicy enforcement, and the rest of the site's
@@ -689,6 +696,124 @@ and `install.sh` does not change a key the file assigns, so set the allowlist in
 refuses `--enable-google-chat` or `--enable-slack` over a file that records the key the other way
 ([`scripts/installer/README.md`](scripts/installer/README.md#the-install-configuration-installenv)).
 
+### GitHub Enterprise Server
+
+The agent can use a GitOps repository on a GitHub Enterprise Server instance: a GitHub instance at a host that you run, behind a certificate that a public CA or your own private CA signed. An install serves one GitHub host: github.com, or one GitHub Enterprise Server. `install.sh`, `upgrade.sh` and `uninstall.sh` cannot write a GitHub Enterprise Server forge yet. Do not use them for this install, now or later: they regenerate `terraform.tfvars` from `install.env`, which has no keys for the instance, and `upgrade.sh` can run from a checkout or a temporary copy of the engine that does not hold your `ghes.auto.tfvars`. Use the Terraform + Helm method in this section.
+
+#### Before you start
+
+- **The cluster's network.** The cluster's pods (the credential broker and the token minter) must reach the instance on TCP port 443 and resolve its hostname. A port other than 443 is not supported. An instance on a private network needs a route from the cluster's VPC, such as [Cloud VPN](https://cloud.google.com/network-connectivity/docs/vpn/concepts/overview) or [Cloud Interconnect](https://cloud.google.com/network-connectivity/docs/interconnect/concepts/overview), [firewall rules](https://cloud.google.com/firewall/docs/firewalls) that allow it, and, for a hostname in a private DNS zone, a [Cloud DNS forwarding zone](https://cloud.google.com/dns/docs/zones/forwarding-zones) in the cluster's VPC.
+  - **A new cluster** (`create_cluster = true`, the default) is created in the project's `default` VPC network: the composition has no network or subnetwork variable. If the instance is reachable only from another VPC (the one your VPN or Interconnect attaches to, or a Shared VPC), create the cluster yourself in that VPC, for example with `gcloud container clusters create-auto CLUSTER --region=REGION --network=NETWORK --subnetwork=SUBNETWORK --project=PROJECT_ID`, and install onto it with `create_cluster = false`, as the [composition README](terraform/examples/full-install/README.md#prerequisites) describes.
+    - **Shared VPC:** name the host project's network and subnetwork by their full paths, and set up the host-project IAM and the subnet's secondary ranges for Pods and Services as [GKE with Shared VPC](https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-shared-vpc) describes.
+    - **The return route:** traffic from the Pods to the instance leaves with the Pod addresses, so the network on the instance's side must route the cluster's Pod range (and node range) back over the VPN or Interconnect.
+    - **Database encryption (CMEK):** the composition sets it only on a cluster it creates. On a cluster that you create, it is your choice: add `--database-encryption-key=projects/PROJECT_ID/locations/REGION/keyRings/RING/cryptoKeys/KEY` to the create command (see [cluster requirements](docs/site/src/content/docs/install/prerequisites.md#cluster-requirements)).
+  - **The check.** On an existing cluster, run it before you install. On a new cluster, run it right after the apply in step 5, before you create the CA Secret. It needs a cluster, and it reads the CA file from your machine:
+
+    ```bash
+    kubectl run ghes-dns-check -n default --rm -i --restart=Never --image=busybox:1.36 -- \
+      nslookup ghe.example.com
+    kubectl run ghes-https-check -n default --rm -i --restart=Never --image=curlimages/curl:8.10.1 \
+      --command -- sh -c 'cat > /tmp/ca.crt && curl -sS --cacert /tmp/ca.crt -o /dev/null -w "%{http_code}\n" https://ghe.example.com/api/v3/meta' \
+      < /path/to/ca.pem
+    ```
+
+    The first command prints the instance's address. The second prints `200`, or `401` on an instance in private mode, which asks for a credential even here; both mean that the cluster reaches the instance and trusts its certificate. A curl error (no route, a DNS failure, or a certificate error) means that the path is not ready: fix the route, the firewall rule or the DNS zone, and run the check again. Until it passes, the agent's calls to the instance fail. For an instance whose certificate a public CA signed, drop `--cacert /tmp/ca.crt` and the `< /path/to/ca.pem`.
+
+- **The GitHub App, on the instance.** An App belongs to one GitHub host, so create it on the GitHub Enterprise Server, not on github.com. Give it the repository permissions `Contents: Read & write`, `Pull requests: Read & write` and `Issues: Read & write`. It needs no webhook: clear "Active" under Webhook. Install it on the organization that owns the GitOps repository, on the GitOps repository, and on each repository that the agent reads as context. The repository must be owned by an organization. Record the App ID, and download the App's private key (a `.pem` file).
+- **The tools.** `gcloud`, `kubectl`, Terraform, Helm, and `go` 1.21 or later for the key import, as for Method 1. The GitHub CLI (`gh`) is not needed.
+- **The release.** Use a release whose CRD serves GitHub Enterprise Server: it carries the rule that a forge at a host other than github.com names its provider. In the release sources, `grep -c 'has(self.provider) || !has(self.host)' charts/kube-agents/crds/kubeagents.x-k8s.io_platformagents.yaml` prints `1`. On an existing install, `kubectl get crd platformagents.kubeagents.x-k8s.io -o yaml | grep -c 'has(self.provider) || !has(self.host)'` prints `0` until you apply the new `crds/`, and the chart refuses the forge until then.
+- **The agent sandbox.** For the gVisor sandbox, set `agent_runtime_class = "gvisor"` in `terraform.tfvars`, and the shell sandbox's `runtimeClassName` in `ghes.auto.tfvars`, as [The Shell Sandbox](#the-shell-sandbox) describes. The chart README explains why the composition renders the agent's runtime class from that variable.
+
+#### Install, in this order
+
+1. **Get the release sources** and authenticate, as in [Step 1](#step-1-obtain-the-release-sources) and [Step 2](#step-2-authenticate-with-google-cloud) above.
+2. **Create the Cloud KMS key and import the App's private key.** The minter is not Ready until the key holds an `ENABLED` version, and the apply in step 5 waits for every Deployment (the composition's Helm release has `wait = true`, with a 600-second timeout), so the key must be imported before the apply. `lifecycle.sh apply` adopts a key ring and key that already exist; a bare `terraform apply` does not, so use `lifecycle.sh`. Use the composition's default names and the cluster's region (for a zonal cluster, the region that contains the zone). The import calls only Cloud KMS, so it is the same for an App on a GitHub Enterprise Server. Do not do step 2 of the token minter guide's Path 2, which runs `install.sh`.
+
+   ```bash
+   gcloud services enable cloudkms.googleapis.com --project=PROJECT_ID
+   gcloud kms keyrings create github-token-minter-keyring --location=REGION --project=PROJECT_ID
+   gcloud kms keys create github-token-minter-key --keyring=github-token-minter-keyring --location=REGION \
+     --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
+     --import-only --skip-initial-version-creation --protection-level=software --project=PROJECT_ID
+   git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git ~/minty
+   (cd ~/minty && go run ./cmd/minty tools import-pk -project-id=PROJECT_ID -location=REGION \
+     -key-ring=github-token-minter-keyring -key=github-token-minter-key -private-key=@/path/to/app.pem)
+   ```
+
+   On a new key, the import makes key version `1`, which is the version the chart uses (`githubMinter.kms.keyVersion`, default `"1"`). **When the key already exists** (a switch from github.com, or a reinstall in the same project), skip the two `create` commands: a key ring or key with these names cannot be deleted, and the import adds a new version to the existing key. Read its number, and set it in step 3:
+
+   ```bash
+   gcloud kms keys versions list --key=github-token-minter-key --keyring=github-token-minter-keyring \
+     --location=REGION --project=PROJECT_ID --filter=state=ENABLED --format='value(name)'
+   ```
+
+   The last path segment of the newest version is `N`. Delete the `.pem` after the import.
+
+3. **Write the GitHub Enterprise Server values in `terraform/examples/full-install/ghes.auto.tfvars`**, beside the `terraform.tfvars` of [Step 3](#step-3-apply-the-composition). Terraform reads every `*.auto.tfvars` file in the directory, and nothing in this repository writes this one. Terraform does not merge a variable across files: the last file wins, so keep **all** of `extra_helm_values` here, other blocks included (the shell sandbox's `runtimeClassName` from [The Shell Sandbox](#the-shell-sandbox), for example), and none in `terraform.tfvars`. `github_repo` is the owner and name on the instance (`owner/name`, not a URL: the composition reads a github.com URL only). The composition reads it for the minter's organization and repository, and writes it into the deprecated `github` alias, which always means github.com. `github = null` in `extra_helm_values` removes that alias (Helm removes a key that a later values document sets to null), and `forges` and `repositories` declare the GitHub forge at the instance's host. `provider = "github"` is required for a forge at a host other than github.com. Omit `caBundleRef` when a public CA signed the instance's certificate, and add `githubMinter = { kms = { keyVersion = "N" } }` beside `platformAgent` when step 2 found an existing key.
+
+   ```hcl
+   enable_github_minter = true
+   github_repo          = "acme/infra"
+   github_app_id        = "12"
+
+   extra_helm_values = {
+     platformAgent = {
+       integration = {
+         github = null
+         forges = [{
+           name        = "github"
+           provider    = "github"
+           host        = "ghe.example.com"
+           namespace   = "acme"
+           caBundleRef = { name = "ghe-ca" }
+         }]
+         repositories = [{ forge = "github", repository = "infra", role = "gitops" }]
+       }
+     }
+   }
+   ```
+
+4. **On an existing cluster** (`create_cluster = false`), **create the CA Secret now**, if a private CA signed the instance's certificate, so that the first rollout reads it. Create the namespace first if it does not exist yet:
+
+   ```bash
+   kubectl create namespace kubeagents-system   # only if it does not exist yet
+   kubectl create secret generic ghe-ca -n kubeagents-system --from-file=ca.crt=/path/to/ca.pem
+   ```
+
+5. **Apply** from `terraform/examples/full-install` with `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply`, as in Step 3. **On a new cluster**, the cluster exists only after this apply. The apply does not wait for the CA: the minter's readiness probe asks only its own `/version` route (minty `v2.7.1` calls the instance only when it mints), and the CA volume is optional, so the minter becomes Ready without the Secret. After the apply, run the network check, create the CA Secret with the command in step 4, and restart the token minter, which reads its CA once when it starts. The credential broker reads the CA on each call, so it needs no restart.
+
+   ```bash
+   kubectl rollout restart deployment/github-token-minter -n kubeagents-system
+   ```
+
+6. **Check the install:**
+
+   ```bash
+   # The minter mints on the instance.
+   kubectl get deployment github-token-minter -n kubeagents-system \
+     -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="SOURCE_SYSTEM_API_BASE_URL")].value}'
+   # The agent reads the instance's host.
+   kubectl get configmap platform-agent-gitops-state -n kubeagents-system -o jsonpath='{.data.github_host}'
+   ```
+
+   The first command prints `https://ghe.example.com/api/v3`, and the second prints `ghe.example.com`.
+
+Keep the forge in `ghes.auto.tfvars`. Do not edit the PlatformAgent with `kubectl edit`: the chart owns it, and the next apply writes the values back. To register another repository on the instance by hand, add its full URL, `https://ghe.example.com/owner/name`, with `"type": "github"`, to `managed_repos` or `context_repos` in the `platform-agent-gitops-state` ConfigMap. A bare `owner/name` or a github.com URL there is skipped, by the agent and by the token minter. With Helm alone (no Terraform), put the same `platformAgent.integration` keys in your values file, with `githubMinter.enabled`, `githubMinter.org`, `githubMinter.repo` and `githubMinter.appId`, and provision the minter's Google Cloud resources with the [`github-minter`](terraform/modules/github-minter) module. The manual kustomize path (`make deploy-github`, Method 2) does not set the minter's API URL or CA. After you rotate the CA Secret, restart the minter, as in step 5.
+
+#### Upgrade, switch and teardown
+
+- **Upgrade.** Do not use `upgrade.sh`. Move the checkout to the new release (`git fetch --tags && git checkout <RELEASE_VERSION>`, or unpack the release archive and copy `terraform.tfvars` and `ghes.auto.tfvars` into its `terraform/examples/full-install`). If `terraform.tfvars` pins `image_tag`, change it to the new release. Then apply the new CRDs and the composition:
+
+  ```bash
+  kubectl apply --server-side --force-conflicts -f charts/kube-agents/crds/
+  cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
+  ```
+
+- **Switch an existing github.com install to a GitHub Enterprise Server.** Apply the new `charts/kube-agents/crds/` first: the CRD of an earlier release refuses `caBundleRef` on a `github` forge. Then follow the steps above from step 2, with the existing-key and existing-cluster orders. The install then serves only the instance: repositories registered on github.com are skipped.
+- **Teardown.** Do not use `uninstall.sh`: it regenerates `terraform.tfvars`. From the checkout that holds `ghes.auto.tfvars`, run `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh destroy` in `terraform/examples/full-install`.
+
+How the broker and the minter use the instance, and what is not supported (a port other than 443, a renamed repository, github.com and an instance in one install): see the [token minter guide](docs/site/src/content/docs/deploy/token-minter.md#github-enterprise-server) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md).
+
 ---
 
 ## The Shell Sandbox
@@ -707,7 +832,10 @@ builds one, and Autopilot ships the `gvisor` RuntimeClass with no pool to manage
 run on the node's standard runtime.
 
 Set it on a new install by adding this to `terraform.tfvars` before the first apply
-([Method 1](#method-1-the-install-engine--terraform--helm), Step 3):
+([Method 1](#method-1-the-install-engine--terraform--helm), Step 3). On a GitHub Enterprise Server
+install, put the `extra_helm_values` block in `ghes.auto.tfvars` instead, merged with the forge
+block there: Terraform takes the variable from one file only
+([GitHub Enterprise Server](#github-enterprise-server), step 3).
 
 ```hcl
 cluster_mode            = "standard" # omit both lines on Autopilot, which
@@ -1167,7 +1295,8 @@ issue and the pull requests.
 ## Upgrading
 
 To move a configured `kube-agents` installation to a newer release, run the `upgrade.sh` published
-for that release. It carries its own version, so the run names no image tag, and it reuses the
+for that release. An install whose GitHub forge is a GitHub Enterprise Server does not use
+`upgrade.sh`: see [Upgrade, switch and teardown](#upgrade-switch-and-teardown). `upgrade.sh` carries its own version, so the run names no image tag, and it reuses the
 install checkout — and the `install.env` in it — that `install.sh` left in `$HOME/kube-agents`:
 
 ```bash
@@ -1273,6 +1402,7 @@ When a Slack bot connects or is online in your workspace but never replies to me
   - The `*:history` scopes (`im:history`, `channels:history`, `groups:history`, `mpim:history`) are the most common cause of silent failures: without them, Socket Mode connects successfully, but Slack never forwards message contents to the bot.
   - Omitting `files:write` drops report artifact uploads quietly (logged as a warning).
   - Omitting `reactions:write` silently prevents reaction emoji from appearing on user messages.
+  - Under `spec.mode: next`, the reactions, a question's answered line, Working… and the suggested prompts also need `users:read`, `assistant:write`, the `assistant_thread_started` event (`app_home_opened` on an agent-view app) and interactivity, which the `hermes slack manifest` output carries unless generated with `--no-assistant`; without them the answers still arrive and only those go missing ([ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack)).
   - For the complete manifest, instructions on generating it with `hermes slack manifest`, and event subscriptions, see [Step 5 §2 (Slack Configuration)](#2-slack-configuration-slack_enabledtrue) or run `./scripts/installer/print_instructions_slack.sh`.
 - **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). Under `mode: today` unlisted users are ignored without a reply; under `next` the A2A gateway answers once with a notice naming their member ID. An empty allowlist admits all members in the workspace. Under `spec.mode: next`, the A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list; under `mode: today`, the legacy consumer has no such check: a guest in a shared channel is admitted by the allowlist alone, and under an empty list that is everyone. See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration).
 - **Single-Workspace vs Multi-Workspace (`spec.mode: next`):** Under the unsupported `spec.mode: next` toggle, the A2A gateway takes a single workspace bot token. If your secret holds a comma-separated list of tokens (supported under `mode: today`), Slack rejects it at `auth.test`; the gateway pod stays Running and Ready, retrying the Slack backend on a backoff, and Slack has no consumer until the secret holds one workspace's token or the install goes back to `today`. Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.
@@ -1339,7 +1469,7 @@ When the checks in the entry above pass and a message still gets no reply, follo
 
 ### 7. A Question Gets No Answer Under `spec.mode: next`
 
-The gateway posts a status line for every task ([what a task looks like](docs/site/src/content/docs/concepts/chatops.md#what-a-task-looks-like)); where it stops says what went wrong.
+On Google Chat the gateway posts a status line for every task ([what a task looks like](docs/site/src/content/docs/concepts/chatops.md#what-a-task-looks-like)); where it stops says what went wrong. Slack keeps no status line, so there a task with no answer shows Working… on the thread until it ends; read the checks below by the bridge's and the gateway's logs.
 
 - **It stays at `⏳ submitted…`.** Nothing has taken the task. (A line reading `⏳ **queued** — N requests are ahead of yours` is waiting its turn behind other conversations' tasks, which is not this.) Tasks on the `platform` route are run by the `hermes-bridge` container in the agent's pod, which logs `hermes bridge consuming` when it starts and `task accepted` for each task:
   ```bash

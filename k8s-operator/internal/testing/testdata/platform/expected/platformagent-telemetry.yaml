@@ -1225,6 +1225,7 @@ spec:
         app.kubernetes.io/managed-by: platformagent-controller
         app.kubernetes.io/name: platform-agent
         app.kubernetes.io/part-of: kube-agents
+        kubeagents.io/is-leader: "true"
     spec:
       automountServiceAccountToken: false
       containers:
@@ -1308,12 +1309,16 @@ spec:
             - name: API_SERVER_MODEL_NAME
               value: model-default
             - name: HERMES_GATEWAY_PROFILE
+            - name: CHAT_METRICS_PORT
+              value: "9097"
           image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
           imagePullPolicy: Always
           name: platform-agent
           ports:
             - containerPort: 8642
               name: api
+            - containerPort: 9097
+              name: chat-metrics
           readinessProbe:
             exec:
               command:
@@ -1966,6 +1971,23 @@ spec:
               app.kubernetes.io/name: kube-agents-operator
       ports:
         - port: 9095
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 9097
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kube-agents-operator
+      ports:
+        - port: 9097
           protocol: TCP
   podSelector:
     matchLabels:

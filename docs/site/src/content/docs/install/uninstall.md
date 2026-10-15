@@ -7,6 +7,13 @@ description: Remove an install, its provisioned GCP resources, and what a teardo
 
 On an install made by `install.sh` the `PlatformAgent` resource and its credentials Secret (`platform-agent-secrets`) belong to the Helm release, so deleting either by hand is undone by a later upgrade that re-renders the release, and leaves the install out of step with its state until then. To remove the agent, tear the install down.
 
+An install whose GitHub forge is a GitHub Enterprise Server does not use `uninstall.sh`, which regenerates `terraform.tfvars` from `install.env` and loses the forge. From the checkout that holds `ghes.auto.tfvars`, run `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh destroy` in `terraform/examples/full-install`: see [GitHub Enterprise Server in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#upgrade-switch-and-teardown). The destroy does not remove what you made outside the composition. Remove each yourself:
+
+- a cluster that you created yourself (`create_cluster = false`): `gcloud container clusters delete CLUSTER --location=LOCATION --project=PROJECT_ID`;
+- the namespace and the CA Secret, on a cluster that stays: `kubectl delete secret ghe-ca -n kubeagents-system`, then `kubectl delete namespace kubeagents-system`;
+- the Cloud DNS forwarding zone and the firewall rules for the instance: `gcloud dns managed-zones delete ZONE` and `gcloud compute firewall-rules delete RULE`;
+- the Cloud KMS key ring and key, which GCP cannot delete; disable the key version with `gcloud kms keys versions disable`.
+
 ## Full teardown
 
 ```bash
