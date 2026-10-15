@@ -6162,6 +6162,8 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                 f"{stubs}"
                 + "".join(f"{n}=v-{n}\n" for n in names)
                 + 'permission_set=read-only slack_enabled=true google_chat_enabled=false\n'
+                # An App ID is the App's number; the menu refuses anything else.
+                + 'github_app_id=12345\n'
                 f'TF_DIR="{tf_dir}" SLACK_BOT_TOKEN=""\n'
                 f'mktemp() {{ local p; p="$(command mktemp "$@")" || return; echo "$p" >>"{made}"; printf "%s\\n" "$p"; }}\n'
                 f"_menu_apply() {{\n{text[start:end]}\n}}\n"

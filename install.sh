@@ -2012,14 +2012,12 @@ record_github_gitops_keys() {
   [ "${PARAM_DRY_RUN:-false}" = "true" ] && return 0
   [ "${GITOPS_FORGE:-github}" = "github" ] || return 0
   [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ] || return 0
-  read_recorded_install_env_values "$file" GITOPS_ORG GITOPS_REPO GITHUB_APP_ID
-  # A last line with no newline would run into the appended assignment.
-  if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
-    printf '\n' >> "$file"
-  fi
   local tmp
   for key in GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
     value="${!key}"
+    # Read afresh for each key: a rewrite below drops a whole line, and a line
+    # that assigned two of these keys takes both with it.
+    RECORDED_INSTALL_ENV_FILE=""
     if install_env_records_key "$file" "$key"; then
       [ "$(recorded_install_env_value "$file" "$key")" != "$value" ] || continue
       tmp="${file}.tmp.$$"
@@ -2030,6 +2028,10 @@ record_github_gitops_keys() {
       mv "$tmp" "$file"
       print_info "Updated ${key}=$(printf '%q' "$value") in ${file} to the value this run applies, so upgrade.sh keeps it."
     else
+      # A last line with no newline would run into the appended assignment.
+      if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
+        printf '\n' >> "$file"
+      fi
       write_env_var "$file" "$key" "$value"
       print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}, so upgrade.sh keeps GitOps on."
     fi
@@ -5449,6 +5451,10 @@ run_menu_system() {
         # PROJECT_NUMBER, KMS_LOCATION and NO_CONFIRM are deliberately not
         # written. The first two are derived wherever they are used, and the third
         # describes an invocation rather than the install.
+        # A non-numeric App ID the file already carries (one a pre-#3076 run
+        # took from the App's name) is refused here too, before anything is
+        # saved or applied.
+        validate_github_app_id "$github_app_id" "GITHUB_APP_ID in ${INSTALL_ENV_FILE}" || return 1
         save_env_var PROJECT_ID "$project_id"
         save_env_var CLUSTER_NAME "$cluster_name"
         save_env_var REGION "$region"
@@ -7131,7 +7137,8 @@ main() {
   # A live GitHub minter this render would destroy (#3075): an install.env
   # without the GitOps keys, and a run without the flags, renders GitOps off.
   # Refused for a run that applies; --dry-run and --generate-only warn. The
-  # context is the one the gate above fetched; without one it says nothing.
+  # context is the one the gate above fetched; an applying run without one has
+  # already been refused there, and a preview says the check did not run.
   if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
     if [ "$PARAM_DRY_RUN" != "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ]; then
       refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" || exit 1

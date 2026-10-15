@@ -80,6 +80,10 @@ unset _gke_dns_endpoint_helper
 
 # Request timeout for kubectl probes against live clusters in the installer.
 readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
+# The GitHub token minter's Deployment, and the Secret its App ID is read from
+# (refuse_apply_dropping_live_gitops, live_github_app_id).
+readonly GITHUB_MINTER_DEPLOYMENT="github-token-minter"
+readonly GITHUB_APP_CREDENTIALS_SECRET="github-app-credentials"
 
 # ─── Scope cap ─────────────────────────────────────
 # The bounds the PlatformAgent puts on spec.scope.maxProjects (SCOPE_MAX_PROJECTS),
@@ -1635,7 +1639,7 @@ validate_github_app_id() {
   local value="${1:-}" source="${2:-GITHUB_APP_ID}"
   [ -n "$value" ] || return 0
   [[ "$value" =~ ^[0-9]+$ ]] && return 0
-  print_error "${source}='${value}' is not a GitHub App ID: it must be the App's number, not its name or slug."
+  print_error "${source}: '${value}' is not a GitHub App ID. It must be the App's number, not its name or slug."
   print_info "Find it on GitHub: the App's settings, General, \"App ID\" (a number such as 1234567). Set it and re-run."
   return 1
 }
@@ -1647,7 +1651,7 @@ validate_github_app_id() {
 live_github_app_id() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" value
   value="$( (trap - ERR; kubectl --context "$(gke_context_name)" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
-    get secret github-app-credentials -n "$namespace" -o jsonpath='{.data.app-id}' 2>/dev/null | base64 --decode 2>/dev/null) || true)"
+    get secret "$GITHUB_APP_CREDENTIALS_SECRET" -n "$namespace" -o jsonpath='{.data.app-id}' 2>/dev/null | base64 --decode 2>/dev/null) || true)"
   [[ "$value" =~ ^[0-9]+$ ]] && printf '%s' "$value"
   return 0
 }
@@ -1687,7 +1691,7 @@ refuse_apply_dropping_live_gitops() {
   # spec.integration.github alias, or spec.integration.forges/repositories
   # (the chart renders the alias only for a plain single GitHub repository).
   if (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
-    get deployment github-token-minter -n "$namespace" -o name >/dev/null 2>&1); then
+    get deployment "$GITHUB_MINTER_DEPLOYMENT" -n "$namespace" -o name >/dev/null 2>&1); then
     minter="present"
   fi
   cr_json="$( (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
@@ -1702,6 +1706,9 @@ except ValueError:
 integ = ((items[0].get("spec") or {}).get("integration") or {}) if items else {}
 gh = integ.get("github") or {}
 repo, org = gh.get("gitRepo") or "", gh.get("org") or ""
+if repo.strip() in ("None", "none"):
+    # The sentinel the alias validator reads as "no repository".
+    repo = ""
 if not repo:
     forges = {f.get("name"): f for f in integ.get("forges") or []}
     for r in integ.get("repositories") or []:
@@ -1710,18 +1717,50 @@ if not repo:
             repo = r.get("repository") or ""
             org = r.get("namespace") or forge.get("namespace") or ""
             break
-if repo and not org and "/" in repo:
-    org = repo.split("/")[-2]
-print(org or "-", repo or "-")
+def path_of(ref):
+    # As the operator reads a reference (ParseRepoRef): a clone URL or an scp
+    # remote reduced to its owner/name path, surrounding slashes and a .git
+    # suffix trimmed.
+    ref = ref.strip()
+    if "://" in ref:
+        ref = ref.split("://", 1)[1].split("/", 1)[1] if "/" in ref.split("://", 1)[1] else ""
+    elif "@" in ref.split("/", 1)[0] and ":" in ref:
+        ref = ref.split(":", 1)[1]
+    ref = ref.strip("/")
+    if ref.endswith(".git"):
+        ref = ref[:-4]
+    return ref.strip("/")
+path = path_of(repo)
+parts = [p for p in path.split("/") if p]
+name = parts[-1] if parts else ""
+if not org and len(parts) >= 2:
+    org = parts[-2]
+print(org or "-", name or "-")
 ' 2>/dev/null) || echo "- -")"
   [ "$live_org" = "-" ] && live_org=""
   [ "$live_repo" = "-" ] && live_repo=""
-  [ -n "$live_repo" ] || [ -n "$minter" ] || return 0
-  repo_name="${live_repo##*/}"
+  # Only a running minter is something the apply destroys. A GitOps repository
+  # with no minter (the App ID left blank, or the minter deferred) renders the
+  # same either way, so there is nothing here to protect.
+  [ -n "$minter" ] || return 0
+  repo_name="$live_repo"
+  [ -z "$live_org" ] || [ -z "$live_repo" ] || live_repo="${live_org}/${live_repo}"
   app_id="$(live_github_app_id "$namespace")"
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
     say=print_warning
     lead="An applying run would be refused: "
+  fi
+  # All three keys set and matching what runs: the keys are right, and the
+  # generator left the minter off because its Cloud KMS key check found no
+  # ENABLED key version (or could not list them). Say that, not "set these".
+  if [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ] &&
+    { [ -z "$live_org" ] || [ "$GITOPS_ORG" = "$live_org" ]; } &&
+    { [ -z "$repo_name" ] || [ "$GITOPS_REPO" = "$repo_name" ]; } &&
+    { [ -z "$app_id" ] || [ "$GITHUB_APP_ID" = "$app_id" ]; }; then
+    "$say" "${lead}the GitHub token minter is running, and ${file} names it correctly, but this run renders it off because the installer found no ENABLED version of its Cloud KMS key (or could not list the key's versions). The apply would destroy the minter (its Cloud KMS key, key ring and service account)."
+    print_info "Check that this identity can list the key's versions (cloudkms.cryptoKeyVersions.list on ${KMS_KEYRING:-the minter key ring}/${KMS_KEY:-its key}) and that the Cloud KMS API answers, then re-run the same command. Nothing in ${file} needs to change."
+    [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+    return 1
   fi
   "$say" "${lead}the PlatformAgent opens pull requests${live_repo:+ on ${live_repo}} through the GitHub token minter, but this run's GITOPS_ORG, GITOPS_REPO and GITHUB_APP_ID (from ${file}, or the installer's defaults where it sets none) do not carry it, so this run renders GitOps off. The apply would destroy the minter (its Cloud KMS key, key ring and service account) and the agent would stop opening pull requests."
   print_info "Set these lines in ${file} (add them, or replace the ones it has), then re-run the same command:"

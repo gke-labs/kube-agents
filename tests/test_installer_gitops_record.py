@@ -71,6 +71,23 @@ class RecordGithubGitopsKeysTest(unittest.TestCase):
         self.assertIn("Updated GITOPS_REPO=new-infra", proc.stdout)
         self.assertEqual(oct(dest.stat().st_mode & 0o777), "0o600")
 
+    def test_a_line_assigning_two_keys_does_not_lose_the_second(self):
+        dest = self._tmp / "install.env"
+        dest.write_text("export GITOPS_ORG=acme GITOPS_REPO=infra\nGITHUB_APP_ID=7\n")
+        proc = self._bash(f'export GITOPS_ORG=newco GITOPS_REPO=infra GITHUB_APP_ID=7\nrecord_github_gitops_keys "{dest}"\n')
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        proc = self._bash("unset GITOPS_ORG GITOPS_REPO GITHUB_APP_ID\n"
+                          f'load_install_env "{dest}"; echo "org=$GITOPS_ORG repo=$GITOPS_REPO app=$GITHUB_APP_ID"\n')
+        self.assertIn("org=newco repo=infra app=7", proc.stdout, proc.stderr + dest.read_text())
+
+    def test_an_unchanged_file_with_no_final_newline_is_left_as_it_is(self):
+        dest = self._tmp / "install.env"
+        original = "GITOPS_ORG=acme\nGITOPS_REPO=infra\nGITHUB_APP_ID=7"
+        dest.write_text(original)
+        proc = self._bash(f'export GITOPS_ORG=acme GITOPS_REPO=infra GITHUB_APP_ID=7\nrecord_github_gitops_keys "{dest}"\n')
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertEqual(dest.read_text(), original)
+
     def test_an_unchanged_file_is_left_byte_for_byte(self):
         dest = self._tmp / "install.env"
         original = "GITOPS_ORG=acme\nGITOPS_REPO=infra\nGITHUB_APP_ID=7\n"
@@ -183,6 +200,36 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
         self.assertIn("INFO:   GITOPS_ORG=<the GitHub organization that owns the GitOps repository>", proc.stdout)
         self.assertIn("INFO:   GITOPS_REPO=<the GitOps repository's name>", proc.stdout)
 
+    def test_repository_references_are_read_as_the_operator_reads_them(self):
+        for ref, org_line, repo_line in (
+            ("git@github.com:acme/infra", "GITOPS_ORG=acme", "GITOPS_REPO=infra"),
+            ("https://github.com/acme/infra/", "GITOPS_ORG=acme", "GITOPS_REPO=infra"),
+            ("https://github.com/acme/infra.git", "GITOPS_ORG=acme", "GITOPS_REPO=infra"),
+            ("/acme/infra/", "GITOPS_ORG=acme", "GITOPS_REPO=infra"),
+        ):
+            with self.subTest(ref=ref):
+                proc = self._run({}, integration={"github": {"gitRepo": ref}})
+                self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn(f"INFO:   {org_line}\n", proc.stdout)
+                self.assertIn(f"INFO:   {repo_line}\n", proc.stdout)
+
+    def test_the_none_sentinel_with_a_running_minter_prints_placeholders_not_none(self):
+        proc = self._run({}, integration={"github": {"gitRepo": "None"}})
+        self.assertIn("rc=1", proc.stdout)
+        self.assertNotIn("=None", proc.stdout)
+        self.assertIn("INFO:   GITOPS_REPO=<the GitOps repository's name>", proc.stdout)
+
+    def test_correct_keys_with_the_minter_rendered_off_name_the_kms_check(self):
+        # The generator defers the minter when it cannot see an ENABLED key
+        # version; the keys are right, so no lines and no removal offer.
+        proc = self._run({"GITOPS_ORG": "sackheads", "GITOPS_REPO": "ka-test-infra", "GITHUB_APP_ID": "5319154",
+                          "KMS_KEYRING": "kr", "KMS_KEY": "k"})
+        self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("found no ENABLED version of its Cloud KMS key", proc.stdout)
+        self.assertIn("cloudkms.cryptoKeyVersions.list on kr/k", proc.stdout)
+        self.assertNotIn("Set these lines", proc.stdout)
+        self.assertNotIn("KUBE_AGENTS_REMOVE_GITOPS", proc.stdout)
+
     def test_a_preview_with_no_context_says_the_check_did_not_run(self):
         proc = self._run({}, mode="warn", context_present=False)
         self.assertIn("rc=0", proc.stdout)
@@ -201,6 +248,10 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
             ("gitlab", {"GITOPS_FORGE": "gitlab"}, "sackheads/ka-test-infra", True, True),
             ("removed on purpose", {"KUBE_AGENTS_REMOVE_GITOPS": "true"}, "sackheads/ka-test-infra", True, True),
             ("no context, applying run", {}, "sackheads/ka-test-infra", False, True),
+            # The App ID left blank, or the minter deferred: a repository and
+            # no minter render the same either way.
+            ("a repository with no minter", {}, "sackheads/ka-test-infra", True, False),
+            ("the 'None' sentinel and no minter", {}, "None", True, False),
         ):
             with self.subTest(label):
                 proc = self._run(keys, git_repo=git_repo, context_present=ctx, minter=minter)
@@ -245,7 +296,7 @@ class ValidateGithubAppIdTest(unittest.TestCase):
             with self.subTest(value=value):
                 proc = self._run(value)
                 self.assertIn("rc=1", proc.stdout)
-                self.assertIn(f"ERROR: --github-app-id='{value}' is not a GitHub App ID", proc.stdout)
+                self.assertIn(f"ERROR: --github-app-id: '{value}' is not a GitHub App ID", proc.stdout)
                 self.assertIn('General, "App ID"', proc.stdout)
 
     def test_both_front_doors_check_it_before_the_preview(self):
@@ -256,6 +307,10 @@ class ValidateGithubAppIdTest(unittest.TestCase):
         # The interview asks again at the prompt, before the KMS questions.
         ask = install.index('while [ -n "$github_app_id" ] && ! validate_github_app_id "$github_app_id" "GitHub App ID"; do')
         self.assertLess(ask, install.index('prompt_read "Cloud KMS Keyring Name" kms_keyring', ask - 2000))
+        # The Day-2 menu, which main() does not reach, checks before it saves.
+        menu = install.index('validate_github_app_id "$github_app_id" "GITHUB_APP_ID in ${INSTALL_ENV_FILE}" || return 1')
+        self.assertLess(menu, install.index('save_env_var GITHUB_APP_ID "$github_app_id"'))
+        self.assertLess(install.index("\nrun_menu_system() {"), menu)
         upgrade = _UPGRADE_SH.read_text()
         self.assertLess(upgrade.index('validate_github_app_id "${GITHUB_APP_ID:-}"'),
                         upgrade.index('print_step "2. Dry-Run Upgrade Plan Preview"'))
