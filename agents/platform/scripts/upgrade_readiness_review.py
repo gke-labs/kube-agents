@@ -280,31 +280,6 @@ PARTIAL_DETAIL_SEPARATOR = "; "
 DRY_RUN_HEADER = "dry run: nothing registered, nothing written"
 
 
-# --- the watch's API, on main and on the declared-scope fix -----------------------
-
-
-def watch_scope():
-    """The declared scope as the watch resolves it, or None on a watch that
-    reads none (the watch before its declared-scope change passes a bare
-    --project, which an undeclared install accepts)."""
-    resolve = getattr(watch, "declared_scope", None)
-    return resolve() if resolve else None
-
-
-def run_watch_report(project: str, scope, timeout: float) -> dict:
-    """One readiness run through the watch's loader, on either shape of
-    `run_report`: the scope-aware one takes the scope and the outside-stands
-    flag, the earlier one only the names."""
-    if hasattr(watch, "declared_scope"):
-        return watch.run_report([project], readiness=True, scope=scope, outside_stands=False, timeout=timeout)
-    return watch.run_report([project], readiness=True, timeout=timeout)
-
-
-WATCH_RUN_ERRORS = tuple(
-    error for error in (getattr(watch, "SandboxTimedOut", None), getattr(watch, "ReportRefused", None), RuntimeError, ValueError) if error
-)
-
-
 # --- time, paths -------------------------------------------------------------
 
 
@@ -644,8 +619,10 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
             failures[project] = BUDGET_EXHAUSTED_DETAIL
             continue
         try:
-            envelope = run_watch_report(project, scope, min(PROJECT_TIMEOUT_SECONDS, remaining))
-        except WATCH_RUN_ERRORS as exc:
+            envelope = watch.run_report(
+                [project], readiness=True, scope=scope, outside_stands=False, timeout=min(PROJECT_TIMEOUT_SECONDS, remaining)
+            )
+        except (RuntimeError, ValueError) as exc:  # the watch's SandboxTimedOut and ReportRefused are RuntimeErrors
             failures[project] = str(exc)
             continue
         report = envelope.get(watch.ENVELOPE_REPORT_KEY) or {}
@@ -680,20 +657,24 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
             continue
         # A complete read of a cluster with nothing to report is sent too: it is
         # what lets the queue lower the confidence of last week's rows there,
-        # and it reaches only this job's own family of checks.
-        body = {"findings": [payload(item) for item in batch[:KV_BATCH_LIMIT]]}
-        if complete:
-            body["scope"] = {"project": project, "cluster": cluster, "complete": True, "check_prefix": CHECK_PREFIX}
-        try:
-            answer = kv_request(KV_FINDINGS_PATH, body)
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            problems.append(f"{project}/{cluster}: {exc}")
-            for item in batch:
-                outcomes[item_id(item)] = REGISTRATION_FAILED
-            continue
-        for result in answer.get("results") or []:
-            if isinstance(result, dict) and result.get("id"):
-                outcomes[str(result["id"])] = str(result.get("outcome") or "")
+        # and it reaches only this job's own family of checks. A cluster with
+        # more findings than one batch holds is sent in pieces and claims no
+        # completeness, since the claim covers only the ids in the call.
+        chunks = [batch[i : i + KV_BATCH_LIMIT] for i in range(0, len(batch), KV_BATCH_LIMIT)] or [[]]
+        for chunk in chunks:
+            body = {"findings": [payload(item) for item in chunk]}
+            if complete and len(chunks) == 1:
+                body["scope"] = {"project": project, "cluster": cluster, "complete": True, "check_prefix": CHECK_PREFIX}
+            try:
+                answer = kv_request(KV_FINDINGS_PATH, body)
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                problems.append(f"{project}/{cluster}: {exc}")
+                for item in chunk:
+                    outcomes[item_id(item)] = REGISTRATION_FAILED
+                continue
+            for result in answer.get("results") or []:
+                if isinstance(result, dict) and result.get("id"):
+                    outcomes[str(result["id"])] = str(result.get("outcome") or "")
     return outcomes, problems
 
 
@@ -749,7 +730,13 @@ def summary(
         )
     counts = {severity: sum(1 for r in rows if r["severity"] == severity) for severity in SEVERITY_ORDER}
     ids = [r["id"] for r in rows]
-    reviewed_pairs = {(str(m.get(watch.MEMBER_ID_KEYS[0]) or ""), str(m.get(watch.MEMBER_ID_KEYS[-1]) or "")) for m in members}
+    # Only a cluster read in full can say that last week's row is gone; one
+    # whose read failed keeps its rows unjudged, as the queue does.
+    reviewed_pairs = {
+        (str(m.get(watch.MEMBER_ID_KEYS[0]) or ""), str(m.get(watch.MEMBER_ID_KEYS[-1]) or ""))
+        for m in members
+        if member_complete(m, errors)
+    }
     previous_ids = [
         r.get("id")
         for r in (previous or {}).get("findings") or []
@@ -948,7 +935,7 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
     """Run the review. Returns the lines to print and the exit code."""
     now = now_utc()
     stamp = now.strftime(STAMP_FORMAT)
-    scope = watch_scope()
+    scope = watch.declared_scope()
     names = watch.projects()
     if not names:
         raise RuntimeError(NO_PROJECTS_DETAIL)

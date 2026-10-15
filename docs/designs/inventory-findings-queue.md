@@ -994,9 +994,11 @@ what makes that visible. An undecided critical holds every new non-critical back
 stays pending, while new criticals still arrive within the day's budget; the daily reminder names
 it only if it is in the day's top, and nothing says that non-criticals are waiting. On a standard
 install only a person's decision (dismiss, snooze or accept) releases a pending item: clearing one without a person needs §7.4's verification, which is not
-built, and the onboarding sweep runs once, so no recurring complete sweep lowers a fixed row's `C`.
-A shown row a later complete sweep stops reporting is not pending and is not reminded, but that
-happens only when someone re-runs the sweep by hand.
+built. The onboarding sweep runs once, so for its rows no recurring complete sweep lowers a fixed
+row's `C` unless someone re-runs the sweep by hand; the weekly upgrade readiness review is such a
+sweep for its own `upgrade-` rows, so a shown row of that family that a Saturday no longer reports
+is not pending and is not reminded from that Saturday on, and comes back at full confidence the
+Saturday it is found again.
 
 ### 7.3 What a dry run showed, and why there is no selection
 

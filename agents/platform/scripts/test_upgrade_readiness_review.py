@@ -226,6 +226,22 @@ class Registration(unittest.TestCase):
             review.register([partial], [], [])
         self.assertEqual(calls, [])
 
+    def test_a_cluster_past_the_batch_limit_is_sent_in_pieces_without_a_claim(self):
+        calls = []
+
+        def fake_request(path, body):
+            calls.append(body)
+            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]]}
+
+        big = member("seeded-z", "blocked", pdbs={"blocking": [budget(name=f"b{i}") for i in range(review.KV_BATCH_LIMIT + 1)]})
+        findings = review.member_findings(big)
+        with mock.patch.object(review, "kv_request", fake_request):
+            outcomes, problems = review.register([big], [], findings)
+        self.assertEqual(problems, [])
+        self.assertEqual([len(c["findings"]) for c in calls], [review.KV_BATCH_LIMIT, 1])
+        self.assertTrue(all("scope" not in c for c in calls))
+        self.assertEqual(len(outcomes), review.KV_BATCH_LIMIT + 1)
+
     def test_a_failed_batch_is_reported_and_marks_its_rows(self):
         def failing(path, body):
             raise OSError("connection refused")
@@ -264,8 +280,11 @@ class TheRecord(unittest.TestCase):
         # run read; a cluster not read this week keeps its rows unjudged.
         gone = {"id": "upgrade-pool-skew.acme-prod.seeded-b._.old-pool", "project": PROJECT, "cluster": "seeded-b"}
         unread = {"id": "upgrade-pool-skew.acme-prod.old-cluster._.default-pool", "project": PROJECT, "cluster": "old-cluster"}
+        half_read = {"id": "upgrade-pool-skew.acme-prod.gemma-gpu._.old-pool", "project": PROJECT, "cluster": "gemma-gpu"}
         kept = dict(doc["findings"][0])
-        doc2, _ = self.summary_for([seeded_b(), gemma()], previous={"findings": [gone, unread, kept]})
+        partial = gemma()
+        partial["readiness"]["read_error"] = "timed out"
+        doc2, _ = self.summary_for([seeded_b(), partial], previous={"findings": [gone, unread, half_read, kept]})
         self.assertEqual(doc2["no_longer_reported_ids"], [gone["id"]])
 
     def test_the_report_names_every_finding_with_its_id_and_action(self):
@@ -415,6 +434,23 @@ class TheTick(unittest.TestCase):
             calls.clear()
             self.run_main()
         self.assertEqual(calls[0], OTHER_PROJECT)
+
+    def test_each_project_is_registered_before_the_next_one_runs(self):
+        events = []
+
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            events.append(("run", names[0]))
+            return self.envelope
+
+        def kv(path, body):
+            events.append(("kv", body["scope"]["cluster"] if "scope" in body else body["findings"][0]["cluster"]))
+            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]]}
+
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: f"{PROJECT},{OTHER_PROJECT}"}), mock.patch.object(watch, "run_report", side_effect=run_report), mock.patch.object(review, "kv_request", side_effect=kv):
+            self.run_main()
+        runs = [i for i, e in enumerate(events) if e[0] == "run"]
+        self.assertEqual(len(runs), 2)
+        self.assertTrue(any(e[0] == "kv" for e in events[runs[0] : runs[1]]), events)
 
     def test_no_project_is_a_failure_line(self):
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: ""}), mock.patch.object(watch, "projects", return_value=[]):

@@ -714,7 +714,7 @@ def _register_one(conn: sqlite3.Connection, finding: dict) -> str:
 
 
 def _downgrade_absent(
-    conn: sqlite3.Connection, project: str, cluster: str, seen: set[str], check_prefix: str = ""
+    conn: sqlite3.Connection, project: str, cluster: str, seen: set[str], check_prefix: str = "", source: str = ""
 ) -> int:
     """§5.2's reciprocal case: absence lowers confidence, it does not resolve.
 
@@ -722,8 +722,10 @@ def _downgrade_absent(
     it: a recurring sweep that reads one family of checks (the weekly upgrade
     readiness review, `upgrade-`) is complete for that family alone, and must
     not lower the confidence of an inventory or event-watcher row on the same
-    cluster that it never looked at. Empty means every row on the cluster, the
-    onboarding sweep's claim.
+    cluster that it never looked at. `source` narrows it the same way to the
+    rows one source wrote, which is what a batch without a prefix claims: the
+    onboarding sweep re-run by hand is complete for the inventory's rows, not
+    for the weekly review's. Both empty means every row on the cluster.
 
     A sweep that died halfway produces the same silence as a fleet that got
     healthier, so a row the run did not re-report is re-ranked down at the
@@ -741,15 +743,17 @@ def _downgrade_absent(
     # row, which says nothing about whether the problem is still there. Exempting
     # it would make the rows the nudge names the only ones absence never reaches.
     rows = conn.execute(
-        "SELECT id, rubric, check_slug FROM findings WHERE project = ? COLLATE NOCASE "
+        "SELECT id, rubric, check_slug, source FROM findings WHERE project = ? COLLATE NOCASE "
         "AND cluster = ? COLLATE NOCASE AND state IN ('queued', 'surfaced')",
         (project, cluster),
     ).fetchall()
     downgraded = 0
-    for finding_id, raw, check_slug in rows:
+    for finding_id, raw, check_slug, row_source in rows:
         if finding_id in seen:
             continue
         if check_prefix and not str(check_slug or "").startswith(check_prefix):
+            continue
+        if source and str(row_source or "") != source:
             continue
         try:
             rubric = validate_rubric(json.loads(raw))
@@ -778,7 +782,10 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
 
     An empty batch is a run that found nothing: refused without a complete
     `scope` (there is nothing to do), accepted with one, where the point is
-    that every row the claim covers was absent (§5.2).
+    that every row the claim covers was absent (§5.2). A complete claim
+    reaches the rows its `check_prefix` names, else the rows of the batch's
+    own `source` (or `scope.source` for an empty batch), else every row on
+    the cluster.
     """
     if not isinstance(findings, list):
         raise FindingError("findings must be a list")
@@ -802,7 +809,9 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
         project = _text(scope.get("project"), "scope.project")
         cluster = _text(scope.get("cluster"), "scope.cluster")
         check_prefix = _text(scope.get("check_prefix"), "scope.check_prefix", required=False)
-        downgraded = _downgrade_absent(conn, project, cluster, seen, check_prefix)
+        sources = {str(raw.get("source") or "") for raw in findings if isinstance(raw, dict)}
+        source = _text(scope.get("source"), "scope.source", required=False) or (next(iter(sources)) if len(sources) == 1 else "")
+        downgraded = _downgrade_absent(conn, project, cluster, seen, check_prefix, source)
 
     return {"results": results, "downgraded": downgraded}
 

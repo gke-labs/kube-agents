@@ -457,6 +457,22 @@ class TestRegistration(QueueTestCase):
         self.assertEqual(fq.get_finding(self.conn, inventory_id)["rubric"]["C"], 1.0)
         self.assertIsNone(fq.get_finding(self.conn, inventory_id)["absent_since"])
 
+    def test_a_complete_claim_without_a_prefix_reaches_its_own_source_only(self):
+        # The onboarding sweep re-run by hand sends no prefix; its claim is
+        # complete for the inventory's rows and must not touch the weekly
+        # review's audit rows on the same cluster.
+        upgrade = sample(source="audit", check="upgrade-pool-skew", namespace="", object="default-pool")
+        stale = sample(object="Deployment/ledger")
+        self.register(sample(), stale, upgrade)
+        upgrade_id = fq.validate_finding(upgrade)["id"]
+        stale_id = fq.validate_finding(stale)["id"]
+
+        result = self.register(sample(), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True})
+
+        self.assertEqual(result["downgraded"], 1)
+        self.assertEqual(fq.get_finding(self.conn, stale_id)["rubric"]["C"], 0.6)
+        self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 1.0)
+
     def test_an_empty_batch_needs_a_complete_scope(self):
         with self.assertRaises(fq.FindingError):
             self.register()
