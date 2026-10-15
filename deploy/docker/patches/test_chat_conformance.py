@@ -4,7 +4,9 @@ Run: python3 -m pytest deploy/docker/patches/test_chat_conformance.py
 
 The cases are ``tests/conformance/chat/`` (``agents/platform/scripts/chat_cases.py``
 reads them). A case with one input runs through the composer that lays it out
-(``agents/platform/scripts/chat_message.py``, or ``slack_ux_incident.chat_triage``).
+(``agents/platform/scripts/chat_message.py``, ``slack_ux_incident.chat_triage``, or the
+fleet-audit and first-inventory cards, ``slack_audit_report.chat_from_issue`` and
+``agents/chat/scripts/inventory_presenter.chat``).
 A case that is a sequence of card events runs through the gateway patches that
 send it, with a stand-in for the chat.notify adapter recording each send:
 ``kanban_progress_lines.deliver`` and ``slack_ux_status`` for the plan (the fold
@@ -29,13 +31,17 @@ from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 SCRIPTS = HERE.parents[2] / "agents" / "platform" / "scripts"
+CHAT_SCRIPTS = HERE.parents[2] / "agents" / "chat" / "scripts"
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(CHAT_SCRIPTS))
 
 import chat_cases
 import chat_message
+import inventory_presenter
 import kanban_notifier
 import kanban_progress_lines
+import slack_audit_report
 import slack_ux_failure
 import slack_ux_incident
 import slack_ux_moments
@@ -149,6 +155,17 @@ class SharedCasesTest(unittest.TestCase):
         """The outputs the emitter gives for ``case``, one per expected entry, as the case spells them."""
         self.reset()
         given = case["input"]
+        if "ledger_issue" in given:
+            # The cron relay's fleet-audit card, on the home-channel chat.notify route.
+            ref = slack_audit_report.ledger_ref(given["relayed"])
+            built = slack_audit_report.chat_from_issue(given["ledger_issue"], ref, given["relayed"])
+            return [_out(built and built[0], NOTIFY)]
+        if "failed_audit_report" in given:
+            built = slack_audit_report.failed_chat(given["failed_audit_report"])
+            return [_out(built and built[0], NOTIFY)]
+        if "inventory_report" in given:
+            built = inventory_presenter.chat(given["inventory_report"])
+            return [_out(built and built[0], NOTIFY)]
         if "markdown" in given:
             return [_out(chat_message.answer_message(given["markdown"]), RESULT)]
         if "reason" in given:

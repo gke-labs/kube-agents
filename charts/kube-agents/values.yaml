@@ -1071,8 +1071,8 @@ platformAgent:
     #
     # forges:
     #   - name: github            # what repositories[].forge refers to
-    #     provider: github        # github or gitlab; default github
-    #     host: ""                # empty is the provider's default (github.com)
+    #     provider: github        # github or gitlab; required when host is not github.com
+    #     host: ""                # empty is github.com; or a GitHub Enterprise Server hostname
     #     namespace: my-org       # default owner for this forge's repositories
     #     credentialsRef:         # Secret for providers that need one; ignored
     #       name: ""              # for github, which uses the GitHub App
@@ -1082,9 +1082,10 @@ platformAgent:
     #     namespace: my-group     # group path; bounds which projects the agent may reach
     #     credentialsRef:         # required for gitlab: a Secret holding an access
     #       name: gitlab-token    # token under the key `token`, created out of band
-    #     caBundleRef:            # optional, self-managed gitlab only: a Secret holding
-    #       name: gitlab-forge-ca # the PEM CA that signed the instance's certificate;
-    #       key: ca.crt           # trusted for this host only, created out of band
+    #     caBundleRef:            # optional, self-managed GitLab or GitHub Enterprise Server only: a Secret holding
+    #       name: gitlab-forge-ca # the PEM CA that signed the instance's certificate, created out of band;
+    #       key: ca.crt           # the broker trusts it for this host only. On a GitHub Enterprise Server
+    #                             # forge, the token minter also gets it and trusts it for all of its calls
     forges: []
     # repositories:
     #   - forge: github

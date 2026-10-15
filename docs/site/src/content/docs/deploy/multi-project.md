@@ -286,7 +286,11 @@ On an install you manage with Helm or `kubectl` directly:
    JSON patch `remove` operation on its index (keeping `spec.scope: {projects: []}`
    if it was the last additional project) so the reconciler retires its Cluster
    Agent profiles over two clean runs.
-2. If you onboarded clusters in chat, add each one to
+2. If you onboarded clusters in chat, exclude each one: on a Helm release, set
+   the chart value `platformAgent.scope.exclude.clusters` and run
+   `helm upgrade`, because the chart renders the field and a hand edit of the
+   CR is overwritten at the next upgrade; on a hand-applied `PlatformAgent`,
+   add it to
    [`spec.scope.exclude.clusters`](/kube-agents/operator/platformagent-crd/#specscope)
    (`projectId`, `location`, `clusterName`). A profile the scope never
    produced is kept (listed under `unmanaged` in `fleet_scope.json`), so

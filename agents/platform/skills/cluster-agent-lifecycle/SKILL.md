@@ -1,6 +1,6 @@
 ---
 name: cluster-agent-lifecycle
-description: Create, delegate to, and tear down per-cluster Cluster Agent Hermes profiles. Use whenever a GKE cluster is onboarded or deleted, or whenever a single-cluster runtime debugging/operations task should be delegated to that cluster's Cluster Agent.
+description: Create, delegate to, and tear down per-cluster Cluster Agent Hermes profiles. Use whenever a GKE cluster is onboarded, deleted or taken out of management, or whenever a single-cluster runtime debugging/operations task should be delegated to that cluster's Cluster Agent.
 ---
 
 # Cluster Agent Lifecycle Skill
@@ -66,6 +66,8 @@ python3 /opt/data/scripts/cluster_agent_profile.py delete \
 ```
 
 This deregisters the profile and removes its home directory. Do not delete a profile while its cluster still exists.
+
+To stop managing a cluster that still exists, exclude it instead; the reconcile below recreates a deleted profile for every in-scope cluster. Follow `manage-cluster`, "Stop managing": the exclusion is declared where the install's scope is declared (`SCOPE_EXCLUDE_CLUSTERS` in `install.env` on an install made with `install.sh`, applied with `./upgrade.sh --upgrade-mode=full`), and that section says how to tell the install shapes apart.
 
 ## Automatic reconciliation (create and prune)
 

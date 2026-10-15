@@ -84,6 +84,10 @@ const (
 	// ones. gitops_workspace.py names the same two keys on the agent side.
 	gitopsStateManagedReposKey = "managed_repos"
 	gitopsStateContextReposKey = "context_repos"
+	// gitopsStateGitHubHostKey is the install's GitHub host, written only when
+	// it is a GitHub Enterprise Server host. The agent reads it, with
+	// github.com as the default, so a github.com install carries no key.
+	gitopsStateGitHubHostKey = "github_host"
 	// minterConfigMapName is the minty rule ConfigMap the chart and the kustomize
 	// template render; minterBaseTemplateKey is the policy every rendered key is
 	// derived from.
@@ -1385,6 +1389,34 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 			updated = true
 		}
 	}
+	// The GitHub host key is the operator's alone: written from the
+	// declaration, and removed when the declaration names github.com. A
+	// declaration that does not resolve leaves it as it is, as it leaves the
+	// lists.
+	if wantHost, resolved := declaredGitHubHost(agent); resolved {
+		haveHost, present := found.Data[gitopsStateGitHubHostKey]
+		if (haveHost != wantHost && wantHost != "") || (wantHost == "" && present) {
+			previous, next := haveHost, wantHost
+			if previous == "" {
+				previous = agentv1alpha1.DefaultGitHubHost
+			}
+			if next == "" {
+				next = agentv1alpha1.DefaultGitHubHost
+			}
+			r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonGitHubHostChanged, fmt.Sprintf(
+				"the install's GitHub host changed from %s to %s; the first GitHub forge declared that can be served decides it, and repositories registered on %s are no longer served",
+				previous, next, previous))
+			if found.Data == nil {
+				found.Data = map[string]string{}
+			}
+			if wantHost == "" {
+				delete(found.Data, gitopsStateGitHubHostKey)
+			} else {
+				found.Data[gitopsStateGitHubHostKey] = wantHost
+			}
+			updated = true
+		}
+	}
 	if updated {
 		if err := r.Update(ctx, found); err != nil {
 			return err
@@ -1392,6 +1424,34 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 	}
 
 	return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
+}
+
+// conditionReasonGitHubHostChanged is the Event reason for a reconcile that
+// moves the install's GitHub host.
+const conditionReasonGitHubHostChanged = "GitHubHostChanged"
+
+// declaredGitHubHost is the GitHub host the gitops-state ConfigMap carries:
+// "" for github.com, so a github.com install carries no key, and the GitHub
+// Enterprise Server host otherwise. resolved is false when the declaration
+// does not resolve, and the key is then left as it is.
+func declaredGitHubHost(agent *agentv1alpha1.PlatformAgent) (host string, resolved bool) {
+	if agent.Spec.Integration == nil {
+		return "", true
+	}
+	ri, err := agent.Spec.Integration.ResolveGit()
+	if err != nil {
+		return "", false
+	}
+	// A declared GitHub forge that validation refuses holds the key as it
+	// is, as a refusal holds the minter's organisation and the egress: a typo
+	// in the instance's forge must not move the install back to github.com.
+	if ri.GitHubForgeRefused() {
+		return "", false
+	}
+	if h := ri.GitHubHost(); h != agentv1alpha1.DefaultGitHubHost {
+		return h, true
+	}
+	return "", true
 }
 
 // mergeRepoEntries puts front before a repository list's JSON and back after
@@ -1608,7 +1668,13 @@ func renderReadOnlyPolicy(baseTemplate string, repos []string) (string, bool) {
 // never by value: a hand-written clone URL can carry a credential, and the
 // names reach the operator's log and the CR's status. The parser's errors
 // quote the value too, so they are not logged either.
-func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) (bare, unreadable []string, err error) {
+//
+// githubHost is the install's GitHub host, which the minter mints for:
+// github.com, or a GitHub Enterprise Server host. On a GitHub Enterprise
+// Server install, a GitHub entry that names github.com is another host's
+// repository, which the minter cannot mint for and the broker does not serve:
+// it is skipped, not unreadable, so it does not hold pruning.
+func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, githubHost, listName string) (bare, unreadable []string, err error) {
 	reposStr = strings.TrimSpace(reposStr)
 	if reposStr == "" {
 		return nil, nil, nil
@@ -1627,9 +1693,33 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 			continue
 		}
 		fullRepo := entry.URL
-		slug, err := agentv1alpha1.CleanRepoSlugWithOrg(fullRepo, primaryOrg)
-		if agentSpelling, ok := agentURLSpelling(fullRepo); err != nil && ok {
-			slug, err = agentv1alpha1.CleanRepoSlugWithOrg(agentSpelling, primaryOrg)
+		// On a GitHub Enterprise Server install a bare owner/name names no
+		// host, and the agent skips it (gitops_workspace), so the minter does
+		// too: a write policy for a repository the agent never serves would
+		// widen the token for nothing.
+		if githubHost != agentv1alpha1.DefaultGitHubHost {
+			// A port is skipped too: the agent reads a GitHub Enterprise
+			// Server entry only without one (gitops_workspace._names_a_port).
+			if agentEntryNamesAPort(fullRepo) {
+				logger.Info("skipping a GitHub repository entry with a port in minter policy sync; the agent does not serve it",
+					"list", listName, "index", positions[i], "githubHost", githubHost)
+				continue
+			}
+			if ref, perr := agentv1alpha1.ParseRepoRef(fullRepo); perr == nil && ref.Host == "" {
+				logger.Info("skipping a GitHub repository entry with no host in minter policy sync; on a GitHub Enterprise Server install an entry names its host",
+					"list", listName, "index", positions[i], "githubHost", githubHost)
+				continue
+			}
+		}
+		slug, err := agentv1alpha1.GitHubRepoSlugOnHost(fullRepo, primaryOrg, githubHost)
+		agentSpelling, spelled := agentURLSpelling(fullRepo)
+		if err != nil && spelled {
+			slug, err = agentv1alpha1.GitHubRepoSlugOnHost(agentSpelling, primaryOrg, githubHost)
+		}
+		if err != nil && githubHost != agentv1alpha1.DefaultGitHubHost && onGitHubDotCom(fullRepo, agentSpelling, spelled) {
+			logger.Info("skipping a github.com repository entry in minter policy sync; the minter mints for the install's GitHub host",
+				"list", listName, "index", positions[i], "githubHost", githubHost)
+			continue
 		}
 		if err != nil {
 			entryName := fmt.Sprintf("%s[%d]", listName, positions[i])
@@ -1664,6 +1754,31 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 	}
 	sort.Strings(bare)
 	return bare, unreadable, nil
+}
+
+// agentPortRegex is gitops_workspace._PORT_RE: a URL, or a bare host:port/path,
+// that names a port.
+var agentPortRegex = regexp.MustCompile(`(?i)^(?:[a-z][a-z0-9+.-]*://)?(?:[^/@]+@)?[^/:]+:\d+(?:/|$)`)
+
+// agentEntryNamesAPort reports whether a registered URL names a port, as the
+// agent reads it.
+func agentEntryNamesAPort(value string) bool {
+	return agentPortRegex.MatchString(strings.TrimSpace(value))
+}
+
+// onGitHubDotCom reports whether a GitHub entry that the install's GitHub
+// Enterprise Server host refused reads as a github.com repository, as written
+// or as the agent spells it. A bare name never reaches it: it resolves onto
+// the declared host.
+func onGitHubDotCom(fullRepo, agentSpelling string, spelled bool) bool {
+	if _, err := agentv1alpha1.CleanRepoSlugWithOrg(fullRepo, ""); err == nil {
+		return true
+	}
+	if !spelled {
+		return false
+	}
+	_, err := agentv1alpha1.CleanRepoSlugWithOrg(agentSpelling, "")
+	return err == nil
 }
 
 // agentURLSchemeRegex is the scheme urlsplit recognises before `://`.
@@ -1719,6 +1834,20 @@ func agentURLSpelling(value string) (string, bool) {
 	return "https://" + host + "/" + path, true
 }
 
+// minterGitHubHost is the GitHub host the minter mints for: the declaration's
+// one GitHub host, or github.com when nothing declares one or the declaration
+// does not resolve.
+func minterGitHubHost(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Integration == nil {
+		return agentv1alpha1.DefaultGitHubHost
+	}
+	resolved, err := agent.Spec.Integration.ResolveGit()
+	if err != nil || resolved == nil {
+		return agentv1alpha1.DefaultGitHubHost
+	}
+	return resolved.GitHubHost()
+}
+
 // minterPrimaryOrg is the organisation the minter policies are scoped to, or,
 // in skip, why the sync must leave them as they were.
 func minterPrimaryOrg(agent *agentv1alpha1.PlatformAgent) (primaryOrg, skip string) {
@@ -1764,8 +1893,9 @@ func (r *PlatformAgentReconciler) minterHeldEntries(ctx context.Context, agent *
 	if skip != "" {
 		return nil
 	}
-	_, managed, errManaged := minterBareRepos(logr.Discard(), managedReposStr, primaryOrg, gitopsStateManagedReposKey)
-	_, contextHeld, errContext := minterBareRepos(logr.Discard(), contextReposStr, primaryOrg, gitopsStateContextReposKey)
+	githubHost := minterGitHubHost(agent)
+	_, managed, errManaged := minterBareRepos(logr.Discard(), managedReposStr, primaryOrg, githubHost, gitopsStateManagedReposKey)
+	_, contextHeld, errContext := minterBareRepos(logr.Discard(), contextReposStr, primaryOrg, githubHost, gitopsStateContextReposKey)
 	if errManaged != nil || errContext != nil {
 		return nil
 	}
@@ -1851,12 +1981,13 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 	// unparseable one skips the sync and leaves the ConfigMap as it is, as the
 	// managed-only sync always did. Treating it as empty would prune every
 	// tracked policy and break every write until the JSON was repaired.
-	allBareRepos, unreadableManaged, err := minterBareRepos(logger, managedReposStr, primaryOrg, gitopsStateManagedReposKey)
+	githubHost := minterGitHubHost(agent)
+	allBareRepos, unreadableManaged, err := minterBareRepos(logger, managedReposStr, primaryOrg, githubHost, gitopsStateManagedReposKey)
 	if err != nil {
 		logger.Error(err, "skipping minter policy sync due to unparseable repository list in ConfigMap", "list", gitopsStateManagedReposKey)
 		return nil
 	}
-	contextCandidates, unreadableContext, err := minterBareRepos(logger, contextReposStr, primaryOrg, gitopsStateContextReposKey)
+	contextCandidates, unreadableContext, err := minterBareRepos(logger, contextReposStr, primaryOrg, githubHost, gitopsStateContextReposKey)
 	if err != nil {
 		logger.Error(err, "skipping minter policy sync due to unparseable repository list in ConfigMap", "list", gitopsStateContextReposKey)
 		return nil
