@@ -536,9 +536,10 @@ RETIRED_IMAGE_HOST_NOTES = {
 REMOVED_APIS_NAME = "removed_apis.json"
 REMOVED_APIS_UNREADABLE = "{name} could not be read beside {module}: {error}"
 REMOVED_APIS_SHAPE = "not an object with a list under {key!r}"
-# Each row as `api_deprecation_scan.load_table` requires it, so the two readers of one file
-# agree on what a readable table is: a row of another shape would otherwise drop out of the
-# lookup and read as a removal with no replacement.
+# Each row holds the three fields this reader uses as non-empty strings, a subset of what
+# `api_deprecation_scan.load_table` requires of the same file (it also reads `as_of` and
+# refuses a duplicate): a row of another shape would otherwise drop out of the lookup and
+# read as a removal with no replacement.
 REMOVED_APIS_ROW_SHAPE = "row {index} under {key!r} is not an object with non-empty strings under {fields}"
 REMOVED_APIS_ROW_FIELDS = ("api_version", "kind", "replacement")
 NO_LOADER_DATA = "the module's loader serves no data"

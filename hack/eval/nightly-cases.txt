@@ -360,16 +360,16 @@
 # the 200s default (a read-only chat turn that runs the readiness report; the
 # report alone measured 62s on the dev install). It is the entry after
 # manage-cluster-exclusion-installer-route-probe below. Counted over every
-# entry below on 2026-10-15, after the merge of `6377575a`: seventy-eight
-# cases (234 units) here, of a ninety-two-case, 276-unit matrix with the
+# entry below on 2026-10-15, after the rebase onto `02f251ff`: seventy-nine
+# cases (237 units) here, of a ninety-three-case, 279-unit matrix with the
 # presubmit file's fourteen.
 # No stack, so the infra lock is untouched.
 # 2026-10-09 adds stop-on-permission-refusal: one case, three units at a
 # 1200s hint (one front-door turn and one delegated card; noop, no infra
 # lock; 13-28 minutes a repetition on the dev install while main runs the
 # worker to its retries). It is the last entry below. Counted from the
-# lists on 2026-10-15, after the merge of `6377575a`: seventy-eight cases
-# (234 units) here, of a ninety-two-case, 276-unit matrix, the paragraphs
+# lists on 2026-10-15, after the rebase onto `02f251ff`: seventy-nine cases
+# (237 units) here, of a ninety-three-case, 279-unit matrix, the paragraphs
 # above included.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────

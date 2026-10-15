@@ -616,7 +616,8 @@ class ExtraRulesTest(unittest.TestCase):
         self.assertEqual(set(audit_log.summaries(ctx)["removed"]), set(audit_log.SUMMARY_KEYS))
         # A defect already in the cache before a rule runs is not that rule's: a list under the
         # key, or the cache key holding None, which the fold replaces with one dict before the
-        # first rule (the snapshot tells it apart from no key at all, and puts back what it saw).
+        # first rule, so the key holds that dict afterwards (the snapshot tells a key holding
+        # None apart from no key at all).
         ctx = context()
         ctx[shared.CONTEXT_CACHE][audit_log.CACHE_KEY] = [1]
         folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, ctx, rules=[fine])
