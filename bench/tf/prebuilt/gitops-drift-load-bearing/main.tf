@@ -634,7 +634,7 @@ resource "null_resource" "load_bearing_change" {
       # EVAL_ALERT_DAILY_LIMIT_DRIFT=0 and _alert_daily_limit treats 0 as off,
       # so an eval install has no drift ceiling at all (the sibling case
       # gitops-drift-noise-filtered-triage carries the same note). It bites on
-      # a DEV install carrying the shipped default of 5, where this case shares
+      # a DEV install carrying the shipped default, where this case shares
       # the bucket with every other drift case -- which is the install the
       # eval-driven loop runs against, and the one the message below is for.
       if [ "$inject_status" = "suppressed" ]; then
