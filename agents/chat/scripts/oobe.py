@@ -34,9 +34,9 @@ run``: that CLI runs the whole job synchronously in the calling process.
 ``.oobe_audits_fired`` records each one before it is marked, and the mark awaiting
 its run, so a run killed partway marks nothing twice: marking an audit due again after it has run
 starts a second full run. An audit that has completed a run since the sweep was filed (a
-scheduled one) is recorded as adopted and not marked: the install already has that run. With no
-GitHub repository the stage records the skip and marks none; the audits themselves run with no
-forge on their own schedules (docs/designs/oobe.md §4.4).
+scheduled one) is recorded as adopted and not marked: the install already has that run. The stage
+reads no repository list: with no GitOps repository each audit runs without a forge
+(docs/designs/oobe.md §4.4).
 
 ``trigger_job`` also sets a job's ``enabled`` back to true, so an audit an operator
 has disabled or paused is left alone rather than started.
@@ -147,9 +147,6 @@ CURRENT_MARKED_AT = "marked_at"
 STATE_SKIPPED = "skipped"
 STATE_REASON = "reason"
 STATE_AT = "at"
-# What the audits publish to is the GitHub entries of managed_repos (gitops_workspace); a repository
-# on another forge is not one they can use.
-SKIP_NO_REPOSITORY = "no GitHub repository in managed_repos for the audits to publish to"
 # Past NEW_INSTALL_SECONDS the stage cannot tell an install that onboarded before this job existed
 # from a new one whose start checks failed all day, so the reason says only what it knows.
 SKIP_NOT_NEW = "the onboarding sweep was filed more than a day before the stage could start"
@@ -282,15 +279,6 @@ def scan_settled(data_dir: Path, now: float) -> bool:
         )
         return True
     return False
-
-
-def managed_repositories() -> list[str]:
-    """The GitOps repositories audits publish to. Raises when the list cannot be read."""
-    import gitops_workspace  # beside this script in the pod
-
-    # On a GitHub Enterprise Server install the repository is named with its
-    # host; the bare-slug reader would answer none.
-    return gitops_workspace.get_managed_github_repo_names()
 
 
 def trigger(job_id: str, data_dir: Path) -> bool:
@@ -605,15 +593,9 @@ def first_run_audits(data_dir: Path, now: float) -> None:
         if filed is not None and now - filed[1] >= NEW_INSTALL_SECONDS:
             skip(data_dir, SKIP_NOT_NEW if scan_finished(data_dir, filed[0]) else SKIP_UNSETTLED, now)
             return
+        # No repository check: with none registered each audit keeps its report in the report store
+        # and posts a summary (the fleet-audit skill's "No forge configured").
         if not scan_settled(data_dir, now):
-            return
-        try:
-            repositories = managed_repositories()
-        except Exception as e:  # noqa: BLE001 - an unreadable list is retried, not taken as empty
-            _log(f"cannot read the managed repositories: {e}")
-            return
-        if not repositories:
-            skip(data_dir, SKIP_NO_REPOSITORY, now)
             return
     advance_chain(data_dir, state, now, since=filed[1] if filed is not None else None)
 

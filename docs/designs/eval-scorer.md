@@ -1456,7 +1456,7 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   **The table above is serial arithmetic, and the loop is no longer serial.** `hack/ci-eval-pr.sh`
   now runs the matrix as a bounded parallel fan-out of (task, repetition) units
   (`EVAL_TASK_PARALLELISM`, default 4, the presubmit's; the nightly periodic exports 6; tofu-stack
-  units and repetitions of one task still serialize
+  units that take the infra lock and repetitions of one task still serialize
   among themselves). Wall clock is therefore fixed cost + roughly invocations ÷ realised
   parallelism, where "realised" is capped by the leased project's model quota — measured on a
   quota-constrained dev install: 16 units serial 3240s, parallelism 4 in 1022s with six units lost
