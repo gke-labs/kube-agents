@@ -935,3 +935,12 @@
 # cases, so a busy board pushes this case's card wait toward its 1800s
 # ceiling. The dated paragraph above carries the budget arithmetic.
 ./tasks/gitops-drift-noise-filtered-triage/task.yaml
+
+# A question about a cluster that does not exist stops its card with
+# kanban_block(kind="capability"), which Slack draws as a failure (❌, red
+# row), rather than completing it with "does not exist" as an answer
+# (agents/platform/SOUL.md). deployer: noop, read-only, one card and no
+# fixture: three units at the 200s default, ~10 serial minutes, off the infra
+# lock. Counted from the lists: seventy-five cases (225 units) here, of an
+# eighty-nine-case, 267-unit matrix with the presubmit file's fourteen.
+./tasks/not-found-target-stops-as-failure/task.yaml

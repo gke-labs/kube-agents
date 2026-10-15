@@ -446,6 +446,24 @@ class ResultLineTest(unittest.TestCase):
         self.assertEqual(result_line("gave_up", {"summary": "x"}), "")
 
 
+class SettlesAsTest(unittest.TestCase):
+    def test_a_hard_wall_block_settles_as_a_give_up(self):
+        self.assertEqual(kanban_progress_lines.settles_as("blocked", {"kind": "capability"}), "gave_up")
+
+    def test_every_other_event_settles_as_itself(self):
+        for kind, payload in (
+            ("blocked", {"kind": "needs_input"}),
+            ("blocked", {"kind": "transient"}),
+            ("blocked", {}),
+            ("blocked", None),
+            ("blocked", "capability"),
+            ("completed", {"kind": "capability"}),
+            ("gave_up", {}),
+        ):
+            with self.subTest(kind=kind, payload=payload):
+                self.assertEqual(kanban_progress_lines.settles_as(kind, payload), kind)
+
+
 class RenderTest(unittest.TestCase):
     HEADER = "[default] @platform "
 
@@ -876,6 +894,25 @@ class SlackQuietTerminalTest(unittest.IsolatedAsyncioTestCase):
             held[sub_key(SLACK_SUB)], {3: ("gave_up", SLACK_SUB["chat_id"], "✖ gave up", {})},
         )
 
+    async def test_a_hard_wall_block_is_held_and_settles_the_ask_as_a_give_up(self):
+        # A card whose target does not exist: the wake explains it, and the ask gets ❌.
+        adapter, watcher = _Adapter(), SimpleNamespace()
+        block = SimpleNamespace(id=3, kind="blocked", payload={"kind": "capability", "reason": "No cluster named seeded-z."})
+        result = await deliver(watcher, adapter, SLACK_SUB, "blocked", block, "⏸ blocked", None, HEADER)
+        self.assertIsNone(result)
+        self.assertEqual(adapter.sent, [])
+        self.assertEqual(self.calls, [("t_e0c1", "gave_up")])
+        held = getattr(watcher, kanban_notifier.HELD_ATTR)
+        self.assertEqual(held[sub_key(SLACK_SUB)], {3: ("blocked", SLACK_SUB["chat_id"], "⏸ blocked", {})})
+
+    async def test_any_other_block_still_settles_as_a_block(self):
+        for payload in ({"kind": "needs_input"}, {"kind": "transient"}, {}, None):
+            with self.subTest(payload=payload):
+                self.calls.clear()
+                block = SimpleNamespace(id=3, kind="blocked", payload=payload)
+                await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "blocked", block, "⏸ blocked", None, HEADER)
+                self.assertEqual(self.calls, [("t_e0c1", "blocked")])
+
     async def test_a_line_that_cannot_be_held_is_posted(self):
         adapter = _Adapter()
         with mock.patch("kanban_notifier.hold_explained", side_effect=RuntimeError("boom")):
@@ -1191,6 +1228,15 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "completed", completed, "Done.", None, HEADER)
         self.assertEqual(self.results, ["seeded-a · 1.33.4 = default"])
 
+    async def test_a_hard_wall_block_settles_its_row_as_a_give_up(self):
+        # The row goes red, as a give-up's does; a question keeps the blocked row.
+        for payload, settled in (({"kind": "capability"}, "gave_up"), ({"kind": "needs_input"}, "blocked")):
+            with self.subTest(payload=payload):
+                self.settled.clear()
+                block = SimpleNamespace(id=3, kind="blocked", payload=payload)
+                await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "blocked", block, "⏸ blocked", None, HEADER)
+                self.assertEqual(self.settled, [("t_e0c1", settled)])
+
     async def test_a_terminal_event_names_the_card_for_a_row_it_opens(self):
         # A card that sent no note gets its row from the settle, led by its title.
         completed = SimpleNamespace(id=3, kind="completed", payload={"summary": "1.33.4 = default"})
@@ -1418,6 +1464,14 @@ class FanOutOpenTest(unittest.IsolatedAsyncioTestCase):
         self._set(stop, "unblocked")
         self._set(stop, "blocked")
         self.assertTrue(await kanban_progress_lines._folds(SLACK_SUB, None))
+
+    async def test_a_creator_stopped_on_a_hard_wall_does_not(self):
+        # Its worker will not run again to carry the children's reports up, as with a give-up.
+        self._set("UPDATE tasks SET status = 'blocked' WHERE id = 't_parent'")
+        self._set(
+            "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_parent', 'blocked', ?)", '{"kind": "capability"}',
+        )
+        self.assertFalse(await kanban_progress_lines._folds(SLACK_SUB, None))
 
     async def test_a_creators_only_child_does_not(self):
         # A single-cluster delegation: the Cluster Agent's whole report is the answer's evidence.

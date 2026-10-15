@@ -176,6 +176,7 @@ ADDED_AFTER_THE_MOVE = [
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
     "session-cluster-question-wake-answers-once",  # a session's delegated question ends in a wake's answer
     "gitops-drift-noise-filtered-triage",  # the drift detector's principal classifier, #2739's fixture
+    "not-found-target-stops-as-failure",  # a missing target stops its card on a hard wall, mock 06
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
