@@ -19,7 +19,7 @@ YAML comments so none of this ships in the rendered manifest.
 apiVersion: monitoring.googleapis.com/v1
 kind: PodMonitoring
 metadata:
-  name: {{ .Values.platformAgent.name }}-gateway-monitoring
+  name: {{ printf "%s-gateway-monitoring" .Values.platformAgent.name | trunc 63 | trimSuffix "-" }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -47,7 +47,7 @@ runs on every replica and keeps the selector above.
 apiVersion: monitoring.googleapis.com/v1
 kind: PodMonitoring
 metadata:
-  name: {{ .Values.platformAgent.name }}-gateway-chat-monitoring
+  name: {{ printf "%s-gateway-chat-monitoring" .Values.platformAgent.name | trunc 63 | trimSuffix "-" }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -73,7 +73,7 @@ the credentialed listener admits no collector.
 apiVersion: monitoring.googleapis.com/v1
 kind: PodMonitoring
 metadata:
-  name: {{ .Values.platformAgent.name }}-credential-proxy-monitoring
+  name: {{ printf "%s-credential-proxy-monitoring" .Values.platformAgent.name | trunc 63 | trimSuffix "-" }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -98,7 +98,7 @@ is the metrics-only one; the doors' ports admit no collector.
 apiVersion: monitoring.googleapis.com/v1
 kind: PodMonitoring
 metadata:
-  name: {{ .Values.platformAgent.name }}-a2a-gateway-monitoring
+  name: {{ printf "%s-a2a-gateway-monitoring" .Values.platformAgent.name | trunc 63 | trimSuffix "-" }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
