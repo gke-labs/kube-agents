@@ -7774,6 +7774,7 @@ _GROUP3 = {
             "seeded-a: next minor none; removed apis still called: none; deprecated but still served: v1 endpoints",
                     "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: endpoints v1 api",
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: endpoints api v1",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: endpoints (core/v1) api",
 ],
         [
             "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, v1",
@@ -7926,6 +7927,7 @@ _GROUP5 = {
             "- `seeded-a/seeded-shapes/stale-kubectl-client`: client kubectl 1.29; server 1.34; within supported skew: no.",
             "* **seeded-a/seeded-shapes/stale-kubectl-client**: client kubectl v1.29.0; server 1.34.1; within supported skew: no",
                     "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (v1.29.0, image registry.k8s.io/kubectl:v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
 ],
         [
             "seeded-a/seeded-shapes/stale-kubectl-client-apiserver-egress: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
@@ -7934,7 +7936,8 @@ _GROUP5 = {
             "seeded-a/seeded-shapes/stale-kubectl-client: client helm v3.14.0; server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: yes",
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no (but still succeeds)",
-        ],
+                    "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (v1.29.1); server v1.34.1-gke.1234000; within supported skew: no",
+],
         "Every client in the seeded clusters is within one minor of its control plane; the kubectl CronJob succeeds on every run.",
     ),
     "upgrades-cgroup-blind-runtime-named": (
@@ -7986,6 +7989,8 @@ _GROUP5 = {
                     "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d:ro; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /opt/cni/bin:/host/opt/cni/bin, /etc/cni/net.d:/host/etc/cni/net.d:ro; coupled to the node image: yes",
             "seeded-a/seeded-shapes/cni-shaped-agent: host network: true; host paths /etc/cni/net.d; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: hostNetwork: true; host paths /etc/cni/net.d; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host-network: yes; host paths /etc/cni/net.d; coupled to the node image: yes",
 ],
         [
             "seeded-a/seeded-shapes/cni-shaped-agent-legacy: host network: yes; host paths /etc/cni/net.d; coupled to the node image: yes",
@@ -8009,6 +8014,7 @@ _GROUP5 = {
             "- `seeded-a/seeded-shapes/cuda-pinned-trainer`: accelerator `nvidia-l4`; CUDA 12.2.0; suspended: yes.",
             "**seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: yes**",
                     "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator cloud.google.com/gke-accelerator=nvidia-l4; cuda 12.2.0-base-ubuntu22.04; suspended: yes",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04; suspended: yes",
 ],
         [
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: false",
@@ -8017,6 +8023,7 @@ _GROUP5 = {
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: no",
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: yes (not running)",
                     "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.4.1-base-ubuntu22.04; suspended: yes",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda nvidia/cuda:12.4.1-base-ubuntu22.04; suspended: yes",
 ],
         "No running workload on the seeded clusters requests a GPU; there is nothing to check against the target image's driver.",
     ),
@@ -8262,6 +8269,8 @@ _GROUP4 = {
             "seeded-a/intree-pd: source in-tree (gcePersistentDisk plugin); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
             "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by pvc intree-pd in seeded-shapes; attaches through CSI migration: yes",
             "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by intree-pd (seeded-shapes); attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by pvc/intree-pd in seeded-shapes; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/pvc/intree-pd; attaches through CSI migration: yes",
 ],
         [
             "seeded-a/intree-pd: source csi; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
@@ -8270,6 +8279,8 @@ _GROUP4 = {
             "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes (pd.csi.storage.gke.io)",
                     "seeded-a/intree-pd: source in-tree?; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
             "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by other-claim in seeded-shapes; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree: no; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree no longer, now csi; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
 ],
         "No PersistentVolume on the seeded clusters uses an in-tree plugin; a CSI driver provisioned every volume.",
     ),
