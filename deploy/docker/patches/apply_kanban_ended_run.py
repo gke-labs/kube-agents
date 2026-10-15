@@ -64,19 +64,27 @@ BLOCK_GATE = _gate("kanban_block")
 
 # Upstream reports the card's last_failure_error, which belongs to an earlier
 # run whenever this worker's own run is still going, except for this run's
-# PR-acceptance refusal, which current_run_failure passes through.
+# PR-acceptance refusal, which current_run_failure passes through. `_check`
+# is a plain call that evaluates its message either way, so the ended-run
+# lookup sits behind `ok`: on a successful handoff the card has just left
+# `running`, and the lookup would latch "your run is over" for a run that
+# ended by finishing.
 COMPLETE_REFUSAL = (
-    "        _check(ok, (task.last_failure_error if task else None) or\n",
+    "        _check(ok, (task.last_failure_error if task else None) or\n"
+    '               f"could not complete {tid} (unknown id, stale run, or already terminal)")\n',
     "        # kube-agents patch: never another run's failure (#2947).\n"
-    "        _check(ok, _kanban_ended_run_refusal(tid, conn) or\n"
-    "               _kanban_current_run_failure(tid, conn) or\n",
+    '        _check(ok, "" if ok else (\n'
+    "            _kanban_ended_run_refusal(tid, conn) or\n"
+    "            _kanban_current_run_failure(tid, conn) or\n"
+    '            f"could not complete {tid} (unknown id, stale run, or already terminal)"))\n',
 )
 
 BLOCK_REFUSAL = (
     '        _check(ok, f"could not block {tid} (unknown id or not in running/ready)")\n',
     "        # kube-agents patch: say plainly when the run is over (#2947).\n"
-    "        _check(ok, _kanban_ended_run_refusal(tid, conn) or\n"
-    '               f"could not block {tid} (unknown id or not in running/ready)")\n',
+    '        _check(ok, "" if ok else (\n'
+    "            _kanban_ended_run_refusal(tid, conn) or\n"
+    '            f"could not block {tid} (unknown id or not in running/ready)"))\n',
 )
 
 TOOLS_TRAILER = (

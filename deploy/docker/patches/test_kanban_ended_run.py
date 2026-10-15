@@ -326,6 +326,8 @@ class TestTheApplier(unittest.TestCase):
         self.assertLess(out.index("_kanban_refuse_ended_run("), out.index("_require_children_settled("))
         self.assertEqual(out.count("_kanban_ended_run_refusal(tid, conn) or"), 2)
         self.assertEqual(out.count("_kanban_current_run_failure(tid, conn) or"), 1)
+        # The lookup latches, so it must only run on a refusal.
+        self.assertEqual(out.count('_check(ok, "" if ok else ('), 2)
         db = self.db.read_text()
         ast.parse(db)
         self.assertIn("block_task = _kanban_stop_worker_on_external_block(", db)

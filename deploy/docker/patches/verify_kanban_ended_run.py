@@ -9,6 +9,8 @@ patched ``block_task`` and tool handlers, with real worker processes:
 - an operator's block (no ``expected_run_id``, outside any worker) on a
   running card stops its live worker, records a ``block_worker_termination``
   event and leaves a comment saying the run was cut short;
+- a worker's own successful ``kanban_block`` or ``kanban_complete`` leaves
+  nothing latched (the refusal lookup runs only on a refusal);
 - the card's own worker blocking through ``kanban_block``, or with no run id
   as the rate-limit exit does, ends its run and stops nothing;
 - a run that ends between the handler's first check and its write is still
@@ -154,6 +156,15 @@ try:
     check("the card is blocked", status(own) == "blocked", status(own))
     check("its worker was not stopped", own_proc.poll() is None)
     check("no termination is recorded", events(own, "block_worker_termination") == 0)
+    check("and the run that blocked itself is not latched as over", ker._LATCHED is None, str(ker._LATCHED))
+
+    print("a worker completing its card:")
+    done = tool_create("Report the node count")
+    done_run, _ = start_run(done)
+    as_worker(done, done_run)
+    out = json.loads(kt._handle_complete({"summary": "3 nodes", "result": "The cluster has 3 nodes."}))
+    check("kanban_complete succeeds", out.get("ok"), str(out))
+    check("and the run that finished is not latched as over", ker._LATCHED is None, str(ker._LATCHED))
 
     print("the card's own worker blocking without a run id (the rate-limit exit):")
     own2 = tool_create("Hit the provider's rate limit")
