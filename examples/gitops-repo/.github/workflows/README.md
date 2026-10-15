@@ -12,3 +12,8 @@ Reference workflows (added in later phases):
   touching guarded paths; block merge on unmitigated high/critical findings (Phase 5, 06 §7).
 
 GitHub Actions is the reference; CircleCI/Jenkins/Argo/Flux/Atlantis are equally valid (06 §4).
+
+`kubectl apply` renders no Helm chart. For charts, and for workloads on a cluster created in the
+same pull request, pair this pipeline with a reconciler that syncs the repository:
+[Reconciler](../../README.md#reconciler) in the layout README names the recommended one. With it in place, this pipeline stops
+applying `clusters/*/namespaces/`, which Config Sync then owns.

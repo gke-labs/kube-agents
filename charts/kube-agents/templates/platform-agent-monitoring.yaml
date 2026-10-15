@@ -33,6 +33,35 @@ spec:
       interval: 30s
 ---
 {{- /*
+The chat_metrics plugin's listener (chatMetricsPort in the operator), in the
+platform-agent container of the gateway pod: inbound chat messages by platform.
+Its own PodMonitoring rather than a second endpoint on the watcher's, because
+the two listeners do not run on the same pods: above one replica
+leader_elect.py starts Hermes on the lease holder alone and stamps
+kubeagents.io/is-leader on that pod, so a standby has nothing on this port by
+design and a scrape of it would read up=0 for the life of the install. The
+selector adds the leader label; at one replica the operator puts it on the
+pod template, so the one pod is selected either way. The watcher's sidecar
+runs on every replica and keeps the selector above.
+*/}}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ .Values.platformAgent.name }}-gateway-chat-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-gateway
+      kubeagents.io/is-leader: "true"
+  endpoints:
+    - port: 9097
+      path: /metrics
+      interval: 30s
+---
+{{- /*
 The credential broker's metrics-only listener (credentialProxyMetricsPort in the
 operator): brokered tool invocations by tool, subcommand and outcome, their
 latency, and the credentialed listener's request counts. Its own PodMonitoring

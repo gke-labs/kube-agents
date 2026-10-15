@@ -64,7 +64,7 @@ const (
 	usageMetricsPath          = "/metrics"
 	usageScrapeScheme         = "http://"
 
-	// The series the poller reads, and the gauge both listeners export so that
+	// The series the poller reads, and the gauge every listener exports so that
 	// a restart is seen whatever the sample did.
 	toolInvocationsSeries  = "kubeagents_tool_invocations_total"
 	eventsInjectedSeries   = "k8s_event_watcher_events_injected_total"
@@ -80,6 +80,9 @@ const (
 	// reported merged, once each per broker process; no labels, so it is
 	// summed whole.
 	vcsMergedSeries = "kubeagents_vcs_proposals_merged_total"
+	// chatInboundSeries is the chat_metrics plugin's counter of messages the
+	// gateway accepted, by platform; summed over every platform.
+	chatInboundSeries = "kubeagents_chat_messages_inbound_total"
 	// clusterUpSeries is the watcher's per-cluster gauge, one series per
 	// cluster it built a client for, 1 once that cluster's informer has
 	// synced and is delivering events. Read from the same body as the
@@ -142,6 +145,8 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 		}
 	case usageCounterRemediationsMerged:
 		return vcsMergedSeries, nil
+	case usageCounterChatMessagesInbound:
+		return chatInboundSeries, nil
 	default:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}

@@ -1611,8 +1611,8 @@ func TestBuildNetworkPolicy(t *testing.T) {
 	if len(netpol.Spec.PolicyTypes) != 2 {
 		t.Errorf("expected 2 PolicyTypes, got %d", len(netpol.Spec.PolicyTypes))
 	}
-	if len(netpol.Spec.Ingress) != 2 {
-		t.Fatalf("expected 2 Ingress rules (the agent namespace, the managed-Prometheus collector), got %d", len(netpol.Spec.Ingress))
+	if len(netpol.Spec.Ingress) != 3 {
+		t.Fatalf("expected 3 Ingress rules (the agent namespace, the managed-Prometheus collector on the watcher's port and on the chat plugin's), got %d", len(netpol.Spec.Ingress))
 	}
 	if len(netpol.Spec.Ingress[0].Ports) != 3 {
 		t.Errorf("expected 3 ports in agent namespace ingress rule when dashboard enabled, got %d", len(netpol.Spec.Ingress[0].Ports))
@@ -1736,8 +1736,8 @@ func TestBuildNetworkPolicy_DashboardDisabled(t *testing.T) {
 	}
 
 	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
-	if len(netpol.Spec.Ingress) != 2 {
-		t.Fatalf("expected 2 Ingress rules (the agent namespace, the managed-Prometheus collector), got %d", len(netpol.Spec.Ingress))
+	if len(netpol.Spec.Ingress) != 3 {
+		t.Fatalf("expected 3 Ingress rules (the agent namespace, the managed-Prometheus collector on the watcher's port and on the chat plugin's), got %d", len(netpol.Spec.Ingress))
 	}
 	if len(netpol.Spec.Ingress[0].Ports) != 2 {
 		t.Errorf("expected 2 ports in agent namespace ingress rule when dashboard disabled, got %d", len(netpol.Spec.Ingress[0].Ports))

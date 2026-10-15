@@ -43,6 +43,10 @@ BROKER_CONNECT_TIMEOUT_SECONDS = 10.0
 # runtime does not attach an execution/chmod hint that misleads the agent
 # into seeking local file workarounds for a policy boundary (#2179).
 EXIT_SECURITY_POLICY_BLOCKED = getattr(os, "EX_NOPERM", 77)
+# The `policy verb:` line is read by the agent runtime one line at a time, so a
+# verb word (an argv token) must not carry a line break or a quote.
+_VERB_WORD_SAFE_RE = re.compile(r"[^\w./:@-]")
+_VERB_WORD_MAX = 64
 
 # `\Z`, not `$`. `$` also matches immediately before a trailing newline, so
 # `re.match` on "nowhere\n" succeeds -- and that value goes on to build the
@@ -822,6 +826,15 @@ def execute(
                 file=sys.stderr,
             )
             print(f"policy rule: {payload.get('rule', 'unknown')}", file=sys.stderr)
+            # The verb the policy resolved and whether this was a local render:
+            # the agent runtime's refusal stop reads these two lines.
+            if payload.get("verb"):
+                # Each word is an argv token the agent chose; keep it to one line
+                # and to the characters a verb or resource name is made of.
+                words = (_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in payload["verb"])
+                print(f"policy verb: {' '.join(words)}", file=sys.stderr)
+            if payload.get("local_render"):
+                print("policy render: local", file=sys.stderr)
             return EXIT_SECURITY_POLICY_BLOCKED
         print(payload.get("error", str(exc)), file=sys.stderr)
         return 1

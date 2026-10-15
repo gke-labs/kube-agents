@@ -55,6 +55,28 @@ var slackSuggestedPrompts = []string{
 	"which clusters are behind their release channel?",
 }
 
+// firstSessionError reports whether this process has not logged err's text
+// from setStatus before, and records it: a missing scope fails every call,
+// and one Warn line says so. The record is bounded like the session state,
+// and starts over when full, so a new error past the bound is still said.
+func (s *SlackAdapter) firstSessionError(err error) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessionErrorsSeen == nil {
+		s.sessionErrorsSeen = map[string]bool{}
+	}
+	key := err.Error()
+	if s.sessionErrorsSeen[key] {
+		return false
+	}
+	if len(s.sessionErrorsSeen) >= slackSessionsCap {
+		// Start over rather than go silent on a new error past the bound.
+		clear(s.sessionErrorsSeen)
+	}
+	s.sessionErrorsSeen[key] = true
+	return true
+}
+
 // slackSessionsAPI is the Agent Sessions slice of the Web API; tests fake it.
 type slackSessionsAPI interface {
 	SetSessionStatus(ctx context.Context, channel, threadTS, status string) error
@@ -218,7 +240,12 @@ func (s *SlackAdapter) sendSession(conversation string, st *slackSession, seq ui
 	defer cancel()
 	if !fresh {
 		if err := api.SetSessionStatus(ctx, channel, thread, want); err != nil {
-			s.log.Debug("slack: agents.sessions.setStatus failed", "conversation", conversation, "status", want, "err", err)
+			if s.firstSessionError(err) {
+				s.log.Warn("slack: agents.sessions.setStatus failed; threads show no Working… status, and the gateway posts no status line on Slack",
+					"conversation", conversation, "status", want, "err", err)
+			} else {
+				s.log.Debug("slack: agents.sessions.setStatus failed", "conversation", conversation, "status", want, "err", err)
+			}
 			return
 		}
 		s.mu.Lock()

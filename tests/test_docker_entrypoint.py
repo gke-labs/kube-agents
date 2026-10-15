@@ -647,6 +647,26 @@ class ConfigBackfillTest(unittest.TestCase):
         )
         self.assertIs(live["platforms"]["slack"]["rich_blocks"], False)
 
+    def test_a_plugin_the_template_enables_joins_the_live_list(self):
+        """plugins.enabled is image-owned: a shipped plugin the volume's list predates is
+        appended after the agent's own entries, and nothing the agent listed is removed."""
+        proc, live, _ = self._fill(
+            {"plugins": {"enabled": ["session_store", "chat_metrics"]}},
+            {"plugins": {"enabled": ["session_store", "my_own_plugin"]}},
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(live["plugins"]["enabled"], ["session_store", "my_own_plugin", "chat_metrics"])
+        self.assertIn("plugins.enabled.chat_metrics", proc.stdout)
+
+    def test_a_plugin_list_the_template_already_matches_is_left_alone(self):
+        """Every template name present: no rewrite, so the agent's file keeps its bytes."""
+        live = "plugins:\n  enabled:\n  - chat_metrics\n  - session_store\n"
+        proc, _, unchanged = self._fill({"plugins": {"enabled": ["session_store", "chat_metrics"]}}, live)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged)
+
     def test_a_live_scalar_is_not_descended_into(self):
         """Where the live file holds a scalar and the template a mapping, the agent wins."""
         proc, live, _ = self._fill({"memory": {"provider": "hindsight"}}, {"memory": "none"})
