@@ -900,26 +900,28 @@ def _index_entries_from_gcs(
     )
     if rc == 0:
         return _index_entries_from_dir(dest), None, []
-    vanished, errors = _gcloud_errors(err)
+    vanished, others, errors = _gcloud_errors(err)
     partial = (
-        rc == GCLOUD_PARTIAL_FAILURE_EXIT
-        and 0 < len(vanished) <= VANISHED_POINTER_LIMIT
-        and len(errors) == len(vanished)
+        rc == GCLOUD_PARTIAL_FAILURE_EXIT and 0 < len(vanished) <= VANISHED_POINTER_LIMIT and not others
     )
     entries = _index_entries_from_dir(dest) if partial else {}
     if not entries:
-        # What decided the refusal, then the error lines, or the last line
-        # when there is none: the stderr is thousands of Copying lines, and a
-        # 404 line alone would read as the case the hour survives.
+        # What decided the refusal, then the error lines with the ones that
+        # are not a vanished pointer first, or the last line when there is
+        # none: the stderr is thousands of Copying lines, and a 404 line
+        # alone would read as the case the hour survives.
         facts = [f"exit {rc}"]
+        if others:
+            facts.append(f"{len(others)} error(s) other than a vanished pointer")
         if len(vanished) > VANISHED_POINTER_LIMIT:
             facts.append(f"{len(vanished)} vanished pointers, over the ceiling of {VANISHED_POINTER_LIMIT}")
         if partial:
             facts.append("nothing landed")
         tail = err.strip().splitlines()
-        detail = "; ".join(errors[:REFUSAL_ERROR_LINES]) or (tail[-1] if tail else "")
-        if len(errors) > REFUSAL_ERROR_LINES:
-            detail += f" and {len(errors) - REFUSAL_ERROR_LINES} more"
+        quoted = others + [line for line in errors if line not in others]
+        detail = "; ".join(quoted[:REFUSAL_ERROR_LINES]) or (tail[-1] if tail else "")
+        if len(quoted) > REFUSAL_ERROR_LINES:
+            detail += f" and {len(quoted) - REFUSAL_ERROR_LINES} more"
         reason = ", ".join(facts) + (f": {detail}" if detail else "")
         return {}, f"could not read the build index: {reason}", []
     return entries, None, [
@@ -927,10 +929,11 @@ def _index_entries_from_gcs(
     ]
 
 
-def _gcloud_errors(stderr: str) -> Tuple[List[int], List[str]]:
-    """gcloud's error lines, and among them the build IDs whose index pointer
-    it reported missing; the two lengths differ when any other error is in."""
+def _gcloud_errors(stderr: str) -> Tuple[List[int], List[str], List[str]]:
+    """The build IDs whose index pointer gcloud reported missing, the error
+    lines that say anything else, and every error line in stderr order."""
     vanished: List[int] = []
+    others: List[str] = []
     errors: List[str] = []
     prefix = f"{GCS_BUILD_INDEX}/"
     for raw in stderr.splitlines():
@@ -944,7 +947,9 @@ def _gcloud_errors(stderr: str) -> Tuple[List[int], List[str]]:
         build_id = _build_id_of(name[len(prefix) :]) if name.startswith(prefix) else None
         if build_id is not None:
             vanished.append(build_id)
-    return vanished, errors
+        else:
+            others.append(line)
+    return vanished, others, errors
 
 
 def _build_id_of(name: str) -> Optional[int]:
@@ -1195,11 +1200,12 @@ def collect_waits(
     waits = [w for w in collected if measured_start <= w.created <= window_end]
     # A vanished pointer below the window the sweep covered is not named
     # beside the days that were read, as the report says those days are
-    # missing: the same bound waits are kept by, with the window's slack.
+    # missing. No slack on this side: the ID encodes the end of the wait, so
+    # one below measured_start was created below it too.
     unreadable = [
         gone
         for gone in vanished_in_window
-        if snowflake_time(int(gone["build_id"])) >= measured_start - SNOWFLAKE_SLACK
+        if snowflake_time(int(gone["build_id"])) >= measured_start
     ] + unreadable
     sweep = Sweep(
         waits, read, time.monotonic() - began, measured_start, truncated, unreadable

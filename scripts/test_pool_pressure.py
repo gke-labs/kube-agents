@@ -917,17 +917,23 @@ class SweepDeadline(unittest.TestCase):
         # too by the clock but on no day with a landed build (today's first
         # build, still running): kept, because it is inside the window the
         # sweep covered, which is the bound, not the days that had reads.
-        quiet = pp.snowflake_time(self.NEW_BUILD) + timedelta(hours=20)
-        quiet_build = (int((quiet.timestamp() * 1000) - pp.SNOWFLAKE_EPOCH_MS)
+        # The first two are on the cut day, the second inside the hours the
+        # window slack would admit; the ID encodes the end of the wait, so a
+        # build below the measured start was created below it too, and the
+        # slack does not apply on this side.
+        def at(moment):
+            return str(int(moment.timestamp() * 1000 - pp.SNOWFLAKE_EPOCH_MS)
                        << pp.SNOWFLAKE_TIMESTAMP_SHIFT)
+        day = datetime(2026, 8, 27, tzinfo=timezone.utc)
         gone = [{"build_id": str(self.OLD_BUILD + 1), "error": pp.INDEX_POINTER_VANISHED},
+                {"build_id": at(day - timedelta(hours=5)), "error": pp.INDEX_POINTER_VANISHED},
                 {"build_id": str(self.NEW_BUILD + 2), "error": pp.INDEX_POINTER_VANISHED},
-                {"build_id": str(quiet_build), "error": pp.INDEX_POINTER_VANISHED}]
+                {"build_id": at(day + timedelta(hours=20)), "error": pp.INDEX_POINTER_VANISHED}]
         full = self._sweep([0, 0, 0, 5], gone).value
         self.assertEqual(gone, full.unreadable)
         cut = self._sweep([0, 0, 99, 99], gone).value
         self.assertTrue(cut.truncated)
-        self.assertEqual(gone[1:], cut.unreadable)
+        self.assertEqual(gone[2:], cut.unreadable)
 
     def test_a_sweep_inside_the_deadline_covers_the_window_it_was_asked_for(self):
         sweep = self._sweep([0, 0, 0, 5]).value
@@ -1073,6 +1079,12 @@ class IndexCopy(unittest.TestCase):
         # The error names what went wrong, not the thousands of Copying lines.
         self.assertNotIn("Copying", err)
         self.assertEqual([], vanished)
+        # The line that decided the refusal is quoted first, however many
+        # tolerated 404 lines came before it.
+        many = [self.VANISHED.replace("2110431553740869632", f"211043155374086963{i}") for i in range(4)]
+        _, err, _ = self._copy(1, "\n".join(many + [denied]))
+        self.assertIn("1 error(s) other than a vanished pointer", err)
+        self.assertLess(err.index("403"), err.index("not found: 404"))
 
     def test_a_404_outside_the_index_is_not_a_vanished_pointer(self):
         other = "ERROR: gs://kube-agents-prow/pr-logs%2Fdirectory%2Fother-job%2F2110431553740869632.txt not found: 404."
