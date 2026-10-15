@@ -500,10 +500,12 @@ class SyncFileTests(unittest.TestCase):
         jobs_path = self.runtime
         orig_reconcile = cron_jobs_sync.reconcile
         pause_thread = None
+        about_to_lock = threading.Event()
 
         def pause_worker():
             fd = open(lock_file, "a+", encoding="utf-8")
             try:
+                about_to_lock.set()
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 try:
                     data = json.loads(jobs_path.read_text(encoding="utf-8"))
@@ -519,10 +521,11 @@ class SyncFileTests(unittest.TestCase):
             nonlocal pause_thread
             pause_thread = threading.Thread(target=pause_worker)
             pause_thread.start()
-            # Give pause_worker time to attempt acquisition. Without cron_jobs_lock in sync,
-            # it acquires immediately and writes mid-sync, which sync's write_json clobbers.
-            # With cron_jobs_lock, it blocks until sync finishes.
-            time.sleep(0.05)
+            self.assertTrue(about_to_lock.wait(timeout=5.0))
+            # If sync holds .jobs.lock, pause_worker blocks in flock(LOCK_EX), so join times out.
+            # If sync does NOT hold .jobs.lock, pause_worker finishes immediately, writing mid-sync
+            # before orig_reconcile runs, which sync's write_json clobbers.
+            pause_thread.join(timeout=0.05)
             return orig_reconcile(*args, **kwargs)
 
         with mock.patch.object(cron_jobs_sync, "reconcile", side_effect=inject_pause_mid_sync):

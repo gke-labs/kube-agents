@@ -255,10 +255,12 @@ class CronStoreMergeTest(unittest.TestCase):
         jobs_path = self.home / "cron" / "jobs.json"
         orig_merge = ps._merge_after_overlay
         pause_thread = None
+        about_to_lock = threading.Event()
 
         def pause_worker():
             fd = open(lock_file, "a+", encoding="utf-8")
             try:
+                about_to_lock.set()
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 try:
                     data = json.loads(jobs_path.read_text(encoding="utf-8"))
@@ -274,10 +276,11 @@ class CronStoreMergeTest(unittest.TestCase):
             nonlocal pause_thread
             pause_thread = threading.Thread(target=pause_worker)
             pause_thread.start()
-            # Give pause_worker time to attempt acquisition. Without cron_jobs_lock in
-            # overlay_template, it acquires immediately and writes mid-merge, which os.replace
-            # clobbers. With cron_jobs_lock, it blocks until overlay_template finishes.
-            time.sleep(0.05)
+            self.assertTrue(about_to_lock.wait(timeout=5.0))
+            # If overlay_template holds .jobs.lock, pause_worker blocks in flock(LOCK_EX), so join times out.
+            # If overlay_template does NOT hold .jobs.lock, pause_worker finishes immediately, writing mid-merge
+            # before orig_merge runs, which orig_merge's os.replace clobbers.
+            pause_thread.join(timeout=0.05)
             return orig_merge(*args, **kwargs)
 
         with unittest.mock.patch.object(ps, "_merge_after_overlay", side_effect=inject_pause_mid_merge):

@@ -93,13 +93,16 @@ What that costs across pods on a shared volume:
   ``cron_jobs_lock`` fails open immediately, and ``write_json`` names its temp file
   per *pod* (see ``writer_tag``) so ``os.replace`` publishes a whole file, though
   one merge could overwrite another until the next boot.
-* A merge racing a remote scheduler in another pod that ticks without taking ``.jobs.lock``
-  remains possible on multi-replica shared storage.
+* If lock acquisition blocks for longer than 15s (contention timeout), ``cron_jobs_lock``
+  also logs a warning and proceeds without the lock.
+* Cross-pod races on multi-replica shared storage remain possible during fail-open windows
+  or if concurrent processes modify the store outside advisory locks.
 
 Eliminating the cross-pod race entirely requires running the reconcile once per
 volume — behind leader election, or from an init container or per-rollout Job —
 which is a change to the deployment topology. Single-replica installs, which are
-the default, are completely protected by ``.jobs.lock``.
+the default, are protected whenever the lock is acquired; the two fail-open paths
+above are the residual.
 """
 
 import argparse
