@@ -10538,6 +10538,9 @@ spec:
                             are unique only within a project and location. This replaces the
                             RECONCILE_EXCLUDE environment variable, which matched bare names across
                             every project.
+                            An excluded cluster gets no Cluster Agent and is left out of every
+                            fleet read and audit the agents run, except the upgrade-readiness
+                            report, which enumerates by project and covers it.
                           items:
                             description: ScopeClusterRef identifies one GKE cluster.
                             properties:

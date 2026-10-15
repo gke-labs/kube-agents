@@ -205,6 +205,11 @@ class DeclaredScope:
         self.projects: list[str] | None = None
         self.unread: list[tuple[str, str]] = []
         self.excluded_clusters: frozenset[tuple[str, str, str]] = frozenset()
+        # What `drop_excluded` dropped, per project, as (name, location): a
+        # collector that judges project-level objects (a disk, a forwarding
+        # rule, an address) against the clusters it read must still know these
+        # exist, or their objects read as orphaned (fleet_waste.py).
+        self.dropped: dict[str, list[tuple[str, str]]] = {}
 
     def set(self, scope_projects: str | None, scope_unread: str | None, scope_exclude_clusters: str | None = None) -> None:
         """Records `--scope-projects` and `--scope-unread`. Either flag passed,
@@ -222,6 +227,7 @@ class DeclaredScope:
         self.projects = parse_scope_projects(scope_projects) if self.declared else None
         self.unread = parse_scope_unread(scope_unread)
         self.excluded_clusters = parse_scope_exclude_clusters(scope_exclude_clusters)
+        self.dropped = {}
 
     def drop_excluded(self, project: str, clusters: list) -> list:
         """`clusters`, as `gcloud container clusters list` returns them for
@@ -237,6 +243,7 @@ class DeclaredScope:
                 location = cluster.get("location") or cluster.get("zone") or ""
                 if (project, location, cluster.get("name") or "") in self.excluded_clusters:
                     dropped.append(format_cluster_ref(project, location, cluster["name"]))
+                    self.dropped.setdefault(project, []).append((cluster["name"], location))
                     continue
             kept.append(cluster)
         if dropped:

@@ -189,7 +189,9 @@ def _platform_script_dirs() -> tuple[str, ...]:
 # the reconcile's snapshot themselves): the flags, their parsing and the note
 # live in fleet_scope_args, shared with every collector. `--scope-projects` is
 # the sweep, complete coverage; `--scope-unread` names each declared project
-# the install could not read, recorded as a coverage gap. Without them the
+# the install could not read, recorded as a coverage gap;
+# `--scope-exclude-clusters` names the clusters spec.scope.exclude.clusters
+# leaves out, dropped from the listing unread (#3081). Without them the
 # collector enumerates every project the identity can list, which is right on
 # a checkout and on an install that declares no scope; on a sandbox whose
 # operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into

@@ -107,15 +107,15 @@ class ExplicitTargetTest(unittest.TestCase):
         return result["members"][0]
 
 
-    def test_a_cluster_the_scope_excludes_is_not_a_member(self):
-        # #3081: spec.scope.exclude.clusters bounds every fleet read.
+    def test_a_cluster_the_scope_excludes_is_still_a_member(self):
+        # #3081 bounds every fleet read by spec.scope.exclude.clusters except
+        # this report (#3026), which covers excluded clusters on purpose.
         report.declared_scope.set("p1", None, "p1/us-central1/lane-b")
         self.addCleanup(report.declared_scope.set, None, None)
         pools = [("default-pool", "1.30.5-gke.100")]
-        with patch("sys.stderr"):
-            result = self._run([cluster("ka-today", "us-central1", "1.30.5-gke.100", pools),
-                                cluster("lane-b", "us-central1", "1.30.5-gke.100", pools)])
-        self.assertEqual([m["cluster"] for m in result["members"]], ["ka-today"])
+        result = self._run([cluster("ka-today", "us-central1", "1.30.5-gke.100", pools),
+                            cluster("lane-b", "us-central1", "1.30.5-gke.100", pools)])
+        self.assertEqual(sorted(m["cluster"] for m in result["members"]), ["ka-today", "lane-b"])
 
     def test_lagging_control_plane(self):
         m = self._member([cluster("a", "us-central1", "1.30.5-gke.1355000", [("default-pool", "1.30.5-gke.1355000")])])

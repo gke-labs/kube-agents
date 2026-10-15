@@ -17,7 +17,7 @@ Use native Google Cloud CLI (`gcloud`) and Kubernetes (`kubectl`) read-only comm
 
 1. **Identify GCP Project & Fleet Bounds:**
    - Run `gcloud config get-value project` and `gcloud container clusters list --project=<project-id>` to enumerate every active and stopped GKE cluster in the project.
-   - Drop every cluster your card says the install excludes (`spec.scope.exclude.clusters`) before you go on. An excluded cluster is outside the scope: it is not in `fleet`, not audited in Step 3, not a gap, and not in the report.
+   - Drop every cluster the install excludes (`spec.scope.exclude.clusters`) before you go on: the ones your card names, or, on a run that did not come from the onboarding card, the ones the platform_control `fleet_scope` tool lists in `excluded_clusters`. An excluded cluster is outside the scope: it is not in `fleet`, not audited in Step 3, not a gap, and not in the report.
 2. **Inspect Cluster Control Planes & Topologies:**
    - For every running GKE cluster discovered (`e.g., kage-mgmt, platform-agent-host`), inspect its configuration: Kubernetes version, control plane region/zone, node pools (`machine types, node counts, autoscaling boundaries`), network configuration (`VPC-native, Dataplane V2 / eBPF`), and enabled GKE features (`Workload Identity, Managed Prometheus, OpenTelemetry collection`).
 3. **Verify Access & Tenancy Boundaries:**

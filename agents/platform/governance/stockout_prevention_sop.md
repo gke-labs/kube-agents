@@ -34,7 +34,7 @@ The helper owns every git and forge operation and renders the ledger issue body 
 
 ### 1. Enumerate the target fleet
 
-Call the platform_control `fleet_scope` tool first. When it reports `declared: true`, the fleet is its `projects` and nothing else: pass its `collector_args` to the collector verbatim, and run any manual per-project command over that list alone, never over `gcloud projects list` (when no declared project is readable they carry `--scope-unread` alone; pass them anyway, and the collector reports that nothing was readable and exits with a top-level `error`). An answer that starts with `ERROR:` means the scope is unknown: list nothing and report the error as your one-line summary. When it reports `declared: false`, the install declares no scope and the collector enumerates every project the identity can list:
+Call the platform_control `fleet_scope` tool first. When it reports `declared: true`, the fleet is its `projects`, less every cluster it lists in `excluded_clusters` (never read, listed or reported, by hand or by the collector), and nothing else: pass its `collector_args` to the collector verbatim, and run any manual per-project command over that list alone, never over `gcloud projects list` (when no declared project is readable they carry `--scope-unread` alone; pass them anyway, and the collector reports that nothing was readable and exits with a top-level `error`). An answer that starts with `ERROR:` means the scope is unknown: list nothing and report the error as your one-line summary. When it reports `declared: false`, the install declares no scope and the collector enumerates every project the identity can list:
 
 ```bash
 # DECLARED and PROJECTS come from the fleet_scope tool's answer; set both before

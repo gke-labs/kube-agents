@@ -6088,6 +6088,38 @@ class GetTargetProjectsTest(unittest.TestCase):
             {("project/proj-a", "collected"), ("project/proj-b", "collected")},
         )
 
+
+    def test_an_excluded_cluster_s_objects_are_not_reported_as_abandoned(self):
+        # #3081: the excluded cluster is dropped unread, but it still owns the
+        # project's disks, forwarding rules and addresses. Its detached disk
+        # must not read as "provisioned for a cluster this project no longer
+        # runs", and the checks that need every cluster's Services are
+        # withheld, not judged clean or flagged.
+        fw.declared_scope.set("proj-a", None, "proj-a/us-central1/lane-b")
+        self.addCleanup(fw.declared_scope.set, None, None)
+        disk = {"name": "gke-lane-b-pvc-1", "sizeGb": "10", "type": "pd-balanced", "creationTimestamp": "2026-01-01T00:00:00Z",
+                "zone": "us-central1-b", "users": [], "lastDetachTimestamp": "2026-07-22T00:00:00Z",
+                "labels": {"goog-k8s-cluster-name": "lane-b"}}
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return run_of(0, json.dumps([{"name": "lane-b", "location": "us-central1", "status": "RUNNING"}]))
+            if argv[:3] == ["gcloud", "compute", "disks"]:
+                return run_of(0, json.dumps([disk]))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            raise AssertionError(argv)
+
+        with patch("sys.stderr"):
+            manifest = fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)
+        entries = {c["name"]: c for c in manifest["clusters"]}
+        self.assertNotIn("proj-a/us-central1/lane-b", entries)
+        project = entries["project/proj-a"]
+        self.assertEqual([c for c in project.get("candidates", []) if c["check"] in ("unattached-disk", "orphan-lb", "idle-address")], [])
+        unevaluated = {c["check"]: c["reason"] for c in project.get("checks_unevaluated", [])}
+        self.assertIn("excluded by spec.scope.exclude.clusters", unevaluated["orphan-lb"])
+        self.assertIn("excluded by spec.scope.exclude.clusters", unevaluated["idle-address"])
+        self.assertIn("lane-b in this project are excluded", project["limitations"])
     def test_project_list_failure_falls_back_to_the_base_project(self):
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:

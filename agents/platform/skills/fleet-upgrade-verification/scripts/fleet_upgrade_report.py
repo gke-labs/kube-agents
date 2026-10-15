@@ -920,7 +920,10 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
             errors.append({"project": project, "location": None, "message": error or f"{' '.join(cmd)} returned no list"})
             unlisted.append(project)
             continue
-        for cluster in declared_scope.drop_excluded(project, listed):
+        # Not narrowed by --scope-exclude-clusters: the upgrade-readiness report
+        # is the one fleet read that covers an excluded cluster, on purpose
+        # (#3081, #3026), since it enumerates by project.
+        for cluster in listed:
             if not isinstance(cluster, dict):
                 continue
             if wanted is not None:

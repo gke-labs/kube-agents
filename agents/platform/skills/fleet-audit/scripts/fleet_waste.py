@@ -5590,6 +5590,15 @@ def _bare_cluster_name(entry: dict) -> str:
     return entry.get("name", "").rsplit(QUALIFIED_TARGET_SEPARATOR, 1)[-1]
 
 
+# Appended to a project's limitations when the install excludes some of its
+# clusters: they count among the unread above, by design rather than failure.
+EXCLUDED_CLUSTERS_NOTE = (
+    "{named} in this project are excluded by the install's spec.scope.exclude.clusters and were not "
+    "read on purpose: the checks above that need every cluster's objects count them as unread, so "
+    "nothing they own is reported as abandoned."
+)
+
+
 def _known_clusters(clusters: list[dict]) -> tuple[set[str], set[tuple[str, str | None]]]:
     """A project's cluster names, and its (name, location) pairs, whatever their status."""
     return (
@@ -5933,7 +5942,7 @@ def forwarding_rules_argv(project: str) -> list[str]:
     return ["gcloud", "compute", "forwarding-rules", "list", "--project", project, "--format", "json"]
 
 
-def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None, forwarding_rules: tuple[object | None, Run] | None = None, unread_clusters: frozenset[str] = frozenset(), clusters_read: int | None = None, unread_labels: list[str] | None = None, announce: bool = True) -> dict | None:
+def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None, forwarding_rules: tuple[object | None, Run] | None = None, unread_clusters: frozenset[str] = frozenset(), clusters_read: int | None = None, unread_labels: list[str] | None = None, announce: bool = True, excluded: list[str] | None = None) -> dict | None:
     # `--filter=-users:*` and not `"--filter", "-users:*"`: a filter value
     # starting with `-` reads as a flag to gcloud's own argument parser, which
     # then rejects the command for the argument it thinks is missing
@@ -6133,14 +6142,20 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
             + " could name one, so an address they hold would read as idle."
         )
         entry["limitations"] = f"{entry['limitations']} {address_gap}" if entry.get("limitations") else address_gap
+    if excluded and compute_ok:
+        # The sentences above say "could not be read"; these were left unread
+        # on purpose, and a reader must not go looking for a failed read.
+        excluded_note = EXCLUDED_CLUSTERS_NOTE.format(named=", ".join(excluded))
+        entry["limitations"] = f"{entry['limitations']} {excluded_note}" if entry.get("limitations") else excluded_note
     unevaluated = {}
     if compute_failed:
         unevaluated.update({slug: compute_error for slug in COMPUTE_CHECKS})
     elif not all_reachable and not compute_disabled:
-        unevaluated["orphan-lb"] = "a cluster in this project could not be read, so its Services are unknown"
-        unevaluated["idle-address"] = "a cluster in this project could not be read, so its Service and Ingress address annotations are unknown"
+        unread_why = "is excluded by spec.scope.exclude.clusters or could not be read" if excluded else "could not be read"
+        unevaluated["orphan-lb"] = f"a cluster in this project {unread_why}, so its Services are unknown"
+        unevaluated["idle-address"] = f"a cluster in this project {unread_why}, so its Service and Ingress address annotations are unknown"
     if not disks_judged and compute_ok:
-        unevaluated["unattached-disk"] = "none of this project's clusters could be read"
+        unevaluated["unattached-disk"] = "none of this project's clusters could be read" + (" (some are excluded by spec.scope.exclude.clusters)" if excluded else "")
     if reg_parsed is None and not registry_disabled:
         unevaluated["registry-no-cleanup"] = (
             f"`gcloud artifacts repositories list` failed (rc={reg_result.rc})"
@@ -6364,7 +6379,12 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             known_by_project[p] = None
             enumeration_failed[p] = error
             continue
-        known_by_project[p], known_pairs_by_project[p] = _known_clusters(running + not_running)
+        # A cluster the scope excludes was dropped from the listing unread, but
+        # it still owns this project's disks, forwarding rules and addresses:
+        # known and never collected, so its disks are skipped and the checks
+        # that need every cluster's Services are withheld, not judged (#3081).
+        excluded = [{"name": name, "location": location} for name, location in declared_scope.dropped.get(p, [])]
+        known_by_project[p], known_pairs_by_project[p] = _known_clusters(running + not_running + excluded)
         forwarding_rules[p] = rules
         if traffic is not None:
             lb_traffic[p] = traffic
@@ -6436,6 +6456,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         # and pinned the run `partial`.
         all_reachable = (
             not skipped_by_project.get(p)
+            and not declared_scope.dropped.get(p)
             and all(entry["outcome"] == "collected" for entry, _ in group)
         )
         fleet_facts = empty_fleet_facts()
@@ -6450,7 +6471,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         known_pairs = known_pairs_by_project.get(p, set())
         collected = collected_by_project.get(p, set())
 
-        return collect_project_compute(p, all_reachable, fleet_facts, run=replay, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs, collected), clusters_read=len(known_pairs & collected), unread_labels=_unread_labels(known_pairs, collected))
+        return collect_project_compute(p, all_reachable, fleet_facts, run=replay, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs, collected), clusters_read=len(known_pairs & collected), unread_labels=_unread_labels(known_pairs, collected), excluded=sorted(name for name, _ in declared_scope.dropped.get(p, [])))
 
     cluster_entries: list[dict] = []
     project_entries: list[dict] = []
