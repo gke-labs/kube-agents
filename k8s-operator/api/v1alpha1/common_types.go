@@ -1501,9 +1501,9 @@ var writeRoles = []string{RepositoryRoleGitOps, RepositoryRoleManaged}
 //
 // A gitlab forge's credentialsRef is required by the API server too, so it
 // holds with the webhook off -- the chart ships it off.
+// +kubebuilder:validation:XValidation:rule="has(self.provider) || !has(self.host) || size(self.host) == 0 || self.host.lowerAscii() in ['github.com', 'www.github.com', 'ssh.github.com']",message="a forge at a host other than github.com names its provider: github for a GitHub Enterprise Server, gitlab for a GitLab instance"
 // +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitlab' || has(self.credentialsRef)",message="a gitlab forge needs credentialsRef.name: the Secret holding its access token under the key token"
-// +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.provider) && self.provider == 'gitlab')",message="caBundleRef is for a gitlab forge: the github provider does not read it yet, and a CA that nothing reads would hide a certificate problem"
-// +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.host) && size(self.host) > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com']))",message="caBundleRef is for a self-managed host: gitlab.com presents a certificate the public CAs sign, and a private CA must never vouch for it"
+// +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.host) && size(self.host) > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com', 'github.com', 'www.github.com', 'ssh.github.com']))",message="caBundleRef is for a self-managed host: gitlab.com and github.com present a certificate the public CAs sign, and a private CA must never vouch for it"
 type ForgeSpec struct {
 	// Name identifies the forge within this PlatformAgent. Repositories refer
 	// to it by this name. The deprecated GitHub alias is the forge "github".
@@ -1518,19 +1518,29 @@ type ForgeSpec struct {
 	// URL's text.
 	//
 	// "github" and "gitlab" are registered; the enum grows with each
-	// agent-side provider. Defaults to "github".
+	// agent-side provider. Omitted, it is "github".
+	//
+	// A forge at a host other than a spelling of github.com must name it, so
+	// a forge written for another instance is never read as a GitHub
+	// Enterprise Server by default.
 	// +kubebuilder:validation:Enum=github;gitlab
-	// +kubebuilder:default=github
 	// +optional
 	Provider string `json:"provider,omitempty"`
 
 	// Host is the forge hostname. Omit it for the provider's default
 	// ("github.com" for GitHub, "gitlab.com" for GitLab). A host the declared
 	// provider does not serve is rejected, and an alternative spelling of one
-	// it does serve resolves to the provider's canonical host. For GitLab it may
-	// also be a self-managed instance's hostname, which every repository on the
-	// forge must then name or leave implied; a host another provider serves is
-	// rejected.
+	// it does serve resolves to the provider's canonical host. It may also be a
+	// self-managed instance's hostname: a GitLab instance, or a GitHub
+	// Enterprise Server instance. Every repository on the forge must then name
+	// that host or leave it implied. A host another provider serves is
+	// rejected, and so is a host under a domain where the provider runs its own
+	// services (for GitHub: github.com, githubusercontent.com, ghe.com and
+	// others).
+	//
+	// An install serves one GitHub host: github.com, or one GitHub Enterprise
+	// Server instance. A second GitHub forge at another host is rejected, and
+	// so is one host declared for two providers.
 	//
 	// The pattern is a DNS name, which every forge's host is; it is here rather
 	// than only in the webhook so the API server still refuses whitespace and
@@ -1583,9 +1593,12 @@ type ForgeSpec struct {
 	// the PEM CA certificates that signed this forge's TLS certificate:
 	// a self-managed instance behind a private CA. The broker trusts these
 	// certificates for this forge's host only, beside the system bundle, in
-	// its API client and in git, so they never vouch for another host. It is
-	// for a gitlab forge at a self-managed host: it is refused when host is
-	// empty or gitlab.com, whose certificate the public CAs sign.
+	// its API client and in git. On a GitHub Enterprise Server forge, the
+	// chart also gives them to the token minter, which trusts them for all of
+	// its outbound calls. It is
+	// for a forge at a self-managed host, GitLab or GitHub Enterprise Server: it
+	// is refused when host is empty, gitlab.com or github.com, whose
+	// certificates the public CAs sign.
 	//
 	// The operator mounts the one key into the credential broker's pod only.
 	// The mount is optional: a missing Secret does not stop the broker, and
@@ -2201,6 +2214,29 @@ func CleanRepoSlug(rawURL string) (string, error) {
 // ResolvedRepository.Resolve.
 func CleanRepoSlugWithOrg(rawURL, org string) (string, error) {
 	ref, err := resolveGitHub(rawURL, org)
+	if err != nil {
+		return "", err
+	}
+	return ref.Path, nil
+}
+
+// GitHubRepoSlugOnHost reads a GitHub repository entry into "owner/repo" on
+// the install's GitHub host: github.com, or a GitHub Enterprise Server host. A
+// bare name is qualified by org. An entry that names another host is refused,
+// never moved onto host. It is what the minter policy sync reads the state
+// ConfigMap's GitHub entries with: the minter mints for the one GitHub host.
+func GitHubRepoSlugOnHost(rawURL, org, host string) (string, error) {
+	if trimmed := strings.TrimSpace(rawURL); trimmed == "" || trimmed == NoRepositorySentinel {
+		return "", fmt.Errorf("empty repository")
+	}
+	provider, err := LookupGitProvider(GitProviderGitHub)
+	if err != nil {
+		return "", err
+	}
+	if provider.Hosts[lowerASCII(strings.TrimSpace(host))] {
+		host = ""
+	}
+	ref, err := provider.Resolve(host, rawURL, org)
 	if err != nil {
 		return "", err
 	}

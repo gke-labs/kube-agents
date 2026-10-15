@@ -301,6 +301,12 @@ the configured value is discarded — which is what stops a hand-written
 to 0 and turning the next apply into a replacement. Nothing writes the probe's answer
 back, so the file never becomes an input and an output at once.
 
+A GitHub Enterprise Server forge is not in it either: no key selects one, and `install.sh`
+writes only the github.com spelling of a GitHub forge. A GitOps repository on a GitHub
+Enterprise Server is installed through the composition, with the forge in its
+`extra_helm_values`: see
+[GitHub Enterprise Server in INSTALL.md](../../INSTALL.md#github-enterprise-server).
+
 ### Credentials
 
 `PERSIST_SECRETS_ON_DISK=false` keeps them out of every file the installer writes: the

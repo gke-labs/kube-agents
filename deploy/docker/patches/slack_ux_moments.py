@@ -269,6 +269,17 @@ async def _post(adapter: Any, sub: dict, blocks: list[dict], text: str, color: s
         return ""
 
 
+def _github_host() -> str:
+    """The install's GitHub host, github.com or its GitHub Enterprise Server host,
+    from the gitops-state ConfigMap's ``github_host`` key; github.com without it."""
+    if _gitops is None:
+        return "github.com"
+    try:
+        return _gitops.github_host()
+    except Exception:  # noqa: BLE001 — github.com, as before
+        return "github.com"
+
+
 def _chat_route(adapter: Any) -> bool:
     """Whether ``adapter`` is the chat.notify stand-in and the chat message composer is importable."""
     return _chat is not None and callable(getattr(adapter, "send_chat", None))
@@ -335,7 +346,7 @@ async def pr_event(adapter: Any, sub: dict, payload: Any, text: str = "") -> boo
         return False
     url = str(payload.get("url") or "")
     hosts = _managed_gitlab_hosts() if _moments.MR_MARKER in url else frozenset()
-    found = _moments.proposal_ref(url, gitlab_hosts=hosts)
+    found = _moments.proposal_ref(url, gitlab_hosts=hosts, github_host=_github_host())
     if found is None:
         return False
     url, repo, number = found
@@ -351,7 +362,7 @@ async def pr_opened(adapter: Any, sub: dict, text: str) -> bool:
     posted = False
     # The managed list is read only for a text that can hold a merge request.
     hosts = _managed_gitlab_hosts() if _moments.MR_MARKER in str(text or "") else frozenset()
-    for url, repo, number, line in _moments.opened_prs(text, gitlab_hosts=hosts):
+    for url, repo, number, line in _moments.opened_prs(text, gitlab_hosts=hosts, github_host=_github_host()):
         posted = await _announce(adapter, sub, url, repo, number, line) or posted
     return posted
 

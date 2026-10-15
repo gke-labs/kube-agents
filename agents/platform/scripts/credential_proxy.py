@@ -1020,12 +1020,12 @@ def required_roles(path: str) -> tuple[str, ...]:
 MANAGED_REPOSITORY_CACHE_SECONDS = 30.0
 
 # A successful forge credential refresh satisfies subsequent refresh requests
-# for the same provider arriving within this window, for any repository the
-# helper reported as scoped into the token it installed -- avoiding redundant
-# token mints when concurrent cron jobs wake on the same tick. A repository
-# outside that reported set runs the helper again, and because the forge CLI
-# holds a single token slot per provider (e.g. github.com), the new mint's
-# scope replaces the previous one's coalesce window entirely.
+# for the same provider and host arriving within this window, for any
+# repository the helper reported as scoped into the token it installed --
+# avoiding redundant token mints when concurrent cron jobs wake on the same
+# tick. A repository outside that reported set runs the helper again, and
+# because the forge CLI holds a single token slot per host (e.g. github.com),
+# the new mint's scope replaces the previous one's coalesce window entirely.
 FORGE_REFRESH_COALESCE_SECONDS = 30.0
 
 # Why a route refresher waiting for the refresh lock stopped waiting.
@@ -1200,7 +1200,9 @@ def _provider_forge(provider: str) -> providers.Forge:
     by a caller that has already resolved them. A provider this install did not
     build is refused rather than read as the install's one forge: answering for
     it from another forge's list is how a registration on one forge would
-    admit a name on another.
+    admit a name on another. GitHub has one forge per install, at github.com
+    or at one GitHub Enterprise Server host, so for GitHub that forge is the
+    answer.
     """
     for forge in forge_registry().forges:
         if forge.name == provider:
@@ -1331,18 +1333,63 @@ def _workspace_credential(registry: providers.Registry, repository: str) -> prov
     clone proceeds without one, as an unregistered repository's does, and the
     log says why.
     """
-    if not _is_bare_name(repository):
-        return read_credential_for(registry, repository)
+    if _is_bare_name(repository):
+        try:
+            _provider_forge(CONTENT_WORKSPACE_PROVIDER)
+        except PermissionError:
+            LOGGER.warning(
+                "content workspace open repo=%s: this install serves no %s forge and the "
+                "content workspace clones %s repositories only; cloning without a credential",
+                repository, CONTENT_WORKSPACE_PROVIDER, CONTENT_WORKSPACE_PROVIDER,
+            )
+            return providers.NoCredential()
+        repository = _hosted(repository, CONTENT_WORKSPACE_PROVIDER)
+    credential = read_credential_for(registry, repository)
+    if isinstance(credential, providers.NoCredential):
+        return credential
     try:
-        _provider_forge(CONTENT_WORKSPACE_PROVIDER)
+        _forge, path = registry.resolve(repository)
+    except providers.WorkspaceError:
+        return credential
+    return _ForgePathCredential(credential, path)
+
+
+class _ForgePathCredential:
+    """A credential that the store asks about by its own name, bound to the forge's path.
+
+    The store names a repository on another host `<host>/<path>`, and a
+    credential is asked about the forge's reading of it, `<path>`: a minted
+    credential's managed and context checks key on the forge and the path,
+    and a host left in the path would match no registration. So every call
+    the store makes with its name is answered for the path.
+    """
+
+    def __init__(self, credential: providers.Credential, path: str) -> None:
+        self._credential = credential
+        self._path = path
+        self.stored_token = bool(getattr(credential, "stored_token", False))
+
+    def ensure(self, repo: str) -> None:
+        self._credential.ensure(self._path)
+
+    def headers(self, repo: str) -> dict[str, str]:
+        return self._credential.headers(self._path)
+
+    def git_config(self, repo: str) -> tuple[tuple[str, str], ...]:
+        return self._credential.git_config(self._path)
+
+
+def _workspace_github_host() -> str:
+    """The install's one GitHub host for the content workspace, or github.com.
+
+    An install that built no GitHub forge answers github.com, so a bare name
+    clones from there with no credential, as it did before.
+    """
+    try:
+        forge = _provider_forge(CONTENT_WORKSPACE_PROVIDER)
     except PermissionError:
-        LOGGER.warning(
-            "content workspace open repo=%s: this install serves no %s forge and the "
-            "content workspace clones %s repositories only; cloning without a credential",
-            repository, CONTENT_WORKSPACE_PROVIDER, CONTENT_WORKSPACE_PROVIDER,
-        )
-        return providers.NoCredential()
-    return read_credential_for(registry, _hosted(repository, CONTENT_WORKSPACE_PROVIDER))
+        return repo_ref.GITHUB_CANONICAL_HOST
+    return forge.hosts[0] if forge.hosts else repo_ref.GITHUB_CANONICAL_HOST
 
 
 def _is_bare_name(repository: object) -> bool:
@@ -1359,14 +1406,15 @@ def _workspace_locate(repository: str) -> tuple[str, str]:
     name -- nesting, allowed paths -- and composes the URL; the caller names a
     repository and never a host or a URL. GitHub's comes back as the bare
     `owner/name` the store has always keyed it by, so `github.com/owner/name`
-    and `owner/name` are one repository there.
+    and `owner/name` are one repository there. A GitHub Enterprise Server
+    repository keeps its host, as another forge's does.
     """
     import content_workspace
 
     try:
         forge, path = forge_registry().resolve(repository)
-        if forge.name == CONTENT_WORKSPACE_PROVIDER:
-            return path, f"https://github.com/{path}.git"
+        if forge.name == CONTENT_WORKSPACE_PROVIDER and forge.hosts[0] == repo_ref.GITHUB_CANONICAL_HOST:
+            return path, forge.clone_url(path)
         # Inside the same refusal: the placeholder for a forge this install
         # names but has no credential for parses the name and refuses here.
         return f"{forge.hosts[0]}/{path}", forge.clone_url(path)
@@ -3431,6 +3479,31 @@ FORGE_REFRESH_HELPER_DIR = "/opt/defaults/scripts"
 # import its CLI side into the broker.
 FORGE_READ_ONLY_FLAG = "--read-only"
 
+# The flag that turns a forge's refresh helper into a write mint for a forge
+# with no CLI behind it (GitHub Enterprise Server): the helper prints the
+# token and the repositories it covers as JSON and installs nothing, and
+# `FORGE_HOST_FLAG` names the host it mints for.
+# `github_token_refresh.PRINT_WRITE_FLAG` and `HOST_FLAG` are the same strings,
+# kept in step by test for FORGE_READ_ONLY_FLAG's reason.
+FORGE_WRITE_MINT_FLAG = "--print-write-token"
+FORGE_HOST_FLAG = "--host"
+
+# What git prints when the server refused the credential it presented. With
+# prompts off it asks for a username on the refusing URL, which names the
+# host (and port); the other two name none.
+GIT_USERNAME_REFUSAL_RE = re.compile(r"could not read Username for 'https://([^'/]+)['/]")
+GIT_REFUSED_CREDENTIAL_MARKERS = (
+    "returned error: 401",
+    "Authentication failed",
+)
+
+# How long a minted write token is handed out again, for any repository the
+# mint reported it covers. An installation token lives an hour; reusing it for
+# half of that keeps a verb from minting once per call and leaves the other
+# half for the verbs that started with it. The managed-repository check runs
+# on every request, cached token or not.
+FORGE_WRITE_TOKEN_REUSE_SECONDS = 30 * 60
+
 # How much of a helper's stderr reaches the broker log. The full text is
 # bounded only by the executor's output ceiling, which is not a log line; this
 # runs on every failed cron tick and on every refresh. The tail, not the head:
@@ -5107,8 +5180,11 @@ class CommandExecutor:
         # vcs verbs waiting for that lock, guarded by `_slot_condition`: a route
         # refresher waiting for the budget under the lock yields it to them.
         self._covered_refresh_waiter_count = 0
-        self._last_forge_refresh: dict[str, tuple[float, frozenset[str]]] = {}
-        self._last_forge_refresh_failure: dict[tuple[str, str], tuple[float, Exception]] = {}
+        # Keyed by (provider, host) and by (provider, host, org): the token
+        # slot is a forge host's, so a refresh on one host coalesces nothing
+        # on another.
+        self._last_forge_refresh: dict[tuple[str, str], tuple[float, frozenset[str]]] = {}
+        self._last_forge_refresh_failure: dict[tuple[str, str, str], tuple[float, Exception]] = {}
         trusted_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         self.executables = {
             name: shutil.which(name, path=trusted_path)
@@ -5868,12 +5944,14 @@ class CommandExecutor:
                 "issues on its own behalf"
             )
         with self._outside_budget():
-            return self._execute(
+            result = self._execute(
                 [executable_path, *argv[1:]],
                 cwd=str(cwd),
                 containment_root=self.content_workspace_root,
                 extra_config=tuple(config),
             )
+        self._drop_write_tokens_refused_by(result.exit_code, result.stderr, config)
+        return result
 
     def tls_refusal(self, output: str):
         """The FORGE_TLS_UNTRUSTED refusal git's `output` stands for, or None.
@@ -5932,6 +6010,7 @@ class CommandExecutor:
             containment_root=self.vcs_root,
             extra_config=tuple(config),
         )
+        self._drop_write_tokens_refused_by(result.exit_code, result.stderr, config)
         if check and result.exit_code != 0:
             raise subprocess.CalledProcessError(
                 result.exit_code, argv, result.stdout, result.stderr
@@ -5989,6 +6068,23 @@ class CommandExecutor:
         return self._forge_refresh_lock
 
     @property
+    def _write_mint_lock(self) -> threading.Lock:
+        if getattr(self, "_forge_write_mint_lock", None) is None:
+            self._forge_write_mint_lock = threading.Lock()
+        return self._forge_write_mint_lock
+
+    @property
+    def _write_tokens(self) -> dict[tuple[str, str, str], tuple[float, frozenset[str], str]]:
+        """(provider, host, owner) -> (minted at, repositories covered, token): in memory only.
+
+        One slot per owner, because a mint covers one organisation's
+        repositories: two organisations on one host would otherwise evict
+        each other's token on every alternate request."""
+        if getattr(self, "_forge_write_tokens", None) is None:
+            self._forge_write_tokens = {}
+        return self._forge_write_tokens
+
+    @property
     def _covered_refresh_waiters(self) -> int:
         """vcs verbs waiting for `_refresh_lock`; read and written under
         `_slot_condition`."""
@@ -6001,13 +6097,14 @@ class CommandExecutor:
         self._covered_refresh_waiter_count = count
 
     @property
-    def _refresh_cache(self) -> dict[str, tuple[float, frozenset[str]]]:
+    def _refresh_cache(self) -> dict[tuple[str, str], tuple[float, frozenset[str]]]:
+        """The last refresh per (provider, host): one token slot per forge host."""
         if getattr(self, "_last_forge_refresh", None) is None:
             self._last_forge_refresh = {}
         return self._last_forge_refresh
 
     @property
-    def _refresh_failure_cache(self) -> dict[tuple[str, str], tuple[float, Exception]]:
+    def _refresh_failure_cache(self) -> dict[tuple[str, str, str], tuple[float, Exception]]:
         if getattr(self, "_last_forge_refresh_failure", None) is None:
             self._last_forge_refresh_failure = {}
         return self._last_forge_refresh_failure
@@ -6079,7 +6176,11 @@ class CommandExecutor:
             return
         clean_repo = repository.strip().lower()
         org = clean_repo.split("/", 1)[0] if "/" in clean_repo else clean_repo
-        failure_key = (provider, org)
+        # Keyed by host as well as provider: the token slot is a forge
+        # host's, so a refresh on one host coalesces nothing on another.
+        host = forge.hosts[0] if forge.hosts else ""
+        cache_key = (provider, host)
+        failure_key = (provider, host, org)
         queued_at = time.monotonic()
         # getattr: an executor built without `__init__`, as the lock and caches
         # below allow for, has no budget and nothing reserved.
@@ -6088,7 +6189,7 @@ class CommandExecutor:
             request_budget, "exempt", False
         )
         if covered:
-            if self._refresh_is_current(provider, clean_repo):
+            if self._refresh_is_current(cache_key, clean_repo):
                 return
             # Counted while waiting, so a route holder parked in the budget
             # wait yields the lock; uncounted only once acquired, so a count
@@ -6109,7 +6210,7 @@ class CommandExecutor:
             finally:
                 self._refresh_lock.release()
             return
-        if self._refresh_is_current(provider, clean_repo):
+        if self._refresh_is_current(cache_key, clean_repo):
             return
         failure = self._refresh_failure_cache.get(failure_key)
         if failure is not None and failure[0] >= queued_at:
@@ -6226,11 +6327,12 @@ class CommandExecutor:
                     )
                 self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
 
-    def _refresh_is_current(self, provider: str, clean_repo: str) -> bool:
-        """The coalesce check, readable without the lock: the cache entry is a
-        tuple replaced whole, so a reader sees the old one or the new one."""
+    def _refresh_is_current(self, cache_key: tuple[str, str], clean_repo: str) -> bool:
+        """The coalesce check for one (provider, host), readable without the
+        lock: the cache entry is a tuple replaced whole, so a reader sees the
+        old one or the new one."""
         now = time.monotonic()
-        current = self._refresh_cache.get(provider)
+        current = self._refresh_cache.get(cache_key)
         if current is None:
             return False
         last_refresh, cached_scoped = current
@@ -6248,7 +6350,7 @@ class CommandExecutor:
         helper: Path,
         repository: str,
         clean_repo: str,
-        failure_key: tuple[str, str],
+        failure_key: tuple[str, str, str],
         queued_at: float,
         reserve: bool = False,
         caller: socket.socket | None = None,
@@ -6277,7 +6379,8 @@ class CommandExecutor:
         says the caller stepped aside, with the seconds since `queued_at` and
         the budget's figures, rather than `_admit`'s text, which names
         COMMAND_SLOT_WAIT_SECONDS: the wait on this leg was shorter."""
-        if self._refresh_is_current(provider, clean_repo):
+        cache_key = failure_key[:2]
+        if self._refresh_is_current(cache_key, clean_repo):
             return None
         failure = self._refresh_failure_cache.get(failure_key)
         if failure is not None:
@@ -6337,7 +6440,7 @@ class CommandExecutor:
                 # The helper may have replaced the slot before it failed; a
                 # stale entry would coalesce the next caller onto a token that
                 # is not theirs.
-                self._refresh_cache.pop(provider, None)
+                self._refresh_cache.pop(cache_key, None)
                 if not isinstance(e, TimeoutError):
                     self._refresh_failure_cache[failure_key] = (time.monotonic(), e)
                 raise
@@ -6349,7 +6452,7 @@ class CommandExecutor:
             )
             if not scoped:
                 scoped = frozenset([clean_repo])
-            self._refresh_cache[provider] = (time.monotonic(), scoped)
+            self._refresh_cache[cache_key] = (time.monotonic(), scoped)
         return None
 
     @staticmethod
@@ -6442,6 +6545,120 @@ class CommandExecutor:
         if not token:
             raise RuntimeError("read-only credential mint returned no token")
         return token
+
+    def mint_write_credential(self, provider: str, repository: str) -> str:
+        """A write token for a managed repository on a forge with no CLI, or raise.
+
+        The privileged operation a `MintedWriteCredential` names and does not
+        perform: GitHub Enterprise Server's counterpart of
+        `refresh_forge_credential`. The same helper runs, with the flag that
+        makes it print the token for this forge's host instead of logging the
+        CLI in. The token is kept here, in memory, and handed to the
+        credential; it is never written to a file, an argv, the environment or
+        the CLI's store.
+
+        The managed check runs first and on every call, so a repository
+        unregistered since the last mint is refused even while a cached token
+        still covers it. A token is handed out again for
+        FORGE_WRITE_TOKEN_REUSE_SECONDS for any repository the mint reported
+        it covers; the cache is keyed by provider and host.
+        """
+        forge = _provider_forge(provider)
+        if not repository_is_managed(repository, forge):
+            raise PermissionError(f"{repository} is not a repository this install manages")
+        host = forge.hosts[0] if forge.hosts else ""
+        clean_repo = repository.strip().lower()
+        key = (provider, host, clean_repo.split("/", 1)[0])
+
+        def cached() -> str | None:
+            entry = self._write_tokens.get(key)
+            if entry is None:
+                return None
+            minted_at, covered, token = entry
+            if clean_repo in covered and time.monotonic() - minted_at < FORGE_WRITE_TOKEN_REUSE_SECONDS:
+                return token
+            return None
+
+        token = cached()
+        if token:
+            return token
+        helper = self._forge_helper(provider)
+        with self._write_mint_lock:
+            token = cached()
+            if token:
+                return token
+            budget = getattr(self, "_request_budget", None)
+            covered_by_request = getattr(budget, "reserved", False) or getattr(budget, "exempt", False)
+            arguments = [FORGE_WRITE_MINT_FLAG, FORGE_HOST_FLAG, host, repository]
+            with contextlib.ExitStack() as admission:
+                # A vcs verb's reservation covers the helper, as it covers a
+                # refresh; anything else -- the content workspace, under its
+                # store lock -- runs on the workspace's fixed term.
+                if not covered_by_request and budget is not None:
+                    admission.enter_context(self._outside_budget())
+                try:
+                    result = self._run_forge_helper(provider, helper, arguments, "write credential mint")
+                except Exception:
+                    self._write_tokens.pop(key, None)
+                    raise
+            try:
+                answer = json.loads(result.stdout or "")
+                token = str(answer["token"]).strip()
+                covered = frozenset(str(r).strip().lower() for r in answer.get("repositories") or ())
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                raise RuntimeError("write credential mint returned no token") from exc
+            if not token:
+                raise RuntimeError("write credential mint returned no token")
+            self._write_tokens[key] = (time.monotonic(), covered | {clean_repo}, token)
+        return token
+
+    def drop_write_credential(self, provider: str) -> None:
+        """Forget the write token cached for ``provider``'s forge, so the next use mints anew.
+
+        Called when the forge refuses the token (401): a reinstalled App or a
+        revoked token then recovers on the next call, not when the reuse
+        window ends.
+        """
+        try:
+            forge = _provider_forge(provider)
+        except PermissionError:
+            return
+        host = forge.hosts[0] if forge.hosts else ""
+        for key in list(self._write_tokens):
+            if key[:2] == (provider, host) and self._write_tokens.pop(key, None) is not None:
+                LOGGER.info("%s write token for %s dropped after the forge refused it", provider, host)
+
+    def _drop_write_tokens_refused_by(
+        self, exit_code: int, stderr: str, config: tuple[tuple[str, str], ...]
+    ) -> None:
+        """Drop each cached write token a failed git call presented and the forge refused.
+
+        With an extraheader and the credential helper cleared, git answers a
+        401 by asking for a username, and with prompts off (`_execute` sets
+        GIT_TERMINAL_PROMPT=0 on these calls) it says `could not read Username
+        for '<url>'`. Older and other paths say `The requested URL returned
+        error: 401` or `Authentication failed`. Only the hosts whose
+        extraheader the call carried are dropped.
+        """
+        text = stderr or ""
+        if exit_code == 0:
+            return
+        hosts = {
+            key[len("http.https://"):-len("/.extraheader")]
+            for key, _ in config
+            if key.startswith("http.https://") and key.endswith("/.extraheader")
+        }
+        # The host git asked a username for is the host that refused. The
+        # other markers name no host, so they count only when the call
+        # carried one host's token.
+        refused = set(GIT_USERNAME_REFUSAL_RE.findall(text)) & hosts
+        if not refused and len(hosts) == 1 and any(marker in text for marker in GIT_REFUSED_CREDENTIAL_MARKERS):
+            refused = hosts
+        for key in list(self._write_tokens):
+            provider, host = key[0], key[1]
+            if host in refused:
+                self._write_tokens.pop(key, None)
+                LOGGER.info("%s write token for %s dropped after git was refused", provider, host)
 
     def _within_workspace(self, candidate: Path) -> bool:
         return _within(self.workspace_dir, candidate)
@@ -6929,6 +7146,13 @@ class CommandExecutor:
         elif argv and Path(argv[0]).name == "kubectl":
             command_environment.pop("GH_CONFIG_DIR", None)
         if extra_config:
+            # A git call that carries a forge credential never prompts: there
+            # is no terminal, and with the helper cleared a refused token
+            # would otherwise end in a prompt that cannot be answered. With
+            # prompts off, git's refusal reads the same every time ("could not
+            # read Username for '<url>': terminal prompts disabled"), which is
+            # what a refused write token is recognised by.
+            command_environment["GIT_TERMINAL_PROMPT"] = "0"
             # Rebuilt rather than appended to, because the count and the keys
             # have to move together. The caller's pairs go first so the forced
             # set still wins on a key both name -- git takes the last value in
@@ -7047,11 +7271,18 @@ def build_workspace_store(
         return None
     from content_workspace import ContentWorkspaceStore
 
-    # Its own registry, carrying the read-only mint and nothing else: the store
-    # clones one host, and the credential it may add to a clone is the one that
-    # can only read. The write token is not this registry's to hand out -- the
-    # broker's has it, and the content workspace never asks.
-    registry = providers.Registry({"mint": executor.mint_read_credential})
+    # Its own registry, carrying the read-only mint, and the write mint a forge
+    # with no ambient credential presents for a managed repository's clone and
+    # push. On github.com the write token stays the CLI's: the GitHub forge
+    # there never asks for the write mint, and the content workspace never
+    # hands its write credential out.
+    registry = providers.Registry(
+        {
+            "mint": executor.mint_read_credential,
+            "mint_write": executor.mint_write_credential,
+            "drop_write": executor.drop_write_credential,
+        }
+    )
     store = ContentWorkspaceStore(
         executor.content_workspace_root,
         executor.workspace_dir,
@@ -7064,6 +7295,7 @@ def build_workspace_store(
         # A repository named with its host is cloned from the forge that serves
         # it, which composes the URL; a bare `owner/name` stays GitHub's.
         locate=_workspace_locate,
+        github_host=_workspace_github_host,
         pinned_bases=pinned_bases,
         tls_refusal=executor.tls_refusal,
     )
@@ -7098,6 +7330,8 @@ def build_vcs_broker(
         git_runner=executor.execute_vcs_git,
         cli_runner=executor.execute_forge_cli,
         refresh=executor.refresh_forge_credential,
+        mint_write=executor.mint_write_credential,
+        drop_write=executor.drop_write_credential,
         base_branch=base_branch,
         http_timeout=executor.timeout_seconds,
         http_max_bytes=executor.max_output_bytes,

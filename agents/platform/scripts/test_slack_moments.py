@@ -258,6 +258,8 @@ class ProposalEventTest(unittest.TestCase):
         self.assertEqual(m.proposal_ref(SELF_MANAGED_MR, {"gitlab.example.com"}), (SELF_MANAGED_MR, "infra", "7"))
         for url in ("https://github.example.com/acme/fleet/pull/3", "https://github.com/acme/fleet/issues/3", ""):
             self.assertIsNone(m.proposal_ref(url), url)
+        ghe = "https://github.example.com/acme/fleet/pull/3"
+        self.assertEqual(m.proposal_ref(ghe, github_host="github.example.com"), (ghe, "fleet", "3"))
 
     def test_evidence_is_the_first_line_naming_the_pr_by_url_or_number(self):
         text = "Checked seeded-a.\nBoth fixes are up for review in PR #9\nDone."

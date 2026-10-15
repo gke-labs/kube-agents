@@ -384,6 +384,14 @@ class PrEventTest(unittest.TestCase):
                 self.assertFalse(_run(runtime.pr_event(adapter, SUB, payload)))
         self.assertEqual(adapter.posts, [])
 
+    def test_a_pr_on_the_installs_github_enterprise_host_posts_and_another_host_does_not(self):
+        adapter = _Adapter()
+        ghe = "https://ghe.example.com/acme/fleet/pull/5"
+        with mock.patch.object(runtime, "_github_host", return_value="ghe.example.com"):
+            self.assertTrue(_run(runtime.pr_event(adapter, SUB, {"url": ghe, "number": 5, "title": "Bump"})))
+            self.assertFalse(_run(runtime.pr_event(adapter, SUB, {"url": "https://ghe.other.example/a/b/pull/5"})))
+        self.assertEqual([b["url"] for b in _buttons(_shown(adapter.posts[0]))], [ghe, ghe + "/files"])
+
     def test_a_cited_pr_in_a_note_with_no_event_posts_nothing(self):
         adapter = _Adapter()
         self.assertFalse(_run(runtime.pr_opened(adapter, SUB, f"{self.EVENT['url']} is up for review")))
