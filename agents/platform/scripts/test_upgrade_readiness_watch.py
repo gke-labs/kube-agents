@@ -995,6 +995,87 @@ class Budget(Base):
         self.assertEqual([c[2] for c in sandbox.calls if c[0] == "readiness"], [watch.READINESS_TIMEOUT_SECONDS])
 
 
+class WebhookReadFailure(unittest.TestCase):
+    """A member whose first read answered and whose other rules were graded is graded, not
+    unread, when only the second, webhook read failed: its `unknown` is a verdict."""
+
+    def _report(self, read_tag):
+        member = {"project": "p", "location": "us-central1", "cluster": "big", "readiness": {"status": "unknown"}}
+        error = {"project": "p", "location": "us-central1", "cluster": "big", "message": "kubectl output cut at the credential proxy's cap"}
+        if read_tag:
+            error[watch.ERROR_READ_KEY] = read_tag
+        return {watch.MEMBERS_KEY: [member], watch.ERRORS_KEY: [error]}
+
+    def test_a_webhook_read_failure_leaves_the_member_graded_unknown(self) -> None:
+        key = watch.member_key({"project": "p", "location": "us-central1", "cluster": "big"})
+        blocked, ready, unknown, unread = watch.readiness_verdicts(self._report(watch.WEBHOOK_READ_ERROR), [key])
+        self.assertEqual((blocked, ready, unknown, unread), ([], [], [key], []))
+
+    def test_a_first_read_failure_still_leaves_the_member_unread(self) -> None:
+        key = watch.member_key({"project": "p", "location": "us-central1", "cluster": "big"})
+        blocked, ready, unknown, unread = watch.readiness_verdicts(self._report(None), [key])
+        self.assertEqual((blocked, ready, unknown, unread), ([], [], [], [key]))
+
+    def test_the_markdown_lists_a_webhook_read_row_apart_from_the_unread_ones(self) -> None:
+        # The summary counts the member as graded (unknown); the row is listed under its own
+        # heading, not under the one that says its member is not graded, which the first-read
+        # row of another member still sits under.
+        big = {"project": "p", "location": "us-central1", "cluster": "big", "readiness": {"status": "unknown"}}
+        small = {"project": "p", "location": "us-central1", "cluster": "small", "readiness": {"status": "unknown"}}
+        rows = [
+            {"project": "p", "location": "us-central1", "cluster": "big", "message": "kubectl output cut at the credential proxy's cap", watch.ERROR_READ_KEY: watch.WEBHOOK_READ_ERROR},
+            {"project": "p", "location": "us-central1", "cluster": "small", "message": "get-credentials failed: 403"},
+        ]
+        keys = [watch.member_key(big), watch.member_key(small)]
+        text = watch.render_markdown(TARGET, "a new version", keys, envelope([big, small], errors=rows), datetime(2026, 10, 14, tzinfo=timezone.utc), "Next report in 7 days")
+        self.assertIn("1 unknown (p/us-central1/big; the table says what it could not decide) and 1 not read (p/us-central1/small;", text)
+        unread_at = text.index(watch.FAILED_READS_HEADING)
+        webhook_at = text.index(watch.WEBHOOK_READ_ROWS_HEADING)
+        self.assertLess(unread_at, webhook_at)
+        self.assertIn("- p/us-central1/small: get-credentials failed: 403", text[unread_at:webhook_at])
+        self.assertNotIn("big", text[unread_at:webhook_at])
+        self.assertIn("- p/us-central1/big: kubectl output cut at the credential proxy's cap", text[webhook_at:])
+        self.assertTrue(watch.webhook_read_row(rows[0]) and not watch.unread_row(rows[0]))
+        self.assertTrue(watch.unread_row(rows[1]) and not watch.webhook_read_row(rows[1]))
+        self.assertFalse(watch.unread_row({"project": "p", "location": "us-central1", "message": "server config failed"}))
+
+    def test_a_member_with_a_first_read_row_and_a_webhook_row_is_listed_as_unread_with_both_rows(self) -> None:
+        # The first read timed out at the deadline (no skip marker), the second read then failed
+        # too: two rows for one member, which the summary counts as not read, so neither row
+        # sits under the heading that says the member was graded.
+        big = {"project": "p", "location": "us-central1", "cluster": "big", "readiness": {"status": "unknown"}}
+        rows = [
+            {"project": "p", "location": "us-central1", "cluster": "big", "message": "kubectl get pdb,deploy,statefulset -A -o json timed out after 60 seconds"},
+            {"project": "p", "location": "us-central1", "cluster": "big", "message": "kubectl output cut at the credential proxy's cap", watch.ERROR_READ_KEY: watch.WEBHOOK_READ_ERROR},
+        ]
+        key = watch.member_key(big)
+        self.assertEqual(watch.readiness_verdicts({watch.MEMBERS_KEY: [big], watch.ERRORS_KEY: rows}, [key])[3], [key])
+        text = watch.render_markdown(TARGET, "a new version", [key], envelope([big], errors=rows), datetime(2026, 10, 14, tzinfo=timezone.utc), "Next report in 7 days")
+        self.assertIn("1 not read (p/us-central1/big;", text)
+        self.assertNotIn(watch.WEBHOOK_READ_ROWS_HEADING, text)
+        tail = text[text.index(watch.FAILED_READS_HEADING):]
+        self.assertIn("- p/us-central1/big: kubectl get pdb,deploy,statefulset -A -o json timed out after 60 seconds", tail)
+        self.assertIn("- p/us-central1/big: kubectl output cut at the credential proxy's cap", tail)
+
+    def test_a_member_in_a_location_whose_server_config_failed_keeps_its_webhook_row_off_the_graded_heading(self) -> None:
+        # The summary counts the member as not read (its location's get-server-config failed and
+        # it is graded unknown, with no target), so its one webhook row is listed with the failed
+        # reads, not under the heading that says the member is graded.
+        big = {"project": "p", "location": "us-central1", "cluster": "big", "readiness": {"status": "unknown"}}
+        rows = [
+            {"project": "p", "location": "us-central1", "message": "get-server-config timed out"},
+            {"project": "p", "location": "us-central1", "cluster": "big", "message": "kubectl output cut at the credential proxy's cap", watch.ERROR_READ_KEY: watch.WEBHOOK_READ_ERROR},
+        ]
+        key = watch.member_key(big)
+        self.assertEqual(watch.readiness_verdicts({watch.MEMBERS_KEY: [big], watch.ERRORS_KEY: rows}, [key])[3], [key])
+        text = watch.render_markdown(TARGET, "a new version", [key], envelope([big], errors=rows), datetime(2026, 10, 14, tzinfo=timezone.utc), "Next report in 7 days")
+        self.assertIn("1 not read (p/us-central1/big;", text)
+        self.assertNotIn(watch.WEBHOOK_READ_ROWS_HEADING, text)
+        tail = text[text.index(watch.FAILED_READS_HEADING):]
+        self.assertIn("- p/us-central1: get-server-config timed out", tail)
+        self.assertIn("- p/us-central1/big: kubectl output cut at the credential proxy's cap", tail)
+
+
 class ProfileHome(unittest.TestCase):
     def test_a_hand_run_from_the_gateway_home_finds_the_profile_s_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as root:

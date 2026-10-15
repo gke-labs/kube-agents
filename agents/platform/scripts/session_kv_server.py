@@ -161,6 +161,14 @@ CONVERSATION_ROUTE_KEY = "conversation_route"
 # Bounds on what a route carries: a gateway conversation key and context id
 # are short, and anything longer is not one.
 CONVERSATION_FIELD_MAX_CHARS = 512
+# The kind of ask the turn's prompt is: a `mark.ask` token of the
+# kube-agents.chat/v1 format, chosen by the bridge with
+# slack_presenter.arrival_reaction's rules. Optional. The kanban notifier reads
+# it back to keep the ask's reaction on while the conversation's cards run.
+# Anything but a token is dropped rather than refused: the route itself is what
+# a card needs.
+CONVERSATION_ROUTE_ASK_KEY = "ask"
+CONVERSATION_ASK_TOKEN = re.compile(r"[a-z0-9-]{1,16}")
 
 # Hermes' managed scope, the administrator-pinned layer `load_hermes_dotenv`
 # applies LAST with override=True. The operator mounts it at /etc/hermes and
@@ -1342,18 +1350,21 @@ def get_active_platform(platforms: Optional[list[str]] = None) -> str:
 ALERT_SENT_WITHOUT_THREAD = "\x00alert-sent-without-thread"
 
 
-def _run_alert_send(active_platform: str, alert_msg: str) -> subprocess.CompletedProcess:
+def _run_alert_send(active_platform: str, alert_msg: str, session_id: str = "") -> subprocess.CompletedProcess:
     """Run the alert's send, waiting out a gateway route that is briefly not there.
 
     The alert has one shot, so `a2a notify`'s "route unavailable" (a gateway
     roll, or its bind retry) is retried on chat_notify's schedule rather than
-    dropping the alert; every other outcome is the caller's to read.
+    dropping the alert; every other outcome is the caller's to read. Under
+    next the post carries the update key of ``session_id``'s alert, so the
+    gateway can edit it in place into the triage when the report lands
+    (slack_ux_incident).
     """
     delays = chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS if chat_notify.routes(active_platform) else ()
     for delay in (*delays, None):
         try:
             return subprocess.run(
-                chat_notify.command(active_platform, alert_msg),
+                chat_notify.command(active_platform, alert_msg, update=chat_notify.alert_update_key(session_id)),
                 check=True,
                 capture_output=True,
                 text=True,
@@ -1368,7 +1379,7 @@ def _run_alert_send(active_platform: str, alert_msg: str) -> subprocess.Complete
     raise AssertionError("unreachable: the last attempt returns or raises")
 
 
-def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
+def _post_initial_alert(active_platform: str, alert_msg: str, session_id: str = "") -> str | None:
     """Send the initial warning alert and return the thread/message ID.
 
     Posts with `hermes send`, or with `a2a notify` for the platform the A2A
@@ -1378,7 +1389,7 @@ def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
     happened here, and it is the one where a retry does damage rather than good.
     """
     try:
-        res = _run_alert_send(active_platform, alert_msg)
+        res = _run_alert_send(active_platform, alert_msg, session_id)
         resp = json.loads(res.stdout)
         msg_id = resp.get("message_id", "")
         if msg_id:
@@ -2419,7 +2430,8 @@ def trigger_agent_troubleshooter(
         thread_id = None
         for candidate in [active_platform] + [p for p in platforms if p != active_platform]:
             thread_id = _post_initial_alert(
-                candidate, slack_alert_msg if candidate == SLACK_PLATFORM and slack_alert_msg else alert_msg
+                candidate, slack_alert_msg if candidate == SLACK_PLATFORM and slack_alert_msg else alert_msg,
+                session_id,
             )
             if thread_id == ALERT_SENT_WITHOUT_THREAD:
                 # Delivered, and unthreadable. Stop: the reader has the alert, and
@@ -2928,11 +2940,22 @@ def _is_fleet_audit_job(profile: str, job_id: str) -> bool:
 
 
 def _is_managed_github_repo(repo: str) -> bool:
-    """Whether `repo` is a managed GitHub repository; False when the list cannot be read."""
-    try:
-        from gitops_workspace import get_managed_github_repos
+    """Whether `repo` is a managed GitHub repository; False when the list cannot be read.
 
-        managed = {slug.lower() for slug in get_managed_github_repos()}
+    A bare `owner/name` is a github.com one. A `<host>/owner/name` is one on
+    the install's GitHub Enterprise Server host, named as the managed list
+    names it.
+    """
+    try:
+        from gitops_workspace import get_managed_github_repos, get_managed_repos, github_host
+
+        if repo.count("/") == 2:
+            host = repo.split("/", 1)[0].lower()
+            if host != github_host():
+                return False
+            managed = {name.lower() for name in get_managed_repos()}
+        else:
+            managed = {slug.lower() for slug in get_managed_github_repos()}
     except Exception as exc:
         logger.warning(f"Audit headline skipped: managed repositories unreadable: {exc}")
         return False
@@ -2974,6 +2997,8 @@ def _post_audit_blocks(
 ) -> AuditPost | None:
     """Post the audit report as Block Kit (headline, findings, choice and link
     buttons, or the clean card); where it landed, or None to post text instead.
+    Under ``spec.mode: next`` the same card goes to the gateway as a chat
+    message instead (:func:`_post_audit_chat_via_gateway`).
 
     None, before anything is posted, when there are no blocks to build (no
     issue, an issue that does not parse), no Slack relay in the
@@ -2993,7 +3018,10 @@ def _post_audit_blocks(
     if headline.issue is None or not (routed or slack_blocks_post.configured()):
         return None
     threaded = bool(chat_id and thread_id)
-    built = slack_audit_report.blocks_from_issue(headline.issue, headline.ref, message)
+    if routed:
+        built = slack_audit_report.chat_from_issue(headline.issue, headline.ref, message)
+    else:
+        built = slack_audit_report.blocks_from_issue(headline.issue, headline.ref, message)
     if built is None:
         return None
     blocks, text = built
@@ -3002,7 +3030,7 @@ def _post_audit_blocks(
         logger.warning(f"Relay for {profile}/{job_id}: no time left for the report blocks, posting text")
         return None
     if routed:
-        return _post_audit_blocks_via_gateway(
+        return _post_audit_chat_via_gateway(
             profile, job_id, blocks, text, thread_id if threaded else "", min(AUDIT_BLOCKS_POST_TIMEOUT_S, left)
         )
     try:
@@ -3025,63 +3053,33 @@ def _post_audit_blocks(
     return AuditPost(thread_id if threaded else ts)
 
 
-# The A2A gateway answers no Slack interaction (it acks only Events API
-# envelopes), so a button posted through it is one a user clicks into a
-# timeout. Interactive elements are taken off the card on that path; a URL
-# button becomes a plain mrkdwn link so the ledger link survives.
-GATEWAY_INTERACTIVE_BLOCK = "actions"
-GATEWAY_BUTTON = "button"
 # How much sooner the CLI gives up than the subprocess bound, so the CLI's
 # own outcome-unknown exit is what a slow post ends in.
-GATEWAY_BLOCKS_TIMEOUT_MARGIN_S = 3
+GATEWAY_POST_TIMEOUT_MARGIN_S = 3
 
 
-def _without_interaction(blocks: list[dict]) -> list[dict]:
-    """The card without anything a user could click: no actions blocks and no
-    interactive accessories. The URLs of any link buttons come back as one
-    context block of mrkdwn links, so the card keeps where it points."""
-    kept: list[dict] = []
-    links: list[str] = []
-
-    def collect(element: dict) -> None:
-        if element.get("type") == GATEWAY_BUTTON and element.get("url"):
-            label = ((element.get("text") or {}).get("text") or element["url"]).replace("|", " ")
-            links.append(f"<{element['url']}|{label}>")
-
-    for block in blocks:
-        if block.get("type") == GATEWAY_INTERACTIVE_BLOCK:
-            for element in block.get("elements") or []:
-                collect(element)
-            continue
-        accessory = block.get("accessory")
-        if isinstance(accessory, dict) and accessory.get("type") not in ("image", None):
-            collect(accessory)
-            block = {key: value for key, value in block.items() if key != "accessory"}
-        kept.append(block)
-    if links:
-        kept.append({"type": "context", "elements": [{"type": "mrkdwn", "text": " · ".join(links)}]})
-    return kept
-
-
-def _post_audit_blocks_via_gateway(
-    profile: str, job_id: str, blocks: list[dict], text: str, thread_id: str, timeout: float
+def _post_audit_chat_via_gateway(
+    profile: str, job_id: str, chat: dict, text: str, thread_id: str, timeout: float
 ) -> AuditPost | None:
-    """Post the audit report's blocks through the gateway's Slack chat.notify route.
+    """Post the audit report's card through the gateway's Slack chat.notify route.
 
     The next-stack half of :func:`_post_audit_blocks`: under ``spec.mode: next``
-    the broker's Slack relay is gone and the gateway holds Slack, so the blocks
-    go as ``a2a notify --blocks-file`` into the home channel (chat_notify.py).
-    Same outcomes as the relay path: None, to post text instead, after a
-    refusal, a failure to send, or a post that may have landed.
+    the broker's Slack relay is gone and the gateway holds Slack, so the card
+    goes as a ``kube-agents.chat/v1`` message (``a2a notify --chat-file``,
+    chat_notify.py) into the home channel, and the gateway lays it out, its
+    buttons included. ``text`` is the message's fallback, which the gateway
+    posts itself when it does not lay the message out. Same outcomes as the
+    relay path: None, to post text instead, after a refusal, a failure to
+    send, or a post that may have landed.
     """
     path = ""
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
-            json.dump(_without_interaction(blocks), handle)
+            json.dump(chat, handle)
             path = handle.name
         res = subprocess.run(
-            chat_notify.blocks_command(
-                SLACK_PLATFORM, thread_id, text, path, max(timeout - GATEWAY_BLOCKS_TIMEOUT_MARGIN_S, 1)
+            chat_notify.chat_command(
+                SLACK_PLATFORM, thread_id, text, path, max(timeout - GATEWAY_POST_TIMEOUT_MARGIN_S, 1)
             ),
             capture_output=True,
             text=True,
@@ -3090,7 +3088,7 @@ def _post_audit_blocks_via_gateway(
             timeout=timeout,
         )
     except Exception as exc:
-        logger.warning(f"Relay for {profile}/{job_id}: report blocks may have posted, posting text: {exc!r}")
+        logger.warning(f"Relay for {profile}/{job_id}: report card may have posted, posting text: {exc!r}")
         return None
     finally:
         if path:
@@ -3100,9 +3098,9 @@ def _post_audit_blocks_via_gateway(
                 pass
     if res.returncode != 0:
         if chat_notify.outcome_unknown(res.returncode):
-            logger.warning(f"Relay for {profile}/{job_id}: report blocks may have posted, posting text: {res.stderr.strip()}")
+            logger.warning(f"Relay for {profile}/{job_id}: report card may have posted, posting text: {res.stderr.strip()}")
         else:
-            logger.warning(f"Relay for {profile}/{job_id}: report blocks not posted, posting text: {res.stderr.strip()}")
+            logger.warning(f"Relay for {profile}/{job_id}: report card not posted, posting text: {res.stderr.strip()}")
         return None
     try:
         resp = json.loads(res.stdout) or {}
@@ -3111,6 +3109,48 @@ def _post_audit_blocks_via_gateway(
     if thread_id:
         return AuditPost(thread_id)
     return AuditPost(chat_notify.thread_from_response(SLACK_PLATFORM, resp if isinstance(resp, dict) else {}))
+
+
+def _post_failed_audit_via_gateway(
+    profile: str, job_id: str, report: str, chat_id: str, thread_id: str, deadline: float
+) -> AuditPost | None:
+    """Under ``spec.mode: next``, post a failed fleet-audit report as its one line with the report folded under it.
+
+    A reply in the thread reaches the gateway there, which cannot replay the
+    report as ``incident_context`` does under today, so the report rides in
+    the message's fold (:func:`slack_audit_report.failed_chat`). None, and the
+    caller posts the line as text, when the message cannot be built, too
+    little of `deadline` is left, or the gateway did not post it.
+    """
+    built = slack_audit_report.failed_chat(report)
+    left = deadline - time.monotonic()
+    if built is None or left < AUDIT_BLOCKS_MIN_POST_S:
+        return None
+    chat, text = built
+    thread = thread_id if chat_id and thread_id else ""
+    return _post_audit_chat_via_gateway(profile, job_id, chat, text, thread, min(AUDIT_BLOCKS_POST_TIMEOUT_S, left))
+
+
+def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, job_id: str) -> str | None:
+    """With ``KAGE_SLACK_UX`` on, the one line a fleet-audit report that could not complete posts in Slack.
+
+    None, and the leg posts the report as written, unless the leg is Slack, the
+    flag is on, a channel is known (the leg's chat id or the Slack home
+    channel), the report ends with no ledger link and opens a "What's wrong"
+    section (:func:`slack_audit_report.failed_line`), and the job runs the
+    fleet-audit skill. The line is that section's first sentence, the agent's
+    own words for what failed; the incident row the caller stores keeps the
+    whole report for a reply in the thread, and under ``spec.mode: next`` the
+    report folds under the line instead (:func:`_post_failed_audit_via_gateway`).
+    """
+    if platform != SLACK_PLATFORM or not slack_presenter.enabled():
+        return None
+    if not (chat_id or _slack_home_channel()):
+        return None
+    line = slack_audit_report.failed_line(report)
+    if line is None or not _is_fleet_audit_job(profile, job_id):
+        return None
+    return line
 
 
 def relay_cron_report(
@@ -3249,15 +3289,33 @@ def relay_cron_report(
             logger.warning(f"Relay for {profile}/{job_id}: audit headline skipped: {exc!r}")
             headline = None
         posted = None
-        # A truncated report keeps its notice, which the blocks have no place for.
+        failed = None
+        # A truncated report keeps its notice, which the blocks have no place for,
+        # and the rest of it.
         if headline and not truncation_notice:
             posted = _post_audit_blocks(
                 profile, job_id, headline, message, leg_chat_id, leg_thread_id, blocks_deadline
             )
+        elif not truncation_notice:
+            try:
+                failed = _failed_audit_line(platform, report, leg_chat_id, profile, job_id)
+            except Exception as exc:
+                logger.warning(f"Relay for {profile}/{job_id}: failed-audit line skipped: {exc!r}")
+            if failed and chat_notify.routes(platform):
+                posted = _post_failed_audit_via_gateway(
+                    profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
+                )
         if posted is not None:
             new_thread_id = posted.thread_id or None
         else:
-            leg_message = truncation_notice + headline.text if headline else message
+            # Under next a reply cannot bring the report back, so a failed audit
+            # whose folded card did not post goes out whole.
+            if headline:
+                leg_message = truncation_notice + headline.text
+            elif failed and not chat_notify.routes(platform):
+                leg_message = failed
+            else:
+                leg_message = message
             new_thread_id = _send_to_chat(platform, leg_message, leg_chat_id, leg_thread_id)
             if new_thread_id == ALERT_SENT_WITHOUT_THREAD:
                 # Posted (or may have): delivered, with no thread to register.
@@ -3790,7 +3848,9 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
     the turn files subscribes to `api_server` and this session id, and
     `deploy/docker/patches/kanban_event_routing.py` reads what this stores under
     `conversation_route` (`platform`, `conversation`, the gateway's key, and
-    `context_id`) and addresses the subscription to the conversation. The
+    `context_id`) and addresses the subscription to the conversation; `ask`,
+    when the bridge sends a valid token, is the kind of the turn's ask, which
+    the notifier's chat messages keep marked while the cards run. The
     kanban notifier then posts the card's report with `a2a notify
     --conversation`, and the gateway posts it only if the conversation's
     session record carries that context id.
@@ -3803,6 +3863,7 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
     platform = str(request_data.get("platform") or "").strip()
     conversation = str(request_data.get("conversation") or "").strip()
     context_id = str(request_data.get("context_id") or "").strip()
+    ask = str(request_data.get(CONVERSATION_ROUTE_ASK_KEY) or "").strip()
     prefix = CONVERSATION_KEY_PREFIXES.get(platform)
     if prefix is None:
         raise HTTPException(status_code=400, detail=f"platform {platform!r} is not one the gateway holds")
@@ -3827,11 +3888,14 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
                     meta = loaded if isinstance(loaded, dict) else {}
                 except ValueError:
                     meta = {}
-            meta[CONVERSATION_ROUTE_KEY] = {
+            route = {
                 "platform": platform,
                 "conversation": conversation,
                 "context_id": context_id,
             }
+            if CONVERSATION_ASK_TOKEN.fullmatch(ask):
+                route[CONVERSATION_ROUTE_ASK_KEY] = ask
+            meta[CONVERSATION_ROUTE_KEY] = route
             conn.execute(
                 "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?) "
                 "ON CONFLICT(session_id) DO UPDATE SET metadata = excluded.metadata, updated_at = CURRENT_TIMESTAMP",

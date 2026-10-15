@@ -162,6 +162,13 @@ RECORD_CELL_UNKNOWN = "--"
 # the grader's reason; the collector (scripts/eval_dashboard/collect.py)
 # caps at the same figure, so the two never disagree about the cut.
 REPORT_EXCERPT_MAX_CHARS = 300
+# The keys of the `rep N timing:` line. The collector
+# (scripts/eval_dashboard/collect.py, _REP_TIMING_KEYS) parses the same two.
+REP_TIMING_AGENT_KEY = "agent_s"
+REP_TIMING_TURN1_KEY = "turn1_s"
+# The line's precision. A value that rounds to zero at it is left out, as the
+# collector reads `0.0` as unknown.
+REP_TIMING_DECIMALS = 1
 
 # What must not reach the log line: C0 and C1 controls and DEL (a captured
 # kubectl colour code, a NUL, a stray 8-bit control), and lone surrogates,
@@ -454,6 +461,16 @@ def _cmd_case(args: argparse.Namespace) -> int:
     for rep in verdict.reps:
         judged = " ".join(f"{k}={v}" for k, v in sorted(rep.judged.items()))
         print(f"  rep {rep.index}: {rep.outcome} -- {rep.reason}" + (f" [{judged}]" if judged else ""))
+        # The agent run's wall clock and its opening chat turn, for the
+        # dashboard's latency rollup. A missing value is left out, and no
+        # line at all when both are. `rep N timing:` does not match `rep N:`.
+        timing = " ".join(
+            f"{key}={value:.{REP_TIMING_DECIMALS}f}"
+            for key, value in ((REP_TIMING_AGENT_KEY, rep.latency), (REP_TIMING_TURN1_KEY, rep.turn1_s))
+            if value is not None and round(value, REP_TIMING_DECIMALS) > 0
+        )
+        if timing:
+            print(f"  rep {rep.index} timing: {timing}")
         # The agent's own words, one line under the grading line of every
         # repetition that did not pass, so the dashboard can quote the report
         # beside the check that failed. A pass needs no quote; an empty

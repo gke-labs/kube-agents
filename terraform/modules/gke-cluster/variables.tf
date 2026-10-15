@@ -177,3 +177,9 @@ variable "gvisor_pool_name" {
   type        = string
   default     = "gvisor-pool"
 }
+
+variable "create_after" {
+  description = "An opaque value the cluster is ordered after. Terraform destroys dependents before dependencies, so a caller that passes something derived from another component gets that component torn down AFTER this cluster -- which is why full-install passes the drift audit ingress: the control plane emits audit records until it is gone, and a topic deleted while it is still emitting mails every project owner. The value itself is never read. Pass null, the default, for no ordering. This is an input rather than a depends_on on the module because a module-level depends_on defers every data source inside it, including the one that reads an existing cluster when create_cluster is false; that leaves the helm provider without a host at plan time, and a helm provider that cannot reach the cluster plans every release as a create."
+  type        = any
+  default     = null
+}

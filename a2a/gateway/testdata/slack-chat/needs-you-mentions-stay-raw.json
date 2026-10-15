@@ -1,0 +1,72 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "Question",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      }
+    ],
+    "attachments": [
+      {
+        "blocks": [
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "text": "<@U123> said so. Which?",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "type": "rich_text"
+          },
+          {
+            "elements": [
+              {
+                "action_id": "kage.choice.0",
+                "text": {
+                  "emoji": true,
+                  "text": "<!here>",
+                  "type": "plain_text"
+                },
+                "type": "button",
+                "value": "<!here>"
+              },
+              {
+                "action_id": "kage.choice.1",
+                "text": {
+                  "emoji": true,
+                  "text": "<!channel>",
+                  "type": "plain_text"
+                },
+                "type": "button",
+                "value": "<!channel>"
+              }
+            ],
+            "type": "actions"
+          }
+        ],
+        "color": "#ECB22E",
+        "fallback": "(the text fallback)"
+      }
+    ]
+  }
+]

@@ -62,6 +62,7 @@ _install_hermes_stubs()
 
 import apply_kanban_chat_notify  # noqa: E402
 import kanban_chat_notify  # noqa: E402
+import kanban_notifier  # noqa: E402
 from gateway.config import Platform  # noqa: E402
 
 ROUTED = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}
@@ -305,6 +306,79 @@ class SendTest(unittest.TestCase):
         self.assertFalse(unsent.success)
         self.assertEqual(len(calls), 1, "a Slack thread with no channel was sent")
 
+    def test_a_chat_message_rides_as_a_file_with_its_update_key(self):
+        # The gateway patches compose a kube-agents.chat/v1 object and hand it
+        # to send_chat; it goes out as --chat-file (removed after the send) and
+        # --update, the text still its fallback after "--".
+        adapter = kanban_chat_notify.ChatNotifyAdapter(Platform.SLACK, _Runner())
+        seen = {}
+
+        async def fake_exec(*argv, **kwargs):
+            argv = list(argv)
+            path = argv[argv.index("--chat-file") + 1]
+            seen["argv"], seen["path"] = argv, path
+            seen["chat"] = json.loads(Path(path).read_text(encoding="utf-8"))
+            seen["mode"] = os.stat(path).st_mode & 0o777
+            return _Proc(0, b'{"message_id":"m1"}')
+
+        chat = {"schema": "kube-agents.chat/v1", "headline": "3 nodes"}
+        self.assertTrue(kanban_chat_notify.chat_route(adapter))
+        with mock.patch.object(kanban_chat_notify.asyncio, "create_subprocess_exec", fake_exec):
+            result = asyncio.run(adapter.send_chat("C1", "3 nodes", chat, "plan", metadata={"thread_id": "1.2"}))
+        self.assertTrue(result.success)
+        self.assertEqual(seen["chat"], chat)
+        self.assertEqual(seen["mode"], 0o600)
+        argv = seen["argv"]
+        self.assertEqual(argv[argv.index("--update") + 1], "plan")
+        self.assertEqual(argv[argv.index("--thread") + 1], "C1/1.2")
+        self.assertEqual(argv[-2:], ["--", "3 nodes"])
+        self.assertFalse(Path(seen["path"]).exists(), "the chat file outlived the send")
+
+    def test_a_chat_message_never_rides_without_its_text(self):
+        adapter = kanban_chat_notify.ChatNotifyAdapter(Platform.SLACK, _Runner())
+        calls = []
+
+        async def fake_exec(*argv, **kwargs):
+            calls.append(list(argv))
+            return _Proc(0, b"{}")
+
+        with mock.patch.object(kanban_chat_notify.asyncio, "create_subprocess_exec", fake_exec):
+            asyncio.run(adapter.send_chat("C1", " ", {"schema": "kube-agents.chat/v1"}, metadata={"thread_id": "1.2"}))
+        self.assertNotIn("--chat-file", calls[0])
+
+    def test_a_marked_failure_reply_is_laid_out(self):
+        # slack_ux_failure marks the reply to a failure wake for the length of
+        # its send; the stand-in asks it for the chat message then.
+        adapter = kanban_chat_notify.ChatNotifyAdapter(Platform.SLACK, _Runner())
+        failure = types.ModuleType("slack_ux_failure")
+        failure.chat_for = lambda content: {"schema": "kube-agents.chat/v1", "headline": content.split(".")[0] + "."}
+        seen = []
+
+        async def fake_exec(*argv, **kwargs):
+            argv = list(argv)
+            seen.append(json.loads(Path(argv[argv.index("--chat-file") + 1]).read_text()) if "--chat-file" in argv else None)
+            return _Proc(0, b"{}")
+
+        with mock.patch.dict(sys.modules, {"slack_ux_failure": failure}), \
+                mock.patch.object(kanban_chat_notify.asyncio, "create_subprocess_exec", fake_exec):
+            asyncio.run(adapter.send("C1", "I couldn't find it. Try there?", metadata={"thread_id": "1.2"}))
+        self.assertEqual(seen, [{"schema": "kube-agents.chat/v1", "headline": "I couldn't find it."}])
+
+    def test_the_conversation_ask_is_read_back_from_the_route(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        db = os.path.join(home.name, "session_kv.db")
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE session_metadata (session_id TEXT PRIMARY KEY, metadata TEXT)")
+            route = {"conversation_route": {"platform": "slack", "conversation": "slack:C1/1.2",
+                                            "context_id": "ctx-1", "ask": "fleet"}}
+            conn.execute("INSERT INTO session_metadata VALUES (?, ?)", ("a2a-ctx-1", json.dumps(route)))
+        with mock.patch.dict(os.environ, {kanban_chat_notify.SESSION_KV_DB_ENV: db}):
+            adapter = kanban_chat_notify.ConversationNotifyAdapter(Platform.SLACK, _Runner())
+            self.assertEqual(adapter.ask("a2a-ctx-1"), "fleet")
+            self.assertEqual(kanban_chat_notify.conversation_context("a2a-ctx-1"), "ctx-1")
+            self.assertEqual(adapter.ask("a2a-ctx-gone"), "")
+
     def test_no_thread_is_a_new_thread(self):
         _, calls = self._send(0, b"{}")
         self.assertNotIn("--thread", calls[0][0])
@@ -534,6 +608,42 @@ class _Task:
     result: str
 
 
+class FoldsIntoRowTest(unittest.TestCase):
+    """``_folds_into_row`` through its own query, against a board with the ``payload`` column it reads."""
+
+    SUB = {"platform": "slack", "chat_id": "a2a-ctx-1", "thread_id": "slack:C1/1.2", "task_id": "t_c1"}
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.executescript(
+            "CREATE TABLE tasks (id TEXT, status TEXT);"
+            "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
+            "CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT);"
+            "INSERT INTO tasks VALUES ('t_parent', 'running'), ('t_c1', 'done'), ('t_c2', 'running');"
+            "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_c1', 'created', '{\"creator_task_id\": \"t_parent\"}');"
+            "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_c2', 'created', '{\"creator_task_id\": \"t_parent\"}');"
+        )
+        self.conn.execute("INSERT INTO kanban_notify_subs VALUES ('t_parent', 'slack', ?, ?)",
+                          (self.SUB["chat_id"], self.SUB["thread_id"]))
+        flag = mock.patch.object(kanban_notifier, "slack_ux_on", side_effect=lambda p: str(p).lower() == "slack")
+        flag.start()
+        self.addCleanup(flag.stop)
+
+    def test_a_child_beneath_an_open_fan_out_on_slack_folds(self):
+        self.assertTrue(kanban_chat_notify._folds_into_row(self.conn, self.SUB))
+
+    def test_not_once_the_parent_is_done(self):
+        self.conn.execute("UPDATE tasks SET status = 'done' WHERE id = 't_parent'")
+        self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, self.SUB))
+
+    def test_not_on_another_thread(self):
+        self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, dict(self.SUB, thread_id="slack:C1/9.9")))
+
+    def test_not_with_the_flag_off(self):
+        with mock.patch.object(kanban_notifier, "slack_ux_on", return_value=False):
+            self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, self.SUB))
+
+
 class FoldFanoutTest(unittest.TestCase):
     """A fanned-out child's answer folds into its parent's on the routed path.
 
@@ -610,6 +720,23 @@ class FoldFanoutTest(unittest.TestCase):
     def test_the_answer_is_held_while_the_parent_works(self):
         self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
         self.assertEqual(self.cursor(), 6, "a hold under the read-only claim writes nothing")
+
+    def test_an_answer_that_folds_into_its_plan_row_delivers_while_the_parent_works(self):
+        # kanban_progress_lines settles the row and posts nothing; a hold would leave the row
+        # running after the parent's answer, since the drop that follows never reaches the plan.
+        claim = self.claim(_Ev(7, "completed", 1900))
+        with mock.patch.object(kanban_chat_notify, "_folds_into_row", return_value=True):
+            self.assertIs(self.fold(claim), claim)
+        self.assertEqual(self.cursor(), 6, "delivered as claimed: the fold writes nothing")
+
+    def test_an_answer_that_folds_into_its_row_is_still_dropped_after_the_parents_posted(self):
+        self.parent("done", completed_event=9, delivered=9)
+        with mock.patch.object(kanban_chat_notify, "_folds_into_row", return_value=True):
+            self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
+
+    def test_no_plan_fold_without_the_slack_flag(self):
+        # This class's thread is Google Chat, which has no plan: the hold stands.
+        self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, dict(self.THREAD, task_id="t_child")))
 
     def test_a_hold_under_the_committed_claim_rewinds(self):
         self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900), committed=True)))

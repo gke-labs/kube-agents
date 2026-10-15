@@ -1,6 +1,6 @@
 ---
 name: manage-cluster
-description: Bring an existing GKE cluster under management on user request (e.g. "manage my cluster <name> in <location>") by creating its Cluster Agent profile. Use whenever a user asks to manage/onboard/watch a specific existing cluster.
+description: Bring an existing GKE cluster under management on user request (e.g. "manage my cluster <name> in <location>") by creating its Cluster Agent profile, or take one out of management by excluding it. Use whenever a user asks to manage/onboard/watch a specific existing cluster, or to stop managing, exclude or offboard one.
 ---
 
 # Manage Cluster Skill
@@ -38,7 +38,7 @@ This is the explicit, user-driven counterpart to onboarding-time creation (`gke-
 Because reconciliation manages **all** clusters in every project in scope, deleting a still-existing cluster's profile alone won't stick — the next reconcile recreates it. To stop managing a cluster:
 
 - **Tear down the cluster** (see `gke-cluster-creation`); reconcile prunes its profile automatically.
-- Or **exclude it**: add the cluster's project, location and name to `spec.scope.exclude.clusters` on the `PlatformAgent` (the operator delivers it to the reconcile, which prunes the profile on its next run). The older `RECONCILE_EXCLUDE` bare-name variable on the `cluster-agent-reconcile` cron still works for one release.
+- Or **exclude it**: declare the cluster as an exclusion where the install's scope is declared, which depends on how the `PlatformAgent` is applied. Take that from the request, or ask; the agent cannot read the Helm release record. On an install made with `install.sh` and upgraded with `upgrade.sh` (an `install.env` exists; the Terraform composition applies the chart from it), have the user add `project/location/cluster` to `SCOPE_EXCLUDE_CLUSTERS` in `install.env` and run `./upgrade.sh --upgrade-mode=full`, which renders the exclusion into `spec.scope.exclude.clusters` and the reconcile prunes the profile on its next run. Do not route them to edit the `PlatformAgent` or the chart values by hand there. A CR edit takes effect at the next reconcile, but the next full upgrade refuses to apply over a `spec.scope` that `install.env` does not record, and prints the `SCOPE_*` lines that would; a `helm upgrade` by hand is not refused, the next full upgrade renders `install.env`'s scope over it and the profile comes back. On a chart installed with `helm install` directly, the exclusion is the value `platformAgent.scope.exclude.clusters` and a `helm upgrade`; on the composition applied directly, `scope.exclude.clusters` in its tfvars. On a hand-applied `PlatformAgent` (no `meta.helm.sh/release-name` annotation: `kubectl get platformagent -n kubeagents-system -o jsonpath='{.items[0].metadata.annotations.meta\.helm\.sh/release-name}'`, the install's namespace), add an entry `{projectId, location, clusterName}` to `spec.scope.exclude.clusters` on it (the operator delivers it to the reconcile, which prunes the profile on its next run). The older `RECONCILE_EXCLUDE` bare-name variable on the `cluster-agent-reconcile` cron still works for one release.
 
 ## Notes
 

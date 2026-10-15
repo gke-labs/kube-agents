@@ -709,6 +709,25 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
                 self.assertRegex(proc.stdout, r"rc=[1-9] cm=\s*$", proc.stderr + proc.stdout)
                 self.assertIn(message, proc.stdout + proc.stderr)
 
+    def test_a_ca_on_a_descriptor_is_not_read_before_the_apply(self):
+        # Review: the CA pre-check uses gitops_source_is_rereadable. A CA on
+        # /dev/fd/N is read only after the apply, so a bad PEM there is not
+        # refused here, and the descriptor still holds its content. With
+        # `[ -f ]` (the old check) Linux reads /dev/fd/9 and refuses it here.
+        bad = self._tmp / "not-pem-on-fd.pem"
+        bad.write_text("hello\n")
+        body = (
+            f"exec 9< {shlex.quote(str(bad))}\n"
+            "PARAM_GITOPS_FORGE=gitlab PARAM_GITLAB_TOKEN_SECRET=gitlab-forge-token "
+            "PARAM_GITOPS_HOST=gitlab.internal PARAM_GITOPS_REPO=group/project "
+            "PARAM_GITOPS_CA_FILE=/dev/fd/9 PARAM_GITOPS_CA_FILE_FROM_FLAG=true\n"
+            'validate_gitops_forge_flags && rc=0 || rc=$?\n'
+            'IFS= read -r line <&9 || true\n'
+            'echo "rc=$rc left=[$line]"'
+        )
+        proc = self._run_install_func(body)
+        self.assertIn("rc=0 left=[hello]", proc.stdout, proc.stderr + proc.stdout)
+
     def test_an_interview_on_an_unreadable_ca_path_can_answer_none_next(self):
         # The prompt offers no default, and a refused interview answer is
         # cleared, so the next pass can leave the CA empty.
@@ -1050,6 +1069,164 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
         self.assertIn("!var.enable_github_minter", self.main)
 
 
+class GitLabEmptyTokenFileEarlyTest(unittest.TestCase):
+    """An empty regular token file stops the run before the apply.
+
+    Before, the validator checked only that the file was readable, and the
+    empty content was found after a full Terraform and Helm apply. A one-shot
+    source is still read only after the apply: reading it early uses it up.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._tmp = pathlib.Path(tmp.name)
+        self._empty_install_env = self._tmp / "install.env"
+        self._empty_install_env.write_text("")
+
+    def _validate_with(self, preamble):
+        setup = (
+            f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            "PARAM_GITOPS_FORGE=gitlab PARAM_GITOPS_REPO=group/sub/project "
+            "PARAM_GITLAB_TOKEN_SECRET=gitlab-forge-token PARAM_GITHUB_APP_ID= PARAM_GITHUB_PEM_PATH=\n"
+            f"{preamble}\n"
+            'validate_gitops_forge_flags && rc=0 || rc=$?; echo "rc=$rc"\n'
+        )
+        env = get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)})
+        return _run_installer_bash(setup, env)
+
+    def _file(self, content):
+        tok = self._tmp / "token-file"
+        tok.write_text(content)
+        return f"PARAM_GITLAB_TOKEN_FILE={shlex.quote(str(tok))}"
+
+    def test_an_empty_regular_file_is_refused(self):
+        proc = self._validate_with(self._file(""))
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("is empty", proc.stdout + proc.stderr)
+
+    def test_a_whitespace_only_regular_file_is_refused(self):
+        proc = self._validate_with(self._file(" \n\t\r\n"))
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("is empty", proc.stdout + proc.stderr)
+
+    def test_a_file_with_a_token_passes_and_its_content_is_not_shown(self):
+        proc = self._validate_with(self._file(_SENTINEL + "\n"))
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn(_SENTINEL, proc.stdout + proc.stderr)
+
+    def test_a_one_shot_source_is_not_read_early(self):
+        # The validator must leave a pipe unread: the post-apply read still
+        # needs the token. An empty pipe is not refused here either.
+        proc = self._validate_with(
+            "exec 9< <(printf %s 'tok-from-pipe')\nPARAM_GITLAB_TOKEN_FILE=/dev/fd/9\n"
+            'validate_gitops_forge_flags && v=0 || v=$?\n'
+            'IFS= read -r -d "" left <&9 || true; echo "v=$v left=$left"\n'
+            "exec 8< <(printf '')\nPARAM_GITLAB_TOKEN_FILE=/dev/fd/8"
+        )
+        self.assertIn("v=0 left=tok-from-pipe", proc.stdout, proc.stderr)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+
+    def test_a_redirected_file_on_dev_fd_survives_repeated_validation(self):
+        # Review: on macOS, /dev/fd/N on a redirected regular file shares the
+        # offset, and `[ -f ]` is true, so an early read moved it to the end.
+        # Without the guard this test can fail only on macOS; Linux reopens
+        # /dev/fd/N through /proc. GitOpsSourceIsRereadableTest covers the
+        # guard on every platform.
+        # The validator runs up to three times in one install; the token must
+        # still reach the read after the apply.
+        tok = self._tmp / "token-file"
+        tok.write_text(_SENTINEL + "\n")
+        proc = self._validate_with(
+            f"exec 9< {shlex.quote(str(tok))}\nPARAM_GITLAB_TOKEN_FILE=/dev/fd/9\n"
+            "validate_gitops_forge_flags && a=0 || a=$?\n"
+            "validate_gitops_forge_flags && b=0 || b=$?\n"
+            'IFS= read -r -d "" got </dev/fd/9 || true\n'
+            'got="$(gitlab_token_strip "$got")"\n'
+            '[ "$got" = ' + shlex.quote(_SENTINEL) + ' ] && ok=yes || ok=no\n'
+            'echo "a=$a b=$b token-kept=$ok"'
+        )
+        self.assertIn("a=0 b=0 token-kept=yes", proc.stdout, proc.stderr)
+        self.assertNotIn(_SENTINEL, proc.stdout + proc.stderr)
+
+
+class GitOpsSourceIsRereadableTest(unittest.TestCase):
+    """The guard both pre-apply checks use: only a regular file outside /dev
+    and /proc, also after symlinks, is read before the apply."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._tmp = pathlib.Path(tmp.name)
+        self._empty_install_env = self._tmp / "install.env"
+        self._empty_install_env.write_text("")
+
+    def _check(self, preamble, path):
+        setup = (
+            f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            f"{preamble}\n"
+            f'gitops_source_is_rereadable {shlex.quote(path)} && echo "yes" || echo "no"\n'
+        )
+        env = get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)})
+        return _run_installer_bash(setup, env).stdout.strip().splitlines()[-1]
+
+    def test_a_regular_file_is_rereadable(self):
+        f = self._tmp / "f"
+        f.write_text("x")
+        self.assertEqual("yes", self._check("", str(f)))
+
+    def test_dev_fd_on_a_redirected_regular_file_is_not(self):
+        f = self._tmp / "f"
+        f.write_text("x")
+        self.assertEqual("no", self._check(f"exec 9< {shlex.quote(str(f))}", "/dev/fd/9"))
+        self.assertEqual("no", self._check(f"exec 0< {shlex.quote(str(f))}", "/dev/stdin"))
+
+    def test_a_symlink_to_dev_stdin_is_not(self):
+        f = self._tmp / "f"
+        f.write_text("x")
+        link = self._tmp / "link"
+        link.symlink_to("/dev/stdin")
+        self.assertEqual("no", self._check(f"exec 0< {shlex.quote(str(f))}", str(link)))
+
+    def test_a_symlink_to_a_regular_file_is_rereadable(self):
+        f = self._tmp / "f"
+        f.write_text("x")
+        link = self._tmp / "link-to-file"
+        link.symlink_to(f)
+        self.assertEqual("yes", self._check("", str(link)))
+
+    def test_other_spellings_of_a_descriptor_path_are_not(self):
+        # Review: the match ran on the path as written.
+        f = self._tmp / "f"
+        f.write_text("x")
+        redirect = f"exec 9< {shlex.quote(str(f))}\nexec 0< {shlex.quote(str(f))}"
+        for spelling in ("//dev/fd/9", "/./dev/fd/9", "/dev/../dev/stdin"):
+            with self.subTest(spelling=spelling):
+                self.assertEqual("no", self._check(redirect, spelling))
+        rel = self._tmp / "rel-link"
+        rel.symlink_to(os.path.relpath("/dev/stdin", self._tmp))
+        self.assertEqual("no", self._check(redirect, str(rel)))
+        dirlink = self._tmp / "fd-dir"
+        dirlink.symlink_to("/dev/fd")
+        self.assertEqual("no", self._check(redirect, str(dirlink / "9")))
+        self.assertEqual("no", self._check(f"{redirect}\ncd /", "dev/stdin"))
+
+    def test_a_regular_file_elsewhere_under_dev_is_rereadable(self):
+        # Only descriptor paths are refused; /dev/shm keeps the early check.
+        shm = pathlib.Path("/dev/shm")
+        if not shm.is_dir() or not os.access(shm, os.W_OK):
+            self.skipTest("this platform has no writable /dev/shm")
+        fd, name = tempfile.mkstemp(dir=shm)
+        os.close(fd)
+        self.addCleanup(os.unlink, name)
+        pathlib.Path(name).write_text("x")
+        self.assertEqual("yes", self._check("", name))
+
+    def test_a_directory_or_a_missing_path_is_not(self):
+        self.assertEqual("no", self._check("", str(self._tmp)))
+        self.assertEqual("no", self._check("", str(self._tmp / "missing")))
+
+
 class GitLabSecretOrderTest(unittest.TestCase):
     """An empty token source stops the run with exit 1 after the apply. The CA
     Secret must exist by then, so it is created first."""
@@ -1063,6 +1240,7 @@ class GitLabSecretOrderTest(unittest.TestCase):
             block.index('create_gitlab_ca_secret "$namespace"'),
             block.index('create_gitlab_token_secret "$namespace"'),
         )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -183,14 +183,14 @@ password manager. No flag or variable takes the token itself:
 For an instance behind a private CA, add `--gitops-ca-file`, as
 [A self-managed GitLab with a private CA](#a-self-managed-gitlab-with-a-private-ca) shows.
 
-| Flag                    | `install.env` key                      | Meaning                                                                                                                                                                               |
-| ----------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--gitops-forge`        | `GITOPS_FORGE`                         | `github` (default) or `gitlab`.                                                                                                                                                       |
-| `--gitops-host`         | `GITOPS_HOST`                          | The GitLab hostname, with no scheme, port or path. Omit it for gitlab.com. The installer refuses a GitHub host.                                                                       |
-| `--gitops-repo`         | `GITOPS_REPO`                          | The project's full path, `group/project` or `group/subgroup/project`, or its `https://` URL on that host. `--gitops-org` is not used.                                                 |
-| `--gitlab-token-file`   | _never recorded_                       | A file, `/dev/stdin` (not under `curl … \| bash`) or `<(command)` that holds the token. The installer reads it once, after the apply, and writes it only into the Secret.             |
-| `--gitlab-token-secret` | `GITLAB_TOKEN_SECRET`                  | The Secret's name, default `gitlab-forge-token`.                                                                                                                                      |
-| `--gitops-ca-file`      | `GITOPS_CA_SECRET` (the Secret's name) | A regular PEM file with the CA certificates of a self-managed instance behind a private CA. The installer stores it in Secret `gitlab-forge-ca`. Its path is not recorded. See below. |
+| Flag                    | `install.env` key                      | Meaning                                                                                                                                                                                                                 |
+| ----------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--gitops-forge`        | `GITOPS_FORGE`                         | `github` (default) or `gitlab`.                                                                                                                                                                                         |
+| `--gitops-host`         | `GITOPS_HOST`                          | The GitLab hostname, with no scheme, port or path. Omit it for gitlab.com. The installer refuses a GitHub host.                                                                                                         |
+| `--gitops-repo`         | `GITOPS_REPO`                          | The project's full path, `group/project` or `group/subgroup/project`, or its `https://` URL on that host. `--gitops-org` is not used.                                                                                   |
+| `--gitlab-token-file`   | _never recorded_                       | A file, `/dev/stdin` (not under `curl … \| bash`) or `<(command)` that holds the token. The installer checks a regular file before the apply, reads the token once after the apply, and writes it only into the Secret. |
+| `--gitlab-token-secret` | `GITLAB_TOKEN_SECRET`                  | The Secret's name, default `gitlab-forge-token`.                                                                                                                                                                        |
+| `--gitops-ca-file`      | `GITOPS_CA_SECRET` (the Secret's name) | A regular PEM file with the CA certificates of a self-managed instance behind a private CA. The installer stores it in Secret `gitlab-forge-ca`. Its path is not recorded. See below.                                   |
 
 The installer refuses `--github-app-id` and `--github-pem-path` with `--gitops-forge=gitlab`.
 
@@ -217,8 +217,10 @@ do not have to restart anything after you create it.
 
 ### Dry run and generate-only
 
-`--dry-run` and `--generate-only` check only that the token source is readable. They do not
-read the token. A real run reads it once, after the apply.
+`--dry-run` and `--generate-only` check that the token source is readable. When the source is
+a regular file, they also stop the run if the file is empty (whitespace only). They store no
+token. `/dev/stdin`, `/dev/fd/N` and a process substitution are not read in these runs. A real
+run reads the token once, after the apply, and writes it only into the Secret.
 
 `--dry-run` and `--generate-only` check the content of a regular CA file.
 
@@ -318,7 +320,9 @@ shell. Use the flags.
 
 A re-run of `install.sh` keeps an existing Secret, unless you give it a new token file or
 choose to replace the Secret at the prompt. The installer refuses an empty token (whitespace
-only), and stores nothing.
+only), and stores nothing. It checks a regular token file before the apply, also in a dry run,
+so an empty file stops the run before the install changes anything. It checks `/dev/stdin`,
+`/dev/fd/N` and a process substitution only after the apply, because a read can use them up.
 
 ## A self-managed GitLab with a private CA
 
