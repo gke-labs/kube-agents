@@ -183,6 +183,8 @@ readonly EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS=300
 # the pause, which the next lease's pause repeats anyway.
 readonly EVAL_RESUME_AUDITS_POD_WAIT_SECONDS=20
 readonly EVAL_PAUSE_AUDITS_POD_POLL_SECONDS=5
+# The bound on one exec that reads a gateway pod's PID 1 (ready_gateway_pod).
+readonly EVAL_PAUSE_AUDITS_PROBE_TIMEOUT=20s
 # What a unit's lock deadline allows past its delegation timeout, for the
 # stack, the verifier and the state writes around the run.
 readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
@@ -1572,46 +1574,56 @@ scheduled_audits() { # <pause|resume> <label>
 # container's PID 1 until `exec "$@"`, so a PID 1 that is no longer
 # agent-entrypoint means the merge is done.
 ready_gateway_pod() { # <context> <namespace> [<wait seconds>]
-  local ctx="$1" ns="$2" deadline=$((SECONDS + ${3:-${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}})) workload="" kind selector names live want p cmdline settled
-  for kind in deployment statefulset; do
-    if kubectl --context "${ctx}" -n "${ns}" get "${kind}/${AGENT_SERVICE_NAME}-gateway" -o name >/dev/null 2>&1; then
-      workload="${kind}/${AGENT_SERVICE_NAME}-gateway"
-      break
-    fi
-  done
-  [ -n "${workload}" ] || return 1
-  selector="$(kubectl --context "${ctx}" -n "${ns}" get "${workload}" \
-    -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}' 2>/dev/null)" || return 1
-  selector="${selector%,}"
-  [ -n "${selector}" ] || return 1
-  want="$(kubectl --context "${ctx}" -n "${ns}" get "${workload}" \
-    -o jsonpath='{.spec.replicas}' 2>/dev/null)" || return 1
-  [ -n "${want}" ] || want=1
-  # Scaled to zero (spec.deployment.scaleToZero) has no pod to wait for.
-  [ "${want}" -gt 0 ] || return 1
+  local ctx="$1" ns="$2" deadline=$((SECONDS + ${3:-${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}})) workload kind err
+  local missing selector want pods ready p cmdline settled
   while :; do
-    names="$(kubectl --context "${ctx}" -n "${ns}" get pods -l "${selector}" \
-      -o go-template='{{range $p := .items}}{{if not $p.metadata.deletionTimestamp}}{{range $p.status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}{{"pod/"}}{{$p.metadata.name}}{{"\n"}}{{end}}{{end}}{{end}}{{end}}' 2>/dev/null)" || names=""
-    # Every pod not terminating, Ready or not: a surge pod still starting is not
-    # Ready yet, and it is the one whose cron merge can rewrite the store.
-    live="$(kubectl --context "${ctx}" -n "${ns}" get pods -l "${selector}" \
-      -o go-template='{{/* all */}}{{range $p := .items}}{{if not $p.metadata.deletionTimestamp}}{{$p.metadata.name}}{{"\n"}}{{end}}{{end}}' 2>/dev/null)" || live=""
-    # As many as the workload wants, all of them Ready, no more: an extra pod means
-    # a rollout is still settling, and a starting container's cron merge can
-    # rewrite the store.
-    if [ -n "${names}" ] && [ "$(printf '%s\n' "${names}" | grep -c .)" -eq "${want}" ] &&
-      [ "$(printf '%s\n' "${live}" | grep -c .)" -eq "${want}" ]; then
-      settled=1
-      for p in ${names}; do
-        cmdline="$(kubectl --context "${ctx}" -n "${ns}" exec "${p}" -c "${EVAL_GATEWAY_CONTAINER}" \
-          --request-timeout=20s -- cat /proc/1/cmdline 2>/dev/null | tr '\0' ' ')" || cmdline=""
-        case "${cmdline}" in
-          ""|*agent-entrypoint*) settled=0; break ;;
-        esac
-      done
-      if [ "${settled}" -eq 1 ]; then
-        printf '%s\n' "${names}" | head -1
-        return 0
+    # The workload, its selector and its replica count, read each round: an API
+    # blip is waited out like a pod problem. Only both kinds answering NotFound
+    # ends it at once.
+    workload="" missing=0
+    for kind in deployment statefulset; do
+      if err="$(kubectl --context "${ctx}" -n "${ns}" get "${kind}/${AGENT_SERVICE_NAME}-gateway" -o name 2>&1 >/dev/null)"; then
+        workload="${kind}/${AGENT_SERVICE_NAME}-gateway"
+        break
+      fi
+      case "${err}" in *NotFound*|*"not found"*) missing=$((missing + 1)) ;; esac
+    done
+    [ -n "${workload}" ] || [ "${missing}" -lt 2 ] || return 1
+    selector="" want=""
+    if [ -n "${workload}" ]; then
+      selector="$(kubectl --context "${ctx}" -n "${ns}" get "${workload}" \
+        -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}' 2>/dev/null)" || selector=""
+      selector="${selector%,}"
+      want="$(kubectl --context "${ctx}" -n "${ns}" get "${workload}" -o jsonpath='{.spec.replicas}' 2>/dev/null)" || want="?"
+      [ -n "${want}" ] || want=1
+      # Scaled to zero (spec.deployment.scaleToZero) has no pod to wait for.
+      [ "${want}" != 0 ] || return 1
+    fi
+    if [ -n "${selector}" ] && [ "${want}" != "?" ]; then
+      # One listing defines the pods that can be running an entrypoint: not
+      # terminating, and not in a terminal phase (an evicted pod stays Failed
+      # with no deletionTimestamp). Each line is "pod/<name> R|N", R for Ready.
+      # One read, so the count and the Ready set are of the same pods.
+      pods="$(kubectl --context "${ctx}" -n "${ns}" get pods -l "${selector}" \
+        -o go-template='{{range $p := .items}}{{if and (not $p.metadata.deletionTimestamp) (ne $p.status.phase "Succeeded") (ne $p.status.phase "Failed")}}{{$r := "N"}}{{range $p.status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}{{$r = "R"}}{{end}}{{end}}{{"pod/"}}{{$p.metadata.name}} {{$r}}{{"\n"}}{{end}}{{end}}' 2>/dev/null)" || pods=""
+      ready="$(printf '%s\n' "${pods}" | awk '$2 == "R" {print $1}')"
+      # As many as the workload wants, all of them Ready, no more: an extra pod
+      # means a rollout is still settling, and a surge pod still starting is the
+      # one whose cron merge can rewrite the store.
+      if [ -n "${pods}" ] && [ "$(printf '%s\n' "${pods}" | grep -c .)" -eq "${want}" ] &&
+        [ "$(printf '%s\n' "${ready}" | grep -c .)" -eq "${want}" ]; then
+        settled=1
+        for p in ${ready}; do
+          cmdline="$(kubectl --context "${ctx}" -n "${ns}" exec "${p}" -c "${EVAL_GATEWAY_CONTAINER}" \
+            --request-timeout="${EVAL_PAUSE_AUDITS_PROBE_TIMEOUT}" -- cat /proc/1/cmdline 2>/dev/null | tr '\0' ' ')" || cmdline=""
+          case "${cmdline}" in
+            ""|*agent-entrypoint*) settled=0; break ;;
+          esac
+        done
+        if [ "${settled}" -eq 1 ]; then
+          printf '%s\n' "${ready}" | head -1
+          return 0
+        fi
       fi
     fi
     [ "${SECONDS}" -lt "${deadline}" ] || return 1

@@ -326,21 +326,30 @@ class RestartTest(unittest.TestCase):
 class ReadyGatewayPodTest(unittest.TestCase):
     """ready_gateway_pod, run from the runner's own text against a fake kubectl."""
 
-    def run_helper(self, replicas, ready, wait=0, kind="deployment", starting=(), unready=()):
+    def run_helper(self, replicas, ready, wait=0, kind="deployment", starting=(), unready=(), api_down=0):
         # `starting`: pods whose PID 1 is still the entrypoint (Ready on HA all the same).
+        # `unready`: live pods not Ready yet (a surge pod). The phase filter is the
+        # server's; ReadyGatewayPodTemplateTest checks the template itself.
+        # `api_down`: workload lookups that fail with a non-NotFound error first.
         pids = "".join(
             f"  *exec\\ pod/{n}\\ *) printf '/bin/bash\\0/usr/local/bin/agent-entrypoint\\0' ;;\n" for n in starting)
+        listing = "".join(f"pod/{n} R" + chr(92) + "n" for n in ready) + "".join(f"pod/{n} N" + chr(92) + "n" for n in unready)
         with tempfile.TemporaryDirectory() as tmp:
             fake = pathlib.Path(tmp) / "kubectl"
+            counter = pathlib.Path(tmp) / "down"
+            counter.write_text(str(api_down))
             fake.write_text(textwrap.dedent(f"""\
                 #!/bin/sh
                 case "$*" in
+                  *-gateway\\ -o\\ name*)
+                    n=$(cat {counter}); if [ "$n" -gt 0 ]; then echo $((n - 1)) > {counter}; echo "Unable to connect to the server" >&2; exit 1; fi ;;
+                esac
+                case "$*" in
                   *get\\ {kind}/platform-agent-gateway\\ -o\\ name*) echo {kind}.apps/platform-agent-gateway ;;
-                  *get\\ *-gateway\\ -o\\ name*) exit 1 ;;
+                  *get\\ *-gateway\\ -o\\ name*) echo 'Error from server (NotFound): not found' >&2; exit 1 ;;
                   *go-template=*matchLabels*) printf 'app=platform-agent-gateway,' ;;
                   *jsonpath=*spec.replicas*) printf '{replicas}' ;;
-                  *'/* all */'*) printf '{"".join(n + chr(92) + "n" for n in (*ready, *unready))}' ;;
-                  *get\\ pods*) printf '{"".join("pod/" + n + chr(92) + "n" for n in ready)}' ;;
+                  *get\\ pods*) printf '{listing}' ;;
                 """) + pids + textwrap.dedent("""\
                   *exec\\ pod/*cmdline*) printf 'python3\\0-m\\0hermes_cli.main\\0gateway\\0' ;;
                 esac
@@ -350,7 +359,7 @@ class ReadyGatewayPodTest(unittest.TestCase):
             script = f"ready_gateway_pod() {{{helper}\n}}\nready_gateway_pod ctx ns {wait}"
             env = {**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}", "AGENT_SERVICE_NAME": "platform-agent",
                    "EVAL_GATEWAY_CONTAINER": "platform-agent", "EVAL_PAUSE_AUDITS_POD_POLL_SECONDS": "1",
-                   "EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS": "300"}
+                   "EVAL_PAUSE_AUDITS_PROBE_TIMEOUT": "5s", "EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS": "300"}
             return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
 
     def test_one_replica_one_ready_pod(self):
@@ -376,6 +385,11 @@ class ReadyGatewayPodTest(unittest.TestCase):
         # set alone still reads as the two old pods: settled, wrongly.
         result = self.run_helper(2, ["gw-a", "gw-b"], unready=("gw-c",))
         self.assertEqual(result.returncode, 1)
+
+    def test_a_lookup_that_fails_for_a_moment_is_waited_out(self):
+        # A blip at the workload read is not "no such workload".
+        result = self.run_helper(1, ["gw-a"], wait=30, api_down=2)
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "pod/gw-a"))
 
     def test_an_ha_gateway_on_rwo_storage_is_a_statefulset(self):
         result = self.run_helper(2, ["gw-0", "gw-1"], kind="statefulset")
