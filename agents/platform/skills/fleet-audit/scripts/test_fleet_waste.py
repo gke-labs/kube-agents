@@ -4964,6 +4964,17 @@ class CollectProjectComputeTest(unittest.TestCase):
         self.assertIn("lane-b in this project are excluded", target["limitations"])
         self.assertIn("the clusters the install excludes were not read", target["limitations"])
 
+    def test_a_same_named_cluster_that_failed_is_not_read_as_an_exclusion(self):
+        # lane-b in us-central1 is excluded; another lane-b in us-east1 was not
+        # read. By name the unread set is {lane-b}, which the exclusion covers;
+        # by (name, location) it is not, and the caller says so.
+        target = fw.collect_project_compute("acme", False, self.FACTS, run=self.run_with(), now=NOW, known_clusters={"lane-b"},
+                                            unread_clusters=frozenset({"lane-b"}), clusters_read=0, excluded=["lane-b"],
+                                            only_excluded_unread=False)
+        self.assertIn("none of its clusters (lane-b) could be read", target["limitations"])
+        self.assertIn("could not be read", target["limitations"])
+        self.assertNotIn("the clusters the install excludes were not read", target["limitations"])
+
     def test_a_failed_read_names_the_command_and_what_it_said(self):
         target = fw.collect_project_compute(
             "acme", True, self.FACTS, run=self.run_with(fail={"addresses": "PERMISSION_DENIED: compute.addresses.list"}), now=NOW

@@ -5911,7 +5911,7 @@ def forwarding_rules_argv(project: str) -> list[str]:
     return ["gcloud", "compute", "forwarding-rules", "list", "--project", project, "--format", "json"]
 
 
-def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None, forwarding_rules: tuple[object | None, Run] | None = None, unread_clusters: frozenset[str] = frozenset(), clusters_read: int | None = None, unread_labels: list[str] | None = None, announce: bool = True, excluded: list[str] | None = None) -> dict | None:
+def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None, forwarding_rules: tuple[object | None, Run] | None = None, unread_clusters: frozenset[str] = frozenset(), clusters_read: int | None = None, unread_labels: list[str] | None = None, announce: bool = True, excluded: list[str] | None = None, only_excluded_unread: bool | None = None) -> dict | None:
     # `--filter=-users:*` and not `"--filter", "-users:*"`: a filter value
     # starting with `-` reads as a flag to gcloud's own argument parser, which
     # then rejects the command for the argument it thinks is missing
@@ -6029,7 +6029,10 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     disks_judged = compute_ok and not none_read
     unread_named = ", ".join(sorted(unread_clusters) if unread_labels is None else unread_labels)
     # Every cluster left unread is one the install excludes: no read failed.
-    only_excluded = bool(excluded) and set(unread_clusters) <= set(excluded)
+    # The caller decides on (name, location) pairs, since `unread_clusters` is
+    # reduced to names and a failed read of a same-named cluster in another
+    # location must not read as an exclusion; by name only when not told.
+    only_excluded = only_excluded_unread if only_excluded_unread is not None else bool(excluded) and set(unread_clusters) <= set(excluded)
     candidates = [_emit("unattached-disk", h) for h in check_unattached_disk(disks_parsed, fleet_facts["pv_handles"], now=now, known_clusters=known_clusters, unread_clusters=unread_clusters)] if disks_judged else []
     # §3.5 clears an address any Service or Ingress annotation names, and
     # `referenced_addresses` holds only the read clusters' annotations, so an
@@ -6466,7 +6469,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         known_pairs = known_pairs_by_project.get(p, set())
         collected = collected_by_project.get(p, set())
 
-        return collect_project_compute(p, all_reachable, fleet_facts, run=replay, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs, collected), clusters_read=len(known_pairs & collected), unread_labels=_unread_labels(known_pairs, collected), excluded=sorted(name for name, _ in declared_scope.dropped.get(p, [])))
+        return collect_project_compute(p, all_reachable, fleet_facts, run=replay, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs, collected), clusters_read=len(known_pairs & collected), unread_labels=_unread_labels(known_pairs, collected), excluded=sorted(name for name, _ in declared_scope.dropped.get(p, [])), only_excluded_unread=bool(declared_scope.dropped.get(p)) and (known_pairs - collected) <= set(declared_scope.dropped.get(p, [])))
 
     cluster_entries: list[dict] = []
     project_entries: list[dict] = []

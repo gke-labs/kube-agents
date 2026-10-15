@@ -401,7 +401,7 @@ def _excluded_clusters_paragraph(data_dir: Path) -> str:
     if not excluded:
         return ""
     return (
-        "**The install excludes these clusters from every fleet read; leave them out entirely:** "
+        "**The install excludes these clusters from the fleet; leave them out of this sweep entirely:** "
         + ", ".join(f"`{ref}`" for ref in excluded)
         + " (`project/location/cluster`, from `spec.scope.exclude.clusters`). They have no Cluster "
         "Agent because they are excluded, not because one is missing: do not audit them in Step 3, "

@@ -452,7 +452,7 @@ def fleet_scope() -> str:
     on a tick that could not read the render while a folder, organisation or
     selector is declared), and the collectors render it as its own sentence.
     `excluded_clusters` names each cluster spec.scope.exclude.clusters leaves
-    out: no fleet read covers one, so do not list, describe, audit or report
+    out: leave it out of fleet answers and audits, so do not list, describe, audit or report
     on it, even though its project is in `projects`. `collector_args` is the string to append to
     a collector command verbatim (`--scope-projects ... --scope-unread ...
     --scope-exclude-clusters ...`);
