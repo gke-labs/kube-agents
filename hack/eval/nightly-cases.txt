@@ -197,8 +197,9 @@
 # Counted from the lists with it, the last entry below: forty-nine cases
 # (147 units) here, of a sixty-three-case, 189-unit matrix with the presubmit
 # file's fourteen. The parallelism arithmetic above does not price
-# this case: every case with a `stack:` holds the infra lock for its whole run,
-# so those cases run one at a time whatever EVAL_TASK_PARALLELISM is. With this
+# this case: every case with a `stack:` holds the infra lock for its whole run
+# (since 2026-10-15 except an infra_lock_exempt one, hack/ci-eval-pr.sh), so
+# those cases run one at a time whatever EVAL_TASK_PARALLELISM is. With this
 # case the nightly carries eleven of them, ~433 serial minutes at their
 # unit_cost_hint figures and three repetitions (~378 without it), against the
 # 480m deadline. Whether that fits is the eval crew's call, on the first nights'
