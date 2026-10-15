@@ -1625,6 +1625,80 @@ require_scope_cluster_triples() {
   $had_noglob || set +f
 }
 
+# A GitHub App ID is the number on the App's settings page ("App ID" under
+# General), not its name or slug. The token minter builds
+# gha://<id>?kms_id=... from it and refuses anything else at startup, which
+# surfaces only as a crash-looping minter behind Helm's rollout wait (#3076),
+# so it is checked here, before anything is planned or applied. $1 the value,
+# $2 where it came from (a flag or an install.env key).
+validate_github_app_id() {
+  local value="${1:-}" source="${2:-GITHUB_APP_ID}"
+  [ -n "$value" ] || return 0
+  [[ "$value" =~ ^[0-9]+$ ]] && return 0
+  print_error "${source}='${value}' is not a GitHub App ID: it must be the App's number, not its name or slug."
+  print_info "Find it on GitHub: the App's settings, General, \"App ID\" (a number such as 1234567). Set it and re-run."
+  return 1
+}
+
+# The GitHub App ID the live token minter runs with, or nothing. It sits in the
+# github-app-credentials Secret under app-id; the ID is not a credential (it is
+# printed on the App's public settings page), and only that key is read. $1
+# namespace.
+live_github_app_id() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" value
+  value="$( (trap - ERR; kubectl --context "$(gke_context_name)" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+    get secret github-app-credentials -n "$namespace" -o jsonpath='{.data.app-id}' 2>/dev/null | base64 --decode 2>/dev/null) || true)"
+  [[ "$value" =~ ^[0-9]+$ ]] && printf '%s' "$value"
+  return 0
+}
+
+# A live install whose PlatformAgent opens pull requests through the GitHub
+# token minter (spec.integration.github) but whose configuration this run
+# renders with GitOps off: the apply would destroy the minter -- its Cloud KMS
+# key and key ring, its service account and their bindings -- and the agent
+# would stop opening pull requests (#3075). The usual cause is an install whose
+# GitOps came from install.sh's flags, which earlier releases did not record
+# in install.env, so the next upgrade.sh rendered from the file alone. Run
+# after the generator (TFVARS_ENABLE_GITHUB_MINTER). Prints the exact lines to
+# append, with the live values filled in, so the fix needs no docs.
+# $1 namespace, $2 the install.env path, $3 SCOPE_CHECK_MODE_WARN for a run
+# that applies nothing (it warns and returns 0).
+refuse_apply_dropping_live_gitops() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" file="${2:-install.env}" mode="${3:-}"
+  local live_repo live_org repo_name app_id say=print_error lead="Refusing to apply: "
+  [ "${TFVARS_ENABLE_GITHUB_MINTER:-false}" = "true" ] && return 0
+  [ "${GITOPS_FORGE:-github}" = "github" ] || return 0
+  # Removing GitOps on purpose is the one case this is not.
+  is_truthy "${KUBE_AGENTS_REMOVE_GITOPS:-false}" && return 0
+  kubectl config get-contexts "$(gke_context_name)" >/dev/null 2>&1 || return 0
+  live_repo="$( (trap - ERR; kubectl --context "$(gke_context_name)" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o jsonpath='{.items[0].spec.integration.github.gitRepo}' 2>/dev/null) || true)"
+  [ -n "$live_repo" ] || return 0
+  live_org="$( (trap - ERR; kubectl --context "$(gke_context_name)" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o jsonpath='{.items[0].spec.integration.github.org}' 2>/dev/null) || true)"
+  repo_name="${live_repo##*/}"
+  [ -n "$live_org" ] || { [ "$repo_name" != "$live_repo" ] && live_org="${live_repo%%/*}"; }
+  app_id="$(live_github_app_id "$namespace")"
+  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+    say=print_warning
+    lead="An applying run would be refused: "
+  fi
+  "$say" "${lead}the PlatformAgent opens pull requests on ${live_repo} through the GitHub token minter, but ${file} does not set all of GITOPS_ORG, GITOPS_REPO and GITHUB_APP_ID, so this run renders GitOps off. The apply would destroy the minter (its Cloud KMS key, key ring and service account) and the agent would stop opening pull requests."
+  print_info "Append these lines to ${file}, then re-run the same command:"
+  [ -n "${GITOPS_ORG:-}" ] || print_info "  GITOPS_ORG=${live_org:-<the GitHub organization that owns ${live_repo}>}"
+  [ -n "${GITOPS_REPO:-}" ] || print_info "  GITOPS_REPO=${repo_name}"
+  if [ -z "${GITHUB_APP_ID:-}" ]; then
+    if [ -n "$app_id" ]; then
+      print_info "  GITHUB_APP_ID=${app_id}"
+    else
+      print_info "  GITHUB_APP_ID=<the number under \"App ID\" on the GitHub App's General settings page>"
+    fi
+  fi
+  print_info "To remove GitOps from this install on purpose, re-run with KUBE_AGENTS_REMOVE_GITOPS=true in the environment instead."
+  [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+  return 1
+}
+
 # Refuses a full apply that would replace a scope the live PlatformAgent
 # carries and nothing this install wrote accounts for.
 #

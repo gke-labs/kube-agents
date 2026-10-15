@@ -1995,6 +1995,37 @@ warn_flag_beats_unrecorded_file_value() {
   print_info "Set ${key}=$(printf '%q' "$value") in ${file}, or repeat ${repeat_flag} on ${repeat_on}."
 }
 
+# The GitHub GitOps keys this run applies and install.env does not assign:
+# appended when the run commits to the apply, as record_flags_into_install_env
+# appends a chat flag's key. upgrade.sh renders from the file alone, so GitOps
+# configured with --gitops-org, --gitops-repo and --github-app-id and never
+# recorded was rendered off by the next full upgrade, which planned to
+# destroy the token minter (#3075). Only keys the file lacks are written; a
+# value the file records is kept, and --github-pem-path never is (the key lives
+# in Cloud KMS once imported). Apply-only, like record_gitops_forge_keys: a
+# --generate-only or declined run leaves the file as it was.
+record_github_gitops_keys() {
+  local file="$1" key value
+  [ -f "$file" ] || return 0
+  [ "${PARAM_DRY_RUN:-false}" = "true" ] && return 0
+  [ "${GITOPS_FORGE:-github}" = "github" ] || return 0
+  [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ] || return 0
+  read_recorded_install_env_values "$file" GITOPS_ORG GITOPS_REPO GITHUB_APP_ID
+  # A last line with no newline would run into the appended assignment.
+  if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
+    printf '\n' >> "$file"
+  fi
+  for key in GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
+    install_env_records_key "$file" "$key" && continue
+    value="${!key}"
+    write_env_var "$file" "$key" "$value"
+    print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}, so upgrade.sh keeps GitOps on."
+  done
+  # The cache read_recorded_install_env_values keeps is keyed by path, and the
+  # file just changed under it.
+  RECORDED_INSTALL_ENV_FILE=""
+}
+
 # The one exception to "an existing install.env is never rewritten": the
 # GitOps forge. upgrade.sh and the Day-2 menu render from the file alone, so a
 # forge this run chose and the file does not record would be reverted to
@@ -5487,6 +5518,8 @@ run_menu_system() {
         gcloud container clusters get-credentials "$cluster_name" --location "$REGION" \
           --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
         refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+        # A live GitHub minter this render would destroy (#3075).
+        refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" || exit 1
         # The menu edits no mode key, but an install.env edited by hand since
         # the last apply reaches the cluster through this apply too, with no
         # confirmation after the notice.
@@ -5677,6 +5710,10 @@ main() {
   # The mode first: a value the CRD refuses is named as that, not as a
   # disagreement with install.env.
   validate_platform_agent_mode || exit 1
+  # A GitHub App ID that is a name rather than the App's number (#3076), from
+  # the flag or install.env, before the interview and any --dry-run preview.
+  validate_github_app_id "${PARAM_GITHUB_APP_ID:-}" \
+    "$([ "${PARAM_GITHUB_APP_FROM_FLAG:-false}" = "true" ] && echo "--github-app-id" || echo "GITHUB_APP_ID")" || exit 1
   # The chat flags and --mode against an existing install.env, as soon as
   # is_truthy and the defaults are loaded: a flag that disagrees with the file
   # stops the run here, before the interview and long before anything is
@@ -6971,6 +7008,9 @@ main() {
   # GITHUB_*, and normalize_gitops_repo_vars keeps them equal to the GITOPS_*
   # values rather than letting them be a second source of truth.
   normalize_gitops_repo_vars
+  # Again on the value this run settled on, which an interactive answer may
+  # have supplied.
+  validate_github_app_id "$github_app_id" "GitHub App ID" || exit 1
   export GITHUB_APP_ID="$github_app_id"
   export KMS_KEYRING="$kms_keyring"
   export KMS_KEY="$kms_key"
@@ -7068,6 +7108,17 @@ main() {
     gcloud container clusters get-credentials "$cluster_name" --location "$region" \
       --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
     refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+  fi
+  # A live GitHub minter this render would destroy (#3075): an install.env
+  # without the GitOps keys, and a run without the flags, renders GitOps off.
+  # Refused for a run that applies; --dry-run and --generate-only warn. The
+  # context is the one the gate above fetched; without one it says nothing.
+  if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
+    if [ "$PARAM_DRY_RUN" != "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ]; then
+      refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" || exit 1
+    else
+      refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" "$SCOPE_CHECK_MODE_WARN"
+    fi
   fi
   # A PLATFORM_AGENT_MODE that moves the CR's spec.mode is a mode switch, and
   # it is named before the operator confirms the apply. Outside the gate
@@ -7381,6 +7432,7 @@ main() {
   # previewed (--generate-only) or declined must leave install.env as it was,
   # or the next upgrade.sh would render the forge nobody applied.
   record_gitops_forge_keys "$INSTALL_ENV_FILE"
+  record_github_gitops_keys "$INSTALL_ENV_FILE"
   record_flags_into_install_env
   run_lifecycle_apply "$repo_dir" "$provisioning_log"
 
