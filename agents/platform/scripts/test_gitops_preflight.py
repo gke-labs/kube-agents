@@ -220,7 +220,8 @@ class ListingShowsBothRegistries(unittest.TestCase):
 
     def test_the_stop_comes_from_the_same_read_as_the_managed_line(self):
         # A registration landing between two reads must not print
-        # "MANAGED: none" above a REGISTERED line: the registry is read once.
+        # "MANAGED: none" above a REGISTERED line: the stop is built from the
+        # list the MANAGED line printed, not from a second get_managed_repos().
         reads = iter([[], [REPO], [REPO], [REPO]])
         with _StateDir(entries=None), patch.object(
             gitops_preflight.gitops_workspace, "get_managed_repos", side_effect=lambda: next(reads)
