@@ -197,8 +197,9 @@ MANAGED_CONFIG_PATH = os.path.join(
 
 # How a Cluster Agent describes a fix on an event or stall triage card. (The
 # drift card keeps its own wording: its report compares the live object with
-# the declared state, which it reads from the object's field ownership.) A Cluster Agent has no GitOps repository: the Platform
-# Agent finds the file when it opens the Pull Request. Without this, "precisely
+# the declared state, which it reads from the object's field ownership.) A
+# Cluster Agent has no GitOps repository: the Platform Agent finds the file
+# when it opens the Pull Request. Without this, "precisely
 # enough that someone can open the Pull Request from your report alone" sent a
 # worker that had its cause in the first minute on a 21-minute hunt for the
 # workload's source, and it never answered (gke-labs#3078).
