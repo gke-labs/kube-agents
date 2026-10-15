@@ -351,6 +351,12 @@
 # Counted from the lists on 2026-10-14, after the merges of main to 1f9b84ba:
 # seventy-four cases (222 units) here, of an eighty-eight-case, 264-unit matrix
 # with the presubmit file's fourteen.
+#
+# 2026-10-15 adds delete-namespace-unowned-stops (#3077): one case, three
+# units, deployer: noop on the seeded fleet's stalled-controller namespace,
+# unhinted at the 200s default. Counted from the lists with it, the last
+# entry below: seventy-five cases (225 units) here, of an eighty-nine-case,
+# 267-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -935,3 +941,10 @@
 # cases, so a busy board pushes this case's card wait toward its 1800s
 # ceiling. The dated paragraph above carries the budget arithmetic.
 ./tasks/gitops-drift-noise-filtered-triage/task.yaml
+
+# A request to delete a namespace the GitOps repository does not declare: the
+# agent stops, says a pull request cannot delete it (or that no repository is
+# registered), deletes nothing and opens no pull request (submit-suggestion's
+# "Deleting a resource", #3077). deployer: noop, the stalled-controller
+# namespace.
+./tasks/delete-namespace-unowned-stops/task.yaml
