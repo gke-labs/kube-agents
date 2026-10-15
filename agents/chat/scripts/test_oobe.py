@@ -1114,6 +1114,13 @@ class RosterTest(unittest.TestCase):
                 self.assertIs(jobs[job_id].get("enabled"), False, job_id)
                 self.assertIn(job_id, seeded.split('"')[1].split(","), job_id)
 
+    def test_the_retired_gate_script_stays_a_no_op(self):
+        # Volumes keep the dropped entry, and nothing prunes it, so its script
+        # must still exist and do nothing.
+        script = Path(__file__).resolve().parent / "first_run_audit_gate.py"
+        proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=30)
+        self.assertEqual((proc.returncode, proc.stdout, proc.stderr), (0, "", ""))
+
 
 class ManagedRepositoriesTest(unittest.TestCase):
     def test_a_github_enterprise_server_repository_is_named_with_its_host(self):

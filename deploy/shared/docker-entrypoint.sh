@@ -1040,8 +1040,8 @@ fi
 # be reinstalled. .bootstrap_completed is that record. `oobe` is seeded on the same record for a
 # different reason: an install that onboarded before the job existed must never get it. oobe.py
 # skips a sweep more than a day old, but one that onboarded recently would start four fleet audits
-# it is not owed. `first-run-quick-value-audit` ships disabled; seeding it keeps an onboarded
-# install from gaining even the disabled entry.
+# it is not owed. `first-run-quick-value-audit` no longer ships, so its id here is inert; it goes
+# with first_run_audit_gate.py once no volume holds the entry.
 CRON_SYNC="/opt/defaults/scripts/cron_jobs_sync.py"
 if [ -f "$CRON_SYNC" ] && [ -f "/opt/defaults/cron/jobs.json" ]; then
     ASSUME_RETIRED=""
