@@ -222,17 +222,24 @@ and a manifest you add declares its object, so merging it keeps the object.
 2. **Find the declaration.** After Step 1's `prepare`, search the `workspace`
    for the object's name, then read each file found and keep the one whose
    `kind`, `metadata.name` and, for a namespaced object, `metadata.namespace`
-   match:
+   match. A namespace is also declared without a Namespace manifest: by
+   objects placed in it, a `kustomization.yaml` whose `namespace:` names it, a
+   `namespaces/<name>/` directory (Config Sync's hierarchical layout), or an
+   Argo CD `Application` with `CreateNamespace=true` deploying into it. Any of
+   those counts as declared.
 
    ```bash
-   grep -rlE "^\s+name: <name>\s*$" <workspace>
+   grep -rlE "^\s+name: [\"']?<name>[\"']?\s*(#.*)?$" <workspace>
+   grep -rlE "^\s*namespace: [\"']?<name>[\"']?\s*(#.*)?$" <workspace>
+   find <workspace> -type d -path "*/namespaces/<name>"
    ```
 
 3. **The repository declares it.** The change is `git rm` of that file, plus
    its line in the directory's `kustomization.yaml` `resources:` list when
-   there is one. For a namespace, the objects the repository declares inside
-   it go too, in the same pull request, each named in its body: left behind,
-   they would recreate the namespace. Then continue with Step 3.
+   there is one. For a namespace, everything step 2 found goes in the same
+   pull request, each named in its body: the objects in it, the directory,
+   and the `kustomization.yaml` or `Application` that creates it. Left
+   behind, any of them recreates the namespace. Then continue with Step 3.
 
 4. **The repository does not declare it.** Stop with: "`<repo>` does not
    declare `<kind>/<name>`, so a pull request cannot delete it: removing a
@@ -242,9 +249,11 @@ and a manifest you add declares its object, so merging it keeps the object.
 
 5. **Say what merging will do, from what you read.** Removing the file deletes
    the object only if a reconciler syncs that directory and prunes. Read the
-   reconciler objects (a `NotFound` for the type means that reconciler is not
-   installed), and match each one's source against `<repo>` and the file's
-   directory:
+   reconciler objects on the target cluster, and on the hub that deploys to it
+   when your kubeconfig reaches one (Argo CD usually runs on a hub). An answer
+   of `the server doesn't have a resource type` means that reconciler is not
+   installed there. Match each object's source against `<repo>` and the
+   file's directory:
 
    ```bash
    kubectl get applications.argoproj.io -A -o yaml
@@ -259,7 +268,7 @@ and a manifest you add declares its object, so merging it keeps the object.
    - Config Sync deletes the objects it applied when their file goes.
 
    A `Forbidden` is not an absence: say you could not read the reconcilers,
-   and fall back to the CRDs, which every reader can see:
+   and fall back to their CRDs, which this agent's role can read:
 
    ```bash
    kubectl get crd applications.argoproj.io kustomizations.kustomize.toolkit.fluxcd.io rootsyncs.configsync.gke.io
@@ -272,8 +281,9 @@ and a manifest you add declares its object, so merging it keeps the object.
    `<kind>/<name>` stays until someone deletes it."
 
 6. **Words.** After a confirmation, say "I'll propose this as a pull request",
-   and report the pull request you opened and the file it removes. Never say
-   "deleting" or "deleted": nothing was deleted.
+   and report the pull request you opened and the files it removes. Never
+   describe the request as an action under way or done ("deleting",
+   "deleted"): the pull request only proposes it.
 
 ### Step 3: Call the Secure Submit Suggestion Script
 
