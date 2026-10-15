@@ -405,6 +405,21 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
+// waitForRecord polls the conversation's session record until cond holds and
+// returns that record. The gateway posts a command's acknowledgement inside
+// the command and writes the record only after it returns, so a test that
+// waited on the post and read the record once could read the old record on a
+// loaded runner.
+func waitForRecord(t *testing.T, r *rig, conv, what string, cond func(*SessionRecord) bool) *SessionRecord {
+	t.Helper()
+	var rec *SessionRecord
+	waitFor(t, what, func() bool {
+		rec, _ = r.g.reg.Get(context.Background(), conv)
+		return rec != nil && cond(rec)
+	})
+	return rec
+}
+
 // inSubjectEnvelopes replays everything on a task's in subject.
 func inSubjectEnvelopes(t *testing.T, url, addressee string) []*lib.Envelope {
 	t.Helper()
@@ -1942,8 +1957,8 @@ func TestSessionOffReleasesThePodAndRehomes(t *testing.T) {
 		d := spawn.deleted()
 		return len(d) == 1 && d[0] == call.Session
 	})
-	rec, _ := r.g.reg.Get(ctx, conv)
-	if rec.SessionRouted || rec.PodName != "" || rec.BusSession != "" || rec.Addressee != "platform" {
+	rec := waitForRecord(t, r, conv, "route cleared", func(rec *SessionRecord) bool { return !rec.SessionRouted })
+	if rec.PodName != "" || rec.BusSession != "" || rec.Addressee != "platform" {
 		t.Fatalf("record after /session off: %+v", rec)
 	}
 
@@ -2184,19 +2199,12 @@ func TestSessionInfoRepliesStillCountAsActivity(t *testing.T) {
 	waitFor(t, "ack", postedContaining(r, "session route on"))
 	// The ack is persisted; take its clock, then let only an informational
 	// reply move it.
-	rec, _ := r.g.reg.Get(context.Background(), conv)
-	if rec == nil || !rec.SessionRouted {
-		t.Fatalf("record after the ack: %+v", rec)
-	}
+	rec := waitForRecord(t, r, conv, "route on", func(rec *SessionRecord) bool { return rec.SessionRouted })
 	first := rec.LastActivity
 	time.Sleep(30 * time.Millisecond)
 	sessionRigTurn(r, conv, "s-232", "/session")
 	waitFor(t, "already", postedContaining(r, "already on the session route"))
-	time.Sleep(50 * time.Millisecond)
-	rec, _ = r.g.reg.Get(context.Background(), conv)
-	if !rec.LastActivity.After(first) {
-		t.Fatalf("informational reply did not move LastActivity: %s then %s", first, rec.LastActivity)
-	}
+	waitForRecord(t, r, conv, "informational reply to move LastActivity", func(rec *SessionRecord) bool { return rec.LastActivity.After(first) })
 }
 
 // TestSessionStatusIsAFirstTurn: the spec's sentence - "/session status" is
@@ -2230,8 +2238,8 @@ func TestSessionOffWorksWithoutASpawner(t *testing.T) {
 	}
 	sessionRigTurn(r, conv, "s-250", "/session off")
 	waitFor(t, "off ack", postedContaining(r, "session route off"))
-	got, _ := r.g.reg.Get(context.Background(), conv)
-	if got.SessionRouted || got.Addressee != "platform" || got.BusSession != "" {
+	got := waitForRecord(t, r, conv, "route cleared", func(rec *SessionRecord) bool { return !rec.SessionRouted })
+	if got.Addressee != "platform" || got.BusSession != "" {
 		t.Fatalf("record after /session off with no spawner: %+v", got)
 	}
 	sessionRigTurn(r, conv, "s-251", "how is the fleet?")
@@ -2301,8 +2309,8 @@ func TestSessionOffDuringAPlatformTaskRehomesWithoutStopping(t *testing.T) {
 	waitFor(t, "ack", postedContaining(r, "after it opens a session pod"))
 	sessionRigTurn(r, conv, "s-272", "/session off")
 	waitFor(t, "off ack", postedContaining(r, "session route off"))
-	rec, _ := r.g.reg.Get(ctx, conv)
-	if rec.SessionRouted || rec.Addressee != "platform" || rec.ActiveTask == nil || rec.ActiveTask.Detached {
+	rec := waitForRecord(t, r, conv, "route cleared", func(rec *SessionRecord) bool { return !rec.SessionRouted })
+	if rec.Addressee != "platform" || rec.ActiveTask == nil || rec.ActiveTask.Detached {
 		t.Fatalf("record after /session off during a platform task: %+v", rec)
 	}
 	for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
