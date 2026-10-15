@@ -2401,6 +2401,24 @@ def test_tool_called_result_errors_on_a_result_it_cannot_read(result):
     assert "no readable result" in res.reason
 
 
+def test_tool_called_result_errors_when_arguments_and_result_are_both_withheld():
+    from kube_agents_bench import worker_trajectory
+
+    withheld = worker_trajectory.WITHHELD
+    transcript.set(
+        "done",
+        [{"name": "skill_view", "args": {"raw": withheld}, "result": withheld, "status": "completed", "agent": "platform"}],
+    )
+    res = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["skill_view"],
+        scope="workers",
+        arguments={"name": "fleet-audit"},
+        result=r"^<persisted-output>",
+    ).verify(5.0)
+    assert res.status == "error"
+
+
 def test_the_withheld_marker_matches_the_in_pod_script():
     from kube_agents_bench import worker_trajectory
 

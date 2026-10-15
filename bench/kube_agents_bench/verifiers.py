@@ -1128,16 +1128,18 @@ class ToolCalledVerifier(BaseVerifier):
             if not entries:
                 matched_agent = False
         wanted = set(self.tool_names)
-        shaped = [
+        named = [
             entry
             for entry in entries
             if (entry.get("name") in wanted or _wrapped_tool_names(entry) & wanted)
             and not (self.require_success and entry.get("status") == "error")
-            and self._arguments_match(entry)
         ]
         if self.result is not None:
+            # Read before the arguments filter: a pod that withholds results
+            # withholds arguments too, so that filter would drop the very call
+            # whose result could not be read.
             unread = [
-                entry for entry in shaped
+                entry for entry in named
                 if entry.get("result") is None or entry.get("result") == worker_trajectory.WITHHELD
             ]
             if unread:
@@ -1151,7 +1153,7 @@ class ToolCalledVerifier(BaseVerifier):
                         f"{self.result!r} could not be evaluated"
                     ),
                 )
-        calls = [entry for entry in shaped if self._result_matches(entry)]
+        calls = [entry for entry in named if self._arguments_match(entry) and self._result_matches(entry)]
         count = len(calls)
         ok = count >= self.minimum_calls
         agent_str = f" for agent {self.agent!r}" if self.agent is not None else ""

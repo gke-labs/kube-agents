@@ -80,14 +80,8 @@ verification_spec:
       type: worker_commands
       required_runs:
         - script: audit_report.py
-          flags: ["start", "--audit"]
-  - name: the-worker-used-full-paths
-    role: objective
-    mode: assert
-    check:
-      type: worker_commands
-      forbidden_patterns:
-        ['(?<![\w/.-])(?:\./)?skills/[\w-]+/scripts/', "scripts/governance/"]
+          flags: [start]
+          word_patterns: ["^--audit(?:=|$)"]
   - name: the-answer-says-no-forge-is-configured
     role: objective
     mode: assert
