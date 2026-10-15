@@ -200,6 +200,16 @@ firing, now against `N-1`'s tools. The rest of what the image seeds is copied wi
 which skips any file the volume holds that is newer, so those files stay at `N`'s copy, and the
 state the agent itself wrote is kept.
 
+The default profile's tool surface. Since the front door's assistant route, the entrypoint adds
+`terminal` and `triage` to every `platform_toolsets` key of the default profile's `config.yaml`,
+drops `terminal` from its `agent.disabled_toolsets`, and enables the `assistant_route` plugin that
+gates that terminal. An earlier release's entrypoint fills missing keys and removes nothing, so after
+a rollback across that change those edits stay, the older image has no `assistant_route` plugin, and
+the front door runs with a terminal that only the credential proxy bounds. Put `terminal` back in
+`agent.disabled_toolsets`, drop `terminal` and `triage` from each `platform_toolsets` list, and drop
+`assistant_route` from `plugins.enabled` and the `tools:` block, in `/opt/data/config.yaml` from the
+gateway's `platform-agent` container, then restart the gateway.
+
 A cluster profile's remote MCP entries. Since the `gke` and `developer_knowledge` MCP servers went
 through the credential proxy, the entrypoint rewrites those two entries in every cluster profile's
 `config.yaml` (and the platform profile's, when it is the front door) to the proxy's relay. An

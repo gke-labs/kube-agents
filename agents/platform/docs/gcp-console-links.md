@@ -15,3 +15,5 @@ Markdown links. Substitute `{project_id}` with the active project ID.
   `https://console.cloud.google.com/monitoring/metrics-explorer?project={project_id}`
 - **GKE Workloads Console:**
   `https://console.cloud.google.com/kubernetes/workload/overview?project={project_id}`
+- **GKE Cluster details** (the front door's assistant-route guide carries a copy, since that profile has no file tool to read this):
+  `https://console.cloud.google.com/kubernetes/clusters/details/{location}/{cluster}/details?project={project_id}`

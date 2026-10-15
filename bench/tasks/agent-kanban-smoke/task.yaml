@@ -1,8 +1,16 @@
+# PARKED 2026-10-15 (#3202): off the presubmit file and the blocking roster,
+# with a KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py. The
+# front door's assistant route now answers this prompt itself, after its
+# triage call, with one read-only terminal command and no kanban card, so the
+# kanban_create objective below can only fail. The file stays because the
+# bench harness's own tests read it as a fixture (bench/tests/conftest.py);
+# chat-assistant-route-lists-clusters grades the route that replaced it.
+#
 # Smoke task: exercises the eval pipeline end to end without provisioning
 # infrastructure. The endpoint the harness POSTs to serves the front-door
-# (default) profile, whose platform_toolsets are mcp-router, kanban and
+# (default) profile, whose platform_toolsets were mcp-router, kanban and
 # memory and nothing else (agents/chat/config.yaml), so a question about
-# live fleet state cannot be answered at the front door: it has to be filed
+# live fleet state could not be answered at the front door: it had to be filed
 # as a kanban card, dispatched to a specialist worker, worked, and delivered
 # back into the thread. One realistic question therefore smokes every stage
 # this probe exists to cover — card creation, worker dispatch, the harness's

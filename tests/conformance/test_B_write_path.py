@@ -1187,5 +1187,51 @@ class B6NoSelfApproval(unittest.TestCase):
                 )
 
 
+class B1TheFrontDoorHoldsNoWriteSurface(unittest.TestCase):
+    """The chat front door's own tool surface: one read-only terminal, gated per
+    turn by the assistant_route plugin, and nothing that writes.
+
+    The terminal reaches the shell sandbox, where kubectl and gcloud are the
+    credential proxy's shims; B1 holds that refusal half. What this pins is the
+    declaration in the front door's config: the file, skill, code-execution and
+    delegation toolsets stay denied; every ingress key, slack included, lists the
+    same five toolsets so no surface falls back to a Hermes base bundle; the
+    plugin that gates the terminal is enabled; and its tool is never deferred
+    behind a tool_describe round trip, which is what keeps the gate first.
+    """
+
+    EXPECTED_SURFACE = {"mcp-router", "kanban", "memory", "terminal", "triage"}
+    STILL_DENIED = {"file", "skills", "code_execution", "delegation", "browser", "web"}
+    INGRESS_KEYS = {"cli", "api_server", "google_chat", "slack"}
+
+    def setUp(self) -> None:
+        self.config = yaml.safe_load(h.text("chat_config")) or {}
+
+    def test_B1_front_door_every_ingress_key_lists_the_same_read_only_surface(self) -> None:
+        # A subset, not an equality: a new chat platform adds its own key, and the
+        # rule is that it carries the same surface, not that no key is ever added.
+        toolsets = self.config.get("platform_toolsets") or {}
+        self.assertTrue(self.INGRESS_KEYS <= set(toolsets), sorted(self.INGRESS_KEYS - set(toolsets)))
+        for key, names in toolsets.items():
+            with self.subTest(key=key):
+                self.assertEqual(set(names), self.EXPECTED_SURFACE)
+
+    def test_B1_front_door_write_capable_toolsets_stay_denied(self) -> None:
+        denied = set((self.config.get("agent") or {}).get("disabled_toolsets") or [])
+        self.assertTrue(self.STILL_DENIED <= denied, sorted(self.STILL_DENIED - denied))
+        self.assertNotIn("terminal", denied)
+        self.assertNotIn("memory", denied)
+
+    def test_B1_front_door_gate_is_enabled_and_its_tool_is_never_deferred(self) -> None:
+        enabled = (self.config.get("plugins") or {}).get("enabled") or []
+        self.assertIn("assistant_route", enabled)
+        tool_search = (self.config.get("tools") or {}).get("tool_search") or {}
+        self.assertEqual(str(tool_search.get("enabled")).lower(), "off")
+
+    def test_B1_front_door_router_is_the_only_mcp_server(self) -> None:
+        self.assertEqual(set(self.config.get("mcp_servers") or {}), {"router"})
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+

@@ -19,7 +19,9 @@ _FALLBACK_SCRIPTS_DIR = Path("/opt/defaults/scripts")
 
 _HEADER = "[SPECIALIST AGENTS AVAILABLE NOW]"
 _FOOTER = (
-    "Use one of the names above verbatim as the `assignee` of `kanban_create`. "
+    "Use one of the names above verbatim as the `assignee` of `kanban_create`, "
+    "or no specialist at all: `triage(needs_specialist=false)` when the request "
+    "is a read-only lookup you can run yourself. "
     "This list is current as of this turn; call `list_agents` only if an agent "
     "you expect is missing."
 )

@@ -241,7 +241,11 @@ fails on a correct agent today, and the nightly record is what will show a fix l
 
 One re-admission on record: **agent-kanban-smoke** earned its seat back after the
 2026-08-27 redesign (a real SRE question graded on `kanban_create` plus cluster names);
-the reds that once argued for un-arming it belonged to the old vocabulary check.
+the reds that once argued for un-arming it belonged to the old vocabulary check. It left again
+on 2026-10-15 (#3202), not as a flake demotion but as a parked premise: the front door's
+assistant route now answers the fleet list itself with no card, so the case is off the presubmit
+file and the roster with a `KNOWN_UNREGISTERED` entry, and `chat-assistant-route-lists-clusters`
+grades the route that replaced it in the nightly.
 
 Admitted on the record since the split:
 
@@ -422,7 +426,8 @@ rebuilt, but the worker half stays until `scoring.py` takes those entries out of
 `worker_blind_checks` for a record that carries the workers.
 
 A premise the transport removes is the lane's exclusion list,
-`hack/eval/inject-lane-exclusions.txt`. `agent-kanban-smoke`'s objective is the default profile
+`hack/eval/inject-lane-exclusions.txt`. `chat-voice-ack-names-target`'s objective (and, until it
+was parked on 2026-10-15, `agent-kanban-smoke`'s) is the default profile
 filing a `kanban_create` and the specialist's answer coming back to the thread. Under the bridge's
 default `api` executor the default profile answers the door's task and can file the card, but the
 card's completion never reaches the A2A thread. The lane's delegation wait reads the card's

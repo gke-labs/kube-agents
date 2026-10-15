@@ -667,6 +667,53 @@ class ConfigBackfillTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(unchanged)
 
+    def test_a_toolset_the_template_lists_joins_each_platform_list(self):
+        """platform_toolsets.<key> is image-owned too: the front door's terminal and
+        triage toolsets reach a volume scaffolded before them, after the agent's own."""
+        template = {"platform_toolsets": {"cli": ["mcp-router", "kanban", "terminal"], "slack": ["kanban"]}}
+        live = {"platform_toolsets": {"cli": ["mcp-router", "kanban", "my-own"]}}
+        proc, live, _ = self._fill(template, live)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(live["platform_toolsets"]["cli"], ["mcp-router", "kanban", "my-own", "terminal"])
+        # A key the live mapping lacked arrives whole through the fill.
+        self.assertEqual(live["platform_toolsets"]["slack"], ["kanban"])
+        self.assertIn("platform_toolsets.cli.terminal", proc.stdout)
+
+    def test_a_toolset_the_template_now_grants_leaves_the_live_denylist(self):
+        """agent.disabled_toolsets yields only to a grant: a name the template lists in a
+        platform_toolsets list and no longer denies is dropped, because the denylist runs
+        last and would cancel the grant. A denial the template merely stopped listing, and
+        every denial it still lists, are kept in the agent's order."""
+        template = {
+            "platform_toolsets": {"cli": ["kanban", "terminal"]},
+            "agent": {"disabled_toolsets": ["file", "skills"]},
+        }
+        live = {
+            "platform_toolsets": {"cli": ["kanban"]},
+            "agent": {"environment_probe": False, "disabled_toolsets": ["terminal", "web", "skills", "file"]},
+        }
+        proc, live, _ = self._fill(template, live)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(live["agent"]["disabled_toolsets"], ["web", "skills", "file"])
+        self.assertEqual(live["platform_toolsets"]["cli"], ["kanban", "terminal"])
+        self.assertIs(live["agent"]["environment_probe"], False)
+        self.assertIn("agent.disabled_toolsets-terminal", proc.stdout)
+        self.assertNotIn("agent.disabled_toolsets-web", proc.stdout)
+
+    def test_a_matching_tool_surface_is_left_alone(self):
+        """Lists already in step with the template: no rewrite, so the file keeps its bytes."""
+        live = (
+            "platform_toolsets:\n  cli:\n  - kanban\n  - terminal\n"
+            "agent:\n  disabled_toolsets:\n  - file\n"
+        )
+        template = {"platform_toolsets": {"cli": ["kanban", "terminal"]}, "agent": {"disabled_toolsets": ["file"]}}
+        proc, _, unchanged = self._fill(template, live)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged)
+
     def test_a_live_scalar_is_not_descended_into(self):
         """Where the live file holds a scalar and the template a mapping, the agent wins."""
         proc, live, _ = self._fill({"memory": {"provider": "hindsight"}}, {"memory": "none"})

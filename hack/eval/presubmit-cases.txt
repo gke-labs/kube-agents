@@ -49,12 +49,13 @@
 # truncating this list's tail. A case known to be slow gets a unit_cost_hint
 # entry in the script, not a position here.
 #
-# BUDGET. Fourteen cases, forty-two units at the script's EVAL_REPETITIONS
+# BUDGET. Thirteen cases, thirty-nine units at the script's EVAL_REPETITIONS
 # of 3: six domain probes, one reliability prompt variation, the remediation
 # writer pdb-remediation-pr (420-1929s measured, hinted at 1250; its three
 # repetitions serialize on the task lock), three cluster-debugging cases, the
-# incident-triage probe, the kanban smoke, and one held-out seat (the
-# compliance canary, ~1000-2000s a repetition, serialized the same way).
+# incident-triage probe, and one held-out seat (the compliance canary,
+# ~1000-2000s a repetition, serialized the same way). The kanban smoke left
+# on 2026-10-15 (#3202: parked, its premise removed by the assistant route).
 # pdb-remediation-pr took its roster line 2026-10-14 (#2016), which took
 # remediation off the docs/designs/domains.yaml allowlist; rca-remediation-pr
 # stays demoted (#1189). The 2026-08-26
@@ -146,12 +147,6 @@
 # wait. Priced at 700s in unit_cost_hint. This line is what took
 # incident-triage off the docs/designs/domains.yaml allowlist.
 ./tasks/incident-triage-oom-event-probe/task.yaml
-
-# agent-kanban-smoke is deployer: noop, so it adds a delegation round trip
-# (~100-300s), not a cluster. Re-admitted to the blocking roster after the
-# 2026-08-27 redesign (a real SRE question graded on kanban_create plus
-# cluster names).
-./tasks/agent-kanban-smoke/task.yaml
 
 # ── Held out: seated here without a roster line ──────────────────────────────
 # The documented exception to the 2026-09-22 rule above, one case per

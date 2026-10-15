@@ -704,9 +704,12 @@ reported until a complete sweep misses it again.
 ## 6. Who reads it
 
 The Chat Agent has no tools to read this, and that is deliberate rather than an oversight to route
-around. Its toolsets are `mcp-router`, `kanban`, and memory — enforced in three layers in
+around. Its toolsets are `mcp-router`, `kanban`, memory, and a sandbox terminal its `assistant_route`
+plugin opens only for a turn whose triage found no specialist is needed — enforced in three layers in
 [`agents/chat/config.yaml`](../../agents/chat/config.yaml), the last of them a denylist applied to
-every platform key so that no reintroduced base bundle can grant terminal, file, or exec access.
+every platform key so that no reintroduced base bundle can grant file or exec access. The findings
+table lives on the agent pod's data volume, which the sandbox mirror does not carry, so that terminal
+does not reach it either.
 
 So an on-demand pull is not a query. It is a kanban card assigned to `platform`, which is exactly
 what [`scan_completed.md`](../../agents/chat/defaults/onboarding/scan_completed.md) already

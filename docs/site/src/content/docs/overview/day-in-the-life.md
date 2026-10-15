@@ -44,7 +44,7 @@ Without kube-agents, the crash loop shows in pod status and events until someone
 
 ## A developer asks why a deployment is stuck
 
-In a Slack direct message to the bot, a developer writes "why is my checkout deployment stuck in Pending?". The message gets a 🔍 reaction, picked from its words with no model call. Every chat message reaches the Planning Agent first, and it has no cluster tools. It replaces "my" with the cluster the developer stored in personal memory earlier, here `prod-east`. It files a card for the `prod-east` Cluster Agent and replies with one line, such as `checking checkout.`
+In a Slack direct message to the bot, a developer writes "why is my checkout deployment stuck in Pending?". The message gets a 🔍 reaction, picked from its words with no model call. Every chat message reaches the Planning Agent first; it answers a read-only lookup itself and hands a diagnosis like this one to a specialist. It replaces "my" with the cluster the developer stored in personal memory earlier, here `prod-east`. It files a card for the `prod-east` Cluster Agent and replies with one line, such as `checking checkout.`
 
 The Cluster Agent runs its preflight check, then reads the pods, the namespace events and the Deployment. For a Pending pod, its troubleshooting skill goes to the namespace events and their `FailedScheduling` message, for example `Insufficient memory`. Progress shows in the thread while it works. When the card completes, the gateway posts the Cluster Agent's full result in the thread: the cause, the evidence and a proposed manifest change. On Slack, the first sentence usually leads in bold, with the rest in a folded "why" section. No pull request opens, because the developer asked a question.
 

@@ -1253,10 +1253,10 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
 
     def test_a_fixture_not_ready_entry_that_a_roster_also_names_is_stale(self):
         with unittest.mock.patch.dict(
-            validator.FIXTURE_NOT_READY, {"agent-kanban-smoke": "#1 waiting"}, clear=False
+            validator.FIXTURE_NOT_READY, {"reliability-pdb-probe": "#1 waiting"}, clear=False
         ):
             self.assertIn(
-                "FIXTURE_NOT_READY: agent-kanban-smoke (also in a roster file)",
+                "FIXTURE_NOT_READY: reliability-pdb-probe (also in a roster file)",
                 validator.stale_allowlist_entries(),
             )
 

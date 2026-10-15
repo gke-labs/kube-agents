@@ -77,8 +77,9 @@ domains:
     # card". Opening it is the remediation domain's journey, one row above.
     journey: A warning event is triaged to a root cause and remediation options a human authorizes, never a cluster write
 
-# Known-uncovered. Two entries; empty is Phase 2's exit criterion. The two
-# kanban probes cover chat-and-routing; cluster-debugging came off first
+# Known-uncovered. Three entries; empty is Phase 2's exit criterion.
+# chat-and-routing went back on 2026-10-15 (#3202), when agent-kanban-smoke,
+# its one roster case, was parked; cluster-debugging came off first
 # among the Phase 2 domains, in #939. Reliability, capacity, security,
 # consistency and cost are covered by five domain probes (upgrades' probe
 # was demoted to the nightly on 2026-10-16, #3269, below) --
@@ -92,6 +93,13 @@ domains:
 #
 # An entry goes back on here only alongside a scenario that stopped running.
 allowlist:
+  # chat-and-routing, since 2026-10-15 (#3202): agent-kanban-smoke, the one
+  # roster case in the domain, graded a kanban card for the fleet list, and
+  # the front door's assistant route now answers that question itself with
+  # no card, so the case was parked. chat-assistant-route-lists-clusters is
+  # the domain's nightly case for the new route; delete this entry in the
+  # pull request that seats it on the roster on its record.
+  - chat-and-routing
   # fleet-audits, since 2026-09-22 (#1023): the domain's one case, the
   # compliance-rbac-overgrant canary, was never admitted (demoted 2026-09-02
   # on #1171) and moved to the nightly that day. Since 2026-09-29 it is seated

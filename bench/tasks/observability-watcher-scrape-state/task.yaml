@@ -74,8 +74,8 @@ verification_spec:
   # Deployment-annotation path (`kubectl get deployment ... -o yaml`).
   # worker_commands sees terminal commands only, so a read through an MCP tool is
   # invisible to it; the skill's step spells the kubectl command and every recorded
-  # run used it. It also fails closed on no delegation at all: the front door holds
-  # no infrastructure tools, so worker_commands reads the delegated worker's
+  # run used it. It also fails closed on no delegation at all: worker_commands
+  # reads only the delegated worker's
   # terminal log and returns an error -- which blocks the repetition -- not a pass,
   # when nothing was delegated, so an undelegated run reds here without a separate
   # delegation objective. The corpus is pinned in

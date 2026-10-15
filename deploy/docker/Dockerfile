@@ -827,6 +827,7 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \
      deploy/docker/patches/verify_google_chat_attachment_notice.py \
+     deploy/docker/patches/verify_assistant_route_contracts.py \
      deploy/docker/patches/apply_slack_reactions_scope.py \
      deploy/docker/patches/verify_slack_reactions_scope.py \
      deploy/docker/patches/apply_slack_ux_reactions.py \
@@ -901,6 +902,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_agent_view.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_code_emphasis.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_google_chat_attachment_notice.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_assistant_route_contracts.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_reactions_scope.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_reactions.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_status.py && \
@@ -2000,7 +2002,8 @@ RUN set -eu; \
 COPY --chown=hermes:hermes agents/chat/defaults/ /opt/defaults/
 COPY agents/chat/SOUL.md agents/chat/AGENTS.md /opt/defaults/
 # Self-contained Chat Agent config: it replaces (NOT merges with) the shared-defaults
-# config, so the front door stays minimal — router tools only, no cloud/write tools.
+# config, so the front door stays minimal — router, board and memory tools plus one
+# triage-gated read-only terminal; no file, skill or write tools.
 #
 # It goes to /opt/chat-template rather than /opt/defaults, and the shared-defaults copy
 # is removed, so that NOTHING under /opt/defaults is called config.yaml. Entrypoint step

@@ -908,9 +908,9 @@
 # lock (the 2026-10-15 paragraph above).
 ./tasks/oobe-first-run-audits/task.yaml
 
-# A delegated answer opens on one bold sentence and does not restate it
-# (the report stanza in deploy/docker/patches/kanban_report_format.py).
-# deployer: noop, transcript-only, one front-door turn plus the card round trip.
+# A quick health question about one named cluster is answered by the front
+# door itself on the assistant route (#3202), opening on one bold sentence.
+# deployer: noop, transcript-only, one front-door turn, no card.
 ./tasks/chat-voice-answer-first/task.yaml
 
 # The agent's own observability: whether the event watcher's metrics are
@@ -1074,3 +1074,10 @@
 # deployer: noop, read-only, no fixture: three units at the 200s default,
 # ~10 serial minutes, off the infra lock, main nightly part.
 ./tasks/observability-trace-latency-brokered/task.yaml
+
+# The front door's assistant route (#3202): the fleet list is answered by the
+# front door itself after its triage call, through a read-only terminal
+# command, with no kanban card. deployer: noop, one front-door turn, no
+# delegation wait. Replaces agent-kanban-smoke's premise, which this route
+# removed; that case is parked (scripts/validate_bench_cases.py).
+./tasks/chat-assistant-route-lists-clusters/task.yaml

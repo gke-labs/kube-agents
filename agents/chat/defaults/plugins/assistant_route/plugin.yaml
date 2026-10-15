@@ -1,0 +1,4 @@
+name: assistant_route
+version: 0.1.0
+description: Triage every user turn into the assistant route (the front door runs read-only commands itself) or the delegation route (a kanban card for a specialist), and show the plan on the Google Chat thinking card.
+kind: standalone

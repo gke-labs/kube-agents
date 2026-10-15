@@ -9,9 +9,13 @@
 # hold at all — the repair for a `save_config` that stripped a then-pinned leaf,
 # or a release that stopped pinning one. So ADDING a key here does reach an
 # existing install on its next roll; CHANGING one does not, because the live file
-# already holds it and the back-fill never overrules a value the agent has. A
-# changed value reaches a deployed agent only through the operator — the managed
-# scope or the overlay in (3) and (4) below — or by hand.
+# already holds it and the back-fill never overrules a value the agent has. The
+# three image-owned lists are the exception to that: `plugins.enabled` and each
+# `platform_toolsets.<key>` gain the names this file has and the live list lacks,
+# and `agent.disabled_toolsets` drops a name this file's `platform_toolsets` now
+# grant (the terminal, when the image stopped denying it). Any other changed
+# value reaches a deployed agent only through the operator — the managed scope or
+# the overlay in (3) and (4) below — or by hand.
 #
 # It is deliberately NOT merged with deploy/shared/defaults/config.yaml: the
 # merge helper only unions keys, so it could never REMOVE the cloud/cluster tools
@@ -57,14 +61,19 @@
 # REPLACE rather than union, so a list pinned there would hand the platform
 # specialist the front door's tools and vice versa.
 #
-# TOOL LOCKDOWN — the Chat Agent's job is to analyze a message, choose the best
-# specialist, delegate, and proxy the chat session. It has NO runtime tools of its
-# own (no gcloud/kubectl/terminal/files/skills/code-exec). Its delegation surface:
+# TOOL SURFACE — the Chat Agent triages every message (the `assistant_route`
+# plugin's `triage` tool), then either answers a read-only lookup itself or
+# delegates to a specialist. It has no file, skill, code-exec or write tools. Its
+# surface:
+#   - `triage` + `terminal`: the assistant route. `terminal` runs in the shell
+#     sandbox, where kubectl and gcloud are shims to the credential proxy, which
+#     refuses every verb that writes; the plugin hides and blocks the tool until
+#     this turn's triage says no specialist is needed.
 #   - `mcp-router` (list_agents): discovery only — lists the dynamic specialist
 #     roster so the Chat Agent can pick the right kanban `assignee`. (The old
 #     synchronous `ask_agent` relay was removed: it blocked up to 300s with no
-#     visible progress. All delegation is now kanban-only.)
-#   - `kanban`: async delegation for ALL substantive work — Hermes auto-subscribes
+#     visible progress. Delegation is kanban-only.)
+#   - `kanban`: async delegation for specialist work — Hermes auto-subscribes
 #     this chat thread and posts the specialist's progress back to it as each step
 #     completes, with no blocking timeout.
 #   - `kube_agents_memory`: per-user + shared memory. The Chat Agent is the ONLY
@@ -72,15 +81,17 @@
 #     it is the only profile that can scope memory per user. See the `memory`
 #     note below.
 # Enforcement layers:
-#   1. `platform_toolsets` lists ONLY `mcp-router` + `kanban` + `memory` (no
-#      `hermes-cli`/`hermes-api-server` base bundles, which would grant
-#      terminal/file/exec). `memory` here is a GATE, not a tool — see below.
+#   1. `platform_toolsets` lists ONLY `mcp-router` + `kanban` + `memory` +
+#      `terminal` + `triage` (no `hermes-cli`/`hermes-api-server` base bundles,
+#      which would grant file/exec). `memory` here is a GATE, not a tool — see below.
 #   2. `toolsets` (top-level) also lists `kanban` — a SECOND gate the kanban tools'
 #      check_fn reads to expose the orchestrator surface (kanban_create/list/…).
 #   3. `agent.disabled_toolsets` is a denylist applied LAST for EVERY platform key
 #      (incl. `google_chat`, the real ingress key). It strips everything except the
-#      delegation surface and the `memory` gate, even if a base bundle is ever
-#      reintroduced. `memory` must stay OUT of it — see the note on that list.
+#      surface above, even if a base bundle is ever reintroduced. `memory` must
+#      stay OUT of it — see the note on that list. `terminal` is not in it: the
+#      plugin gates it per turn, and the sandbox and the credential proxy bound
+#      what it can reach.
 
 model:
   provider: custom
@@ -163,21 +174,41 @@ mcp_servers:
 # `memory_enabled: false` leaves agent._memory_store as None, and
 # tools/memory_tool.py short-circuits on a null store with "Memory is not
 # available", touching no disk.
+#
+# `terminal` and `triage` are the assistant route (the `assistant_route` plugin):
+# the plugin hides `terminal` from the model and refuses it until the turn's
+# `triage` call says no specialist is needed. Listed on every key so no surface
+# gets a different answer; the lists are unioned onto an existing volume by the
+# entrypoint's step 2d back-fill.
 platform_toolsets:
   cli:
     - mcp-router
     - kanban
     - memory
+    - terminal
+    - triage
   api_server:
     - mcp-router
     - kanban
     - memory
+    - terminal
+    - triage
   # Real Google Chat ingress resolves under the `google_chat` platform key; pin
-  # it to the delegation surface too so it never falls back to a full base bundle.
+  # it to the same surface so it never falls back to a full base bundle.
   google_chat:
     - mcp-router
     - kanban
     - memory
+    - terminal
+    - triage
+  # Slack ingress resolves under `slack`. An absent key falls back to Hermes'
+  # `hermes-slack` bundle, bounded only by the denylist below; pin it too.
+  slack:
+    - mcp-router
+    - kanban
+    - memory
+    - terminal
+    - triage
 
 # Second gate for the kanban orchestrator surface (kanban_create/list/…): the
 # kanban tools' check_fn reads this top-level key, distinct from platform_toolsets.
@@ -248,9 +279,12 @@ kanban:
   # per install and unmeasured: if worker logs show 429s, lower this.
   max_in_progress: 6
 
-# Denylist applied last for every platform key — the authoritative guarantee that
-# the front door cannot touch the system. Everything except the delegation
-# surface (mcp-router + kanban) is off.
+# Denylist applied last for every platform key — the guarantee that the front
+# door holds no file, skill, code-exec or write surface. Everything except the
+# surface in the header (mcp-router + kanban + memory + terminal + triage) is
+# off. `terminal` left this list with the assistant route: the plugin gates it
+# per turn, and the entrypoint's step 2d back-fill drops it from an existing
+# volume's list too.
 agent:
   # This file is not merged with deploy/shared/defaults/config.yaml (see the
   # header), so the probe has to be turned off again here. Rationale lives in
@@ -258,7 +292,6 @@ agent:
   # Python-toolchain line that is factually wrong on this image.
   environment_probe: false
   disabled_toolsets:
-    - terminal # shell / gcloud / kubectl / command execution + process mgmt
     - file # read_file / write_file / patch / search_files
     - skills # skills_list / skill_view / skill_manage
     - code_execution # execute_code
@@ -441,6 +474,18 @@ plugins:
     # DefaultBuiltInPlugins (platformagent_manifests.go) is only the roster an
     # AgentPlugin may not shadow; keep the two in step.
     - agent_roster
+    # The two routes: a `triage` call opens every user turn, and the sandbox
+    # terminal is unlocked for the turn only when it says no specialist is
+    # needed. See defaults/plugins/assistant_route/README.md.
+    - assistant_route
+
+# Tool search defers plugin and MCP tools behind a catalog stub, and a deferred
+# tool costs a `tool_describe` round trip before it can be called (44 s measured
+# on the platform worker). The front door's surface is small, and `triage` must
+# be callable on the first model call of every turn, so nothing is deferred here.
+tools:
+  tool_search:
+    enabled: "off"
 
 # Per-file character cap on context files (SOUL.md, AGENTS.md) in the system
 # prompt. Without it Hermes falls back to 20,000 whenever the model window is

@@ -640,6 +640,9 @@ if not isinstance(template, dict) or not isinstance(live, dict):
 added = []
 PLUGINS_KEY = "plugins"
 ENABLED_KEY = "enabled"
+TOOLSETS_KEY = "platform_toolsets"
+AGENT_KEY = "agent"
+DISABLED_KEY = "disabled_toolsets"
 
 
 def fill(src, dst, path):
@@ -655,7 +658,8 @@ def fill(src, dst, path):
 
 fill(template, live, [])
 
-# plugins.enabled is the one list the image owns: a plugin directory the image
+# plugins.enabled is one of three lists the image owns (the tool-surface lists
+# follow below): a plugin directory the image
 # ships is inert until the profile's list names it, and the fill above never
 # enters a list, so a volume scaffolded before a plugin existed would carry it
 # into every image and never load it. Add the template's names the live list
@@ -669,6 +673,44 @@ if isinstance(template_enabled, list) and isinstance(live_plugins, dict) and isi
             live_plugins[ENABLED_KEY].append(name)
             added.append(".".join([PLUGINS_KEY, ENABLED_KEY, str(name)]))
 
+# The tool surface is image-owned the same way, in two lists the fill cannot
+# reach. Each platform_toolsets.<key> gains the template's names it lacks (a
+# toolset the image added, such as the front door's terminal). And a name the
+# template GRANTS in one of those lists while the live agent.disabled_toolsets
+# still denies it is dropped from the denylist, because the denylist runs last
+# and would cancel the grant (the same terminal, when the image stops denying
+# it). Nothing else leaves the denylist: a denial the template does not grant
+# against, however it got there, is kept, and so is every name the agent added
+# to a toolset list on its own.
+template_toolsets = template.get(TOOLSETS_KEY)
+live_toolsets = live.get(TOOLSETS_KEY)
+granted = set()
+if isinstance(template_toolsets, dict):
+    for wanted in template_toolsets.values():
+        if isinstance(wanted, list):
+            granted.update(str(name) for name in wanted)
+if isinstance(template_toolsets, dict) and isinstance(live_toolsets, dict):
+    for key, wanted in template_toolsets.items():
+        have = live_toolsets.get(key)
+        if not isinstance(wanted, list) or not isinstance(have, list):
+            continue
+        for name in wanted:
+            if name not in have:
+                have.append(name)
+                added.append(".".join([TOOLSETS_KEY, str(key), str(name)]))
+template_agent = template.get(AGENT_KEY)
+live_agent = live.get(AGENT_KEY)
+if (isinstance(template_agent, dict) and isinstance(live_agent, dict)
+        and isinstance(template_agent.get(DISABLED_KEY), list) and isinstance(live_agent.get(DISABLED_KEY), list)):
+    still_denied = template_agent[DISABLED_KEY]
+    kept = []
+    for name in live_agent[DISABLED_KEY]:
+        if name not in still_denied and str(name) in granted:
+            added.append("-".join([".".join([AGENT_KEY, DISABLED_KEY]), str(name)]))
+            continue
+        kept.append(name)
+    live_agent[DISABLED_KEY] = kept
+
 if added:
     # Atomic, because a truncated config.yaml is worse than a hollow one: os.replace
     # over a plain PVC file is a rename, and the reader either sees all of the old file
@@ -678,7 +720,7 @@ if added:
     with open(tmp_path, "w") as fh:
         yaml.safe_dump(live, fh, sort_keys=False, default_flow_style=False)
     os.replace(tmp_path, live_path)
-    print(f"[ENTRYPOINT] config backfill: restored {len(added)} key(s) the live file did not hold: {', '.join(added)}")
+    print(f"[ENTRYPOINT] config backfill: brought {len(added)} image-owned key(s) in step (a '-name' suffix is a denylist entry the image's toolsets now grant against): {', '.join(added)}")
 PYEOF
 }
 
