@@ -600,8 +600,8 @@ class AdmissionMetricsTest(unittest.TestCase):
         # Measured from the first leg's arrival, which comes after the holder
         # took its slot, so the wait is at least the time from arrival to the
         # earliest the slot could come free -- not the whole 0.4 s hold, which
-        # it misses by however long the yield took (#3127). The 1e-6 is the
-        # rendered sum's six-decimal rounding.
+        # it misses by however long after the hold began the first leg arrived
+        # (#3127). The 1e-6 is the rendered sum's six-decimal rounding.
         earliest_release = holder.held_at + 0.4
         self.assertGreater(earliest_release - arrival, 0.3, "the arrival came too late to measure a wait")
         self.assertGreaterEqual(
