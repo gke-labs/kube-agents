@@ -7960,6 +7960,7 @@ _GROUP5 = {
         
             "seeded-a/seeded-shapes/deployment.apps/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre@sha256:a1b2cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc; reads cgroup v2 limits: no; memory limit 192Mi",
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre@sha256:0f1eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; reads cgroup v2 limits: no; memory limit 192Mi",            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime image: eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192Mi",
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192Mi (reads host memory)",
 ],
         [
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u372-b07-jre@sha256:0f1eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; reads cgroup v2 limits: no; memory limit 192Mi",
@@ -7969,7 +7970,6 @@ _GROUP5 = {
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u372-b07-jre; reads cgroup v2 limits: no; memory limit 192Mi",
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: yes; memory limit 192Mi",
             "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit none",
-            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192Mi (reads host memory)",
         ],
         "No workload on the seeded clusters runs a Java or .NET runtime older than the cgroup v2 releases.",
     ),
@@ -8241,12 +8241,12 @@ _GROUP4 = {
                     "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch: amd64; deprecated: yes; replacement kubernetes.io/arch",
             "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch=amd64; deprecated: yes; replacement kubernetes.io/arch",
             "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch=amd64; deprecated: yes; replacement kubernetes.io/arch=amd64",
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch (since 1.14)",
 ],
         [
             "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/os; deprecated: yes; replacement kubernetes.io/arch",
             "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: no; replacement kubernetes.io/arch",
             "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement none",
-            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch (since 1.14)",
                     "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch=amd64; deprecated: yes; replacement kubernetes.io/os=linux",
 ],
         "No workload on the seeded clusters selects nodes by a deprecated label; every nodeSelector names a GA key.",
@@ -8261,12 +8261,12 @@ _GROUP4 = {
                     "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock:ro",
             "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path hostPath /run/containerd/containerd.sock",
             "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path unix:///run/containerd/containerd.sock",
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock (read-only)",
 ],
         [
             "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: no; path /run/containerd/containerd.sock",
             "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /var/run/docker.sock",
             "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path none",
-            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock (read-only)",
         ],
         "No workload on the seeded clusters mounts the container runtime's socket from the host.",
     ),
