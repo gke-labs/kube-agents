@@ -1572,7 +1572,7 @@ scheduled_audits() { # <pause|resume> <label>
 # container's PID 1 until `exec "$@"`, so a PID 1 that is no longer
 # agent-entrypoint means the merge is done.
 ready_gateway_pod() { # <context> <namespace> [<wait seconds>]
-  local ctx="$1" ns="$2" deadline=$((SECONDS + ${3:-${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}})) workload="" kind selector names want p cmdline settled
+  local ctx="$1" ns="$2" deadline=$((SECONDS + ${3:-${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}})) workload="" kind selector names live want p cmdline settled
   for kind in deployment statefulset; do
     if kubectl --context "${ctx}" -n "${ns}" get "${kind}/${AGENT_SERVICE_NAME}-gateway" -o name >/dev/null 2>&1; then
       workload="${kind}/${AGENT_SERVICE_NAME}-gateway"
@@ -1592,9 +1592,15 @@ ready_gateway_pod() { # <context> <namespace> [<wait seconds>]
   while :; do
     names="$(kubectl --context "${ctx}" -n "${ns}" get pods -l "${selector}" \
       -o go-template='{{range $p := .items}}{{if not $p.metadata.deletionTimestamp}}{{range $p.status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}{{"pod/"}}{{$p.metadata.name}}{{"\n"}}{{end}}{{end}}{{end}}{{end}}' 2>/dev/null)" || names=""
-    # As many as the workload wants, no more: an extra Ready pod means a rollout is
-    # still settling, and a starting container's cron merge can rewrite the store.
-    if [ -n "${names}" ] && [ "$(printf '%s\n' "${names}" | grep -c .)" -eq "${want}" ]; then
+    # Every pod not terminating, Ready or not: a surge pod still starting is not
+    # Ready yet, and it is the one whose cron merge can rewrite the store.
+    live="$(kubectl --context "${ctx}" -n "${ns}" get pods -l "${selector}" \
+      -o go-template='{{/* all */}}{{range $p := .items}}{{if not $p.metadata.deletionTimestamp}}{{$p.metadata.name}}{{"\n"}}{{end}}{{end}}' 2>/dev/null)" || live=""
+    # As many as the workload wants, all of them Ready, no more: an extra pod means
+    # a rollout is still settling, and a starting container's cron merge can
+    # rewrite the store.
+    if [ -n "${names}" ] && [ "$(printf '%s\n' "${names}" | grep -c .)" -eq "${want}" ] &&
+      [ "$(printf '%s\n' "${live}" | grep -c .)" -eq "${want}" ]; then
       settled=1
       for p in ${names}; do
         cmdline="$(kubectl --context "${ctx}" -n "${ns}" exec "${p}" -c "${EVAL_GATEWAY_CONTAINER}" \

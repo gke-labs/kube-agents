@@ -39,8 +39,9 @@ outlives it would otherwise leave five audits off for good.
 
 Prints one line naming what it did. Exit codes, which the caller's retry reads:
 0 done; 1 worth another try (a pause that timed out, a store it couldn't read
-back); 3 decided, so a retry would only repeat it (its inputs are unreadable, or
-Hermes refused a pause or wrote no markers).
+back, a marker still missing after the last round, which is another writer
+still at work); 3 decided, so a retry would only repeat it (its inputs are
+unreadable, or Hermes refused a pause).
 """
 
 import ast
@@ -202,6 +203,9 @@ def pause():
             break
     done = [jid for jid in targets if paused(after.get(jid, {}))]
     failed += [f"{jid} (not paused in the store)" for jid in pending]
+    # A marker still missing after the last round is a writer still at work,
+    # not a verdict: the caller settles the gateway, waits and runs this again.
+    retryable |= bool(pending)
     print(
         f"paused {', '.join(done) or 'nothing'}; left {', '.join(left) or 'nothing'}"
         + (f"; FAILED {', '.join(failed)}" if failed else "")

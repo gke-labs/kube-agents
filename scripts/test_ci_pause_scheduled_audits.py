@@ -233,7 +233,9 @@ class PauseTest(unittest.TestCase):
     def test_the_store_is_believed_over_the_exit_code(self):
         self.write_roster([{"id": "c", "enabled": True}])
         result, _ = self.run_script(mode="noop")
-        self.assertEqual(result.returncode, 3)
+        # Worth another try, not decided: the caller's next attempt settles the
+        # gateway and waits first, which is what outlasts another writer.
+        self.assertEqual(result.returncode, 1)
         self.assertIn("FAILED c (not paused in the store)", result.stdout)
 
     def test_a_failed_pause_is_named(self):
@@ -324,7 +326,7 @@ class RestartTest(unittest.TestCase):
 class ReadyGatewayPodTest(unittest.TestCase):
     """ready_gateway_pod, run from the runner's own text against a fake kubectl."""
 
-    def run_helper(self, replicas, ready, wait=0, kind="deployment", starting=()):
+    def run_helper(self, replicas, ready, wait=0, kind="deployment", starting=(), unready=()):
         # `starting`: pods whose PID 1 is still the entrypoint (Ready on HA all the same).
         pids = "".join(
             f"  *exec\\ pod/{n}\\ *) printf '/bin/bash\\0/usr/local/bin/agent-entrypoint\\0' ;;\n" for n in starting)
@@ -337,6 +339,7 @@ class ReadyGatewayPodTest(unittest.TestCase):
                   *get\\ *-gateway\\ -o\\ name*) exit 1 ;;
                   *go-template=*matchLabels*) printf 'app=platform-agent-gateway,' ;;
                   *jsonpath=*spec.replicas*) printf '{replicas}' ;;
+                  *'/* all */'*) printf '{"".join(n + chr(92) + "n" for n in (*ready, *unready))}' ;;
                   *get\\ pods*) printf '{"".join("pod/" + n + chr(92) + "n" for n in ready)}' ;;
                 """) + pids + textwrap.dedent("""\
                   *exec\\ pod/*cmdline*) printf 'python3\\0-m\\0hermes_cli.main\\0gateway\\0' ;;
@@ -366,6 +369,12 @@ class ReadyGatewayPodTest(unittest.TestCase):
     def test_an_ha_pod_ready_but_still_in_its_entrypoint_is_waited_out(self):
         # HA's probe passes with nothing on 8642, so gw-c is Ready mid-merge.
         result = self.run_helper(2, ["gw-a", "gw-c"], starting=("gw-c",))
+        self.assertEqual(result.returncode, 1)
+
+    def test_a_surge_pod_not_ready_yet_is_waited_out(self):
+        # A rollout's surge pod is not Ready while its entrypoint runs, so the Ready
+        # set alone still reads as the two old pods: settled, wrongly.
+        result = self.run_helper(2, ["gw-a", "gw-b"], unready=("gw-c",))
         self.assertEqual(result.returncode, 1)
 
     def test_an_ha_gateway_on_rwo_storage_is_a_statefulset(self):
