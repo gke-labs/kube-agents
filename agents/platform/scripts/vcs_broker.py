@@ -309,7 +309,23 @@ class Binding:
 
     def api(self, method: str, path: str, **kwargs: Any) -> Any:
         self.ensure()
-        return self.transport().api(method, path, **kwargs)
+        return self.refused_drops(lambda: self.transport().api(method, path, **kwargs))
+
+    def whoami(self) -> str:
+        """The transport's login, on the credential made current first."""
+        self.ensure()
+        return self.refused_drops(lambda: self.transport().whoami())
+
+    def refused_drops(self, call: Callable[[], Any]) -> Any:
+        """Run `call`; on a 401, the credential drops a token it cached, so the next call mints anew."""
+        try:
+            return call()
+        except WorkspaceError as refused:
+            if refused.status == 401:
+                invalidate = getattr(self.forge.credential, "invalidate", None)
+                if invalidate is not None:
+                    invalidate(self.repo)
+            raise
 
     def stamp(self, result: dict[str, Any]) -> dict[str, Any]:
         result.update({"forge": self.forge.name, "repo": self.repo})
@@ -342,6 +358,8 @@ class VcsBroker:
         tls_refusal: Callable[[str], WorkspaceError | None] | None = None,
         merge_observer: Callable[[int], None] | None = None,
         started_at: float | None = None,
+        mint_write: Callable[[str, str], str] | None = None,
+        drop_write: Callable[[str], None] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
         # git's output to the FORGE_TLS_UNTRUSTED refusal it stands for, or
@@ -394,7 +412,9 @@ class VcsBroker:
         # The refresh operation is configuration in the sense that matters: it
         # is how this install performs a privileged act, and a forge decides
         # whether its credential strategy has any use for one.
-        self.registry = Registry({"refresh": refresh})
+        # `mint_write` is the second: the in-memory write token a forge with no
+        # CLI behind it presents itself.
+        self.registry = Registry({"refresh": refresh, "mint_write": mint_write, "drop_write": drop_write})
         # Only the counter. Two requests share nothing else -- each gets its own
         # scratch directory and deletes it -- so serialising whole requests
         # would make a clone of one repository wait on a publish of another for
@@ -431,6 +451,7 @@ class VcsBroker:
                 timeout=self._http_timeout,
                 max_bytes=self._http_max_bytes,
                 whoami_route=forge.whoami_route,
+                whoami_graphql=getattr(forge, "whoami_graphql", ""),
                 opener=self._http_opener,
                 outer_deadline=self._request_deadline,
                 ca_file=forge.ca_file,
@@ -457,9 +478,11 @@ class VcsBroker:
         invocations, so a credential belonging to one forge is not installed on
         every git in the process.
         """
-        config = tuple(forge.credential.git_config(repo))
-
+        # Read per invocation, not at bind time: a minted credential holds no
+        # token until the verb's `ensure` has run, and a token minted later
+        # than the bind is the one git must present.
         def run(cwd: Path, *args: str, check: bool = True):
+            config = tuple(forge.credential.git_config(repo))
             return self._git_runner(["git", *args], cwd, check, config)
 
         return run
@@ -1456,7 +1479,7 @@ class VcsBroker:
         it is left to the caller to refuse.
         """
         try:
-            return bound.transport().whoami()
+            return bound.whoami()
         except ForgeUnsupported:
             return ""
 
@@ -1657,9 +1680,7 @@ class VcsBroker:
         caller hands the fact back rather than a spelling it does not know.
         """
         bound = self._bind(payload)
-        bound.ensure()
-        transport = bound.transport()
-        viewer = transport.whoami()
+        viewer = bound.whoami()
         login = payload.get("login")
         if login is not None and not isinstance(login, str):
             raise WorkspaceError("login must be a string")

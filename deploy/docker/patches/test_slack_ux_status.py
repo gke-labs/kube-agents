@@ -600,9 +600,9 @@ class PlanTest(_RuntimeCase):
         self.assertTrue(self._note(adapter, 1, "reading logs"))
         self.assertEqual(self._kinds(adapter), ["post", "setStatus"])
         blocks = adapter.calls[0][1]
-        self.assertEqual(blocks[0]["type"], "plan")
-        self.assertEqual(blocks[0]["title"], "check payments")
-        self.assertEqual(blocks[0]["tasks"][0]["status"], "in_progress")
+        self.assertEqual(blocks[0]["type"], "task_card")
+        self.assertEqual(blocks[0]["title"], "reading logs")
+        self.assertEqual(blocks[0]["status"], "in_progress")
         self.assertEqual(len(blocks), 1, "the plan carries no Stop")
         self.assertEqual(adapter.calls[1], ("setStatus", "processing"))
 
@@ -611,7 +611,7 @@ class PlanTest(_RuntimeCase):
         self._note(adapter, 1, "reading logs")
         self._note(adapter, 2, "reading metrics")
         self.assertEqual(self._kinds(adapter), ["post", "setStatus", "update"])
-        steps = adapter.calls[2][1][0]["tasks"][0]["details"]["elements"][0]["elements"]
+        steps = adapter.calls[2][1][0]["details"]["elements"][0]["elements"]
         texts = [step["elements"][0]["text"] for step in steps]
         self.assertEqual(texts, ["✓ reading logs", "◌ reading metrics"])
 
@@ -620,18 +620,20 @@ class PlanTest(_RuntimeCase):
         self._note(adapter, 1, "a", task="t_a", title="check seeded-a")
         self._note(adapter, 2, "b", task="t_b", title="check seeded-b")
         self._note(adapter, 3, "a2", task="t_a", title="check seeded-a")
-        plan = adapter.calls[-1][1][0]
-        self.assertEqual([t["task_id"] for t in plan["tasks"]], ["t_a", "t_b"])
-        self.assertEqual(plan["title"], "2 cards")
+        tasks = adapter.calls[-1][1]
+        self.assertEqual([t["task_id"] for t in tasks], ["t_a", "t_b"])
+        self.assertEqual([t["type"] for t in tasks], ["task_card", "task_card"], "no plan folds them to one line")
         self.assertEqual(self._kinds(adapter).count("post"), 1)
 
-    def test_the_session_title_names_the_plan(self):
+    def test_the_session_title_draws_no_row(self):
+        # The ask titles the session; each row says where its own card is.
         adapter = _Adapter()
         runtime.note_ask(CHANNEL, THREAD, "is the fleet healthy?")
         _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, PHRASE, "failed"))
         self._note(adapter, 1, "a", task="t_a")
         self._note(adapter, 2, "b", task="t_b")
-        self.assertEqual(adapter.calls[-1][1][0]["title"], "is the fleet healthy?")
+        titles = [t["title"] for t in adapter.calls[-1][1]]
+        self.assertEqual(titles, ["check payments · a", "check payments · b"])
 
     def test_a_replay_is_delivered_but_not_appended(self):
         adapter = _Adapter()
@@ -898,7 +900,7 @@ class PlanTest(_RuntimeCase):
         self.assertEqual(self._kinds(adapter), ["post", "setStatus", "update", "setStatus"])
         blocks = adapter.calls[2][1]
         self.assertEqual(len(blocks), 1)
-        self.assertEqual(blocks[0]["tasks"][0]["status"], "complete")
+        self.assertEqual(blocks[0]["status"], "complete")
         self.assertEqual(adapter.calls[3], ("setStatus", "closed"))
         self.assertNotIn((CHANNEL, THREAD), runtime._plans)
 
@@ -907,10 +909,10 @@ class PlanTest(_RuntimeCase):
         last = slack_status.STEPS_MAX + 2
         for event_id in range(1, last + 1):
             self._note(adapter, event_id, f"note {event_id}")
-        running = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"][0]
+        running = [v for n, v in adapter.calls if n == "update"][-1][0]
         self.assertEqual(running["title"], f"note {last} · step {last} ▸")
         _run(runtime.settle_row(adapter, _sub(), "completed", "both pods are up"))
-        done = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"][0]
+        done = [v for n, v in adapter.calls if n == "update"][-1][0]
         self.assertEqual((done["status"], done["title"]), ("complete", "both pods are up"))
 
     def test_a_waiting_row_keeps_the_plan(self):
@@ -919,12 +921,12 @@ class PlanTest(_RuntimeCase):
         self._note(adapter, 2, "b", task="t_b")
         _run(runtime.settle_row(adapter, _sub("t_a"), "gave_up"))
         _run(runtime.settle_row(adapter, _sub("t_b"), "blocked"))
-        tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
+        tasks = [v for n, v in adapter.calls if n == "update"][-1]
         self.assertEqual([t["status"] for t in tasks], ["error", "pending"])
         self.assertIn((CHANNEL, THREAD), runtime._plans)
 
     def _tasks(self, adapter):
-        return [v for n, v in adapter.calls if n in ("post", "update")][-1][0]["tasks"]
+        return [v for n, v in adapter.calls if n in ("post", "update")][-1]
 
     def test_a_card_that_completes_without_a_note_gets_its_row(self):
         adapter = _Adapter()
@@ -1043,7 +1045,7 @@ class PlanTest(_RuntimeCase):
         self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
         _run(runtime.settle_row(adapter, _sub(), "unblocked"))
         self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
-        tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
+        tasks = [v for n, v in adapter.calls if n == "update"][-1]
         self.assertEqual([t["status"] for t in tasks], ["in_progress"])
 
     def test_a_card_that_gave_up_leaves_the_next_card_a_fresh_plan(self):
@@ -1068,7 +1070,7 @@ class PlanTest(_RuntimeCase):
         self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
         _run(runtime.settle_row(adapter, _sub(), "unblocked"))
         self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
-        tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
+        tasks = [v for n, v in adapter.calls if n == "update"][-1]
         self.assertEqual([t["status"] for t in tasks], ["in_progress"])
         self.assertEqual(self._kinds(adapter).count("post"), 1)
 
@@ -1081,7 +1083,7 @@ class PlanTest(_RuntimeCase):
         self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
         _run(runtime.settle_row(adapter, _sub(), "unblocked"))
         self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
-        tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
+        tasks = [v for n, v in adapter.calls if n == "update"][-1]
         self.assertEqual([t["status"] for t in tasks], ["in_progress", "pending"])
 
     def _move(self, adapter, event_id, moved, task="t_a"):
@@ -1105,10 +1107,10 @@ class PlanTest(_RuntimeCase):
         self._note(adapter, 1, "reading logs")
         _run(runtime.deliver_row(adapter, _sub(), 2, "check payments", "🔄 moved", ""))
         self._move(adapter, 3, "todo")
-        task = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"][0]
+        task = [v for n, v in adapter.calls if n == "update"][-1][0]
         self.assertEqual(task["title"], "reading logs")
         self._note(adapter, 4, "→ rolling back the node pool")
-        task = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"][0]
+        task = [v for n, v in adapter.calls if n == "update"][-1][0]
         self.assertEqual(task["title"], "→ rolling back the node pool · step 2 ▸")
 
     def test_a_move_joins_the_trail_and_leaves_a_settled_row_settled(self):
@@ -1117,7 +1119,7 @@ class PlanTest(_RuntimeCase):
         self._note(adapter, 2, "reading metrics", task="t_b")
         _run(runtime.settle_row(adapter, _sub("t_a"), "completed"))
         self.assertTrue(self._move(adapter, 3, "ready", task="t_a"))
-        task = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"][0]
+        task = [v for n, v in adapter.calls if n == "update"][-1][0]
         self.assertEqual(task["status"], "complete")
         steps = task["details"]["elements"][0]["elements"]
         self.assertEqual([step["elements"][0]["text"] for step in steps], ["✓ reading logs", "✓ → ready"])
@@ -1126,7 +1128,7 @@ class PlanTest(_RuntimeCase):
         adapter = _Adapter()
         self._note(adapter, 1, "reading logs")
         self.assertTrue(self._move(adapter, 2, "review"))
-        tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
+        tasks = [v for n, v in adapter.calls if n == "update"][-1]
         self.assertEqual([t["status"] for t in tasks], ["pending"])
         self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
 
@@ -1159,7 +1161,7 @@ class PlanTest(_RuntimeCase):
         self._note(adapter, 1, "reading logs", task="t_a")
         self._note(adapter, 1, "reading metrics", task="t_b")
         _run(runtime.settle_row(adapter, _sub("t_a"), "archived"))
-        tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
+        tasks = [v for n, v in adapter.calls if n == "update"][-1]
         self.assertEqual([(t["task_id"], t["status"]) for t in tasks], [("t_a", "error"), ("t_b", "in_progress")])
         self.assertEqual(runtime._plans[(CHANNEL, THREAD)].rows["t_a"].lines[-1], runtime.ARCHIVED_NOTE)
         _run(runtime.settle_row(adapter, _sub("t_b"), "completed"))
@@ -1172,7 +1174,7 @@ class PlanTest(_RuntimeCase):
         self._note(adapter, 1, "reading logs")
         _run(runtime.settle_row(adapter, _sub(), "archived"))
         self.assertEqual(self._kinds(adapter), ["post", "setStatus", "update", "setStatus"])
-        self.assertEqual(adapter.calls[2][1][0]["tasks"][0]["status"], "error")
+        self.assertEqual(adapter.calls[2][1][0]["status"], "error")
         self.assertNotIn((CHANNEL, THREAD), runtime._plans)
         self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
 
@@ -1341,7 +1343,7 @@ class PlanTest(_RuntimeCase):
         self.assertFalse(self._note(adapter, 2, "reading metrics"))
         adapter.client.fail.clear()
         _run(runtime.settle_row(adapter, _sub(), "completed"))
-        tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
+        tasks = [v for n, v in adapter.calls if n == "update"][-1]
         self.assertEqual(tasks[0]["status"], "complete")
         self.assertNotIn((CHANNEL, THREAD), runtime._plans)
 
@@ -1509,7 +1511,7 @@ class PlanTest(_RuntimeCase):
         with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
             _run(scenario(adapter))
         self.assertEqual(self._kinds(adapter), ["post", "setStatus", "setStatus", "update"])
-        task = adapter.calls[-1][1][0]["tasks"][0]
+        task = adapter.calls[-1][1][0]
         self.assertEqual((task["status"], task["title"]), ("complete", "both pods are up"))
         self.assertEqual(adapter.calls[2], ("setStatus", "closed"))
         self.assertEqual(runtime._lapsed, {})
@@ -1525,7 +1527,7 @@ class PlanTest(_RuntimeCase):
         with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
             _run(scenario(adapter))
         updates = [v for n, v in adapter.calls if n == "update"]
-        self.assertEqual([u[0]["tasks"][0]["status"] for u in updates], ["complete", "complete"])
+        self.assertEqual([u[0]["status"] for u in updates], ["complete", "complete"])
         self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
 
     def test_a_card_waiting_past_the_lapse_holds_suspended(self):
@@ -1553,7 +1555,7 @@ class PlanTest(_RuntimeCase):
         self.assertEqual(self._kinds(adapter).count("post"), 1)
         updates = [v for n, v in adapter.calls if n == "update"]
         self.assertEqual(
-            [u[0]["tasks"][0]["status"] for u in updates], ["pending", "in_progress", "in_progress", "complete"],
+            [u[0]["status"] for u in updates], ["pending", "in_progress", "in_progress", "complete"],
         )
         self.assertEqual(runtime._lapsed, {})
 
@@ -1690,7 +1692,7 @@ class PlanTest(_RuntimeCase):
             runtime, "LAPSED_PER_THREAD", 2,
         ):
             _run(scenario(adapter))
-        last = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
+        last = [v for n, v in adapter.calls if n == "update"][-1]
         self.assertEqual([(t["task_id"], t["status"]) for t in last], [("t_w", "complete")])
 
     def test_a_set_aside_thread_evicted_at_the_cap_sends_its_session(self):
@@ -1739,7 +1741,7 @@ class PlanTest(_RuntimeCase):
         with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
             _run(scenario(adapter))
         updates = [v for n, v in adapter.calls if n == "update"]
-        self.assertEqual([u[0]["tasks"][0]["status"] for u in updates], ["complete", "complete"])
+        self.assertEqual([u[0]["status"] for u in updates], ["complete", "complete"])
         self.assertEqual(runtime._lapsed, {})
 
     def test_the_cap_drops_settled_rows_before_a_live_one(self):
@@ -1750,7 +1752,7 @@ class PlanTest(_RuntimeCase):
                 self._note(adapter, event_id, "x", task=card)
                 _run(runtime.settle_row(adapter, _sub(card), "completed"))
             self._note(adapter, 4, "d", task="t_d")
-        tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
+        tasks = [v for n, v in adapter.calls if n == "update"][-1]
         self.assertEqual([t["task_id"] for t in tasks], ["t_a", "t_d"])
 
     def test_a_fallen_back_plan_holds_working_for_its_rolling_cards(self):
@@ -1874,7 +1876,7 @@ class StartTest(_RuntimeCase):
         adapter = _Adapter()
         self.assertTrue(self._start(adapter))
         self.assertEqual(self._kinds(adapter), ["post", "setStatus"])
-        task = adapter.calls[0][1][0]["tasks"][0]
+        task = adapter.calls[0][1][0]
         self.assertEqual((task["title"], task["status"]), ("check checkout-gateway", "in_progress"))
         self.assertNotIn("details", task, "no note yet")
         self.assertEqual(self._sent(adapter), ["processing"])
@@ -1884,9 +1886,9 @@ class StartTest(_RuntimeCase):
         self._start(adapter)
         self.assertTrue(_run(runtime.deliver_row(adapter, _sub(), 1, "check checkout-gateway", "reading logs")))
         self.assertEqual(self._kinds(adapter), ["post", "setStatus", "update"])
-        plan = adapter.calls[-1][1][0]
-        self.assertEqual([t["title"] for t in plan["tasks"]], ["reading logs"])
-        self.assertEqual(plan["tasks"][0]["status"], "in_progress")
+        tasks = adapter.calls[-1][1]
+        self.assertEqual([t["title"] for t in tasks], ["reading logs"])
+        self.assertEqual(tasks[0]["status"], "in_progress")
 
     def test_a_card_already_shown_opens_no_row_when_it_starts(self):
         adapter = _Adapter()
@@ -1901,7 +1903,7 @@ class StartTest(_RuntimeCase):
         self._start(adapter)
         _run(runtime.settle_row(adapter, _sub(), "completed", "no restarts in 24h"))
         self.assertEqual(self._kinds(adapter), ["post", "setStatus", "update", "setStatus"])
-        task = adapter.calls[2][1][0]["tasks"][0]
+        task = adapter.calls[2][1][0]
         self.assertEqual((task["status"], task["title"]), ("complete", "no restarts in 24h"))
         self.assertEqual(self._sent(adapter), ["processing", "closed"])
         self.assertFalse(self._start(adapter), "a heartbeat replayed after it opens no second plan")

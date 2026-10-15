@@ -85,7 +85,7 @@ it. An agent should read all of it.
 | [1. Why](#1-why)                                                | the customer requirement, where GitHub is named today, and the shape of the answer — **stop here if that is what you came for** |
 | [2. The concepts](#2-the-concepts)                              | what the systems call things, which words the verbs use, and how a repository is named                                          |
 | [3. The seam](#3-the-seam)                                      | the broker, the bundle transport, the sandbox’s one git, the routes and the error contract                                      |
-| [4. The provider interface](#4-the-provider-interface)          | what a provider supplies, and the decisions a second forge forces                                                               |
+| [4. The provider interface](#4-the-provider-interface)          | what a provider supplies, the decisions a second forge forces, and GitHub Enterprise Server as a declared host                  |
 | [5. Modularity](#5-modularity)                                  | the package layout, and what makes the boundary hold at the third forge                                                         |
 | [6. The declarative surface](#6-the-declarative-surface)        | how an install says which provider it uses                                                                                      |
 | [7. GitLab](#7-gitlab)                                          | the worked example: identity, credential, translation, errors                                                                   |
@@ -108,7 +108,9 @@ question about the tree at the time, not about the design.
 GitLab and Bitbucket are the two required in the short term, and the list being
 open is what shapes the design rather than the two names on it. Self-hosted
 GitLab and Gerrit come up often enough that a design which handles three by
-enumeration and a fourth by rewrite is the wrong design.
+enumeration and a fourth by rewrite is the wrong design. GitHub Enterprise
+Server comes up too. It is not a new forge: it is the `github` provider at a
+host the install declares ([GitHub Enterprise Server](#github-enterprise-server)).
 
 That demand is the whole reason the work exists. It is worth being explicit that
 nothing else is: this is not a response to a deficiency in how repositories are
@@ -238,8 +240,8 @@ reconciliation intact and reaches the agent.
 
 There, `get_managed_repos()` is what every consumer enumerates: the audit, the issue resolver,
 pr-conversation, submit-suggestion, the scan gate and the pre-upgrade API-removal scan. It names
-each entry the way the verbs take it. A GitHub entry is its bare `owner/name` however many forges
-the list names, so a repository's name does not change when a second forge is added and the names
+each entry the way the verbs take it. A github.com entry is its bare `owner/name` however many forges
+the list names (an entry on a GitHub Enterprise Server is `<host>/owner/name`, as another forge's is), so a repository's name does not change when a second forge is added and the names
 already written into lease records, run records and cron `--repo` arguments stay valid. Any other
 forge's entry is `host/path` at whatever depth it has, because a self-managed instance has no
 canonical host to leave off. The broker refuses a hostless name when it serves more than one forge,
@@ -406,7 +408,8 @@ sidecar validates across a trust boundary and must not pull in a module that she
 - `CleanRepoSlugWithOrg` in the operator was the Go one. It is now a deprecated wrapper over the
   GitHub provider's resolution: `repo_ref.go` parses the value with its host kept, and the
   provider refuses any host that is not one of its spellings — `github.com`, `www.github.com`,
-  `ssh.github.com` — before its two-segment rule runs. `ValidateGitRepoURLWithOrg`, no longer on
+  `ssh.github.com` — or the forge's declared GitHub Enterprise Server host, before its
+  two-segment rule runs. `ValidateGitRepoURLWithOrg`, no longer on
   the admission path, goes through the same `Resolve`, so it and normalisation are still one
   rule, now a provider's.
 
@@ -1468,10 +1471,11 @@ the cost side:
   property that quietly stops being true when the transport changes.
 
 In exchange the token never enters an argv, an environment variable, or a child
-process at all. That is strictly better than `gh`, and it is worth noting that
-migrating `GitHubForge` onto `HttpTransport` later becomes a small change once
-the App token is available to the broker directly — not proposed here, but the
-shape does not foreclose it.
+process at all. That is strictly better than `gh`. A `GitHubForge` at a GitHub
+Enterprise Server host already uses `HttpTransport`, with the App token minted
+into the broker's memory ([GitHub Enterprise Server](#github-enterprise-server)).
+The github.com forge keeps `gh`; moving it onto `HttpTransport` too is now a
+small change, and it is not proposed here.
 
 ### One package, many hosts
 
@@ -1490,8 +1494,9 @@ def build_forges(config: ForgeConfig) -> tuple[Forge, ...]
 ```
 
 `GitHubForge` yields one instance when no forge configuration is mounted, or
-when the configuration names a `github` forge, and none otherwise; a configured
-host it does not serve is refused. `GitLabForge` yields
+when the configuration names a `github` forge, and none otherwise. Its host is
+github.com, or the one GitHub Enterprise Server host the configuration names; a
+configuration that names two GitHub hosts is refused. `GitLabForge` yields
 one per configured host, and none when none is configured — in which case
 `gitlab.com` resolves to the `StubForge`, so an install that has not set GitLab
 up gets a named refusal rather than a confusing authentication failure. The host
@@ -1515,6 +1520,126 @@ when there are several), and an in-cluster GitLab
 reached as `gitlab` with no scheme is read as a repository named `gitlab` until
 the configured host joins the parser's known set. Registering it there is part
 of wiring the provider up; the misreading is otherwise silent and confusing.
+
+### GitHub Enterprise Server
+
+**Why.** Some customers keep their repositories on GitHub Enterprise Server, a
+GitHub instance they run at their own hostname, often behind a private CA. It
+serves the same REST API as github.com, under `https://<host>/api/v3`, and the
+same GitHub App installation tokens. So it is not a new forge. It is the
+`github` provider at a host the install declares, with the same verbs, the same
+translation and the same recordings in the contract test.
+
+**One GitHub host per install.** An install has one GitHub App and one token
+minter, and the minter mints for one GitHub host. So an install serves
+github.com or one GitHub Enterprise Server, never both. The operator refuses a
+second GitHub forge at another host, and it refuses one host that two providers
+claim. Two GitHub forges at one host are still allowed: they name two
+organisations, as they always could. The first GitHub forge declared that can
+be served decides the host. A change of the declaration that moves the host
+writes a `GitHubHostChanged` Warning Event on the PlatformAgent, because the
+repositories registered on the old host are then no longer served.
+
+**The host.** A GitHub forge's `host` may be a GitHub Enterprise Server
+hostname. A spelling of github.com folds to github.com. A host at or under a
+domain where GitHub runs its own services is refused, because it is not an
+instance the customer runs: github.com and its subdomains,
+githubusercontent.com, githubassets.com, githubapp.com, github.io, github.dev,
+and ghe.com (GitHub Enterprise Cloud with data residency, which GitHub runs).
+GitLab refuses the same domains. A repository on the forge names the declared
+host or no host. The operator seeds it into the state ConfigMap by its full URL,
+`https://<host>/owner/name`, and the broker keys it `github:<host>/owner/name`,
+so an entry for github.com never admits a repository on the instance, and the
+reverse. On such an install, the agent and the minter's policy sync both skip a
+GitHub entry that names github.com or no host.
+
+**The provider is named.** A forge at a host other than github.com must name
+its `provider`. The CRD stores no default; an omitted provider reads as github,
+and only at github.com. A forge written for a GitLab instance
+without a provider would otherwise be read as a GitHub Enterprise Server and be
+handed a GitHub token.
+
+**The credential.** The token is a GitHub App installation token, minted by the
+minter as on github.com. What changes is where the broker keeps it:
+
+- On github.com, the token goes into the `gh` CLI's store, and a credential
+  helper that the CLI installs gives it to git (`BrokeredCredential`).
+- On a GitHub Enterprise Server, nothing is installed. The broker runs the
+  minter helper in print mode. The helper prints the token and the repositories
+  it covers, and the broker keeps the token in its memory
+  (`MintedWriteCredential`). The API client sends it as an `Authorization`
+  header. git gets it as `http.https://<host>/.extraheader` on that host only,
+  in the configuration of the one git invocation that spends it, with
+  `credential.helper` cleared. A 401 from the instance, on an API call or a
+  git push, drops the cached token, so a reinstalled App or a revoked token is
+  replaced on the next call. The token is in the environment of the one git
+  process that spends it (`GIT_CONFIG_VALUE_n`), never in argv, a file, a CLI's
+  store or the sandbox, as the read token is. The broker uses one token again for 30 minutes for
+  each repository it covers, and it checks the managed list on every request.
+- A context repository gets a read-only token for each clone, as on github.com.
+
+**The transport.** The forge uses `HttpTransport` at `https://<host>/api/v3`, so
+the broker runs no `gh` for it, and an install with only a GitHub Enterprise
+Server gets no `gh` in the broker's executable allowlist.
+
+**The broker's own login.** The ownership checks (an `advance` onto a branch, a
+`branch-delete`) compare a proposal's author with the credential's own login. An
+installation token cannot read `GET /user`, which answers it with 403, so the
+forge asks GraphQL `viewer { login }` at `https://<host>/api/graphql`, which
+answers an installation with its App's bot login. That is the query `gh auth
+status` makes on github.com. A login that does not come back is a refusal, not
+an empty answer: an empty login would drop the ownership checks.
+
+**Redirects.** Every git invocation a minted token rides on the instance sets
+`http.https://<host>/.followRedirects=false`, with or without a CA bundle, so a
+redirect never carries the token to another host. github.com keeps git's own
+redirect handling, so a repository renamed there still clones.
+
+**A private CA.** A GitHub Enterprise Server behind a private CA names it in
+`caBundleRef`, as a self-managed GitLab does
+([A self-managed instance behind a private CA](#a-self-managed-instance-behind-a-private-ca)).
+The broker trusts the CA for that host only, in its API client and in git.
+
+**The minter.** The token minter mints on the instance: the chart reads the
+GitHub forge and sets the minter's `SOURCE_SYSTEM_API_BASE_URL` to
+`https://<host>/api/v3`, the root it composes its App routes under in place of
+`api.github.com`. The minter reaches the instance to mint, so it needs the CA
+too. It is a Go program on the default HTTP transport, which reads the system
+roots: the bundle in its image, and each certificate file in the directories
+`SSL_CERT_DIR` names. So the chart mounts the forge's `caBundleRef` key into
+the minter's pod and points `SSL_CERT_DIR` at it. The minter's client trusts
+the configured CA for all of its outbound calls, beside the image's bundle.
+The CA is one that the customer trusts and installs. No `githubMinter.*` value
+repeats the host or the CA: the forge declaration is the one place both are
+set.
+
+**The agent side.** The managed list names a GitHub Enterprise Server
+repository `<host>/owner/name`, as it names another forge's repository. A bare
+`owner/name` is github.com's everywhere a link or a CLI call is built from it,
+so a name with its host is what keeps the links right. The links that the
+scripts build from a repository use the host in the name: the fleet-audit
+ledger, the audit headline and the opened-pull-request message. The install's
+GitHub host is the `github_host` key of the gitops-state ConfigMap. The
+operator writes the key only for a GitHub Enterprise Server host, so a
+github.com install has no key and reads as github.com. The host is never read
+from a repository entry: the lists are administrator-writable, and one entry
+added by hand must not move the host that every refresh and publish goes to. A
+GitHub entry on any other host is skipped with a warning.
+
+**What it does not include.**
+
+- **github.com and a GitHub Enterprise Server in one install.** There is one
+  minter, so this needs a second minter, which is a second design.
+- **GitHub Enterprise Cloud.** github.com organisations on Enterprise Cloud are
+  github.com. Enterprise Cloud with data residency (`<name>.ghe.com`) is refused
+  as a host; it has its own API host and needs a check of its own.
+- **A port.** The broker reads a forge on the standard HTTPS port only, as for
+  GitLab.
+- **A renamed repository.** GitHub answers a renamed repository with a
+  redirect to its new name. The API client refuses every redirect, and git on
+  a GitHub Enterprise Server host follows none, so an API call on the old name fails
+  with `FORGE_REDIRECTED` and a clone on it fails. Declare the repository by
+  its new name.
 
 ### Where the error contract splits
 
@@ -2468,7 +2593,8 @@ forge's entry in the broker configuration names the file (`caFile`). The
 agent's pod and the shell sandbox get nothing.
 
 A private CA must never vouch for github.com or gitlab.com, so a forge at the
-provider's public host (gitlab.com, or an empty host) refuses `caBundleRef`.
+provider's public host (github.com or gitlab.com in any spelling, or an empty
+host) refuses `caBundleRef`.
 For the other forges, the broker trusts the CA for that forge's host and for no
 other host:
 
@@ -2484,7 +2610,10 @@ other host:
 - git also gets `http.https://<host>/.followRedirects=false`. curl keeps the CA
   file across a redirect, so a redirect would carry the CA to another host.
   GitLab answers a moved project in the git protocol itself, and its clone URLs
-  end in `.git`, so its git traffic needs no redirect.
+  end in `.git`, so its git traffic needs no redirect. GitHub Enterprise Server
+  redirects a renamed repository to its new name. That redirect is refused too,
+  so a renamed repository is declared by its new name; the CA and the token
+  never follow a redirect to another host.
 
 Python 3.13 turns on strict X.509 checks in its default context. These checks
 refuse a CA certificate with no Key Usage extension, and a server certificate
@@ -2510,9 +2639,12 @@ untrusted chain.
 The broker reads the file on each call, so an update of the Secret reaches
 the broker with no restart.
 
-Only the `gitlab` provider accepts `caBundleRef`. The `github` provider reads no
-CA bundle, so it refuses the field: a CA that nothing reads would hide a
-certificate problem from the administrator who set it.
+Both providers accept `caBundleRef` at a self-managed host: a self-managed
+GitLab, or a GitHub Enterprise Server. A provider that reads no CA bundle would
+refuse the field, because a CA that nothing reads would hide a certificate
+problem from the administrator who set it. On a GitHub Enterprise Server the
+token minter reads the same CA too: see
+[GitHub Enterprise Server](#github-enterprise-server).
 
 ### GitLab in the content workspace
 

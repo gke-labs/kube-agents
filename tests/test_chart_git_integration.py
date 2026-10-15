@@ -619,10 +619,12 @@ class ChartGitIntegrationTest(unittest.TestCase):
 
     def test_a_ca_bundle_the_operator_refuses_fails_the_render(self):
         """The same refusals the CRD and the operator make, naming the values
-        key: a github forge reads no CA, and the names are Kubernetes names."""
+        key: github.com takes no private CA, and the names are Kubernetes names."""
         for fields, expected in (
             ({"provider": "github", "namespace": "gke-labs", "caBundleRef.name": "gh-ca"},
-             "caBundleRef is for a gitlab forge"),
+             "caBundleRef is for a self-managed host"),
+            ({"provider": "github", "host": "WWW.GitHub.com", "namespace": "gke-labs", "caBundleRef.name": "gh-ca"},
+             "caBundleRef is for a self-managed host"),
             ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
               "caBundleRef.name": "Bad_Name"}, "caBundleRef.name"),
             ({"provider": "gitlab", "host": "gitlab.internal", "namespace": "acme", "credentialsRef.name": "t",
@@ -649,6 +651,62 @@ class ChartGitIntegrationTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn(f"{_P}forges[0].{expected.split()[0]}", result.stderr)
                 self.assertIn(expected, result.stderr)
+
+    def test_a_github_enterprise_server_forge_renders_as_the_lists(self):
+        """The alias has no host field, so a GitHub forge at a GitHub
+        Enterprise Server host renders as the lists, with its host and CA
+        bundle, even when the alias could carry everything else."""
+        integration = _integration(
+            *_forge(0, name="ghe", provider="github", host="ghe.example.com", namespace="acme"),
+            *_repo(0, forge="ghe", repository="infra", role="gitops"),
+        )
+        self.assertNotIn("github", integration)
+        self.assertEqual("ghe.example.com", integration["forges"][0]["host"])
+        integration = _integration(
+            *_forge(0, name="ghe", provider="github", host="ghe.example.com", namespace="acme"),
+            f"{_P}forges[0].caBundleRef.name=ghe-ca",
+        )
+        self.assertEqual({"name": "ghe-ca"}, integration["forges"][0]["caBundleRef"])
+
+    def test_github_hosts_the_operator_refuses_fail_the_render(self):
+        """Chart parity with the operator: a host under a domain GitHub
+        operates is not a GitHub Enterprise Server, an install serves one
+        GitHub host, and one host is one forge's."""
+        secret = f"{_P}forges[1].credentialsRef.name=gitlab-token"
+        for label, sets, expected in (
+            ("api host", _forge(0, name="gh", host="api.github.com", namespace="acme"), "forges[0].host"),
+            ("ghe.com", _forge(0, name="gh", host="acme.ghe.com", namespace="acme"), "forges[0].host"),
+            ("content host", _forge(0, name="gh", host="raw.githubusercontent.com", namespace="acme"), "forges[0].host"),
+            ("gitlab host", _forge(0, name="gh", host="gitlab.com", namespace="acme"), "forges[0].host"),
+            ("not a hostname", _forge(0, name="gh", host="ghe..example.com", namespace="acme"), "forges[0].host"),
+            ("two GitHub hosts", (*_forge(0, name="gh", namespace="acme"),
+                                  *_forge(1, name="ghe", provider="github", host="ghe.example.com", namespace="acme")),
+             "forges[1].host: this install's GitHub host is already github.com"),
+            ("two GHES hosts", (*_forge(0, name="gh", provider="github", host="ghe.example.com", namespace="acme"),
+                                *_forge(1, name="ghe", provider="github", host="ghe.other.example", namespace="acme")),
+             "forges[1].host: this install's GitHub host is already ghe.example.com"),
+            ("unnamed provider", _forge(0, name="gh", host="ghe.example.com", namespace="acme"),
+             "forges[0].provider is required"),
+            ("one host, two providers", (*_forge(0, name="gh", provider="github", host="git.example.com", namespace="acme"),
+                                         *_forge(1, name="gl", provider="gitlab", host="GIT.example.com", namespace="acme"),
+                                         secret),
+             "forges[1].host: git.example.com is already the host of a github forge"),
+            ("two CA bundles", (*_forge(0, name="a", provider="github", host="ghe.example.com", namespace="acme"),
+                                f"{_P}forges[0].caBundleRef.name=ca-one",
+                                *_forge(1, name="b", provider="github", host="ghe.example.com", namespace="beta"),
+                                f"{_P}forges[1].caBundleRef.name=ca-two"),
+             "forges[1].host: ghe.example.com already has a CA bundle"),
+        ):
+            with self.subTest(case=label):
+                result = _render(_CR_TEMPLATE, *sets)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}{expected}", result.stderr)
+        # Two forges on one GitHub host, in two spellings, are one host.
+        integration = _integration(
+            *_forge(0, name="a", namespace="acme"),
+            *_forge(1, name="b", host="www.github.com", namespace="beta"),
+        )
+        self.assertEqual(2, len(integration["forges"]))
 
     def test_a_gitlab_forge_without_a_secret_fails_naming_it(self):
         """The broker would have no token to call GitLab with; the operator
