@@ -200,7 +200,12 @@ def record(task_id, proposal):
 
 
 def _recorded(checker, task_id, proposal):
-    """Check ``proposal`` with the forge and record the forge's answer on the card; True when recorded."""
+    """Check ``proposal`` with the forge and record the forge's answer on the card.
+
+    True when recorded, False when the forge says it is not one the agent just
+    opened, None when the check or the record failed (the broker or the sandbox
+    hop did not answer, or the board refused the write).
+    """
     try:
         confirmed = checker.ours(proposal)
         if confirmed is None:
@@ -210,7 +215,7 @@ def _recorded(checker, task_id, proposal):
         return True
     except Exception as exc:  # noqa: BLE001 — the PR is open; the thread falls back to the note
         logger.warning("pr_opened: recording %s on %s failed: %s", proposal.get("url"), task_id, exc)
-        return False
+        return None
 
 
 def on_terminal_output(command="", output="", **_):
@@ -218,25 +223,29 @@ def on_terminal_output(command="", output="", **_):
 
     At most :data:`RECORDS_CHECKED_MAX` distinct urls in one output are asked
     about; a line repeating a url already asked about follows that answer, and
-    lines past the cap are left as they are, unasked. Returns the output without
-    the recorded lines, or None (unchanged) when none was recorded.
+    lines past the cap are left as they are, unasked. The first check that fails
+    rather than answers ends the asking for this output, so a broker or sandbox
+    hop that is down costs one timeout, not one per url. Returns the output
+    without the recorded lines, or None (unchanged) when none was recorded.
     """
     if not isinstance(output, str) or PROPOSAL_OPENED_KEY not in output:
         return None
     task_id = os.environ.get(TASK_ENV, "").strip()
     if not task_id:
         return None
-    checker, verdicts, kept = None, {}, []
+    checker, verdicts, kept, failed = None, {}, [], False
     for line in output.splitlines(keepends=True):
         proposal = opened(line)
         url = proposal["url"] if proposal else None
-        if url is not None and url not in verdicts and len(verdicts) < RECORDS_CHECKED_MAX:
+        if url is not None and url not in verdicts and len(verdicts) < RECORDS_CHECKED_MAX and not failed:
             try:
                 checker = checker or Checker()
             except Exception as exc:  # noqa: BLE001 — no forge here; the thread falls back to the note
                 logger.warning("pr_opened: the forge is not reachable from this process: %s", exc)
                 return None
-            verdicts[url] = _recorded(checker, task_id, proposal)
+            verdict = _recorded(checker, task_id, proposal)
+            failed = verdict is None
+            verdicts[url] = bool(verdict)
         if not verdicts.get(url):
             kept.append(line)
     return "".join(kept) if any(verdicts.values()) else None

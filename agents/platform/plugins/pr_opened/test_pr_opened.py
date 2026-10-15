@@ -214,6 +214,16 @@ class PrOpenedTest(unittest.TestCase):
         with self.assertLogs(plugin.logger, "WARNING"):
             self.assertIsNone(self.run_hook(_vcs_record(), kanban))
 
+    def test_a_check_that_fails_ends_the_asking_for_that_output(self):
+        # A broker or sandbox hop that is down costs one timeout, not one per url.
+        kanban, forge = _Kanban(), _Forge(fail=RuntimeError("SANDBOX_UNREACHABLE"))
+        urls = [f"https://github.com/acme/fleet-config/pull/{n}" for n in range(3)]
+        output = "".join(_vcs_record(url=url) for url in urls)
+        with self.assertLogs(plugin.logger, "WARNING"):
+            self.assertIsNone(self.run_hook(output, kanban, forge=forge))
+        self.assertEqual(len([entry for entry in forge.asked if entry[0] == "proposal-view"]), 1)
+        self.assertEqual(kanban.events, [])
+
     def test_the_title_is_bounded(self):
         kanban = _Kanban()
         self.run_hook(_vcs_record(), kanban, forge=_Forge(title="x" * (plugin.TITLE_MAX * 2)))

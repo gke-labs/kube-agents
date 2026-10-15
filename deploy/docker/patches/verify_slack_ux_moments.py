@@ -142,10 +142,11 @@ async def _drive(module) -> None:
         raise _fail(f"the PR moment was {adapter.posts[0]!r}")
 
     adapter = _StubAdapter()
-    await module.pr_event(adapter, sub, {"url": EVENT_PR, "number": EVENT_NUMBER, "title": EVENT_TITLE}, EVENT_NOTE)
-    await module.pr_opened(adapter, sub, f"Opened {EVENT_PR}")
-    if len(adapter.posts) != 1:
-        raise _fail(f"a pr_opened event and the note after it posted {len(adapter.posts)} times, expected once")
+    event = {"url": EVENT_PR, "number": EVENT_NUMBER, "title": EVENT_TITLE}
+    if not await module.pr_event(adapter, sub, event, EVENT_NOTE) or len(adapter.posts) != 1:
+        raise _fail(f"a pr_opened event did not post its PR on its own (posts: {len(adapter.posts)})")
+    if await module.pr_opened(adapter, sub, f"Opened {EVENT_PR}") or len(adapter.posts) != 1:
+        raise _fail(f"the note after a pr_opened event posted the PR again (posts: {len(adapter.posts)})")
     urls = [b.get("url") for b in _buttons(_shown(adapter.posts[0]))]
     if urls != [EVENT_PR, EVENT_PR + "/files"] or "PR #99" not in adapter.posts[0]["text"]:
         raise _fail(f"the PR moment from a pr_opened event was {adapter.posts[0]!r}")
