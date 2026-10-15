@@ -110,6 +110,7 @@ ADDED_AFTER_THE_SPLIT = [
     "compliance-declared-token-shields-siblings",  # the compliance stream's other posture, over the declared-token-workload fixture (#1408)
     "patch-declared-intent-no-finding",  # the patch stream's declared-intent step, over seeded-c's missing upgrade notifications (#1408)
     "cost-declared-intent-no-finding",  # the waste stream's declared-intent step, over the declared-overrequest-workload fixture (#1408)
+    "autoops-missing-service-triage",  # gke-labs#3078: a triage worker reports a found cause, not a source hunt
 ]
 # Appended at the tail of the nightly file.
 ADDED_AT_THE_TAIL = [

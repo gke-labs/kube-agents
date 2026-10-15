@@ -125,6 +125,7 @@ CONTRACTS = [
     (TASKS / "autoops-warning-event-triage" / "task.yaml", TRIAGE_TEMPLATE),
     (TASKS / "incident-triage-oom-event-probe" / "task.yaml", TRIAGE_TEMPLATE),
     (TASKS / "autoops-crashloop-config-triage" / "task.yaml", TRIAGE_TEMPLATE),
+    (TASKS / "autoops-missing-service-triage" / "task.yaml", TRIAGE_TEMPLATE),
     (TASKS / "gitops-drift-out-of-band-triage" / "task.yaml", DRIFT_TEMPLATE),
     (TASKS / "gitops-drift-noise-filtered-triage" / "task.yaml", DRIFT_TEMPLATE),
     (TASKS / "autoops-controller-stall-triage" / "task.yaml", STALL_TEMPLATE),
