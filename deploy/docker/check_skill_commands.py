@@ -23,7 +23,8 @@ refused form therefore fails every time an agent copies it, and nothing short
 of a live run would say so.
 
 This reads every ``bash``, ``sh``, ``shell`` and ``zsh`` fenced block in each
-``SKILL.md`` under the skill trees named on the command line, replaces each
+``SKILL.md`` under the skill trees named on the command line, and in its
+``references/*.md`` unless the skill is mirrored from google/skills, replaces each
 ``<placeholder>`` with its bare name, and passes the block whole to Hermes' own
 ``tools.tirith_security.check_command_security``, the call the approval gate
 makes on a terminal command of any length. The block is not split into
@@ -87,6 +88,14 @@ from pathlib import Path
 from markdown_it import MarkdownIt
 
 SKILL_FILE_NAME = "SKILL.md"
+# A skill's reference pages hold commands the agent runs once SKILL.md sends it
+# there, so they are scanned too -- except a mirrored skill's: those pages are
+# google/skills' own, and scripts/skill_overlay.py overwrites any edit made here.
+# The prefix is reserved for mirrored skills in that one tree (AGENTS.md, Skills
+# Guidelines); test_check_skill_commands holds the prefix to the overlay locks.
+REFERENCES_GLOB = "references/*.md"
+MIRRORED_TREE = "agents/platform/skills"
+MIRRORED_PREFIX = "gke-"
 SHELL_LANGUAGES = frozenset({"bash", "sh", "shell", "zsh"})
 REFUSED_ACTIONS = frozenset({"block", "warn"})
 
@@ -309,13 +318,18 @@ def substitute_placeholders(command: str) -> str:
 
 
 def skill_blocks(repo_dir: str, skills_dir: Path) -> list[Block]:
-    """Every shell block in the ``SKILL.md`` files under ``skills_dir``.
+    """Every shell block in the ``SKILL.md`` files under ``skills_dir`` and their own reference pages.
 
     ``repo_dir`` is where the repository keeps that tree, so a finding names the
     file to edit rather than its copy in the image.
     """
     shell_blocks = []
-    for skill_file in sorted(skills_dir.rglob(SKILL_FILE_NAME)):
+    documents = []
+    for skill_md in sorted(skills_dir.rglob(SKILL_FILE_NAME)):
+        documents.append(skill_md)
+        if not (repo_dir == MIRRORED_TREE and skill_md.parent.name.startswith(MIRRORED_PREFIX)):
+            documents += sorted(skill_md.parent.glob(REFERENCES_GLOB))
+    for skill_file in documents:
         path = f"{repo_dir}/{skill_file.relative_to(skills_dir).as_posix()}"
         try:
             blocks = list(code_blocks(skill_file.read_text(encoding="utf-8")))
