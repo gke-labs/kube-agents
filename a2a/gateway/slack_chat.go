@@ -69,9 +69,6 @@ const (
 	// running row is the open one.
 	slackChatStepDone = "✓"
 	slackChatStepOpen = "◌"
-	// slackChatPlanCountTitle is slack_status.py's CARDS_TITLE, the plan's
-	// title when the message names none and it has more than one item.
-	slackChatPlanCountTitle = "%d cards"
 	// slackChatRawTextCell is the Slack table cell type that shows its text
 	// as written.
 	slackChatRawTextCell = "raw_text"
@@ -120,7 +117,7 @@ func renderSlackChat(m *chatmsg.Message, text string) (slackChatLayout, error) {
 		blocks = append(blocks, detail)
 	}
 	if m.Plan != nil && len(m.Plan.Items) > 0 {
-		blocks = append(blocks, slackChatPlan(m.Plan))
+		blocks = append(blocks, slackChatPlan(m.Plan)...)
 	} else if rows := slackChatRows(m.Rows); rows != nil {
 		blocks = append(blocks, slackChatDivider(), rows, slackChatDivider())
 	}
@@ -371,11 +368,13 @@ func slackChatTableRow(cells []string) []map[string]any {
 	return row
 }
 
-// slackChatPlan is the plan as Slack's plan block of task cards, as
+// slackChatPlan is the plan as one top-level task card per item, as
 // slack_status.plan_blocks lays it out: a row's title arrives composed, and
 // its steps are listed under it, each marked done but the last of a running
-// row, which is the open one.
-func slackChatPlan(p *chatmsg.Plan) map[string]any {
+// row, which is the open one. Not Slack's plan block: Slack draws that as its
+// title alone, folded, so a fan-out read as one "N cards" line, and allows one
+// per message. The plan's title is the fallback text's, and draws nothing.
+func slackChatPlan(p *chatmsg.Plan) []map[string]any {
 	tasks := make([]map[string]any, 0, len(p.Items))
 	for _, item := range p.Items {
 		card := map[string]any{
@@ -401,15 +400,7 @@ func slackChatPlan(p *chatmsg.Plan) map[string]any {
 		}
 		tasks = append(tasks, card)
 	}
-	title := p.Title
-	switch {
-	case title != "":
-	case len(p.Items) == 1:
-		title = p.Items[0].Title
-	default:
-		title = fmt.Sprintf(slackChatPlanCountTitle, len(p.Items))
-	}
-	return map[string]any{"type": "plan", "title": title, "tasks": tasks}
+	return tasks
 }
 
 // slackChatActions is the buttons, choices before links, five to a row. A

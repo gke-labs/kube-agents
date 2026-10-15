@@ -29,6 +29,12 @@ const (
 	// slackTitleClipMinShare: a word-aligned clip shorter than 1/this of the
 	// hard cut drops too much, and cuts hard instead.
 	slackTitleClipMinShare = 2
+	// slackTitleQuestionEnd and slackTitleQuestionMinWords end the ask's
+	// first question (slackFirstQuestion), as slack_status.py's QUESTION_END
+	// and QUESTION_MIN_WORDS do. Only "?": a "." or "!" also closes "e.g.",
+	// "1." and "Hi!", and a thread keeps its first title.
+	slackTitleQuestionEnd      = '?'
+	slackTitleQuestionMinWords = 2
 )
 
 // slackTitleReplacements are the ASCII stand-ins for refused characters an
@@ -59,8 +65,35 @@ var (
 	slackTitleRepeatedComma = regexp.MustCompile(`\s*,[\s,]*`)
 )
 
-// slackSessionTitle is a title agents.sessions.rename accepts, from the
-// ask's words, or "" when nothing survives.
+// slackFirstQuestion is text up to the end of its first question, or all of
+// it when it asks none. A question ends at a run of slackTitleQuestionEnd
+// followed by whitespace, which stays with it, when it closes a word (a run of
+// non-space holding a word character, so punctuation a stripped mention or
+// link left behind does not count) and the text so far holds
+// slackTitleQuestionMinWords such words.
+func slackFirstQuestion(text string) string {
+	runes := []rune(text)
+	words := 0
+	worded := false
+	for i, r := range runes {
+		if unicode.IsSpace(r) {
+			worded = false
+			continue
+		}
+		if !worded && slackWordChar(r) {
+			worded = true
+			words++
+		}
+		if r == slackTitleQuestionEnd && worded && words >= slackTitleQuestionMinWords &&
+			i+1 < len(runes) && unicode.IsSpace(runes[i+1]) {
+			return string(runes[:i+1])
+		}
+	}
+	return text
+}
+
+// slackSessionTitle is a short title agents.sessions.rename accepts, from
+// the ask up to its first question, or "" when nothing survives.
 func slackSessionTitle(ask string) string {
 	title := slackTitleMention.ReplaceAllString(ask, " ")
 	title = slackTitleChannel.ReplaceAllString(title, "$1")
@@ -71,6 +104,7 @@ func slackSessionTitle(ask string) string {
 		return " "
 	})
 	title = norm.NFKC.String(title)
+	title = slackFirstQuestion(title)
 	title = slackTitleChars(title)
 	title = slackTitleWhitespace.ReplaceAllString(title, " ")
 	title = strings.Trim(slackTitleRepeatedComma.ReplaceAllString(title, ", "), " ,")

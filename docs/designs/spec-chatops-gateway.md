@@ -1382,7 +1382,9 @@ only after its children with the synthesis, so the child's `completed` is held w
 works and until the parent's own answer has been delivered on that thread, then dropped with its
 cursor moved past it, and posted after all if the parent ends blocked, its subscription is gone,
 or the hold passes two hours (then led "Interim result from <card title> …"). One that arrives after
-the parent's answer has posted opens with "Late result from <card title>:". Its other events (blocked, gave up, progress) post as before. A route probe (an empty notify, which an armed gateway refuses at once) tells the
+the parent's answer has posted opens with "Late result from <card title>:". On Slack with
+`KAGE_SLACK_UX` on, a child whose parent still works is not held: its `completed` delivers, and
+`kanban_progress_lines` settles its plan row and posts nothing, as under `today`. Its other events (blocked, gave up, progress) post as before. A route probe (an empty notify, which an armed gateway refuses at once) tells the
 notifier when the route is unavailable (the gateway restarting), and it holds deliveries
 unclaimed then; only a send that meets the outage before the next probe spends one unit of
 the subscription's failure budget. Once, when routed delivery first goes live on an install,
@@ -1687,7 +1689,8 @@ does (its cards still running, or blocked), the session follows the newest such 
 so it holds until every chain's cards have settled. Only an older ask a notify `update` key
 is bound to holds it, and for at most four hours after its mark was last drawn or a keyed notify last repeated it (the latest across every chain that marked the ask, so a click or typed answer continuing it keeps the clock), since nothing else can settle an older ask and a lost settle would otherwise hold it for good. A terminal that draws nothing still tells Slack when that bound alone has moved the session. `closed` is sent even for a thread this process never opened, since a restarted gateway
 otherwise leaves the old process's Working… on it; the thread is renamed once from its first
-verified ask that is not a gateway command, with today's title sanitiser. That state is process
+verified ask that is not a gateway command, with today's title rules: the ask up to its first
+question, sanitised. That state is process
 memory too, so after a restart the next verified ask in a thread may title it again. `assistant_thread_started`, and `app_home_opened` on the Messages tab, get today's
 three suggested prompts. `agent_session_stopped` is not handled: Stop stays deferred.
 
@@ -1770,8 +1773,9 @@ block whose first row is the column names; then the buttons, choices before link
 `actions` block, the one `primary` entry drawn as Slack's primary button. A choice's `value` is
 what a click sends, its `reply` or else its `text`, and a link button opens its url; action ids
 are the presenter's `kage.choice.<n>` and `kage.link.<n>`. A progress message's `plan` is
-Slack's `plan` block of `task_card`s, each row's steps listed under it and marked `✓`, the last
-step of an `in_progress` row `◌`. A `tone` colours a side bar (green `#2EB67D`, yellow `#ECB22E`,
+one top-level `task_card` per item, each row's steps listed under it and marked `✓`, the last
+step of an `in_progress` row `◌`; not Slack's `plan` block, which Slack draws as its title alone,
+folded, and allows once per message, so the plan's `title` is the fallback text's only. A `tone` colours a side bar (green `#2EB67D`, yellow `#ECB22E`,
 red `#E01E5A`) holding every block under the headline. Slack refuses a `container` inside the
 attachment a side bar is, and an attachment draws after every top-level block, so a message with
 a fold keeps the fold and everything above it top-level and the bar holds only the buttons; with

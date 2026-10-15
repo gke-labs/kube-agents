@@ -21,6 +21,7 @@ the ask kind they carry is the one ``chat_message.ask_kind`` gives.
 
 import asyncio
 import itertools
+import json
 import sys
 import time
 import unittest
@@ -31,6 +32,8 @@ from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 SCRIPTS = HERE.parents[2] / "agents" / "platform" / "scripts"
+#: The Slack renderer's golden files under next, one per shared case it lays out.
+SLACK_GOLDEN = HERE.parents[2] / "a2a" / "gateway" / "testdata" / "slack-chat"
 CHAT_SCRIPTS = HERE.parents[2] / "agents" / "chat" / "scripts"
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(SCRIPTS))
@@ -285,6 +288,23 @@ class SharedCasesTest(unittest.TestCase):
         for case in cases:
             with self.subTest(case=case["name"]):
                 self.assertEqual(_as_case(self.run_case(case), case["expected"]), case["expected"])
+
+
+class PlanDrawnAlikeTest(unittest.TestCase):
+    """Today's plan blocks for a plan case are next's: the Go renderer's golden for the same case."""
+
+    def test_every_plan_case(self):
+        cases = [c for c in chat_cases.load() if "rows" in c["input"] and not ({"events", "headline"} & c["input"].keys())]
+        self.assertGreater(len(cases), 0)
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                given = case["input"]
+                # The window slack_ux_status._prune applies before today draws, as the emitter applies it.
+                rows = chat_message._plan_rows([_row(r) for r in given["rows"]])
+                today = slack_ux_status._status.plan_blocks(given.get("title"), rows)
+                golden = json.loads((SLACK_GOLDEN / f"{case['name']}.json").read_text())
+                self.assertEqual(today, golden[0]["blocks"])
+                self.assertEqual({b["type"] for b in today}, {"task_card"}, "one line per card, no folded plan")
 
 
 class ChatRoutePlanTest(unittest.TestCase):
