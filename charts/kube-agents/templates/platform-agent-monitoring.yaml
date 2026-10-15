@@ -19,7 +19,7 @@ YAML comments so none of this ships in the rendered manifest.
 apiVersion: monitoring.googleapis.com/v1
 kind: PodMonitoring
 metadata:
-  name: {{ printf "%s-gateway-monitoring" .Values.platformAgent.name | trunc 63 | trimSuffix "-" }}
+  name: {{ .Values.platformAgent.name }}-gateway-monitoring
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -47,7 +47,7 @@ runs on every replica and keeps the selector above.
 apiVersion: monitoring.googleapis.com/v1
 kind: PodMonitoring
 metadata:
-  name: {{ printf "%s-gateway-chat-monitoring" .Values.platformAgent.name | trunc 63 | trimSuffix "-" }}
+  name: {{ .Values.platformAgent.name }}-gateway-chat-monitoring
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -73,7 +73,7 @@ the credentialed listener admits no collector.
 apiVersion: monitoring.googleapis.com/v1
 kind: PodMonitoring
 metadata:
-  name: {{ printf "%s-credential-proxy-monitoring" .Values.platformAgent.name | trunc 63 | trimSuffix "-" }}
+  name: {{ .Values.platformAgent.name }}-credential-proxy-monitoring
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -98,7 +98,7 @@ is the metrics-only one; the doors' ports admit no collector.
 apiVersion: monitoring.googleapis.com/v1
 kind: PodMonitoring
 metadata:
-  name: {{ printf "%s-a2a-gateway-monitoring" .Values.platformAgent.name | trunc 63 | trimSuffix "-" }}
+  name: {{ .Values.platformAgent.name }}-a2a-gateway-monitoring
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "kube-agents.labels" . | nindent 4 }}
@@ -112,6 +112,9 @@ spec:
       interval: 30s
 {{- end }}
 {{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentServiceMonitor" .) }}
+{{- if gt (len .Values.platformAgent.name) 35 }}
+{{- fail "platformAgent.name must be at most 35 characters when platformAgent.serviceMonitor is enabled" }}
+{{- end }}
 ---
 {{- /*
 Prometheus Operator ServiceMonitors and headless metrics Services for the agent's
@@ -348,7 +351,7 @@ spec:
       interval: 30s
 {{- end }}
 
-{{- if and .Values.platformAgent.enabled (or (include "kube-agents.platformAgentServiceMonitor" .) (include "kube-agents.platformAgentVMPodScrape" .)) .Values.platformAgent.monitoringScraperNamespace }}
+{{- if and .Values.platformAgent.enabled .Values.platformAgent.monitoringScraperNamespace }}
 ---
 {{- /*
 NetworkPolicy admitting metrics scrapes from the configured monitoring scraper namespace.
@@ -371,7 +374,7 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: {{ .Values.platformAgent.monitoringScraperNamespace }}
+              kubernetes.io/metadata.name: {{ .Values.platformAgent.monitoringScraperNamespace | quote }}
       ports:
         - protocol: TCP
           port: 9095
@@ -395,11 +398,10 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: {{ .Values.platformAgent.monitoringScraperNamespace }}
+              kubernetes.io/metadata.name: {{ .Values.platformAgent.monitoringScraperNamespace | quote }}
       ports:
         - protocol: TCP
           port: 8766
-{{- if eq (default "today" .Values.platformAgent.mode) "next" }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -418,9 +420,8 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: {{ .Values.platformAgent.monitoringScraperNamespace }}
+              kubernetes.io/metadata.name: {{ .Values.platformAgent.monitoringScraperNamespace | quote }}
       ports:
         - protocol: TCP
           port: 9096
-{{- end }}
 {{- end }}

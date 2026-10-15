@@ -441,6 +441,8 @@ class MonitoringRenderTest(unittest.TestCase):
         }
         self.assertIn(f"{_AGENT}-gateway-metrics-netpol", netpols)
         self.assertIn(f"{_AGENT}-credential-proxy-metrics-netpol", netpols)
+        self.assertIn(f"{_AGENT}-a2a-gateway-metrics-netpol", netpols)
+
         gw_np = netpols[f"{_AGENT}-gateway-metrics-netpol"]
         self.assertEqual(gw_np["spec"]["podSelector"]["matchLabels"]["app"], f"{_AGENT}-gateway")
         self.assertEqual(
@@ -451,17 +453,103 @@ class MonitoringRenderTest(unittest.TestCase):
         self.assertIn(9095, ports)
         self.assertIn(9097, ports)
 
-    def test_name_longer_than_35_chars_rejected_by_schema(self):
+        cp_np = netpols[f"{_AGENT}-credential-proxy-metrics-netpol"]
+        self.assertEqual(cp_np["spec"]["podSelector"]["matchLabels"]["app"], f"{_AGENT}-credential-proxy")
+        self.assertEqual(
+            cp_np["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "monitoring",
+        )
+        self.assertEqual(cp_np["spec"]["ingress"][0]["ports"][0]["port"], 8766)
+
+        a2a_np = netpols[f"{_AGENT}-a2a-gateway-metrics-netpol"]
+        self.assertEqual(a2a_np["spec"]["podSelector"]["matchLabels"]["app"], f"{_AGENT}-a2a-gateway")
+        self.assertEqual(
+            a2a_np["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "monitoring",
+        )
+        self.assertEqual(a2a_np["spec"]["ingress"][0]["ports"][0]["port"], 9096)
+
+    def test_monitoring_scraper_namespace_unset_renders_no_network_policy(self):
+        proc = subprocess.run(
+            [
+                "helm", "template", "test-release", str(_CHART),
+                *_REQUIRED, *_ON_PROMETHEUS,
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        netpols = [
+            doc["metadata"]["name"]
+            for doc in yaml.safe_load_all(proc.stdout)
+            if isinstance(doc, dict) and doc.get("kind") == "NetworkPolicy" and "metrics-netpol" in doc.get("metadata", {}).get("name", "")
+        ]
+        self.assertEqual(netpols, [])
+
+    def test_monitoring_scraper_namespace_renders_even_when_scrape_crds_disabled(self):
         proc = subprocess.run(
             [
                 "helm", "template", "test-release", str(_CHART),
                 *_REQUIRED,
-                "--set", "platformAgent.name=this-platform-agent-name-is-far-too-long-for-schema",
+                "--set", "platformAgent.monitoringScraperNamespace=monitoring",
+                "--set", "platformAgent.serviceMonitor=false",
+                "--set", "platformAgent.vmPodScrape=false",
             ],
             capture_output=True, text=True,
         )
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("maxLength: got 51, want 35", proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        netpols = {
+            doc["metadata"]["name"]: doc
+            for doc in yaml.safe_load_all(proc.stdout)
+            if isinstance(doc, dict) and doc.get("kind") == "NetworkPolicy" and "metrics-netpol" in doc.get("metadata", {}).get("name", "")
+        }
+        self.assertEqual(len(netpols), 3)
+
+    def test_monitoring_scraper_namespace_quoted_properly_for_yaml_non_strings(self):
+        for ns in ["123", "on", "yes", "true"]:
+            with self.subTest(ns=ns):
+                proc = subprocess.run(
+                    [
+                        "helm", "template", "test-release", str(_CHART),
+                        *_REQUIRED,
+                        "--set-string", f"platformAgent.monitoringScraperNamespace={ns}",
+                    ],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                netpols = [
+                    doc for doc in yaml.safe_load_all(proc.stdout)
+                    if isinstance(doc, dict) and doc.get("kind") == "NetworkPolicy" and "metrics-netpol" in doc.get("metadata", {}).get("name", "")
+                ]
+                self.assertEqual(len(netpols), 3)
+                for np in netpols:
+                    val = np["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"]
+                    self.assertIsInstance(val, str)
+                    self.assertEqual(val, ns)
+
+    def test_name_longer_than_35_chars_rejected_when_service_monitor_enabled(self):
+        long_name = "this-platform-agent-name-is-far-too-long-for-schema"
+        # Without serviceMonitor: accepted (no schema cap regressing existing installs)
+        proc_default = subprocess.run(
+            [
+                "helm", "template", "test-release", str(_CHART),
+                *_REQUIRED,
+                "--set", f"platformAgent.name={long_name}",
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc_default.returncode, 0, proc_default.stderr)
+
+        # With serviceMonitor: rejected by template fail check to avoid 63-char headless Service name overflows
+        proc_sm = subprocess.run(
+            [
+                "helm", "template", "test-release", str(_CHART),
+                *_REQUIRED, *_ON_PROMETHEUS,
+                "--set", f"platformAgent.name={long_name}",
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(proc_sm.returncode, 0)
+        self.assertIn("platformAgent.name must be at most 35 characters when platformAgent.serviceMonitor is enabled", proc_sm.stderr)
 
 
 if __name__ == "__main__":
