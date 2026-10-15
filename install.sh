@@ -3765,7 +3765,7 @@ ensure_existing_cluster_cmek() {
   gcloud beta services identity create --service=container.googleapis.com --project="$project_id" 2>/dev/null || true
   retry_kms_create gcloud kms keys add-iam-policy-binding "$key" --keyring="$keyring" --location="$kms_location" \
     --member="serviceAccount:${service_agent}" \
-    --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" --project="$project_id" --quiet >/dev/null
+    --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" --project="$project_id" --quiet --format=none
   print_info "Updating the live cluster control plane; this can take several minutes..."
   gcloud container clusters update "$cluster_name" --location "$region" \
     --database-encryption-key="$key_resource" --project "$project_id" --quiet

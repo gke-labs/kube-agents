@@ -4678,6 +4678,7 @@ source "{_INSTALLER_COMMON}"
             text=True,
             env=get_isolated_test_env(overrides=merged),
             cwd=str(_REPO_ROOT),
+            timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
         )
 
     def test_retry_kms_create_retries_and_succeeds(self):
@@ -4765,18 +4766,20 @@ KMS_API_PROPAGATION_ATTEMPTS=3 retry_kms_create stub
         self.assertIn("Cloud KMS still rejects requests 3 attempts after enabling it", proc.stderr)
 
     def test_retry_kms_create_non_integer_attempts_falls_back_to_default(self):
-        script = f"""
+        for invalid_val in ["invalid", "99999999999999999999", "-1", "0"]:
+            with self.subTest(attempts=invalid_val):
+                script = f"""
 count=0
 stub() {{
   count=$((count + 1))
   echo "{self._KMS_403}" >&2
   exit 1
 }}
-KMS_API_PROPAGATION_ATTEMPTS="invalid" retry_kms_create stub
+KMS_API_PROPAGATION_ATTEMPTS="{invalid_val}" retry_kms_create stub
 """
-        proc = self._run_cmd(script)
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("Cloud KMS still rejects requests 5 attempts after enabling it", proc.stderr)
+                proc = self._run_cmd(script)
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("Cloud KMS still rejects requests 5 attempts after enabling it", proc.stderr)
 
     def test_sourcing_installer_common_then_lifecycle_does_not_fail_on_readonly_pattern(self):
         """Sourcing installer_common.sh and then lifecycle.sh does not fail on KMS_API_PROPAGATION_PATTERN."""

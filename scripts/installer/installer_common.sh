@@ -1427,28 +1427,28 @@ tf_state_prefix() {
 # has been named "Google Cloud KMS API" and "Cloud Key Management Service (KMS)
 # API" in this message, and both end the same way. Matching lifecycle.sh.
 KMS_API_PROPAGATION_PATTERN="${KMS_API_PROPAGATION_PATTERN:-KMS\)? API has not been used in project}"
-KMS_API_PROPAGATION_ATTEMPTS="${KMS_API_PROPAGATION_ATTEMPTS:-5}"
-if [[ ! "$KMS_API_PROPAGATION_ATTEMPTS" =~ ^[0-9]+$ ]] || [ "$KMS_API_PROPAGATION_ATTEMPTS" -lt 1 ]; then
-  KMS_API_PROPAGATION_ATTEMPTS=5
-fi
-KMS_API_PROPAGATION_WAIT_SECONDS="${KMS_API_PROPAGATION_WAIT_SECONDS:-60}"
-if [[ ! "$KMS_API_PROPAGATION_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
-  KMS_API_PROPAGATION_WAIT_SECONDS=60
-fi
+
+_sanitize_kms_int() {
+  local val="$1" default_val="$2" min_val="${3:-0}"
+  if [[ "$val" =~ ^[0-9]{1,9}$ ]] && [ "$val" -ge "$min_val" ]; then
+    echo "$val"
+  else
+    echo "$default_val"
+  fi
+}
+
+KMS_API_PROPAGATION_ATTEMPTS="$(_sanitize_kms_int "${KMS_API_PROPAGATION_ATTEMPTS:-5}" 5 1)"
+KMS_API_PROPAGATION_WAIT_SECONDS="$(_sanitize_kms_int "${KMS_API_PROPAGATION_WAIT_SECONDS:-60}" 60 0)"
 
 # Retries a Cloud KMS command on Cloud KMS's first-enablement 403
 # (KMS_API_PROPAGATION_PATTERN). On a fresh GCP project, Cloud KMS can answer 403
 # for a few minutes after being enabled. Output of the command is preserved and
 # echoed on completion; retry warnings are printed to stderr.
 retry_kms_create() {
-  local max_attempts="${KMS_API_PROPAGATION_ATTEMPTS:-5}"
-  if [[ ! "$max_attempts" =~ ^[0-9]+$ ]] || [ "$max_attempts" -lt 1 ]; then
-    max_attempts=5
-  fi
-  local wait_seconds="${KMS_API_PROPAGATION_WAIT_SECONDS:-60}"
-  if [[ ! "$wait_seconds" =~ ^[0-9]+$ ]]; then
-    wait_seconds=60
-  fi
+  local max_attempts
+  max_attempts="$(_sanitize_kms_int "${KMS_API_PROPAGATION_ATTEMPTS:-5}" 5 1)"
+  local wait_seconds
+  wait_seconds="$(_sanitize_kms_int "${KMS_API_PROPAGATION_WAIT_SECONDS:-60}" 60 0)"
   local attempt=1 status=0 output=""
   while :; do
     output="$(trap - ERR; "$@" 2>&1)" && status=0 || status=$?
