@@ -69,6 +69,25 @@ streaming and tool progress are skipped and only the turn's final reply comes
 back, through ``send``. ``edit_message`` is left at the base default
 (unsupported), which tells the rolling progress line to post each note anew;
 attachments are not posted (there is no file route), and say so in the log.
+
+Chat messages
+-------------
+Under ``next`` the gateway lays a card's post out from a
+``kube-agents.chat/v1`` object and composes nothing
+(``docs/designs/spec-a2a-payloads.md``, "Card work after the task ends"). The
+``today`` presenters' gateway patches (``slack_ux_status``, ``slack_ux_moments``,
+``slack_ux_incident``, ``slack_ux_failure``, ``kanban_progress_lines``) reach a
+Slack card through this stand-in as well, and :func:`chat_route` tells them
+they can: instead of ``chat.postMessage``/``chat.update`` they compose the same
+state into a chat message (``agents/platform/scripts/chat_message.py``) and
+hand it to :meth:`ChatNotifyAdapter.send_chat`, with an ``update`` key for a
+message that is edited in place (the thread's plan, a card's question, the
+alert). :meth:`ChatNotifyAdapter.send` forwards both as ``a2a notify
+--chat-file`` and ``--update``; the text stays the fallback, and a gateway that
+does not read them posts the text. A failure wake's reply with a Try again
+offer (``slack_ux_failure.chat_for``) is laid out the same way.
+:func:`conversation_ask` reads back the kind of ask the hermes-bridge recorded
+on the conversation's route, which the plan's ``mark`` keeps while its cards run.
 """
 
 from __future__ import annotations
@@ -81,6 +100,7 @@ import math
 import os
 import sqlite3
 import subprocess
+import tempfile
 import time
 from contextlib import closing
 from typing import Any, Dict, Optional
@@ -163,6 +183,15 @@ API_SERVER_HOST = "127.0.0.1"
 API_SERVER_PORT = 8642
 API_SERVER_MODEL = "model-default"
 API_SERVER_KEY_ENV = "API_SERVER_KEY"
+# The keys a gateway patch puts a chat message and its update key under in
+# send()'s metadata (see "Chat messages" above), and the route record's ask.
+CHAT_METADATA_KEY = "kage_chat"
+UPDATE_METADATA_KEY = "kage_update"
+CONVERSATION_ASK_KEY = "ask"
+# The chat message's file for `a2a notify --chat-file`: written mode 0600 by
+# tempfile, removed once the command returns.
+CHAT_FILE_PREFIX = "kage-chat-"
+CHAT_FILE_SUFFIX = ".json"
 
 # routed_since's answer, read or written once per process.
 _routed_since: Optional[float] = None
@@ -195,6 +224,11 @@ def conversation_platform() -> str:
 def is_conversation(sub: Optional[dict]) -> bool:
     """Whether ``sub`` is addressed to a gateway conversation (its thread is a conversation key)."""
     return str((sub or {}).get("thread_id") or "").strip().startswith(CONVERSATION_KEY_PREFIXES)
+
+
+def chat_route(adapter: Any) -> bool:
+    """Whether ``adapter`` is a stand-in that carries chat messages (:meth:`ChatNotifyAdapter.send_chat`)."""
+    return callable(getattr(adapter, "send_chat", None))
 
 
 def active_platforms(names: set) -> set:
@@ -672,6 +706,43 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         logger.info("chat.notify: %s not posted (no file route): %s", kind, file_name or "attachment")
         return SendResult(success=False, error="attachments are not posted over chat.notify")
 
+    async def send_chat(self, chat_id: str, content: str, chat: Optional[dict], update: str = "",
+                        metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """:meth:`send` laid out by ``chat``, a ``kube-agents.chat/v1`` object, with ``content`` its fallback.
+
+        ``update`` names the message: a later send with the same key, in the
+        same conversation, edits it in place.
+        """
+        extra = {CHAT_METADATA_KEY: chat, UPDATE_METADATA_KEY: update}
+        return await self.send(chat_id, content, metadata={**(metadata or {}), **extra})
+
+    def _chat_args(self, content: str, metadata: Optional[Dict[str, Any]]) -> tuple:
+        """``(argv, chat file)`` for the metadata's chat message and update key; the file is the caller's to remove.
+
+        The chat message rides only with a text fallback. A failure wake's reply
+        that carries none of its own is laid out by ``slack_ux_failure.chat_for``.
+        """
+        meta = metadata or {}
+        chat = meta.get(CHAT_METADATA_KEY)
+        update = str(meta.get(UPDATE_METADATA_KEY) or "").strip()
+        if chat is None and self.platform.value == SLACK_PLATFORM:
+            chat = _failure_chat(content)
+        argv, path = [], ""
+        if isinstance(chat, dict) and str(content or "").strip():
+            # Serialized before the file exists, so a value JSON cannot hold leaves no file behind.
+            body = json.dumps(chat, ensure_ascii=False)
+            fd, path = tempfile.mkstemp(prefix=CHAT_FILE_PREFIX, suffix=CHAT_FILE_SUFFIX)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(body)
+            except OSError:
+                os.unlink(path)
+                raise
+            argv += ["--chat-file", path]
+        if update:
+            argv += ["--update", update]
+        return argv, path
+
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         thread = str((metadata or {}).get("thread_id") or "").strip()
@@ -681,7 +752,24 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         except LookupError as exc:
             logger.warning("chat.notify: %s; the card's report is not posted", exc)
             return SendResult(success=False, error=str(exc))
+        try:
+            chat_argv, chat_file = self._chat_args(content, metadata)
+        except (OSError, TypeError, ValueError) as exc:
+            # The text is the deliverable: a chat message that cannot be written posts without it.
+            logger.warning("chat.notify: the chat message is not sent (%s); posting the text", exc)
+            chat_argv, chat_file = [], ""
+        argv += chat_argv
         argv += ["--", content]
+        try:
+            return await self._notify(argv, chat_id)
+        finally:
+            if chat_file:
+                try:
+                    os.unlink(chat_file)
+                except OSError as exc:
+                    logger.debug("chat.notify: removing %s failed: %s", chat_file, exc)
+
+    async def _notify(self, argv: list, chat_id: str) -> SendResult:
         proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -715,19 +803,45 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=answer.get("message_id") or None, raw_response=answer)
 
 
-def conversation_context(session_id: str) -> str:
-    """The context id of the gateway conversation ``session_id`` holds the route for, or ""."""
+def _failure_chat(content: str) -> Optional[dict]:
+    """``slack_ux_failure.chat_for``'s chat message for a marked failure reply, or None."""
+    try:
+        from gateway import slack_ux_failure
+    except ImportError:
+        try:  # Unit tests import the patch modules flat.
+            import slack_ux_failure
+        except ImportError:
+            return None
+    try:
+        return slack_ux_failure.chat_for(content)
+    except Exception as exc:  # noqa: BLE001 - the reply still posts as text
+        logger.warning("chat.notify: laying out the failure reply failed: %s", exc)
+        return None
+
+
+def _route(session_id: str) -> dict:
+    """The conversation route ``session_id`` holds, as the bridge recorded it, or {}."""
     path = os.environ.get(SESSION_KV_DB_ENV) or SESSION_KV_DEFAULT_DB
     if not session_id or not os.path.exists(path):
-        return ""
+        return {}
     try:
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=SESSION_KV_TIMEOUT_SECONDS)) as conn:
             row = conn.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,)).fetchone()
         route = (json.loads(row[0]) if row and row[0] else {}).get(CONVERSATION_ROUTE_KEY)
     except Exception as exc:  # noqa: BLE001 - an unreadable route is a failed send, said in the log
         logger.warning("chat.notify: route for %s unreadable: %s", session_id, exc)
-        return ""
-    return str(route.get("context_id") or "") if isinstance(route, dict) else ""
+        return {}
+    return route if isinstance(route, dict) else {}
+
+
+def conversation_context(session_id: str) -> str:
+    """The context id of the gateway conversation ``session_id`` holds the route for, or ""."""
+    return str(_route(session_id).get("context_id") or "")
+
+
+def conversation_ask(session_id: str) -> str:
+    """The kind of ask the conversation ``session_id`` routes was last asked (a ``mark.ask`` token), or ""."""
+    return str(_route(session_id).get(CONVERSATION_ASK_KEY) or "")
 
 
 class ConversationNotifyAdapter(ChatNotifyAdapter):
@@ -754,6 +868,10 @@ class ConversationNotifyAdapter(ChatNotifyAdapter):
         if not context:
             raise LookupError(f"no conversation route recorded for {chat_id}")
         return ["--conversation", thread, "--context", context]
+
+    def ask(self, chat_id: str) -> str:
+        """The kind of ask the conversation was last asked, which the plan's mark keeps while cards run."""
+        return conversation_ask(chat_id)
 
     async def handle_message(self, event: Any) -> None:
         if not getattr(event, "internal", False):
