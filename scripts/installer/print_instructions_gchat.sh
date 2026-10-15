@@ -4,6 +4,22 @@
 # ==============================================================================
 set -e
 
+case "${1:-}" in
+  -h|--help)
+    cat <<'USAGE'
+Usage: print_instructions_gchat.sh
+
+Prints the Google Chat setup checklist for this install: the app settings to
+verify, the first message to send, and the optional steps after it. It reads
+the install.env at the root of the checkout it sits in ($KUBE_AGENTS_INSTALL_ENV
+instead, when set) and scripts/installer/vars.sh, and prints nothing unless
+GOOGLE_CHAT_ENABLED=true there. install.sh runs it at the end of an install with
+Google Chat enabled; run it again at any time. It changes nothing.
+USAGE
+    exit 0
+    ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/common.sh" "$@"
