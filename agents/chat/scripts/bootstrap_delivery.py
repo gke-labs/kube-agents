@@ -44,8 +44,9 @@ text. A failure after the request was sent may have posted, so that path can sen
 report twice; see ``_posted_as_blocks``.
 
 Every delivery closes with a short note on the first-run audits, read off the ``oobe`` stage's
-marker by ``_audits_note``: the report's scan leaves the workload checks to those audits, and a
-short report would otherwise read as a healthy fleet. The text path appends it to the report; the
+marker by ``_audits_note``: the report's scan leaves the workload checks to those audits (except
+on an install whose kept marker records an older stage's no-repository skip, where the scan ran
+them), and a short report would otherwise read as a healthy fleet. The text path appends it to the report; the
 card paths print it on their own, since the card leaves closing lines out.
 
 Just before the claim, the run registers the sweep's findings in the
@@ -176,7 +177,8 @@ PRESENTED_PLATFORM = "slack"
 AUDITS_SKIPPED_NOTE = "The first-run audits did not run: {reason}."
 AUDITS_NO_REASON = "no reason was recorded"
 # The reason an older oobe stage recorded when it skipped for no repository. A marker an install
-# kept through the upgrade still carries it, and on such an install the scan ran those checks.
+# kept through the upgrade still carries it, and on such an install the scan ran those checks,
+# unless a repository registered when the sweep was filed was removed before the stage read the list.
 LEGACY_NO_REPOSITORY_REASON = "no GitHub repository in managed_repos for the audits to publish to"
 AUDITS_COVERED_NOTE = (
     "This scan checked probes, requests and limits, autoscaling, NetworkPolicy and pod security in "

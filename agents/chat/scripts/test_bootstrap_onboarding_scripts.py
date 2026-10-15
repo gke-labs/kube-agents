@@ -1667,6 +1667,12 @@ class FirstRunAuditsTest(unittest.TestCase):
             f"The first-run audits did not run: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
             f"{bootstrap_delivery.AUDITS_COVERED_NOTE}",
         )
+        # A report no cluster's audit reached covers nothing, whatever the older stage recorded.
+        self.assertEqual(
+            self._note(no_coverage=True),
+            f"The first-run audits did not run: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
+            f"{bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE}",
+        )
 
     def test_the_not_covered_note_does_not_say_the_report_covers_them(self):
         self.assertNotIn("covers", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE)
