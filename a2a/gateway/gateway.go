@@ -46,6 +46,10 @@ const (
 	retireRefusalStillOn    = "⚠️ could not close the previous task on the bus; the session route is still on and its pod still there — try `/session off` again in a moment"
 )
 
+// noticeBusUnreachable says a task's publish failed: on its rolling line, or
+// posted when the backend keeps none (StatusShower).
+const noticeBusUnreachable = "❌ could not reach the bus; try again"
+
 // turnTimeout bounds one handler turn — an inbound message or a relay
 // batch — so a stuck bus or backend call frees the conversation's queue
 // slot instead of holding it forever. Where the clock starts relative to
@@ -2300,10 +2304,6 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 
 // noticeSteerNotSent tells the room a steer did not reach the running task.
 const noticeSteerNotSent = "⚠️ could not send that to the running task; it is still working on the original instruction"
-
-// noticeBusUnreachable says a task's publish failed: on its rolling line, or
-// posted when the backend keeps none (StatusShower).
-const noticeBusUnreachable = "❌ could not reach the bus; try again"
 
 // The steer acknowledgements, one per route (spec-chatops-gateway.md,
 // "Gateway-authored posts"). The fixed-route wording is a product decision:

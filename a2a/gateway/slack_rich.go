@@ -54,13 +54,18 @@ type slackRichDoc struct {
 	listLevel int
 	listStyle string
 	item      map[string]any
+	// proseFrom is where the section's last line starts when that line is
+	// prose a setext underline can make a heading, else -1.
+	proseFrom int
+	// lastLineFrom is where line put the section's last line.
+	lastLineFrom int
 }
 
 // slackRichDocument is md as the elements of one rich_text block.
 func slackRichDocument(md string) []map[string]any {
 	lines := strings.Split(strings.ReplaceAll(md, "\r\n", "\n"), "\n")
 	noCode := make([]bool, len(lines))
-	d := &slackRichDoc{}
+	d := &slackRichDoc{proseFrom: -1}
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
 		if m := slackRichFenceRE.FindStringSubmatch(line); m != nil {
@@ -69,6 +74,21 @@ func slackRichDocument(md string) []map[string]any {
 		}
 		if strings.TrimSpace(line) == "" {
 			d.blank = true
+			d.proseFrom = -1
+			continue
+		}
+		// A setext underline bolds the prose line above it, as the text path
+		// does; a rule ("---", "* * *") is read before a list item, which
+		// "* * *" would otherwise also match.
+		if d.proseFrom >= 0 && slackSetextRE.MatchString(line) {
+			slackRichBold(d.section[d.proseFrom:])
+			d.proseFrom = -1
+			continue
+		}
+		if slackRuleRE.MatchString(line) {
+			d.endList()
+			d.blank = true
+			d.proseFrom = -1
 			continue
 		}
 		if m := slackRichItemRE.FindStringSubmatch(line); m != nil {
@@ -84,10 +104,6 @@ func slackRichDocument(md string) []map[string]any {
 			table := renderSlackTable(lines[i], lines[i+2:end])
 			d.block(slackRichPre(strings.Join(table[1:len(table)-1], slackRichLineBreak)))
 			i = end - 1
-			continue
-		}
-		if slackRuleRE.MatchString(line) {
-			d.blank = true
 			continue
 		}
 		if m := slackHeadingRE.FindStringSubmatch(line); m != nil {
@@ -106,6 +122,9 @@ func slackRichDocument(md string) []map[string]any {
 			continue
 		}
 		d.line(slackRichMarkdown(strings.TrimSpace(line)))
+		if !slackNotParagraphRE.MatchString(line) {
+			d.proseFrom = d.lastLineFrom
+		}
 	}
 	d.endList()
 	d.flush()
@@ -122,8 +141,10 @@ func (d *slackRichDoc) line(elements []map[string]any) {
 		}
 		d.section = append(d.section, slackRichText(sep, nil))
 	}
+	d.lastLineFrom = len(d.section)
 	d.section = append(d.section, elements...)
 	d.blank = false
+	d.proseFrom = -1
 }
 
 // flush ends the section.
@@ -131,7 +152,7 @@ func (d *slackRichDoc) flush() {
 	if len(d.section) > 0 {
 		d.out = append(d.out, slackRichSection(d.section))
 	}
-	d.section, d.blank = nil, false
+	d.section, d.blank, d.proseFrom = nil, false, -1
 }
 
 // block ends the section and the list element and adds a block element.
@@ -263,9 +284,10 @@ func slackRichLen(v any) int {
 }
 
 // slackRichPreChunks cuts an element past budget runes into several: a
-// preformatted one between its lines (chatChunks), a section between its
-// spans, a text span past budget cut by runes. A list or a quote is kept
-// whole.
+// preformatted one between its lines (chatChunks), a section or a quote
+// between its spans, a text span past budget cut by runes, a list between
+// its items (a numbered list's numbering kept by offset). A single item
+// past budget stands alone.
 func slackRichPreChunks(e map[string]any, budget int) []map[string]any {
 	if slackRichLen(e) <= budget {
 		return []map[string]any{e}
@@ -277,7 +299,9 @@ func slackRichPreChunks(e map[string]any, budget int) []map[string]any {
 		for _, chunk := range chatChunks(text, budget) {
 			out = append(out, slackRichPre(chunk))
 		}
-	case "rich_text_section":
+	case "rich_text_list":
+		return slackRichListChunks(e, budget)
+	case "rich_text_section", "rich_text_quote":
 		var spans, group []map[string]any
 		for _, span := range e["elements"].([]map[string]any) {
 			spans = append(spans, slackRichSpanChunks(span, budget)...)
@@ -286,16 +310,43 @@ func slackRichPreChunks(e map[string]any, budget int) []map[string]any {
 		for _, span := range spans {
 			n := slackRichLen(span)
 			if len(group) > 0 && size+n > budget {
-				out = append(out, slackRichSection(group))
+				out = append(out, map[string]any{"type": e["type"], "elements": group})
 				group, size = nil, 0
 			}
 			group = append(group, span)
 			size += n
 		}
-		out = append(out, slackRichSection(group))
+		out = append(out, map[string]any{"type": e["type"], "elements": group})
 	default:
 		out = append(out, e)
 	}
+	return out
+}
+
+// slackRichListChunks cuts a list between its items into lists of at most
+// budget runes, each keeping the style and indent, a numbered one its
+// numbering through offset.
+func slackRichListChunks(e map[string]any, budget int) []map[string]any {
+	items, _ := e["elements"].([]map[string]any)
+	offset, _ := e["offset"].(int)
+	var out []map[string]any
+	start, size := 0, 0
+	emit := func(end int) {
+		part := map[string]any{"type": e["type"], "style": e["style"], "indent": e["indent"], "elements": items[start:end]}
+		if n := offset + start; n > 0 && e["style"] == slackRichOrdered {
+			part["offset"] = n
+		}
+		out = append(out, part)
+	}
+	for i, item := range items {
+		n := slackRichLen(item)
+		if i > start && size+n > budget {
+			emit(i)
+			start, size = i, 0
+		}
+		size += n
+	}
+	emit(len(items))
 	return out
 }
 

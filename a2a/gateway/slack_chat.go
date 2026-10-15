@@ -165,8 +165,8 @@ func renderSlackChat(m *chatmsg.Message, text string) (slackChatLayout, error) {
 // refuseSlackChat is the last check before a rendered message is sent. The
 // only text Slack parses for mentions is a mrkdwn text object (rich_text
 // text, plain_text and a task card's title are shown as written, so a field
-// carrying <!here> there is inert text), and the renderer writes mrkdwn only
-// for a fold's text, escaped (toMrkdwn) and verbatim. blocksMention, the
+// carrying <!here> there is inert text), and the renderer writes no mrkdwn
+// of its own (a fold's text is rich text too, slackRichBlocks). blocksMention, the
 // notify route's own check, reads every mrkdwn text object, so the two Block
 // Kit paths hold one bound; and blocksInteractive finds no interactive
 // element outside the actions blocks the renderer wrote itself from the

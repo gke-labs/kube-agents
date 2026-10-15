@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -76,6 +77,57 @@ func TestSlackRichDocumentTableAndRule(t *testing.T) {
 	}
 	if code := got[0]["elements"].([]map[string]any)[0]["text"]; code != "a   | bb\n----+---\nccc | d" {
 		t.Errorf("table = %q", code)
+	}
+}
+
+// A spaced rule goes rather than reading as a list item, and a setext
+// underline bolds the line above it, as on the text path.
+func TestSlackRichDocumentSpacedRuleAndSetext(t *testing.T) {
+	for _, rule := range []string{"* * *", "- - -", "___"} {
+		got := slackRichDocument("one\n\n" + rule + "\n\ntwo")
+		if kinds := slackRichKinds(got); strings.Join(kinds, " ") != "rich_text_section" {
+			t.Errorf("%q: kinds = %v, want the rule dropped", rule, kinds)
+		}
+	}
+	for _, underline := range []string{"---", "==="} {
+		got := slackRichDocument("Root cause\n" + underline + "\nIt ran out of memory.")
+		first := got[0]["elements"].([]map[string]any)[0]
+		if first["text"] != "Root cause" || first["style"] == nil || first["style"].(map[string]any)["bold"] != true {
+			t.Errorf("%q: first = %v, want the line above bold", underline, first)
+		}
+		raw, _ := json.Marshal(got)
+		if strings.Contains(string(raw), underline) {
+			t.Errorf("%q: the underline is drawn: %s", underline, raw)
+		}
+	}
+}
+
+// A fold that is one long numbered list is cut between its items, each part
+// under the share and numbered on from the last.
+func TestSlackRichLongListIsCut(t *testing.T) {
+	var md strings.Builder
+	for i := 1; i <= 15; i++ {
+		md.WriteString(strconv.Itoa(i) + ". " + strings.Repeat("finding text ", 20) + "\n")
+	}
+	blocks := slackRichBlocks(md.String(), slackChatFoldChunk)
+	if len(blocks) < 2 {
+		t.Fatalf("blocks = %d, want the list cut", len(blocks))
+	}
+	next := 0
+	for _, b := range blocks {
+		if n := slackRichLen(b); n > slackChatFoldChunk {
+			t.Errorf("a block of %d runes, over the share", n)
+		}
+		for _, list := range b["elements"].([]map[string]any) {
+			offset, _ := list["offset"].(int)
+			if offset != next {
+				t.Errorf("a part starts at offset %d, want %d", offset, next)
+			}
+			next += len(list["elements"].([]map[string]any))
+		}
+	}
+	if next != 15 {
+		t.Fatalf("the parts hold %d items, want 15", next)
 	}
 }
 

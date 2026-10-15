@@ -399,8 +399,9 @@ refused here, with the same target-only notice and an audit line, and nothing re
 
 **The child** carries the platform agent's own `in` subject, the parent's `correlationId`, and the
 parent's stored `authority` with fresh grants and `via: {taskId, session}` naming the turn and
-incarnation that asked. The conversation's rolling line for it is the same "working on" line any
-task gets, suffixed `(delegated to platform)`; the parent's own line is left in place on the
+incarnation that asked. The conversation's rolling line for it, on a backend that keeps one (not
+Slack, a `StatusShower`), is the same "working on" line any task gets, suffixed
+`(delegated to platform)`; the parent's own line is left in place on the
 parent's history entry and closes on the parent's own terminal, not the child's. From the mint on,
 the child is the conversation's active task: a follow-up steers it, `stop` cancels it, a status ask
 reports it. A heal releases the child from the conversation's active-task slot, and retires its
@@ -1766,7 +1767,8 @@ notification and a thread read-back carry it): the headline bold with the note a
 same line, as one `rich_text` block; the detail under it; the rows between two dividers, each led
 by its severity as inline code; the `after` lines; the fold as a collapsible `container`,
 collapsed (a fold with neither text nor a table is omitted), its text as `rich_text` blocks of
-at most 2,500 characters each, cut between elements (a long fenced block between its lines), and its table as a native `table`
+at most 2,500 characters each, cut between elements (a long fenced block between its lines, a
+long list between its items, its numbering kept; one item past that stands alone), and its table as a native `table`
 block whose first row is the column names; then the buttons, choices before links, five to an
 `actions` block, the one `primary` entry drawn as Slack's primary button. A choice's `value` is
 what a click sends, its `reply` or else its `text`, and a link button opens its url; action ids
@@ -1801,9 +1803,9 @@ clicks and Agent Sessions, above); a link button opens its url and its click is 
 That is the exception to the notify route's refusal of interactive blocks: a raw `blocks`
 request is the sender's layout and the gateway cannot vouch for what a click sends, while a chat
 message's buttons are the gateway's own, built from validated choices whose click text the
-gateway reads as an ordinary message. The fold's text goes through
-`toMrkdwn`, the translation the text path uses, so a heading there shows as a bold line and a
-bullet as `•`, as they do in a text answer. `a2a/gateway/testdata/slack-chat/` holds the layout of every chat
+gateway reads as an ordinary message. The fold's text is drawn as rich text as the detail is,
+so a heading there shows as a bold line and a list as a list, as `toMrkdwn` renders them in a
+text answer. `a2a/gateway/testdata/slack-chat/` holds the layout of every chat
 message the shared cases in `tests/conformance/chat/` expect, checked on every run.
 
 A conversation notify request (below) reads its `chat` field and `update` key the same way.
