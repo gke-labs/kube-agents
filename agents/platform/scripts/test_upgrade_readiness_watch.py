@@ -1598,6 +1598,10 @@ class DeclaredScope(Base):
     def test_a_tick_whose_every_project_is_refused_fails_in_the_install_s_terms(self) -> None:
         self.declare_scope(["p1"])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p2"}):
+            code, out = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}), ["--dry-run"])
+            self.assertEqual(code, 0)
+            self.assertIn("the tick failed: ReportRefused:", out)
+            self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists(), "a dry run changes nothing")
             code, out = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
         self.assertEqual(code, 0)
         self.assertEqual(
@@ -1606,7 +1610,62 @@ class DeclaredScope(Base):
             "it lists p1; the remedy is on the install, not this job: name the project in spec.scope, "
             "or take it out of the roster (its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)",
         )
-        self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
+        # The failed tick writes nothing of its own to the ledger but the standing-outside record, which the next tick's hold reads.
+        self.assertEqual(self.ledger()["standing_outside"], {"p2": []})
+        self.assertEqual((self.ledger()["last_tick"], self.ledger()["targets"], self.ledger()["table_runs"]), (None, {}, {}))
+
+    def test_an_all_refused_tick_keeps_the_standing_record_so_its_failure_line_holds_across_a_failed_lookup(self) -> None:
+        """A folder-scoped install whose roster holds nothing but p2, in no
+        part of the declaration: every run is refused, the tick fails in the
+        install's terms, and the failure line is keyed on the refusal's text.
+        The record the refusal filed is saved though the tick wrote nothing
+        else, so the folder lookup failing on the next tick keeps the cause
+        and the text, and the lookup resolving after that posts nothing more:
+        one failure line, not three. The record is written once, not on each
+        failed tick; declaring p2 reads it, and the recovery line follows."""
+        resolved = {"id": "folders/123456789012", "outcome": "ok", "projects": 0}
+        failed = dict(resolved, outcome="unreachable")
+        outs = []
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p2"}), mock.patch.object(watch, "save_ledger", wraps=watch.save_ledger) as saves:
+            for containers in ([resolved], [failed], [resolved]):
+                self.declare_scope(["p1"], containers=containers)
+                code, out = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
+                self.assertEqual(code, 0)
+                outs.append(out)
+                self.assertEqual(self.ledger()["standing_outside"], {"p2": ["folders/123456789012"]})
+                self.assertIsNone(self.ledger()["last_tick"], "nothing else of the failed tick is written")
+            self.assertEqual(saves.call_count, 1)
+            self.assertIn(
+                "the tick failed: ReportRefused: refused by the report script: the install's declared scope does not list p2; it lists p1; "
+                "the remedy is on the install, not this job: name the project in spec.scope",
+                outs[0],
+            )
+            self.assertEqual(outs[1:], ["", ""], "one failure line, not three")
+            self.assertNotIn("the declaration is not fully resolved", self.marker().read_text())
+            self.declare_scope(["p1", "p2"], containers=[resolved])
+            code, out = self.run_tick(FakeSandbox(envelope([])))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines(), ["upgrade readiness watch: the tick runs again"])
+        self.assertEqual(self.ledger()["standing_outside"], {})
+        self.assertFalse(self.marker().exists())
+
+    def test_an_all_failed_tick_keeps_the_record_of_the_project_it_refused_beside_the_failure_it_names(self) -> None:
+        """p1's sandbox run fails beside p2's refusal: the tick fails with the
+        sandbox's failure, and p2's record is saved all the same, so the
+        sandbox recovering on a day the folder lookup fails posts p2 under
+        the declaration remedy, not the lookup's."""
+        versions = envelope([member("a", "current")])
+        resolved = {"id": "folders/123456789012", "outcome": "ok", "projects": 0}
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            self.declare_scope(["p1"], containers=[resolved])
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}, table_failing_projects={"p1"}))
+            self.assertIn("the tick failed: RuntimeError: sandbox exited 255 without a report", out)
+            self.assertEqual(self.ledger()["standing_outside"], {"p2": ["folders/123456789012"]})
+            self.declare_scope(["p1"], containers=[dict(resolved, outcome="unreachable")])
+            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            self.assertEqual(out.splitlines()[0], "upgrade readiness watch: the tick runs again")
+            self.assertIn("p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; the remedy is on the install, not this job: name the project in spec.scope", out)
+            self.assertNotIn("the declaration is not fully resolved", out)
 
     def test_each_refusal_is_re_said_from_the_script_s_own_message_with_the_remedy_and_cause_it_has(self) -> None:
         label = "(declared scope: fleet_scope): "
