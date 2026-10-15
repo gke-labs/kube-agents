@@ -1,6 +1,6 @@
 ---
 name: submit-suggestion
-description: Propose declarative configuration updates securely by committing file changes and submitting pull requests (merge requests on GitLab) for SRE review. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
+description: Propose declarative configuration updates securely by committing file changes and submitting pull requests (merge requests on GitLab) for SRE review, including a deletion, which removes the resource's manifest from the repository. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
 ---
 
 # submit-suggestion - Secure GitOps Pull Request Orchestrator
@@ -12,6 +12,7 @@ This skill equips the Platform Agent to propose declarative file updates, GKE in
 - **Declarative File Provisioning:** Triggered when new GKE manifests or configs are requested.
 - **Configuration Upgrades:** Triggered when upgrading version configurations, security patches, or network policies.
 - **Governance Policy Syncs:** Triggered when compliance playbooks or settings require updates.
+- **Deletions:** Triggered when someone asks to delete a resource. See [Deleting a resource](#deleting-a-resource) before Step 2: a pull request can only delete what the repository declares.
 
 _Crucially, you are strictly forbidden from executing direct, manual mutations. All changes must flow through a secure PR path — this skill, or the **fleet-audit** skill for fixes of its findings (below)._
 
@@ -199,6 +200,80 @@ The rule above still holds at Step 3: a file the copy has never seen is not
 swept in for you. `submit` refuses and names it, because it cannot tell a
 manifest you generated from a log you left behind. Stage the ones that belong
 (`git add <path>`) and delete the rest.
+
+### Deleting a resource
+
+A request to delete something (a namespace, a Deployment, a ConfigMap) reaches
+review the same way as any other change, and the only delete a pull request
+can carry is the removal of a manifest the repository already has. Never add a
+file, an annotation or a label to say "delete": nothing reads one you invent,
+and a manifest you add declares its object, so merging it keeps the object.
+
+1. **The repository first.** Before Step 1:
+
+   ```bash
+   python3 "$HERMES_HOME"/scripts/gitops_preflight.py
+   ```
+
+   Any line other than `REGISTERED: ...` is the answer: block with that line as
+   the reason (`kanban_block(kind="needs_input")`), change nothing, and do not
+   look for another way to delete it.
+
+2. **Find the declaration.** After Step 1's `prepare`, search the `workspace`
+   for the object's name, then read each file found and keep the one whose
+   `kind`, `metadata.name` and, for a namespaced object, `metadata.namespace`
+   match:
+
+   ```bash
+   grep -rlE "^\s+name: <name>\s*$" <workspace>
+   ```
+
+3. **The repository declares it.** The change is `git rm` of that file, plus
+   its line in the directory's `kustomization.yaml` `resources:` list when
+   there is one. For a namespace, the objects the repository declares inside
+   it go too, in the same pull request, each named in its body: left behind,
+   they would recreate the namespace. Then continue with Step 3.
+
+4. **The repository does not declare it.** Stop with: "`<repo>` does not
+   declare `<kind>/<name>`, so a pull request cannot delete it: removing a
+   declaration is the only delete a pull request carries. Someone with write
+   access to `<cluster>` has to run the delete. I have changed nothing."
+   Block with that line as the reason. Do not write a manifest for it.
+
+5. **Say what merging will do, from what you read.** Removing the file deletes
+   the object only if a reconciler syncs that directory and prunes. Read the
+   reconciler objects (a `NotFound` for the type means that reconciler is not
+   installed), and match each one's source against `<repo>` and the file's
+   directory:
+
+   ```bash
+   kubectl get applications.argoproj.io -A -o yaml
+   kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A -o yaml
+   kubectl get rootsyncs.configsync.gke.io -A -o yaml
+   kubectl get reposyncs.configsync.gke.io -A -o yaml
+   ```
+
+   - Argo CD prunes only with `spec.syncPolicy.automated.prune: true`; without
+     it the Application goes OutOfSync and someone syncs with prune.
+   - A Flux `Kustomization` prunes only with `spec.prune: true`.
+   - Config Sync deletes the objects it applied when their file goes.
+
+   A `Forbidden` is not an absence: say you could not read the reconcilers,
+   and fall back to the CRDs, which every reader can see:
+
+   ```bash
+   kubectl get crd applications.argoproj.io kustomizations.kustomize.toolkit.fluxcd.io rootsyncs.configsync.gke.io
+   ```
+
+   Name a reconciler in the reply or the pull request body only if you found
+   it syncing that directory. When one prunes, say it will delete the object
+   after merge. Otherwise say: "Merging removes the declaration only. I found
+   nothing on `<cluster>` that deletes what is removed from `<repo>`, so
+   `<kind>/<name>` stays until someone deletes it."
+
+6. **Words.** After a confirmation, say "I'll propose this as a pull request",
+   and report the pull request you opened and the file it removes. Never say
+   "deleting" or "deleted": nothing was deleted.
 
 ### Step 3: Call the Secure Submit Suggestion Script
 
