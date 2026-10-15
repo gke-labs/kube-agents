@@ -15,8 +15,8 @@
 # project's next lease (#1006). Step 4 names the kinds the label cannot reach.
 #
 # Step 0 asks Boskos whether the project is still this run's before any of
-# it: a run that outlived its lease finds its project leased to another run,
-# whose install is not this run's to remove (#3129).
+# it: a run that outlived its lease finds its project free or leased to
+# another run, and whatever is installed there is not its to remove (#3129).
 #
 # One step is conditional. The CRD delete runs when a release record outlives
 # Step 1, which needs its CRDs or the next lease can neither uninstall nor
@@ -80,9 +80,12 @@ readonly PROW_BOSKOS_DEFAULT_HOST="http://boskos.boskos.svc.cluster.local"
 # is ranch's OwnerNotMatch, the lease is not. Anything else (000 when the curl
 # times out, a 5xx while Boskos restarts) is asked again at the next beat. The
 # budget spans three beats at the daemon's 30 s cadence, so one or two blips
-# still reach an answer; without one, a Prow teardown refuses, because a
-# refusal costs one lease's tidiness (the next job's opening sweep takes what
-# is left) and a wrong proceed costs another run's install.
+# still reach an answer; without one, a Prow teardown refuses, because a wrong
+# proceed costs another run's install. A refusal is not free: at the ceiling
+# it leaves this run's objects for the next job's opening sweep, and on the
+# opening sweep itself (Boskos silent for the whole budget right after it
+# granted the lease) it leaves a killed predecessor's objects for the deploy,
+# which can fail on them; that run is then a retest.
 readonly LEASE_CHECK_WAIT_SECONDS="${CI_TEARDOWN_LEASE_CHECK_WAIT_SECONDS:-100}"
 readonly BOSKOS_OWNED_HTTP="200"
 readonly BOSKOS_OWNER_MISMATCH_HTTP="401"
@@ -145,10 +148,9 @@ trap 'kill "${HEARTBEAT_PID}" 2>/dev/null || true; rm -rf "${BEAT_CODES_DIR}"' E
 # projects, other runs leased two of them and installed, and at the ceiling
 # the dead runs' teardowns heartbeated 401, logged "continuing", and
 # uninstalled the new tenants' releases, CRDs and volumes (#3129). A 401 here
-# is that signal: the project is another run's now, and the next tenant's own
-# pre-deploy teardown has already swept whatever this run left, so refusing
-# costs nothing. Only the daemon's answers are read; nothing here is a second
-# Boskos client.
+# is that signal: the project is free or another run's now, and the next
+# tenant's own opening sweep takes whatever this run left. Only the daemon's
+# answers are read; nothing here is a second Boskos client.
 LEASE_ANSWER=""
 LEASE_CODES_SEEN=""
 for ((tick = 0; tick < LEASE_CHECK_WAIT_SECONDS; tick++)); do
@@ -176,7 +178,7 @@ if [ "${LEASE_ANSWER}" = "${BOSKOS_OWNER_MISMATCH_HTTP}" ]; then
   exit 0
 fi
 if [ -z "${LEASE_ANSWER}" ]; then
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Teardown skipped: Boskos gave no definitive answer on ${PROJECT_ID} within ${LEASE_CHECK_WAIT_SECONDS}s (beats: ${LEASE_CODES_SEEN:-none}); refusing rather than risk removing another run's install, and the next job's opening sweep takes what this run left (#3129) ==="
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Teardown skipped: Boskos gave no definitive answer on ${PROJECT_ID} within ${LEASE_CHECK_WAIT_SECONDS}s (beats: ${LEASE_CODES_SEEN:-none}); refusing rather than risk removing another run's install; what is left here waits for the next opening sweep, and a deploy that fails on it is a retest (#3129) ==="
   exit 0
 fi
 

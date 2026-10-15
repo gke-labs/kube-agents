@@ -23,8 +23,8 @@
 #
 # With BOSKOS_HEARTBEAT_CODES_FILE set, every beat's HTTP code is appended
 # there as well, one per line: ci-teardown.sh reads them before it touches the
-# cluster, because a 401 (owner mismatch) means the project has been leased to
-# another run since, and only a 200 proves it has not (#3129).
+# cluster, because a 401 (owner mismatch) means the project is no longer this
+# run's (free, or leased to another run), and only a 200 proves it is (#3129).
 #
 # Disabled (single notice, exit 0) unless BOSKOS_HOST, BOSKOS_RESOURCE_NAME,
 # and BOSKOS_OWNER_NAME are all set. Pool resource names are DNS-safe, so
@@ -58,7 +58,9 @@ BOSKOS_RESOURCE_STATE="${BOSKOS_RESOURCE_STATE:-busy}"
 BOSKOS_HEARTBEAT_LOG="${BOSKOS_HEARTBEAT_LOG:-${ARTIFACTS:-/tmp}/boskos-heartbeat.log}"
 # Where an external command's output lands to be read back (see the header
 # on why not a $(...)). Removed by the stop summary; a SIGKILL leaves it.
-readonly CAPTURE_FILE="${BOSKOS_HEARTBEAT_LOG}.capture"
+# Per process: consecutive steps each run a daemon on the same log, and one
+# that lingers in its last sleep must not remove the next one's file.
+readonly CAPTURE_FILE="${BOSKOS_HEARTBEAT_LOG}.capture.$$"
 # Where each beat's HTTP code goes for a caller that needs the answer before
 # it acts (ci-teardown.sh); empty writes nothing.
 BOSKOS_HEARTBEAT_CODES_FILE="${BOSKOS_HEARTBEAT_CODES_FILE:-}"

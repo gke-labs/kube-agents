@@ -1447,6 +1447,15 @@ else
   rm -f "${CLOUD_BUILD_DESCRIBE_ERR}"
   if [ "${CLOUD_BUILD_OUTCOME}" != "${BUILD_SUCCESS_STATUS}" ]; then
     echo "ERROR: Cloud Build ${CLOUD_BUILD_ID} ${CLOUD_BUILD_OUTCOME}; its log follows (${CLOUD_BUILD_LOG_URL:-no log URL})" >&2
+    # A build this loop gave up on (the cap, or describe failing) may still be
+    # running; cancel it so it stops pushing into a project this run is about
+    # to hand back. A build that ended on its own needs nothing.
+    case "${CLOUD_BUILD_OUTCOME}" in
+      ended\ *) ;;
+      *) with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds cancel "${CLOUD_BUILD_ID}" \
+           --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} >/dev/null \
+           || echo "WARNING: gcloud builds cancel ${CLOUD_BUILD_ID} exited $?; it runs until its own timeout" >&2 ;;
+    esac
     with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds log "${CLOUD_BUILD_ID}" \
       --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} \
       || echo "WARNING: gcloud builds log ${CLOUD_BUILD_ID} exited $?; read it at ${CLOUD_BUILD_LOG_URL:-the Cloud Build console}" >&2

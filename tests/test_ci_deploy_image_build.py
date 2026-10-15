@@ -150,6 +150,7 @@ class CiDeployImageBuildTest(unittest.TestCase):
         self.assertRegex(combined, r"(?i)cap|did not reach a terminal|within 1s")
         self.assertGreaterEqual(len(self._calls("builds describe")), 1, self.calls.read_text())
         self.assertEqual(len(self._calls("builds log")), 1, "the log is printed on the way out")
+        self.assertEqual(len(self._calls("builds cancel")), 1, "a build the loop gave up on is cancelled")
 
     def test_a_failed_build_prints_its_log_and_exits_nonzero(self):
         result = self._run("WORKING FAILURE")
@@ -159,6 +160,7 @@ class CiDeployImageBuildTest(unittest.TestCase):
         self.assertIn(_BUILD_ID, combined)
         self.assertIn(_LOG_LINE, result.stdout, "gcloud builds log output must reach the job log")
         self.assertNotIn("REACHED SECTION 5", result.stdout)
+        self.assertEqual(self._calls("builds cancel"), [], "a build that ended needs no cancel")
 
     def test_a_describe_that_errors_is_polled_again(self):
         result = self._run("ERR ERR SUCCESS")
@@ -177,6 +179,7 @@ class CiDeployImageBuildTest(unittest.TestCase):
         self.assertIn("describe 2110451680007950336 exited 1 (", result.stdout)
         self.assertIn(_BUILD_ID, result.stdout + result.stderr)
         self.assertEqual(len(self._calls("builds log")), 1)
+        self.assertEqual(len(self._calls("builds cancel")), 1)
 
     def test_describe_and_log_carry_the_worker_pools_region(self):
         # The submit's region rides in BUILD_WORKER_ARGS as before; the two
