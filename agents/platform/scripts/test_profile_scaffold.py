@@ -11,11 +11,14 @@ directory cases below are that regression, not a formality.
 """
 
 import io
+import fcntl
 import shutil
 import json
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 from contextlib import redirect_stderr
@@ -216,6 +219,83 @@ class CronStoreMergeTest(unittest.TestCase):
         custom = next(j for j in merged if j["id"] == "legacy-custom")
         self.assertEqual("low", custom.get("risk"))
         self.assertNotIn("risk", legacy, "the merge must not mutate caller input in-place")
+
+    def test_cron_jobs_lock_held_during_overlay(self):
+        """Issue #3179: Hermes' .jobs.lock must be held exclusively while merging jobs.json."""
+        write(self.template / "cron" / "jobs.json", json.dumps({"jobs": [job("audit")]}))
+        write(self.home / "cron" / "jobs.json", json.dumps({"jobs": [job("audit", last_run="yesterday")]}))
+
+        lock_held = False
+        lock_file = self.home / "cron" / ".jobs.lock"
+
+        orig_merge = ps.merge_cron_store
+
+        def probe_merge(*args, **kwargs):
+            nonlocal lock_held
+            self.assertTrue(lock_file.is_file(), ".jobs.lock must exist while merge runs")
+            with open(lock_file, "r") as f:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    lock_held = False
+                except (BlockingIOError, OSError):
+                    lock_held = True
+            return orig_merge(*args, **kwargs)
+
+        with unittest.mock.patch.object(ps, "merge_cron_store", side_effect=probe_merge):
+            ps.overlay_template(self.home, self.template, None, ("cron",))
+
+        self.assertTrue(lock_held, ".jobs.lock was NOT held exclusively during overlay")
+
+    def test_cron_pause_during_overlay_not_lost(self):
+        """Issue #3179: A cron pause landing while gateway starts must survive the merge."""
+        write(self.template / "cron" / "jobs.json", json.dumps({"jobs": [job("audit", prompt="image prompt")]}))
+        write(self.home / "cron" / "jobs.json", json.dumps({"jobs": [job("audit", prompt="old prompt")]}))
+
+        lock_file = self.home / "cron" / ".jobs.lock"
+        (self.home / "cron").mkdir(parents=True, exist_ok=True)
+
+        lock_fd = open(lock_file, "a+")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+        def background_pause():
+            time.sleep(0.05)
+            jobs_path = self.home / "cron" / "jobs.json"
+            data = json.loads(jobs_path.read_text(encoding="utf-8"))
+            data["jobs"][0]["state"] = "paused"
+            data["jobs"][0]["paused_at"] = "2026-10-15T07:23:22Z"
+            jobs_path.write_text(json.dumps(data), encoding="utf-8")
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+
+        t = threading.Thread(target=background_pause)
+        t.start()
+
+        ps.overlay_template(self.home, self.template, None, ("cron",))
+        t.join()
+
+        merged = json.loads((self.home / "cron" / "jobs.json").read_text())["jobs"]
+        self.assertEqual(merged[0]["state"], "paused", "pause state was lost during startup merge")
+        self.assertEqual(merged[0]["paused_at"], "2026-10-15T07:23:22Z")
+        self.assertEqual(merged[0]["prompt"], "image prompt", "image prompt was not updated")
+
+    def test_cron_jobs_lock_timeout_fallback(self):
+        """When .jobs.lock is held and times out, overlay_template still completes."""
+        write(self.template / "cron" / "jobs.json", json.dumps({"jobs": [job("audit", prompt="new")]}))
+        write(self.home / "cron" / "jobs.json", json.dumps({"jobs": [job("audit", prompt="old")]}))
+
+        lock_file = self.home / "cron" / ".jobs.lock"
+        (self.home / "cron").mkdir(parents=True, exist_ok=True)
+        lock_fd = open(lock_file, "a+")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            with unittest.mock.patch.object(ps, "DEFAULT_JOBS_LOCK_TIMEOUT_SECONDS", 0.05):
+                ps.overlay_template(self.home, self.template, None, ("cron",))
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+
+        merged = json.loads((self.home / "cron" / "jobs.json").read_text())["jobs"]
+        self.assertEqual(merged[0]["prompt"], "new")
 
     def test_an_operator_job_with_explicit_risk_is_preserved(self):
         custom_high = {"id": "custom-high", "schedule": {"kind": "cron", "expr": "* * * * *"}, "risk": "high"}
