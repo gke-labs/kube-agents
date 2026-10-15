@@ -449,7 +449,13 @@ func slackRichMarkdown(md string) []map[string]any {
 	for i := 0; i < len(md); {
 		if span, n, ok := slackRichSpan(md, i); ok {
 			flush()
-			out = append(out, span)
+			if bold, _ := span["style"].(map[string]any); bold["bold"] == true && span["type"] == "text" {
+				// A bold run's own spans (a code span, a link, an italic)
+				// draw as they would outside it, each kept bold.
+				out = append(out, slackRichBold(slackRichMarkdown(span["text"].(string)))...)
+			} else {
+				out = append(out, span)
+			}
 			i += n
 			continue
 		}

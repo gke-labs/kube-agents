@@ -56,6 +56,18 @@ func TestSlackRichDocumentDrawsTheBlockForms(t *testing.T) {
 	}
 }
 
+// A bold run's own code span draws as code, kept bold, rather than showing
+// its backticks: a clause cut leaves the rest of a bold first sentence bold.
+func TestSlackRichMarkdownCodeInsideBold(t *testing.T) {
+	got, _ := json.Marshal(slackRichMarkdown("**Because it runs `tail /dev/zero`.** Done."))
+	want := `[{"style":{"bold":true},"text":"Because it runs ","type":"text"},` +
+		`{"style":{"bold":true,"code":true},"text":"tail /dev/zero","type":"text"},` +
+		`{"style":{"bold":true},"text":".","type":"text"},{"text":" Done.","type":"text"}]`
+	if string(got) != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+}
+
 // A table is a preformatted block with its columns lined up, and a rule goes.
 func TestSlackRichDocumentTableAndRule(t *testing.T) {
 	got := slackRichDocument("| a | bb |\n|---|---|\n| ccc | d |\n\n---\n\nend")
