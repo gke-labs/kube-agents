@@ -30,7 +30,7 @@ _CONSTANT_RE = re.compile(r"^readonly GITOPS_(?:SEED|INTENT_NOTE|NOTE_ABSENT|WOR
 # values), so the constants are lifted as the span from the first to the
 # manifest's closing quote line.
 _CONSTANTS_SPAN_RE = re.compile(
-    r"^readonly GITOPS_SEED_FILE=.*?^readonly GITOPS_WORKLOAD_MANIFEST_CONTENT='.*?^              memory: 32Mi'$",
+    r"^readonly GITOPS_SEED_FILE=.*?^readonly GITOPS_WORKLOAD_MANIFEST_CONTENT='[^']*'$",
     re.MULTILINE | re.DOTALL,
 )
 

@@ -484,21 +484,25 @@ spec:
               memory: 16Mi
             limits:
               memory: 32Mi"""
-# What the body read back must declare for the audit's index to key it:
-# the kind, name and namespace, each on a line of its own. Presence alone is
-# not the check: a file at the path that declares another object leaves the
-# finding manual and the cases red with a presence check green.
+# What the body read back must declare for the audit's index to key it
+# (collect.py workload_declarations: kind, metadata.name, metadata.namespace).
+# Presence alone is not the check: a file at the path that declares another
+# object leaves the finding manual and the cases red with a presence check
+# green. Read with PyYAML when it imports, as the index does; the line
+# patterns stand in where it does not.
+GITOPS_WORKLOAD_MANIFEST_OBJECT = ("Deployment", "seeded-reliability", "checkout-gateway")
 GITOPS_WORKLOAD_MANIFEST_LINES = (
     re.compile(r"^kind:\s*Deployment\s*$", re.MULTILINE),
-    re.compile(r"^\s+name:\s*checkout-gateway\s*$", re.MULTILINE),
-    re.compile(r"^\s+namespace:\s*seeded-reliability\s*$", re.MULTILINE),
+    re.compile(r"^  name:\s*checkout-gateway\s*$", re.MULTILINE),
+    re.compile(r"^  namespace:\s*seeded-reliability\s*$", re.MULTILINE),
 )
 # The cases that fail on a project whose repository lacks the declaration:
-# the roster case, and the two #2228 holds for it.
+# the roster case, and the #2228 case parked on this fixture
+# (obtainability-refusal-direct-mutation, nightly, only loses its
+# pull-request arm: its inline-proposal arm passes without the file).
 GITOPS_WORKLOAD_MANIFEST_CASES = (
     "pdb-remediation-pr",
     "obtainability-major-pdb-auto-pr",
-    "obtainability-refusal-direct-mutation",
 )
 
 # Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /
@@ -2926,16 +2930,39 @@ def check_gitops_workload_manifest(project_id: str) -> CheckResult:
             body = base64.b64decode(payload.get("content") or "").decode("utf-8")
     except Exception as exc:
         return CheckResult(name, False, f"Could not parse the contents of {path} in {repo_slug}: {exc}")
-    missing = [line.pattern for line in GITOPS_WORKLOAD_MANIFEST_LINES if not line.search(body)]
-    if missing:
+    problem = _workload_manifest_problem(body)
+    if problem:
         return CheckResult(
             name,
             False,
             f"{repo_slug} carries {path} but it does not declare Deployment/checkout-gateway in seeded-reliability "
-            f"(no line matches {', '.join(missing)}), so the audit's index does not key it and {cases} fail on this project. "
+            f"({problem}), so the audit's index does not key it and {cases} fail on this project. "
             f"Replace it: {gitops_manifest_seed_command(repo_slug, sha)}",
         )
     return CheckResult(name, True, f"{repo_slug} declares Deployment/checkout-gateway at {path}")
+
+
+def _workload_manifest_problem(body: str) -> str:
+    """Why `body` does not declare GITOPS_WORKLOAD_MANIFEST_OBJECT, or "" when it does.
+
+    PyYAML, when it imports, reads the documents the way collect.py's
+    workload_declarations does; without it the line patterns decide.
+    """
+    kind, namespace, name = GITOPS_WORKLOAD_MANIFEST_OBJECT
+    try:
+        import yaml  # noqa: PLC0415 -- optional, as it is for the audit's index
+    except ImportError:
+        missing = [line.pattern for line in GITOPS_WORKLOAD_MANIFEST_LINES if not line.search(body)]
+        return f"no line matches {', '.join(missing)}" if missing else ""
+    try:
+        docs = list(yaml.safe_load_all(body))
+    except yaml.YAMLError as exc:
+        return f"not YAML: {exc}"
+    for doc in docs:
+        meta = doc.get("metadata") if isinstance(doc, dict) else None
+        if isinstance(meta, dict) and str(doc.get("kind") or "") == kind and str(meta.get("name") or "") == name and str(meta.get("namespace") or "") == namespace:
+            return ""
+    return f"no document has kind {kind}, metadata.name {name} and metadata.namespace {namespace}"
 
 
 def check_github_repo_and_app(
