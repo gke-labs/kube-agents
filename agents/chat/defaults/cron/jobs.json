@@ -87,7 +87,7 @@
       "no_agent": true,
       "script": "first_run_audit_gate.py",
       "risk": "low",
-      "enabled": true,
+      "enabled": false,
       "deliver": "local"
     }
   ]

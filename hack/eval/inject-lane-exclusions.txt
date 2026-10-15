@@ -125,3 +125,9 @@ chat-voice-answer-first
 # thread and the lane's delegation wait reads no card ids. Returns to the
 # lane with agent-kanban-smoke.
 chat-fanout-fleet-restarts-rows
+# #2039: grades the worker's needs_input block under the one card the chat front
+# door files for an asked-for choice (scope: workers). The same gap as
+# chat-fanout-fleet-restarts-rows: the lane's delegation wait reads no card
+# ids, so the worker checks fail closed. Returns to the lane with
+# agent-kanban-smoke.
+chat-question-asked-to-choose-pauses

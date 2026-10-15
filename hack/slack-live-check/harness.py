@@ -42,6 +42,10 @@ from decimal import Decimal, InvalidOperation
 from typing import Callable, Optional
 
 SLACK_API_BASE = "https://slack.com/api/"
+# Why thread is not run under --no-status-line (parse_args, check_thread).
+THREAD_LINELESS = ("thread cannot be judged with --no-status-line: without the status line the follow-up's "
+                   "reply cannot be told from the mention task's later posts in the same thread; run thread "
+                   "against a gateway that keeps a status line")
 METADATA_TOKEN_URL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
 METADATA_FLAVOR_HEADER = "Metadata-Flavor"
 METADATA_FLAVOR_VALUE = "Google"
@@ -445,7 +449,7 @@ def classify(text: str) -> str:
     return KIND_ANSWER
 
 
-def read_turn(bot_msgs: list[dict], mode: str) -> Optional[tuple[dict, str]]:
+def read_turn(bot_msgs: list[dict], mode: str, lineless: bool = False) -> Optional[tuple[dict, str]]:
     """The bot's reply to one turn, from its messages since the turn, oldest first.
 
     The status line is the first message in its grammar. Everything before it is
@@ -456,8 +460,14 @@ def read_turn(bot_msgs: list[dict], mode: str) -> Optional[tuple[dict, str]]:
     read by its state: the deliverable
     or the failure notice is posted before the terminal edit, so once the line is
     terminal the last message after it is that post, whatever its first character.
+
+    With lineless (--no-status-line), for a gateway that keeps no status line on
+    Slack, the first post in the failure grammar, else the first post outside the
+    grammar, is the reply: text alone then decides, so a notice the gateway posts
+    outside its grammar reads as an answer.
     """
-    status_at = next((i for i, m in enumerate(bot_msgs) if status_state(m.get("text", ""))), None)
+    # Lineless, a post in the line's grammar (a standalone queue notice) is no status line.
+    status_at = None if lineless else next((i for i, m in enumerate(bot_msgs) if status_state(m.get("text", ""))), None)
     before = bot_msgs if status_at is None else bot_msgs[:status_at]
     for msg in before:
         kind = classify(msg.get("text", ""))
@@ -466,6 +476,11 @@ def read_turn(bot_msgs: list[dict], mode: str) -> Optional[tuple[dict, str]]:
     if mode == WAIT_ANY and before:
         return before[0], KIND_NOTICE
     if status_at is None:
+        if lineless:
+            for kind in (KIND_FAILURE, KIND_ANSWER):
+                posts = [m for m in before if classify(m.get("text", "")) == kind]
+                if posts:
+                    return posts[0], kind
         return None
     status = bot_msgs[status_at]
     state = status_state(status.get("text", ""))
@@ -569,7 +584,7 @@ def wait_for_bot(session: Session, fetch: Callable[[], list[dict]], mode: str, t
         if not bot_msgs:
             return None
         seen["last"] = bot_msgs[-1]
-        return read_turn(bot_msgs, mode)
+        return read_turn(bot_msgs, mode, session.args.no_status_line)
 
     found = poll(step, timeout, session.args.poll_interval, session.clock, session.sleep)
     if found is None:
@@ -600,7 +615,8 @@ def judge_listed_reply(session: Session, name: str, channel: str, sent_ts: str, 
             evidence["last_bot_text"] = truncate(last_seen.get("text", ""))
             if session.args.wait_answer:
                 return CheckResult(name, False, f"the bot posted no answer (--wait-answer) within {timeout}s", evidence)
-            return CheckResult(name, False, f"the bot posted no status line within {timeout}s, only: "
+            missing = "answer" if session.args.no_status_line else "status line"
+            return CheckResult(name, False, f"the bot posted no {missing} within {timeout}s, only: "
                                f"{evidence['last_bot_text']!r}", evidence)
         return CheckResult(name, False, f"no reply from the bot within {timeout}s", evidence)
     if kind == KIND_NOT_STARTED:
@@ -726,6 +742,11 @@ def check_mention(session: Session) -> CheckResult:
 
 
 def check_thread(session: Session) -> CheckResult:
+    # Without a status line nothing marks which bot post is the follow-up's own: the
+    # mention's task keeps posting progress and its result in the same thread after
+    # its ack, so a gateway that dropped the reply would pass on those. Fail closed.
+    if session.args.no_status_line:
+        return CheckResult(CHECK_THREAD, False, THREAD_LINELESS, {"channel": session.channel_id})
     root = session.mention_root or session.args.thread_ts or ""
     if not root:
         return CheckResult(CHECK_THREAD, False, "no thread to reply in: the mention check did not pass in this run and --thread-ts is unset",
@@ -733,9 +754,10 @@ def check_thread(session: Session) -> CheckResult:
     # inbound() in a2a/gateway/slack.go takes an unmentioned reply only in a thread the
     # gateway started a task in (isSessionThread), and startTask posts the status line
     # there. A --thread-ts without one would wait out the settle and blame a steer.
-    if not any(m.get("user") == session.bot_user_id and status_state(m.get("text", ""))
+    if not any(m.get("user") == session.bot_user_id and (session.args.no_status_line or status_state(m.get("text", "")))
                for m in replies_after(session.listed, session.channel_id, root, "0")):
-        return CheckResult(CHECK_THREAD, False, f"thread {root} holds no gateway status line, so the gateway never started "
+        held = "bot post" if session.args.no_status_line else "gateway status line"
+        return CheckResult(CHECK_THREAD, False, f"thread {root} holds no {held}, so the gateway never started "
                            "a task in it, and it takes an unmentioned reply only in a thread it started a task in; "
                            "run mention in the same run, or pass a --thread-ts the bot answered",
                            {"channel": session.channel_id, "thread_ts": root})
@@ -1050,6 +1072,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--type-timeout", type=positive_seconds, default=DEFAULT_TYPE_TIMEOUT_SECONDS,
                         help="seconds a TYPE line waits for the person to type the turn")
     parser.add_argument("--wait-answer", action="store_true", help="wait past the status line for the answer itself")
+    parser.add_argument("--no-status-line", action="store_true",
+                        help="the gateway keeps no status line on Slack (Agent Sessions): read the first answer or failure post as the reply")
     parser.add_argument("--reply-timeout", type=positive_seconds, default=DEFAULT_REPLY_TIMEOUT_SECONDS)
     parser.add_argument("--poll-interval", type=positive_seconds, default=DEFAULT_POLL_INTERVAL_SECONDS)
     parser.add_argument("--unlisted-via", choices=(UNLISTED_VIA_DM, UNLISTED_VIA_MENTION), default=UNLISTED_VIA_DM)
@@ -1078,6 +1102,13 @@ def parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
         parser.error("pass --bot-name <your bot's name> or --bot-user-id <its member id>; there is no default bot name")
     if CHECK_HOME in args.checks and not args.home_channel:
         parser.error("the home check needs --home-channel")
+    # Without a status line nothing marks which bot post is the thread follow-up's own
+    # (check_thread), so thread is left out of the run rather than failed in it.
+    args.thread_skipped = bool(args.no_status_line and CHECK_THREAD in args.checks)
+    if args.thread_skipped:
+        args.checks = [check for check in args.checks if check != CHECK_THREAD]
+        if not args.checks:
+            parser.error(THREAD_LINELESS)
     return args
 
 
@@ -1148,6 +1179,8 @@ def run(args: argparse.Namespace, transport, clock, sleep, wall, typist: Optiona
             return summarize(results)
         setattr(session, f"{label}_label", shown)
 
+    if getattr(args, "thread_skipped", False):
+        say(f"NOTE thread not run: {THREAD_LINELESS}")
     for check in args.checks:
         try:
             outcome = run_check(session, check, home_channel, args.home_since or started)

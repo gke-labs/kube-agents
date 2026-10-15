@@ -878,6 +878,20 @@ class ModesAndArgsTest(unittest.TestCase):
         jobs = [pod_spec(yaml.safe_load(doc))["containers"][0]["args"] for doc in cluster.applied[2::2]]
         self.assertEqual([a[a.index("--checks") + 1] for a in jobs], ["dm,mention", "restart"])
 
+    def test_no_status_line_plans_no_job_around_thread(self):
+        # The harness leaves thread out under the flag; the launcher neither names it in a
+        # Job nor records it as unanswered, and a dm/thread/restart split leaves no
+        # thread-only Job.
+        cluster = FakeCluster()
+        cluster.job_log = "PASS dm: answer\nPASS restart: answer\n"
+        code, out = run_launch(cluster, "--context", CONTEXT, "--checks", "dm,thread,restart", "--after-restart",
+                               "--", "--no-status-line")
+        self.assertEqual(code, launch.EXIT_OK, out)
+        self.assertIn("NOTE thread not run", out)
+        self.assertNotIn("FAIL thread", out)
+        jobs = [pod_spec(yaml.safe_load(doc))["containers"][0]["args"] for doc in cluster.applied[2::2]]
+        self.assertEqual([a[a.index("--checks") + 1] for a in jobs], ["dm", "restart"])
+
     def test_cleanup_validates_no_harness_flags(self):
         cluster = FakeCluster()
         cluster.namespaces["slack-test"] = {"app.kubernetes.io/name": "slack-live-check"}
