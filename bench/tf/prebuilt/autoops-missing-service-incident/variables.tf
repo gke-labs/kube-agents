@@ -50,7 +50,7 @@ variable "agent_deployment" {
 }
 
 variable "agent_container" {
-  type        = string
+  type = string
   # k8s-event-watcher is not a container of its own: it runs inside the
   # agent-api-auth sidecar of the gateway pod (buildAgentAPIAuthSidecar in
   # k8s-operator/internal/controller/platformagent_manifests.go). It used to
