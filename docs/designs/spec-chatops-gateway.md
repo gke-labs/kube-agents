@@ -1039,7 +1039,8 @@ not be silent about it.
   (`InboundObserver`), because neither is knowable from what the conversation received: the heal
   posts twice before `startTask` announces, so a door concluding "answered without a task" from
   posts alone can tell its caller nothing started while the turn goes on to mint a task that then
-  runs unobserved; and the unverified-sender notice is posted once per sender, so a second
+  runs unobserved; and the unverified-sender notice is posted once per sender (never for an
+  unaddressed message), so a second
   message from the same author posts nothing at all. The notice's own dedupe stays the gateway's.
 
 - `GET /conversations/{key}` returns what the relay posted, as a sequence a caller pages through
@@ -1711,7 +1712,9 @@ table is maintained by hand, which is honest at the current install count.
 **Unverified senders.** Dropped at ingress, as everywhere (on Slack that is an unlisted
 sender; an unmapped one is attributed by member id, below) - but visibly now: the gateway
 posts a one-line notice to the conversation, once per sender, and keeps the structured
-log line. A silent drop of a real user is a support burden. Per sender, not per
+log line. The exception is a message the sender addressed to nobody (`Unaddressed`: an
+unmentioned Slack reply under one of the bot's own posts, #3246), which is dropped with a
+debug log line only and does not count as the sender's notice. A silent drop of a real user is a support burden. Per sender, not per
 conversation - a channel mention mints a fresh conversation every time, so a
 conversation-scoped dedupe would be no bound at all. The memory is capped and evicted
 wholesale at the cap, so the worst an unverified sender can do is make one notice

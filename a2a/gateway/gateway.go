@@ -724,8 +724,15 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 	backend = g.backendFor(msg)
 	principal = g.resolvePrincipal(backend, msg.AuthorID)
 	if principal == "" {
-		g.log.Warn("dropping message from unverified sender",
-			"backend", backend, "author", msg.AuthorID, "conversation", msg.Conversation)
+		if msg.Unaddressed {
+			// Someone off the list talking under one of the bot's posts, to a
+			// colleague as often as not: routine, so not a Warn per message.
+			g.log.Debug("dropping unaddressed message from unverified sender",
+				"backend", backend, "author", msg.AuthorID, "conversation", msg.Conversation, "unaddressed", true)
+		} else {
+			g.log.Warn("dropping message from unverified sender",
+				"backend", backend, "author", msg.AuthorID, "conversation", msg.Conversation)
+		}
 		// Keyed by backend and case-folded author: one gateway has several
 		// ingresses, and the same id on two of them is not the same sender,
 		// so a notice on one must not silence the other. Case-folded because
