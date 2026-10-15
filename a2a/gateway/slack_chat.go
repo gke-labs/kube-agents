@@ -71,9 +71,9 @@ const (
 	// slackChatRawTextCell is the Slack table cell type that shows its text
 	// as written.
 	slackChatRawTextCell = "raw_text"
-	// slackChatMrkdwn is the text object type Slack parses as mrkdwn; the
-	// renderer sends it verbatim, so Slack links and mentions nothing the
-	// text does not spell out as <url|label>.
+	// slackChatMrkdwn is the text object type Slack parses as mrkdwn, which
+	// the renderer no longer writes; refuseSlackChat still reads every one
+	// for a mention (slackMrkdwnTexts).
 	slackChatMrkdwn = "mrkdwn"
 	// slackChatActionsBlock is the block the renderer writes its buttons
 	// into, the one block refuseSlackChat lets carry interactive elements.
@@ -89,7 +89,7 @@ var slackChatColors = map[string]string{
 }
 
 // errSlackChatTooLarge is a valid chat message that is more than one Slack
-// message holds: the fold's text past its sections, the blocks past Slack's
+// message holds: the fold's text past its container's blocks, the blocks past Slack's
 // count, the fallback past the text cap. The caller posts the fallback.
 var errSlackChatTooLarge = errors.New("the chat message is more than one Slack message holds")
 

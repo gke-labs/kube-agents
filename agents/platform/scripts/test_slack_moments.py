@@ -668,6 +668,13 @@ class AnswerChoicesTest(unittest.TestCase):
         self.assertIsNotNone(m.answer_choices(f"{findings}\n\nWhich should I fix first?"))
         self.assertIsNotNone(m.answer_choices(f"{findings}\n\nWhat would you prefer?"))
 
+    def test_recommended_after_the_bold_lead_is_primary_and_leaves_the_line(self):
+        shown, _folded, _question, options = m.answer_choices(
+            "1. **Fix it** (Recommended): use sleep.\n2. **Raise it**: give it 512Mi.\n\nWhich?"
+        )
+        self.assertEqual(options, [("Fix it", True), ("Raise it", False)])
+        self.assertEqual(shown, "1. **Fix it** — use sleep.\n2. **Raise it** — give it 512Mi.")
+
     def test_only_the_first_recommended_is_primary(self):
         _s, _f, _q, options = m.answer_choices("- **A (recommended)**\n- **B (Recommended)**\n\nWhich one?")
         self.assertEqual(options, [("A", True), ("B", False)])

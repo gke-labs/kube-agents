@@ -131,6 +131,19 @@ func TestSlackRichLongListIsCut(t *testing.T) {
 	}
 }
 
+// A one-line ```cmd``` is a code span in prose, not a fence opener that
+// would swallow what follows it.
+func TestSlackRichDocumentOneLineTripleBacktickIsCode(t *testing.T) {
+	got := slackRichDocument("Run ```kubectl rollout restart deploy/api``` now.\n```kubectl get pods```\nThen check.")
+	if kinds := slackRichKinds(got); strings.Join(kinds, " ") != "rich_text_section" {
+		t.Fatalf("kinds = %v, want one section of prose", kinds)
+	}
+	raw, _ := json.Marshal(got)
+	if !strings.Contains(string(raw), "Then check.") || !strings.Contains(string(raw), "kubectl get pods") {
+		t.Fatalf("a line went missing: %s", raw)
+	}
+}
+
 // A fence that never closes runs to the end, as CommonMark reads it.
 func TestSlackRichDocumentUnclosedFence(t *testing.T) {
 	got := slackRichDocument("look:\n```\nkubectl get pods")

@@ -212,7 +212,7 @@ The commands below assume the default resource names (`platform-agent`) and the 
 
    The startup line should carry `"executor":"api"`. Its `"profile":"platform"` is the bus address the bridge takes tasks from, not the Hermes profile that runs the turn. With `"executor":"cli"` (the operator setting `A2A_BRIDGE_EXECUTOR=cli`, or a bridge with no API server key), each message runs as a one-off `hermes -p platform` command instead: the Platform Agent answers it directly, with no Planning Agent and no memory of the thread, and a card it files does not report back to the thread.
 
-3. **The Planning Agent files a card and acknowledges.** It routes the request the way it does under `today`: to the Cluster Agent for a named cluster's live runtime state when one is on the roster, otherwise to `platform`. It files a kanban card for that specialist, then replies with one short line naming what is being checked, such as `checking prod-east.` The gateway posts that line as a message and the status line becomes `✅ completed`. The turn has ended; the work has not. The gateway logs the end of the turn:
+3. **The Planning Agent files a card and acknowledges.** It routes the request the way it does under `today`: to the Cluster Agent for a named cluster's live runtime state when one is on the roster, otherwise to `platform`. It files a kanban card for that specialist, then replies with one short line naming what is being checked, such as `checking prod-east.` The gateway posts that line as a message (and, on Google Chat, the status line becomes `✅ completed`). The turn has ended; the work has not. The gateway logs the end of the turn:
 
    ```bash
    kubectl logs deployment/platform-agent-a2a-gateway -n kubeagents-system -c gateway | grep '"msg":"task terminal"'

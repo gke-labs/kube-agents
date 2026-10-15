@@ -343,6 +343,11 @@
       "in": "The ingress controller on seeded-c keeps dropping long-lived websocket connections at startup, *because the node pool has no headroom left* today, so the HPA cannot add a replica. Raise the pool.",
       "headline": "The ingress controller on seeded-c keeps dropping long-lived websocket connections at startup, because the node pool has no headroom left today.",
       "body": ["So the HPA cannot add a replica. Raise the pool."]
+    },
+    {
+      "in": "If the pool is full, the HPA cannot add a replica and the queue keeps growing until the ingress controller on seeded-c drops long-lived websocket connections at startup. Raise the pool.",
+      "headline": "If the pool is full, the HPA cannot add a replica and the queue keeps growing until the ingress controller on seeded-c drops long-lived websocket…",
+      "body": ["Raise the pool."]
     }
   ],
   "plain": [
@@ -971,6 +976,23 @@
           },
           {
             "text": "short"
+          }
+        ]
+      }
+    },
+    {
+      "in": "Two fixes.\n\n1. **Fix the command** (Recommended): change it to `sleep infinity`.\n2. **Raise the limit**: give it 512Mi.\n\nWhich should I do?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Two fixes.",
+        "detail": "1. **Fix the command** — change it to `sleep infinity`.\n2. **Raise the limit** — give it 512Mi.\n\nWhich should I do?",
+        "choices": [
+          {
+            "text": "Fix the command",
+            "primary": true
+          },
+          {
+            "text": "Raise the limit"
           }
         ]
       }

@@ -19,7 +19,8 @@ import (
 // rule goes, as on the text path (slack_blocks.go).
 var (
 	// slackRichFenceRE opens a fenced block: its indent, then a run of three
-	// or more backticks or tildes.
+	// or more backticks or tildes. A backtick run with a backtick after it on
+	// the line (```cmd```) is a code span, as CommonMark reads it.
 	slackRichFenceRE = regexp.MustCompile("^( *)(`{3,}|~{3,})")
 	// slackRichItemRE is a list item: its indent, its marker (a bullet, or a
 	// number and its "." or ")"), whitespace, the item's text.
@@ -68,7 +69,8 @@ func slackRichDocument(md string) []map[string]any {
 	d := &slackRichDoc{proseFrom: -1}
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
-		if m := slackRichFenceRE.FindStringSubmatch(line); m != nil {
+		if m := slackRichFenceRE.FindStringSubmatch(line); m != nil &&
+			!(m[2][0] == '`' && strings.Contains(line[len(m[0]):], "`")) {
 			i = d.fence(lines, i, len(m[1]), m[2])
 			continue
 		}

@@ -1782,7 +1782,7 @@ no buttons it has no bar, and its tone shows nowhere (the text states the fact e
 in the detail and the fold's text is drawn as rich text (`slackRichDocument`): a heading as a bold
 line, a fenced block as `rich_text_preformatted` (one inside a list item loses the item's indent),
 bullet and numbered lists as `rich_text_list` with their nesting as its `indent` and a numbered
-list's first number as its `offset`, a quote as `rich_text_quote`, a table as a preformatted block
+list's first number less one as its `offset`, a quote as `rich_text_quote`, a table as a preformatted block
 with its columns lined up, a rule dropped, and paragraphs a blank line apart. Inline, it and the
 rows and `after` keep code spans, bold, italic, strike and links whose url passes the links rule,
 the label check included; anything else shows as written. Every field goes out as `rich_text` or

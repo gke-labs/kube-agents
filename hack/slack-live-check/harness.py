@@ -462,7 +462,8 @@ def read_turn(bot_msgs: list[dict], mode: str, lineless: bool = False) -> Option
     grammar, is the reply: text alone then decides, so a notice the gateway posts
     outside its grammar reads as an answer.
     """
-    status_at = next((i for i, m in enumerate(bot_msgs) if status_state(m.get("text", ""))), None)
+    # Lineless, a post in the line's grammar (a standalone queue notice) is no status line.
+    status_at = None if lineless else next((i for i, m in enumerate(bot_msgs) if status_state(m.get("text", ""))), None)
     before = bot_msgs if status_at is None else bot_msgs[:status_at]
     for msg in before:
         kind = classify(msg.get("text", ""))

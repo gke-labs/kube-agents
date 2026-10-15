@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -91,6 +92,19 @@ func TestTheSideDoorKeepsTheLineForItsDoors(t *testing.T) {
 	}
 	if (&sideDoorAdapter{primary: newFakeAdapter()}).ShowsTaskStatus("discord:g/1") {
 		t.Error("a primary that shows no status: want the rolling line kept")
+	}
+}
+
+// A setStatus error is said at Warn once per text, so a missing scope is one
+// line rather than one per event.
+func TestASessionErrorIsWarnedOnce(t *testing.T) {
+	s := &SlackAdapter{}
+	scope, other := errors.New("missing_scope"), errors.New("ratelimited")
+	if !s.firstSessionError(scope) || s.firstSessionError(scope) {
+		t.Error("missing_scope: want the first warned and the second not")
+	}
+	if !s.firstSessionError(other) {
+		t.Error("a different error: want it warned too")
 	}
 }
 

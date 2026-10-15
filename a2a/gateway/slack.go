@@ -222,6 +222,9 @@ type SlackAdapter struct {
 	sessionStates map[string]*slackSession
 	sessionOrder  []string
 	syncSessions  bool
+	// sessionErrorsSeen is the setStatus error texts already logged at Warn
+	// (firstSessionError), under s.mu.
+	sessionErrorsSeen map[string]bool
 
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.

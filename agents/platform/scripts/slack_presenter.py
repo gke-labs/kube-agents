@@ -385,6 +385,12 @@ CLAUSE_BREAK = re.compile(r"(?:,|;|\s+[—–])\s+|(?P<connector>\s+)(?:due\s+to
 #: A rest a comma, semicolon or dash cut may not leave: one opening on a relative word hangs off the
 #: noun before the cut ("…, which exhausts its limit"), so it reads as no sentence of its own.
 CLAUSE_RELATIVE = re.compile(r"(?:which|who|whom|whose|where|that)\b", re.IGNORECASE)
+#: A head a comma, semicolon or dash cut may not leave: a leading subordinate clause ("If the pool
+#: is full.") states a condition, not the finding.
+CLAUSE_SUBORDINATE = re.compile(
+    r"(?:if|when|whenever|while|although|though|because|since|unless|until|after|before|once|as|whether)\b",
+    re.IGNORECASE,
+)
 #: The shortest headline a clause cut may leave, its stop included: "In seeded-a." names nothing.
 CLAUSE_HEADLINE_MIN = 20
 #: A clause cut never falls inside a parenthetical or a link's label or url.
@@ -772,6 +778,8 @@ def clause_cut(sentence: str) -> tuple[str, str] | None:
                for marker, (opener, _closer) in ITALIC_EDGES.items()):
             continue
         if not connector and CLAUSE_RELATIVE.match(rest):
+            continue
+        if not connector and CLAUSE_SUBORDINATE.match(_plain(_restore_code(head, spans))):
             continue
         if head[-1:] not in CLAUSE_ENDS:
             head += CLAUSE_STOP

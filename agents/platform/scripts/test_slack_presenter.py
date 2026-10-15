@@ -483,6 +483,11 @@ class ClauseCutTest(unittest.TestCase):
         )
         self.assertEqual(head.count("*") % 2, 0)
 
+    def test_no_leading_subordinate_clause_as_the_headline(self):
+        sentence = ("If the pool is full, the HPA cannot add a replica and the queue keeps growing until the "
+                    "ingress controller on seeded-c drops long-lived websocket connections.")
+        self.assertIsNone(sp.clause_cut(sentence))
+
     def test_too_short_a_headline_is_no_cut(self):
         self.assertIsNone(sp.clause_cut("In seeded-a, " + "z " * 80))
 

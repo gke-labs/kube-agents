@@ -1495,6 +1495,11 @@ class NoStatusLineTest(unittest.TestCase):
         failed = {"text": "❌ failed: reason: spawn-failed", "ts": "3"}
         self.assertEqual(harness.read_turn([answer, failed], harness.WAIT_ANSWER, lineless=True), (failed, harness.KIND_FAILURE))
 
+    def test_a_standalone_queue_notice_is_no_status_line(self):
+        queued = {"text": "⏳ *queued* — 3 requests are ahead of yours; I'll start on it as soon as there's room", "ts": "2"}
+        answer = {"text": "*payments-api is CrashLooping.*", "ts": "3"}
+        self.assertEqual(harness.read_turn([queued, answer], harness.WAIT_ANSWER, lineless=True), (answer, harness.KIND_ANSWER))
+
     def test_a_steer_still_ends_the_turn_first(self):
         steer = {"text": harness.STEER_QUEUED_ACK, "ts": "2"}
         self.assertEqual(harness.read_turn([steer], harness.WAIT_ANSWER, lineless=True), (steer, harness.KIND_STEER))

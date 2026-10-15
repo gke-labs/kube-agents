@@ -56,6 +56,8 @@ const (
 var (
 	clauseBreak = regexp.MustCompile(`(?i)(?:,|;|` + pySpace + `+[—–])` + pySpace + `+|(` + pySpace + `+)(?:due` + pySpace + `+to|because)\b`)
 	itemLine    = regexp.MustCompile(`^( {0,3})([-*+•]|\p{Nd}+[.)]|[A-Za-z][.)])` + pySpace + `+([^` + pySpaceChars + `].*?)` + pySpace + `*$`)
+	// clauseSubordinate is CLAUSE_SUBORDINATE, matched at the head's start.
+	clauseSubordinate = regexp.MustCompile(`(?i)^(?:if|when|whenever|while|although|though|because|since|unless|until|after|before|once|as|whether)\b`)
 	// clauseRelative is CLAUSE_RELATIVE, matched at the rest's start.
 	clauseRelative = regexp.MustCompile(`(?i)^(?:which|who|whom|whose|where|that)\b`)
 	boldLead       = regexp.MustCompile(`^\*\*(.+?)\*\*|^__(.+?)__`)
@@ -123,6 +125,9 @@ func clauseCut(sentence string) (string, string, bool) {
 			continue
 		}
 		if !connector && clauseRelative.MatchString(r) {
+			continue
+		}
+		if !connector && clauseSubordinate.MatchString(plainLine(restoreCode(h, spans, false))) {
 			continue
 		}
 		italic := false
@@ -286,8 +291,14 @@ func optionOf(item listItem) (answerOption, bool) {
 	text := item.text
 	lead := boldLead.FindStringSubmatchIndex(text)
 	said, raw := "", text
+	marked := false
 	if lead != nil {
-		said = strings.TrimLeft(text[lead[1]:], leadJoiner)
+		said = text[lead[1]:]
+		// "**Fix it** (Recommended): …" marks the option outside its bold.
+		if loc := recommended.FindStringIndex(said); loc != nil && loc[0] == 0 {
+			said, marked = said[loc[1]:], true
+		}
+		said = strings.TrimLeft(said, leadJoiner)
 		if lead[2] >= 0 {
 			raw = text[lead[2]:lead[3]]
 		} else {
@@ -295,7 +306,7 @@ func optionOf(item listItem) (answerOption, bool) {
 		}
 	}
 	label := plainLine(raw)
-	primary := recommended.MatchString(label)
+	primary := marked || recommended.MatchString(label)
 	label = strings.Join(strings.Fields(optionNum.ReplaceAllString(recommended.ReplaceAllString(label, ""), "")), " ")
 	label = pyStrip(strings.TrimRight(label, labelTrim))
 	if label == "" || (lead == nil && runeLen(label) > buttonTextMax) {

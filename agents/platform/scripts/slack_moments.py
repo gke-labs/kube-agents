@@ -679,9 +679,12 @@ def _option(marker: str, text: str, continuation: Sequence[str]) -> tuple[str, b
     line carry all the item says.
     """
     lead = BOLD_LEAD.match(text)
-    said = text[lead.end():].lstrip(LEAD_JOINER) if lead else ""
+    said = text[lead.end():] if lead else ""
+    # "**Fix it** (Recommended): …" marks the option outside its bold as well.
+    marked = RECOMMENDED.match(said)
+    said = said[marked.end():].lstrip(LEAD_JOINER) if marked else said.lstrip(LEAD_JOINER)
     label = _presenter._plain(lead.group(1) or lead.group(2) if lead else text)
-    primary = bool(RECOMMENDED.search(label))
+    primary = bool(marked or RECOMMENDED.search(label))
     label = " ".join(OPTION_NUMBER.sub("", RECOMMENDED.sub("", label)).split()).rstrip(":").strip()
     if not label or (not lead and len(label) > _presenter.BUTTON_TEXT_MAX):
         return None
