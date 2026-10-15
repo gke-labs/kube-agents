@@ -110,6 +110,18 @@ class RecordGithubGitopsKeysTest(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
                 self.assertEqual(dest.read_text(), "PROJECT_ID=p\n")
 
+    def test_the_interview_drift_warning_leaves_out_the_keys_the_run_records(self):
+        dest = self._tmp / "install.env"
+        dest.write_text("GITOPS_ORG=acme\nGITOPS_REPO=old-infra\nGITHUB_APP_ID=7\nMODEL_PROVIDER=gemini\n")
+        # An interactive run (the warning names answers typed at the interview).
+        proc = self._bash(f'has_controlling_tty() {{ return 0; }}\nPARAM_NON_INTERACTIVE=false\n'
+                          f'export GITOPS_ORG=acme GITOPS_REPO=new-infra GITHUB_APP_ID=7 MODEL_PROVIDER=vertex_ai\n'
+                          f'warn_unrecorded_interview_answers "{dest}"\n')
+        out = proc.stdout + proc.stderr
+        self.assertIn("MODEL_PROVIDER=vertex_ai", out)
+        self.assertNotIn("GITOPS_REPO=", out)
+        self.assertIn('scripts/installer/README.md ("install.env")', out)
+
     def test_it_runs_where_the_run_commits_and_nowhere_earlier(self):
         # The --generate-only handoff (its lifecycle.sh apply renders the keys)
         # and the apply; never before the step-11 decision.
@@ -260,15 +272,23 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
         self.assertNotIn("in fra", proc.stdout.split("Set these lines", 1)[-1])
         self.assertIn("INFO:   GITOPS_REPO=<the GitOps repository's name>", proc.stdout)
 
-    def test_no_context_says_the_check_did_not_run_and_passes(self):
-        # An applying run has already been refused by the scope check for the
-        # same context; a preview, and --generate-only, are told what to check.
-        for mode in ("warn", ""):
-            with self.subTest(mode=mode or "refuse"):
-                proc = self._run({}, mode=mode, context_present=False)
-                self.assertIn("rc=0", proc.stdout)
-                self.assertIn("WARN: The GitOps check did not run: the kubeconfig has no context", proc.stdout)
-                self.assertIn("kubectl get deployment github-token-minter -n kubeagents-system", proc.stdout)
+    def test_no_context_refuses_outside_a_preview(self):
+        # --generate-only reaches the guard with only the generator's
+        # best-effort context fetch behind it, so a missing context refuses.
+        proc = self._run({}, context_present=False)
+        self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("ERROR: Refusing to apply: the kubeconfig has no context", proc.stdout)
+        self.assertIn("gcloud container clusters get-credentials c --location r --project p", proc.stdout)
+        proc = self._run({}, mode="warn", context_present=False)
+        self.assertIn("rc=0", proc.stdout)
+        self.assertIn("WARN: The GitOps check did not run: the kubeconfig has no context", proc.stdout)
+
+    def test_a_run_that_keeps_the_minter_but_points_it_elsewhere_is_named_before_the_apply(self):
+        proc = self._run({"TFVARS_ENABLE_GITHUB_MINTER": "true", "GITOPS_ORG": "firstorg", "GITOPS_REPO": "gke-fleet-iac"})
+        self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("WARN: This run points the GitHub token minter at firstorg/gke-fleet-iac, but it serves sackheads/ka-test-infra now.", proc.stdout)
+        self.assertIn("set GITOPS_ORG=sackheads and GITOPS_REPO=ka-test-infra", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
 
     def test_a_plan_warns_and_goes_on(self):
         proc = self._run({}, mode="warn")
@@ -278,7 +298,9 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
 
     def test_the_cases_with_nothing_to_protect_pass_silently(self):
         for label, keys, git_repo, ctx, minter in (
-            ("the minter stays on", {"TFVARS_ENABLE_GITHUB_MINTER": "true"}, "sackheads/ka-test-infra", True, True),
+            ("the minter stays on, same repository", {"TFVARS_ENABLE_GITHUB_MINTER": "true", "GITOPS_ORG": "sackheads",
+                                                      "GITOPS_REPO": "ka-test-infra"}, "sackheads/ka-test-infra", True, True),
+            ("the minter stays on, no context", {"TFVARS_ENABLE_GITHUB_MINTER": "true"}, "sackheads/ka-test-infra", False, True),
             ("no live GitOps", {}, "", True, False),
             ("gitlab", {"GITOPS_FORGE": "gitlab"}, "sackheads/ka-test-infra", True, True),
             ("removed on purpose", {"KUBE_AGENTS_REMOVE_GITOPS": "true"}, "sackheads/ka-test-infra", True, True),
@@ -343,6 +365,10 @@ class ValidateGithubAppIdTest(unittest.TestCase):
         install = _INSTALL_SH.read_text()
         self.assertLess(install.index("validate_github_app_id \"${PARAM_GITHUB_APP_ID:-}\""),
                         install.index("check_flags_against_install_env || exit 1"))
+        # The label names the flag only when --github-app-id itself was passed
+        # (--github-pem-path sets the shared GitHub-App flag too).
+        self.assertIn('PARAM_GITHUB_APP_ID_FROM_FLAG="true"; shift ;;', install)
+        self.assertIn('"$([ "${PARAM_GITHUB_APP_ID_FROM_FLAG:-false}" = "true" ] && echo "--github-app-id" || echo "GITHUB_APP_ID in ${INSTALL_ENV_FILE:-install.env}")"', install)
         # The interview asks again at the prompt, before the KMS questions.
         ask = install.index('while [ -n "$github_app_id" ] && ! validate_github_app_id "$github_app_id" "GitHub App ID"; do')
         self.assertLess(ask, install.index('prompt_read "Cloud KMS Keyring Name" kms_keyring', ask - 2000))

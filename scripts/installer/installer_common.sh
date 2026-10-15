@@ -1670,7 +1670,8 @@ live_github_app_id() {
 refuse_apply_dropping_live_gitops() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" file="${2:-install.env}" mode="${3:-}"
   local ctx cr_json minter="" live_repo live_org repo_name app_id say=print_error lead="Refusing to apply: "
-  [ "${TFVARS_ENABLE_GITHUB_MINTER:-false}" = "true" ] && return 0
+  local minter_stays_on="false"
+  [ "${TFVARS_ENABLE_GITHUB_MINTER:-false}" = "true" ] && minter_stays_on="true"
   [ "${GITOPS_FORGE:-github}" = "github" ] || return 0
   # Removing GitOps on purpose is the one case this is not.
   is_truthy "${KUBE_AGENTS_REMOVE_GITOPS:-false}" && return 0
@@ -1679,11 +1680,19 @@ refuse_apply_dropping_live_gitops() {
   [ -n "${PROJECT_ID:-}" ] && [ -n "${CLUSTER_NAME:-}" ] && [ -n "${REGION:-}" ] || return 0
   ctx="$(gke_context_name)"
   if ! kubectl config get-contexts "$ctx" >/dev/null 2>&1; then
-    # An applying run has already been refused by the scope check for the same
-    # missing context. A preview, and --generate-only (which fetches none),
-    # say this check did not run.
-    print_warning "The GitOps check did not run: the kubeconfig has no context '${ctx}'. Before applying, check it would not remove a running GitHub token minter: kubectl get deployment ${GITHUB_MINTER_DEPLOYMENT} -n ${namespace}."
-    return 0
+    # With the minter rendered on there is nothing to destroy; the re-point
+    # notice below is best-effort.
+    [ "$minter_stays_on" = "true" ] && return 0
+    # Like an unreadable Deployment below: a preview says the check did not
+    # run; a run that applies or hands off (--generate-only, whose context
+    # comes only from the generator's best-effort fetch) is refused.
+    if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+      print_warning "The GitOps check did not run: the kubeconfig has no context '${ctx}'. An applying run refuses until it can check for a running GitHub token minter."
+      return 0
+    fi
+    print_error "Refusing to apply: the kubeconfig has no context '${ctx}', so this run cannot tell whether the apply would destroy a running GitHub token minter."
+    print_info "Fetch it (gcloud container clusters get-credentials ${CLUSTER_NAME} --location ${REGION} --project ${PROJECT_ID}) and re-run the same command."
+    return 1
   fi
   # The minter's own Deployment is what the apply would destroy, whichever
   # spelling the PlatformAgent declares its repository in: the deprecated
@@ -1695,6 +1704,7 @@ refuse_apply_dropping_live_gitops() {
   local minter_out=""
   if ! minter_out="$( (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
     get deployment "$GITHUB_MINTER_DEPLOYMENT" -n "$namespace" -o name --ignore-not-found 2>/dev/null) )"; then
+    [ "$minter_stays_on" = "true" ] && return 0
     if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
       print_warning "The GitOps check did not run: the ${GITHUB_MINTER_DEPLOYMENT} Deployment in namespace '${namespace}' could not be read. An applying run refuses until it can be."
       return 0
@@ -1764,6 +1774,17 @@ print((org if ok.match(org or "") else "-") + "\t" + (name if ok.match(name or "
   [ -n "$minter" ] || return 0
   repo_name="$live_repo"
   [ -z "$live_org" ] || [ -z "$live_repo" ] || live_repo="${live_org}/${live_repo}"
+  # The minter stays on, so nothing is destroyed; but a run that fell back to
+  # an auto-selected organisation or the default repository name would point
+  # the running minter at another repository, and record it. Said before the
+  # confirmation, so an unintended re-point is caught there.
+  if [ "$minter_stays_on" = "true" ]; then
+    if [ -n "$live_org" ] && [ -n "$repo_name" ] &&
+      { [ "${GITOPS_ORG:-}" != "$live_org" ] || [ "${GITOPS_REPO:-}" != "$repo_name" ]; }; then
+      print_warning "This run points the GitHub token minter at ${GITOPS_ORG:-}/${GITOPS_REPO:-}, but it serves ${live_repo} now. If that is not intended, set GITOPS_ORG=${live_org} and GITOPS_REPO=${repo_name} in ${file} (or pass --gitops-org/--gitops-repo) before applying."
+    fi
+    return 0
+  fi
   app_id="$(live_github_app_id "$namespace")"
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
     say=print_warning

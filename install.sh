@@ -987,7 +987,7 @@ parse_args() {
       --gitlab-token-file=*) PARAM_GITLAB_TOKEN_FILE="${1#*=}"; shift ;;
       --gitlab-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; shift ;;
       --gitops-ca-file=*) PARAM_GITOPS_CA_FILE="${1#*=}"; PARAM_GITOPS_CA_FILE_FROM_FLAG="true"; shift ;;
-      --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
+      --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_APP_ID_FROM_FLAG="true"; shift ;;
       --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
       --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
       --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
@@ -1768,7 +1768,8 @@ install_env_records_key() {
 # menu gets the Pub/Sub topic destroyed by this apply and re-created by the
 # next run, because the file still says the integration is on. Nothing else
 # tells them: "Kept your install configuration" reads as reassurance, and the
-# Day-2 menu's Save & Apply is the only path that writes a changed key back.
+# Day-2 menu's Save & Apply is the path that writes a changed key back (the
+# GitOps keys aside: see scripts/installer/README.md, "install.env").
 #
 # A warning rather than a write, deliberately. Making install.sh persist here
 # would contradict the contract stated in install.env.example, INSTALL.md and
@@ -1833,12 +1834,22 @@ warn_unrecorded_interview_answers() {
       *) current="${!key:-}" ;;
     esac
     [ "$recorded" != "$current" ] || continue
+    # The GitHub GitOps keys follow the answer when the run commits
+    # (record_github_gitops_keys), so they are not drift to report.
+    case "$key" in
+      GITOPS_ORG | GITOPS_REPO | GITHUB_APP_ID)
+        if [ "${GITOPS_FORGE:-github}" = "github" ] && [ -n "${GITOPS_ORG:-}" ] &&
+          [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ]; then
+          continue
+        fi
+        ;;
+    esac
     drifted="${drifted}${drifted:+ }${key}"
   done
   [ -n "$drifted" ] || return 0
 
   print_warning "This run applied answers that ${file} does not record."
-  print_info "install.env is an input: install.sh reads it and never changes a key it sets, except its GitOps forge keys when an applied run changes them."
+  print_info "install.env is an input: install.sh changes only the keys scripts/installer/README.md (\"install.env\") lists, and these are not among them."
   print_info "The next run -- or upgrade.sh, or the Day-2 menu -- regenerates from"
   print_info "the file, which will revert what you just changed. Update these keys:"
   for key in $drifted; do
@@ -5736,7 +5747,7 @@ main() {
   # A GitHub App ID that is a name rather than the App's number (#3076), from
   # the flag or install.env, before the interview and any --dry-run preview.
   validate_github_app_id "${PARAM_GITHUB_APP_ID:-}" \
-    "$([ "${PARAM_GITHUB_APP_FROM_FLAG:-false}" = "true" ] && echo "--github-app-id" || echo "GITHUB_APP_ID")" || exit 1
+    "$([ "${PARAM_GITHUB_APP_ID_FROM_FLAG:-false}" = "true" ] && echo "--github-app-id" || echo "GITHUB_APP_ID in ${INSTALL_ENV_FILE:-install.env}")" || exit 1
   # The chat flags and --mode against an existing install.env, as soon as
   # is_truthy and the defaults are loaded: a flag that disagrees with the file
   # stops the run here, before the interview and long before anything is

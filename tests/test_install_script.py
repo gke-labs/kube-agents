@@ -6147,7 +6147,8 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
             "tf_compose_dir() { printf '%s' \"$TF_DIR\"; }\n"
             f"{generator}"
             "check_service_account_ownership() { :; }\ngke_dns_endpoint_flag() { :; }\ngcloud() { :; }\n"
-            "refuse_apply_over_undeclared_scope() { :; }\nannounce_platform_agent_mode_for_apply() { :; }\n"
+            "refuse_apply_over_undeclared_scope() { :; }\nrefuse_apply_dropping_live_gitops() { :; }\n"
+            "announce_platform_agent_mode_for_apply() { :; }\n"
             "check_scope_container_access() { :; }\nenable_scope_selector_apis() { :; }\n"
             'apply_crd_upgrades() { echo "APPLIED crds"; }\nrun_lifecycle_apply() { echo "APPLIED terraform"; }\n'
         )
