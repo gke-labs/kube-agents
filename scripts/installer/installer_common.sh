@@ -1426,19 +1426,27 @@ tf_state_prefix() {
 # seconds before creating the key ring and key. An ERE, for grep -E: the API
 # has been named "Google Cloud KMS API" and "Cloud Key Management Service (KMS)
 # API" in this message, and both end the same way. Matching lifecycle.sh.
-KMS_API_PROPAGATION_PATTERN="${KMS_API_PROPAGATION_PATTERN:-KMS\)? API has not been used in project}"
+KMS_API_PROPAGATION_PATTERN='KMS\)? API has not been used in project'
 
 _sanitize_kms_int() {
-  local val="$1" default_val="$2" min_val="${3:-0}"
+  local val="$1" default_val="$2" min_val="${3:-0}" name="${4:-}"
+  if [ -z "$val" ]; then
+    echo "$default_val"
+    return 0
+  fi
   if [[ "$val" =~ ^[0-9]{1,9}$ ]] && [ "$val" -ge "$min_val" ]; then
     echo "$val"
   else
+    if [ -n "$name" ]; then
+      if type print_warning >/dev/null 2>&1; then
+        print_warning "${name}='${val}' is not a whole number >= ${min_val}; using default ${default_val}." >&2
+      else
+        echo -e "  ⚠ ${name}='${val}' is not a whole number >= ${min_val}; using default ${default_val}." >&2
+      fi
+    fi
     echo "$default_val"
   fi
 }
-
-KMS_API_PROPAGATION_ATTEMPTS="$(_sanitize_kms_int "${KMS_API_PROPAGATION_ATTEMPTS:-5}" 5 1)"
-KMS_API_PROPAGATION_WAIT_SECONDS="$(_sanitize_kms_int "${KMS_API_PROPAGATION_WAIT_SECONDS:-60}" 60 0)"
 
 # Retries a Cloud KMS command on Cloud KMS's first-enablement 403
 # (KMS_API_PROPAGATION_PATTERN). On a fresh GCP project, Cloud KMS can answer 403
@@ -1446,9 +1454,9 @@ KMS_API_PROPAGATION_WAIT_SECONDS="$(_sanitize_kms_int "${KMS_API_PROPAGATION_WAI
 # echoed on completion; retry warnings are printed to stderr.
 retry_kms_create() {
   local max_attempts
-  max_attempts="$(_sanitize_kms_int "${KMS_API_PROPAGATION_ATTEMPTS:-5}" 5 1)"
+  max_attempts="$(_sanitize_kms_int "${KMS_API_PROPAGATION_ATTEMPTS:-}" 5 1 "KMS_API_PROPAGATION_ATTEMPTS")"
   local wait_seconds
-  wait_seconds="$(_sanitize_kms_int "${KMS_API_PROPAGATION_WAIT_SECONDS:-60}" 60 0)"
+  wait_seconds="$(_sanitize_kms_int "${KMS_API_PROPAGATION_WAIT_SECONDS:-}" 60 0 "KMS_API_PROPAGATION_WAIT_SECONDS")"
   local attempt=1 status=0 output=""
   while :; do
     output="$(trap - ERR; "$@" 2>&1)" && status=0 || status=$?

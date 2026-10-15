@@ -3756,9 +3756,18 @@ ensure_existing_cluster_cmek() {
   local key_resource="projects/${project_id}/locations/${kms_location}/keyRings/${keyring}/cryptoKeys/${key}"
   print_info "Enabling CMEK database encryption on existing cluster '$cluster_name' (key: $key_resource)..."
   gcloud services enable cloudkms.googleapis.com --project="$project_id"
-  retry_kms_create gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id" >/dev/null || true
-  retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
-    --purpose="encryption" --project="$project_id" >/dev/null || true
+  local kr_err="" k_err=""
+  kr_err="$(trap - ERR; retry_kms_create gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id" 2>&1)" || true
+  if printf '%s\n' "$kr_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    print_error "Cloud KMS keyring create failed after propagation retries: $kr_err"
+    return 1
+  fi
+  k_err="$(trap - ERR; retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
+    --purpose="encryption" --project="$project_id" 2>&1)" || true
+  if printf '%s\n' "$k_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    print_error "Cloud KMS key create failed after propagation retries: $k_err"
+    return 1
+  fi
   local project_number service_agent
   project_number=$(gcloud projects describe "$project_id" --format="value(projectNumber)")
   service_agent="service-${project_number}@container-engine-robot.iam.gserviceaccount.com"
@@ -5161,16 +5170,27 @@ import_github_pem() {
   # `INVALID_ARGUMENT: Import-only keys must skip initial version creation` without
   # it. It matches skip_initial_version_creation in terraform/modules/github-minter,
   # which is where the key normally comes from.
-  kms_key_err="$(trap - ERR; retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
-    --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
-    --import-only --skip-initial-version-creation \
-    --protection-level=software --project="$project_id")" || true
+  if printf '%s\n' "$kms_ring_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    kms_key_err="skipped: keyring creation exhausted Cloud KMS API propagation retry budget"
+  else
+    kms_key_err="$(trap - ERR; retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
+      --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
+      --import-only --skip-initial-version-creation \
+      --protection-level=software --project="$project_id")" || true
+  fi
 
   # The assertion, not the create, is what makes a failure visible. Whatever went
   # wrong above, the import cannot work without this key, and saying so here names
   # the cause instead of leaving a confusing failure two steps later.
-  if ! retry_kms_create gcloud kms keys describe "$key" --keyring="$keyring" --location="$kms_location" \
+  local kms_describe_failed=0
+  if printf '%s\n' "$kms_ring_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN" || \
+     printf '%s\n' "$kms_key_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    kms_describe_failed=1
+  elif ! retry_kms_create gcloud kms keys describe "$key" --keyring="$keyring" --location="$kms_location" \
     --project="$project_id" >/dev/null; then
+    kms_describe_failed=1
+  fi
+  if [ "$kms_describe_failed" -ne 0 ]; then
     # Deliberately says "could not be confirmed" rather than "does not exist":
     # describe also fails on an IAM denial for cloudkms.cryptoKeys.get or an API
     # blip, and asserting absence from that would be stating more than was

@@ -4406,8 +4406,13 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
                 ["bash", "-c", body],
                 capture_output=True,
                 text=True,
-                env=get_isolated_test_env(bin_dir=str(bin_dir), overrides=merged_env),
+                env=get_isolated_test_env(
+                    bin_dir=str(bin_dir),
+                    overrides=merged_env,
+                    absent=["KMS_API_PROPAGATION_ATTEMPTS", "KMS_API_PROPAGATION_PATTERN"],
+                ),
                 cwd=str(_REPO_ROOT),
+                timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
             )
             calls = log.read_text().splitlines() if log.exists() else []
             return proc, calls
@@ -4636,6 +4641,21 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
         kr_creates = [c for c in calls if "kms keyrings create" in c]
         self.assertEqual(len(kr_creates), 1, "unrelated API 403 must not be retried")
 
+    def test_import_github_pem_skips_key_create_when_keyring_create_exhausts_retries(self):
+        """When keyring create exhausts its KMS 403 retries, keys create and describe are skipped."""
+        proc, calls = self._run(
+            keyrings_fail_first=5,
+            env_overrides={"KMS_API_PROPAGATION_ATTEMPTS": "2"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        k_creates = [c for c in calls if "kms keys create" in c]
+        k_describes = [c for c in calls if "kms keys describe" in c]
+        self.assertEqual(len(kr_creates), 2, f"expected 2 attempts before exhaustion, got calls: {calls}")
+        self.assertEqual(len(k_creates), 0, "keys create must be skipped after keyring exhaustion")
+        self.assertEqual(len(k_describes), 0, "keys describe must be skipped after keyring exhaustion")
+        self.assertIn("could not be confirmed to exist", proc.stdout)
+
     def test_main_turns_a_failed_import_into_a_hard_exit(self):
         """The two returns above are only fatal because main() makes them so.
 
@@ -4676,7 +4696,10 @@ source "{_INSTALLER_COMMON}"
             ["bash", "-c", body],
             capture_output=True,
             text=True,
-            env=get_isolated_test_env(overrides=merged),
+            env=get_isolated_test_env(
+                overrides=merged,
+                absent=["KMS_API_PROPAGATION_ATTEMPTS", "KMS_API_PROPAGATION_PATTERN"],
+            ),
             cwd=str(_REPO_ROOT),
             timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
         )
@@ -4793,9 +4816,21 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{lifecycle_sh}"
             ["bash", "-c", script],
             capture_output=True,
             text=True,
+            env=get_isolated_test_env(absent=["KMS_API_PROPAGATION_ATTEMPTS", "KMS_API_PROPAGATION_PATTERN"]),
             cwd=str(_REPO_ROOT),
+            timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_sanitize_kms_int_warns_on_invalid_value(self):
+        script = """
+_sanitize_kms_int "invalid" 5 1 "TEST_KMS_KNOB"
+_sanitize_kms_int "0" 5 1 "TEST_KMS_KNOB_ZERO"
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("TEST_KMS_KNOB='invalid' is not a whole number >= 1; using default 5", proc.stderr)
+        self.assertIn("TEST_KMS_KNOB_ZERO='0' is not a whole number >= 1; using default 5", proc.stderr)
 
 
 class EnsureExistingClusterCmekKmsTest(unittest.TestCase):
@@ -4853,8 +4888,10 @@ ensure_existing_cluster_cmek p1 c1 us-central1-a
                 env=get_isolated_test_env(
                     bin_dir=str(bin_dir),
                     overrides={"KMS_API_PROPAGATION_WAIT_SECONDS": "0"},
+                    absent=["KMS_API_PROPAGATION_ATTEMPTS", "KMS_API_PROPAGATION_PATTERN"],
                 ),
                 cwd=str(_REPO_ROOT),
+                timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
             )
             calls = log.read_text().splitlines() if log.exists() else []
 
@@ -4866,6 +4903,55 @@ ensure_existing_cluster_cmek p1 c1 us-central1-a
         self.assertEqual(len(k_creates), 2, f"expected retry on key create, got calls: {calls}")
         self.assertEqual(len(b_creates), 2, f"expected retry on key binding, got calls: {calls}")
         self.assertIn("Cloud KMS was enabled minutes ago and has not finished propagating", proc.stderr)
+
+    def test_cmek_skips_later_creates_when_keyring_create_exhausts_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            log = pathlib.Path(tmp) / "gcloud.log"
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> '{log}'
+case "$*" in
+  *'container clusters describe'*)
+    echo "UNKNOWN" ;;
+  *'projects describe'*)
+    echo "12345" ;;
+  *'kms keyrings create'*)
+    echo "Error 403: Google Cloud KMS API has not been used in project p1 before or it is disabled." >&2
+    exit 1 ;;
+  *)
+    exit 0 ;;
+esac
+exit 0
+""")
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+source "{_INSTALLER_COMMON}"
+ensure_existing_cluster_cmek p1 c1 us-central1-a
+"""
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(
+                    bin_dir=str(bin_dir),
+                    overrides={"KMS_API_PROPAGATION_WAIT_SECONDS": "0", "KMS_API_PROPAGATION_ATTEMPTS": "2"},
+                    absent=["KMS_API_PROPAGATION_PATTERN"],
+                ),
+                cwd=str(_REPO_ROOT),
+                timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
+            )
+            calls = log.read_text().splitlines() if log.exists() else []
+
+        self.assertEqual(proc.returncode, 1)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        k_creates = [c for c in calls if "kms keys create" in c]
+        b_creates = [c for c in calls if "kms keys add-iam-policy-binding" in c]
+        self.assertEqual(len(kr_creates), 2)
+        self.assertEqual(len(k_creates), 0, "key create should be skipped when keyring create exhausts retry budget")
+        self.assertEqual(len(b_creates), 0, "binding should be skipped when keyring create exhausts retry budget")
 
 
 class InstallEnvIsCreatedInTheCheckoutTest(unittest.TestCase):
