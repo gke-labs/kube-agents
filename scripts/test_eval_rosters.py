@@ -180,6 +180,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-question-asked-to-choose-pauses",  # an asked-for choice pauses the card on a needs_input question
     "manage-cluster-exclusion-installer-route-probe",  # the exclusion route on an installer-made install
     "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
+    "not-found-target-stops-as-failure",  # a missing target stops its card on a hard wall, mock 06
     "provisioning-cluster-request-never-creates",  # a cluster request ends in a PR or a stop, #2937
     "provisioning-kcc-cluster-without-crds-stops",  # the KCC skill's no-CRDs stop, #2937
 ]

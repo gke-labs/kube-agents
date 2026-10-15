@@ -180,13 +180,26 @@ FOLDED_KIND = "completed"
 #: malformed chain from walking the board.
 FOLD_ANCESTOR_DEPTH = 8
 
-#: A card parked by a give-up: still ``blocked``, with a ``gave_up`` as its
-#: latest stop, as ``slack_ux_reactions.OPEN_CARDS_SQL`` reads it. ``{card}``
-#: is the alias of its ``tasks`` row.
+#: Hermes's hard-wall block kind, as a ``blocked`` event's payload names it:
+#: "no access, missing credentials, an action no agent can do"
+#: (``KANBAN_BLOCK_SCHEMA``), such as a target that does not exist. Such a
+#: card has stopped as a give-up stops, parked at ``blocked`` for a human, so
+#: it settles as one (:func:`settles_as`); ``needs_input`` stays a pause.
+HARD_WALL_BLOCK_KIND = "capability"
+#: The kind a hard-wall block settles as.
+GAVE_UP_KIND = "gave_up"
+#: The most of a hard-wall block's reason its line carries, as
+#: ``slack_ux_moments.needs_you`` clips a question's.
+HARD_WALL_REASON_LIMIT = 2000
+
+#: A card parked by a give-up: still ``blocked``, with a ``gave_up`` or a
+#: hard-wall block as its latest stop, as ``slack_ux_reactions.OPEN_CARDS_SQL``
+#: reads it. ``{card}`` is the alias of its ``tasks`` row.
 GAVE_UP_SQL = (
-    "({card}.status = 'blocked' AND COALESCE((SELECT g.kind FROM task_events g "
+    "({card}.status = 'blocked' AND COALESCE((SELECT CASE g.kind WHEN 'blocked' "
+    "THEN json_extract(g.payload, '$.kind') ELSE g.kind END FROM task_events g "
     "WHERE g.task_id = {card}.id AND g.kind IN ('blocked', 'unblocked', 'gave_up') "
-    "ORDER BY g.id DESC LIMIT 1), '') = 'gave_up')"
+    "ORDER BY g.id DESC LIMIT 1), '') IN ('" + GAVE_UP_KIND + "', '" + HARD_WALL_BLOCK_KIND + "'))"
 )
 
 #: One row when the card's nearest ancestor that created more than one card is
@@ -348,6 +361,13 @@ def result_line(kind: str, payload: object) -> str:
     line = HEADING_MARKS.sub("", str(payload.get("summary") or "").strip())
     line = EMPHASIS_MARKS.sub(r"\2", CODE_MARKS.sub(r"\1", LINK_MARKS.sub(r"\1", line)))
     return progress_note({"note": line})
+
+
+def settles_as(kind: str, payload: object) -> str:
+    """The kind an event settles its plan row and its ask as: a hard-wall block as a give-up, else its own."""
+    if kind == NEEDS_YOU_KIND and isinstance(payload, dict) and payload.get("kind") == HARD_WALL_BLOCK_KIND:
+        return GAVE_UP_KIND
+    return kind
 
 
 def rolling_line(kind: str, payload: object) -> str:
@@ -869,7 +889,7 @@ def _chat_notify() -> Any:
 
 
 def _with_answer(adapter: Any, quiet: Any, kind: str, message: str, metadata: Optional[dict]) -> Optional[dict]:
-    """``metadata`` with a completed card's report laid out as an answer, for the chat.notify stand-in.
+    """``metadata`` with a completed card's report, or a hard-wall block's reason, laid out as an answer, for the chat.notify stand-in.
 
     Under ``spec.mode: next`` the gateway lays the report out from a
     ``kube-agents.chat/v1`` answer (``chat_message.answer_message``). Only with
@@ -892,6 +912,31 @@ def _with_answer(adapter: Any, quiet: Any, kind: str, message: str, metadata: Op
     if chat is None:
         return metadata
     return {**(metadata or {}), notify.CHAT_METADATA_KEY: chat}
+
+
+def hard_wall_line(payload: object, message: str) -> str:
+    """What a hard-wall block posts, if anything does: the worker's own reason, else the notifier's line.
+
+    The notifier's line for a ``blocked`` event reads as a pause; the reason is
+    the worker's sentence saying what it could not find or do.
+    """
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    return clip_handoff(reason, HARD_WALL_REASON_LIMIT) if isinstance(reason, str) and reason.strip() else message
+
+
+def _wake_reply_lost(adapter: Any) -> bool:
+    """Whether a wake for this card is answered where no one sees it.
+
+    Under ``spec.mode: next`` a conversation card's wake is self-posted into
+    the bridge's session and its reply goes nowhere
+    (``kanban_chat_notify.ConversationNotifyAdapter``), so a line held for it
+    would never be told. Only a hard-wall block is posted instead (see
+    :func:`deliver`): a give-up or crash on such a card is still held and
+    dropped, a gap this module leaves to the next-mode wake work.
+    """
+    notify = _chat_notify()
+    stand_in = getattr(notify, "ConversationNotifyAdapter", None) if notify is not None else None
+    return isinstance(stand_in, type) and isinstance(adapter, stand_in)
 
 
 def _explained_by_wake(quiet: Any, sub: dict, kind: str) -> bool:
@@ -994,13 +1039,19 @@ async def deliver(
     ``None``, once the plan shows that row complete (:data:`FOLDED_KIND`).
     Every line it posts, holds or edits keeps
     the ``@assignee`` and drops the board tag and ``Kanban <id>``
-    (:func:`slack_line`). A card blocked on ``needs_input``
+    (:func:`slack_line`), except a hard-wall block's, which is the worker's
+    reason alone. A card blocked on ``needs_input``
     posts its question instead of the blocked line, once however often the
     notifier replays the event, and loses that question's buttons at its next
     event; a PR the card opened, read from its ``pr_opened`` event or, as the
     fallback, from a note or report saying a PR was opened, is
     followed by that PR as a message of its own. See
-    ``gateway/slack_ux_moments.py``.
+    ``gateway/slack_ux_moments.py``. A card blocked on Hermes's hard-wall kind
+    (:data:`HARD_WALL_BLOCK_KIND`) asks nothing: its row and its ask settle as
+    a give-up's, red and ❌ (:func:`settles_as`), and the line it holds or posts
+    is the worker's reason (:func:`hard_wall_line`). Under ``spec.mode: next``
+    a conversation card's wake reply is never posted, so that line posts
+    rather than waiting on the wake (:func:`_wake_reply_lost`).
     """
     chat_id = sub["chat_id"]
     tracked = tracked_messages(watcher)
@@ -1012,11 +1063,17 @@ async def deliver(
     header, message = _slack_heads(quiet, sub, header, board, message)
 
     if kind not in ROLLING_KINDS:
+        # The row and the ask settle a hard-wall block as a give-up; the
+        # question and the wake's hold still read the event's own kind.
+        settled_as = settles_as(kind, getattr(ev, "payload", None))
+        hard_wall = quiet is not None and settled_as != kind
+        if hard_wall:
+            message = hard_wall_line(getattr(ev, "payload", None), message)
         plan = _slack_plan(quiet)
         shown = False
         if plan is not None:
             result = result_line(kind, getattr(ev, "payload", None))
-            shown = await _settle_plan_row(plan, adapter, sub, kind, result, title)
+            shown = await _settle_plan_row(plan, adapter, sub, settled_as, result, title)
         if entry and entry["message_id"] and entry["lines"]:
             # A queued line says the card is waiting; once it settles that is
             # stale, so the settled message keeps only the card's own notes.
@@ -1041,25 +1098,28 @@ async def deliver(
             return None
         await _settle_question(moments, adapter, sub, kind, event_id)
         if kind == NEEDS_YOU_KIND and moments is not None and await _needs_you(moments, adapter, sub, ev):
-            await _settle_reaction(adapter, sub, kind, board)
+            await _settle_reaction(adapter, sub, settled_as, board)
             return None
         if kind == FOLDED_KIND and shown and await _folds(sub, board):
             # The row says it; the creator's completion carries the answer.
-            await _settle_reaction(adapter, sub, kind, board)
+            await _settle_reaction(adapter, sub, settled_as, board)
             await _pr_opened(moments, adapter, sub, _with_summary(ev, message), None)
             return None
-        if _explained_by_wake(quiet, sub, kind) and _hold(
+        if not (hard_wall and _wake_reply_lost(adapter)) and _explained_by_wake(quiet, sub, kind) and _hold(
             quiet, watcher, sub, kind, event_id, message, metadata,
         ):
-            await _settle_reaction(adapter, sub, kind, board)
+            await _settle_reaction(adapter, sub, settled_as, board)
             return None
-        result = await adapter.send(chat_id, message, metadata=_with_answer(adapter, quiet, kind, message, metadata))
+        laid_out = ANSWER_KIND if hard_wall else kind
+        result = await adapter.send(
+            chat_id, message, metadata=_with_answer(adapter, quiet, laid_out, message, metadata),
+        )
         # A failed post raises in the notifier, which rewinds its claim so the
         # next tick posts again, and that post settles. After the notifier's
         # MAX_SEND_FAILURES it drops the subscription instead, and the ask
         # never settles.
         if getattr(result, "success", True) is not False:
-            await _settle_reaction(adapter, sub, kind, board)
+            await _settle_reaction(adapter, sub, settled_as, board)
         if kind == PR_REPORT_KIND:
             await _pr_opened(moments, adapter, sub, _with_summary(ev, message), result)
         return result
