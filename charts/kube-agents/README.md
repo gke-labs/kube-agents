@@ -418,6 +418,7 @@ whether a scrape is configured, and the operator's own read of the counters and
 cluster gauges into `status.usage` does not depend on it.
 
 Non-GMP clusters scrape these metrics through the corresponding alternative knobs:
+
 - `platformAgent.serviceMonitor` renders Prometheus Operator `ServiceMonitor` objects and headless metrics `Service`s for the three pods (selects `monitoring.coreos.com/v1/ServiceMonitor`).
 - `platformAgent.vmPodScrape` renders VictoriaMetrics Operator `VMPodScrape` objects for the three pods (selects `operator.victoriametrics.com/v1beta1/VMPodScrape`).
 
