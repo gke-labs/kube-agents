@@ -537,8 +537,9 @@ ONBOARDING_STATE = re.compile(r"bootstrap_scan_filed|bootstrap_handoff_filed|oob
 
 
 def task_stack(case: str) -> str:
-    match = re.search(r'^\s*stack:\s*"?([^"\n#]+?)"?\s*$', (TASKS_DIR / case / "task.yaml").read_text(encoding="utf-8"), re.M)
-    return match.group(1) if match else ""
+    """The stack the script resolves for a case, through its own task_stack."""
+    out = run_bash(lifted("task_stack") + f' && task_stack "{TASKS_DIR / case / "task.yaml"}"').stdout
+    return out.strip()
 
 
 def stack_text(stack: str) -> str:
@@ -585,7 +586,12 @@ class StateLockTest(unittest.TestCase):
         for task in sorted(TASKS_DIR.glob("*/task.yaml")):
             case = task.parent.name
             stack = task_stack(case)
-            if stack and (TF_ROOT / stack).is_dir() and ONBOARDING_STATE.search(stack_text(stack)):
+            if not stack:
+                continue
+            # A stack the script resolves but this test cannot read would pass
+            # unchecked, so it is a failure, not a skip.
+            self.assertTrue((TF_ROOT / stack).is_dir(), f"{case}: stack {stack!r} is not a directory under bench/tf")
+            if ONBOARDING_STATE.search(stack_text(stack)):
                 rewriters.append(case)
         self.assertIn("oobe-first-run-audits", rewriters)
         self.assertIn("bootstrap-discovery-fanout", rewriters)
@@ -603,25 +609,27 @@ class StateLockTest(unittest.TestCase):
                 self.assertLess(own, main.index("get-credentials"))
                 self.assertLess(own, main.index("kubectl"))
 
-    def test_the_state_lock_is_taken_before_the_streams_or_with_the_infra_lock(self):
-        # Off the infra lock, a unit takes it after the task lock and before its
-        # streams. A stack-bearing unit takes it only while it holds the infra
+    def test_the_state_lock_is_taken_after_the_stream_waits_or_with_the_infra_lock(self):
+        # Off the infra lock, a unit takes it once its stream locks are held and
+        # wait_platform_runs is over, so it holds the state only while its stack
+        # is in use. A stack-bearing unit takes it only while it holds the infra
         # lock, so it never holds the state lock while queued for infra.
         unit = lifted("run_one_unit")
         task_lock = unit.index('lock_acquire "${STATE_DIR}/lock-task-${name}"')
-        blocking = unit.index('lock_acquire "${STATE_DIR}/lock-state-${state_lock}"')
         stream_lock = unit.index('lock_acquire "${STATE_DIR}/lock-stream-${s}"')
+        wait = unit.index('wait_platform_runs "${name} rep ${rep}" "${streams}"')
+        blocking = unit.index('lock_acquire "${STATE_DIR}/lock-state-${state_lock}"')
         infra_lock = unit.index('lock_acquire "${STATE_DIR}/lock-infra"')
         one_try = unit.index('mkdir "${STATE_DIR}/lock-state-${state_lock}"')
-        self.assertIn('if [ -n "${state_lock}" ] && [ -z "${has_stack}" ]; then', unit[task_lock:blocking])
-        self.assertLess(task_lock, blocking)
-        self.assertLess(blocking, stream_lock)
-        self.assertLess(stream_lock, infra_lock)
+        self.assertIn('if [ -n "${state_lock}" ] && [ -z "${has_stack}" ]', unit[wait:blocking])
+        self.assertLess(task_lock, stream_lock)
+        self.assertLess(stream_lock, wait)
+        self.assertLess(wait, blocking)
+        self.assertLess(blocking, infra_lock)
         self.assertLess(infra_lock, one_try)
-        # Given back after the run and in skip_unit, and on the stream give-up
-        # path only when held: a stack-bearing unit has not taken it there.
-        self.assertIn('[ -n "${state_held}" ] && release_state_lock "${name}"', unit)
-        self.assertEqual(unit.count('release_state_lock "${name}"'), 2)
+        # Given back after the run and in skip_unit, the two places a unit
+        # reaches only holding it; no give-up path before them took it.
+        self.assertEqual(unit.count('release_state_lock "${name}"'), 1)
         self.assertIn('release_state_lock "${name}"', lifted("skip_unit"))
 
     def stack_unit(self, hold_state: str, deadline: int) -> subprocess.CompletedProcess:
@@ -689,24 +697,21 @@ class StateLockTest(unittest.TestCase):
         self.assertIn("RELEASED", out)
 
     def test_the_state_lock_deadline_outlasts_every_holder(self):
-        # Each case on the lock may wait out its streams and the infra queue
-        # while it holds it, then keep its stack applied.
+        # Each case on the lock keeps its stack applied while it holds it, and a
+        # stack-bearing waiter queues for infra between its tries.
         body = "\n".join(
             [
                 lifted("unit_state_lock"),
                 lifted("state_lock_deadline"),
                 lifted_constant("STATE_LOCK_HOLD_SECONDS"),
                 "INFRA_LOCK_DEADLINE=100",
-                'stream_lock_deadline() { echo 10; }',
-                "TASKS=(a b c d)",
                 "TASK_NAMES=(oobe-first-run-audits bootstrap-discovery-fanout capacity-pinned-pool-probe bootstrap-inventory-ranking-delivery)",
-                'TASK_STREAMS=("s1 s2 s3 s4" "" "s1" "")',
                 "state_lock_deadline onboarding",
                 "state_lock_deadline none",
             ]
         )
         hold = int(lifted_constant("STATE_LOCK_HOLD_SECONDS").split("=")[1])
-        self.assertEqual(run_bash(body).stdout.split(), [str(3 * (100 + hold) + 4 * 10), "0"])
+        self.assertEqual(run_bash(body).stdout.split(), [str(3 * (100 + hold)), "0"])
 
     def test_the_task_lock_waits_out_a_previous_rep_on_the_state_lock(self):
         unit = lifted("run_one_unit")

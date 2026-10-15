@@ -261,14 +261,21 @@
 # own, and its unit runs devops-bench on a private copy of the shared one. The
 # onboarding state lock keeps it apart from bootstrap-discovery-fanout and
 # bootstrap-inventory-ranking-delivery, whose stacks rewrite the same markers
-# and `oobe` job. Its unit_cost_hint goes to 3000s, the top of the queue, so its
-# three repetitions (~150 lane-minutes at 2530-3144s each) start first, in one
-# of the eight lanes, beside the chain rather than on it. Its four audit-stream
-# locks still hold the audit cases on those streams back while it runs: the
-# compliance-audit stream already carries nine other units, so that stream's
-# chain grows by the same ~150 minutes plus the audits each repetition leaves
-# running. The bootstrap cases take the state lock only while they hold the
-# infra lock, in one try, so a busy one costs the chain nothing. #2699
+# and `oobe` job. Its unit_cost_hint goes to 3000s, the top of the queue, so
+# each repetition launches first in its repetition round: repetition 1 at the
+# start of the night, 2 and 3 once every unit of the round before has
+# launched, each then waiting on its stream locks and the previous
+# repetition's audits (wait_platform_runs). That is ~150 lane-minutes at
+# 2530-3144s a repetition, beside the chain rather than on it, but spread
+# across the night, so the later repetitions can extend the night's tail. Its
+# four audit-stream locks still hold the audit cases on those streams back
+# while it runs: the compliance-audit stream already carries nine other units,
+# so that stream's chain grows by the same ~150 minutes plus the audits each
+# repetition leaves running. It takes the state lock only once its stream
+# waits are over, and the bootstrap cases take it only while they hold the
+# infra lock, in one try. A bootstrap unit that finds it busy gives the infra
+# lock back and keeps its lane for up to one oobe run (~50 minutes), which
+# costs the chain nothing unless the chain has nothing else left to run. #2699
 # made it gradable: tool_calls_optional lets its no-tool reply pass the liveness
 # rung that graded the first night blocked. The first night with it measures
 # whether the main part still fits; if it does not, it is parked again. Counted

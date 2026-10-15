@@ -2660,7 +2660,8 @@ unit_cost_hint() {
     # the previous repetition's audits to finish (wait_platform_runs), then the
     # stack waits for the stage to run the four one after another (1-15 min
     # each, #985; up to its chain_wait, 3600s). 2530-3144s a repetition on the
-    # nightly of 2026-10-09; the top of the list, so it starts first.
+    # nightly of 2026-10-09; the top of the list, so it launches first in each
+    # repetition round.
     oobe-first-run-audits) echo 3000 ;;
     # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
@@ -2890,7 +2891,7 @@ STATE_DIR="$(mktemp -d)"
 #                 name. Serial reps are also what keeps them comparable.
 #   per state  -- cases whose stacks rewrite the same agent-install state
 #                 (unit_state_lock) never overlap. A unit off the infra lock
-#                 takes it after the task lock and before its streams; a
+#                 takes it after its streams and wait_platform_runs; a
 #                 stack-bearing unit takes it only while it holds the infra
 #                 lock, in one try, giving the infra lock back when it is
 #                 busy. No unit holds it while queued for infra, and no unit
@@ -2981,21 +2982,15 @@ release_streams() { # <space-separated audit ids>
   for s in $1; do lock_release "${STATE_DIR}/lock-stream-${s}"; done
 }
 
-# How long a unit waits for a state lock: every case holding it may, while it
-# does, wait out each of its stream locks, then keep its stack applied for
-# STATE_LOCK_HOLD_SECONDS; a stack-bearing waiter queues for the infra lock
-# between its tries, one INFRA_LOCK_DEADLINE a case.
+# How long a unit waits for a state lock: every case holding it keeps its
+# stack applied for up to STATE_LOCK_HOLD_SECONDS, and a stack-bearing waiter
+# queues for the infra lock between its tries, one INFRA_LOCK_DEADLINE a case.
 state_lock_deadline() { # <lock>
-  local total=0 i s
-  for i in "${!TASKS[@]}"; do
-    [ "$(unit_state_lock "${TASK_NAMES[i]}")" = "$1" ] || continue
-    total=$((total + INFRA_LOCK_DEADLINE + STATE_LOCK_HOLD_SECONDS))
-    # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
-    for s in ${TASK_STREAMS[i]}; do
-      total=$((total + $(stream_lock_deadline "${TASK_NAMES[i]}" "${s}" "${TASK_STREAMS[i]}")))
-    done
+  local n=0 t
+  for t in "${TASK_NAMES[@]}"; do
+    [ "$(unit_state_lock "${t}")" = "$1" ] && n=$((n + 1))
   done
-  echo "${total}"
+  echo $(( n * (INFRA_LOCK_DEADLINE + STATE_LOCK_HOLD_SECONDS) ))
 }
 
 release_state_lock() { # <task-name>
@@ -3222,7 +3217,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # lock keeps its default: it is taken last, after any stream wait, so it is
   # held only while this unit's own stack is in use. A case with a state lock
   # adds that lock's deadline, which its previous rep may wait out first.
-  local audit_id lock_deadline held="" s state_lock state_held=""
+  local audit_id lock_deadline held="" s state_lock
   audit_id="$(ledger_audit_id_for_task "${task}")"
   state_lock="$(unit_state_lock "${name}")"
   lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}" "${streams}")"
@@ -3235,16 +3230,6 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   if ! lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"; then
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
     return 0
-  fi
-  # A unit without the infra lock waits for its state lock here, before its
-  # streams; a stack-bearing one takes it with the infra lock, below.
-  if [ -n "${state_lock}" ] && [ -z "${has_stack}" ]; then
-    if ! lock_acquire "${STATE_DIR}/lock-state-${state_lock}" "$(state_lock_deadline "${state_lock}")"; then
-      lock_release "${STATE_DIR}/lock-task-${name}"
-      echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the ${state_lock} state lock" >&2
-      return 0
-    fi
-    state_held="true"
   fi
   # A ledger-writing unit also holds the stream lock from here until its
   # state files are written, released with the task lock below: cases on
@@ -3261,7 +3246,6 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   for s in ${streams}; do
     if ! lock_acquire "${STATE_DIR}/lock-stream-${s}" "$(stream_lock_deadline "${name}" "${s}" "${streams}")"; then
       release_streams "${held}"
-      [ -n "${state_held}" ] && release_state_lock "${name}"
       lock_release "${STATE_DIR}/lock-task-${name}"
       echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the ${s} stream lock" >&2
       return 0
@@ -3269,6 +3253,16 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     held="${held} ${s}"
   done
   wait_platform_runs "${name} rep ${rep}" "${streams}"
+  # A unit without the infra lock waits for its state lock here, once its
+  # stream waits are over, so it holds the state only while its stack is in
+  # use; a stack-bearing one takes it with the infra lock, below.
+  if [ -n "${state_lock}" ] && [ -z "${has_stack}" ] \
+    && ! lock_acquire "${STATE_DIR}/lock-state-${state_lock}" "$(state_lock_deadline "${state_lock}")"; then
+    release_streams "${streams}"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the ${state_lock} state lock" >&2
+    return 0
+  fi
   # A stack-bearing unit with a state lock tries it once while it holds the
   # infra lock and never waits on it there: a busy one sends the infra lock
   # back to the queue, so the tofu chain does not stall behind an exempt
@@ -3282,7 +3276,6 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
       && lock_acquire "${STATE_DIR}/lock-infra" "$(( infra_deadline - (SECONDS - infra_start) ))"; do
       if [ -z "${state_lock}" ] || mkdir "${STATE_DIR}/lock-state-${state_lock}" 2>/dev/null; then
         infra_held="true"
-        [ -n "${state_lock}" ] && state_held="true"
         break
       fi
       lock_release "${STATE_DIR}/lock-infra"
