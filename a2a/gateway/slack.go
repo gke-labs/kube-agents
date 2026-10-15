@@ -145,7 +145,7 @@ type slackAPI interface {
 	OpenConversation(params *slack.OpenConversationParameters) (*slack.Channel, bool, bool, error)
 	AddReaction(name string, item slack.ItemRef) error
 	RemoveReaction(name string, item slack.ItemRef) error
-	GetUserInfo(user string) (*slack.User, error)
+	GetUserInfo(user string, options ...slack.GetUserInfoOption) (*slack.User, error)
 	SetAssistantThreadsSuggestedPrompts(params slack.AssistantThreadsSetSuggestedPromptsParameters) error
 }
 

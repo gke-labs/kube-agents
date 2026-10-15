@@ -69,7 +69,7 @@ func (f *fakeSlackAPI) RemoveReaction(name string, item slack.ItemRef) error {
 	return f.reactErr
 }
 
-func (f *fakeSlackAPI) GetUserInfo(user string) (*slack.User, error) {
+func (f *fakeSlackAPI) GetUserInfo(user string, _ ...slack.GetUserInfoOption) (*slack.User, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.userInfoCalls++
