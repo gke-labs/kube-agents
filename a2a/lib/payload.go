@@ -39,7 +39,7 @@ func validTaskState(s TaskState) bool {
 	return false
 }
 
-// Reserved artifact names. The set of names is open; only these six carry
+// Reserved artifact names. The set of names is open; only these carry
 // reserved semantics.
 const (
 	ArtifactResult   = "result"
@@ -58,6 +58,11 @@ const (
 	// completes; it is never the deliverable (spec-a2a-payloads.md,
 	// "Reserved artifact names").
 	ArtifactTurn = "turn"
+	// ArtifactNotice is a message the task posts on its own, beside its
+	// live message and its answer (a PR it opened): a text part, optionally
+	// with a chat message. Each one posts once and is never edited
+	// (spec-a2a-payloads.md, "Reserved artifact names").
+	ArtifactNotice = "notice"
 )
 
 // DelegateRequest is the ArtifactDelegate data part's shape: one child task

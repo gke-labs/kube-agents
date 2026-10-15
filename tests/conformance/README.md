@@ -168,6 +168,10 @@ currently fails.
 | B1  | the denylist refuses merge and approve                                     | 1        | `test_B1_the_denylist_refuses_merge_and_approve`                                    | `gh pr merge` _used_ to work — the original recording of this violation — until `github.merge`/`github.assent` shipped; this pins the two rules that closed it, each with its own mutation                                                               |
 | B1  | the agent cannot force-push                                                | 1 **KV** | `test_B1_the_agent_cannot_merge_or_approve`                                         | `git push --force origin main` matches no denylist rule; the git verb and lease machinery constrain where git writes, not this flag — a watched branch is still rewritable                                                                               |
 | B1  | the Slack relay removes nothing but the bot's own reaction                 | 1        | `test_B1_the_slack_relay_removes_nothing_but_its_own_reaction`                      | a second exemption beside `reactions.remove`, or the exemption case-folded: the workspace bot token deleting a message or a pin nobody can put back                                                                                                      |
+| B1  | the broker refuses every gke MCP write tool                                | 1        | `test_B1_the_broker_refuses_every_gke_mcp_write_tool`                               | `mcp__gke__patch_k8s_resource` or `create_cluster` reaching Google on the broker's credential because the Hermes tool list drifted                                                                                                                       |
+| B1  | no remote MCP server is reached around the broker                          | 1        | `test_B1_no_remote_mcp_server_is_reached_on_the_agents_own_credential`              | an `mcp-remote` entry pointed straight at `*.googleapis.com`, running on the agent pod's own Google credential with no allowlist                                                                                                                         |
+| B1  | only the gateway reaches the MCP relay                                     | 1        | `test_B1_only_the_gateway_reaches_the_mcp_relay`                                    | the shell sandbox or a session pod gaining a GKE read path through the relay                                                                                                                                                                             |
+| B1  | the operator's relay URL is the route the policy guards                    | 1        | `test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route`                | the route renamed on one side, leaving every `gke` call failing with no policy refusal to read                                                                                                                                                           |
 | B2  | no workflow approves or merges a pull request                              | 1        | `test_B2_no_workflow_approves_or_merges_a_pull_request`                             | a model verdict causing a merge                                                                                                                                                                                                                          |
 | B2  | `pull-requests: write` has exactly six holders                             | 1        | `test_B2_no_workflow_grants_a_bot_the_ability_to_approve`                           | —                                                                                                                                                                                                                                                        |
 | B2  | a certified predicate in a human-only path                                 | **3**    | —                                                                                   | no such mechanism exists. Auto-merge over a certified predicate is a D2 tier that was never built.                                                                                                                                                       |
@@ -356,3 +360,17 @@ suite once at the end: a run that ends red says so and exits non-zero.
 5. If it fails against current code, decorate it `@known_violation` with the
    invariant and the document that records the finding — and give its class a
    `..._precondition_...` test, which the self-check requires.
+
+## `chat/` holds data, not tests
+
+Each file in `chat/` pairs an input, lifted from a `today` presenter test or
+built to show a rule one pins, with the `kube-agents.chat/v1` messages the next-mode emitter owes for it. The payload
+spec gives its chat message assertions (27 and 28) this directory as their
+home, but they are wire-format rules rather than security invariants, so
+`run.py` and the self-check never read these files. The Go tests in
+`a2a/lib/chatmsg` validate every expected message, and
+`agents/platform/scripts/test_chat_cases.py` checks the files' shape under
+`make test-python`. The emitter runs every case: the kanban notifier's half in
+`deploy/docker/patches/test_chat_conformance.py`, and the hermes-bridge's half
+(the answer, and the ask's mark on its heartbeat and terminal) in
+`a2a/hermes-bridge/chat_test.go`.

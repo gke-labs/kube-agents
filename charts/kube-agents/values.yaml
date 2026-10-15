@@ -230,7 +230,7 @@ litellm:
   # http://inference-gateway.kubeagents-system.svc.cluster.local/v1 (see
   # deploy/shared/defaults/config.yaml), so a working install needs this
   # gateway. Disable only if you run your own inference gateway (or point the
-  # agent elsewhere). Mirrors k8s-operator/config/integrations/litellm/base.
+  # agent elsewhere). Mirrors k8s-operator/config/integrations/litellm/base and its provider overlays.
   # NOTE: the namespace in that endpoint is baked — installing the release
   # into any namespace other than kubeagents-system leaves the agent unable
   # to reach the gateway rendered here.

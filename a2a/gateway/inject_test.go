@@ -19,6 +19,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
 // The inject backend, end to end against a real nats-server: a POST is an
@@ -1373,7 +1374,7 @@ func TestInjectCancelDoesNotGoThroughTheStopText(t *testing.T) {
 		if err := json.Unmarshal(env.Payload, &message); err != nil {
 			continue
 		}
-		if isStop(joinTextParts(message.Parts)) {
+		if chattext.IsStop(joinTextParts(message.Parts)) {
 			t.Fatalf("the cancel route sent the stop text as a message: %q", joinTextParts(message.Parts))
 		}
 	}

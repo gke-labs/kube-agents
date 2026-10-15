@@ -32,7 +32,7 @@ card appears only in the rare case where there is genuine work. What it gives
 up it can afford — the card body names the skill, and ``model``/``max_turns``
 take their defaults — and the one thing it must not give up, an audible
 failure, stays here: this job keeps ``deliver: "chat"``, so anything printed
-to stdout below is a fault report the Chat Agent posts to the room.
+to stdout below is a fault report the relay posts to the room.
 
 One watcher, several sweeps
 ---------------------------

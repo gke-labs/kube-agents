@@ -192,10 +192,13 @@ platform_control `fleet_scope` tool hands the SOPs (`--scope-projects`,
 outside it with the reason, which the table carries as that project's failure;
 an install that declares none keeps the bare flag, and a scope render the pod
 cannot read fails the tick with the reason. That read is `gcloud` cluster metadata
-for the version table and, on a report day, one `get-credentials` and one
-`kubectl get pdb,deploy,statefulset -A` per cluster for the readiness grade;
-the budget names those objects in the saved report, which is tenant-written
-text, so the entry declares `risk: high` as `stall-watch` does. A project
+for the version table and, on a report day, one `get-credentials` and two
+`kubectl get` per cluster for the readiness grade, one of
+`pdb,deploy,statefulset -A` and one of
+`validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces -A`;
+the budget names those objects, and a fail-closed webhook with no reachable
+backend names its configuration and its Service, in the saved report, which is
+tenant-written text, so the entry declares `risk: high` as `stall-watch` does. A project
 spelled by its number is keyed by the id `gcloud projects describe` resolves,
 learned on its first table run. A number the credential cannot resolve is
 never a key, so its clusters earn no report until it resolves: when nothing
@@ -343,8 +346,9 @@ agent handing out both when asked. `feedback_prompt.py` is the one place the
 product asks, and it does so once per install: a fixed message in the home
 chat channel carrying the form's short link, the form's disclosure that a
 submission becomes a public issue, and a line saying a reply in the thread
-reaches the agent. `deliver: "chat"` is what makes that last line true; the
-Chat Agent posts the message and owns the thread.
+reaches the agent. `deliver: "chat"` is what makes that last line true: the
+relay stores the message against its thread, so a reply there reaches the Chat
+Agent with it attached.
 
 It is a daily cron entry that fires once, not a Hermes one-shot, and the
 reason is this roster's merge. A shipped entry cannot carry an absolute
@@ -375,8 +379,8 @@ job fails in the direction of at most once: a post the scheduler recorded as
 undelivered is a lost request, which `chat-delivery-watch` counts like any
 other failed delivery, and which an operator sends again by removing
 `.feedback_prompt_sent` from the profile home, after which the next tick
-claims afresh. One Chat Agent composition is all the job ever costs, on the
-one tick that prints. The clock starts at the first
+claims afresh. One post is all the job ever costs, on the one tick that
+prints. The clock starts at the first
 tick, not at any record of when the install finished: nothing in the operator
 status carries a ready-since time, and the Chat Agent's onboarding markers
 live in a different home. An install that predates the entry therefore gets
@@ -442,7 +446,7 @@ with the run still recording `ok`. `check_cron_delivery` in
 `CRON_DELIVER_VALUES` set in that file, bare or as a `platform:chat_id` prefix, so
 the typo fails the pull request instead.
 
-## `deliver: "chat"` — reporting through the Chat Agent
+## `deliver: "chat"` — reports the Chat Agent can answer for
 
 `"all"` gets the words into a channel. It does not make them answerable: the
 process that produced them has exited, and the Chat Agent — which is who the
@@ -453,8 +457,10 @@ where that leaves it another platform to post to; on an install where the cron
 child can address every enabled channel itself, both copies land
 ([design](../../../docs/designs/cron-report-relay.md)).
 
-`deliver: "chat"` hands the run's report to the Chat Agent instead, which posts
-it and thereby owns the thread the user replies in. It is a delivery mode, not a
+`deliver: "chat"` hands the run's report to the relay instead, which posts it as
+written (on Slack, a fleet-audit report is replaced by a headline linking its
+ledger issue) and stores the full report against its thread, so the user's reply there reaches the
+Chat Agent with the report attached. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the
 scheduler applies `[SILENT]` and builds the failure summary before delivery is
 reached.
@@ -471,8 +477,8 @@ that Hermes registers like any other. So it is one target among several — a jo
 on `"chat,slack"` relays _and_ posts, and an unreachable relay records
 `last_delivery_error` rather than falling back. Note that `"all"` now expands to
 include the relay, so `"all"` and `"chat"` together deliver once, not twice, but
-`"all"` alone relays too. The full rationale — why the Chat Agent composes but
-does not send, why the session is per job per day, why a mode rather than an
+`"all"` alone relays too. The full rationale — why the report is posted as the
+job wrote it, why the thread is per job per day, why a mode rather than an
 instruction, and what the plugin route costs — is
 [`docs/designs/cron-report-relay.md`](../../../docs/designs/cron-report-relay.md).
 

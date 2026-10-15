@@ -1,0 +1,649 @@
+{
+  "_comment": "Shared cases for the bridge's ports of slack_presenter.split_answer, _plain and arrival_reaction (a2a/hermes-bridge/chat.go). Expected values are the Python presenter's; agents/platform/scripts/test_chat_message.py fails when they drift from it.",
+  "split_answer": [
+    {
+      "in": "checkout-gateway is crashlooping on an OOM. It hit its 256Mi limit.\n\nRaise it to 512Mi.",
+      "headline": "checkout-gateway is crashlooping on an OOM.",
+      "body": ["It hit its 256Mi limit.", "Raise it to 512Mi."]
+    },
+    {
+      "in": "## **Yes**, [seeded-a](https://x) is `healthy`\n- one\n- two",
+      "headline": "Yes, seeded-a is healthy",
+      "body": ["- one\n- two"]
+    },
+    {
+      "in": "",
+      "headline": "",
+      "body": []
+    },
+    {
+      "in": "   \n\n ",
+      "headline": "",
+      "body": []
+    },
+    {
+      "in": "Here it is.\n\n```\na\n\nb\n```\n\nDone.",
+      "headline": "Here it is.",
+      "body": ["```\na\n\nb\n```", "Done."]
+    },
+    {
+      "in": "```\nkubectl get pods\n```",
+      "headline": "",
+      "body": ["```\nkubectl get pods\n```"]
+    },
+    {
+      "in": "Pods fail readiness, e.g. checkout-gateway in ns. prod.",
+      "headline": "Pods fail readiness, e.g. checkout-gateway in ns. prod.",
+      "body": []
+    },
+    {
+      "in": "Pods fail readiness, e.g. Checkout in prod.",
+      "headline": "Pods fail readiness, e.g. Checkout in prod.",
+      "body": []
+    },
+    {
+      "in": "Deployments, StatefulSets, etc. All fail readiness. Node-a is cordoned.",
+      "headline": "Deployments, StatefulSets, etc. All fail readiness.",
+      "body": ["Node-a is cordoned."]
+    },
+    {
+      "in": "payments-api keeps crashing: secret\npayments-db-creds is missing. Since 14:02.\n- one",
+      "headline": "payments-api keeps crashing: secret payments-db-creds is missing.",
+      "body": ["Since 14:02.\n- one"]
+    },
+    {
+      "in": "payments-api is crashlooping with:\n```\nOOMKilled. Exit 137\n```\nSince 14:02.",
+      "headline": "payments-api is crashlooping with:",
+      "body": ["```\nOOMKilled. Exit 137\n```\nSince 14:02."]
+    },
+    {
+      "in": "```payments-api``` is crashlooping on OOM.\n\nRaise the limit.",
+      "headline": "payments-api is crashlooping on OOM.",
+      "body": ["Raise the limit."]
+    },
+    {
+      "in": "The pod logs `connection refused. Retrying` on every start. Since 14:02.",
+      "headline": "The pod logs connection refused. Retrying on every start.",
+      "body": ["Since 14:02."]
+    },
+    {
+      "in": "`__init__.py` is missing.",
+      "headline": "__init__.py is missing.",
+      "body": []
+    },
+    {
+      "in": "##\tSummary\nCheckout is down. Since 14:02.",
+      "headline": "Summary",
+      "body": ["Checkout is down. Since 14:02."]
+    },
+    {
+      "in": "**Checkout is crashlooping on OOM. Raise the limit.**",
+      "headline": "Checkout is crashlooping on OOM.",
+      "body": ["**Raise the limit.**"]
+    },
+    {
+      "in": "**Checkout is down.** Raise the limit.",
+      "headline": "Checkout is down.",
+      "body": ["Raise the limit."]
+    },
+    {
+      "in": "*It is down. Restart it.*",
+      "headline": "It is down.",
+      "body": ["*Restart it.*"]
+    },
+    {
+      "in": "_It is down. Restart it._",
+      "headline": "It is down.",
+      "body": ["_Restart it._"]
+    },
+    {
+      "in": "Use *one* of them. Next *two*.",
+      "headline": "Use one of them.",
+      "body": ["Next *two*."]
+    },
+    {
+      "in": "The env var DB__HOST is unset. Pods crashloop.",
+      "headline": "The env var DB__HOST is unset.",
+      "body": ["Pods crashloop."]
+    },
+    {
+      "in": "Memory is 2**20 bytes. Raise it.",
+      "headline": "Memory is 2**20 bytes.",
+      "body": ["Raise it."]
+    },
+    {
+      "in": "DB__HOST or DB__PORT is unset.",
+      "headline": "DB__HOST or DB__PORT is unset.",
+      "body": []
+    },
+    {
+      "in": "**Pod**s are down. Restart them.",
+      "headline": "Pods are down.",
+      "body": ["Restart them."]
+    },
+    {
+      "in": "Node pool np-1 at rev. 7 is cordoned.",
+      "headline": "Node pool np-1 at rev. 7 is cordoned.",
+      "body": []
+    },
+    {
+      "in": "Certs expired Sept. 30 on seeded-a.",
+      "headline": "Certs expired Sept. 30 on seeded-a.",
+      "body": []
+    },
+    {
+      "in": "Several pods fail (e.g. Checkout) in prod. Raise it.",
+      "headline": "Several pods fail (e.g. Checkout) in prod.",
+      "body": ["Raise it."]
+    },
+    {
+      "in": "Pods fail (i.e. Checkout). Raise it.",
+      "headline": "Pods fail (i.e. Checkout).",
+      "body": ["Raise it."]
+    },
+    {
+      "in": "Ticket No. 3 is open. Second sentence.",
+      "headline": "Ticket No. 3 is open.",
+      "body": ["Second sentence."]
+    },
+    {
+      "in": "payments-api fails readiness since deploy No. 42. Restore the secret.",
+      "headline": "payments-api fails readiness since deploy No. 42.",
+      "body": ["Restore the secret."]
+    },
+    {
+      "in": "See No. 3. Second sentence.",
+      "headline": "See No. 3.",
+      "body": ["Second sentence."]
+    },
+    {
+      "in": "Filed under #No. 7 on seeded-a. Then wait.",
+      "headline": "Filed under #No. 7 on seeded-a.",
+      "body": ["Then wait."]
+    },
+    {
+      "in": "Use the default, ex. Checkout. More.",
+      "headline": "Use the default, ex. Checkout.",
+      "body": ["More."]
+    },
+    {
+      "in": "Disk is at 90% (approx. Two hours left). Then it fills.",
+      "headline": "Disk is at 90% (approx. Two hours left).",
+      "body": ["Then it fills."]
+    },
+    {
+      "in": "Latency is high vs. Yesterday. Scale up.",
+      "headline": "Latency is high vs. Yesterday.",
+      "body": ["Scale up."]
+    },
+    {
+      "in": "Replicas are at max. Raise the HPA ceiling.",
+      "headline": "Replicas are at max.",
+      "body": ["Raise the HPA ceiling."]
+    },
+    {
+      "in": "Restarted after 5 min. Raise it.",
+      "headline": "Restarted after 5 min.",
+      "body": ["Raise it."]
+    },
+    {
+      "in": "The answer is no. Checkout is down.",
+      "headline": "The answer is no.",
+      "body": ["Checkout is down."]
+    },
+    {
+      "in": "The pool is at its max. 4 pods are pending. Raise it.",
+      "headline": "The pool is at its max. 4 pods are pending.",
+      "body": ["Raise it."]
+    },
+    {
+      "in": "Keep min. 2 replicas on seeded-a. Then drain.",
+      "headline": "Keep min. 2 replicas on seeded-a.",
+      "body": ["Then drain."]
+    },
+    {
+      "in": "Hello \u00005\u0000 world. More.",
+      "headline": "Hello 5 world.",
+      "body": ["More."]
+    },
+    {
+      "in": "The answer is no. 3 pods are down.",
+      "headline": "The answer is no. 3 pods are down.",
+      "body": []
+    },
+    {
+      "in": "a \u00005\u0000 b. c",
+      "headline": "a 5 b. c",
+      "body": []
+    },
+    {
+      "in": "Run ```a` now. Next.",
+      "headline": "Run ```a` now.",
+      "body": ["Next."]
+    },
+    {
+      "in": "Done.) Next.",
+      "headline": "Done.) Next.",
+      "body": []
+    },
+    {
+      "in": "Done.\" Next.",
+      "headline": "Done.\" Next.",
+      "body": []
+    },
+    {
+      "in": "Mr. Smith says hi. Next.",
+      "headline": "Mr.",
+      "body": ["Smith says hi. Next."]
+    },
+    {
+      "in": "1. Checkout is crashlooping on OOM. It hit 256Mi.",
+      "headline": "Checkout is crashlooping on OOM.",
+      "body": ["It hit 256Mi."]
+    },
+    {
+      "in": "~~~\nkubectl get pods\n~~~",
+      "headline": "",
+      "body": ["~~~\nkubectl get pods\n~~~"]
+    },
+    {
+      "in": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word ",
+      "headline": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word…",
+      "body": []
+    },
+    {
+      "in": "**Yes.** checkout-gateway in seeded-a restarted 14 times in the last hour, OOMKilled each time.\n\n| pod | restarts |\n|---|---|\n| checkout-gateway-7d9 | 14 |\n\nRaise the memory limit to 512Mi.",
+      "headline": "Yes. checkout-gateway in seeded-a restarted 14 times in the last hour, OOMKilled each time.",
+      "body": [
+        "| pod | restarts |\n|---|---|\n| checkout-gateway-7d9 | 14 |",
+        "Raise the memory limit to 512Mi."
+      ]
+    },
+    {
+      "in": "Three clusters have pods restarting right now: seeded-a, seeded-b and seeded-c.\n\n- seeded-a: checkout-gateway (14)\n- seeded-b: cart (3)",
+      "headline": "Three clusters have pods restarting right now: seeded-a, seeded-b and seeded-c.",
+      "body": ["- seeded-a: checkout-gateway (14)\n- seeded-b: cart (3)"]
+    },
+    {
+      "in": "Écoute: le pod redémarre. Ensuite rien.",
+      "headline": "Écoute: le pod redémarre.",
+      "body": ["Ensuite rien."]
+    },
+    {
+      "in": "# Summary\nThe pod restarted.",
+      "headline": "Summary",
+      "body": ["The pod restarted."]
+    },
+    {
+      "in": "١. Checkout is down. More follows.",
+      "headline": "Checkout is down.",
+      "body": ["More follows."]
+    },
+    {
+      "in": "Pods restart. Then\u001cmore.",
+      "headline": "Pods restart.",
+      "body": ["Then\u001cmore."]
+    },
+    {
+      "in": "See [logs](https://x.io/a b) now. Next.",
+      "headline": "See [logs](https://x.io/a b) now.",
+      "body": ["Next."]
+    }
+  ],
+  "plain": [
+    {
+      "in": "Set DB__HOST and DB__PORT",
+      "out": "Set DB__HOST and DB__PORT"
+    },
+    {
+      "in": "2**20 and 2**30 bytes",
+      "out": "2**20 and 2**30 bytes"
+    },
+    {
+      "in": "**Checkout** and __payments__ are down",
+      "out": "Checkout and payments are down"
+    },
+    {
+      "in": "**Pod**s are down",
+      "out": "Pods are down"
+    },
+    {
+      "in": "It re**start**ed twice",
+      "out": "It restarted twice"
+    },
+    {
+      "in": "**3**x faster",
+      "out": "3x faster"
+    },
+    {
+      "in": "snake__case__name",
+      "out": "snake__case__name"
+    },
+    {
+      "in": "x**2 and y**2",
+      "out": "x**2 and y**2"
+    },
+    {
+      "in": "`x` \u00000\u0000 and \u00009\u0000",
+      "out": "x 0 and 9"
+    },
+    {
+      "in": "___x___",
+      "out": "___x___"
+    },
+    {
+      "in": "******a.",
+      "out": "******a."
+    },
+    {
+      "in": "__foo__bar__",
+      "out": "__foo__bar__"
+    },
+    {
+      "in": "***bold*** and __init__",
+      "out": "bold and init"
+    },
+    {
+      "in": "`__init__.py` is missing",
+      "out": "__init__.py is missing"
+    },
+    {
+      "in": "Delete `__pycache__` and **this**",
+      "out": "Delete __pycache__ and this"
+    },
+    {
+      "in": "Remove *.log,*.tmp",
+      "out": "Remove *.log,*.tmp"
+    },
+    {
+      "in": "Scale replicas 2*3 → 6",
+      "out": "Scale replicas 2*3 → 6"
+    },
+    {
+      "in": "Delete *.tmp under /var/cache",
+      "out": "Delete *.tmp under /var/cache"
+    },
+    {
+      "in": "**Bold**, *italic*, _also_ and `code`",
+      "out": "Bold, italic, also and code"
+    },
+    {
+      "in": "see [logs](https://x/query=(k8s_container)) now",
+      "out": "see logs now"
+    }
+  ],
+  "ask_kind": [
+    {
+      "in": "is checkout-gateway restarting? it looks like it's crashlooping?",
+      "kind": "investigate"
+    },
+    {
+      "in": "why is the node pool at 90%?",
+      "kind": "investigate"
+    },
+    {
+      "in": "what are these 502 errors on checkout?",
+      "kind": "investigate"
+    },
+    {
+      "in": "is checkout crashlooping?",
+      "kind": "investigate"
+    },
+    {
+      "in": "diagnose the pending pods on seeded-a",
+      "kind": "investigate"
+    },
+    {
+      "in": "which clusters have pods restarting right now?",
+      "kind": "fleet"
+    },
+    {
+      "in": "check all clusters for unready nodes",
+      "kind": "fleet"
+    },
+    {
+      "in": "is ingress healthy across the fleet?",
+      "kind": "fleet"
+    },
+    {
+      "in": "<@U0KAGE> list each of our clusters",
+      "kind": "fleet"
+    },
+    {
+      "in": "<@U0KAGE> what version is seeded-b on",
+      "kind": "upgrade"
+    },
+    {
+      "in": "upgrade seeded-c to 1.31",
+      "kind": "upgrade"
+    },
+    {
+      "in": "which clusters are behind their release channel default?",
+      "kind": "upgrade"
+    },
+    {
+      "in": "is anything out of date?",
+      "kind": "upgrade"
+    },
+    {
+      "in": "what did seeded-a cost last month?",
+      "kind": "cost"
+    },
+    {
+      "in": "where is our GKE spend going?",
+      "kind": "cost"
+    },
+    {
+      "in": "are we over budget on all clusters?",
+      "kind": "cost"
+    },
+    {
+      "in": "run a security audit on seeded-b",
+      "kind": "security"
+    },
+    {
+      "in": "any CVEs in the checkout image?",
+      "kind": "security"
+    },
+    {
+      "in": "who has cluster-admin? check the RBAC",
+      "kind": "security"
+    },
+    {
+      "in": "is the dashboard exposed to the internet?",
+      "kind": "security"
+    },
+    {
+      "in": "check the ingress certs on seeded-a",
+      "kind": "question"
+    },
+    {
+      "in": "how many nodes does seeded-a have?",
+      "kind": "question"
+    },
+    {
+      "in": "fix it",
+      "kind": "change"
+    },
+    {
+      "in": "can you fix the crashlooping pod?",
+      "kind": "change"
+    },
+    {
+      "in": "bump the image to 1.4.2",
+      "kind": "change"
+    },
+    {
+      "in": "roll back checkout to yesterday's release",
+      "kind": "change"
+    },
+    {
+      "in": "please rollback the deploy",
+      "kind": "change"
+    },
+    {
+      "in": "open a PR for the memory limit",
+      "kind": "change"
+    },
+    {
+      "in": "open a pull request with that change",
+      "kind": "change"
+    },
+    {
+      "in": "scale the web deployment down to 2",
+      "kind": "change"
+    },
+    {
+      "in": "fix the version skew on seeded-c",
+      "kind": "change"
+    },
+    {
+      "in": "board",
+      "kind": "board"
+    },
+    {
+      "in": "what's running right now?",
+      "kind": "board"
+    },
+    {
+      "in": "status of the fleet audit",
+      "kind": "board"
+    },
+    {
+      "in": "checkout is down",
+      "kind": "incident"
+    },
+    {
+      "in": "we're paging on payments",
+      "kind": "incident"
+    },
+    {
+      "in": "sev1 outage in us-east4",
+      "kind": "incident"
+    },
+    {
+      "in": "payments pods in crashloopbackoff",
+      "kind": "incident"
+    },
+    {
+      "in": "thanks",
+      "kind": "question"
+    },
+    {
+      "in": "",
+      "kind": "question"
+    },
+    {
+      "in": "",
+      "kind": "question"
+    },
+    {
+      "in": "the prefix looks odd",
+      "kind": "question"
+    },
+    {
+      "in": "downstream latency",
+      "kind": "question"
+    },
+    {
+      "in": "the statusline plugin",
+      "kind": "question"
+    },
+    {
+      "in": "the costume party",
+      "kind": "question"
+    },
+    {
+      "in": "an oomph of bloom",
+      "kind": "question"
+    },
+    {
+      "in": "the clusterrole binding",
+      "kind": "question"
+    },
+    {
+      "in": "prod is down, roll back now",
+      "kind": "change"
+    },
+    {
+      "in": "should we scale down?",
+      "kind": "change"
+    },
+    {
+      "in": "is checkout-gateway restarting in seeded-a?",
+      "kind": "investigate"
+    },
+    {
+      "in": "which clusters have pods restarting right now?",
+      "kind": "fleet"
+    },
+    {
+      "in": "which clusters are restarting?",
+      "kind": "fleet"
+    },
+    {
+      "in": "fixé the pod",
+      "kind": "question"
+    },
+    {
+      "in": "le pod redémarre, pourquoi?",
+      "kind": "question"
+    },
+    {
+      "in": "checkout　is down",
+      "kind": "incident"
+    },
+    {
+      "in": "upgradé seeded-a",
+      "kind": "question"
+    },
+    {
+      "in": "Ünd all clusters?",
+      "kind": "fleet"
+    },
+    {
+      "in": "café costs?",
+      "kind": "cost"
+    },
+    {
+      "in": "fıx it",
+      "kind": "change"
+    },
+    {
+      "in": "ſcale the pool",
+      "kind": "change"
+    },
+    {
+      "in": "Kubernetes upgrade",
+      "kind": "upgrade"
+    },
+    {
+      "in": "which\u000bclusters are down",
+      "kind": "fleet"
+    },
+    {
+      "in": "why\u001dis it slow",
+      "kind": "investigate"
+    },
+    {
+      "in": "İs checkout down",
+      "kind": "incident"
+    },
+    {
+      "in": "ıs checkout down",
+      "kind": "incident"
+    },
+    {
+      "in": "ſhould we page",
+      "kind": "incident"
+    },
+    {
+      "in": "roll bacK now",
+      "kind": "change"
+    },
+    {
+      "in": "oomKilled again",
+      "kind": "investigate"
+    }
+  ]
+}
