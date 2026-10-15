@@ -688,7 +688,8 @@ export SLACK_ENABLED="false"
 # out of the gitops-state ConfigMap — the fleet-audit streams do it in `audit_report.py
 # start`, before anything else happens. The operator seeds that entry from
 # spec.integration.github.gitRepo on the PlatformAgent CR; with the field unset
-# no repository is registered and those scenarios stop at step 0 with nothing to clone.
+# no repository is registered, so a fleet audit runs with no forge and writes no ledger
+# or pull request for those scenarios to grade.
 #
 # CI supplies the value and deliberately does NOT lean on the chart default.
 # On the presubmit path everything this job deploys — chart, operator, agent —

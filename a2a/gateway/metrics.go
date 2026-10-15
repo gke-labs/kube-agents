@@ -38,6 +38,7 @@ const (
 	taskTerminalsName       = "task_terminals_total"
 	gchatEventsReceivedName = "gchat_events_received_total"
 	gchatPullsName          = "gchat_pulls_total"
+	chatMessagesName        = "chat_messages_total"
 
 	// The label names. Every value under them comes from a closed list
 	// below, never from a task, a conversation or an executor's text, so
@@ -57,6 +58,17 @@ const (
 	gchatPullEvents = "events"
 	gchatPullEmpty  = "empty"
 	gchatPullFailed = "failed"
+
+	// The chat-message outcomes (spec-a2a-payloads.md, "Chat messages"):
+	// rendered, laid out by the backend; text-only, a backend that renders
+	// none posted the fallback; refused, a backend that renders them could
+	// not hold this one or its API refused it, and the fallback posted;
+	// invalid, the message broke a rule and was dropped whole (or, for a
+	// mark alone, the mark was), the fallback standing.
+	chatRendered = "rendered"
+	chatTextOnly = "text_only"
+	chatRefused  = "refused"
+	chatInvalid  = "invalid"
 
 	// metricsMaxConnections is the broker's METRICS_MAX_CONNECTIONS: at
 	// most this many connections are open at once, so a peer that reaches
@@ -96,6 +108,7 @@ var (
 	}
 	metricsTerminalSources = []TerminalSource{TerminalFromExecutor, TerminalFromSupervisor, TerminalFromGateway, TerminalNeverStarted}
 	metricsGchatOutcomes   = []string{gchatPullEvents, gchatPullEmpty, gchatPullFailed}
+	metricsChatOutcomes    = []string{chatRendered, chatTextOnly, chatRefused, chatInvalid}
 )
 
 // Metrics is the gateway's counters and the private registry that serves
@@ -109,6 +122,7 @@ type Metrics struct {
 	taskTerminals       *prometheus.CounterVec
 	gchatEventsReceived prometheus.Counter
 	gchatPulls          *prometheus.CounterVec
+	chatMessages        *prometheus.CounterVec
 }
 
 // NewMetrics builds the counters on a fresh registry.
@@ -133,8 +147,17 @@ func NewMetrics() *Metrics {
 			Name:      gchatPullsName,
 			Help:      "Pulls of the Google Chat relay, by outcome: events (one arrived), empty (none did), failed (the relay refused or did not answer).",
 		}, []string{labelOutcome}),
+		chatMessages: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      chatMessagesName,
+			Help:      "kube-agents.chat/v1 messages the gateway handed a chat adapter or dropped, counted per hand-over, by outcome: rendered (laid out by the backend), text_only (a backend that renders none posted the fallback), refused (the backend could not hold it or its API refused it; the fallback posted), invalid (it broke a rule and was dropped; the fallback posted, or for a bad mark alone the mark was dropped).",
+		}, []string{labelOutcome}),
 	}
-	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls)
+	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages)
+	for _, outcome := range metricsChatOutcomes {
+		m.chatMessages.WithLabelValues(outcome)
+	}
 	for _, state := range append(append([]lib.TaskState(nil), metricsTerminalStates...), metricsLabelOther) {
 		for _, source := range append(append([]TerminalSource(nil), metricsTerminalSources...), metricsLabelOther) {
 			m.taskTerminals.WithLabelValues(string(state), string(source))
@@ -173,6 +196,15 @@ func (m *Metrics) gchatPull(outcome string) {
 		m.gchatEventsReceived.Inc()
 	}
 	m.gchatPulls.WithLabelValues(outcome).Inc()
+}
+
+// chatMessage counts one chat message under its outcome, one of
+// metricsChatOutcomes; the callers pass only those constants.
+func (m *Metrics) chatMessage(outcome string) {
+	if m == nil {
+		return
+	}
+	m.chatMessages.WithLabelValues(outcome).Inc()
 }
 
 // metricsTerminalStateLabel is state if the closed list has it, else other.

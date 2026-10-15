@@ -256,8 +256,9 @@ Rules for the agent:
   substitution for it. The installer stores it in the Secret `gitlab-forge-ca`. Only the
   credential broker trusts the CA, and only for that host. Use a release whose
   `install.sh --help` lists `--gitops-ca-file`.
-- `--dry-run` and `--generate-only` check only that the token source is readable. They do not read
-  the token. They check the content of a regular CA file. `--generate-only` never creates the
+- `--dry-run` and `--generate-only` check that the token source is readable, and stop the run if a
+  regular token file is empty. They store no token, and they do not read `/dev/stdin` or a process
+  substitution. They check the content of a regular CA file. `--generate-only` never creates the
   Secrets. On a first install it writes the GitLab keys into `install.env`. Over an existing
   `install.env`, it does not change them, so set `GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_REPO`,
   `GITLAB_TOKEN_SECRET` and, for a private CA, `GITOPS_CA_SECRET` in that file before
@@ -1148,10 +1149,12 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
   env HERMES_HOME=/opt/data/profiles/platform hermes cron list
 ```
 
-Each audit's report is a ledger issue in the GitOps repository, so the audits need a GitOps
-repository, on GitHub or on GitLab: with none configured, every run fails before it audits
-anything. A
-run that changed something since the last one also posts a one-line summary linking the issue to
+Each audit's report is a ledger issue in the GitOps repository, and its fixes are pull requests
+there, so those two need a GitOps repository, on GitHub or on GitLab. With no GitOps repository
+registered (none at all, rather than one the install cannot use), the audits still run: each keeps
+its findings in the report store on the agent's volume, and a run that changed something posts a
+summary to chat that says no forge is configured. With a repository, a
+run that changed something since the last one posts a one-line summary linking the issue to
 the home channel of each enabled chat platform (wherever `/sethome` last ran; otherwise the chat
 the install's first chat message came from; otherwise `SLACK_HOME_CHANNEL` or
 `GOOGLE_CHAT_HOME_CHANNEL` from the install), and an audit can open remediation pull requests in the

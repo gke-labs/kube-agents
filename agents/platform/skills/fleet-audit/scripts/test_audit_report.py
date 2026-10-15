@@ -24998,5 +24998,259 @@ class TestManifestRemediationLinks(HarnessTestCase):
             self.assertNotIn("refreshed", out["b"])
 
 
+class TestNoForge(BaseTestCase):
+    """An install that registers no GitOps repository still runs its audits (#2419)."""
+
+    def setUp(self):
+        super().setUp()
+        self.patch_attr("GITOPS_WORKSPACE", str(self.tmp_path / "gitops"))
+        # Any git or forge call fails the test: a run with no forge has none to make.
+        self.recorder = Recorder()
+        self.patch_attr("run_cmd", self.recorder)
+        no_remote = type(sys)("github_token_refresh")
+        no_remote.get_current_git_repo = lambda cwd=None: None
+        # What `managed_repos` holds before parsing; blank is nothing registered.
+        self.managed_text = ""
+        for patcher in (
+            patch("gitops_workspace.get_managed_repos", return_value=[]),
+            patch("gitops_workspace._read_state_text", lambda key: self.managed_text),
+            patch("gitops_workspace.get_context_github_repo_entries", return_value=[]),
+            patch.dict(sys.modules, {"github_token_refresh": no_remote}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def store(self):
+        return self.reports_dir / AUDIT / "no_forge" / "local"
+
+    def start(self):
+        code = self.run_main(["start", "--audit", AUDIT])
+        self.assertEqual(code, 0, self.err)
+        return self.stdout_json()
+
+    def finish(self, doc):
+        self.start()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        code = self.run_main(["finish", "--audit", AUDIT, "--findings-file", path])
+        self.assertEqual(code, 0, self.err)
+        return self.stdout_json()
+
+    def test_start_hands_over_an_empty_workspace_and_says_no_forge(self):
+        workspace = Path(audit_report.SCRATCH_DIR) / f"workspace_{AUDIT}"
+        workspace.mkdir(parents=True)
+        (workspace / "leftover.yaml").write_text("kind: Namespace\n", encoding="utf-8")
+
+        out = self.start()
+
+        self.assertIsNone(out["repo"])
+        self.assertIsNone(out["issue"])
+        self.assertEqual(out["mode"], audit_report.NO_FORGE_MODE)
+        self.assertEqual(out["no_forge"], audit_report.NO_FORGE_NOTE)
+        self.assertEqual(out["workspace"], str(workspace))
+        self.assertEqual(list(workspace.iterdir()), [])
+        self.assertEqual(out[audit_report.DECLARED_INTENT_REPOS_KEY], [])
+        self.assertIn("NO FORGE:", self.err)
+        self.assertEqual(self.recorder.calls, [])
+
+    def test_an_unreadable_repository_list_is_not_taken_for_no_forge(self):
+        unreadable = RuntimeError("Failed to read ConfigMap platform-agent-gitops-state")
+        with patch("gitops_workspace.get_managed_repos", side_effect=unreadable), patch(
+            "gitops_workspace._read_state_text", side_effect=unreadable
+        ):
+            code = self.run_main(["start", "--audit", AUDIT])
+        self.assertEqual(code, 1)
+        self.assertIn("Failed to read ConfigMap", self.err)
+        self.assertEqual(self.out, "")
+
+    def test_a_lease_from_an_earlier_forge_run_does_not_keep_the_forge_path(self):
+        holder = gitops_workspace.lease_dir(audit_report.GITOPS_WORKSPACE, AUDIT)
+        holder.mkdir(parents=True)
+        gitops_workspace.write_lease(holder, AUDIT, "acme/gitops", owner=f"fleet-audit:{AUDIT}")
+        self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/gitops")
+
+        self.assertEqual(self.start()["mode"], audit_report.NO_FORGE_MODE)
+        self.assertEqual(self.recorder.calls, [])
+
+    def test_several_repositories_keep_the_resolvers_error(self):
+        self.managed_text = '[{"type": "github", "url": "https://github.com/acme/a"}, {"type": "github", "url": "https://github.com/acme/b"}]'
+        with patch("gitops_workspace.get_managed_repos", return_value=["acme/a", "acme/b"]):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 1)
+        self.assertIn("Multiple repositories configured", self.err)
+        self.assertNotIn("cannot use", self.err)
+
+    def test_an_empty_list_is_nothing_registered(self):
+        self.managed_text = "[]"
+        self.assertEqual(self.start()["mode"], audit_report.NO_FORGE_MODE)
+
+    def test_a_registered_value_the_image_cannot_use_is_not_taken_for_no_forge(self):
+        for text in (
+            '{"type": "github", "url": "https://github.com/acme/gitops"}',
+            '[{"url": "https://github.com/acme/gitops"}]',
+            '[{"type": "subversion", "url": "https://svn.example.com/acme/gitops"}]',
+            "[not json",
+        ):
+            with self.subTest(text=text):
+                self.managed_text = text
+                self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 1)
+                self.assertIn("holds a value this image cannot use", self.err)
+                self.assertEqual(self.out, "")
+
+    def test_finish_stores_the_findings_and_prints_a_summary(self):
+        doc = make_doc(findings=THREE_SEVERITIES)
+
+        out = self.finish(doc)
+
+        self.assertEqual(out["status"], audit_report.NO_FORGE_STATUS)
+        self.assertIsNone(out["issue_url"])
+        self.assertEqual((out["findings"], out["critical"], out["new"]), (4, 2, 4))
+        self.assertFalse(out["silent_ok"])
+        self.assertEqual(out["prs_opened"], [])
+        summary = out["summary"].splitlines()
+        self.assertTrue(summary[0].startswith(audit_report.audit_name(AUDIT)))
+        self.assertIn("4 findings (2 critical) across 2 cluster(s); 4 new, 0 resolved", summary[0])
+        # Most severe first.
+        self.assertEqual(
+            [line.split("] ", 1)[1].split(" (")[0] for line in summary[1:5]],
+            ["Crit one", "Crit two", "Major one", "Minor one"],
+        )
+        self.assertEqual(summary[-1], audit_report.NO_FORGE_NOTE)
+        latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+        self.assertEqual(latest["status"], audit_report.NO_FORGE_STATUS)
+        self.assertEqual(latest["repo"], audit_report.NO_FORGE_REPO)
+        self.assertIsNone(latest["issue_number"])
+        self.assertEqual(len(latest["current_ids"]), 4)
+        self.assertEqual(len(latest["document"]["findings"]), 4)
+        self.assertEqual(self.recorder.calls, [])
+
+    def test_the_delta_runs_against_the_previous_no_forge_report(self):
+        doc = make_doc(findings=THREE_SEVERITIES)
+        self.finish(doc)
+
+        unchanged = self.finish(doc)
+        self.assertEqual((unchanged["new"], unchanged["resolved"]), (0, 0))
+        self.assertTrue(unchanged["silent_ok"])
+
+        fixed = self.finish(make_doc(findings=THREE_SEVERITIES[1:]))
+        self.assertEqual((fixed["new"], fixed["resolved"]), (0, 1))
+        self.assertFalse(fixed["silent_ok"])
+
+    def test_a_withheld_posture_is_not_reported_as_held(self):
+        self.finish(make_doc())
+        (fid,) = json.loads((self.store() / "latest.json").read_text())["current_ids"]
+        self.patch_attr("still_flagged_ids", lambda manifest, data: {fid})
+        doc = make_doc()
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        self.record_run(repo=audit_report.NO_FORGE_REPO, context=["acme/context"], audit=AUDIT)
+        self.patch_attr("context_repo_entries", lambda: [{"repo": "acme/context", "ref": None, audit_report.REFUSED_REF_KEY: None}])
+
+        out = self.finish(doc)
+
+        self.assertEqual(out[audit_report.POSTURES_WITHHELD_KEY], [fid])
+        self.assertNotIn("Still flagged", out["summary"])
+
+    def test_a_finding_the_collector_still_flags_is_held_not_resolved(self):
+        self.finish(make_doc(findings=THREE_SEVERITIES))
+        previous = set(json.loads((self.store() / "latest.json").read_text())["current_ids"])
+        kept = make_doc(findings=THREE_SEVERITIES[1:])
+        kept_ids = set(audit_report.finding_ids(audit_report.load_findings(self.write_findings(kept), AUDIT)["findings"]))
+        (left_out,) = previous - kept_ids
+        self.patch_attr("still_flagged_ids", lambda manifest, data: {left_out})
+
+        out = self.finish(kept)
+
+        self.assertEqual(out["resolved"], 0)
+        self.assertIn(left_out, out["summary"])
+        latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+        self.assertIn(left_out, latest["current_ids"])
+
+    def test_a_failed_store_write_says_the_message_is_the_only_record(self):
+        self.reports_dir.mkdir(parents=True)
+        (self.reports_dir / AUDIT).write_text("not a directory", encoding="utf-8")
+
+        out = self.finish(make_doc())
+
+        self.assertEqual(out["no_forge"], audit_report.NO_FORGE_UNSTORED_NOTE)
+
+    def test_an_unchanged_run_the_store_did_not_take_is_not_silent(self):
+        self.finish(make_doc())
+        self.assertTrue(self.finish(make_doc())["silent_ok"])
+        # Raised rather than a read-only mode bit, which binds no root runner.
+        def unwritable(path, text):
+            raise PermissionError(13, "Permission denied", str(path))
+
+        self.patch_attr("_atomic_write", unwritable)
+
+        out = self.finish(make_doc())
+
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertEqual(out["no_forge"], audit_report.NO_FORGE_UNSTORED_NOTE)
+        self.assertFalse(out["silent_ok"])
+        self.assertEqual(out["summary"].splitlines()[-1], audit_report.NO_FORGE_UNSTORED_NOTE)
+
+    def test_the_summary_order_does_not_follow_the_document(self):
+        first = self.finish(make_doc(findings=THREE_SEVERITIES))["summary"].splitlines()[1:5]
+        second = self.finish(make_doc(findings=list(reversed(THREE_SEVERITIES))))["summary"].splitlines()[1:5]
+        self.assertEqual(first, second)
+
+    def test_the_summary_says_when_collector_candidates_were_left_out(self):
+        self.patch_attr("unpublished_candidates", lambda accounted, manifest: [{"id": "a"}, {"id": "b"}])
+        out = self.finish(make_doc())
+        self.assertIn("The collector flagged 2 candidate(s)", out["summary"])
+
+    def test_the_summary_names_the_object(self):
+        out = self.finish(make_doc(findings=[make_finding(obj="ClusterRoleBinding/debug-binding", namespace="")]))
+        self.assertIn("(prod-us-east/ClusterRoleBinding/debug-binding)", out["summary"])
+
+    def test_a_lost_latest_falls_back_to_the_ring(self):
+        self.finish(make_doc(findings=THREE_SEVERITIES))
+        (self.store() / "latest.json").unlink()
+
+        out = self.finish(make_doc(findings=THREE_SEVERITIES))
+
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertTrue(out["silent_ok"])
+
+    def test_an_unreadable_record_makes_the_delta_unknown(self):
+        self.finish(make_doc())
+        (self.store() / "latest.json").write_text("{", encoding="utf-8")
+        for entry in (self.store() / "runs").glob("*.json"):
+            entry.write_text("{", encoding="utf-8")
+
+        out = self.finish(make_doc())
+
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertFalse(out["silent_ok"])
+        self.assertIn("unknown", out["summary"].splitlines()[0])
+        latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+        self.assertFalse(latest["delta_known"])
+
+    def test_a_coverage_gap_claims_nothing_resolved(self):
+        self.finish(make_doc(findings=THREE_SEVERITIES))
+
+        out = self.finish(make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}]))
+
+        self.assertEqual(out["resolved"], 0)
+        self.assertTrue(out["partial"])
+        self.assertIn("Coverage is incomplete", out["summary"])
+
+    def test_postures_are_not_withheld_for_a_repository_that_does_not_exist(self):
+        doc = make_doc()
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+
+        out = self.finish(doc)
+
+        self.assertEqual(out[audit_report.POSTURES_WITHHELD_KEY], [])
+        self.assertEqual(out["findings"], 1)
+        self.assertFalse(out["partial"])
+
+    def test_the_report_readers_find_the_store(self):
+        self.finish(make_doc())
+        import report_status
+
+        dirs, unreadable = report_status.scan_repo_dirs(str(self.reports_dir), AUDIT)
+        self.assertEqual((dirs, unreadable), ([audit_report.NO_FORGE_REPO], []))
+
+
 if __name__ == "__main__":
     unittest.main()

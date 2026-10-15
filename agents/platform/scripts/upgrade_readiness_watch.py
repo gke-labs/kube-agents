@@ -4,8 +4,10 @@ publishes a version the fleet would move to, without anyone asking.
 
 The ``fleet-upgrade-verification`` skill's readiness report grades every
 cluster on what would stop its next upgrade: a drain-blocking
-PodDisruptionBudget, a maintenance exclusion covering the upgrade, node pools
-too far below the target. Until this job existed it ran only when a user asked
+PodDisruptionBudget, a fail-closed admission webhook with an unreachable
+backend in the upgrade's path or able to refuse the control plane's bootstrap
+RBAC writes, a maintenance exclusion covering the upgrade, node pools too far
+below the target. Until this job existed it ran only when a user asked
 for it in chat, so the fleet learned what an upgrade would break only when
 someone thought to ask. This job runs once a day from the Platform Agent's
 roster and asks the cheap half of the question first: which version is each
@@ -26,9 +28,11 @@ which it is recorded as reported and stays on the weekly cadence until a
 cluster is graded, so an unreachable cluster costs its project one sweep a
 week rather than one a day and the daily ladder runs once, not every week; a cluster the script graded
 ``unknown`` counts as graded, since that is a verdict with its reason in the
-table; "not read" is a cluster whose kubectl read failed (the script lists it
-under ``errors`` and grades it ``unknown``) or that the run returned nothing
-for, and a ``blocked`` verdict stands whatever the kubectl read did. A tick with nothing due prints nothing.
+table; "not read" is a cluster whose first kubectl read failed (the script
+lists it under ``errors`` and grades it ``unknown`` for want of that read;
+``unread_row``) or that the run returned nothing for; a row the second, webhook
+read wrote (``read: webhooks``) is a graded ``unknown``, not an unread member,
+and is listed apart; and a ``blocked`` verdict stands whatever the kubectl read did. A tick with nothing due prints nothing.
 
 Which clusters. The projects come from this pod, not from the sandbox:
 ``UPGRADE_READINESS_PROJECTS`` when set, otherwise the management project
@@ -222,6 +226,9 @@ STATUS_KEY = "status"
 TARGET_KEY = "target_version"
 READINESS_KEY = "readiness"
 ERRORS_KEY = "errors"
+# The key and value fleet_upgrade_report.py puts on an `errors` row the webhook read wrote.
+ERROR_READ_KEY = "read"
+WEBHOOK_READ_ERROR = "webhooks"
 MESSAGE_KEY = "message"
 MEMBER_ID_KEYS = ("project", "location", "cluster")
 # The report's lists whose entries name a project under MEMBER_ID_KEYS[0]: the
@@ -316,6 +323,11 @@ NOT_RUN_LINE = (
     "was spent before {projects} finished; retried tomorrow, starting there"
 )
 UNKNOWN_COUNT = ", {count} unknown"
+# The two lists under the Markdown's tables: reads whose member is not graded (the first read,
+# the credentials, a project or a location), and the webhook read's rows, whose member is graded
+# on its other rules and `unknown` on this one.
+FAILED_READS_HEADING = "Reads that failed during this run, and so are not graded:"
+WEBHOOK_READ_ROWS_HEADING = "Webhook reads that failed during this run; each member is graded on its other rules and `unknown` on this one:"
 UNREAD_COUNT = ", {count} not read"
 READS_FAILED_DETAIL = "their kubectl read failed or the run returned nothing for them"
 UNGRADED_ATTEMPTS_BEFORE_WEEKLY = 3
@@ -870,18 +882,20 @@ def settle_from_readiness(report: dict, pending: dict[str, list[str]], ledger: d
 
 def readiness_verdicts(report: dict, clusters: list[str]) -> tuple[list[str], list[str], list[str], list[str]]:
     """The blocked, ready, unknown and unread clusters among ``clusters``, by
-    member key. ``unknown`` is a verdict the script gave (an exclusion or a pool
-    it could not decide) and counts as graded; ``unread`` is a cluster the run
-    returned no member for, one whose kubectl read the report lists under
-    ``errors`` and that the script graded ``unknown`` for want of that read, or
-    one graded ``unknown`` in a location whose ``get-server-config`` failed (an
-    ``errors`` entry with a location and no cluster), which left it no target. A
+    member key. ``unknown`` is a verdict the script gave (an exclusion, a pool
+    or a webhook read it could not decide) and counts as graded; ``unread`` is a
+    cluster the run returned no member for, one whose first kubectl read the
+    report lists under ``errors`` (``unread_row``) and that the script graded
+    ``unknown`` for want of that read, or one graded ``unknown`` in a location
+    whose ``get-server-config`` failed (an ``errors`` entry with a location and
+    no cluster), which left it no target. A row the second, webhook read wrote
+    is a graded ``unknown``, not an unread member. A
     ``blocked`` verdict stands whatever the kubectl read did: the script grades
     a covering exclusion or blocking skew from cluster metadata and says a
     definite blocker beats an unknown."""
     wanted = set(clusters)
     errors = report.get(ERRORS_KEY) or []
-    failed_reads = {member_key(error) for error in errors if error.get(MEMBER_ID_KEYS[-1])}
+    failed_reads = {member_key(error) for error in errors if unread_row(error)}
     failed_locations = {
         (error.get(MEMBER_ID_KEYS[0]), error.get(MEMBER_ID_KEYS[1]))
         for error in errors
@@ -902,6 +916,25 @@ def readiness_verdicts(report: dict, clusters: list[str]) -> tuple[list[str], li
     seen = {k for keys in buckets.values() for k in keys}
     unread = sorted(wanted - seen)
     return sorted(buckets[READINESS_BLOCKED]), sorted(buckets[READINESS_READY]), sorted(buckets[READINESS_UNKNOWN]), unread
+
+
+def webhook_read_row(error: dict) -> bool:
+    """Whether an ``errors`` row is one the second, webhook read wrote (``read: webhooks``). When
+    it is the member's only row, the member's PDB, maintenance and skew rules were graded and
+    ``unknown`` is its verdict, not an absence, so the member is graded and the row is listed
+    apart, unless the summary counts the member as unread on another ground (its location's
+    ``get-server-config`` failed; ``render_markdown``); a member whose first read also failed
+    (two rows: the deadline, then the second read) is unread, and both its rows are listed with
+    the unread ones."""
+    return bool(error.get(MEMBER_ID_KEYS[-1])) and error.get(ERROR_READ_KEY) == WEBHOOK_READ_ERROR
+
+
+def unread_row(error: dict) -> bool:
+    """Whether an ``errors`` row marks a member the run never graded: a cluster-keyed row that
+    the webhook read did not write (the credentials, the kubeconfig directory or the first read
+    failed). Rows keyed by a project or a location alone are read failures of another kind and
+    are not members."""
+    return bool(error.get(MEMBER_ID_KEYS[-1])) and not webhook_read_row(error)
 
 
 def project_of(member_key_text: str) -> str:
@@ -1163,13 +1196,25 @@ def render_markdown(version: str, reason: str, clusters: list[str], envelope: di
         "",
     ]
     errors = version_slice(report, clusters)[ERRORS_KEY]
-    if errors:
-        lines.append("Reads that failed during this run, and so are not graded:")
-        lines.append("")
-        for error in errors:
-            where = MEMBER_KEY_SEPARATOR.join(str(error.get(k)) for k in MEMBER_ID_KEYS if error.get(k))
-            lines.append(f"- {where}: {error.get(MESSAGE_KEY, '')}")
-        lines.append("")
+    # A webhook row is listed as a graded member's only when no row of the same member says its
+    # first read failed and the summary above counts the member as graded: `unread` also names a
+    # member whose location's `get-server-config` failed and whose verdict is `unknown`, which
+    # `unread_row` cannot see, and the row rule still covers the same project's members outside
+    # `clusters`, which `unread` never names. With both rows the member is unread, and both rows
+    # say so.
+    unread_members = {member_key(e) for e in errors if unread_row(e)} | set(unread)
+    graded_webhook_rows = [e for e in errors if webhook_read_row(e) and member_key(e) not in unread_members]
+    for heading, rows in (
+        (FAILED_READS_HEADING, [e for e in errors if not any(e is row for row in graded_webhook_rows)]),
+        (WEBHOOK_READ_ROWS_HEADING, graded_webhook_rows),
+    ):
+        if rows:
+            lines.append(heading)
+            lines.append("")
+            for error in rows:
+                where = MEMBER_KEY_SEPARATOR.join(str(error.get(k)) for k in MEMBER_ID_KEYS if error.get(k))
+                lines.append(f"- {where}: {error.get(MESSAGE_KEY, '')}")
+            lines.append("")
     return "\n".join(lines)
 
 

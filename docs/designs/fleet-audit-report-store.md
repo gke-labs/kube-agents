@@ -28,9 +28,10 @@ Both are the same missing thing: the run's structured output, kept where it was 
 
 ## 2. The store
 
-`finish` keeps what it publishes. On the exit-0 path only — clean and findings branches alike, never
+`finish` keeps what it publishes. On the exit-0 path only — clean, findings and no-forge branches alike, never
 on `--dry-run`, never after a rejection, never from `remediate` — it writes one envelope under
-`<root>/<audit-id>/<owner>/<name>/`, the directory of the repository the run published to:
+`<root>/<audit-id>/<owner>/<name>/`, the directory of the repository the run published to (a
+no-forge run uses the reserved one below):
 
 - `runs/<finished-at, UTC, filename-safe>.json` — the envelope. The ring prunes to the newest 14 at
   write time: two weeks of a daily stream.
@@ -44,6 +45,20 @@ lost. `repo` must be exactly `owner/name` with no `.` or `..` segment before it 
 run whose repository fails that stores nothing. The path is lower-cased, because GitHub's names are
 not case-sensitive: an on-demand `--repo Acme/GitOps` and a ConfigMap's `acme/gitops` are one
 ledger, and two directories for it would each trust a memory the other had moved past.
+
+An install that registers no GitOps repository has no ledger to publish to, and the store is then
+the only record of the run. `start` and `finish` take that install from a raw `managed_repos` value
+that is blank or `[]`. A value that does not parse, or whose entries this image cannot serve, still
+fails, and so does one that could not be read. `finish` validates the document as usual, skips every
+forge step, and writes the envelope under the reserved directory `no_forge/local` with `status:
+NO_FORGE`, `issue_number: null` and an empty `ledger_body`. No GitHub owner contains `_`, and a
+first segment without a dot is never another forge's host, so the key cannot name a real
+repository's store. With no public body to check it against, the next no-forge run trusts that
+`latest.json` on its own (its `status`, `repo` and `id_scheme`) and takes the delta from its
+`current_ids`; when `latest.json` is missing or fails those checks, it reads the newest ring entry
+that passes them, since a failed write drops `latest.json` and leaves the ring. A store with no
+envelope is a first run, and one whose envelopes all fail is a lost memory, as in §4. A previous id the collector still flags is held in `current_ids` and not
+counted as resolved, as the ledger holds it.
 
 Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries
 `audit_id`, `repo` and `finished_at`, the run's outcome (`status`, `issue_number`, `issue_url`,

@@ -11,7 +11,8 @@ import (
 // convention -- into surfaces that read a dialect of it. This file holds the
 // rules Slack's mrkdwn and Google Chat's text format share: a bold pair is one
 // star, not two; a code span is verbatim to the markdown rules; a markdown
-// link becomes <url|text>; and a link whose label carries a URL must not
+// link becomes <url|text>, and one the executor wrote in that form already
+// is kept (keepChatLinks); and a link whose label carries a URL must not
 // name a host the link does not open. What differs per surface -- the
 // escaping or defang that runs over the whole text before any of this, and
 // the exact URL class -- stays in the adapter that owns it.
@@ -59,20 +60,95 @@ const (
 	chatLinkClose = ">"
 )
 
+// chatLinkURLPattern is the link destination both chat surfaces accept from
+// raw executor text: an http(s) URL with no whitespace, no angle bracket and
+// no pipe, and at most one level of balanced parentheses. None of the
+// refused characters is legal in a URL unencoded. gchatLinkRe reads markdown
+// destinations with it and chatNativeLinkRE reads <url|text> ones.
+const chatLinkURLPattern = `https?://(?:[^()\s<>|]|\([^()\s<>|]*\))+`
+
+// chatNativeLinkRE matches a closed <url|text> link in the surfaces' own
+// form, which models write as well as the markdown one (keepChatLinks). The
+// URL is chatLinkURLPattern; the text is one line of at least one character
+// with no angle bracket and no pipe, so a second opener, a nested sequence
+// or a pipe that two readers could split differently is not a match and is
+// left to the surface's escaping or defang.
+var chatNativeLinkRE = regexp.MustCompile(`<(` + chatLinkURLPattern + `)\|([^<>|\n]+)>`)
+
 // rewriteMarkdown translates the two markdown forms the relay emits, bold
 // pairs and links, into the form both chat surfaces read, leaving code spans
 // as written. It runs after the surface's own escaping or defang: Slack's
-// escaping and Chat's mention defang cover the whole text, code included --
-// a prompt-injected <!channel> or <users/all> in a code span is as live as
-// one in prose -- and Chat's link defang covers everything outside closed
-// code (rewriteOutsideCode), so no control sequence the executor wrote is live
-// by the time rewriteLinks writes the adapter's own, and what reaches here
-// needs no further escaping. Bold first, so a pair that wraps a whole link
-// still converts; the link pass finds its code spans again afterwards,
-// since the bold pass moved them without touching a backtick.
+// escaping and Chat's mention defang cover the whole text, code included -- a
+// prompt-injected <!channel> or <users/all> in a code span is as live as one
+// in prose -- and Chat's link defang covers everything outside closed code
+// (rewriteOutsideCode), so the only control sequence the executor wrote that
+// is live by the time rewriteLinks writes the adapter's own is a link
+// keepChatLinks kept, and what reaches here needs no further escaping. A kept
+// link is the one chatNativeLinkRE match outside code that the escape or
+// defang left whole, so it is found again here (chatLinksOutsideCode: every
+// other <url|text the executor wrote outside code is escaped or carries the
+// defang's space by now) and read as the link it is: its URL is as protected
+// as a markdown destination, and a markdown link that overlaps it is refused,
+// so no link the adapter writes nests with it or splits it. Bold first, so a
+// pair that wraps a whole link still converts; the link pass finds its code
+// spans and kept links again afterwards, since the bold pass moved them
+// without touching a backtick or an angle bracket.
 func rewriteMarkdown(s string, linkRE *regexp.Regexp) string {
-	s = rewriteBoldPairs(s, mdCodeSpanRE.FindAllStringIndex(s, -1), linkRE)
-	return rewriteLinks(s, mdCodeSpanRE.FindAllStringIndex(s, -1), linkRE)
+	code := mdCodeSpanRE.FindAllStringIndex(s, -1)
+	s = rewriteBoldPairs(s, code, chatLinksOutsideCode(s, code), linkRE)
+	code = mdCodeSpanRE.FindAllStringIndex(s, -1)
+	return rewriteLinks(s, code, chatLinksOutsideCode(s, code), linkRE)
+}
+
+// chatLinksOutsideCode returns the submatch indexes of each chatNativeLinkRE
+// match in s that lies in a stretch outside every code span in code, an
+// unclosed fence included. Each stretch is searched alone, so a match that a
+// code span cuts short is not one.
+func chatLinksOutsideCode(s string, code [][]int) [][]int {
+	var out [][]int
+	gap := 0
+	find := func(end int) {
+		for _, m := range chatNativeLinkRE.FindAllStringSubmatchIndex(s[gap:end], -1) {
+			for i := range m {
+				m[i] += gap
+			}
+			out = append(out, m)
+		}
+	}
+	for _, r := range code {
+		find(r[0])
+		gap = r[1]
+	}
+	find(len(s))
+	return out
+}
+
+// keepChatLinks keeps each <url|text> link the executor wrote that the
+// adapters would have made from the markdown link [text](url), and hands
+// everything else to defuse, the surface's escaping or defang. A link is
+// kept when chatNativeLinkRE matches it in a stretch outside every code
+// span, an unclosed fence included (the link pass reads one as code to the
+// end of the text, so a markdown link there is not converted either), and
+// its text does not name a host other than its URL's (chattext.LinkLabelMisnamesHost,
+// the refusal a markdown link with that label meets). link writes each kept
+// one, escaped as the surface escapes; the stretches between them go to
+// defuse one at a time. A link a code span cuts short, an unclosed opener
+// and a refused link are not kept, so defuse treats them as it did before.
+// rewriteMarkdown then reads the result whole, kept links included.
+func keepChatLinks(s string, defuse func(string) string, link func(dest, label string) string) string {
+	var b strings.Builder
+	end := 0
+	for _, m := range chatLinksOutsideCode(s, mdCodeSpanRE.FindAllStringIndex(s, -1)) {
+		dest, label := s[m[2]:m[3]], s[m[4]:m[5]]
+		if chattext.LinkLabelMisnamesHost(label, dest) {
+			continue
+		}
+		b.WriteString(defuse(s[end:m[0]]))
+		b.WriteString(link(dest, label))
+		end = m[1]
+	}
+	b.WriteString(defuse(s[end:]))
+	return b.String()
 }
 
 // rewriteOutsideCode applies rewrite to each stretch of s that lies outside
@@ -132,6 +208,17 @@ func insideAny(i int, ranges [][]int) bool {
 	return false
 }
 
+// overlapsAny reports whether the [start, end) range shares a byte with one
+// of the ranges.
+func overlapsAny(start, end int, ranges [][]int) bool {
+	for _, r := range ranges {
+		if start < r[1] && r[0] < end {
+			return true
+		}
+	}
+	return false
+}
+
 // maskRanges returns s with every byte inside one of the [start, end)
 // ranges replaced by mdMaskByte, newlines excepted, so a search over the
 // result reads nothing inside them and still sees where each line ends.
@@ -152,20 +239,24 @@ func maskRanges(s string, ranges [][]int) string {
 // form both surfaces read, and a matched bold-italic triple to *_x_*. The
 // pairs are sought in a copy of s with every protected range blanked
 // (maskRanges): a code span, the destination of a markdown link (one linkRE
-// matches), and the whole of a link rewriteLinks will refuse (linkRefused).
-// A star inside one is not a candidate for either side of a pair, so a `**`
-// in a code span or a URL never opens or closes one and is never altered,
-// a refused link stays the markdown it arrived as, and a pair that wraps a
-// whole code span or a whole link converts, since only its own stars
-// change, even when the span holds a `**` of its own (**`**kwargs`**). The
-// mask keeps newlines, so a pair is still one line of content. A triple
-// closed by a double, or the reverse, is not a pair and is left as written.
-// A bare URL is not a shape this recognises (both surfaces auto-link it),
-// so a closed pair inside one is rewritten.
-func rewriteBoldPairs(s string, code [][]int, linkRE *regexp.Regexp) string {
+// matches) or of a kept <url|text> link (chatLinksOutsideCode), and the whole
+// of a link rewriteLinks will refuse (linkRefused). A star inside one is not
+// a candidate for either side of a pair, so a `**` in a code span or a URL
+// never opens or closes one and is never altered, a refused link stays the
+// markdown it arrived as, and a pair that wraps a whole code span or a whole
+// link converts, since only its own stars change, even when the span holds a
+// `**` of its own (**`**kwargs`**). The mask keeps newlines, so a pair is
+// still one line of content. A triple closed by a double, or the reverse, is
+// not a pair and is left as written. A bare URL is not a shape this
+// recognises (both surfaces auto-link it), so a closed pair inside one is
+// rewritten.
+func rewriteBoldPairs(s string, code, kept [][]int, linkRE *regexp.Regexp) string {
 	protected := append([][]int(nil), code...)
+	for _, m := range kept {
+		protected = append(protected, []int{m[2], m[3]})
+	}
 	for _, m := range linkRE.FindAllStringSubmatchIndex(s, -1) {
-		if linkRefused(s, m, code) {
+		if linkRefused(s, m, code, kept) {
 			protected = append(protected, []int{m[0], m[1]})
 			continue
 		}
@@ -193,13 +284,13 @@ func rewriteBoldPairs(s string, code [][]int, linkRE *regexp.Regexp) string {
 // rewriteLinks rewrites each markdown link linkRE matches in s to <url|text>,
 // label and destination as written, and leaves a link linkRefused names as
 // the markdown it arrived as.
-func rewriteLinks(s string, code [][]int, linkRE *regexp.Regexp) string {
+func rewriteLinks(s string, code, kept [][]int, linkRE *regexp.Regexp) string {
 	var b strings.Builder
 	end := 0
 	for _, m := range linkRE.FindAllStringSubmatchIndex(s, -1) {
 		b.WriteString(s[end:m[0]])
 		end = m[1]
-		if linkRefused(s, m, code) {
+		if linkRefused(s, m, code, kept) {
 			b.WriteString(s[m[0]:m[1]])
 			continue
 		}
@@ -210,14 +301,16 @@ func rewriteLinks(s string, code [][]int, linkRE *regexp.Regexp) string {
 }
 
 // linkRefused reports whether the markdown link linkRE matched at m in s is
-// one the adapters will not convert, on either of two grounds. Its brackets
+// one the adapters will not convert, on one of three grounds. Its brackets
 // open or close inside a code span: it is code, not a link (a label that
-// merely contains a code span still converts). Or its label carries a URL
-// naming a host other than the destination's: both surfaces render the
-// label, so [https://good.example](https://evil.example) would read as a
-// link to good.example that opens evil.example, and the pipe refusal in
-// each adapter's URL class closes the other route to that display.
-func linkRefused(s string, m []int, code [][]int) bool {
-	return insideAny(m[0], code) || insideAny(m[1]-1, code) ||
+// merely contains a code span still converts). It shares a byte with a kept
+// <url|text> link (chatLinksOutsideCode): converting it would nest the two
+// sequences or cut the kept one open, whichever holds which. Or its label
+// carries a URL naming a host other than the destination's: both surfaces
+// render the label, so [https://good.example](https://evil.example) would
+// read as a link to good.example that opens evil.example, and the pipe
+// refusal in each adapter's URL class closes the other route to that display.
+func linkRefused(s string, m []int, code, kept [][]int) bool {
+	return insideAny(m[0], code) || insideAny(m[1]-1, code) || overlapsAny(m[0], m[1], kept) ||
 		chattext.LinkLabelMisnamesHost(s[m[2]:m[3]], s[m[4]:m[5]])
 }
