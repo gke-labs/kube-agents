@@ -46,6 +46,11 @@ class A1AuthorityIsNotObtainableThroughUs(unittest.TestCase):
         ["gcloud", "container", "clusters", "delete", MARKER],
         ["gcloud", f"--flags-file=/workspace/{MARKER}.yaml", "info"],
         ["gcloud", "info", f"--account={MARKER}@example.com"],
+        # The write-remainder refusals (#2979) name the verb in a structured
+        # field only, never in the message.
+        ["kubectl", "delete", "pod", MARKER, f"--token={MARKER}"],
+        ["gcloud", "container", "clusters", "update", MARKER, f"--account={MARKER}@example.com"],
+        ["gcloud", "container", "clusters", "update", MARKER, f"--{MARKER}=x"],
     )
 
     def test_A1_a_refusal_names_no_caller_supplied_value(self) -> None:
@@ -74,6 +79,42 @@ class A1AuthorityIsNotObtainableThroughUs(unittest.TestCase):
                 # which D1 covers. offending_flag is log-side.
                 self.assertNotIn(MARKER, decision.rule_id)
                 self.assertNotIn(MARKER, decision.message)
+
+    def test_A1_a_refusal_invites_no_retry_it_would_refuse(self) -> None:
+        """A refusal is not a path to try next.
+
+        A flag refusal used to invite a retry without the flag whatever the
+        command, and the gcloud unreadable refusal said "re-run without the
+        flag". On a write, the agent took the invitation and ran the bare
+        write, refused again, and treated each refusal as a step to work
+        through (#2979). A refusal invites a flagless retry only when that
+        retry would be allowed: for each argv below, which is a write with a
+        refused or unknown flag, the message invites nothing, and the retry it
+        used to invite is refused as a write.
+        """
+        invitations = ("without the flag", "Re-run without", "Remove ", "Drop the flag")
+        for argv, retry in (
+            (["kubectl", "delete", "pod", "web-0", "--token", "t"], ["kubectl", "delete", "pod", "web-0"]),
+            (["kubectl", "--as=system:admin", "delete", "pod", "web-0"], ["kubectl", "delete", "pod", "web-0"]),
+            (["gcloud", "container", "clusters", "update", "prod", "--account", "a@example.com"],
+             ["gcloud", "container", "clusters", "update", "prod"]),
+            (["gcloud", "container", "clusters", "update", "prod",
+              "--binauthz-evaluation-mode=PROJECT_SINGLETON_POLICY_ENFORCE"],
+             ["gcloud", "container", "clusters", "update", "prod"]),
+            (["gcloud", "container", "--new-flag=1", "clusters", "update", "prod"],
+             ["gcloud", "container", "clusters", "update", "prod"]),
+        ):
+            with self.subTest(argv=argv):
+                decision = command_policy.evaluate(argv)
+                self.assertFalse(decision.allowed)
+                for invitation in invitations:
+                    self.assertNotIn(invitation, decision.message, "a write's refusal invites a retry")
+                self.assertIn(command_policy.evaluate(retry).rule_id, ("kubernetes.read-only", "gcp.read-only"))
+        # Bounded the other way: on a read, the flagless retry is allowed, and
+        # the refusal still says so.
+        read = command_policy.evaluate(["kubectl", "get", "pods", "--token", "t"])
+        self.assertIn("without the flag", read.message)
+        self.assertTrue(command_policy.evaluate(["kubectl", "get", "pods"]).allowed)
 
     def test_A1_a_refusal_names_the_rule_that_fired(self) -> None:
         """Bounded is not the same as opaque.

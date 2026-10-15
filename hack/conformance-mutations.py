@@ -143,8 +143,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A1-refusal-content",
         "agents/platform/scripts/command_policy.py",
-        ('                "Identity and API server address belong to the broker. Remove "',
-         '                f"Identity belongs to the broker; {argv} was refused. Remove "'),
+        ('                "Identity and API server address belong to the broker.",\n',
+         '                f"Identity belongs to the broker; {argv} was refused.",\n'),
         "test_A1_a_refusal_names_no_caller_supplied_value",
         "make the refusal more helpful by naming what was refused -- the "
         "obvious improvement that turns a denial into an oracle",
@@ -166,14 +166,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A1-refusal-emptied",
         "agents/platform/scripts/command_policy.py",
-        ('                message=(\n'
-         '                    "Identity and API server address belong to the broker. Remove "\n'
-         '                    "--server, --token, --user, --client-certificate, "\n'
-         '                    "--insecure-skip-tls-verify and the other credential flags to "\n'
-         '                    "use the cluster and identity the proxy configured. "\n'
-         '                    + _FLAG_BOUNDARY_NOTICE\n'
-         '                ),\n',
-         '                message="",\n'),
+        ('    return Decision(allowed=False, rule_id=rule_id, message=" ".join(parts), offending_flag=flag)\n',
+         '    return Decision(allowed=False, rule_id=rule_id, message="", offending_flag=flag)\n'),
         "test_A1_a_refusal_names_the_rule_that_fired",
         "collapse a refusal onto its rule id -- the cheapest way to satisfy "
         "A1's no-caller-supplied-byte bound is to stop saying anything, and an "
@@ -766,6 +760,26 @@ Mutation(
         "every IAM principal in a tool result then reaches the model as "
         "[REDACTED_EMAIL], which is the over-eager shape that gets redaction "
         "turned off",
+    ),
+    Mutation(
+        "A1-flag-refusal-invites-a-write-retry",
+        "agents/platform/scripts/command_policy.py",
+        ("    stripped = _strip_refused_flags(argv)\n",
+         "    return None\n    stripped = _strip_refused_flags(argv)\n"),
+        "test_A1_a_refusal_invites_no_retry_it_would_refuse",
+        "skip the remainder check to save an evaluation per refusal -- every "
+        "flag refusal on a write invites the flagless retry again, and the "
+        "agent runs the bare write it was always going to be refused",
+    ),
+    Mutation(
+        "A1-unknown-flag-invites-a-write-retry",
+        "agents/platform/scripts/command_policy.py",
+        ("        if words is None and reading_verb is not _NOT_A_WRITE and (\n",
+         "        if False and words is None and reading_verb is not _NOT_A_WRITE and (\n"),
+        "test_A1_a_refusal_invites_no_retry_it_would_refuse",
+        "drop the write variant of the unreadable refusal as an edge case -- "
+        "an unknown flag on clusters update says re-run without the flag, "
+        "seven times over",
     ),
     Mutation(
         "C2-unknown-flag-fail-open",
