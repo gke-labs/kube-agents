@@ -1109,17 +1109,21 @@ class RosterTest(unittest.TestCase):
         jobs = {job["id"]: job for job in json.loads(roster.read_text(encoding="utf-8"))["jobs"]}
         entrypoint = (Path(__file__).resolve().parents[3] / "deploy" / "shared" / "docker-entrypoint.sh").read_text()
         seeded = next(line for line in entrypoint.splitlines() if line.strip().startswith('ASSUME_RETIRED="bootstrap'))
-        for job_id in ("bootstrap-inventory-scan", "bootstrap-inventory-delivery", "first-run-quick-value-audit"):
+        for job_id in ("bootstrap-inventory-scan", "bootstrap-inventory-delivery"):
             if job_id in jobs:
                 self.assertIs(jobs[job_id].get("enabled"), False, job_id)
                 self.assertIn(job_id, seeded.split('"')[1].split(","), job_id)
 
-    def test_the_retired_gate_script_stays_a_no_op(self):
-        # Volumes keep the dropped entry, and nothing prunes it, so its script
-        # must still exist and do nothing.
-        script = Path(__file__).resolve().parent / "first_run_audit_gate.py"
-        proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=30)
-        self.assertEqual((proc.returncode, proc.stdout, proc.stderr), (0, "", ""))
+    def test_the_retired_first_run_gate_is_deleted_from_volumes(self):
+        # oobe runs the first-run audits. A volume can still hold the gate
+        # enabled, and only the default profile's --cron-retire removes it.
+        roster = Path(__file__).resolve().parent.parent / "defaults" / "cron" / "jobs.json"
+        ids = {job["id"] for job in json.loads(roster.read_text(encoding="utf-8"))["jobs"]}
+        self.assertNotIn("first-run-quick-value-audit", ids)
+        entrypoint = (Path(__file__).resolve().parents[3] / "deploy" / "shared" / "docker-entrypoint.sh").read_text()
+        retire = next(line for line in entrypoint.splitlines() if "--cron-retire" in line and "github-issue-resolver" in line
+                      and "compliance-audit" in line)
+        self.assertIn("first-run-quick-value-audit", retire.split('"')[1].split())
 
 
 class ManagedRepositoriesTest(unittest.TestCase):

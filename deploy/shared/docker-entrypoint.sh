@@ -974,6 +974,10 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # this image ships it. Retiring it and shipping it on the Platform Agent's roster
 # is the same move, applied late.
 #
+# first-run-quick-value-audit is retired, not moved: `oobe` runs the same first-run audits. A
+# volume that never booted an image shipping it disabled still holds it enabled, and nothing
+# else can reach that copy once the image stops shipping it.
+#
 # It runs BEFORE 2c-bis deliberately, and the two lists must not overlap. The
 # order only decides how fast an accidental overlap bites, not whether it does:
 # retire-last would delete a job the image still ships on every single boot,
@@ -1000,7 +1004,7 @@ if [ -f "/opt/defaults/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
         --template /opt/defaults \
         --items "cron" \
         --cron-jobs "profile-cron-tick" \
-        --cron-retire "compliance-audit obtainability-audit security-patch-orchestrator fleet-wide-cost-analysis fleet-consistency-drift ai-security-audit stockout-prevention github-issue-resolver" \
+        --cron-retire "compliance-audit obtainability-audit security-patch-orchestrator fleet-wide-cost-analysis fleet-consistency-drift ai-security-audit stockout-prevention github-issue-resolver first-run-quick-value-audit" \
         >/dev/null || echo "WARN: default-profile cron merge failed; jobs added by this image will not run" >&2
 fi
 
@@ -1040,13 +1044,12 @@ fi
 # be reinstalled. .bootstrap_completed is that record. `oobe` is seeded on the same record for a
 # different reason: an install that onboarded before the job existed must never get it. oobe.py
 # skips a sweep more than a day old, but one that onboarded recently would start four fleet audits
-# it is not owed. `first-run-quick-value-audit` no longer ships, so its id here is inert; it goes
-# with first_run_audit_gate.py once no volume holds the entry.
+# it is not owed.
 CRON_SYNC="/opt/defaults/scripts/cron_jobs_sync.py"
 if [ -f "$CRON_SYNC" ] && [ -f "/opt/defaults/cron/jobs.json" ]; then
     ASSUME_RETIRED=""
     if [ -f "$TARGET_DIR/.bootstrap_completed" ]; then
-        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery,oobe,first-run-quick-value-audit"
+        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery,oobe"
     fi
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
         "$CRON_SYNC" \
