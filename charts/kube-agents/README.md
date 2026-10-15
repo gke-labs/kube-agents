@@ -431,23 +431,12 @@ regardless and fails at apply time where the CRD is absent; `false` never render
 `--api-versions monitoring.coreos.com/v1/ServiceMonitor`, or `--api-versions operator.victoriametrics.com/v1beta1/VMPodScrape`
 to see the default render.
 
-When deploying via GitOps tools like ArgoCD that render Helm templates client-side (disconnected from the live API server),
-default detection resolves to false because `helm template` sees no cluster capabilities. To enable default detection in
-ArgoCD, configure `helm.apiVersions` in the `Application` manifest:
+> **NetworkPolicy & Selector Requirements:**
+>
+> - **NetworkPolicy:** The operator's default NetworkPolicies on agent pods admit metrics ports only from `gke-gmp-system` (and operator pods on gateway/proxy). On clusters enforcing NetworkPolicy, you must create a NetworkPolicy admitting your scraper's namespace on ports 9095, 9097, 8766 (and 9096 on next mode), or set `platformAgent.networkPolicy.enabled: false` on the PlatformAgent CR if managing policies independently.
+> - **Prometheus Operator Selectors:** `kube-prometheus-stack` defaults `serviceMonitorSelector` to match its own Helm release label (`release: <stack-release-name>`). Ensure your Prometheus instance is configured to discover across namespaces without release label constraints (e.g., `serviceMonitorSelectorNilUsesHelmValues: false` or `serviceMonitorSelector: {}`).
 
-```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-spec:
-  source:
-    helm:
-      apiVersions:
-        - operator.victoriametrics.com/v1beta1/VMPodScrape # for VictoriaMetrics
-        # - monitoring.coreos.com/v1/ServiceMonitor        # for Prometheus Operator
-        # - monitoring.googleapis.com/v1/PodMonitoring     # for GKE Managed Prometheus
-```
-
-Alternatively, explicitly set the target monitoring value to `true` in Helm values (for example, `platformAgent.vmPodScrape: true`).
+When deploying via GitOps tools like ArgoCD, `helm template` passes the destination cluster's discovered API versions by default when connected to the target cluster. If default detection does not pick up your CRDs or if running disconnected templates, explicitly set `platformAgent.serviceMonitor: true` or `platformAgent.vmPodScrape: true` in your Helm values.
 
 ### Turning telemetry off
 
