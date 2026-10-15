@@ -52,7 +52,11 @@ func (f *fakeBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	status := f.status
 	f.mu.Unlock()
 	if status != 0 {
-		http.Error(w, `{"error":{"code":403,"message":"denied"}}`, status)
+		// The broker's own error shape, which is not Google's: googleapi
+		// then takes the code from the HTTP status, as it does in production.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"error":"refused","code":"SECURITY_POLICY_BLOCKED"}`))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -238,6 +242,49 @@ func TestDiscoverThroughBrokerSkipsAClusterWithNoUsableEndpoint(t *testing.T) {
 	}
 	if skips["cluster-dark"] == nil || len(skips) != 1 {
 		t.Fatalf("skips = %v, want cluster-dark alone", skips)
+	}
+}
+
+// TestDiscoverFailsWhenTheBrokerCannotBeReached keeps a broker that is down
+// from reading as every cluster refusing: discovery runs once, so skipping
+// them all would leave the fleet unwatched until a restart. It fails instead,
+// which the supervisor answers with a restart. An HTTP refusal is still a skip.
+func TestDiscoverFailsWhenTheBrokerCannotBeReached(t *testing.T) {
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "no-such-adc.json"))
+	srv := httptest.NewServer(http.NotFoundHandler())
+	unreachable := srv.URL
+	srv.Close()
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeToken(t, tokenFile, "token-1")
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-a", "proj", "a", "us-central1")
+
+	skips := map[string]error{}
+	d := Discoverer{Broker: &Broker{URL: unreachable, TokenFile: tokenFile}, OnSkip: func(p string, err error) { skips[p] = err }}
+	clusters, err := d.Discover(context.Background(), dir)
+	if err == nil || len(clusters) != 0 {
+		t.Fatalf("Discover = %v, %v; want an error and no clusters", clusters, err)
+	}
+	if !strings.Contains(err.Error(), "credential proxy") || len(skips) != 0 {
+		t.Errorf("err = %v, skips = %v; want a credential-proxy error and no skip", err, skips)
+	}
+
+	fb, broker := newFakeBroker(t)
+	fb.status = http.StatusForbidden
+	skips = map[string]error{}
+	d = Discoverer{Broker: broker, OnSkip: func(p string, err error) { skips[p] = err }}
+	if _, err := d.Discover(context.Background(), dir); err != nil || skips["cluster-a"] == nil {
+		t.Errorf("a 403 from the broker: err = %v, skips = %v; want a skip and no error", err, skips)
+	}
+
+	// The broker's own state: no credential yet (503), or its hop to Google
+	// failed (502, 504). Fatal, like a broker that cannot be reached.
+	for _, code := range []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+		fb.status = code
+		skips = map[string]error{}
+		if _, err := d.Discover(context.Background(), dir); err == nil || len(skips) != 0 {
+			t.Errorf("a %d from the broker: err = %v, skips = %v; want an error and no skip", code, err, skips)
+		}
 	}
 }
 

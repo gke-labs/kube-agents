@@ -46,6 +46,7 @@ RULE_GCP_METHOD = "gcp.watcher.method"
 RULE_GCP_ROUTE = "gcp.watcher.route"
 RULE_GCP_SUBSCRIPTION = "gcp.watcher.subscription"
 RULE_GCP_BODY = "gcp.watcher.body"
+RULE_GCP_CLUSTER_GET = "gcp.watcher.cluster-get"
 RULE_K8S_METHOD = "kubernetes.watcher.method"
 RULE_K8S_TARGET = "kubernetes.watcher.target"
 RULE_K8S_PATH = "kubernetes.watcher.path"
@@ -58,14 +59,16 @@ RULE_K8S_QUERY = "kubernetes.watcher.query"
 PROJECT_ID = r"[a-z][a-z0-9-]{4,28}[a-z0-9]"
 # A domain-scoped project carries `<domain>:` in front of its id.
 PROJECT = rf"(?:[a-z0-9][a-z0-9.-]*[a-z0-9]:)?{PROJECT_ID}"
-# A Pub/Sub path may name the project by id or by number.
-PUBSUB_PROJECT = rf"(?:{PROJECT}|[0-9]{{1,20}})"
+# A Google resource path may name the project by id or by number: Pub/Sub's,
+# GKE's, and so the Kubernetes route's target, which names the same cluster.
+PROJECT_REF = rf"(?:{PROJECT}|[0-9]{{1,20}})"
+PUBSUB_PROJECT = PROJECT_REF
 LOCATION = r"[a-z][a-z0-9-]{1,62}"
 CLUSTER = r"[a-z]([a-z0-9-]{0,38}[a-z0-9])?"
 # A Pub/Sub subscription id: 3 to 255 characters, starting with a letter.
 SUBSCRIPTION = r"[A-Za-z][A-Za-z0-9._~+%-]{2,254}"
 
-_GKE_CLUSTER_GET = re.compile(rf"v1/projects/{PROJECT}/locations/{LOCATION}/clusters/{CLUSTER}")
+_GKE_CLUSTER_GET = re.compile(rf"v1/projects/{PROJECT_REF}/locations/{LOCATION}/clusters/{CLUSTER}")
 _PUBSUB_SUBSCRIPTION = re.compile(
     rf"v1/(?P<sub>projects/{PUBSUB_PROJECT}/subscriptions/{SUBSCRIPTION})(?P<verb>:pull|:acknowledge|:modifyAckDeadline)?"
 )
@@ -75,7 +78,7 @@ PUBSUB_BODIES: dict[str, dict[str, type]] = {
     ":acknowledge": {"ackIds": list},
     ":modifyAckDeadline": {"ackIds": list, "ackDeadlineSeconds": int},
 }
-_TARGET = re.compile(rf"(?P<project>{PROJECT})/(?P<location>{LOCATION})/(?P<cluster>{CLUSTER})")
+_TARGET = re.compile(rf"(?P<project>{PROJECT_REF})/(?P<location>{LOCATION})/(?P<cluster>{CLUSTER})")
 
 # A Kubernetes path segment for a namespace, group, version or resource plural:
 # DNS-1123 labels and subdomains. Nothing here admits a dot segment or an encoding.
@@ -122,6 +125,31 @@ EVENTS_QUERY_KEYS = frozenset(
 NAMED_QUERY_KEYS = frozenset({"resourceVersion"})
 
 
+# What of a GKE `Cluster` the watchers are relayed: the fields the Go side reads
+# (clusterprofiles.ClientConfigForIdentity and Discover) and nothing else. The
+# rest of `clusters.get` is not theirs, and `masterAuth` is the sharp part: on a
+# cluster with client certificate issuance on, it carries `clientCertificate`
+# and `clientKey`, a credential for that cluster's API server far wider than the
+# GET-only route the watcher role is held to. Only its CA, which is public, is kept.
+CLUSTER_FIELDS = frozenset({"name", "location", "status", "endpoint", "controlPlaneEndpointsConfig", "autopilot"})
+CLUSTER_MASTER_AUTH_FIELDS = frozenset({"clusterCaCertificate"})
+
+
+def project_cluster(body: bytes) -> bytes | None:
+    """The relayed form of a `clusters.get` answer, or None if it is not one."""
+    try:
+        cluster = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(cluster, dict):
+        return None
+    kept = {k: v for k, v in cluster.items() if k in CLUSTER_FIELDS}
+    master_auth = cluster.get("masterAuth")
+    if isinstance(master_auth, dict):
+        kept["masterAuth"] = {k: v for k, v in master_auth.items() if k in CLUSTER_MASTER_AUTH_FIELDS}
+    return json.dumps(kept, separators=(",", ":")).encode()
+
+
 def _refuse(rule_id: str, message: str) -> Decision:
     return Decision(allowed=False, rule_id=rule_id, message=message)
 
@@ -136,7 +164,7 @@ def evaluate_gcp(method: str, host: str, path: str, body: bytes, subscription: s
         return _refuse(RULE_GCP_METHOD, "The watcher relay forwards GET and POST only.")
     if host == GKE_HOST:
         if method == METHOD_GET and _GKE_CLUSTER_GET.fullmatch(path):
-            return Decision(allowed=True, rule_id="gcp.watcher.cluster-get", message="")
+            return Decision(allowed=True, rule_id=RULE_GCP_CLUSTER_GET, message="")
         return _refuse(RULE_GCP_ROUTE, "The watcher relay reads one GKE cluster by name and nothing else.")
     if host == PUBSUB_HOST:
         match = _PUBSUB_SUBSCRIPTION.fullmatch(path)
@@ -218,16 +246,19 @@ def evaluate_k8s(method: str, rest: str, query: dict[str, list[str]]) -> Decisio
     return Decision(allowed=True, rule_id="kubernetes.watcher.named-get", message="")
 
 
-# Go's strconv.ParseBool true spellings, which the API server reads `watch` with.
-WATCH_TRUE = frozenset({"1", "t", "T", "TRUE", "true", "True"})
+# The values the API server reads `watch` as false. It decodes ListOptions with
+# apimachinery's runtime.Convert_Slice_string_To_bool, not strconv.ParseBool:
+# no value is false, "0" or a case-insensitive "false" is false, and any other
+# first value -- "yes", "on", "f", the empty string -- is true.
+WATCH_FALSE = frozenset({"0", "false"})
 
 
 def is_watch(query: dict[str, Any]) -> bool:
     """True when an events request asks for a watch stream.
 
     Decided as the API server decides it: the first `watch` value, read with
-    ParseBool. Anything the server would stream is therefore under the watch
-    caps here.
+    Convert_Slice_string_To_bool. Anything the server would stream is
+    therefore under the watch caps here.
     """
     values = query.get("watch") or []
-    return bool(values) and values[0] in WATCH_TRUE
+    return bool(values) and values[0].lower() not in WATCH_FALSE

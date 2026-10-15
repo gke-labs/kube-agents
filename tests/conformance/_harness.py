@@ -136,7 +136,7 @@ SOURCES: dict[str, Source] = {
     # watchers under the watcher role.
     "watcher_policy": Source(
         "agents/platform/scripts/watcher_policy.py",
-        ("def evaluate_k8s(", "def evaluate_gcp(", "REFUSED_RESOURCES", "WATCHER_K8S_PREFIX"),
+        ("def evaluate_k8s(", "def evaluate_gcp(", "REFUSED_RESOURCES", "WATCHER_K8S_PREFIX", "def project_cluster("),
     ),
     # C1 holds the operator's copy of the drift detector's default
     # subscription to the detector's own.

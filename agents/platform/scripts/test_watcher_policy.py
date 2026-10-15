@@ -77,6 +77,32 @@ class GcpTest(unittest.TestCase):
             with self.subTest(method=method, path=path):
                 self.assertFalse(w.evaluate_gcp(method, w.GKE_HOST, path, b"", SUB).allowed)
 
+    def test_a_cluster_is_projected_to_the_fields_the_watchers_read(self):
+        body = json.dumps({
+            "name": "c", "location": "us-east4", "status": "RUNNING", "endpoint": "1.2.3.4",
+            "controlPlaneEndpointsConfig": {"dnsEndpointConfig": {"endpoint": "c.example"}},
+            "autopilot": {"enabled": True},
+            "masterAuth": {"clusterCaCertificate": "CA", "clientCertificate": "CERT", "clientKey": "KEY",
+                           "username": "admin", "password": "pw"},
+            "nodePools": [{}], "legacyAbac": {"enabled": True},
+        }).encode()
+        projected = json.loads(w.project_cluster(body))
+        self.assertEqual(projected["masterAuth"], {"clusterCaCertificate": "CA"})
+        self.assertEqual(set(projected), set(w.CLUSTER_FIELDS) | {"masterAuth"})
+
+    def test_an_answer_that_is_not_a_cluster_object_is_not_projected(self):
+        for body in (b"not json", b"[]", b'"x"'):
+            with self.subTest(body=body):
+                self.assertIsNone(w.project_cluster(body))
+
+    def test_a_cluster_named_by_project_number_is_read_and_targeted(self):
+        # GKE takes a project number in a cluster's resource name, and a profile
+        # may carry one; the Go side's identity check admits it.
+        self.assertTrue(
+            w.evaluate_gcp("GET", w.GKE_HOST, "v1/projects/123456789012/locations/us-east4/clusters/fleet-a", b"", SUB).allowed
+        )
+        self.assertTrue(w.evaluate_k8s("GET", "123456789012/us-east4/fleet-a/api/v1/events", {}).allowed)
+
     def test_no_other_host(self):
         self.assertEqual(
             w.evaluate_gcp("GET", "iamcredentials.googleapis.com", "v1/x", b"", SUB).rule_id, w.RULE_GCP_ROUTE
@@ -143,8 +169,15 @@ class K8sTest(unittest.TestCase):
                 self.assertEqual(self.evaluate(path).rule_id, "kubernetes.watcher.named-get")
 
     def test_watch_is_decided_like_the_api_server_decides_it(self):
-        self.assertTrue(w.is_watch({"watch": ["t"]}))
-        self.assertFalse(w.is_watch({"watch": ["0", "1"]}))
+        # apimachinery's Convert_Slice_string_To_bool: false only for "0" or a
+        # case-insensitive "false"; every other first value streams, the empty
+        # string included.
+        for value in ("t", "1", "true", "yes", "on", "f", "F", "2", "tRuE", ""):
+            with self.subTest(value=value):
+                self.assertTrue(w.is_watch({"watch": [value, "0"]}))
+        for value in ("0", "false", "FALSE", "False"):
+            with self.subTest(value=value):
+                self.assertFalse(w.is_watch({"watch": [value, "1"]}))
         self.assertFalse(w.is_watch({}))
 
     def test_the_watches_client_go_actually_sends_are_allowed(self):
