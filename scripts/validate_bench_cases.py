@@ -56,6 +56,8 @@ PLATFORM_JOBS_FILE = REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json"
 AUDIT_STREAMS_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "audit_streams.py"
 AUDIT_STREAMS_MODULE_NAME = "bench_audit_streams"
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
+# The tag PyYAML gives a `<<:` merge key; its pairs are merged in, not repeated.
+YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 # The rosters hack/ci-eval-pr.sh reads at startup (#1546): what the presubmit
 # runs, what the nightly adds. A case is registered by being in one of them.
 PRESUBMIT_CASES_FILE = eval_rosters.PRESUBMIT_CASES_FILE
@@ -163,25 +165,12 @@ KNOWN_UNREGISTERED = {
     # three greens on the fix), and belongs in the nightly. #2755 lists what it
     # still needs first: Compute network permission for the CI runners,
     # confirmed or granted; a scheduled hack/ci_sweep_compute_plants.py; and
-    # room on the main part's infra-lock chain, measured with
-    # oobe-first-run-audits in it if that parked case returns first (or stack
-    # cases moved to a second project).
+    # room on the main part's infra-lock chain (or stack cases moved to a
+    # second project).
     # The entry goes when the case joins hack/eval/nightly-cases.txt.
     "networking-audit-subnet-range-exhaustion": (
         "#2755: stack case held out of the nightly until runner Compute "
         "permission, a scheduled plant sweep and infra-lock room land"
-    ),
-    # Parked out of hack/eval/nightly-cases.txt on 2026-10-09 after its first
-    # night (build 2108346853085941760): its three repetitions held the infra
-    # lock 140 minutes and the deadline cut the main part, and each graded
-    # blocked, because its no-tool turn leaves an empty trajectory, which the
-    # gate's liveness rung reads as no agent run. The entry goes when the case
-    # can record a pass or a fail (#2699's tool_calls_optional would let its
-    # reply pass that rung) and the main part's infra-lock chain has room for
-    # it (or it runs on a job of its own); #2806 tracks both.
-    "oobe-first-run-audits": (
-        "#2806: parked 2026-10-09; 140 infra-lock minutes truncated the main "
-        "nightly, and its empty trajectory grades every repetition blocked"
     ),
     # It grades what a chat channel received, and every CI install deploys with
     # GOOGLE_CHAT_ENABLED and SLACK_ENABLED false (hack/ci-deploy.sh), so the
@@ -349,6 +338,12 @@ KNOWN_NO_DOMAIN = {
         "image; it reads no fleet and no domains.yaml row describes skill or "
         "sandbox integrity"
     ),
+    "alert-config-terraform-promql-probe": (
+        "a skill-guidance probe: a Terraform alert policy written from the "
+        "gke-alert-configuration skill, graded on its PromQL condition, metric "
+        "and label; it reads no fleet and no domains.yaml row describes "
+        "alert authoring"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
@@ -506,9 +501,42 @@ class CaseError(Exception):
     """A case file that could not be read at all."""
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """SafeLoader that refuses a key written twice in one mapping.
+
+    devops-bench loads a task with ruamel's safe loader, which raises on a
+    repeated key, while yaml.safe_load keeps the last value. With safe_load
+    here, a task.yaml the runner cannot load at all would pass this validator.
+    A key that overrides one brought in by a merge key (`<<: *anchor`) is not a
+    repeat; both loaders accept it.
+    """
+
+
+def _construct_unique_mapping(loader: _UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False) -> Any:
+    # The mapping's own keys only, before construct_mapping flattens merged
+    # pairs into node.value, where an override would look like a repeat. Keys
+    # are compared as written (resolved tag and text), never constructed here:
+    # constructing one before construct_mapping normalises it can raise on a
+    # key both other loaders accept. A composite key is left to them.
+    seen: set[tuple[str, str]] = set()
+    for key_node, _ in node.value:
+        if key_node.tag == YAML_MERGE_TAG or not isinstance(key_node, yaml.ScalarNode):
+            continue
+        key = (key_node.tag, key_node.value)
+        if key in seen:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark, f"found duplicate key {key_node.value!r}", key_node.start_mark
+            )
+        seen.add(key)
+    return loader.construct_mapping(node, deep=deep)
+
+
+_UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
+
+
 def _load_yaml(path: pathlib.Path) -> Any:
     try:
-        return yaml.safe_load(path.read_text(encoding="utf-8"))
+        return yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)  # noqa: S506 - a SafeLoader subclass
     except (OSError, yaml.YAMLError) as exc:
         raise CaseError(f"{path}: could not be parsed as YAML: {exc}") from exc
 

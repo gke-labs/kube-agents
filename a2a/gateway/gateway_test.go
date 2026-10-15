@@ -1206,6 +1206,69 @@ type fakeSpawner struct {
 	// tests use it to assert the terminal was already on the stream when
 	// the pod went, which "terminal exists and pod deleted" alone cannot.
 	onDelete func(podName string)
+	// reusable names the pods Reusable vouches for; reusableErr fails the
+	// read. Empty, no pod is reusable, which is every pre-#2825 test's
+	// world: each turn a fresh pod.
+	reusable    map[string]bool
+	reusableErr error
+	// sessionPods is what SessionPods lists, the cap eviction's candidates.
+	sessionPods []sessionPod
+	// orphansErr fails TerminalOrphans, the orphan sweep's list.
+	orphansErr error
+	// deleteErr fails Delete (the call is still recorded).
+	deleteErr error
+	// started is each pod's start time for PodStarted; startedErr fails it.
+	started    map[string]time.Time
+	startedErr error
+}
+
+func (s *fakeSpawner) Reusable(_ context.Context, podName string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reusableErr != nil {
+		return false, s.reusableErr
+	}
+	return s.reusable[podName], nil
+}
+
+// PodStarted answers from started; a pod not in it has no start time.
+func (s *fakeSpawner) PodStarted(_ context.Context, podName string) (time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.startedErr != nil {
+		return time.Time{}, s.startedErr
+	}
+	return s.started[podName], nil
+}
+
+func (s *fakeSpawner) setStarted(pod string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started == nil {
+		s.started = map[string]time.Time{}
+	}
+	s.started[pod] = at
+}
+
+func (s *fakeSpawner) setReusable(pods ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reusable = map[string]bool{}
+	for _, p := range pods {
+		s.reusable[p] = true
+	}
+}
+
+func (s *fakeSpawner) SessionPods(context.Context) ([]sessionPod, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]sessionPod(nil), s.sessionPods...), nil
+}
+
+func (s *fakeSpawner) setSessionPods(p ...sessionPod) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionPods = p
 }
 
 type fakeSpawn struct {
@@ -1234,13 +1297,19 @@ func (s *fakeSpawner) failSpawns(err error) {
 
 func (s *fakeSpawner) Delete(_ context.Context, podName string) error {
 	s.mu.Lock()
-	hook := s.onDelete
+	hook, err := s.onDelete, s.deleteErr
 	s.deletes = append(s.deletes, podName)
 	s.mu.Unlock()
 	if hook != nil {
 		hook(podName)
 	}
-	return nil
+	return err
+}
+
+func (s *fakeSpawner) setDeleteErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteErr = err
 }
 
 func (s *fakeSpawner) deleted() []string {
@@ -1252,6 +1321,9 @@ func (s *fakeSpawner) deleted() []string {
 func (s *fakeSpawner) TerminalOrphans(context.Context) ([]orphanPod, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.orphansErr != nil {
+		return nil, s.orphansErr
+	}
 	return append([]orphanPod(nil), s.orphans...), nil
 }
 
@@ -1692,6 +1764,10 @@ func TestTaskEndCountsAsActivity(t *testing.T) {
 	if !after.LastTaskActivity.Equal(after.LastActivity) {
 		t.Fatalf("the executor's terminal must move the task's own clock with the session's: task=%v session=%v", after.LastTaskActivity, after.LastActivity)
 	}
+	// Only a user's message moves the reap's idle clock; an answer must not.
+	if !after.LastUserMessage.Equal(before.LastUserMessage) {
+		t.Fatalf("the executor's terminal moved LastUserMessage from %v to %v", before.LastUserMessage, after.LastUserMessage)
+	}
 	held, until, err := r.g.hasSession(ctx, conv)
 	if err != nil || !held || !until.Equal(after.LastTaskActivity.Add(r.g.cfg.IdleTTL)) {
 		t.Fatalf("after the terminal the session must be held until LastTaskActivity+IdleTTL: held=%v until=%v err=%v", held, until, err)
@@ -1894,6 +1970,11 @@ func TestHealedExecutorTerminalCountsAsActivity(t *testing.T) {
 	}
 	if !after.LastTaskActivity.After(stale) {
 		t.Fatalf("the healed executor terminal did not count as activity: %v", after.LastTaskActivity)
+	}
+	// The "stop" stamped LastUserMessage before the heal ran; the heal's own
+	// stamp, later, must leave it there.
+	if !after.LastUserMessage.Before(after.LastTaskActivity) {
+		t.Fatalf("the healed executor terminal moved LastUserMessage to %v (task clock %v)", after.LastUserMessage, after.LastTaskActivity)
 	}
 	if held, _, err := r.g.hasSession(ctx, conv); err != nil || !held {
 		t.Fatalf("after the heal posted the answer the thread must still be a session thread: held=%v err=%v", held, err)

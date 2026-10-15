@@ -1261,9 +1261,7 @@ audits' workload checks as well: liveness and readiness probes, requests and lim
 NetworkPolicy, the cluster's Workload Identity setting and pod security. Four streams
 (`fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, `stockout-prevention`) now
 also run once right after the scan as the first-run audits (`oobe.md`), so the sweep leaves their
-checks to them (`cluster_inventory_audit_sop.md`, Step 5). The exception is an install with no
-GitOps repository: the first-run audits do not run there, and the sweep's cards keep the checks under the
-audits' own slugs (that SOP's "Without a GitOps repository" section). What the sweep still shares
+checks to them (`cluster_inventory_audit_sop.md`, Step 5), on every install. What the sweep still shares
 with a stream everywhere is four cluster settings whose owners are not in the first-run chain:
 
 | what the sweep checks          | stream that owns it           | check slug           |
