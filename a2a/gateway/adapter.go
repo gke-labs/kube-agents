@@ -64,6 +64,19 @@ type InboundMessage struct {
 	// where to send it instead of being read as an ask. False is every
 	// other message, and every other backend's case.
 	TopLevel bool
+	// Click marks a message that is a click on a choice button rather than a
+	// message of its own: MessageID then names the click (the audit chain's
+	// join), not a message anything can be drawn on. A chain a click starts
+	// carries its mark on the conversation's previous ask instead (mark.go).
+	// False for a typed message, and for every backend but Slack.
+	Click bool
+	// Answer marks a typed message that answers a question the conversation
+	// has open (one the adapter laid out with choices). Like a click, it
+	// continues that ask's work rather than starting an ask of its own, so
+	// its chain marks the previous ask: otherwise the card that asked
+	// settles on the answer, and the ask keeps ⏸️. False on every backend
+	// but Slack.
+	Answer bool
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running
@@ -122,6 +135,47 @@ type Adapter interface {
 	// that decides to use it comes later. Until then everything posts to the
 	// room it came from.
 	OpenDirect(userID string) (conversation string, err error)
+
+	// React puts the reaction for a mark token on a message the conversation
+	// received, and RemoveReaction takes it off: the `mark` of a chat
+	// message (spec-a2a-payloads.md, "mark"), an ask kind (question,
+	// investigate, ...) or a settle (blocked, failed). The gateway decides
+	// which tokens a message carries; the adapter only owns which emoji, if
+	// any, a token shows, and a token it has none for is a nil no-op.
+	//
+	// Both are best effort, and the rule is the adapter's own: the gateway
+	// holds the bot token, so no credential-proxy rule applies here. An
+	// adapter removes only a reaction the bot itself put on, never anyone
+	// else's, and a backend that cannot react returns nil from both, as
+	// does a reaction that is already there or already gone. A failure is
+	// returned for the caller to log; it never holds up the answer.
+	React(conversation, messageID, token string) error
+	RemoveReaction(conversation, messageID, token string) error
+}
+
+// MarkObserver is the optional extension an Adapter implements to learn a
+// conversation's session mark whenever it changes: the latest ask's whole
+// mark state, or the newest older ask's while that one still has open card
+// work (SessionRecord.sessionMark), beside the React and RemoveReaction calls that draw it. The
+// Slack adapter uses it to hold the thread's Agent Sessions status: an ask
+// whose chain has ended but still carries its kind is card work still open,
+// and a blocked settle is work waiting on the user. Called where the mark is
+// applied, on the conversation's worker under its session lock: record and
+// return.
+type MarkObserver interface {
+	MarkChanged(conversation string, ask, settle string)
+}
+
+// VerifiedObserver is the optional extension an Adapter implements to learn
+// whether a message it handed over passed sender verification (verified:
+// it goes on as a turn) or was dropped. A backend that has to act on the
+// message itself -- the Slack adapter rewriting a clicked question to say
+// who answered, or titling the thread -- must not act for a sender the
+// gateway drops, and only the gateway holds the principal map. Called once
+// per message, on the conversation's inbox worker before the session lock
+// is taken: record and return.
+type VerifiedObserver interface {
+	InboundVerified(conversation, messageID string, verified bool)
 }
 
 // OutMessage is one post or edit as a value: the text, and the chat message
@@ -169,19 +223,6 @@ func editTextOnly(edit func(conversation, messageID, text string) error, convers
 		return ErrTextOnly
 	}
 	return edit(conversation, messageID, m.Text)
-}
-
-// ChatMarker is the optional extension an Adapter implements to receive the
-// mark a task's terminal status-update carried (spec-a2a-payloads.md,
-// "mark"): the reaction state for the message that started the work. The
-// relay reads and validates the terminal's mark-only chat message and hands
-// the mark over; the marks a posted chat message carries ride inside
-// OutMessage.Chat. Nothing implements it yet: the reactions, and the rule
-// that applies a mark only from the chain's newest task, come with the
-// Slack interactivity. Called on the relay queue under the session lock:
-// record and return.
-type ChatMarker interface {
-	ChatMark(conversation, taskID string, mark chatmsg.Mark)
 }
 
 // TaskObserver is the optional extension an Adapter implements when it has to

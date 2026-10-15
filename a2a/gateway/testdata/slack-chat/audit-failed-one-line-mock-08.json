@@ -1,0 +1,64 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "The GCP networking fabric and VPC IPAM audit ran and identified 2 critical firewall issues in project ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "my-project",
+                "type": "text"
+              },
+              {
+                "text": ", but could not publish its findings because no GitOps repository is registered in the ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "platform-agent-gitops-state",
+                "type": "text"
+              },
+              {
+                "text": " ConfigMap.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "child_blocks": [
+          {
+            "text": {
+              "text": "Here is the latest scheduled GCP networking fabric and VPC IPAM audit report from the platform agent.\n\n*What's wrong*\nThe GCP networking fabric and VPC IPAM audit ran and identified 2 critical firewall issues in project `my-project`, but could not publish its findings because no GitOps repository is registered in the `platform-agent-gitops-state` ConfigMap.\n\n*Why*\n• *FirewallRule/default-allow-rdp* — `sourceRanges 0.0.0.0/0` allows `tcp:3389` (RDP) with no target restriction.\n• *FirewallRule/default-allow-ssh* — `sourceRanges 0.0.0.0/0` allows `tcp:22` (SSH) with no target restriction.\n\n*What to do*\n• *Register a GitOps repository* — add one to the `platform-agent-gitops-state` ConfigMap so future audits can open a ledger issue.",
+              "type": "mrkdwn",
+              "verbatim": true
+            },
+            "type": "section"
+          }
+        ],
+        "default_collapsed": true,
+        "is_collapsible": true,
+        "title": {
+          "text": "why",
+          "type": "plain_text"
+        },
+        "type": "container"
+      }
+    ],
+    "attachments": []
+  }
+]

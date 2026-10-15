@@ -16,11 +16,16 @@ import unittest.mock
 
 from eval_dashboard import nightly, post_health, render, trend
 from test_eval_dashboard_pages import (
+    TWO_POLLS_BUDGET_MS,
     chrome,
+    dom_html,
     dom_text,
+    fast_timers_page,
     health_doc,
     load_fixture,
     render_to,
+    scroll_counting_page,
+    scrolls,
 )
 
 UTC = datetime.timezone.utc
@@ -158,6 +163,7 @@ class NightDocumentTest(unittest.TestCase):
         self.assertEqual((by_name["case-c"]["turn1_p50_s"], by_name["case-c"]["agent_p50_s"]), (None, None), "a value that is not a finite number is unknown")
         # 100.0, 110.0, 120.0: nearest rank, index round(1.8) == 2 for p90.
         self.assertEqual([by_name[name]["agent_p90_s"] for name in ("case-a", "case-b", "case-c")], [120.0, 300.0, None])
+        self.assertEqual([by_name[name]["turn1_p90_s"] for name in ("case-a", "case-b", "case-c")], [9.0, 12.0, None], "the infra rep left out")
         # 4.0, 6.0, 9.0, 12.0: nearest rank, index round(1.5) == 2 for p50.
         self.assertEqual((last["turn1_p50_s"], last["turn1_p95_s"]), (9.0, 12.0))
         self.assertEqual((first["turn1_p50_s"], first["turn1_p95_s"]), (None, None), "no rep carried a time")
@@ -766,10 +772,10 @@ class NightlyPageTest(unittest.TestCase):
         self.assertIn("check y: required phrases absent", app)
         # The timing: case-a's medians, a dash where none was recorded, and
         # the night's opening turn beside the target, as advice.
-        self.assertIn('2/3</td><td class="num tm" title="median opening chat turn / median agent wall clock, then the agent\'s p90, over the repetitions not lost to infra">6.0 s / 110.0 s<br><small class="mut">p90 120.0 s</small></td>', app)
+        self.assertIn('2/3</td><td class="num tm" title="median opening chat turn / median agent wall clock, then the p90 of each, over the repetitions not lost to infra">6.0 s / 110.0 s<br><small class="mut">p90 11.5 s / 120.0 s</small></td>', app)
         self.assertIn(">— / —</td>", app)
         self.assertIn('<div class="k">Chat turn 1</div><div class="v">6.0<small>s p50</small></div><div class="d2">p95 11.5 s · advisory target p95 &lt; 10 s</div>', app)
-        self.assertNotIn("Chat turn 1", dom_text(self.page, fragment=f"#build={NIGHT_1}"), "no tile for a night with no timing")
+        self.assertNotIn('<div class="k">Chat turn 1</div>', dom_text(self.page, fragment=f"#build={NIGHT_1}"), "no tile for a night with no timing")
         self.assertIn("chat turn 1 p50 5.3 s, p95 9.0 s (6 reps) · agent p50 120.0 s (6 reps)", dom_text(self.out / "cases.html"))
         self.assertIn(f'href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/{NIGHT_2}/artifacts/eval_case-b_rep1.log"', app)
         self.assertIn('href="cases.html#case-b"', app)
@@ -785,6 +791,49 @@ class NightlyPageTest(unittest.TestCase):
         self.assertIn(running, app)
         self.assertNotIn(running, dom_text(self.page, fragment=f"#build={NIGHT_1}"))
         self.assertNotIn('class="c running"', dom_text(self.out / "grid.html"), "a night in flight is no presubmit column")
+
+    def test_timing_night_over_night(self):
+        """The whole night's opening turn per night, and a case's own table
+        for `#cases=`: a night that did not record the case says so, and a
+        case no night recorded gets a note, not an empty table."""
+        data = load_fixture()
+        data["generated_at"] = NOW
+        data["cases"] = copy.deepcopy(CASES)
+        first, second = copy.deepcopy([FIRST, SECOND])
+        first["tasks"] = first["tasks"][1:]
+        for r, (agent, turn1) in zip(second["tasks"][0]["reps"], [(100.0, 4.0), (120.0, 11.5), (110.0, 6.0)]):
+            r.update(agent_s=agent, turn1_s=turn1)
+        # A name the link grammar refuses (over 80 characters) gets no timing link.
+        refused = "x" * 81
+        second["tasks"].append({**copy.deepcopy(second["tasks"][0]), "name": refused})
+        data["runs"] += [first, second]
+        with tempfile.TemporaryDirectory() as tmp, \
+                unittest.mock.patch.object(render.classify, "admitted_cases", return_value=frozenset()), \
+                unittest.mock.patch.object(render, "demotion_dates", return_value={}), \
+                unittest.mock.patch.object(render, "recent_merges", return_value=None):
+            page = render_to(tmp, data, health=health_doc("GREEN")) / "nightly.html"
+            app = dom_text(page)
+            self.assertIn("<h2>Timing, night over night</h2>", app)
+            self.assertIn(f'<tr><td class="tm"><a href="nightly.html#build={NIGHT_2}">Mon, Sep 7</a></td><td class="num">6.0 s</td><td class="num">11.5 s</td></tr>', app)
+            self.assertIn(f'<tr><td class="tm"><a href="nightly.html#build={NIGHT_1}">Sun, Sep 6</a></td><td class="num">—</td><td class="num">—</td></tr>', app)
+            self.assertIn("Over every repetition of the night not lost to infra; advisory target p95 &lt; 10 s.", app)
+            self.assertIn(f'<a href="nightly.html#build={NIGHT_2}&amp;cases=case-a">timing</a>', app)
+            self.assertNotIn(f"cases={refused}", app)
+            # On an older night, the timing link keeps that night.
+            self.assertIn(f'<a href="nightly.html#build={NIGHT_1}&amp;cases=case-b">timing</a>', dom_text(page, fragment=f"#build={NIGHT_1}"))
+            self.assertNotIn("night over night</h3>", app, "no case table without a case in the link")
+            app = dom_text(page, fragment="#cases=case-a")
+            self.assertIn("<h3><code>case-a</code>, night over night</h3>", app)
+            self.assertIn(f'<tr><td class="tm"><a href="nightly.html#build={NIGHT_2}&amp;cases=case-a">Mon, Sep 7</a></td><td><span class="pill p-partial" title="failed some reps">partial</span></td><td class="num">2/3</td>'
+                          '<td class="num tm">6.0 s</td><td class="num tm">11.5 s</td><td class="num tm">110.0 s</td><td class="num tm">120.0 s</td></tr>', app)
+            self.assertIn(f'<tr><td class="tm"><a href="nightly.html#build={NIGHT_1}&amp;cases=case-a">Sun, Sep 6</a></td><td class="mut" colspan="6">not recorded</td></tr>', app)
+            # Scrolled to once on navigation, not on the polls; a plain load does not scroll.
+            fast = fast_timers_page(scroll_counting_page(page))
+            self.assertEqual(scrolls(dom_html(fast, fragment="#cases=case-a", budget_ms=TWO_POLLS_BUDGET_MS)).group(1), "1")
+            self.assertIsNone(scrolls(dom_html(fast, budget_ms=TWO_POLLS_BUDGET_MS)), "no case, no scroll")
+            app = dom_text(page, fragment="#cases=no-such-case")
+            self.assertIn("No night on this page recorded <code>no-such-case</code>.", app)
+            self.assertNotIn("<h3><code>no-such-case</code>", app)
 
     def test_an_older_night_and_an_unknown_build(self):
         app = dom_text(self.page, fragment=f"#build={NIGHT_1}")

@@ -804,6 +804,10 @@ func (g *Gateway) observeChildEnd(rec *SessionRecord, child TaskRef, state lib.T
 		}
 	}
 	g.observeTaskTerminal(rec.Key, child.rootID(), end.State, end.Source, end.Reason)
+	// The chain ends at the child, so its mark settles here, as the chain's
+	// end the observers were just told (terminalMark leaves a child's
+	// terminal to this or to the wake).
+	g.applyTerminalMark(rec, child.ID, end.State)
 }
 
 // wakeNeedsFullAnswer reports whether the wake has to give the whole answer

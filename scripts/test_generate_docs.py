@@ -19,6 +19,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import generate_docs
 
@@ -163,6 +164,125 @@ class MultiPageBlockTest(unittest.TestCase):
         self.assertEqual(
             [(block, changed) for _, _, changed, block in targets],
             [("first", False), ("second", True)],
+        )
+
+
+def audit_job(job_id: str, schedule: dict, **extra) -> dict:
+    job = {
+        "id": job_id,
+        "name": job_id,
+        "schedule": schedule,
+        "prompt": f"Read the SOP at 'governance/{job_id}_sop.md'.",
+        "skills": [generate_docs.AUDIT_SKILL],
+        "enabled": True,
+    }
+    job.update(extra)
+    return job
+
+
+class CapabilitiesTest(unittest.TestCase):
+    """The README's capabilities matrix lists every audit and every skill."""
+
+    def test_the_block_is_registered_for_the_readme(self):
+        # Without this entry `--check` stops reading the README region and the
+        # table goes stale with every other test still green.
+        self.assertEqual(
+            generate_docs.BLOCKS["capabilities"],
+            ((generate_docs.README,), generate_docs.gen_capabilities),
+        )
+
+    def test_each_enabled_audit_is_listed_with_a_named_cadence(self):
+        jobs = [
+            job
+            for job in generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER)
+            if job.get("enabled") and generate_docs.AUDIT_SKILL in job.get("skills", [])
+        ]
+        audits = generate_docs.governance_audits()
+        self.assertEqual(sorted(a["id"] for a in audits), sorted(j["id"] for j in jobs))
+        body = generate_docs.gen_capabilities()
+        for audit in audits:
+            cadence = generate_docs.CRON_CADENCE[audit["expr"]]
+            self.assertIn(f"| {generate_docs.md_escape(audit['name'])} | {cadence} |", body)
+
+    def test_script_jobs_are_left_out(self):
+        ids = {a["id"] for a in generate_docs.governance_audits()}
+        for job in generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER):
+            if job.get("no_agent"):
+                self.assertNotIn(job["id"], ids)
+
+    def test_every_skill_is_listed(self):
+        skills = generate_docs.gen_capabilities().split("### Skills by area")[1]
+        names = {
+            *generate_docs._read_skills(generate_docs.SKILLS_DIR),
+            *generate_docs._read_skills(generate_docs.CLUSTER_SKILLS_DIR),
+        }
+        for name in names:
+            self.assertIn(f"`{name}`", skills)
+
+    def test_daily_audits_come_first_and_untimed_schedules_last(self):
+        roster = [
+            audit_job("step", {"expr": "0 */6 * * *"}),
+            audit_job("interval", {"kind": "interval", "minutes": 30, "display": "every 30m"}),
+            audit_job("null-expr", {"expr": None}),
+            audit_job("unicode-digit", {"expr": "0 \u00b2 * * *"}),
+            audit_job("weekly", {"expr": "0 7 * * 1"}),
+            audit_job("january", {"expr": "0 8 * 1 *"}),
+            audit_job("monthly", {"expr": "0 9 1 * *"}),
+            audit_job("daily-late", {"expr": "0 10 * * *"}),
+            audit_job("daily-early", {"expr": "30 6 * * *"}),
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            order = [a["id"] for a in generate_docs.governance_audits()]
+            body = generate_docs.gen_capabilities()
+        self.assertEqual(
+            order,
+            [
+                "daily-early",
+                "daily-late",
+                "weekly",
+                "january",
+                "monthly",
+                "step",
+                "interval",
+                "null-expr",
+                "unicode-digit",
+            ],
+        )
+        self.assertIn("| interval | `every 30m` |", body)
+
+    def test_a_cell_is_escaped_and_a_missing_name_falls_back_to_the_id(self):
+        roster = [
+            audit_job("piped", {"expr": "20 6 * * *"}, name="A | B <x>"),
+            audit_job("nameless", {"expr": "0 7 * * *"}, name=None),
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            body = generate_docs.gen_capabilities()
+        self.assertIn("| A \\| B &lt;x&gt; | Daily 06:20 |", body)
+        self.assertIn("| nameless |", body)
+
+    def test_disabled_and_skill_less_jobs_are_left_out(self):
+        roster = [
+            audit_job("off", {"expr": "0 6 * * *"}, enabled=False),
+            audit_job("no-skill", {"expr": "0 6 * * *"}, skills=[]),
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            self.assertEqual(generate_docs.governance_audits(), [])
+
+    def test_an_audit_whose_prompt_names_no_sop_fails_the_run(self):
+        roster = [audit_job("lost", {"expr": "0 6 * * *"}, prompt="Run the audit.")]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            with self.assertRaises(SystemExit) as caught:
+                generate_docs.governance_audits()
+        self.assertIn("lost", str(caught.exception))
+
+    def test_a_hyphenated_or_capitalised_sop_name_is_linked(self):
+        roster = [
+            audit_job("odd-name", {"expr": "0 6 * * *"}, prompt="Read 'governance/Odd-Name_SOP.md'.")
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            body = generate_docs.gen_capabilities()
+        self.assertIn(
+            "[`Odd-Name_SOP.md`](agents/platform/governance/Odd-Name_SOP.md)", body
         )
 
 

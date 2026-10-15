@@ -355,7 +355,7 @@
 # 2026-10-13 adds helm-chart-no-reconciler-stops (#2938): one probe-shaped
 # case, deployer: noop, unhinted at the 200s default, about 10 serial minutes
 # at three repetitions. Counted from the lists with it, the last entry below:
-# seventy-five cases (225 units) here, of an eighty-nine-case, 267-unit matrix.
+# seventy-six cases (228 units) here, of a ninety-case, 270-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -940,6 +940,12 @@
 # cases, so a busy board pushes this case's card wait toward its 1800s
 # ceiling. The dated paragraph above carries the budget arithmetic.
 ./tasks/gitops-drift-noise-filtered-triage/task.yaml
+
+# manage-cluster skill probe: excluding a cluster on an installer-managed
+# install goes through SCOPE_EXCLUDE_CLUSTERS in install.env and a full
+# upgrade, not a hand edit of the PlatformAgent (#2019). deployer: noop,
+# transcript-only, one delegation round trip.
+./tasks/manage-cluster-exclusion-installer-route-probe/task.yaml
 
 # A request to install a third-party Helm chart where nothing renders charts
 # from the GitOps repository: the agent stops, names the missing reconciler or

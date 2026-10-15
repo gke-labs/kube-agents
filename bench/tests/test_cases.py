@@ -140,6 +140,22 @@ def test_a_non_boolean_expected_fail_is_fatal(write_task, literal):
         load_case(path)
 
 
+def test_tool_calls_optional_defaults_to_false(write_task):
+    assert load_case(write_task("plain", {"id": "plain"})).tool_calls_optional is False
+
+
+def test_tool_calls_optional_true_is_read(write_task):
+    path = write_task("greet", {"id": "greet", "tool_calls_optional": True})
+    assert load_case(path).tool_calls_optional is True
+
+
+def test_a_non_boolean_tool_calls_optional_is_fatal(write_task):
+    """A quoted `"false"` would waive the trajectory signal for the case."""
+    path = write_task("quoted", 'id: quoted\ntool_calls_optional: "false"\n')
+    with pytest.raises(CaseSpecError, match="must be a YAML boolean"):
+        load_case(path)
+
+
 def test_a_missing_task_file_is_fatal(tmp_path):
     with pytest.raises(CaseSpecError, match="no such task file"):
         load_case(tmp_path / "nope" / "task.yaml")

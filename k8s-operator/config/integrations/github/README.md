@@ -5,6 +5,10 @@ This directory contains the configuration and deployment manifests for integrati
 - **Upstream Project & Guide:** [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter)
 - **Operational Model:** **Ahead-Of-Time (AOT)**. Cloud KMS keyrings, asymmetric signing keys, and the GitHub App private key import are pre-provisioned once upfront as durable cloud infrastructure. Because Cloud KMS keys cannot be destroyed or deleted in GCP, once Version 1 is `ENABLED`, it persists permanently across cluster teardowns and redeployments.
 
+## GitHub Enterprise Server
+
+These manifests mint on github.com only. For a GitHub Enterprise Server, use the chart, which sets the minter's API URL (`SOURCE_SYSTEM_API_BASE_URL`) and CA (`SSL_CERT_DIR`) from the GitHub forge: see [GitHub Enterprise Server in INSTALL.md](../../../../INSTALL.md#github-enterprise-server).
+
 ## How It All Works
 
 Minty acts as a secure broker between Google Cloud IAM (Workload Identity) and GitHub. When an agent requires access to a GitHub repository, the following flow occurs:
