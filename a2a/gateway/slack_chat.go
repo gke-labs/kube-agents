@@ -46,7 +46,8 @@ const (
 	// slackChatSectionMax is Slack's cap on a section's text.
 	slackChatSectionMax = 3000
 	// slackChatFoldChunk is the text one of a fold's rich_text blocks holds
-	// at most, under slackChatSectionMax (slackRichBlocks); a fold past
+	// at most, under slackChatSectionMax (slackRichBlocks), but for a single
+	// list item past it, which stands alone; a fold past
 	// slackChatContainerChildMax blocks is a message Slack cannot hold, which
 	// posts as its fallback.
 	slackChatFoldChunk = 2500

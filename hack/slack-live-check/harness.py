@@ -611,7 +611,8 @@ def judge_listed_reply(session: Session, name: str, channel: str, sent_ts: str, 
             evidence["last_bot_text"] = truncate(last_seen.get("text", ""))
             if session.args.wait_answer:
                 return CheckResult(name, False, f"the bot posted no answer (--wait-answer) within {timeout}s", evidence)
-            return CheckResult(name, False, f"the bot posted no status line within {timeout}s, only: "
+            missing = "answer" if session.args.no_status_line else "status line"
+            return CheckResult(name, False, f"the bot posted no {missing} within {timeout}s, only: "
                                f"{evidence['last_bot_text']!r}", evidence)
         return CheckResult(name, False, f"no reply from the bot within {timeout}s", evidence)
     if kind == KIND_NOT_STARTED:
