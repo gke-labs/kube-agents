@@ -52,6 +52,7 @@ AUDIT_IDS = {
     "compliance-rbac-overgrant": "compliance-audit",
     "consistency-drift-outlier": "fleet-consistency-drift",
     "consistency-no-environment-label": "fleet-consistency-drift",
+    "fleet-audit-clean-close-reads-clean": "ai-security-audit",
     "fleet-audit-unchanged-finding-keeps-wording": "fleet-consistency-drift",
     "fleet-cost-idle-pool": "fleet-wide-cost-analysis",
     "obtainability-planted-pdb": "obtainability-audit",

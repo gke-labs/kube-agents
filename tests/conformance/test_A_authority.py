@@ -49,14 +49,16 @@ class A1AuthorityIsNotObtainableThroughUs(unittest.TestCase):
     )
 
     def test_A1_a_refusal_names_no_caller_supplied_value(self) -> None:
-        """The body the caller receives carries no byte the caller supplied.
+        """The refusal's rule id and message carry no byte the caller supplied.
 
         Historical shape: A1 requires a denial to be bounded, because "you lack
         access to tenant-b/payments" is an existence oracle over another
-        tenant's namespace names. The refusal body is a fixed rule id and a
-        fixed message, and this asserts it stays that way -- interpolating the
-        offending value into the message is the obvious, helpful-looking change
-        that would break it.
+        tenant's namespace names. The rule id and the message are fixed, and
+        this asserts they stay that way -- interpolating the offending value
+        into the message is the obvious, helpful-looking change that would
+        break it. The body's ``verb`` field (kubectl's own verb words; gcloud's
+        surface words, a two-word surface's positional among them) is the
+        sanitised, length-capped value D1 covers.
         """
         for argv in self.HOSTILE_ARGVS:
             with self.subTest(argv=argv):
@@ -65,9 +67,11 @@ class A1AuthorityIsNotObtainableThroughUs(unittest.TestCase):
                     decision.allowed,
                     f"{argv} was allowed; this corpus is meant to be entirely refusals",
                 )
-                # The caller receives rule_id and message. verb_tuple and
-                # offending_flag are log-side and are covered by
-                # test_D_accountability.py.
+                # The caller receives rule_id and message, and for a kubectl
+                # refusal the verb and, when the second word is one of kubectl's
+                # own subcommands, that word (credential_proxy._KUBECTL_SUBCOMMANDS);
+                # a gcloud refusal's body carries the surface words the log does,
+                # which D1 covers. offending_flag is log-side.
                 self.assertNotIn(MARKER, decision.rule_id)
                 self.assertNotIn(MARKER, decision.message)
 

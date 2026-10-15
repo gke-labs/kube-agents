@@ -1,0 +1,4 @@
+name: chat_metrics
+version: 1.0.0
+description: Count inbound chat messages by platform and serve them on a metrics-only listener for the operator and the collector.
+kind: standalone

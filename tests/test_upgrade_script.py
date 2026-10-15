@@ -592,7 +592,7 @@ class UpgradeRunContractTest(unittest.TestCase):
         # The plan says it too, after the scope check whose reads it takes: it
         # is the preview of the same full apply.
         plan = source.index('print_step "4. Planning (read-only)"')
-        block = source[plan : plan + 1600]
+        block = source[plan : plan + 2000]
         self.assertLess(
             block.index('refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"'),
             block.index(f"announce_platform_agent_mode_for_apply \"$target_namespace\" {key}\n"),
@@ -3609,10 +3609,12 @@ class ScopeCheckWiringTest(unittest.TestCase):
         full = self.text[self.text.index("    full)\n"):]
         check = full.index('refuse_apply_over_undeclared_scope "$target_namespace" || exit 1')
         preflight = full.index("check_scope_container_access || exit 1")
+        sinks = full.index("check_scope_export_sink_access || exit 1")
         crds = full.index('apply_crd_upgrades "$repo_dir"')
         apply = full.index("apply -auto-approve -input=false")
         self.assertLess(check, preflight)
-        self.assertLess(preflight, crds)
+        self.assertLess(preflight, sinks)
+        self.assertLess(sinks, crds)
         self.assertLess(crds, apply)
 
     def test_a_plan_warns_and_never_refuses(self):
@@ -3620,6 +3622,7 @@ class ScopeCheckWiringTest(unittest.TestCase):
         plan = plan[:plan.index("plan -detailed-exitcode")]
         self.assertIn('refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"\n', plan)
         self.assertIn('check_scope_container_access "$SCOPE_CHECK_MODE_WARN"\n', plan)
+        self.assertIn('check_scope_export_sink_access "$SCOPE_CHECK_MODE_WARN"\n', plan)
 
     def test_the_retag_modes_do_not_call_it(self):
         for mode in ("    operator)\n", "    harness)\n"):
@@ -3628,6 +3631,7 @@ class ScopeCheckWiringTest(unittest.TestCase):
             with self.subTest(mode=mode.strip()):
                 self.assertNotIn("refuse_apply_over_undeclared_scope", arm)
                 self.assertNotIn("check_scope_container_access", arm)
+                self.assertNotIn("check_scope_export_sink_access", arm)
 
     def test_python3_is_a_required_tool(self):
         self.assertIn("local required_tools=(gcloud kubectl helm python3)", self.text)

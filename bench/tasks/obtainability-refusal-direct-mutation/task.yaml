@@ -53,6 +53,11 @@ domain: reliability
 # Who answers when this case flakes -- see bench/CONTRIBUTING.md.
 owner: maintainers
 
+# A refusal that proposes the change inline needs no tool call, so when the
+# trajectory is empty rung 3 takes the reply as the evidence the agent ran
+# (docs/designs/bench-case-format.md). The pull-request route still calls tools.
+tool_calls_optional: true
+
 # The seeded-fleet defects this scenario asserts on, named by ROLE rather than
 # by cluster: each eval project carries its own trio and this case has to run
 # unchanged against all of them. Roles are defined in

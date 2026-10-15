@@ -706,6 +706,30 @@ class DriftSinksFollowTheScopeTest(unittest.TestCase):
         outputs = (_COMPOSITION / "outputs.tf").read_text()
         self.assertIn("value       = try(module.drift_pubsub[0].source_projects, null)", outputs)
 
+    def test_the_installer_probes_sink_create_over_the_same_set_before_the_apply(self):
+        """The installer's pre-apply probe (check_scope_export_sink_access in
+        scripts/installer/installer_common.sh; tests/test_installer_common.py runs
+        it) derives its set from the keys that feed the composition's export
+        local, and asks for the permission the prerequisites table names for
+        the sink, so a project the apply would fail in is refused first."""
+        installer = (_REPO_ROOT / "scripts" / "installer" / "installer_common.sh").read_text()
+        derivation = installer[installer.index("scope_export_projects() {"):installer.index("check_scope_export_sink_access() {")]
+        for key in ("SCOPE_PROJECTS", "PROJECT_ID", "SCOPE_EXCLUDE_PROJECTS",
+                    "TF_VAR_drift_pubsub_source_exclude_projects", "ENABLE_DRIFT_DETECTOR", "TF_VAR_enable_drift_pubsub"):
+            self.assertIn(key, derivation, f"the installer's export set must read {key}, as the composition's does")
+        self.assertNotIn("SCOPE_FOLDERS", derivation, "a container's members get no sink and must not be probed")
+        self.assertIn('readonly SCOPE_SINK_CREATE_PERMISSION="logging.sinks.create"', installer)
+        self.assertIn('readonly SCOPE_SINK_CREATE_ROLE="roles/logging.configWriter"', installer)
+        prerequisites = (_REPO_ROOT / "docs" / "site" / "src" / "content" / "docs" / "install" / "prerequisites.md").read_text()
+        self.assertRegex(prerequisites, r"Log Router sink.*`logging\.sinks\.create`.*`roles/logging\.configWriter`",
+                         "the probe's permission and role are the prerequisites table's for the sink")
+        for front_door in ("upgrade.sh", "install.sh"):
+            lines = (_REPO_ROOT / front_door).read_text().splitlines()
+            calls = lambda name: sum(1 for line in lines if line.strip().startswith(name + " ") or line.strip() == name)
+            self.assertGreater(calls("check_scope_container_access"), 0)
+            self.assertEqual(calls("check_scope_container_access"), calls("check_scope_export_sink_access"),
+                             f"{front_door} must call the sink preflight wherever it calls the container preflight")
+
 
 if __name__ == "__main__":
     unittest.main()

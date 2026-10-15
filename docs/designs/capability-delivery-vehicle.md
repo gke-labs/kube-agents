@@ -158,7 +158,7 @@ configures — a gateway turn by default, or on `dispatch: kanban` a task owned 
 - Every applied change is announced in the capability's next report — what changed, why the agent
   thinks so, and how to revert it — so nothing moves silently. An applied change therefore makes
   that next run **audible**: today the helper decides silence from the run's own findings alone
-  (`silent_ok` in the `fleet-audit` helper: nothing new or resolved, no coverage gap, no
+  (`silent_ok` in the `fleet-audit` helper: nothing new or resolved, no new or changed coverage gap, no
   remediation pull request opened or closed), and a criteria change is none of those, so "first run after a criteria change" becomes one more
   condition that cancels silence. The announcement lands in the capability's **chat thread**
   through the relay, not the ledger — the same run may close the ledger issue, and a closed issue

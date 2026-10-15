@@ -46,7 +46,7 @@ worker follows `inventory.md` and lists the fleet, while the gate files one audi
 second card follows `inventory_prioritize_sop.md`, scoring and registering everything, and
 `inventory_findings.py select` chooses what it renders to `/opt/data/INVENTORY.md`: at most
 `FINDINGS_FIRST_REPORT_CRITICALS` (2) critical items and nothing below critical (§7.2);
-`bootstrap_delivery.py` posts that file to chat verbatim (on Slack with `KAGE_SLACK_UX` on, laid out
+`bootstrap_delivery.py` posts that file to chat as written, followed by a note on the first-run audits (on Slack with `KAGE_SLACK_UX` on, laid out
 again by a fixed script that keeps every listed finding with its sentence as written) and marks the
 listed findings shown. The cap covers criticals too. A fleet with six criticals gets two in the report
 and the other four through the paced nudge; a fleet with one critical and forty gaps gets one, and the
@@ -1255,29 +1255,43 @@ rejected before any git/gh call", with that stream labelling the PR and linking 
 
 ## 10. Overlap with the audit streams
 
-The seven audit streams re-scan much of what the bootstrap sweep looks at, on their own schedules,
-into their own ledger issues. Comparing the sweep in `inventory.md` against the check rosters in
-`AUDITS` shows the overlap is not partial — it is nearly total:
+The seven audit streams re-scan some of what the bootstrap sweep looks at, on their own schedules,
+into their own ledger issues. The sweep used to check most of the compliance and reliability
+audits' workload checks as well: liveness and readiness probes, requests and limits, HPA,
+NetworkPolicy, the cluster's Workload Identity setting and pod security. Four streams
+(`fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, `stockout-prevention`) now
+also run once right after the scan as the first-run audits (`oobe.md`), so the sweep leaves their
+checks to them (`cluster_inventory_audit_sop.md`, Step 5). The exception is an install with no
+GitOps repository: the first-run audits do not run there, and the sweep's cards keep the checks under the
+audits' own slugs (that SOP's "Without a GitOps repository" section). What the sweep still shares
+with a stream everywhere is four cluster settings whose owners are not in the first-run chain:
 
-| what the sweep checks           | stream that owns it           | check slug                            |
-| ------------------------------- | ----------------------------- | ------------------------------------- |
-| liveness / readiness probes     | `obtainability-audit`         | `probes-liveness`, `probes-readiness` |
-| requests, limits, QoS class     | `obtainability-audit`         | `no-requests`, `no-memory-limit`      |
-| HPA coverage                    | `obtainability-audit`         | `no-hpa`, `hpa-cannot-scale`          |
-| NetworkPolicy                   | `compliance-audit`            | `netpol-missing`                      |
-| Workload Identity               | `compliance-audit`            | `workload-identity-off`               |
-| `runAsNonRoot` security context | `compliance-audit`            | `podsecurity-gaps`                    |
-| Shielded Nodes                  | `fleet-consistency-drift`     | `shielded-nodes`                      |
-| Dataplane V2                    | `fleet-consistency-drift`     | `datapath-provider`                   |
-| Managed Service for Prometheus  | `fleet-consistency-drift`     | `managed-prometheus`                  |
-| node auto-upgrade               | `security-patch-orchestrator` | `no-autoupgrade`                      |
+| what the sweep checks          | stream that owns it           | check slug           |
+| ------------------------------ | ----------------------------- | -------------------- |
+| Shielded Nodes                 | `fleet-consistency-drift`     | `shielded-nodes`     |
+| Dataplane V2                   | `fleet-consistency-drift`     | `datapath-provider`  |
+| Managed Service for Prometheus | `fleet-consistency-drift`     | `managed-prometheus` |
+| node auto-upgrade              | `security-patch-orchestrator` | `no-autoupgrade`     |
+
+They stay in the sweep on purpose. Drift flags only a cluster that differs from its peers, and only
+when at least three clusters can be compared; the patch orchestrator runs weekly. On a small fleet,
+nothing else reports them on day one.
+
+The split has a cost in the queue. No audit stream registers its findings in the queue (the end of
+§10.1 keeps the ledgers out of the queue's job), so on an install with a repository the checks the
+sweep leaves to the first-run audits no longer reach it. The morning nudge, the first report's
+critical cap and "Fix the first one" never surface them; they appear only on the audits' ledger
+issues, chat summaries and remediation pull requests. That is the price of telling the user about
+each problem once rather than twice, under two ids. It lasts until the audits feed the queue, which
+is the follow-up this split calls for.
 
 **This resolves two questions at once, so adopt the audit check slugs as the inventory sweep's
 vocabulary.**
 
 The first question is what happens when both sources report the same problem. If the sweep emits
-`probes-readiness` on the object `obtainability-audit` also emits it on, `derive_finding_id` yields
-the same string for both, so they are one row rather than two findings to reconcile. (That holds
+`no-autoupgrade` on the cluster `security-patch-orchestrator` also emits it on, `derive_finding_id`
+yields the same string for both, so they are one row rather than two findings to reconcile, once
+that stream registers in the queue. (That holds
 because the queue derives the id itself from the registration payload — a source never sends one —
 and the payload's required `project` is the same GCP project either way.) Whichever
 arrives first creates it; the other updates `last_verified` and, if the rubric vector moved, triggers
@@ -1295,7 +1309,7 @@ new SOP, and no change to shared code the seven live streams depend on.
 
 ### 10.1 The residue, and the three checks that need a home
 
-Five sweep checks have no owning stream. Two of them cost nothing: SLO and error-budget alerting
+Seven sweep checks have no owning stream. Two of them cost nothing: SLO and error-budget alerting
 practice, and the OTel collector inventory, are unactionable observations caught by §4.4's gate.
 They never reach `remediate`, so the allowlist never sees them; the queue ranks and surfaces them
 with their recommendation and no PR, exactly as §9 says.
@@ -1303,19 +1317,24 @@ with their recommendation and no PR, exactly as §9 says.
 The other three are manifest-kind, promotable, and unowned, which is the case per-check routing
 cannot serve:
 
-| unowned sweep check                         | where it is stated                    | nearest stream        |
-| ------------------------------------------- | ------------------------------------- | --------------------- |
-| `startupProbe` absent                       | `inventory.md` Probes Check           | `obtainability-audit` |
-| `readOnlyRootFilesystem` absent             | `inventory.md` Security Context Check | `compliance-audit`    |
-| namespace has no ResourceQuota / LimitRange | `inventory.md` Multi-Tenancy Audit    | `compliance-audit`    |
+| unowned sweep check                         | where it is stated (`cluster_inventory_audit_sop.md` Step 3) | nearest stream        |
+| ------------------------------------------- | ------------------------------------------------------------ | --------------------- |
+| `startupProbe` absent                       | Startup probes                                               | `obtainability-audit` |
+| `readOnlyRootFilesystem` absent             | Security Context                                             | `compliance-audit`    |
+| namespace has no ResourceQuota / LimitRange | Multi-Tenancy & Governance                                   | `compliance-audit`    |
 
-Each is a pod-spec or namespace YAML edit — the most promotable kind of finding there is — and each
+The sixth, `static-sa-key` (a pod on static Google Cloud keys rather than Workload Identity), was filed under `compliance-audit`'s cluster-level `workload-identity-off` until the sweep left that check to the audit. Its fix spans the pod's ServiceAccount and an IAM binding, so it stays `manual` and is not one of the three.
+
+The seventh, `added-capabilities` (a container adding a Linux capability other than `SYS_ADMIN`), runs on every sweep because no audit covers it: `compliance-audit`'s `privileged-container` flags only `privileged` and an added `SYS_ADMIN`, and `podsecurity-gaps` checks for `drop: ALL` but not what a container adds. Removing a capability the workload may need is the owner's call, so it stays `manual` and is not one of the three either.
+
+Each of the three is a pod-spec or namespace YAML edit — the most promotable kind of finding there is — and each
 would be rejected by `validate_audit_id` for want of a stream. The near misses are worth naming so
 nobody re-derives them: `obtainability-audit` covers `probes-liveness` and `probes-readiness` but
 has no startup-probe check; `podsecurity-gaps` covers `runAsNonRoot`, `runAsUser`, and
 `seccompProfile` but not read-only root filesystems, and its remediation template sets
-`allowPrivilegeEscalation` and `capabilities` without touching them; `netpol-missing` covers the
-NetworkPolicy third of the multi-tenancy check and leaves quotas and limit ranges.
+`allowPrivilegeEscalation` and `capabilities` without touching them; `netpol-missing` covers
+NetworkPolicy, which the sweep's multi-tenancy check leaves to `compliance-audit`, and not quotas or
+limit ranges.
 
 **Give each of the three a `####` section in the SOP of its nearest stream.** That is the
 implementation task this design names rather than papers over: a heading, a detection query, a
@@ -1336,7 +1355,7 @@ stream owns. It would solve §10.1 without touching the existing SOPs, which is 
 is still the wrong trade: `AuditSpec` requires a SOP under `agents/platform/governance/` whose
 `####` check headings are re-derived in CI by `test_check_rosters_match_the_sops`, so the cost is
 restructuring `inventory.md` into a check roster and maintaining a coverage denominator for a job
-that runs once per install — and it buys a second name for the eight checks that already have one,
+that runs once per install — and it buys a second name for the checks that already have one,
 to give three checks a first name. Three `####` sections in the SOPs that should have had them is
 the smaller change and leaves one vocabulary.
 
@@ -1345,7 +1364,7 @@ the smaller change and leaves one vocabulary.
 It does not replace the audit ledgers. It builds no new remediation-PR machinery, reusing
 `remediate` wholesale. It changes the shape of the first-time report only as pacing needs (§7.2):
 the delivered `INVENTORY.md` lists at most `FINDINGS_FIRST_REPORT_CRITICALS` (2) critical items and
-nothing below critical, it is still posted verbatim (laid out again on Slack with `KAGE_SLACK_UX` on,
+nothing below critical, it is still posted as written (laid out again on Slack with `KAGE_SLACK_UX` on,
 each listed finding as written), and its `Also found: N items` line gains a link to the backlog (§5).
 What also changes is which items: §5 renders the report from what the sweep registered, so §4's
 single scale decides the order and §4.2's thresholds supply the severity word, where

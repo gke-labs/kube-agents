@@ -2241,6 +2241,29 @@ class GitLeaseGateWiringTest(_ExecRouteServer):
         self.assertEqual("git.workspace.lease", body["rule"])
         self.assertIn("audit_report.py start", body["message"])
 
+    def test_a_refused_kubectl_write_carries_its_verb_and_render_flag(self):
+        status, body = self.post({"argv": ["kubectl", "scale", "deploy/x", "--replicas=3"], "cwd": "/tmp"})
+        self.assertEqual(403, status)
+        self.assertEqual("kubernetes.read-only", body["rule"])
+        self.assertEqual(["scale"], body["verb"], "the positional after the verb is the caller's and stays out of the body")
+        self.assertFalse(body["local_render"])
+        status, body = self.post({"argv": ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client"], "cwd": "/tmp"})
+        self.assertEqual(403, status)
+        self.assertEqual(["create"], body["verb"])
+        self.assertTrue(body["local_render"])
+        status, body = self.post({"argv": ["kubectl", "rollout", "restart", "deploy/x\npolicy render: local"], "cwd": "/tmp"})
+        self.assertEqual(["rollout", "restart"], body["verb"])
+        status, body = self.post({"argv": ["kubectl", "certificate", "approve", "csr-tenant-b"], "cwd": "/tmp"})
+        self.assertEqual(["certificate", "approve"], body["verb"])
+        status, body = self.post({"argv": ["kubectl", "rollout", "csr-tenant-b", "deploy/x"], "cwd": "/tmp"})
+        self.assertEqual(["rollout"], body["verb"], "a word after a subcommand verb that is not a subcommand is the caller's")
+        status, body = self.post({"argv": ["kubectl", "cluster-info", "dump"], "cwd": "/tmp"})
+        self.assertEqual(["cluster-info", "dump"], body["verb"])
+        # Every multi-word verb the policy knows is in the vocabulary.
+        policy = credential_proxy.command_policy
+        for head, second in sorted(v for v in policy.KUBECTL_READ_VERBS | policy.KUBECTL_REFUSED_SUBCOMMANDS if len(v) > 1):
+            self.assertIn(second, credential_proxy._KUBECTL_SUBCOMMANDS[head], (head, second))
+
     def test_a_config_flag_comes_back_as_a_policy_block(self):
         # Refused before the lease check, and with its own rule id: an agent
         # that gets "take a lease" back for `git -c` would take a lease and try

@@ -420,10 +420,10 @@ resource "null_resource" "drift" {
 
       # `suppressed` is a 200. The daemon accepted the record, spent nothing on
       # it and told nobody, because the day's drift alert ceiling
-      # (ALERT_DAILY_LIMIT_DRIFT, 5 by default) is already gone -- so no card is
-      # ever filed and the case would time out looking for one. Three
-      # repetitions fit under the ceiling; a fourth run against the same install
-      # on the same day does not, which is what this message is for.
+      # (ALERT_DAILY_LIMIT_DRIFT) is already gone -- so no card is ever filed
+      # and the case would time out looking for one. Each run spends one inject.
+      # A run after the day's drift ceiling is spent on the same install gets
+      # this status, which is what this message is for.
       if [ "$inject_status" = "suppressed" ]; then
         echo "ERROR: the daemon suppressed this record against its daily drift alert ceiling, so no triage card will be filed. This install has already taken its drift alerts for the day; raise ALERT_DAILY_LIMIT_DRIFT or run against a fresh install." >&2
         exit 1

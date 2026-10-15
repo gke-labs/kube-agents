@@ -20,6 +20,7 @@ from admin_console.chat.models import (
     utc_now,
 )
 from admin_console.chat.store import InteractionStore, InteractionStoreProtocol
+from admin_console.kanban_view import display_status
 from admin_console.telemetry import redact_evidence
 
 ACTIVE_TASK_STATUSES = {"triage", "todo", "ready", "scheduled", "running", "review"}
@@ -373,12 +374,12 @@ class ChatService:
             if quiet >= self._quiet_polls:
                 failed = [
                     task
-                    for task in tasks
+                    for task in result.tasks
                     if task.status.strip().lower() in FAILED_TASK_STATUSES
                 ]
                 if failed:
                     detail = "; ".join(
-                        f"{task.task_id}: {task.error or task.status}"
+                        f"{task.task_id}: {task.error or display_status(task)}"
                         for task in failed
                     )
                     self.store.transition(
