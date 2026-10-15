@@ -42,6 +42,7 @@ _READ_CUT_SHORT_GUIDANCE = (
 _READ_SCRIPT = r'''
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -57,6 +58,33 @@ WRITE_CHUNK_BYTES = 65536
 # kubectl tears down the stdout stream when this process exits; give the final
 # frames a moment to ship, as scripts/exec_tunnel.py does.
 EXIT_HOLD_SECONDS = 0.25
+# The dispatcher's breaker sets status 'blocked' and keeps block_kind. Thus only
+# the newest 'blocked', 'unblocked' or 'gave_up' event shows if the card gave
+# up. The gateway's progress lines and Slack reactions use the same events.
+GAVE_UP_SQL = """
+    (t.status = 'blocked' AND COALESCE(
+        (SELECT e.kind = 'gave_up' FROM task_events e
+         WHERE e.task_id = t.id
+           AND e.kind IN ('blocked', 'unblocked', 'gave_up')
+         ORDER BY e.id DESC LIMIT 1),
+        0))
+"""
+# A run can record a PR or MR URL in its metadata. Any run counts, because a
+# later review run does not repeat the URL. Only a text value is a URL.
+PR_METADATA_SQL = """
+    EXISTS (SELECT 1 FROM task_runs r WHERE r.task_id = t.id
+            AND CASE WHEN json_valid(r.metadata)
+                     THEN json_type(r.metadata, '$.pr_url') = 'text'
+                          AND json_extract(r.metadata, '$.pr_url') <> ''
+                     ELSE 0 END)
+"""
+# Most workers give the PR or MR URL only in the card result. The console shows
+# the PR only for a done card. Thus the read selects the result of a done card
+# in this column, and removes the column before it sends the row.
+PR_RESULT_COLUMN = "pr_scan_result"
+PR_RESULT_SQL = "CASE WHEN t.status = 'done' THEN t.result END"
+# A PR or MR URL in the result. The URL must not contain white space.
+PR_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|merge_requests)/\d+")
 
 
 def profiles():
@@ -85,6 +113,33 @@ def connect(path):
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     return connection
+
+
+def card_state(connection):
+    # An older board can lack a column. Then select a neutral value.
+    def has(table, column):
+        return any(
+            row["name"] == column
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        )
+
+    block_kind = "t.block_kind" if has("tasks", "block_kind") else "NULL"
+    gave_up = GAVE_UP_SQL if has("task_events", "kind") else "0"
+    has_pr = PR_METADATA_SQL if has("task_runs", "metadata") else "0"
+    result = PR_RESULT_SQL if has("tasks", "result") else "NULL"
+    return (
+        f"{block_kind} AS block_kind, {gave_up} AS gave_up, {has_pr} AS has_pr, "
+        f"{result} AS {PR_RESULT_COLUMN}"
+    )
+
+
+def card_row(row):
+    # Scan the result for a PR or MR URL. Then remove the result to keep the
+    # read small.
+    card = dict(row)
+    result = card.pop(PR_RESULT_COLUMN) or ""
+    card["has_pr"] = bool(card["has_pr"]) or bool(PR_URL_PATTERN.search(result))
+    return card
 
 
 def metadata(session_ids):
@@ -211,9 +266,9 @@ def tasks(session_id, limit):
         return {"tasks": [], "truncated": False}
     with connect(path) as connection:
         rows = [
-            dict(row)
+            card_row(row)
             for row in connection.execute(
-                """
+                f"""
                 SELECT t.id, t.title, t.assignee, t.status, t.created_at,
                        COALESCE(
                            t.completed_at,
@@ -244,7 +299,8 @@ def tasks(session_id, limit):
                               AND r.error IS NOT NULL AND r.error <> ''
                             ORDER BY r.id DESC LIMIT 1),
                            t.last_failure_error
-                       ) AS previous_error
+                       ) AS previous_error,
+                       {card_state(connection)}
                 FROM tasks t
                 WHERE t.session_id = ?
                 ORDER BY t.created_at, t.id
@@ -262,9 +318,9 @@ def board(limit):
         return {"tasks": [], "truncated": False}
     with connect(path) as connection:
         rows = [
-            dict(row)
+            card_row(row)
             for row in connection.execute(
-                """
+                f"""
                 SELECT t.id, t.title, t.assignee, t.status, t.priority,
                        t.created_at,
                        COALESCE(
@@ -288,7 +344,8 @@ def board(limit):
                             WHERE r.task_id = t.id
                             ORDER BY r.id DESC LIMIT 1),
                            t.last_failure_error
-                       ) AS error
+                       ) AS error,
+                       {card_state(connection)}
                 FROM tasks t
                 ORDER BY updated_at DESC, t.id
                 LIMIT ?
@@ -305,7 +362,7 @@ def task_detail(task_id):
         raise ValueError("Task Kanban unavailable")
     with connect(path) as connection:
         task = connection.execute(
-            """
+            f"""
             SELECT t.*,
                    (SELECT COUNT(*) FROM task_runs r
                     WHERE r.task_id = t.id) AS total_run_count,
@@ -314,7 +371,8 @@ def task_detail(task_id):
                        t.last_heartbeat_at,
                        t.started_at,
                        t.created_at
-                   ) AS updated_at
+                   ) AS updated_at,
+                   {card_state(connection)}
             FROM tasks t WHERE t.id = ?
             """,
             (task_id,),
@@ -324,10 +382,11 @@ def task_detail(task_id):
 
         def related(column, match_column):
             return [
-                dict(row)
+                card_row(row)
                 for row in connection.execute(
                     f"""
-                    SELECT t.id, t.title, t.assignee, t.status
+                    SELECT t.id, t.title, t.assignee, t.status,
+                           {card_state(connection)}
                     FROM task_links l JOIN tasks t ON t.id = l.{column}
                     WHERE l.{match_column} = ? ORDER BY t.created_at, t.id
                     """,
@@ -404,7 +463,7 @@ def task_detail(task_id):
         parents = related("parent_id", "child_id")
         children = related("child_id", "parent_id")
     return {
-        "task": dict(task),
+        "task": card_row(task),
         "parents": parents,
         "children": children,
         "runs": runs,
@@ -636,6 +695,9 @@ class AgentTaskUpdate:
     latest_event: str = ""
     latest_event_at: datetime | None = None
     previous_error: str = ""
+    block_kind: str = ""
+    gave_up: bool = False
+    has_pr: bool = False
 
 
 @dataclass(frozen=True)
@@ -659,6 +721,9 @@ class KanbanTaskSummary:
     child_count: int
     summary: str
     error: str
+    block_kind: str = ""
+    gave_up: bool = False
+    has_pr: bool = False
 
 
 @dataclass(frozen=True)
@@ -673,6 +738,9 @@ class KanbanRelatedTask:
     title: str
     assignee: str
     status: str
+    block_kind: str = ""
+    gave_up: bool = False
+    has_pr: bool = False
 
 
 @dataclass(frozen=True)
@@ -1063,6 +1131,9 @@ class AgentRuntimeProvider:
                 latest_event=str(row.get("latest_event") or ""),
                 latest_event_at=_optional_timestamp(row.get("latest_event_at")),
                 previous_error=redact_evidence(row.get("previous_error") or ""),
+                block_kind=str(row.get("block_kind") or ""),
+                gave_up=bool(row.get("gave_up")),
+                has_pr=bool(row.get("has_pr")),
             )
             for row in payload.get("tasks", [])
         )
@@ -1092,6 +1163,9 @@ class AgentRuntimeProvider:
                 child_count=int(row.get("child_count") or 0),
                 summary=redact_evidence(row.get("summary") or ""),
                 error=redact_evidence(row.get("error") or ""),
+                block_kind=str(row.get("block_kind") or ""),
+                gave_up=bool(row.get("gave_up")),
+                has_pr=bool(row.get("has_pr")),
             )
             for row in payload.get("tasks", [])
         )
@@ -1171,6 +1245,9 @@ class AgentRuntimeProvider:
                 title=redact_evidence(item.get("title") or ""),
                 assignee=str(item.get("assignee") or "unassigned"),
                 status=str(item.get("status") or "unknown"),
+                block_kind=str(item.get("block_kind") or ""),
+                gave_up=bool(item.get("gave_up")),
+                has_pr=bool(item.get("has_pr")),
             )
 
         runs = tuple(
@@ -1207,6 +1284,9 @@ class AgentRuntimeProvider:
             child_count=len(children),
             summary=summary,
             error=redact_evidence(error),
+            block_kind=str(row.get("block_kind") or ""),
+            gave_up=bool(row.get("gave_up")),
+            has_pr=bool(row.get("has_pr")),
         )
         return KanbanTaskDetail(
             task=task,
