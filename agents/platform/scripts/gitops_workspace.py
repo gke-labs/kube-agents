@@ -1163,8 +1163,12 @@ def _read_state_text(key: str) -> str:
     if state_file.is_file():
         try:
             return state_file.read_text(encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as err:
+            if in_operator_pod():
+                # The mount is the only source in the pod: the kubectl read
+                # below takes its ConfigMap, namespace and context from an
+                # environment the model can set (gke-labs/kube-agents#2989).
+                raise RuntimeError(f"Could not read the repository list from {state_file}: {err}") from err
     elif state_file.parent.is_dir():
         # The mount is there and the key is not, which is what kubelet projects
         # for a ConfigMap with no data: an install with nothing registered. That
@@ -1174,12 +1178,6 @@ def _read_state_text(key: str) -> str:
         # pod has no context of its own to pass, so the fallback fails and every
         # gated call answers 503 instead of refusing the repository.
         return ""
-    if in_operator_pod():
-        # The mount is the only source in the pod: the kubectl read below takes
-        # its ConfigMap, namespace and context from an environment the model
-        # can set (gke-labs/kube-agents#2989).
-        raise RuntimeError(f"Could not read the repository list from {state_file}")
-
     cfg_name = os.environ.get("GITOPS_STATE_CONFIGMAP", "platform-agent-gitops-state")
     ns = os.environ.get("KUBE_DEFAULT_NAMESPACE", "kubeagents-system")
     cmd = ["kubectl", "get", "configmap", cfg_name, "-n", ns, "-o", "json"]
@@ -1719,6 +1717,13 @@ def resolve_repo(workspace: str | Path | None = None) -> str:
         )
 
     if in_operator_pod():
+        if managed_repos_registered():
+            raise RuntimeError(
+                "Could not resolve the target repository as owner/name: managed_repos in "
+                "the GitOps state ConfigMap ($GITOPS_STATE_CONFIGMAP) holds a value this "
+                "image cannot use (see the warning above). Fixing the entry is the user's "
+                "call; report that."
+            )
         raise RuntimeError(
             "Could not resolve the target repository as owner/name: no repository "
             "is registered in the GitOps state ConfigMap ($GITOPS_STATE_CONFIGMAP). "

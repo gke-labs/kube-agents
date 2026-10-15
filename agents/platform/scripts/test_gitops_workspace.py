@@ -30,6 +30,19 @@ import vcs_client  # noqa: E402
 LEASE = "compliance-audit"
 
 
+def setUpModule():
+    # in_operator_pod() keys on the real /etc/gitops, and in the pod a test's
+    # own GITOPS_STATE_PATH is then ignored. Keep every test off the host's
+    # mount; TestReadersIgnoreWorkerSources points it at a temp dir of its own.
+    global _NO_MOUNT
+    _NO_MOUNT = patch("gitops_workspace.GITOPS_STATE_DIR", "/nonexistent/kube-agents-test/etc-gitops")
+    _NO_MOUNT.start()
+
+
+def tearDownModule():
+    _NO_MOUNT.stop()
+
+
 class WorkspaceTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1060,9 +1073,19 @@ class TestReadersIgnoreWorkerSources(WorkspaceTestCase):
         self.register("https://github.com/acme/fleet")
         with patch.object(Path, "read_text", side_effect=PermissionError("denied")), \
                 patch("subprocess.run") as run:
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(RuntimeError) as caught:
                 gitops_workspace.get_managed_repo_entries()
             run.assert_not_called()
+        self.assertIsInstance(caught.exception.__cause__, PermissionError)
+
+    def test_a_registered_entry_this_image_cannot_use_is_not_called_unregistered(self):
+        (self.mount / "managed_repos").write_text(
+            json.dumps([{"type": "bitbucket", "url": "https://bitbucket.org/acme/fleet"}]), encoding="utf-8")
+        with patch.dict(sys.modules, {"github_token_refresh": self.cwd_origin}):
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.resolve_repo()
+        self.assertIn("cannot use", str(caught.exception))
+        self.assertNotIn("no repository is registered", str(caught.exception))
 
     def test_the_ignored_variable_is_logged_once(self):
         self.register("https://github.com/acme/fleet")
