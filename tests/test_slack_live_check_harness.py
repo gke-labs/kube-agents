@@ -826,14 +826,18 @@ class ListedChecksTest(HarnessTestCase):
         self.assertEqual(code, harness.EXIT_FAIL)
         self.assertIn("FAIL thread", text)
 
-    def test_thread_fails_closed_without_a_status_line(self):
-        # Lineless, the mention task's later posts in the thread would pass a dropped reply.
-        code, text = self.run_harness("--checks", "mention", "--no-status-line")
-        root = self.evidence(text, "mention")["sent_ts"]
+    def test_thread_is_left_out_without_a_status_line(self):
+        # Lineless, the mention task's later posts in the thread would pass a dropped reply,
+        # so thread is not run, and the checks after it still are.
         self.world.ignore_unmentioned_thread_replies = True
-        code, text = self.run_harness("--checks", "thread", "--thread-ts", root, "--no-status-line")
-        self.assertEqual(code, harness.EXIT_FAIL, text)
-        self.assertIn("cannot be judged with --no-status-line", self.line(text, "FAIL thread"))
+        _code, text = self.run_harness("--checks", "mention,thread,unlisted", "--no-status-line")
+        self.assertIn("NOTE thread not run: thread cannot be judged with --no-status-line", text)
+        self.assertNotIn("PASS thread", text)
+        self.assertNotIn("FAIL thread", text)
+        self.assertIn("unlisted", text.split("NOTE thread not run")[1])
+        with self.assertRaises(SystemExit):
+            harness.parse_args(["--checks", "thread", "--bot-user-id", BOT_ID, "--no-status-line"])
+        self.assertNotIn("thread", harness.parse_args(["--bot-user-id", BOT_ID, "--no-status-line"]).checks)
 
     def test_thread_is_not_fooled_by_the_mention_answer_landing_late(self):
         # The mention passes on its status line; its answer arrives later. A gateway

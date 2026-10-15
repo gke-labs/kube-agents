@@ -42,6 +42,10 @@ from decimal import Decimal, InvalidOperation
 from typing import Callable, Optional
 
 SLACK_API_BASE = "https://slack.com/api/"
+# Why thread is not run under --no-status-line (parse_args, check_thread).
+THREAD_LINELESS = ("thread cannot be judged with --no-status-line: without the status line the follow-up's "
+                   "reply cannot be told from the mention task's later posts in the same thread; run thread "
+                   "against a gateway that keeps a status line")
 METADATA_TOKEN_URL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
 METADATA_FLAVOR_HEADER = "Metadata-Flavor"
 METADATA_FLAVOR_VALUE = "Google"
@@ -742,10 +746,7 @@ def check_thread(session: Session) -> CheckResult:
     # mention's task keeps posting progress and its result in the same thread after
     # its ack, so a gateway that dropped the reply would pass on those. Fail closed.
     if session.args.no_status_line:
-        return CheckResult(CHECK_THREAD, False, "thread cannot be judged with --no-status-line: without the status "
-                           "line the follow-up's reply cannot be told from the mention task's later posts in the "
-                           "same thread; run thread against a gateway that keeps a status line",
-                           {"channel": session.channel_id})
+        return CheckResult(CHECK_THREAD, False, THREAD_LINELESS, {"channel": session.channel_id})
     root = session.mention_root or session.args.thread_ts or ""
     if not root:
         return CheckResult(CHECK_THREAD, False, "no thread to reply in: the mention check did not pass in this run and --thread-ts is unset",
@@ -1101,6 +1102,13 @@ def parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
         parser.error("pass --bot-name <your bot's name> or --bot-user-id <its member id>; there is no default bot name")
     if CHECK_HOME in args.checks and not args.home_channel:
         parser.error("the home check needs --home-channel")
+    # Without a status line nothing marks which bot post is the thread follow-up's own
+    # (check_thread), so thread is left out of the run rather than failed in it.
+    args.thread_skipped = bool(args.no_status_line and CHECK_THREAD in args.checks)
+    if args.thread_skipped:
+        args.checks = [check for check in args.checks if check != CHECK_THREAD]
+        if not args.checks:
+            parser.error(THREAD_LINELESS)
     return args
 
 
@@ -1171,6 +1179,8 @@ def run(args: argparse.Namespace, transport, clock, sleep, wall, typist: Optiona
             return summarize(results)
         setattr(session, f"{label}_label", shown)
 
+    if getattr(args, "thread_skipped", False):
+        say(f"NOTE thread not run: {THREAD_LINELESS}")
     for check in args.checks:
         try:
             outcome = run_check(session, check, home_channel, args.home_since or started)
