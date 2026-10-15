@@ -584,37 +584,55 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         )
         self.assertGreater(len(payload["text"]), 9000)  # cut to fit, not emptied
 
-    async def test_unauthorized_tenant_rejected(self):
+    def _recording_adapter(self):
+        """An adapter with every gate open except the one a test closes, so
+        the gate under test is the only reason an activity is dropped, and a
+        recorder on the dispatch path so a pass is a positive signal."""
         from gateway.platform_registry import PlatformRegistry
 
         teams_relay_patch.install()
-        registry = PlatformRegistry()
-        adapter = registry.create_adapter("teams")
-        adapter.configured_tenant_id = "allowed-tenant-only"
+        adapter = PlatformRegistry().create_adapter("teams")
+        adapter.allow_all_users = True
+        handled = []
+        adapter.set_handler(lambda c, t, m: handled.append((c, t, m)))
+        return adapter, handled
 
+    @staticmethod
+    def _ok_urlopen():
+        mock_resp = mock.MagicMock()
+        mock_resp.read.return_value = json.dumps({"status": "ok"}).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        return mock.patch("urllib.request.urlopen", return_value=mock_resp)
+
+    async def test_unauthorized_tenant_rejected(self):
+        adapter, handled = self._recording_adapter()
+        adapter.configured_tenant_id = "allowed-tenant-only"
         activity = {
             "type": "message",
+            "text": "hi",
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
             "channelData": {"tenant": {"id": "unauthorized-tenant"}},
             "from": {"id": "user-1"},
             "conversation": {"id": "conv-1"},
         }
-        handled = []
-        adapter.set_handler(lambda c, t, m: handled.append(t))
-        await adapter._process_activity(activity)
-        self.assertEqual(len(handled), 0)
+        with self._ok_urlopen(), self.assertLogs("teams-relay-patch", level="WARNING") as logs:
+            await adapter._process_activity(activity)
+        self.assertEqual(handled, [])
+        self.assertTrue(any("unauthorized tenant" in line for line in logs.output), logs.output)
+        # Control: the same activity from the configured tenant is dispatched.
+        activity["channelData"]["tenant"]["id"] = "allowed-tenant-only"
+        with self._ok_urlopen():
+            await adapter._process_activity(activity)
+        self.assertEqual([h[0] for h in handled], ["conv-1"])
 
     async def test_unauthorized_user_rejected_and_warned(self):
-        from gateway.platform_registry import PlatformRegistry
-
-        teams_relay_patch.install()
-        registry = PlatformRegistry()
-        adapter = registry.create_adapter("teams")
+        adapter, handled = self._recording_adapter()
         adapter.allow_all_users = False
         adapter.allowed_users = {"allowed-admin@domain.com"}
-
-        # Display name equals allowed-admin@domain.com, but id/aad/email do not -> MUST reject!
+        # Display name equals an allowlisted UPN, but id/aad/email do not -> rejected.
         activity = {
             "type": "message",
+            "text": "hi",
             "from": {
                 "id": "29:user-unknown",
                 "name": "allowed-admin@domain.com",
@@ -623,40 +641,52 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             "conversation": {"id": "conv-2"},
             "serviceUrl": "https://smba.trafficmanager.net/teams/",
         }
-
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
-            mock_resp = mock.MagicMock()
-            mock_resp.read.return_value = json.dumps({"status": "ok"}).encode("utf-8")
-            mock_resp.__enter__.return_value = mock_resp
-            mock_urlopen.return_value = mock_resp
-
+        with self._ok_urlopen() as mock_urlopen, self.assertLogs(
+            "teams-relay-patch", level="WARNING"
+        ) as logs:
             await adapter._process_activity(activity)
-            self.assertTrue(mock_urlopen.called)
+        self.assertEqual(handled, [])
+        self.assertTrue(any("unauthorized user" in line for line in logs.output), logs.output)
+        # Exactly one outbound call: the "not authorized" notice, and no typing indicator.
+        posted = [json.loads(call.args[0].data) for call in mock_urlopen.call_args_list]
+        self.assertEqual(len(posted), 1)
+        self.assertIn("not authorized", json.dumps(posted[0]["payload"]))
+        self.assertNotIn('"typing"', json.dumps(posted[0]["payload"]))
+        # Control: the allowlisted email is admitted and dispatched.
+        activity["from"]["email"] = "allowed-admin@domain.com"
+        with self._ok_urlopen():
+            await adapter._process_activity(activity)
+        self.assertEqual([h[0] for h in handled], ["conv-2"])
 
     async def test_malformed_activity_and_untrusted_service_url_dropped(self):
-        from gateway.platform_registry import PlatformRegistry
-
-        teams_relay_patch.install()
-        registry = PlatformRegistry()
-        adapter = registry.create_adapter("teams")
-        adapter.allow_all_users = True
-
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
-            for bad_activity in (
-                {"type": "message", "channelData": "bad"},
-                {"type": "message", "from": "bad"},
-                {"type": "message", "conversation": "bad"},
-                {"type": "message", "text": 12345},
-                {
-                    "type": "message",
-                    "text": "hi",
-                    "serviceUrl": "https://attacker.trafficmanager.net/",
-                    "conversation": {"id": "conv-1"},
-                    "from": {"id": "u1"},
-                },
-            ):
-                await adapter._process_activity(bad_activity)
+        adapter, handled = self._recording_adapter()
+        base = {
+            "type": "message",
+            "text": "hi",
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "conversation": {"id": "conv-1"},
+            "from": {"id": "u1"},
+        }
+        # Each fixture differs from a dispatchable activity in exactly one field.
+        cases = (
+            ({"channelData": "bad"}, "malformed"),
+            ({"from": "bad"}, "malformed"),
+            ({"conversation": "bad"}, "malformed"),
+            ({"text": 12345}, "malformed"),
+            ({"serviceUrl": "https://attacker.trafficmanager.net/"}, "untrusted serviceUrl"),
+        )
+        for change, phrase in cases:
+            with self._ok_urlopen() as mock_urlopen, self.assertLogs(
+                "teams-relay-patch", level="WARNING"
+            ) as logs:
+                await adapter._process_activity({**base, **change})
+            self.assertEqual(handled, [], change)
             mock_urlopen.assert_not_called()
+            self.assertTrue(any(phrase in line for line in logs.output), (change, logs.output))
+        # Control: the unchanged activity is dispatched.
+        with self._ok_urlopen():
+            await adapter._process_activity(dict(base))
+        self.assertEqual([h[0] for h in handled], ["conv-1"])
 
     async def test_non_message_ignored(self):
         from gateway.platform_registry import PlatformRegistry
