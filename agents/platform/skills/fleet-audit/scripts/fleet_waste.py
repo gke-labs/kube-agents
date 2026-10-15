@@ -6028,6 +6028,8 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     compute_ok = not compute_disabled and not compute_failed
     disks_judged = compute_ok and not none_read
     unread_named = ", ".join(sorted(unread_clusters) if unread_labels is None else unread_labels)
+    # Every cluster left unread is one the install excludes: no read failed.
+    only_excluded = bool(excluded) and set(unread_clusters) <= set(excluded)
     candidates = [_emit("unattached-disk", h) for h in check_unattached_disk(disks_parsed, fleet_facts["pv_handles"], now=now, known_clusters=known_clusters, unread_clusters=unread_clusters)] if disks_judged else []
     # §3.5 clears an address any Service or Ingress annotation names, and
     # `referenced_addresses` holds only the read clusters' annotations, so an
@@ -6080,7 +6082,7 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         # would turn every load balancer it serves into a false positive. The
         # unreadable clusters are their own manifest entries, carrying the
         # stderr that explains each one.
-        if excluded and set(unread_clusters) <= set(excluded):
+        if only_excluded:
             # Every cluster left unread is one the install excludes: there is no
             # failed entry to point at, and EXCLUDED_CLUSTERS_NOTE below names them.
             entry["limitations"] = (
@@ -6100,9 +6102,10 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
             )
     if not disks_judged and compute_ok:
         disk_gap = (
-            "unattached-disk was not evaluated for this project: none of its clusters "
-            f"({unread_named}) could be read, so no disk can be "
-            "cleared against a live PersistentVolume."
+            "unattached-disk was not evaluated for this project: "
+            + (f"its clusters ({unread_named}) are all excluded by spec.scope.exclude.clusters and were not read"
+               if only_excluded else f"none of its clusters ({unread_named}) could be read")
+            + ", so no disk can be cleared against a live PersistentVolume."
         )
         entry["limitations"] = f"{entry['limitations']} {disk_gap}" if entry.get("limitations") else disk_gap
     elif unread_clusters and compute_ok:
@@ -6134,7 +6137,10 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         unevaluated["orphan-lb"] = f"a cluster in this project {unread_why}, so its Services are unknown"
         unevaluated["idle-address"] = f"a cluster in this project {unread_why}, so its Service and Ingress address annotations are unknown"
     if not disks_judged and compute_ok:
-        unevaluated["unattached-disk"] = "none of this project's clusters could be read" + (" (some are excluded by spec.scope.exclude.clusters)" if excluded else "")
+        unevaluated["unattached-disk"] = (
+            "this project's clusters are all excluded by spec.scope.exclude.clusters" if only_excluded
+            else "none of this project's clusters could be read" + (" (some are excluded by spec.scope.exclude.clusters)" if excluded else "")
+        )
     if reg_parsed is None and not registry_disabled:
         unevaluated["registry-no-cleanup"] = (
             f"`gcloud artifacts repositories list` failed (rc={reg_result.rc})"

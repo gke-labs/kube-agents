@@ -567,6 +567,9 @@ EXIT_PROJECTS_NONE = "none"
 EXIT_NOTE_FORMAT = " ({note})"
 # A `--cluster` names its project under `--project`'s rule: inside the readable scope.
 FORCED_OUTSIDE_SCOPE_TEXT = "--cluster {cluster}: {error}"
+# A `--cluster` naming a cluster spec.scope.exclude.clusters excludes (#3081):
+# refused up front, rather than reported as a cluster its listing did not return.
+FORCED_EXCLUDED_TEXT = "--cluster {cluster} names a cluster spec.scope.exclude.clusters excludes; it is not reviewed"
 # A cluster key is <project>/<location>/<name>, three non-empty parts; a bare
 # name would otherwise be swept as a project id.
 CLUSTER_KEY_PARTS = 3
@@ -5554,6 +5557,8 @@ def validate_args(args: argparse.Namespace, now: datetime | None = None) -> None
             forced_error = declared_scope.override_error(parts[0])
             if forced_error:
                 raise argparse.ArgumentTypeError(FORCED_OUTSIDE_SCOPE_TEXT.format(cluster=key, error=forced_error))
+            if (parts[0], parts[1], parts[2]) in declared_scope.excluded_clusters:
+                raise argparse.ArgumentTypeError(FORCED_EXCLUDED_TEXT.format(cluster=key))
     full = bool(getattr(args, "full", False))
     if full:
         if forced:

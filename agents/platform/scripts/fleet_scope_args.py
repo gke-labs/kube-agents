@@ -30,9 +30,10 @@ SCOPE_PROJECTS_HELP = (
 )
 SCOPE_EXCLUDE_CLUSTERS_FLAG = "--scope-exclude-clusters"
 SCOPE_EXCLUDE_CLUSTERS_HELP = (
-    "project/location/cluster entries from the same tool: the clusters spec.scope.exclude.clusters leaves out "
-    "of every fleet read (#3081). Dropped from the listing before anything is read, and not a coverage gap: "
-    "the operator excluded them on purpose"
+    "project/location/cluster entries from the same tool: the clusters spec.scope.exclude.clusters excludes "
+    "(#3081). A collector that lists clusters drops them before reading anything, not as a coverage gap: the "
+    "operator excluded them on purpose. The networking and GCE audits accept the flag and still count an "
+    "excluded cluster's subnet usage and node VMs"
 )
 SCOPE_UNREAD_HELP = (
     "project=outcome entries from the same tool: declared projects this install could not read, "

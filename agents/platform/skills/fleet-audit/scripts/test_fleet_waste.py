@@ -4943,6 +4943,27 @@ class CollectProjectComputeTest(unittest.TestCase):
         self.assertIn("--filter=-users:*", disks)
         self.assertNotIn("--filter", disks)
 
+    def test_an_excluded_cluster_s_disk_is_skipped_beside_a_read_cluster_s(self):
+        # #3081, the mixed project: lane-b is excluded (known, never read) and
+        # ka-today was read. lane-b's detached disk is skipped, not judged
+        # against ka-today's PersistentVolumes; ka-today's is judged.
+        def disk(name, owner):
+            return {"name": name, "sizeGb": "10", "type": "pd-standard", "creationTimestamp": "2026-01-01T00:00:00Z",
+                    "zone": "us-central1-a", "users": [], "labels": {fw.GKE_CLUSTER_LABEL: owner}}
+
+        def run(argv, **kwargs):
+            if argv[2] == "disks":
+                return run_of(0, json.dumps([disk("gke-lane-b-pvc-1", "lane-b"), disk("gke-ka-today-pvc-1", "ka-today")]))
+            return self.run_with()(argv, **kwargs)
+
+        target = fw.collect_project_compute("acme", False, self.FACTS, run=run, now=NOW, known_clusters={"ka-today", "lane-b"},
+                                            unread_clusters=frozenset({"lane-b"}), clusters_read=1, excluded=["lane-b"])
+        disks = [c["object"] for c in target["candidates"] if c["check"] == "unattached-disk"]
+        self.assertEqual(disks, ["Disk/us-central1-a:gke-ka-today-pvc-1"])
+        self.assertIn("could belong to a cluster this run did not read (lane-b)", target["limitations"])
+        self.assertIn("lane-b in this project are excluded", target["limitations"])
+        self.assertIn("the clusters the install excludes were not read", target["limitations"])
+
     def test_a_failed_read_names_the_command_and_what_it_said(self):
         target = fw.collect_project_compute(
             "acme", True, self.FACTS, run=self.run_with(fail={"addresses": "PERMISSION_DENIED: compute.addresses.list"}), now=NOW
@@ -6122,6 +6143,9 @@ class GetTargetProjectsTest(unittest.TestCase):
         self.assertIn("lane-b in this project are excluded", project["limitations"])
         self.assertIn("the clusters the install excludes were not read", project["limitations"])
         self.assertNotIn("the reason each one failed", project["limitations"])
+        self.assertIn("its clusters (lane-b) are all excluded by spec.scope.exclude.clusters and were not read", project["limitations"])
+        self.assertNotIn("could be read", project["limitations"])
+        self.assertEqual(unevaluated["unattached-disk"], "this project's clusters are all excluded by spec.scope.exclude.clusters")
     def test_project_list_failure_falls_back_to_the_base_project(self):
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:

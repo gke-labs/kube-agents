@@ -173,7 +173,7 @@ Rules:
   `custom` role set to exclude the management cluster by that variable; a scope that silently
   ended the exclusion would recreate the one profile they were told to prevent. The places that
   name the variable as the opt-out (§8) change with it.
-- **`exclude.clusters` bounds every fleet read, not only the roster.** Decided 2026-10-15
+- **`exclude.clusters` bounds fleet answers and the audits that list clusters, not only the roster.** Decided 2026-10-15
   (#3081). An excluded cluster gets no Cluster Agent. The platform MCP server's `fleet_scope` tool
   lists it under `excluded_clusters` and hands the collectors `--scope-exclude-clusters`, which
   drop it from their listing before reading anything. It is not a coverage gap, because the

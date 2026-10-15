@@ -3553,6 +3553,15 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertEqual([c["name"] for c in clusters], ["ka-today"])
         self.assertIsNone(error)
 
+    def test_a_forced_cluster_the_scope_excludes_is_refused_not_reported_unlisted(self):
+        # #3081: not "named by --cluster but not listed in its project", which
+        # would be untrue: the listing returned it and the run dropped it.
+        with self.assertRaises(argparse.ArgumentTypeError) as caught:
+            ur.validate_args(args(scope_projects=PROJECT, scope_exclude_clusters=f"{PROJECT}/us-central1-a/lane-b",
+                                  cluster=[f"{PROJECT}/us-central1-a/lane-b"], full=False))
+        self.addCleanup(ur.declared_scope.set, None, None)
+        self.assertEqual(str(caught.exception), ur.FORCED_EXCLUDED_TEXT.format(cluster=f"{PROJECT}/us-central1-a/lane-b"))
+
     def test_main_hands_the_scope_flags_to_the_resolver_and_help_names_them(self):
         with mock.patch.object(ur.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
             ur.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied", "--scope-exclude-clusters", "ops-mgmt/us-central1/lane-b"])
