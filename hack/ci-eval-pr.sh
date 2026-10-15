@@ -150,6 +150,9 @@ readonly EVAL_ROLLBACK_SKIP_JOB_TYPES="presubmit batch"
 # next, the round trip runs before the matrix and ends with the install at
 # this mode, and the matrix then grades today over the agent API.
 readonly EVAL_ROLLBACK_LANE_END_MODE="today"
+# MEASUREMENT ONLY, never merged: run the today lane under the on-demand next
+# job, whose Prow config sets EVAL_MODE_NEXT=1 and not EVAL_ROLLBACK_LANE.
+EVAL_ROLLBACK_LANE="${EVAL_ROLLBACK_LANE:-1}"
 
 # release_inflight_note (beside the ledger reset, section 5): the sandbox
 # pod's shell container, the scratch directory audit_report.py writes its
