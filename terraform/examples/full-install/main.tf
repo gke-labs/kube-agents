@@ -396,6 +396,34 @@ module "gke_cluster" {
     "kube-agents-host" = "true"
   }
 
+  # The DESTROY order, not the apply one. Terraform destroys dependents before
+  # dependencies, so the cluster has to depend on the drift ingress for its
+  # teardown to precede the topic's deletion. The control plane emits mutating
+  # audit records for as long as it is up -- measured at ~4 minutes past the
+  # point the topic used to go -- and each one that lands on a missing topic
+  # mails every project owner (#2426). sink_drain cannot cover that: it is a
+  # fixed timer and a teardown's length varies with the cluster.
+  #
+  # Passed as a value rather than named in depends_on, and the difference is
+  # load-bearing. A module-level depends_on defers every data source inside
+  # the module while the target has a planned change. Here that would reach
+  # data.google_container_cluster.existing, which exists when create_cluster
+  # is false and is where cluster_endpoint comes from -- so an ordinary edit
+  # to the ingress would leave provider "helm" (providers.tf) without a host,
+  # and a helm provider that cannot reach the cluster reports every release as
+  # absent: the plan plans helm_release.kube_agents and cert_manager as
+  # creates, and the apply trips over a name still in use. An input reaches
+  # only the gate the two cluster resources depend on, so the data source
+  # stays outside the edge and the destroy order is unchanged.
+  #
+  # try(...[0]..., null), not one(...[*]...): the ingress is count-gated and
+  # this has to resolve to null when it is off, but a splat over the module
+  # reaches its close node and so source_projects, which comes from
+  # kube-agents-iam and therefore from the cluster -- a cycle. Indexing the
+  # single output depends on that output alone, which is why teardown_gate
+  # has to name everything the ordering covers.
+  create_after = try(module.drift_pubsub[0].teardown_gate, null)
+
   depends_on = [google_project_service.required]
 }
 
@@ -546,7 +574,8 @@ module "chat_pubsub" {
 }
 
 # The drift detector's audit-log ingress: Log Router sink, drift-audit topic
-# and pull subscription, and the sink-writer and detector IAM. The three names
+# and pull subscription, and the sink-writer IAM from the module, with the
+# detector's own subscription IAM below rather than inside it. The three names
 # are composition variables, as the stockout trio's are, because a second
 # install in the project has to be able to name its own -- lifecycle.sh's
 # guard_drift_adoption refuses an apply that would otherwise find all three

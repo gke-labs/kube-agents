@@ -383,8 +383,8 @@
 # they failed (one run each, 2026-10-07 and 10-08). Entry 5's follow-up
 # takes 600s (one maintenance-policy read per cluster, 257-571s measured).
 # About 750 serial minutes at three repetitions, none of it on a lock.
-# Counted from the lists: ninety-one cases (273 units) here, of a
-# one-hundred-and-five-case, 315-unit matrix with the presubmit file's
+# Counted from the lists: ninety-two cases (276 units) here, of a
+# one-hundred-and-six-case, 318-unit matrix with the presubmit file's
 # fourteen. The eleven on the
 # seeded-a shapes (entries 4, 8, 10, 12, 13, 14, 15, 17, 18, 19 and 20) read
 # fixtures #2916 plants and enter on the author's decision of 2026-10-14,
@@ -983,6 +983,12 @@
 # ceiling. The dated paragraph above carries the budget arithmetic.
 ./tasks/gitops-drift-noise-filtered-triage/task.yaml
 
+
+# manage-cluster skill probe: excluding a cluster on an installer-managed
+# install goes through SCOPE_EXCLUDE_CLUSTERS in install.env and a full
+# upgrade, not a hand edit of the PlatformAgent (#2019). deployer: noop,
+# transcript-only, one delegation round trip.
+./tasks/manage-cluster-exclusion-installer-route-probe/task.yaml
 # Upgrade-failure catalogue entry 1 (a PodDisruptionBudget forbids the
 # eviction), the first of the catalogue's scenario cases on fixtures the
 # fleet already carries (entries 1, 2, 3, 5, 6 and 16, the first six of the

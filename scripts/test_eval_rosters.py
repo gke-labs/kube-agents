@@ -176,6 +176,7 @@ ADDED_AFTER_THE_MOVE = [
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
     "session-cluster-question-wake-answers-once",  # a session's delegated question ends in a wake's answer
     "gitops-drift-noise-filtered-triage",  # the drift detector's principal classifier, #2739's fixture
+    "manage-cluster-exclusion-installer-route-probe",  # the exclusion route on an installer-made install
     "upgrades-drain-blocking-budget-named",  # upgrade-failure catalogue entries 1, 2, 3 and 5, the second scenario group
     "upgrades-no-surge-pool-recreate-warned",
     "upgrades-zonal-skew-replicas-warned",

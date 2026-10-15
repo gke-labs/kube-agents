@@ -56,9 +56,11 @@ its target, and a ``<!channel>``-style token loses its brackets.
 
 from __future__ import annotations
 
+import functools
 import re
 from typing import NamedTuple
 
+import chat_message as _chat
 from slack_presenter import (
     BACKTICK,
     CLAUSE_ENDS,
@@ -73,6 +75,7 @@ from slack_presenter import (
     fallback_text,
     gap_parts,
     severity_row,
+    split_lead,
 )
 
 #: Any link Hermes' text path would post (``SlackAdapter.format_message``): its
@@ -89,18 +92,57 @@ LINK_JOIN_BROKEN = "] ("
 
 #: Every count is at most nine digits, so ``int()`` never meets a digit run
 #: past its limit; a longer run matches nothing.
-ISSUE_URL = r"https://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/issues/(?P<number>\d{1,9})"
+#: The issue URL on github.com, and on the install's GitHub Enterprise Server
+#: host when it has one (``_issue_url``): no other host's link is a ledger.
+ISSUE_URL_TEMPLATE = r"https://(?P<host>{hosts})/(?P<repo>[\w.-]+/[\w.-]+)/issues/(?P<number>\d{{1,9}})"
+ISSUE_URL = ISSUE_URL_TEMPLATE.format(hosts=r"github\.com")
 #: The ledger link: the report's last URL, after the SOPs' dash or a "Ledger:"
 #: label, bare, in angle brackets or as a markdown link; or a markdown link
 #: whose own label names the ledger ("[Ledger issue #231](url)"), with nothing
 #: before it. Labels are bounded, and the pattern only searches the report's
 #: last ``LEDGER_TAIL_MAX`` characters, so a long report cannot make it backtrack.
-TRAILING_LEDGER = re.compile(
+TRAILING_LEDGER_PREFIX = (
     r"(?:(?:[—–]|\s-|\bledger(?:\s+issue)?:?)\s*(?:\[[^\]\n]{0,80}\]\()?|\[(?P<label>[^\]\n]{0,80})\]\()<?"
-    + ISSUE_URL
-    + r">?\)?[\s.]*\Z",
-    re.IGNORECASE,
 )
+TRAILING_LEDGER_SUFFIX = r">?\)?[\s.]*\Z"
+TRAILING_LEDGER = re.compile(TRAILING_LEDGER_PREFIX + ISSUE_URL + TRAILING_LEDGER_SUFFIX, re.IGNORECASE)
+#: An issue on any forge, anywhere in a report (``failed_line``): GitHub's ``/issues/<n>``,
+#: GitLab's ``/-/issues/<n>`` or ``/-/work_items/<n>``, on any host. Only says a ledger was named.
+ANY_ISSUE_URL = re.compile(r"https?://\S+?/(?:-/)?(?:issues|work_items)/\d{1,9}\b", re.IGNORECASE)
+
+
+@functools.lru_cache(maxsize=8)
+def _trailing_ledger_re(github_host: str) -> re.Pattern:
+    """``TRAILING_LEDGER`` for an install whose GitHub host is ``github_host``.
+
+    github.com alone when that host is github.com; github.com and the GitHub
+    Enterprise Server host otherwise.
+    """
+    host = github_host.strip().lower()
+    if not host or host == "github.com":
+        return TRAILING_LEDGER
+    hosts = r"github\.com|" + re.escape(host)
+    return re.compile(
+        TRAILING_LEDGER_PREFIX + ISSUE_URL_TEMPLATE.format(hosts=hosts) + TRAILING_LEDGER_SUFFIX,
+        re.IGNORECASE,
+    )
+
+
+def _github_host() -> str:
+    """The install's GitHub host, from the mounted repository lists; github.com without them.
+
+    The one input here that is not the text: a ledger on a GitHub Enterprise
+    Server is an issue URL on that host, and nothing in the report says which
+    host is the install's.
+    """
+    try:
+        from gitops_workspace import github_host
+    except ImportError:
+        return "github.com"
+    try:
+        return github_host()
+    except Exception:  # noqa: BLE001 - github.com, as before
+        return "github.com"
 LEDGER_TAIL_MAX = 512
 #: What a link label alone must say to mark the ledger.
 LEDGER_WORD = re.compile(r"\bledger\b", re.IGNORECASE)
@@ -248,6 +290,23 @@ ACTION_ID_PREFIX = "kage_audit"
 LOOK_FIRST = "Look at the first one"
 LEDGER_BUTTON = "Ledger issue #{number} ↗"
 
+#: The "What's wrong" section of a report written to the Platform Agent's three
+#: sections (``agents/platform/SOUL.md``): a heading (``## What's wrong``) or a
+#: bold label alone on its line, the section's text below it; or the label, a
+#: colon or a dash, a space and the text on the same line (``**What's wrong** —
+#: The audit ...``). Anything else after the label (``## What's wrong?``, ``What's
+#: wrong is that ...``) is not the label, so such a report posts whole.
+WRONG_LABEL = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*|__)?What['’]s[ \t]+wrong"
+    r"(?:(?:[ \t]*[:—–-](?:\*\*|__)?|(?:\*\*|__)[ \t]*[:—–-])[ \t]+(?P<rest>\S.*)"
+    r"|[ \t]*:?(?:\*\*|__)?[ \t]*(?:#+[ \t]*)?)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+#: A line that ends the section's first paragraph: a heading, a list item, or a bold label alone.
+SECTION_BREAK = re.compile(r"^[ \t]*(?:#{1,6}[ \t]|[-*+][ \t]|\d+[.)][ \t]|(?:\*\*|__)[^*_]+(?:\*\*|__)[ \t]*$)")
+#: How far into a report the "What's wrong" label is looked for; the section opens a report.
+WRONG_READ_MAX = 4000
+
 
 class LedgerRef(NamedTuple):
     url: str
@@ -265,7 +324,8 @@ def _trailing_ledger(text: str) -> tuple[int, re.Match] | None:
     offset = max(len(text.rstrip()) - LEDGER_TAIL_MAX, 0)
     tail = text[offset:]
     at = 0
-    while (match := TRAILING_LEDGER.search(tail, at)) is not None:
+    pattern = _trailing_ledger_re(_github_host())
+    while (match := pattern.search(tail, at)) is not None:
         label = match.group("label")
         if label is None or LEDGER_WORD.search(label):
             return offset + match.start(), match
@@ -277,16 +337,19 @@ def ledger_ref(report: str) -> LedgerRef | None:
     """The ledger issue a report ends with, or None when it does not end with one.
 
     The repository is whatever the report's URL names, so the caller must
-    fetch the issue only from a repository it manages.
+    fetch the issue only from a repository it manages. On github.com it is
+    the bare ``owner/name``; on a GitHub Enterprise Server host it is
+    ``<host>/owner/name``, the name the managed list gives it.
     """
     found = _trailing_ledger(report)
     if found is None:
         return None
     match = found[1]
-    repo, number = match.group("repo"), match.group("number")
+    host, repo, number = match.group("host").lower(), match.group("repo"), match.group("number")
     if any(segment in DOT_SEGMENTS for segment in repo.split("/")):
         return None
-    return LedgerRef(f"https://github.com/{repo}/issues/{number}", repo, int(number))
+    url = f"https://{host}/{repo}/issues/{number}"
+    return LedgerRef(url, repo if host == "github.com" else f"{host}/{repo}", int(number))
 
 
 def _new_count(line: str) -> int:
@@ -675,6 +738,81 @@ def blocks_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> tuple[li
     return blocks, fallback_text(card.headline, rows=card.rows, links=links, after_rows=after)
 
 
+def chat_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> tuple[dict, str] | None:
+    """:func:`blocks_from_issue`'s card as a ``kube-agents.chat/v1`` message, for ``spec.mode: next``.
+
+    ``(chat, text)``, or None whenever :func:`blocks_from_issue` is. The same
+    headline, rows, lines under them, "Look at the first one" and ledger link,
+    composed by :func:`chat_message.report_message`. ``text`` is
+    :func:`headline_from_issue`'s markdown, the fallback the gateway posts when
+    it does not lay the message out.
+    """
+    text = headline_from_issue(issue, ref, report)
+    if text is None:
+        return None
+    links = [(LEDGER_BUTTON.format(number=ref.number), ref.url)]
+    clean = _clean_name(issue, report)
+    if clean:
+        return _chat.report_message(CLEAN_CARD.format(name=clean), links=links), text
+    card = _card(_parse_issue(issue, report))
+    chat = _chat.report_message(
+        card.headline,
+        rows=card.rows,
+        after_rows="\n".join(_after_rows(card)),
+        choices=[LOOK_FIRST] if card.rows else [],
+        links=links,
+    )
+    return chat, text
+
+
+def failed_line(report: str) -> str | None:
+    """The one line a fleet-audit report that could not complete posts, or None.
+
+    A report that ends with its ledger link completed (the card is built from
+    the ledger), and so did one that names an issue URL on any forge anywhere: it wrote a
+    ledger, and posts as written. One with no issue URL that opens a "What's
+    wrong" section is a run that could not write its ledger (no GitOps
+    repository registered, say): the line is that section's first sentence, as
+    the agent wrote it, markdown and all. None for a report with no such
+    section, which posts as written.
+    """
+    if ledger_ref(report) is not None or ANY_ISSUE_URL.search(report):
+        return None
+    found = WRONG_LABEL.search(report[:WRONG_READ_MAX])
+    if found is None:
+        return None
+    # Matched again on the whole report, so a line or paragraph past the
+    # search window is read whole rather than cut at it.
+    label = WRONG_LABEL.match(report, found.start())
+    if label is None:
+        return None
+    paragraph = [label.group("rest").strip()] if label.group("rest") else []
+    if not paragraph:
+        for line in report[label.end() :].lstrip("\r\n").splitlines():
+            if not line.strip() or SECTION_BREAK.match(line):
+                break
+            paragraph.append(line.strip())
+    sentence, _rest = split_lead(" ".join(paragraph))
+    return sentence.strip() or None
+
+
+def failed_chat(report: str) -> tuple[dict, str] | None:
+    """:func:`failed_line` as a ``kube-agents.chat/v1`` message for ``spec.mode: next``: ``(chat, text)``, or None.
+
+    The line is the message, and the whole report folds under it ("why"): under
+    next a reply in the thread reaches the gateway, which cannot replay the
+    report the way ``incident_context`` does under today. ``text`` is the
+    report itself, the fallback the gateway posts when it does not lay the
+    message out. None for a report past the fold's cap: the fold would be its only
+    Slack copy, so it goes out whole as text rather than clipped.
+    """
+    line = failed_line(report)
+    if line is None or len(report.strip()) > _chat.FOLD_TEXT_MAX:
+        return None
+    fold = {"title": _chat.FOLD_TITLE_DEFAULT, "text": report.strip()}
+    return _chat.message(detail=_clip(line, _chat.DETAIL_MAX), fold=fold), report
+
+
 def _fallback_line(line: str) -> str:
     """A report line as plain text without its ledger link, any link or mention reduced to its text."""
     found = _trailing_ledger(line)
@@ -698,7 +836,7 @@ def _ledger_line(report: str) -> str:
     if not lines:
         return ""
     end = lines[-1].strip()
-    last = "" if BARE_URL_LINE.match(end) or TRAILING_LEDGER.match(end) else _fallback_line(lines[-1])
+    last = "" if BARE_URL_LINE.match(end) or _trailing_ledger_re(_github_host()).match(end) else _fallback_line(lines[-1])
     if last:
         return last
     counted = [
