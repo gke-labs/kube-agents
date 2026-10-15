@@ -85,6 +85,29 @@ class TestSessionKvServerUtils(unittest.TestCase):
         # Non-pod resource names should not be modified
         self.assertEqual(clean_workload_name("service", "billing-processor-service"), "billing-processor-service")
 
+    def test_clean_workload_name_gives_the_workloads_the_recap_counts(self):
+        """The recap counts withheld alerts per cleaned workload name.
+
+        The design doc says which names fold into one workload. If the
+        cleaner changes, change these cases and the doc together. SOP: "What
+        this recap does not report".
+        """
+        # Pods from two runs of one CronJob fold into one workload.
+        self.assertEqual(clean_workload_name("Pod", "backup-29340180-x7k2p"), "backup")
+        self.assertEqual(clean_workload_name("Pod", "backup-29340240-q9zzm"), "backup")
+        # Each Job keeps the run minute, so it is not the same workload as its pod.
+        self.assertEqual(clean_workload_name("Job", "backup-29340180"), "backup-29340180")
+        # Each StatefulSet pod keeps its ordinal.
+        self.assertEqual(clean_workload_name("Pod", "db-0"), "db-0")
+        self.assertEqual(clean_workload_name("Pod", "db-1"), "db-1")
+        # A Pod name that ends in five lowercase letters or digits loses that
+        # segment. DaemonSet pods fold, and so does a word of five letters.
+        self.assertEqual(clean_workload_name("Pod", "fluentd-x7k2p"), "fluentd")
+        self.assertEqual(clean_workload_name("Pod", "ingest-batch"), "ingest")
+        self.assertEqual(clean_workload_name("Pod", "ingest-queue"), "ingest")
+        # Only Pod names change.
+        self.assertEqual(clean_workload_name("Deployment", "ingest-batch"), "ingest-batch")
+
     def test_clean_reason_label_camel_case(self):
         self.assertEqual(clean_reason_label("FailedToDrainNode"), "Failed to drain node")
         self.assertEqual(clean_reason_label("PodEviction"), "Pod eviction")
@@ -1876,6 +1899,15 @@ class TestAlertDailyQuota(unittest.TestCase):
             # Garbage must not silently disable the cap or block everything.
             self.assertEqual(parse("X_LIMIT", 10), 10)
 
+    def test_drift_ceiling_default_is_twenty(self):
+        # This test pins the literal, not the constant. A change to the value
+        # then needs a change to this test.
+        self.assertEqual(
+            os.environ.get("ALERT_DAILY_LIMIT_DRIFT", ""), "",
+            "ALERT_DAILY_LIMIT_DRIFT is set, so the module did not read the default",
+        )
+        self.assertEqual(session_kv_server.ALERT_DAILY_LIMITS[session_kv_server.DRIFT_QUOTA_KEY], 20)
+
     def test_zero_limit_never_suppresses(self):
         with patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Warning": 0}):
             for _ in range(20):
@@ -3591,7 +3623,8 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertTrue(calls[0].args[1].startswith("**Security & RBAC posture audit: 2 new"))
 
     def test_flag_on_a_closed_ledger_falls_back_to_the_line(self):
-        # A clean run closes the ledger without rewriting its title.
+        # A clean run closes the ledger; the body below its new title still
+        # lists the last run's findings, so the state decides the card.
         os.environ["KAGE_SLACK_UX"] = "1"
         _, calls = self._post(composed=self.ONE_LINE, issue=dict(self.ISSUE, state="closed"))
         self.assertTrue(calls[0].args[1].startswith("**Security & RBAC posture audit: 2 new"))
@@ -3633,6 +3666,80 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual([c.args for c in calls], [("slack", self.ONE_LINE, "", "")])
 
+    #: A fleet-audit report that could not write its ledger, as the agent relayed it (no GitOps repository).
+    FAILED = (
+        "Here is the scheduled workload reliability audit report from the platform agent:\n\n"
+        "**What's wrong** — The daily workload reliability audit could not run because no GitOps repository "
+        "is registered.\n**Why**\n- The ConfigMap contains no `managed_repos` entries.\n"
+        "**What to do**\n- Register your GitOps repository in the ConfigMap.\n"
+    )
+    FAILED_LINE = "The daily workload reliability audit could not run because no GitOps repository is registered."
+
+    def test_flag_on_a_failed_audit_posts_one_line_and_stores_the_report(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        response, calls = self._post(composed=self.FAILED, job_id="reliability")
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual([c.args for c in calls], [("slack", self.FAILED_LINE, "", "")])
+        self.fetch.assert_not_called()
+        # A reply in the thread still gets the whole report.
+        self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.FAILED.strip())])
+
+    def test_under_next_a_failed_audit_is_its_line_with_the_report_folded(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
+        with patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("7.7")
+        ) as via:
+            response, calls = self._post(composed=self.FAILED, job_id="reliability")
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        chat, text = via.call_args.args[2:4]
+        self.assertEqual(chat["detail"], self.FAILED_LINE)
+        self.assertEqual(chat["fold"], {"title": "why", "text": self.FAILED.strip()})
+        self.assertEqual(text, self.FAILED.strip())
+
+    def test_under_next_a_failed_audit_whose_card_did_not_post_goes_out_whole(self):
+        # A reply cannot bring the report back under next, so the line alone would lose it.
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
+        with patch.object(session_kv_server, "_post_audit_chat_via_gateway", return_value=None):
+            _, calls = self._post(composed=self.FAILED, job_id="reliability")
+        self.assertEqual([c.args for c in calls], [("slack", self.FAILED.strip(), "", "")])
+
+    def test_flag_off_a_failed_audit_posts_the_report(self):
+        os.environ["KAGE_SLACK_UX"] = "false"
+        _, calls = self._post(composed=self.FAILED, job_id="reliability")
+        self.assertEqual([c.args for c in calls], [("slack", self.FAILED.strip(), "", "")])
+
+    def test_flag_on_a_failed_report_from_a_job_that_is_not_an_audit_is_unchanged(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        _, calls = self._post(composed=self.FAILED, fleet_audit=False, job_id="drift-fixer")
+        self.assertEqual([c.args for c in calls], [("slack", self.FAILED.strip(), "", "")])
+
+    def test_flag_on_a_failed_audit_is_one_line_on_slack_only(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        _, calls = self._post(composed=self.FAILED, platforms=("slack", "google_chat"), job_id="reliability")
+        self.assertEqual(
+            sorted(c.args[:2] for c in calls),
+            [("google_chat", self.FAILED.strip()), ("slack", self.FAILED_LINE)],
+        )
+
+    def test_flag_on_a_truncated_failed_audit_keeps_its_notice_and_the_report(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        over = self.FAILED + "\n" + "x" * 50
+        with patch.object(session_kv_server, "CRON_REPORT_MAX_CHARS", len(self.FAILED)):
+            _, calls = self._post(composed=over, job_id="reliability")
+        posted = calls[0].args[1]
+        self.assertTrue(posted.startswith("[truncated]"), posted[:40])
+        self.assertIn("**What to do**", posted)
+
+    def test_flag_on_a_failed_line_error_posts_the_report(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        with patch.object(session_kv_server.slack_audit_report, "failed_line", side_effect=ValueError("boom")):
+            response, calls = self._post(composed=self.FAILED, job_id="reliability")
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual([c.args for c in calls], [("slack", self.FAILED.strip(), "", "")])
+
     def test_managed_repositories_unreadable_is_not_managed(self):
         with patch("gitops_workspace.get_managed_github_repos", side_effect=RuntimeError("no kubectl")):
             self.assertFalse(session_kv_server._is_managed_github_repo("acme/fleet-config"))
@@ -3641,6 +3748,18 @@ class TestSlackAuditHeadline(unittest.TestCase):
         with patch("gitops_workspace.get_managed_github_repos", return_value=["Acme/Fleet-Config"]):
             self.assertTrue(session_kv_server._is_managed_github_repo("acme/fleet-config"))
             self.assertFalse(session_kv_server._is_managed_github_repo("evil/phish"))
+
+    def test_an_enterprise_repository_is_checked_against_the_managed_list_on_its_host(self):
+        # A ledger on a GitHub Enterprise Server host is named `<host>/owner/name`,
+        # as the managed list names it; another host's is never managed here.
+        host = "ghe.example.com"
+        with patch("gitops_workspace.github_host", return_value=host), \
+                patch("gitops_workspace.get_managed_repos", return_value=[f"{host}/Acme/Infra"]), \
+                patch("gitops_workspace.get_managed_github_repos", return_value=["acme/web"]):
+            self.assertTrue(session_kv_server._is_managed_github_repo(f"{host}/acme/infra"))
+            self.assertFalse(session_kv_server._is_managed_github_repo("ghe.other.example/acme/infra"))
+            self.assertTrue(session_kv_server._is_managed_github_repo("acme/web"))
+            self.assertFalse(session_kv_server._is_managed_github_repo("acme/infra"))
 
     def test_a_forge_failure_reads_as_no_issue(self):
         import forge

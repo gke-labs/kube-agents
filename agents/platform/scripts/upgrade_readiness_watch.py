@@ -55,12 +55,12 @@ project the sandbox cannot finish leaves only its own clusters ungraded.
 Where it runs, and how. The agent container carries no ``gcloud`` or
 ``kubectl``; both live in the shell sandbox behind the credential proxy, and
 the sandbox login never executes a file under the agent-owned ``/opt/data``
-(``deploy/sandbox/Dockerfile``). So the skill's two scripts are read here, from
-the agent image's copy under ``/opt/platform-template``, and handed to
-``python3 -I -`` on the command's stdin wrapped in a small loader that
-registers ``upgrade_readiness`` as a module before running
-``fleet_upgrade_report.main``: the same route ``stall_watch.py`` takes with
-``stall_report.py``. ``-I`` keeps the sandbox's working directory off the
+(``deploy/sandbox/Dockerfile``). So every module under the skill's ``scripts/``
+except its tests, with the data files beside them, is read here from the agent
+image's copy under ``/opt/platform-template`` and handed to ``python3 -I -`` on
+the command's stdin behind a loader, a meta-path finder that serves the shipped
+set, before running ``fleet_upgrade_report.main``: the route ``stall_watch.py``
+takes with ``stall_report.py``, widened to a package. ``-I`` keeps the sandbox's working directory off the
 module path. The loader gives the report script a private temporary directory
 of its own (``tempfile.mkdtemp``, owned by the sandbox login and readable by
 nobody else) for its JSON output and its rollout record, reads the output
@@ -172,6 +172,18 @@ SKILL_SCRIPTS_DIR_ENV = "UPGRADE_READINESS_SKILL_SCRIPTS"
 REPORT_MODULE = "fleet_upgrade_report"
 READINESS_MODULE = "upgrade_readiness"
 PYTHON_SOURCE_SUFFIX = ".py"
+# What the loader ships into the sandbox: every module under the skill's scripts directory
+# except its tests, behind a meta-path finder, so the report's imports (the readiness
+# module, the readiness_rules package, the shape tables, and whatever a later rule adds)
+# resolve from the shipped set alone. The sandbox has the files on disk but on no import
+# path, and a stdin program under -I has no script directory to find them from.
+SKILL_TEST_PREFIX = "test_"
+PACKAGE_INIT = "__init__"
+PYCACHE_DIR = "__pycache__"
+MODULE_SEPARATOR = "."
+# The skill's data files ship beside its modules (the removal table the shape tables read
+# through `pkgutil.get_data`); the tests' fixtures do not.
+SKILL_DATA_SKIPPED_DIRS = (PYCACHE_DIR, "testdata")
 
 # How the report runs in the sandbox.
 PYTHON_EXECUTABLE = "python3"
@@ -486,30 +498,93 @@ def skill_scripts_dir() -> Path:
     raise RuntimeError(f"{REPORT_MODULE}.py not found under {', '.join(str(c) for c in candidates)}")
 
 
-def loader_source(argv: list[str]) -> str:
-    """The program ``python3 -I -`` runs in the sandbox: both skill scripts as
-    string literals, the readiness module registered first so the report's
-    ``import upgrade_readiness`` resolves, then ``main`` with ``argv`` plus an
-    output path and a rollout record inside a private temporary directory, its
-    tables captured, the directory removed, and one JSON envelope printed after
-    a sentinel line."""
+def _stamped(path: Path, scripts: Path, root: str | None) -> str:
+    """The path a shipped file is known by in the sandbox: where it was read from on the
+    agent side, or the same path under ``root`` when a caller re-roots the set (the tests
+    do, to a directory that does not exist, so a read can only come from the shipped set)."""
+    return str(path) if root is None else str(Path(root) / path.relative_to(scripts))
+
+
+def shipped_modules(root: str | None = None) -> dict[str, tuple[str, str, bool]]:
+    """Every module the loader ships, by import name: its source, the path it is known by
+    (the module's ``__file__`` in the sandbox, so the report's own path-relative lookups
+    are unchanged) and whether it is a package. Every ``.py`` under the skill's scripts
+    directory except the tests, so a module a later rule adds ships without a change here,
+    and an import the set does not satisfy fails the loader tests rather than the job."""
     scripts = skill_scripts_dir()
-    readiness_path = scripts / (READINESS_MODULE + PYTHON_SOURCE_SUFFIX)
-    report_path = scripts / (REPORT_MODULE + PYTHON_SOURCE_SUFFIX)
+    shipped: dict[str, tuple[str, str, bool]] = {}
+    for path in sorted(scripts.rglob("*" + PYTHON_SOURCE_SUFFIX)):
+        relative = path.relative_to(scripts)
+        if PYCACHE_DIR in relative.parts or relative.name.startswith(SKILL_TEST_PREFIX):
+            continue
+        parts = list(relative.with_suffix("").parts)
+        is_package = parts[-1] == PACKAGE_INIT
+        if is_package:
+            parts = parts[:-1]
+        shipped[MODULE_SEPARATOR.join(parts)] = (path.read_text(encoding="utf-8"), _stamped(path, scripts, root), is_package)
+    return shipped
+
+
+def shipped_data(root: str | None = None) -> dict[str, str]:
+    """Every data file the loader ships, by the path it is known by (beside its module, so
+    ``pkgutil.get_data(module, name)`` finds it through the finder): every file under the
+    skill's scripts directory that is not a module, a test or a test fixture. Today that is
+    the removal table the shape tables and the GitOps scan share."""
+    scripts = skill_scripts_dir()
+    data: dict[str, str] = {}
+    for path in sorted(scripts.rglob("*")):
+        relative = path.relative_to(scripts)
+        if not path.is_file() or path.suffix == PYTHON_SOURCE_SUFFIX or relative.name.startswith(SKILL_TEST_PREFIX):
+            continue
+        if any(part in SKILL_DATA_SKIPPED_DIRS for part in relative.parts):
+            continue
+        data[_stamped(path, scripts, root)] = path.read_text(encoding="utf-8")
+    return data
+
+
+def loader_preamble(root: str | None = None) -> str:
+    """The first part of the sandbox program: the shipped modules and data files as
+    literals behind a meta-path finder, so ``import fleet_upgrade_report`` and every import
+    under it resolve from them, in whatever order the imports ask, each module's
+    ``__file__`` the path it is known by, and a module's ``pkgutil.get_data`` reads the
+    shipped file beside it (the finder is the module's loader, and serves the data)."""
     return "\n".join(
         [
-            "import contextlib, io, json, os, shutil, sys, tempfile, types",
-            f"READINESS_SRC = {json.dumps(readiness_path.read_text(encoding='utf-8'))}",
-            f"REPORT_SRC = {json.dumps(report_path.read_text(encoding='utf-8'))}",
+            "import contextlib, importlib, importlib.abc, importlib.util, io, json, os, shutil, sys, tempfile",
+            f"SOURCES = {shipped_modules(root)!r}",
+            f"DATA = {shipped_data(root)!r}",
+            "class Shipped(importlib.abc.MetaPathFinder, importlib.abc.Loader):",
+            "    def find_spec(self, name, path=None, target=None):",
+            "        entry = SOURCES.get(name)",
+            "        return None if entry is None else importlib.util.spec_from_loader(name, self, origin=entry[1], is_package=entry[2])",
+            "    def create_module(self, spec):",
+            "        return None",
+            "    def exec_module(self, module):",
+            "        source, file, _ = SOURCES[module.__name__]",
+            "        module.__file__ = file",
+            "        exec(compile(source, file, 'exec'), module.__dict__)",
+            "    def get_data(self, path):",
+            "        if path in DATA:",
+            "            return DATA[path].encode('utf-8')",
+            "        with open(path, 'rb') as handle:",
+            "            return handle.read()",
+            "sys.meta_path.insert(0, Shipped())",
+            "",
+        ]
+    )
+
+
+def loader_source(argv: list[str]) -> str:
+    """The program ``python3 -I -`` runs in the sandbox: the skill's modules behind a
+    finder (``loader_preamble``), the report imported through it, then ``main`` with
+    ``argv`` plus an output path and a rollout record inside a private temporary
+    directory, its tables captured, the directory removed, and one JSON envelope printed
+    after a sentinel line."""
+    return loader_preamble() + "\n".join(
+        [
             f"ARGV = {json.dumps(argv)}",
             f"SENTINEL = {json.dumps(ENVELOPE_SENTINEL)}",
-            f"readiness = types.ModuleType({json.dumps(READINESS_MODULE)})",
-            f"readiness.__file__ = {json.dumps(str(readiness_path))}",
-            "exec(compile(READINESS_SRC, readiness.__file__, 'exec'), readiness.__dict__)",
-            f"sys.modules[{json.dumps(READINESS_MODULE)}] = readiness",
-            f"report = types.ModuleType({json.dumps(REPORT_MODULE)})",
-            f"report.__file__ = {json.dumps(str(report_path))}",
-            "exec(compile(REPORT_SRC, report.__file__, 'exec'), report.__dict__)",
+            f"report = importlib.import_module({json.dumps(REPORT_MODULE)})",
             f"private = tempfile.mkdtemp(prefix={json.dumps(SANDBOX_TMP_PREFIX)})",
             f"output = os.path.join(private, {json.dumps(SANDBOX_OUTPUT_NAME)})",
             f"state = os.path.join(private, {json.dumps(SANDBOX_STATE_DIR_NAME)})",

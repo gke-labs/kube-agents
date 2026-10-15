@@ -26,6 +26,7 @@ from admin_console.clients.portal_api import (
 )
 from admin_console.chat.models import is_portal_session_id
 from admin_console.chat.service import ACTIVE_TASK_STATUSES
+from admin_console.kanban_view import display_status
 from admin_console.project_config import DeploymentTarget
 from admin_console.ui import paginated_selectable_table
 
@@ -121,6 +122,9 @@ def task_fingerprint(result: TaskUpdateResult) -> tuple:
             task.run_count,
             task.latest_event,
             task.previous_error,
+            task.block_kind,
+            task.gave_up,
+            task.has_pr,
         )
         for task in result.tasks
     ) + (("truncated", result.truncated),)
@@ -141,7 +145,7 @@ def render_task_cards(
     st.markdown("#### Agent work")
     for task in result.tasks:
         with st.container(border=True):
-            st.markdown(f"**{task.assignee}** · {task.status}")
+            st.markdown(f"**{task.assignee}** · {display_status(task)}")
             st.write(task.title or task.task_id)
             if task.summary:
                 st.success(task.summary)
@@ -160,7 +164,7 @@ def render_task_cards(
             if task.status == "done" and task.run_count > 1:
                 st.caption(f"Completed after {task.run_count} runs")
             st.page_link(
-                "pages/kanban.py",
+                "views/kanban.py",
                 label=task.task_id,
                 icon=":material/open_in_new:",
                 help="Open this task in Task Kanban",
@@ -659,7 +663,7 @@ with thread:
                 st.caption(f"Root run: {last_run.root_run_id}")
             for diagnostic in last_run.diagnostics:
                 st.caption(diagnostic)
-            st.page_link("pages/activity.py", label="Open Activity Explorer")
+            st.page_link("views/activity.py", label="Open Activity Explorer")
 
     prompt = st.chat_input(
         "Message the agent",

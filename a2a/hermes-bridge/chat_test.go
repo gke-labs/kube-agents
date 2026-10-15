@@ -38,6 +38,10 @@ type chatCases struct {
 		In   string `json:"in"`
 		Kind string `json:"kind"`
 	} `json:"ask_kind"`
+	AnswerChat []struct {
+		In   string          `json:"in"`
+		Chat json.RawMessage `json:"chat"`
+	} `json:"answer_chat"`
 }
 
 func loadChatCases(t *testing.T) chatCases {
@@ -50,7 +54,7 @@ func loadChatCases(t *testing.T) chatCases {
 	if err := json.Unmarshal(raw, &cases); err != nil {
 		t.Fatal(err)
 	}
-	if len(cases.SplitAnswer) == 0 || len(cases.Plain) == 0 || len(cases.AskKind) == 0 {
+	if len(cases.SplitAnswer) == 0 || len(cases.Plain) == 0 || len(cases.AskKind) == 0 || len(cases.AnswerChat) == 0 {
 		t.Fatal("testdata/chat_cases.json has an empty section")
 	}
 	return cases
@@ -80,6 +84,24 @@ func TestAskKindMatchesThePresenter(t *testing.T) {
 	for _, c := range loadChatCases(t).AskKind {
 		if got := askKind(c.In); got != c.Kind {
 			t.Errorf("askKind(%q) = %q, want %q", c.In, got, c.Kind)
+		}
+	}
+}
+
+// The whole answer layout, the clause cut and the options as choices
+// included, is chat_message.answer_message's: null where it posts text.
+func TestAnswerChatMatchesThePresenter(t *testing.T) {
+	for _, c := range loadChatCases(t).AnswerChat {
+		msg, ok := answerChat(c.In)
+		got := []byte("null")
+		if ok {
+			var err error
+			if got, err = json.Marshal(msg); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !sameChat(t, lib.Part{Data: got}, c.Chat) {
+			t.Errorf("answerChat(%.60q) = %s\nwant %s", c.In, got, c.Chat)
 		}
 	}
 }
@@ -405,6 +427,14 @@ func TestCardsSettleTheAsk(t *testing.T) {
 }
 
 func ptr(s string) *string { return &s }
+
+// An invalid UTF-8 byte inside an open bracket at the sentence's end is
+// masked at its own width: no write past the buffer, no panic.
+func TestClauseCutSurvivesAnInvalidByteInABracket(t *testing.T) {
+	sentence := strings.Repeat("word ", 40) + "and more (open \xff"
+	splitAnswer(sentence)
+	clauseCut(sentence)
+}
 
 // The presenter's linear-time cases: nothing here retries a line's end from
 // every marker.

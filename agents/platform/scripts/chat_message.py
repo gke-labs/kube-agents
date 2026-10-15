@@ -380,6 +380,12 @@ def answer_message(markdown: str) -> dict | None:
     ``slack_presenter.split_answer``'s rules. A rest longer than a detail holds
     goes under "why" instead. None when today posts it plain: no headline (an
     answer that opens on a code fence) or a rest past :data:`FOLD_TEXT_MAX`.
+
+    An answer that ends by asking which of its options to take
+    (``slack_moments.answer_choices``) offers them as choices instead: the
+    detail is its opening paragraph, each option's shown line and the question,
+    and the rest goes under "why". A choice the gateway would read as a command,
+    or a detail past :data:`DETAIL_MAX`, keeps the layout above.
     """
     headline, body = _presenter.split_answer(markdown)
     if not headline:
@@ -387,6 +393,14 @@ def answer_message(markdown: str) -> dict | None:
     text = "\n\n".join(body).strip()
     if len(text) > FOLD_TEXT_MAX:
         return None
+    offered = _moments.answer_choices(text)
+    if offered is not None:
+        shown, folded, question, options = offered
+        choices = [_choice(label, primary=primary) for label, primary in options]
+        detail = "\n\n".join(part for part in (shown, question) if part)
+        if all(choices) and len(detail) <= DETAIL_MAX:
+            fold = {"title": FOLD_TITLE_DEFAULT, "text": folded} if folded else None
+            return message(headline=headline, detail=detail, fold=fold, choices=choices)
     if len(text) > DETAIL_MAX:
         return message(headline=headline, fold={"title": FOLD_TITLE_DEFAULT, "text": text})
     return message(headline=headline, detail=text)
@@ -411,6 +425,14 @@ def _row(row: Any) -> dict:
     return out
 
 
+def _fold_line(row: Any) -> str:
+    """A row as a fold's markdown: its severity as inline code ahead of its text, its detail on the next line."""
+    severity, text = _presenter._row_parts(row)
+    line = _presenter.severity_row(severity, text.strip()) if severity else text.strip()
+    detail = _presenter._row_detail(row).strip()
+    return f"{line}\n{detail}" if detail else line
+
+
 def _usable(choices: Iterable[Any]) -> tuple[list[str], list[str]]:
     """``(labels that can be buttons, labels left for the detail)``, each clipped to a label."""
     kept, left = [], []
@@ -427,12 +449,16 @@ def report_message(
     links: Iterable[Any] = (),
     detail: str = "",
     after_rows: str = "",
+    fold_title: str = "",
+    fold_rows: Sequence[Any] = (),
 ) -> dict:
     """:func:`slack_presenter.blocks_report`'s report: the first choice primary, links after.
 
     ``after`` keeps its first :data:`AFTER_MAX` lines. A choice the
     gateway would read as a command is left out of the buttons and named in
     ``detail``, as a needs-you question keeps an option it cannot offer.
+    ``fold_rows`` go under ``fold_title`` as the fold's text, a row each
+    (its severity as inline code, its detail on the line under it).
     """
     shown = _presenter._shown(rows)[:ROWS_MAX]
     kept, left = _usable(choices)
@@ -440,12 +466,20 @@ def report_message(
     if left:
         detail_line = "\n".join(part for part in (detail_line, *left) if part)
     after = [_presenter._clip(_line(line), _presenter.ROW_TEXT_MAX) for line in _presenter._after_lines(after_rows)]
+    folded = [_fold_line(row) for row in _presenter._shown(fold_rows)]
+    fold = None
+    if folded:
+        fold = {
+            "title": _presenter._clip(_line(fold_title), FOLD_TITLE_MAX) or FOLD_TITLE_DEFAULT,
+            "text": _presenter._clip("\n".join(folded), FOLD_TEXT_MAX),
+        }
     return message(
         headline=_headline(headline),
         note=_presenter._clip(_line(_presenter._plain(note or "")), NOTE_MAX),
         detail=detail_line,
         rows=[_row(row) for row in shown],
         after=after[:AFTER_MAX],
+        fold=fold,
         choices=[_choice(label, primary=not i) for i, label in enumerate(kept[:CHOICES_MAX])],
         links=_links(links),
     )

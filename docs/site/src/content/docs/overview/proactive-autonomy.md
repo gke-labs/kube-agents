@@ -40,7 +40,7 @@ Alongside them, `github-repo-watcher` polls the target repo every 10 minutes and
 
 `stall-watch` sweeps the namespaces of every running or reconciling cluster that has a Cluster Agent every half hour for controllers that stopped reconciling without erroring, a Gateway waiting on a TLS Secret that will never exist or a rollout wedged behind a missing ConfigMap, and, when one appears, raises an alert the way a Warning event does: the alert is posted, that cluster's Cluster Agent runs `gke-stall-detection` and answers in the alert's thread with what each controller is waiting on and the GitOps fixes to choose from, and a reply of "apply" there opens the pull request. Chat also gets one line when the stall clears.
 
-Each audit calls the [`fleet-audit`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/fleet-audit) skill, whose helper owns every forge call, through the version-control broker, and renders every body from a validated findings file. The stream's ledger issue is rewritten in place each run; findings with a mergeable manifest are promoted into narrow remediation PRs that link back to it — automatically for critical ones and a few additive major fixes, on request for the rest ([Declarative workflow](/kube-agents/concepts/declarative-workflow/#the-fleet-audit-skill) has the mechanism). A finding with no reproducible command is dropped, not softened; a clean run closes the ledger as completed and says nothing at all — unless it could not read the whole fleet, in which case it leaves the ledger open and reports the gaps rather than passing a partial look off as an all-clear, or it resolved findings on the way there, in which case it reports what closed rather than letting the good news be the only thing it swallows.
+Each audit calls the [`fleet-audit`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/fleet-audit) skill, whose helper owns every forge call, through the version-control broker, and renders every body from a validated findings file. The stream's ledger issue is rewritten in place each run; findings with a mergeable manifest are promoted into narrow remediation PRs that link back to it — automatically for critical ones and a few additive major fixes, on request for the rest ([Declarative workflow](/kube-agents/concepts/declarative-workflow/#the-fleet-audit-skill) has the mechanism). A finding with no reproducible command is dropped, not softened; a clean run closes the ledger as completed and says nothing at all — unless it could not read the whole fleet, in which case it leaves the ledger open and reports the gaps rather than passing a partial look off as an all-clear (on a scheduled run, only when the gaps are new or changed), or it resolved findings on the way there, in which case it reports what closed rather than letting the good news be the only thing it swallows.
 
 Those nine are the whole watchdog roster; five further watchdogs shipped disabled for a time and have since been [retired](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs). [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) has the full table, generated from `jobs.json`, with exact cron expressions and prompts.
 
@@ -50,7 +50,7 @@ The alternative for each of these is a person on a rotation, a static Terraform 
 
 - **Audit → issue → PR** — the agent doesn't just detect drift, it keeps a standing report of it and proposes the mergeable fixes as PRs you review.
 - **Fleet-wide read, mutations through Git** — the Platform Agent reads the fleet via the GKE MCP server and is designed to route every change through a pull request. Which parts of that are _enforced_ rather than _intended_ is set out in [Security &amp; IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do).
-- **Recovery ladder before escalation** — `SOUL.md §4` caps recovery attempts at 5 iterations / ~10 minutes per blocker before asking a human.
+- **Recovery ladder before escalation** — `SOUL.md §4` caps recovery attempts at 5 iterations / ~10 minutes per transient blocker before asking a human; an authorization denial skips the ladder and is reported at once.
 
 The design goal: fleet issues stop rotting silently while the on-call queue is quiet.
 
@@ -58,7 +58,7 @@ The design goal: fleet issues stop rotting silently while the on-call queue is q
 
 - **Declarative-only for infra changes.** `SOUL.md §1` forbids direct `kubectl apply` for GKE infrastructure. Everything routes through the GitOps write path — `submit-suggestion` for a one-off change, `fleet-audit` for a scheduled audit run, and nothing else (`SOUL.md §3.2`).
 - **Destructive operations always ask.** Cluster deletion, tenant offboarding, broad IAM revocation — the persona explicitly gates these on human confirmation, no matter how many "just do it" phrases are in the user's message.
-- **Bounded retries.** The recovery ladder in `SOUL.md §4` bounds each blocker at 5 attempts / 10 minutes before escalating.
+- **Bounded retries.** The recovery ladder in `SOUL.md §4` bounds each transient blocker at 5 attempts / 10 minutes before escalating; an authorization denial is not retried.
 
 ## Where to go next
 

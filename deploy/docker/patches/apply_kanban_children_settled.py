@@ -69,6 +69,14 @@ COMPLETE_GATE = (
     "    )\n"
     "    if _children_err:\n"
     "        return tool_error(_children_err)\n"
+    "    # kube-agents patch: a card whose declared steps are not all done has\n"
+    "    # not delivered what it names (#2935, #2939). See\n"
+    "    # tools/kanban_children_settled.py.\n"
+    "    _steps_err = _require_steps_settled(\n"
+    "        tid, _kanban_children_connect, result\n"
+    "    )\n"
+    "    if _steps_err:\n"
+    "        return tool_error(_steps_err)\n"
 )
 
 # Appended rather than inserted: every name is resolved when a tool handler
@@ -105,6 +113,7 @@ TRAILER = (
     "    maybe_record_worker_child as _kanban_record_worker_child,\n"
     "    refuse_idle_dependency_block as _refuse_idle_dependency_block,\n"
     "    require_children_settled as _require_children_settled,\n"
+    "    require_steps_settled as _require_steps_settled,\n"
     ")\n"
 )
 
@@ -119,6 +128,7 @@ def apply(root: Path) -> None:
         "_kanban_record_worker_child(conn, new_tid)",
         "_require_children_settled(",
         "_refuse_idle_dependency_block(",
+        "_require_steps_settled(",
     )
     patch.substitute(CREATE_ANCHOR, CREATE_HOOK, label="create attribution hook")
     patch.substitute(

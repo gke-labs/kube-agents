@@ -26,11 +26,12 @@ writes six pages and two data files into ``out/``:
 * ``cases.html`` -- **the Cases page**: one row per case with its last
   ``STRIP_RUNS`` presubmit outcomes, its 7- and 30-day pass rates per tier,
   its roster status and its last failure; ``#<case>`` lands on the row.
-* ``nightly.html[#build=<prow build id>]`` -- **the Nightly report**: last
-  night's run of the nightly tier (or the night ``build`` names), its cases
-  by domain with pass / partial / fail and the grader's reason, what is
-  newly failing against the night before, the wall clock and whether the
-  night was cut short (``nightly.py``).
+* ``nightly.html[#build=<prow build id>&cases=a,b]`` (either key may be left out) -- **the Nightly
+  report**: last night's run of the nightly tier (or the night ``build``
+  names), its cases by domain with pass / partial / fail and the grader's
+  reason, what is newly failing against the night before, the wall clock
+  and whether the night was cut short (``nightly.py``); the timing night
+  over night, with each case ``cases`` names in its own table.
 * ``trend.html[#cases=a,b|domain=<domain>][&metric=<judged metric>][&since=<ISO>]``
   -- **the Trend page**: scores over time on ``main``, read from the
   evidence store (``--store``, the ``store.json`` ``store.py`` wrote): per

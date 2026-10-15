@@ -749,6 +749,8 @@ with the created topic/subscription — restrict access with
 
 With `enable_github_minter = true`, set `github_repo` to your primary GitOps repository (in `owner/repo` or GitHub URL format). Additional GitOps repositories within the same organization can also be registered in the ConfigMap by cluster administrators.
 
+For a GitOps repository on a GitHub Enterprise Server, `github_repo` must be `owner/name` on the instance, not a URL: the composition reads a github.com URL only. The forge itself is declared in `extra_helm_values`, in a `ghes.auto.tfvars` file beside `terraform.tfvars`; keep all of `extra_helm_values` in that one file, because Terraform does not merge a variable across files. The minter's Cloud KMS key ring and key are created and the App key imported before the apply, so apply with `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply`, which adopts them, not a bare `terraform apply`. A new cluster goes into the project's `default` VPC network, because the composition has no network or subnetwork variable: an instance reachable only from another VPC or a Shared VPC needs a cluster created in that VPC and `create_cluster = false`. See [GitHub Enterprise Server in INSTALL.md](../../../INSTALL.md#github-enterprise-server).
+
 With `gitops_forge = "gitlab"`, set `gitlab_repo` to the GitLab project's full path (`group/project`, nested groups allowed) and, for a self-managed instance, `gitops_host` to its hostname. The CR then declares one `gitlab` forge and the project as its `gitops` repository, with `credentialsRef` naming `gitlab_token_secret_name` (default `gitlab-forge-token`). Terraform never sees the token: create that Secret, with the token under the key `token`, in the agent's namespace yourself (`install.sh` does it for you). A self-managed instance whose certificate a private CA signed also sets `gitlab_ca_secret_name` to the Secret that holds the CA under the key `ca.crt`; the broker trusts it for that host only (`install.sh --gitops-ca-file` creates it). A Secret, not a ConfigMap, so changing the CA needs the same rights as changing the token. A GitLab install has no GitHub App, so `github_repo` and `enable_github_minter` must stay unset; the plan refuses otherwise. See [GitLab as the GitOps forge](../../../docs/site/src/content/docs/install/gitlab.md).
 
 `enable_slack = true` writes `slack_bot_token` / `slack_app_token` into the
@@ -857,8 +859,11 @@ parallelism window and, on a first install, the IAM module and the chart
 release behind the cluster — waits for a second apply. The identity applying
 needs `logging.sinks.create`, the
 project's number and the Service Usage call that mints its Logging agent in
-each listed project (`roles/owner` carries them), and nothing probes for that
-before the apply: a number it cannot read fails the plan, or the apply at
+each listed project (`roles/owner` carries them). The installer's front doors
+probe the first in each `SCOPE_PROJECTS` entry the sinks will cover before an apply
+and refuse naming
+the project ([`scripts/installer/README.md`](../../../scripts/installer/README.md));
+a hand-driven apply, and a selector's members on any route, have no probe: a number it cannot read fails the plan, or the apply at
 that read when the plan deferred it (a first install, or any apply that
 enables an API), and an agent or grant it cannot make stops the apply with
 the host's trio untouched and every source sink held back until the next

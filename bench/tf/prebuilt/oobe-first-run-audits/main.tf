@@ -41,7 +41,8 @@
 # The teardown, and the exit trap on a failed apply, run disarm.py: the markers
 # go back as they were and the `oobe` job comes out if this stack put it there.
 # The audits the stage started are left to finish. Each writes its ledger issue in
-# the install's GitOps repository and posts its summary where it always does.
+# the install's GitOps repository (with none, its report in the report store) and
+# posts its summary where it always does.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -61,8 +62,9 @@ locals {
   disarm_b64 = base64encode(file("${path.module}/disarm.py"))
   own_b64    = base64encode(file("${path.module}/own_stage.py"))
   # A fresh CI install's scan settles about 17 minutes after boot, then its chain runs three
-  # audits and claims the fourth (one to 45 minutes each). Held under the infra lock, which
-  # gives each stack-bearing case 30 minutes per contender, so a longer wait starves them.
+  # audits and claims the fourth (one to 45 minutes each). The runner holds the onboarding
+  # state lock while this waits, and hack/ci-eval-pr.sh sizes that lock's deadline from
+  # own_wait plus chain_wait (STATE_LOCK_HOLD_SECONDS), so a change here changes that too.
   own_wait = 3600
   # arm.py prints this when the image ships no oobe job.
   no_job = "ships no oobe job"

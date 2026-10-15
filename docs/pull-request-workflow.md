@@ -697,6 +697,14 @@ Prow's own form of the re-pin — a `[prow:skip-retest]` sentinel written by `/o
 upstream but not in the Prow build this repository merges through; `scripts/pin_smoke_status.py`
 says when to switch.
 
+**A pull request on `main` can also carry `Smoke gate` and `Merge labels` statuses.** They
+are the gate checks of a GitHub merge queue that `main` does not use yet, posted by
+[`merge-gate.yml`](../.github/workflows/merge-gate.yml), and each restates something Tide already
+decides: the smoke result (or that the change touches only paths the smoke skips), and the label
+query above. Nothing requires them. Because Tide holds on any posted context
+that is not green, each is posted only when it is green, and a green can go stale until the next
+event. `scripts/merge_gate.py` is the reference for what each one reads.
+
 **`mergeStateStatus` cannot answer "is this ready to merge" here, and it is the natural thing to
 reach for.** Every open pull request reads `BLOCKED` or `DIRTY` and none ever reads `CLEAN`, because
 `main` restricts pushes to the `google-oss-prow` app and GitHub scores that restriction as a block
