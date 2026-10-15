@@ -223,10 +223,11 @@ resource "null_resource" "deleted_policy" {
       # The policy itself is not the exposure -- step 1 re-creates it before
       # step 2 deletes it, so a leftover namespace whose policy is already
       # gone still gets a fresh one to delete. What survives is everything
-      # step 1 does NOT rewrite: the workload's pods keep their original ages
-      # and restart history, the namespace keeps labels from whichever run
-      # created it, and the ownership assertion reads managedFields written by
-      # a server-side apply that may have happened hours ago. Deleting first
+      # step 1 does NOT rewrite. Its label call is `--overwrite`, so the
+      # labels are not it; what survives is the workload's pods, which keep
+      # the ages and restart history of whichever run created them, and the
+      # managedFields the ownership assertion reads, written by a
+      # server-side apply that may have happened hours ago. Deleting first
       # is what makes the case recover on its own, and it is also the only
       # thing that can: the run that leaked the namespace is over, and nothing
       # else visits this cluster between runs.
@@ -237,8 +238,14 @@ resource "null_resource" "deleted_policy" {
       # to say the namespace is ours. A namespace of this name that we did not
       # plant is a stop, not a target.
       if kubectl get namespace "${local.ns}" >/dev/null 2>&1; then
+        # Not swallowed: the enclosing `if` has already proved the namespace
+        # exists, so a failing read here is a transport or RBAC failure and
+        # not an absent label. Swallowed, it becomes an empty value that the
+        # branch below reports as "this stack did not create it" -- a refusal
+        # with the wrong reason, and indistinguishable from a namespace that
+        # genuinely carries no label.
         leftover_owner="$(kubectl get namespace "${local.ns}" \
-          -o jsonpath='{.metadata.labels.managed-by}' 2>/dev/null || true)"
+          -o jsonpath='{.metadata.labels.managed-by}')"
         if [ "$leftover_owner" != "${local.ci_labels["managed-by"]}" ]; then
           echo "ERROR: ${local.ns} already exists on ${var.host_cluster_name} but is not labelled managed-by=${local.ci_labels["managed-by"]} (found '$leftover_owner'). This stack did not create it, so it will not delete it. Remove it by hand if it is stale." >&2
           exit 1
@@ -253,6 +260,46 @@ resource "null_resource" "deleted_policy" {
           exit 1
         fi
       fi
+
+      # ---- 0c. Refuse a daemon that cannot take the record ------------------
+      # A daemon predating the `gitops-drift` dispatch takes the payload down
+      # its event path instead, grades it as a Warning Pod alert for `default/`,
+      # answers 200, and files a card that has nothing to do with drift. Every
+      # objective would then fail against a card that looks plausible in the
+      # transcript, which is the worst way for a fixture to be wrong.
+      #
+      # /healthz is unauthenticated, so this runs before the key is needed and
+      # separates "the install is too old" from "the key is wrong".
+      #
+      # BEFORE THE PLANT, like the load-bearing sibling. It reads only the
+      # kubeconfig from step 0 and four plain variables, and this stack's
+      # plant is a leftover delete, a namespace create, two server-side
+      # applies and a rollout wait. Probing afterwards would spend all of
+      # that, then let the exit trap delete the namespace it just built,
+      # before reporting a condition knowable in ten seconds.
+      #
+      # `|| true` stays, and the exit status is tested separately below: an
+      # exec that failed is a different diagnosis from a daemon that answered
+      # and advertised the wrong kinds.
+      pod="deployment/${var.agent_deployment}"
+      exec_in_pod=(kubectl exec "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
+      exec_in_pod_stdin=(kubectl exec -i "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
+
+      # jq runs inside the pod rather than on the runner, here and in the calls
+      # below. The agent image installs it; the Prow runner has no jq in any of
+      # hack/'s scripts, so assuming one would be a dependency nothing else in
+      # bench/tf takes.
+      kinds_rc=0
+      kinds="$("$${exec_in_pod[@]}" sh -c 'curl -sS --max-time 10 "$1/healthz" | jq -r ".inject_kinds[]?"' sh "${var.daemon_url}")" || kinds_rc=$?
+      if [ "$kinds_rc" -ne 0 ]; then
+        echo "ERROR: could not read ${var.daemon_url}/healthz in ${var.agent_container} (exit $kinds_rc); kubectl's or curl's own error is above. This says nothing about which inject kinds the daemon advertises -- it is an exec, RBAC, or connection failure, and the install may be perfectly current." >&2
+        exit 1
+      fi
+      if ! printf '%s\n' "$kinds" | grep -qxF 'gitops-drift'; then
+        echo "ERROR: the Session KV daemon at ${var.daemon_url} does not advertise the 'gitops-drift' inject kind (it advertises: $kinds). This install predates the drift dispatch, so a record sent to it would be graded as a Warning Pod event and reported back as delivered. Redeploy the agent image before running this case." >&2
+        exit 1
+      fi
+
 
       # ---- 1. Plant the protected namespace ---------------------------------
       # Both objects are applied server-side under ${var.gitops_field_manager},
@@ -359,7 +406,7 @@ resource "null_resource" "deleted_policy" {
       # ---- 2. Make the deletion real ----------------------------------------
       # A plain delete, with no --field-manager, because a deletion claims no
       # field: the verb is the whole change. This is also why the record in
-      # step 4 carries `join: no_object` rather than an ownership block.
+      # step 3 carries `join: no_object` rather than an ownership block.
       kubectl delete networkpolicy "${local.policy}" -n "${local.ns}" --wait=true
 
       # The namespace must hold NO policy, not merely not this one. The report's
@@ -379,30 +426,7 @@ resource "null_resource" "deleted_policy" {
       fi
       echo "Planted ${local.resource_path}: applied by ${var.gitops_field_manager}, deleted out of band, ${var.workload_replicas} pods now unprotected."
 
-      # ---- 3. Refuse a daemon that cannot take the record -------------------
-      # A daemon predating the `gitops-drift` dispatch takes the payload down
-      # its event path instead, grades it as a Warning Pod alert for `default/`,
-      # answers 200, and files a card that has nothing to do with drift. Every
-      # objective would then fail against a card that looks plausible in the
-      # transcript, which is the worst way for a fixture to be wrong.
-      #
-      # /healthz is unauthenticated, so this runs before the key is needed and
-      # separates "the install is too old" from "the key is wrong".
-      pod="deployment/${var.agent_deployment}"
-      exec_in_pod=(kubectl exec "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
-      exec_in_pod_stdin=(kubectl exec -i "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
-
-      # jq runs inside the pod rather than on the runner, here and in the calls
-      # below. The agent image installs it; the Prow runner has no jq in any of
-      # hack/'s scripts, so assuming one would be a dependency nothing else in
-      # bench/tf takes.
-      kinds="$("$${exec_in_pod[@]}" sh -c 'curl -sS --max-time 10 "$1/healthz" | jq -r ".inject_kinds[]?"' sh "${var.daemon_url}" || true)"
-      if ! printf '%s\n' "$kinds" | grep -qxF 'gitops-drift'; then
-        echo "ERROR: the Session KV daemon at ${var.daemon_url} does not advertise the 'gitops-drift' inject kind (it advertises: $kinds). This install predates the drift dispatch, so a record sent to it would be graded as a Warning Pod event and reported back as delivered. Redeploy the agent image before running this case." >&2
-        exit 1
-      fi
-
-      # ---- 4. Hand the daemon the record ------------------------------------
+      # ---- 3. Hand the daemon the record ------------------------------------
       # The key is read from the pod's own environment inside the exec, never
       # passed in: SESSION_KV_API_KEY is on this container and a value that
       # crossed the runner would be one argv away from a CI log.
@@ -414,7 +438,7 @@ resource "null_resource" "deleted_policy" {
         exit 1
       fi
 
-      # Minted per apply, and the card poll in step 5 matches on it. That is
+      # Minted per apply, and the card poll in step 4 matches on it. That is
       # what makes the poll run-scoped without a per-run object name: the card
       # body renders `insertId=<this>`, so a card left on the board by an
       # earlier run against this same namespace cannot satisfy it.
@@ -507,7 +531,7 @@ resource "null_resource" "deleted_policy" {
       fi
       echo "Daemon accepted the drift record (insert_id=$insert_id)."
 
-      # ---- 5. Wait for the card ---------------------------------------------
+      # ---- 4. Wait for the card ---------------------------------------------
       # The inject returns as soon as the daemon has queued the front-door turn,
       # and that turn -- one kanban_create against the cluster agent scoped to
       # ${var.host_cluster_name} -- is what puts the card on the board. Without
@@ -566,8 +590,12 @@ resource "null_resource" "deleted_policy" {
       # interpreter, and whether a bare `python3` is also on PATH in this
       # container is an image detail that should not be what this case fails on.
       pod_python=""
+      # `import sqlite3`, not `pass`: the probe's own import sits outside its
+      # try block, so an interpreter that satisfies `pass` but has no
+      # _sqlite3 module would be picked, fail on every poll, and surface
+      # 300 seconds later as "the front-door turn filed nothing".
       for candidate in python3 /opt/hermes/.venv/bin/python3; do
-        if "$${exec_in_pod[@]}" "$candidate" -c 'pass' >/dev/null 2>&1; then
+        if "$${exec_in_pod[@]}" "$candidate" -c 'import sqlite3' >/dev/null 2>&1; then
           pod_python="$candidate"
           break
         fi

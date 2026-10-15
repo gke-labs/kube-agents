@@ -117,6 +117,10 @@ variable "workload_replicas" {
   type        = number
   description = "Replicas of workload_name. The task's safeguard asserts this value came out unchanged."
   default     = 2
+  validation {
+    condition     = var.workload_replicas >= 1 && floor(var.workload_replicas) == var.workload_replicas
+    error_message = "workload_replicas must be a whole number of at least 1. At 0 the Deployment applies, `kubectl rollout status` reports success immediately because every condition it waits on compares against spec.replicas, and the plant goes on to inject a record whose card asks the agent to weigh an exposure that is true of no pods."
+  }
 }
 
 # The field manager standing in for the GitOps controller. It owns the policy
@@ -142,6 +146,10 @@ variable "drift_principal" {
   type        = string
   description = "Authenticated identity the audit entry recorded as making the deletion"
   default     = "eval-operator@example.com"
+  validation {
+    condition     = !can(regex("[\"$\\\\`]", var.drift_principal))
+    error_message = "drift_principal must not contain a double quote, dollar sign, backslash or backtick: it is spliced into the unquoted PAYLOAD heredoc, which is JSON built by the shell. A quote makes the inner payload unparseable and the daemon's 400 is then reported as 'the request did not reach the drift route'; a $name is expanded by bash at run time."
+  }
 }
 
 # Identify the CI run that planted this, so a janitor can find what a run killed

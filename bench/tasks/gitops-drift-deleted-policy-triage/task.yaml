@@ -4,8 +4,8 @@
 # to now, offers the two ways out, and nothing writes to the cluster.
 #
 # This is CUJ 1 of docs/designs/drift-detection.md -- "security loosening", the
-# one that table marks as the flagship -- in the shape it names first: "a
-# NetworkPolicy is deleted". Its three clauses are "names the actor, weighs the
+# one that table marks as the flagship -- in the shape its drift column
+# names first: "NetworkPolicy deleted". Its three clauses are "names the actor, weighs the
 # security impact, recommends revert or codify", and nothing covered any of
 # them before this case.
 #

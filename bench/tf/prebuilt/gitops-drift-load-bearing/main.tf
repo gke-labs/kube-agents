@@ -255,14 +255,17 @@ resource "null_resource" "load_bearing_change" {
       # objective would then fail against a card that looks plausible in the
       # transcript, which is the worst way for a fixture to be wrong.
       #
-      # BEFORE THE PLANT, unlike the sibling stacks, which probe after theirs.
-      # This reads nothing the plant produces -- only the kubeconfig from step
-      # 0 and four plain variables -- and this stack's plant is the expensive
+      # BEFORE THE PLANT, as gitops-drift-deleted-policy also does. This
+      # reads nothing the plant produces -- only the kubeconfig from step 0
+      # and four plain variables -- and this stack's plant is the expensive
       # half of the file: three observed rollouts, two of them waiting out a
-      # failure. Probing afterwards would spend those minutes, tear the
-      # namespace back down and then report a condition that was knowable in
-      # ten seconds. The sibling ordering costs nothing because its plant is
-      # two kubectl calls; here it would cost the whole plant.
+      # failure. Probing afterwards would spend those minutes, let the exit
+      # trap tear the namespace back down, and then report a condition that
+      # was knowable in ten seconds.
+      #
+      # The merged ../gitops-drift still probes after its plant, and there it
+      # costs little: that plant is an apply, a patch and two reads with no
+      # wait. It is not a precedent for a stack that waits.
       pod="deployment/${var.agent_deployment}"
       exec_in_pod=(kubectl exec "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
       exec_in_pod_stdin=(kubectl exec -i "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
@@ -371,8 +374,14 @@ resource "null_resource" "load_bearing_change" {
       # Deployment would mean the setting is not what is blocking it, and the
       # report's reasoning -- reverting takes the service down -- would be
       # false.
+      # Not swallowed. The guard below treats an empty value as "nothing
+      # ready", so `2>/dev/null || true` would let a failed read SATISFY the
+      # one check that proves the declared state does not run -- a silent pass
+      # on the case's premise. Removing it is safe for the absent-field case
+      # this check is actually about: `kubectl -o jsonpath` on a missing
+      # `.status.readyReplicas` prints nothing and exits zero.
       ready_before="$(kubectl get deployment "${local.workload}" -n "${local.ns}" \
-        -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
+        -o jsonpath='{.status.readyReplicas}')"
       if [ -n "$ready_before" ] && [ "$ready_before" != "0" ]; then
         echo "ERROR: ${local.workload} already has $ready_before ready replica(s) under runAsNonRoot: true, so the declared state runs after all and this case's premise is false." >&2
         exit 1
@@ -384,9 +393,13 @@ resource "null_resource" "load_bearing_change" {
       # loudly now rather than as an unexplainable red later -- but the case
       # does NOT depend on the agent still seeing it, which is what the
       # ReplicaSet assertion in step 5 is for.
-      if ! kubectl get events -n "${local.ns}" \
-        -o jsonpath='{range .items[*]}{.message}{"\n"}{end}' 2>/dev/null \
-        | grep -qi 'runasnonroot'; then
+      # Read into a variable first, without swallowing, so a transport
+      # failure aborts here with kubectl's own stderr. Inside the pipeline it
+      # would hand grep an empty stream and the branch below would report a
+      # missing kubelet event when nothing about the kubelet was read.
+      event_messages="$(kubectl get events -n "${local.ns}" \
+        -o jsonpath='{range .items[*]}{.message}{"\n"}{end}')"
+      if ! printf '%s\n' "$event_messages" | grep -qi 'runasnonroot'; then
         echo "ERROR: no event in ${local.ns} mentions runAsNonRoot, so the kubelet did not report the reason it refused the container and the richest evidence this scenario offers is missing. Events follow." >&2
         kubectl get events -n "${local.ns}" --sort-by=.metadata.creationTimestamp >&2 || true
         exit 1
@@ -671,8 +684,12 @@ resource "null_resource" "load_bearing_change" {
       # interpreter, and whether a bare `python3` is also on PATH in this
       # container is an image detail that should not be what this case fails on.
       pod_python=""
+      # `import sqlite3`, not `pass`: the probe's own import sits outside its
+      # try block, so an interpreter that satisfies `pass` but has no
+      # _sqlite3 module would be picked, fail on every poll, and surface
+      # 300 seconds later as "the front-door turn filed nothing".
       for candidate in python3 /opt/hermes/.venv/bin/python3; do
-        if "$${exec_in_pod[@]}" "$candidate" -c 'pass' >/dev/null 2>&1; then
+        if "$${exec_in_pod[@]}" "$candidate" -c 'import sqlite3' >/dev/null 2>&1; then
           pod_python="$candidate"
           break
         fi

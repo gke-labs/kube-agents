@@ -376,7 +376,10 @@ verification_spec:
       # neither is more right: matching is substring on a normalized string
       # that lowercases but leaves hyphens alone, so "runasnonroot" catches the
       # camel-cased field and the two prose spellings need their own entries.
-      any_of_phrases: ["runasnonroot", "non-root", "nonroot"]
+      # "nonroot" alone covers the camel-cased field: normalization lowercases,
+      # so "runAsNonRoot" becomes "runasnonroot", which contains it. A separate
+      # "runasnonroot" entry would be dead.
+      any_of_phrases: ["nonroot", "non-root"]
 
   - name: triage-names-the-ownership-handover
     role: objective
