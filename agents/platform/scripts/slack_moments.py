@@ -704,7 +704,7 @@ def _option(marker: str, text: str, continuation: Sequence[str]) -> tuple[str, b
     return label, primary, shown if summary else "", whole
 
 
-def answer_choices(rest: str) -> tuple[str, str, str, list[tuple[str, bool]]] | None:
+def answer_choices(rest: str, buttons: bool = True) -> tuple[str, str, str, list[tuple[str, bool]]] | None:
     """A finished answer's options as choices: ``(shown, folded, question, options)``, or None.
 
     ``rest`` is the answer after its headline, as markdown. It offers choices when it ends with
@@ -715,6 +715,8 @@ def answer_choices(rest: str) -> tuple[str, str, str, list[tuple[str, bool]]] | 
     recommended one primary. ``shown`` is a prose paragraph that opens ``rest``, then each
     option's shown line when every option has one; ``folded`` is everything else before the options, then the options
     as written when any says more than its first line, for a fold; ``question`` is the question.
+    With ``buttons`` False, as outside a thread, nothing carries the labels, so ``shown`` holds
+    the options as written and ``folded`` only what came before them.
     """
     lines = (rest or "").strip("\n").split("\n")
     while lines and not lines[-1].strip():
@@ -754,6 +756,11 @@ def answer_choices(rest: str) -> tuple[str, str, str, list[tuple[str, bool]]] | 
     lead_end = next((i for i, line in enumerate(head) if not line.strip()), len(head))
     lead = head[:lead_end] if head and not _not_prose(head[0]) else []
     folded = head[len(lead):]
+    if not buttons:
+        shown = "\n\n".join(part for part in ("\n".join(lead).strip(), "\n".join(region).strip()) if part)
+        return shown, "\n".join(folded).strip(), question, [
+            (label, i == first) for i, (label, _primary, _shown, _whole) in enumerate(options)
+        ]
     # The options' lines show only when each says more than its button does.
     lines = [line for _label, _primary, line, _whole in options]
     shown_all = all(lines)

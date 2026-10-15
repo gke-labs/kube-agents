@@ -74,7 +74,8 @@ func busyNotice(ahead int) string {
 // from replacing it (updateRollingLine); its working and terminal edits
 // replace it as they replace the placeholder.
 //
-// A turn whose placeholder post failed has no line to edit, and gets the
+// A turn whose placeholder post failed, or that never got one because the
+// backend keeps no line (StatusShower), has no line to edit, and gets the
 // notice as a post, the shape before the notice moved onto the line: with no
 // status line there is no "completed" header for it to sit under. An edit
 // that fails is logged and not retried as a post, which would put back the

@@ -1790,8 +1790,8 @@ the label check included; anything else shows as written. Every field goes out a
 `refuseSlackChat` still refuses a layout carrying a mention in a mrkdwn text object
 (`blocksMention`, the notify route's check), which the renderer no longer writes. The blocks go on
 the wire as the renderer wrote them, not through slack-go's types.
-With Agent Sessions wired (every Slack adapter the gateway builds) there is no live message on
-Slack, since the adapter is a `StatusShower`; where a backend keeps one, the live message shows
+With Agent Sessions wired (every Slack adapter the gateway builds) there is no live message in a
+Slack thread, since the adapter is a `StatusShower` for any conversation with a thread; where a backend keeps one, the live message shows
 the newest progress chat message under every display mode, and keeps it when the task ends, its text turning to the terminal line; a progress artifact without one turns
 the message back to text. A layout the backend refuses is not offered again until the progress
 chat message changes, and the Slack adapter's text `Edit` sends the blocks and side bar cleared,

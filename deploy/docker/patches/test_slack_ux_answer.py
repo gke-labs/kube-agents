@@ -456,10 +456,10 @@ class SendTest(unittest.TestCase):
         self.assertNotIn("thread_ts", post)
         types_ = [block["type"] for block in post["blocks"]]
         self.assertNotIn("actions", types_)
-        chat = case["expected"][0]["chat"]
-        shown = post["blocks"][1:types_.index("container")]
-        self.assertEqual(shown, _render_blocks(chat["detail"].rsplit("\n\n", 1)[0], adapter.format_message),
-                         "the options stay in sight above the fold")
+        shown = json.dumps(post["blocks"][1:types_.index("container")])
+        # No buttons carry the labels, so the options stay in sight as written, above the fold.
+        for line in ("Option 1 (Recommended): Fix the command", "Option 2: Increase the memory limit", "sleep infinity"):
+            self.assertIn(line, shown)
 
     def test_a_closing_question_posts_after_the_fold(self):
         question = "Want me to scale the pool to 6 nodes?"

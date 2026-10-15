@@ -747,7 +747,8 @@ def check_thread(session: Session) -> CheckResult:
     # there. A --thread-ts without one would wait out the settle and blame a steer.
     if not any(m.get("user") == session.bot_user_id and (session.args.no_status_line or status_state(m.get("text", "")))
                for m in replies_after(session.listed, session.channel_id, root, "0")):
-        return CheckResult(CHECK_THREAD, False, f"thread {root} holds no gateway status line, so the gateway never started "
+        held = "bot post" if session.args.no_status_line else "gateway status line"
+        return CheckResult(CHECK_THREAD, False, f"thread {root} holds no {held}, so the gateway never started "
                            "a task in it, and it takes an unmentioned reply only in a thread it started a task in; "
                            "run mention in the same run, or pass a --thread-ts the bot answered",
                            {"channel": session.channel_id, "thread_ts": root})

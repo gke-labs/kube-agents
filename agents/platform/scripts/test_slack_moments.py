@@ -675,6 +675,16 @@ class AnswerChoicesTest(unittest.TestCase):
         self.assertEqual(options, [("Fix it", True), ("Raise it", False)])
         self.assertEqual(shown, "1. **Fix it** — use sleep.\n2. **Raise it** — give it 512Mi.")
 
+    def test_without_buttons_the_options_stay_in_sight_as_written(self):
+        options = "1. **Restart the pod**\n2. **Raise the limit**"
+        shown, folded, question, labels = m.answer_choices(
+            f"It is OOMKilled.\n\n## Why\nThe limit is low.\n\n{options}\n\nWhich would you prefer?", buttons=False
+        )
+        self.assertEqual(shown, f"It is OOMKilled.\n\n{options}")
+        self.assertEqual(folded, "## Why\nThe limit is low.")
+        self.assertEqual(question, "Which would you prefer?")
+        self.assertEqual([label for label, _primary in labels], ["Restart the pod", "Raise the limit"])
+
     def test_only_the_first_recommended_is_primary(self):
         _s, _f, _q, options = m.answer_choices("- **A (recommended)**\n- **B (Recommended)**\n\nWhich one?")
         self.assertEqual(options, [("A", True), ("B", False)])

@@ -683,7 +683,8 @@ func clipRunes(text string, limit int) string {
 }
 
 // splitAnswer is the presenter's split_answer: the first sentence of the
-// first paragraph as a plain headline, and the rest as markdown sections.
+// first paragraph as a plain headline, cut at a clause when it runs past the
+// cap (clauseCut), and the rest as markdown sections.
 func splitAnswer(md string) (string, []string) {
 	paras := paragraphs(strings.ReplaceAll(md, "\x00", ""))
 	if len(paras) == 0 {
