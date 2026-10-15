@@ -366,6 +366,7 @@ class SplitLostNothingTest(unittest.TestCase):
         result = subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+
 # The inject lane's exclusions at their introduction (#2039, 2026-09-25): the
 # one presubmit case whose premise needs the chat front door. An edit to the
 # file edits this set in the same pull request, for the reason the sets above
@@ -581,6 +582,7 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                     self.assertIn(case, eval_rosters.blocking_roster())
                 else:
                     self.assertIn(case, eval_rosters.nightly_cases())
+
 
 # The inject lane's safeguards at their introduction (#2079, 2026-09-28): the
 # one entry every case on the lane carries beside its own. An edit to the
