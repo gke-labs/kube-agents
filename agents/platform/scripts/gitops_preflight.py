@@ -14,13 +14,16 @@ when there is no mount. A list with no usable entry reads as empty. It
 prints exactly one line:
 
     REGISTERED: <repo> [<repo> ...]                  exit 0
-    NO_REGISTERED_REPO: stop now. ...                exit 3
-    REPO_UNREACHABLE: <repo>: stop now. ...          exit 4  (with --repo)
-    STATE_UNREADABLE: stop now. ...                  exit 5
-    BROKER_UNAVAILABLE: stop now. ...                exit 6  (with --repo)
+    NO_REGISTERED_REPO: <fact>. <remedy>. Stop now: ...           exit 3
+    REPO_UNREACHABLE: <repo>: <fact>. <remedy>. Stop now: ...     exit 4  (with --repo)
+    STATE_UNREADABLE: <fact>. Stop now: ...                       exit 5
+    BROKER_UNAVAILABLE: <fact>. <remedy>. Stop now: ...           exit 6  (with --repo)
 
-Only REGISTERED (and --list with a usable managed repository) is exit 0. Every other line tells the reader to stop and
-block, because that is the whole point of having one. A malformed command line
+Only REGISTERED (and --list with a usable managed repository) is exit 0.
+Every other line tells the reader to stop and block, because that is the whole
+point of having one. Each line puts the fact and the remedy first and the
+worker's stop last: an operator reads a blocked card's reason, and a clipped
+notice keeps its start. A malformed command line
 (an empty --repo, --repo with --list) is argparse's exit 2, with no status line.
 
 With --repo, the named repository (a bare path, a clone URL, an scp remote:
@@ -98,8 +101,11 @@ REGISTRATION_STEPS = (
     "Register the repository in the PlatformAgent's spec.integration.repositories "
     "(or re-run the installer with --gitops-repo), then ask again."
 )
+# Last on every line: the operator reads a blocked card's reason first, and a
+# clipped notice keeps its start, so the fact and the remedy come before the
+# worker's instruction.
 STOP = (
-    'stop now. Call kanban_block(kind="needs_input") with this line, change nothing, '
+    'Stop now: call kanban_block(kind="needs_input") with this line, change nothing, '
     "and do not look for another route or check again another way."
 )
 
@@ -208,7 +214,7 @@ def listing() -> tuple[int, str]:
         context = _context_names(gitops_workspace.get_context_repo_entries())
     except Exception as exc:  # noqa: BLE001 - any failure to read is the same answer
         return EXIT_STATE_UNREADABLE, (
-            f"STATE_UNREADABLE: the registry could not be read ({_one_line(str(exc))}); {STOP}"
+            f"STATE_UNREADABLE: the registry could not be read ({_one_line(str(exc))}). {STOP}"
         )
     managed_text = " ".join(managed)
     if not managed:
@@ -231,12 +237,12 @@ def _empty_registry_line(skipped: list[str]) -> str:
             f"NO_REGISTERED_REPO: {len(skipped)} registered entr"
             f"{'y is' if len(skipped) == 1 else 'ies are'} not usable "
             f"({' '.join(skipped)}): an unsupported type, a port, or a host the "
-            f"forges do not serve; {STOP} Fix the entry in the PlatformAgent's "
-            "spec.integration.repositories, then ask again."
+            "forges do not serve. Fix the entry in the PlatformAgent's "
+            f"spec.integration.repositories, then ask again. {STOP}"
         )
     return (
-        f"NO_REGISTERED_REPO: this install has no registered GitOps repository; "
-        f"{STOP} {REGISTRATION_STEPS}"
+        f"NO_REGISTERED_REPO: this install has no registered GitOps repository. "
+        f"{REGISTRATION_STEPS} {STOP}"
     )
 
 
@@ -255,7 +261,7 @@ def preflight(repo: str | None = None) -> tuple[int, str]:
         repos = gitops_workspace.get_managed_repos()
     except Exception as exc:  # noqa: BLE001 - any failure to read is the same answer
         return EXIT_STATE_UNREADABLE, (
-            f"STATE_UNREADABLE: the registry could not be read ({_one_line(str(exc))}); {STOP}"
+            f"STATE_UNREADABLE: the registry could not be read ({_one_line(str(exc))}). {STOP}"
         )
     if not repos:
         return EXIT_NO_REGISTERED_REPO, _empty_registry_line(_unusable_entries())
@@ -267,7 +273,7 @@ def preflight(repo: str | None = None) -> tuple[int, str]:
     if registered is None:
         return EXIT_NO_REGISTERED_REPO, (
             f"NO_REGISTERED_REPO: {asked} is not registered on this install "
-            f"(registered: {' '.join(repos)}); {STOP} {REGISTRATION_STEPS}"
+            f"(registered: {' '.join(repos)}). {REGISTRATION_STEPS} {STOP}"
         )
     # From here on the name is the list's own spelling, which is what every
     # later gate (the broker, submit-suggestion) compares against.
@@ -275,19 +281,19 @@ def preflight(repo: str | None = None) -> tuple[int, str]:
     outcome, why = _reachable(repo)
     if outcome == NOT_MANAGED:
         return EXIT_NO_REGISTERED_REPO, (
-            f"NO_REGISTERED_REPO: the broker does not manage {repo} ({why}); {STOP} "
-            f"{REGISTRATION_STEPS}"
+            f"NO_REGISTERED_REPO: the broker does not manage {repo} ({why}). "
+            f"{REGISTRATION_STEPS} {STOP}"
         )
     if outcome == BROKER:
         return EXIT_BROKER_UNAVAILABLE, (
             f"BROKER_UNAVAILABLE: the broker, the forge or this sandbox could not "
-            f"answer for {repo} ({why}); {STOP} This is not a registration problem; "
-            "the reason in parentheses says what to fix."
+            f"answer for {repo} ({why}). This is not a registration problem; "
+            f"the reason in parentheses says what to fix. {STOP}"
         )
     if outcome == REPOSITORY:
         return EXIT_REPO_UNREACHABLE, (
-            f"REPO_UNREACHABLE: {repo}: the broker could not read it ({why}); {STOP} "
-            "Check the repository exists and the install's forge credential can read it."
+            f"REPO_UNREACHABLE: {repo}: the broker could not read it ({why}). "
+            f"Check the repository exists and the install's forge credential can read it. {STOP}"
         )
     return EXIT_REGISTERED, f"REGISTERED: {repo}"
 

@@ -197,6 +197,33 @@ class PreflightAnswersInOneLine(unittest.TestCase):
         self.assertEqual(0, gitops_preflight.EXIT_REGISTERED)
 
 
+class TheOperatorReadsTheFactFirst(unittest.TestCase):
+    """A blocked card's reason reaches the operator, and a clipped notice keeps
+    its start (review on #3003): the fact and the remedy lead, the worker's
+    stop instruction ends the line."""
+
+    def test_the_stop_instruction_ends_every_stop_line(self):
+        lines = []
+        with _StateDir(entries=None):
+            lines.append(gitops_preflight.preflight()[1])
+        unusable = [{"type": "github", "url": "https://github.example.com:8443/acme/fleet"}]
+        with _StateDir(entries=unusable):
+            lines.append(gitops_preflight.preflight()[1])
+        with _StateDir(entries=ENTRY):
+            lines.append(gitops_preflight.preflight("acme/other")[1])
+        with patch.object(gitops_preflight.gitops_workspace, "get_managed_repos", side_effect=RuntimeError("boom")):
+            lines.append(gitops_preflight.preflight()[1])
+        for line in lines:
+            with self.subTest(line=line[:40]):
+                self.assertTrue(line.endswith(gitops_preflight.STOP), line)
+                self.assertEqual(1, line.count("Stop now:"), line)
+
+    def test_the_no_repository_line_names_the_remedy_before_the_stop(self):
+        with _StateDir(entries=None):
+            line = gitops_preflight.preflight()[1]
+        self.assertLess(line.index("spec.integration.repositories"), line.index("Stop now:"))
+
+
 class ListingShowsBothRegistries(unittest.TestCase):
     """`--list` is for SOUL.md's repository resolution: managed versus context."""
 
