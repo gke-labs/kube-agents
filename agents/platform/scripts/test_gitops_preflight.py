@@ -218,6 +218,18 @@ class ListingShowsBothRegistries(unittest.TestCase):
         self.assertEqual(gitops_preflight.EXIT_NO_REGISTERED_REPO, code)
         self.assertIn("\nNO_REGISTERED_REPO: 1 registered entry is not usable", text)
 
+    def test_the_stop_comes_from_the_same_read_as_the_managed_line(self):
+        # A registration landing between two reads must not print
+        # "MANAGED: none" above a REGISTERED line: the registry is read once.
+        reads = iter([[], [REPO], [REPO], [REPO]])
+        with _StateDir(entries=None), patch.object(
+            gitops_preflight.gitops_workspace, "get_managed_repos", side_effect=lambda: next(reads)
+        ):
+            code, text = gitops_preflight.listing()
+        self.assertEqual(gitops_preflight.EXIT_NO_REGISTERED_REPO, code)
+        self.assertTrue(text.splitlines()[-1].startswith("NO_REGISTERED_REPO: "), text)
+        self.assertNotIn("REGISTERED: ", text.replace("NO_REGISTERED_REPO: ", ""))
+
     def test_the_list_as_a_command_exits_3_on_an_empty_registry(self):
         with _StateDir(entries=None):
             out = io.StringIO()
