@@ -124,6 +124,8 @@ FORWARDABLE_HARNESS_FLAGS = frozenset({
     "--home-channel", "--home-since", "--home-timeout", "--home-match",
 })
 WAIT_ANSWER_FLAG = "--wait-answer"
+# The harness leaves thread out under it (harness.parse_args); the launcher plans no Job around it.
+NO_STATUS_LINE_FLAG = "--no-status-line"
 RESULT_PREFIXES = ("PASS ", "FAIL ")
 # wait_job's answer for a Job that no longer exists.
 JOB_GONE = "gone"
@@ -634,6 +636,9 @@ class Launcher:
             return any(not passed for _, passed, _ in self.results)
 
         pod_checks = [c for c in checks if c in harness.CHECK_ORDER and c != harness.CHECK_RESTART]
+        if NO_STATUS_LINE_FLAG in self.forwarded and harness.CHECK_THREAD in pod_checks:
+            say(f"NOTE thread not run: {harness.THREAD_LINELESS}")
+            pod_checks = [c for c in pod_checks if c != harness.CHECK_THREAD]
         restarting = harness.CHECK_RESTART in checks
         if CHECK_LEGACY_SOCKET in checks or restarting or self.args.expect_principal or (pod_checks and not self.args.image):
             # Finding the PlatformAgent is setup, not any one check's verdict.
