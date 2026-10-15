@@ -175,7 +175,14 @@ PRESENTED_PLATFORM = "slack"
 # The note on the first-run audits (_audits_note). The scan leaves their workload checks to them.
 AUDITS_SKIPPED_NOTE = "The first-run audits did not run: {reason}."
 AUDITS_NO_REASON = "no reason was recorded"
-# Every skip leaves the audits to their schedules, and the scan did not run their checks.
+# The reason an older oobe stage recorded when it skipped for no repository. A marker an install
+# kept through the upgrade still carries it, and on such an install the scan ran those checks.
+LEGACY_NO_REPOSITORY_REASON = "no GitHub repository in managed_repos for the audits to publish to"
+AUDITS_COVERED_NOTE = (
+    "This scan checked probes, requests and limits, autoscaling, NetworkPolicy and pod security in "
+    "their place, so this report covers them."
+)
+# Every other skip leaves the audits to their schedules, and the scan did not run their checks.
 AUDITS_NOT_COVERED_NOTE = (
     "This scan did not check probes, requests and limits, autoscaling, NetworkPolicy or pod security "
     "either, so this report does not cover them."
@@ -598,7 +605,12 @@ def _audits_note(data_dir: Path, no_coverage: bool) -> str:
     state = oobe.read_state(data_dir)
     if state.get(oobe.STATE_SKIPPED):
         reason = str(state.get(oobe.STATE_REASON) or AUDITS_NO_REASON)
-        coverage = AUDITS_UNCHECKED_SCHEDULED_NOTE if no_coverage else AUDITS_NOT_COVERED_NOTE
+        if no_coverage:
+            coverage = AUDITS_UNCHECKED_SCHEDULED_NOTE
+        elif reason == LEGACY_NO_REPOSITORY_REASON:
+            coverage = AUDITS_COVERED_NOTE
+        else:
+            coverage = AUDITS_NOT_COVERED_NOTE
         return f"{AUDITS_SKIPPED_NOTE.format(reason=reason)} {coverage}"
     fired = [a for a in oobe.FIRST_RUN_AUDITS if a in _list(state.get(oobe.STATE_FIRED))]
     held = state.get(oobe.STATE_HELD) if isinstance(state.get(oobe.STATE_HELD), dict) else {}
