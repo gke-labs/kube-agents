@@ -2738,6 +2738,33 @@ class TestAuditCatalogue(unittest.TestCase):
                     f"collector {name} actually documents",
                 )
 
+    def test_compliance_collector_runs_in_the_foreground_with_out(self):
+        """The compliance collector takes minutes on a larger fleet, and the
+        terminal's default timeout kills it part-way. A worker given only a
+        stdout redirect then answered from the partial output and published no
+        ledger (#2856). The SOP's invocation therefore writes with `--out`
+        rather than `>`, the SOP says `timeout: 600` in the foreground, and the
+        cron prompt says the same. The held-out canary that caught the failure
+        cannot red a regression, so these lines are pinned here.
+        """
+        audit_id = "compliance-audit"
+        manifest = f"--out /opt/data/scratch/manifest_{audit_id}.json"
+        sop_text = (self.sop_dir() / SOP_FILENAMES[audit_id]).read_text(encoding="utf-8")
+        idx = sop_text.index("Run the collector")
+        fence_marker = "```bash\n"
+        fence_start = sop_text.index(fence_marker, idx) + len(fence_marker)
+        fence_end = sop_text.index("\n```", fence_start)
+        invocation_line = sop_text[fence_start:fence_end].splitlines()[0]
+        self.assertIn(manifest, invocation_line)
+        self.assertNotIn(" > ", invocation_line, "the collector's manifest must not be a stdout redirect")
+        guidance = sop_text[fence_end:].split("\n\n", 2)[1]
+        self.assertIn("in the foreground", guidance)
+        self.assertIn("`timeout: 600`", guidance)
+        prompt = self.cron_jobs()[audit_id]["prompt"]
+        self.assertIn(manifest, prompt)
+        self.assertIn("in the foreground with the terminal tool's timeout: 600", prompt)
+        self.assertNotIn("redirecting its stdout", prompt)
+
     def test_every_collector_prompt_names_a_command_argparse_accepts(self):
         """Naming the right script is not the same as naming a runnable command.
 
