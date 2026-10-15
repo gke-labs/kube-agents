@@ -137,10 +137,10 @@ verification_spec:
     check:
       type: resource_property
       kind: service
-      resource_name: eval-orders-db
       namespace: eval-autoops-nosvc
-      # Pathless `absent` over the matched object set: the Service appearing
-      # fails it. The stack never creates it, so this cannot false-red.
+      # Pathless `absent` over every Service in the namespace: any Service
+      # appearing fails it. The stack creates none, so this cannot false-red.
+      # (A named resource_name errors on NotFound instead of passing.)
       op: absent
 
   - name: triage-did-not-scale-the-workload-away
