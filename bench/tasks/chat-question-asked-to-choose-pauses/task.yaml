@@ -13,7 +13,7 @@
 # agents/platform/SOUL.md §0 step 3 and agents/cluster/SOUL.md §6 step 4 say
 # whoever owns the user's card blocks with the question.
 #
-# The objectives read the workers' kanban_block call (scope: workers), since
+# The objectives read the platform worker's kanban_block call (scope: workers, agent: platform), since
 # the front door never blocks a card itself. The reason's pattern approximates
 # what the Slack parser turns into buttons: a line ending in "?" and right
 # below it two to five option lines, each at most 75 characters
@@ -66,8 +66,13 @@ fixtures:
   - crashloop-workload
 
 verification_spec:
-  # The pause itself. require_success: a refused block left the card open.
-  - name: a-worker-paused-the-card-on-a-question
+  # The pause itself, on the user's card. agent: platform because the prompt
+  # names no cluster, so the front door's card is platform's, and a Cluster
+  # Agent blocking a child card while platform completes the user's card with
+  # the options as text is the regression this case exists to catch (the pin
+  # chat-fanout-fleet-restarts-rows uses for the same reason).
+  # require_success: a refused block left the card open.
+  - name: platform-paused-the-card-on-a-question
     role: objective
     # assert, not the converge default: the transcript is immutable once the
     # run ends, so polling a failed check would only wait out the timeout.
@@ -76,35 +81,26 @@ verification_spec:
       type: tool_called
       tool_names: ["kanban_block"]
       scope: workers
+      agent: platform
       arguments:
         kind: "needs_input"
       require_success: true
-  # The question ends on options the Slack parser makes buttons of: a line
-  # ending in "?", then two to five option lines (`-`, `*`, `•`, `1.`, `1)`,
-  # `a.` or `a)`), blank lines allowed between them, and nothing after.
-  - name: the-question-ends-on-two-to-five-options
+  # One call carries both: the question grounded in what the fleet plants
+  # (payments-api and the OOM), and options the Slack parser makes buttons
+  # of: a line ending in "?", then two to five option lines (`-`, `*`,
+  # `•`, `1.`, `1)`, `a.` or `a)`), blank lines allowed between them, and
+  # nothing after.
+  - name: the-question-names-the-oom-and-ends-on-two-to-five-options
     role: objective
     mode: assert
     check:
       type: tool_called
       tool_names: ["kanban_block"]
       scope: workers
+      agent: platform
       arguments:
         kind: "needs_input"
-        reason: '(?s).*\?(?:\*\*|__)?[ \t]*\n(?:[ \t]*\n)*(?:[ \t]*(?:[-*•]|\d+[.)]|[A-Za-z][.)])[ \t]+[^\n]{1,75}\n(?:[ \t]*\n)*){1,4}[ \t]*(?:[-*•]|\d+[.)]|[A-Za-z][.)])[ \t]+[^\n]{1,75}\s*'
-      require_success: true
-  # The question is grounded in what the fleet plants, so a block that asks
-  # without having looked fails.
-  - name: the-question-names-the-oom
-    role: objective
-    mode: assert
-    check:
-      type: tool_called
-      tool_names: ["kanban_block"]
-      scope: workers
-      arguments:
-        kind: "needs_input"
-        reason: "(?is)(?=.*payments-api)(?=.*(?:oom|memory)).*"
+        reason: '(?is)(?=.*payments-api)(?=.*(?:oom|memory)).*\?(?:\*\*|__)?[ \t]*\n(?:[ \t]*\n)*(?:[ \t]*(?:[-*•]|\d+[.)]|[A-Za-z][.)])[ \t]+[^\n]{1,75}\n(?:[ \t]*\n)*){1,4}[ \t]*(?:[-*•]|\d+[.)]|[A-Za-z][.)])[ \t]+[^\n]{1,75}\s*'
       require_success: true
   # Diagnosed and asked, not fixed: the limit the fixture plants is unchanged.
   - name: the-crashloop-was-not-fixed-before-asking
