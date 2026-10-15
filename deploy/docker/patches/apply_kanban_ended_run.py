@@ -63,11 +63,13 @@ COMPLETE_GATE = _gate("kanban_complete")
 BLOCK_GATE = _gate("kanban_block")
 
 # Upstream reports the card's last_failure_error, which belongs to an earlier
-# run whenever this worker's own run is still going.
+# run whenever this worker's own run is still going, except for this run's
+# PR-acceptance refusal, which current_run_failure passes through.
 COMPLETE_REFUSAL = (
     "        _check(ok, (task.last_failure_error if task else None) or\n",
     "        # kube-agents patch: never another run's failure (#2947).\n"
-    "        _check(ok, _kanban_ended_run_refusal(tid, conn) or\n",
+    "        _check(ok, _kanban_ended_run_refusal(tid, conn) or\n"
+    "               _kanban_current_run_failure(tid, conn) or\n",
 )
 
 BLOCK_REFUSAL = (
@@ -83,6 +85,7 @@ TOOLS_TRAILER = (
     "    connect as _kanban_ended_run_connect,\n"
     ")\n"
     "from tools.kanban_ended_run import (  # noqa: E402\n"
+    "    current_run_failure as _kanban_current_run_failure,\n"
     "    ended_run_refusal as _kanban_ended_run_refusal,\n"
     "    refuse_ended_run as _kanban_refuse_ended_run,\n"
     ")\n"

@@ -34,8 +34,9 @@ Two upstream gaps made that possible:
    there (#76196: "Clearing ``worker_pid`` in the DB alone left the OS process
    running"), but not for a block.
 2. A refused ``kanban_complete`` replays ``last_failure_error``. A worker's
-   own run hasn't failed while it is still calling tools, so that text always
-   belongs to an earlier run.
+   own run hasn't failed while it is still calling tools, so that text
+   belongs to an earlier run, with one exception: a PR-acceptance refusal
+   (``completion_contract``) writes the current run's reason there.
 
 It is the same shape as #2947's first duplicate, a block that ended the run
 but not the session, reached from the operator's side rather than the
@@ -45,10 +46,11 @@ What this changes
 -----------------
 1. :func:`stop_worker_on_external_block` wraps ``block_task``. A block that
    names no ``expected_run_id`` comes from outside the card's run: the
-   ``hermes kanban block`` CLI outside a worker, the dashboard, another card.
-   Every worker-side caller (``kanban_block``, the CLI inside a worker, the
-   goal loop, the rate-limit exit) passes its run id, or is the card's own
-   worker by ``HERMES_KANBAN_TASK``. When an outside block lands on a
+   ``hermes kanban block`` CLI outside a worker, or the dashboard (upstream
+   already refuses a worker blocking another card). Every worker-side
+   caller (``kanban_block``, the CLI inside a worker, the goal loop, the
+   rate-limit exit) passes its run id, or is the card's own worker by
+   ``HERMES_KANBAN_TASK``. When an outside block lands on a
    ``running`` card, it is pinned to the run it saw, so the stop is contingent
    on this caller ending exactly that run, as ``archive_task`` does. The
    host-local worker is then stopped by upstream's
@@ -65,7 +67,14 @@ What this changes
 3. :func:`ended_run_refusal` replaces ``last_failure_error`` in the refusal
    text when the board refuses a worker's ``complete_task`` or ``block_task``,
    covering the run ending between the first check and the write. If the run
-   is still current, the reason is upstream's generic one.
+   is still current, ``kanban_complete`` reports :func:`current_run_failure`
+   (this run's PR-acceptance refusal, the one reason upstream writes there for
+   the run in progress) or upstream's generic reason.
+
+Known windows, each caught by item 2 rather than a stop: a new run claiming
+the card between the outside block's read and its write is blocked unpinned
+and its worker isn't stopped, and a block that lands after a claim but before
+the dispatcher records ``worker_pid`` has no process to stop.
 
 Everything fails open: a board that can't be read, or a caller with no run id,
 leaves upstream's behavior unchanged.
@@ -74,6 +83,7 @@ leaves upstream's behavior unchanged.
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 from typing import Any, Callable, Optional
@@ -106,7 +116,9 @@ def ended_run_text(task_id: str, status: Optional[str], current_run_id: Optional
     if status == "running":
         why = f"another run (run {current_run_id}) has taken it over"
     elif status == "blocked":
-        why = "it was blocked from outside your run"
+        why = "it is blocked"
+    elif status == "todo":
+        why = "it was put back in the queue"
     elif status in ("done", "archived"):
         why = f"it is already {status}"
     else:
@@ -148,6 +160,29 @@ def ended_run_refusal(task_id: str, conn: Any) -> Optional[str]:
     return _LATCHED
 
 
+def current_run_failure(task_id: str, conn: Any) -> Optional[str]:
+    """``last_failure_error`` when the card's current run wrote it: a failed
+    ``pr_acceptance`` event on that run (``record_acceptance``). Else None."""
+    try:
+        row = conn.execute(
+            "SELECT e.payload, t.last_failure_error FROM task_events e "
+            "JOIN tasks t ON t.id = e.task_id "
+            "WHERE e.task_id = ? AND e.kind = 'pr_acceptance' "
+            "AND e.run_id = t.current_run_id ORDER BY e.id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    except Exception as exc:
+        logger.warning("kanban_ended_run: could not read %s: %s", task_id, exc)
+        return None
+    if row is None or not row[1]:
+        return None
+    try:
+        receipt = json.loads(row[0] or "{}")
+    except ValueError:
+        return None
+    return row[1] if isinstance(receipt, dict) and receipt.get("ok") is False else None
+
+
 def refuse_ended_run(task_id: str, connect: Callable[[], Any]) -> Optional[str]:
     """:func:`ended_run_refusal` on a board this opens and closes. For the top
     of ``kanban_complete`` and ``kanban_block``, before any gate runs."""
@@ -185,11 +220,8 @@ def _is_own_worker(task_id: str, pid: Optional[int]) -> bool:
 
 
 def _blocker() -> str:
-    """Who is blocking, as far as this process can tell. The CLI's own
-    ``BLOCKED:`` comment carries the profile name."""
-    env_task = os.environ.get("HERMES_KANBAN_TASK")
-    if env_task:
-        return f"card {env_task}'s worker"
+    """Who is blocking. Only the CLI outside a worker or the dashboard gets
+    here; the CLI's own ``BLOCKED:`` comment carries the profile name."""
     return "the kanban CLI or dashboard"
 
 
@@ -221,8 +253,9 @@ def _stop_worker(kb: Any, conn: Any, task_id: str, run_id: int, pid: Optional[in
     """Stop the run's worker after the block committed, then record it.
 
     Post-commit, as in ``archive_task``: the wait for exit can take ~5 s and
-    must not hold the write lock. Safe because the card is out of ``running``
-    and only an unblock can give it a new worker.
+    must not hold the write lock. Safe because the signal goes only to the pid
+    the ended run recorded; a run the card gets next (after an unblock, or a
+    dependency block's promotion from ``todo``) has its own process.
     """
     try:
         termination = terminate(pid, claim_lock)

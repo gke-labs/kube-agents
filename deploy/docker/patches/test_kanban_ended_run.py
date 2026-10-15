@@ -104,13 +104,6 @@ class TestAnOutsideBlock(Board):
         self.wrapped()(self.conn, TID, reason="operator")
         self.assertEqual(self.block_calls, [2])
 
-    def test_another_cards_worker_is_named_as_the_blocker(self):
-        self.card()
-        os.environ["HERMES_KANBAN_TASK"] = "t_other"
-        self.wrapped()(self.conn, TID, reason="dependency on me")
-        self.assertEqual(self.terminated, [(PID, LOCK)])
-        self.assertIn("card t_other's worker", self.kb.comments[0][2])
-
     def test_a_card_that_moved_meanwhile_is_blocked_without_a_stop(self):
         """The run seen ended before the write: block what's there, stop nothing."""
         self.card()
@@ -192,7 +185,7 @@ class TestEndedRunRefusal(Board):
         self.worker()
         text = ker.ended_run_refusal(TID, self.conn)
         self.assertIn("no longer yours to finish", text)
-        self.assertIn("blocked from outside your run", text)
+        self.assertIn("it is blocked", text)
         self.assertIn("Stop now", text)
 
     def test_a_card_another_run_holds_is_over(self):
@@ -256,6 +249,42 @@ class TestEndedRunRefusal(Board):
         raise AssertionError("opened the board")
 
 
+class TestCurrentRunFailure(unittest.TestCase):
+    """The one last_failure_error the current run wrote: a PR-acceptance refusal."""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.executescript(
+            "CREATE TABLE tasks (id TEXT, current_run_id INTEGER, last_failure_error TEXT);"
+            "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER,"
+            " kind TEXT, payload TEXT);")
+        self.conn.execute("INSERT INTO tasks VALUES (?, 2, 'PR acceptance unmerged: fix the checks')", (TID,))
+
+    def event(self, run, ok, kind="pr_acceptance"):
+        self.conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload) VALUES (?, ?, ?, ?)",
+                          (TID, run, kind, '{"ok": %s}' % ("true" if ok else "false")))
+
+    def test_this_runs_failed_acceptance_is_reported(self):
+        self.event(2, False)
+        self.assertEqual(ker.current_run_failure(TID, self.conn), "PR acceptance unmerged: fix the checks")
+
+    def test_an_earlier_runs_failure_is_not(self):
+        self.event(1, False)
+        self.assertIsNone(ker.current_run_failure(TID, self.conn))
+
+    def test_a_passed_acceptance_is_not(self):
+        self.event(2, True)
+        self.assertIsNone(ker.current_run_failure(TID, self.conn))
+
+    def test_no_acceptance_event_is_not(self):
+        """The rehearsal: last_failure_error from run 1's exit, no acceptance at all."""
+        self.assertIsNone(ker.current_run_failure(TID, self.conn))
+
+    def test_an_unreadable_board_is_not(self):
+        self.conn.execute("DROP TABLE task_events")
+        self.assertIsNone(ker.current_run_failure(TID, self.conn))
+
+
 class TestTheApplier(unittest.TestCase):
     TOOLS = (
         "def _handle_complete(args, **kw):\n"
@@ -296,6 +325,7 @@ class TestTheApplier(unittest.TestCase):
         self.assertEqual(out.count("_kanban_refuse_ended_run(tid, _kanban_ended_run_connect)"), 2)
         self.assertLess(out.index("_kanban_refuse_ended_run("), out.index("_require_children_settled("))
         self.assertEqual(out.count("_kanban_ended_run_refusal(tid, conn) or"), 2)
+        self.assertEqual(out.count("_kanban_current_run_failure(tid, conn) or"), 1)
         db = self.db.read_text()
         ast.parse(db)
         self.assertIn("block_task = _kanban_stop_worker_on_external_block(", db)

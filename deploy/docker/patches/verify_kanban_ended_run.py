@@ -9,8 +9,10 @@ patched ``block_task`` and tool handlers, with real worker processes:
 - an operator's block (no ``expected_run_id``, outside any worker) on a
   running card stops its live worker, records a ``block_worker_termination``
   event and leaves a comment saying the run was cut short;
-- the card's own worker blocking through ``kanban_block`` ends its run and
-  stops nothing;
+- the card's own worker blocking through ``kanban_block``, or with no run id
+  as the rate-limit exit does, ends its run and stops nothing;
+- a run that ends between the handler's first check and its write is still
+  told the run is over by the board's refusal, not shown the earlier failure;
 - the stopped run's ``kanban_complete``, on a card whose
   ``last_failure_error`` holds an earlier run's "protocol violation" text,
   gets the terminal answer and none of that text, and a second call (and its
@@ -55,6 +57,7 @@ for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_SESSION_KEY"):
 from hermes_cli import kanban_db as K  # noqa: E402
 from hermes_cli import kanban_db_connect as KC  # noqa: E402
 import tools.kanban_tools as kt  # noqa: E402
+import tools.kanban_ended_run as ker  # noqa: E402
 
 conn = KC.connect(DB)
 WORKERS: list[subprocess.Popen] = []
@@ -124,7 +127,7 @@ print("wiring:")
 check("block_task is the wrapper", getattr(K.block_task, "__kanban_ended_run__", False))
 check("the tool handlers resolved the imports",
       all(hasattr(kt, n) for n in ("_kanban_refuse_ended_run", "_kanban_ended_run_refusal",
-                                   "_kanban_ended_run_connect")))
+                                   "_kanban_ended_run_connect", "_kanban_current_run_failure")))
 
 try:
     print("an operator's block on a running card:")
@@ -151,6 +154,31 @@ try:
     check("the card is blocked", status(own) == "blocked", status(own))
     check("its worker was not stopped", own_proc.poll() is None)
     check("no termination is recorded", events(own, "block_worker_termination") == 0)
+
+    print("the card's own worker blocking without a run id (the rate-limit exit):")
+    own2 = tool_create("Hit the provider's rate limit")
+    own2_run, own2_proc = start_run(own2)
+    os.environ["HERMES_KANBAN_TASK"] = own2
+    os.environ.pop("HERMES_KANBAN_RUN_ID", None)
+    check("the block lands", K.block_task(conn, own2, reason="429", kind="transient"))
+    check("its worker was not stopped", own2_proc.poll() is None)
+
+    print("a run that ends between the first check and the write:")
+    raced = tool_create("Summarize the incident")
+    raced_run, _ = start_run(raced)
+    conn.execute("UPDATE tasks SET last_failure_error = ? WHERE id = ?", (PRIOR_FAILURE, raced))
+    conn.commit()
+    gate = kt._kanban_refuse_ended_run
+    kt._kanban_refuse_ended_run = lambda *a: None
+    as_operator()
+    K.block_task(conn, raced, reason="operator: pausing this")
+    as_worker(raced, raced_run)
+    out = json.loads(kt._handle_complete({"summary": "done", "result": "Summary."}))
+    err = out.get("error", "")
+    check("the board's refusal says the run is over", "no longer yours to finish" in err, err)
+    check("and none of the earlier run's failure", "protocol violation" not in err, err)
+    kt._kanban_refuse_ended_run = gate
+    ker._LATCHED = None
 
     print("the stopped run's handoffs:")
     as_worker(rehearsal, run_id)
