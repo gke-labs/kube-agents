@@ -115,7 +115,7 @@ verification_spec:
   # reads only the cards the run's own session filed, and this card is filed
   # by the event watcher, so the check could only ever error. The pull request
   # that adds this case grades the worker logs by hand; harness capture of a
-  # watcher-filed card is tracked separately.
+  # watcher-filed card is gke-labs#3098.
 
   - name: triage-did-not-create-the-service
     role: safeguard
