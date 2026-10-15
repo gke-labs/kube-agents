@@ -7826,6 +7826,8 @@ _GROUP3 = {
             "seeded-a: dataplane legacy (kube-proxy, no Calico); networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-stall, seeded-token, seeded-headroom and seeded-reliability",
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 9 (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, seeded-stall, seeded-token, seeded-headroom, seeded-shapes, seeded-defaults)",
                     "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability: default-deny, seeded-debug: default-deny, seeded-capacity: default-deny, seeded-deprecation: apiserver-egress-only",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: the seeded-reliability namespace, the seeded-debug namespace, the seeded-capacity namespace and the seeded-deprecation namespace",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability & seeded-debug & seeded-capacity & seeded-deprecation",
 ],
         [
             "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, namespace/none",
@@ -7905,6 +7907,7 @@ _GROUP5 = {
             "1. seeded-a (us-central1-a)/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes",
                     "seeded-a/seeded-defaults: enforce pod-security.kubernetes.io/enforce=baseline; enforce-version pod-security.kubernetes.io/enforce-version=latest; rule set changes at the next minor: yes",
             "seeded-a/seeded-defaults: enforce=baseline; enforce-version=latest; rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce baseline, warn baseline; enforce-version latest; rule set changes at the next minor: yes",
 ],
         [
             "seeded-a/seeded-defaults: enforce restricted; enforce-version latest; rule set changes at the next minor: yes",
@@ -7928,6 +7931,7 @@ _GROUP5 = {
             "* **seeded-a/seeded-shapes/stale-kubectl-client**: client kubectl v1.29.0; server 1.34.1; within supported skew: no",
                     "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (v1.29.0, image registry.k8s.io/kubectl:v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (registry.k8s.io/kubectl:v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
 ],
         [
             "seeded-a/seeded-shapes/stale-kubectl-client-apiserver-egress: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
@@ -7937,6 +7941,7 @@ _GROUP5 = {
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: yes",
             "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no (but still succeeds)",
                     "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (v1.29.1); server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (v1.30.0, was v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
 ],
         "Every client in the seeded clusters is within one minor of its control plane; the kubectl CronJob succeeds on every run.",
     ),
@@ -8015,6 +8020,8 @@ _GROUP5 = {
             "**seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: yes**",
                     "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator cloud.google.com/gke-accelerator=nvidia-l4; cuda 12.2.0-base-ubuntu22.04; suspended: yes",
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04; suspended: yes",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator gke-accelerator=nvidia-l4; cuda 12.2; suspended: yes",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4 GPU; cuda 12.2; suspended: yes",
 ],
         [
             "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: false",
@@ -8244,6 +8251,8 @@ _GROUP4 = {
             "**seeded-a/seeded-shapes/node-runtime-probe**: runtime socket mounted: yes; path /run/containerd/containerd.sock",
             "1. seeded-a (us-central1-a)/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock",
                     "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock:ro",
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path hostPath /run/containerd/containerd.sock",
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path unix:///run/containerd/containerd.sock",
 ],
         [
             "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: no; path /run/containerd/containerd.sock",
@@ -8271,6 +8280,11 @@ _GROUP4 = {
             "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by intree-pd (seeded-shapes); attaches through CSI migration: yes",
             "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by pvc/intree-pd in seeded-shapes; attaches through CSI migration: yes",
             "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/pvc/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source kubernetes.io/gce-pd (in-tree); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk, in-tree; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk (legacy in-tree plugin); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by intree-pd (namespace seeded-shapes); attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by intree-pd (seeded-shapes, Bound); attaches through CSI migration: yes",
 ],
         [
             "seeded-a/intree-pd: source csi; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
@@ -8281,6 +8295,8 @@ _GROUP4 = {
             "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by other-claim in seeded-shapes; attaches through CSI migration: yes",
             "seeded-a/intree-pd: source in-tree: no; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
             "seeded-a/intree-pd: source in-tree no longer, now csi; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk, now csi; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk migrated to csi; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
 ],
         "No PersistentVolume on the seeded clusters uses an in-tree plugin; a CSI driver provisioned every volume.",
     ),

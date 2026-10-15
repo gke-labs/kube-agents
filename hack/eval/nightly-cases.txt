@@ -391,8 +391,8 @@
 # with their fixture scan on record: 2026-10-14 18:12 UTC, each role healthy
 # on 38 of 40 pool projects and absent on kube-agents-evals-12 and -24. The
 # postsubmit reconcile that followed #2916 failed on seeded-b's pin (#3025,
-# fixed by #3042); the reconcile report and a scan reading every role healthy
-# on every project are cited here when a clean one exists
+# with #3042 as its fix); the reconcile report and a scan reading every role
+# healthy on every project are cited here when a clean one exists
 # (docs/designs/bench-case-format.md, Registration). Until then, on a project
 # that lacks a role, a repetition errors as CHECK_DID_NOT_RUN, a broken
 # environment rather than a wrong answer, as the entry-6 comment says; the

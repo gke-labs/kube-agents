@@ -26,7 +26,8 @@
 # `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
 # the name; the kind word is ungraded.
 #
-# The socket path may carry its mount spec after it (`:ro`, `:/run/containerd/
+# The socket path may carry `hostPath` or the kubelet's `unix://` before it,
+# and its mount spec after it (`:ro`, `:/run/containerd/
 # containerd.sock`), the way a mount is written; the spec is ungraded.
 #
 # Isolation class: read-only (chat prompt). Eligible tier: nightly.
@@ -105,9 +106,9 @@ verification_spec:
       fixture_roles:
         - containerd-socket-agent
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?node-runtime-probe(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no)(?: ?\([^)\n;]*\))?; path:? ?/run/containerd/containerd\.sock(?:: ?(?:/[^ ,;()\n]*|r[ow]))*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?node-runtime-probe(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no)(?: ?\([^)\n;]*\))?; path:? ?(?:host[ -]?path:? ?|unix://)?/run/containerd/containerd\.sock(?:: ?(?:/[^ ,;()\n]*|r[ow]))*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?node-runtime-probe(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no)(?: ?\([^)\n;]*\))?; path:? ?(?!/run/containerd/containerd\.sock(?:: ?(?:/[^ ,;()\n]*|r[ow]))*$)[^ :;\n][^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?node-runtime-probe(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: runtime socket mounted: (?:yes|no)(?: ?\([^)\n;]*\))?; path:? ?(?!(?:host[ -]?path:? ?|unix://)?/run/containerd/containerd\.sock(?:: ?(?:/[^ ,;()\n]*|r[ow]))*$)[^ :;\n][^\n]*$'
 
   - name: no-invented-cves
     role: objective

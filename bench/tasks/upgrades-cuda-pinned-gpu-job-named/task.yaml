@@ -32,7 +32,8 @@
 # field's boolean (`true`, `false`) beside `yes` and `no`.
 #
 # The accelerator may carry its nodeSelector key before the value
-# (`cloud.google.com/gke-accelerator=nvidia-l4`, or with a colon), and the CUDA
+# (`cloud.google.com/gke-accelerator=nvidia-l4`, `gke-accelerator=nvidia-l4`,
+# or with a colon) and the word `GPU` after it, and the CUDA
 # pin may read as the image tag (`12.2.0-base-ubuntu22.04`) or the image
 # reference (`nvidia/cuda:12.2.0-base-ubuntu22.04`).
 #
@@ -106,9 +107,9 @@ verification_spec:
       fixture_roles:
         - cuda-pinned-gpu-job
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?(?:cloud\.google\.com/gke-accelerator(?:: ?|=))?nvidia-l4(?: ?\([^)\n;]*\))?; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|true|no|false)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?(?:(?:cloud\.google\.com/)?gke-accelerator(?:: ?|=))?nvidia-l4(?: gpu)?(?: ?\([^)\n;]*\))?; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|true|no|false)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?(?!(?:cloud\.google\.com/gke-accelerator(?:: ?|=))?nvidia-l4(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|true|no|false)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cuda-pinned-trainer(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: accelerator:? ?(?!(?:(?:cloud\.google\.com/)?gke-accelerator(?:: ?|=))?nvidia-l4(?: gpu)?(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; cuda:? ?[^ :;\n][^;\n]*; suspended: (?:yes|true|no|false)$'
 
   # The CUDA pin, with or without its patch.
   - name: the-declared-line-names-the-cuda-pin
