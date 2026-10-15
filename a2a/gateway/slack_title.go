@@ -29,6 +29,11 @@ const (
 	// slackTitleClipMinShare: a word-aligned clip shorter than 1/this of the
 	// hard cut drops too much, and cuts hard instead.
 	slackTitleClipMinShare = 2
+	// slackTitleClauseEnds and slackTitleClauseBreak end the ask's first
+	// clause (slackFirstClause), as slack_status.py's CLAUSE_ENDS and
+	// CLAUSE_BREAK do.
+	slackTitleClauseEnds  = ".?!"
+	slackTitleClauseBreak = '\n'
 )
 
 // slackTitleReplacements are the ASCII stand-ins for refused characters an
@@ -59,8 +64,28 @@ var (
 	slackTitleRepeatedComma = regexp.MustCompile(`\s*,[\s,]*`)
 )
 
-// slackSessionTitle is a title agents.sessions.rename accepts, from the
-// ask's words, or "" when nothing survives.
+// slackFirstClause is text up to the end of its first sentence or line, or
+// all of it when it has neither. A sentence ends at a run of
+// slackTitleClauseEnds followed by whitespace, which stays with it, and a line
+// at slackTitleClauseBreak; either counts only after a word character, so an
+// ask that opens on "!!" or a blank line is not cut to nothing.
+func slackFirstClause(text string) string {
+	runes := []rune(text)
+	seenWord := false
+	for i, r := range runes {
+		if seenWord && r == slackTitleClauseBreak {
+			return string(runes[:i])
+		}
+		if seenWord && strings.ContainsRune(slackTitleClauseEnds, r) && i+1 < len(runes) && unicode.IsSpace(runes[i+1]) {
+			return string(runes[:i+1])
+		}
+		seenWord = seenWord || slackWordChar(r)
+	}
+	return text
+}
+
+// slackSessionTitle is a short title agents.sessions.rename accepts, from
+// the ask's first sentence or line, or "" when nothing survives.
 func slackSessionTitle(ask string) string {
 	title := slackTitleMention.ReplaceAllString(ask, " ")
 	title = slackTitleChannel.ReplaceAllString(title, "$1")
@@ -71,6 +96,7 @@ func slackSessionTitle(ask string) string {
 		return " "
 	})
 	title = norm.NFKC.String(title)
+	title = slackFirstClause(title)
 	title = slackTitleChars(title)
 	title = slackTitleWhitespace.ReplaceAllString(title, " ")
 	title = strings.Trim(slackTitleRepeatedComma.ReplaceAllString(title, ", "), " ,")

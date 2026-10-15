@@ -49,6 +49,14 @@ func TestSlackSessionTitle(t *testing.T) {
 		"👨‍👩 🇯🇵 team":                        "👨👩 team",
 		"Restart " + strings.Repeat("n", 90): "Restart " + strings.Repeat("n", 69) + slackTitleEllipsis,
 		strings.Repeat("word ", 40):          strings.TrimRight(strings.Repeat("word ", 15), " ") + slackTitleEllipsis,
+		"is checkout-gateway restarting in prod? someone in #oncall said it's crashlooping": "is checkout-gateway restarting in prod?",
+		"seeded-b is behind. Ask me before doing anything.":                                 "seeded-b is behind.",
+		"check seeded-a\nthen seeded-b":                                                     "check seeded-a",
+		"is 1.33.4 the default?":                                                            "is 1.33.4 the default?",
+		"wait... is it up? yes":                                                             "wait...",
+		"!! x now":                                                                          "!! x now",
+		"\n\nup? ok":                                                                        "up?",
+		"<@U1> hi. there":                                                                   "hi.",
 		"Check the platform-agent-host cluster: are any pods outside kube-system not Running, and is any node under memory pressure?": "Check the platform-agent-host cluster, are any pods outside kube-system not...",
 	}
 	for ask, want := range cases {
