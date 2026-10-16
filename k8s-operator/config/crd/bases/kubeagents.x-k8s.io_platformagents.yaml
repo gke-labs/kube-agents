@@ -10555,6 +10555,11 @@ spec:
                             are unique only within a project and location. This replaces the
                             RECONCILE_EXCLUDE environment variable, which matched bare names across
                             every project.
+                            An excluded cluster gets no Cluster Agent, and fleet answers, the
+                            onboarding sweep and the fleet-audit collectors that list clusters leave
+                            it out. Still covering it: the daily upgrade-readiness watch, the
+                            networking audit's subnet usage, the GCE audit's instance listing, and
+                            the third-party gke MCP server's list_clusters.
                           items:
                             description: ScopeClusterRef identifies one GKE cluster.
                             properties:

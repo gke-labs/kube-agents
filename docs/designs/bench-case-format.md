@@ -132,13 +132,15 @@ unit on the stream, which waits for it first (`wait_platform_runs`), so an audit
 run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the four it
 starts. devops-bench ignores the key.
 
-The runner pauses most of the Platform Agent's clock-started audits once per lease, before any
-unit (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
+The runner pauses most of the Platform Agent's clock-started audits at lease time and again
+right before the fan-out (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
 repository in the middle of an eval and be charged to whichever cases are running. It leaves the
 four the `oobe` stage starts (the stage holds a paused audit rather than starting it), the
 `no_agent` jobs, and any job the image doesn't ship. Those four still run on their clock, so a
 write from one of them mid-eval is still possible. An audit case starts its own run from its
-prompt, which a paused schedule doesn't affect.
+prompt, which a paused schedule doesn't affect. A pause that still fails after its attempts
+stops the run as an infrastructure failure rather than letting a scheduled audit's writes be
+charged to the cases.
 
 `verification_spec` is the exact half of the grade, and the rest of this document is
 mostly about it.
@@ -204,7 +206,7 @@ deployment's ready replicas land in a range). A fourth, `fleet_resource_property
 this repository's `resource_property` against the seeded-fleet cluster that carries a
 fixture role, named by `fixture_role:` rather than by cluster.
 
-Ten read what the run produced, from this repository
+Eleven read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns`, `required_patterns` and
@@ -233,7 +235,7 @@ entry for every slot it means; its `fixture_roles` names the seeded-fleet
 roles whose clusters the patterns require a line about, each resolved to its slot's own
 credential (`clusters/<slot>.kubeconfig`, written for every seeded cluster the runner reached,
 before any role on it is confirmed), and a slot the runner did not reach returns
-`status: "error"`, the cluster being absent from the project rather than missed by the agent), `answer_first` (each delivered card result, raw:
+`status: "error"`, the cluster being absent from the project rather than missed by the agent), `report_manifest` (the fenced code blocks in the same text, parsed as YAML: one document of `kind` carries every `fields` value and a label selector that selects every `selects` set and no `excludes` set), `answer_first` (each delivered card result, raw:
 it opens on one bold sentence, has no heading, stays
 under its character and sentence caps, and no later sentence matches a
 `recap_patterns` regex; each of the case's `lead_terms` appears in at least one result's

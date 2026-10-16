@@ -22,13 +22,25 @@ spec:
   nodePoolAutoCreation:
     enabled: true
   priorities:
+  # --- ALTERNATIVE FOR GKE 1.36.0+ (SIMPLER) ---
+  # If running GKE 1.36.0-gke.3204000+, you can avoid hardcoding reservation names.
+  # Use locationPolicy: BALANCED with location.zones, and AnyThenFail affinity:
+  # - machineType: n4-standard-32
+  #   spot: false
+  #   location:
+  #     locationPolicy: BALANCED
+  #     zones: ['us-central1-a', 'us-central1-b', 'us-central1-c']
+  #   reservations:
+  #     affinity: AnyThenFail
+
+
   # --- Priority 1: preferred shape, balanced across 3 zonal reservations ---
   - machineType: n4-standard-32   # IMPORTANT: Align machineFamily/type with your existing CUDs/Reservations
     spot: false
     location:
       locationPolicy: BALANCED      # node-level even spread; NO zones here (they come from the reservations)
     reservations:
-      affinity: Specific            # NEVER AnyBestEffort — it falls back to On-Demand at the GCE layer and skips lower priorities
+      affinity: Specific            # NEVER AnyBestEffort — it consumes On-Demand capacity before evaluating lower priorities
       specific:
       - name: <RESERVATION-ZONE-A>
         zones: ['us-central1-a']

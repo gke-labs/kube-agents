@@ -73,6 +73,7 @@ FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
     "Security Scanning",
     # pull_request_target automations, not checks on the tree.
     "Auto Assign Milestone on Merge",
+    "Auto Enqueue",
     "Hold Unresolved Threads",
     "Merge Gate",
     "Risk Classification",
@@ -122,6 +123,13 @@ class SpecToolRegistryTest(unittest.TestCase):
         "*skill_manage_image_owned*": {"skill_manage"},
     }
     HERMES_BUILTIN_TOOLS = set().union(*HERMES_BUILTIN_EVIDENCE.values())
+
+    # Hermes core tools no image patch touches, so the patches carry no
+    # evidence of them. Evidence of each is the agent text that tells the agent
+    # to use it, backticked or called
+    # (test_the_core_allowlist_still_has_evidence_in_the_agent_text).
+    HERMES_CORE_TOOLS = {"skill_view"}
+    CORE_TOOL_EVIDENCE = ("agents/platform/skills/github-issue-resolver/SKILL.md",)
 
     # Tools behind a remote MCP proxy (`/opt/mcp-remote/dist/proxy.js <url>`),
     # as (server alias, tool): nothing in this repository can enumerate them,
@@ -313,6 +321,7 @@ class SpecToolRegistryTest(unittest.TestCase):
             self._registered_mcp_tools()
             | self._remote_mcp_tools()
             | self.HERMES_BUILTIN_TOOLS
+            | self.HERMES_CORE_TOOLS
             | self.SESSION_HARNESS_TOOLS
             | self.TRANSPORT_MARKERS
         )
@@ -360,6 +369,17 @@ class SpecToolRegistryTest(unittest.TestCase):
         self.assertTrue(self._names_builtin("kanban_create", 'if action == "create":'))
         self.assertFalse(self._names_builtin("skill_manage", 'if action == "create":'))
 
+
+    def test_the_core_allowlist_still_has_evidence_in_the_agent_text(self):
+        corpus = "\n".join(
+            (REPO_ROOT / rel).read_text(errors="replace") for rel in self.CORE_TOOL_EVIDENCE
+        )
+        for name in sorted(self.HERMES_CORE_TOOLS):
+            self.assertTrue(
+                f"`{name}`" in corpus or f"{name}(" in corpus,
+                f"{name} is allowlisted as a hermes core tool but the agent text "
+                "carries no evidence of it — stale allowlist entry",
+            )
 
     def test_the_remote_allowlist_still_has_evidence_in_the_agent_text(self):
         remote = self._remote_mcp_aliases()
