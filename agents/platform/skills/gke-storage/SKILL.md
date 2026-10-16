@@ -42,10 +42,18 @@ GKE provides built-in StorageClasses:
 
 StorageClass   | Disk Type             | Use Case
 -------------- | --------------------- | ------------------------------
-`standard-rwo` | `pd-standard`         | Cost-effective, low IOPS
-`premium-rwo`  | `pd-ssd`              | High IOPS, databases
+`standard-rwo` | `pd-standard` (GKE)   | Cost-effective, low IOPS
+`premium-rwo`  | `pd-ssd` (GKE)        | High IOPS, databases
+`standard-csi` | `pd-balanced` (OCP)   | OpenShift on GCE default block storage
+`ssd-csi`      | `pd-ssd` (OCP)        | OpenShift on GCE fast SSD storage
 `standard-rwx` | Filestore (Basic HDD) | Shared NFS
 `premium-rwx`  | Filestore (Basic SSD) | Shared NFS, higher performance
+
+> **Cluster StorageClass Discovery**: To discover the cluster's active default
+> StorageClass dynamically on either GKE or OpenShift:
+> ```bash
+> kubectl get sc -o jsonpath='{.items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")].metadata.name}'
+> ```
 
 ### Custom StorageClass
 
