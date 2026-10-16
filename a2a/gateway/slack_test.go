@@ -53,6 +53,9 @@ type fakeSlackAPI struct {
 	userInfoCalls int
 	// prompts records setSuggestedPrompts calls.
 	prompts []slack.AssistantThreadsSetSuggestedPromptsParameters
+	// conversations and conversationErr answer conversations.info.
+	conversations   map[string]*slack.Channel
+	conversationErr error
 }
 
 func (f *fakeSlackAPI) AddReaction(name string, item slack.ItemRef) error {
@@ -77,6 +80,27 @@ func (f *fakeSlackAPI) GetUserInfo(user string, _ ...slack.GetUserInfoOption) (*
 		return u, nil
 	}
 	return nil, errors.New("user_not_found")
+}
+
+func (f *fakeSlackAPI) GetUserInfoContext(_ context.Context, user string, options ...slack.GetUserInfoOption) (*slack.User, error) {
+	return f.GetUserInfo(user, options...)
+}
+
+// GetConversationInfoContext answers conversations.info from conversations:
+// a conversation it names, conversationErr for one it does not, or a channel
+// the bot is a member of when neither is set.
+func (f *fakeSlackAPI) GetConversationInfoContext(_ context.Context, input *slack.GetConversationInfoInput) (*slack.Channel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if ch, ok := f.conversations[input.ChannelID]; ok {
+		return ch, nil
+	}
+	if f.conversationErr != nil {
+		return nil, f.conversationErr
+	}
+	ch := &slack.Channel{}
+	ch.ID, ch.IsMember = input.ChannelID, true
+	return ch, nil
 }
 
 func (f *fakeSlackAPI) SetAssistantThreadsSuggestedPrompts(p slack.AssistantThreadsSetSuggestedPromptsParameters) error {

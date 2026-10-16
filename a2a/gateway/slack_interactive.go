@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -102,14 +103,17 @@ type slackQuestion struct {
 }
 
 // slackPending is a message handed to the gateway and not yet verified: a
-// click, with the question it answered and the label it showed, or a typed
+// click, with the question it answered and the label it showed; a typed
 // message, which answers the conversation's open question and may title the
-// thread.
+// thread; or a shortcut, whose text is the message it quotes, which may title
+// the thread, and whose responseURL reaches its clicker alone.
 type slackPending struct {
 	conversation, author, text string
 	click                      bool
 	label                      string
 	question                   slackQuestion
+	shortcut                   bool
+	responseURL                string
 }
 
 // slackUX is the adapter's click and question state, under s.mu.
@@ -390,6 +394,22 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 		s.mu.Unlock()
 		return
 	}
+	if p.shortcut {
+		// A shortcut answers no question: it is an ask about a message, so
+		// it titles the thread after that message, and a clicker the
+		// gateway refused is told so where only they can see it.
+		s.mu.Unlock()
+		if verified {
+			s.noteAsk(conversation, p.text)
+			return
+		}
+		s.goSession(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), slackShortcutTimeout)
+			defer cancel()
+			s.respondPrivately(ctx, p.responseURL, unverifiedNotice(slackBackend, p.author))
+		})
+		return
+	}
 	var q slackQuestion
 	label := ""
 	switch {
@@ -476,6 +496,17 @@ func slackTypedWords(text string) string {
 // then real name, then handle, never a mention or an id.
 func (s *SlackAdapter) slackUserName(userID string) string {
 	u, err := s.api.GetUserInfo(userID)
+	return s.slackNameOf(userID, u, err)
+}
+
+// slackUserNameContext is slackUserName under ctx.
+func (s *SlackAdapter) slackUserNameContext(ctx context.Context, userID string) string {
+	u, err := s.api.GetUserInfoContext(ctx, userID)
+	return s.slackNameOf(userID, u, err)
+}
+
+// slackNameOf is the name a users.info answer gives userID.
+func (s *SlackAdapter) slackNameOf(userID string, u *slack.User, err error) string {
 	if err != nil || u == nil {
 		if err != nil {
 			s.log.Debug("slack: users.info failed; naming the answer generically", "user", userID, "err", err)

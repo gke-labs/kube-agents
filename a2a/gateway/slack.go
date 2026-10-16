@@ -149,6 +149,8 @@ type slackAPI interface {
 	AddReaction(name string, item slack.ItemRef) error
 	RemoveReaction(name string, item slack.ItemRef) error
 	GetUserInfo(user string, options ...slack.GetUserInfoOption) (*slack.User, error)
+	GetUserInfoContext(ctx context.Context, user string, options ...slack.GetUserInfoOption) (*slack.User, error)
+	GetConversationInfoContext(ctx context.Context, input *slack.GetConversationInfoInput) (*slack.Channel, error)
 	SetAssistantThreadsSuggestedPrompts(params slack.AssistantThreadsSetSuggestedPromptsParameters) error
 }
 
@@ -232,6 +234,10 @@ type SlackAdapter struct {
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.
 	ux *slackUX
+
+	// postWebhook posts to a shortcut's response_url (slack_shortcut.go);
+	// nil is slack-go's, through the bounded client. Tests fake it.
+	postWebhook func(ctx context.Context, url string, msg *slack.WebhookMessage) error
 }
 
 // slackLinkRE matches the markdown links the relay emits, for rewriteLinks
@@ -556,7 +562,8 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				// them, becomes a turn (slack_interactive.go). A click on any
 				// other button (one on a message posted under today, a link)
 				// is acked and changes nothing. The route's raw blocks still
-				// carry none.
+				// carry none. The "ask about this" message shortcut arrives
+				// the same way and becomes a turn too (slack_shortcut.go).
 				continue
 			}
 			// Ack before parsing, not after: unacked envelopes redeliver in
@@ -645,10 +652,20 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				}
 			}
 			if evt.Type == socketmode.EventTypeInteractive {
-				if evt.Request != nil {
-					if msg, ok := s.interactive(evt.Request.Payload); ok {
-						handler(msg)
-					}
+				if evt.Request == nil {
+					continue
+				}
+				if payload := evt.Request.Payload; slackIsShortcut(payload) {
+					// The message shortcut reads from Slack before it has a
+					// turn to hand over, so it runs off the pump; wg holds Run
+					// until it is done, and every read it makes is under ctx.
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						s.shortcut(ctx, payload, handler)
+					}()
+				} else if msg, ok := s.interactive(payload); ok {
+					handler(msg)
 				}
 				continue
 			}
