@@ -400,9 +400,6 @@ def answer_message(markdown: str) -> dict | None:
     """
     written = markdown
     markdown, step = _moments.next_step(markdown)
-    if step and _choice(step, next_step=True) is None:
-        # A step the gateway would act on as a command is no button, and its line stays as written.
-        markdown, step = written, ""
     headline, body = _presenter.split_answer(markdown)
     if not headline:
         return None
@@ -418,6 +415,12 @@ def answer_message(markdown: str) -> dict | None:
             fold = {"title": FOLD_TITLE_DEFAULT, "text": folded} if folded else None
             return message(headline=headline, detail=detail, fold=fold, choices=choices)
     choice = _choice(step, next_step=True) if step else None
+    if step and choice is None:
+        # A step the gateway would act on as a command is no button: the answer as written.
+        headline, body = _presenter.split_answer(written)
+        text = "\n\n".join(body).strip()
+        if not headline or len(text) > FOLD_TEXT_MAX:
+            return None
     choices = [choice] if choice else None
     if len(text) > DETAIL_MAX:
         return message(headline=headline, fold={"title": FOLD_TITLE_DEFAULT, "text": text}, choices=choices)

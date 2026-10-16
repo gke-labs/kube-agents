@@ -1188,6 +1188,22 @@
       }
     },
     {
+      "in": "Two ways.\n\n1. **Raise it**\n2. **Roll back**\n\nWhich do you want?\n\n[next: stop]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Two ways.",
+        "detail": "Which do you want?",
+        "choices": [
+          {
+            "text": "Raise it"
+          },
+          {
+            "text": "Roll back"
+          }
+        ]
+      }
+    },
+    {
       "in": "seeded-c is behind.\r\n[next: check seeded-b]\r\n[next: upgrade plan for seeded-c]\r\n",
       "chat": {
         "schema": "kube-agents.chat/v1",

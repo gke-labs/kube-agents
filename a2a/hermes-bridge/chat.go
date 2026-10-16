@@ -206,9 +206,6 @@ func askIsQuestion(text string) bool {
 func answerChat(answer string) (chatmsg.Message, bool) {
 	written := answer
 	answer, step := nextStep(answer)
-	if step != "" && chattext.IsCommand(step) {
-		answer, step = written, ""
-	}
 	headline, body := splitAnswer(answer)
 	if headline == "" {
 		return chatmsg.Message{}, false
@@ -220,7 +217,16 @@ func answerChat(answer string) (chatmsg.Message, bool) {
 			return offered, true
 		}
 	}
-	if step != "" {
+	if step != "" && chattext.IsCommand(step) {
+		// A step the gateway would act on as a command is no button: the
+		// answer as written.
+		headline, body = splitAnswer(written)
+		if headline == "" {
+			return chatmsg.Message{}, false
+		}
+		rest = pyStrip(strings.Join(body, "\n\n"))
+		msg.Headline = headline
+	} else if step != "" {
 		msg.Choices = []chatmsg.Choice{{Text: step, Next: true}}
 	}
 	switch n := runeLen(rest); {

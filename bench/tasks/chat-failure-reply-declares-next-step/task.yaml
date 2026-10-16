@@ -64,8 +64,9 @@ verification_spec:
   # reason points to: a last line `[next: <label>]`, the label 1-75
   # characters (the button's cap, slack_presenter BUTTON_TEXT_MAX) with no
   # `[`, `<`, `>` or `|` (a bracket, or a Slack link or mention, which a button cannot show).
-  # `*`, `_` and backticks are dropped before matching, as next_step drops
-  # `*` and backticks from a label and keeps `_` as typed. Blank lines and trailing spaces
+  # `*`, `_` and backticks are dropped before matching; next_step makes the
+  # label plain as an option's is (paired emphasis and code marks go, a lone
+  # `*` and `_` stay), so the grader's 75 can undercount a label. Blank lines and trailing spaces
   # after it are allowed, any other text is not: the presenters read only the
   # last line.
   - name: the-reply-ends-on-a-next-step-naming-seeded-a
