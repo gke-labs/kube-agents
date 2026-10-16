@@ -14,6 +14,7 @@ import kanban_fanout_reaper as reaper
 # out to seeded-b (t_26cc6001), which waited for a workload that wasn't there.
 PARENT, CHILD, PERSON = "t_89bc86c4", "t_26cc6001", "t_person01"
 HOST = "agent-pod:"
+ME = HOST + "1"
 NOW = 1_800_000_000
 OVER = reaper.FANOUT_CHILD_MAX_SECONDS + 60
 
@@ -39,7 +40,7 @@ class Fixture(unittest.TestCase):
         self.killed, self.completed = [], []
         self.addCleanup(self.conn.close)
 
-    def card(self, tid, title, *, started_ago, child=True, lock=HOST + "1",
+    def card(self, tid, title, *, started_ago, child=True, lock=ME,
              status="running", run_started_ago=None, pid=4242, assignee=None,
              creator=PARENT, result=None, created_ago=0):
         if assignee is None:
@@ -68,7 +69,7 @@ class Fixture(unittest.TestCase):
             self.completed.append((tid, text))
             return complete_ok
         return reaper.reap_overdue_fanout_children(
-            self.conn, now=NOW, host_prefix=HOST,
+            self.conn, now=NOW, claimer_id=ME,
             kill=self.killed.append, complete=complete)
 
 
@@ -110,6 +111,14 @@ class TestTheBound(Fixture):
         self.assertEqual(self.reap(), [])
         self.assertEqual(self.killed, [])
 
+    def test_a_previous_lifes_claim_is_settled_without_a_kill(self):
+        """The gateway restarted in place: same pod, new dispatcher pid. The
+        recorded worker pid may now be an unrelated process."""
+        self.card(CHILD, "seeded-b", started_ago=OVER, lock=HOST + "7")
+        self.sibling()
+        self.assertEqual(self.reap(), [CHILD])
+        self.assertEqual(self.killed, [])
+
     def test_a_card_with_no_worker_pid_is_still_settled(self):
         self.card(CHILD, "seeded-b", started_ago=OVER, pid=None)
         self.sibling()
@@ -132,7 +141,7 @@ class TestTheBound(Fixture):
             self.killed.append(pid)
 
         settled = reaper.reap_overdue_fanout_children(
-            self.conn, now=NOW, host_prefix=HOST, kill=kill,
+            self.conn, now=NOW, claimer_id=ME, kill=kill,
             complete=lambda conn, tid, text, payload: True)
         self.assertEqual(len(settled), 1)
 
@@ -199,11 +208,15 @@ class TestOnlyPerClusterFanout(Fixture):
 
 
 class TestFailOpen(Fixture):
+    def test_the_table_name_is_the_writers(self):
+        import kanban_children_settled
+        self.assertIs(reaper.CHILDREN_TABLE, kanban_children_settled.CHILDREN_TABLE)
+
     def test_a_board_without_the_attribution_table_reaps_nothing(self):
         self.conn.execute("DROP TABLE kanban_worker_children")
         self.assertEqual(self.reap(), [])
 
-    def test_a_missing_host_prefix_reaps_nothing(self):
+    def test_a_missing_claimer_id_reaps_nothing(self):
         self.card(CHILD, "seeded-b", started_ago=OVER)
         self.sibling()
         reached = []
@@ -212,15 +225,15 @@ class TestFailOpen(Fixture):
             reached.append(True)
             raise RuntimeError("no claimer id")
 
-        original = reaper._default_host_prefix
-        reaper._default_host_prefix = boom
+        original = reaper._default_claimer_id
+        reaper._default_claimer_id = boom
         try:
             self.assertEqual(reaper.reap_overdue_fanout_children(
                 self.conn, now=NOW, kill=self.killed.append,
                 complete=lambda c, t, x, p: True), [])
         finally:
-            reaper._default_host_prefix = original
-        self.assertEqual(reached, [True], "the host-prefix lookup was never reached")
+            reaper._default_claimer_id = original
+        self.assertEqual(reached, [True], "the claimer-id lookup was never reached")
 
     def test_settle_text_names_this_cluster_when_untitled(self):
         self.assertIn("on this cluster", reaper.settle_text(""))

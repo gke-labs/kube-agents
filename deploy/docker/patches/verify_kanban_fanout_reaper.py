@@ -118,6 +118,7 @@ K.claim_task(conn, parent)
 os.environ["HERMES_KANBAN_TASK"] = parent
 stuck_child = tool_create(title="seeded-b", assignee=cluster("seeded-b"))
 young_child = tool_create(title="seeded-c", assignee=cluster("seeded-c"))
+restart_child = tool_create(title="seeded-e", assignee=cluster("seeded-e"))
 os.environ.pop("HERMES_KANBAN_TASK", None)
 # A card a person filed (no worker created it).
 person_card = tool_create(title="A long investigation a person asked for")
@@ -132,6 +133,12 @@ stuck_proc = run_as_worker(stuck_child, over)
 young_proc = run_as_worker(young_child, 300)
 person_proc = run_as_worker(person_card, over)
 solo_proc = run_as_worker(solo_child, over)
+# Claimed by this host's dispatcher before a restart in place: same pod, another
+# dispatcher pid. Its recorded worker pid now names a live, unrelated process.
+unrelated_proc = run_as_worker(restart_child, over)
+conn.execute("UPDATE tasks SET claim_lock = ? WHERE id = ?",
+             (f"{K._claimer_id().split(':', 1)[0]}:999999", restart_child))
+conn.commit()
 
 print("the #2978 replay:")
 try:
@@ -148,6 +155,9 @@ try:
         "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'fanout_reaped'", (stuck_child,)
     ).fetchone()[0]
     check("a fanout_reaped event tells it apart from a real finish", reaped == 1, f"events={reaped}")
+    status, _ = card(restart_child)
+    check("an overdue child claimed before a restart in place is settled", status == "done", f"status={status}")
+    check("without killing the process its recorded pid now names", unrelated_proc.poll() is None)
     status, _ = card(solo_child)
     check("a single delegation running as long is left alone", status == "running", f"status={status}")
     check("and its worker keeps running", solo_proc.poll() is None)

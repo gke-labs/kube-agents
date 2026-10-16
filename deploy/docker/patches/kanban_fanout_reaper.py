@@ -62,8 +62,11 @@ completion. The parent's poll then sees it settled, and its answer can name the
 gap. Heartbeats don't matter here.
 
 Only fan-out children are touched. A card a person or a front door filed has no
-attribution row and is never reaped, however long it runs. Only a worker on
-this host is stopped, the same rule upstream's reclaimers follow. Every read
+attribution row and is never reaped, however long it runs. Only this process
+life's own worker is stopped (the whole claim token, as the crash sweep in
+``kanban_scheduling`` checks it). A card claimed on this host by a dispatcher
+that has since restarted is settled without a kill, and another host's card is
+left to its own dispatcher. Every read
 and step fails open: a bookkeeping failure must never break the tick.
 """
 
@@ -73,6 +76,15 @@ import contextlib
 import logging
 import signal
 import time
+
+try:
+    from tools.kanban_children_settled import CHILDREN_TABLE
+except ImportError:  # flat on the host, for the tests
+    from kanban_children_settled import CHILDREN_TABLE
+try:
+    from hermes_cli.kanban_scheduling import claim_host, claim_is_self
+except ImportError:
+    from kanban_scheduling import claim_host, claim_is_self
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +98,6 @@ FANOUT_CHILD_MAX_SECONDS = 30 * 60
 #: count as one fan-out. The guidance files them in one burst, seconds apart;
 #: a second delegation decided on later is minutes away.
 FANOUT_BURST_SECONDS = 120
-
-#: The attribution table ``kanban_children_settled`` owns.
-CHILDREN_TABLE = "kanban_worker_children"
 
 #: Running per-cluster fan-out cards (see the module docstring for the four
 #: conditions), with their active run's start and any stashed draft.
@@ -154,10 +163,10 @@ def _default_complete(conn, task_id: str, text: str, payload: dict) -> bool:
     return True
 
 
-def _default_host_prefix() -> str:
+def _default_claimer_id() -> str:
     from hermes_cli import kanban_db as kb
 
-    return kb._host_prefix()
+    return kb._claimer_id()
 
 
 def reap_overdue_fanout_children(
@@ -165,13 +174,13 @@ def reap_overdue_fanout_children(
     *,
     now: int | None = None,
     limit_seconds: int = FANOUT_CHILD_MAX_SECONDS,
-    host_prefix: str | None = None,
+    claimer_id: str | None = None,
     kill=None,
     complete=None,
 ) -> list[str]:
     """Settle overdue fan-out children; returns the ids it settled.
 
-    ``kill``, ``complete`` and ``host_prefix`` default to upstream's own
+    ``kill``, ``complete`` and ``claimer_id`` default to upstream's own
     helpers and are parameters so a host test can stand them in.
     """
     settled: list[str] = []
@@ -184,9 +193,9 @@ def reap_overdue_fanout_children(
         return settled
     now = int(time.time()) if now is None else int(now)
     try:
-        prefix = _default_host_prefix() if host_prefix is None else host_prefix
+        me = _default_claimer_id() if claimer_id is None else claimer_id
     except Exception as exc:  # noqa: BLE001
-        logger.warning("kanban_fanout_reaper: no host prefix, skipping: %r", exc)
+        logger.warning("kanban_fanout_reaper: no claimer id, skipping: %r", exc)
         return settled
     kill = kill or _default_kill
     complete = complete or _default_complete
@@ -196,9 +205,15 @@ def reap_overdue_fanout_children(
             elapsed = now - int(started)
             if elapsed < limit_seconds:
                 continue
-            if not str(lock or "").startswith(prefix):
+            lock = str(lock or "")
+            if claim_host(lock) != claim_host(me):
                 continue  # another host's worker; its own dispatcher reaps it
-            if pid:
+            # Kill only this process life's own worker. A claim from this host
+            # with another token is a dispatcher that died in place (the same
+            # reading kanban_scheduling.classify_reclaim gives it). Its worker
+            # went with the old PID namespace, and the recorded PID may now
+            # name an unrelated process, so the card is settled without a kill.
+            if pid and claim_is_self(lock, me):
                 kill(int(pid))
             text = settle_text(title, limit_seconds, draft)
             payload = {"elapsed_seconds": elapsed, "limit_seconds": limit_seconds, "pid": pid}
