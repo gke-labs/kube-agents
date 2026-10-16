@@ -66,6 +66,18 @@ def dump_of(*items):
     return {"items": list(items)}
 
 
+def node(name, zone):
+    return {"kind": "Node", "metadata": {"name": name, "labels": {collect._ZONE_KEY: zone}}}
+
+
+# Two zones, one node each, so the cluster-shaped fakes below carry a zonal
+# distribution for §3.25 to read, and one system pod row to answer its
+# placement read with. Without them the collector declares the check
+# inapplicable (one zone) and the "every check ran" controls would be false.
+TWO_ZONE_NODES = (node("node-a", "us-central1-a"), node("node-b", "us-central1-b"))
+POD_PLACEMENT_ROWS = "kube-system\tkube-dns-5d-x1\tnode-a\tRunning\tReplicaSet\tkube-dns-5d\t\t\n"
+
+
 def with_container_resources(dep, resources):
     dep["spec"]["template"]["spec"]["containers"][0]["resources"] = resources
     return dep
@@ -1769,6 +1781,209 @@ class TestSpreadNotAchieved(unittest.TestCase):
     def test_single_replica_is_never_flagged(self):
         wl = self.wl(replicas=1, tsc=self.ADVISORY)
         self.assertIsNone(collect.check_spread_not_achieved(wl, self.ctx(wl)))
+
+
+class TestZonalSkew(unittest.TestCase):
+    """§3.25. Running replicas concentrated in one zone, with the cause named.
+
+    The three shapes `bench/tf/fleet/defects-d.tf` plants are the first three
+    tests: a manifest pin, zonal claims, and a capacity shortfall that leaves
+    the surplus Pending. The rest hold the edges: the threshold, one zone, one
+    running replica, a node the dump does not know.
+    """
+
+    ZONE_A = "us-central1-a"
+    ZONE_B = "us-central1-b"
+    ZONES = {"node-a": ZONE_A, "node-b": ZONE_B}
+    INSUFFICIENT = "0/2 nodes are available: 2 Insufficient cpu. no new claims to deallocate, preemption: 0/2 nodes are available: 2 No preemption victims found for incoming pod."
+    ADVISORY_ZONE = [{"maxSkew": 1, "topologyKey": collect._ZONE_KEY, "whenUnsatisfiable": "ScheduleAnyway"}]
+    PIN_A = {
+        "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [
+                    {"matchExpressions": [{"key": collect._ZONE_KEY, "operator": "In", "values": ["us-central1-a"]}]}
+                ]
+            }
+        }
+    }
+
+    def wl(self, replicas=2, kind="Deployment", name="api", tsc=None, affinity=None, vct=False):
+        d = deployment(name, **{"spec.replicas": replicas})
+        d["kind"] = kind
+        if tsc is not None:
+            d["spec"]["template"]["spec"]["topologySpreadConstraints"] = tsc
+        if affinity is not None:
+            d["spec"]["template"]["spec"]["affinity"] = affinity
+        if vct:
+            d["spec"]["volumeClaimTemplates"] = [{"metadata": {"name": "data"}, "spec": {"storageClassName": "zonal-pd"}}]
+        return collect.normalize_workloads(dump_of(d))[0]
+
+    @staticmethod
+    def pod(node, phase="Running", message=""):
+        return {"node": node, "phase": phase, "scheduled_message": message}
+
+    def ctx(self, workload, pods, zones=None, **overrides):
+        key = (workload["ns"], workload["kind"], workload["name"])
+        return context_of(
+            node_zones=self.ZONES if zones is None else zones,
+            pod_placements_by_workload={key: pods},
+            workloads=[workload],
+            **overrides,
+        )
+
+    def test_the_manifest_pin_is_the_cause_and_every_replica_in_one_zone_is_critical(self):
+        wl = self.wl(affinity=self.PIN_A)
+        hit = collect.check_zonal_skew(wl, self.ctx(wl, [self.pod("node-a"), self.pod("node-a")]))
+        self.assertEqual(hit["severity"], "critical")
+        self.assertIn("us-central1-a=2, us-central1-b=0 (skew 2, threshold 2)", hit["excerpt"])
+        self.assertIn("100% of running replicas in us-central1-a", hit["excerpt"])
+        self.assertIn("cause: pinned to us-central1-a by its own manifest (required nodeAffinity", hit["excerpt"])
+        self.assertTrue(hit["impact"].startswith("100% of this workload's running replicas are in us-central1-a"))
+        self.assertIn("the fix is a manifest change", hit["impact"])
+
+    def test_a_statefulset_with_claim_templates_is_pinned_by_its_disks(self):
+        wl = self.wl(kind="StatefulSet", name="store", vct=True, tsc=self.ADVISORY_ZONE)
+        hit = collect.check_zonal_skew(wl, self.ctx(wl, [self.pod("node-a"), self.pod("node-a")]))
+        self.assertIn("cause: pinned by its PersistentVolumeClaims: volumeClaimTemplates on StorageClass zonal-pd bind", hit["excerpt"])
+        self.assertIn("a migration, not a scheduling change", hit["impact"])
+
+    def test_pending_replicas_the_scheduler_could_not_place_make_it_capacity(self):
+        # capacity-starved-worker's shape: an advisory zone spread is declared,
+        # but the Pending replicas' own message says why the spread could not
+        # hold, and that outranks the manifest.
+        wl = self.wl(replicas=4, tsc=self.ADVISORY_ZONE)
+        pods = [
+            self.pod("node-b"), self.pod("node-b"),
+            self.pod("", "Pending", self.INSUFFICIENT), self.pod("", "Pending", self.INSUFFICIENT),
+        ]
+        hit = collect.check_zonal_skew(wl, self.ctx(wl, pods))
+        self.assertEqual(hit["severity"], "critical")
+        self.assertIn("replicas=4, 2 running across 2 zones: us-central1-a=0, us-central1-b=2", hit["excerpt"])
+        # The scheduler's first sentence only; the preemption detail after it is noise here.
+        self.assertIn("cause: capacity: 2 replica(s) Pending because no node has room (0/2 nodes are available: 2 Insufficient cpu)", hit["excerpt"])
+        self.assertTrue(hit["excerpt"].endswith("; 2 Pending"))
+        self.assertIn("capacity shortfall", hit["impact"])
+
+    def test_advisory_spreading_is_the_cause_when_nothing_else_explains_it(self):
+        wl = self.wl(replicas=3, tsc=self.ADVISORY_ZONE)
+        hit = collect.check_zonal_skew(wl, self.ctx(wl, [self.pod("node-a")] * 3))
+        self.assertIn("cause: spreading is advisory (topologySpreadConstraint on topology.kubernetes.io/zone is ScheduleAnyway with maxSkew 1)", hit["excerpt"])
+
+    def test_nothing_declared_defers_the_fix_to_no_spread(self):
+        wl = self.wl()
+        hit = collect.check_zonal_skew(wl, self.ctx(wl, [self.pod("node-a"), self.pod("node-a")]))
+        self.assertIn("cause: no spreading declared (no-spread's finding on this object)", hit["excerpt"])
+
+    def test_a_binding_zone_spread_whose_max_skew_allows_it_is_permitted(self):
+        tsc = [{"maxSkew": 3, "topologyKey": collect._ZONE_KEY, "whenUnsatisfiable": "DoNotSchedule"}]
+        wl = self.wl(replicas=3, tsc=tsc)
+        hit = collect.check_zonal_skew(wl, self.ctx(wl, [self.pod("node-a")] * 3))
+        self.assertIn("cause: the declared constraints permit it (", hit["excerpt"])
+        self.assertIn("DoNotSchedule with maxSkew 3", hit["excerpt"])
+
+    def test_a_partial_skew_is_major_with_the_share_it_puts_at_risk(self):
+        wl = self.wl(replicas=4)
+        pods = [self.pod("node-a")] * 3 + [self.pod("node-b")]
+        hit = collect.check_zonal_skew(wl, self.ctx(wl, pods))
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("(skew 2, threshold 2); 75% of running replicas in us-central1-a", hit["excerpt"])
+
+    def test_a_skew_below_the_threshold_is_not_a_finding_until_the_threshold_says_so(self):
+        wl = self.wl(replicas=3)
+        pods = [self.pod("node-a"), self.pod("node-a"), self.pod("node-b")]
+        self.assertIsNone(collect.check_zonal_skew(wl, self.ctx(wl, pods)))
+        hit = collect.check_zonal_skew(wl, self.ctx(wl, pods, zonal_skew_threshold=1))
+        self.assertIn("(skew 1, threshold 1)", hit["excerpt"])
+
+    def test_a_balanced_workload_is_not_flagged(self):
+        wl = self.wl()
+        self.assertIsNone(collect.check_zonal_skew(wl, self.ctx(wl, [self.pod("node-a"), self.pod("node-b")])))
+
+    def test_a_single_zone_cluster_has_nothing_to_skew(self):
+        wl = self.wl()
+        ctx = self.ctx(wl, [self.pod("node-a"), self.pod("node-a")], zones={"node-a": self.ZONE_A})
+        self.assertIsNone(collect.check_zonal_skew(wl, ctx))
+
+    def test_one_running_replica_has_no_distribution(self):
+        wl = self.wl(replicas=2)
+        pods = [self.pod("node-a"), self.pod("", "Pending", self.INSUFFICIENT)]
+        self.assertIsNone(collect.check_zonal_skew(wl, self.ctx(wl, pods)))
+
+    def test_a_pod_on_a_node_the_dump_does_not_know_is_not_counted(self):
+        wl = self.wl()
+        pods = [self.pod("node-a"), self.pod("node-a"), self.pod("node-gone")]
+        hit = collect.check_zonal_skew(wl, self.ctx(wl, pods))
+        self.assertIn("2 running across 2 zones", hit["excerpt"])
+
+    def test_a_daemonset_and_a_single_replica_workload_are_skipped(self):
+        ds = self.wl(kind="DaemonSet")
+        self.assertIsNone(collect.check_zonal_skew(ds, self.ctx(ds, [self.pod("node-a")] * 2)))
+        one = self.wl(replicas=1)
+        self.assertIsNone(collect.check_zonal_skew(one, self.ctx(one, [self.pod("node-a")] * 2)))
+
+
+class TestPodPlacementRead(unittest.TestCase):
+    """The placement read's parser, its owner join, and the collector's gate."""
+
+    ROW = "ns1\tapi-7d9f\tnode-a\tRunning\tReplicaSet\tapi-7d9f\t\t"
+    PENDING = "ns1\tapi-7d9f-x\t\tPending\tReplicaSet\tapi-7d9f\tUnschedulable\t0/2 nodes are available: 2 Insufficient cpu."
+
+    def test_eight_fields_parse_and_the_message_keeps_its_own_text(self):
+        rows = collect.parse_pod_placements(self.ROW + "\n" + self.PENDING + "\n")
+        self.assertEqual([r["phase"] for r in rows], ["Running", "Pending"])
+        self.assertEqual(rows[1]["scheduled_message"], "0/2 nodes are available: 2 Insufficient cpu.")
+        self.assertEqual(rows[0]["node"], "node-a")
+
+    def test_a_short_row_or_empty_output_fails_the_gate(self):
+        self.assertIsNone(collect.parse_pod_placements("ns1\tapi\tnode-a\tRunning\n"))
+        self.assertIsNone(collect.parse_pod_placements(""))
+        self.assertIsNone(collect.parse_pod_placements(json.dumps({"items": []})))
+
+    def test_pods_join_their_owner_only_when_the_dump_holds_it(self):
+        rows = collect.parse_pod_placements(
+            "ns1\tapi-7d9f-a\tnode-a\tRunning\tReplicaSet\tapi-7d9f\t\t\n"
+            "ns1\tstore-0\tnode-a\tRunning\tStatefulSet\tstore\t\t\n"
+            "ns1\tlone-7d9f-a\tnode-a\tRunning\tReplicaSet\tlone-7d9f\t\t\n"
+            "ns1\tbare\tnode-a\tRunning\tReplicaSet\tbare\t\t\n"
+            "ns1\tjob-a\tnode-a\tRunning\tJob\tjob\t\t\n"
+        )
+        keys = {("ns1", "Deployment", "api"), ("ns1", "StatefulSet", "store"), ("ns1", "Deployment", "lone-7d9f-a")}
+        grouped = collect.placements_by_workload(rows, keys)
+        self.assertEqual(
+            {k: [r["name"] for r in v] for k, v in grouped.items()},
+            {("ns1", "Deployment", "api"): ["api-7d9f-a"], ("ns1", "StatefulSet", "store"): ["store-0"]},
+        )
+
+    def collect_with(self, zones, rc=0, stdout=None):
+        context = {"node_zones": zones, "workload_keys": {("ns1", "Deployment", "api")}}
+        commands = {collect.ZONAL_SKEW_SLUG: {"command": "dump"}, "no-pdb": {"command": "dump"}}
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return Run(argv, rc, self.ROW + "\n" if stdout is None else stdout, "boom" if rc else "", 0.1)
+
+        collect._collect_pod_placements(context, commands, Path("/tmp/kc"), run=run)
+        return context, commands, calls
+
+    def test_a_single_zone_cluster_is_declared_inapplicable_without_a_read(self):
+        context, commands, calls = self.collect_with({"node-a": "us-central1-a"})
+        self.assertEqual(calls, [])
+        self.assertNotIn(collect.ZONAL_SKEW_SLUG, commands)
+        self.assertIn("every node is in one zone (us-central1-a)", context["not_applicable"][collect.ZONAL_SKEW_SLUG])
+
+    def test_a_failed_read_leaves_the_check_unevaluated_not_clean(self):
+        context, commands, _ = self.collect_with({"node-a": "us-central1-a", "node-b": "us-central1-b"}, rc=1)
+        self.assertNotIn(collect.ZONAL_SKEW_SLUG, commands)
+        self.assertIn("exited 1 (boom)", context["unevaluated"][collect.ZONAL_SKEW_SLUG])
+        self.assertNotIn("pod_placements_by_workload", context)
+
+    def test_a_good_read_records_its_own_command_and_the_threshold(self):
+        context, commands, calls = self.collect_with({"node-a": "us-central1-a", "node-b": "us-central1-b"})
+        self.assertEqual(calls, [collect.POD_PLACEMENT_ARGV])
+        self.assertIn("kubectl get pods -A --field-selector", commands[collect.ZONAL_SKEW_SLUG]["command"])
+        self.assertEqual(list(context["pod_placements_by_workload"]), [("ns1", "Deployment", "api")])
+        self.assertEqual(context["zonal_skew_threshold"], collect.ZONAL_SKEW_THRESHOLD_DEFAULT)
 
 
 class TestEndpointNodeCollection(unittest.TestCase):
@@ -4025,8 +4240,10 @@ class TestCollectCluster(unittest.TestCase):
             calls.append(argv)
             if "get-credentials" in argv:
                 return Run(argv, cred_rc, "", "" if cred_rc == 0 else "denied", 0.1)
+            if "pods" in argv:
+                return Run(argv, dump_rc, POD_PLACEMENT_ROWS, "", 0.1)
             if argv[:2] == ["kubectl", "get"]:
-                return Run(argv, dump_rc, json.dumps(dump_of(*dump_items)), "", 0.2)
+                return Run(argv, dump_rc, json.dumps(dump_of(*dump_items, *TWO_ZONE_NODES)), "", 0.2)
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
@@ -4338,19 +4555,15 @@ class TestCollectCluster(unittest.TestCase):
 
     def test_the_collection_command_is_the_same_across_every_check(self):
         result, _ = self.collect([deployment("api")])
-        dump_commands = {
-            c["command"]
-            for c in result["commands"]
-            if c["check"] != "untargeted-compute-class-workload"
-        }
+        # Two checks read something the dump does not hold, and each records
+        # its own read: §3.24 the ComputeClasses, §3.25 the pod placement.
+        own_read = {"untargeted-compute-class-workload", collect.ZONAL_SKEW_SLUG}
+        dump_commands = {c["command"] for c in result["commands"] if c["check"] not in own_read}
         self.assertEqual(len(dump_commands), 1)
         self.assertIn("kubectl get", next(iter(dump_commands)))
-        cc_cmd = next(
-            c["command"]
-            for c in result["commands"]
-            if c["check"] == "untargeted-compute-class-workload"
-        )
-        self.assertIn("kubectl get computeclasses", cc_cmd)
+        by_check = {c["check"]: c["command"] for c in result["commands"]}
+        self.assertIn("kubectl get computeclasses", by_check["untargeted-compute-class-workload"])
+        self.assertIn("kubectl get pods -A --field-selector", by_check[collect.ZONAL_SKEW_SLUG])
 
 
 class TestCollectFleet(unittest.TestCase):
@@ -4687,8 +4900,10 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
                 return Run(argv, 0, clusters_json, "", 0.05)
             if "get-credentials" in argv:
                 return Run(argv, 0, "", "", 0.05)
+            if "pods" in argv:
+                return Run(argv, 0, POD_PLACEMENT_ROWS, "", 0.05)
             if argv[:2] == ["kubectl", "get"]:
-                return Run(argv, 0, json.dumps(dump_of(*dump_items)), "", 0.1)
+                return Run(argv, 0, json.dumps(dump_of(*dump_items, *TWO_ZONE_NODES)), "", 0.1)
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:

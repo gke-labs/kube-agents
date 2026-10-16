@@ -6035,7 +6035,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "schedule-never-succeeds", "rollout-drops-traffic", "strategy-causes-downtime", "cronjob-runs-overlap",
         "service-selects-nothing", "service-port-unresolved", "liveness-preempts-readiness",
         "spread-not-achieved", "prestop-outlives-grace", "rwo-claim-contended", "hpa-floors-at-one",
-        "pdb-overlapping", "untargeted-compute-class-workload",
+        "pdb-overlapping", "untargeted-compute-class-workload", "zonal-skew",
     ),
     "stockout-prevention": (
         "ccc-missing-fallbacks", "ccc-no-ondemand-floor", "ccc-large-vm-scarcity", "ccc-priority-starvation",
