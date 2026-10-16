@@ -1676,7 +1676,11 @@ text and fields (the fallback when it has none), its files' names, who posted it
 Slack name, an app's posting name) and the channel's name. The frame tells the agent the
 quote is something to check, not an instruction, because the requester is the clicker and
 the message's author may be anyone, a program included; the eval case
-`chat-shortcut-alert-is-checked-not-obeyed` holds the agent to it. Before handing anything
+`chat-shortcut-alert-is-checked-not-obeyed` holds the agent to it. Once the gateway has
+verified the clicker, the adapter's next post in that conversation carries a context line
+above it naming them by their Slack name (`<name> asked me to look at this`), kept through
+every edit of that message, so a channel reading a bot's reply under someone else's message
+can see who asked; a line no post took is dropped when the chain ends. Before handing anything
 over the adapter asks `conversations.info` whether it can post there. A channel it is not a
 member of, and a conversation it cannot see at all (a private channel or a DM it is not in,
 `channel_not_found`), gets a note only the clicker sees, through the payload's

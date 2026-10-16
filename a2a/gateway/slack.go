@@ -401,6 +401,7 @@ func (s *SlackAdapter) startedExpiry() time.Time {
 // and return.
 func (s *SlackAdapter) TaskTerminal(conversation, _ string, _ lib.TaskState, _ TerminalSource, _ string) {
 	s.updateSession(conversation, func(st *slackSession) { st.running = false })
+	s.dropCredit(conversation)
 	channel, threadTS, ok := slackChannelThread(conversation)
 	if !ok || threadTS == "" || slackIsDM(conversation) {
 		return
@@ -708,16 +709,36 @@ func (s *SlackAdapter) Post(conversation, text string) (string, error) {
 	// No unfurls: an answer cites console and documentation links, and each
 	// unfurled into a preview card (a console link previews as the Google
 	// sign-in page), three or four under every answer.
-	opts := []slack.MsgOption{
-		slack.MsgOptionText(toMrkdwn(text), false),
-		slack.MsgOptionDisableLinkUnfurl(),
-		slack.MsgOptionDisableMediaUnfurl(),
+	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false)}
+	// The first post after a shortcut carries its credit line.
+	credit := s.takeCredit(conversation)
+	if credit != "" {
+		if credited, err := slackCreditedOptions(OutMessage{Text: text}, credit); err == nil {
+			opts = credited
+		}
 	}
+	opts = append(opts, slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl())
 	if threadTS != "" {
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
 	_, ts, err := s.api.PostMessage(channel, opts...)
+	s.settleCredit(conversation, channel, ts, credit, err)
 	return ts, err
+}
+
+// settleCredit records the credit line a post carried, or, when the post
+// failed, holds it for the next one (the gateway posts a refused layout's
+// text instead).
+func (s *SlackAdapter) settleCredit(conversation, channel, ts, credit string, err error) {
+	switch {
+	case credit == "":
+	case err != nil:
+		s.mu.Lock()
+		s.creditLocked(conversation, credit)
+		s.mu.Unlock()
+	default:
+		s.noteCredited(channel, ts, credit)
+	}
 }
 
 // PostNotify writes text into channel, top-level when thread is empty or as a
@@ -848,6 +869,11 @@ func (s *SlackAdapter) Edit(conversation, messageID, text string) error {
 	// have been laid out by EditMessage before, in this process or one a
 	// restart replaced, and chat.update keeps whatever it is not sent.
 	opts, _ := slackMessageOptions(OutMessage{Text: text})
+	if credit := s.creditedLine(channel, messageID); credit != "" {
+		if credited, err := slackCreditedOptions(OutMessage{Text: text}, credit); err == nil {
+			opts = credited
+		}
+	}
 	_, _, _, err := s.api.UpdateMessage(channel, messageID, opts...)
 	return err
 }
@@ -866,8 +892,14 @@ func (s *SlackAdapter) PostMessage(conversation string, m OutMessage) (string, e
 	if !ok {
 		return "", fmt.Errorf("malformed conversation id %q", conversation)
 	}
+	// The first post after a shortcut carries its credit line.
+	credit := s.takeCredit(conversation)
 	opts, err := slackMessageOptions(m)
+	if credit != "" {
+		opts, err = slackCreditedOptions(m, credit)
+	}
 	if err != nil {
+		s.settleCredit(conversation, channel, "", credit, err)
 		return "", err
 	}
 	opts = append(opts, slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl())
@@ -875,6 +907,7 @@ func (s *SlackAdapter) PostMessage(conversation string, m OutMessage) (string, e
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
 	_, ts, err := s.api.PostMessage(channel, opts...)
+	s.settleCredit(conversation, channel, ts, credit, err)
 	if err == nil {
 		s.trackQuestion(conversation, ts, m)
 	}
@@ -924,6 +957,10 @@ func (s *SlackAdapter) EditMessage(conversation, messageID string, m OutMessage)
 		// settling it on the notify route, laid out or as text) keeps the
 		// line that names who answered.
 		opts, err = slackAnsweredOptions(m, line)
+	} else if credit := s.creditedLine(channel, messageID); credit != "" {
+		// The first post after a shortcut keeps its credit line through
+		// every edit.
+		opts, err = slackCreditedOptions(m, credit)
 	}
 	if err != nil {
 		return err

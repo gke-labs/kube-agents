@@ -76,6 +76,11 @@ const (
 	// private notes for a message the bot cannot answer under.
 	slackShortcutNotInChannel      = "I'm not in <#%s>, so I can't reply there. Invite me with /invite <@%s> and ask again."
 	slackShortcutNotInConversation = "I can't post in this conversation, so I can't look at this here."
+
+	// slackShortcutCredit names the clicker on the bot's first post in the
+	// thread, so the channel sees who asked: a small line above the post,
+	// the clicker by their Slack name, never a mention.
+	slackShortcutCredit = "%s asked me to look at this"
 )
 
 // slackShortcutPlaceholderNames are the names Slack gives a conversation that
@@ -189,9 +194,10 @@ func (s *SlackAdapter) shortcut(ctx context.Context, raw json.RawMessage, handle
 			slackShortcutQuote(quoted)),
 		Shortcut: true,
 	}
+	clicker := s.slackUserNameContext(ctx, p.User.ID)
 	s.mu.Lock()
 	s.addPendingLocked(slackPendingKey(msg.Conversation, msg.MessageID), slackPending{conversation: msg.Conversation,
-		author: msg.AuthorID, text: quoted, shortcut: true, responseURL: p.ResponseURL})
+		author: msg.AuthorID, text: quoted, shortcut: true, responseURL: p.ResponseURL, clicker: clicker})
 	s.mu.Unlock()
 	handler(msg)
 }
@@ -310,4 +316,98 @@ func slackShortcutQuote(text string) string {
 		lines[i] = slackShortcutQuotePrefix + line
 	}
 	return strings.Join(lines, "\n")
+}
+
+// creditLocked holds line for the bot's next post in conversation. Caller
+// holds s.mu.
+func (s *SlackAdapter) creditLocked(conversation, line string) {
+	ux := s.uxLocked()
+	remember(&ux.creditsOrder, conversation, func(k string) { delete(ux.credits, k) })
+	ux.credits[conversation] = line
+}
+
+// takeCredit hands over the credit line waiting for conversation's next
+// post, and forgets it: it goes on one message only.
+func (s *SlackAdapter) takeCredit(conversation string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ux := s.uxLocked()
+	line, ok := ux.credits[conversation]
+	if !ok {
+		return ""
+	}
+	delete(ux.credits, conversation)
+	forget(&ux.creditsOrder, conversation)
+	return line
+}
+
+// dropCredit forgets a credit line no post took, when the work it was for
+// has ended (TaskTerminal), so it cannot land on a later, unrelated post.
+func (s *SlackAdapter) dropCredit(conversation string) {
+	_ = s.takeCredit(conversation)
+}
+
+// noteCredited records that the message at channel/ts carries line, so an
+// edit of it keeps the line.
+func (s *SlackAdapter) noteCredited(channel, ts, line string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ux := s.uxLocked()
+	key := channel + "/" + ts
+	remember(&ux.creditedOrder, key, func(k string) { delete(ux.credited, k) })
+	ux.credited[key] = line
+}
+
+// creditedLine is the credit line the message at channel/ts carries, or "".
+func (s *SlackAdapter) creditedLine(channel, ts string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.uxLocked().credited[channel+"/"+ts]
+}
+
+// slackCreditNote is the credit line as the context block above a post.
+func slackCreditNote(line string) map[string]any {
+	return map[string]any{"type": slackContextBlock, "elements": []any{
+		map[string]any{"type": slackPlainText, "text": line, "emoji": true}}}
+}
+
+// slackCreditedOptions is slackMessageOptions with the credit line above the
+// message: a context block before the chat message's layout, or before the
+// text laid out as a section when there is no chat message (text past a
+// section's cap posts as text alone, without the line).
+func slackCreditedOptions(m OutMessage, line string) ([]slack.MsgOption, error) {
+	text := toMrkdwn(m.Text)
+	if m.Chat == nil {
+		if utf8.RuneCountInString(text) > slackChatSectionMax {
+			return slackMessageOptions(m)
+		}
+		set, err := slackRawBlocks([]map[string]any{slackCreditNote(line),
+			{"type": slackSectionBlock, "text": map[string]any{"type": slackMrkdwnText, "text": text}}})
+		if err != nil {
+			return nil, err
+		}
+		return []slack.MsgOption{slack.MsgOptionText(text, false), slack.MsgOptionBlocks(set...),
+			slack.MsgOptionAttachments([]slack.Attachment{}...)}, nil
+	}
+	layout, err := slackCreditedLayout(m, text, line)
+	if err != nil {
+		return nil, err
+	}
+	return slackChatOptions(layout, text)
+}
+
+// slackCreditedLayout is a chat message's layout with the credit line's
+// block first, refused as slackMessageOptions refuses it.
+func slackCreditedLayout(m OutMessage, text, line string) (slackChatLayout, error) {
+	if utf8.RuneCountInString(text) > slackChatTextMax {
+		return slackChatLayout{}, fmt.Errorf("%w: %w", ErrLayoutRefused, errSlackChatTooLarge)
+	}
+	layout, err := renderSlackChat(m.Chat, text)
+	if err != nil {
+		return slackChatLayout{}, fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+	}
+	if line != "" {
+		layout.Blocks = append([]map[string]any{slackCreditNote(line)}, layout.Blocks...)
+	}
+	return layout, nil
 }

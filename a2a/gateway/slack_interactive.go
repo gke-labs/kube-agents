@@ -114,6 +114,8 @@ type slackPending struct {
 	question                   slackQuestion
 	shortcut                   bool
 	responseURL                string
+	// clicker is a shortcut clicker's Slack name, for the credit line.
+	clicker string
 }
 
 // slackUX is the adapter's click and question state, under s.mu.
@@ -133,13 +135,21 @@ type slackUX struct {
 	// questions is each conversation's open question, the latest posted.
 	questions      map[string]slackQuestion
 	questionsOrder []string
+	// credits is each conversation's shortcut credit line still waiting for
+	// the bot's next post there; credited is the line a post took, by
+	// channel/ts, so an edit of that message keeps it (slack_shortcut.go).
+	credits       map[string]string
+	creditsOrder  []string
+	credited      map[string]string
+	creditedOrder []string
 }
 
 // uxLocked is s.ux, made on first use. Caller holds s.mu.
 func (s *SlackAdapter) uxLocked() *slackUX {
 	if s.ux == nil {
 		s.ux = &slackUX{pending: map[string]slackPending{}, claims: map[string]bool{},
-			answered: map[string]bool{}, lines: map[string]string{}, questions: map[string]slackQuestion{}}
+			answered: map[string]bool{}, lines: map[string]string{}, questions: map[string]slackQuestion{},
+			credits: map[string]string{}, credited: map[string]string{}}
 	}
 	return s.ux
 }
@@ -208,7 +218,9 @@ func (s *SlackAdapter) trackQuestion(conversation, ts string, m OutMessage) {
 		return
 	}
 	text := toMrkdwn(m.Text)
-	layout, err := renderSlackChat(m.Chat, text)
+	// With the credit line the message carries, so an answer's rewrite
+	// keeps it.
+	layout, err := slackCreditedLayout(m, text, s.creditedLine(channel, ts))
 	if err != nil {
 		return
 	}
@@ -396,13 +408,16 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 	}
 	if p.shortcut {
 		// A shortcut answers no question: it is an ask about a message, so
-		// it titles the thread after that message, and a clicker the
-		// gateway refused is told so where only they can see it.
-		s.mu.Unlock()
+		// it titles the thread after that message and credits the clicker
+		// on the bot's next post there, and a clicker the gateway refused is
+		// told so where only they can see it.
 		if verified {
+			s.creditLocked(conversation, fmt.Sprintf(slackShortcutCredit, p.clicker))
+			s.mu.Unlock()
 			s.noteAsk(conversation, p.text)
 			return
 		}
+		s.mu.Unlock()
 		s.goSession(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), slackShortcutTimeout)
 			defer cancel()

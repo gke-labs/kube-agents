@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -237,6 +238,75 @@ func TestSlackShortcutVerifiedTitlesTheThreadAfterTheMessage(t *testing.T) {
 	}
 	if len(hooks.got()) != 0 {
 		t.Errorf("a verified clicker gets no note: %+v", hooks.got())
+	}
+}
+
+func TestSlackShortcutVerifiedCreditsTheClickerOnce(t *testing.T) {
+	api := &fakeSlackAPI{users: map[string]*slack.User{"U1": {Profile: slack.UserProfile{DisplayName: "jayanti"}}}}
+	a, _ := newShortcutAdapter(api)
+	turns := runShortcut(a, shortcutPayload(t, "C1", "oncall", "203.0", alertMessage()))
+	if len(turns) != 1 {
+		t.Fatalf("turns = %+v", turns)
+	}
+	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, true)
+	if got := a.takeCredit(turns[0].Conversation); got != "jayanti asked me to look at this" {
+		t.Errorf("credit = %q, want the clicker's name in the mock's words", got)
+	}
+	if got := a.takeCredit(turns[0].Conversation); got != "" {
+		t.Errorf("a credit goes on one post only; second take = %q", got)
+	}
+}
+
+func TestSlackShortcutRefusedOrEndedLeavesNoCredit(t *testing.T) {
+	a, _ := newShortcutAdapter(&fakeSlackAPI{})
+	turns := runShortcut(a, shortcutPayload(t, "C1", "oncall", "203.1", alertMessage()))
+	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, false)
+	if got := a.takeCredit(turns[0].Conversation); got != "" {
+		t.Errorf("a refused clicker is credited: %q", got)
+	}
+	turns = runShortcut(a, shortcutPayload(t, "C1", "oncall", "203.2", alertMessage()))
+	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, true)
+	a.TaskTerminal(turns[0].Conversation, "task-1", lib.StateFailed, "", "")
+	if got := a.takeCredit(turns[0].Conversation); got != "" {
+		t.Errorf("a credit outlived its work and could land on a later post: %q", got)
+	}
+}
+
+// The credit line goes above the first post, as a context block, and stays
+// through an edit of that message; the next post carries none.
+func TestSlackCreditLineIsAboveTheFirstPostAndSurvivesItsEdit(t *testing.T) {
+	a, stub := startSlackStubAdapter(t)
+	a.mu.Lock()
+	a.creditLocked("slack:C1/100.5", "jayanti asked me to look at this")
+	a.mu.Unlock()
+	ts, err := a.Post("slack:C1/100.5", "checking payments-api in seeded-debug.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Post("slack:C1/100.5", "second"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Edit("slack:C1/100.5", ts, "checking payments-api in seeded-debug. (edited)"); err != nil {
+		t.Fatal(err)
+	}
+	stub.mu.Lock()
+	forms := append([]url.Values(nil), stub.forms...)
+	stub.mu.Unlock()
+	if len(forms) != 3 {
+		t.Fatalf("calls = %d, want two posts and an edit", len(forms))
+	}
+	for i, want := range []bool{true, false, true} {
+		blocks := forms[i].Get("blocks")
+		has := strings.Contains(blocks, `"context"`) && strings.Contains(blocks, "jayanti asked me to look at this")
+		if has != want {
+			t.Errorf("call %d carries the credit line = %v, want %v: %s", i, has, want, blocks)
+		}
+	}
+	if first := decodeBlocks(t, forms[0].Get("blocks")); len(first) != 2 || first[0]["type"] != "context" || first[1]["type"] != "section" {
+		t.Errorf("first post's blocks = %v, want the credit line, then the text", first)
+	}
+	if forms[0].Get("thread_ts") != "100.5" {
+		t.Errorf("first post thread = %q", forms[0].Get("thread_ts"))
 	}
 }
 
