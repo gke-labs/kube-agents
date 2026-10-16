@@ -37,7 +37,7 @@ gets the same shape in chat. Read only. Register nothing, decide nothing, upgrad
      A row in state `queued` **or** `surfaced` is **undecided**: nobody has decided on it, whether or
      not the hourly nudge has named it yet. `accepted` is decided (being worked on).
    - `get_findings` with `state=snoozed`, then `state=dismissed`: the other decided rows; the backlog
-     never carries them.
+     never carries them. Keep the `upgrade-` rows of these too.
 3. Compose the brief in exactly this shape, at most sixteen lines, ids verbatim in backticks:
 
    ```

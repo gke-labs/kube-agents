@@ -714,7 +714,7 @@ def _register_one(conn: sqlite3.Connection, finding: dict) -> str:
 
 
 def _downgrade_absent(
-    conn: sqlite3.Connection, project: str, cluster: str, seen: set[str], check_prefix: str = "", source: str = ""
+    conn: sqlite3.Connection, project: str, cluster: str, seen: set[str], check_prefix: str = "", sources: frozenset = frozenset()
 ) -> int:
     """§5.2's reciprocal case: absence lowers confidence, it does not resolve.
 
@@ -722,10 +722,11 @@ def _downgrade_absent(
     it: a recurring sweep that reads one family of checks (the weekly upgrade
     readiness review, `upgrade-`) is complete for that family alone, and must
     not lower the confidence of an inventory or event-watcher row on the same
-    cluster that it never looked at. `source` narrows it the same way to the
-    rows one source wrote, which is what a batch without a prefix claims: the
-    onboarding sweep re-run by hand is complete for the inventory's rows, not
-    for the weekly review's. Both empty means every row on the cluster.
+    cluster that it never looked at. `sources` narrows it the same way to the
+    rows those sources wrote, which is what a batch without a prefix claims:
+    the onboarding sweep re-run by hand is complete for the inventory's rows,
+    not for the weekly review's. A claim with neither is refused upstream, so
+    no caller can lower every row on a cluster by accident.
 
     A sweep that died halfway produces the same silence as a fleet that got
     healthier, so a row the run did not re-report is re-ranked down at the
@@ -753,7 +754,7 @@ def _downgrade_absent(
             continue
         if check_prefix and not str(check_slug or "").startswith(check_prefix):
             continue
-        if source and str(row_source or "") != source:
+        if sources and str(row_source or "") not in sources:
             continue
         try:
             rubric = validate_rubric(json.loads(raw))
@@ -784,8 +785,9 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
     `scope` (there is nothing to do), accepted with one, where the point is
     that every row the claim covers was absent (§5.2). A complete claim
     reaches the rows its `check_prefix` names, else the rows of the batch's
-    own `source` (or `scope.source` for an empty batch), else every row on
-    the cluster.
+    own sources (or `scope.source` for an empty batch); a complete claim that
+    names neither a prefix nor a source and carries no findings is refused,
+    since it would reach every row on the cluster and no caller means that.
     """
     if not isinstance(findings, list):
         raise FindingError("findings must be a list")
@@ -795,7 +797,7 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
     if len(findings) > MAX_BATCH:
         raise FindingError(f"batch is {len(findings)} findings, over the {MAX_BATCH} limit")
 
-    results, seen = [], set()
+    results, seen, sources = [], set(), set()
     for index, raw in enumerate(findings):
         try:
             finding = validate_finding(raw)
@@ -803,15 +805,19 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
             raise FindingError(f"findings[{index}]: {exc}") from None
         results.append({"id": finding["id"], "outcome": _register_one(conn, finding)})
         seen.add(finding["id"])
+        sources.add(finding["source"])
 
     downgraded = 0
     if complete:
         project = _text(scope.get("project"), "scope.project")
         cluster = _text(scope.get("cluster"), "scope.cluster")
         check_prefix = _text(scope.get("check_prefix"), "scope.check_prefix", required=False)
-        sources = {str(raw.get("source") or "") for raw in findings if isinstance(raw, dict)}
-        source = _text(scope.get("source"), "scope.source", required=False) or (next(iter(sources)) if len(sources) == 1 else "")
-        downgraded = _downgrade_absent(conn, project, cluster, seen, check_prefix, source)
+        named = _text(scope.get("source"), "scope.source", required=False)
+        if named:
+            sources = {named}
+        if not check_prefix and not sources:
+            raise FindingError("a complete scope with no findings needs check_prefix or source to say what it covers")
+        downgraded = _downgrade_absent(conn, project, cluster, seen, check_prefix, frozenset(sources))
 
     return {"results": results, "downgraded": downgraded}
 

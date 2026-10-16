@@ -639,13 +639,15 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
 # --- registering ------------------------------------------------------------------
 
 
-def register(members: list[dict], errors: list[dict], findings: list[dict]) -> tuple[dict[str, str], list[str]]:
+def register(members: list[dict], errors: list[dict], findings: list[dict]) -> tuple[dict[str, str], list[str], set[tuple[str, str]]]:
     """Register the findings cluster by cluster, each batch with its scope when
     the cluster was read in full (a complete cluster with nothing to report
-    sends an empty batch with the scope). Returns the outcome per id and the
-    registration errors."""
+    sends an empty batch with the scope). Returns the outcome per id, the
+    registration errors, and the clusters whose claim of completeness reached
+    the queue, which is what the week's delta may be counted over."""
     outcomes: dict[str, str] = {}
     problems: list[str] = []
+    claimed: set[tuple[str, str]] = set()
     by_cluster: dict[tuple[str, str], list[dict]] = {}
     for item in findings:
         by_cluster.setdefault((item["project"], item["cluster"]), []).append(item)
@@ -663,7 +665,8 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
         chunks = [batch[i : i + KV_BATCH_LIMIT] for i in range(0, len(batch), KV_BATCH_LIMIT)] or [[]]
         for chunk in chunks:
             body = {"findings": [payload(item) for item in chunk]}
-            if complete and len(chunks) == 1:
+            claims = complete and len(chunks) == 1
+            if claims:
                 body["scope"] = {"project": project, "cluster": cluster, "complete": True, "check_prefix": CHECK_PREFIX}
             try:
                 answer = kv_request(KV_FINDINGS_PATH, body)
@@ -672,10 +675,12 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
                 for item in chunk:
                     outcomes[item_id(item)] = REGISTRATION_FAILED
                 continue
+            if claims:
+                claimed.add((project, cluster))
             for result in answer.get("results") or []:
                 if isinstance(result, dict) and result.get("id"):
                     outcomes[str(result["id"])] = str(result.get("outcome") or "")
-    return outcomes, problems
+    return outcomes, problems, claimed
 
 
 def item_id(item: dict) -> str:
@@ -707,6 +712,7 @@ def summary(
     problems: list[str],
     previous: dict | None,
     report_path: Path,
+    claimed: set[tuple[str, str]] | None = None,
 ) -> dict:
     keys = [watch.member_key(m) for m in members]
     blocked, ready, unknown, unread = watch.readiness_verdicts({watch.MEMBERS_KEY: members, watch.ERRORS_KEY: errors}, keys)
@@ -730,13 +736,16 @@ def summary(
         )
     counts = {severity: sum(1 for r in rows if r["severity"] == severity) for severity in SEVERITY_ORDER}
     ids = [r["id"] for r in rows]
-    # Only a cluster read in full can say that last week's row is gone; one
-    # whose read failed keeps its rows unjudged, as the queue does.
+    # Only a cluster read in full, whose claim of completeness reached the
+    # queue, can say that last week's row is gone; one whose read failed, or
+    # that was sent in pieces, keeps its rows unjudged, as the queue does.
     reviewed_pairs = {
         (str(m.get(watch.MEMBER_ID_KEYS[0]) or ""), str(m.get(watch.MEMBER_ID_KEYS[-1]) or ""))
         for m in members
         if member_complete(m, errors)
     }
+    if claimed is not None:
+        reviewed_pairs &= claimed
     previous_ids = [
         r.get("id")
         for r in (previous or {}).get("findings") or []
@@ -944,15 +953,17 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
     findings: list[dict] = []
     outcomes: dict[str, str] = {}
     problems: list[str] = []
+    claimed: set[tuple[str, str]] = set()
 
     def registered(found: list[dict], read_errors: list[dict]) -> None:
         items = [item for member in found for item in member_findings(member)]
         findings.extend(items)
         if dry_run:
             return
-        got, bad = register(found, read_errors, items)
+        got, bad, done = register(found, read_errors, items)
         outcomes.update(got)
         problems.extend(bad)
+        claimed.update(done)
 
     members, errors, tables, failures = run_projects(ordered_names(names, previous), scope, on_project=registered)
     if not members and failures:
@@ -961,6 +972,7 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
     summary_doc = summary(
         stamp=stamp, now=now, names=names, members=members, errors=errors, failures=failures,
         findings=findings, outcomes=outcomes, problems=problems, previous=previous, report_path=report_path,
+        claimed=None if dry_run else claimed,
     )
     report_md = render_report(summary_doc, findings, tables, errors)
     if dry_run:

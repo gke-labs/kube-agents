@@ -4401,9 +4401,9 @@ def register_findings(body: Dict[str, Any]) -> Dict[str, Any]:
     the only condition under which absence may lower a row's confidence. A
     partial run must omit it: a sweep that died halfway looks exactly like a
     fleet that got healthier. `scope.check_prefix` narrows the claim to one
-    family of checks and a batch's `source` narrows it to that source's rows;
-    with a complete scope an empty `findings` list is accepted as a complete
-    run that found nothing.
+    family of checks and a batch's sources narrow it to their rows; with a
+    complete scope an empty `findings` list is accepted as a complete run that
+    found nothing when it names `check_prefix` or `source`, and refused otherwise.
     """
     return _findings_write(findings_queue.register_findings, body.get("findings"), body.get("scope"))
 

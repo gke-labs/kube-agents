@@ -90,7 +90,7 @@ afterwards, how to prevent or repair it, and whether Google's own advisor for GK
 One row per entry. The first three tables group the entries by the reader that covers the entry's
 own failure on `main` today: a scheduled audit, one of the `fleet-upgrade-verification` skill's two
 scripts, or the assistant answering a question; the fourth lists all twenty against the two
-scheduled readers, the daily readiness watch on `main` and the upgrade retrospective, whose collector is in review, with the Saturday `upgrade-readiness-weekly-review` running the readiness rules over every cluster in scope and registering what they find on the findings queue. Entry 10 sits in the second group for its node-pool half, and entry 7 for
+scheduled readers, the daily readiness watch on `main` and the upgrade retrospective, with the Saturday `upgrade-readiness-weekly-review` running the readiness rules over every cluster in scope and registering what they find on the findings queue. Entry 10 sits in the second group for its node-pool half, and entry 7 for
 its webhook rule. Scenario links to the entry's
 section below. Reason says in plain words why the upgrade breaks it. Detection says which reader
 finds it and what a stock install ships for it: the cron jobs in `agents/platform/cron/jobs.json`
@@ -113,7 +113,7 @@ tables under "How each failure is tested" say row by row whether its fixture exi
 repeats neither. Two
 parts of this section change as work merges: the column's in-review items, and the fourth table,
 "Gap to scheduled coverage", whose cells say what the daily readiness watch (`upgrade-readiness-watch`, on `main`) and the
-upgrade retrospective (#2729, in review) cover before and after an upgrade and what is left to
+upgrade retrospective cover before and after an upgrade and what is left to
 build. The column and the table were last reconciled on 2026-10-15.
 
 ### A scheduled audit files it, without anyone asking
@@ -158,7 +158,7 @@ Saturday job `upgrade-readiness-weekly-review` runs the readiness report over ev
 and registers each blocker and risk on the findings queue, which reminds until the user dismisses,
 snoozes or accepts it. The daily
 job `upgrade-readiness-watch` (`agents/platform/cron/jobs.json`, 10:10 UTC) runs the readiness report's rules before an
-upgrade, for a cluster below a version its release channel offers. The weekly job `upgrade-retrospective` (its [design](upgrade-retrospective.md) on `main`; collector #2729, in review) runs
+upgrade, for a cluster below a version its release channel offers. The weekly job `upgrade-retrospective` (its [design](upgrade-retrospective.md) and collector on `main`; the job itself is not yet on the roster) runs
 after one; its collector matches symptoms to this list, and it also reads a set of risk shapes on
 every cluster it reviews and writes them as guards for the readiness watch to print. "Rule" means a
 rule in the readiness report, run daily with the target version known; the entry's own section says

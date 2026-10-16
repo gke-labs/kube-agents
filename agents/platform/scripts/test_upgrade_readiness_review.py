@@ -199,8 +199,9 @@ class Registration(unittest.TestCase):
         members = [seeded_b(), partial]
         findings = [item for m in members for item in review.member_findings(m)]
         with mock.patch.object(review, "kv_request", fake_request):
-            outcomes, problems = review.register(members, [], findings)
+            outcomes, problems, claimed = review.register(members, [], findings)
         self.assertEqual(problems, [])
+        self.assertEqual(claimed, {(PROJECT, "seeded-b")})
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][1]["scope"], {"project": PROJECT, "cluster": "seeded-b", "complete": True, "check_prefix": review.CHECK_PREFIX})
         self.assertNotIn("scope", calls[1][1])
@@ -216,8 +217,8 @@ class Registration(unittest.TestCase):
 
         clean = member("seeded-c")
         with mock.patch.object(review, "kv_request", fake_request):
-            outcomes, problems = review.register([clean], [], [])
-        self.assertEqual((outcomes, problems), ({}, []))
+            outcomes, problems, claimed = review.register([clean], [], [])
+        self.assertEqual((outcomes, problems, claimed), ({}, [], {(PROJECT, "seeded-c")}))
         self.assertEqual(calls, [{"findings": [], "scope": {"project": PROJECT, "cluster": "seeded-c", "complete": True, "check_prefix": review.CHECK_PREFIX}}])
         partial = member("seeded-c")
         partial["readiness"]["read_error"] = "timed out"
@@ -236,8 +237,9 @@ class Registration(unittest.TestCase):
         big = member("seeded-z", "blocked", pdbs={"blocking": [budget(name=f"b{i}") for i in range(review.KV_BATCH_LIMIT + 1)]})
         findings = review.member_findings(big)
         with mock.patch.object(review, "kv_request", fake_request):
-            outcomes, problems = review.register([big], [], findings)
+            outcomes, problems, claimed = review.register([big], [], findings)
         self.assertEqual(problems, [])
+        self.assertEqual(claimed, set())
         self.assertEqual([len(c["findings"]) for c in calls], [review.KV_BATCH_LIMIT, 1])
         self.assertTrue(all("scope" not in c for c in calls))
         self.assertEqual(len(outcomes), review.KV_BATCH_LIMIT + 1)
@@ -249,7 +251,7 @@ class Registration(unittest.TestCase):
         members = [seeded_b()]
         findings = review.member_findings(members[0])
         with mock.patch.object(review, "kv_request", failing):
-            outcomes, problems = review.register(members, [], findings)
+            outcomes, problems, _claimed = review.register(members, [], findings)
         self.assertEqual(len(problems), 1)
         self.assertIn("seeded-b", problems[0])
         self.assertEqual(set(outcomes.values()), {review.REGISTRATION_FAILED})
@@ -475,7 +477,6 @@ class TheRoster(unittest.TestCase):
     def test_the_skill_carries_the_sop_shape_verbatim(self):
         # The on-request route lives in a skill the worker loads; its template
         # must be the SOP's, or a chat brief and a Saturday brief drift apart.
-        import re
         skill = (Path(__file__).resolve().parents[1] / "skills" / "upgrade-readiness-brief" / "SKILL.md").read_text()
         def template(text):
             blocks, current = [], None

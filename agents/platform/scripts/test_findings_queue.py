@@ -449,7 +449,7 @@ class TestRegistration(QueueTestCase):
         upgrade_id = fq.validate_finding(upgrade)["id"]
         inventory_id = fq.validate_finding(sample())["id"]
 
-        result = self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})
+        result = self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})  # empty batch, prefixed claim
 
         self.assertEqual(result, {"results": [], "downgraded": 1})
         self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 0.6)
@@ -478,7 +478,27 @@ class TestRegistration(QueueTestCase):
             self.register()
         with self.assertRaises(fq.FindingError):
             self.register(scope={"project": "acme-prod", "cluster": "prod-eu"})
-        self.assertEqual(self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True}), {"results": [], "downgraded": 0})
+        # Complete and empty, but naming neither a prefix nor a source: it would
+        # reach every row on the cluster, which no caller means.
+        with self.assertRaises(fq.FindingError):
+            self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True})
+        self.assertEqual(self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "source": "inventory"}), {"results": [], "downgraded": 0})
+
+    def test_a_mixed_batch_claims_completeness_for_its_sources_only(self):
+        upgrade = sample(source="audit", check="upgrade-pool-skew", namespace="", object="default-pool")
+        other = sample(source="event-watcher", check="crashloop", object="Deployment/ledger")
+        self.register(sample(), upgrade, other)
+        other_id = fq.validate_finding(other)["id"]
+        upgrade_id = fq.validate_finding(upgrade)["id"]
+        stale = sample(object="Deployment/stale")
+        self.register(stale)
+        stale_id = fq.validate_finding(stale)["id"]
+
+        self.register(sample(), sample(source="event-watcher", check="crashloop", object="Deployment/other"), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True})
+
+        self.assertEqual(fq.get_finding(self.conn, stale_id)["rubric"]["C"], 0.6)
+        self.assertEqual(fq.get_finding(self.conn, other_id)["rubric"]["C"], 0.6)
+        self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 1.0)
 
     def test_absence_does_not_reach_a_state_the_user_set(self):
         accepted = sample(object="Deployment/ledger")

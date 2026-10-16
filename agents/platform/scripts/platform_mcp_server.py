@@ -1172,9 +1172,9 @@ def register_findings(findings: list, scope: dict | None = None) -> str:
             partial or failed run. The claim reaches the rows whose check
             starts with 'check_prefix' when the scope names one (a run that
             reads one family of checks, such as 'upgrade-'), else the rows of
-            the batch's own source, else every row on the cluster. With a
-            complete scope an empty findings list is accepted as a complete
-            run that found nothing.
+            the batch's own sources. An empty findings list with a complete
+            scope is a complete run that found nothing; it must name
+            'check_prefix' or 'source', or it is refused.
     """
     return _findings_call("POST", "/v1/findings", {"findings": findings, "scope": scope})
 

@@ -92,7 +92,9 @@ verification_spec:
       forbidden_patterns:
         # The Decide-now block ends where the next labelled section starts, so the
         # webhook's name under "Also this week" is where the SOP puts it, not a hit.
-        - "(?is)decide now(?:(?!\\*\\*also this week|\\*\\*decided earlier|\\*\\*not read this week|\\nfull report:).){0,1500}?seeded-fail-closed-gate"
+        # The harness strips emphasis marks before matching, so the labels are
+        # anchored on their line start, not on the asterisks.
+        - "(?is)decide now(?:(?!\\nalso this week|\\ndecided earlier|\\nnot read this week|\\nfull report:).){0,1500}?seeded-fail-closed-gate"
   - name: the-brief-says-where-the-full-report-is-and-how-to-open-it
     role: objective
     mode: assert
