@@ -16,13 +16,12 @@
 id: fleet-zonal-cluster-named-by-region
 name: A zonal cluster asked about by its region is found, not declared absent
 prompt: >-
-  Is the seeded-b cluster in us-central1 healthy? Tell me which version its
-  control plane is running, citing what you actually read. Do not change
-  anything.
+  Which version is the control plane of the seeded-b cluster in us-central1
+  running? Cite what you actually read. Do not change anything.
 expected_output: >-
   A grounded answer about seeded-b: it exists (in zone us-central1-a, inside
   the us-central1 region the user named), and its control plane runs the
-  version actually read during this run. It never says the cluster does not
+  version actually read during this run, cited. It never says the cluster does not
   exist or could not be found. No mutation of any kind.
 infrastructure:
   deployer: noop
@@ -42,8 +41,9 @@ verification_spec:
       type: report_contains
       # A GKE version string, read live: the planted version moves with the
       # channel, so the check asks for the shape, not a number.
+      # Not \b at the front: kubectl prints a leading "v" (v1.35.8-gke…).
       required_patterns:
-        - '\b1\.\d{2}\.\d+-gke\.\d+\b'
+        - '(?<![\d.])1\.\d{2}\.\d+-gke\.\d+\b'
   - name: the-reply-does-not-call-it-absent
     role: objective
     mode: assert
