@@ -113,7 +113,15 @@ const (
 	// budget to decide. Sized apart, the sandbox was 5Gi against the agent's
 	// 10Gi and the mirror needed a cap that silently truncated the migration on
 	// any install whose working directories were larger than the guess.
-	agentDataStorageSize = "10Gi"
+	//
+	// 50Gi holds a scope of a few hundred clusters at today's per-profile cost.
+	// Every cluster in scope gets a scaffolded profile under /opt/data/profiles,
+	// and at 10Gi a 209-cluster scope filled the volume in under two hours; the
+	// board's SQLite then failed every write while the CR stayed Ready. On an
+	// existing install growDataClaim widens both claims to this size, online,
+	// where the StorageClass allows expansion. A spec field and a full-volume
+	// condition are the lasting fix.
+	agentDataStorageSize = "50Gi"
 	credentialProxyPort  = 8765
 	// The Chat consumers' broker env: the project id both carry, the legacy
 	// consumer's subscription name, and the fully qualified subscription

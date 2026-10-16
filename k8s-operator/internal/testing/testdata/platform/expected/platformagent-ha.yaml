@@ -272,7 +272,7 @@ spec:
     - ReadWriteMany
   resources:
     requests:
-      storage: 10Gi
+      storage: 50Gi
   storageClassName: standard-rwx
 status: {}
 ---
@@ -803,7 +803,7 @@ spec:
           - ReadWriteOnce
         resources:
           requests:
-            storage: 10Gi
+            storage: 50Gi
       status: {}
     - metadata:
         name: sshd

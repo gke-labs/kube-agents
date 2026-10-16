@@ -100,16 +100,22 @@ The first command omits a key whose value is unset, so a requirement that is not
 The chart's quota check counts the stock release only, not the `spec.mode: next` additions in the capacity row above or the session pods. Autopilot sizes nodes to fit; on a Standard cluster, check the free allocatable against those figures, or a session pod stays `Pending` when one is asked for.
 
 A quota is more than CPU and memory, and so is the check: a stock install also needs 7
-pods, 4 persistent volume claims totalling 22 GiB of `requests.storage`, and 5 GiB of
+pods, 4 persistent volume claims totalling 102 GiB of `requests.storage`, and 5 GiB of
 ephemeral-storage requests against 5 GiB of limits. A namespace quota that caps pod or
 claim counts below what the release needs refuses the install the same way; note that
 constraining ephemeral storage additionally requires every container to declare it (or
 a `LimitRange` to default it), as the chart README explains. Under `spec.mode: next`,
 NATS adds a 40 GiB JetStream persistent volume claim (bringing the total to 5 claims
-totalling 62 GiB of `requests.storage`), and the operator renders a namespace-wide
+totalling 142 GiB of `requests.storage`), and the operator renders a namespace-wide
 `ResourceQuota` on `pods` of `maxSessions + 16` (26 pods by default, from
 `spec.harness.tuning.maxSessions: 10`), sized for the session pods plus the rest
-of the release; anything else you run in the namespace counts against it.
+of the release; anything else you run in the namespace counts against it. The claims
+are also disks: on GKE's default `standard-rwo` class they are balanced persistent
+disks, which count against the project's regional SSD quota (`SSD_TOTAL_GB`) with the
+node boot disks. The chart does not check that quota. A new claim that exceeds it stays
+`Pending` with a `QUOTA_EXCEEDED` event. A claim the operator grows on an upgrade stays
+`Bound` at its old `status.capacity` under the new `spec`, with a `Resizing` condition and
+`VolumeResizeFailed` events, until the quota frees.
 
 Three more things the installer sets on a cluster it creates, and treats differently on one it adopts:
 
