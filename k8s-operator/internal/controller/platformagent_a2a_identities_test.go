@@ -450,6 +450,42 @@ func TestTheEventsWriterCheckIsTightenedByConfigNotByCode(t *testing.T) {
 	}
 }
 
+// The card stop (gke-labs#3263) is opt-in per install: rendered explicitly
+// off, turned on by the controller's own A2A_CARD_STOP=true and nothing
+// else, with its wait beside it at the gateway's default.
+func TestTheCardStopIsOptInThroughTheOperator(t *testing.T) {
+	agent := a2aTestAgent()
+	gatewayEnv := func() map[string]corev1.EnvVar {
+		t.Helper()
+		env := map[string]corev1.EnvVar{}
+		for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+			env[e.Name] = e
+		}
+		return env
+	}
+	env := gatewayEnv()
+	e, ok := env["A2A_CARD_STOP"]
+	if !ok {
+		t.Fatal("the gateway Deployment does not render A2A_CARD_STOP; the card stop has no switch")
+	}
+	if e.Value != "false" {
+		t.Errorf("A2A_CARD_STOP defaults to %q, want \"false\": the control needs images that answer it", e.Value)
+	}
+	if got := env["A2A_CARD_STOP_TIMEOUT"].Value; got != "75s" {
+		t.Errorf("A2A_CARD_STOP_TIMEOUT = %q, want the gateway's default 75s", got)
+	}
+	t.Setenv("A2A_CARD_STOP", "true")
+	if got := gatewayEnv()["A2A_CARD_STOP"].Value; got != "true" {
+		t.Errorf("the controller override did not reach the gateway: %q", got)
+	}
+	for _, near := range []string{"TRUE", "1", "yes"} {
+		t.Setenv("A2A_CARD_STOP", near)
+		if got := gatewayEnv()["A2A_CARD_STOP"].Value; got != "false" {
+			t.Errorf("A2A_CARD_STOP=%q armed the card stop: %q", near, got)
+		}
+	}
+}
+
 // The credential A5 retired, refused by name at the render.
 //
 // Three routes could bring it back and two of them would be quiet. A
