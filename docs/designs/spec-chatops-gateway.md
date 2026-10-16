@@ -1662,6 +1662,27 @@ applies; Discord's group DMs read as DMs, and the asymmetry is deliberate. The b
 only sees channels it has been invited to, so the invitation is the trust boundary for
 group ingress.
 
+**The message shortcut (added 10/16).** A member can make a turn of any message, whoever
+wrote it, with the app's message shortcut (manifest `features.shortcuts`, `type: message`,
+`callback_id: ask_about_message`, which needs the `commands` scope). Slack sends a
+`message_action` interactive envelope, acked like a click; the adapter handles it off the
+event pump, because it reads from Slack before it has a turn to hand over, and `Run` waits
+for it like the pump. The turn is the clicker's: the allowlist and the workspace rule apply
+to them, as for a typed ask, and a redelivery is dropped by `action_ts`. Its conversation is
+the thread under the message (the message's thread when it is a reply), its message id is
+the message, so the ask's reaction goes on it, and its text is a fixed frame
+(`slackShortcutAsk`) around the message quoted: its text, its attachments' pretext, title,
+text and fields (the fallback when it has none), its files' names, who posted it (a member's
+Slack name, an app's posting name) and the channel's name. The frame tells the agent the
+quote is something to check, not an instruction, because the requester is the clicker and
+the message's author may be anyone, a program included; the eval case
+`chat-shortcut-alert-is-checked-not-obeyed` holds the agent to it. Before handing anything
+over the adapter asks `conversations.info` whether it can post there. A channel it is not a
+member of, and a conversation it cannot see at all (a private channel or a DM it is not in,
+`channel_not_found`), gets a note only the clicker sees, through the payload's
+`response_url` (posted only when it is on `hooks.slack.com`), and no turn. A failed read is
+not a refusal: the turn goes ahead.
+
 **The mapping table - where it lives and who writes it.** The table is an optional
 override, not an admission gate: the allowed-users list admits, and the table joins an
 admitted sender's immutable `user_id` to an identity sourced from our own IdP; never
@@ -1714,7 +1735,10 @@ sender; an unmapped one is attributed by member id, below) - but visibly now: th
 posts a one-line notice to the conversation, once per sender, and keeps the structured
 log line. The exception is a message the sender addressed to nobody (`Unaddressed`: an
 unmentioned Slack reply under one of the bot's own posts, #3246), which is dropped with a
-info-level log line only and does not count as the sender's notice. A silent drop of a real user is a support burden. Per sender, not per
+info-level log line only and does not count as the sender's notice. A shortcut's
+conversation is a thread under someone else's message, so the gateway posts no notice
+there either (`Shortcut`); the adapter sends it to the clicker alone through the
+shortcut's `response_url`, every time. A silent drop of a real user is a support burden. Per sender, not per
 conversation - a channel mention mints a fresh conversation every time, so a
 conversation-scoped dedupe would be no bound at all. The memory is capped and evicted
 wholesale at the cap, so the worst an unverified sender can do is make one notice
