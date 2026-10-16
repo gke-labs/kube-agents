@@ -308,3 +308,47 @@ func TestConsoleTurnsPastTheQueueCapAreDroppedWithOneNotice(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestAnUnaddressedMessageFromAnUnverifiedSenderPostsNoNotice: a reply typed
+// under one of the bot's posts without a mention (Unaddressed) is often people
+// talking to each other. An unverified sender there is dropped without the
+// public refusal, and is not counted as notified, so their first real ask
+// still gets it (gke-labs/kube-agents#3246).
+func TestAnUnaddressedMessageFromAnUnverifiedSenderPostsNoNotice(t *testing.T) {
+	r := startRig(t)
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "discord:g1/alert", Kind: "group",
+		AuthorID: "9999", MessageID: "u1", Text: "looks like the db again", Unaddressed: true,
+	}
+	// Same conversation, so the same queue: once this sentinel is submitted,
+	// the unaddressed message ahead of it has been decided.
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "discord:g1/alert", Kind: "group",
+		AuthorID: "1001", MessageID: "u2", Text: "sentinel ask",
+	}
+	waitFor(t, "the sentinel submission", func() bool {
+		env, _ := latestSubmissionOrNil(r.bus)
+		if env == nil {
+			return false
+		}
+		var m lib.Message
+		return json.Unmarshal(env.Payload, &m) == nil && joinTextParts(m.Parts) == "sentinel ask"
+	})
+	for _, p := range r.adapter.postTextsFor("discord:g1/alert") {
+		if strings.Contains(p, "can't verify who you are") {
+			t.Fatalf("an unaddressed message got the public refusal: %q", p)
+		}
+	}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "discord:g1/ask", Kind: "group",
+		AuthorID: "9999", MessageID: "u3", Text: "who am i",
+	}
+	waitFor(t, "the refusal on the sender's first real ask", func() bool {
+		for _, p := range r.adapter.postTextsFor("discord:g1/ask") {
+			if strings.Contains(p, "can't verify who you are on discord") {
+				return true
+			}
+		}
+		return false
+	})
+}

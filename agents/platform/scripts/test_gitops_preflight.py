@@ -1,5 +1,6 @@
 import json
 import os
+import io
 import subprocess
 import sys
 import tempfile
@@ -196,20 +197,74 @@ class PreflightAnswersInOneLine(unittest.TestCase):
         self.assertEqual(0, gitops_preflight.EXIT_REGISTERED)
 
 
+class TheOperatorReadsTheFactFirst(unittest.TestCase):
+    """A blocked card's reason reaches the operator, and a clipped notice keeps
+    its start (review on #3003): the fact and the remedy lead, the worker's
+    stop instruction ends the line."""
+
+    def test_the_stop_instruction_ends_every_stop_line(self):
+        lines = []
+        with _StateDir(entries=None):
+            lines.append(gitops_preflight.preflight()[1])
+        unusable = [{"type": "github", "url": "https://github.example.com:8443/acme/fleet"}]
+        with _StateDir(entries=unusable):
+            lines.append(gitops_preflight.preflight()[1])
+        with _StateDir(entries=ENTRY):
+            lines.append(gitops_preflight.preflight("acme/other")[1])
+        with patch.object(gitops_preflight.gitops_workspace, "get_managed_repos", side_effect=RuntimeError("boom")):
+            lines.append(gitops_preflight.preflight()[1])
+        for line in lines:
+            with self.subTest(line=line[:40]):
+                self.assertTrue(line.endswith(gitops_preflight.STOP), line)
+                self.assertEqual(1, line.count("Stop now:"), line)
+
+    def test_the_no_repository_line_names_the_remedy_before_the_stop(self):
+        with _StateDir(entries=None):
+            line = gitops_preflight.preflight()[1]
+        self.assertLess(line.index("spec.integration.repositories"), line.index("Stop now:"))
+
+
 class ListingShowsBothRegistries(unittest.TestCase):
     """`--list` is for SOUL.md's repository resolution: managed versus context."""
 
-    def test_nothing_registered_lists_none_twice_and_exits_zero(self):
+    def test_nothing_registered_lists_none_twice_then_stops(self):
+        # #3077: a worker read "MANAGED: none" at exit 0 as an answer and ran
+        # a direct delete. The empty list now carries the bare form's stop.
         with _StateDir(entries=None):
             code, text = gitops_preflight.listing()
-        self.assertEqual(gitops_preflight.EXIT_REGISTERED, code)
-        self.assertEqual("MANAGED: none\nCONTEXT: none", text)
+            _, stop = gitops_preflight.preflight()
+        self.assertEqual(gitops_preflight.EXIT_NO_REGISTERED_REPO, code)
+        self.assertEqual(f"MANAGED: none\nCONTEXT: none\n{stop}", text)
+        self.assertTrue(stop.startswith("NO_REGISTERED_REPO: "), stop)
 
     def test_unusable_managed_entries_are_listed_as_unusable_not_none(self):
         unusable = [{"type": "github", "url": "https://github.example.com:8443/acme/fleet"}]
         with _StateDir(entries=unusable):
             code, text = gitops_preflight.listing()
         self.assertTrue(text.startswith("MANAGED: none usable (1 registered, unusable: "), text)
+        self.assertEqual(gitops_preflight.EXIT_NO_REGISTERED_REPO, code)
+        self.assertIn("\nNO_REGISTERED_REPO: 1 registered entry is not usable", text)
+
+    def test_the_stop_comes_from_the_same_read_as_the_managed_line(self):
+        # A registration landing between two reads must not print
+        # "MANAGED: none" above a REGISTERED line: the stop is built from the
+        # list the MANAGED line printed, not from a second get_managed_repos().
+        reads = iter([[], [REPO], [REPO], [REPO]])
+        with _StateDir(entries=None), patch.object(
+            gitops_preflight.gitops_workspace, "get_managed_repos", side_effect=lambda: next(reads)
+        ):
+            code, text = gitops_preflight.listing()
+        self.assertEqual(gitops_preflight.EXIT_NO_REGISTERED_REPO, code)
+        self.assertTrue(text.splitlines()[-1].startswith("NO_REGISTERED_REPO: "), text)
+        self.assertNotIn("REGISTERED: ", text.replace("NO_REGISTERED_REPO: ", ""))
+
+    def test_the_list_as_a_command_exits_3_on_an_empty_registry(self):
+        with _StateDir(entries=None):
+            out = io.StringIO()
+            with patch("sys.stdout", out):
+                code = gitops_preflight.main(["--list"])
+        self.assertEqual(3, code)
+        self.assertEqual("NO_REGISTERED_REPO", out.getvalue().splitlines()[-1].split(":")[0])
 
     def test_managed_and_context_are_listed_apart(self):
         context = [{"type": "github", "url": "https://github.com/acme/tf-live", "ref": "prod"}]
