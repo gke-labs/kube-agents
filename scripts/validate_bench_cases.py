@@ -195,6 +195,11 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    "scope-excluded-cluster-not-listed": (
+        "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
+        "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
+        "cluster exclusion and the case cannot patch the CR for a run"
+    ),
     "networking-world-open-ingress": (
         "#2682: needs bench/tf/fleet's world_open firewall rule and VM applied to "
         "every pool project (fleet re-apply); no pool project has a rule opening a "
