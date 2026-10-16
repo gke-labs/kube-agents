@@ -11,10 +11,11 @@
 # (deploy/docker/patches/kanban_report_format.py) keeps an offer about
 # something the user did not ask about a question, with no `[next: ...]` line.
 #
-# What is graded is the delivered answer (report_contains, final): no
-# declared step names payments-api or the crash. A step about checkout-gateway
-# itself is not this case's concern, nor whether the answer mentions
-# payments-api at all. The safeguards keep the run read-only.
+# What is graded is the delivered answer (report_contains, final): any
+# declared step is about checkout-gateway, the one thing the user asked
+# about. A step about payments-api, inventory-api or anything else in
+# seeded-debug fails it. Whether the answer mentions those at all is not
+# graded. The safeguards keep the run read-only.
 #
 # The prompt names no cluster: fixtures.json is the only thing allowed to
 # address a seeded cluster (cluster-agent-crashloop-debug's header). It names
@@ -29,7 +30,8 @@ id: chat-answer-tangent-offer-declares-no-step
 name: An answer's offer about a workload the user did not ask about declares no step
 prompt: >-
   is checkout-gateway restarting? someone in #oncall said it's crashlooping,
-  but they may have mixed it up with something in seeded-debug
+  though they may have been looking at seeded-debug. I only care about
+  checkout-gateway right now.
 expected_output: >-
   The front door files one card and acks it. The worker finds checkout-gateway
   healthy and not restarting, and may say the workload that is crashlooping is
@@ -53,8 +55,9 @@ fixtures:
   - crashloop-workload
 
 verification_spec:
-  # No declared step reaches for the workload the user did not ask about. The
-  # report is normalized first (lowercased; `*`, `_` and backticks dropped).
+  # Any declared step names checkout-gateway; a step about anything else is an
+  # offer about what the user did not ask. The report is normalized first
+  # (lowercased; `*`, `_` and backticks dropped).
   - name: no-step-about-the-unasked-workload
     role: objective
     # assert, not the converge default: the transcript is immutable once the
@@ -63,7 +66,7 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\[next:[^\]\n]*(?:payments|seeded-debug|crash|oom)'
+        - '\[next:(?![^\]\n]*checkout-gateway)[^\]\n]*\]'
   # The answer is about what was asked: checkout-gateway.
   - name: the-answer-names-checkout-gateway
     role: objective
