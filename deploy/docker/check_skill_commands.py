@@ -43,12 +43,13 @@ A tree with no shell block fails the check, and so do two trees where one path
 is, or holds, the other: an empty copy, or a path repeated from another tree in
 the Dockerfile, would otherwise pass a tree with nothing read.
 
-Tirith is not in the image, so ``main`` downloads the release ``TIRITH_VERSION``
-names into a temporary directory, checks the archive against the digest pinned
-here, and points Hermes at that binary. A pod instead installs Tirith's latest
-release on first use, so the pin can lag the runtime: a rule a newer release
-adds is refused in production before this check sees it. Raising the pin is a
-change of its own, with the digests copied from that release's
+The image carries the pinned Tirith on PATH (``deploy/docker/Dockerfile``'s
+``a2a-tools`` stage), and the image build passes it with ``--tirith-bin``, so the
+check scans with the binary that ships. Run anywhere else, ``main`` downloads the
+release ``TIRITH_VERSION`` names into a temporary directory, checks the archive
+against the digest pinned here, and points Hermes at that binary. The Dockerfile
+pins the same version and digests, and the tests hold the two equal. Raising the
+pin is a change of its own, with the digests copied from that release's
 ``checksums.txt``; pinning is what keeps a Tirith release from failing pull
 requests that did not touch a skill. Two probe commands with a known verdict
 run before and after the scan, and fail-open is off, so a binary that does not
