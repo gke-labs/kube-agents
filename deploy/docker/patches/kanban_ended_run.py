@@ -312,6 +312,7 @@ _WAITED_ON_SQL = (
 )
 # What identifies the lead, compared after normalising (see _lead_end).
 _LEAD_KEY = "result from a run that was re-queued when a prerequisite was added"
+_LEAD_TAIL = "pull request"
 _CURLY = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'})
 
 
@@ -320,8 +321,9 @@ def _lead_end(body: str) -> int:
     three lines opens with the lead. Tolerant of what a worker does to a line
     it was shown in quotes: a heading or blank line before it, leading quote
     marks, Markdown emphasis or code ticks, curly apostrophes, case. The
-    result starts after the lead's closing colon, or on the next line if there
-    isn't one."""
+    result starts after the lead's own tail ("pull request", and its colon if
+    one follows), or on the next line if the tail isn't on this one. Never at
+    the first colon: that may be the result's own, in a URL or a time."""
     folded = body.translate(_CURLY).lower()
     offset = 0
     for line in folded.split("\n")[:3]:
@@ -329,8 +331,11 @@ def _lead_end(body: str) -> int:
         if head.startswith(_LEAD_KEY):
             start = offset + (len(line) - len(head)) + len(_LEAD_KEY)
             line_end = offset + len(line)
-            colon = folded.find(":", start, line_end)
-            return colon + 1 if colon != -1 else min(line_end + 1, len(body))
+            tail = folded.find(_LEAD_TAIL, start, line_end)
+            if tail == -1:
+                return min(line_end + 1, len(body))
+            end = tail + len(_LEAD_TAIL)
+            return end + 1 if folded[end:end + 1] == ":" else end
         offset += len(line) + 1
     return -1
 

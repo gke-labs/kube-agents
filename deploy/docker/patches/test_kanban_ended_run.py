@@ -415,6 +415,22 @@ class TestSavedResultBanner(unittest.TestCase):
                 self.event(ker.DEPENDENCY_WAIT_EVENT)
                 self.assertIn("> web-7 is fine", ker.saved_result_banner(self.conn, TID))
 
+    def test_a_colon_in_the_result_is_not_taken_for_the_leads(self):
+        """A lead written without its tail, then a result with a URL on the
+        same line, mustn't be cut at "https:"."""
+        url = "https://github.com/o/r/pull/12"
+        for body in (ker.SAVED_RESULT_LEAD + " opened " + url,
+                     ker.SAVED_RESULT_LEAD.rstrip(":") + " opened " + url,
+                     ker.SAVED_RESULT_LEAD.split(";")[0] + " - opened\nPR " + url):
+            with self.subTest(body=body[-40:]):
+                self.conn.execute("DELETE FROM task_comments")
+                self.conn.execute("DELETE FROM task_events")
+                self.comment(body)
+                self.event(ker.DEPENDENCY_WAIT_EVENT)
+                banner = "\n".join(ker.saved_result_banner(self.conn, TID))
+                self.assertIn(url, banner)
+                self.assertNotIn("> //github.com", banner)
+
     def test_the_results_own_marks_are_kept(self):
         """Only the lead's closing mark is shed: a bullet, a closing fence and
         a trailing backtick belong to the result."""
