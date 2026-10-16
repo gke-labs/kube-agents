@@ -1,6 +1,6 @@
 """Stop kanban workers leaking out of ``run_conversation`` without a board write.
 
-Seven anchored edits across six files. Since v2026.9.14 the turn loop is split
+Eight anchored edits across six files. Since v2026.9.14 the turn loop is split
 into phase helpers under ``agent/turn_*.py``, each returning a verdict the loop
 copies back into its locals, so every site lives in the module that owns its
 phase:
@@ -10,8 +10,8 @@ phase:
    kanban stop gate that runs only in the text-response phase
    (``agent/turn_stop_gates.py``). Nudge the worker to finish on the board and
    return ``_verdict("continue")`` instead.
-2. ``agent/turn_finalizer.py`` — a backstop in ``finalize_turn``, the single
-   funnel every exit passes through, for the six sibling exits that leak the
+2. ``agent/turn_finalizer.py`` — a backstop in ``finalize_turn``, the funnel
+   every exit without a failed result passes through, for the six sibling exits that leak the
    same way and for the halt path when its nudges are spent. A
    retries-exhausted exit whose last failure was a rate limit is blocked with
    the provider's text instead of being charged a ``timed_out``. Either write
@@ -27,7 +27,12 @@ phase:
 5. ``hermes_cli/cli_chat_turn_mixin.py`` — ``_chat_render_turn``, where the
    non-quiet ``chat -q`` path every normal worker takes last holds the failed
    result. Same block; whichever of the two runs second finds the card already
-   moved.
+   moved. After it, ``close_failed_chat_turn`` picks the exit code the ``-Q``
+   path would use for a failed result (1, or 75 for a rate limit; ``billing``
+   gets 1 here). For anything but a rate limit it charges the run itself
+   (``crashed``, counted, claim released, text clear of
+   ``check_respawn_guard``'s pattern), so the reaper's burst breaker never
+   sees it, and then leaves the reason on the card as a comment.
 6. ``hermes_cli/kanban_db_dispatch.py`` — two edits to ``_record_task_failure``:
    an ``expected_run_id`` keyword, and a check of it against the
    ``current_run_id`` the function already reads inside its write transaction.
@@ -38,12 +43,18 @@ phase:
    ``heartbeat_worker`` already take the same keyword. ``apply_kanban_scheduling``
    edits a later part of the same function (the trip floor) and runs first;
    neither anchor overlaps it.
+7. ``cli.py`` — ``_run_single_query_mode``'s non-quiet branch, after
+   ``chat()`` and the resume summary: exit with the code edit 5 left on the
+   CLI object, or 1 for a kanban worker whose ``chat()`` returned before any
+   turn ran (``-Q`` exits 1 for the same credential and agent-init failures).
+   Without it the chat path exits 0 for every failed turn, and a failure edit
+   5 could not record is booked as a protocol violation.
 
 The inserts mirror code that is already in the tree: edit 1 copies the shape of
 upstream's kanban stop gate in ``agent/turn_stop_gates.py`` (local import,
 synthetic user row through ``append_message``, nudge counter on the agent), and
 edit 2 copies the ``_record_task_failure`` call ``_resolve_budget_fallback``
-directly above it already makes. None is idempotent: edits 1 to 5 sit next to
+directly above it already makes. None is idempotent: edits 1 to 5 and 7 sit next to
 their anchors rather than consuming them, and edit 6 splits its two anchors
 with the inserted lines. Either way a second run cannot be told from the
 anchors alone, so a marker check refuses it.
@@ -290,9 +301,14 @@ CHAT_INSERT = '''        # kube-agents patch: the non-quiet single-query path ev
         # never reaches the exit-code block in cli.py, so this is where its
         # failed result is last in hand. Block the card here on a 429
         # exhaustion; the exit-code site covers the -Q path and finds nothing
-        # left to do when this ran first.
+        # left to do when this ran first. Then, for any other failure, charge
+        # the run to the card (counted, back to ready), leave the reason as a
+        # comment once that landed, and pick the exit code the -Q path would
+        # have used (billing aside); _run_single_query_mode exits with it
+        # after the summary.
         # See hermes_cli/kanban_guardrail_exit.py.
         if turn.result and os.environ.get("HERMES_KANBAN_TASK"):
+            self._kube_kanban_turn_seen = True
             try:
                 from hermes_cli.kanban_guardrail_exit import (
                     block_rate_limited_worker as _kube_block_rate_limited_chat,
@@ -307,6 +323,56 @@ CHAT_INSERT = '''        # kube-agents patch: the non-quiet single-query path ev
                 logging.getLogger(__name__).debug(
                     "kanban rate-limit block failed", exc_info=True
                 )
+            try:
+                from hermes_cli.kanban_guardrail_exit import (
+                    close_failed_chat_turn as _kube_close_failed_chat_turn,
+                )
+
+                _kube_exit_code = _kube_close_failed_chat_turn(turn.result)
+                if _kube_exit_code is not None:
+                    self._kube_kanban_exit_code = _kube_exit_code
+                    logging.getLogger(__name__).info(
+                        "kanban task %s: failed turn (failure_reason=%s), exiting %s",
+                        os.environ.get("HERMES_KANBAN_TASK", ""),
+                        turn.result.get("failure_reason"),
+                        _kube_exit_code,
+                    )
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    "kanban failed-turn exit failed", exc_info=True
+                )
+'''
+
+# ``_run_single_query_mode``'s non-quiet branch: the one ``chat()`` turn and the
+# resume summary. The exit goes after both, still inside the ``try`` whose
+# ``finally`` runs ``_finalize_single_query``, which is the same place the -Q
+# branch's ``sys.exit`` leaves from.
+SINGLE_QUERY_ANCHOR = (
+    "        cli.chat(query, images=single_query_images or None)\n"
+    "        cli._print_exit_summary(clear_screen=False)\n"
+)
+
+SINGLE_QUERY_INSERT = '''        # kube-agents patch: a kanban worker whose turn failed exits the way
+        # the -Q path does (exit 1; 75 for a rate limit) instead of 0.
+        # _chat_render_turn set the code after recording the failure; if that
+        # record was refused, this exit is what the reaper counts instead of
+        # booking a protocol violation. A worker whose chat() returned before
+        # any turn (credentials or agent init failed) exits 1, as -Q does.
+        # See hermes_cli/kanban_guardrail_exit.py.
+        _kube_kanban_exit_code = getattr(cli, "_kube_kanban_exit_code", None)
+        try:
+            from hermes_cli.kanban_guardrail_exit import (
+                single_query_exit_code as _kube_single_query_exit_code,
+            )
+
+            _kube_kanban_exit_code = _kube_single_query_exit_code(
+                _kube_kanban_exit_code,
+                turn_seen=getattr(cli, "_kube_kanban_turn_seen", False),
+            )
+        except Exception:
+            logger.debug("kanban single-query exit check failed", exc_info=True)
+        if _kube_kanban_exit_code:
+            sys.exit(_kube_kanban_exit_code)
 '''
 
 # The end of ``_record_task_failure``'s signature. The keyword goes last so no
@@ -384,6 +450,13 @@ EDITS = (
         CHAT_ANCHOR,
         CHAT_INSERT + CHAT_ANCHOR,
         "_kube_block_rate_limited_chat",
+    ),
+    (
+        CLI_RELATIVE,
+        "failed kanban turn single-query exit",
+        SINGLE_QUERY_ANCHOR,
+        SINGLE_QUERY_ANCHOR + SINGLE_QUERY_INSERT,
+        "sys.exit(_kube_kanban_exit_code)",
     ),
     (
         DISPATCH_RELATIVE,

@@ -321,14 +321,23 @@ are scaffolded.
 Both limits matter because they fail the same way, and it is not an obvious way. A run that
 exhausts either stops mid-task without ever calling a terminal kanban tool. The card is charged a
 `timed_out` failure whose error text names how the turn ended — `Iteration budget exhausted (N/M)`
-for `maxTurns`, `turn_exit_reason=all_retries_exhausted_no_response` for `apiMaxRetries` — and
-retrying re-runs into the same wall, so read that text and the upstream error rate before suspecting
-the worker. One `apiMaxRetries` exhaustion is handled differently: when the retries were spent on
-provider rate limits (429s), the worker blocks its own card instead, kind `transient`, with the
-provider's error text as the reason; `kanban_unblock` it once the quota window has passed. A
-second rate-limit block after an unblock sends the card to `triage`. An exit like this that reaches
-the dispatcher unexplained surfaces instead as a **protocol violation**, which describes the
-symptom and hides the cause; the image narrows that window in
+for `maxTurns`, `turn_exit_reason=all_retries_exhausted_no_response` for an `apiMaxRetries`
+exhaustion that ends with no response — and retrying re-runs into the same wall, so read that text
+and the upstream error rate before suspecting the worker. One `apiMaxRetries` exhaustion is handled
+differently: when the retries were spent on provider rate limits (429s), the worker blocks its own
+card instead, kind `transient`, with the provider's error text as the reason; `kanban_unblock` it
+once the quota window has passed. A second rate-limit block after an unblock sends the card to
+`triage`. A turn that fails outright, because the provider refused the call (an HTTP 401, a billing
+wall, a safety block) or the last retry ended on an error, is recorded by the worker itself: the
+error Hermes reported goes on the card as a comment, the run is charged as `crashed` and counted,
+and the card goes back to `ready` until it reaches its retry limit. The chat thread shows the
+generic "worker crashed" line for it, so read the card's comment for the cause. The charge's own
+error text names no provider error, so the dispatcher retries the card rather than parking it as
+an auth or quota failure. Goal-mode cards, which the dispatcher runs as a loop of turns judged
+against the card's goal, get none of this: their failures exit through the dispatcher's reaper as
+before, with exit 1, or exit 75 and a `rate_limited` run for a rate limit or a billing wall. A run
+that stops without a terminal call and reaches the dispatcher unexplained surfaces instead as a
+**protocol violation**, which describes the symptom and hides the cause; the image narrows that window in
 [`deploy/docker/patches/kanban_guardrail_exit.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_guardrail_exit.py).
 
 Sizing notes: `maxTurns` is consumed mostly by repository exploration, so scale it against how much
