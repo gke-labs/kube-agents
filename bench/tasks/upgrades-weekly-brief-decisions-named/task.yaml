@@ -84,11 +84,13 @@ verification_spec:
         - readiness-drain-blocked
       any_of_patterns:
         # One line: the cluster, the budget and its cost must sit on the same
-        # Decide-now line, so the gaps never cross a line break, and the id's
-        # own "drain-blocking" does not count as the cost clause.
-        - "(?i){cluster:b}[^\\n]{0,400}?pinned-batch-runner[^\\n]{0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)"
-        - "(?i)pinned-batch-runner[^\\n]{0,400}?{cluster:b}[^\\n]{0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)"
-        - "(?i){cluster:b}[^\\n]{0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)[^\\n]{0,400}?pinned-batch-runner"
+        # Decide-now line, so the gaps never cross a line break; the cost word
+        # must come before the action ("Do:"), so an action phrased with evict
+        # or drain is not taken for the cost clause; and the id's own
+        # "drain-blocking" does not count as one either.
+        - "(?i){cluster:b}[^\\n]{0,400}?pinned-batch-runner(?:(?!\\bdo:)[^\\n]){0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)"
+        - "(?i)pinned-batch-runner[^\\n]{0,400}?{cluster:b}(?:(?!\\bdo:)[^\\n]){0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)"
+        - "(?i){cluster:b}(?:(?!\\bdo:)[^\\n]){0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)[^\\n]{0,400}?pinned-batch-runner"
   - name: the-webhook-outage-is-not-a-decision
     role: objective
     mode: assert
@@ -116,7 +118,11 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      required_phrases: ["dismiss", "snooze", "accept"]
+      any_of_patterns:
+        # The closing line's decision words, or the live brief's form of that
+        # line (no queue record yet, so no id to decide with until Saturday).
+        - "(?is)\\bdismiss\\b.{0,200}?\\bsnooze\\b.{0,200}?\\baccept\\b"
+        - "(?i)each gets an id you can decide with"
   - name: no-invented-cves
     role: objective
     mode: assert

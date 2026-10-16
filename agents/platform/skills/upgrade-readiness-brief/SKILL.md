@@ -30,8 +30,9 @@ gets the same shape in chat. Read only. Register nothing, decide nothing, upgrad
      path are critical; a budget over several replicas, a webhook refusing only what it matches
      today and a pool at the ceiling are major; a covering exclusion is minor; a readiness rule's
      risk takes the severity the review's rubric gives its catalogue entry), name objects where the
-     queue would give ids, and say "live brief, composed now; the weekly review has not run" in the
-     headline.
+     queue would give ids, say "live brief, composed now; the weekly review has not run" in the
+     headline, and close with the live form of the last line: there is no report file and no id to
+     reply with until the Saturday review registers them.
 2. Read the queue, with the `platform_control` tools:
    - `get_ranked_findings`: the open backlog. Keep the rows whose `check` starts with `upgrade-`.
      A row in state `queued` **or** `surfaced` is **undecided**: nobody has decided on it, whether or
@@ -57,6 +58,7 @@ gets the same shape in chat. Read only. Register nothing, decide nothing, upgrad
    <when project_failures is not empty: "**Not read this week:** <project>: <reason>; last week's findings there stand.">
 
    Full report: /opt/data/upgrade-readiness/weekly/latest.md on the agent. Reply "show me this week's upgrade readiness report" to read it here, or reply with an id and `dismiss`, `snooze until <date>` or `accept` to decide.
+   <for a live brief, instead: "No weekly record yet: the Saturday review registers these on <next Saturday>, and each gets an id you can decide with. Reply "show me the upgrade readiness report" for the table.">
    ```
 
    - **Decide now** lists the undecided criticals, worst first (the queue's order), one line per

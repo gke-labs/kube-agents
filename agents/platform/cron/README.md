@@ -307,7 +307,7 @@ and a webhook refusing only what it matches today are major; a covering exclusio
 the user dismissed stays dismissed; and the hourly nudge paces what is named and reminds daily of
 undecided criticals. A cluster read in full sends its batch with a `scope` naming the job's own
 check family (`upgrade-`), an empty batch when nothing was found, so a finding the week no longer
-reports loses confidence and stops being reminded without touching another source's rows on that
+reports loses confidence and stops being reminded without touching another family's rows on that
 cluster; a cluster with more findings than one batch holds (500) is sent in pieces that claim
 nothing. The script writes the technical report under `upgrade-readiness/weekly/` beside the
 watch's ledger, keeps the newest eight runs, and places a copy of `latest.md` and `latest.json` in
@@ -316,7 +316,7 @@ nothing on success: the brief speaks for the week and the queue for each finding
 not read is one line naming it; a batch the findings queue refused, or a sandbox copy that failed,
 is one line each, since both leave the week's findings where the brief cannot act on them; a
 failure of the run is one line, once per distinct failure (numbers aside), with the recovery line
-on the next clean run. The entry declares `risk: high` as the watch does: the budget, pool, exclusion and webhook names it reads are tenant-written, and they reach the queue, the report and the sandbox copy.
+on the next clean run. The entry declares `risk: high` as the watch does: the budget, pool, exclusion and webhook names it reads are tenant-written, and they reach the queue, the report, the sandbox copy and, by queue id and object name, the brief in chat.
 
 `upgrade-readiness-weekly-brief` (`0 7 * * 6`, an hour after the review starts and past its
 budget) is the model turn, and the reason the pair is not one job: the review can rank by rubric

@@ -13,9 +13,9 @@ else is read, and nothing is run.
 
 **Cron id:** `upgrade-readiness-weekly-brief` — `0 7 * * 6` (Saturdays, 07:00 UTC), an hour after
 `upgrade-readiness-weekly-review` starts. The review grades every cluster in scope and registers what
-it finds on the findings queue inside a 45-minute budget, so by 07:00 its summary is on disk, its
-failure line is in chat, or (a run the hour cut short before its record) neither, which step 1
-treats as a review that did not finish; nothing else sequences the two.
+it finds on the findings queue inside a 45-minute budget, so by 07:00 its summary is on disk, or
+chat carries one of its lines: the failure line, the partial line, or the line that says its copy
+did not land. Step 1 says what each means; nothing else sequences the two.
 
 **Why a model turn.** The review job can rank by rubric; it cannot tell that two criticals on one
 cluster are one problem, that a major on the cluster the agent itself runs on outranks a critical on
@@ -40,12 +40,15 @@ shape; the model chooses the emphasis.
    `project`, `cluster`, `namespace`, `object`, `title`, `action`, `outcome`), `new_ids`, `suppressed_ids`,
    `no_longer_reported_ids`, `project_failures`, `registration_errors` and `report_path`.
 
-2. If the file is missing, or `generated_at` is older than **48 hours**, the review did not
-   finish this week (it did not run, or the hour cut it short before its record). Say so in one
-   line, name the job (`upgrade-readiness-weekly-review`) and the last `generated_at` you found,
-   and stop. Do not run the readiness report yourself from this job: the
-   queue would hold nothing for the findings, and a brief that names findings nobody can decide on
-   is noise.
+2. If the file is missing, or `generated_at` is older than **48 hours**, the review's record did
+   not reach you: the review did not run, the hour cut it short before its record, or its sandbox
+   copy failed after its registrations and its record (the review's own chat line, posted before
+   07:00, says which). Say so in the headline, name the job (`upgrade-readiness-weekly-review`) and
+   the last `generated_at` you found, and compose **Decide now** from the queue alone (step 2): the
+   ids are there whatever happened to the copy. Leave out the headline's counts and **Also this
+   week**, which only the summary gives. Do not run the readiness report yourself from this job:
+   the queue would hold nothing for the findings, and a brief that names findings nobody can decide
+   on is noise.
 3. Read the full report when a line needs more than the summary row says:
 
    ```bash
@@ -91,6 +94,7 @@ Upgrade readiness, week of <YYYY-MM-DD>: <n> clusters reviewed, <b> blocked, <r>
 <when project_failures is not empty: "**Not read this week:** <project>: <reason>; last week's findings there stand.">
 
 Full report: /opt/data/upgrade-readiness/weekly/latest.md on the agent. Reply "show me this week's upgrade readiness report" to read it here, or reply with an id and `dismiss`, `snooze until <date>` or `accept` to decide.
+<for a live brief, instead: "No weekly record yet: the Saturday review registers these on <next Saturday>, and each gets an id you can decide with. Reply "show me the upgrade readiness report" for the table.">
 ```
 
 Rules for the judgement:
@@ -158,7 +162,9 @@ its shape is the one in section 3, kept identical by a test.
   minor; a rule's risk takes the severity the review's rubric gives its catalogue entry), read the queue
   for any decision already recorded, and compose the same shape. Say "live brief, composed now; the
   weekly review has not run" in the headline, use the object's name where the queue would have an
-  id, and register nothing: the Saturday review owns the queue.
+  id, close with the live form of the last line (there is no report file and no id to reply with
+  until the Saturday review registers them), and register nothing: the Saturday review owns the
+  queue.
 - **A decision in reply** ("`<id>` dismiss", "snooze until 2026-11-01", "accept") is not this
   SOP's to apply: the Chat Agent files it as a card and the `update_finding` tool records it. Do
   not answer a decision with a new brief.

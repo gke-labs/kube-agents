@@ -59,6 +59,9 @@ class FindingNotFound(KeyError):
 
 
 SOURCES = ("inventory", "event-watcher", "audit", "upgrade-readiness")
+# A check family is the slug up to and including its first separator (`upgrade-`):
+# what a complete claim may name with `scope.check_prefix`.
+CHECK_FAMILY_SEPARATOR = "-"
 SEVERITIES = ("critical", "major", "minor")
 REMEDIATION_KINDS = ("manifest", "gcloud", "manual")
 VERIFICATION_KINDS = ("kubectl", "gcloud", "manual")
@@ -787,12 +790,13 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
     An empty batch is a run that found nothing: refused without a complete
     `scope` (there is nothing to do), accepted with one, where the point is
     that every row the claim covers was absent (§5.2). A complete claim
-    reaches the rows its `check_prefix` names, whatever wrote them; else the
-    rows of the batch's own sources, or of `scope.source`, which must be a
-    known source and, when the batch is not empty, one the batch wrote; a
-    complete claim that names neither a prefix nor a source and carries no
-    findings is refused, since it would reach every row on the cluster and no
-    caller means that.
+    reaches the rows its `check_prefix` names, whatever wrote them, where the
+    prefix is a check family (it ends with `-`) and, when the batch is not
+    empty, one every row of the batch belongs to; else the rows of the batch's
+    own sources, or of `scope.source`, which must be a known source and, when
+    the batch is not empty, one the batch wrote; a complete claim that names
+    neither a prefix nor a source and carries no findings is refused, since it
+    would reach every row on the cluster and no caller means that.
     """
     if not isinstance(findings, list):
         raise FindingError("findings must be a list")
@@ -802,7 +806,7 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
     if len(findings) > MAX_BATCH:
         raise FindingError(f"batch is {len(findings)} findings, over the {MAX_BATCH} limit")
 
-    results, seen, sources = [], set(), set()
+    results, seen, sources, checks = [], set(), set(), set()
     for index, raw in enumerate(findings):
         try:
             finding = validate_finding(raw)
@@ -811,12 +815,21 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
         results.append({"id": finding["id"], "outcome": _register_one(conn, finding)})
         seen.add(finding["id"])
         sources.add(finding["source"])
+        checks.add(str(finding.get("check_slug") or finding.get("check") or ""))
 
     downgraded = 0
     if complete:
         project = _text(scope.get("project"), "scope.project")
         cluster = _text(scope.get("cluster"), "scope.cluster")
-        check_prefix = _text(scope.get("check_prefix"), "scope.check_prefix", required=False)
+        raw_prefix = scope.get("check_prefix")
+        if raw_prefix is not None and not isinstance(raw_prefix, str):
+            raise FindingError("scope.check_prefix must be a string")
+        # Folded as the stored check is, so the two sides cannot drift.
+        check_prefix = _text(raw_prefix, "scope.check_prefix", required=False).lower()
+        if check_prefix and not check_prefix.endswith(CHECK_FAMILY_SEPARATOR):
+            raise FindingError(f"scope.check_prefix is {_brief(check_prefix)}; a check family ends with '{CHECK_FAMILY_SEPARATOR}', as 'upgrade-' does")
+        if check_prefix and checks and not all(check.startswith(check_prefix) for check in checks):
+            raise FindingError("scope.check_prefix names a family the batch did not write; a claim reaches only what the run read")
         named = _text(scope.get("source"), "scope.source", required=False)
         if named and named not in SOURCES:
             raise FindingError(f"scope.source is {_brief(named)}; must be one of {list(SOURCES)}")

@@ -1179,7 +1179,8 @@ def register_findings(findings: list, scope: dict | None = None) -> str:
             confidence of queued rows the run did not re-report. Omit it for a
             partial or failed run. The claim reaches the rows whose check
             starts with 'check_prefix' when the scope names one (a run that
-            reads one family of checks, such as 'upgrade-'), whatever wrote
+            reads one family of checks, such as 'upgrade-'; a family ends with
+            '-', and a batch with findings must belong to it), whatever wrote
             them; else the rows of the batch's own sources, or of 'source',
             which must be a known source and one the batch wrote. An empty
             findings list with a complete scope is a complete run that found

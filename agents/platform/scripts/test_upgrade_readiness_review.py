@@ -406,10 +406,10 @@ class TheRecord(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
 
-    def summary_for(self, members, outcomes=None, previous=None):
+    def summary_for(self, members, outcomes=None, previous=None, claimed=None):
         findings = [item for m in members for item in review.member_findings(m)]
         outcomes = outcomes if outcomes is not None else {review.item_id(f): "created" for f in findings}
-        doc = review.summary(stamp="20261018T060000Z", now=NOW, names=[PROJECT], members=members, errors=[], failures={}, findings=findings, outcomes=outcomes, problems=[], previous=previous, report_path=self.home / "x")
+        doc = review.summary(stamp="20261018T060000Z", now=NOW, names=[PROJECT], members=members, errors=[], failures={}, findings=findings, outcomes=outcomes, problems=[], previous=previous, report_path=self.home / "x", claimed=claimed)
         return doc, findings
 
     def test_the_summary_counts_verdicts_severities_and_the_delta(self):
@@ -428,6 +428,12 @@ class TheRecord(unittest.TestCase):
         partial["readiness"]["read_error"] = "timed out"
         doc2, _ = self.summary_for([seeded_b(), partial], previous={"findings": [gone, unread, half_read, kept]})
         self.assertEqual(doc2["no_longer_reported_ids"], [gone["id"]])
+        # A cluster read in full whose claim never reached the queue (a batch
+        # refused, or sent in pieces) keeps last week's rows unjudged too.
+        doc3, _ = self.summary_for([seeded_b(), partial], previous={"findings": [gone, unread, half_read, kept]}, claimed=set())
+        self.assertEqual(doc3["no_longer_reported_ids"], [])
+        doc4, _ = self.summary_for([seeded_b(), partial], previous={"findings": [gone, unread, half_read, kept]}, claimed={f"{PROJECT}/us-central1-a/seeded-b"})
+        self.assertEqual(doc4["no_longer_reported_ids"], [gone["id"]])
 
     def test_the_report_names_every_finding_with_its_id_and_action(self):
         doc, findings = self.summary_for([seeded_b()])
@@ -474,6 +480,17 @@ class TheRecord(unittest.TestCase):
         exec(second.replace(json.dumps(review.SANDBOX_COPY_DIR), json.dumps(str(fake_dir))), {})  # noqa: S102 - the program under test
         self.assertEqual((fake_dir / "latest.md").read_text(encoding="utf-8"), "# second\n")
         self.assertEqual(oct(os.stat(fake_dir).st_mode & 0o777), oct(review.SANDBOX_COPY_DIR_CLOSED_MODE))
+        self.assertEqual(sorted(p.name for p in fake_dir.iterdir()), ["latest.json", "latest.md"])  # no temporary file left behind
+        # A write that fails leaves the previous pair whole and the directory closed.
+        broken = review.sandbox_copy_program({"latest.md": "# third\n", "latest.json": "{}"}).replace(json.dumps(review.SANDBOX_COPY_DIR), json.dumps(str(fake_dir)))
+        broken = broken.replace("    for name in FILES:", "    raise OSError('disk full')\n    for name in FILES:")
+        with self.assertRaises(OSError):
+            exec(broken, {})  # noqa: S102 - the program under test
+        self.assertEqual((fake_dir / "latest.md").read_text(encoding="utf-8"), "# second\n")
+        self.assertEqual(oct(os.stat(fake_dir).st_mode & 0o777), oct(review.SANDBOX_COPY_DIR_CLOSED_MODE))
+        os.chmod(fake_dir, review.SANDBOX_COPY_DIR_OPEN_MODE)
+        for stray in fake_dir.glob("*" + review.TMP_SUFFIX):
+            stray.unlink()
         os.chmod(fake_dir, review.SANDBOX_COPY_DIR_OPEN_MODE)  # so the fixture's cleanup can remove it
 
     def test_without_an_ssh_sandbox_the_copy_is_a_plain_local_write(self):
@@ -613,18 +630,59 @@ class TheTick(unittest.TestCase):
                 raise RuntimeError("the sandbox run timed out after 1500s")
             return self.envelope
 
-        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: f"{PROJECT},{OTHER_PROJECT}"}), mock.patch.object(watch, "run_report", side_effect=run_report):
+        # `projects()` sorts, which would put acme-dev first on its own; the
+        # names are handed unsorted so the second run's order is `ordered_names`'s.
+        with mock.patch.object(watch, "projects", return_value=[PROJECT, OTHER_PROJECT]), mock.patch.object(watch, "run_report", side_effect=run_report):
             code, out = self.run_main()
         self.assertEqual(code, 0)
+        self.assertEqual(calls, [PROJECT, OTHER_PROJECT])
         self.assertIn("1 project(s) not read this week: acme-dev: the sandbox run timed out", out)
         self.assertEqual(len(self.registered), 2)
         latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
         self.assertEqual(latest["project_failures"], {OTHER_PROJECT: "the sandbox run timed out after 1500s"})
         # Next run, the project that failed goes first.
-        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: f"{PROJECT},{OTHER_PROJECT}"}), mock.patch.object(watch, "run_report", side_effect=run_report):
+        with mock.patch.object(watch, "projects", return_value=[PROJECT, OTHER_PROJECT]), mock.patch.object(watch, "run_report", side_effect=run_report):
             calls.clear()
             self.run_main()
-        self.assertEqual(calls[0], OTHER_PROJECT)
+        self.assertEqual(calls, [OTHER_PROJECT, PROJECT])
+
+    def test_a_project_whose_listing_failed_is_not_read(self):
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            if names[0] == OTHER_PROJECT:
+                return {"exit": 0, "tables": "", "report": {"members": [], "errors": [{"project": OTHER_PROJECT, "location": None, "message": "clusters list: PERMISSION_DENIED"}]}}
+            return self.envelope
+
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: f"{PROJECT},{OTHER_PROJECT}"}), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("1 project(s) not read this week: acme-dev: clusters list: PERMISSION_DENIED", out)
+        latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
+        self.assertEqual(latest["project_failures"], {OTHER_PROJECT: "clusters list: PERMISSION_DENIED"})
+        self.assertEqual(len(self.registered), 2)  # the read project's two members, nothing for the unlisted one
+
+    def test_a_run_the_budget_cut_short_is_said_as_such(self):
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            if names[0] == OTHER_PROJECT:
+                raise watch.SandboxTimedOut(f"the sandbox run timed out after {int(timeout)}s")
+            return self.envelope
+
+        with mock.patch.object(watch, "projects", return_value=[PROJECT, OTHER_PROJECT]), mock.patch.object(review, "PROJECT_TIMEOUT_SECONDS", 1500), mock.patch.object(review, "TOTAL_BUDGET_SECONDS", 900), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("cut short by the review's time budget", out)
+        self.assertNotIn("the sandbox run timed out", out)
+
+    def test_two_rows_that_derive_one_id_are_one_finding(self):
+        twice = with_rules()
+        twice["readiness"]["risks"].append({"rule": "zonal-control-plane", "entry": 11, "text": "control plane is zonal (us-central1-a), said again"})
+        found = review.rule_findings(twice)
+        self.assertEqual(len(found), 4)  # the mapper itself keeps both zonal rows
+        merged = [f for f in review.member_findings(twice) if f["check"] == "upgrade-zonal-control-plane"]
+        self.assertEqual(len(merged), 1)
+        self.assertIn("said again", merged[0]["detail"])
+        self.assertIn(review.DUPLICATE_DETAIL_SEPARATOR.strip(), merged[0]["detail"])
+        ids = [review.item_id(f) for f in review.member_findings(twice)]
+        self.assertEqual(len(ids), len(set(ids)))
 
     def test_each_project_is_registered_before_the_next_one_runs(self):
         events = []

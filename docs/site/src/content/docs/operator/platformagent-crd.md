@@ -704,7 +704,7 @@ spec:
   `RECONCILE_EXCLUDE` environment variable, which matched bare names across every project and keeps
   working for one release alongside it. An excluded cluster gets no Cluster Agent, and fleet answers,
   the onboarding sweep and the fleet-audit collectors that list clusters leave it out. Still covering
-  it: the daily upgrade-readiness watch, whose report enumerates by project; the networking audit's
+  it: the daily upgrade-readiness watch and the Saturday `upgrade-readiness-weekly-review`, whose reports enumerate by project (the review's findings on such a cluster reach the findings queue and the weekly brief); the networking audit's
   subnet usage, since its pods still hold their IPs; the GCE audit's instance listing; and the
   third-party `gke` MCP server's `list_clusters`.
 

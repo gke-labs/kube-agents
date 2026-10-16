@@ -460,7 +460,7 @@ class TestRegistration(QueueTestCase):
     def test_a_complete_claim_without_a_prefix_reaches_its_own_source_only(self):
         # The onboarding sweep re-run by hand sends no prefix; its claim is
         # complete for the inventory's rows and must not touch the weekly
-        # review's audit rows on the same cluster.
+        # review's rows on the same cluster.
         upgrade = sample(source="audit", check="upgrade-pool-skew", namespace="", object="default-pool")
         stale = sample(object="Deployment/ledger")
         self.register(sample(), stale, upgrade)
@@ -489,6 +489,24 @@ class TestRegistration(QueueTestCase):
         self.assertEqual(result["downgraded"], 1)
         self.assertEqual(fq.get_finding(self.conn, foreign_id)["rubric"]["C"], 0.6)
         self.assertEqual(fq.get_finding(self.conn, inventory_id)["rubric"]["C"], 1.0)
+
+    def test_a_prefixed_claim_must_name_the_batchs_own_family(self):
+        upgrade = sample(source="upgrade-readiness", check="upgrade-pool-skew", namespace="", object="default-pool")
+        self.register(upgrade)
+        upgrade_id = fq.validate_finding(upgrade)["id"]
+        crash = sample(source="event-watcher", check="crashloop", object="Deployment/ledger")
+        # A crashloop batch cannot claim the review's family.
+        with self.assertRaises(fq.FindingError):
+            self.register(crash, scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})
+        # A prefix that is not a family (no trailing separator) reaches too much.
+        with self.assertRaises(fq.FindingError):
+            self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade"})
+        with self.assertRaises(fq.FindingError):
+            self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": ["upgrade-"]})
+        self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 1.0)
+        # Folded like the stored check: a capitalised prefix reaches the row.
+        result = self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "Upgrade-"})
+        self.assertEqual(result["downgraded"], 1)
 
     def test_a_check_is_stored_lower_case_so_the_prefix_reaches_it(self):
         odd = sample(source="upgrade-readiness", check="Upgrade-Pool-Skew", namespace="", object="old-pool")

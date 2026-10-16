@@ -319,6 +319,10 @@ REPORT_TITLE = "Weekly upgrade readiness review"
 SUMMARY_VERSION = 1
 NO_PROJECTS_DETAIL = "no project to review: set UPGRADE_READINESS_PROJECTS or declare a scope"
 BUDGET_EXHAUSTED_DETAIL = "the run's time budget ran out before this project"
+CUT_SHORT_DETAIL = "readiness run cut short by the review's time budget after {seconds}s; it goes first next week"
+LISTING_FAILED_DETAIL = "the project's cluster listing failed"
+DUPLICATE_DETAIL_SEPARATOR = " | also: "  # two rows of one member that derive one queue id
+TMP_SUFFIX = watch.LEDGER_TMP_SUFFIX  # a file is written beside its name and renamed over it
 FAILED_LINE = "{prefix}: failed: {detail}"
 RECOVERED_LINE = "{prefix}: runs again after a failure"
 PARTIAL_LINE = "{prefix}: {count} project(s) not read this week: {detail}; their clusters keep last week's findings and are not counted"
@@ -646,7 +650,27 @@ def rule_findings(member: dict) -> list[dict]:
 
 
 def member_findings(member: dict) -> list[dict]:
-    return budget_findings(member) + exclusion_findings(member) + skew_findings(member) + webhook_findings(member) + rule_findings(member)
+    """Every finding of one member, one per queue id: two rows that derive one
+    id (a rule that names one object twice, or a cluster-wide rule row twice)
+    are one finding whose detail carries both texts and whose rubric is the
+    higher, since the queue would hold one row and answer the second as an
+    update of the first."""
+    items = budget_findings(member) + exclusion_findings(member) + skew_findings(member) + webhook_findings(member) + rule_findings(member)
+    by_id: dict[str, dict] = {}
+    for item in items:
+        fid = item_id(item)
+        first = by_id.get(fid)
+        if first is None:
+            by_id[fid] = item
+            continue
+        first["detail"] = clip(first["detail"] + DUPLICATE_DETAIL_SEPARATOR + item["detail"])
+        if rank_of(item) > rank_of(first):
+            first["rubric"] = item["rubric"]
+    return list(by_id.values())
+
+
+def rank_of(item: dict) -> float:
+    return findings_queue.rank_score(findings_queue.validate_rubric(item["rubric"]))
 
 
 def member_complete(member: dict, report_errors: list) -> bool:
@@ -711,19 +735,34 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
         if remaining < MIN_PROJECT_RUN_SECONDS:
             failures[project] = BUDGET_EXHAUSTED_DETAIL
             continue
+        timeout = min(PROJECT_TIMEOUT_SECONDS, remaining)
         try:
-            envelope = watch.run_report(
-                [project], readiness=True, scope=scope, outside_stands=False, timeout=min(PROJECT_TIMEOUT_SECONDS, remaining)
-            )
-        except (RuntimeError, ValueError) as exc:  # the watch's SandboxTimedOut and ReportRefused are RuntimeErrors
+            envelope = watch.run_report([project], readiness=True, scope=scope, outside_stands=False, timeout=timeout)
+        except watch.SandboxTimedOut as exc:
+            # The review's own budget, not the sandbox, ended a run it started
+            # with less than the full timeout; said as such, so the remedy read
+            # is fewer projects or a longer budget, not a sandbox fault.
+            failures[project] = CUT_SHORT_DETAIL.format(seconds=int(timeout)) if timeout < PROJECT_TIMEOUT_SECONDS else str(exc)
+            continue
+        except (RuntimeError, ValueError) as exc:  # the watch's ReportRefused is a RuntimeError
             failures[project] = str(exc)
             continue
         report = envelope.get(watch.ENVELOPE_REPORT_KEY) or {}
         found = [m for m in report.get(watch.MEMBERS_KEY) or [] if isinstance(m, dict)]
         read_errors = [e for e in report.get(watch.ERRORS_KEY) or [] if isinstance(e, dict)]
-        members.extend(found)
         errors.extend(read_errors)
         tables[project] = str(envelope.get(watch.ENVELOPE_TABLES_KEY) or "")
+        if project in watch.unlisted_projects(read_errors):
+            # The sandbox ran but the project's cluster listing failed: the
+            # report says so in an errors row with the project and no location
+            # and returns no member for it. A project not read, as the watch
+            # counts it, not a clean project with no clusters.
+            failures[project] = next(
+                (str(e.get(watch.MESSAGE_KEY) or LISTING_FAILED_DETAIL) for e in read_errors if e.get(watch.MEMBER_ID_KEYS[0]) == project and not e.get(watch.MEMBER_ID_KEYS[1])),
+                LISTING_FAILED_DETAIL,
+            )
+            continue
+        members.extend(found)
         if on_project is not None:
             on_project(found, read_errors)
     return members, errors, tables, failures
@@ -969,8 +1008,12 @@ def write_record(home: Path, stamp: str, report_md: str, report_json: dict, find
     (run_dir / REPORT_MD_NAME).write_text(report_md, encoding="utf-8")
     (run_dir / REPORT_JSON_NAME).write_text(json.dumps(report_json, indent=1, sort_keys=True), encoding="utf-8")
     (run_dir / FINDINGS_JSON_NAME).write_text(json.dumps(findings_json, indent=1, sort_keys=True), encoding="utf-8")
-    (home / LATEST_MD_NAME).write_text(report_md, encoding="utf-8")
-    (home / LATEST_JSON_NAME).write_text(json.dumps(summary_doc, indent=1, sort_keys=True), encoding="utf-8")
+    # The two latest files are replaced together, after both are written.
+    latest = {LATEST_MD_NAME: report_md, LATEST_JSON_NAME: json.dumps(summary_doc, indent=1, sort_keys=True)}
+    for name, text in latest.items():
+        (home / (name + TMP_SUFFIX)).write_text(text, encoding="utf-8")
+    for name in latest:
+        os.replace(home / (name + TMP_SUFFIX), home / name)
     prune(home)
     return run_dir / REPORT_MD_NAME
 
@@ -983,8 +1026,8 @@ def prune(home: Path) -> None:
 
 def sandbox_copy_program(files: dict[str, str]) -> str:
     """The program the terminal login runs to place the copy: the directory
-    made and opened, each file made writable, written whole and set read-only,
-    the directory closed again. The copy is the terminal login's own file, so
+    made and opened, each file written whole beside its name, set read-only and
+    renamed into place once both are complete, the directory closed again. The copy is the terminal login's own file, so
     nothing stops a model turn that ran the readiness report by hand from
     copying its JSON over the brief's Markdown, which one did; read-only modes
     make that an error the turn sees instead of a record the brief misreads
@@ -1002,16 +1045,22 @@ def sandbox_copy_program(files: dict[str, str]) -> str:
             f"MODE = {SANDBOX_COPY_MODE}",
             f"OPEN = {SANDBOX_COPY_DIR_OPEN_MODE}",
             f"CLOSED = {SANDBOX_COPY_DIR_CLOSED_MODE}",
+            f"TMP = {json.dumps(TMP_SUFFIX)}",
             "os.makedirs(DIR, exist_ok=True)",
             "os.chmod(DIR, OPEN)",
-            "for name, text in FILES.items():",
-            "    path = os.path.join(DIR, name)",
-            "    if os.path.exists(path):",
-            "        os.chmod(path, OPEN)",
-            "    with open(path, 'wb') as handle:",
-            "        handle.write(base64.b64decode(text))",
-            "    os.chmod(path, MODE)",
-            "os.chmod(DIR, CLOSED)",
+            "try:",
+            # Both files land beside their names and are renamed over them only
+            # once both are complete, so a reader never sees this week's report
+            # beside last week's summary, or a half-written file; the directory
+            # is closed again whatever happened.
+            "    for name, text in FILES.items():",
+            "        with open(os.path.join(DIR, name + TMP), 'wb') as handle:",
+            "            handle.write(base64.b64decode(text))",
+            "        os.chmod(os.path.join(DIR, name + TMP), MODE)",
+            "    for name in FILES:",
+            "        os.replace(os.path.join(DIR, name + TMP), os.path.join(DIR, name))",
+            "finally:",
+            "    os.chmod(DIR, CLOSED)",
             "print(len(FILES))",
             "",
         ]
