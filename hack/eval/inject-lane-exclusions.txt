@@ -135,3 +135,7 @@ chat-question-asked-to-choose-pauses
 # it, as chat-voice-failure-leads-with-fact does: a card-wake replay needs
 # AGENT_TRANSPORT=api and errors on this lane. Returns to the lane with it.
 chat-failure-reply-declares-next-step
+# #2039: grades the worker's answer under the one card the chat front door
+# files, as chat-question-asked-to-choose-pauses does: the lane's delegation
+# wait reads no card ids. Returns to the lane with agent-kanban-smoke.
+chat-answer-declares-next-step

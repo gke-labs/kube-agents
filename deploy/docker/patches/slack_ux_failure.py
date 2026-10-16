@@ -27,7 +27,7 @@ should it use?"), a request ("Could you share the namespace?") or an either/or
 stays text, since it needs a word, not a click. A reply that declares its next step on a
 last line of its own (``slack_moments.next_step``: ``[next: check seeded-a]``) gets that
 step as the button instead, whatever its question says, and the line is left out of the
-blocks. A click is the clicker answering in the thread with the button's text
+blocks; outside a thread the line stays as written. A click is the clicker answering in the thread with the button's text
 (``gateway/slack_ux_clicks.py``), so the Planning Agent reads it as the user
 saying yes. The words are the agent's; only how they are drawn changes. The
 ``text`` Slack keeps for notifications and for a later read of the thread is
@@ -62,8 +62,8 @@ Under ``spec.mode: next`` a wake's reply in an alert's thread is sent by the
 kanban notifier's chat.notify stand-in (``kanban_chat_notify``), which has no
 blocks to hand :func:`maybe_blocks`. It asks :func:`chat_for` instead, under
 the same mark: the reply's first sentence as the headline, the rest as the
-detail, and Try again as a choice when :func:`present` finds the offer
-(``agents/platform/scripts/chat_message.py``).
+detail, and the declared step, else Try again when :func:`present` finds the
+offer, as a choice (:func:`layout`, ``agents/platform/scripts/chat_message.py``).
 
 Fail-soft: anything that raises is logged and the reply goes out as upstream
 renders it.
@@ -439,8 +439,9 @@ def _next_step(content: str) -> tuple[str, str]:
 
 def layout(content: str, in_thread: bool) -> Optional[dict]:
     """A failure reply as a ``kube-agents.chat/v1`` message: :func:`present`'s offer, or the
-    declared next step in its place, as its button, only ``in_thread``."""
-    content, step = _next_step(content)
+    declared next step in its place, as its button, only ``in_thread``; outside a thread a
+    declared step's line stays in the reply as written."""
+    content, step = _next_step(content) if in_thread else (content, "")
     _bolded, offer = present(content)
     return _chat.failure_message(content, bool((step or offer) and in_thread), step)
 
@@ -468,7 +469,7 @@ def maybe_blocks(content: str, render: Callable[[str], Optional[list]]) -> Optio
     if thread is None:
         return render(content)
     try:
-        shown, step = _next_step(content)
+        shown, step = _next_step(content) if thread else (content, "")
         bolded, offer = present(shown)
         blocks = render(bolded)
         if blocks is None:

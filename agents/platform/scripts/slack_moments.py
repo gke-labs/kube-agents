@@ -297,9 +297,11 @@ SHOWN_SUMMARY = "{line} — {summary}"
 NOT_PROSE = re.compile(r"^\s*[>|]")
 #: The next step an answer declares (:func:`next_step`): a line of its own, ``[next: <label>]``.
 NEXT_STEP_LINE = re.compile(r"[ \t]*\[next:[ \t]*([^\]\n]*?)[ \t]*\][ \t]*", re.IGNORECASE)
-#: What a declared step's label cannot hold: markup or a Slack link or mention, which a button
-#: shows as typed, and the brackets of a second step.
-NEXT_STEP_MARKUP = re.compile(r"[*_`~<>|\[\]]")
+#: What a declared step's label cannot hold: a Slack link or mention, which a button shows as
+#: typed, and the brackets of a second step.
+NEXT_STEP_REFUSED = re.compile(r"[<>|\[\]]")
+#: Emphasis and code marks a label sheds, as an id the report format asks to wrap in backticks.
+NEXT_STEP_MARKS = "*`"
 
 
 def opened_pr(
@@ -852,8 +854,9 @@ def next_step(text: str) -> tuple[str, str]:
 
     The agent declares it on the answer's last line, a line of its own reading
     ``[next: <label>]``, the words a user would type to ask for it. The label is
-    one line of 1 to ``BUTTON_TEXT_MAX`` characters with no markup, link or
-    mention; the text returned is the answer above that line. Anything else,
+    one line of 1 to ``BUTTON_TEXT_MAX`` characters once its ``*`` and backticks
+    are dropped, with no link or mention; the text returned is the answer above
+    that line. Anything else,
     including a second ``[next: ...]`` line anywhere, declares none and leaves
     the text as written.
     """
@@ -861,7 +864,7 @@ def next_step(text: str) -> tuple[str, str]:
     match = NEXT_STEP_LINE.fullmatch(lines[-1])
     if match is None or any(NEXT_STEP_LINE.fullmatch(line) for line in lines[:-1]):
         return text, ""
-    label = " ".join(match.group(1).split())
-    if not label or len(label) > _presenter.BUTTON_TEXT_MAX or NEXT_STEP_MARKUP.search(label):
+    label = " ".join("".join(c for c in match.group(1) if c not in NEXT_STEP_MARKS).split())
+    if not label or len(label) > _presenter.BUTTON_TEXT_MAX or NEXT_STEP_REFUSED.search(label):
         return text, ""
     return "\n".join(lines[:-1]).rstrip(), label

@@ -184,6 +184,7 @@ ADDED_AFTER_THE_MOVE = [
     "not-found-target-stops-as-failure",  # a missing target stops its card on a hard wall, mock 06
     "alert-config-terraform-promql-probe",  # the gke-alert-configuration skill sync
     "chat-failure-reply-declares-next-step",  # a blocked card's reply declares the one next step, mock 06
+    "chat-answer-declares-next-step",  # a card's answer declares its one obvious next step, mocks 03 and 07
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
@@ -389,6 +390,7 @@ INJECT_LANE_EXCLUDED = [
     "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
     "chat-question-asked-to-choose-pauses",  # #2039: grades the worker's needs_input block under the door's one card; same door
     "chat-failure-reply-declares-next-step",  # #2039: grades the front door's reply to a blocked card's wake; a card-wake replay
+    "chat-answer-declares-next-step",  # #2039: grades the worker's answer under the door's one card; same door
 ]
 # The directives a case's prompt opens with to replay a wake into the chat
 # front door (bench/kube_agents_bench/card_wake.py); the harness errors such
@@ -418,6 +420,7 @@ INJECT_LANE_EXCLUDED_TIER = {
     "chat-fanout-fleet-restarts-rows": "nightly",
     "chat-question-asked-to-choose-pauses": "nightly",
     "chat-failure-reply-declares-next-step": "nightly",
+    "chat-answer-declares-next-step": "nightly",
 }
 
 

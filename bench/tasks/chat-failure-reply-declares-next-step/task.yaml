@@ -9,7 +9,8 @@
 # reply declares the step on a last line of its own, `[next: check seeded-a]`
 # (agents/chat/SOUL.md §2 step 5), which the presenters lift into one choice
 # button and drop from what Slack shows (slack_moments.next_step and the
-# bridge's nextStep; docs/designs/spec-a2a-payloads.md, "A next step").
+# bridge's nextStep; docs/designs/spec-a2a-payloads.md, "Chat messages", the
+# emitter paragraph).
 # Before this case the reply ended on the question alone, and today's Slack
 # guessed a "Try again" button from its wording, whatever the step was.
 #
@@ -62,8 +63,9 @@ verification_spec:
   # The reply ends on one declared step that names the cluster the card's
   # reason points to: a last line `[next: <label>]`, the label 1-75
   # characters (the button's cap, slack_presenter BUTTON_TEXT_MAX) with no
-  # `<`, `>` or `|` (a Slack link or mention, which a button cannot show; the
-  # other markup is dropped before matching). Blank lines and trailing spaces
+  # `<`, `>` or `|` (a Slack link or mention, which a button cannot show).
+  # `*`, `_` and backticks are dropped before matching, as next_step drops
+  # `*` and backticks from a label and keeps `_` as typed. Blank lines and trailing spaces
   # after it are allowed, any other text is not: the presenters read only the
   # last line.
   - name: the-reply-ends-on-a-next-step-naming-seeded-a

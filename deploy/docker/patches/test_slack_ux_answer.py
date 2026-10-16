@@ -502,6 +502,13 @@ class SendTest(unittest.TestCase):
         self.assertEqual(whole, _render_blocks("Checkout is healthy.", adapter.format_message)[0])
         self.assertEqual(actions["elements"][0]["value"], "check checkout on seeded-b")
 
+    def test_an_answer_drawn_whole_at_the_block_cap_keeps_the_upstream_post(self):
+        answer = "\n\n".join(f"- item {i}" for i in range(runtime.MESSAGE_BLOCKS_MAX)) + "\n\n[next: check it]"
+        adapter = _Adapter()
+        with self.assertLogs(runtime.logger):
+            self.send(adapter, answer)
+        self.assertEqual(adapter.log, [("send", CHANNEL, answer, METADATA)])
+
     def test_options_win_over_a_declared_step(self):
         answer = f"{HEADLINE} Two ways.\n\n1. **Scale it**\n2. **Shed load**\n\nWhich do you want?\n\n[next: scale it]"
         adapter = _Adapter()

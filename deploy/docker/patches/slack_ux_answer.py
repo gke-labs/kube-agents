@@ -41,9 +41,11 @@ question below it, and the options as choice buttons (``kage_answer.choice.<n>``
 the label) in a thread, which ``slack_ux_clicks`` answers as the clicker's reply; outside one the options stay text.
 An answer that declares its next step on a last line of its own (``slack_moments.next_step``,
 ``[next: check seeded-a]``) gets that step as one such button in a thread, the line left
-out of the blocks, after the question when there is one; an answer the fold refuses is
+out of the blocks, after the question when there is one; an answer ``split`` refuses is
 then drawn whole, as upstream's renderer draws it, with the button under it. Options the
-answer offers win over a declared step. Outside a thread the line stays as written. The folded post
+answer offers win over a declared step. Outside a thread, and for an answer that keeps the
+upstream post for any other reason (an actionable report, or one that cannot be drawn
+whole within Slack's 50 blocks), the line stays as written. The folded post
 carries what upstream's adds: link-preview settings, ``reply_broadcast``, the
 feedback buttons, the status clear and the reply tracking for the thread. An incident report
 that edits its alert never reaches this send, and a report a reply can act on
@@ -112,6 +114,8 @@ LABEL_LINE = re.compile(r"^\S+(?: \S+){0,2}:\s+\S")
 NOT_PROSE_LINE = re.compile(r"^\s*[>|]")
 #: The choice buttons' action-id prefix: ``<prefix>.choice.<n>``, which ``slack_ux_clicks`` answers.
 ACTION_PREFIX = "kage_answer"
+#: Slack's cap on a message's blocks: an answer drawn whole at it has no room for a step's button.
+MESSAGE_BLOCKS_MAX = 50
 #: Upstream's per-post ``config.extra`` switches the folded post carries as well.
 REPLY_BROADCAST = "reply_broadcast"
 #: The Slack adapter module's link-preview helper, read from the adapter's own module.
@@ -349,7 +353,7 @@ class _AnswerFolder:
                 return None
             # The answer as upstream draws it, without the step's line, and the step's button.
             whole_blocks = render_fold(shown_answer, mrkdwn_fn)
-            if whole_blocks is None:
+            if whole_blocks is None or len(whole_blocks) >= MESSAGE_BLOCKS_MAX:
                 return None
             layout = [*whole_blocks, *step_blocks]
         else:

@@ -131,9 +131,11 @@ past 4000 characters across messages:
   how you investigated.
 - When that next step is one thing the requester could ask for in a few
   words, end the answer with those words on a last line of their own,
-  `[next: check seeded-a]`. Slack shows them as a button that sends them, so
-  write what the user would type, at most 75 characters and no markup. Never
-  more than one, and none when no single step is the obvious one.
+  `[next: check seeded-a]`, after everything else, a `## Sources` section
+  included. Slack shows them as a button that sends them, so write what the
+  user would type, at most 75 characters, with no backticks, link or
+  mention. Never more than one, and none when no single step is the obvious
+  one.
 - A question gets that paragraph and nothing more: no sections, no list of the
   commands you ran. A question that spans clusters may follow it with one pipe
   table, a row per cluster, holding the finding each one rests on.

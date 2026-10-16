@@ -1048,3 +1048,9 @@
 # planted per run (bench/kube_agents_bench/card_wake.py), so one front-door
 # turn and no worker: filing or unblocking a card fails its catastrophic fence.
 ./tasks/chat-failure-reply-declares-next-step/task.yaml
+
+# A card's answer with one obvious next step declares it on a last line of
+# its own, `[next: <label>]`, which Slack draws as a button (the report-format
+# stanza in deploy/docker/patches/kanban_report_format.py). Read-only against
+# the crashloop-workload fixture; one card, nothing changed.
+./tasks/chat-answer-declares-next-step/task.yaml

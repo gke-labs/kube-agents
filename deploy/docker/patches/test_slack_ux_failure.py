@@ -333,7 +333,15 @@ class MarkTest(FlagOn):
             runtime.end(token)
         self.assertEqual(chat["choices"], [{"text": "check seeded-a"}])
         self.assertTrue(chat["detail"].endswith("Check it there?"))
-        self.assertEqual(runtime.layout(DECLARED_REPLY, False).get("choices"), None, "no button outside a thread")
+        outside = runtime.layout(DECLARED_REPLY, False)
+        self.assertIsNone(outside.get("choices"), "no button outside a thread")
+        self.assertTrue(outside["detail"].endswith("[next: check seeded-a]"), "so the line stays as written")
+
+    def test_outside_a_thread_a_declared_step_stays_as_written(self):
+        runtime.note_wake({**SUB, "thread_id": None}, {"blocked"}, WAKE)
+        blocks = self.draw(_turn(thread_id=None), content=DECLARED_REPLY)
+        self.assertEqual(_buttons(blocks), [])
+        self.assertTrue(blocks[0]["text"]["text"].endswith("[next: check seeded-a]"))
 
     def test_a_reply_needs_its_turn_to_have_claimed_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)

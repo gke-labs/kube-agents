@@ -1102,7 +1102,11 @@
       "chat": {
         "schema": "kube-agents.chat/v1",
         "headline": "seeded-c is behind.",
-        "detail": "[next: upgrade `seeded-c`]"
+        "choices": [
+          {
+            "text": "upgrade seeded-c"
+          }
+        ]
       }
     },
     {

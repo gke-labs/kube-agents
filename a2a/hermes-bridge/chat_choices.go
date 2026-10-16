@@ -59,6 +59,9 @@ const (
 	shownSummary = "%s — %s"
 	// labelTrim is what a label sheds from its end ("Fix it:").
 	labelTrim = ":"
+	// nextStepMarks is NEXT_STEP_MARKS: the emphasis and code marks a
+	// declared step's label sheds.
+	nextStepMarks = "*`"
 )
 
 var (
@@ -72,11 +75,6 @@ var (
 	recommended    = regexp.MustCompile(`(?i)` + pySpace + `*\(` + pySpace + `*recommended` + pySpace + `*\)`)
 	optionNum      = regexp.MustCompile(`(?i)^option` + pySpace + `+(?:\p{Nd}+|[a-z])\b` + pySpace + `*[:.)\-–—]?` + pySpace + `*`)
 	notProse       = regexp.MustCompile(`^` + pySpace + `*[>|]`)
-	// nextStepLine is NEXT_STEP_LINE, matched against a whole line, and
-	// nextStepMarkup is NEXT_STEP_MARKUP: what a declared step's label
-	// cannot hold.
-	nextStepLine   = regexp.MustCompile(`(?i)^[ \t]*\[next:[ \t]*([^\]\n]*?)[ \t]*\][ \t]*$`)
-	nextStepMarkup = regexp.MustCompile("[*_`~<>|\\[\\]]")
 	choiceWord     = regexp.MustCompile(`(?i)\b(?:which|or)\b`)
 	// choiceHint is CHOICE_HINT: words that ask to choose, for a question
 	// with no "which" or "or".
@@ -88,6 +86,14 @@ var (
 		`|^(?:(?:does\s+(?:this|that|it|the)|do\s+(?:these|they|those|the))(?:\s+[\w-]+){0,2}\s+)?(?:sounds?|looks?)\s+(?:good|ok(?:ay)?|right|fine)` +
 		`(?:\s+to\s+you)?\s*\?$` +
 		`|^(?:ok(?:ay)?|agreed|any\s+objections)\s*\?$`)
+)
+
+var (
+	// nextStepLine is NEXT_STEP_LINE, matched against a whole line, and
+	// nextStepRefused is NEXT_STEP_REFUSED: what a declared step's label
+	// cannot hold.
+	nextStepLine    = regexp.MustCompile(`(?i)^[ \t]*\[next:[ \t]*([^\]\n]*?)[ \t]*\][ \t]*$`)
+	nextStepRefused = regexp.MustCompile(`[<>|\[\]]`)
 )
 
 // clauseCut is slack_presenter.clause_cut: the headline and the rest for a
@@ -485,8 +491,9 @@ func answerChoices(rest string) (answerOffer, bool) {
 
 // nextStep is slack_moments.next_step: the one next step an answer declares
 // on its last line, a line of its own reading "[next: <label>]", split off as
-// (the answer above that line, the label). A label that is empty, longer than
-// a button or holds markup, a link or a mention, or a second "[next: ...]"
+// (the answer above that line, the label). The label sheds its "*" and
+// backticks (nextStepMarks); one that is then empty, longer than a button or
+// holds a link or a mention, or a second "[next: ...]"
 // line anywhere, declares none, and the answer is returned as written with
 // an empty label.
 func nextStep(answer string) (string, string) {
@@ -500,8 +507,14 @@ func nextStep(answer string) (string, string) {
 			return answer, ""
 		}
 	}
-	label := strings.Join(strings.FieldsFunc(m[1], isPySpace), " ")
-	if label == "" || runeLen(label) > buttonTextMax || nextStepMarkup.MatchString(label) {
+	shed := strings.Map(func(r rune) rune {
+		if strings.ContainsRune(nextStepMarks, r) {
+			return -1
+		}
+		return r
+	}, m[1])
+	label := strings.Join(strings.FieldsFunc(shed, isPySpace), " ")
+	if label == "" || runeLen(label) > buttonTextMax || nextStepRefused.MatchString(label) {
 		return answer, ""
 	}
 	return strings.TrimRightFunc(strings.Join(lines[:len(lines)-1], "\n"), isPySpace), label

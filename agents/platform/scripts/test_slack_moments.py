@@ -743,12 +743,19 @@ class NextStepTest(unittest.TestCase):
             "Up.\n[next: check seeded-b]\n[next: check seeded-a]",  # two steps
             "Up.\n[next: ]",
             "Up.\n[next: " + "x" * (p.BUTTON_TEXT_MAX + 1) + "]",
-            "Up.\n[next: check `seeded-a`]",
             "Up.\n[next: ask <@U1>]",
+            "Up.\n[next: open <https://x.example|x>]",
+            "Up.\n[next: **]",
             "Up.\n[next: [x] check]",
         ):
             with self.subTest(text=text):
                 self.assertEqual(m.next_step(text), (text, ""))
+
+    def test_a_label_sheds_its_bold_and_backticks(self):
+        # The report format asks for ids in backticks; a button shows them as typed, so they go.
+        self.assertEqual(m.next_step("Up.\n[next: check `seeded-a`]"), ("Up.", "check seeded-a"))
+        self.assertEqual(m.next_step("Up.\n[next: **check seeded-a**]"), ("Up.", "check seeded-a"))
+        self.assertEqual(m.next_step("Up.\n[next: scale my_app]"), ("Up.", "scale my_app"))
 
     def test_a_label_at_the_button_cap_is_kept(self):
         label = "x" * p.BUTTON_TEXT_MAX
