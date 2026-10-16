@@ -68,8 +68,14 @@ verification_spec:
   # rigid-scheduling finding for that object beside any zonal-skew finding at
   # all, and a long id is shortened (`capacity-starved-work-dc658d` on the dev
   # install), so a composite id cannot be matched either. The heading binds
-  # check and object in one string. On a main without the check all three are
-  # absent, which is the red this case exists to show.
+  # check and object in one string. It is the title `draft` wrote, which the
+  # model may in principle rewrite: SOP §3.25 tells it to keep it, and where
+  # the collector's own excerpt (restored by `finish`, so never the model's)
+  # carries a fragment unique to the object, that fragment is the fallback.
+  # The capacity cause has no object-unique fragment (first-zone-sponge is
+  # starved too), so that objective rests on the heading alone. On a main
+  # without the check all three are absent, which is the red this case
+  # exists to show.
   - name: the-pinned-workload-is-a-zonal-skew-finding
     role: objective
     mode: assert
@@ -77,7 +83,9 @@ verification_spec:
       type: ledger_issue_contains
       audit: obtainability-audit
       scope: body
-      required_phrases: ["zonal-skew on Deployment/zone-pinned-api"]
+      any_of_phrases:
+        - "zonal-skew on Deployment/zone-pinned-api"
+        - "pinned to us-central1-a by its manifest (required nodeAffinity topology.kubernetes.io/zone=us-central1-a)"
   - name: the-disk-bound-workload-is-a-zonal-skew-finding
     role: objective
     mode: assert
@@ -85,7 +93,9 @@ verification_spec:
       type: ledger_issue_contains
       audit: obtainability-audit
       scope: body
-      required_phrases: ["zonal-skew on StatefulSet/zone-bound-store"]
+      any_of_phrases:
+        - "zonal-skew on StatefulSet/zone-bound-store"
+        - "volumeClaimTemplates (StorageClass seeded-zonal-pd"
   - name: the-capacity-starved-workload-is-a-zonal-skew-finding
     role: objective
     mode: assert
