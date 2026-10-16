@@ -2716,6 +2716,17 @@ func TestTheWakeWithCardsPendingIncludesNote(t *testing.T) {
 	if len(rest) > lib.DelegateTextCap {
 		t.Fatalf("wake after header+note is %d bytes, over cap %d", len(rest), lib.DelegateTextCap)
 	}
+
+	// Verify that a body fitting the exact budget without note reservation when cardsPending=false
+	// is not truncated, proving wakeReplyGuideMax does not reserve for the note when not pending.
+	fenceLen := 3
+	expectedGuideMax := max(len(wakeReplyGuide), len(wakeReplyGuideFull))
+	budgetWithoutNote := lib.DelegateTextCap - len(wakeResultLabel) - 2*fenceLen - 3 - 1 - expectedGuideMax
+	exactBody := strings.Repeat("a", budgetWithoutNote)
+	notPendingText := wakeText(lib.StateCompleted, "task-1", "", nil, exactBody, "", false, false)
+	if strings.Contains(notPendingText, wakeTruncatedNote) {
+		t.Fatalf("cardsPending=false: body of length %d was truncated, expected full delivery", len(exactBody))
+	}
 }
 
 // TestAChildEndingWithCardsPendingWakesWithPendingNote verifies that when a

@@ -437,14 +437,16 @@ func wakeText(state lib.TaskState, childID, ask string, turns []string, result, 
 	} else {
 		text = fmt.Sprintf("The task you delegated to %s (task %s) %s.", targetPlatform, childID, outcome)
 	}
+	extraReserve := 0
 	if cardsPending {
 		text += "\n" + wakeCardsPendingNote
+		extraReserve = len("\n") + len(wakeCardsPendingNote)
 	}
 	if earlier != "" {
 		// wakeAnswers trimmed each answer; last opens with its separator.
-		text += "\n" + fenceWakeBody(earlier, body)
+		text += "\n" + fenceWakeBody(earlier, body, extraReserve)
 	} else if body = strings.TrimSpace(body); body != "" {
-		text += "\n" + fenceWakeBody("", body)
+		text += "\n" + fenceWakeBody("", body, extraReserve)
 	}
 	if fullAnswer {
 		return text + "\n" + wakeReplyGuideFull
@@ -479,8 +481,8 @@ const (
 )
 
 // wakeReplyGuideMax is the longer of the two guides, which the result
-// body's budget reserves room for, plus room for the cards-pending note.
-var wakeReplyGuideMax = max(len(wakeReplyGuide), len(wakeReplyGuideFull)) + len("\n") + len(wakeCardsPendingNote)
+// body's budget reserves room for.
+var wakeReplyGuideMax = max(len(wakeReplyGuide), len(wakeReplyGuideFull))
 
 // wakeFollowUpMarker opens each follow-up's answer in a wake body that
 // carries a child's turns, numbered from the first follow-up.
@@ -542,8 +544,8 @@ func wakeAnswers(turns []string, outcome string, completed bool, body string) (e
 // body is earlier then last. Over the cap, earlier is cut first, so the
 // newest answer arrives whole when it fits the cap alone; when it does not,
 // the joined body is cut from its end as a lone result is. Either cut is
-// marked.
-func fenceWakeBody(earlier, last string) string {
+// marked. When cards are pending, extraReserve reserves room for the note.
+func fenceWakeBody(earlier, last string, extraReserve int) string {
 	earlier = breakBacktickRuns(earlier, wakeFenceMax-1)
 	last = breakBacktickRuns(last, wakeFenceMax-1)
 	body := earlier + last
@@ -551,7 +553,7 @@ func fenceWakeBody(earlier, last string) string {
 	// label \n fence \n body \n fence, then \n and the closing guide
 	// (wakeReplyGuide or wakeReplyGuideFull), which wakeText appends after
 	// this block.
-	budget := lib.DelegateTextCap - len(wakeResultLabel) - 2*len(fence) - 3 - 1 - wakeReplyGuideMax
+	budget := lib.DelegateTextCap - len(wakeResultLabel) - 2*len(fence) - 3 - 1 - wakeReplyGuideMax - extraReserve
 	if len(body) > budget {
 		if keep := budget - len(last) - len("…") - len(wakeTruncatedNote); earlier != "" && keep >= 0 {
 			body = truncateRunes(earlier, keep) + wakeTruncatedNote + last
