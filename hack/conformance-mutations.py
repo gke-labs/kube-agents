@@ -1200,6 +1200,14 @@ Mutation(
         "log the hint raw, which is the state the sanitiser was added to fix",
     ),
     Mutation(
+        "D1-cluster-profile-unaudited",
+        "agents/cluster/config.yaml",
+        ("    - hermes_otel\n    - tool_call_audit\n", "    - hermes_otel\n"),
+        "test_D1_every_profile_records_its_tool_calls",
+        "trim the Cluster Agent template's plugin list back to otel alone, the "
+        "state the template shipped in",
+    ),
+    Mutation(
         "D1-platform-role-reaches-secrets",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("      - configmaps\n      - serviceaccounts", "      - configmaps\n      - secrets\n      - serviceaccounts"),

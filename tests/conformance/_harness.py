@@ -630,6 +630,28 @@ SOURCES: dict[str, Source] = {
         "agents/cluster/config.yaml",
         ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
     ),
+    # --- the tool-call audit ---------------------------------------------
+    # D1 reads that every profile config enables tool_call_audit. The Planning
+    # Agent's config is the one the image ships as the default profile. A
+    # Cluster Agent profile copies the shared plugins tree when it is
+    # scaffolded, and the image fills that tree from agents/chat/defaults/, so
+    # these anchors pin that the plugin a Cluster Agent enables is there to load.
+    "chat_config": Source("agents/chat/config.yaml", ("plugins:",)),
+    "tool_call_audit_manifest": Source(
+        "agents/chat/defaults/plugins/tool_call_audit/plugin.yaml",
+        ("name: tool_call_audit",),
+    ),
+    "cluster_agent_profile": Source(
+        "agents/platform/scripts/cluster_agent_profile.py",
+        (
+            'SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))',
+            "overlay_template(home, TEMPLATE_DIR, SHARED_PLUGINS_DIR",
+        ),
+    ),
+    "dockerfile_shared_plugins": Source(
+        "deploy/docker/Dockerfile",
+        ("COPY --chown=hermes:hermes agents/chat/defaults/ /opt/defaults/",),
+    ),
     "merge_configs": Source("deploy/docker/merge_configs.py", ("def merge(",)),
     "dockerfile_profile_configs": Source(
         "deploy/docker/Dockerfile",
