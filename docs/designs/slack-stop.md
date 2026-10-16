@@ -5,7 +5,7 @@ other reply is pending maintainer approval. This design covers
 `spec.mode: next`, where the Go gateway (`a2a/gateway`) serves Slack. `today`'s Hermes Slack
 adapter is out of scope.
 
-Slack's agent view puts a ■ Stop button on a thread's Working… line. Pressing it ends everything
+Slack puts a ■ Stop button on a thread's Working… line. Pressing it ends everything
 the thread started: the Planning Agent's turn and every kanban card it filed that has not
 finished. Each card's plan row settles to "Stopped", Working… goes away, and the agent replies once
 in the thread. The first build says only what it knows: "Stopped.", plus the pull request a card
@@ -71,9 +71,10 @@ card is killed can still land (below), so "Stopped." is all it can stand behind.
 
 1. **The manifest subscribes the event.** `agent_session_stopped` joins `bot_events` in the
    gateway's manifest in `docs/site/src/content/docs/install/slack-app.md`, and the page says
-   what it is for. Stop is an Agent Sessions control, so only an app using agent view shows it; an
-   assistant-view app keeps typed `stop`. The switch to agent view cannot be undone
-   (`concepts/chatops.md`, "Agent view"), so the page does not tell anyone to make it for Stop.
+   what it is for. Stop belongs to the Agent Session the gateway already drives
+   (`agents.sessions.setStatus`). An app whose threads show "<app> is working" lacks only the
+   subscription, and adding an event is an ordinary manifest edit that can be taken back. An app
+   whose threads show no Working… keeps typed `stop`.
 2. **The adapter turns the event into a stop.** A new case in the event switch builds an
    `InboundMessage` with `Intent: IntentCancel`, a new `Scope` field set to `conversation`, the
    event's `user` as `AuthorID`, `event_ts` as `MessageID`, and the conversation key and `Kind`
@@ -186,8 +187,8 @@ one in the same pull request.
 
 ### Live validation
 
-On the `next` dev install, with an app using agent view and subscribed to the event (see "Open
-before the build"): ask for a remediation in the demo channel, wait for its plan row, press Stop.
+On the `next` dev install, whose app already shows "is working" on its threads, once the event is
+added to the app's subscriptions (see "Open before the build"): ask for a remediation in the demo channel, wait for its plan row, press Stop.
 Observe, each with an explicit `kubectl --context`: the gateway logs the stop as ingress for the
 thread; the bridge logs a scoped cancel and the route's answer; the board, read in the agent
 container, shows the cards archived, and `ps` there shows no worker for them; the plan rows read
@@ -266,9 +267,11 @@ half retires into it; the `scope` field is what stays.
 
 ## Open before the build
 
-- **An agent-view app to test on.** The dev apps' saved manifests use assistant view. Switching one
-  to agent view cannot be undone, so the first live probe needs the owner's go-ahead or a new
-  throwaway app: subscribe the event, press Stop once, and log the event at the gateway.
+- **The first live probe.** The `next` dev app already draws Agent Sessions: its replies carry the
+  AGENT badge and its threads show "is working", with no Stop button. No view switch and no
+  throwaway app are needed. The probe adds `agent_session_stopped` to that app's subscriptions (a
+  manifest edit, so the owner's go-ahead), presses Stop once, and logs the event at the gateway.
+  It confirms that the subscription is all Stop needs.
 - **Which users Slack shows Stop to** in a shared channel thread. This decides how much step 4
   matters.
 - **Whether a card filed in an `a2a-*` session carries that `session_id`.** The lookup in step 1
