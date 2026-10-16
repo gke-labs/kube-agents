@@ -79,9 +79,9 @@ type relayState struct {
 	// with it unset reads the fold for a request this process never saw
 	// (relayTerminal).
 	sawDelegate bool
-	// handoff is set once the task published lib.ArtifactHandoff: its last
-	// turn handed its work to kanban cards that report into the conversation
-	// themselves (#3258).
+	// handoff is set once the task published lib.ArtifactHandoff: it handed
+	// work to kanban cards that report into the conversation themselves
+	// (#3258).
 	handoff bool
 	// local is set when this gateway started the task (startTaskWith), so
 	// every event of it reached this process's relay: an event acked and

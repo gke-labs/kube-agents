@@ -2915,3 +2915,25 @@ func TestAChildWithNeitherSignalWakesWithoutTheNote(t *testing.T) {
 		t.Fatalf("wake text = %q carries the note with no signal", got)
 	}
 }
+
+// TestAHandoffAckedBeforeARestartIsReadOffTheReplay: the handoff reached the
+// relay and was acked, then the gateway restarted before the terminal came.
+// The new process has no render state, so the wake's signal comes from the
+// replay of the stream (relay.go's fold read).
+func TestAHandoffAckedBeforeARestartIsReadOffTheReplay(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "slack:C1/t-replay-handoff"
+	_, _, child := delegated(t, r, spawn, conv, "")
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	cexec := r.execFor(t, child, targetPlatform)
+	r2, spawn2 := restartRig(t, r, func() {
+		handOff(t, cexec)
+		drainRelayDurable(t, r.url)
+	})
+	completeTask(t, cexec, "on it")
+	waitFor(t, "wake spawn", func() bool { return len(spawn2.calls()) == 1 })
+	wake := r2.awaitTask(t, spawn2.calls()[0].Session)
+	if got := envText(t, wake); !strings.Contains(got, wakeCardsPendingNote) {
+		t.Fatalf("wake text after a restart = %q, want the cards-pending note read off the replay", got)
+	}
+}
