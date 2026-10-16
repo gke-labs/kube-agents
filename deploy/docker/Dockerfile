@@ -53,6 +53,16 @@ ARG ENVOY_VERSION=v1.39.1
 ARG ENVOY_IMAGE=envoyproxy/envoy
 ARG GOLANG_IMAGE=golang
 ARG GOLANG_VERSION=1.27-alpine
+# tirith, the command scanner Hermes runs before a terminal command. Pinned and
+# checksum-verified here, and put on PATH in the image (the a2a-tools stage), so
+# Hermes' tools/tirith_security finds it on PATH and never downloads the "latest"
+# release into each profile's $HERMES_HOME/bin: that was 38 MiB per scaffolded
+# Cluster Agent profile, 6.5 GiB of a 10 GiB data volume at 209 clusters
+# (gke-labs#3325). Bump the version and both sums together, from the release's
+# checksums.txt.
+ARG TIRITH_VERSION=v0.4.2
+ARG TIRITH_SHA256_AMD64=efa6bf414a83dba385d4f13137e8677f850ced9102fe74ebb14c72f31df0dc77
+ARG TIRITH_SHA256_ARM64=c550b1bfb0c8c872ab3421cd6ef756f260f7cf4981a18cedd49f141fa2d77569
 # Declared here as well as in the `platform` stage that consumes it, so the
 # credential-proxy build -- which shares deploy/docker/cloudbuild.yaml and is
 # therefore handed the same --build-arg -- does not warn about an argument no
@@ -113,6 +123,26 @@ COPY a2a/ /workspace/a2a/
 WORKDIR /workspace/a2a
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -ldflags="-w -s" -o /workspace/bin/a2a ./cmd/a2a/
+
+# tirith joins a2a in /workspace/bin, so agent-base copies both with the one
+# COPY it already has and the image gains no layer. The download is verified
+# against the pinned sum for the target architecture before anything is kept.
+FROM a2a-builder AS a2a-tools
+ARG TARGETARCH
+ARG TIRITH_VERSION
+ARG TIRITH_SHA256_AMD64
+ARG TIRITH_SHA256_ARM64
+RUN set -eu; \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) triple=x86_64-unknown-linux-gnu; sum="${TIRITH_SHA256_AMD64}" ;; \
+        arm64) triple=aarch64-unknown-linux-gnu; sum="${TIRITH_SHA256_ARM64}" ;; \
+        *) echo "no tirith build pinned for ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    wget -qO /tmp/tirith.tar.gz "https://github.com/sheeki03/tirith/releases/download/${TIRITH_VERSION}/tirith-${triple}.tar.gz"; \
+    echo "${sum}  /tmp/tirith.tar.gz" | sha256sum -c -; \
+    mkdir /tmp/tirith; tar -xzf /tmp/tirith.tar.gz -C /tmp/tirith tirith; \
+    install -m 0755 /tmp/tirith/tirith /workspace/bin/tirith; \
+    rm -rf /tmp/tirith /tmp/tirith.tar.gz
 
 FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
 
@@ -1949,8 +1979,9 @@ COPY --chmod=0755 deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entryp
 # of the pod, on a pod that stays Ready while it does.
 COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /workspace/drift-detector /usr/local/bin/
 
-# The a2a CLI, ungated (see the a2a-builder stage for why that is safe).
-COPY --from=a2a-builder --chmod=0755 /workspace/bin/a2a /usr/local/bin/a2a
+# The a2a CLI, ungated (see the a2a-builder stage for why that is safe), and the
+# pinned tirith (see the a2a-tools stage).
+COPY --from=a2a-tools --chmod=0755 /workspace/bin/a2a /workspace/bin/tirith /usr/local/bin/
 
 # 6. Expose ports shared by all agent gateways
 EXPOSE 8642
@@ -1973,6 +2004,7 @@ CMD ["hermes", "gateway", "run"]
 #   - `cluster-*` = per-cluster read-only agents — scaffolded at runtime from
 #                   /opt/cluster-template (see scripts/cluster_agent_profile.py).
 FROM agent-base AS platform
+ARG TIRITH_VERSION
 
 # Base trees this stage never writes to normalize first — including the
 # plugin tree's root-ownership barrier — so the ~150MB copy-up layer caches
@@ -1987,12 +2019,20 @@ FROM agent-base AS platform
 # a part of. Cost is not the reason either way: a find/chmod over a tree whose
 # modes are already correct exports a ~4kB layer, since BuildKit diffs the
 # result rather than the syscall.
+#
+# The same layer checks that the pinned tirith is what PATH resolves, so Hermes
+# never installs a per-profile copy, and points npm's cache at one directory on
+# the data volume. Each profile's HOME is its own, so without the global setting
+# every profile that ran an npx tool kept its own ~100 MiB cache (gke-labs#3325).
 RUN set -eu; \
     for d in /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools; do \
         find "$d" -type d -exec chmod 755 {} + ; \
         find "$d" -type f -exec chmod 644 {} + ; \
     done; \
-    chown -R root:root /opt/hermes/plugins
+    chown -R root:root /opt/hermes/plugins; \
+    [ "$(command -v tirith)" = /usr/local/bin/tirith ]; \
+    tirith --version | grep -qx "tirith ${TIRITH_VERSION#v}"; \
+    printf 'cache=/opt/data/.cache/npm\n' >> "$(npm config get globalconfig)"
 
 # --- Chat Agent (the `default` profile) ---
 # Chat ingress plugins/hooks (session_store, session_otel_bridge, tool_call_audit,
