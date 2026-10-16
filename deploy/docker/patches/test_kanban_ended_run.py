@@ -317,6 +317,7 @@ class TestWaitingParentRefusal(unittest.TestCase):
         text = ker.waiting_parent_refusal(TID, self.conn)
         self.assertIn('kanban_block(kind="dependency")', text)
         self.assertNotIn("Don't call kanban_complete or kanban_block", text)
+        self.assertIn(ker.SAVED_RESULT_LEAD, text)
 
     def test_the_answer_is_not_latched(self):
         """The parent can go away; a retried completion should then succeed,

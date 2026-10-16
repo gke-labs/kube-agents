@@ -193,14 +193,25 @@ def current_run_failure(task_id: str, conn: Any) -> Optional[str]:
     return row[1] if isinstance(receipt, dict) and receipt.get("ok") is False else None
 
 
+# How the cut-short run's comment opens. Comments reach the next run's worker
+# context (``kanban_db._ctx_comments``), so this line is what tells it to
+# finish from the saved result rather than redo the work and, say, open a
+# second pull request (#2947's duplicate shape).
+SAVED_RESULT_LEAD = (
+    "Result from a run that was re-queued before it could complete; "
+    "verify it and complete with it rather than redoing the work:"
+)
+
+
 def waiting_parent_text(task_id: str, parent_id: str) -> str:
     """The terminal answer for a current run whose card gained a parent."""
     return (
         f"Card {task_id} now waits on {parent_id}, which was linked as its parent "
         f"after your run started, so it can't be completed until {parent_id} "
-        f"finishes. Save your result with kanban_comment so it isn't lost, then "
-        f"call kanban_block(kind=\"dependency\") and end your turn: the card goes "
-        f"back to the queue and runs again once {parent_id} is done. Don't retry "
+        f"finishes. Save your result with kanban_comment, opening it with "
+        f"\"{SAVED_RESULT_LEAD}\", then call kanban_block(kind=\"dependency\") and "
+        f"end your turn: the card goes back to the queue and runs again once "
+        f"{parent_id} is done, and that run reads your comment. Don't retry "
         f"kanban_complete."
     )
 
