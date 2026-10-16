@@ -110,7 +110,8 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      required_phrases: ["cannot open a pull request", "spec.integration.repositories"]
+      required_phrases:
+        ["cannot open a pull request", "spec.integration.repositories"]
 
   # What the explain-only card exists to prevent: the options and the call to
   # action that `actionable_report` reads as an incident with buttons, for an
