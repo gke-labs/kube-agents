@@ -1,0 +1,148 @@
+# NIGHTLY — registered in hack/eval/nightly-cases.txt from the pull request
+# that adds the `zonal-skew` check to the obtainability-audit SOP (#1356);
+# a presubmit seat is a later pull request that cites its nightly record.
+#
+# Domain: reliability (obtainability-audit SOP). Journey: the daily
+# reliability sweep names the workload whose replicas sit in one zone, says
+# why they do, and says how much of the workload one zone failure takes.
+#
+# Planted defect required: slot `d` of the seeded fleet, the one multi-zonal
+# cluster, carries three workloads in namespace `seeded-topology` whose
+# replicas are all in one zone for three different reasons (the roles under
+# `fixtures:`; docs/designs/anomaly-fleet-fixtures.md is the plan). The check
+# this case grades has to find all three and tell the causes apart:
+#   - zone-pinned-api: a ScheduleAnyway zonal spread beside a required node
+#     affinity only the first zone satisfies -- the manifest pinned it;
+#   - zone-bound-store: a StatefulSet whose claims bind to `seeded-zonal-pd`,
+#     a StorageClass restricted to the first zone -- its disks pin it;
+#   - capacity-starved-worker: four replicas at 500m CPU, of which the
+#     second zone's node fits one to three and the first zone's node none,
+#     so the rest stay Pending on `Insufficient cpu` -- capacity pins it.
+# Every noun below is one the fleet planted or an API literal, so the exact
+# matches are fair. The two zone names are the fleet's `var.zone` and
+# `var.second_zone` defaults (bench/tf/fleet/variables.tf), the same
+# contract the upgrade cases hold with `seeded-b`; a fleet applied with other
+# zones changes this case's shape too.
+# Isolation class: cluster-read-only, GitOps-repo write -- step 0 of the
+# stream mints a repo-scoped token and clones the workspace, and `finish`
+# rewrites the ledger issue. Same class as obtainability-planted-pdb.
+# Eligible tier: nightly (a full audit, the same cost band as
+# obtainability-planted-pdb's 962s).
+id: obtainability-zonal-skew
+name: Reliability sweep names the zone-skewed workloads and why each is skewed
+prompt: >-
+  Run the workload reliability audit against the fleet, following the
+  obtainability-audit SOP.
+expected_output: >-
+  The closing response carries the ledger URL in full and, where it
+  summarises, counts zonal-skew among the findings on the multi-zonal seeded
+  cluster. The ledger issue itself, which the deterministic checks in
+  verification_spec read, carries a zonal-skew finding for each of the three workloads in
+  seeded-topology, each naming the zone that holds every running replica,
+  the cause (a node affinity pin, zonal PersistentVolumeClaims on
+  seeded-zonal-pd, or replicas Pending on Insufficient cpu) and the share of
+  the workload lost if that zone fails. Every conclusion cites live cluster
+  reads made during this run.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: reliability
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# The seeded-fleet defects this scenario asserts on, named by ROLE rather than
+# by cluster (bench/tf/fleet/fixtures.json; docs/designs/bench-fleet-catalog.md).
+fixtures:
+  - zonal-skew-scheduling
+  - zonal-skew-volume
+  - zonal-skew-capacity
+
+verification_spec:
+  # One objective per planted cause, on the finding's rendered heading
+  # (`#### zonal-skew on <Kind>/<name>`, composed by audit_report.py's
+  # `_finding_identity_lines`). Not on finding ids: the id check tests each
+  # phrase on its own, so `zonal-skew` plus `zone-pinned-api` would pass on a
+  # rigid-scheduling finding for that object beside any zonal-skew finding at
+  # all, and a long id is shortened (`capacity-starved-work-dc658d` on the dev
+  # install), so a composite id cannot be matched either. The heading binds
+  # check and object in one string, and it is the collector's, not the
+  # model's: the candidate carries `title_authoritative`, so `finish` restores
+  # `draft`'s title over any rewrite, the way it restores an arm-specific
+  # impact. On a main without the check all three are absent, which is the
+  # red this case exists to show.
+  - name: the-pinned-workload-is-a-zonal-skew-finding
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: obtainability-audit
+      scope: body
+      required_phrases: ["zonal-skew on Deployment/zone-pinned-api"]
+  - name: the-disk-bound-workload-is-a-zonal-skew-finding
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: obtainability-audit
+      scope: body
+      required_phrases: ["zonal-skew on StatefulSet/zone-bound-store"]
+  - name: the-capacity-starved-workload-is-a-zonal-skew-finding
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: obtainability-audit
+      scope: body
+      required_phrases: ["zonal-skew on Deployment/capacity-starved-worker"]
+  - name: the-ledger-names-the-zones-and-the-causes
+    role: objective
+    mode: assert
+    check:
+      # The body, not the ids: the second zone (the first is in every ledger
+      # of this fleet, so it would prove nothing), the scheduler's own words
+      # for the capacity cause, and the StorageClass that pins the volume cause.
+      type: ledger_issue_contains
+      audit: obtainability-audit
+      scope: body
+      required_phrases: ["us-central1-b", "Insufficient cpu", "seeded-zonal-pd"]
+  # Cluster-state safeguards, addressed by fixture ROLE: an audit that
+  # "fixed" a workload by rescaling or deleting it fails the case.
+  - name: the-pinned-workload-survived-the-audit
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: zonal-skew-scheduling
+      kind: deployment
+      resource_name: zone-pinned-api
+      namespace: seeded-topology
+      path: spec.replicas
+      op: eq
+      value: 2
+  - name: the-disk-bound-workload-survived-the-audit
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: zonal-skew-volume
+      kind: statefulset
+      resource_name: zone-bound-store
+      namespace: seeded-topology
+      path: spec.replicas
+      op: eq
+      value: 2
+  - name: the-capacity-starved-workload-survived-the-audit
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: zonal-skew-capacity
+      kind: deployment
+      resource_name: capacity-starved-worker
+      namespace: seeded-topology
+      path: spec.replicas
+      op: eq
+      value: 4

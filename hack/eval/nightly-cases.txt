@@ -1047,3 +1047,13 @@
 # publishing. deployer: noop; reads the seeded fleet's rbac-overgrant role.
 # Nightly rather than presubmit for the collector's full sweep.
 ./tasks/security-chat-request-runs-collector/task.yaml
+
+# 2026-10-16 adds obtainability-zonal-skew (#1356): the full obtainability
+# audit against slot d's three planted zonal-skew causes, graded on the
+# ledger it rewrites. Same shape as obtainability-planted-pdb, hinted at
+# 900s and given its 3000s delegation ceiling in hack/ci-eval-pr.sh: the
+# three dev-install runs took 16, 39 and 19 minutes. Three units, one card,
+# off the infra lock. Counted from the lists: eighty-four cases (252 units)
+# here, of a ninety-eight-case, 294-unit matrix with the presubmit file's
+# fourteen.
+./tasks/obtainability-zonal-skew/task.yaml
