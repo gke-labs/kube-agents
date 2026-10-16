@@ -2066,6 +2066,30 @@ class C2FailClosed(unittest.TestCase):
 class C3UntrustedByDefault(unittest.TestCase):
     """C3: no privileged decision may be derived from content the agent controls."""
 
+    def test_C3_the_management_project_cannot_come_from_the_agents_env_file(self) -> None:
+        """The reconcile's management project is pinned where the agent cannot outrank it.
+
+        cluster_agent_reconcile.py takes RECONCILE_PROJECT, then GKE_PROJECT_ID, as
+        the management project, and a changed management project retires the old
+        one's profiles. The agent can write $HERMES_HOME/.env, which beats the
+        container env; only the managed .env beats it. So both keys are pinned
+        there on every golden: RECONCILE_PROJECT empty, GKE_PROJECT_ID to the
+        harness's own value.
+        """
+        checked = 0
+        for fixture, documents in h.golden_documents().items():
+            for document in documents:
+                managed = (document.get("data") or {}).get("managed.env") if document.get("kind") == "ConfigMap" else None
+                if managed is None:
+                    continue
+                checked += 1
+                lines = managed.splitlines()
+                self.assertIn("RECONCILE_PROJECT=", lines, fixture)
+                pinned = [line for line in lines if line.startswith("GKE_PROJECT_ID=")]
+                self.assertEqual(len(pinned), 1, f"{fixture}: GKE_PROJECT_ID is not pinned in managed.env")
+                self.assertNotEqual(pinned[0], "GKE_PROJECT_ID=", f"{fixture}: pinned empty, which reads as unset")
+        self.assertGreater(checked, 0, "no golden renders a managed.env; this test would be vacuous")
+
     def test_C3_the_policy_decision_reads_nothing_but_its_argv(self) -> None:
         """The strongest form of "untrusted content cannot reach the decision".
 

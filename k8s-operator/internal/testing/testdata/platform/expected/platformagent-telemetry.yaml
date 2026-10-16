@@ -338,6 +338,7 @@ data:
     KUBEAGENTS_MODE=today
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
     RECONCILE_PROJECT=
+    GKE_PROJECT_ID=example-project
   profile-platform.overlay.yaml: |
     memory:
       provider: ""

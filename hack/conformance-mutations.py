@@ -603,6 +603,16 @@ Mutation(
         "for each fleet cluster that has client certificate issuance on",
     ),
     Mutation(
+        "C3-management-project-unpinned",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("    RECONCILE_PROJECT=\n    GKE_PROJECT_ID=example-project\n",
+         "    RECONCILE_PROJECT=\n"),
+        "test_C3_the_management_project_cannot_come_from_the_agents_env_file",
+        "drop the GKE_PROJECT_ID pin as a duplicate of the container env -- one "
+        "line in the agent-writable PVC .env then re-points the management "
+        "project, and two clean runs later its profiles are retired",
+    ),
+    Mutation(
         "C1-watcher-route-allows-a-list",
         "agents/platform/scripts/watcher_policy.py",
         ('_EVENTS_LIST = re.compile(r"api/v1/events")\n',

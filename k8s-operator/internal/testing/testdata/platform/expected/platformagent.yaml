@@ -366,6 +366,7 @@ data:
     KUBEAGENTS_MODE=today
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
     RECONCILE_PROJECT=
+    GKE_PROJECT_ID=example-project
     GOOGLE_CHAT_RELAY_URL=http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
     GOOGLE_CHAT_PROJECT_ID=kube-agents-gkedemos
     GOOGLE_CHAT_SUBSCRIPTION_NAME=projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub

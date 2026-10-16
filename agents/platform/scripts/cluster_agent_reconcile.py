@@ -58,7 +58,6 @@ import re
 import subprocess
 import sys
 import time
-import urllib.request
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
@@ -83,7 +82,6 @@ DESCRIBE_TIMEOUT_SECONDS = 30
 # The reconcile notice's kill timeout for `hermes send`; a routed send gets
 # at least `a2a notify`'s own bound (chat_notify.subprocess_timeout).
 NOTIFY_SEND_TIMEOUT_SECONDS = 30
-_MD_BASE = "http://metadata.google.internal/computeMetadata/v1/"
 # The management project as the operator renders it from the CR's harness
 # (platformagent_manifests.go, GKE_PROJECT_ID on the agent container).
 OPERATOR_PROJECT_ENV = "GKE_PROJECT_ID"
@@ -276,18 +274,6 @@ def _run_env() -> dict[str, str]:
     return {**os.environ, "HOME": "/tmp"}
 
 
-def _metadata(path: str):
-    """Read a GKE/GCE metadata value, or None if unavailable."""
-    try:
-        req = urllib.request.Request(_MD_BASE + path, headers={"Metadata-Flavor": "Google"})
-        # Context-managed: this runs on a cron tick, so a socket left to the garbage
-        # collector is a socket leaked once per tick, forever.
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.read().decode().strip()
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def _project_source() -> tuple[str | None, bool]:
     """The management project and whether the answer is authoritative.
 
@@ -316,11 +302,11 @@ def _project_source() -> tuple[str | None, bool]:
         # carry, or a failed lookup, is not an answer.
         resolved, outcome = _project_id_of(operator_project)
         operator_project = resolved if (resolved and outcome == OUTCOME_OK) else ""
-    p = (
-        os.environ.get("RECONCILE_PROJECT")
-        or operator_project
-        or _metadata("project/project-id")
-    )
+    # No metadata rung: this change closes the gateway's route to the metadata
+    # server, and the CRD requires spec.harness.projectId, so GKE_PROJECT_ID is
+    # always rendered (and pinned in the managed .env, which the agent cannot
+    # outrank from the PVC .env).
+    p = os.environ.get("RECONCILE_PROJECT") or operator_project
     if p:
         return p, True
     try:

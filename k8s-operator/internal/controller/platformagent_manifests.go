@@ -693,13 +693,22 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	add(scopeFileEnvKey, scopeDir+"/"+scopeFileName)
 
 	// RECONCILE_PROJECT, pinned empty. The reconcile reads it as the management project
-	// ahead of the metadata server, and since the scope prune exists a management
-	// identity that changes retires the old project's profiles. Unpinned, one line in
-	// the PVC .env would re-point it, and two clean runs later every profile of the
-	// real management project would be gone. Nothing in the operator or the chart sets
-	// it, so pinning it empty costs no install anything; the script treats an empty
-	// value as unset and asks the metadata server.
+	// first, and since the scope prune exists a management identity that changes
+	// retires the old project's profiles. Unpinned, one line in the PVC .env would
+	// re-point it, and two clean runs later every profile of the real management
+	// project would be gone. Nothing in the operator or the chart sets it, so pinning it
+	// empty costs no install anything; the script treats an empty value as unset and
+	// reads GKE_PROJECT_ID next.
 	add(reconcileProjectEnvKey, "")
+
+	// GKE_PROJECT_ID, pinned to the harness's own value, for the same reason. The
+	// reconcile reads it as the management project once RECONCILE_PROJECT is empty: the
+	// gateway reaches no metadata server, so this is now the answer. The container env
+	// carries it too, but the PVC .env beats the container env, so without this pin one
+	// line there would re-point the management project exactly as above.
+	if harness := agent.Spec.Harness; harness != nil {
+		add(gkeProjectEnvKey, harness.ProjectID)
+	}
 
 	integration := agent.Spec.Integration
 	if integration == nil {
@@ -971,6 +980,9 @@ const (
 	// reconcileProjectEnvKey is the reconcile's management-project override, pinned
 	// empty in the managed .env (see renderManagedEnv) so the agent cannot write it.
 	reconcileProjectEnvKey = "RECONCILE_PROJECT"
+	// gkeProjectEnvKey is the management project the reconcile reads, rendered on the
+	// container and pinned in the managed .env (see renderManagedEnv).
+	gkeProjectEnvKey = "GKE_PROJECT_ID"
 
 	// gitopsStateVolumeName projects the GitOps state ConfigMap as a mounted directory
 	// volume into the agent container so skills can read managed repositories directly from disk.
@@ -3836,8 +3848,10 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 //
 // The harness triple is part of the condition rather than a validation reported
 // elsewhere. The detector requires --project; --cluster-name requires
-// --cluster-location; and it checks that name against the cluster its credentials
-// actually reach, exiting on a mismatch. An install that asks for the detector
+// --cluster-location; and, where its in-cluster probe can reach the metadata server
+// (not inside the gateway, where the probe times out and the triple is taken on
+// trust), it checks that name against the cluster its credentials actually reach,
+// exiting on a mismatch. An install that asks for the detector
 // without naming its cluster would therefore get a restart loop for as long as the
 // pod lives, so the operator reports it as off and leaves the pod quiet.
 //
@@ -5953,14 +5967,11 @@ func buildPlatformLeaderRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 	}
 }
 
-// buildLeaderRoleBinding generates the RoleBinding manifest for leader election in the agent namespace
 // buildLeaderRoleBinding binds the leader Role to the gateway's own
 // ServiceAccount alone. Leader election runs in the gateway (leader_elect.py);
 // nothing in the credential broker's Pod touches a Lease or patches a pod, so
 // the broker, which used to share this subject, holds none of it.
 func buildLeaderRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, roleName string) *rbacv1.RoleBinding {
-	saName := gatewayServiceAccountName(agent)
-
 	return &rbacv1.RoleBinding{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "rbac.authorization.k8s.io/v1",
@@ -5970,13 +5981,7 @@ func buildLeaderRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, rol
 			Name:      bindingName,
 			Namespace: agent.Namespace,
 		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      saName,
-				Namespace: agent.Namespace,
-			},
-		},
+		Subjects: []rbacv1.Subject{gatewaySubject(agent)},
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "Role",
