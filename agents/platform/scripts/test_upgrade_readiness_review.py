@@ -472,6 +472,19 @@ class TheRoster(unittest.TestCase):
         self.assertIn("governance/upgrade_readiness_brief_sop.md", brief["prompt"])
         self.assertFalse(brief.get("no_agent"))
 
+    def test_the_skill_carries_the_sop_shape_verbatim(self):
+        # The on-request route lives in a skill the worker loads; its template
+        # must be the SOP's, or a chat brief and a Saturday brief drift apart.
+        import re
+        skill = (Path(__file__).resolve().parents[1] / "skills" / "upgrade-readiness-brief" / "SKILL.md").read_text()
+        def template(text):
+            blocks = re.findall(r"```\n(.*?)```", text, flags=re.S)
+            shapes = [b for b in blocks if "Decide now" in b]
+            self.assertEqual(len(shapes), 1, "one fenced template with Decide now")
+            return "\n".join(line.strip() for line in shapes[0].strip().splitlines() if line.strip())
+        self.assertEqual(template(SOP.read_text()), template(skill))
+        self.assertIn("upgrade-readiness-brief", SOP.read_text())
+
     def test_the_brief_sop_names_the_copy_the_review_places(self):
         text = SOP.read_text()
         self.assertIn(f"{review.SANDBOX_COPY_DIR}/{review.LATEST_JSON_NAME}", text)

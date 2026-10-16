@@ -126,7 +126,9 @@ reply in that thread reaches the agent with the brief attached.
 
 ## On request
 
-A user may ask in chat for the brief or the report, at any time.
+A user may ask in chat for the brief or the report, at any time. The `upgrade-readiness-brief` skill
+(`skills/upgrade-readiness-brief/SKILL.md`) is this section as the agent loads it for a chat request;
+its shape is the one in section 3, kept identical by a test.
 
 - **"Show me this week's upgrade readiness report"**, or any ask for the full report → print
   `/opt/data/upgrade-readiness/weekly/latest.md` as it is. Google Chat splits anything past 4,000
