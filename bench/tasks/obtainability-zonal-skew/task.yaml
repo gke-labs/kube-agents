@@ -34,15 +34,15 @@ prompt: >-
   Run the workload reliability audit against the fleet, following the
   obtainability-audit SOP.
 expected_output: >-
-  The ledger issue carries a zonal-skew finding for each of the three
-  workloads in seeded-topology on the multi-zonal seeded cluster, naming the
-  zone that holds every running replica and the cause: zone-pinned-api is
-  pinned by its own node affinity, zone-bound-store by its zonal
-  PersistentVolumeClaims on seeded-zonal-pd, and capacity-starved-worker by
-  capacity, its surplus replicas Pending on Insufficient cpu. Each finding
-  states the share of the workload lost if the crowded zone fails. Every
-  conclusion cites live cluster reads made during this run. The closing
-  response is the SOP's one line, carrying the ledger URL in full.
+  The closing response carries the ledger URL in full and, where it
+  summarises, counts zonal-skew among the findings on the multi-zonal seeded
+  cluster. The ledger issue itself, which the deterministic checks above
+  read, carries a zonal-skew finding for each of the three workloads in
+  seeded-topology, each naming the zone that holds every running replica,
+  the cause (a node affinity pin, zonal PersistentVolumeClaims on
+  seeded-zonal-pd, or replicas Pending on Insufficient cpu) and the share of
+  the workload lost if that zone fails. Every conclusion cites live cluster
+  reads made during this run.
 infrastructure:
   deployer: noop
 validated: false
