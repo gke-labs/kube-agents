@@ -40,7 +40,8 @@ const topLevelNothingRunningNotice = "🤷 nothing is running here — each ques
 
 // nothingRunningNotice answers a "stop" in a conversation with no active
 // task. nothingRunningCardNotice is the same answer for a conversation that
-// has run a task before: its turn may have filed a kanban card, which ends the
+// has run a task before: its turn may have filed a kanban card (the gateway
+// cannot tell whether it did, so the reply says "if"), which ends the
 // turn within seconds but is not a task the gateway holds or can cancel. The
 // card keeps working and posts here, so the reply must not read as "nothing
 // is happening" (gke-labs#3263); stopping the card is the follow-up there. A
@@ -49,7 +50,7 @@ const topLevelNothingRunningNotice = "🤷 nothing is running here — each ques
 // text, so readers matching "nothing is running" still do.
 const (
 	nothingRunningNotice     = "🤷 nothing is running"
-	nothingRunningCardNotice = "🤷 nothing is running in this conversation. A card the agent filed for it keeps working and posts here; stopping a card from chat isn't supported yet."
+	nothingRunningCardNotice = "🤷 nothing is running in this conversation. If the agent filed a card for it, the card keeps working and posts here; stopping a card from chat isn't supported yet."
 )
 
 // What retireIncarnation posts when the previous task cannot be closed on
