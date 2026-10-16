@@ -72,4 +72,5 @@ verification_spec:
     check:
       type: report_contains
       required_phrases: ["Workload Identity", "Shielded Nodes"]
-      any_of_phrases: ["PASS", "FAIL", "WARN"]
+      # Bounded: a substring would also take "password", "failed" or "warning".
+      any_of_patterns: ['(?i)\b(?:pass|fail|warn)\b']
