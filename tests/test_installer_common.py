@@ -1099,6 +1099,62 @@ class InstallerCommonTest(unittest.TestCase):
                     self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
 
     # Empty reads as unset, so a developer's own exported value cannot stand in.
+    _ALERT_DAILY_LIMITS_UNSET = {
+        "ALERT_DAILY_LIMIT_CRITICAL": "",
+        "ALERT_DAILY_LIMIT_WARNING": "",
+        "ALERT_DAILY_LIMIT_INFO": "",
+        "ALERT_DAILY_LIMIT_DRIFT": "",
+    }
+
+    def _alert_daily_limits_block(self, content):
+        match = re.search(r"^alert_daily_limits = (\{\}|\{\n(?:  .*\n)*\})$", content, re.MULTILINE)
+        self.assertIsNotNone(match, content)
+        return match.group(1)
+
+    def test_tfvars_carry_no_alert_daily_limits_when_none_is_set(self):
+        # An empty key keeps the image default, so nothing reaches the chart.
+        content = self._tfvars({"API_SERVER_KEY": "k", **self._ALERT_DAILY_LIMITS_UNSET},
+                               describe_stub="printf '\\n'; exit 0")
+        self.assertEqual(self._alert_daily_limits_block(content), "{}")
+
+    def test_tfvars_carry_only_the_alert_daily_limits_that_are_set(self):
+        content = self._tfvars(
+            {"API_SERVER_KEY": "k", **self._ALERT_DAILY_LIMITS_UNSET,
+             "ALERT_DAILY_LIMIT_CRITICAL": "50", "ALERT_DAILY_LIMIT_DRIFT": "20"},
+            describe_stub="printf '\\n'; exit 0",
+        )
+        self.assertEqual(
+            self._alert_daily_limits_block(content),
+            "{\n  critical = 50\n  drift = 20\n}",
+        )
+
+    def test_tfvars_carry_an_alert_daily_limit_of_zero(self):
+        # 0 removes the cap for that bucket, so it is a value, not an empty key.
+        content = self._tfvars(
+            {"API_SERVER_KEY": "k", **self._ALERT_DAILY_LIMITS_UNSET, "ALERT_DAILY_LIMIT_WARNING": "0"},
+            describe_stub="printf '\\n'; exit 0",
+        )
+        self.assertEqual(self._alert_daily_limits_block(content), "{\n  warning = 0\n}")
+
+    def test_tfvars_refuse_an_alert_daily_limit_that_is_not_a_whole_number(self):
+        # upgrade.sh regenerates from install.env without install.sh's
+        # interview, so the generator is the check that reaches it.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for key in self._ALERT_DAILY_LIMITS_UNSET:
+                for value in ("ten", "-1"):
+                    with self.subTest(key=key, value=value):
+                        proc = self._run(
+                            f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                            env={"API_SERVER_KEY": "k", **self._ALERT_DAILY_LIMITS_UNSET, key: value},
+                            describe_stub="printf '\\n'; exit 0",
+                        )
+                        self.assertIn("rc=1", proc.stdout, proc.stderr)
+                        self.assertIn(key, proc.stderr + proc.stdout)
+                        self.assertIn("install.env", proc.stderr + proc.stdout)
+                        self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
+    # Empty reads as unset, so a developer's own exported value cannot stand in.
     _REDACTION_UNSET = {
         "LITELLM_REDACTION_ENABLED": "",
         "LITELLM_REDACTION_IP_ACTION": "",

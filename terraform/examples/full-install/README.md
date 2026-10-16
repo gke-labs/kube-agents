@@ -61,6 +61,14 @@ install without the interview.
   development stack. `install.sh` sets it from `PLATFORM_AGENT_MODE` in
   `install.env`. Changing it on a running install is a mode switch
   ([`docs/designs/spec-mode-switch.md`](../../../docs/designs/spec-mode-switch.md)).
+  `alert_daily_limits` (default `{}`) sets the daily alert ceilings, and
+  `install.sh` sets it from the `ALERT_DAILY_LIMIT_*` keys in `install.env`.
+  A key that is not set keeps the default in the agent image. Each apply that
+  changes the env list that the chart renders replaces the `PlatformAgent`'s
+  `spec.deployment.env`, and entries added to the CR by hand are lost. Set
+  those through `platformAgent.deployment.env` in `extra_helm_values`. The
+  [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling)
+  gives the buckets, the defaults and a sizing method.
 - Two `random_password` values added to that Secret rather than asked for:
   `SESSION_KV_API_KEY`, the bearer token for the pod-local Session KV server,
   and `SESSION_KV_SALT`, the HMAC salt that pseudonymises chat identities.
