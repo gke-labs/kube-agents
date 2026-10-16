@@ -10,7 +10,8 @@ the previous run's ids and titles, which is how a finding is known to be new or 
 
 A finding whose `evidence` and `severity` are the same as in the previous run publishes with the
 previous run's `title` and `impact`, and usually its `recommendation` and `remediation` together. So
-new words for an unchanged finding do not reach the ledger. Your `manifest` remediation and its
+new words for an unchanged finding do not reach the ledger. A collector candidate marked
+`title_authoritative` keeps the title `draft` wrote whatever anyone writes. Your `manifest` remediation and its
 `recommendation` always stay, and so does a `gcloud` command where the previous run wrote `manual`.
 
 | State                | Rendered as                           | Meaning                                    | What the harness does                                        |

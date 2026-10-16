@@ -215,6 +215,12 @@ TRIAGE_BY_SLUG = {
 # tab-separated, a few hundred bytes each; completed pods are left out
 # server-side because they hold no replica.
 ZONAL_SKEW_SLUG = "zonal-skew"
+# Checks whose finding title is the collector's, not the model's. `draft` writes
+# every title as `<check> on <Kind>/<name>`; for a slug here the candidate
+# carries `title_authoritative` and `audit_report.py finish` restores that form
+# over a model rewrite, the way it restores an arm-specific impact. The
+# zonal-skew heading is what the nightly case and a reader key on.
+TITLE_AUTHORITATIVE_SLUGS = frozenset({ZONAL_SKEW_SLUG})
 POD_PLACEMENT_FIELD_SELECTOR = "status.phase!=Succeeded,status.phase!=Failed"
 POD_PLACEMENT_JSONPATH = (
     r'{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.nodeName}{"\t"}'
@@ -9757,6 +9763,8 @@ def collect_cluster(
         }
         if arm_specific:
             emitted["impact_authoritative"] = True
+        if spec.slug in TITLE_AUTHORITATIVE_SLUGS:
+            emitted["title_authoritative"] = True
         if isinstance(hit.get("pod_selector"), dict):
             emitted["pod_selector"] = hit["pod_selector"]
         if isinstance(hit.get("namespace_pdbs"), list):
