@@ -363,14 +363,14 @@ class TestSavedResultBanner(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
         self.conn.executescript(
-            "CREATE TABLE tasks (id TEXT, assignee TEXT, completed_at INTEGER);"
+            "CREATE TABLE tasks (id TEXT, assignee TEXT, completed_at INTEGER, status TEXT DEFAULT 'running');"
             "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, started_at INTEGER);"
             "CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT, created_at INTEGER);"
             "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, created_at INTEGER);"
             "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);")
-        self.conn.execute("INSERT INTO tasks VALUES (?, 'platform', NULL)", (TID,))
+        self.conn.execute("INSERT INTO tasks VALUES (?, 'platform', NULL, 'running')", (TID,))
         # The parent linked mid-run, finished after the block.
-        self.conn.execute("INSERT INTO tasks VALUES ('t_rotate', 'platform', 150)")
+        self.conn.execute("INSERT INTO tasks VALUES ('t_rotate', 'platform', 150, 'done')")
         self.conn.execute("INSERT INTO task_links VALUES ('t_rotate', ?)", (TID,))
         self.conn.execute("INSERT INTO task_runs VALUES (52, ?, 90)", (TID,))
 
@@ -424,7 +424,7 @@ class TestSavedResultBanner(unittest.TestCase):
         self.assertEqual(ker.saved_result_banner(self.conn, TID), [])
 
     def test_a_parent_done_before_the_block_isnt_named(self):
-        self.conn.execute("INSERT INTO tasks VALUES ('t_audit', 'platform', 50)")
+        self.conn.execute("INSERT INTO tasks VALUES ('t_audit', 'platform', 50, 'done')")
         self.conn.execute("INSERT INTO task_links VALUES ('t_audit', ?)", (TID,))
         self.comment(ker.SAVED_RESULT_LEAD + " web-7 is fine")
         self.event(ker.DEPENDENCY_WAIT_EVENT)
@@ -459,11 +459,27 @@ class TestSavedResultBanner(unittest.TestCase):
         self.event(ker.DEPENDENCY_WAIT_EVENT)
         self.assertEqual(ker.saved_result_banner(self.conn, TID), [])
 
-    def test_a_long_result_is_capped(self):
-        self.comment(ker.SAVED_RESULT_LEAD + " " + "x" * (ker.SAVED_RESULT_MAX_CHARS + 50))
+    def test_a_long_result_is_clipped_without_severing_a_link(self):
+        link = "https://github.com/gke-agentic/infra/pull/276"
+        self.comment(ker.SAVED_RESULT_LEAD + " " + "word " * (ker.SAVED_RESULT_MAX_CHARS // 5) + link)
         self.event(ker.DEPENDENCY_WAIT_EVENT)
-        quoted = [l for l in ker.saved_result_banner(self.conn, TID) if l.startswith("> ")]
-        self.assertTrue(quoted[-1].endswith("[truncated]"))
+        quoted = " ".join(l for l in ker.saved_result_banner(self.conn, TID) if l.startswith("> "))
+        self.assertLessEqual(len(quoted), ker.SAVED_RESULT_MAX_CHARS + 10)
+        self.assertNotIn("https://github.com/gke-agentic/infra/pul", quoted.replace(link, ""))
+
+    def test_a_card_completed_after_the_block_gets_no_banner(self):
+        """Reopened after finishing from the saved result: it's spent."""
+        self.comment(ker.SAVED_RESULT_LEAD + " web-7 is fine")
+        self.event(ker.DEPENDENCY_WAIT_EVENT)
+        self.event("completed", at=160, run=53)
+        self.assertEqual(ker.saved_result_banner(self.conn, TID), [])
+
+    def test_an_archived_parent_isnt_named(self):
+        self.conn.execute("INSERT INTO tasks VALUES ('t_wrong', 'platform', NULL, 'archived')")
+        self.conn.execute("INSERT INTO task_links VALUES ('t_wrong', ?)", (TID,))
+        self.comment(ker.SAVED_RESULT_LEAD + " web-7 is fine")
+        self.event(ker.DEPENDENCY_WAIT_EVENT)
+        self.assertNotIn("t_wrong", ker.saved_result_banner(self.conn, TID)[1])
 
     def test_an_unreadable_board_fails_open(self):
         self.conn.execute("DROP TABLE task_events")

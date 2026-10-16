@@ -282,6 +282,10 @@ _NEWEST_DEPENDENCY_WAIT_SQL = (
     " JOIN task_runs r ON r.id = e.run_id"
     " JOIN tasks t ON t.id = e.task_id"
     " WHERE e.task_id = ? AND e.kind = ?"
+    # Spent once a run after it completed the card: a card reopened after
+    # finishing from the saved result mustn't be handed it again.
+    " AND NOT EXISTS (SELECT 1 FROM task_events d WHERE d.task_id = e.task_id"
+    "   AND d.kind = 'completed' AND d.id > e.id)"
     " ORDER BY e.id DESC LIMIT 1"
 )
 # The card's own worker's comments inside that run, newest first.
@@ -294,7 +298,8 @@ _RUN_COMMENTS_SQL = (
 # The parents the card was waiting on at the block: unfinished then.
 _WAITED_ON_SQL = (
     "SELECT p.id FROM task_links l JOIN tasks p ON p.id = l.parent_id"
-    " WHERE l.child_id = ? AND (p.completed_at IS NULL OR p.completed_at > ?)"
+    " WHERE l.child_id = ? AND p.status != 'archived'"
+    " AND (p.completed_at IS NULL OR p.completed_at > ?)"
     " ORDER BY p.id"
 )
 # What identifies the lead, compared after normalising (see _lead_end).
@@ -340,6 +345,20 @@ def banner_text(parents: list[str]) -> str:
     return SAVED_RESULT_BANNER.format(parents=names)
 
 
+def _clip(text: str) -> str:
+    """``text`` cut to :data:`SAVED_RESULT_MAX_CHARS` without severing a
+    token (``kanban_handoff_clip.clip_handoff``), so a pull-request link at
+    the end stays whole."""
+    try:  # In the image, /opt/hermes is on sys.path.
+        from gateway.kanban_handoff_clip import clip_handoff
+    except Exception:
+        try:  # Local unittest discovery: the patches dir is top-level.
+            from kanban_handoff_clip import clip_handoff
+        except Exception:
+            return text[:SAVED_RESULT_MAX_CHARS]
+    return clip_handoff(text, SAVED_RESULT_MAX_CHARS)
+
+
 def saved_result_banner(conn: Any, task_id: str) -> list[str]:
     """Lines for the top of the worker context when the card's newest
     saved-result comment came from a run that then blocked on a dependency:
@@ -377,8 +396,7 @@ def saved_result_banner(conn: Any, task_id: str) -> list[str]:
             break
     if not result:
         return []
-    if len(result) > SAVED_RESULT_MAX_CHARS:
-        result = result[:SAVED_RESULT_MAX_CHARS] + "… [truncated]"
+    result = _clip(result)
     return [
         SAVED_RESULT_HEADING,
         banner_text(parents),
