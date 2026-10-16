@@ -81,7 +81,7 @@ Upgrade readiness, week of <YYYY-MM-DD>: <n> clusters reviewed, <b> blocked, <r>
 
 **Decided earlier:** <a> accepted, <s> snoozed, <d> dismissed; nothing changes there<, or "none yet">.
 
-<when the summary's project_failures is not empty: "**Not read this week:** <project>: <reason>; last week's findings there stand.">
+<when project_failures is not empty: "**Not read this week:** <project>: <reason>; last week's findings there stand.">
 
 Full report: /opt/data/upgrade-readiness/weekly/latest.md on the agent. Reply "show me this week's upgrade readiness report" to read it here, or reply with an id and `dismiss`, `snooze until <date>` or `accept` to decide.
 ```

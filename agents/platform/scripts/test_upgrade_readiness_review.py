@@ -478,10 +478,19 @@ class TheRoster(unittest.TestCase):
         import re
         skill = (Path(__file__).resolve().parents[1] / "skills" / "upgrade-readiness-brief" / "SKILL.md").read_text()
         def template(text):
-            blocks = re.findall(r"```\n(.*?)```", text, flags=re.S)
-            shapes = [b for b in blocks if "Decide now" in b]
+            blocks, current = [], None
+            for line in text.splitlines():
+                if line.strip().startswith("```"):
+                    if current is None:
+                        current = []
+                    else:
+                        blocks.append(current)
+                        current = None
+                elif current is not None:
+                    current.append(line.strip())
+            shapes = [b for b in blocks if any("Decide now" in line for line in b)]
             self.assertEqual(len(shapes), 1, "one fenced template with Decide now")
-            return "\n".join(line.strip() for line in shapes[0].strip().splitlines() if line.strip())
+            return "\n".join(line for line in shapes[0] if line)
         self.assertEqual(template(SOP.read_text()), template(skill))
         self.assertIn("upgrade-readiness-brief", SOP.read_text())
 
