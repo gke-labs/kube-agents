@@ -25,6 +25,11 @@ spec:
 :                                : **Does NOT require   :                      :
 :                                : cluster-level Node   :                      :
 :                                : Auto Provisioning.** :                      :
+| `nodePoolAutoCreation.shieldedInstanceConfig` | Shielded GKE Nodes   | Optional. Toggles    |
+:                                               : settings for auto-   : `enableSecureBoot`   :
+:                                               : created pools.       : and `enableIntegrity-:
+:                                               :                      : Monitoring` (GKE     :
+:                                               :                      : 1.36.3-gke.1244000+).:
 | `nodePoolConfig`               | Defaults for node    | See below.           |
 :                                : pool auto-creation   :                      :
 :                                : pools (image, SA,    :                      :
@@ -81,6 +86,9 @@ Applied to pools created by the autoscaler.
     -   `linuxNodeConfig`: `sysctls` (e.g., `net.ipv4.tcp_tw_reuse: true`,
         `net.core.somaxconn: 4096`). **Never quote integer or boolean values.**
     -   `kubeletConfig`: `cpuCfsQuota`, `podPidsLimit`, etc.
+-   `secondaryBootDisks`: Attach secondary boot disks (e.g. pre-warmed container image disks) to auto-provisioned nodes for zero-delay container startup.
+-   `bootDiskProfile`: Performance profile for boot disks (e.g. `BALANCED`).
+-   `ephemeralLocalSsdProfile` / `dedicatedLocalSsdProfile`: Intent-based NVMe scratch space profiles.
 -   `storage`: Set `bootDiskType`, `bootDiskSize`, and `localSSDCount`
     specifically for this priority. Overrides cluster/nodePoolConfig defaults.
     **This is the NODE boot disk, NOT the workload's data PV** — for attached
@@ -92,7 +100,7 @@ Applied to pools created by the autoscaler.
 
 -   **Case Sensitivity**: `imageType` must be lowercase (e.g.,
     `cos_containerd`).
--   **Field Hallucinations**: NEVER use `spec.description`, `gvnic`,
+-   **Field Hallucinations**: NEVER use `spec.description`,
     `transparentHugepageEnabled`, or `shutdownGracePeriodSeconds`. They do not
     exist in the CRD.
 -   **YAML Formatting**: ALWAYS use literal integers for fields like
