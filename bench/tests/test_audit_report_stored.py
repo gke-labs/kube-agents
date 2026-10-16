@@ -31,7 +31,7 @@ import yaml
 from devops_bench.verification.spec import parse_node
 
 from kube_agents_bench import onboarding, transcript, verifiers
-from kube_agents_bench.verifiers import AuditReportStoredVerifier
+from kube_agents_bench.verifiers import AuditReportStoredVerifier, ReportContainsVerifier, WorkerCommandsVerifier
 
 REPO = Path(__file__).resolve().parents[2]
 TASK = REPO / "bench" / "tasks" / "fleet-audit-without-forge-keeps-the-report" / "task.yaml"
@@ -147,3 +147,78 @@ def test_the_status_set_matches_what_the_status_view_knows():
     known = set(re.findall(r'^\s+"([A-Z_]+)": "', block, re.M))
     assert len(known) == 5, known
     assert known == set(verifiers.AuditStatus.__args__)
+
+
+SCRIPTS = "/opt/data/profiles/platform/skills/fleet-audit/scripts"
+
+
+def _worker_check(name: str, commands: list[str]) -> str:
+    spec = yaml.safe_load(TASK.read_text())["verification_spec"]
+    check = next(entry for entry in spec if entry["name"] == name)["check"]
+    transcript.set(output="", trajectory=[], worker_commands=[{"task": "t_1", "command": c} for c in commands])
+    try:
+        return WorkerCommandsVerifier(**check).verify(5.0).status
+    finally:
+        transcript.clear()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"python3 {SCRIPTS}/audit_report.py start --audit {AUDIT}",
+        f"python3 {SCRIPTS}/audit_report.py start --audit={AUDIT}",
+        f"cd /tmp && {SCRIPTS}/audit_report.py start --audit {AUDIT} > start.json",
+    ],
+)
+def test_a_start_run_is_credited(command):
+    assert _worker_check("the-worker-ran-start", [command]) == "pass"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f'grep -n "audit_report.py start --audit" {SCRIPTS}/../SKILL.md',
+        f'echo "python3 {SCRIPTS}/audit_report.py start --audit {AUDIT}"',
+        f"python3 {SCRIPTS}/audit_report.py start --help",
+        f"python3 {SCRIPTS}/audit_report.py finish --audit {AUDIT}",
+        f"python3 {SCRIPTS}/collect.py {AUDIT}",
+    ],
+)
+def test_a_mention_or_another_run_is_not(command):
+    assert _worker_check("the-worker-ran-start", [command]) == "fail"
+
+
+def _answer_check(name: str, answer: str) -> str:
+    spec = yaml.safe_load(TASK.read_text())["verification_spec"]
+    check = next(entry for entry in spec if entry["name"] == name)["check"]
+    transcript.set(output=answer, trajectory=[], final_message=answer)
+    try:
+        return ReportContainsVerifier(**check).verify(5.0).status
+    finally:
+        transcript.clear()
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "No GitOps forge is configured, so no ledger issue was opened.",
+        "No forge is configured on this install.",
+        "no git forge here",
+        "There is no GitOps repository registered.",
+        "No GitHub forge is configured, so no ledger issue was opened.",
+        "There is no GitLab forge on this install.",
+    ],
+)
+def test_the_no_forge_answer_is_recognised(answer):
+    assert _answer_check("the-answer-says-no-forge-is-configured", answer) == "pass"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "Opened ledger issue #12 in acme/infra.",
+        "The forge rejected the push.",
+    ],
+)
+def test_an_answer_without_it_is_not(answer):
+    assert _answer_check("the-answer-says-no-forge-is-configured", answer) == "fail"

@@ -249,6 +249,9 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 // rolling-line edit; posts always happen.
 func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relayItem, render bool) {
 	env := item.env
+	if g.sessionForTask(ctx, env.TaskID) != rec.Key {
+		return
+	}
 	rs := g.relayFor(env.TaskID)
 
 	switch env.Kind {
@@ -477,7 +480,11 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// post IS the answer. The replay above is skipped for the same
 		// backends, so reaching here with an empty result costs nothing.
 		if !isConsoleConversation(rec.Key) {
-			g.postMessage(rec.Key, answer)
+			if ref.TerminalObserved && result == completedNonTextResult {
+				// The heal already posted the status card; skip completedNonTextResult.
+			} else {
+				g.postMessage(rec.Key, answer)
+			}
 		}
 		g.markFrom(rec, taskID, answerChat)
 	case lib.StateFailed:
@@ -531,11 +538,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			}
 			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote), rs)
 		}
+		unmarkOnSupervisorTerminal(rec, taskID, source)
 		rec.ActiveTask = nil
-		// An executor's end of a live task is activity. The idle TTL that
-		// bounds the session (the reap, and the Slack adapter's session-
-		// thread rule through hasSession) counts from here, not from the ask
-		// that started the task: a long task's thread must not go quiet the
+		// An executor's end of a live task is activity. The Slack adapter's
+		// session-thread rule (hasSession, through LastTaskActivity) counts
+		// from here, not from the ask that started the task; the reap does
+		// not, it counts from the last user message (idleSince): a long task's thread must not go quiet the
 		// instant its answer posts, and the user's follow-up right after the
 		// result is the most ordinary message a session carries. The
 		// executor's confirmation of a stop is an answer too: a detached
@@ -604,7 +612,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// chain's (observedAs): a turn that delegated and a child end quietly,
 	// and the root's one terminal comes from the wake or, when none runs,
 	// from observeChildEnd below.
-	g.observeEnded(rec, taskID, s.Status.State, source, reason)
+	if !ref.TerminalObserved {
+		g.observeEnded(rec, taskID, s.Status.State, source, reason)
+	}
 
 	// A delegated child's end wakes the session that asked.
 	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild {

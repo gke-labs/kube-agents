@@ -1,12 +1,4 @@
-# Capped below 1.66.0 because that release changed the AppTest harness
-# ("Keep AppTest page widget state on rerun"): the page hash is kept between
-# AppTest.run() calls, the sidebar's polling fragment no longer executes on
-# later runs, and the connect-job tests in tests/test_admin_portal_ui.py fail
-# because a finished connect job is never applied. The console itself is not
-# known to be affected. Lift the cap together with the streamlit ignore rule
-# in .github/dependabot.yml once that suite passes on the new line, which
-# means adapting the console or its tests to the retained page state.
-streamlit>=1.65.0,<1.66.0
+streamlit>=1.65.0,<2
 plotly>=7.1.0,<8
 fastapi>=0.142.3,<1
 httpx>=0.28.1,<1
@@ -15,7 +7,7 @@ uvicorn>=0.54.0,<1
 # The upper bound was Streamlit's: 1.62.0 required websockets<17, so raising
 # this pin made the file unresolvable rather than merely untested. The 1.65.0
 # floor above allows websockets<18, so the cap is now ours and lifting it is
-# its own change, separate from the streamlit cap: it needs a run of
+# its own change: it needs a run of
 # api/streamlit_proxy.py, which imports websockets directly and is why the
 # dependency is stated here at all, on the 17 line. Lift it together with the
 # websockets ignore rule in .github/dependabot.yml.

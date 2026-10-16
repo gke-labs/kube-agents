@@ -240,17 +240,21 @@ The same script's `--readiness` flag executes three items of this skill's pre-up
 per member, against the same target: PodDisruptionBudgets that would block a node drain
 (`maxUnavailable: 0`, or `minAvailable` demanding every expected pod), maintenance exclusions and
 the maintenance window at a given instant (`--at`, default now), and node-pool version skew
-against the target control plane. Run it before writing the plan and carry its `blocked` rows into
-the checklist rather than asking the operator to check those three by hand. It also grades a
-fourth thing the checklist's admission-webhook item points at: a fail-closed webhook whose
-backend is unreachable and whose rules reach the upgrade's path (the writes a node drain and a node
-join make, as `UPGRADE_PATH_TARGETS` in `./skills/fleet-upgrade-verification/scripts/upgrade_readiness.py` lists them), which is a cause of
-a drain that will not finish, or whose rules reach the bootstrap RBAC writes a new master reconciles (ClusterRoles and ClusterRoleBindings
-always; Roles and RoleBindings in `kube-system` or `kube-public` when its namespace selector admits that
-namespace), which is a cause of a master that will not start. The two reads cost one
-`get-credentials` and two `kubectl get` per member and leave a per-member kubeconfig under
-`${HERMES_HOME:-/opt/data}/.kubeconfigs/`; an exclusion is reported as holding back automatic
-upgrades only.
+against the target control plane. It also grades a fourth thing the checklist's admission-webhook
+item points at: a fail-closed webhook whose backend is unreachable and whose rules reach the
+upgrade's path (the writes a node drain and a node join make, as `UPGRADE_PATH_TARGETS` in
+`./skills/fleet-upgrade-verification/scripts/upgrade_readiness.py` lists them), which is a cause of
+a drain that will not finish, or whose rules reach the bootstrap RBAC writes a new master reconciles
+(ClusterRoles and ClusterRoleBindings always; Roles and RoleBindings in `kube-system` or
+`kube-public` when its namespace selector admits that namespace), which is a cause of a master that
+will not start. It then runs the per-entry rules the fleet-upgrade-verification skill lists for the
+upgrade-failure catalogue, each a blocker the report lists under `other blockers` or a risk it lists
+under `risks` (a zonal control plane is one). Run it before writing the plan; carry its `blocked`
+rows and `other blockers` into the checklist rather than asking the operator to check those items
+by hand, and its risks as what to watch. The cluster reads cost one `get-credentials` and the
+`kubectl get`s that skill's "Check upgrade readiness" section lists per member, and leave a
+per-member kubeconfig under `${HERMES_HOME:-/opt/data}/.kubeconfigs/`; an exclusion is reported as
+holding back automatic upgrades only.
 
 When the checklist's deprecated-API item comes up, the same skill's `api_deprecation_scan.py` scans
 the linked GitOps repositories' manifests for apiVersions the target removes and reports each with

@@ -53,7 +53,7 @@ from admin_console.telemetry import TelemetrySnapshot, TelemetrySourceState
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 APP_PATH = REPO_ROOT / "admin_console" / "app.py"
-CONNECTION_PAGE_PATH = REPO_ROOT / "admin_console" / "pages" / "connections.py"
+CONNECTION_PAGE_PATH = REPO_ROOT / "admin_console" / "views" / "connections.py"
 PROJECT = "test-project-01"
 CLUSTER = "test-cluster-01"
 LOCATION = "us-east4"
@@ -752,13 +752,28 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         ).click().run()
         return self.finish_connection_job(app)
 
+    def test_a_switched_page_still_runs_the_app_shell(self):
+        """The sidebar, the connection poll and the sign-in caption come from
+        app.py. A pages/ folder beside app.py turns on streamlit's legacy
+        multipage layout, and AppTest then reruns a page without app.py
+        (#3044). On streamlit 1.66 the connect-job tests catch that; on 1.65
+        only this test does.
+        """
+        self.assertFalse((APP_PATH.parent / "pages").exists())
+        app = self.app().run().switch_page("views/kanban.py").run()
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(
+            any("Signed in as admin@example.com" in item.value for item in app.sidebar.caption)
+        )
+
     def test_provider_backed_pages_stay_visible_before_connection(self):
         for page, title in (
-            ("pages/chat.py", "Chat"),
-            ("pages/overview.py", "Overview"),
-            ("pages/activity.py", "Activity Explorer"),
-            ("pages/kanban.py", "Task Kanban"),
-            ("pages/autonomous.py", "Scheduled Cron"),
+            ("views/chat.py", "Chat"),
+            ("views/overview.py", "Overview"),
+            ("views/activity.py", "Activity Explorer"),
+            ("views/kanban.py", "Task Kanban"),
+            ("views/autonomous.py", "Scheduled Cron"),
         ):
             with self.subTest(page=page):
                 app = self.app().run().switch_page(page).run()
@@ -863,7 +878,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         ):
             app = self.connect_project(self.app().run())
             app = self.connect_cluster(app)
-            app = app.switch_page("pages/kanban.py").run()
+            app = app.switch_page("views/kanban.py").run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(len(app.info), 0)
@@ -1422,7 +1437,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_runtime.AgentRuntimeProvider",
             FakeHistoryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/chat.py").run()
+            app = self.app(connected=True).run().switch_page("views/chat.py").run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(len(app.chat_message), 2)
@@ -1463,7 +1478,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_runtime.AgentRuntimeProvider",
             FakePaginatedHistoryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/chat.py").run()
+            app = self.app(connected=True).run().switch_page("views/chat.py").run()
             self.assertEqual(
                 app.dataframe[0].value.iloc[0]["Session"],
                 "Task Kanban · t_00000000",
@@ -1488,7 +1503,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_runtime.AgentRuntimeProvider",
             FakeActiveTaskHistoryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/chat.py").run()
+            app = self.app(connected=True).run().switch_page("views/chat.py").run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(len(app.status), 1)
@@ -1508,7 +1523,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_runtime.AgentRuntimeProvider",
             FakeCompletingTaskHistoryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/chat.py").run()
+            app = self.app(connected=True).run().switch_page("views/chat.py").run()
             for _ in range(3):
                 app = app.run()
 
@@ -1527,7 +1542,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_runtime.AgentRuntimeProvider",
             FakeReviewTaskHistoryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/chat.py").run()
+            app = self.app(connected=True).run().switch_page("views/chat.py").run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertTrue(
@@ -1540,7 +1555,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_runtime.AgentRuntimeProvider",
             FakeGaveUpTaskHistoryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/chat.py").run()
+            app = self.app(connected=True).run().switch_page("views/chat.py").run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertIn("**platform** · failed after all attempts", [item.value for item in app.markdown])
@@ -1561,7 +1576,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         ):
             app = self.app(connected=True).run()
             app.query_params.clear()
-            app = app.switch_page("pages/chat.py").run()
+            app = app.switch_page("views/chat.py").run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(self.controller(app).selected_target.cluster_name, CLUSTER)
@@ -1575,7 +1590,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         ):
             app = self.app(connected=True)
             app.query_params["chat_session"] = "default:portal_saved"
-            app = app.run().switch_page("pages/chat.py").run()
+            app = app.run().switch_page("views/chat.py").run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(len(app.chat_message), 2)
@@ -1604,7 +1619,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_chat.AgentChatProvider",
             FakeChatProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/chat.py").run()
+            app = self.app(connected=True).run().switch_page("views/chat.py").run()
             next(button for button in app.button if button.label == "New chat").click().run()
             app.chat_input[0].set_value("Build Battleship").run()
 
@@ -1621,7 +1636,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_runtime.AgentRuntimeProvider",
             FakeHistoryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/kanban.py").run()
+            app = self.app(connected=True).run().switch_page("views/kanban.py").run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(app.title[0].value, "Task Kanban")
@@ -1646,7 +1661,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             return dict(zip(frame["Task"], frame["Status"]))
 
         def open_board() -> AppTest:
-            app = self.app(connected=True).run().switch_page("pages/kanban.py").run()
+            app = self.app(connected=True).run().switch_page("views/kanban.py").run()
             self.assertEqual(len(app.exception), 0)
             return app
 
@@ -1726,7 +1741,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_runtime.AgentRuntimeProvider",
             FakePaginatedHistoryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/kanban.py").run()
+            app = self.app(connected=True).run().switch_page("views/kanban.py").run()
             next(
                 button for button in app.button if button.label == "Next"
             ).click().run()
@@ -1745,8 +1760,8 @@ class AdminPortalFunctionalTest(unittest.TestCase):
 
     def test_each_activity_page_owns_its_scope_controls(self):
         for page, title in (
-            ("pages/overview.py", "Overview"),
-            ("pages/activity.py", "Activity Explorer"),
+            ("views/overview.py", "Overview"),
+            ("views/activity.py", "Activity Explorer"),
         ):
             with self.subTest(page=page), patch(
                 "admin_console.activity_scope.CloudTelemetryProvider",
@@ -1765,7 +1780,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.activity_scope.CloudTelemetryProvider",
             FakeLargeTelemetryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/activity.py").run()
+            app = self.app(connected=True).run().switch_page("views/activity.py").run()
             self.assertEqual(len(app.dataframe[0].value), 50)
             next(button for button in app.button if button.label == "Next").click().run()
 
@@ -1780,7 +1795,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.activity_scope.CloudTelemetryProvider",
             FakeTelemetryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/activity.py").run()
+            app = self.app(connected=True).run().switch_page("views/activity.py").run()
             next(
                 button
                 for button in app.button
@@ -1800,7 +1815,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             app = (
                 self.app(connected=True)
                 .run()
-                .switch_page("pages/autonomous.py")
+                .switch_page("views/autonomous.py")
                 .run()
             )
 
@@ -1838,7 +1853,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             try:
                 os.chdir(temporary_directory)
-                app = self.app().run().switch_page("pages/connections.py").run()
+                app = self.app().run().switch_page("views/connections.py").run()
             finally:
                 os.chdir(original_cwd)
 

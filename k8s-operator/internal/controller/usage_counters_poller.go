@@ -597,7 +597,7 @@ func (p *UsageCounterPoller) reader() client.Reader {
 	return p.r.Client
 }
 
-// targets lists the pods the two policies select and returns the running ones
+// targets lists the pods the policies select and returns the running ones
 // whose listener the poll reads, with every pod that exists and is neither
 // terminating nor in a terminal phase, scraped or not, in live. When the CR switches the watcher off the gateway pods stay live, so
 // their entries persist, and are not read: the entrypoint starts no watcher,
@@ -634,6 +634,10 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 	}{
 		{gatewayPodSelector(agent), usageGatewayCounters, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent), everyPod},
 		{gatewayPodSelector(agent), usageChatCounters, platformAgentContainerName, chatMetricsPortName, true, runsGateway},
+		// The A2A gateway, a pod a next-mode install runs and a today install
+		// does not: the chat counter again, from the gateway that owns Chat
+		// ingress there. The selector matches no pod elsewhere.
+		{a2aGatewayPodSelector(agent), usageChatCounters, a2aGatewayContainerName, a2aGatewayMetricsPortName, true, everyPod},
 		{credentialProxySelector(agent), usageBrokerCounters, credentialProxyContainerName, credentialProxyMetricsPortName, true, everyPod},
 	}
 	live := map[string]bool{}
@@ -700,6 +704,12 @@ func (p *UsageCounterPoller) closeStreak(key usageStreakKey) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.streaks, key)
+}
+
+// a2aGatewayPodSelector selects the A2A gateway's pods, the label its fence
+// policy and the chart's PodMonitoring select on.
+func a2aGatewayPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
+	return map[string]string{"app": a2aGatewayName(agent)}
 }
 
 // gatewayPodSelector selects the gateway pods, the ones the gateway policy

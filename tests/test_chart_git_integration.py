@@ -184,7 +184,7 @@ class ChartGitIntegrationTest(unittest.TestCase):
         the rewrite the provider rules exist to refuse."""
         result = _render(
             _CR_TEMPLATE,
-            *_forge(0, name="github", host="gitlab.com"),
+            *_forge(0, name="github", provider="github", host="gitlab.com"),
             *_repo(0, forge="github", repository="group/project", role="gitops"),
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -674,11 +674,17 @@ class ChartGitIntegrationTest(unittest.TestCase):
         GitHub host, and one host is one forge's."""
         secret = f"{_P}forges[1].credentialsRef.name=gitlab-token"
         for label, sets, expected in (
-            ("api host", _forge(0, name="gh", host="api.github.com", namespace="acme"), "forges[0].host"),
-            ("ghe.com", _forge(0, name="gh", host="acme.ghe.com", namespace="acme"), "forges[0].host"),
-            ("content host", _forge(0, name="gh", host="raw.githubusercontent.com", namespace="acme"), "forges[0].host"),
-            ("gitlab host", _forge(0, name="gh", host="gitlab.com", namespace="acme"), "forges[0].host"),
-            ("not a hostname", _forge(0, name="gh", host="ghe..example.com", namespace="acme"), "forges[0].host"),
+            ("api host", _forge(0, name="gh", provider="github", host="api.github.com", namespace="acme"), "forges[0].host"),
+            ("ghe.com", _forge(0, name="gh", provider="github", host="acme.ghe.com", namespace="acme"), "forges[0].host"),
+            ("content host", _forge(0, name="gh", provider="github", host="raw.githubusercontent.com", namespace="acme"), "forges[0].host"),
+            ("gitlab host", _forge(0, name="gh", provider="github", host="gitlab.com", namespace="acme"), "forges[0].host"),
+            # A forge with no provider at another host is told to name it first,
+            # as the CRD's rule does, not to change a host it did not mean for GitHub.
+            ("gitlab host, no provider", _forge(0, name="gl", host="gitlab.com", namespace="acme"),
+             "forges[0].provider is required"),
+            ("GitHub-operated host, no provider", _forge(0, name="gh", host="acme.ghe.com", namespace="acme"),
+             "forges[0].provider is required"),
+            ("not a hostname", _forge(0, name="gh", provider="github", host="ghe..example.com", namespace="acme"), "forges[0].host"),
             ("two GitHub hosts", (*_forge(0, name="gh", namespace="acme"),
                                   *_forge(1, name="ghe", provider="github", host="ghe.example.com", namespace="acme")),
              "forges[1].host: this install's GitHub host is already github.com"),

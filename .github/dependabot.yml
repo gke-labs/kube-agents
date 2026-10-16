@@ -93,21 +93,10 @@ updates:
     # semver-major comparison needs a resolved current version, and the cap is
     # a bare range rather than an `==` pin, so there is none. Remove this rule
     # and lift the pin in one change.
-    #
-    # admin_console/requirements.txt also caps streamlit below 1.66.0: that
-    # release keeps AppTest page state between runs and the console's
-    # connect-job UI tests fail on it, so a grouped bump that reaches it drags
-    # the whole python group red. Same `versions` form as above, since this
-    # cap is a bare range too. Remove this rule and that cap in one change,
-    # once the console's tests pass on the new line; that lift is independent
-    # of the websockets one.
     ignore:
       - dependency-name: "websockets"
         versions:
           - ">=17"
-      - dependency-name: "streamlit"
-        versions:
-          - ">=1.66"
     groups:
       python:
         patterns:

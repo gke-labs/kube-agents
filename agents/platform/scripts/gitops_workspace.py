@@ -1600,7 +1600,7 @@ def get_managed_github_repo_names() -> list[str]:
 
     `owner/name` on github.com, and `<host>/owner/name` on the install's
     GitHub Enterprise Server host. For a reader that picks a repository to act
-    on (the first-run audits, the delivery ledger), not for a reader that
+    on (the delivery ledger), not for a reader that
     compares a bare slug: `get_managed_github_repos` stays bare, and on a GitHub
     Enterprise Server install it is empty.
     """
