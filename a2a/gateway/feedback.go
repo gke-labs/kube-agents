@@ -43,15 +43,26 @@ const (
 	// newest turns, each clipped.
 	feedbackAskMax        = 4000
 	feedbackAnswerMax     = 16000
-	feedbackNoteMax       = 500
+	feedbackNoteMax       = 2000
 	feedbackTurnMax       = 4000
 	feedbackTranscriptMax = 40
+	// feedbackNoteChars is how many characters a note may be, as a backend
+	// asks for it; feedbackNoteMax holds that many in any script.
+	feedbackNoteChars = 500
 
 	// feedbackKeySep joins a record's task id and rater in its key.
 	feedbackKeySep = "."
 
-	// feedbackRecorderDeadline bounds one rating's store calls.
+	// feedbackRecorderDeadline bounds one rating's store calls, and
+	// feedbackMergeAttempts how many times a write that raced another is
+	// tried again (mergeFeedback); two writers race at most.
 	feedbackRecorderDeadline = 10 * time.Second
+	feedbackMergeAttempts    = 5
+
+	// feedbackRetryInterval is how often the gateway looks again for a
+	// feedback bucket it did not find at start: on an upgrade the provision
+	// Job that creates it can finish after the new gateway starts.
+	feedbackRetryInterval = time.Minute
 
 	// feedbackDay converts the bucket's max age to the days the rater is
 	// told it is kept.
@@ -69,9 +80,9 @@ var (
 	// errFeedbackUnverified is a rating from a sender the gateway would not
 	// take a turn from.
 	errFeedbackUnverified = errors.New("the rater is not a verified sender")
-	// errFeedbackGone is a note for a 👎 the bucket no longer holds: taken
-	// back by a 👍, or expired.
-	errFeedbackGone = errors.New("no 👎 is kept for this answer and rater")
+	// errFeedbackContended is a record that kept changing under every
+	// attempt to merge into it.
+	errFeedbackContended = errors.New("the record kept changing; giving up")
 )
 
 // FeedbackTurn is one message of the exchange a 👎 keeps.
@@ -126,7 +137,7 @@ type FeedbackRecord struct {
 type FeedbackRecorder interface {
 	Admits(backend, rater string) bool
 	Rate(r FeedbackRating) error
-	Note(backend, rater, taskID, note string) error
+	Note(r FeedbackRating, note string) error
 	KeptDays() int
 }
 
@@ -143,24 +154,55 @@ type feedbackDesk struct {
 	ttl time.Duration
 }
 
-// startFeedback finds the feedback bucket and, when it has a max age, turns
-// answer feedback on: answers are marked from here on, and the adapter is
-// handed the recorder. A missing bucket (a deployment that predates it, or
-// a test) or one that would keep ratings forever leaves it off.
+// startFeedback turns answer feedback on (tryFeedback), or, when it cannot
+// yet, keeps trying every feedbackRetryInterval until it can or ctx ends.
+// The first try is made before it returns, so the relay marks every answer
+// alike from the start on an install that already has the bucket.
 func (g *Gateway) startFeedback(ctx context.Context) {
+	if g.tryFeedback(ctx, false) {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(feedbackRetryInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if g.tryFeedback(ctx, true) {
+					return
+				}
+			}
+		}
+	}()
+}
+
+// tryFeedback finds the feedback bucket and, when it has a max age, turns
+// answer feedback on: answers are marked from here on, and the adapter is
+// handed the recorder. A missing bucket (a deployment that predates it, a
+// provision Job not yet finished, or a test) or one that would keep ratings
+// forever leaves it off. A retry (quiet) logs why only at debug.
+func (g *Gateway) tryFeedback(ctx context.Context, quiet bool) bool {
+	off := func(why string, args ...any) bool {
+		args = append([]any{"bucket", lib.FeedbackBucket}, args...)
+		if quiet {
+			g.log.Debug(why, args...)
+		} else {
+			g.log.Info(why, args...)
+		}
+		return false
+	}
 	kv, err := g.client.KV(ctx, lib.FeedbackBucket)
 	if err != nil {
-		g.log.Info("answer feedback is off: no feedback bucket", "bucket", lib.FeedbackBucket, "err", err)
-		return
+		return off("answer feedback is off: no feedback bucket", "err", err)
 	}
 	status, err := kv.Status(ctx)
 	if err != nil {
-		g.log.Warn("answer feedback is off: the feedback bucket's settings could not be read", "bucket", lib.FeedbackBucket, "err", err)
-		return
+		return off("answer feedback is off: the feedback bucket's settings could not be read", "err", err)
 	}
 	if status.TTL() <= 0 {
-		g.log.Warn("answer feedback is off: the feedback bucket has no max age, so a kept rating would never expire", "bucket", lib.FeedbackBucket)
-		return
+		return off("answer feedback is off: the feedback bucket has no max age, so a kept rating would never expire")
 	}
 	desk := &feedbackDesk{g: g, ttl: status.TTL()}
 	g.feedback.Store(desk)
@@ -168,6 +210,7 @@ func (g *Gateway) startFeedback(ctx context.Context) {
 		sink.SetFeedbackRecorder(desk)
 	}
 	g.log.Info("answer feedback is on", "bucket", lib.FeedbackBucket, "keptFor", status.TTL().String())
+	return true
 }
 
 // feedbackTarget is the task id an answer to taskID is marked with, or ""
@@ -224,28 +267,30 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 			"conversation", r.Conversation, "kept", false)
 		return nil
 	}
-	rec := FeedbackRecord{
-		Rating:       FeedbackDown,
-		Platform:     r.Platform,
-		Rater:        r.Rater,
-		Conversation: r.Conversation,
-		MessageID:    r.MessageID,
-		TaskID:       r.TaskID,
-		Ask:          truncateRunes(r.Ask, feedbackAskMax),
-		Answer:       truncateRunes(r.Answer, feedbackAnswerMax),
-		Transcript:   clipTranscript(r.Transcript),
-		RatedAt:      time.Now().UTC(),
-	}
 	// The context id joins the rating to the stream's copy of the
 	// conversation; best effort, since a reaped session has no record.
+	contextID := ""
 	if session, err := g.reg.Get(ctx, r.Conversation); err == nil && session != nil {
-		rec.ContextID = session.ContextID
+		contextID = session.ContextID
 	}
-	// Re-rating keeps the note the rater already gave.
-	if old, err := getFeedback(ctx, kv, key); err == nil {
-		rec.Note = old.Note
-	}
-	if err := putFeedback(ctx, kv, key, rec); err != nil {
+	// Merged, not replaced: a note sent from the modal while the exchange
+	// was being read may already be there, and re-rating keeps it too.
+	if err := mergeFeedback(ctx, kv, key, func(rec *FeedbackRecord) {
+		*rec = FeedbackRecord{
+			Rating:       FeedbackDown,
+			Note:         rec.Note,
+			Platform:     r.Platform,
+			Rater:        r.Rater,
+			Conversation: r.Conversation,
+			MessageID:    r.MessageID,
+			TaskID:       r.TaskID,
+			ContextID:    contextID,
+			Ask:          truncateRunes(r.Ask, feedbackAskMax),
+			Answer:       truncateRunes(r.Answer, feedbackAnswerMax),
+			Transcript:   clipTranscript(r.Transcript),
+			RatedAt:      time.Now().UTC(),
+		}
+	}); err != nil {
 		return err
 	}
 	g.log.Info("answer rated", "platform", r.Platform, "rating", r.Rating, "taskId", r.TaskID,
@@ -253,10 +298,14 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 	return nil
 }
 
-// Note adds the rater's note to their kept 👎 on taskID's answer.
-func (d *feedbackDesk) Note(backend, rater, taskID, note string) error {
+// Note adds the rater's note (empty: none) to their 👎 on r's answer. The
+// modal opens on the tap, before the 👎 is written, so a note that arrives
+// first starts the record and the rating fills it in (Rate). A note sent
+// after a 👍 took the 👎 back keeps the 👎 again: Send under "What went
+// wrong?" is a 👎 of its own.
+func (d *feedbackDesk) Note(r FeedbackRating, note string) error {
 	g := d.g
-	if !d.Admits(backend, rater) {
+	if !d.Admits(r.Backend, r.Rater) {
 		return errFeedbackUnverified
 	}
 	ctx, cancel := context.WithTimeout(g.runCtx, feedbackRecorderDeadline)
@@ -265,19 +314,17 @@ func (d *feedbackDesk) Note(backend, rater, taskID, note string) error {
 	if err != nil {
 		return fmt.Errorf("feedback bucket: %w", err)
 	}
-	key := feedbackKey(taskID, rater)
-	rec, err := getFeedback(ctx, kv, key)
-	if errors.Is(err, jetstream.ErrKeyNotFound) {
-		return errFeedbackGone
-	}
-	if err != nil {
+	key := feedbackKey(r.TaskID, r.Rater)
+	if err := mergeFeedback(ctx, kv, key, func(rec *FeedbackRecord) {
+		if rec.Rating == "" {
+			*rec = FeedbackRecord{Rating: FeedbackDown, Platform: r.Platform, Rater: r.Rater,
+				Conversation: r.Conversation, MessageID: r.MessageID, TaskID: r.TaskID, RatedAt: time.Now().UTC()}
+		}
+		rec.Note = truncateRunes(strings.TrimSpace(note), feedbackNoteMax)
+	}); err != nil {
 		return err
 	}
-	rec.Note = truncateRunes(strings.TrimSpace(note), feedbackNoteMax)
-	if err := putFeedback(ctx, kv, key, rec); err != nil {
-		return err
-	}
-	g.log.Info("answer feedback note kept", "taskId", taskID, "conversation", rec.Conversation)
+	g.log.Info("answer feedback note kept", "taskId", r.TaskID, "conversation", r.Conversation)
 	return nil
 }
 
@@ -318,13 +365,41 @@ func getFeedback(ctx context.Context, kv jetstream.KeyValue, key string) (Feedba
 	return rec, nil
 }
 
-func putFeedback(ctx context.Context, kv jetstream.KeyValue, key string, rec FeedbackRecord) error {
-	raw, err := json.Marshal(rec)
-	if err != nil {
-		return err
+// mergeFeedback applies change to the record at key (a zero record when
+// there is none) and writes it back only if nobody wrote in between, trying
+// again from a fresh read when someone did: the rating and its note are
+// written by two goroutines, and neither may lose the other's half.
+func mergeFeedback(ctx context.Context, kv jetstream.KeyValue, key string, change func(*FeedbackRecord)) error {
+	for range feedbackMergeAttempts {
+		var rec FeedbackRecord
+		var revision uint64
+		entry, err := kv.Get(ctx, key)
+		switch {
+		case errors.Is(err, jetstream.ErrKeyNotFound):
+		case err != nil:
+			return fmt.Errorf("feedback %s: %w", key, err)
+		default:
+			if err := json.Unmarshal(entry.Value(), &rec); err != nil {
+				return fmt.Errorf("feedback %s: %w", key, err)
+			}
+			revision = entry.Revision()
+		}
+		change(&rec)
+		raw, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		if revision == 0 {
+			_, err = kv.Create(ctx, key, raw)
+		} else {
+			_, err = kv.Update(ctx, key, raw, revision)
+		}
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, jetstream.ErrKeyExists) && !errors.Is(err, jetstream.ErrKeyRevisionMismatch) {
+			return fmt.Errorf("feedback %s: %w", key, err)
+		}
 	}
-	if _, err := kv.Put(ctx, key, raw); err != nil {
-		return fmt.Errorf("feedback %s: %w", key, err)
-	}
-	return nil
+	return fmt.Errorf("feedback %s: %w", key, errFeedbackContended)
 }

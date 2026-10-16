@@ -215,7 +215,7 @@ func NewMetrics() *Metrics {
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      answerFeedbackName,
-			Help:      "Ratings verified chat users gave the gateway's answers, by platform (slack, other) and rating (up, down, other); a rating changed is counted again.",
+			Help:      "Ratings verified chat users gave the gateway's answers, by platform (googlechat, slack, discord, console, other) and rating (up, down, other); a rating changed is counted again.",
 		}, []string{labelPlatform, labelRating}),
 		processStart: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: processStartTimeName,

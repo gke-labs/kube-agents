@@ -226,9 +226,10 @@ Four KV buckets ride the same JetStream deployment:
 - `feedback` - the 👎 ratings chat users gave the gateway's answers, each with the
   exchange it rated: user content that can hold cluster data. The one bucket with a max
   age (`--ttl=720h`), which is its retention, and capped at 64MiB. The gateway's user is
-  its only reader and writer, with the registry's four verbs on `KV_feedback`; the
-  gateway keeps nothing in a bucket without a max age. The chatops gateway design owns
-  what a record holds ("Answer feedback").
+  its only reader and writer by grant, with the registry's four verbs on `KV_feedback`,
+  and the session-state deliver-subject residue above applies to `$KV.feedback.>` the
+  same way. The gateway keeps nothing in a bucket without a max age. The chatops gateway
+  design owns what a record holds ("Answer feedback").
 
 ## Accounts and connection-time authorization
 

@@ -509,7 +509,8 @@ func (g *Gateway) Metrics() *Metrics { return g.metrics }
 // the adapter until ctx is done.
 func (g *Gateway) Run(ctx context.Context) error {
 	g.runCtx = ctx
-	// Before the relay starts, so every answer it posts is marked alike.
+	// Its first try before the relay starts, so on an install with the
+	// bucket every answer the relay posts is marked alike.
 	g.startFeedback(ctx)
 	// Both task-event subjects, one durable: the executors' events and the
 	// terminals this gateway synthesizes as supervisor, which it relays to

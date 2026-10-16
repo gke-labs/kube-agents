@@ -31,8 +31,10 @@ const (
 	feedbackCaseDateForm  = "20060102"
 	feedbackRatedDateForm = "2006-01-02"
 	// feedbackCaseIDHash is how many hex digits of the record key's hash
-	// tell two drafts from one day apart.
-	feedbackCaseIDHash = 4
+	// tell two drafts from one day apart, and feedbackCaseIDHashLong how
+	// many a draft takes when its short id is already in the export.
+	feedbackCaseIDHash     = 4
+	feedbackCaseIDHashLong = 16
 	feedbackTaskFile   = "task.yaml"
 	feedbackTranscript = "transcript.md"
 	feedbackFileMode   = 0o600
@@ -74,8 +76,15 @@ func ExportFeedback(ctx context.Context, c *lib.Client, since time.Duration, now
 	}
 	slices.SortFunc(recs, func(a, b kept) int { return b.rec.RatedAt.Compare(a.rec.RatedAt) })
 	tw := tar.NewWriter(w)
+	ids := map[string]bool{}
 	for i, k := range recs {
-		id := feedbackCaseID(k.key, k.rec.RatedAt)
+		id := feedbackCaseID(k.key, k.rec.RatedAt, feedbackCaseIDHash)
+		if ids[id] {
+			// Two drafts would extract into one directory, the second
+			// overwriting the first.
+			id = feedbackCaseID(k.key, k.rec.RatedAt, feedbackCaseIDHashLong)
+		}
+		ids[id] = true
 		files := []struct{ name, body string }{
 			{id + "/" + feedbackTaskFile, feedbackCaseYAML(id, k.rec)},
 			{id + "/" + feedbackTranscript, feedbackTranscriptMD(k.rec)},
@@ -97,11 +106,11 @@ func ExportFeedback(ctx context.Context, c *lib.Client, since time.Duration, now
 	return len(recs), tw.Close()
 }
 
-// feedbackCaseID is a draft's id and directory: the day it was rated and a
-// few digits of its record's key.
-func feedbackCaseID(key string, ratedAt time.Time) string {
+// feedbackCaseID is a draft's id and directory: the day it was rated and
+// digits hex digits of its record key's hash.
+func feedbackCaseID(key string, ratedAt time.Time, digits int) string {
 	sum := sha256.Sum256([]byte(key))
-	return feedbackCaseIDPrefix + ratedAt.UTC().Format(feedbackCaseDateForm) + "-" + hex.EncodeToString(sum[:])[:feedbackCaseIDHash]
+	return feedbackCaseIDPrefix + ratedAt.UTC().Format(feedbackCaseDateForm) + "-" + hex.EncodeToString(sum[:])[:digits]
 }
 
 // feedbackCaseYAML is the draft's task.yaml. The strings are written as

@@ -1929,15 +1929,21 @@ and a tap from a sender the gateway would not take a turn from (`resolvePrincipa
 another workspace's member, changes nothing.
 
 A 👍 is counted and nothing is kept or posted (Slack fills the tapped icon itself); it also
-deletes the rater's 👎 on the same answer, if one is kept. A 👎 is counted at once, then the
-adapter opens a modal on the tap's trigger ("What went wrong?", one optional line up to 500
-characters, and a line telling the rater how long the exchange is kept, read from the bucket's max
-age) and reads the conversation up to the rated message (`conversations.replies`, or
-`conversations.history` for a top-level answer). The ask is the last message a person wrote before
-it, the answer is the rated message's text, and the transcript is every message up to it, the
-newest 40, each clipped. Send adds the note and posts "Thanks. I kept this answer for your team to
-review." to the rater alone (`chat.postEphemeral`) in the thread; Cancel keeps the 👎 without a
-note. No new scope: `chat:write` covers the ephemeral line, the history scopes the read, and
+deletes the rater's 👎 on the same answer, if one is kept. A 👎 first opens a modal on the tap's
+trigger, which lapses three seconds after the tap ("What went wrong?", one optional line of up to
+500 characters, and a line telling the rater how long the exchange is kept, read from the bucket's
+max age). The adapter then reads the conversation up to the rated message
+(`conversations.replies`, or `conversations.history` for a top-level answer), and the gateway
+counts the 👎 and keeps it. The ask is the last message a person wrote before the answer; the
+answer is the rated message's text, which for a text answer longer than one chunk is its last
+chunk, the rest being in the transcript; and the transcript is the agent's messages, the asker's
+and the rater's up to the answer, the newest 40, each clipped, so a colleague's aside in the
+thread is not kept. Send writes the note, and posts "Thanks. I kept this answer for your team to
+review." to the rater alone (`chat.postEphemeral`) in the thread once the record holds it; Cancel
+keeps the 👎 without a note. The note and the rating are written by separate taps and merged
+under the record's revision (`mergeFeedback`), so a note sent while the thread is still being read
+starts the record and the rating fills it in. Send after a 👍 took the 👎 back keeps the 👎 again.
+No new scope: `chat:write` covers the ephemeral line, the history scopes the read, and
 `views.open` takes only the trigger.
 
 A kept 👎 is a JSON record in the `feedback` KV bucket, one key per answer and rater
@@ -1947,14 +1953,17 @@ the transcript. It is user content and may hold cluster data, which the bucket's
 the provision Job creates it with a 30-day max age (`--ttl=720h`), so NATS drops a record 30 days
 after the rating; the gateway turns feedback on only when the bucket exists and has a max age, and
 leaves answers unmarked otherwise (an install whose operator predates the bucket, or a bucket
-someone recreated without one); and the gateway's user is the bucket's only reader and writer by
-grant. It is capped at 64MiB, past which a 👎 is counted but not kept. Logs and
+someone recreated without one), looking again every minute so that a provision Job finishing after
+an upgraded gateway started still turns it on; and the gateway's user is the bucket's only reader
+and writer by grant. It is capped at 64MiB, a few hundred records at their caps, past which a 👎 is
+counted but not kept. Logs and
 `answer_feedback_total` carry the task id, the conversation and the rating, never the text.
 
 An operator reads the bucket through the gateway's own binary, in its pod, since nothing else holds
 the bucket's credentials:
-`kubectl exec deploy/<name>-a2a-gateway -- /gateway feedback export [--since 7d] > feedback.tar`.
-Each kept 👎 becomes a directory `feedback-<date>-<hash>/` holding `task.yaml`, a draft case per
+`kubectl exec -n kubeagents-system deploy/<name>-a2a-gateway -- /gateway feedback export [--since 7d] > feedback.tar`.
+Each kept 👎 becomes a directory `feedback-<date>-<hash>/` (more digits when two would share one)
+holding `task.yaml`, a draft case per
 [`bench-case-format.md`](bench-case-format.md) (the ask as its `prompt`, `deployer: noop`, the note
 in its header comment and `expected_output`, and TODOs for `domain`, `owner` and the
 `verification_spec`), and `transcript.md`, the exchange with its ids. The draft is for a person to

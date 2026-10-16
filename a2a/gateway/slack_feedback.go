@@ -72,6 +72,7 @@ type slackFeedbackMeta struct {
 	Task         string `json:"t"`
 	Channel      string `json:"ch"`
 	Thread       string `json:"th,omitempty"`
+	Message      string `json:"m,omitempty"`
 }
 
 // slackViewPayload is the part of a view_submission payload the adapter
@@ -216,11 +217,11 @@ func (s *SlackAdapter) feedbackClick(p slackClickPayload, blockID, value string)
 		defer cancel()
 		if value == FeedbackDown {
 			// First: the trigger lapses three seconds after the tap.
-			meta := slackFeedbackMeta{Conversation: conversation, Task: taskID, Channel: p.Channel.ID, Thread: thread}
+			meta := slackFeedbackMeta{Conversation: conversation, Task: taskID, Channel: p.Channel.ID, Thread: thread, Message: p.Message.TS}
 			if _, err := s.feedbackAPI.OpenViewContext(ctx, p.TriggerID, slackFeedbackModal(meta, recorder.KeptDays())); err != nil {
 				s.log.Warn("slack: opening the feedback note failed; the 👎 is kept without one", "channel", p.Channel.ID, "err", err)
 			}
-			rating.Ask, rating.Transcript = s.feedbackExchange(ctx, p.Channel.ID, thread, p.Message.TS)
+			rating.Ask, rating.Transcript = s.feedbackExchange(ctx, p.Channel.ID, thread, p.Message.TS, p.User.ID)
 			rating.Answer = p.Message.Text
 		}
 		if err := recorder.Rate(rating); err != nil {
@@ -237,7 +238,7 @@ func slackFeedbackModal(meta slackFeedbackMeta, days int) slack.ModalViewRequest
 		kept = slackFeedbackOneDay
 	}
 	input := slack.NewInputBlock(slackFeedbackNoteID, slack.NewTextBlockObject(slackPlainText, slackFeedbackLabel, false, false), nil,
-		slack.NewPlainTextInputBlockElement(nil, slackFeedbackNoteID).WithMaxLength(feedbackNoteMax))
+		slack.NewPlainTextInputBlockElement(nil, slackFeedbackNoteID).WithMaxLength(feedbackNoteChars))
 	input.Optional = true
 	return slack.ModalViewRequest{
 		Type:            slack.VTModal,
@@ -269,12 +270,14 @@ func (s *SlackAdapter) feedbackNote(raw json.RawMessage) {
 		return
 	}
 	note := strings.TrimSpace(p.View.State.Values[slackFeedbackNoteID][slackFeedbackNoteID].Value)
+	rating := FeedbackRating{Platform: platformSlack, Backend: slackBackend, Rater: p.User.ID,
+		Conversation: meta.Conversation, MessageID: meta.Message, TaskID: meta.Task, Rating: FeedbackDown}
 	s.goSession(func() {
-		if note != "" {
-			if err := recorder.Note(slackBackend, p.User.ID, meta.Task, note); err != nil {
-				s.log.Warn("slack: keeping a feedback note failed", "channel", meta.Channel, "taskId", meta.Task, "err", err)
-				return
-			}
+		// An empty note is still written: the thanks says the answer was
+		// kept, so it posts only once it is.
+		if err := recorder.Note(rating, note); err != nil {
+			s.log.Warn("slack: keeping a feedback note failed", "channel", meta.Channel, "taskId", meta.Task, "err", err)
+			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), slackFeedbackDeadline)
 		defer cancel()
@@ -289,9 +292,11 @@ func (s *SlackAdapter) feedbackNote(raw json.RawMessage) {
 }
 
 // feedbackExchange reads the conversation up to the rated message: the ask
-// (the last message a person wrote before it) and every turn, oldest first.
-// A read that fails keeps what it has; the rating is kept either way.
-func (s *SlackAdapter) feedbackExchange(ctx context.Context, channel, thread, ratedTS string) (string, []FeedbackTurn) {
+// (the last message a person wrote before it) and the turns, oldest first,
+// of the agent, the asker and the rater. Slack timestamps compare as
+// strings: whole seconds of a fixed width, then the fraction. A read that
+// fails keeps what it has; the rating is kept either way.
+func (s *SlackAdapter) feedbackExchange(ctx context.Context, channel, thread, ratedTS, rater string) (string, []FeedbackTurn) {
 	var msgs []slack.Message
 	if thread != "" && thread != ratedTS {
 		params := &slack.GetConversationRepliesParameters{ChannelID: channel, Timestamp: thread,
@@ -321,17 +326,26 @@ func (s *SlackAdapter) feedbackExchange(ctx context.Context, channel, thread, ra
 			}
 		}
 	}
-	var turns []FeedbackTurn
-	ask := ""
+	agent := func(m slack.Message) bool { return m.BotID != "" || (s.botUserID != "" && m.User == s.botUserID) }
+	ask, asker := "", ""
 	for _, m := range msgs {
-		if m.Timestamp > ratedTS && m.Timestamp != "" {
+		if m.Timestamp != ratedTS && m.Timestamp <= ratedTS && !agent(m) {
+			ask, asker = m.Text, m.User
+		}
+	}
+	// The exchange as the rater is told it is kept: the agent's messages,
+	// the asker's and the rater's own, and nobody else's.
+	var turns []FeedbackTurn
+	for _, m := range msgs {
+		if m.Timestamp > ratedTS {
 			continue
 		}
-		from := FeedbackFromUser
-		if m.BotID != "" || (s.botUserID != "" && m.User == s.botUserID) {
-			from = FeedbackFromAgent
-		} else if m.Timestamp != ratedTS {
-			ask = m.Text
+		from := FeedbackFromAgent
+		if !agent(m) {
+			if m.User != asker && m.User != rater {
+				continue
+			}
+			from = FeedbackFromUser
 		}
 		turns = append(turns, FeedbackTurn{From: from, Text: slackEntitiesReduced(m.Text)})
 	}

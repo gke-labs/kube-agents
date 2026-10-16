@@ -32,10 +32,10 @@ func (f *fakeRecorder) Rate(r FeedbackRating) error {
 	return nil
 }
 
-func (f *fakeRecorder) Note(_, rater, taskID, note string) error {
+func (f *fakeRecorder) Note(r FeedbackRating, note string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.notes = append(f.notes, rater+" "+taskID+" "+note)
+	f.notes = append(f.notes, r.Rater+" "+r.TaskID+" "+r.MessageID+" "+r.Conversation+" "+note)
 	return f.noteErr
 }
 
@@ -236,7 +236,7 @@ func TestSlackRatingFromAnUnverifiedSenderChangesNothing(t *testing.T) {
 
 func notePayload(t *testing.T, note string) json.RawMessage {
 	t.Helper()
-	meta, _ := json.Marshal(slackFeedbackMeta{Conversation: "slack:C1/40.0", Task: "t-root", Channel: "C1", Thread: "40.0"})
+	meta, _ := json.Marshal(slackFeedbackMeta{Conversation: "slack:C1/40.0", Task: "t-root", Channel: "C1", Thread: "40.0", Message: "50.0"})
 	p := map[string]any{
 		"type": slackViewSubmission,
 		"user": map[string]any{"id": "U1", "team_id": "T1"},
@@ -255,7 +255,7 @@ func TestSlackNoteJoinsTheRatingAndThanksTheRaterAlone(t *testing.T) {
 	if _, ok := a.interactive(notePayload(t, " the limit is 256Mi ")); ok {
 		t.Fatal("a note is never a turn")
 	}
-	if len(rec.notes) != 1 || rec.notes[0] != "U1 t-root the limit is 256Mi" {
+	if len(rec.notes) != 1 || rec.notes[0] != "U1 t-root 50.0 slack:C1/40.0 the limit is 256Mi" {
 		t.Errorf("notes = %v", rec.notes)
 	}
 	if len(api.ephemerals) != 1 || api.ephemerals[0] != "C1 U1 40.0 "+slackFeedbackThanksLine {
@@ -263,20 +263,43 @@ func TestSlackNoteJoinsTheRatingAndThanksTheRaterAlone(t *testing.T) {
 	}
 }
 
-func TestSlackEmptyNoteStillThanksAndAddsNothing(t *testing.T) {
+func TestSlackEmptyNoteIsStillKeptAndThanked(t *testing.T) {
 	a, rec, api := newFeedbackSlackAdapter()
 	a.interactive(notePayload(t, ""))
-	if len(rec.notes) != 0 || len(api.ephemerals) != 1 {
-		t.Errorf("notes = %v ephemerals = %v; want no note and the thanks", rec.notes, api.ephemerals)
+	if len(rec.notes) != 1 || !strings.HasSuffix(rec.notes[0], "slack:C1/40.0 ") || len(api.ephemerals) != 1 {
+		t.Errorf("notes = %q ephemerals = %v; want the 👎 written without a note, then the thanks", rec.notes, api.ephemerals)
 	}
 }
 
-func TestSlackNoteForARatingNoLongerKeptThanksNobody(t *testing.T) {
+func TestSlackNoteThatWasNotKeptThanksNobody(t *testing.T) {
 	a, rec, api := newFeedbackSlackAdapter()
-	rec.noteErr = errFeedbackGone
+	rec.noteErr = errFeedbackContended
 	a.interactive(notePayload(t, "late"))
 	if len(api.ephemerals) != 0 {
 		t.Error("the thanks says the answer was kept; it must not post when it was not")
+	}
+}
+
+func TestSlackExchangeKeepsOnlyTheAgentTheAskerAndTheRater(t *testing.T) {
+	a, rec, api := newFeedbackSlackAdapter()
+	api.replies = []slack.Message{
+		threadMsg("40.0", "U3", "", "<@UBOT> is checkout healthy?"),
+		threadMsg("41.0", "U4", "", "a colleague's aside"),
+		threadMsg("45.0", "UBOT", "B1", "It is."),
+		threadMsg("46.0", "U1", "", "are you sure?"),
+		threadMsg("50.0", "UBOT", "B1", "*It is OOMKilled.*"),
+	}
+	a.interactive(ratingPayload(t, "U1", FeedbackDown))
+	r := rec.ratings[0]
+	if r.Ask != "are you sure?" {
+		t.Errorf("ask = %q, want the last message a person wrote before the answer", r.Ask)
+	}
+	var texts []string
+	for _, turn := range r.Transcript {
+		texts = append(texts, turn.Text)
+	}
+	if got := strings.Join(texts, "|"); strings.Contains(got, "aside") || strings.Contains(got, "checkout") {
+		t.Errorf("transcript = %q; a third party's messages are not kept", got)
 	}
 }
 
