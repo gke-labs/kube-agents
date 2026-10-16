@@ -1909,6 +1909,58 @@ key reaches that ask while a newer chain runs. A `mark` with no key goes to the 
 once nothing runs, and is dropped, logged and counted (`notify_marks_dropped_total`) while a
 chain runs.
 
+### Answer feedback (added 10/16)
+
+A chat user rates the final answer of an ask 👍 or 👎, and a 👎 keeps the exchange so an operator
+can turn it into an eval case. The gateway marks the one message of a chain that is its answer
+(`OutMessage.Feedback`, the chain's root task id): the completed result of the task whose end is
+the chain's (`observedAs`), never a hand-off line (`handOffEnd`), the same message the
+`DeliverableObserver` is handed. Plan rows, progress, a question waiting on the user, notices, a
+child's own result and the notify route's posts are not marked. A text answer chunked under the
+cap carries the mark on its last chunk.
+
+The Slack adapter draws the mark as Slack's own feedback buttons: a `context_actions` block holding
+one `feedback_buttons` element (hover text "Good answer" and "Bad answer"), the message's last
+block, inside its side bar when it has one (an attachment draws after every top-level block, and
+Slack draws the block there too, seen live). The block's id carries the task id
+(`kage.feedback.<task>`). A text chunk carrying the mark is posted as one `section` and the block;
+a chunk Slack refuses posts as text. Every other backend ignores the mark. A tap is never a turn,
+and a tap from a sender the gateway would not take a turn from (`resolvePrincipal`), or from
+another workspace's member, changes nothing.
+
+A 👍 is counted and nothing is kept or posted (Slack fills the tapped icon itself); it also
+deletes the rater's 👎 on the same answer, if one is kept. A 👎 is counted at once, then the
+adapter opens a modal on the tap's trigger ("What went wrong?", one optional line up to 500
+characters, and a line telling the rater how long the exchange is kept, read from the bucket's max
+age) and reads the conversation up to the rated message (`conversations.replies`, or
+`conversations.history` for a top-level answer). The ask is the last message a person wrote before
+it, the answer is the rated message's text, and the transcript is every message up to it, the
+newest 40, each clipped. Send adds the note and posts "Thanks. I kept this answer for your team to
+review." to the rater alone (`chat.postEphemeral`) in the thread; Cancel keeps the 👎 without a
+note. No new scope: `chat:write` covers the ephemeral line, the history scopes the read, and
+`views.open` takes only the trigger.
+
+A kept 👎 is a JSON record in the `feedback` KV bucket, one key per answer and rater
+(`<task>.<rater>`, so re-rating replaces it): the rating, the note, the platform, the rater's Slack
+member id, the conversation and rated message, the task and context ids, the ask, the answer and
+the transcript. It is user content and may hold cluster data, which the bucket's posture answers:
+the provision Job creates it with a 30-day max age (`--ttl=720h`), so NATS drops a record 30 days
+after the rating; the gateway turns feedback on only when the bucket exists and has a max age, and
+leaves answers unmarked otherwise (an install whose operator predates the bucket, or a bucket
+someone recreated without one); and the gateway's user is the bucket's only reader and writer by
+grant. It is capped at 64MiB, past which a 👎 is counted but not kept. Logs and
+`answer_feedback_total` carry the task id, the conversation and the rating, never the text.
+
+An operator reads the bucket through the gateway's own binary, in its pod, since nothing else holds
+the bucket's credentials:
+`kubectl exec deploy/<name>-a2a-gateway -- /gateway feedback export [--since 7d] > feedback.tar`.
+Each kept 👎 becomes a directory `feedback-<date>-<hash>/` holding `task.yaml`, a draft case per
+[`bench-case-format.md`](bench-case-format.md) (the ask as its `prompt`, `deployer: noop`, the note
+in its header comment and `expected_output`, and TODOs for `domain`, `owner` and the
+`verification_spec`), and `transcript.md`, the exchange with its ids. The draft is for a person to
+finish and submit; the transcript holds the install's data and stays out of the pull request. The
+install never writes to this repository, and no sink files the drafts anywhere.
+
 ## The console adapter (added 9/23)
 
 The web console's chat door. Not a chat product's ingress: the browser is a bus client
@@ -2156,6 +2208,7 @@ text, so nothing a chat user or an executor sends can mint a series:
 | `kubeagents_a2a_gateway_chat_messages_total`         | `outcome`: `rendered`, `text_only`, `refused`, `invalid`                                                                                         | Each `kube-agents.chat/v1` message the gateway hands an adapter, and each it drops, on the relay and on a conversation notify ("Chat messages" under the Slack adapter): laid out by the backend; posted as its text by a backend that renders none; refused by a backend that does (too large for it, or its API said no) and posted as its text; or, under `invalid`, dropped for a broken rule with the text standing, or a bad `mark` dropped alone with the layout still rendering. Counted per hand-over, so a live message laid out again on each progress artifact counts each time.                                              |
 | `kubeagents_a2a_gateway_notify_marks_dropped_total`  | none                                                                                                                                             | Conversation notify marks dropped because they name no chain (no `update` key bound to one) while a chain runs in the conversation ("Chat messages" under the Slack adapter).                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `kubeagents_a2a_gateway_messages_inbound_total`      | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`                                                                                 | Each chat message the gateway accepted as a turn, counted in `handleInbound` before the sender is verified, so a message from a sender the principal map does not know counts, as the `chat_metrics` plugin counts the Hermes-side ingress before its allowlist; the doors' turns (inject, a2a, a2a-google) are programs' and are not counted. The operator's usage poller reads it into `status.usage.chatMessagesInboundTotal` beside the plugin's series.                                                                                                                                                                              |
+| `kubeagents_a2a_gateway_answer_feedback_total`       | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`                                                | Each rating a verified sender gave an answer ("Answer feedback" under the Slack adapter), counted before the 👎's record is written, so a rating the bucket could not keep still counts; a rating changed counts again.                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 The body also carries `process_start_time_seconds`, captured once at start and never
 re-derived, which the operator's usage poller reads to tell an in-place restart from a counter

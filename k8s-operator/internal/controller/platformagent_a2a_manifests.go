@@ -112,6 +112,7 @@ const (
 	a2aTopicsJournalStream = "TOPICS-JOURNAL"
 	a2aRuntimeStateBucket  = "runtime-state"
 	a2aSessionStateBucket  = "session-state"
+	a2aFeedbackBucket      = "feedback"
 	a2aKVStreamPrefix      = "KV_"
 
 	// a2aNATSConfGrantLine renders one allow-list entry at the depth
@@ -1540,7 +1541,7 @@ var a2aWildcardListenHosts = map[string]bool{"": true, "0.0.0.0": true, "::": tr
 // still connects with it. Nothing yet binds that third spelling to this list.
 var a2aProvisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
-	"KV_runtime-state", "KV_session-state", "KV_cap",
+	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback",
 }
 
 // a2aSeedJetStreamGrants is seed's publish allow-list for the JetStream API,
@@ -1799,6 +1800,12 @@ func a2aAgentJetStreamGrants() []string {
 //     Create, Put and Delete are publishes on $KV.session-state.>, granted
 //     beside this list.
 //
+//   - KV_feedback, the kept 👎 ratings (a2a/gateway/feedback.go): the same
+//     four verbs for the same calls -- STREAM.INFO to bind it and read its
+//     max age at start, DIRECT.GET for a rating's note and the export's
+//     reads, and the watcher's CONSUMER.CREATE and CONSUMER.DELETE for the
+//     export's key list. Put and Delete are publishes on $KV.feedback.>.
+//
 // Reads go through DIRECT.GET and not STREAM.MSG.GET because every stream the
 // provision script creates has allow_direct set: the script says
 // --allow-direct on each `stream add`, and a KV bucket always has it. nats.go
@@ -1879,6 +1886,7 @@ func a2aAgentJetStreamGrants() []string {
 // by grant.
 func a2aGatewayJetStreamGrants() []string {
 	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
+	kvFeedback := a2aKVStreamPrefix + a2aFeedbackBucket
 	return []string{
 		"$JS.API.STREAM.INFO." + a2aTasksStream,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
@@ -1888,6 +1896,10 @@ func a2aGatewayJetStreamGrants() []string {
 		"$JS.API.DIRECT.GET." + kvSessionState + ".>",
 		"$JS.API.CONSUMER.CREATE." + kvSessionState + ".>",
 		"$JS.API.CONSUMER.DELETE." + kvSessionState + ".*",
+		"$JS.API.STREAM.INFO." + kvFeedback,
+		"$JS.API.DIRECT.GET." + kvFeedback + ".>",
+		"$JS.API.CONSUMER.CREATE." + kvFeedback + ".>",
+		"$JS.API.CONSUMER.DELETE." + kvFeedback + ".*",
 	}
 }
 
@@ -2661,7 +2673,7 @@ func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
 	}}
 }
 
-// a2aProvisionScript is the provisioning payload: the four streams, three KV
+// a2aProvisionScript is the provisioning payload: the four streams, four KV
 // buckets, and three starter topics from the deployment spec, created
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
@@ -2963,6 +2975,14 @@ $NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOUR
 $NATS kv info runtime-state >/dev/null 2>&1 || $NATS kv add runtime-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
 $NATS kv info session-state >/dev/null 2>&1 || $NATS kv add session-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
 $NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
+
+# feedback: the 👎 ratings chat users gave the gateway's answers, each with
+# the exchange it rated (a2a/gateway/feedback.go). User content, so the max
+# age is the retention: NATS drops a rating 30 days after it was given, and
+# the gateway refuses to keep ratings in a bucket without one. Only the
+# gateway's user reads or writes it. 64MiB holds thousands at their caps;
+# past it the write is refused and the rating is counted but not kept.
+$NATS kv info feedback      >/dev/null 2>&1 || $NATS kv add feedback --history=1 --replicas=1 --storage=file --max-bucket-size=67108864 --ttl=720h
 
 # TASKS older than this render: the limits the create above could not apply.
 #

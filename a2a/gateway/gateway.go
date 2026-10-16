@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -144,6 +145,9 @@ type Gateway struct {
 	spawner spawner // nil until SpawnSessions arms (W4)
 	// metrics is the gateway's counters (metrics.go); never nil after New.
 	metrics *Metrics
+	// feedback is the answer-feedback recorder, set by Run once the
+	// feedback bucket is found (startFeedback); nil leaves answers unmarked.
+	feedback atomic.Pointer[feedbackDesk]
 
 	// runCtx is Run's context; queue workers derive their timeouts from it.
 	runCtx context.Context
@@ -505,6 +509,8 @@ func (g *Gateway) Metrics() *Metrics { return g.metrics }
 // the adapter until ctx is done.
 func (g *Gateway) Run(ctx context.Context) error {
 	g.runCtx = ctx
+	// Before the relay starts, so every answer it posts is marked alike.
+	g.startFeedback(ctx)
 	// Both task-event subjects, one durable: the executors' events and the
 	// terminals this gateway synthesizes as supervisor, which it relays to
 	// the requester and retires the task on exactly like an executor's own.

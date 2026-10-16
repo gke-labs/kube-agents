@@ -85,12 +85,16 @@ type slackClickPayload struct {
 	} `json:"message"`
 	Actions []struct {
 		ActionID string `json:"action_id"`
+		BlockID  string `json:"block_id"`
 		Value    string `json:"value"`
 		Text     struct {
 			Text string `json:"text"`
 		} `json:"text"`
 	} `json:"actions"`
 	ActionTS string `json:"action_ts"`
+	// TriggerID opens a modal for the clicker (a 👎's note,
+	// slack_feedback.go).
+	TriggerID string `json:"trigger_id"`
 }
 
 // slackQuestion is a posted message with choice buttons, as the rewrite
@@ -205,6 +209,10 @@ func (s *SlackAdapter) trackQuestion(conversation, ts string, m OutMessage) {
 	}
 	text := toMrkdwn(m.Text)
 	layout, err := renderSlackChat(m.Chat, text)
+	if err == nil && s.rates(m) {
+		// As posted, so a typed answer's rewrite keeps the rating controls.
+		layout, err = withFeedback(layout, m.Feedback)
+	}
 	if err != nil {
 		return
 	}
@@ -310,10 +318,20 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 		s.log.Warn("slack: unreadable interactive payload", "err", err)
 		return InboundMessage{}, false
 	}
+	if p.Type == slackViewSubmission {
+		// A 👎's note, sent from its modal: never a turn.
+		s.feedbackNote(raw)
+		return InboundMessage{}, false
+	}
 	if p.Type != slackBlockActions || len(p.Actions) == 0 {
 		return InboundMessage{}, false
 	}
 	action := p.Actions[0]
+	if action.ActionID == slackFeedbackAction {
+		// A rating: never a turn.
+		s.feedbackClick(p, action.BlockID, action.Value)
+		return InboundMessage{}, false
+	}
 	if !strings.HasPrefix(action.ActionID, slackChoiceActionPrefix) {
 		// A link button (Slack opened the url) or a button not ours.
 		return InboundMessage{}, false
@@ -329,18 +347,7 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	if s.alreadySeen("click:" + p.Channel.ID + "/" + p.ActionTS) {
 		return InboundMessage{}, false
 	}
-	thread := p.Message.ThreadTS
-	if thread == "" {
-		thread = p.Container.ThreadTS
-	}
-	if thread == "" {
-		thread = p.Message.TS
-	}
-	kind, channelType := "group", "channel"
-	if strings.HasPrefix(p.Channel.ID, slackDMChannelPrefix) {
-		kind, channelType = "dm", slackChannelTypeIM
-	}
-	conversation := slackConversationID(channelType, p.Channel.ID, thread)
+	conversation, thread, kind := slackClickConversation(p)
 	text := action.Value
 	if text == "" {
 		text = action.Text.Text
@@ -370,6 +377,24 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 		Text:         text,
 		Click:        true,
 	}, true
+}
+
+// slackClickConversation is the conversation a clicked message is in, the
+// thread it is in (the message itself when it is top-level), and the turn
+// kind a click there is.
+func slackClickConversation(p slackClickPayload) (conversation, thread, kind string) {
+	thread = p.Message.ThreadTS
+	if thread == "" {
+		thread = p.Container.ThreadTS
+	}
+	if thread == "" {
+		thread = p.Message.TS
+	}
+	kind, channelType := "group", "channel"
+	if strings.HasPrefix(p.Channel.ID, slackDMChannelPrefix) {
+		kind, channelType = "dm", slackChannelTypeIM
+	}
+	return slackConversationID(channelType, p.Channel.ID, thread), thread, kind
 }
 
 // InboundVerified acts on a message once the gateway has decided on its
@@ -452,24 +477,27 @@ func (s *SlackAdapter) answeredLine(channel, ts string) string {
 // slackTypedWords is a typed answer's words for its line: Slack's entities
 // reduced, whitespace collapsed, clipped to slackTypedAnswerMax code points.
 func slackTypedWords(text string) string {
-	// Slack's entities as the line shows them: a mention dropped (the line
-	// is plain text, and a name needs a lookup), a channel by its name, a
-	// link by its label, or its url when it has none.
+	words := strings.Join(strings.Fields(slackEntitiesReduced(text)), " ")
+	if utf8.RuneCountInString(words) <= slackTypedAnswerMax {
+		return words
+	}
+	r := []rune(words)
+	return strings.TrimRight(string(r[:slackTypedAnswerMax-utf8.RuneCountInString(slackClipEllipsis)]), " ") + slackClipEllipsis
+}
+
+// slackEntitiesReduced is text with Slack's entities as plain text shows
+// them: a mention dropped (a name needs a lookup), a channel by its name, a
+// link by its label, or its url when it has none.
+func slackEntitiesReduced(text string) string {
 	text = slackTitleMention.ReplaceAllString(text, " ")
 	text = slackTitleChannel.ReplaceAllString(text, "$1")
-	text = slackTitleLink.ReplaceAllStringFunc(text, func(m string) string {
+	return slackTitleLink.ReplaceAllStringFunc(text, func(m string) string {
 		sub := slackTitleLink.FindStringSubmatch(m)
 		if sub[2] != "" {
 			return sub[2]
 		}
 		return sub[1]
 	})
-	words := strings.Join(strings.Fields(text), " ")
-	if utf8.RuneCountInString(words) <= slackTypedAnswerMax {
-		return words
-	}
-	r := []rune(words)
-	return strings.TrimRight(string(r[:slackTypedAnswerMax-utf8.RuneCountInString(slackClipEllipsis)]), " ") + slackClipEllipsis
 }
 
 // slackUserName is how a user is named on an answered line: display name,

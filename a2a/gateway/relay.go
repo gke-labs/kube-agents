@@ -469,6 +469,8 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		} else if !isConsoleConversation(rec.Key) {
 			answerChat = g.resultChat(rec.Key, taskID, rs, replayedResult)
 			answer.Chat = layoutOf(answerChat)
+			// The chain's final answer, and only that, can be rated.
+			answer.Feedback = g.feedbackTarget(rec, taskID)
 		}
 		result = answer.Text
 		// The console renders answers straight off TASKS, so posting the
