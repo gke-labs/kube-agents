@@ -517,8 +517,7 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   Platform Agent's own watchdogs therefore tick natively, which is the upside; the cost is that the
   three jobs on the `default` roster never come due. Those are `cluster-agent-reconcile`, which
   scaffolds a profile for a newly onboarded cluster and prunes one for a deleted cluster;
-  `oobe`, which runs first-run onboarding (the `bootstrap-inventory-*` and
-  `first-run-quick-value-audit` entries ship disabled); and
+  `oobe`, which runs first-run onboarding (the `bootstrap-inventory-*` entries ship disabled); and
   `profile-cron-tick`, the only thing that ticks a **named** profile's own store — so every
   `cluster-*` roster goes quiet with it. Nothing errors and nothing is logged: a job that is never
   ticked simply stays `scheduled` with a `next_run_at` in the past.

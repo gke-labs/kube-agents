@@ -48,7 +48,6 @@
 reliability-pdb-probe
 capacity-pinned-pool-probe
 security-overgrant-probe
-upgrades-lagging-master-probe
 consistency-authorized-networks-probe
 cost-idle-pool-probe
 obtainability-remediation-proposal
