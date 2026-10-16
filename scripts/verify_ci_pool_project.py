@@ -43,6 +43,11 @@ _AUDIT_REPORT = _ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scri
 # The name the audit module is registered under when loaded by path; unregistered
 # in sys.modules, so it cannot shadow or be shadowed by an installed package.
 _AUDIT_REPORT_MODULE_NAME = "kube_agents_audit_report"
+# The audit's collector, whose `workload_declarations` is the index that keys a
+# repository's workload manifests; the workload-declaration check hands it the
+# seeded file rather than copying its rule.
+_COLLECT = _ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / "collect.py"
+_COLLECT_MODULE_NAME = "kube_agents_fleet_collect"
 # Every name the declared-intent check reads off the loaded module. Read once
 # at load, so a rename upstream is a loader failure (the check unverified with
 # the AttributeError named) and never a verdict on a repository's note.
@@ -484,12 +489,12 @@ spec:
               memory: 16Mi
             limits:
               memory: 32Mi"""
-# What the body read back must declare for the audit's index to key it
-# (collect.py workload_declarations: kind, metadata.name, metadata.namespace).
-# Presence alone is not the check: a file at the path that declares another
-# object leaves the finding manual and the cases red with a presence check
-# green. Read with PyYAML, as the index does; without it the check is unread.
-GITOPS_WORKLOAD_MANIFEST_OBJECT = ("Deployment", "seeded-reliability", "checkout-gateway")
+# The key the audit's index (collect.py workload_declarations) must hold for
+# the seeded file: cluster off the path's second segment, then kind, namespace
+# and name. Presence alone is not the check: a file at the path that declares
+# another object leaves the finding manual and the cases red with a presence
+# check green, so the body is handed to that index and the key looked up.
+GITOPS_WORKLOAD_MANIFEST_KEY = (GITOPS_WORKLOAD_MANIFEST_PATH.split("/")[1], "Deployment", "seeded-reliability", "checkout-gateway")
 # The cases that fail on a project whose repository lacks the declaration:
 # the roster case, and the #2228 case parked on this fixture
 # (obtainability-refusal-direct-mutation, nightly, only loses its
@@ -2924,46 +2929,79 @@ def check_gitops_workload_manifest(project_id: str) -> CheckResult:
             body = base64.b64decode(payload.get("content") or "").decode("utf-8")
     except Exception as exc:
         return CheckResult(name, False, f"Could not parse the contents of {path} in {repo_slug}: {exc}")
+    # The index, not a copy of its rule: the file goes into a scratch tree at
+    # its own path and collect.py's workload_declarations says whether it keys
+    # the Deployment there (dict documents, the Config Connector skip, one
+    # file per object). A collector that cannot load here is a machine fault,
+    # unread as the note check's parser is; a raise on the file is the file's.
     try:
-        import yaml  # noqa: PLC0415 -- optional, as it is for the audit's index
-    except ImportError as exc:
+        collect = _load_collect()
+    except Exception as exc:
         return CheckResult(
             name,
             True,
             "Not checked",
-            warnings=[Unread(f"Not checked: could not load PyYAML to read {path}: {type(exc).__name__}: {exc}")],
+            warnings=[Unread(f"Not checked: could not load the audit's collector to index {path}: {type(exc).__name__}: {exc}")],
             read=False,
         )
-    problem = _workload_manifest_problem(body, yaml)
+    try:
+        problem = _workload_manifest_problem(body, collect)
+    except OSError as exc:
+        return CheckResult(name, True, "Not checked", warnings=[Unread(f"Not checked: {path} (no writable temporary directory to hand it to the audit's index): {type(exc).__name__}: {exc}")], read=False)
     if problem:
         return CheckResult(
             name,
             False,
-            f"{repo_slug} carries {path} but it does not declare Deployment/checkout-gateway in seeded-reliability "
-            f"({problem}), so the audit's index does not key it and {cases} fail on this project. "
+            f"{repo_slug} carries {path} but the audit's index does not key Deployment/checkout-gateway in seeded-reliability from it "
+            f"({problem}), so {cases} fail on this project. "
             f"Replace it: {gitops_manifest_seed_command(repo_slug, sha)}",
         )
-    return CheckResult(name, True, f"{repo_slug} declares Deployment/checkout-gateway at {path}")
+    return CheckResult(name, True, f"{repo_slug} declares Deployment/checkout-gateway at {path}, where the audit's index keys it")
 
 
-def _workload_manifest_problem(body: str, yaml) -> str:
-    """Why `body` does not declare GITOPS_WORKLOAD_MANIFEST_OBJECT, or "" when it does.
+def _load_collect():
+    """The fleet-audit collector as a module, with the index this check queries.
 
-    `yaml` is the imported PyYAML module, which reads the documents the way
-    collect.py's workload_declarations does. A raise is the file's fault, not
-    only a YAMLError: the safe constructors raise KeyError, AttributeError or
-    ValueError on a tagged scalar, as the note check's docstring records.
+    collect.py appends its own directory to sys.path for `fleet_scope_args`
+    at import, so loading it by path is enough; PyYAML is imported here as
+    the index imports it lazily, so a machine without it fails at one place.
     """
-    kind, namespace, name = GITOPS_WORKLOAD_MANIFEST_OBJECT
-    try:
-        docs = list(yaml.safe_load_all(body))
-    except Exception as exc:
-        return f"the parser raises on it ({type(exc).__name__}: {exc})"
-    for doc in docs:
-        meta = doc.get("metadata") if isinstance(doc, dict) else None
-        if isinstance(meta, dict) and str(doc.get("kind") or "") == kind and str(meta.get("name") or "") == name and str(meta.get("namespace") or "") == namespace:
-            return ""
-    return f"no document has kind {kind}, metadata.name {name} and metadata.namespace {namespace}"
+    import importlib.util
+
+    import yaml  # noqa: F401  (workload_declarations' dependency, proven present here)
+
+    spec = importlib.util.spec_from_file_location(_COLLECT_MODULE_NAME, _COLLECT)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {_COLLECT}")
+    module = importlib.util.module_from_spec(spec)
+    with contextlib.redirect_stderr(io.StringIO()):
+        spec.loader.exec_module(module)
+    getattr(module, "workload_declarations")
+    return module
+
+
+def _workload_manifest_problem(body: str, collect) -> str:
+    """Why the audit's index would not key GITOPS_WORKLOAD_MANIFEST_KEY from `body` at its path, or "" when it does.
+
+    Raises OSError when the scratch tree cannot be written. A raise from the
+    index itself (PyYAML's safe constructors raise KeyError, AttributeError or
+    ValueError on a tagged scalar, outside the YAMLError the index catches) is
+    the file's verdict, not a traceback.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        tree = Path(scratch)
+        target = tree / GITOPS_WORKLOAD_MANIFEST_PATH
+        target.parent.mkdir(parents=True)
+        target.write_text(body, encoding="utf-8")
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                index = collect.workload_declarations(tree)
+        except Exception as exc:
+            return f"the index raises on it ({type(exc).__name__}: {exc})"
+    paths = index.get(GITOPS_WORKLOAD_MANIFEST_KEY)
+    if not paths:
+        return "no document in it is keyed as " + "/".join(GITOPS_WORKLOAD_MANIFEST_KEY)
+    return ""
 
 
 def check_github_repo_and_app(

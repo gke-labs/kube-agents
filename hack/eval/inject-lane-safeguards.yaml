@@ -67,12 +67,6 @@ requesting:
   # Opens a pull request and closes it to spend the branch name, then opens
   # the second one its check grades; the reply names both.
   vcs-spent-branch-reuse: 2
-  # The two full obtainability audits. The pool repositories declare
-  # seeded-a's checkout-gateway (scripts/provision_ci_pool_project.sh,
-  # GITOPS_WORKLOAD_MANIFEST_PATH), so `finish` opens one budget pull request
-  # for its major `no-pdb` finding on every run; neither case grades it.
-  obtainability-planted-pdb: 1
-  obtainability-planted-orphan-service: 1
 
 safeguards:
   # #2079: fails a repetition on any pull request or branch the agent wrote

@@ -102,21 +102,27 @@ class PauseTest(unittest.TestCase):
 
     def test_the_shipped_roster(self):
         # The real roster and the real stage: every model-run watchdog is paused except the
-        # oobe stage's four, and no plumbing job is touched.
+        # oobe stage's four, less the one PAUSED_DESPITE_STAGE names (the obtainability
+        # audit, whose finish opens a budget pull request on every run now that the pool
+        # repositories declare checkout-gateway), and no plumbing job is touched.
         shipped = json.loads(ROSTER_SOURCE.read_text())
         self.write_roster(shipped["jobs"])
         result, store = self.run_script()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         stage = set(ast.literal_eval(re.search(r"FIRST_RUN_AUDITS = (\([^)]*\))", STAGE.read_text(), re.S).group(1)))
+        paused_anyway = set(ast.literal_eval(re.search(r"PAUSED_DESPITE_STAGE = frozenset\((\{[^}]*\})\)", SCRIPT.read_text()).group(1)))
+        self.assertEqual(paused_anyway, {"obtainability-audit"})
+        self.assertLess(paused_anyway, stage, "a job paused despite the stage must be one the stage holds")
         for job in shipped["jobs"]:
             jid, after = job["id"], store[job["id"]]
-            if job.get("no_agent") or jid in stage or not job.get("enabled", True):
+            if job.get("no_agent") or (jid in stage and jid not in paused_anyway) or not job.get("enabled", True):
                 self.assertEqual(after, job, jid)
             else:
                 self.assertEqual(after["state"], "paused", jid)
                 self.assertFalse(after["enabled"], jid)
         self.assertIn("gcp-networking-fabric-audit", result.stdout.split(";")[0])
         self.assertIn("compliance-audit (oobe stage)", result.stdout)
+        self.assertNotIn("obtainability-audit (oobe stage)", result.stdout)
 
     def test_already_paused_and_disabled_jobs_are_left(self):
         self.write_roster([

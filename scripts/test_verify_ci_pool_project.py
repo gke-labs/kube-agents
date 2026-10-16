@@ -2116,8 +2116,22 @@ class GitopsWorkloadManifestTest(unittest.TestCase):
         other = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT.replace("name: checkout-gateway", "name: notification-relay")
         result, _ = self._check(_ok(self._contents(other, sha="deadbeef")))
         self.assertFalse(result.passed)
-        self.assertIn("does not declare Deployment/checkout-gateway in seeded-reliability", result.message)
+        self.assertIn("the audit's index does not key Deployment/checkout-gateway in seeded-reliability", result.message)
         self.assertIn("-f sha=deadbeef", result.message)
+
+    def test_the_verdict_is_the_audit_index_s_not_a_copy_of_its_rule(self):
+        # A Config Connector apiVersion with the right kind, name and namespace:
+        # collect.py's workload_declarations skips it (KCC_API_GROUP_SUFFIX), so
+        # the finding stays manual; a copy of the keying rule would pass it.
+        kcc = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT.replace("apiVersion: apps/v1", "apiVersion: compute.cnrm.cloud.google.com/v1beta1")
+        result, _ = self._check(_ok(self._contents(kcc, sha="c0ffee")))
+        self.assertFalse(result.passed)
+        self.assertIn("-f sha=c0ffee", result.message)
+        # A list document, and a document with no namespace, are not keyed either.
+        for body in ("- a\n- b\n", "kind: Deployment\nmetadata:\n  name: checkout-gateway\n"):
+            with self.subTest(body):
+                result, _ = self._check(_ok(self._contents(body)))
+                self.assertFalse(result.passed)
 
     def test_a_transient_is_not_checked_and_any_other_error_fails(self):
         result, _ = self._check(_fail("gh: HTTP 502"))
@@ -2134,7 +2148,7 @@ class GitopsWorkloadManifestTest(unittest.TestCase):
             with self.subTest(body):
                 result, _ = self._check(_ok(self._contents(body, sha="f00d")))
                 self.assertFalse(result.passed)
-                self.assertIn("the parser raises on it", result.message)
+                self.assertIn("the index raises on it", result.message)
                 self.assertIn("-f sha=f00d", result.message)
 
     def test_without_pyyaml_the_check_is_not_checked(self):
@@ -2150,7 +2164,7 @@ class GitopsWorkloadManifestTest(unittest.TestCase):
         self.assertTrue(result.passed)
         self.assertIs(result.read, False)
         self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_UNCHECKED)
-        self.assertIn("PyYAML", result.warnings[0])
+        self.assertIn("collector", result.warnings[0])
 
     def test_a_body_over_the_inline_limit_is_read_raw(self):
         meta = json.dumps({"sha": "abc", "encoding": "none", "content": "", "size": 2_000_000})
@@ -2172,8 +2186,7 @@ class GitopsWorkloadManifestTest(unittest.TestCase):
         # The content the verifier expects is one its own read accepts, and it
         # says nothing about the budget: a word about it reads as declared
         # intent and silences the finding the cases grade.
-        import yaml
-        self.assertEqual("", checker._workload_manifest_problem(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT, yaml))
+        self.assertEqual("", checker._workload_manifest_problem(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT, checker._load_collect()))
         self.assertNotIn("PodDisruptionBudget", checker.GITOPS_WORKLOAD_MANIFEST_CONTENT)
         self.assertNotIn("#", checker.GITOPS_WORKLOAD_MANIFEST_CONTENT)
 
