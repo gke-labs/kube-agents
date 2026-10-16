@@ -259,27 +259,7 @@ asked can stop this.", pending approval). Which rule ships is the maintainer's d
 whether a shared channel thread needs anything finer. The check lives in `a2a/gateway/gateway.go`;
 live validation needs a second Slack user pressing Stop on the first user's thread.
 
-## What a `today` design needs that `next` does not
-
-Built on `today`, where Hermes's Slack adapter owns the connection, Stop needs pieces that `next`
-makes unnecessary or moves:
-
-- **The Hermes listener applier and the `!stop`/`/stop` interception** go. The gateway owns Slack
-  ingress, and Hermes renders no Slack platform under `next`.
-- **`apply_slack_agent_view.py`'s manifest edit** goes. It edits the manifest `hermes slack manifest`
-  prints for `today`; the `next` manifest is the one in `slack-app.md`.
-- **The credential proxy's `SlackRelay`** is not in the path: the gateway holds its own Socket
-  Mode connection.
-- **`_interrupt_and_clear_session`** interrupts a Hermes chat-platform session. A `next` turn is an
-  API-server run, interrupted through its registered agent instead.
-- **Opening the plan at `kanban_create` so Stop exists between turns** is already true: the
-  gateway holds `processing` from the acknowledgement through the cards.
-- **Settling the session to `suspended` after a Stop** goes. The gateway's ordinary rule sends
-  `closed` once nothing runs, for a stop as for any finished turn.
-- **The API-server `/stop` patch to `_handle_responses` and the api-lane-only eval** go. The inject
-  door already has a cancel route, and the `next` lane reaches the Planning Agent through it.
-- **The broker fence, caller label, ledger and MCP record** still apply, because cards run the same
-  way, and move to step 2.
+## When cards become A2A tasks
 
 When kanban cards become child A2A tasks, the bus cancel reaches them directly and step 1's card
 half retires into it; the `scope` field is what stays.
