@@ -2054,8 +2054,8 @@ Mutation(
     Mutation(
         "A3-session-asks-the-board",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.BoardSubject,\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.BoardSubject,\n\t\t},'),
         "test_A3_a_board_request_has_one_writer_and_its_answer_has_one",
         "derive a session pod a publish grant on the board request, so "
         "whatever runs in a session pod can make the bridge read session-kv "
