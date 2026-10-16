@@ -195,6 +195,11 @@ def link_shared_profile_resources(home: Path, hermes_home: Path) -> None:
     home = Path(home)
     hermes_home = Path(hermes_home)
     tirith_bin = home / "bin" / "tirith"
+    if tirith_bin.is_symlink() and not tirith_bin.exists():
+        try:
+            tirith_bin.unlink()
+        except OSError:
+            pass
     if not tirith_bin.exists() and not tirith_bin.is_symlink():
         candidates = []
         if env_tirith := os.environ.get("TIRITH_BIN"):
@@ -218,6 +223,11 @@ def link_shared_profile_resources(home: Path, hermes_home: Path) -> None:
         else (Path(hermes_home) / ".npm-cache").resolve()
     )
     for profile_npm in (home / "home" / ".npm", home / ".npm"):
+        if profile_npm.is_symlink() and not profile_npm.exists():
+            try:
+                profile_npm.unlink()
+            except OSError:
+                pass
         if not profile_npm.exists() and not profile_npm.is_symlink():
             try:
                 shared_cache_dir.mkdir(parents=True, exist_ok=True)

@@ -801,6 +801,51 @@ class BackfillCronStoreTest(unittest.TestCase):
         self.assertTrue(tirith_link.is_symlink())
         self.assertEqual(tirith_link.resolve(), system_tirith.resolve())
 
+    def test_link_shared_profile_resources_unlinks_dangling_symlinks(self):
+        """Dangling symlinks from image rollback or missing targets are unlinked and repaired (#3325)."""
+        hermes_home = self.root / "hermes_dangling"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        home = hermes_home / "profiles" / "dangling-cluster"
+        home.mkdir(parents=True, exist_ok=True)
+
+        # 1. Create dangling tirith and npm symlinks
+        tirith_bin = home / "bin" / "tirith"
+        tirith_bin.parent.mkdir(parents=True, exist_ok=True)
+        tirith_bin.symlink_to(Path("/nonexistent/old/target"))
+        self.assertTrue(tirith_bin.is_symlink())
+        self.assertFalse(tirith_bin.exists())
+
+        npm_dir = home / "home" / ".npm"
+        npm_dir.parent.mkdir(parents=True, exist_ok=True)
+        npm_dir.symlink_to(Path("/nonexistent/old/cache"))
+        self.assertTrue(npm_dir.is_symlink())
+        self.assertFalse(npm_dir.exists())
+
+        # When no tirith candidate exists, dangling tirith is unlinked and stays absent
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(ps, "TIRITH_SYSTEM_BIN", Path("/nonexistent/tirith")):
+            ps.link_shared_profile_resources(home, hermes_home)
+
+        self.assertFalse(tirith_bin.is_symlink(), "dangling tirith symlink must be unlinked when no candidate exists")
+        self.assertFalse(tirith_bin.exists())
+        self.assertTrue(npm_dir.is_symlink(), "npm cache symlink must be repaired")
+        self.assertTrue(npm_dir.exists())
+
+        # 2. When a valid candidate exists, dangling tirith is repaired to point to the candidate
+        tirith_bin.symlink_to(Path("/nonexistent/old/target"))
+        shared_tirith = hermes_home / "bin" / "tirith"
+        shared_tirith.parent.mkdir(parents=True, exist_ok=True)
+        shared_tirith.write_text("#!/bin/sh\nexit 0\n")
+        shared_tirith.chmod(0o755)
+
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(ps, "TIRITH_SYSTEM_BIN", Path("/nonexistent/tirith")):
+            ps.link_shared_profile_resources(home, hermes_home)
+
+        self.assertTrue(tirith_bin.is_symlink())
+        self.assertTrue(tirith_bin.exists())
+        self.assertEqual(tirith_link := tirith_bin.resolve(), shared_tirith.resolve())
+
 
 class RunEnvTest(unittest.TestCase):
     """Tests for run_env injection of NPM_CONFIG_CACHE and TIRITH_BIN."""
