@@ -1074,3 +1074,7 @@
 # deployer: noop, read-only, no fixture: three units at the 200s default,
 # ~10 serial minutes, off the infra lock, main nightly part.
 ./tasks/observability-trace-latency-brokered/task.yaml
+# The weekly upgrade readiness brief's on-request route: a brief in the SOP's shape
+# whose Decide-now lines name slot b's singleton budget and keep the webhook outage
+# under Also-this-week. deployer: noop, read-only, one readiness report.
+./tasks/upgrades-weekly-brief-decisions-named/task.yaml

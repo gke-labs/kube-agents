@@ -2280,9 +2280,16 @@ class TestAuditCatalogue(unittest.TestCase):
         """
         live = self.governance_jobs()
         prompted = {job_id for job_id, job in live.items() if not job.get("no_agent")}
+        # The one prompt job that is not an audit stream: the Saturday brief
+        # composes the week's upgrade readiness message from the weekly
+        # review's record and the findings queue, and publishes no ledger, so
+        # it has no stream in `AUDITS` to pair with. Named here so that adding
+        # a second one stays a deliberate act.
+        non_audit_prompt_jobs = {"upgrade-readiness-weekly-brief"}
+        self.assertEqual(non_audit_prompt_jobs & set(audit_report.AUDITS), set())
         self.assertEqual(
             set(audit_report.AUDITS),
-            prompted,
+            prompted - non_audit_prompt_jobs,
             "the platform roster's enabled agent runs are not the governance "
             "set; a stream switched off here simply stops running",
         )
@@ -2297,6 +2304,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "chat-delivery-watch",
                 "feedback-prompt",
                 "upgrade-readiness-watch",
+                "upgrade-readiness-weekly-review",
             },
             set(live) - prompted,
             "the platform roster's `no_agent` entries are not the expected "
