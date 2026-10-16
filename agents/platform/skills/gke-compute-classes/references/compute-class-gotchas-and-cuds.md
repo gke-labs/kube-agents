@@ -4,8 +4,7 @@
 
 ## Common Traps
 
--   **`AnyBestEffort` Reservation:** Bypasses ComputeClass priorities and falls
-    back to On-Demand at the GCE level. Avoid; use `Specific` affinity.
+-   **`AnyBestEffort` Reservation:** Consumes On-Demand capacity at the GCE level before evaluating your remaining ComputeClass priorities. Avoid if you want to fall back to Spot or cheaper families; use `AnyThenFail` (GKE 1.36.0-gke.3204000+) or `Specific` affinity.
 -   **Reservations are Zonal:** Pin zones via `reservations.specific[].zones`.
     `location.zones` (per-priority or `priorityDefaults.location`) collides with
     `Specific` — omit it; a policy-only `location.locationPolicy: BALANCED` is

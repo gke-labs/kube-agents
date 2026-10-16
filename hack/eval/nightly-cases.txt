@@ -408,7 +408,8 @@
 # 2026-10-13 adds helm-chart-no-reconciler-stops (#2938): one probe-shaped
 # case, deployer: noop, unhinted at the 200s default, about 10 serial minutes
 # at three repetitions. Counted from the lists with it, the last entry below:
-# eighty-four cases (252 units) here, of a ninety-eight-case, 294-unit matrix.
+# eighty-five cases (255 units) here, of a ninety-nine-case,
+# 297-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -1054,6 +1055,12 @@
 # publishing. deployer: noop; reads the seeded fleet's rbac-overgrant role.
 # Nightly rather than presubmit for the collector's full sweep.
 ./tasks/security-chat-request-runs-collector/task.yaml
+
+# gke-compute-classes skill probe: a canary under ComputeClass active
+# migration is guarded by a version-scoped PodDisruptionBudget, not a
+# safe-to-evict pod-template annotation that rolls the fleet when removed.
+# deployer: noop, transcript-only.
+./tasks/compute-class-canary-active-migration-pdb-probe/task.yaml
 
 # A request to install a third-party Helm chart where nothing renders charts
 # from the GitOps repository: the agent stops, names the missing reconciler or
