@@ -2204,8 +2204,8 @@ Mutation(
     Mutation(
         "C1-agent-principal-gets-a-static-password",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ('\t\tuser:           a2aAgentBusUser,',
-         '\t\tuser:           a2aAgentBusUser,\n\t\tcredsKey:       a2aBridgePasswordKey,'),
+        ('\t\tuser:    a2aAgentBusUser,',
+         '\t\tuser:    a2aAgentBusUser,\n\t\tcredsKey: a2aBridgePasswordKey,'),
         "test_C1_the_agent_principal_carries_no_static_bus_password",
         "give the agent's callout principal a Secret key as well, so the same "
         "name is answered for by both the callout and nats.conf's auth_users "
