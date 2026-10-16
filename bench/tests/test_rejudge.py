@@ -162,3 +162,41 @@ def test_outcome_validity_measures_the_outcome_case_of_the_saved_record(monkeypa
 def test_main_reports_an_unreadable_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     assert rejudge.main([str(tmp_path / "absent.json")]) == rejudge.EXIT_UNREADABLE
     assert "cannot read" in capsys.readouterr().err
+
+
+def test_a_judge_that_cannot_be_built_is_recorded_like_a_failed_call():
+    def broken_factory():
+        raise ValueError("JUDGE_PROVIDER names no provider")
+
+    record = _record()
+    rejudge.rejudge_record(record, GATED, broken_factory, {"OutcomeValidity": _scored(1.0)})
+    assert record[rejudge.JUDGE_ERRORS_KEY]["OutcomeValidity"]["type"] == "builtins.ValueError"
+
+
+def test_the_composite_is_assembled_when_the_filled_score_is_its_correctness():
+    # No deterministic correctness key: devops-bench left OutcomeScore out
+    # because OutcomeValidity, its only correctness source, was missing.
+    record = _record()
+    del record["scores"]["VerificationCorrectness"]
+    del record["scores"]["OutcomeScore"]
+    rejudge.rejudge_record(record, GATED, object, {"OutcomeValidity": _scored(0.6)})
+    assert record["scores"]["OutcomeScore"]["score"] is not None
+
+
+def test_no_partial_file_is_left_beside_the_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setitem(rejudge.REJUDGERS, "OutcomeValidity", _scored(0.9))
+    path = tmp_path / "results.json"
+    path.write_text(json.dumps([_record()]), encoding="utf-8")
+    rejudge.rejudge_file(path, GATED, object)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["results.json"]
+
+
+def test_the_presubmit_re_judges_before_it_hands_the_record_to_grading():
+    # run_one_unit's order is the whole contract: after devops-bench names the
+    # run directory, before the .dir state file lets the grading pass read it.
+    script = (Path(__file__).resolve().parents[2] / "hack" / "ci-eval-pr.sh").read_text(encoding="utf-8")
+    body = script[script.index("run_one_unit() {") :]
+    named = body.index('dir="$(grep -oE \'results: ')
+    rejudged = body.index('kube_agents_bench.rejudge "${dir}/results.json"')
+    handed_over = body.index('> "${STATE_DIR}/${name}.rep${rep}.dir"')
+    assert named < rejudged < handed_over

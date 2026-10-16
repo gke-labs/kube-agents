@@ -14,12 +14,12 @@
 
 """Judge a repetition's saved answer once more when a gated judged score is missing.
 
-devops-bench scores every metric inside one ``try`` per metric and writes the
-record without the key when the judge call fails (``metrics/pipeline.py``,
-``evaluate_metrics_batch``), and DeepEval itself drops a metric whose call
-errored from the result it returns. Either way ``results.json`` comes back with
-``OutcomeValidity`` absent, and rung 6 then averages the repetitions that kept
-one -- a mean over one or two scores held to a margin sized for three (#2546).
+devops-bench scores every metric inside one ``try`` per metric, logs the
+exception, and writes the record without the key when the judge call fails
+(``metrics/pipeline.py``, ``evaluate_metrics_batch``). ``results.json`` then
+comes back with ``OutcomeValidity`` absent, and rung 6 averages the repetitions
+that kept one -- a mean over one or two scores held to a margin sized for
+three (#2546).
 
 The answer the judge needed is still in the record (``input``, ``output``,
 ``expected_output``), so the score can be asked for again without running the
@@ -32,8 +32,12 @@ What it writes back, beside ``scores``:
 - ``rejudged``: the metric names this filled in, so a reader of the record can
   tell a second-pass score from a first-pass one;
 - ``judge_errors``: per metric still missing, the exception the judge raised on
-  the second pass (``type``, ``root_type``, ``message``). The scorer reads this
-  to name the cause rather than guess it.
+  the second pass (``type``, ``root_type``, ``message``), kept so the cause can
+  be named -- a provider 429 is not a bad answer -- rather than guessed.
+
+When a score is filled, the composite ``OutcomeScore`` is assembled again the
+way devops-bench assembles it, since a task with no deterministic correctness
+key takes its correctness from ``OutcomeValidity``.
 
 Records the harness marked as infrastructure are left alone: the scorer sets
 them aside whatever their scores say, so judging them again spends quota on
@@ -43,6 +47,7 @@ nothing.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -59,6 +64,7 @@ USE_MCP_ENV_VAR = "BENCH_USE_MCP"
 # that a stack of HTML from a proxy does not bloat the record.
 ERROR_MESSAGE_LIMIT = 500
 EXIT_UNREADABLE = 1
+PARTIAL_SUFFIX = ".rejudge-partial"
 
 Rejudger = Callable[[dict[str, Any], Any], dict[str, Any]]
 
@@ -72,9 +78,9 @@ def _use_mcp() -> bool:
 def _outcome_validity(record: dict[str, Any], judge: Any) -> dict[str, Any]:
     """Score OutcomeValidity on the saved answer; raises what the judge raises.
 
-    ``measure`` is called directly rather than through DeepEval's ``evaluate``,
-    which swallows a failed metric and returns no score and no exception -- the
-    exception type is the thing the scorer needs to tell a 429 from a bad answer.
+    ``measure`` is called directly rather than through devops-bench's batch
+    pipeline, whose per-metric ``except`` keeps only a log line -- the exception
+    type is what tells a 429 from a bad answer.
     """
     from devops_bench.metrics.outcome_validity import build_outcome_validity_metric
     from devops_bench.metrics.pipeline import _build_context
@@ -132,11 +138,11 @@ def rejudge_record(
         if rejudger is None:
             lines.append(f"{name}: missing, and there is no re-judge for it")
             continue
-        if judge is None:
-            judge = judge_factory()
         try:
+            if judge is None:
+                judge = judge_factory()
             entry = rejudger(record, judge)
-        except Exception as exc:  # noqa: BLE001 - recorded for the scorer, never raised
+        except Exception as exc:  # noqa: BLE001 - recorded in the record, never raised
             described = _describe(exc)
             record.setdefault(JUDGE_ERRORS_KEY, {})[name] = described
             lines.append(f"{name}: still missing after a re-judge ({described['type']}: {described['message']})")
@@ -144,7 +150,18 @@ def rejudge_record(
         record["scores"][name] = entry
         record.setdefault(REJUDGED_KEY, []).append(name)
         lines.append(f"{name}: re-judged, score {entry['score']}")
+    if REJUDGED_KEY in record:
+        _refresh_outcome_score(record["scores"])
     return lines
+
+
+def _refresh_outcome_score(scores: dict[str, Any]) -> None:
+    from devops_bench.metrics.pipeline import _finalize_outcome_score
+
+    try:
+        _finalize_outcome_score(scores)
+    except Exception:  # noqa: BLE001 - the composite is reported, never gated
+        pass
 
 
 def rejudge_file(
@@ -159,7 +176,12 @@ def rejudge_file(
     for record in records:
         lines.extend(rejudge_record(record, metrics, judge_factory))
     if lines:
-        path.write_text(json.dumps(loaded, indent=2), encoding="utf-8")
+        # Replaced, not rewritten in place: a job killed mid-write must leave
+        # the record devops-bench wrote, not a truncated one the grader reads
+        # as no run at all.
+        partial = path.with_name(path.name + PARTIAL_SUFFIX)
+        partial.write_text(json.dumps(loaded, indent=2), encoding="utf-8")
+        os.replace(partial, path)
     return lines
 
 
