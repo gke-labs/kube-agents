@@ -663,6 +663,30 @@ slack_moves_to_a2a_gateway() {
   [ "${1:-}" = "next" ] && is_truthy "${2:-}" && ! is_truthy "${3:-}"
 }
 
+# True when $1 names an external Secret (non-empty and neither the shared Secret nor "default").
+slack_secret_ref_is_external() {
+  local name="${1:-}"
+  [ -n "$name" ] && [ "$name" != "default" ] && [ "$name" != "${PLATFORM_AGENT_SECRET}" ]
+}
+
+# The four Slack Secret ref fields on the PlatformAgent CR in $1 (a `kubectl get -o json` list):
+# "<bot_sec>|<bot_key>|<app_sec>|<app_key>". Delimited by '|' to preserve empty fields.
+slack_secret_refs_on_cr() {
+  printf '%s' "${1:-}" | (trap - ERR; python3 -c '
+import json, sys
+items = (json.load(sys.stdin) or {}).get("items") or []
+if items:
+    slack = ((items[0].get("spec") or {}).get("integration") or {}).get("slack") or {}
+    bot_ref = slack.get("botTokenSecretRef") or {}
+    app_ref = slack.get("appTokenSecretRef") or {}
+    b_sec = bot_ref.get("name") or ""
+    b_key = bot_ref.get("key") or ""
+    a_sec = app_ref.get("name") or ""
+    a_key = app_ref.get("key") or ""
+    sys.stdout.write(f"{b_sec}|{b_key}|{a_sec}|{a_key}")
+' 2>/dev/null) || true
+}
+
 # The three checks behind refuse_next_slack_gateway_settings, one per
 # setting, which the install.sh interview also uses to re-ask. Each prints
 # nothing for a setting that passes.
@@ -3729,30 +3753,48 @@ write_tfvars_from_state() {
       fi
     done
     if [ -z "${SLACK_BOT_TOKEN_SECRET:-}" ] || [ -z "${SLACK_APP_TOKEN_SECRET:-}" ]; then
-      local cr_slack_refs
-      cr_slack_refs="$({ kubectl get platformagents.kubeagents.x-k8s.io -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" \
-        --context "$expected_ctx" \
-        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
-        -o jsonpath="{.items[0].spec.integration.slack.botTokenSecretRef.name}{'\t'}{.items[0].spec.integration.slack.botTokenSecretRef.key}{'\t'}{.items[0].spec.integration.slack.appTokenSecretRef.name}{'\t'}{.items[0].spec.integration.slack.appTokenSecretRef.key}" 2>/dev/null || true; })"
-      if [ -n "$cr_slack_refs" ]; then
-        local cr_slack_bot_sec="" cr_slack_bot_key="" cr_slack_app_sec="" cr_slack_app_key=""
-        IFS=$'\t' read -r cr_slack_bot_sec cr_slack_bot_key cr_slack_app_sec cr_slack_app_key <<< "$cr_slack_refs"
-        if [ -z "${SLACK_BOT_TOKEN_SECRET:-}" ] && [ -n "$cr_slack_bot_sec" ] && [ "$cr_slack_bot_sec" != "${PLATFORM_AGENT_SECRET}" ]; then
-          export SLACK_BOT_TOKEN_SECRET="$cr_slack_bot_sec"
-          print_info "Recovered SLACK_BOT_TOKEN_SECRET='${cr_slack_bot_sec}' from the live PlatformAgent CR."
-          if [ -n "$cr_slack_bot_key" ] && [ "$cr_slack_bot_key" != "SLACK_BOT_TOKEN" ]; then
-            export SLACK_BOT_TOKEN_KEY="$cr_slack_bot_key"
+      local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+      read_platform_agent_install_state "$ns" cr-only
+      PLATFORM_AGENT_READS_HELD_FOR=""
+      if [ "$PLATFORM_AGENT_CR_READ" = "$PLATFORM_AGENT_READ_FAILED" ]; then
+        print_info "The PlatformAgent in namespace '${ns}' could not be read (${PLATFORM_AGENT_READ_ERROR}); any external Slack Secret ref it carries was not recovered."
+      elif [ "$PLATFORM_AGENT_CR_READ" = "$PLATFORM_AGENT_READ_OK" ]; then
+        local cr_slack_refs=""
+        cr_slack_refs="$(slack_secret_refs_on_cr "$PLATFORM_AGENT_CR_JSON")"
+        if [ -n "$cr_slack_refs" ]; then
+          local cr_slack_bot_sec="" cr_slack_bot_key="" cr_slack_app_sec="" cr_slack_app_key=""
+          IFS='|' read -r cr_slack_bot_sec cr_slack_bot_key cr_slack_app_sec cr_slack_app_key <<< "$cr_slack_refs"
+          if [ -z "${SLACK_BOT_TOKEN_SECRET:-}" ] && slack_secret_ref_is_external "$cr_slack_bot_sec"; then
+            export SLACK_BOT_TOKEN_SECRET="$cr_slack_bot_sec"
+            print_info "Recovered SLACK_BOT_TOKEN_SECRET='${cr_slack_bot_sec}' from the live PlatformAgent CR."
+            if [ -n "$cr_slack_bot_key" ] && [ "$cr_slack_bot_key" != "SLACK_BOT_TOKEN" ]; then
+              export SLACK_BOT_TOKEN_KEY="$cr_slack_bot_key"
+            fi
           fi
-        fi
-        if [ -z "${SLACK_APP_TOKEN_SECRET:-}" ] && [ -n "$cr_slack_app_sec" ] && [ "$cr_slack_app_sec" != "${PLATFORM_AGENT_SECRET}" ]; then
-          export SLACK_APP_TOKEN_SECRET="$cr_slack_app_sec"
-          print_info "Recovered SLACK_APP_TOKEN_SECRET='${cr_slack_app_sec}' from the live PlatformAgent CR."
-          if [ -n "$cr_slack_app_key" ] && [ "$cr_slack_app_key" != "SLACK_APP_TOKEN" ]; then
-            export SLACK_APP_TOKEN_KEY="$cr_slack_app_key"
+          if [ -z "${SLACK_APP_TOKEN_SECRET:-}" ] && slack_secret_ref_is_external "$cr_slack_app_sec"; then
+            export SLACK_APP_TOKEN_SECRET="$cr_slack_app_sec"
+            print_info "Recovered SLACK_APP_TOKEN_SECRET='${cr_slack_app_sec}' from the live PlatformAgent CR."
+            if [ -n "$cr_slack_app_key" ] && [ "$cr_slack_app_key" != "SLACK_APP_TOKEN" ]; then
+              export SLACK_APP_TOKEN_KEY="$cr_slack_app_key"
+            fi
           fi
         fi
       fi
     fi
+  fi
+
+  local slack_bot_sec="${SLACK_BOT_TOKEN_SECRET:-}"
+  local slack_bot_key="${SLACK_BOT_TOKEN_KEY:-}"
+  local slack_app_sec="${SLACK_APP_TOKEN_SECRET:-}"
+  local slack_app_key="${SLACK_APP_TOKEN_KEY:-}"
+
+  if ! slack_secret_ref_is_external "$slack_bot_sec"; then
+    slack_bot_sec=""
+    slack_bot_key=""
+  fi
+  if ! slack_secret_ref_is_external "$slack_app_sec"; then
+    slack_app_sec=""
+    slack_app_key=""
   fi
 
   # MEMORY is the one key whose absence from install.env costs DATA rather than
@@ -4208,17 +4250,17 @@ write_tfvars_from_state() {
       echo "slack_bot_token         = $(hcl_str "${SLACK_BOT_TOKEN:-}")"
       echo "slack_app_token         = $(hcl_str "${SLACK_APP_TOKEN:-}")"
     fi
-    if [ -n "${SLACK_BOT_TOKEN_SECRET:-}" ] && [ "${SLACK_BOT_TOKEN_SECRET}" != "${PLATFORM_AGENT_SECRET}" ] && [ "${SLACK_BOT_TOKEN_SECRET}" != "default" ]; then
-      echo "slack_bot_token_secret_name = $(hcl_str "${SLACK_BOT_TOKEN_SECRET}")"
+    if [ -n "$slack_bot_sec" ]; then
+      echo "slack_bot_token_secret_name = $(hcl_str "$slack_bot_sec")"
+      if [ -n "$slack_bot_key" ]; then
+        echo "slack_bot_token_secret_key  = $(hcl_str "$slack_bot_key")"
+      fi
     fi
-    if [ -n "${SLACK_BOT_TOKEN_KEY:-}" ] && [ "${SLACK_BOT_TOKEN_SECRET:-}" != "${PLATFORM_AGENT_SECRET}" ] && [ "${SLACK_BOT_TOKEN_SECRET:-}" != "default" ]; then
-      echo "slack_bot_token_secret_key  = $(hcl_str "${SLACK_BOT_TOKEN_KEY}")"
-    fi
-    if [ -n "${SLACK_APP_TOKEN_SECRET:-}" ] && [ "${SLACK_APP_TOKEN_SECRET}" != "${PLATFORM_AGENT_SECRET}" ] && [ "${SLACK_APP_TOKEN_SECRET}" != "default" ]; then
-      echo "slack_app_token_secret_name = $(hcl_str "${SLACK_APP_TOKEN_SECRET}")"
-    fi
-    if [ -n "${SLACK_APP_TOKEN_KEY:-}" ] && [ "${SLACK_APP_TOKEN_SECRET:-}" != "${PLATFORM_AGENT_SECRET}" ] && [ "${SLACK_APP_TOKEN_SECRET:-}" != "default" ]; then
-      echo "slack_app_token_secret_key  = $(hcl_str "${SLACK_APP_TOKEN_KEY}")"
+    if [ -n "$slack_app_sec" ]; then
+      echo "slack_app_token_secret_name = $(hcl_str "$slack_app_sec")"
+      if [ -n "$slack_app_key" ]; then
+        echo "slack_app_token_secret_key  = $(hcl_str "$slack_app_key")"
+      fi
     fi
     echo "slack_allowed_users     = $(hcl_csv_list "${SLACK_ALLOWED_USERS:-}")"
     echo "slack_home_channel      = $(hcl_str "${SLACK_HOME_CHANNEL:-}")"
@@ -4316,18 +4358,10 @@ write_tfvars_from_state() {
   export TF_VAR_anthropic_api_key="${ANTHROPIC_API_KEY:-}"
   export TF_VAR_slack_bot_token="${SLACK_BOT_TOKEN:-}"
   export TF_VAR_slack_app_token="${SLACK_APP_TOKEN:-}"
-  local slack_bot_sec="${SLACK_BOT_TOKEN_SECRET:-}"
-  local slack_app_sec="${SLACK_APP_TOKEN_SECRET:-}"
-  if [ "$slack_bot_sec" = "${PLATFORM_AGENT_SECRET}" ] || [ "$slack_bot_sec" = "default" ]; then
-    slack_bot_sec=""
-  fi
-  if [ "$slack_app_sec" = "${PLATFORM_AGENT_SECRET}" ] || [ "$slack_app_sec" = "default" ]; then
-    slack_app_sec=""
-  fi
   export TF_VAR_slack_bot_token_secret_name="$slack_bot_sec"
-  export TF_VAR_slack_bot_token_secret_key="${SLACK_BOT_TOKEN_KEY:-}"
+  export TF_VAR_slack_bot_token_secret_key="$slack_bot_key"
   export TF_VAR_slack_app_token_secret_name="$slack_app_sec"
-  export TF_VAR_slack_app_token_secret_key="${SLACK_APP_TOKEN_KEY:-}"
+  export TF_VAR_slack_app_token_secret_key="$slack_app_key"
   export TF_VAR_session_kv_api_key="${SESSION_KV_API_KEY:-}"
   export TF_VAR_session_kv_salt="${SESSION_KV_SALT:-}"
 }

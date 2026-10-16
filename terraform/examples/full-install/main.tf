@@ -209,10 +209,10 @@ locals {
   # Slack app is a manual step, so an empty value has to reach the Secret as
   # an empty value unless an external Secret is referenced.
   slack_credentials = var.enable_slack ? merge(
-    var.slack_bot_token_secret_name == "" || var.slack_bot_token != "" ? {
+    var.slack_bot_token_secret_name == "" ? {
       SLACK_BOT_TOKEN = var.slack_bot_token
     } : {},
-    var.slack_app_token_secret_name == "" || var.slack_app_token != "" ? {
+    var.slack_app_token_secret_name == "" ? {
       SLACK_APP_TOKEN = var.slack_app_token
     } : {}
   ) : {}

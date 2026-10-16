@@ -168,7 +168,7 @@ on_error() {
   # `bash`; both read as the script by name.
   local source_file="${BASH_SOURCE[1]:-}"
   case "$source_file" in
-    ""|main) source_file="$INSTALL_SCRIPT_NAME" ;;
+    ""|main|bash) source_file="$INSTALL_SCRIPT_NAME" ;;
   esac
   local func_name="${FUNCNAME[1]:-main}"
   echo -e "\n\033[91m\033[1m✗ Error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
@@ -609,11 +609,7 @@ PARAM_USER_PROFILE_ENABLED="${USER_PROFILE_ENABLED:-}"
 # install recorded rather than clearing it.
 PARAM_ENABLE_SLACK="${SLACK_ENABLED:-}"
 PARAM_SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}"
-PARAM_SLACK_BOT_TOKEN_SECRET="${SLACK_BOT_TOKEN_SECRET:-}"
-PARAM_SLACK_BOT_TOKEN_KEY="${SLACK_BOT_TOKEN_KEY:-}"
 PARAM_SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}"
-PARAM_SLACK_APP_TOKEN_SECRET="${SLACK_APP_TOKEN_SECRET:-}"
-PARAM_SLACK_APP_TOKEN_KEY="${SLACK_APP_TOKEN_KEY:-}"
 PARAM_SLACK_ALLOWED_USERS="${SLACK_ALLOWED_USERS:-}"
 PARAM_SLACK_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}"
 PARAM_SLACK_HOME_CHANNEL_NAME="${SLACK_HOME_CHANNEL_NAME:-}"
@@ -5874,10 +5870,10 @@ run_menu_system() {
 require_slack_tokens_after_recovery() {
   is_truthy "${SLACK_ENABLED:-}" || return 0
   local slack_missing=""
-  if [ -z "${SLACK_BOT_TOKEN:-}" ] && [ -z "${SLACK_BOT_TOKEN_SECRET:-}" ]; then
+  if [ -z "${SLACK_BOT_TOKEN:-}" ] && ! slack_secret_ref_is_external "${SLACK_BOT_TOKEN_SECRET:-}"; then
     slack_missing="${slack_missing} --slack-bot-token (SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_SECRET)"
   fi
-  if [ -z "${SLACK_APP_TOKEN:-}" ] && [ -z "${SLACK_APP_TOKEN_SECRET:-}" ]; then
+  if [ -z "${SLACK_APP_TOKEN:-}" ] && ! slack_secret_ref_is_external "${SLACK_APP_TOKEN_SECRET:-}"; then
     slack_missing="${slack_missing} --slack-app-token (SLACK_APP_TOKEN or SLACK_APP_TOKEN_SECRET)"
   fi
   if [ -n "$slack_missing" ]; then
@@ -6324,11 +6320,7 @@ main() {
   # loaded SLACK_* keys, so the non-interactive path can carry the Slack
   # settings: prompt_read keeps a non-empty current value there.
   local slack_bot_token="${PARAM_SLACK_BOT_TOKEN:-}"
-  local slack_bot_token_secret="${PARAM_SLACK_BOT_TOKEN_SECRET:-}"
-  local slack_bot_token_key="${PARAM_SLACK_BOT_TOKEN_KEY:-}"
   local slack_app_token="${PARAM_SLACK_APP_TOKEN:-}"
-  local slack_app_token_secret="${PARAM_SLACK_APP_TOKEN_SECRET:-}"
-  local slack_app_token_key="${PARAM_SLACK_APP_TOKEN_KEY:-}"
   local slack_allowed_users="${PARAM_SLACK_ALLOWED_USERS:-}"
   local slack_home_channel="${PARAM_SLACK_HOME_CHANNEL:-}"
   local slack_home_channel_name="${PARAM_SLACK_HOME_CHANNEL_NAME:-}"
@@ -7304,6 +7296,10 @@ main() {
   export SLACK_ENABLED="$slack_enabled"
   export SLACK_BOT_TOKEN="$slack_bot_token"
   export SLACK_APP_TOKEN="$slack_app_token"
+  export SLACK_BOT_TOKEN_SECRET="${SLACK_BOT_TOKEN_SECRET:-}"
+  export SLACK_BOT_TOKEN_KEY="${SLACK_BOT_TOKEN_KEY:-}"
+  export SLACK_APP_TOKEN_SECRET="${SLACK_APP_TOKEN_SECRET:-}"
+  export SLACK_APP_TOKEN_KEY="${SLACK_APP_TOKEN_KEY:-}"
   export SLACK_ALLOWED_USERS="$slack_allowed_users"
   export SLACK_HOME_CHANNEL="$slack_home_channel"
   export SLACK_HOME_CHANNEL_NAME="$slack_home_channel_name"

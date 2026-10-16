@@ -7716,8 +7716,14 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         kubectl_stub = (
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
-            '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            '  *"get platformagents"*"botTokenSecretRef.name"*) printf "custom-bot-secret\tcustom-bot-key\tcustom-app-secret\tcustom-app-key" ;;\n'
+            '  *"config current-context"*|*"config get-contexts"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
+            '  *"get platformagents"*) cat << \'EOF\'\n'
+            '{"items": [{"spec": {"integration": {"slack": {\n'
+            '  "botTokenSecretRef": {"name": "custom-bot-secret", "key": "custom-bot-key"},\n'
+            '  "appTokenSecretRef": {"name": "custom-app-secret", "key": "custom-app-key"}\n'
+            '}}}}]}\n'
+            'EOF\n'
+            ";;\n"
             "  *) exit 1 ;;\n"
             "esac\n"
         )
@@ -7737,7 +7743,13 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
             '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            '  *"get platformagents"*"botTokenSecretRef.name"*) printf "platform-agent-secrets\tSLACK_BOT_TOKEN\tplatform-agent-secrets\tSLACK_APP_TOKEN" ;;\n'
+            '  *"get platformagents"*) cat << \'EOF\'\n'
+            '{"items": [{"spec": {"integration": {"slack": {\n'
+            '  "botTokenSecretRef": {"name": "platform-agent-secrets", "key": "SLACK_BOT_TOKEN"},\n'
+            '  "appTokenSecretRef": {"name": "platform-agent-secrets", "key": "SLACK_APP_TOKEN"}\n'
+            '}}}}]}\n'
+            'EOF\n'
+            ";;\n"
             "  *) exit 1 ;;\n"
             "esac\n"
         )
@@ -7754,8 +7766,14 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         kubectl_stub = (
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
-            '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            '  *"get platformagents"*"botTokenSecretRef.name"*) printf "custom-bot-secret\tcustom-bot-key\tcustom-app-secret\tcustom-app-key" ;;\n'
+            '  *"config current-context"*|*"config get-contexts"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
+            '  *"get platformagents"*) cat << \'EOF\'\n'
+            '{"items": [{"spec": {"integration": {"slack": {\n'
+            '  "botTokenSecretRef": {"name": "custom-bot-secret", "key": "custom-bot-key"},\n'
+            '  "appTokenSecretRef": {"name": "custom-app-secret", "key": "custom-app-key"}\n'
+            '}}}}]}\n'
+            'EOF\n'
+            ";;\n"
             "  *) exit 1 ;;\n"
             "esac\n"
         )
@@ -7765,6 +7783,27 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             self.assertNotIn("slack_bot_token_secret_name", tfvars)
             self.assertNotIn("slack_app_token_secret_name", tfvars)
             self.assertIn("TFVAR_BOT_SEC=[]", stdout)
+
+    def test_bootstrap_install_env_file_records_slack_secret_refs(self):
+        """A first install records SLACK_BOT_TOKEN_SECRET and SLACK_APP_TOKEN_SECRET into install.env (#3275)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "new.install.env"
+            script = (
+                f'export SLACK_ENABLED=true SLACK_BOT_TOKEN_SECRET=my-slack-secret SLACK_BOT_TOKEN_KEY=BOT_KEY '
+                f'SLACK_APP_TOKEN_SECRET=my-slack-secret SLACK_APP_TOKEN_KEY=APP_KEY\n'
+                f'bootstrap_install_env_file "{dest}" v1.0.0 >/dev/null\n'
+                f'cat "{dest}"'
+            )
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nsource "{_INSTALLER_COMMON}"\n{script}'],
+                capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                env=get_isolated_test_env(),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertRegex(proc.stdout, re.compile(r"^SLACK_BOT_TOKEN_SECRET=my-slack-secret$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SLACK_BOT_TOKEN_KEY=BOT_KEY$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SLACK_APP_TOKEN_SECRET=my-slack-secret$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SLACK_APP_TOKEN_KEY=APP_KEY$", re.MULTILINE))
 
 
 class TfvarsTempFileIsCleanedUpTest(unittest.TestCase):
@@ -10453,7 +10492,7 @@ class SlackRequiresTokensNonInteractivelyTest(unittest.TestCase):
         self._install_env = pathlib.Path(tmp.name) / "install.env"
         self._install_env.write_text("")
 
-    def _run_deferred_check(self, bot="", app="", enabled="true", before=""):
+    def _run_deferred_check(self, bot="", app="", enabled="true", before="", bot_sec="", app_sec=""):
         """Execute require_slack_tokens_after_recovery on a given recovery.
 
         The variables are assigned after the source rather than exported into
@@ -10466,6 +10505,8 @@ class SlackRequiresTokensNonInteractivelyTest(unittest.TestCase):
             f"SLACK_ENABLED={shlex.quote(enabled)}\n"
             f"SLACK_BOT_TOKEN={shlex.quote(bot)}\n"
             f"SLACK_APP_TOKEN={shlex.quote(app)}\n"
+            f"SLACK_BOT_TOKEN_SECRET={shlex.quote(bot_sec)}\n"
+            f"SLACK_APP_TOKEN_SECRET={shlex.quote(app_sec)}\n"
             'PARAM_NON_INTERACTIVE="true"\n'
             f"{before}\n"
             "require_slack_tokens_after_recovery\n"
@@ -10487,22 +10528,34 @@ class SlackRequiresTokensNonInteractivelyTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("REACHED_THE_APPLY", proc.stdout)
         combined = proc.stdout + proc.stderr
-        self.assertIn("--slack-bot-token (SLACK_BOT_TOKEN)", combined)
-        self.assertIn("--slack-app-token (SLACK_APP_TOKEN)", combined)
+        self.assertIn("--slack-bot-token (SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_SECRET)", combined)
+        self.assertIn("--slack-app-token (SLACK_APP_TOKEN or SLACK_APP_TOKEN_SECRET)", combined)
 
     def test_the_deferred_check_refuses_on_one_token_and_names_only_it(self):
         """Half a recovery is still a relay that cannot open a socket."""
         proc = self._run_deferred_check(bot="xoxb-recovered")
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         combined = proc.stdout + proc.stderr
-        self.assertIn("--slack-app-token (SLACK_APP_TOKEN)", combined)
-        self.assertNotIn("--slack-bot-token (SLACK_BOT_TOKEN)", combined)
+        self.assertIn("--slack-app-token (SLACK_APP_TOKEN or SLACK_APP_TOKEN_SECRET)", combined)
+        self.assertNotIn("--slack-bot-token (SLACK_BOT_TOKEN", combined)
 
     def test_a_recovery_that_found_both_tokens_proceeds(self):
         """The unattended PERSIST_SECRETS_ON_DISK=false re-run this unblocks."""
         proc = self._run_deferred_check(bot="xoxb-recovered", app="xapp-recovered")
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertIn("REACHED_THE_APPLY", proc.stdout)
+
+    def test_external_secret_refs_satisfy_the_deferred_check(self):
+        """When Slack tokens are stored in external Secrets, require_slack_tokens_after_recovery proceeds."""
+        proc = self._run_deferred_check(bot_sec="custom-slack-secret", app_sec="custom-slack-secret")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("REACHED_THE_APPLY", proc.stdout)
+
+    def test_default_sentinel_secret_ref_still_refuses_without_tokens(self):
+        """Specifying 'default' or the shared Secret name requires actual tokens."""
+        proc = self._run_deferred_check(bot_sec="default", app_sec="platform-agent-secrets")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("REACHED_THE_APPLY", proc.stdout)
 
     def test_an_install_without_slack_is_never_asked_for_tokens(self):
         proc = self._run_deferred_check(enabled="false")
@@ -10529,8 +10582,8 @@ class SlackRequiresTokensNonInteractivelyTest(unittest.TestCase):
 
     def test_the_guard_names_both_tokens(self):
         text = _INSTALL_SH.read_text()
-        self.assertIn("--slack-bot-token (SLACK_BOT_TOKEN)", text)
-        self.assertIn("--slack-app-token (SLACK_APP_TOKEN)", text)
+        self.assertIn("--slack-bot-token (SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_SECRET)", text)
+        self.assertIn("--slack-app-token (SLACK_APP_TOKEN or SLACK_APP_TOKEN_SECRET)", text)
 
     def test_an_interactive_run_without_tokens_is_still_refused_after_recovery(self):
         """Even with a TTY, missing tokens after recovery cannot reach apply.
