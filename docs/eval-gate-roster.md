@@ -136,6 +136,16 @@ with a filed issue naming the exit condition:
   no presubmit case, so `remediation` joined `fleet-audits` on the allowlist until
   pdb-remediation-pr's roster line on 2026-10-14 (below) took it off again. Enters when #1189's
   re-admission bar holds.
+- **upgrades-lagging-master-probe** —
+  [#3269](https://github.com/gke-labs/kube-agents/issues/3269): demoted 2026-10-16 after
+  rung-4 collapses on unrelated pull requests the same day (#2997, #2959, #3282, #3271 and
+  more failed it 0/3; it was UNSTABLE on several others). The fixture, not the diff: seeded-b
+  runs an off-channel patch on the eval pools (1.34.12-gke.1011000 on RAPID, or
+  1.35.8-gke.1626001, ahead of REGULAR's target) instead of the one-minor-behind version the
+  case grades, so the agent truthfully reports no lag. Its removal leaves `upgrades` with no
+  presubmit case, so the domain is on the `domains.yaml` allowlist until it returns. Enters
+  again when seeded-b is pinned to a version one minor behind the REGULAR default, chosen from
+  REGULAR's own list, and the case shows greens (#3269).
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
 [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its
