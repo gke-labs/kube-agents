@@ -408,8 +408,8 @@
 # 2026-10-13 adds helm-chart-no-reconciler-stops (#2938): one probe-shaped
 # case, deployer: noop, unhinted at the 200s default, about 10 serial minutes
 # at three repetitions. Counted from the lists with it, the last entry below:
-# eighty-five cases (255 units) here, of a ninety-nine-case,
-# 297-unit matrix.
+# eighty-seven cases (261 units) here, of a one-hundred-case,
+# 300-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -673,6 +673,14 @@
 # INSTANTANEOUS question, so the cost domain is covered meanwhile. Audit
 # shape, unmeasured: priced with the 900s band in unit_cost_hint.
 ./tasks/fleet-cost-idle-pool/task.yaml
+
+# #3269: upgrades-lagging-master-probe demoted 2026-10-16. The fixture is
+# healthy (seeded-b one minor behind REGULAR's defaultVersion on every pool),
+# but the agent compares seeded-b against the channel's upgradeTargetVersion,
+# the newest patch of its own minor, and reports no lag, so it fails 0/3 on
+# unrelated pull requests. Back on the roster once an agent-side fix has the
+# comparison use the channel default and the case shows greens (#3269).
+./tasks/upgrades-lagging-master-probe/task.yaml
 
 # Blocker: #1254, for all four fleet-upgrade-verification cases (#1343
 # Phases 1-4: #1365, #1410, #1411, #1412). #1254 is the open issue on
@@ -1061,6 +1069,17 @@
 # safe-to-evict pod-template annotation that rolls the fleet when removed.
 # deployer: noop, transcript-only.
 ./tasks/compute-class-canary-active-migration-pdb-probe/task.yaml
+
+# kube-agents-observability skill's trace latency helper, run to completion
+# through the credential broker's relay and graded on the report's breakdown
+# shape and on the worker's route (no token fetched or pasted). Reads the
+# install's own traces; parked in FIXTURE_NOT_READY from its merge until the
+# pool host clusters exported traces (scope set 2026-10-02, held by the
+# provisioning script and the verifier since). Nightly from the merge
+# that un-parked it.
+# deployer: noop, read-only, no fixture: three units at the 200s default,
+# ~10 serial minutes, off the infra lock, main nightly part.
+./tasks/observability-trace-latency-brokered/task.yaml
 
 # A request to install a third-party Helm chart where nothing renders charts
 # from the GitOps repository: the agent stops, names the missing reconciler or

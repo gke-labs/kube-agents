@@ -59,6 +59,7 @@ import json
 import os
 import re
 import shlex
+import ssl
 import subprocess
 import textwrap
 import time
@@ -1706,6 +1707,19 @@ _NO_PR_URL_REASON = (
     "reply must carry the pull request URL in full"
 )
 
+
+def _no_pr_url_reason(host: str) -> str:
+    """``_NO_PR_URL_REASON`` for the GitHub host the reply must name."""
+    if host == forges.GITHUB_DEFAULT_HOST:
+        return _NO_PR_URL_REASON
+    return (
+        f"the run's report names no {host} pull request URL, so no fix was "
+        "proposed (or the agent did not report the PR it opened); a remediation "
+        "reply must carry the pull request URL in full. A github.com URL does not "
+        f"count: this run's GitHub forge is the GitHub Enterprise Server at {host} "
+        f"({forges.GITHUB_HOST_ENV_VAR})"
+    )
+
 _NO_TOKEN_REASON = (
     "no GitHub read credential in the environment: set one of "
     f"{', '.join(LEDGER_TOKEN_ENV_VARS)} to a token that can read issues on "
@@ -1818,7 +1832,7 @@ def _gitlab_path_key(value: str) -> str:
 def _issue_api_url(forge: str, repo: str, number: int) -> str:
     if forge == forges.FORGE_GITLAB:
         return f"{forges.gitlab_api_root()}{forges.gitlab_project_path(repo)}/issues/{number}"
-    return f"{forges.GITHUB_API_ROOT}/repos/{repo}/issues/{number}"
+    return f"{forges.github_api_root()}/repos/{repo}/issues/{number}"
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -3023,7 +3037,16 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
         },
         method="GET",
     )
-    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        context = forges.forge_ssl_context()
+    except forges.UnknownForge as exc:
+        raise OSError(str(exc)) from exc
+    handlers: list[Any] = [_NoRedirect]
+    if context is not None:
+        # BENCH_FORGE_CA_FILE: the system CAs plus a private one, for a
+        # self-managed GitLab or the GHES proxy.
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+    opener = urllib.request.build_opener(*handlers)
     for attempt in range(1, _FORGE_READ_ATTEMPTS + 1):
         try:
             with opener.open(request, timeout=timeout) as response:
@@ -3044,6 +3067,16 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
             if attempt == _FORGE_READ_ATTEMPTS:
                 if isinstance(exc, http.client.HTTPException):
                     raise OSError(f"{type(exc).__name__}: {exc}") from exc
+                reason = getattr(exc, "reason", exc)
+                if context is not None and isinstance(reason, ssl.SSLCertVerificationError):
+                    # With BENCH_FORGE_CA_FILE set, a certificate failure is
+                    # most likely that file (an old or another CA); name it,
+                    # or the error reads as if no CA file was set at all.
+                    raise OSError(
+                        f"{forges.FORGE_CA_FILE_ENV_VAR}="
+                        f"{os.environ.get(forges.FORGE_CA_FILE_ENV_VAR, '')!r} does not verify "
+                        f"{urllib.parse.urlsplit(url).netloc}: {reason}"
+                    ) from exc
                 raise
             time.sleep(_FORGE_READ_RETRY_PAUSE_SEC)
     raise AssertionError("unreachable")
@@ -4060,7 +4093,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         pull request.
         """
         globs = [g for check in self.content for g in check.paths]
-        base = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files"
+        base = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/files"
         texts: dict[str, str] = {}
         unread: list[str] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
@@ -4106,7 +4139,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         A rename counts under both names: moving the declaration away is as
         much a change to it as rewriting it.
         """
-        base = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files"
+        base = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/files"
         paths: list[str] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
             status, files = _http_get_json(
@@ -4152,7 +4185,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         if not ref:
             return None, f"GitHub returned no head ref for {slug}; this check could not be evaluated"
         status_code, listed = _http_get_json(
-            f"https://api.github.com/repos/{owner}/{repo}/pulls"
+            f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls"
             f"?state=closed&head={owner}:{urllib.parse.quote(ref, safe='')}&per_page={_GITHUB_PAGE_SIZE}",
             token,
             budget,
@@ -4210,7 +4243,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     status_code = 200
                 else:
                     status_code, commits = _http_get_json(
-                        f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/commits"
+                        f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/commits"
                         f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
                         token,
                         budget,
@@ -4271,7 +4304,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         same for every repetition, and no grade drawn from it would mean
         anything. Everything else the agent chose, so it is graded.
         """
-        base = f"https://api.github.com/repos/{owner}/{repo}"
+        base = f"{forges.github_api_root()}/repos/{owner}/{repo}"
         first, payload = _http_get_json(f"{base}/issues/{number}", token, budget)
         status_code = first
         if first in (401, 403, 404):
@@ -4339,7 +4372,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         as on ``/pulls/{n}``; folding it into ``None`` would pass a leftover
         the run only wrote to.
         """
-        base = f"https://api.github.com/repos/{owner}/{repo}"
+        base = f"{forges.github_api_root()}/repos/{owner}/{repo}"
         payload = resolved
         if "changed_files" not in payload:
             status, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
@@ -4717,7 +4750,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     "so no fix was proposed (or the agent did not report the merge request "
                     "it opened); a remediation reply must carry its URL in full",
                 )
-            return done(False, _NO_PR_URL_REASON)
+            return done(False, _no_pr_url_reason(forges.web_host(forge)))
         if len(seen) > _MAX_PR_CANDIDATES:
             return done(
                 False,
