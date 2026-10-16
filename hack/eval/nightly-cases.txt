@@ -1055,3 +1055,8 @@
 # safe-to-evict pod-template annotation that rolls the fleet when removed.
 # deployer: noop, transcript-only.
 ./tasks/compute-class-canary-active-migration-pdb-probe/task.yaml
+
+# A Cluster Agent runs its gke-workload-security audit script from the card's
+# workspace: graded on a Cluster Agent doing the work, audit_cluster.sh being run,
+# and no result showing the script missing.
+./tasks/cluster-agent-security-audit-script/task.yaml

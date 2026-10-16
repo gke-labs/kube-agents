@@ -1,0 +1,72 @@
+# NIGHTLY — an entry in hack/eval/nightly-cases.txt.
+#
+# Domain: security (Cluster Agent). Journey: a user asks for one cluster's
+# security audit; the Platform Agent hands it to that cluster's Cluster
+# Agent, which runs the audit script its gke-workload-security skill names
+# and reports what the script printed.
+#
+# What it catches. A Cluster Agent's terminal runs in the shell sandbox,
+# which carries the Platform Agent's skills under /opt/data/skills and none
+# of the Cluster Agent's own (deploy/sandbox/Dockerfile). A skill command
+# that names its script relative to the skill folder
+# (`./scripts/audit_cluster.sh`) resolves against the card's working
+# directory, finds nothing, and the shell prints `No such file or
+# directory`. The worker then writes its own `gcloud container clusters
+# describe` survey, and the answer can still read right, so the checks here
+# grade the route: a Cluster Agent did the work, it ran audit_cluster.sh,
+# and no call's result shows the script missing.
+#
+# The result check opens its window at the first result any worker call
+# returns: a Cluster Agent runs cluster_preflight.sh before anything else
+# (agents/cluster/SOUL.md), so the audit is never the call that opens it.
+#
+# No planted defect: the script reads the cluster's own configuration, and
+# any seeded cluster has one. Isolation class: read-only. Eligible tier:
+# nightly.
+id: cluster-agent-security-audit-script
+name: A Cluster Agent runs its security audit script from the card's workspace
+prompt: >-
+  Have the Cluster Agent for the seeded-a cluster run the security audit
+  script from its gke-workload-security skill against seeded-a, and report
+  each check the script prints with its PASS or FAIL result.
+expected_output: >-
+  The Platform Agent delegates the audit to seeded-a's Cluster Agent, which
+  runs audit_cluster.sh for seeded-a and reports each check the script
+  printed (Workload Identity, Network Policy, Shielded Nodes, Binary
+  Authorization, Private Cluster) with its PASS or FAIL result. No change is
+  made to the cluster.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: security
+
+owner: toshiowang
+
+# No fixtures: the seeded fleet's standing clusters are the target, and every
+# check reads the run's transcript.
+fixtures: []
+
+verification_spec:
+  - name: a-cluster-agent-did-the-work
+    role: objective
+    check:
+      type: worker_agents
+      required_agents: ["cluster-.+"]
+  - name: the-audit-script-ran-and-was-found
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      after_result_pattern: '[\s\S]'
+      forbidden_result_patterns:
+        - 'audit_cluster\.sh: (?:[Nn]o such file or directory|(?:command )?not found|[Pp]ermission denied)'
+      required_runs:
+        - script: audit_cluster.sh
+  - name: report-carries-the-script-results
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["Workload Identity", "Shielded Nodes"]
+      any_of_phrases: ["PASS", "FAIL"]
