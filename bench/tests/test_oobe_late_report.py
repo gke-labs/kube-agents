@@ -190,6 +190,15 @@ def test_an_audit_the_stage_did_not_start_is_not_graded(install: Install) -> Non
     assert result.status == "pass", result.reason
 
 
+def test_a_marker_with_no_started_audit_is_an_error(install: Install) -> None:
+    install.chain()
+    install.marker.write_text(json.dumps({"skipped": True, "reason": "not new"}))
+    install.deliver("anything")
+    result = _verify()
+    assert result.status == "error"
+    assert "records no audit it started" in result.reason
+
+
 def test_no_failed_summary_is_an_error(install: Install) -> None:
     install.chain(outcome="delivered")
     install.deliver("anything")
