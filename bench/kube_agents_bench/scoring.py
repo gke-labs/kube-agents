@@ -247,7 +247,7 @@ A2A_STATE_WORKING = "working"
 #: on every inject record, marker or not: the trace carries no card ids,
 #: no worker's entries and no results (``cases.py``,
 #: ``worker_blind_checks``). The names are duplicated rather than imported,
-#: like the status entry, and so are the marker's three loss arguments
+#: like the status entry, and so are the marker's four loss arguments
 #: (``inject_transport.ACTIVITY_LOSS_ARGS``); ``test_scoring.py`` asserts
 #: each agrees with the transport's.
 INJECT_TASK_EVENT = "inject.task"
