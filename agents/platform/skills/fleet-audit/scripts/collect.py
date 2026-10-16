@@ -211,7 +211,7 @@ TRIAGE_BY_SLUG = {
 # §3.25 `zonal-skew`: the per-cluster pod placement read and its thresholds.
 # Pods are deliberately not in the obtainability dump (`DUMP_COMMAND_KINDS`): a
 # full `-o json` of them is the largest list a cluster has and can reach the
-# credential proxy's output cap. This read takes eight scalar fields a pod,
+# credential proxy's output cap. This read takes nine scalar fields a pod,
 # tab-separated, a few hundred bytes each; completed pods are left out
 # server-side because they hold no replica.
 ZONAL_SKEW_SLUG = "zonal-skew"
@@ -2983,23 +2983,30 @@ def _collect_pod_placements(context: dict, commands: dict, kubeconfig: Path, *, 
 
 # The Impact's head is the same for every cause; the cause supplies its tail,
 # because the fix differs by cause and the sentence has to send the reader to
-# the right one.
+# the right one. Every phrase claims only what the collector read: the
+# manifest, the Nodes' labels, the pods' phase and node, the scheduler's own
+# message, and the claims' names and phase -- never a StorageClass's topology
+# or a PersistentVolume's affinity, which are not in the dump.
 _IMPACT_ZONAL_SKEW = (
-    "{share}% of this workload's running replicas are in {zone}, so a zonal outage or "
+    "{share}% of this workload's placed replicas are in {zone}, so a zonal outage or "
     "stockout there takes that share down at once."
 )
 _ZONAL_SKEW_CAUSES = {
-    "volume": (
-        "pinned by its PersistentVolumeClaims: volumeClaimTemplates on StorageClass {classes} bind each replica to the zone of its disk",
-        " Their disks are zonal, so the pods cannot move without their data; the fix is a migration, not a scheduling change.",
-    ),
-    "confined": (
-        "confined to {zone} by its node selection ({selection}): no eligible node is in another zone",
-        " Its node selection admits nodes in one zone only, so the scheduler cannot place it elsewhere; the fix is the selection, or a pool in the other zone when a pool label is what confines it.",
+    "pinned-with-disks": (
+        "pinned to {zone} by its manifest ({pin}), keeping it with its volumeClaimTemplates (StorageClass {classes}, {bound} of {total} claims Bound)",
+        " The manifest keeps the pods with their disks; if that class is zonal the fix is a migration, and if it is regional the pin alone is the fix.",
     ),
     "capacity": (
         "capacity: {count} replica(s) Pending because no node has room ({message})",
         " The other zone had no room for the rest, which is a capacity shortfall before it is a spreading fault.",
+    ),
+    "pinned": (
+        "pinned to {zone} by its manifest ({pin})",
+        " The manifest put them there and the scheduler cannot move them; the fix is a manifest change.",
+    ),
+    "volume": (
+        "its volumeClaimTemplates (StorageClass {classes}, {bound} of {total} claims Bound) bind each replica to the zone of its disk when that class is zonal; the collector does not read the class",
+        " If that class is zonal the pods cannot move without their data and the fix is a migration; if it is regional or RWX, treat this as a spreading fault.",
     ),
     "none": (
         "no spreading declared (no-spread's finding on this object)",
@@ -3018,31 +3025,39 @@ _ZONAL_SKEW_CAUSES = {
         " The rule did not hold at placement time -- the other zone's nodes were absent, tainted or full then; check what was eligible when these pods were scheduled.",
     ),
 }
-_SELECTOR_OP_NOT_IN = "NotIn"
-_SELECTOR_OP_EXISTS = "Exists"
-_SELECTOR_OP_DOES_NOT_EXIST = "DoesNotExist"
+# Appended to the excerpt, not a cause: a selection that matches one zone of
+# the Nodes present today is the same observation whether the selection admits
+# one zone or the other zone's pool is scaled to zero, and the collector cannot
+# tell those apart.
+_ZONAL_SKEW_SELECTION_NOTE = (
+    "; note: its node selection ({selection}) matches nodes in {zone} only today, which a pool "
+    "scaled to zero in another zone would also show"
+)
 
 
-def _expression_matches(expr: dict, labels: dict) -> bool:
-    """One `matchExpressions` entry against one node's labels. `Gt`/`Lt` are
-    taken as matching: a wrong "confined" is worse than a missed one."""
-    key, op, values = expr.get("key"), expr.get("operator"), expr.get("values") or []
-    if op == NODE_SELECTOR_OP_IN:
-        return key in labels and labels[key] in values
-    if op == _SELECTOR_OP_NOT_IN:
-        return key not in labels or labels[key] not in values
-    if op == _SELECTOR_OP_EXISTS:
-        return key in labels
-    if op == _SELECTOR_OP_DOES_NOT_EXIST:
-        return key not in labels
-    return True
+def _manifest_zone_pin(template: dict) -> tuple[str, str] | None:
+    """The one-zone pin §3.7 reads, as `(zone, phrase)`, or None."""
+    zone = (template.get("nodeSelector") or {}).get(_ZONE_KEY)
+    if zone:
+        return zone, f"nodeSelector {_ZONE_KEY}={zone}"
+    required = ((template.get("affinity") or {}).get("nodeAffinity") or {}).get(
+        "requiredDuringSchedulingIgnoredDuringExecution"
+    ) or {}
+    for term in required.get("nodeSelectorTerms") or []:
+        for expr in term.get("matchExpressions") or []:
+            values = expr.get("values") or []
+            if expr.get("key") == _ZONE_KEY and expr.get("operator") == NODE_SELECTOR_OP_IN and len(values) == 1:
+                return values[0], f"required nodeAffinity {_ZONE_KEY}={values[0]}"
+    return None
 
 
 def _node_selection(template: dict) -> tuple[list[str], Callable[[dict], bool]] | None:
     """The template's required node selection: `(phrases, matches(labels))`,
     or None when it declares none. `nodeSelector` entries all have to hold;
     required `nodeAffinity` terms are alternatives, each of whose expressions
-    all have to hold -- the API's own semantics.
+    all have to hold -- the API's own semantics, which `selector_matches`
+    already implements for the four set operators (`Gt`/`Lt` match anything,
+    on purpose: a wrong narrowing is worse than a missed one).
     """
     selector = template.get("nodeSelector") or {}
     required = ((template.get("affinity") or {}).get("nodeAffinity") or {}).get(
@@ -3063,16 +3078,17 @@ def _node_selection(template: dict) -> tuple[list[str], Callable[[dict], bool]] 
         )
 
     def matches(labels: dict) -> bool:
-        if any(labels.get(k) != v for k, v in selector.items()):
+        if not selector_matches({"matchLabels": selector}, labels):
             return False
-        return not terms or any(all(_expression_matches(e, labels) for e in term) for term in terms)
+        return not terms or any(selector_matches({"matchExpressions": term}, labels) for term in terms)
 
     return phrases, matches
 
 
 def _eligible_zones(template: dict, context: dict) -> tuple[set[str], list[str]] | None:
-    """The zones holding a node this template may land on, with the selection
-    that decides it; None when the template selects no nodes in particular."""
+    """The zones holding a Node this template may land on today, with the
+    selection that decides it; None when the template selects no nodes in
+    particular. "Today": a pool scaled to zero in a zone has no Node there."""
     selection = _node_selection(template)
     if selection is None:
         return None
@@ -3086,31 +3102,54 @@ def _eligible_zones(template: dict, context: dict) -> tuple[set[str], list[str]]
     return eligible, phrases
 
 
-def _zonal_skew_cause(workload: dict, context: dict, starved: list[dict], skew: int) -> tuple[str, str]:
+def _claims_bound(workload: dict, pods: list[dict], context: dict) -> tuple[int, int]:
+    """`(bound, total)` over the claims a StatefulSet's volumeClaimTemplates
+    name for its pods (`<template>-<pod>`), read off the dump's claims."""
+    claims = context.get("claims") or {}
+    names = [str((t.get("metadata") or {}).get("name") or "") for t in workload["spec"].get("volumeClaimTemplates") or []]
+    total = bound = 0
+    for pod in pods:
+        for name in names:
+            total += 1
+            claim = claims.get((workload["ns"], f"{name}-{pod['name']}"))
+            if claim is not None and (claim.get("status") or {}).get("phase") == "Bound":
+                bound += 1
+    return bound, total
+
+
+def _zonal_skew_cause(workload: dict, context: dict, pods: list[dict], starved: list[dict], skew: int) -> tuple[str, str]:
     """`(cause phrase, impact tail)` for a skewed workload, first match wins.
 
-    The order is the order of certainty: zonal claims and a node selection
-    that admits one zone are read off the object and the Nodes; Pending
-    replicas the scheduler could not place are its own report; the spreading
-    rules only say what was asked for. Claims come before the selection
-    because a zone-pinned StatefulSet with zonal disks is pinned by the disks
-    -- the pin is how its author kept it with them -- which is also why §3.7
-    raises nothing on that shape.
+    The order is the order of certainty: a zone pin and the claims are read off
+    the object; Pending replicas the scheduler could not place are its own
+    report; the spreading rules only say what was asked for. A pinned
+    StatefulSet with claims is one cause, not two: the pin is how its author
+    kept it with its disks, which is also why §3.7 raises nothing on that
+    shape. Capacity outranks the claims because a replica Pending for room has
+    no disk yet.
     """
     template = workload["template"]
+    pin = _manifest_zone_pin(template)
     templates = workload["spec"].get("volumeClaimTemplates") or []
-    if workload["kind"] == STATEFULSET_KIND and templates:
-        phrase, tail = _ZONAL_SKEW_CAUSES["volume"]
-        classes = sorted({str((t.get("spec") or {}).get("storageClassName") or DEFAULT_STORAGE_CLASS_NAME) for t in templates})
-        return phrase.format(classes=", ".join(classes)), tail
-    eligible = _eligible_zones(template, context)
-    if eligible is not None and len(eligible[0]) == 1:
-        phrase, tail = _ZONAL_SKEW_CAUSES["confined"]
-        return phrase.format(zone=next(iter(eligible[0])), selection="; ".join(eligible[1])), tail
+    has_claims = workload["kind"] == STATEFULSET_KIND and bool(templates)
+    classes = ", ".join(
+        sorted({str((t.get("spec") or {}).get("storageClassName") or DEFAULT_STORAGE_CLASS_NAME) for t in templates})
+    )
+    if pin and has_claims:
+        bound, total = _claims_bound(workload, pods, context)
+        phrase, tail = _ZONAL_SKEW_CAUSES["pinned-with-disks"]
+        return phrase.format(zone=pin[0], pin=pin[1], classes=classes, bound=bound, total=total), tail
     if starved:
         phrase, tail = _ZONAL_SKEW_CAUSES["capacity"]
         message = starved[0]["scheduled_message"].split(SCHEDULER_SENTENCE_END)[0].rstrip(".")[:SCHEDULER_MESSAGE_CHARS]
         return phrase.format(count=len(starved), message=message), tail
+    if pin:
+        phrase, tail = _ZONAL_SKEW_CAUSES["pinned"]
+        return phrase.format(zone=pin[0], pin=pin[1]), tail
+    if has_claims:
+        bound, total = _claims_bound(workload, pods, context)
+        phrase, tail = _ZONAL_SKEW_CAUSES["volume"]
+        return phrase.format(classes=classes, bound=bound, total=total), tail
     constraints = template.get("topologySpreadConstraints") or []
     anti_affinity = ((template.get("affinity") or {}).get("podAntiAffinity")) or {}
     required = anti_affinity.get("requiredDuringSchedulingIgnoredDuringExecution") or []
@@ -3146,18 +3185,24 @@ def _zonal_skew_cause(workload: dict, context: dict, starved: list[dict], skew: 
 
 
 def check_zonal_skew(workload: dict, context: dict) -> dict | None:
-    """§3.25 — running replicas concentrated in one zone, with the cause named.
+    """§3.25 — placed replicas concentrated in one zone, with the cause named.
 
-    Fires on the observation, never on the manifest: the running replicas,
-    counted per zone off the pod read and the Nodes' zone labels, differ
-    between the busiest and the emptiest zone by the threshold or more -- or,
-    where replicas are Pending for want of room, every running replica (one or
-    more) is in one zone, because the shortfall is where the rest would have
-    gone. A cluster whose nodes are all in one zone, a workload with fewer
-    running replicas than that, a terminating pod and a pod on a node the dump
-    does not know are all outside it. The excerpt carries the distribution, the
-    share of running replicas the busiest zone holds (the blast radius of
-    losing it), the cause, and the Pending count where there is one.
+    Fires on the observation, never on the manifest. A replica counts where
+    the scheduler put it: any non-terminating pod with a node, Running or
+    still starting, since a pod placed in the other zone and pulling its image
+    is not absent from that zone. The zones it is counted over are the ones
+    its node selection can reach today when that is two or more (a pool whose
+    `node_locations` is two of a regional cluster's three zones is spread
+    across two, not three), else every zone a Node carries. It fires when the
+    busiest zone holds the threshold more placed replicas than the emptiest,
+    or when replicas are Pending for want of room and every placed replica
+    (one or more) is in one zone, because the shortfall is where the rest
+    would have gone. A cluster whose nodes are all in one zone, a workload
+    with fewer placed replicas than that, a terminating pod and a pod on a
+    node the dump does not know are all outside it. The excerpt carries the
+    distribution, the share of placed replicas the busiest zone holds (the
+    blast radius of losing it), the cause, and the Pending count where there
+    is one.
     """
     if workload["kind"] == DAEMONSET_KIND:
         return None
@@ -3170,32 +3215,34 @@ def check_zonal_skew(workload: dict, context: dict) -> dict | None:
         return None
     key = (workload["ns"], workload["kind"], workload["name"])
     pods = (context.get("pod_placements_by_workload") or {}).get(key) or []
-    running = [
-        p for p in pods if p["phase"] == POD_PHASE_RUNNING and not p.get("deleting") and p["node"] in zones_by_node
-    ]
-    pending = [p for p in pods if p["phase"] == POD_PHASE_PENDING]
-    starved = [p for p in pending if SCHEDULER_INSUFFICIENT_MARKER in p["scheduled_message"]]
+    placed = [p for p in pods if not p.get("deleting") and p["node"] in zones_by_node]
+    unplaced = [p for p in pods if p["phase"] == POD_PHASE_PENDING and not p["node"]]
+    starved = [p for p in unplaced if SCHEDULER_INSUFFICIENT_MARKER in p["scheduled_message"]]
     floor = ZONAL_SKEW_MIN_RUNNING_STARVED if starved else ZONAL_SKEW_MIN_RUNNING
-    if len(running) < floor:
+    if len(placed) < floor:
         return None
-    per_zone = {zone: 0 for zone in cluster_zones}
-    for pod in running:
-        per_zone[zones_by_node[pod["node"]]] += 1
+    eligible = _eligible_zones(workload["template"], context)
+    domain = sorted(eligible[0]) if eligible is not None and len(eligible[0]) >= ZONAL_SKEW_MIN_ZONES else cluster_zones
+    per_zone = {zone: 0 for zone in domain}
+    for pod in placed:
+        per_zone[zones_by_node[pod["node"]]] = per_zone.get(zones_by_node[pod["node"]], 0) + 1
     threshold = context.get("zonal_skew_threshold", _zonal_skew_threshold)
     skew = max(per_zone.values()) - min(per_zone.values())
-    crowded = max(cluster_zones, key=lambda zone: per_zone[zone])
-    all_in_one = per_zone[crowded] == len(running)
+    crowded = max(sorted(per_zone), key=lambda zone: per_zone[zone])
+    all_in_one = per_zone[crowded] == len(placed)
     if skew < threshold and not (starved and all_in_one):
         return None
-    share = round(100 * per_zone[crowded] / len(running))
-    cause, tail = _zonal_skew_cause(workload, context, starved, skew)
-    distribution = ", ".join(f"{zone}={per_zone[zone]}" for zone in cluster_zones)
+    share = round(100 * per_zone[crowded] / len(placed))
+    cause, tail = _zonal_skew_cause(workload, context, pods, starved, skew)
+    distribution = ", ".join(f"{zone}={per_zone[zone]}" for zone in sorted(per_zone))
     excerpt = (
-        f"replicas={replicas}, {len(running)} running across {len(cluster_zones)} zones: {distribution} "
-        f"(skew {skew}, threshold {threshold}); {share}% of running replicas in {crowded}; cause: {cause}"
+        f"replicas={replicas}, {len(placed)} placed across {len(per_zone)} zones: {distribution} "
+        f"(skew {skew}, threshold {threshold}); {share}% of placed replicas in {crowded}; cause: {cause}"
     )
-    if pending:
-        excerpt += f"; {len(pending)} Pending"
+    if unplaced:
+        excerpt += f"; {len(unplaced)} Pending unplaced"
+    if eligible is not None and len(eligible[0]) == 1 and not _manifest_zone_pin(workload["template"]):
+        excerpt += _ZONAL_SKEW_SELECTION_NOTE.format(selection="; ".join(eligible[1]), zone=next(iter(eligible[0])))
     return {
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": excerpt,

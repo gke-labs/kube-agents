@@ -93,7 +93,7 @@ requirement.
   traffic the imbalance pays for — alongside zonal capacity headroom (autoscaler maximum against
   current size per zone) and load-balancer backend distribution per zone. The daily half ships as
   the obtainability SOP's §3.25 `zonal-skew`: pod distribution per zone per workload, the cause
-  (zonal disks, a node selection that admits one zone, capacity, nothing declared, no binding zone rule, a binding rule that permits it, or one the placement did not honour) and the share lost
+  (a manifest pin with or without zonal disks, capacity, zonal disks, nothing declared, no binding zone rule, a binding rule that permits it, or one the placement did not honour) and the share lost
   with the busiest zone. Still owed: the event re-evaluation, cross-zone traffic, capacity
   headroom and backend distribution, each of which needs a source the audit does not read.
 - **Utilization per family.** Requested-versus-used CPU and memory per family, flagging the
