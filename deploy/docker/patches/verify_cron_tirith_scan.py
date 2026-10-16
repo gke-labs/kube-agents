@@ -19,8 +19,8 @@ own module.
 
 What is faked, and why that is still a real test
 ------------------------------------------------
-Tirith is not in the image at build time — it downloads to ``$HERMES_HOME/bin``
-on first use at runtime — so ``check_command_security`` is replaced with a stub
+While Tirith is installed on ``PATH`` at build time, runtime environments may
+experience a missing scanner, so ``check_command_security`` is replaced with a stub
 that returns a fixed verdict. Everything between that stub and the caller is
 the shipped code: the real ``check_all_command_guards``, the real patched cron
 arm, the real ``cron_tirith_block``, the real ``_format_tirith_description``,
@@ -197,11 +197,10 @@ def main() -> int:
     state["cron"] = True
 
     # --- a missing scanner honours security.tirith_fail_open ----------------
-    # Tirith genuinely is absent from the image at build time, so this is the
-    # state a first cron run hits before the background install lands. It must
-    # not brick the roster. The default (fail open) is checked against the real
-    # config read; the fail-closed variant pins the loader because the build
-    # image has no config.yaml to set it in.
+    # If Tirith is absent or fails to load, this verifies that a cron run honours
+    # fail-open without bricking the roster. The default (fail open) is checked
+    # against the real config read; the fail-closed variant pins the loader
+    # because the build image has no config.yaml to set it in.
     install_scanner(ImportError("No module named 'tirith'"))
     del scan_calls[:]
     result = ap.check_all_command_guards(COMMAND, "local")

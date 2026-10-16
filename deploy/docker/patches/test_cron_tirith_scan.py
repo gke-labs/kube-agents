@@ -121,16 +121,15 @@ class VerdictTest(unittest.TestCase):
 
 
 class ScannerUnavailableTest(unittest.TestCase):
-    """Tirith downloads at runtime, so "not installed yet" is a real state."""
+    """When Tirith is not installed or available on PATH, scanner unavailability is tested."""
 
     IMPORT_ERROR = ImportError("No module named 'tirith'")
 
     def test_the_default_is_to_let_the_command_through(self):
         """Matches security.tirith_fail_open's default and the deny arm's.
 
-        A first cron run can fire before the background install lands. Refusing
-        every command until it does would take the roster down for a reason
-        that has nothing to do with the command.
+        If the scanner is unavailable, refusing every command would take the roster
+        down for a reason that has nothing to do with the command.
         """
         self.assertIsNone(
             cron_tirith_block(

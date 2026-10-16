@@ -22,6 +22,7 @@ import threading
 import time
 import unittest
 import unittest.mock
+from unittest import mock
 from contextlib import redirect_stderr
 from pathlib import Path
 
@@ -568,6 +569,23 @@ class EnsureProfileTest(unittest.TestCase):
         (self.home / "profile.yaml").write_text("name: platform\n")
         self.assertTrue(ps.is_scaffolded(self.home))
 
+    def test_ensure_profile_links_shared_resources(self):
+        shared_tirith = self.tmp / "bin" / "tirith"
+        shared_tirith.parent.mkdir(parents=True, exist_ok=True)
+        shared_tirith.write_text("#!/bin/sh\nexit 0\n")
+        shared_tirith.chmod(0o755)
+
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(ps, "TIRITH_SYSTEM_BIN", Path("/nonexistent/tirith")):
+            home = self.ensure()
+
+        tirith_link = home / "bin" / "tirith"
+        self.assertTrue(tirith_link.is_symlink(), "profile bin/tirith must be a symlink")
+        self.assertEqual(tirith_link.resolve(), shared_tirith.resolve())
+        npm_link = home / "home" / ".npm"
+        self.assertTrue(npm_link.is_symlink(), "profile home/.npm must be a symlink")
+        self.assertEqual(npm_link.resolve(), (self.tmp / ".npm-cache").resolve())
+
 
 class BackfillCronStoreTest(unittest.TestCase):
     """Tests for standalone cron store backfill helpers (for cluster profiles and runtime stores)."""
@@ -659,7 +677,9 @@ class BackfillCronStoreTest(unittest.TestCase):
         home = hermes_home / "profiles" / "test-cluster"
         home.mkdir(parents=True, exist_ok=True)
 
-        ps.link_shared_profile_resources(home, hermes_home)
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(ps, "TIRITH_SYSTEM_BIN", Path("/nonexistent/tirith")):
+            ps.link_shared_profile_resources(home, hermes_home)
 
         tirith_link = home / "bin" / "tirith"
         self.assertTrue(tirith_link.is_symlink())
@@ -675,7 +695,7 @@ class BackfillCronStoreTest(unittest.TestCase):
         self.assertEqual(direct_npm.resolve(), (hermes_home / ".npm-cache").resolve())
 
     def test_main_link_shared_links_all_profiles(self):
-        """main with --link-shared links every profile under profiles_base (#3325)."""
+        """main with --link-shared links scaffolded profiles under profiles_base (#3325)."""
         hermes_home = self.root / "hermes_home_cli"
         hermes_home.mkdir(parents=True, exist_ok=True)
         shared_tirith = hermes_home / "bin" / "tirith"
@@ -686,8 +706,14 @@ class BackfillCronStoreTest(unittest.TestCase):
         for name in ("platform", "cluster-a", "cluster-b"):
             p = hermes_home / "profiles" / name
             p.mkdir(parents=True, exist_ok=True)
+            (p / "profile.yaml").write_text(f"name: {name}\n")
 
-        with unittest.mock.patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+        # Bare skeleton directory must not be linked (#3325 review finding)
+        bare_dir = hermes_home / "profiles" / "bare-skeleton"
+        bare_dir.mkdir(parents=True, exist_ok=True)
+
+        with mock.patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}, clear=True), \
+                mock.patch.object(ps, "TIRITH_SYSTEM_BIN", Path("/nonexistent/tirith")):
             with unittest.mock.patch.object(sys, "argv", ["profile_scaffold.py", "--link-shared"]):
                 ps.main()
 
@@ -699,6 +725,35 @@ class BackfillCronStoreTest(unittest.TestCase):
             npm_link = p / "home" / ".npm"
             self.assertTrue(npm_link.is_symlink(), f"{name} home/.npm must be symlink")
             self.assertEqual(npm_link.resolve(), (hermes_home / ".npm-cache").resolve())
+
+        self.assertFalse((bare_dir / "bin" / "tirith").exists(), "bare directory must not be linked")
+        self.assertFalse((bare_dir / "home" / ".npm").exists(), "bare directory must not be linked")
+
+
+class RunEnvTest(unittest.TestCase):
+    """Tests for run_env injection of NPM_CONFIG_CACHE and TIRITH_BIN."""
+
+    def test_run_env_injects_npm_cache_and_tirith_bin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_home = Path(tmp)
+            shared_tirith = hermes_home / "bin" / "tirith"
+            shared_tirith.parent.mkdir(parents=True, exist_ok=True)
+            shared_tirith.write_text("#!/bin/sh\nexit 0\n")
+            shared_tirith.chmod(0o755)
+
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(ps, "TIRITH_SYSTEM_BIN", Path("/nonexistent/tirith")):
+                env = ps.run_env(hermes_home)
+                self.assertEqual(env["HOME"], "/tmp")
+                self.assertEqual(env["HERMES_HOME"], str(hermes_home))
+                self.assertEqual(env["NPM_CONFIG_CACHE"], str(hermes_home / ".npm-cache"))
+                self.assertEqual(env["TIRITH_BIN"], str(shared_tirith))
+
+    def test_run_env_respects_existing_env(self):
+        with mock.patch.dict(os.environ, {"NPM_CONFIG_CACHE": "/custom/cache", "TIRITH_BIN": "/custom/tirith"}, clear=True):
+            env = ps.run_env(Path("/dummy"))
+            self.assertEqual(env["NPM_CONFIG_CACHE"], "/custom/cache")
+            self.assertEqual(env["TIRITH_BIN"], "/custom/tirith")
 
 
 if __name__ == "__main__":

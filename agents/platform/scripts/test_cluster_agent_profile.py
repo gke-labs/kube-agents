@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "deploy" / "shared"))
 
 import cluster_agent_profile as cap  # noqa: E402
+import profile_scaffold as ps  # noqa: E402
 import terminal_env_pin  # noqa: E402
 import gke_endpoint  # noqa: E402
 
@@ -670,7 +671,9 @@ class CreateProfileTest(unittest.TestCase):
         shared_tirith.write_text("#!/bin/sh\nexit 0\n")
         shared_tirith.chmod(0o755)
 
-        self.create()
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(ps, "TIRITH_SYSTEM_BIN", Path("/nonexistent/tirith")):
+            self.create()
 
         tirith_link = self.profile / "bin" / "tirith"
         self.assertTrue(tirith_link.is_symlink(), "profile bin/tirith must be a symlink")
@@ -682,7 +685,9 @@ class CreateProfileTest(unittest.TestCase):
 
     def test_link_shared_resources_tolerates_missing_tirith(self):
         """Scaffold succeeds and links npm cache even when Tirith binary is not yet present."""
-        self.create()
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(ps, "TIRITH_SYSTEM_BIN", Path("/nonexistent/tirith")):
+            self.create()
 
         tirith_link = self.profile / "bin" / "tirith"
         self.assertFalse(tirith_link.exists(), "no tirith symlink if shared binary is missing")
@@ -703,7 +708,9 @@ class CreateProfileTest(unittest.TestCase):
         shared_tirith.write_text("shared tirith")
         shared_tirith.chmod(0o755)
 
-        self.create()
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(ps, "TIRITH_SYSTEM_BIN", Path("/nonexistent/tirith")):
+            self.create()
 
         self.assertFalse(prof_bin.is_symlink(), "existing file must not be replaced with a symlink")
         self.assertEqual(prof_bin.read_text(), "existing custom tirith")

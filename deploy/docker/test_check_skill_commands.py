@@ -476,6 +476,11 @@ class InstallTirithTest(unittest.TestCase):
             self.assertEqual(dest.read_bytes(), b"ELF-TIRITH")
             self.assertEqual(dest.stat().st_mode & 0o777, 0o755)
 
+    def test_dockerfile_passes_install_tirith(self):
+        dockerfile = (Path(__file__).resolve().parent / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("--install-tirith /usr/local/bin/tirith", dockerfile)
+        self.assertNotIn("ENV NPM_CONFIG_CACHE", dockerfile)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2129,7 +2129,7 @@ COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 # in the SKILL.md files and references/*.md pages of the image's three skill
 # trees through Hermes' Tirith scan, which is why the Cluster Agent template is
 # copied above this block rather than below it.
-# It downloads the Tirith release it pins; see its module docstring.
+# It downloads the Tirith release it pins and installs it to /usr/local/bin/tirith; see its module docstring.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
 COPY agents/platform/config.yaml \
      deploy/docker/merge_configs.py \
@@ -2471,7 +2471,6 @@ USER 10000:10000
 # names the exact image.
 ARG KUBE_AGENTS_VERSION
 ENV KUBE_AGENTS_VERSION=${KUBE_AGENTS_VERSION}
-ENV NPM_CONFIG_CACHE=/opt/data/.npm-cache
 
 # --- CREDENTIAL PROXY TOOLING ---
 # Everything the sidecar needs that is not agent source: the credential-aware

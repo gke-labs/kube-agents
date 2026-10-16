@@ -163,6 +163,8 @@ def _clear_mount_skeleton(home: Path) -> bool:
 # which /opt/hermes/.venv/bin is not on PATH — a bare `hermes` raises ENOENT there
 # while working fine from an interactive shell.
 HERMES_BIN = os.environ.get("HERMES_BIN") or "/opt/hermes/.venv/bin/hermes"
+TIRITH_SYSTEM_BIN: Path = Path("/usr/local/bin/tirith")
+TIRITH_OPT_DATA_BIN: Path = Path("/opt/data/bin/tirith")
 
 
 def run_env(hermes_home: Path | str | None = None, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -180,8 +182,8 @@ def run_env(hermes_home: Path | str | None = None, extra: dict[str, str] | None 
         if "NPM_CONFIG_CACHE" not in env:
             env["NPM_CONFIG_CACHE"] = str(Path(hermes_home) / ".npm-cache")
     if "TIRITH_BIN" not in env:
-        if Path("/usr/local/bin/tirith").is_file():
-            env["TIRITH_BIN"] = "/usr/local/bin/tirith"
+        if TIRITH_SYSTEM_BIN.is_file():
+            env["TIRITH_BIN"] = str(TIRITH_SYSTEM_BIN)
         elif hermes_home is not None and (Path(hermes_home) / "bin" / "tirith").is_file():
             env["TIRITH_BIN"] = str(Path(hermes_home) / "bin" / "tirith")
     if extra:
@@ -196,11 +198,11 @@ def link_shared_profile_resources(home: Path, hermes_home: Path) -> None:
         candidates = []
         if env_tirith := os.environ.get("TIRITH_BIN"):
             candidates.append(Path(env_tirith))
-        candidates.extend([
-            Path("/usr/local/bin/tirith"),
-            Path(hermes_home) / "bin" / "tirith",
-            Path("/opt/data/bin/tirith"),
-        ])
+        if TIRITH_SYSTEM_BIN:
+            candidates.append(TIRITH_SYSTEM_BIN)
+        candidates.append(Path(hermes_home) / "bin" / "tirith")
+        if TIRITH_OPT_DATA_BIN:
+            candidates.append(TIRITH_OPT_DATA_BIN)
         for target in candidates:
             if target.is_file() and os.access(target, os.X_OK):
                 try:
@@ -620,7 +622,7 @@ def main() -> None:
         base = profiles_base(hermes_home)
         if base.is_dir():
             for prof in base.iterdir():
-                if prof.is_dir():
+                if prof.is_dir() and is_scaffolded(prof):
                     link_shared_profile_resources(prof, hermes_home)
         return
 
