@@ -23,8 +23,9 @@ import (
 //
 // A 👍 is counted (answer_feedback_total) and nothing else is kept; it also
 // takes back an earlier 👎 from the same rater. A 👎 is counted and keeps
-// the exchange it rated in the feedback bucket: the ask, the answer, the
-// thread up to the answer, and later an optional note from the rater. The
+// what the rater is told is kept, in the feedback bucket: the ask, the
+// answer, the ids, and an optional note from the rater, and nothing else of
+// the thread. The
 // bucket's max age is the retention, set where the deployment provisions it,
 // and the gateway refuses to keep anything in a bucket without one. The
 // gateway's user is the bucket's only reader and writer; an operator reads
@@ -39,13 +40,10 @@ const (
 
 	// The caps on what a 👎 keeps, so one rating cannot grow the bucket
 	// past what it is sized for: the ask, the answer and the note clipped
-	// (in bytes, at a rune boundary: truncateRunes), and the thread to its
-	// newest turns, each clipped.
-	feedbackAskMax        = 4000
-	feedbackAnswerMax     = 16000
-	feedbackNoteMax       = 2000
-	feedbackTurnMax       = 4000
-	feedbackTranscriptMax = 40
+	// in bytes, at a rune boundary (truncateRunes).
+	feedbackAskMax    = 4000
+	feedbackAnswerMax = 16000
+	feedbackNoteMax   = 2000
 	// feedbackNoteChars is how many characters a note may be, as a backend
 	// asks for it; feedbackNoteMax holds that many in any script.
 	feedbackNoteChars = 500
@@ -69,13 +67,6 @@ const (
 	feedbackDay = 24 * time.Hour
 )
 
-// The speakers a transcript turn names: a person in the conversation, or
-// the agent (the bot's own posts).
-const (
-	FeedbackFromUser  = "user"
-	FeedbackFromAgent = "agent"
-)
-
 var (
 	// errFeedbackUnverified is a rating from a sender the gateway would not
 	// take a turn from.
@@ -84,12 +75,6 @@ var (
 	// attempt to merge into it.
 	errFeedbackContended = errors.New("the record kept changing; giving up")
 )
-
-// FeedbackTurn is one message of the exchange a 👎 keeps.
-type FeedbackTurn struct {
-	From string `json:"from"`
-	Text string `json:"text"`
-}
 
 // FeedbackRating is one rating as a backend hands it to the gateway.
 type FeedbackRating struct {
@@ -106,37 +91,34 @@ type FeedbackRating struct {
 	// TaskID is the task id the answer was marked with (OutMessage.Feedback).
 	TaskID string
 	Rating string
-	// Ask, Answer and Transcript are the exchange, read by the backend for a
-	// 👎 only.
-	Ask        string
-	Answer     string
-	Transcript []FeedbackTurn
+	// Answer is the rated message's text, handed over for a 👎 only.
+	Answer string
 }
 
 // FeedbackRecord is a kept 👎, as the feedback bucket holds it.
 type FeedbackRecord struct {
-	Rating       string         `json:"rating"`
-	Note         string         `json:"note,omitempty"`
-	Platform     string         `json:"platform"`
-	Rater        string         `json:"rater"`
-	Conversation string         `json:"conversation"`
-	MessageID    string         `json:"messageId"`
-	TaskID       string         `json:"taskId"`
-	ContextID    string         `json:"contextId,omitempty"`
-	Ask          string         `json:"ask,omitempty"`
-	Answer       string         `json:"answer,omitempty"`
-	Transcript   []FeedbackTurn `json:"transcript,omitempty"`
-	RatedAt      time.Time      `json:"ratedAt"`
+	Rating       string    `json:"rating"`
+	Note         string    `json:"note,omitempty"`
+	Platform     string    `json:"platform"`
+	Rater        string    `json:"rater"`
+	Conversation string    `json:"conversation"`
+	MessageID    string    `json:"messageId"`
+	TaskID       string    `json:"taskId"`
+	ContextID    string    `json:"contextId,omitempty"`
+	Ask          string    `json:"ask,omitempty"`
+	Answer       string    `json:"answer,omitempty"`
+	RatedAt      time.Time `json:"ratedAt"`
 }
 
 // FeedbackRecorder is what the gateway offers a backend that draws rating
-// controls: whether it takes ratings from a sender, record a rating, add a
-// note to a kept 👎, and how many days a 👎 is kept (for the rater to be
-// told). Every call is safe from any goroutine and bounded by its own
-// deadline.
+// controls: whether it takes ratings from a sender, record a rating, add
+// the ask to a kept 👎 once the backend has read it, add the rater's note,
+// and how many days a 👎 is kept (for the rater to be told). Every call is
+// safe from any goroutine and bounded by its own deadline.
 type FeedbackRecorder interface {
 	Admits(backend, rater string) bool
 	Rate(r FeedbackRating) error
+	AddAsk(r FeedbackRating, ask string) error
 	Note(r FeedbackRating, note string) error
 	KeptDays() int
 }
@@ -273,9 +255,9 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 	if session, err := g.reg.Get(ctx, r.Conversation); err == nil && session != nil {
 		contextID = session.ContextID
 	}
-	// Merged, not replaced: a note sent from the modal while the exchange
-	// was being read may already be there, and re-rating keeps it too.
-	if err := mergeFeedback(ctx, kv, key, func(rec *FeedbackRecord) {
+	// Merged, not replaced: re-rating keeps the note and the ask already
+	// there, and a note sent from the modal may have started the record.
+	if _, err := mergeFeedback(ctx, kv, key, true, func(rec *FeedbackRecord) {
 		*rec = FeedbackRecord{
 			Rating:       FeedbackDown,
 			Note:         rec.Note,
@@ -285,9 +267,8 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 			MessageID:    r.MessageID,
 			TaskID:       r.TaskID,
 			ContextID:    contextID,
-			Ask:          truncateRunes(r.Ask, feedbackAskMax),
+			Ask:          rec.Ask,
 			Answer:       truncateRunes(r.Answer, feedbackAnswerMax),
-			Transcript:   clipTranscript(r.Transcript),
 			RatedAt:      time.Now().UTC(),
 		}
 	}); err != nil {
@@ -298,10 +279,24 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 	return nil
 }
 
-// Note adds the rater's note (empty: none) to their 👎 on r's answer. The
-// modal opens on the tap, before the 👎 is written, so a note that arrives
-// first starts the record and the rating fills it in (Rate). A note sent
-// after a 👍 took the 👎 back keeps the 👎 again: Send under "What went
+// AddAsk adds the ask the backend read after the 👎 was kept. A 👎 taken
+// back by a 👍 in the meantime stays gone.
+func (d *feedbackDesk) AddAsk(r FeedbackRating, ask string) error {
+	g := d.g
+	ctx, cancel := context.WithTimeout(g.runCtx, feedbackRecorderDeadline)
+	defer cancel()
+	kv, err := g.client.KV(ctx, lib.FeedbackBucket)
+	if err != nil {
+		return fmt.Errorf("feedback bucket: %w", err)
+	}
+	_, err = mergeFeedback(ctx, kv, feedbackKey(r.TaskID, r.Rater), false, func(rec *FeedbackRecord) {
+		rec.Ask = truncateRunes(ask, feedbackAskMax)
+	})
+	return err
+}
+
+// Note adds the rater's note (empty: none) to their 👎 on r's answer. A note
+// sent after a 👍 took the 👎 back keeps the 👎 again: Send under "What went
 // wrong?" is a 👎 of its own.
 func (d *feedbackDesk) Note(r FeedbackRating, note string) error {
 	g := d.g
@@ -315,7 +310,7 @@ func (d *feedbackDesk) Note(r FeedbackRating, note string) error {
 		return fmt.Errorf("feedback bucket: %w", err)
 	}
 	key := feedbackKey(r.TaskID, r.Rater)
-	if err := mergeFeedback(ctx, kv, key, func(rec *FeedbackRecord) {
+	if _, err := mergeFeedback(ctx, kv, key, true, func(rec *FeedbackRecord) {
 		if rec.Rating == "" {
 			*rec = FeedbackRecord{Rating: FeedbackDown, Platform: r.Platform, Rater: r.Rater,
 				Conversation: r.Conversation, MessageID: r.MessageID, TaskID: r.TaskID, RatedAt: time.Now().UTC()}
@@ -341,18 +336,6 @@ func feedbackKey(taskID, rater string) string {
 	}, rater)
 }
 
-// clipTranscript keeps the newest turns, each clipped.
-func clipTranscript(turns []FeedbackTurn) []FeedbackTurn {
-	if len(turns) > feedbackTranscriptMax {
-		turns = turns[len(turns)-feedbackTranscriptMax:]
-	}
-	out := make([]FeedbackTurn, 0, len(turns))
-	for _, t := range turns {
-		out = append(out, FeedbackTurn{From: t.From, Text: truncateRunes(t.Text, feedbackTurnMax)})
-	}
-	return out
-}
-
 func getFeedback(ctx context.Context, kv jetstream.KeyValue, key string) (FeedbackRecord, error) {
 	entry, err := kv.Get(ctx, key)
 	if err != nil {
@@ -366,28 +349,33 @@ func getFeedback(ctx context.Context, kv jetstream.KeyValue, key string) (Feedba
 }
 
 // mergeFeedback applies change to the record at key (a zero record when
-// there is none) and writes it back only if nobody wrote in between, trying
-// again from a fresh read when someone did: the rating and its note are
-// written by two goroutines, and neither may lose the other's half.
-func mergeFeedback(ctx context.Context, kv jetstream.KeyValue, key string, change func(*FeedbackRecord)) error {
+// there is none and create is set; without create a missing record is left
+// missing and reported unwritten) and writes it back only if nobody wrote in
+// between, trying again from a fresh read when someone did: the rating, its
+// ask and its note are written by separate goroutines, and none may lose
+// another's part.
+func mergeFeedback(ctx context.Context, kv jetstream.KeyValue, key string, create bool, change func(*FeedbackRecord)) (bool, error) {
 	for range feedbackMergeAttempts {
 		var rec FeedbackRecord
 		var revision uint64
 		entry, err := kv.Get(ctx, key)
 		switch {
 		case errors.Is(err, jetstream.ErrKeyNotFound):
+			if !create {
+				return false, nil
+			}
 		case err != nil:
-			return fmt.Errorf("feedback %s: %w", key, err)
+			return false, fmt.Errorf("feedback %s: %w", key, err)
 		default:
 			if err := json.Unmarshal(entry.Value(), &rec); err != nil {
-				return fmt.Errorf("feedback %s: %w", key, err)
+				return false, fmt.Errorf("feedback %s: %w", key, err)
 			}
 			revision = entry.Revision()
 		}
 		change(&rec)
 		raw, err := json.Marshal(rec)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if revision == 0 {
 			_, err = kv.Create(ctx, key, raw)
@@ -395,11 +383,11 @@ func mergeFeedback(ctx context.Context, kv jetstream.KeyValue, key string, chang
 			_, err = kv.Update(ctx, key, raw, revision)
 		}
 		if err == nil {
-			return nil
+			return true, nil
 		}
 		if !errors.Is(err, jetstream.ErrKeyExists) && !errors.Is(err, jetstream.ErrKeyRevisionMismatch) {
-			return fmt.Errorf("feedback %s: %w", key, err)
+			return false, fmt.Errorf("feedback %s: %w", key, err)
 		}
 	}
-	return fmt.Errorf("feedback %s: %w", key, errFeedbackContended)
+	return false, fmt.Errorf("feedback %s: %w", key, errFeedbackContended)
 }

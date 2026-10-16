@@ -15,11 +15,13 @@ import (
 // context_actions block under the final answer of an ask, the last block of
 // the message (inside its side bar when it has one, where Slack draws it as
 // well). A tap is never a turn. A 👍 is handed to the gateway and Slack
-// fills the icon; nothing posts. A 👎 opens a modal asking what was wrong,
-// optionally, while the adapter reads the thread up to the answer and hands
-// the gateway the exchange; Send adds the note and thanks the rater with an
-// ephemeral line in the thread, and Cancel leaves the 👎 as it is. The
-// controls are drawn only once the gateway has handed over its recorder.
+// fills the icon; nothing posts. A 👎 is kept with the rated answer first,
+// then opens a modal asking what was wrong, optionally, while the adapter
+// reads the ask (the last message a person wrote before the answer) and adds
+// it; Send adds the note and thanks the rater with an ephemeral line in the
+// thread, and Cancel leaves the 👎 as it is. Nothing else of the thread is
+// kept. The controls are drawn only once the gateway has handed over its
+// recorder.
 const (
 	// slackFeedbackAction is the feedback buttons' action_id; the answer's
 	// task id rides in the block's id after slackFeedbackBlockPrefix.
@@ -50,8 +52,8 @@ const (
 	// slackFeedbackDeadline bounds the Slack calls one tap makes.
 	slackFeedbackDeadline = 15 * time.Second
 	// slackFeedbackRepliesPage and slackFeedbackRepliesPages bound the read
-	// of the thread a 👎 keeps; slackFeedbackHistory is how far back a
-	// top-level answer (a DM's thread-less conversation) looks for its ask.
+	// of the thread a 👎's ask is found in; slackFeedbackHistory is how far
+	// back a top-level answer (a DM's thread-less conversation) looks.
 	slackFeedbackRepliesPage  = 200
 	slackFeedbackRepliesPages = 5
 	slackFeedbackHistory      = 10
@@ -132,23 +134,22 @@ func slackFeedbackBlock(taskID string) map[string]any {
 
 // withFeedback adds the rating controls for taskID as the layout's last
 // block: in its side bar when it has one, since an attachment draws after
-// every top-level block. A layout already at Slack's block cap is refused.
-func withFeedback(layout slackChatLayout, taskID string) (slackChatLayout, error) {
+// every top-level block. A layout already at Slack's block cap is left as it
+// is: the answer posts laid out, without the controls.
+func withFeedback(layout slackChatLayout, taskID string) slackChatLayout {
 	block := slackFeedbackBlock(taskID)
 	if n := len(layout.Attachments); n > 0 {
 		last := layout.Attachments[n-1]
 		inner, _ := last["blocks"].([]map[string]any)
-		if len(inner) >= slackChatBlocksMax {
-			return slackChatLayout{}, errSlackChatTooLarge
+		if len(inner) < slackChatBlocksMax {
+			last["blocks"] = append(inner, block)
 		}
-		last["blocks"] = append(inner, block)
-		return layout, nil
+		return layout
 	}
-	if len(layout.Blocks) >= slackChatBlocksMax {
-		return slackChatLayout{}, errSlackChatTooLarge
+	if len(layout.Blocks) < slackChatBlocksMax {
+		layout.Blocks = append(layout.Blocks, block)
 	}
-	layout.Blocks = append(layout.Blocks, block)
-	return layout, nil
+	return layout
 }
 
 // slackRatedOptions is slackMessageOptions for an answer drawn with rating
@@ -162,13 +163,10 @@ func slackRatedOptions(m OutMessage) ([]slack.MsgOption, error) {
 		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, errSlackChatTooLarge)
 	}
 	layout, err := renderSlackChat(m.Chat, text)
-	if err == nil {
-		layout, err = withFeedback(layout, m.Feedback)
-	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, err)
 	}
-	return slackChatOptions(layout, text)
+	return slackChatOptions(withFeedback(layout, m.Feedback), text)
 }
 
 // slackRatedTextOptions is a text-only answer's last chunk with the rating
@@ -212,20 +210,29 @@ func (s *SlackAdapter) feedbackClick(p slackClickPayload, blockID, value string)
 	conversation, thread, _ := slackClickConversation(p)
 	rating := FeedbackRating{Platform: platformSlack, Backend: slackBackend, Rater: p.User.ID,
 		Conversation: conversation, MessageID: p.Message.TS, TaskID: taskID, Rating: value}
+	if value == FeedbackDown {
+		rating.Answer = p.Message.Text
+	}
 	s.goSession(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), slackFeedbackDeadline)
-		defer cancel()
-		if value == FeedbackDown {
-			// First: the trigger lapses three seconds after the tap.
-			meta := slackFeedbackMeta{Conversation: conversation, Task: taskID, Channel: p.Channel.ID, Thread: thread, Message: p.Message.TS}
-			if _, err := s.feedbackAPI.OpenViewContext(ctx, p.TriggerID, slackFeedbackModal(meta, recorder.KeptDays())); err != nil {
-				s.log.Warn("slack: opening the feedback note failed; the 👎 is kept without one", "channel", p.Channel.ID, "err", err)
-			}
-			rating.Ask, rating.Transcript = s.feedbackExchange(ctx, p.Channel.ID, thread, p.Message.TS, p.User.ID)
-			rating.Answer = p.Message.Text
-		}
+		// Kept first, so the note the modal sends and a 👍 that follows find
+		// the 👎 already there; one KV write, inside the three seconds the
+		// modal's trigger lasts.
 		if err := recorder.Rate(rating); err != nil {
 			s.log.Warn("slack: recording a rating failed", "channel", p.Channel.ID, "taskId", taskID, "err", err)
+		}
+		if value != FeedbackDown {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), slackFeedbackDeadline)
+		defer cancel()
+		meta := slackFeedbackMeta{Conversation: conversation, Task: taskID, Channel: p.Channel.ID, Thread: thread, Message: p.Message.TS}
+		if _, err := s.feedbackAPI.OpenViewContext(ctx, p.TriggerID, slackFeedbackModal(meta, recorder.KeptDays())); err != nil {
+			s.log.Warn("slack: opening the feedback note failed; the 👎 is kept without one", "channel", p.Channel.ID, "err", err)
+		}
+		if ask := s.feedbackAsk(ctx, p.Channel.ID, thread, p.Message.TS); ask != "" {
+			if err := recorder.AddAsk(rating, ask); err != nil {
+				s.log.Warn("slack: adding the ask to a rating failed", "channel", p.Channel.ID, "taskId", taskID, "err", err)
+			}
 		}
 	})
 }
@@ -291,12 +298,12 @@ func (s *SlackAdapter) feedbackNote(raw json.RawMessage) {
 	})
 }
 
-// feedbackExchange reads the conversation up to the rated message: the ask
-// (the last message a person wrote before it) and the turns, oldest first,
-// of the agent, the asker and the rater. Slack timestamps compare as
+// feedbackAsk reads the conversation up to the rated message for its ask:
+// the last message a person wrote before it, as an eval prompt reads it (the
+// bot's mention gone, spaces collapsed). Slack timestamps compare as
 // strings: whole seconds of a fixed width, then the fraction. A read that
-// fails keeps what it has; the rating is kept either way.
-func (s *SlackAdapter) feedbackExchange(ctx context.Context, channel, thread, ratedTS, rater string) (string, []FeedbackTurn) {
+// fails finds what it can; the rating is kept either way.
+func (s *SlackAdapter) feedbackAsk(ctx context.Context, channel, thread, ratedTS string) string {
 	var msgs []slack.Message
 	if thread != "" && thread != ratedTS {
 		params := &slack.GetConversationRepliesParameters{ChannelID: channel, Timestamp: thread,
@@ -326,30 +333,12 @@ func (s *SlackAdapter) feedbackExchange(ctx context.Context, channel, thread, ra
 			}
 		}
 	}
-	agent := func(m slack.Message) bool { return m.BotID != "" || (s.botUserID != "" && m.User == s.botUserID) }
-	ask, asker := "", ""
+	ask := ""
 	for _, m := range msgs {
-		if m.Timestamp != ratedTS && m.Timestamp <= ratedTS && !agent(m) {
-			ask, asker = m.Text, m.User
+		agent := m.BotID != "" || (s.botUserID != "" && m.User == s.botUserID)
+		if m.Timestamp < ratedTS && !agent {
+			ask = m.Text
 		}
 	}
-	// The exchange as the rater is told it is kept: the agent's messages,
-	// the asker's and the rater's own, and nobody else's.
-	var turns []FeedbackTurn
-	for _, m := range msgs {
-		if m.Timestamp > ratedTS {
-			continue
-		}
-		from := FeedbackFromAgent
-		if !agent(m) {
-			if m.User != asker && m.User != rater {
-				continue
-			}
-			from = FeedbackFromUser
-		}
-		turns = append(turns, FeedbackTurn{From: from, Text: slackEntitiesReduced(m.Text)})
-	}
-	// The ask as an eval prompt reads it: the bot's mention gone, spaces
-	// collapsed.
-	return strings.Join(strings.Fields(slackEntitiesReduced(ask)), " "), turns
+	return strings.Join(strings.Fields(slackEntitiesReduced(ask)), " ")
 }

@@ -137,9 +137,11 @@ func TestDeskKeepsADownRatingWithItsNoteAndAnUpTakesItBack(t *testing.T) {
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	desk := r.g.feedback.Load()
 	down := FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001", Conversation: "discord:g1/fb5",
-		MessageID: "m9", TaskID: "t-1", Rating: FeedbackDown, Ask: "why is it crashing?", Answer: "it is OOMKilled",
-		Transcript: []FeedbackTurn{{From: FeedbackFromUser, Text: "why is it crashing?"}, {From: FeedbackFromAgent, Text: "it is OOMKilled"}}}
+		MessageID: "m9", TaskID: "t-1", Rating: FeedbackDown, Answer: "it is OOMKilled"}
 	if err := desk.Rate(down); err != nil {
+		t.Fatal(err)
+	}
+	if err := desk.AddAsk(down, "why is it crashing?"); err != nil {
 		t.Fatal(err)
 	}
 	if err := desk.Note(down, "  the limit is 256Mi  "); err != nil {
@@ -181,7 +183,7 @@ func TestDeskKeepsADownRatingWithItsNoteAndAnUpTakesItBack(t *testing.T) {
 			t.Errorf("task.yaml lacks %q:\n%s", want, task)
 		}
 	}
-	for _, want := range []string{"it is OOMKilled", "t-1", "### agent"} {
+	for _, want := range []string{"why is it crashing?", "it is OOMKilled", "t-1", "the limit is 256Mi"} {
 		if !strings.Contains(transcript, want) {
 			t.Errorf("transcript.md lacks %q:\n%s", want, transcript)
 		}
@@ -221,13 +223,16 @@ func TestDeskNoteBeforeTheRatingKeepsBoth(t *testing.T) {
 	desk := r.g.feedback.Load()
 	down := FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001", Conversation: "discord:g1/fb8",
 		MessageID: "m1", TaskID: "t-4", Rating: FeedbackDown}
-	// The modal's Send can land before the thread is read and the rating
-	// written; neither half may lose the other.
+	// The three parts land from separate goroutines in any order; none may
+	// lose another.
 	if err := desk.Note(down, "stale limit"); err != nil {
 		t.Fatal(err)
 	}
-	down.Ask, down.Answer = "why?", "because"
+	down.Answer = "because"
 	if err := desk.Rate(down); err != nil {
+		t.Fatal(err)
+	}
+	if err := desk.AddAsk(down, "why?"); err != nil {
 		t.Fatal(err)
 	}
 	kv, err := r.client.KV(context.Background(), lib.FeedbackBucket)
@@ -237,6 +242,29 @@ func TestDeskNoteBeforeTheRatingKeepsBoth(t *testing.T) {
 	rec, err := getFeedback(context.Background(), kv, feedbackKey("t-4", "1001"))
 	if err != nil || rec.Note != "stale limit" || rec.Ask != "why?" || rec.Answer != "because" {
 		t.Fatalf("record = %+v, %v; want the note and the exchange together", rec, err)
+	}
+}
+
+func TestDeskAskAfterAnUpKeepsNothing(t *testing.T) {
+	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
+	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
+	desk := r.g.feedback.Load()
+	down := FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001", Conversation: "discord:g1/fb9",
+		MessageID: "m1", TaskID: "t-5", Rating: FeedbackDown, Answer: "because"}
+	if err := desk.Rate(down); err != nil {
+		t.Fatal(err)
+	}
+	up := down
+	up.Rating = FeedbackUp
+	if err := desk.Rate(up); err != nil {
+		t.Fatal(err)
+	}
+	// The ask read after the 👎 arrives once the 👍 has taken it back.
+	if err := desk.AddAsk(down, "why?"); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := ExportFeedback(context.Background(), r.client, 0, time.Now(), io.Discard, io.Discard); n != 0 {
+		t.Errorf("kept %d after a 👍; the late ask must not bring the 👎 back", n)
 	}
 }
 
@@ -255,7 +283,7 @@ func TestDeskRefusesAnUnverifiedRater(t *testing.T) {
 	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	err := r.g.feedback.Load().Rate(FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "9999",
-		Conversation: "discord:g1/fb6", TaskID: "t-2", Rating: FeedbackDown, Ask: "x"})
+		Conversation: "discord:g1/fb6", TaskID: "t-2", Rating: FeedbackDown, Answer: "x"})
 	if !errors.Is(err, errFeedbackUnverified) {
 		t.Fatalf("Rate from an unmapped sender = %v, want errFeedbackUnverified", err)
 	}

@@ -163,12 +163,6 @@ func feedbackTranscriptMD(rec FeedbackRecord) string {
 	}
 	fmt.Fprintf(&b, "- Conversation: `%s`, message `%s`\n\n", rec.Conversation, rec.MessageID)
 	b.WriteString("## The ask\n\n" + rec.Ask + "\n\n## The rated answer\n\n" + rec.Answer + "\n")
-	if len(rec.Transcript) > 0 {
-		b.WriteString("\n## The conversation up to the answer\n")
-		for _, t := range rec.Transcript {
-			fmt.Fprintf(&b, "\n### %s\n\n%s\n", t.From, t.Text)
-		}
-	}
 	return b.String()
 }
 

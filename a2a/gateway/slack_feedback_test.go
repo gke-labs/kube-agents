@@ -18,17 +18,31 @@ type fakeRecorder struct {
 	mu      sync.Mutex
 	admit   map[string]bool
 	ratings []FeedbackRating
+	asks    []string
 	notes   []string
 	noteErr error
+	// onRate runs inside Rate, for a test that checks what had happened
+	// by then.
+	onRate func()
 }
 
 func (f *fakeRecorder) Admits(_, rater string) bool { return f.admit[rater] }
 func (f *fakeRecorder) KeptDays() int               { return 30 }
 
 func (f *fakeRecorder) Rate(r FeedbackRating) error {
+	if f.onRate != nil {
+		f.onRate()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ratings = append(f.ratings, r)
+	return nil
+}
+
+func (f *fakeRecorder) AddAsk(_ FeedbackRating, ask string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.asks = append(f.asks, ask)
 	return nil
 }
 
@@ -189,7 +203,7 @@ func TestSlackUpRatingIsRecordedAndIsNoTurn(t *testing.T) {
 		t.Fatal("a rating is never a turn")
 	}
 	if len(rec.ratings) != 1 || rec.ratings[0].Rating != FeedbackUp || rec.ratings[0].TaskID != "t-root" ||
-		rec.ratings[0].Conversation != "slack:C1/40.0" || rec.ratings[0].Ask != "" {
+		rec.ratings[0].Conversation != "slack:C1/40.0" || rec.ratings[0].Answer != "" || len(rec.asks) != 0 {
 		t.Fatalf("ratings = %+v, want one bare 👍 on t-root", rec.ratings)
 	}
 	if len(api.views) != 0 || len(api.ephemerals) != 0 {
@@ -204,8 +218,13 @@ func TestSlackDownRatingOpensTheNoteAndKeepsTheExchange(t *testing.T) {
 		threadMsg("45.0", "UBOT", "B1", "checking seeded-a."),
 		threadMsg("50.0", "UBOT", "B1", "*It is OOMKilled.*"),
 	}
+	viewsAtRate := -1
+	rec.onRate = func() { viewsAtRate = len(api.views) }
 	if _, ok := a.interactive(ratingPayload(t, "U1", FeedbackDown)); ok {
 		t.Fatal("a rating is never a turn")
+	}
+	if viewsAtRate != 0 {
+		t.Errorf("the 👎 was kept after the modal opened (%d views); it must be kept first", viewsAtRate)
 	}
 	if len(api.triggers) != 1 || api.triggers[0] != "trig-1" || api.views[0].CallbackID != slackFeedbackCallback {
 		t.Fatalf("views = %+v, want the note modal opened on the tap's trigger", api.views)
@@ -220,9 +239,11 @@ func TestSlackDownRatingOpensTheNoteAndKeepsTheExchange(t *testing.T) {
 		t.Fatalf("ratings = %+v", rec.ratings)
 	}
 	r := rec.ratings[0]
-	if r.Rating != FeedbackDown || r.Ask != "why is payments-api crashing?" || r.Answer != "*It is OOMKilled.*" || len(r.Transcript) != 3 ||
-		r.Transcript[0].From != FeedbackFromUser || r.Transcript[2].From != FeedbackFromAgent {
-		t.Errorf("rating = %+v, want the ask without the mention, the answer, and the thread", r)
+	if r.Rating != FeedbackDown || r.Answer != "*It is OOMKilled.*" {
+		t.Errorf("rating = %+v, want the 👎 with the rated answer", r)
+	}
+	if len(rec.asks) != 1 || rec.asks[0] != "why is payments-api crashing?" {
+		t.Errorf("asks = %q, want the ask without the mention", rec.asks)
 	}
 }
 
@@ -280,7 +301,7 @@ func TestSlackNoteThatWasNotKeptThanksNobody(t *testing.T) {
 	}
 }
 
-func TestSlackExchangeKeepsOnlyTheAgentTheAskerAndTheRater(t *testing.T) {
+func TestSlackAskIsTheLastMessageAPersonWroteBeforeTheAnswer(t *testing.T) {
 	a, rec, api := newFeedbackSlackAdapter()
 	api.replies = []slack.Message{
 		threadMsg("40.0", "U3", "", "<@UBOT> is checkout healthy?"),
@@ -290,16 +311,24 @@ func TestSlackExchangeKeepsOnlyTheAgentTheAskerAndTheRater(t *testing.T) {
 		threadMsg("50.0", "UBOT", "B1", "*It is OOMKilled.*"),
 	}
 	a.interactive(ratingPayload(t, "U1", FeedbackDown))
-	r := rec.ratings[0]
-	if r.Ask != "are you sure?" {
-		t.Errorf("ask = %q, want the last message a person wrote before the answer", r.Ask)
+	// Only the ask is read out of the thread; nothing else of it is kept.
+	if len(rec.asks) != 1 || rec.asks[0] != "are you sure?" {
+		t.Errorf("asks = %q, want the last message a person wrote before the answer", rec.asks)
 	}
-	var texts []string
-	for _, turn := range r.Transcript {
-		texts = append(texts, turn.Text)
+}
+
+func TestSlackLayoutAtTheBlockCapPostsWithoutTheButtons(t *testing.T) {
+	full := slackChatLayout{Blocks: make([]map[string]any, slackChatBlocksMax)}
+	if got := withFeedback(full, "t"); len(got.Blocks) != slackChatBlocksMax {
+		t.Errorf("blocks = %d, want the answer left as it is at the cap", len(got.Blocks))
 	}
-	if got := strings.Join(texts, "|"); strings.Contains(got, "aside") || strings.Contains(got, "checkout") {
-		t.Errorf("transcript = %q; a third party's messages are not kept", got)
+}
+
+func TestSlackAnsweredLineStaysAboveTheFeedbackButtons(t *testing.T) {
+	note := map[string]any{"type": slackContextBlock}
+	got := slackWithNote([]map[string]any{{"type": slackSectionBlock}, slackFeedbackBlock("t")}, note)
+	if len(got) != 3 || got[1]["type"] != slackContextBlock || got[2]["type"] != slackContextActionsBlock {
+		t.Errorf("blocks = %v, want the answered line above the rating controls", got)
 	}
 }
 

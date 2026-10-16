@@ -1929,46 +1929,49 @@ and a tap from a sender the gateway would not take a turn from (`resolvePrincipa
 another workspace's member, changes nothing.
 
 A 👍 is counted and nothing is kept or posted (Slack fills the tapped icon itself); it also
-deletes the rater's 👎 on the same answer, if one is kept. A 👎 first opens a modal on the tap's
-trigger, which lapses three seconds after the tap ("What went wrong?", one optional line of up to
-500 characters, and a line telling the rater how long the exchange is kept, read from the bucket's
-max age). The adapter then reads the conversation up to the rated message
-(`conversations.replies`, or `conversations.history` for a top-level answer), and the gateway
-counts the 👎 and keeps it. The ask is the last message a person wrote before the answer; the
-answer is the rated message's text, which for a text answer longer than one chunk is its last
-chunk, the rest being in the transcript; and the transcript is the agent's messages, the asker's
-and the rater's up to the answer, the newest 40, each clipped, so a colleague's aside in the
-thread is not kept. Send writes the note, and posts "Thanks. I kept this answer for your team to
-review." to the rater alone (`chat.postEphemeral`) in the thread once the record holds it; Cancel
-keeps the 👎 without a note. The note and the rating are written by separate taps and merged
-under the record's revision (`mergeFeedback`), so a note sent while the thread is still being read
-starts the record and the rating fills it in. Send after a 👍 took the 👎 back keeps the 👎 again.
-No new scope: `chat:write` covers the ephemeral line, the history scopes the read, and
-`views.open` takes only the trigger.
+deletes the rater's 👎 on the same answer, if one is kept. A 👎 is counted and kept with the rated
+answer first, one KV write, then opens a modal on the tap's trigger, which lapses three seconds
+after the tap ("What went wrong?", one optional line of up to 500 characters, and a line telling
+the rater how long their question and the answer are kept, read from the bucket's max age). The
+adapter then reads the conversation up to the rated message (`conversations.replies`, or the last
+10 messages of `conversations.history` for a top-level answer) for the ask, the last message a
+person wrote before the answer, and adds it to the record; nothing else of the thread is kept, so
+what is stored is what the modal says is. The answer is the rated message's text, which for a text
+answer longer than one chunk is its last chunk. Send writes the note and posts "Thanks. I kept this
+answer for your team to review." to the rater alone (`chat.postEphemeral`) in the thread once the
+record holds it; Cancel keeps the 👎 without a note. The rating, the ask and the note are written
+by separate goroutines and merged under the record's revision (`mergeFeedback`), so none loses
+another's part: an ask read after a 👍 took the 👎 back leaves it gone, and Send after a 👍 keeps
+the 👎 again. No new scope: `chat:write` covers the ephemeral line, the history scopes the read,
+and `views.open` takes only the trigger.
 
 A kept 👎 is a JSON record in the `feedback` KV bucket, one key per answer and rater
 (`<task>.<rater>`, so re-rating replaces it): the rating, the note, the platform, the rater's Slack
-member id, the conversation and rated message, the task and context ids, the ask, the answer and
-the transcript. It is user content and may hold cluster data, which the bucket's posture answers:
-the provision Job creates it with a 30-day max age (`--ttl=720h`), so NATS drops a record 30 days
-after the rating; the gateway turns feedback on only when the bucket exists and has a max age, and
-leaves answers unmarked otherwise (an install whose operator predates the bucket, or a bucket
-someone recreated without one), looking again every minute so that a provision Job finishing after
-an upgraded gateway started still turns it on; and the gateway's user is the bucket's only reader
-and writer by grant. It is capped at 64MiB, a few hundred records at their caps, past which a 👎 is
-counted but not kept. Logs and
-`answer_feedback_total` carry the task id, the conversation and the rating, never the text.
+member id, the conversation and rated message, the task and context ids, the ask and the answer.
+It is user content and may hold cluster data, which the bucket's posture answers: the provision Job
+creates it with a 30-day max age (`--ttl=720h`), so NATS drops a record 30 days after the rating;
+the gateway turns feedback on only when the bucket exists and has a max age, and leaves answers
+unmarked otherwise (an install whose operator predates the bucket, or a bucket someone recreated
+without one), looking again every minute so that a provision Job finishing after an upgraded
+gateway started still turns it on; and the gateway's user is the bucket's only reader and writer by
+grant. It is capped at 64MiB, past which a 👎 is counted but not kept. Logs carry the task id, the
+conversation and the rating, never the text; `answer_feedback_total` carries only the platform and
+the rating.
+
+An answer whose layout is already at Slack's 50-block cap posts laid out without the controls. The
+answered line a click or typed reply leaves on an answer's question goes above the controls, which
+stay the last block.
 
 An operator reads the bucket through the gateway's own binary, in its pod, since nothing else holds
 the bucket's credentials:
 `kubectl exec -n kubeagents-system deploy/<name>-a2a-gateway -- /gateway feedback export [--since 7d] > feedback.tar`.
 Each kept 👎 becomes a directory `feedback-<date>-<hash>/` (more digits when two would share one)
-holding `task.yaml`, a draft case per
-[`bench-case-format.md`](bench-case-format.md) (the ask as its `prompt`, `deployer: noop`, the note
-in its header comment and `expected_output`, and TODOs for `domain`, `owner` and the
-`verification_spec`), and `transcript.md`, the exchange with its ids. The draft is for a person to
-finish and submit; the transcript holds the install's data and stays out of the pull request. The
-install never writes to this repository, and no sink files the drafts anywhere.
+holding `task.yaml`, a draft case per [`bench-case-format.md`](bench-case-format.md) (the ask as its
+`prompt`, `deployer: noop`, the note in its header comment and `expected_output`, and TODOs for
+`domain`, `owner` and the `verification_spec`), and `transcript.md`, the ask, the answer and the
+note with their ids. The draft is for a person to finish and submit; `transcript.md` holds the
+install's data and stays out of the pull request. The install never writes to this repository, and
+no sink files the drafts anywhere.
 
 ## The console adapter (added 9/23)
 

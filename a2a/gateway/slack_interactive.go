@@ -209,12 +209,12 @@ func (s *SlackAdapter) trackQuestion(conversation, ts string, m OutMessage) {
 	}
 	text := toMrkdwn(m.Text)
 	layout, err := renderSlackChat(m.Chat, text)
-	if err == nil && s.rates(m) {
-		// As posted, so a typed answer's rewrite keeps the rating controls.
-		layout, err = withFeedback(layout, m.Feedback)
-	}
 	if err != nil {
 		return
+	}
+	if s.rates(m) {
+		// As posted, so a typed answer's rewrite keeps the rating controls.
+		layout = withFeedback(layout, m.Feedback)
 	}
 	blocks, err := json.Marshal(layout.Blocks)
 	if err != nil {
@@ -586,13 +586,13 @@ func slackAnsweredLayout(rawBlocks, rawAttachments json.RawMessage, line string)
 		var did bool
 		list, did = slackWithoutChoices(list, nil)
 		if did && !placed {
-			list = append(list, note)
+			list = slackWithNote(list, note)
 			placed = true
 		}
 		a["blocks"] = list
 	}
 	if !placed {
-		top = append(top, note)
+		top = slackWithNote(top, note)
 	}
 	// Sent as written, as the renderer sends them (slackRawBlocks):
 	// slack-go's typed blocks drop what they do not model, a fold's
@@ -645,7 +645,18 @@ func slackWithoutChoices(blocks []map[string]any, note map[string]any) ([]map[st
 		out = append(out, b)
 	}
 	if dropped && note != nil {
-		out = append(out, note)
+		out = slackWithNote(out, note)
 	}
 	return out, dropped
+}
+
+// slackWithNote adds the answered line as the last block, or just above an
+// answer's rating controls (slack_feedback.go), which stay the last block.
+func slackWithNote(blocks []map[string]any, note map[string]any) []map[string]any {
+	if n := len(blocks); n > 0 {
+		if t, _ := blocks[n-1]["type"].(string); t == slackContextActionsBlock {
+			return append(blocks[:n-1:n-1], note, blocks[n-1])
+		}
+	}
+	return append(blocks, note)
 }
