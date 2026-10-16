@@ -179,10 +179,19 @@ Which clusters it reads is decided on the agent pod: `UPGRADE_READINESS_PROJECTS
 when set, otherwise the management project and every project a Cluster Agent
 profile's identity names, the roster `stall-watch` follows; with neither, the
 sandbox's configured project; and with nothing at all the tick fails closed,
-because the report script's own fallback is every project the credential can
-list. Within those projects the report script
+because on an install that declares no scope the report script's own fallback
+is every project the credential can list. Within those projects the report script
 enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
-Cluster Agent from is still read here. That read is `gcloud` cluster metadata
+Cluster Agent from is still read here. On an install that declares a scope (a
+`spec.scope` block), the report script, a fleet-audit collector, refuses a bare
+`--project` in the sandbox, so the job reads the declared scope on the agent
+pod (`fleet_scope_targets.declared_scope_targets()`) and hands the script the
+resolved scope beside each `--project`, the `collector_args` the
+platform_control `fleet_scope` tool hands the SOPs (`--scope-projects`,
+`--scope-unread`): the script reads a project inside the scope and refuses one
+outside it with the reason, which the table carries as that project's failure;
+an install that declares none keeps the bare flag, and a scope render the pod
+cannot read fails the tick with the reason. That read is `gcloud` cluster metadata
 for the version table and, on a report day, the readiness report's read set,
 the same as a run on request: one `get-credentials` and six `kubectl get`s
 per cluster (budgets, Deployments and StatefulSets; webhook configurations
@@ -212,7 +221,9 @@ It runs the skill the way `stall-watch` runs `stall_report.py`: every module
 under the skill's `scripts/` except its tests, with the data files beside them,
 is read from the agent image's `/opt/platform-template/skills/` copy and handed
 to `python3 -I -` in the sandbox on stdin, behind a loader (a meta-path finder
-serving the shipped set) before running `fleet_upgrade_report.main`. The
+serving the shipped set, the agent image's `fleet_scope_args` among them so the
+script formats a refusal with the constants the job parses it by) before
+running `fleet_upgrade_report.main`. The
 loader gives the report a private `tempfile.mkdtemp` directory for its JSON
 output and rollout record, so nothing the model can write to is on the path
 the result crosses, and removes it afterwards; the sandbox's `/opt/data` is
@@ -257,10 +268,12 @@ chat line says "none graded" and the version is tried again tomorrow), and the
 weekly comparison carries ten minutes of slack so the tick's own drift cannot
 push a refresh to day eight. A partial table, an ungraded version or a failed
 tick is announced once, not daily: the ledger keeps what was announced (the
-kinds of read error for a partial table; each project and how it went
-ungraded for a version, never the error text, which an outage rewords from
-one run to the next), a
-failed tick (which writes nothing to the ledger) keeps its line in
+kinds of read error for a partial table, and for a refusal the project and
+its cause; each project and how it went ungraded for a version, never the
+error text, which an outage rewords from one run to the next), a
+failed tick (which writes nothing to the ledger but its record of the projects
+the hops refused as outside the declared scope, kept at whichever step the tick
+failed, so the next tick files them under the same cause) keeps its line in
 `last-failure.txt` beside it, and the next line is the recovery. A version
 none of whose clusters can be read is retried
 three days running and then recorded, so an unreachable cluster costs its

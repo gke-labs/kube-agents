@@ -67,6 +67,9 @@ DECLARED_SCOPE_ARGS_MISSING_ERROR = (
     "fleet_scope tool and pass its collector_args verbatim; nothing was swept or listed"
 )
 # A `--project` on an install with a declared scope must name a project inside it.
+# The scope it lists is joined with this; the upgrade-readiness watch splits
+# the message on it to re-say the refusal in the install's terms.
+OVERRIDE_PROJECTS_SEPARATOR = ", "
 DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR = (
     "the project override names {project}, which the install's declared scope does not list ({projects}); nothing was swept. "
     "Pass the fleet_scope tool's collector_args, or override with a project it lists"
@@ -191,7 +194,7 @@ class DeclaredScope:
             unread = dict(self.unread)
             if project in unread:
                 return DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR.format(project=project, outcome=unread[project])
-            return DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project=project, projects=", ".join(self.projects or []) or "none readable")
+            return DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project=project, projects=OVERRIDE_PROJECTS_SEPARATOR.join(self.projects or []) or "none readable")
         return None
 
     def sweep_is_declared(self, override: object = None) -> bool:
