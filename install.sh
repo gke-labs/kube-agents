@@ -741,7 +741,9 @@ Flags for AI Agents & Automation:
   --scope-exclude-projects=IDS  Project IDs or shell-style globs (*-sandbox) to leave
                                 unmanaged
   --scope-exclude-clusters=TRIPLES
-                                Clusters to leave unmanaged, each as project/location/cluster
+                                Clusters to leave unmanaged and out of fleet answers and
+                                the per-cluster audits, each as
+                                project/location/cluster
   --scoped-sa-pool-enabled[=BOOL]
                                 Arm the scoped service account pool: one reader service
                                 account per project in scope, which the credential broker

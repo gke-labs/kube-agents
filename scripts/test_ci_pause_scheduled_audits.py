@@ -16,8 +16,8 @@
 
 Pinned: which jobs it pauses and which it leaves (plumbing, the oobe stage's audits, a job
 already off), that it believes the store over Hermes' exit code, its exit codes, that --resume
-undoes exactly what it paused, and that ci-eval-pr.sh pauses once per lease before any unit and
-resumes from the EXIT trap.
+undoes exactly what it paused, and that ci-eval-pr.sh pauses at lease time before any unit and
+again right before the fan-out, and resumes from the EXIT trap.
 """
 
 import ast
@@ -30,6 +30,8 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
+import time
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -50,6 +52,13 @@ FAKE_HERMES = textwrap.dedent('''\
     assert sys.argv[1:4] == ["-p", "platform", "cron"] and sys.argv[4] in ("pause", "resume"), sys.argv
     if mode == "noop":
         sys.exit(0)
+    if mode.startswith("lose-first:") and sys.argv[5] == mode.split(":", 1)[1]:
+        # A concurrent writer (a starting container's cron merge) rewrites the
+        # store over the first pause of this job: Hermes says yes, no marker lands.
+        flag = os.environ["FAKE_ROSTER"] + ".lost"
+        if not os.path.exists(flag):
+            open(flag, "w").close()
+            sys.exit(0)
     if mode.startswith("die-at:") and sys.argv[5] == mode.split(":", 1)[1]:
         import signal
         os.kill(os.getppid(), signal.SIGKILL)  # the pod going away mid-loop
@@ -224,7 +233,9 @@ class PauseTest(unittest.TestCase):
     def test_the_store_is_believed_over_the_exit_code(self):
         self.write_roster([{"id": "c", "enabled": True}])
         result, _ = self.run_script(mode="noop")
-        self.assertEqual(result.returncode, 3)
+        # Worth another try, not decided: the caller's next attempt settles the
+        # gateway and waits first, which is what outlasts another writer.
+        self.assertEqual(result.returncode, 1)
         self.assertIn("FAILED c (not paused in the store)", result.stdout)
 
     def test_a_failed_pause_is_named(self):
@@ -233,6 +244,45 @@ class PauseTest(unittest.TestCase):
         # Hermes refused it: a retry would only repeat that, so the verdict is final.
         self.assertEqual(result.returncode, 3)
         self.assertIn("FAILED c (exit 1: boom)", result.stdout)
+
+    def test_a_pause_lost_to_a_concurrent_writer_is_paused_again(self):
+        # eval-next 2110626938950258691: the gateway was replaced mid-pause and the
+        # new container's cron merge dropped one marker. The read-back finds it
+        # and the next round pauses it again.
+        self.write_roster([{"id": "c", "enabled": True}, {"id": "d", "enabled": True}])
+        result, store = self.run_script(mode="lose-first:d")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(store["d"]["state"], "paused")
+        self.assertIn("paused c, d;", result.stdout)
+
+    def test_a_stale_rewrite_after_the_first_clean_read_is_caught(self):
+        # The incident's writer reads its copy before the pause and writes it after:
+        # the first read-back is clean, and the marker goes a second later.
+        self.write_roster([{"id": "c", "enabled": True}, {"id": "d", "enabled": True}])
+        stale = self.roster.read_text()
+
+        def late_writer():
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                try:
+                    jobs = {j["id"]: j for j in json.loads(self.roster.read_text())["jobs"]}
+                except (OSError, ValueError):
+                    jobs = {}
+                if jobs.get("d", {}).get("state") == "paused":
+                    time.sleep(1)
+                    self.roster.write_text(stale)
+                    return
+                time.sleep(0.05)
+
+        writer = threading.Thread(target=late_writer)
+        writer.start()
+        result, _ = self.run_script()
+        writer.join()
+        # Read after the writer is done: the store the run left is what the cases get.
+        store = {j["id"]: j for j in json.loads(self.roster.read_text())["jobs"]}
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(store["d"].get("state"), "paused", "the late rewrite dropped d's marker")
+        self.assertEqual(store["c"].get("state"), "paused")
 
     def test_an_unreadable_stage_pauses_nothing(self):
         # Without the stage's list it can't tell which audits the stage owns, so it leaves all.
@@ -273,11 +323,98 @@ class RestartTest(unittest.TestCase):
                 self.assertNotIn(key, shipped_job, f"{shipped_job['id']}: the image now ships a pause key; the merge would reset it")
 
 
+class ReadyGatewayPodTest(unittest.TestCase):
+    """ready_gateway_pod, run from the runner's own text against a fake kubectl."""
+
+    def run_helper(self, replicas, ready, wait=0, kind="deployment", starting=(), unready=(), api_down=0):
+        # `starting`: pods whose PID 1 is still the entrypoint (Ready on HA all the same).
+        # `unready`: live pods not Ready yet (a surge pod). The phase filter is the
+        # server's; ReadyGatewayPodTemplateTest checks the template itself.
+        # `api_down`: workload lookups that fail with a non-NotFound error first.
+        pids = "".join(
+            f"  *exec\\ pod/{n}\\ *) printf '/bin/bash\\0/usr/local/bin/agent-entrypoint\\0' ;;\n" for n in starting)
+        listing = "".join(f"pod/{n} R" + chr(92) + "n" for n in ready) + "".join(f"pod/{n} N" + chr(92) + "n" for n in unready)
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = pathlib.Path(tmp) / "kubectl"
+            counter = pathlib.Path(tmp) / "down"
+            counter.write_text(str(api_down))
+            fake.write_text(textwrap.dedent(f"""\
+                #!/bin/sh
+                case "$*" in
+                  *-gateway\\ -o\\ name*)
+                    n=$(cat {counter}); if [ "$n" -gt 0 ]; then echo $((n - 1)) > {counter}; echo "Unable to connect to the server" >&2; exit 1; fi ;;
+                esac
+                case "$*" in
+                  *get\\ {kind}/platform-agent-gateway\\ -o\\ name*) echo {kind}.apps/platform-agent-gateway ;;
+                  *get\\ *-gateway\\ -o\\ name*) echo 'Error from server (NotFound): not found' >&2; exit 1 ;;
+                  *go-template=*matchLabels*) printf 'app=platform-agent-gateway,' ;;
+                  *jsonpath=*spec.replicas*) printf '{replicas}' ;;
+                  *get\\ pods*) printf '{listing}' ;;
+                """) + pids + textwrap.dedent("""\
+                  *exec\\ pod/*cmdline*) printf 'python3\\0-m\\0hermes_cli.main\\0gateway\\0' ;;
+                esac
+                """))
+            fake.chmod(0o755)
+            helper = RUNNER.read_text().split("ready_gateway_pod() {", 1)[1].split("\n}\n", 1)[0]
+            script = f"ready_gateway_pod() {{{helper}\n}}\nready_gateway_pod ctx ns {wait}"
+            env = {**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}", "AGENT_SERVICE_NAME": "platform-agent",
+                   "EVAL_GATEWAY_CONTAINER": "platform-agent", "EVAL_PAUSE_AUDITS_POD_POLL_SECONDS": "1",
+                   "EVAL_PAUSE_AUDITS_PROBE_TIMEOUT": "5s", "EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS": "300"}
+            return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
+
+    def test_one_replica_one_ready_pod(self):
+        result = self.run_helper(1, ["gw-a"])
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "pod/gw-a"))
+
+    def test_a_rollout_still_settling_is_waited_out(self):
+        # Two Ready pods for a one-replica Deployment: the old one has not gone yet.
+        result = self.run_helper(1, ["gw-a", "gw-b"])
+        self.assertEqual(result.returncode, 1)
+
+    def test_an_ha_gateway_with_all_replicas_ready_is_accepted(self):
+        result = self.run_helper(2, ["gw-a", "gw-b"])
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "pod/gw-a"))
+
+    def test_an_ha_pod_ready_but_still_in_its_entrypoint_is_waited_out(self):
+        # HA's probe passes with nothing on 8642, so gw-c is Ready mid-merge.
+        result = self.run_helper(2, ["gw-a", "gw-c"], starting=("gw-c",))
+        self.assertEqual(result.returncode, 1)
+
+    def test_a_surge_pod_not_ready_yet_is_waited_out(self):
+        # A rollout's surge pod is not Ready while its entrypoint runs, so the Ready
+        # set alone still reads as the two old pods: settled, wrongly.
+        result = self.run_helper(2, ["gw-a", "gw-b"], unready=("gw-c",))
+        self.assertEqual(result.returncode, 1)
+
+    def test_a_lookup_that_fails_for_a_moment_is_waited_out(self):
+        # A blip at the workload read is not "no such workload".
+        result = self.run_helper(1, ["gw-a"], wait=30, api_down=2)
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "pod/gw-a"))
+
+    def test_an_ha_gateway_on_rwo_storage_is_a_statefulset(self):
+        result = self.run_helper(2, ["gw-0", "gw-1"], kind="statefulset")
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "pod/gw-0"))
+
+    def test_a_gateway_scaled_to_zero_returns_at_once(self):
+        start = time.monotonic()
+        result = self.run_helper(0, [], wait=300)
+        self.assertEqual(result.returncode, 1)
+        self.assertLess(time.monotonic() - start, 30)
+
+    def test_no_gateway_workload_returns_at_once(self):
+        result = self.run_helper(1, ["gw-a"], wait=300, kind="daemonset")
+        self.assertEqual(result.returncode, 1)
+
+
 class RunnerTest(unittest.TestCase):
-    def test_called_once_per_lease_before_any_unit(self):
+    def test_called_at_lease_and_before_the_fan_out(self):
         text = RUNNER.read_text()
         calls = [m.start() for m in re.finditer(r'^scheduled_audits pause "lease"$', text, re.M)]
         self.assertEqual(len(calls), 1)
+        # And again right before the fan-out, which catches a restart in between.
+        again = [m.start() for m in re.finditer(r'^scheduled_audits pause "fan-out"$', text, re.M)]
+        self.assertEqual(len(again), 1)
+        self.assertLess(again[0], text.index('# Two phases on the inject lane'))
         lease_reset = text.index('reset_agent_pulls "lease"')
         first_unit = re.search(r'^\s+run_one_unit "\$\{TASKS', text, re.M).start()
         self.assertLess(lease_reset, calls[0])
@@ -289,6 +426,12 @@ class RunnerTest(unittest.TestCase):
         self.assertIn('"gke_${PROJECT_ID}_"*', body)
         self.assertIn("EVAL_PAUSE_AUDITS_ATTEMPTS", body)
         self.assertIn("return 0", body)
+        # A pause that does not take stops the run, loudly; a resume only warns.
+        pause_branch = body.split('if [ "${mode}" = "pause" ]; then', 1)[1].split("\n  fi\n", 1)[0]
+        self.assertIn("exit 1", pause_branch)
+        # It execs into one Ready pod by name, not deployment/<name>.
+        self.assertIn('pod="$(ready_gateway_pod "${ctx}" "${ns}" "${wait}")"', body)
+        self.assertNotIn('exec -i "deployment/', body)
         # The script's DECIDED exit ends the retries.
         self.assertIn('"${rc}" -eq "${EVAL_PAUSE_AUDITS_DECIDED_EXIT}" ] && break', body)
         decided = re.search(r"^readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=(\d+)$", RUNNER.read_text(), re.M).group(1)
@@ -297,6 +440,14 @@ class RunnerTest(unittest.TestCase):
     def test_the_exit_trap_resumes(self):
         trap = RUNNER.read_text().split("profile_and_dump_on_exit() {", 1)[1].split("\n}\n", 1)[0]
         self.assertIn('declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"', trap)
+
+    def test_the_resume_waits_briefly_for_the_gateway(self):
+        # It runs in the EXIT trap, ahead of the artifact dump.
+        text = RUNNER.read_text()
+        body = text.split("scheduled_audits() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('[ "${mode}" = "pause" ] || wait="${EVAL_RESUME_AUDITS_POD_WAIT_SECONDS}"', body)
+        resume = int(re.search(r"^readonly EVAL_RESUME_AUDITS_POD_WAIT_SECONDS=(\d+)$", text, re.M).group(1))
+        self.assertLessEqual(resume, 30)
 
 
 if __name__ == "__main__":

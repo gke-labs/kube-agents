@@ -459,7 +459,8 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          /usr/local/bin/credential-proxy-exec above, as the
 #                          kubectl/gcloud shim; that copy is not importable by
 #                          module name, so it is staged here as well
-#   fleet_scope_args.py    the two flags (`--scope-projects`, `--scope-unread`) the
+#   fleet_scope_args.py    the flags (`--scope-projects`, `--scope-unread`,
+#                          `--scope-exclude-clusters`) the
 #                          fleet-audit collectors take the install's declared scope
 #                          by. The scope's snapshot sits on the agent pod's data
 #                          volume, which this container does not share, so the agent

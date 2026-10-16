@@ -2427,6 +2427,91 @@ def test_tool_called_arguments_must_be_patterns():
         ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], arguments={"title": "("})
 
 
+def test_tool_called_result_counts_only_the_calls_that_answered_so():
+    spilled = "<persisted-output>\nThis tool result was too large (109,963 characters, 107.4 KB)."
+    transcript.set(
+        "done",
+        [
+            {"name": "skill_view", "args": {"name": "fleet-audit"}, "result": spilled, "status": "completed", "agent": "platform"},
+            {"name": "skill_view", "args": {"name": "gke-reliability"}, "result": '{"success": true}', "status": "completed", "agent": "platform"},
+        ],
+    )
+
+    def check(pattern):
+        return ToolCalledVerifier(
+            type="tool_called", tool_names=["skill_view"], scope="workers", result=pattern
+        ).verify(5.0)
+
+    res = check(r"too large")
+    assert res.status == "pass"
+    assert res.raw == {"matching_calls": 1}
+    assert "too large" in res.reason
+    assert check(r"never answered").status == "fail"
+
+
+@pytest.mark.parametrize("result", [None, "[WITHHELD: redactor unavailable in the pod]"])
+def test_tool_called_result_errors_on_a_result_it_cannot_read(result):
+    entry = {"name": "skill_view", "args": {"name": "fleet-audit"}, "status": "completed", "agent": "platform"}
+    if result is not None:
+        entry["result"] = result
+    transcript.set("done", [entry])
+    res = ToolCalledVerifier(
+        type="tool_called", tool_names=["skill_view"], scope="workers", result=r"^<persisted-output>"
+    ).verify(5.0)
+    assert res.status == "error"
+    assert "no readable result" in res.reason
+
+
+def test_tool_called_result_errors_when_arguments_and_result_are_both_withheld():
+    from kube_agents_bench import worker_trajectory
+
+    withheld = worker_trajectory.WITHHELD
+    transcript.set(
+        "done",
+        [{"name": "skill_view", "args": {"raw": withheld}, "result": withheld, "status": "completed", "agent": "platform"}],
+    )
+    res = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["skill_view"],
+        scope="workers",
+        arguments={"name": "fleet-audit"},
+        result=r"^<persisted-output>",
+    ).verify(5.0)
+    assert res.status == "error"
+
+
+def test_tool_called_result_ignores_an_unread_call_whose_arguments_rule_it_out():
+    transcript.set(
+        "done",
+        [
+            {"name": "skill_view", "args": {"name": "gke-cost-analysis"}, "status": "called", "agent": "platform"},
+            {"name": "skill_view", "args": {"name": "fleet-audit"}, "result": '{"success": true}', "status": "completed", "agent": "platform"},
+        ],
+    )
+    res = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["skill_view"],
+        scope="workers",
+        arguments={"name": "fleet-audit"},
+        result=r"^<persisted-output>",
+    ).verify(5.0)
+    assert res.status == "fail"
+    assert res.raw == {"matching_calls": 0}
+
+
+def test_the_withheld_marker_matches_the_in_pod_script():
+    from kube_agents_bench import worker_trajectory
+
+    assert f'WITHHELD = "{worker_trajectory.WITHHELD}"' in worker_trajectory._IN_POD_SCRIPT
+
+
+def test_tool_called_result_must_be_a_pattern():
+    with pytest.raises(ValueError):
+        ToolCalledVerifier(type="tool_called", tool_names=["skill_view"], result="")
+    with pytest.raises((ValueError, re.error)):
+        ToolCalledVerifier(type="tool_called", tool_names=["skill_view"], result="(")
+
+
 _WORKER_TAGGED = [
     {"name": "kanban_create", "args": {}, "status": "completed"},
     {

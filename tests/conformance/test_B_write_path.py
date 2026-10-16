@@ -593,9 +593,11 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
 
         A veto is monotone in the safe direction -- successful injection
         against one produces a false block, a nuisance on one pull request
-        rather than a breach. That property only holds while nothing in CI can
-        assent, so this refuses the mechanisms rather than the intent: the
-        merge and approve calls, and GitHub's auto-merge.
+        rather than a breach. That property only holds while nothing in CI
+        assents on its own verdict, so this refuses the mechanisms rather than
+        the intent: the merge and approve calls, and GitHub's auto-merge, in
+        workflow text. One script enacts the human `lgtm` and `approved` labels
+        through auto-merge; the two tests after the next pin it.
         """
         assenting = (
             r"gh\s+pr\s+merge",
@@ -650,7 +652,9 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         The list is an allowlist of holders, not of intents: the permission is
         a capability, and this asserts membership rather than absence so a
         seventh holder is a red test and a conversation rather than a silent
-        addition. Adding a name here means someone read the workflow.
+        addition. Adding a name here means someone read the workflow. A GitHub
+        App token minted with Pull requests write is not a `permissions:`
+        grant; `test_B2_app_token_write_grants_are_pinned` holds those.
         """
         holders = []
         for path, document in _workflow_documents():
@@ -675,6 +679,127 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
             sorted(set(holders)),
             "an unexpected workflow can write to pull requests",
         )
+
+
+    def test_B2_no_script_merges_except_the_enqueue_sweep(self) -> None:
+        """The workflow-text scan above cannot see a merge call made from a script.
+
+        A workflow that runs `python3 scripts/x.py` carries none of the
+        patterns itself, so this reads the scripts too, for the calls that
+        merge, enqueue or approve. One is allowed on purpose: the sweep in
+        `scripts/merge_gate.py`, run by `auto-enqueue.yml`, turns on GitHub
+        auto-merge, which with a merge queue on `main` means "enqueue once the
+        required checks pass". That is assent by policy: it fires only on
+        `lgtm` and `approved` with no `do-not-merge` label, the predicate Tide
+        merges on today, and Prow sets those two labels only for accounts the
+        `OWNERS` files name. No model verdict is an input. The call runs on a
+        GitHub App token, not on a `pull-requests: write` grant, so the holder
+        list above does not show it; the App-token test below pins who mints
+        one. The next test pins the predicate; any other script under
+        `scripts/` making one of these calls is a red.
+        """
+        merging = (
+            r"enablePullRequestAutoMerge",
+            r"enqueuePullRequest",
+            r"mergePullRequest",
+            r"addPullRequestReview",
+            r"gh\s+pr\s+merge",
+            r"gh\s+pr\s+review[^\n]*--approve",
+            r"/pulls/[^\n]*/merge\b",
+        )
+        allowed = {("scripts/merge_gate.py", "enablePullRequestAutoMerge")}
+        found = set()
+        offences = []
+        for path in sorted((h.REPO_ROOT / "scripts").rglob("*")):
+            if path.suffix not in (".py", ".sh") or path.name.startswith("test_"):
+                continue
+            text = path.read_text()
+            for pattern in merging:
+                for match in re.finditer(pattern, text):
+                    key = (str(path.relative_to(h.REPO_ROOT)), match.group(0))
+                    if key in allowed:
+                        found.add(key)
+                        continue
+                    line = text[: match.start()].count("\n") + 1
+                    offences.append(f"{path.relative_to(h.REPO_ROOT)}:{line} {match.group(0)!r}")
+        self.assertEqual([], offences, "a script can assent to its own repository's changes")
+        self.assertEqual(allowed, found, "the allowed call is gone; drop it from the allowlist")
+
+    def test_B2_the_enqueue_sweep_assents_only_on_both_human_labels(self) -> None:
+        """The predicate behind the one allowed call, driven over the label space.
+
+        Auto-merge goes on only for a pull request that is not a draft, carries
+        both `lgtm` and `approved`, and carries none of the `do-not-merge`
+        labels Tide's query excludes. Every other combination must leave it
+        off.
+        """
+        scripts = h.REPO_ROOT / "scripts"
+        if str(scripts) not in sys.path:
+            sys.path.insert(0, str(scripts))
+        import merge_gate
+
+        holds = (
+            "do-not-merge",
+            "do-not-merge/hold",
+            "do-not-merge/invalid-owners-file",
+            "do-not-merge/work-in-progress",
+        )
+        for lgtm in (False, True):
+            for approved in (False, True):
+                for hold in (None,) + holds:
+                    for draft in (False, True):
+                        labels = {"size/S"} | ({"lgtm"} if lgtm else set()) | ({"approved"} if approved else set())
+                        if hold:
+                            labels.add(hold)
+                        pull = {"draft": draft, "labels": labels, "auto_merge": False, "queue_entry": None}
+                        expected = lgtm and approved and not hold and not draft
+                        with self.subTest(labels=sorted(labels), draft=draft):
+                            self.assertEqual(
+                                expected,
+                                merge_gate.enqueue_action(pull) == merge_gate.ENABLE,
+                            )
+
+
+    def test_B2_app_token_write_grants_are_pinned(self) -> None:
+        """The write scopes a workflow mints for a GitHub App token, which `permissions:` does not show.
+
+        The release path mints Contents and Workflows write to push its tags.
+        `auto-enqueue.yml` alone also mints Pull requests write, for the
+        enqueue sweep above: it turns auto-merge on and off and dequeues, and
+        the script scan holds it to that. Its key is read nowhere else, so no
+        other workflow can mint the same token. A new grant is a red test and
+        a conversation, as for the holder list above, and so is a minting step
+        that names no scope, which gets every permission the App holds.
+        """
+        grants = set()
+        key_readers = set()
+        for path, document in _workflow_documents():
+            if "MERGE_QUEUE_APP_PRIVATE_KEY" in path.read_text():
+                key_readers.add(path.name)
+            for job in (document.get("jobs") or {}).values():
+                for step in (job or {}).get("steps") or []:
+                    if "create-github-app-token" not in str(step.get("uses", "")):
+                        continue
+                    scopes = {
+                        str(name): value
+                        for name, value in (step.get("with") or {}).items()
+                        if str(name).startswith("permission-")
+                    }
+                    # No `permission-*` input mints every permission the App holds.
+                    self.assertTrue(scopes, f"{path.name} mints an App token with the App's full permission set")
+                    for name, value in scopes.items():
+                        if value != "read":
+                            grants.add((path.name, name))
+        release = {"permission-contents", "permission-workflows"}
+        expected = {(name, scope) for name in (
+            "rc-create-tag.yml",
+            "rc-tag-validated.yml",
+            "release-publish.yml",
+            "staging-promotion-pipeline.yml",
+        ) for scope in release}
+        expected |= {("auto-enqueue.yml", scope) for scope in release | {"permission-pull-requests"}}
+        self.assertEqual(expected, grants)
+        self.assertEqual({"auto-enqueue.yml"}, key_readers)
 
 
 class B3TheSubstrateIsNotAgentAuthorable(unittest.TestCase):
