@@ -774,8 +774,8 @@ Mutation(
     Mutation(
         "A1-unknown-flag-invites-a-write-retry",
         "agents/platform/scripts/command_policy.py",
-        ("        if words is None and reading_verb is not _NOT_A_WRITE and (\n",
-         "        if False and words is None and reading_verb is not _NOT_A_WRITE and (\n"),
+        ("        if retry_refused:\n",
+         "        if False and retry_refused:\n"),
         "test_A1_a_refusal_invites_no_retry_it_would_refuse",
         "drop the write variant of the unreadable refusal as an edge case -- "
         "an unknown flag on clusters update says re-run without the flag, "

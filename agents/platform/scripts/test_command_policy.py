@@ -2024,7 +2024,7 @@ class NoRetryInvitationForAWriteTest(unittest.TestCase):
             + " For its synopsis only, --help with no other flags is allowed.",
             decision.message,
         )
-        self.assertEqual(("container", "clusters", "update"), decision.verb_tuple)
+        self.assertIsNone(decision.verb_tuple)
         self.assertEqual("--binauthz-evaluation-mode", decision.offending_flag)
         # And the retry it used to invite is refused, which is why it is not invited.
         self.assertFalse(evaluate(self.LIVE[:-1]).allowed)
@@ -2043,8 +2043,26 @@ class NoRetryInvitationForAWriteTest(unittest.TestCase):
     def test_no_help_clause_where_help_is_not_an_escape(self):
         decision = evaluate(["gcloud", "config", "set", "project", "p", "--brand-new-flag=x"])
         self.assertEqual("gcp.unreadable-command", decision.rule_id)
-        self.assertIsNotNone(decision.verb_tuple, "the write variant stopped firing; this test would be vacuous")
+        self.assertTrue(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD),
+                        "the refused-retry variant stopped firing; this test would be vacuous")
         self.assertNotIn("--help", decision.message)
+
+    def test_the_unreadable_variant_names_no_positional(self):
+        # On a two-word surface the third word is the caller's positional; the
+        # variant carries no verb at all, as the flag refusals do not.
+        decision = evaluate(["gcloud", "projects", "delete", "acme-prod", "--new-flag=x"])
+        self.assertTrue(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD))
+        self.assertIsNone(decision.verb_tuple)
+
+    def test_a_bare_gcloud_with_an_unknown_flag_invites_no_refused_retry(self):
+        # The retry, bare `gcloud` or `gcloud beta`, is refused; an answer of
+        # "every reading is refused" must not be lost for having no verb words.
+        for argv in (["gcloud", "--new-flag"], ["gcloud", "beta", "--new-flag"]):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertTrue(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD))
+                self.assertNotIn("Re-run without", decision.message)
+                self.assertFalse(evaluate([a for a in argv if a != "--new-flag"]).allowed)
 
     def test_a_synopsis_request_after_an_unknown_flag_keeps_the_retry(self):
         # Dropping the unknown flag leaves `update x -h`, which the help escape

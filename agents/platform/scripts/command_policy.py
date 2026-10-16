@@ -64,7 +64,9 @@ _ALLOWED = Decision(allowed=True, rule_id="", message="")
 # tool, or another identity (#1945). Two spellings because the refusals come
 # in two shapes: an action refusal means a state change is off-limits, while
 # a flag refusal leaves re-running without the flag as the legitimate retry,
-# and only the flag's effect is off-limits. Every claim is conditional on
+# and only the flag's effect is off-limits -- when that retry would be
+# allowed. When it would not, the flag notice is not used at all (see
+# _STILL_REFUSED and _flag_refusal, #2979). Every claim is conditional on
 # purpose. The read-only fallbacks also fire on unlisted reads -- `kubectl
 # help delete`, `gcloud topic formats`, `cluster-info dump` -- where the
 # permitted outcome is an allowed spelling (`--help` where an escape exists,
@@ -102,6 +104,13 @@ _FLAG_BOUNDARY_NOTICE = (
 # (#2979). So the invitation is made only when the remainder would be allowed,
 # and otherwise the refusal says the command itself is the boundary.
 _STILL_REFUSED = "Without that flag the command is still refused, so do not retry it with the flag removed."
+# The gcloud unreadable refusal's lead when the retry it would invite is
+# refused too. Also how a reading's decision is recognised as that variant,
+# so the variant needs no verb_tuple to mark it.
+_UNREADABLE_WRITE_LEAD = (
+    "gcloud used a flag whose arity is unknown to this module, but the "
+    "command is refused whatever that flag is."
+)
 _KUBECTL_READ_ONLY_MESSAGE = (
     "Agents hold read-only access to Kubernetes. Propose this change "
     "as a pull request instead. "
@@ -1217,15 +1226,12 @@ def _strip_refused_flags(argv: list[str]) -> list[str]:
     return kept
 
 
-def _gcloud_prefix_write(argv: list[str]) -> tuple[str, ...] | None:
-    """The verb a gcloud argv names before an unknown flag, when that is already a write.
+def _gcloud_words_before_unknown_flag(argv: list[str]) -> tuple[list[str], int]:
+    """The words of a gcloud argv up to its first unknown flag, and that flag's index.
 
     Everything before the first unknown flag is parsed with known arity, so
-    those words are the command path as far as it goes. When no entry in
-    GCLOUD_READ_COMMANDS agrees with them (neither a prefix of them nor
-    extending them), no flag or word after them can make the command a read:
-    it is refused as a write whatever follows. Returns the verb, for the
-    structured field only, or None when the words could still be a read.
+    those words are the command path as far as it goes. The index is
+    len(argv) when there is no unknown flag.
     """
     words: list[str] = []
     index = 1
@@ -1242,13 +1248,28 @@ def _gcloud_prefix_write(argv: list[str]) -> tuple[str, ...] | None:
             break
         words.append(token)
         index += 1
+    return words, index
+
+
+def _gcloud_prefix_write(argv: list[str]) -> bool:
+    """Whether the words before a gcloud argv's unknown flag already rule out a read.
+
+    When no entry in GCLOUD_READ_COMMANDS agrees with them (neither a prefix
+    of them nor extending them), no flag or word after them can make the
+    command a read: it is refused whatever follows.
+    """
+    words, _ = _gcloud_words_before_unknown_flag(argv)
     if not words:
-        return None
-    for command in GCLOUD_READ_COMMANDS:
-        shared = min(len(command), len(words))
-        if tuple(words[:shared]) == command[:shared]:
-            return None
-    return _gcloud_verb_tuple(words)
+        return False
+    return not any(
+        tuple(words[:min(len(command), len(words))]) == command[:min(len(command), len(words))]
+        for command in GCLOUD_READ_COMMANDS
+    )
+
+
+def _is_unreadable_write(decision: Decision) -> bool:
+    """Whether a decision is the gcloud unreadable refusal's refused-retry variant."""
+    return decision.rule_id == "gcp.unreadable-command" and decision.message.startswith(_UNREADABLE_WRITE_LEAD)
 
 
 def _still_refused_without_flags(argv: list[str]) -> str | None:
@@ -1272,7 +1293,7 @@ def _still_refused_without_flags(argv: list[str]) -> str | None:
     remainder = evaluate(stripped)
     if remainder.rule_id in (KUBERNETES_READ_ONLY_RULE, "gcp.read-only"):
         return remainder.message
-    if remainder.rule_id == "gcp.unreadable-command" and remainder.verb_tuple is not None:
+    if _is_unreadable_write(remainder):
         return _GCLOUD_READ_ONLY_MESSAGE
     return None
 
@@ -1297,14 +1318,8 @@ def _flag_refusal(argv: list[str], rule_id: str, reason: str, removal: str, flag
     return Decision(allowed=False, rule_id=rule_id, message=" ".join(parts), offending_flag=flag)
 
 
-# _gcloud_unknown_flag_write's answer when a reading of the retry is not a
-# refused write, so the prefix check must not overrule it: `update x --new -h`
-# drops to `update x -h`, a synopsis request the policy allows.
-_NOT_A_WRITE: tuple[str, ...] = ("<not a write>",)
-
-
-def _gcloud_unknown_flag_write(argv: list[str]) -> tuple[str, ...] | None:
-    """The verb, when every flagless retry of an unknown-flag gcloud argv is a refused write.
+def _gcloud_unknown_flag_write(argv: list[str]) -> bool | None:
+    """Whether every flagless retry of an unknown-flag gcloud argv is refused.
 
     The retry the unreadable refusal would invite drops the first unknown
     flag: just its token when the value is attached with `=`, and when it is
@@ -1313,37 +1328,26 @@ def _gcloud_unknown_flag_write(argv: list[str]) -> tuple[str, ...] | None:
     the retry, and the refusal says so instead of inviting it. One level only:
     a reading that is itself unreadable is judged by its prefix
     (_gcloud_prefix_write), so a run of unknown flags costs a fixed amount.
+
+    True when every reading is refused, False when some reading is not (it
+    is allowed, so the retry is worth inviting: `update x --new -h` drops to
+    `update x -h`, a synopsis request), and None when a reading cannot be
+    judged, which leaves the decision to the prefix check.
     """
-    index = 1
-    while index < len(argv):
-        token = argv[index]
-        if token.startswith("-"):
-            name, separator, _ = token.partition("=")
-            if name in _GCLOUD_BOOLEAN_FLAGS:
-                index += 1
-                continue
-            if name in _GCLOUD_FLAGS_WITH_VALUE:
-                index += 1 if separator else 2
-                continue
-            break
-        index += 1
-    else:
+    _, index = _gcloud_words_before_unknown_flag(argv)
+    if index >= len(argv):
         return None
     readings = [argv[:index] + argv[index + 1:]]
     if "=" not in argv[index]:
         readings.append(argv[:index] + argv[index + 2:])
-    verbs = []
+    refused = 0
     for reading in readings:
         decision = _evaluate(reading, readings=False)
-        if decision.rule_id == "gcp.read-only" or (
-            decision.rule_id == "gcp.unreadable-command" and decision.verb_tuple is not None
-        ):
-            verbs.append(decision.verb_tuple or ())
-        elif decision.rule_id == "gcp.unreadable-command":
-            continue  # another unknown flag: judged by the prefix below
-        else:
-            return _NOT_A_WRITE  # a reading is allowed (or refused for a flag): invite it
-    return verbs[0] if verbs and len(verbs) == len(readings) else None
+        if decision.rule_id == "gcp.read-only" or _is_unreadable_write(decision):
+            refused += 1
+        elif decision.rule_id != "gcp.unreadable-command":
+            return False
+    return True if refused == len(readings) else None
 
 
 def evaluate(argv: list[str]) -> Decision:
@@ -1473,28 +1477,32 @@ def _evaluate(argv: list[str], readings: bool = True) -> Decision:
             )
 
         words, unknown_flag = _gcloud_words_and_flag(argv)
-        reading_verb = _gcloud_unknown_flag_write(argv) if (words is None and readings) else None
-        if words is None and reading_verb is not _NOT_A_WRITE and (
-            prefix_verb := reading_verb or _gcloud_prefix_write(argv)
-        ) is not None:
-            # The words before the unknown flag already name a write, so the
-            # retry the message below offers would be refused too (#2979).
+        retry_refused = None
+        if words is None:
+            # The retry the generic refusal below invites would be refused too
+            # (#2979): every flagless reading is refused, or, where a reading
+            # cannot be judged, the words before the flag already rule out a read.
+            from_readings = _gcloud_unknown_flag_write(argv) if readings else None
+            retry_refused = from_readings if from_readings is not None else _gcloud_prefix_write(argv)
+        if retry_refused:
+            prefix_words, _ = _gcloud_words_before_unknown_flag(argv)
             help_clause = (
-                "" if _gcloud_surface(prefix_verb) in _NO_HELP_ESCAPE_SURFACES
+                "" if _gcloud_surface(prefix_words) in _NO_HELP_ESCAPE_SURFACES
                 else " For its synopsis only, --help with no other flags is allowed."
             )
             return Decision(
                 allowed=False,
                 rule_id="gcp.unreadable-command",
                 message=(
-                    "gcloud used a flag whose arity is unknown to this module, but the "
-                    "command is refused whatever that flag is. "
+                    _UNREADABLE_WRITE_LEAD
+                    + " "
                     + _STILL_REFUSED
                     + " "
                     + _GCLOUD_READ_ONLY_MESSAGE
                     + help_clause
                 ),
-                verb_tuple=prefix_verb,
+                # No verb: on a two-word surface the third word would be
+                # the caller's positional (`projects delete acme-prod`).
                 offending_flag=unknown_flag,
             )
         if words is None:
