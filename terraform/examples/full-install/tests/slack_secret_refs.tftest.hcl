@@ -98,7 +98,7 @@ run "slack_with_external_secret_refs_and_no_tokens_passes_check" {
   }
 }
 
-run "slack_key_without_name_is_rejected_by_check" {
+run "slack_key_without_name_is_rejected" {
   command = plan
   variables {
     enable_slack               = true
@@ -107,7 +107,7 @@ run "slack_key_without_name_is_rejected_by_check" {
     slack_bot_token_secret_key = "custom-key"
   }
   expect_failures = [
-    check.slack_secret_keys_require_name,
+    helm_release.kube_agents,
   ]
 }
 

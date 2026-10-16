@@ -7742,7 +7742,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         kubectl_stub = (
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
-            '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
+            '  *"config current-context"*|*"config get-contexts"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
             '  *"get platformagents"*) cat << \'EOF\'\n'
             '{"items": [{"spec": {"integration": {"slack": {\n'
             '  "botTokenSecretRef": {"name": "platform-agent-secrets", "key": "SLACK_BOT_TOKEN"},\n'
@@ -7783,6 +7783,48 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             self.assertNotIn("slack_bot_token_secret_name", tfvars)
             self.assertNotIn("slack_app_token_secret_name", tfvars)
             self.assertIn("TFVAR_BOT_SEC=[]", stdout)
+
+    def test_upgrade_recovered_cr_secret_with_canonical_key_clears_file_key(self):
+        """When the live CR carries an external Secret with a canonical key, an orphaned
+        SLACK_BOT_TOKEN_KEY in install.env is cleared rather than paired with the CR's Secret name."""
+        kubectl_stub = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"config current-context"*|*"config get-contexts"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
+            '  *"get platformagents"*) cat << \'EOF\'\n'
+            '{"items": [{"spec": {"integration": {"slack": {\n'
+            '  "botTokenSecretRef": {"name": "my-slack-secret", "key": "SLACK_BOT_TOKEN"},\n'
+            '  "appTokenSecretRef": {"name": "my-app-secret", "key": "SLACK_APP_TOKEN"}\n'
+            '}}}}]}\n'
+            'EOF\n'
+            ";;\n"
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, self._COORDINATES + "SLACK_ENABLED=true\nSLACK_BOT_TOKEN_KEY=FOO\nSLACK_APP_TOKEN_KEY=BAR\n")
+            tfvars, stdout = self._upgrade_render(path, kubectl_script=kubectl_stub)
+            self.assertIn('slack_bot_token_secret_name = "my-slack-secret"', tfvars)
+            self.assertNotIn("slack_bot_token_secret_key", tfvars)
+            self.assertIn('slack_app_token_secret_name = "my-app-secret"', tfvars)
+            self.assertNotIn("slack_app_token_secret_key", tfvars)
+
+    def test_slack_secret_refs_on_cr_rejects_delimiter_injection(self):
+        """A '|' or newline inside a Slack Secret ref field on the CR fails validation and emits nothing."""
+        script = (
+            'cr_json=\'{"items": [{"spec": {"integration": {"slack": {\n'
+            '  "botTokenSecretRef": {"name": "my-secret", "key": "a|b"},\n'
+            '  "appTokenSecretRef": {"name": "app-secret", "key": "valid-key"}\n'
+            '}}}}]}\'\n'
+            'slack_secret_refs_on_cr "$cr_json"\n'
+        )
+        proc = subprocess.run(
+            ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nsource "{_INSTALLER_COMMON}"\n{script}'],
+            capture_output=True, text=True, cwd=str(_REPO_ROOT),
+            env=get_isolated_test_env(),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
 
     def test_bootstrap_install_env_file_records_slack_secret_refs(self):
         """A first install records SLACK_BOT_TOKEN_SECRET and SLACK_APP_TOKEN_SECRET into install.env (#3275)."""

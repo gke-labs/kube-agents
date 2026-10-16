@@ -671,9 +671,20 @@ slack_secret_ref_is_external() {
 
 # The four Slack Secret ref fields on the PlatformAgent CR in $1 (a `kubectl get -o json` list):
 # "<bot_sec>|<bot_key>|<app_sec>|<app_key>". Delimited by '|' to preserve empty fields.
+# If any field fails Kubernetes Secret name or data key validation (e.g. contains '|'
+# or invalid characters), prints nothing so malformed CR refs cannot shift field delimiters.
 slack_secret_refs_on_cr() {
   printf '%s' "${1:-}" | (trap - ERR; python3 -c '
-import json, sys
+import json, re, sys
+DNS_1123_SUBDOMAIN_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$")
+SECRET_KEY_RE = re.compile(r"^[-._a-zA-Z0-9]+$")
+
+def valid_name(s: str) -> bool:
+    return not s or (len(s) <= 253 and bool(DNS_1123_SUBDOMAIN_RE.match(s)))
+
+def valid_key(s: str) -> bool:
+    return not s or (len(s) <= 253 and bool(SECRET_KEY_RE.match(s)))
+
 items = (json.load(sys.stdin) or {}).get("items") or []
 if items:
     slack = ((items[0].get("spec") or {}).get("integration") or {}).get("slack") or {}
@@ -683,6 +694,8 @@ if items:
     b_key = bot_ref.get("key") or ""
     a_sec = app_ref.get("name") or ""
     a_key = app_ref.get("key") or ""
+    if not (valid_name(b_sec) and valid_key(b_key) and valid_name(a_sec) and valid_key(a_key)):
+        sys.exit(0)
     sys.stdout.write(f"{b_sec}|{b_key}|{a_sec}|{a_key}")
 ' 2>/dev/null) || true
 }
@@ -3769,6 +3782,8 @@ write_tfvars_from_state() {
             print_info "Recovered SLACK_BOT_TOKEN_SECRET='${cr_slack_bot_sec}' from the live PlatformAgent CR."
             if [ -n "$cr_slack_bot_key" ] && [ "$cr_slack_bot_key" != "SLACK_BOT_TOKEN" ]; then
               export SLACK_BOT_TOKEN_KEY="$cr_slack_bot_key"
+            else
+              export SLACK_BOT_TOKEN_KEY=""
             fi
           fi
           if [ -z "${SLACK_APP_TOKEN_SECRET:-}" ] && slack_secret_ref_is_external "$cr_slack_app_sec"; then
@@ -3776,6 +3791,8 @@ write_tfvars_from_state() {
             print_info "Recovered SLACK_APP_TOKEN_SECRET='${cr_slack_app_sec}' from the live PlatformAgent CR."
             if [ -n "$cr_slack_app_key" ] && [ "$cr_slack_app_key" != "SLACK_APP_TOKEN" ]; then
               export SLACK_APP_TOKEN_KEY="$cr_slack_app_key"
+            else
+              export SLACK_APP_TOKEN_KEY=""
             fi
           fi
         fi

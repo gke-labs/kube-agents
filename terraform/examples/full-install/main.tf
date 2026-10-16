@@ -352,15 +352,7 @@ check "slack_tokens_present" {
   }
 }
 
-check "slack_secret_keys_require_name" {
-  assert {
-    condition = (
-      (var.slack_bot_token_secret_key == "" || var.slack_bot_token_secret_name != "") &&
-      (var.slack_app_token_secret_key == "" || var.slack_app_token_secret_name != "")
-    )
-    error_message = "slack_bot_token_secret_key and slack_app_token_secret_key require the corresponding slack_bot_token_secret_name or slack_app_token_secret_name to be set."
-  }
-}
+
 
 # A warning rather than a refusal, for the same reason as slack_tokens_present:
 # an exclusion written before its project joins the scope, or left after it
@@ -1283,6 +1275,17 @@ resource "helm_release" "kube_agents" {
     precondition {
       condition     = !local.extra_helm_values_countermands_detector
       error_message = "enable_drift_detector is true, but extra_helm_values sets platformAgent.harness.driftDetector.enabled to something other than true, and Helm merges that document over the one this composition computes -- so the CR decides against the flag: a null leaf deletes the field and the CRD's default false applies, a false leaf arrives as false. The sink, topic and subscription are provisioned and bill either way, and no detector reads them. Remove the enabled leaf from extra_helm_values -- enable_drift_detector already writes it, and the rest of your driftDetector block is still merged in -- or set it to true."
+    }
+
+    # A key override requires the matching Secret name: without a Secret name,
+    # the key is dropped and the pod reads the default key from the shared
+    # credentials Secret, silently ignoring the key override.
+    precondition {
+      condition = (
+        (var.slack_bot_token_secret_key == "" || var.slack_bot_token_secret_name != "") &&
+        (var.slack_app_token_secret_key == "" || var.slack_app_token_secret_name != "")
+      )
+      error_message = "slack_bot_token_secret_key and slack_app_token_secret_key require the corresponding slack_bot_token_secret_name or slack_app_token_secret_name to be set."
     }
   }
 }
