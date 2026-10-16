@@ -334,27 +334,22 @@ verification_spec:
       # summary line -- the payload's `summary` reaches the chat alert and the
       # ledger row, not the body -- and what the body carries is
       # "- **What:** `delete` via `io.k8s.networking.v1.networkpolicies.delete`",
-      # which matches none of the phrasings below -- "delete" does not contain
-      # "deleted". So this stays a check on the agent's own prose rather than
+      # which matches none of the patterns below -- "delete" carries none of
+      # the suffixes they require. So this stays a check on the agent's own prose rather than
       # on a transcription, and the failure it catches is a report describing
       # a policy that was "changed" or "loosened": every remediation such a
       # report proposes is about editing an object that does not exist.
       #
-      # Four entries, not two, because the matcher does no stemming and these
-      # are the forms a correct report actually reaches for: "was deleted",
-      # "the deletion", "was removed", "its removal". A bare "delet"/"remov"
-      # stem would cover more and would also let the card's own `delete` verb
-      # satisfy the check, which is the one thing this objective is written to
-      # exclude.
-      # Patterns rather than a longer phrase list, because the inflections
-      # that were missing are the participles -- "deleting the policy",
-      # "removing the default-deny" -- and enumerating every form is what
-      # produced two rounds of this finding. The stems carry a suffix
-      # requirement and a word boundary, which keeps the exclusion the phrase
-      # list was protecting: the card's own bare `delete` and
-      # `networkpolicies.delete` match neither, so this still grades the
-      # agent's prose rather than a transcription. any_of_patterns and
-      # any_of_phrases are one pool, so either satisfies the check.
+      # Patterns rather than a phrase list, because the matcher does no
+      # stemming and the inflections a phrase list kept missing are the
+      # participles -- "deleting the policy", "removing the default-deny" --
+      # and enumerating every form is what produced two rounds of this
+      # finding. The stems carry a suffix requirement and a word boundary,
+      # which keeps the exclusion a phrase list was protecting: the card's own
+      # bare `delete` and `networkpolicies.delete` match neither, so this
+      # still grades the agent's prose rather than a transcription.
+      # any_of_patterns and any_of_phrases are one pool, so either satisfies
+      # the check.
       any_of_patterns:
         [
           "\\bdelet(?:ed|ion|ing)\\b",

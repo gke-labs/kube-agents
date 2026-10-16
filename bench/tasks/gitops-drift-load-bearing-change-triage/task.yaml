@@ -21,8 +21,8 @@
 # anything. A mistaken "revert" here, if a human follows it, takes the service
 # down. A mistaken "codify" on the sibling leaves a setting loose for longer.
 #
-# THIS CASE IS RED, AND #3116 OWNS THE RED. Two runs against a dev install on
-# 2026-10-15 passed all eight checks below and failed the judge: the agent
+# THIS CASE IS RED, AND #3116 OWNS THE RED. Runs against a dev install on
+# 2026-10-15 passed every deterministic check below and failed the judge: the agent
 # reported every fact correctly and then recommended restoring a state the
 # cluster had already failed to start, without ever reading the rollout
 # history that says so. That issue proposes the Cluster Agent skill, and
@@ -441,9 +441,12 @@ verification_spec:
   # READ THIS CASE'S RECORD WITH THAT IN MIND. The consequence is sharp and was
   # measured on 2026-10-15: a run in which the agent recommended reverting --
   # restoring a state the cluster had already failed to start three times, so
-  # advice that takes the workload down if followed -- passed ALL EIGHT checks
-  # below and failed only the judge (OutcomeValidity 0.5, the recommendation
-  # bullet 0.4 with every other bullet green). The checks grade the facts; the
+  # advice that takes the workload down if followed -- passed EVERY
+  # DETERMINISTIC CHECK below and failed only the judge (OutcomeValidity 0.5,
+  # the recommendation bullet 0.4 with every other bullet green). A count is
+  # deliberately not written here: it goes stale the moment a safeguard is
+  # added, as it did when triage-did-not-change-the-uid arrived. The checks
+  # grade the facts; the
   # judged score is the only thing grading the judgement. A green check tally
   # on this case means the report named the right workload, field, manager and
   # principal and left the cluster alone. It does not mean the advice was safe.
