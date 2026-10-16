@@ -147,6 +147,69 @@ class SharedStateGateTest(unittest.TestCase):
                 f"scratch/ is {oct(mode & 0o777)}: the sidecar reaches it only "
                 "through the group bits",
             )
+            npm_cache = home / ".npm-cache"
+            self.assertTrue(npm_cache.is_dir(), "the setup must create .npm-cache/ (#3325)")
+
+    def test_entrypoint_exports_npm_config_cache(self):
+        """Line 28: the entrypoint exports NPM_CONFIG_CACHE derived from TARGET_DIR (#3325)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp) / "data"
+            proc = subprocess.run(
+                ["sh", str(_ENTRYPOINT), "env"],
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "PLATFORM_AGENT_HOME": str(home),
+                    "AGENT_SHARED_STATE_WAIT_SECS": "0",
+                },
+                timeout=60,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(f"NPM_CONFIG_CACHE={home}/.npm-cache", proc.stdout.splitlines())
+
+    def test_step_2_6c_invokes_profile_scaffold_link_shared(self):
+        """Step 2.6c: container start runs profile_scaffold.py --link-shared (#3325)."""
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        starts = [i for i, line in enumerate(lines) if "2.6c" in line and "Link" in line]
+        self.assertEqual(len(starts), 1, "expected exactly one step 2.6c comment")
+        block_start = next(i for i in range(starts[0], len(lines)) if lines[i].startswith('if [ -d "$TARGET_DIR/profiles" ]'))
+        block_end = next(i for i in range(block_start, len(lines)) if lines[i] == "fi")
+        block = "\n".join(lines[block_start : block_end + 1])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            profiles_dir = root / "data" / "profiles"
+            profiles_dir.mkdir(parents=True)
+            log = root / "scaffold.log"
+            scaffold = root / "scaffold.py"
+            scaffold.write_text(
+                f'#!/bin/sh\necho "$@" >> "{log}"\n',
+                encoding="utf-8",
+            )
+            scaffold.chmod(0o755)
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            py = venv / "python3"
+            py.write_text(f'#!/bin/sh\nexec "$@"\n', encoding="utf-8")
+            py.chmod(0o755)
+
+            proc = subprocess.run(
+                ["sh", "-c", "set -e\n" + block],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "TARGET_DIR": str(root / "data"),
+                    "INSTALL_DIR": str(root / "install"),
+                    "SCAFFOLD": str(scaffold),
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue(log.is_file(), "step 2.6c must execute SCAFFOLD helper")
+            invocations = log.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(any("--link-shared" in inv for inv in invocations), f"expected --link-shared in invocations: {invocations}")
 
     def test_dashboard_sidecar_skips_the_setup(self):
         proc, ran_setup = self._run(["hermes", "dashboard"])

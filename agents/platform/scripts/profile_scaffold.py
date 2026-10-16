@@ -198,11 +198,9 @@ def link_shared_profile_resources(home: Path, hermes_home: Path) -> None:
         candidates = []
         if env_tirith := os.environ.get("TIRITH_BIN"):
             candidates.append(Path(env_tirith))
-        if TIRITH_SYSTEM_BIN:
-            candidates.append(TIRITH_SYSTEM_BIN)
+        candidates.append(TIRITH_SYSTEM_BIN)
         candidates.append(Path(hermes_home) / "bin" / "tirith")
-        if TIRITH_OPT_DATA_BIN:
-            candidates.append(TIRITH_OPT_DATA_BIN)
+        candidates.append(TIRITH_OPT_DATA_BIN)
         for target in candidates:
             if target.is_file() and os.access(target, os.X_OK):
                 try:
@@ -582,7 +580,7 @@ def main() -> None:
     group.add_argument(
         "--link-shared",
         action="store_true",
-        help="Link shared Tirith binary and npm cache into all profiles under $HERMES_HOME/profiles.",
+        help="Link shared Tirith binary and npm cache into registered profiles under $HERMES_HOME/profiles.",
     )
     ap.add_argument("--template", default="", help="Baked template dir to overlay onto the profile home.")
     ap.add_argument("--description", default="", help="Profile description (surfaced in discovery).")

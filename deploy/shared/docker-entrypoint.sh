@@ -1266,8 +1266,9 @@ if [ -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -d "$PLATFORM_TEMPLA
         >/dev/null || echo "WARN: platform profile force-sync failed; continuing" >&2
 fi
 
-# 2.6c Link shared binaries and caches for existing unscaffolded or never-run profiles (#3325).
-# Profiles already containing standalone binaries or npm caches are skipped to avoid clobbering.
+# 2.6c Link the shared Tirith binary and npm cache into registered profiles that have never run (#3325).
+# Only homes carrying profile.yaml are visited — a bare mount skeleton must stay empty for
+# _clear_mount_skeleton — and a profile already holding its own bin/tirith or home/.npm is left as it is.
 if [ -d "$TARGET_DIR/profiles" ] && [ -f "$SCAFFOLD" ]; then
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
         "$SCAFFOLD" --link-shared || echo "WARN: link-shared profile resources failed; continuing" >&2
