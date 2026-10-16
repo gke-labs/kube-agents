@@ -73,6 +73,7 @@ FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
     "Security Scanning",
     # pull_request_target automations, not checks on the tree.
     "Auto Assign Milestone on Merge",
+    "Auto Enqueue",
     "Hold Unresolved Threads",
     "Merge Gate",
     "Risk Classification",

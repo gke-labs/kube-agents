@@ -699,6 +699,42 @@ Mutation(
         "workflow that runs on every pull_request",
     ),
     Mutation(
+        "B2-script-merge",
+        "scripts/hold_unresolved_threads.py",
+        ('LABEL = "do-not-merge"\n',
+         'LABEL = "do-not-merge"\n'
+         'MERGE = "mutation($id: ID!) { mergePullRequest(input: {pullRequestId: $id}) { clientMutationId } }"\n'),
+        "test_B2_no_script_merges_except_the_enqueue_sweep",
+        "have the threads sweep merge a pull request once its threads resolve. "
+        "The call lives in a script the workflow-text scan never reads",
+    ),
+    Mutation(
+        "B2-enqueue-predicate-ignores-holds",
+        "scripts/merge_gate.py",
+        ('wanted = not pull["draft"] and labels_verdict(pull["labels"])[0] == SUCCESS',
+         'wanted = not pull["draft"] and {"lgtm", "approved"} <= pull["labels"]'),
+        "test_B2_the_enqueue_sweep_assents_only_on_both_human_labels",
+        "simplify the enqueue test to the two labels it wants, dropping the "
+        "do-not-merge check, so a held pull request is enqueued anyway",
+    ),
+    Mutation(
+        "B2-app-token-grants-pull-requests",
+        ".github/workflows/rc-create-tag.yml",
+        ("          permission-contents: write\n",
+         "          permission-contents: write\n          permission-pull-requests: write\n"),
+        "test_B2_app_token_write_grants_are_pinned",
+        "let the release bot token also write pull requests, a grant no "
+        "permissions: block shows",
+    ),
+    Mutation(
+        "B2-app-token-scopes-dropped",
+        ".github/workflows/rc-create-tag.yml",
+        ("          permission-contents: write\n          permission-workflows: write\n", ""),
+        "test_B2_app_token_write_grants_are_pinned",
+        "drop the scope inputs from the release bot's minting step, which "
+        "mints the App's full permission set instead",
+    ),
+    Mutation(
         "B3-apply-read-verb",
         "agents/platform/scripts/command_policy.py",
         ('        ("get",),\n', '        ("apply",),\n        ("get",),\n'),

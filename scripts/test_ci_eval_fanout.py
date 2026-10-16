@@ -773,6 +773,8 @@ class StateLockTest(unittest.TestCase):
         body = "\n".join(
             [
                 lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+                lifted_constant("EVAL_GATEWAY_GONE_RC"),
+                lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),

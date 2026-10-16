@@ -115,6 +115,41 @@ class ExplicitTargetTest(unittest.TestCase):
         self.assertEqual(len(result["members"]), 1)
         return result["members"][0]
 
+
+    def test_a_cluster_the_scope_excludes_is_not_a_member(self):
+        # #3081: an agent-run report (collector_args carry the exclusion) leaves
+        # an excluded cluster out; live run 2026-10-15 answered a fleet question
+        # through this script and listed every excluded cluster.
+        report.declared_scope.set("p1", None, "p1/us-central1/lane-b")
+        self.addCleanup(report.declared_scope.set, None, None)
+        pools = [("default-pool", "1.30.5-gke.100")]
+        with patch("sys.stderr"):
+            result = self._run([cluster("ka-today", "us-central1", "1.30.5-gke.100", pools),
+                                cluster("lane-b", "us-central1", "1.30.5-gke.100", pools)])
+        self.assertEqual([m["cluster"] for m in result["members"]], ["ka-today"])
+
+    def test_a_cluster_spec_naming_an_excluded_cluster_says_excluded_not_unmatched(self):
+        report.declared_scope.set("p1", None, "p1/us-central1/lane-b")
+        self.addCleanup(report.declared_scope.set, None, None)
+        pools = [("default-pool", "1.30.5-gke.100")]
+        fake = FakeGcloud({"p1": [cluster("ka-today", "us-central1", "1.30.5-gke.100", pools),
+                                  cluster("lane-b", "us-central1", "1.30.5-gke.100", pools)]}, {})
+        with patch.object(report, "run_cmd", fake), patch("sys.stderr"):
+            result = report.build_report(["p1"], self.TARGET, clusters=["lane-b"])
+        self.assertEqual(result["members"], [])
+        self.assertEqual([e["message"] for e in result["errors"]],
+                         [report.EXCLUDED_CLUSTER_SPEC.format(spec="lane-b", clusters="p1/us-central1/lane-b")])
+
+    def test_without_the_exclusion_flag_every_cluster_is_a_member(self):
+        # The readiness watch passes --project flags and no exclusion: its
+        # report covers excluded clusters, the documented exception (#3026).
+        report.declared_scope.set("p1", None)
+        self.addCleanup(report.declared_scope.set, None, None)
+        pools = [("default-pool", "1.30.5-gke.100")]
+        result = self._run([cluster("ka-today", "us-central1", "1.30.5-gke.100", pools),
+                            cluster("lane-b", "us-central1", "1.30.5-gke.100", pools)])
+        self.assertEqual(sorted(m["cluster"] for m in result["members"]), ["ka-today", "lane-b"])
+
     def test_lagging_control_plane(self):
         m = self._member([cluster("a", "us-central1", "1.30.5-gke.1355000", [("default-pool", "1.30.5-gke.1355000")])])
         self.assertEqual(m["status"], report.STATUS_LAGGING)
@@ -1429,11 +1464,11 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(errors, [])
 
     def test_main_hands_the_flags_to_the_resolver(self):
-        # The wiring the SOP relies on: the two flags main parses reach the
+        # The wiring the SOP relies on: the three flags main parses reach the
         # holder the resolver reads, before anything else runs.
         with mock.patch.object(report.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
-            report.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
-        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+            report.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied", "--scope-exclude-clusters", "ops-mgmt/us-central1/lane-b"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied", "ops-mgmt/us-central1/lane-b")
 
     def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
         # `--scope-unread` alone (what collector_args carries when no declared
