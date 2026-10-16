@@ -7648,6 +7648,7 @@ main() {
     fi
     print_success "Dry-run execution complete! Configuration generated without touching cloud resources."
     write_json_report "DRY_RUN_SUCCESS"
+    print_next_home_channel_unset_summary flags
     exit 0
   fi
 
