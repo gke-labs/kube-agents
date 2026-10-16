@@ -75,6 +75,7 @@ COMPLETE_REFUSAL = (
     "        # kube-agents patch: never another run's failure (#2947).\n"
     '        _check(ok, "" if ok else (\n'
     "            _kanban_ended_run_refusal(tid, conn) or\n"
+    "            _kanban_waiting_parent_refusal(tid, conn) or\n"
     "            _kanban_current_run_failure(tid, conn) or\n"
     '            f"could not complete {tid} (unknown id, stale run, or already terminal)"))\n',
 )
@@ -96,6 +97,7 @@ TOOLS_TRAILER = (
     "    current_run_failure as _kanban_current_run_failure,\n"
     "    ended_run_refusal as _kanban_ended_run_refusal,\n"
     "    refuse_ended_run as _kanban_refuse_ended_run,\n"
+    "    waiting_parent_refusal as _kanban_waiting_parent_refusal,\n"
     ")\n"
 )
 

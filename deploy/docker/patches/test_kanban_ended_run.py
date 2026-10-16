@@ -285,6 +285,63 @@ class TestCurrentRunFailure(unittest.TestCase):
         self.assertIsNone(ker.current_run_failure(TID, self.conn))
 
 
+class TestWaitingParentRefusal(unittest.TestCase):
+    """#3252: a parent linked onto a running card mid-run."""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.executescript(
+            "CREATE TABLE tasks (id TEXT, status TEXT, current_run_id INTEGER);"
+            "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);")
+        self.conn.execute("INSERT INTO tasks VALUES (?, 'running', 2)", (TID,))
+        self.conn.execute("INSERT INTO tasks VALUES ('t_parent', 'running', 5)")
+        env = mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": TID, "HERMES_KANBAN_RUN_ID": "2"})
+        env.start()
+        self.addCleanup(env.stop)
+        latch = mock.patch.object(ker, "_LATCHED", None)
+        latch.start()
+        self.addCleanup(latch.stop)
+
+    def link(self):
+        self.conn.execute("INSERT INTO task_links VALUES ('t_parent', ?)", (TID,))
+
+    def test_a_running_card_with_a_linked_unfinished_parent_gets_the_answer(self):
+        self.link()
+        text = ker.waiting_parent_refusal(TID, self.conn)
+        self.assertIn("now waits on t_parent", text)
+        self.assertIn("kanban_comment", text)
+        self.assertNotIn("stale run", text)
+
+    def test_the_answer_is_latched(self):
+        self.link()
+        first = ker.waiting_parent_refusal(TID, self.conn)
+        self.conn.execute("DELETE FROM task_links")
+        self.assertEqual(ker.waiting_parent_refusal(TID, self.conn), first)
+        self.assertEqual(ker.refuse_ended_run(TID, TestEndedRunRefusal.fail_connect), first)
+
+    def test_no_parent_is_no_answer(self):
+        self.assertIsNone(ker.waiting_parent_refusal(TID, self.conn))
+
+    def test_a_finished_parent_is_no_answer(self):
+        self.link()
+        self.conn.execute("UPDATE tasks SET status = 'done' WHERE id = 't_parent'")
+        self.assertIsNone(ker.waiting_parent_refusal(TID, self.conn))
+
+    def test_another_run_is_left_to_the_ended_run_answer(self):
+        self.link()
+        self.conn.execute("UPDATE tasks SET current_run_id = 3 WHERE id = ?", (TID,))
+        self.assertIsNone(ker.waiting_parent_refusal(TID, self.conn))
+
+    def test_not_a_dispatcher_worker_is_no_answer(self):
+        self.link()
+        os.environ.pop("HERMES_KANBAN_RUN_ID")
+        self.assertIsNone(ker.waiting_parent_refusal(TID, self.conn))
+
+    def test_an_unreadable_board_fails_open(self):
+        self.conn.execute("DROP TABLE task_links")
+        self.assertIsNone(ker.waiting_parent_refusal(TID, self.conn))
+
+
 class TestTheApplier(unittest.TestCase):
     TOOLS = (
         "def _handle_complete(args, **kw):\n"
@@ -326,6 +383,7 @@ class TestTheApplier(unittest.TestCase):
         self.assertLess(out.index("_kanban_refuse_ended_run("), out.index("_require_children_settled("))
         self.assertEqual(out.count("_kanban_ended_run_refusal(tid, conn) or"), 2)
         self.assertEqual(out.count("_kanban_current_run_failure(tid, conn) or"), 1)
+        self.assertEqual(out.count("_kanban_waiting_parent_refusal(tid, conn) or"), 1)
         # The lookup latches, so it must only run on a refusal.
         self.assertEqual(out.count('_check(ok, "" if ok else ('), 2)
         db = self.db.read_text()

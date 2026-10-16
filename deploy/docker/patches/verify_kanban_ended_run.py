@@ -21,6 +21,10 @@ patched ``block_task`` and tool handlers, with real worker processes:
   ``kanban_block``) gets the same answer without opening the board, even
   with the card put back as if the run were current.
 
+- a parent linked onto a running card mid-run gets the card's
+  ``kanban_complete`` a plain answer that it now waits on that parent, not
+  upstream's "stale run" (#3252).
+
 Before the patch the blocked card's worker keeps running, and its
 ``kanban_complete`` is told "If the prior run already did the work, verify it
 and report the result via kanban_complete".
@@ -189,6 +193,24 @@ try:
     check("the board's refusal says the run is over", "no longer yours to finish" in err, err)
     check("and none of the earlier run's failure", "protocol violation" not in err, err)
     kt._kanban_refuse_ended_run = gate
+    ker._LATCHED = None
+
+    print("a parent linked onto a running card mid-run (#3252):")
+    linked = tool_create("Check web-7 logs")
+    linked_run, _ = start_run(linked)
+    gate_parent = tool_create("Rotate the web-7 credentials first")
+    as_operator()
+    K.link_tasks(conn, gate_parent, linked)
+    linked_row = tuple(conn.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (linked,)).fetchone())
+    check("the linked card is still running on its run", linked_row == ("running", linked_run), str(linked_row))
+    as_worker(linked, linked_run)
+    out = json.loads(kt._handle_complete({"summary": "done", "result": "web-7 is fine."}))
+    err = out.get("error", "")
+    check("kanban_complete is refused saying the card now waits on its new parent",
+          f"now waits on {gate_parent}" in err and "kanban_comment" in err, err)
+    check("not with upstream's stale-run reason", "stale run" not in err, err)
+    again = json.loads(kt._handle_complete({"summary": "done", "result": "web-7 is fine."}))
+    check("and the answer holds on a retry", again.get("error") == err, str(again))
     ker._LATCHED = None
 
     print("the stopped run's handoffs:")

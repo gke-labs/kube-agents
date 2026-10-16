@@ -71,6 +71,14 @@ What this changes
    (this run's PR-acceptance refusal, the one reason upstream writes there for
    the run in progress) or upstream's generic reason.
 
+4. :func:`waiting_parent_refusal` covers a run that is still current but
+   whose card gained an unfinished parent mid-run (``link_tasks`` leaves a
+   running child running), so ``complete_task`` refuses on
+   ``_parents_satisfied``. The worker is told the card now waits on that
+   parent, to save its result with ``kanban_comment`` and end its turn,
+   latched the same way (#3252). The ``kanban_link`` guard (#3248) refuses
+   such a link from an agent; this covers one from the CLI or the dashboard.
+
 Known windows, each caught by item 2 rather than a stop: a new run claiming
 the card between the outside block's read and its write is blocked unpinned
 and its worker isn't stopped, and a block that lands after a claim but before
@@ -181,6 +189,55 @@ def current_run_failure(task_id: str, conn: Any) -> Optional[str]:
     except ValueError:
         return None
     return row[1] if isinstance(receipt, dict) and receipt.get("ok") is False else None
+
+
+def waiting_parent_text(task_id: str, parent_id: str) -> str:
+    """The terminal answer for a current run whose card gained a parent."""
+    return (
+        f"Card {task_id} now waits on {parent_id}, which was linked as its parent "
+        f"after your run started, so it can't be completed yet. Save your result "
+        f"with kanban_comment so it isn't lost, then end your turn. Don't call "
+        f"kanban_complete or kanban_block again."
+    )
+
+
+def waiting_parent_refusal(task_id: str, conn: Any) -> Optional[str]:
+    """The terminal answer if this worker's run is current but its card now
+    has an unfinished parent, else None. Latches like :func:`ended_run_refusal`.
+
+    ``link_tasks`` leaves a running child running on its run, so a parent
+    linked mid-run (from the CLI or the dashboard; the kanban_link guard
+    refuses it from an agent) makes ``complete_task`` refuse on
+    ``_parents_satisfied`` while the run is still current. Upstream's reason
+    is the generic "unknown id, stale run, or already terminal", which
+    invites a retry (#3252).
+    """
+    global _LATCHED
+    if _LATCHED is not None:
+        return _LATCHED
+    run_id = _own_run_id(task_id)
+    if run_id is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT t.status, t.current_run_id, ("
+            "  SELECT l.parent_id FROM task_links l JOIN tasks p ON p.id = l.parent_id"
+            "  WHERE l.child_id = t.id AND p.status NOT IN ('done', 'archived')"
+            "  ORDER BY l.parent_id LIMIT 1)"
+            " FROM tasks t WHERE t.id = ?",
+            (task_id,),
+        ).fetchone()
+    except Exception as exc:
+        logger.warning("kanban_ended_run: could not read %s: %s", task_id, exc)
+        return None
+    if row is None or row[0] != "running" or row[1] != run_id or not row[2]:
+        return None
+    _LATCHED = waiting_parent_text(task_id, row[2])
+    logger.warning(
+        "kanban_ended_run: run %s on %s waits on parent %s linked mid-run; "
+        "refusing its handoffs from now on", run_id, task_id, row[2],
+    )
+    return _LATCHED
 
 
 def refuse_ended_run(task_id: str, connect: Callable[[], Any]) -> Optional[str]:
