@@ -122,15 +122,12 @@ answered with the whole report. Under a fallback headline, that reply is the onl
 way to what the report said beyond its line, such as lines above it or the link
 targets the bold line drops.
 
-A fleet-audit report that ends with no ledger link and opens a "What's wrong" section
-(the Platform Agent's three sections, as a `##` heading or a bold label) is a run that
-could not write its ledger, most often because no GitOps repository is registered. With
-the flag on, its Slack leg posts that section's first sentence alone, as the agent wrote
-it (`slack_audit_report.failed_line`), and the incident row still stores the whole report
-for a reply in the thread. Under `spec.mode: next`, where a reply does not bring the
-report back, the line goes to the gateway as a chat message with the whole report folded
-under it (`slack_audit_report.failed_chat`), and the leg posts the report whole when that
-message did not post. A truncated report, or one with no such section, posts unchanged.
+`_failed_audit_line` posts the first sentence of a report's "What's wrong" section
+(`slack_audit_report.failed_line`, or `failed_chat` under `spec.mode: next`) for a report
+that ends with no ledger link, and only for a job that runs the fleet-audit skill. Such a
+job's report is what its `finish` rendered or a notice that it did not finish
+([A fleet-audit report comes from `finish`](#a-fleet-audit-report-comes-from-finish-not-the-final-message)),
+and neither has that section, so the line is never posted.
 
 Every other report (Google Chat, one that does not end with
 a managed-repository issue link and is not such a failed run, a job the scheduler already delivered to Slack
@@ -202,6 +199,58 @@ in practice and for what it did not provide:
 
 Platform formatting was never the turn's either: the instructions told it to keep
 the report's markdown, and the adapters render it for each platform on the send.
+
+## A fleet-audit report comes from `finish`, not the final message
+
+Posting the final message as written leaves one gap the turn used to close by
+accident: the final message is the model's whole last turn. On 2026-10-15 a
+`compliance-audit` report arrived after several paragraphs of the model
+reasoning over `finish`'s line and quoting its own instructions (#3217). The turn
+had rewritten that away; posting as written does not.
+
+So for a job that runs the fleet-audit skill, the relay does not post the final
+message at all. The run keeps a record in `chat_report_<audit>.json` in its
+scratch directory, with one entry per repository it starts. `start` adds the
+repository's entry, and `audit_report.py finish` fills it with the chat report
+it renders from its own line and the findings document (`render_chat_report`;
+`summary` on a no-forge run). An SOP that walks several repositories runs
+`start` and `finish` once for each, so a record whose last step is within two
+hours (the stream lease, which covers one step) and that has not started this
+repository yet is the same run; any other `start` opens a new record. The relay
+reads the record, over the gateway's sandbox login where the shell runs in the
+shell sandbox (`sandbox_exec.read_bytes`).
+
+The relay posts the finished repositories' reports as one message, followed by
+a line naming each repository the run started and did not finish. It posts each
+run once: the run it last posted per job is kept in `audit_report_runs`. A
+record with no finished repository, one already posted, or one whose last step
+is older than two hours means the run did not reach `finish`, and the relay
+posts a one-line notice that the job did not finish in place of whatever the
+scheduler delivered, a final message or its failure summary. A read of the file
+that fails, rather than finding none, posts a second notice naming the failure,
+and leaves the run unposted. `[SILENT]` is unchanged: the scheduler drops a
+silent run before delivery. The substitution is keyed on the job, not the
+caller, so a mid-run `report_to_chat` from a fleet-audit job is replaced the
+same way; no fleet-audit SOP calls it.
+
+Each report ends with a `Ledger: <url>` line, which the Slack headline reads. On
+a stream that walks several repositories the headline is built from the last
+report's ledger, and the earlier repositories' lines reach the thread's stored
+report but not the card. The line naming unfinished repositories goes last, so
+a message that carries it does not end with a ledger link and Slack posts it
+whole, with no card.
+
+The match is by job id, because Hermes hands the relay no run id, and four
+cases fall outside it. A repository whose `start` was refused, or never run,
+has no entry, so nothing names it. A cron run that dies before `start` within
+two hours of the last step of a run whose report was never posted (an on-demand run, or a silent
+one the scheduler dropped) posts that run's report. A run of another repository
+within two hours of an earlier run's last step joins that earlier record, as
+does a run whose first repository is one an earlier run started and left
+unfinished; when the earlier run was already posted, the relay posts the
+not-finished notice. A
+runtime job that runs fleet-audit under an id that is not a stream id finds no
+file and posts the notice.
 
 ## Which key the loopback call presents
 
@@ -567,13 +616,14 @@ time delivery is reached. `run_one_job` applies the `[SILENT]` check and, on a
 failed run, substitutes `_summarize_cron_failure_for_delivery(job, error)` —
 both _before_ calling `_deliver_result`. So a `deliver: "chat"` job inherits
 silence-on-nothing-to-report and audible failures without asking the model for
-either. One case the scheduler's check misses: it matches the bare marker only,
+either. For a fleet-audit job the relay posts its not-finished notice in place of
+that failure summary, as it does in place of any final message. One case the scheduler's check misses: it matches the bare marker only,
 and a run that emphasised it (`**[SILENT]**`, where the SOP asked for the bare
 marker as the whole response) reached both senders. The adapter therefore
 carries its own `is_silent_report`, which undresses the marker before testing,
 and the Slack sender imports the same predicate so the two ends agree. The
-scheduler's direct Google Chat leg, which the two roster jobs on `"all"` still
-use, is upstream's sender and carries no such guard.
+scheduler's direct Google Chat leg, which a job on `"all"` uses, is upstream's
+sender and carries no such guard; no roster job uses `"all"`.
 
 ## How the switch is wired: `chat` is a platform
 
@@ -640,7 +690,7 @@ every one of them is visible to a job author:
   on an install where the child can address every enabled platform, a job on
   `all` still posts twice; the subtraction bites only where the child could
   address a strict subset. That is why every report-producing job on the
-  Platform Agent roster names `"chat"` except the two the roster README names:
+  Platform Agent roster names `"chat"`:
   the `deliver` token itself remains additive, and `"chat"` is the only way to
   ask for one relayed copy without depending on a subtraction that is designed
   to give up rather than risk silence.

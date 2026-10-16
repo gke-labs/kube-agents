@@ -1,0 +1,153 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The ``audit_chat_report_posted`` verdict, and the reads behind it.
+
+The gateway read runs under ``sh`` with this interpreter standing in for the
+agent's, against a state file, a Session KV store and a cron output directory in
+a temporary directory.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import sqlite3
+import subprocess
+import sys
+import tomllib
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import yaml
+
+from kube_agents_bench import audit_chat_report as acr
+
+REPO = Path(__file__).resolve().parents[2]
+TASK = REPO / "bench" / "tasks" / "fleet-audit-chat-report-is-the-report" / "task.yaml"
+FIRED = datetime(2026, 10, 15, 18, 0, 0, tzinfo=timezone.utc)
+REPORT = "Security & RBAC Posture Audit: 0 new, 3 resolved; 2 findings (0 critical) across 4 cluster(s).\nhttps://github.com/acme/fleet/issues/3"
+NOTES = "silent_ok is false (resolved: 3).\nLet's format the final response!## Security & RBAC Posture Audit"
+
+
+def gateway(posted, ended=True, response="report", delivery_error=None, threads=1):
+    state = {"job_id": "compliance-audit", "fired_at": FIRED.isoformat()}
+    if ended:
+        state.update(last_run_at=(FIRED + timedelta(minutes=20)).isoformat(), last_delivery_error=delivery_error)
+    return {"state": state, "posted": posted, "threads": threads, "response": response}
+
+
+def record(parts, started=FIRED + timedelta(minutes=1)):
+    return {"run": "r1", "started_at": started.timestamp(), "parts": [{"repo": "acme/fleet", "text": t} for t in parts]}
+
+
+def test_the_report_finish_rendered_passes():
+    status, _ = acr.verdict(gateway([REPORT]), record([REPORT]))
+    assert status == "pass"
+
+
+def test_every_repositorys_part_is_one_post():
+    status, _ = acr.verdict(gateway(["a\n\nb"]), record(["a", "b"]))
+    assert status == "pass"
+
+
+def test_a_repository_that_did_not_finish_fails():
+    rec = record([REPORT])
+    rec["parts"].append({"repo": "acme/other", "text": None})
+    status, reason = acr.verdict(gateway([REPORT]), rec)
+    assert status == "fail"
+    assert "acme/other" in reason
+
+
+def test_the_final_message_with_notes_fails():
+    status, reason = acr.verdict(gateway([NOTES]), record([REPORT]))
+    assert status == "fail"
+    assert "not the report finish rendered" in reason
+
+
+def test_no_report_from_finish_is_the_red_on_an_image_that_posts_the_final_message():
+    status, reason = acr.verdict(gateway([NOTES]), None)
+    assert status == "fail"
+    assert "left no report from finish" in reason
+
+
+def test_an_earlier_runs_report_does_not_count():
+    status, _ = acr.verdict(gateway([REPORT]), record([REPORT], started=FIRED - timedelta(hours=1)))
+    assert status == "fail"
+
+
+def test_a_silent_run_is_an_error():
+    status, _ = acr.verdict(gateway([], response="**[SILENT]**\n"), record([]))
+    assert status == "error"
+
+
+def test_a_run_that_has_not_ended_is_an_error():
+    status, _ = acr.verdict(gateway([], ended=False), None)
+    assert status == "error"
+
+
+def test_a_failed_delivery_fails_with_its_error():
+    status, reason = acr.verdict(gateway([], delivery_error="chat relay answered HTTP 502"), record([REPORT]))
+    assert status == "fail"
+    assert "HTTP 502" in reason
+
+
+def test_no_thread_is_an_error():
+    status, _ = acr.verdict(gateway([], threads=0), record([REPORT]))
+    assert status == "error"
+
+
+def test_the_gateway_read_returns_the_rows_and_the_response(tmp_path):
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"job_id": "compliance-audit", "fired_at": FIRED.isoformat()}))
+    db = tmp_path / "kv.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE session_metadata (session_id TEXT, metadata TEXT)")
+        conn.execute("CREATE TABLE incidents (chat_id TEXT, thread_id TEXT, report TEXT, created_at TIMESTAMP)")
+        conn.execute(
+            "INSERT INTO session_metadata VALUES (?, ?)",
+            ("cron-platform-compliance-audit-2026-10-15",
+             json.dumps({"platform_threads": {"google_chat": {"chat_id": "spaces/S", "thread_id": "T"}}})),
+        )
+        conn.execute("INSERT INTO incidents VALUES ('spaces/S', 'T', 'old', '2026-10-15 17:00:00')")
+        conn.execute("INSERT INTO incidents VALUES ('spaces/S', 'T', ?, '2026-10-15 18:20:00')", (REPORT,))
+    output = tmp_path / "output" / "compliance-audit"
+    output.mkdir(parents=True)
+    run = output / "2026-10-15_18-20-00.md"
+    run.write_text("# Cron Job\n\n## Prompt\n\nx\n\n## Response\n\n" + REPORT)
+    os.utime(run, (FIRED.timestamp() + 60, FIRED.timestamp() + 60))
+    script = acr._GATEWAY_SCRIPT
+    args = [str(state), str(db), "platform", str(tmp_path / "output"), acr.GATEWAY_READ]
+    out = subprocess.run(
+        ["sh", "-c", f"{shlex.quote(sys.executable)} -c {shlex.quote(script)} " + " ".join(shlex.quote(a) for a in args)],
+        capture_output=True, text=True, check=True, env={**os.environ, "SESSION_KV_DB_PATH": ""},
+    ).stdout
+    read = acr.read_gateway(lambda command, timeout: out, 1)
+    assert read["posted"] == [REPORT]
+    assert read["response"].strip() == REPORT
+
+
+def test_the_sandbox_read_tells_absent_from_unreadable():
+    assert acr.read_chat_report(lambda c, t: acr.SANDBOX_ABSENT, "compliance-audit", 1) == (True, None)
+    assert acr.read_chat_report(lambda c, t: "", "compliance-audit", 1) == (False, None)
+    body = json.dumps(record([REPORT]))
+    assert acr.read_chat_report(lambda c, t: acr.SANDBOX_READ + body, "compliance-audit", 1) == (True, json.loads(body))
+
+
+def test_the_check_is_registered_and_the_task_names_it():
+    entry_points = tomllib.loads((REPO / "bench" / "pyproject.toml").read_text())["project"]["entry-points"]
+    assert entry_points["devops_bench.verifiers"]["audit_chat_report_posted"].endswith(":AuditChatReportPostedVerifier")
+    task = yaml.safe_load(TASK.read_text())
+    assert task["verification_spec"][0]["check"]["type"] == "audit_chat_report_posted"

@@ -2,6 +2,7 @@ import copy
 import importlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -3472,6 +3473,182 @@ class TestIsFleetAuditJob(unittest.TestCase):
                     self.assertFalse(session_kv_server._is_fleet_audit_job(profile, job_id))
 
 
+class TestAuditChatReport(unittest.TestCase):
+    """A fleet-audit job posts the report its run's `finish` left, never its final message."""
+
+    FINAL = (
+        "silent_ok is false (resolved: 3).\nPer instructions: report normally.\n"
+        "Let's format the final response!## Security & RBAC Posture Audit\nhttps://github.com/acme/fleet/issues/3"
+    )
+    REPORT = "Security & RBAC Posture Audit: 0 new, 3 resolved; 2 findings (0 critical) across 4 cluster(s).\nLedger: https://github.com/acme/fleet/issues/3"
+    THREAD = "spaces/S/threads/T"
+
+    def setUp(self):
+        import sqlite3
+
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(os.environ.pop, "SESSION_KV_API_KEY", None)
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        self.scratch = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.scratch, True)
+        scratch = patch.object(session_kv_server, "FLEET_AUDIT_SCRATCH_DIR", self.scratch)
+        scratch.start()
+        self.addCleanup(scratch.stop)
+        import sandbox_exec
+
+        local = patch.object(sandbox_exec, "sandbox_enabled", return_value=False)
+        local.start()
+        self.addCleanup(local.stop)
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute("DELETE FROM session_metadata")
+            conn.execute("DELETE FROM incidents")
+            conn.execute("DELETE FROM audit_report_runs")
+
+    def leave(self, parts, run="20261015T062000.000000Z", updated=None, job="compliance-audit"):
+        record = {
+            "audit": job,
+            "run": run,
+            "started_at": time.time(),
+            "updated_at": time.time() if updated is None else updated,
+            "parts": [
+                {"repo": part[0], "text": part[1]} if isinstance(part, tuple) else {"repo": "acme/fleet", "text": part}
+                for part in parts
+            ],
+        }
+        with open(os.path.join(self.scratch, f"chat_report_{job}.json"), "w", encoding="utf-8") as handle:
+            json.dump(record, handle)
+
+    def post(self, fleet_audit=True, send=None, job="compliance-audit"):
+        sent = []
+
+        def default_send(platform, message, chat_id="", thread_id="", timeout=None):
+            sent.append(message)
+            return self.THREAD
+
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
+             patch.object(session_kv_server, "_is_fleet_audit_job", return_value=fleet_audit), \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=send or default_send):
+            response = self.client.post(
+                "/v1/cron-reports",
+                json={"job_id": job, "title": "Security & RBAC Posture Audit", "report": self.FINAL},
+            )
+        return response, sent
+
+    def stored(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            return [row[0] for row in conn.execute("SELECT report FROM incidents")]
+
+    def notice(self):
+        return session_kv_server.AUDIT_NOT_FINISHED_NOTICE.format(
+            label="Security & RBAC Posture Audit", job="compliance-audit"
+        )
+
+    def test_finishs_report_is_posted_and_stored_in_place_of_the_final_message(self):
+        self.leave([self.REPORT])
+        response, sent = self.post()
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(sent, [self.REPORT])
+        self.assertEqual(self.stored(), [self.REPORT])
+
+    def test_each_repositorys_part_is_posted_in_order(self):
+        self.leave(["first part", "second part"])
+        _, sent = self.post()
+        self.assertEqual(sent, ["first part\n\nsecond part"])
+
+    def test_a_repository_that_did_not_finish_is_named_after_the_reports(self):
+        self.leave([("acme/a", "report A"), ("acme/b", None), ("acme/c", self.REPORT)])
+        _, sent = self.post()
+        self.assertEqual(
+            sent,
+            ["report A\n\n" + self.REPORT + "\n\nSecurity & RBAC Posture Audit did not finish for acme/b. "
+             "See the run log for job `compliance-audit`."],
+        )
+        # No trailing ledger link, so Slack posts the whole message rather than
+        # a card that would drop the unfinished line.
+        self.assertIsNone(session_kv_server.slack_audit_report.ledger_ref(sent[0]))
+
+    def test_a_finished_report_ends_with_a_ledger_link_slack_reads(self):
+        self.leave([self.REPORT])
+        _, sent = self.post()
+        ref = session_kv_server.slack_audit_report.ledger_ref(sent[0])
+        self.assertEqual(ref.url, "https://github.com/acme/fleet/issues/3")
+        self.assertEqual(
+            session_kv_server.slack_audit_report._ledger_line(sent[0]), self.REPORT.splitlines()[0]
+        )
+
+    def test_a_run_with_no_finished_repository_posts_the_notice(self):
+        self.leave([("acme/a", None)])
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+
+    def test_a_run_is_posted_once(self):
+        self.leave([self.REPORT])
+        self.post()
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+
+    def test_a_failed_delivery_leaves_the_run_unposted(self):
+        self.leave([self.REPORT])
+        response, _ = self.post(send=lambda *a, **k: None)
+        self.assertEqual(response.status_code, 502)
+        _, sent = self.post()
+        self.assertEqual(sent, [self.REPORT])
+
+    def test_a_run_that_never_reached_finish_posts_the_notice(self):
+        self.leave([])
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+        self.assertNotIn("silent_ok", sent[0])
+
+    def test_no_record_posts_the_notice(self):
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+
+    def test_a_record_older_than_a_run_can_last_posts_the_notice(self):
+        self.leave([self.REPORT], updated=time.time() - session_kv_server.CHAT_REPORT_MAX_AGE_S - 1)
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+
+    def test_an_unparseable_record_posts_the_notice(self):
+        with open(os.path.join(self.scratch, "chat_report_compliance-audit.json"), "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+
+    def test_a_job_that_is_not_an_audit_posts_its_final_message(self):
+        self.leave([self.REPORT], job="drift-fixer")
+        _, sent = self.post(fleet_audit=False, job="drift-fixer")
+        self.assertEqual(sent, [self.FINAL])
+
+    def test_a_failed_sandbox_read_says_so_and_leaves_the_run_unposted(self):
+        import sandbox_exec
+
+        self.leave([self.REPORT])
+        with patch.object(sandbox_exec, "sandbox_enabled", return_value=True), \
+             patch.object(sandbox_exec, "read_bytes", side_effect=sandbox_exec.SandboxUnavailable("down")):
+            _, sent = self.post()
+        self.assertIn("could not read the run's report", sent[0])
+        self.assertIn("SandboxUnavailable", sent[0])
+        _, sent = self.post()
+        self.assertEqual(sent, [self.REPORT])
+
+    def test_the_report_is_read_from_the_sandbox_when_there_is_one(self):
+        import sandbox_exec
+
+        record = {"run": "r1", "updated_at": time.time(), "parts": [{"repo": "acme/fleet", "text": self.REPORT}]}
+        with patch.object(sandbox_exec, "sandbox_enabled", return_value=True), \
+             patch.object(sandbox_exec, "read_bytes", return_value=json.dumps(record).encode()) as read:
+            _, sent = self.post()
+        self.assertEqual(sent, [self.REPORT])
+        self.assertEqual(
+            read.call_args.args[0], os.path.join(self.scratch, "chat_report_compliance-audit.json")
+        )
+
+
 class TestSlackAuditHeadline(unittest.TestCase):
     """With KAGE_SLACK_UX on, a fleet-audit report leads with a headline in Slack.
 
@@ -3537,8 +3714,11 @@ class TestSlackAuditHeadline(unittest.TestCase):
         def send(platform, message, chat_id="", thread_id="", timeout=None):
             return answers[platform]
 
+        # These cases are about how a fleet-audit report is presented, so the
+        # report is the one `finish` left (TestAuditChatReport covers that).
         with patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms)), \
              patch.object(session_kv_server, "_is_fleet_audit_job", return_value=fleet_audit) as is_audit, \
+             patch.object(session_kv_server, "audit_chat_report", return_value=(composed.strip(), "")), \
              patch.object(session_kv_server, "_is_managed_github_repo", return_value=managed) as is_managed, \
              patch.object(session_kv_server, "_fetch_ledger_issue", return_value=issue) as fetch, \
              patch.object(session_kv_server.slack_blocks_post, "post", side_effect=blocks_post) as poster, \
@@ -3656,7 +3836,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         report = f"Drift fixed in the payments namespace.\nTracked here — {self.LEDGER}"
         _, calls = self._post(composed=report, fleet_audit=False, job_id="drift-fixer")
         self.assertEqual([c.args for c in calls], [("slack", report, "", "")])
-        self.is_audit.assert_called_once_with("platform", "drift-fixer")
+        self.is_audit.assert_called_with("platform", "drift-fixer")
         self.fetch.assert_not_called()
 
     def test_flag_on_a_headline_error_posts_the_report(self):

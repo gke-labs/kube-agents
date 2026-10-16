@@ -198,6 +198,34 @@ MANAGED_CONFIG_PATH = os.path.join(
 )
 
 
+# The report a fleet-audit run's `finish` leaves for the relay, in the
+# directory the run's shell writes to (`audit_report.SCRATCH_DIR`, in the shell
+# sandbox when there is one). The relay posts it in place of the job's final
+# message, which holds whatever else the model wrote in its last turn.
+FLEET_AUDIT_SCRATCH_DIR = os.environ.get("FLEET_AUDIT_SCRATCH_DIR") or "/opt/data/scratch"
+CHAT_REPORT_FILE = "chat_report_{audit}.json"
+# `audit_report.CHAT_REPORT_*_KEY`.
+CHAT_REPORT_RUN_KEY = "run"
+CHAT_REPORT_UPDATED_KEY = "updated_at"
+CHAT_REPORT_PARTS_KEY = "parts"
+CHAT_REPORT_REPO_KEY = "repo"
+CHAT_REPORT_TEXT_KEY = "text"
+# Above the relay's own report ceiling, so a long report is clipped with its
+# notice by `_truncate_report` rather than refused here.
+CHAT_REPORT_MAX_BYTES = 1024 * 1024
+CHAT_REPORT_READ_TIMEOUT_S = 20
+# `audit_report.INFLIGHT_TTL_SECONDS`: no step of a run outlives its stream's
+# lease, so a record whose last step is older than that is an earlier run's.
+CHAT_REPORT_MAX_AGE_S = 2 * 60 * 60
+CHAT_REPORT_PARTS_SEPARATOR = "\n\n"
+AUDIT_NOT_FINISHED_NOTICE = "{label} did not finish, so it has no report. See the run log for job `{job}`."
+AUDIT_UNREADABLE_NOTICE = "{label}: the relay could not read the run's report ({why}). See the run log for job `{job}`."
+AUDIT_UNFINISHED_REPOS_LINE = "{label} did not finish for {repos}. See the run log for job `{job}`."
+# Busy timeout for the audit-run bookkeeping below, as for every other
+# connection this server opens.
+AUDIT_RUNS_DB_TIMEOUT_S = 5.0
+
+
 def _dotenv_value(path: str, name: str) -> str:
     """Return `name`'s value from a dotenv file, or "" if it does not carry one.
 
@@ -803,6 +831,20 @@ def init_db() -> None:
                     sent       INTEGER NOT NULL DEFAULT 0,
                     suppressed INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (day, severity)
+                )
+                """
+            )
+            # The fleet-audit run whose report each audit job last posted, so a
+            # run's report is posted once and a later run that never reached
+            # `finish` gets the not-finished notice instead of it.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_report_runs (
+                    profile   TEXT NOT NULL,
+                    job_id    TEXT NOT NULL,
+                    run       TEXT NOT NULL,
+                    posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (profile, job_id)
                 )
                 """
             )
@@ -3166,6 +3208,114 @@ def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, j
     return line
 
 
+class ChatReportUnreadable(Exception):
+    """The record may exist, but the read did not return it."""
+
+
+def _read_chat_report_record(job_id: str) -> dict | None:
+    """The chat report record `finish` left for `job_id`, or None when there is none.
+
+    Raises ChatReportUnreadable when the read itself failed, which says
+    nothing about whether the run finished.
+    """
+    path = os.path.join(FLEET_AUDIT_SCRATCH_DIR, CHAT_REPORT_FILE.format(audit=job_id))
+    try:
+        import sandbox_exec
+
+        if sandbox_exec.sandbox_enabled():
+            raw = sandbox_exec.read_bytes(
+                path, max_bytes=CHAT_REPORT_MAX_BYTES, timeout=CHAT_REPORT_READ_TIMEOUT_S
+            )
+        else:
+            with open(path, "rb") as handle:
+                raw = handle.read(CHAT_REPORT_MAX_BYTES)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.warning(f"Relay for {job_id}: chat report unreadable: {exc!r}")
+        raise ChatReportUnreadable(type(exc).__name__) from exc
+    if raw is None:
+        return None
+    try:
+        record = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        logger.warning(f"Relay for {job_id}: chat report is not JSON")
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _last_posted_run(profile: str, job_id: str) -> str:
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            row = conn.execute(
+                "SELECT run FROM audit_report_runs WHERE profile = ? AND job_id = ?",
+                (profile, job_id),
+            ).fetchone()
+        return str(row[0]) if row else ""
+    except Exception as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: last posted run unreadable: {exc!r}")
+        return ""
+
+
+def _mark_run_posted(profile: str, job_id: str, run: str) -> None:
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO audit_report_runs (profile, job_id, run) VALUES (?, ?, ?)",
+                    (profile, job_id, run),
+                )
+    except Exception as exc:
+        logger.error(f"Relay for {profile}/{job_id}: run {run} not marked posted: {exc!r}")
+
+
+def audit_chat_report(profile: str, job_id: str, title: str) -> tuple[str, str]:
+    """What a fleet-audit job posts, and the run it is for: `(report, run)`.
+
+    The reports `finish` left for each repository of this job's latest run,
+    followed by a line naming any repository the run started and did not
+    finish, when that run has not been posted and its last step is within
+    `CHAT_REPORT_MAX_AGE_S`. A run with no finished repository posts
+    `AUDIT_NOT_FINISHED_NOTICE`, as does one already posted or too old, with no
+    run. The final message is never posted: it is what the model wrote, and
+    posting it is how a channel got working notes in place of a report.
+    """
+    label = title or job_id
+    notice = AUDIT_NOT_FINISHED_NOTICE.format(label=label, job=job_id)
+    try:
+        record = _read_chat_report_record(job_id)
+    except ChatReportUnreadable as exc:
+        return AUDIT_UNREADABLE_NOTICE.format(label=label, why=exc, job=job_id), ""
+    if record is None:
+        return notice, ""
+    run = str(record.get(CHAT_REPORT_RUN_KEY) or "")
+    parts = record.get(CHAT_REPORT_PARTS_KEY)
+    parts = [part for part in (parts if isinstance(parts, list) else []) if isinstance(part, dict)]
+    texts = [str(part.get(CHAT_REPORT_TEXT_KEY) or "").strip() for part in parts]
+    finished = [text for text in texts if text]
+    unfinished = [
+        str(part.get(CHAT_REPORT_REPO_KEY) or "")
+        for part, text in zip(parts, texts)
+        if not text
+    ]
+    try:
+        age = time.time() - float(record.get(CHAT_REPORT_UPDATED_KEY))
+    except (TypeError, ValueError):
+        age = None
+    if not run or not finished or age is None or age > CHAT_REPORT_MAX_AGE_S:
+        return notice, ""
+    if run == _last_posted_run(profile, job_id):
+        return notice, ""
+    if unfinished:
+        # Last, so the message no longer ends with a ledger link and Slack
+        # posts it whole: a headline card would show one repository's ledger
+        # and drop this line.
+        finished.append(
+            AUDIT_UNFINISHED_REPOS_LINE.format(label=label, repos=", ".join(unfinished), job=job_id)
+        )
+    return CHAT_REPORT_PARTS_SEPARATOR.join(finished), run
+
+
 def relay_cron_report(
     session_id: str,
     profile: str,
@@ -3452,6 +3602,9 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
         raise HTTPException(status_code=400, detail="job_id field is required")
     if not report:
         raise HTTPException(status_code=400, detail="report field is required")
+    audit_run = ""
+    if _is_fleet_audit_job(profile, job_id):
+        report, audit_run = audit_chat_report(profile, job_id, title)
     report, truncation_notice = _truncate_report(report, profile, job_id)
 
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -3466,6 +3619,8 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {type(exc).__name__}") from exc
     if error:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {error}")
+    if audit_run:
+        _mark_run_posted(profile, job_id, audit_run)
     # 200, because the report is in the channel and the run did its job. `relay`
     # and `relay_detail` reported a degraded delivery, which only a failed Chat
     # Agent turn produced; no turn runs now, so they always read ok, and they
