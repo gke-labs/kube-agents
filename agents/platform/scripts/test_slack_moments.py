@@ -733,7 +733,7 @@ class NextStepTest(unittest.TestCase):
         )
 
     def test_the_word_and_the_spacing_are_forgiven(self):
-        self.assertEqual(m.next_step("Up.\n  [Next:   look at\tpayments-api ]  "), ("Up.", "look at payments-api"))
+        self.assertEqual(m.next_step("Up.\n  [Next:   upgrade plan for\tseeded-c ]  "), ("Up.", "upgrade plan for seeded-c"))
 
     def test_anything_else_declares_none_and_keeps_the_text(self):
         for text in (

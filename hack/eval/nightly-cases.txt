@@ -1068,3 +1068,8 @@
 # stanza in deploy/docker/patches/kanban_report_format.py). Read-only against
 # the crashloop-workload fixture; one card, nothing changed.
 ./tasks/chat-answer-declares-next-step/task.yaml
+
+# Mock 03's shape: an answer whose offer is about a workload the user did
+# not ask about declares no next step (the report-format stanza). Read-only
+# against the no-pdb-workload and crashloop-workload fixtures; one card.
+./tasks/chat-answer-tangent-offer-declares-no-step/task.yaml

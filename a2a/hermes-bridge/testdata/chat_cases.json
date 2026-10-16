@@ -1051,14 +1051,14 @@
       }
     },
     {
-      "in": "**Good news: it's not restarting.** Both pods have been up for 45h on seeded-a.\n#oncall may mean payments-api in seeded-debug, which is crashing. Want me to look?\n[Next:   look at   payments-api ]  \n\n",
+      "in": "**seeded-c is one minor version behind.** It runs 1.32.9 while stable is 1.33.4;\nseeded-a and seeded-b are current.\n[Next:   upgrade plan for   seeded-c ]  \n\n",
       "chat": {
         "schema": "kube-agents.chat/v1",
-        "headline": "Good news: it's not restarting.",
-        "detail": "Both pods have been up for 45h on seeded-a. #oncall may mean payments-api in seeded-debug, which is crashing. Want me to look?",
+        "headline": "seeded-c is one minor version behind.",
+        "detail": "It runs 1.32.9 while stable is 1.33.4; seeded-a and seeded-b are current.",
         "choices": [
           {
-            "text": "look at payments-api",
+            "text": "upgrade plan for seeded-c",
             "next": true
           }
         ]

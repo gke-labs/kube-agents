@@ -1,7 +1,7 @@
 {
   "name": "answer-declares-next-step",
   "source": "agents/platform/scripts/test_chat_message.py::NextStepTest.test_mock_07",
-  "notes": "Mock 07: an answer whose last line declares its next step, [next: upgrade plan for seeded-c], offers that step as its one choice, and the line is not shown. (Mock 03's offer has no button.)",
+  "notes": "Mock 07: an answer whose last line declares its next step, [next: upgrade plan for seeded-c], offers that step as its one choice, and the line is not shown.",
   "input": {
     "markdown": "**seeded-c is one minor version behind.** It runs 1.32.9 and stable is 1.33.4; seeded-a and seeded-b are current.\n\n[next: upgrade plan for seeded-c]"
   },
