@@ -128,7 +128,7 @@ class ApplyTest(unittest.TestCase):
         insert = patched.index("sample.update(_kube_cgroup_memory())")
         self.assertLess(sample_def, insert)
         self.assertLess(insert, patched.index("    return sample", insert))
-        self.assertNotIn("_kube_cgroup_memory()", patched[patched.index("def other("):patched.index(f"# {MARKER}\n")])
+        self.assertNotIn("_kube_cgroup_memory()", patched[patched.index("def other("):patched.index(f"\n# {MARKER}\n")])
 
     def test_refuses_a_second_run(self):
         self.patched()

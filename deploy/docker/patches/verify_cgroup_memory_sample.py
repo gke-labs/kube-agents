@@ -34,21 +34,22 @@ from hermes_cli import kanban_db_dispatch
 GIB = 1024**3
 LIMIT = 8 * GIB
 
-# (case, memory.max, memory.current, inactive_file or (inactive_file, active_file), expected level)
+# (case, memory.max, memory.current, inactive_file or (inactive_file, active_file[, slab_reclaimable]), expected level)
 CASES = (
     ("light use", str(LIMIT), int(0.7 * GIB), int(0.1 * GIB), "ok"),
     ("94% held", str(LIMIT), int(0.94 * LIMIT), 0, "elevated"),
     ("98% held", str(LIMIT), int(0.98 * LIMIT), 0, "critical"),
     ("98% current, mostly inactive cache", str(LIMIT), int(0.98 * LIMIT), (int(0.5 * LIMIT), 0), "ok"),
     ("98% current, mostly active cache", str(LIMIT), int(0.98 * LIMIT), (0, int(0.5 * LIMIT)), "ok"),
+    ("98% current, mostly reclaimable slab", str(LIMIT), int(0.98 * LIMIT), (0, 0, int(0.5 * LIMIT)), "ok"),
 )
 
 
 def _write(cgroup: Path, limit: str, current: int, cache) -> None:
-    inactive, active = cache if isinstance(cache, tuple) else (cache, 0)
+    inactive, active, slab = (tuple(cache) + (0, 0))[:3] if isinstance(cache, tuple) else (cache, 0, 0)
     (cgroup / "memory.max").write_text(limit + "\n")
     (cgroup / "memory.current").write_text(f"{current}\n")
-    (cgroup / "memory.stat").write_text(f"anon 1\nfile 2\nactive_file {active}\ninactive_file {inactive}\nslab_reclaimable 0\n")
+    (cgroup / "memory.stat").write_text(f"anon 1\nfile 2\nactive_file {active}\ninactive_file {inactive}\nslab_reclaimable {slab}\n")
 
 
 def main() -> int:
