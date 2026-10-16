@@ -61,6 +61,7 @@ import copy
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -2941,8 +2942,10 @@ def _read_chat_record(audit_id: str) -> dict | None:
     """This stream's chat report record, or None when there is none that parses."""
     try:
         record = json.loads(Path(chat_report_path_for(audit_id)).read_text(encoding="utf-8"))
-        float(record[CHAT_REPORT_UPDATED_KEY])
+        updated = float(record[CHAT_REPORT_UPDATED_KEY])
     except (OSError, ValueError, TypeError, KeyError):
+        return None
+    if not math.isfinite(updated):
         return None
     if not isinstance(record.get(CHAT_REPORT_PARTS_KEY), list):
         return None
@@ -2961,6 +2964,23 @@ def _new_chat_record(audit_id: str, now: datetime) -> dict:
     }
 
 
+def _current_chat_record(audit_id: str, repo: str, now: datetime) -> dict:
+    """This run's record: the one on disk when its last step is within
+    `INFLIGHT_TTL_SECONDS` and it holds no finished report for `repo`, else a
+    new one."""
+    record = _read_chat_record(audit_id)
+    if record is None:
+        return _new_chat_record(audit_id, now)
+    finished = {
+        str(part.get(CHAT_REPORT_REPO_KEY))
+        for part in record[CHAT_REPORT_PARTS_KEY]
+        if part.get(CHAT_REPORT_TEXT_KEY)
+    }
+    if now.timestamp() - float(record[CHAT_REPORT_UPDATED_KEY]) >= INFLIGHT_TTL_SECONDS or repo in finished:
+        return _new_chat_record(audit_id, now)
+    return record
+
+
 def open_chat_report(audit_id: str, repo: str, now: datetime) -> None:
     """Record that this run started `repo`. Best-effort: never fails the run.
 
@@ -2972,15 +2992,7 @@ def open_chat_report(audit_id: str, repo: str, now: datetime) -> None:
     `start` opens a new run. A `start` retried after a failure finds its own
     pending entry and keeps it.
     """
-    record = _read_chat_record(audit_id)
-    parts = record[CHAT_REPORT_PARTS_KEY] if record else []
-    finished = {str(part.get(CHAT_REPORT_REPO_KEY)) for part in parts if part.get(CHAT_REPORT_TEXT_KEY)}
-    if (
-        record is None
-        or now.timestamp() - float(record[CHAT_REPORT_UPDATED_KEY]) >= INFLIGHT_TTL_SECONDS
-        or repo in finished
-    ):
-        record = _new_chat_record(audit_id, now)
+    record = _current_chat_record(audit_id, repo, now)
     if not any(part.get(CHAT_REPORT_REPO_KEY) == repo for part in record[CHAT_REPORT_PARTS_KEY]):
         record[CHAT_REPORT_PARTS_KEY].append({CHAT_REPORT_REPO_KEY: repo, CHAT_REPORT_TEXT_KEY: None})
     record[CHAT_REPORT_UPDATED_KEY] = now.timestamp()
@@ -2994,10 +3006,10 @@ def append_chat_report(audit_id: str, repo: str, text: str, now: datetime) -> No
     """Add `repo`'s report to this run's chat report. Best-effort: never fails the run.
 
     Fills the entry `start` opened for `repo`. A `finish` with no such entry
-    adds one, and with no record opens one, so its report still reaches the
-    relay.
+    adds one, and with no current record (see `_current_chat_record`) opens
+    one, so its report still reaches the relay under a run of its own.
     """
-    record = _read_chat_record(audit_id) or _new_chat_record(audit_id, now)
+    record = _current_chat_record(audit_id, repo, now)
     pending = [
         part for part in record[CHAT_REPORT_PARTS_KEY]
         if part.get(CHAT_REPORT_REPO_KEY) == repo and not part.get(CHAT_REPORT_TEXT_KEY)

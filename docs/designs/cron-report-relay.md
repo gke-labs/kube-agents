@@ -240,17 +240,21 @@ report but not the card. The line naming unfinished repositories goes last, so
 a message that carries it does not end with a ledger link and Slack posts it
 whole, with no card.
 
-The match is by job id, because Hermes hands the relay no run id, and four
+The substitution applies only to a job the image's Platform Agent roster ships
+with the fleet-audit skill (`/opt/platform-template/cron/jobs.json`), because
+only such a job runs under the stream id that names the record; a job created at
+runtime keeps posting its final message. A record over 1 MiB posts the
+unreadable notice.
+
+The match is by job id, because Hermes hands the relay no run id, and three
 cases fall outside it. A repository whose `start` was refused, or never run,
 has no entry, so nothing names it. A cron run that dies before `start` within
-two hours of the last step of a run whose report was never posted (an on-demand run, or a silent
-one the scheduler dropped) posts that run's report. A run of another repository
-within two hours of an earlier run's last step joins that earlier record, as
-does a run whose first repository is one an earlier run started and left
-unfinished; when the earlier run was already posted, the relay posts the
-not-finished notice. A
-runtime job that runs fleet-audit under an id that is not a stream id finds no
-file and posts the notice.
+two hours of the last step of a run whose report was never posted (an on-demand
+run, or a silent one the scheduler dropped) posts that run's report. A run of
+another repository within two hours of an earlier run's last step joins that
+earlier record, as does a run whose first repository is one an earlier run
+started and left unfinished; when the earlier run was already posted, the relay
+posts the not-finished notice.
 
 ## Which key the loopback call presents
 

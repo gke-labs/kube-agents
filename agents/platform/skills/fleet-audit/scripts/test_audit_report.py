@@ -25644,6 +25644,11 @@ class TestNoForge(BaseTestCase):
         self.assertEqual(summary[-1], audit_report.NO_FORGE_NOTE)
         latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
         self.assertEqual(latest["status"], audit_report.NO_FORGE_STATUS)
+        # The chat relay posts the summary, from the record `finish` leaves.
+        record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
+        self.assertEqual(
+            record["parts"], [{"repo": audit_report.NO_FORGE_REPO, "text": out["summary"]}]
+        )
         self.assertEqual(latest["repo"], audit_report.NO_FORGE_REPO)
         self.assertIsNone(latest["issue_number"])
         self.assertEqual(len(latest["current_ids"]), 4)
@@ -25930,6 +25935,39 @@ class TestChatReport(HarnessTestCase):
         audit_report.open_chat_report(AUDIT, "acme/a", NOW)
         audit_report.append_chat_report(AUDIT, "acme/a", "yesterday", NOW)
         audit_report.open_chat_report(AUDIT, "acme/b", NOW + timedelta(days=1))
+        self.assertEqual(self.entries(), [("acme/b", None)])
+
+    def test_a_clean_run_leaves_its_report_for_the_relay(self):
+        previous_body = published_body(
+            make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]),
+            generated_at=NOW,
+        )
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        self.assertEqual(self.run_finish(doc), 0)
+        [(repo, text)] = self.entries()
+        self.assertEqual(repo, "acme/fleet")
+        self.assertTrue(text.splitlines()[0].startswith(f"{audit_report.audit_name(AUDIT)}: "))
+        self.assertTrue(text.splitlines()[-1].startswith("Ledger: "))
+
+    def test_a_finish_with_no_start_does_not_join_a_stale_record(self):
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        audit_report.append_chat_report(AUDIT, "acme/a", "yesterday", NOW)
+        run = self.chat_record()["run"]
+        audit_report.append_chat_report(AUDIT, "acme/a", "today", NOW + timedelta(days=1))
+        self.assertEqual(self.entries(), [("acme/a", "today")])
+        self.assertNotEqual(self.chat_record()["run"], run)
+
+    def test_a_non_finite_stamp_does_not_hold_a_record_current(self):
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        record = self.chat_record()
+        record["updated_at"] = float("inf")
+        Path(audit_report.chat_report_path_for(AUDIT)).write_text(json.dumps(record), encoding="utf-8")
+        audit_report.open_chat_report(AUDIT, "acme/b", NOW)
         self.assertEqual(self.entries(), [("acme/b", None)])
 
     def test_a_finish_with_no_start_still_leaves_its_report(self):

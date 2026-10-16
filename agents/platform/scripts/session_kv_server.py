@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import math
 import os
 import hashlib
 import re
@@ -211,8 +212,12 @@ CHAT_REPORT_PARTS_KEY = "parts"
 CHAT_REPORT_REPO_KEY = "repo"
 CHAT_REPORT_TEXT_KEY = "text"
 # Above the relay's own report ceiling, so a long report is clipped with its
-# notice by `_truncate_report` rather than refused here.
+# notice by `_truncate_report`; a record past it posts the unreadable notice.
 CHAT_REPORT_MAX_BYTES = 1024 * 1024
+# The roster the image ships for the Platform Agent. Only a job in it runs under
+# its audit stream's id, which is the name `finish` gives the record; a job
+# created at runtime keeps posting its final message.
+IMAGE_PLATFORM_ROSTER = "/opt/platform-template/cron/jobs.json"
 CHAT_REPORT_READ_TIMEOUT_S = 20
 # `audit_report.INFLIGHT_TTL_SECONDS`: no step of a run outlives its stream's
 # lease, so a record whose last step is older than that is an earlier run's.
@@ -3222,13 +3227,14 @@ def _read_chat_report_record(job_id: str) -> dict | None:
     try:
         import sandbox_exec
 
+        # One byte past the cap, so a record over it is told from one at it.
         if sandbox_exec.sandbox_enabled():
             raw = sandbox_exec.read_bytes(
-                path, max_bytes=CHAT_REPORT_MAX_BYTES, timeout=CHAT_REPORT_READ_TIMEOUT_S
+                path, max_bytes=CHAT_REPORT_MAX_BYTES + 1, timeout=CHAT_REPORT_READ_TIMEOUT_S
             )
         else:
             with open(path, "rb") as handle:
-                raw = handle.read(CHAT_REPORT_MAX_BYTES)
+                raw = handle.read(CHAT_REPORT_MAX_BYTES + 1)
     except FileNotFoundError:
         return None
     except Exception as exc:
@@ -3236,6 +3242,9 @@ def _read_chat_report_record(job_id: str) -> dict | None:
         raise ChatReportUnreadable(type(exc).__name__) from exc
     if raw is None:
         return None
+    if len(raw) > CHAT_REPORT_MAX_BYTES:
+        logger.warning(f"Relay for {job_id}: chat report is over {CHAT_REPORT_MAX_BYTES} bytes")
+        raise ChatReportUnreadable(f"over {CHAT_REPORT_MAX_BYTES} bytes")
     try:
         record = json.loads(raw.decode("utf-8", "replace"))
     except ValueError:
@@ -3267,6 +3276,22 @@ def _mark_run_posted(profile: str, job_id: str, run: str) -> None:
                 )
     except Exception as exc:
         logger.error(f"Relay for {profile}/{job_id}: run {run} not marked posted: {exc!r}")
+
+
+def _is_shipped_audit_job(job_id: str) -> bool:
+    """Whether the image's Platform Agent roster ships `job_id` as a fleet-audit job."""
+    try:
+        with open(IMAGE_PLATFORM_ROSTER, encoding="utf-8") as handle:
+            store = json.load(handle)
+    except (OSError, ValueError) as exc:
+        logger.warning(f"Relay for {job_id}: image roster unreadable: {exc}")
+        return False
+    jobs = store.get("jobs") if isinstance(store, dict) else store
+    for job in jobs if isinstance(jobs, list) else []:
+        if isinstance(job, dict) and str(job.get("id") or "") == job_id:
+            skills = job.get("skills") or job.get("skill") or []
+            return FLEET_AUDIT_SKILL in ([skills] if isinstance(skills, str) else skills)
+    return False
 
 
 def audit_chat_report(profile: str, job_id: str, title: str) -> tuple[str, str]:
@@ -3301,6 +3326,8 @@ def audit_chat_report(profile: str, job_id: str, title: str) -> tuple[str, str]:
     try:
         age = time.time() - float(record.get(CHAT_REPORT_UPDATED_KEY))
     except (TypeError, ValueError):
+        age = None
+    if age is not None and not math.isfinite(age):
         age = None
     if not run or not finished or age is None or age > CHAT_REPORT_MAX_AGE_S:
         return notice, ""
@@ -3603,7 +3630,7 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     if not report:
         raise HTTPException(status_code=400, detail="report field is required")
     audit_run = ""
-    if _is_fleet_audit_job(profile, job_id):
+    if _is_fleet_audit_job(profile, job_id) and _is_shipped_audit_job(job_id):
         report, audit_run = audit_chat_report(profile, job_id, title)
     report, truncation_notice = _truncate_report(report, profile, job_id)
 

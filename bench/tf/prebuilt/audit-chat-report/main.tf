@@ -20,8 +20,11 @@
 # fires, the stack renames the stream's `latest.json` in the report store on the
 # shell sandbox (to `latest.json.bench-moved`): with no trusted memory of the
 # previous run, `finish` answers `silent_ok: false` whatever the fleet holds
-# (fleet-audit SKILL.md, "lost memory"). The run then writes a new `latest.json`,
-# which is the store's correct record from then on, so nothing is put back.
+# (fleet-audit SKILL.md, "lost memory"). A run that reaches `finish` writes a new
+# `latest.json`, the store's record from then on, and the renamed copy is
+# deleted; where no new one was written, the teardown, or the exit trap on a
+# failed apply, puts the renamed copy back (store.sh), so the stream keeps its
+# memory.
 #
 # arm.py (beside this file) marks the job due with Hermes' own `trigger_job`, as
 # the `oobe` job's first-run audits stage does, and waits for the run to end. The
@@ -33,7 +36,8 @@
 # On an install with a chat platform the report is posted to the home channel,
 # and the audit writes its ledger issue in the install's GitOps repository.
 #
-# The teardown removes the state file and the renamed store files.
+# The teardown removes the state file and restores or deletes the renamed store
+# files as above.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -46,9 +50,10 @@ terraform {
 }
 
 locals {
-  home    = "/opt/data"
-  python  = "/opt/hermes/.venv/bin/python3"
-  arm_b64 = base64encode(file("${path.module}/arm.py"))
+  home      = "/opt/data"
+  python    = "/opt/hermes/.venv/bin/python3"
+  arm_b64   = base64encode(file("${path.module}/arm.py"))
+  store_b64 = base64encode(file("${path.module}/store.sh"))
   # audit_report.py: REPORTS_DIR and the in-flight note under SCRATCH_DIR.
   store    = "/opt/data/fleet-audit/reports/${var.audit_job}"
   inflight = "/opt/data/scratch/inflight_${var.audit_job}.json"
@@ -73,6 +78,7 @@ resource "null_resource" "audit_chat_report" {
     python            = local.python
     store             = local.store
     arm_b64           = local.arm_b64
+    store_b64         = local.store_b64
   }
 
   provisioner "local-exec" {
@@ -81,7 +87,21 @@ resource "null_resource" "audit_chat_report" {
       set -euo pipefail
 
       kubeconfig_dir="$(mktemp -d)"
-      trap 'rm -rf "$kubeconfig_dir"' EXIT
+      # Terraform taints a resource whose create-time provisioner failed and
+      # skips its destroy-time provisioners, so a failure after the rename puts
+      # the store back here. errexit stays in force inside a trap, hence `set +e`.
+      moved=""
+      on_exit() {
+        status=$?
+        trap '' TERM INT
+        set +e
+        if [ "$status" -ne 0 ] && [ -n "$moved" ]; then
+          echo "Apply failed (exit $status); restoring the report store." >&2
+          store restore >&2 || echo "WARNING: could not restore the report store." >&2
+        fi
+        rm -rf "$kubeconfig_dir"
+      }
+      trap on_exit EXIT
       trap 'exit 143' TERM INT
       KUBECONFIG="$kubeconfig_dir/config"
       export KUBECONFIG
@@ -106,6 +126,11 @@ resource "null_resource" "audit_chat_report" {
       sandbox() {
         kubectl exec -n "${var.agent_namespace}" "${var.sandbox_pod}" -c "${var.sandbox_container}" -- sh -c "$1"
       }
+      store() {
+        printf '%s' '${local.store_b64}' | base64 -d | \
+          kubectl exec -i -n "${var.agent_namespace}" "${var.sandbox_pod}" -c "${var.sandbox_container}" -- \
+            sh -s "$1" "${local.store}"
+      }
 
       arm clean "${local.home}"
 
@@ -119,7 +144,8 @@ resource "null_resource" "audit_chat_report" {
         sleep 30
       done
 
-      sandbox 'if [ -d ${local.store} ]; then find ${local.store} -name latest.json -exec mv {} {}.bench-moved \; ; fi'
+      moved=1
+      store move
 
       arm fire "${local.home}" "${local.python}" "${var.audit_job}"
       arm wait "${local.home}" "${var.audit_job}" "${var.run_wait}"
@@ -150,9 +176,10 @@ resource "null_resource" "audit_chat_report" {
           -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
           ${self.triggers.python} - clean "${self.triggers.home}" \
         || echo "WARNING: could not remove the state file; the next run removes it first." >&2
-      kubectl exec -n "${self.triggers.namespace}" "${self.triggers.sandbox_pod}" -c "${self.triggers.sandbox_container}" -- \
-        sh -c 'if [ -d ${self.triggers.store} ]; then find ${self.triggers.store} -name latest.json.bench-moved -delete; fi' \
-        || echo "WARNING: could not remove the renamed store files." >&2
+      printf '%s' '${self.triggers.store_b64}' | base64 -d \
+        | kubectl exec -i -n "${self.triggers.namespace}" "${self.triggers.sandbox_pod}" -c "${self.triggers.sandbox_container}" -- \
+          sh -s restore "${self.triggers.store}" \
+        || echo "WARNING: could not restore the renamed store files." >&2
     EOT
   }
 }

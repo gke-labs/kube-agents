@@ -3520,7 +3520,7 @@ class TestAuditChatReport(unittest.TestCase):
         with open(os.path.join(self.scratch, f"chat_report_{job}.json"), "w", encoding="utf-8") as handle:
             json.dump(record, handle)
 
-    def post(self, fleet_audit=True, send=None, job="compliance-audit"):
+    def post(self, fleet_audit=True, send=None, job="compliance-audit", shipped=True):
         sent = []
 
         def default_send(platform, message, chat_id="", thread_id="", timeout=None):
@@ -3529,6 +3529,7 @@ class TestAuditChatReport(unittest.TestCase):
 
         with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_is_fleet_audit_job", return_value=fleet_audit), \
+             patch.object(session_kv_server, "_is_shipped_audit_job", return_value=shipped), \
              patch.object(session_kv_server, "_send_to_chat", side_effect=send or default_send):
             response = self.client.post(
                 "/v1/cron-reports",
@@ -3616,6 +3617,31 @@ class TestAuditChatReport(unittest.TestCase):
     def test_an_unparseable_record_posts_the_notice(self):
         with open(os.path.join(self.scratch, "chat_report_compliance-audit.json"), "w", encoding="utf-8") as handle:
             handle.write("{not json")
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+
+    def test_a_runtime_audit_job_the_image_does_not_ship_posts_its_final_message(self):
+        _, sent = self.post(job="nightly-compliance", shipped=False)
+        self.assertEqual(sent, [self.FINAL])
+
+    def test_the_image_roster_decides_which_audit_jobs_are_shipped(self):
+        roster = os.path.join(self.scratch, "jobs.json")
+        with open(roster, "w", encoding="utf-8") as handle:
+            json.dump({"jobs": [{"id": "compliance-audit", "skills": ["fleet-audit"]},
+                                {"id": "stall-watch", "no_agent": True}]}, handle)
+        with patch.object(session_kv_server, "IMAGE_PLATFORM_ROSTER", roster):
+            self.assertTrue(session_kv_server._is_shipped_audit_job("compliance-audit"))
+            self.assertFalse(session_kv_server._is_shipped_audit_job("stall-watch"))
+            self.assertFalse(session_kv_server._is_shipped_audit_job("nightly-compliance"))
+
+    def test_a_record_over_the_size_cap_posts_the_unreadable_notice(self):
+        self.leave([self.REPORT])
+        with patch.object(session_kv_server, "CHAT_REPORT_MAX_BYTES", 64):
+            _, sent = self.post()
+        self.assertIn("could not read the run's report (over 64 bytes)", sent[0])
+
+    def test_a_non_finite_stamp_posts_the_notice(self):
+        self.leave([self.REPORT], updated=float("inf"))
         _, sent = self.post()
         self.assertEqual(sent, [self.notice()])
 
@@ -3718,6 +3744,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         # report is the one `finish` left (TestAuditChatReport covers that).
         with patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms)), \
              patch.object(session_kv_server, "_is_fleet_audit_job", return_value=fleet_audit) as is_audit, \
+             patch.object(session_kv_server, "_is_shipped_audit_job", return_value=True), \
              patch.object(session_kv_server, "audit_chat_report", return_value=(composed.strip(), "")), \
              patch.object(session_kv_server, "_is_managed_github_repo", return_value=managed) as is_managed, \
              patch.object(session_kv_server, "_fetch_ledger_issue", return_value=issue) as fetch, \
