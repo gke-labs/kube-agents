@@ -415,11 +415,11 @@ func TestAPI_ATurnThatFiledCardsPublishesTheHandoff(t *testing.T) {
 	}
 }
 
-// The handoff speaks for the turn whose answer is the result: turn 1 files a
-// card and acks, a queued follow-up runs as turn 2 and answers directly, and
-// the task's result is that direct answer, so no handoff is published (#3258
-// self-review: cardsFiled is task-wide, the handoff is per turn).
-func TestAPI_AFollowUpThatAnswersDirectlyIsNotAHandoff(t *testing.T) {
+// The handoff is task-wide, like the cards mark: turn 1 files a card and
+// acks, a queued follow-up answers directly as turn 2, and turn 1's card is
+// still going to report into the conversation, so the terminal still carries
+// the handoff. On Slack with KAGE_SLACK_UX on the mark says the same.
+func TestAPI_AFollowUpAfterACardStillReportsTheHandoff(t *testing.T) {
 	t.Setenv(slackUXEnv, "")
 	const shared = "pod-wide-activity-key"
 	_, url := startServer(t)
@@ -445,7 +445,7 @@ func TestAPI_AFollowUpThatAnswersDirectlyIsNotAHandoff(t *testing.T) {
 	})
 	door.Store(b.ActivityURL())
 	c := gatewayClient(t, url)
-	origin := submitFromEnv(t, c, "task-followup", "ctx-followup", "slack:C1/1.2", "diagnose crash-ns")
+	origin := submitFromEnv(t, c, "task-followup", "ctx-followup", "gchat:spaces/A/threads/B", "diagnose crash-ns")
 	waitFor(t, 10*time.Second, "turn 1 in flight", func() bool { return turns.Load() == 1 })
 	sendSteer(t, c, origin, "just tell me why it crashes")
 	waitFor(t, 10*time.Second, "follow-up queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
@@ -454,8 +454,8 @@ func TestAPI_AFollowUpThatAnswersDirectlyIsNotAHandoff(t *testing.T) {
 	if task.State != lib.StateCompleted || turns.Load() != 2 {
 		t.Fatalf("state %s after %d turns, want completed after 2", task.State, turns.Load())
 	}
-	if art := task.Artifact(lib.ArtifactHandoff); art != nil {
-		t.Fatalf("handoff %+v published for a task whose last turn answered directly", art)
+	if art := task.Artifact(lib.ArtifactHandoff); art == nil {
+		t.Fatal("no handoff for a task whose first turn filed a card that is still to report")
 	}
 }
 

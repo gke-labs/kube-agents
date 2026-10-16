@@ -63,11 +63,11 @@ const (
 	// with a chat message. Each one posts once and is never edited
 	// (spec-a2a-payloads.md, "Reserved artifact names").
 	ArtifactNotice = "notice"
-	// ArtifactHandoff says a completed task's last turn handed its work to
-	// kanban cards that are still running and will report into the task's
-	// conversation themselves: one text part, HandoffCards. The hermes-bridge
-	// publishes it ahead of the terminal of such a turn whenever the
-	// conversation route was recorded, on any chat platform; the gateway never
+	// ArtifactHandoff says a completed task handed work to kanban cards,
+	// which report into the task's conversation themselves: one text part,
+	// HandoffCards. The hermes-bridge's API executor publishes it ahead of the
+	// terminal of such a task whenever the conversation route was recorded
+	// (Slack or Google Chat); the gateway never
 	// renders it and reads it as a delegated child's cards-pending signal
 	// beside the terminal's chat mark, which the bridge sets only on Slack
 	// with KAGE_SLACK_UX on (#3258; spec-a2a-payloads.md, "Reserved artifact
