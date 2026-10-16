@@ -861,8 +861,8 @@ class DeliveryFromSandboxTest(unittest.TestCase):
 class ScanGateTest(unittest.TestCase):
     """The scan gate files the sweep as a kanban task for the `platform` profile.
 
-    The Chat Agent profile this cron runs on opens its terminal only on a human's
-    triaged turn, never a job's, so the
+    The Chat Agent profile this cron runs on opens its terminal only after a
+    model turn's `triage` call, and this job is `no_agent` (no model turn), so the
     sweep cannot execute here; the gate's whole job is to decide whether to file
     the card. It must stay silent on stdout either way — `deliver: local` plus
     empty output means the scheduler never posts anything for this job.

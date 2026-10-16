@@ -681,10 +681,11 @@ class ConfigBackfillTest(unittest.TestCase):
         self.assertIn("platform_toolsets.cli.terminal", proc.stdout)
 
     def test_a_toolset_the_template_now_grants_leaves_the_live_denylist(self):
-        """agent.disabled_toolsets yields only to a grant: a name the template lists in a
-        platform_toolsets list and no longer denies is dropped, because the denylist runs
-        last and would cancel the grant. A denial the template merely stopped listing, and
-        every denial it still lists, are kept in the agent's order."""
+        """agent.disabled_toolsets yields only to a released grant: `terminal`, the name the
+        image stopped denying, is dropped when the template lists it in a platform_toolsets
+        list and no longer denies it, because the denylist runs last and would cancel the
+        grant. A denial the template merely stopped listing, and every denial it still lists,
+        are kept in the agent's order."""
         template = {
             "platform_toolsets": {"cli": ["kanban", "terminal"]},
             "agent": {"disabled_toolsets": ["file", "skills"]},
@@ -701,6 +702,25 @@ class ConfigBackfillTest(unittest.TestCase):
         self.assertIs(live["agent"]["environment_probe"], False)
         self.assertIn("agent.disabled_toolsets-terminal", proc.stdout)
         self.assertNotIn("agent.disabled_toolsets-web", proc.stdout)
+
+    def test_a_hand_added_denial_of_a_granted_name_is_kept(self):
+        """The denylist is the operator's lockdown lever on this profile: a denial of a name
+        the template grants but the image never released (`memory`, to keep a second store
+        off the front door; `kanban`) survives every start, and nothing is logged for it."""
+        template = {
+            "platform_toolsets": {"cli": ["mcp-router", "kanban", "memory", "terminal", "triage"]},
+            "agent": {"disabled_toolsets": ["file"]},
+        }
+        live = {
+            "platform_toolsets": {"cli": ["mcp-router", "kanban", "memory", "terminal", "triage"]},
+            "agent": {"disabled_toolsets": ["memory", "kanban", "file"]},
+        }
+        proc, live, unchanged = self._fill(template, live)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged, proc.stdout)
+        self.assertEqual(live["agent"]["disabled_toolsets"], ["memory", "kanban", "file"])
+        self.assertNotIn("agent.disabled_toolsets-", proc.stdout)
 
     def test_a_matching_tool_surface_is_left_alone(self):
         """Lists already in step with the template: no rewrite, so the file keeps its bytes."""

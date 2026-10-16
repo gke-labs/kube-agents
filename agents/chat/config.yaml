@@ -12,10 +12,11 @@
 # already holds it and the back-fill never overrules a value the agent has. The
 # three image-owned lists are the exception to that: `plugins.enabled` and each
 # `platform_toolsets.<key>` gain the names this file has and the live list lacks,
-# and `agent.disabled_toolsets` drops a name this file's `platform_toolsets` now
-# grant (the terminal, when the image stopped denying it). Any other changed
-# value reaches a deployed agent only through the operator — the managed scope or
-# the overlay in (3) and (4) below — or by hand.
+# and `agent.disabled_toolsets` drops `terminal`, the one name the image stopped
+# denying, while this file's `platform_toolsets` grant it; a denial of any other
+# name stays, however it got there. Any other changed value reaches a deployed
+# agent only through the operator — the managed scope or the overlay in (3) and
+# (4) below — or by hand.
 #
 # It is deliberately NOT merged with deploy/shared/defaults/config.yaml: the
 # merge helper only unions keys, so it could never REMOVE the cloud/cluster tools

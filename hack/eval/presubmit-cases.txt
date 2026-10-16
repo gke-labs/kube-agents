@@ -49,8 +49,9 @@
 # truncating this list's tail. A case known to be slow gets a unit_cost_hint
 # entry in the script, not a position here.
 #
-# BUDGET. Thirteen cases, thirty-nine units at the script's EVAL_REPETITIONS
-# of 3: six domain probes, one reliability prompt variation, the remediation
+# BUDGET. Twelve cases, thirty-six units at the script's EVAL_REPETITIONS
+# of 3: five domain probes (upgrades' left for the nightly on 2026-10-16,
+# #3269), one reliability prompt variation, the remediation
 # writer pdb-remediation-pr (420-1929s measured, hinted at 1250; its three
 # repetitions serialize on the task lock), three cluster-debugging cases, the
 # incident-triage probe, and one held-out seat (the compliance canary,

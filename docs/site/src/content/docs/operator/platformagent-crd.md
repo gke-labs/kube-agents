@@ -1158,11 +1158,11 @@ every image and never load it.
 The tool surface follows the image the same way, in two lists. Each `platform_toolsets.<key>`
 gains the names the template's list has and the live list lacks, appended after the agent's own
 (the front door's `terminal` and `triage`, on a volume scaffolded before them). And
-`agent.disabled_toolsets` yields to a grant: a name the template lists in one of those
-`platform_toolsets` lists and no longer denies is dropped from the live denylist, because the
-denylist runs last and would cancel the grant. That is the one removal the back-fill makes.
-Nothing else leaves the denylist: a denial the template does not grant against, however it got
-there, stays.
+`agent.disabled_toolsets` loses exactly the names the image has stopped denying, today one, the
+front door's `terminal`, while the template lists it in one of those `platform_toolsets` lists
+and no longer denies it, because the denylist runs last and would cancel the grant. That is the
+one removal the back-fill makes. Nothing else leaves the denylist: a denial of any other name,
+the template's or one an operator added by hand, stays.
 
 **Merge semantics.** These differ between the two mechanisms, which is the easiest thing to get
 wrong here. In a startup **overlay** — every profile including `default` — maps merge recursively,

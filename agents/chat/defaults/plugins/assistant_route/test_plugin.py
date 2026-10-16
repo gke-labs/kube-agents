@@ -315,8 +315,27 @@ class AvailabilityTest(_Base):
             gate = plugin.handle_pre_tool_call(tool_name="terminal", args={}, session_id="s1", turn_id="t1")
             self.assertEqual(gate["action"], "block")
             self.assertIn("not available", gate["message"])
+            # No decision was recorded: the terminal stays hidden and triage stays
+            # offered, since the result asks the model to call it again.
             req = self.request(api_call_count=2)
-            self.assertNotIn("terminal", names(req["request"]))
+            self.assertEqual(names(req["request"]), ["triage", "kanban_create"])
+            self.assertNotIn("tool_choice", req["request"])
+            self.card_mock.assert_not_called()
+
+    def test_an_unavailable_route_still_takes_the_retry_as_a_delegation(self):
+        with mock.patch.dict("os.environ", {plugin.ROUTE_ENABLED_ENV: "off"}):
+            self.new_turn()
+            self.assertEqual(
+                plugin.handle_triage({"needs_specialist": False, "preliminary_plan": "I will."}, session_id="s1"),
+                plugin.ASSISTANT_UNAVAILABLE,
+            )
+            out = plugin.handle_triage(
+                {"needs_specialist": True, "assignee": "platform", "preliminary_plan": "I will."}, session_id="s1"
+            )
+            self.assertIn("kanban_create", out)
+            self.assertEqual(plugin._route_for("s1", "t1"), plugin.ROUTE_DELEGATION)
+            self.assertNotIn("triage", names(self.request(api_call_count=3)["request"]))
+            self.card_mock.assert_called_once_with(plugin.DELEGATED_CARD_TEXT)
 
     def test_the_route_is_closed_without_a_backend_at_all(self):
         env = {k: v for k, v in dict(__import__("os").environ).items() if k != plugin.TERMINAL_BACKEND_ENV}
@@ -339,6 +358,7 @@ class AvailabilityTest(_Base):
             out = plugin.handle_triage({"needs_specialist": False, "preliminary_plan": "I will."}, session_id="s1")
             self.assertEqual(out, plugin.ASSISTANT_UNAVAILABLE)
             self.assertEqual(plugin.handle_pre_tool_call(tool_name="terminal", args={}, session_id="s1", turn_id="t1")["action"], "block")
+            self.assertIn("triage", names(self.request(api_call_count=2)["request"]))
 
     def test_delegation_still_works_with_the_route_off(self):
         with mock.patch.dict("os.environ", {plugin.ROUTE_ENABLED_ENV: "off"}):
@@ -350,23 +370,52 @@ class AvailabilityTest(_Base):
 
 
 class MemoryWriteTest(_Base):
+    MULTIUSER_MEMORY_SCHEMA = (
+        pathlib.Path(__file__).resolve().parents[3] / "plugins" / "memory" / "multiuser_memory" / "__init__.py"
+    )
+
     def _unlock_and_run(self):
         self.new_turn()
         plugin.handle_triage({"needs_specialist": False, "preliminary_plan": "I will."}, session_id="s1")
         plugin.handle_post_tool_call(tool_name="terminal", args={"command": "kubectl get ns"}, result="ok", session_id="s1", turn_id="t1")
 
-    def test_a_shared_write_is_refused_after_a_command(self):
-        self._unlock_and_run()
-        out = plugin.handle_pre_tool_call(tool_name="memory_retain", args={"scope": "shared", "content": "x"}, session_id="s1", turn_id="t1")
-        self.assertEqual(out["action"], "block")
-        out = plugin.handle_pre_tool_call(tool_name="multiuser_memory", args={"action": "add", "target": "memory"}, session_id="s1", turn_id="t1")
-        self.assertEqual(out["action"], "block")
+    def _gate(self, tool_name, args):
+        return plugin.handle_pre_tool_call(tool_name=tool_name, args=args, session_id="s1", turn_id="t1")
 
-    def test_a_personal_write_and_a_read_are_not(self):
+    def test_every_memory_write_is_refused_after_a_command(self):
         self._unlock_and_run()
-        self.assertIsNone(plugin.handle_pre_tool_call(tool_name="memory_retain", args={"scope": "personal", "content": "x"}, session_id="s1", turn_id="t1"))
-        self.assertIsNone(plugin.handle_pre_tool_call(tool_name="memory_recall", args={"query": "x"}, session_id="s1", turn_id="t1"))
-        self.assertIsNone(plugin.handle_pre_tool_call(tool_name="multiuser_memory", args={"action": "search"}, session_id="s1", turn_id="t1"))
+        for tool_name, args in (
+            ("memory_retain", {"scope": "shared", "content": "x"}),
+            # The provider's default scope for an unattended write is shared.
+            ("memory_retain", {"content": "x"}),
+            ("memory_retain", {"scope": "personal", "content": "x"}),
+            ("multiuser_memory", {"action": "add", "target": "memory", "content": "x"}),
+            ("multiuser_memory", {"action": "replace", "target": "memory", "index": 0, "new_content": "x"}),
+            ("multiuser_memory", {"action": "remove", "target": "user", "index": 0}),
+        ):
+            with self.subTest(tool=tool_name, args=args):
+                out = self._gate(tool_name, args)
+                self.assertEqual(out["action"], "block")
+                self.assertIn("ran a command", out["message"])
+
+    def test_the_write_actions_are_the_providers_own_minus_read(self):
+        # The guard is derived from the provider's schema rather than guessed at:
+        # every action the enum offers but `read` is a write.
+        import re
+
+        text = self.MULTIUSER_MEMORY_SCHEMA.read_text(encoding="utf-8")
+        enum = re.search(r'"action":\s*\{.*?"enum":\s*\[([^\]]*)\]', text, re.S).group(1)
+        actions = re.findall(r'"([a-z_]+)"', enum)
+        self.assertIn("read", actions)
+        self.assertIn("replace", actions)
+        for action in actions:
+            with self.subTest(action=action):
+                self.assertEqual(plugin._is_memory_write("multiuser_memory", {"action": action}), action != "read")
+
+    def test_a_read_is_not_a_write(self):
+        self._unlock_and_run()
+        self.assertIsNone(self._gate("memory_recall", {"query": "x"}))
+        self.assertIsNone(self._gate("multiuser_memory", {"action": "read", "target": "memory"}))
 
     def test_a_call_the_gate_refused_does_not_count_as_a_command(self):
         self.new_turn()
@@ -374,16 +423,17 @@ class MemoryWriteTest(_Base):
             tool_name="terminal", args={"command": "kubectl get ns"}, error_type=plugin.PLUGIN_BLOCK_ERROR_TYPE,
             session_id="s1", turn_id="t1",
         )
-        self.assertIsNone(plugin.handle_pre_tool_call(tool_name="memory_retain", args={"scope": "shared", "content": "x"}, session_id="s1", turn_id="t1"))
+        self.assertIsNone(self._gate("memory_retain", {"scope": "shared", "content": "x"}))
 
-    def test_a_shared_write_is_allowed_when_no_command_ran(self):
+    def test_a_write_is_allowed_when_no_command_ran(self):
         self.new_turn()
-        self.assertIsNone(plugin.handle_pre_tool_call(tool_name="memory_retain", args={"scope": "shared", "content": "x"}, session_id="s1", turn_id="t1"))
+        self.assertIsNone(self._gate("memory_retain", {"scope": "shared", "content": "x"}))
+        self.assertIsNone(self._gate("multiuser_memory", {"action": "replace", "target": "memory", "index": 0}))
 
     def test_a_new_turn_forgets_that_a_command_ran(self):
         self._unlock_and_run()
         self.new_turn(turn_id="t2")
-        self.assertIsNone(plugin.handle_pre_tool_call(tool_name="memory_retain", args={"scope": "shared", "content": "x"}, session_id="s1", turn_id="t2"))
+        self.assertIsNone(plugin.handle_pre_tool_call(tool_name="memory_retain", args={"content": "x"}, session_id="s1", turn_id="t2"))
 
 
 class GatedSetTest(unittest.TestCase):

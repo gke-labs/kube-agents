@@ -1,4 +1,4 @@
-"""Tests for ``answer_first``: a delivered card result opens on its answer and stops."""
+"""Tests for ``answer_first``: a delivered card result, or the reply itself, opens on its answer and stops."""
 
 from __future__ import annotations
 
@@ -242,11 +242,36 @@ def test_an_artifact_is_not_read_as_a_result():
     assert _verifier().verify(timeout_sec=1.0).success
 
 
-def test_no_delivered_result_fails():
+def test_with_no_delivered_result_the_reply_itself_is_graded():
+    # The assistant route: no card, the front door's own turn is the answer.
+    transcript.set(GOOD, [])
+    outcome = _verifier(lead_terms=["pod", "memory"], recap_patterns=[r"cluster is healthy"]).verify(timeout_sec=1.0)
+    assert outcome.success, outcome.reason
+    assert outcome.reason.startswith("the reply")
+
+
+def test_a_reply_that_is_only_an_ack_fails_on_its_shape():
     transcript.set(ACK, [])
     outcome = _verifier().verify(timeout_sec=1.0)
     assert not outcome.success
     assert outcome.status != "error"
+    assert outcome.reason.startswith("reply: does not open with a bold sentence")
+
+
+def test_a_report_shaped_reply_fails_on_each_defect():
+    transcript.set(REPORT, [], final_message=REPORT)
+    outcome = _verifier(recap_patterns=[r"cluster is healthy"]).verify(timeout_sec=1.0)
+    assert not outcome.success
+    assert "section heading" in outcome.reason
+    assert "restates its verdict" in outcome.reason
+
+
+def test_an_empty_final_message_fails():
+    transcript.set("", [])
+    outcome = _verifier().verify(timeout_sec=1.0)
+    assert not outcome.success
+    assert outcome.status != "error"
+    assert "reply is empty" in outcome.reason
 
 
 def test_an_empty_stash_errors():

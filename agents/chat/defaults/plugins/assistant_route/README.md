@@ -26,14 +26,16 @@ turn files a kanban card as before.
 - The route opens only when the terminal backend resolves to the shell sandbox (`TERMINAL_ENV=ssh`,
   which the entrypoint pins from the managed scope, or `terminal.backend: ssh` in the loaded
   config). On a start with no operator and no sandbox the gate stays closed and `triage` says so.
-- A turn that ran a command refuses a shared-memory write (`memory_retain` with `scope: shared`,
-  or a `multiuser_memory` write action) for the rest of the turn: what a command prints is
-  cluster data, not a fact for the memory every user recalls.
+- A turn that ran a command refuses every memory write for the rest of the turn: `memory_retain`
+  (whose default scope in an unattended session is the shared bank, so a call with no `scope` is
+  no personal write) and every `multiuser_memory` action but `read`, the set the provider's own
+  schema offers. What a command prints is cluster data, not a fact for memory.
 - Two switches reach the plugin through `spec.deployment.env`: `KUBE_AGENTS_ASSISTANT_ROUTE=off`
-  closes the route (the gated tools stay hidden and refused on every turn, and `triage` tells the
-  model to delegate), and `KUBE_AGENTS_TRIAGE_FORCE_TOOL_CHOICE=0` only stops forcing `triage` as
-  the first call. Removing the plugin from `plugins.enabled` is not a switch: the entrypoint's
-  back-fill re-adds the image's list on the next start.
+  closes the route (the gated tools stay hidden and refused on every turn; a `triage` that picks
+  the assistant route records no decision, so `triage` stays offered and its result tells the
+  model to call it again with a specialist), and `KUBE_AGENTS_TRIAGE_FORCE_TOOL_CHOICE=0` only
+  stops forcing `triage` as the first call. Removing the plugin from `plugins.enabled` is not a
+  switch: the entrypoint's back-fill re-adds the image's list on the next start.
 - The gated set is the static pair widened at `register()` from Hermes' own `terminal` toolset,
   so a tool upstream adds to that toolset is gated too.
 
@@ -43,9 +45,11 @@ The sandbox holds no credentials and no network beyond the credential proxy, and
 refuses every `kubectl` and `gcloud` verb that writes. Failures surface as ordinary tool
 errors, which the front door explains and offers to delegate. The gate decides when the
 terminal runs, not what it runs: the same sandbox carries the platform specialist's
-version-control client, which can clone and push a branch through the proxy, and the proxy
-cannot tell the front door from the platform worker. The persona keeps that path off this
-route; a sandbox principal of the front door's own is the follow-up that would enforce it.
+version-control client, whose brokered verbs push a branch and open, comment on, update or
+close a proposal or an issue on a registered repository, and the proxy cannot tell the front
+door from the platform worker (merge and approval stay refused for every caller). The persona
+keeps that path off this route; a sandbox principal of the front door's own is the follow-up
+that would enforce it.
 
 If Hermes fails to load this plugin (its startup log says `Failed to load plugin
 'assistant_route'`), the terminal is enabled with no gate at all, which is why

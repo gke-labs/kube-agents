@@ -643,6 +643,10 @@ ENABLED_KEY = "enabled"
 TOOLSETS_KEY = "platform_toolsets"
 AGENT_KEY = "agent"
 DISABLED_KEY = "disabled_toolsets"
+# The names an image has stopped denying: the only ones the back-fill ever
+# takes off a live agent.disabled_toolsets, and only while the template grants
+# them. A denial of any other name stays, however it got there.
+RELEASED_DENIALS = frozenset({"terminal"})
 
 
 def fill(src, dst, path):
@@ -676,12 +680,12 @@ if isinstance(template_enabled, list) and isinstance(live_plugins, dict) and isi
 # The tool surface is image-owned the same way, in two lists the fill cannot
 # reach. Each platform_toolsets.<key> gains the template's names it lacks (a
 # toolset the image added, such as the front door's terminal). And a name the
-# template GRANTS in one of those lists while the live agent.disabled_toolsets
-# still denies it is dropped from the denylist, because the denylist runs last
-# and would cancel the grant (the same terminal, when the image stops denying
-# it). Nothing else leaves the denylist: a denial the template does not grant
-# against, however it got there, is kept, and so is every name the agent added
-# to a toolset list on its own.
+# image has stopped denying (RELEASED_DENIALS) is dropped from the live
+# agent.disabled_toolsets while the template GRANTS it in one of those lists
+# and no longer denies it, because the denylist runs last and would cancel the
+# grant. Nothing else leaves the denylist: a denial of any other name, the
+# template's or one an operator added by hand, is kept, and so is every name
+# the agent added to a toolset list on its own.
 template_toolsets = template.get(TOOLSETS_KEY)
 live_toolsets = live.get(TOOLSETS_KEY)
 granted = set()
@@ -705,7 +709,7 @@ if (isinstance(template_agent, dict) and isinstance(live_agent, dict)
     still_denied = template_agent[DISABLED_KEY]
     kept = []
     for name in live_agent[DISABLED_KEY]:
-        if name not in still_denied and str(name) in granted:
+        if name not in still_denied and str(name) in granted and str(name) in RELEASED_DENIALS:
             added.append("-".join([".".join([AGENT_KEY, DISABLED_KEY]), str(name)]))
             continue
         kept.append(name)
@@ -720,7 +724,7 @@ if added:
     with open(tmp_path, "w") as fh:
         yaml.safe_dump(live, fh, sort_keys=False, default_flow_style=False)
     os.replace(tmp_path, live_path)
-    print(f"[ENTRYPOINT] config backfill: brought {len(added)} image-owned key(s) in step (a '-name' suffix is a denylist entry the image's toolsets now grant against): {', '.join(added)}")
+    print(f"[ENTRYPOINT] config backfill: brought {len(added)} image-owned key(s) in step (a '-name' suffix is a denylist entry the image stopped denying and now grants): {', '.join(added)}")
 PYEOF
 }
 

@@ -421,9 +421,10 @@ INJECT_LANE_EXCLUDED = [
     "chat-reset-history-names-the-command",  # #2039: grades the front door's answer to a reset request; excluded under cli, not yet graded on api
     "chat-routing-board-read",  # the same for the front door reading the board instead of filing a card
     "chat-routing-fleet-question",  # #3202: the front door's own triage and terminal read, not yet graded on this lane
+    "chat-assistant-route-lists-clusters",  # the same for the front door listing the clusters itself
     "first-install-hello-running",  # #2039: grades the chat profile's onboarding greeting; excluded under cli, not yet graded on api
     "first-install-hello-done",  # the same once the first-look scan has finished
-    "chat-voice-answer-first",  # #2039: grades the card result the front door delivers; the inject door files no card
+    "chat-voice-answer-first",  # #3202: the front door's own triage, terminal read and verdict-first reply, not yet graded on this lane
     "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
     "chat-question-asked-to-choose-pauses",  # #2039: grades the worker's needs_input block under the door's one card; same door
 ]
@@ -431,9 +432,10 @@ INJECT_LANE_EXCLUDED = [
 # front door (bench/kube_agents_bench/card_wake.py); the harness errors such
 # a run on any transport but api.
 FRONT_DOOR_WAKE_DIRECTIVES = ("[bench:card-failure-wake]", "[bench:slack-question-wake]")
-# Check types that read what only the chat front door's card round trip
-# delivers; on the inject lane there is no card, so the check fails rather
-# than being set aside (bench/README.md, the transport table).
+# Check types that read the chat front door's reply: the card results it
+# delivered, or the reply itself when no card was filed. The inject door's
+# reply has not been graded by one, so a case carrying it is held off the lane
+# until a run grades it (bench/README.md, the transport table).
 FRONT_DOOR_DELIVERY_CHECK_TYPES = frozenset({"answer_first"})
 # Each exclusion's api-lane tier, pinned beside it: an entry is not a
 # demotion, so a case that leaves its tier's file while still excluded reds.
@@ -448,6 +450,7 @@ INJECT_LANE_EXCLUDED_TIER = {
     "chat-reset-history-names-the-command": "nightly",
     "chat-routing-board-read": "nightly",
     "chat-routing-fleet-question": "nightly",
+    "chat-assistant-route-lists-clusters": "nightly",
     "first-install-hello-running": "nightly",
     "first-install-hello-done": "nightly",
     "chat-voice-answer-first": "nightly",
@@ -586,8 +589,8 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                     self.assertIn(case, excluded, f"{case} replays a wake but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
 
     def test_every_registered_front_door_delivery_case_is_excluded(self):
-        # answer_first fails on the inject lane rather than being set aside,
-        # so an unlisted case carrying one reds there every repetition.
+        # answer_first is graded, not set aside, on the inject lane, and no run
+        # there has graded it yet, so an unlisted case carrying one is a bet.
         import yaml
 
         def check_types(node):
@@ -605,7 +608,7 @@ class InjectLaneExclusionsTest(unittest.TestCase):
             doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
             if FRONT_DOOR_DELIVERY_CHECK_TYPES & set(check_types(doc.get("verification_spec"))):
                 with self.subTest(case=case):
-                    self.assertIn(case, excluded, f"{case} reads a delivered card result but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
+                    self.assertIn(case, excluded, f"{case} grades the front door's reply but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
 
     def test_an_exclusion_is_not_a_demotion(self):
         # The api lane's roster is untouched by an entry here: an excluded

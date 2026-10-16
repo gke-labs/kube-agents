@@ -89,6 +89,11 @@ chat-routing-board-read
 # card). Not yet graded on this lane. Returns to the lane once a run on the
 # api executor with it included grades it.
 chat-routing-fleet-question
+# #3202: the same for the front door listing the clusters itself (a triage
+# call, then a read-only `gcloud container clusters list`, no card). Not yet
+# graded on this lane. Returns to the lane once a run on the api executor
+# with it included grades it.
+chat-assistant-route-lists-clusters
 
 # #2039: grades the greeting the chat profile's bootstrap_onboarding plugin
 # gives on a new user's first chat turn, which the stack arms for the API
@@ -104,9 +109,10 @@ first-install-hello-done
 
 # #3202: grades the chat front door's own turn on the assistant route -- its
 # triage call, a read-only kubectl read through its terminal, and a reply
-# that opens on the verdict. The inject door addresses `platform` directly,
-# so no front-door turn happens and the objectives fail every repetition.
-# Returns to the lane when the door routes through the chat profile.
+# that opens on the verdict (answer_first reads the delivered card results,
+# or the reply itself when no card was filed). Not yet graded on this lane.
+# Returns to the lane once a run on the api executor with it included grades
+# it.
 chat-voice-answer-first
 # #2039: grades the chat front door's ack for a fleet question and the
 # platform worker's fan-out beneath the one card it files. The same gap as
@@ -118,6 +124,6 @@ chat-fanout-fleet-restarts-rows
 # #2039: grades the worker's needs_input block under the one card the chat front
 # door files for an asked-for choice (scope: workers). The same gap as
 # chat-fanout-fleet-restarts-rows: the lane's delegation wait reads no card
-# ids, so the worker checks fail closed. Returns to the lane with
-# agent-kanban-smoke.
+# ids, so the worker checks fail closed. Returns to the lane when the
+# delegation wait reads card ids on this path.
 chat-question-asked-to-choose-pauses
