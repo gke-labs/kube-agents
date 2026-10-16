@@ -180,6 +180,14 @@ KNOWN_UNREGISTERED = {
     "chat-relay-posts-report-as-written": (
         "needs a chat platform, which no CI install has; run by hand on a chat install"
     ),
+    # It grades a GitHub forge declared at a GitHub Enterprise Server host,
+    # which needs the GHES proxy (hack/ghes-proxy) and an install pointed at
+    # it. No eval lane deploys either, so it runs by hand with the recipe in
+    # its header. The entry goes when a lane deploys both.
+    "ghes-pdb-remediation-pr": (
+        "needs the GHES proxy and a GHES-forge install, which no eval lane has; "
+        "run by hand with the recipe in the case header"
+    ),
 }
 
 # Cases whose fixture does not exist at all, waiting on the issue that plants
@@ -281,18 +289,6 @@ FIXTURE_NOT_READY = {
         "#1873: needs the stalled-controller role applied to every pool "
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
-    ),
-    "observability-trace-latency-brokered": (
-        "#2244: needs the pool host clusters to export traces; until "
-        "2026-10-02, 33 of the 35 had no managed OpenTelemetry collection "
-        "scope, so the operator's telemetry discovery resolved to None, the "
-        "agent ran with OTEL_SDK_DISABLED=true and Cloud Trace in those "
-        "projects was empty, which the case reports as an empty window and "
-        "fails on the report check (a fixture gap, not a red). The scope was "
-        "set by hand that day, and the provisioning script and the verifier's "
-        "gke/host-otel-scope finding now hold it (docs/ci-pool-projects.md "
-        "section 2); the case moves to the nightly once the first leases "
-        "after the repair show traces landing"
     ),
 }
 
