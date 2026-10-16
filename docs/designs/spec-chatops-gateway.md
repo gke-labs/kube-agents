@@ -1714,7 +1714,7 @@ sender; an unmapped one is attributed by member id, below) - but visibly now: th
 posts a one-line notice to the conversation, once per sender, and keeps the structured
 log line. The exception is a message the sender addressed to nobody (`Unaddressed`: an
 unmentioned Slack reply under one of the bot's own posts, #3246), which is dropped with a
-debug log line only and does not count as the sender's notice. A silent drop of a real user is a support burden. Per sender, not per
+info-level log line only and does not count as the sender's notice. A silent drop of a real user is a support burden. Per sender, not per
 conversation - a channel mention mints a fresh conversation every time, so a
 conversation-scoped dedupe would be no bound at all. The memory is capped and evicted
 wholesale at the cap, so the worst an unverified sender can do is make one notice

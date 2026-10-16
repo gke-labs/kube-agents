@@ -1270,7 +1270,7 @@ func (s *SlackAdapter) otherWorkspace(team string) bool {
 // message must mention the bot, and the ask's own ts becomes the session
 // thread's root (Slack threads are implicit); a thread reply is a turn when
 // it mentions the bot, the thread's root is the bot's own post (an alert or
-// a card's report; read from the event, see inboundEvent), or the thread is
+// another home-channel post; read from the event, see inboundEvent), or the thread is
 // already a session thread — one the gateway has started a task in, which a
 // mention alone does not make it,
 // the channel ask's own thread included: the gateway starting the task
@@ -1380,8 +1380,9 @@ func (s *SlackAdapter) inboundEvent(ctx context.Context, m *slackevents.MessageE
 		return InboundMessage{}, false
 	}
 	// A reply under one of the bot's own posts is addressed to it, mention or
-	// not: an alert, a card's report or any other chat.notify post roots a
-	// thread no task started, so it is never a session thread, and its
+	// not: an alert, or any other chat.notify post the bot roots in the home
+	// channel, starts a thread no task started, so it is never a session
+	// thread, and its
 	// replies used to vanish without a log line (gke-labs/kube-agents#3246).
 	// Same rule as the today path's Slack adapter (_bot_authored_thread_root,
 	// upstream #63530), and like it, durable: Slack says who rooted the

@@ -79,8 +79,8 @@ type InboundMessage struct {
 	Answer bool
 	// Unaddressed marks a message the sender did not address to the bot,
 	// delivered only because of where it was typed: today an unmentioned
-	// Slack reply under one of the bot's own posts (an alert, a card's
-	// report), which is often people talking to each other. An unverified
+	// Slack reply under one of the bot's own posts (an alert, or another
+	// post it roots in the home channel), which is often people talking to each other. An unverified
 	// sender's such message is dropped without the public refusal notice,
 	// since they asked the bot nothing. False on every other path.
 	Unaddressed bool

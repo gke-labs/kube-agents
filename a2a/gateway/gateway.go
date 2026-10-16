@@ -726,8 +726,10 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 	if principal == "" {
 		if msg.Unaddressed {
 			// Someone off the list talking under one of the bot's posts, to a
-			// colleague as often as not: routine, so not a Warn per message.
-			g.log.Debug("dropping unaddressed message from unverified sender",
+			// colleague as often as not: routine, so Info rather than a Warn per
+			// message. Not Debug: the gateway's handler drops Debug, and this
+			// line is the only trace the drop leaves.
+			g.log.Info("dropping unaddressed message from unverified sender",
 				"backend", backend, "author", msg.AuthorID, "conversation", msg.Conversation, "unaddressed", true)
 		} else {
 			g.log.Warn("dropping message from unverified sender",
