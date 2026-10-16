@@ -1628,16 +1628,19 @@ _USAGE_FLAGS = ("-h", "--help")
 class WorkerRun(BaseModel):
     """One program run a case requires of a worker, or forbids: a script by its basename (or its
     module stem under ``-m``), the flags that have to follow it on the same shell segment as exact
-    words, and ``word_patterns``, regular expressions each of which some later word of the segment
+    words, ``word_patterns``, regular expressions each of which some later word of the segment
     must match on its own (``^(?:get|describe)$`` for a verb; a resource list such as
     ``pdb,validatingwebhookconfigurations`` is one word, so a pattern over the word reads it
-    whole, and a quoted mention of the whole command is one word that is no command)."""
+    whole, and a quoted mention of the whole command is one word that is no command), and
+    ``succeeded``, whether the command must have exited 0 (a non-zero or unrecorded exit
+    does not count)."""
 
     model_config = ConfigDict(extra="forbid")
 
     script: str
     flags: list[str] = Field(default_factory=list)
     word_patterns: list[str] = Field(default_factory=list)
+    succeeded: bool = False
 
     @field_validator("word_patterns")
     @classmethod
@@ -2101,7 +2104,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
-    and no ``-h``/``--help`` (:func:`_argv_runs`). ``forbidden_runs``: the same
+    and no ``-h``/``--help`` (:func:`_argv_runs`). When ``succeeded: true``,
+    the command must also have exited 0 (a non-zero or unrecorded exit does
+    not count). ``forbidden_runs``: the same
     shape, and no segment may run it. An argv tells a quoted mention of the
     invocation from a run, where a pattern over the text cannot: a forbidden
     ``kubectl get`` of budgets is not met by ``grep "kubectl get pdb" SKILL.md``
@@ -2232,6 +2237,10 @@ class WorkerCommandsVerifier(BaseVerifier):
                 )
             typed = [row.get("command", "") for row in snap.worker_commands]
             windowed = typed
+            command_entries = [
+                (row.get("command", ""), row.get("exit") == 0)
+                for row in snap.worker_commands
+            ]
         else:
             calls = _worker_terminal_calls(snap.trajectory)
             if not calls:
@@ -2248,6 +2257,10 @@ class WorkerCommandsVerifier(BaseVerifier):
                         reason=_NO_WORKER_TERMINAL_CALLS_REASON,
                     )
             typed = [command for _, _, command, _, _ in calls]
+            command_entries = [
+                (command, not failed)
+                for _, _, command, _, failed in calls
+            ]
             untimed = [command for _, at, command, _, _ in calls if at is None]
             if untimed:
                 shown = "; ".join(repr(c[:_SHOWN_COMMAND_CHARS]) for c in untimed[:_MAX_NAMED_COMMANDS])
@@ -2286,15 +2299,34 @@ class WorkerCommandsVerifier(BaseVerifier):
         # exemption touched is out of the required list. The forbidden list
         # reads the windowed commands (every command without a window).
         commands = [c for c in typed if self._without_exempt_text(c) == c]
+        active_entries = [(c, succ) for c, succ in command_entries if self._without_exempt_text(c) == c]
         exempted = f" ({len(typed) - len(commands)} exempted)" if len(commands) < len(typed) else ""
         graded = [(c, self._without_exempt_text(c)) for c in windowed]
         missing = [p for p in self.required_patterns if not any(re.search(p, c) for c in commands)]
         hits = [(p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)]
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
-        argvs = [argv for c in commands for argv in _shell_argvs(c)]
-        typed_argvs = [argv for c in typed for argv in _shell_argvs(c)]
-        unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
-        ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
+
+        def _credited(run: WorkerRun) -> bool:
+            for c, succ in active_entries:
+                if run.succeeded and not succ:
+                    continue
+                for argv in _shell_argvs(c):
+                    if _argv_runs(argv, run):
+                        return True
+            return False
+
+        def _forbidden_hit(run: WorkerRun) -> list[list[str]]:
+            hits_found = []
+            for c, succ in command_entries:
+                if run.succeeded and not succ:
+                    continue
+                for argv in _shell_argvs(c):
+                    if _argv_runs(argv, run):
+                        hits_found.append(argv)
+            return hits_found
+
+        unrun = [run for run in self.required_runs if not _credited(run)]
+        ran = [(run, argv) for run in self.forbidden_runs for argv in _forbidden_hit(run)]
         # A forbidden command that was read is conclusive whatever else was
         # not; a missing required command, or a clean read, is not when the
         # capture has gaps (the siblings' rule, ``worker_agents`` first).

@@ -40,10 +40,10 @@ def _check(name: str) -> dict:
     return check["check"]
 
 
-def _passes(check: dict, command: str) -> bool:
+def _passes(check: dict, command: str, exit_code: int | None = 0) -> bool:
     """Grade one worker command with the verifier; True when the check passes."""
     assert "\n" not in command, command
-    transcript.set("ok", [], worker_commands=[{"task": "t_1", "command": command}])
+    transcript.set("ok", [], worker_commands=[{"task": "t_1", "command": command, "exit": exit_code}])
     try:
         result = WorkerCommandsVerifier(**check).verify(5.0)
     finally:
@@ -164,3 +164,13 @@ def test_ledger_mention_help_or_draft_is_not_flagged(command):
 )
 def test_no_ledger_objective_fails_a_form_one_run(command, passes):
     assert _passes(_check("no-ledger-run-was-opened"), command) is passes
+
+
+def test_collector_run_exiting_nonzero_is_not_credited():
+    cmd = f"python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json"
+    assert not _passes(_check(COLLECTOR_CHECK), cmd, exit_code=1)
+
+
+def test_collector_run_with_unrecorded_exit_is_not_credited():
+    cmd = f"python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json"
+    assert not _passes(_check(COLLECTOR_CHECK), cmd, exit_code=None)

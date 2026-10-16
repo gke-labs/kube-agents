@@ -8335,6 +8335,33 @@ def test_worker_commands_required_run_names_what_did_not_run():
     assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason
 
 
+def test_worker_commands_required_run_succeeded_flag():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+
+    # Command exited 0 passes.
+    transcript.set("ok", _TRAJECTORY, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness", "exit": 0}])
+    assert v.verify(5.0).status == "pass"
+
+    # Command exited non-zero fails.
+    transcript.set("ok", _TRAJECTORY, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness", "exit": 1}])
+    res = v.verify(5.0)
+    assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness" in res.reason
+
+    # Command with unrecorded exit fails.
+    transcript.set("ok", _TRAJECTORY, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness", "exit": None}])
+    res = v.verify(5.0)
+    assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness" in res.reason
+
+    # Without succeeded=True (default False), a non-zero exit is credited.
+    run_any = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"])
+    v_any = WorkerCommandsVerifier(type="worker_commands", required_runs=[run_any])
+    transcript.set("ok", _TRAJECTORY, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness", "exit": 1}])
+    assert v_any.verify(5.0).status == "pass"
+
+
 
 
 # The readiness case for the same catalogue entry grades the readiness report's

@@ -50,8 +50,18 @@ def test_every_command_line_becomes_a_row_without_its_suffixes(monkeypatch):
         "printenv",
         "cd /tmp && gh api repos/acme/infra/commits",
     ]
+    assert [r["exit"] for r in rows] == [0, 0, 1, 0]
     assert all(r["task"] == "t_ab12" for r in rows)
     assert seen and "/opt/data/kanban/logs/t_ab12.log" in seen[0]
+
+
+def test_worker_command_without_exit_or_duration_records_none_exit(monkeypatch):
+    log = """__WORKER_LOG__
+  ┊ 💻 $         tail -f /var/log/syslog
+"""
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: log)
+    rows = harness._worker_commands(harness._worker_logs(["t_ab12"], 5.0))
+    assert rows == [{"task": "t_ab12", "command": "tail -f /var/log/syslog", "exit": None}]
 
 
 def test_the_read_returns_text_when_the_output_is_cut_inside_a_glyph(monkeypatch):

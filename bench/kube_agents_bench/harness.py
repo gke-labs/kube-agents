@@ -288,12 +288,13 @@ _ARCHIVED_PREFIX = "Archived "
 _LOG_EXCERPT_CHARS = 200
 # One terminal command per line in a card's worker log, as hermes renders it:
 # ``  ┊ 💻 $         <command>  0.6s [exit 1]``. The timing and exit suffixes
-# are stripped; the rendering is kept verbatim otherwise, and it is hermes's
-# one-line summary of the command rather than the text as typed (a chain
-# arrives as its first command plus `` + N command(s)``; the verifier's
-# docstring lists the rest).
+# are parsed to record the command and its exit code (0 for a timed command with
+# no exit suffix, N for ``[exit N]``, None when unrecorded); the rendering is kept
+# verbatim otherwise, and it is hermes's one-line summary of the command rather
+# than the text as typed (a chain arrives as its first command plus
+# `` + N command(s)``; the verifier's docstring lists the rest).
 _WORKER_COMMAND_RE = re.compile(
-    r"💻 \$\s+(?P<command>.+?)(?:\s+\d+(?:\.\d+)?s(?: \[exit \d+\])?)?\s*$"
+    r"💻 \$\s+(?P<command>.+?)(?:\s+(?P<duration>\d+(?:\.\d+)?s)(?: \[exit (?P<exit>-?\d+)\])?)?\s*$"
 )
 _MAX_WORKER_LOG_BYTES = 512_000
 # Where a stalled card's transcript is kept. Prow sets ARTIFACTS to the
@@ -927,7 +928,7 @@ def _worker_logs(task_ids: list[str], timeout: float) -> dict[str, _WorkerLog | 
     return logs
 
 
-def _worker_commands(logs: dict[str, _WorkerLog | None] | None) -> list[dict[str, str]] | None:
+def _worker_commands(logs: dict[str, _WorkerLog | None] | None) -> list[dict[str, Any]] | None:
     """Every terminal command the delegated workers ran, from their card logs.
 
     The worker is a separate hermes session; its log records each terminal
@@ -943,14 +944,25 @@ def _worker_commands(logs: dict[str, _WorkerLog | None] | None) -> list[dict[str
     """
     if logs is None:
         return None
-    commands: list[dict[str, str]] = []
+    commands: list[dict[str, Any]] = []
     for tid, log in logs.items():
         if log is None:
             return None
         for line in log.body.splitlines():
             match = _WORKER_COMMAND_RE.search(line)
             if match:
-                commands.append({"task": tid, "command": match.group("command").strip()})
+                exit_str = match.group("exit")
+                if exit_str is not None:
+                    exit_code = int(exit_str)
+                elif match.group("duration") is not None:
+                    exit_code = 0
+                else:
+                    exit_code = None
+                commands.append({
+                    "task": tid,
+                    "command": match.group("command").strip(),
+                    "exit": exit_code,
+                })
     return commands
 
 
