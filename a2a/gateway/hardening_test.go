@@ -139,7 +139,9 @@ func TestStopWithNothingToStopStartsNoTask(t *testing.T) {
 		AuthorID: "1001", MessageID: "sg-1", Text: "stop"}
 	waitFor(t, "bare stop answered", func() bool {
 		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, "nothing is running") {
+			// The plain reply: a conversation that never ran a task has
+			// no card of its own to mention (gke-labs#3263).
+			if p == nothingRunningNotice {
 				return true
 			}
 		}
