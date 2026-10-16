@@ -34,8 +34,9 @@ const sessionKindDM = "dm"
 // in a message the adapter marked TopLevel: one that roots a conversation of
 // its own (a top-level Slack DM), so nothing is running in it and the task
 // the user means is in another thread. The notice says where to send it. A
-// thread with nothing running, a question refused at the session cap among
-// them, gets the plain reply: the user is already in the right place.
+// thread with nothing running gets one of the in-thread replies below
+// (nothingRunningNotice or nothingRunningCardNotice): the user is already in
+// the right place.
 const topLevelNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread"
 
 // nothingRunningNotice answers a "stop" in a conversation with no active
