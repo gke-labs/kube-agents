@@ -42,6 +42,10 @@ vertex_project_id  = ""
 vertex_location    = ""
 vertex_manage_serving_project = true
 
+# The daily alert ceilings (ALERT_DAILY_LIMIT_* in install.env), only the
+# keys that are set. A bucket that is not here keeps the image default.
+alert_daily_limits = {}
+
 # The PlatformAgent's spec.mode (PLATFORM_AGENT_MODE in install.env). The
 # composition passes the chart nothing for "today", so its CR carries no mode.
 platform_agent_mode = "today"

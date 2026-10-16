@@ -198,7 +198,9 @@
 # (147 units) here, of a sixty-three-case, 189-unit matrix with the presubmit
 # file's fourteen. The parallelism arithmetic above does not price
 # this case: every case with a `stack:` holds the infra lock for its whole run,
-# so those cases run one at a time whatever EVAL_TASK_PARALLELISM is. With this
+# so those cases run one at a time whatever EVAL_TASK_PARALLELISM is (since
+# 2026-10-15 an infra_lock_exempt case, hack/ci-eval-pr.sh, takes no infra lock
+# and is not one of them). With this
 # case the nightly carries eleven of them, ~433 serial minutes at their
 # unit_cost_hint figures and three repetitions (~378 without it), against the
 # 480m deadline. Whether that fits is the eval crew's call, on the first nights'
@@ -406,8 +408,8 @@
 # 2026-10-15 adds delete-namespace-unowned-stops (#3077): one case, three
 # units, deployer: noop on the seeded fleet's stalled-controller namespace,
 # unhinted at the 200s default. Counted from the lists with it, the last
-# entry below: eighty-three cases (249 units) here, of a ninety-seven-case,
-# 291-unit matrix.
+# entry below: eighty-four cases (252 units) here, of a ninety-eight-case,
+# 294-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -1047,6 +1049,12 @@
 # memory limit and the skill's created-with-google-skill label. deployer:
 # noop, transcript-only, one delegation round trip.
 ./tasks/alert-config-terraform-promql-probe/task.yaml
+
+# A plain chat request to check the fleet's security posture runs the
+# compliance audit's collector (#2386), and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's rbac-overgrant role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/security-chat-request-runs-collector/task.yaml
 
 # A request to delete a namespace the GitOps repository does not declare: the
 # agent stops, says a pull request cannot delete it (or that no repository is

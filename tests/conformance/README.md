@@ -95,8 +95,9 @@ an absence is true of the empty set, so `_workflows()` in
 `test_B_write_path.py` raises on its behalf. C4's SHA-pin sweep keeps its own
 copy of the glob and guards it the same way. C4 is the invariant; its
 stricter form, which also requires the version comment beside each SHA and a
-digest on a `docker://` ref, and the fork-guard check on every auto-triggered
-credentialed workflow, run under `make test-python` in
+digest on a `docker://` ref, the fork-guard check on every auto-triggered
+credentialed workflow, and the check that every Docker Hub pull goes through
+`mirror.gcr.io`, run under `make test-python` in
 `tests/test_workflow_pins_and_fork_guards.py`.
 
 Another is the site's content tree, which D2 walks for the read-only

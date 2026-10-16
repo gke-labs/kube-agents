@@ -28,8 +28,8 @@
 # the run and restores them,
 # files two archived cards, and adds and removes the `oobe` job. The four audits
 # it starts are real runs: each writes its ledger issue in the install's GitOps
-# repository (with none, its report in the report store) and posts its summary
-# wherever the install sends audit reports. The
+# repository (with none, its report in the report store) and, when it changed
+# something, posts its summary wherever the install sends audit reports. The
 # runner holds their four streams' locks for the unit (`audit_streams` below), and
 # every unit on one of those streams first waits up to two hours for a run the
 # install started there, so no audit case runs beside them and the next repetition

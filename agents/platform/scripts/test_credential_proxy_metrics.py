@@ -344,11 +344,17 @@ class RequestCountingTest(_BrokerFixture):
 
 
 def _hold_a_slot(case, executor, seconds):
-    """Hold a request slot for `seconds` on another thread; return once held."""
+    """Hold a request slot for `seconds` on another thread; return once held.
+
+    The returned thread's `held_at` is the monotonic time the slot was taken,
+    the clock `queued_at` is on, so a test can bound a wait by when the slot
+    could first come free (`held_at + seconds`) rather than by `seconds` alone.
+    """
     held = threading.Event()
 
     def hold():
         with executor.request_slot():
+            thread.held_at = time.monotonic()
             held.set()
             time.sleep(seconds)
 
@@ -591,7 +597,20 @@ class AdmissionMetricsTest(unittest.TestCase):
         # arrival, so it is a waited admission under the budget, not `none`.
         self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
         self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
-        self.assertGreaterEqual(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget"), 0.4)
+        # Measured from the first leg's arrival, which comes after the holder
+        # took its slot, so the wait is at least the time from arrival to the
+        # earliest the slot could come free -- not the whole 0.4 s hold, which
+        # it misses by however long after the hold began the first leg arrived
+        # (#3127). The 1e-6 is the rendered sum's six-decimal rounding.
+        # No guard on the gap itself: a gap of 0.4 s or more means the first
+        # leg was admitted rather than yielded, which self.fail above catches,
+        # and any shorter gap leaves a floor the regression (a wait near zero)
+        # falls under.
+        earliest_release = holder.held_at + 0.4
+        self.assertGreaterEqual(
+            _series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget"),
+            earliest_release - arrival - 1e-6,
+        )
 
     def test_the_snapshot_is_typed_and_the_render_reads_its_fields(self):
         snapshot = self.executor(max_concurrent_commands=3).admission_snapshot()
