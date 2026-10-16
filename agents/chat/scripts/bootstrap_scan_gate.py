@@ -371,6 +371,50 @@ def _scope_gap_paragraph(data_dir: Path) -> str:
     )
 
 
+def _excluded_clusters(data_dir: Path) -> list[str] | None:
+    """The clusters spec.scope.exclude.clusters leaves out, as `project/location/cluster`;
+    None when they cannot be known.
+
+    Read through `fleet_scope_targets`, the fleet_scope tool's own reader: the snapshot the
+    reconcile writes, or the operator's render when there is no snapshot yet (the gate files
+    the sweep without one when it gives up on the reconcile). The sweep's worker lists the
+    fleet with `gcloud container clusters list`, which names an excluded cluster like any
+    other, and the card's "audit every cluster with no Cluster Agent" would send it to exactly
+    these: the reconcile gives an excluded cluster no profile (#3081). No declared scope is an
+    empty list; a render that cannot be read is None, and the card then sends the worker to the
+    tool instead.
+    """
+    try:
+        import fleet_scope_targets  # beside this script in the pod, as for the reconcile
+        targets = fleet_scope_targets.declared_scope_targets(data_dir)
+    except Exception:  # noqa: BLE001 - unreadable render or a missing module: unknown, not "none"
+        return None
+    if targets is None:
+        return []
+    return ["/".join(ref) for ref in targets.excluded_clusters]
+
+
+def _excluded_clusters_paragraph(data_dir: Path) -> str:
+    """The sweep's note on the clusters the install excludes; empty when it excludes none."""
+    excluded = _excluded_clusters(data_dir)
+    if excluded is None:
+        return (
+            "**The install's cluster exclusions could not be read when this card was filed.** Before "
+            "Step 1, call the platform_control `fleet_scope` tool and leave out every cluster it lists "
+            "in `excluded_clusters`: do not audit them in Step 3, do not put them in `fleet` or `gaps`, "
+            "and do not name them in the report.\n\n"
+        )
+    if not excluded:
+        return ""
+    return (
+        "**The install excludes these clusters from the fleet; leave them out of this sweep entirely:** "
+        + ", ".join(f"`{ref}`" for ref in excluded)
+        + " (`project/location/cluster`, from `spec.scope.exclude.clusters`). They have no Cluster "
+        "Agent because they are excluded, not because one is missing: do not audit them in Step 3, "
+        "do not put them in `fleet` or `gaps`, and do not name them in the report.\n\n"
+    )
+
+
 def _reconcile_attempts(data_dir: Path) -> int:
     try:
         first = (data_dir / RECONCILE_ATTEMPTS_MARKER).read_text(encoding="utf-8").splitlines()[0]
@@ -563,6 +607,7 @@ def _task_body() -> str:
         "onboarding runs once, and a report saying discovery failed is worth more than a thin "
         "one that reads as a clean fleet.\n\n"
         f"{_scope_gap_paragraph(_data_dir())}"
+        f"{_excluded_clusters_paragraph(_data_dir())}"
         "**Step 2 — do not fan out; the gate has.** This gate files one audit card per Cluster "
         "Agent itself, read from the profiles when this card was filed:\n\n"
         f"{roster}\n\n"

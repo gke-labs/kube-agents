@@ -247,7 +247,7 @@ import fleet_scope_args  # noqa: E402
 
 # The install's declared scope, handed in by the SOP from the platform_control
 # `fleet_scope` tool (`--scope-projects`, `--scope-unread`), one holder per
-# collector module as the siblings keep it: set from the two flags by
+# collector module as the siblings keep it: set from the scope flags by
 # `validate_args`, which `main` and `collect_fleet` both call first.
 declared_scope = fleet_scope_args.DeclaredScope()
 
@@ -567,6 +567,9 @@ EXIT_PROJECTS_NONE = "none"
 EXIT_NOTE_FORMAT = " ({note})"
 # A `--cluster` names its project under `--project`'s rule: inside the readable scope.
 FORCED_OUTSIDE_SCOPE_TEXT = "--cluster {cluster}: {error}"
+# A `--cluster` naming a cluster spec.scope.exclude.clusters excludes (#3081):
+# refused up front, rather than reported as a cluster its listing did not return.
+FORCED_EXCLUDED_TEXT = "--cluster {cluster} names a cluster spec.scope.exclude.clusters excludes; it is not reviewed"
 # A cluster key is <project>/<location>/<name>, three non-empty parts; a bare
 # name would otherwise be swept as a project id.
 CLUSTER_KEY_PARTS = 3
@@ -1468,6 +1471,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], str | N
         return [], f"clusters list returned non-JSON: {exc}"
     if not isinstance(clusters, list):
         return [], "clusters list returned JSON that is not a list"
+    clusters = declared_scope.drop_excluded(project, clusters)
     for cluster in clusters:
         cluster["project"] = project
         cluster["location"] = cluster.get("location") or cluster.get("zone") or ""
@@ -5531,7 +5535,7 @@ def validate_args(args: argparse.Namespace, now: datetime | None = None) -> None
     # The scope the run was handed, read before anything else: a `--project`
     # override outside a declared scope, a declared scope with nothing
     # readable, or the sandbox's scope guard with no flags is refused here.
-    declared_scope.set(getattr(args, "scope_projects", None), getattr(args, "scope_unread", None))
+    declared_scope.set(getattr(args, "scope_projects", None), getattr(args, "scope_unread", None), getattr(args, "scope_exclude_clusters", None))
     project = project_override(args)
     if not (getattr(args, "probe_lock", False) or getattr(args, "reset_ledger", False)):
         if project is not None and not project:
@@ -5553,6 +5557,8 @@ def validate_args(args: argparse.Namespace, now: datetime | None = None) -> None
             forced_error = declared_scope.override_error(parts[0])
             if forced_error:
                 raise argparse.ArgumentTypeError(FORCED_OUTSIDE_SCOPE_TEXT.format(cluster=key, error=forced_error))
+            if (parts[0], parts[1], parts[2]) in declared_scope.excluded_clusters:
+                raise argparse.ArgumentTypeError(FORCED_EXCLUDED_TEXT.format(cluster=key))
     full = bool(getattr(args, "full", False))
     if full:
         if forced:
@@ -6421,7 +6427,7 @@ def reset_ledger(store: Path, now: datetime, ledger_path: Path | None = None, gu
 def main(argv: list[str] | None = None) -> int:
     run_started = time.monotonic()  # the deadline counts the lock wait too
     args = build_parser().parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     try:
         validate_args(args)
     except argparse.ArgumentTypeError as exc:

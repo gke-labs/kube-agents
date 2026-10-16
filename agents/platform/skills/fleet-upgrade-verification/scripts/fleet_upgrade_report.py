@@ -101,7 +101,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 
-# The scope this collector was handed, set by main from the two flags.
+# The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
 
 CONFIG_PROJECT_CMD = (GCLOUD, "config", "get-value", "project")
@@ -460,6 +460,9 @@ NARROWED_RUN_NOTE = "Narrowed by --cluster: the rollout record was neither read 
 # A `--cluster` spec that matched nothing is an error with exit 1, like a project that
 # could not be listed: an empty table with exit 0 would read as "nothing to grade".
 UNMATCHED_CLUSTER_SPEC = "no cluster matched --cluster {spec!r} in {projects}"
+# A `--cluster` spec naming a cluster the install excludes (--scope-exclude-clusters,
+# #3081): it exists and was left out on purpose, which is not "no match".
+EXCLUDED_CLUSTER_SPEC = "--cluster {spec!r} names {clusters}, which spec.scope.exclude.clusters excludes; it was not checked"
 # When a project's listing failed, the run cannot say the spec matched nothing
 # there: the line names the projects it did list and the ones it could not,
 # rather than sending the operator after a typo or a deleted cluster.
@@ -1279,7 +1282,12 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
             errors.append({"project": project, "location": None, "message": error or f"{' '.join(cmd)} returned no list"})
             unlisted.append(project)
             continue
-        for cluster in listed:
+        # Narrowed by --scope-exclude-clusters, which the agent passes with the
+        # fleet_scope tool's collector_args (#3081). The daily upgrade-readiness
+        # watch (upgrade_readiness_watch.py) builds its own --project flags and
+        # passes no exclusion, so its report still covers excluded clusters
+        # (#3026), as the CRD field documents.
+        for cluster in declared_scope.drop_excluded(project, listed):
             if not isinstance(cluster, dict):
                 continue
             fleet.append(cluster)
@@ -1309,9 +1317,16 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
         members.append(member)
     errors.extend(cache.errors)
     listed = [p for p in projects if p not in unlisted]
+    excluded_by_spec: dict[tuple[str, str], list[str]] = {}
+    for project in projects:
+        for name, location in declared_scope.dropped.get(project, []):
+            for hit in _wanted({"name": name, "location": location}, wanted or set()):
+                excluded_by_spec.setdefault(hit, []).append(f"{project}/{location}/{name}")
     for location, name in sorted((wanted or set()) - matched):
         spec = f"{location}/{name}" if location else name
-        if not unlisted:
+        if (location, name) in excluded_by_spec:
+            message = EXCLUDED_CLUSTER_SPEC.format(spec=spec, clusters=", ".join(excluded_by_spec[(location, name)]))
+        elif not unlisted:
             message = UNMATCHED_CLUSTER_SPEC.format(spec=spec, projects=", ".join(projects))
         elif listed:
             message = UNMATCHED_CLUSTER_SPEC_PARTIAL.format(spec=spec, listed=", ".join(listed), unlisted=", ".join(unlisted))
@@ -1758,7 +1773,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--at", help="RFC 3339 instant to evaluate maintenance exclusions and the window at (default: now). Only with --readiness.")
     parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $HERMES_HOME/.kubeconfigs).")
     args = parser.parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
 
     if args.target_version and parse_version(args.target_version) is None:
         sys.stderr.write(f"--target-version {args.target_version!r} is not MAJOR.MINOR.PATCH[-gke.BUILD]\n")
