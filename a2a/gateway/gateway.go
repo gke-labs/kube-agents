@@ -39,13 +39,18 @@ const sessionKindDM = "dm"
 const topLevelNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread"
 
 // nothingRunningNotice answers a "stop" in a conversation with no active
-// task. The active task is only the front door's turn, which ends seconds
-// after it files a kanban card, and a card is not a task the gateway holds or
-// can cancel: it keeps working and posts here when it finishes. So the reply
-// must not read as "nothing is happening" (gke-labs#3263). Stopping the card
-// itself is the follow-up there. Starts with the old text so readers that
-// match "nothing is running" still do.
-const nothingRunningNotice = "🤷 nothing is running at the front desk. If it filed a task card for this question, the card keeps working and will post here — stopping a card from chat isn't supported yet."
+// task. nothingRunningCardNotice is the same answer for a conversation that
+// has run a task before: its turn may have filed a kanban card, which ends the
+// turn within seconds but is not a task the gateway holds or can cancel. The
+// card keeps working and posts here, so the reply must not read as "nothing
+// is happening" (gke-labs#3263); stopping the card is the follow-up there. A
+// conversation that never ran a task (a first message, or one refused at the
+// session cap) has no card of its own to mention. Both start with the same
+// text, so readers matching "nothing is running" still do.
+const (
+	nothingRunningNotice     = "🤷 nothing is running"
+	nothingRunningCardNotice = "🤷 nothing is running in this conversation. A card the agent filed for it keeps working and posts here; stopping a card from chat isn't supported yet."
+)
 
 // What retireIncarnation posts when the previous task cannot be closed on
 // the bus, by what the caller was about to do: three callers start a task,
@@ -936,6 +941,8 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			g.post(rec.Key, "🛑 cancel already sent — the task ends when the executor confirms")
 		case msg.TopLevel:
 			g.post(rec.Key, topLevelNothingRunningNotice)
+		case len(rec.Tasks) > 0:
+			g.post(rec.Key, nothingRunningCardNotice)
 		default:
 			g.post(rec.Key, nothingRunningNotice)
 		}

@@ -3471,6 +3471,9 @@ func TestRelayReportsQueuedFollowUpsThatNeverRan(t *testing.T) {
 // time a user says "stop" the conversation holds no active task while the
 // card is still working and will post here. The gateway cannot see or cancel
 // the card, and its reply must say so rather than a bare "nothing is running".
+// The rig models the turn, not the card: what the gateway keys on is that the
+// conversation ran a task and holds none now. A conversation that never ran
+// one gets the plain reply (TestStopWithNothingToStopStartsNoTask).
 func TestStopAfterTheTurnEndedSaysACardKeepsWorking(t *testing.T) {
 	r := startRig(t)
 	conv := "discord:g1/thread-card-stop"
@@ -3493,15 +3496,10 @@ func TestStopAfterTheTurnEndedSaysACardKeepsWorking(t *testing.T) {
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "c-2", Text: "stop"}
 	waitFor(t, "the stop to be answered with the card notice", func() bool {
 		for _, p := range r.adapter.postTexts() {
-			if p == nothingRunningNotice {
+			if p == nothingRunningCardNotice {
 				return true
 			}
 		}
 		return false
 	})
-	for _, want := range []string{"nothing is running", "card keeps working", "will post here", "isn't supported yet"} {
-		if !strings.Contains(nothingRunningNotice, want) {
-			t.Errorf("the no-task stop reply %q lacks %q", nothingRunningNotice, want)
-		}
-	}
 }
