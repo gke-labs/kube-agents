@@ -1049,3 +1049,9 @@
 # publishing. deployer: noop; reads the seeded fleet's rbac-overgrant role.
 # Nightly rather than presubmit for the collector's full sweep.
 ./tasks/security-chat-request-runs-collector/task.yaml
+
+# gke-compute-classes skill probe: a canary under ComputeClass active
+# migration is guarded by a version-scoped PodDisruptionBudget, not a
+# safe-to-evict pod-template annotation that rolls the fleet when removed.
+# deployer: noop, transcript-only.
+./tasks/compute-class-canary-active-migration-pdb-probe/task.yaml
