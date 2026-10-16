@@ -447,7 +447,8 @@ type TierCounts struct {
 	Actionable int
 
 	// NonDeclarative counts successful human calls dropped for naming a
-	// subresource in nonDeclarativeSubresources. Counted rather than dropped
+	// subresource in nonDeclarativeSubresources or an ephemeral coordination
+	// ConfigMap in coordinationConfigMaps. Counted rather than dropped
 	// silently: these are real actions by real people, and an operator
 	// wondering why their kubectl exec raised nothing should find a number
 	// saying so instead of an absence.
