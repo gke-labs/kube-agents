@@ -215,8 +215,10 @@ repository's entry, and `audit_report.py finish` fills it with the chat report
 it renders from its own line and the findings document (`render_chat_report`;
 `summary` on a no-forge run). An SOP that walks several repositories runs
 `start` and `finish` once for each, so a record whose last step is within two
-hours (the stream lease, which covers one step) and that has not started this
-repository yet is the same run; any other `start` opens a new record. The relay
+hours (the stream lease, which covers one step) and that holds no finished
+report for this repository is the same run, and a `start` retried after a
+failure keeps its own pending entry; any other `start` opens a new record. A
+`finish` applies the same rule. The relay
 reads the record, over the gateway's sandbox login where the shell runs in the
 shell sandbox (`sandbox_exec.read_bytes`).
 

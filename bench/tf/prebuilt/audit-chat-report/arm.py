@@ -19,7 +19,7 @@ Runs in the agent container, streamed in by main.tf. Three commands:
   fire <home> <python> <job>   mark <job> due with Hermes' own ``cron.jobs.trigger_job``
                                and record when, in STATE_FILE
   wait <home> <job> <seconds>  wait until the job's runtime record shows a run that ended
-                               after the mark, and record its status and delivery error
+                               after the mark, and record its delivery error
   clean <home>                 remove STATE_FILE
 
 The run is a real scheduled run: the profile's cron tick claims the mark and the
@@ -84,11 +84,7 @@ def wait(home, job_id, seconds):
         job = _job(home, job_id)
         ended = job.get("last_run_at")
         if ended and datetime.fromisoformat(ended) > fired:
-            state.update(
-                last_run_at=ended,
-                last_status=job.get("last_status"),
-                last_delivery_error=job.get("last_delivery_error"),
-            )
+            state.update(last_run_at=ended, last_delivery_error=job.get("last_delivery_error"))
             _write(home, state)
             print(f"{job_id} ended at {ended}: {job.get('last_status')}")
             return

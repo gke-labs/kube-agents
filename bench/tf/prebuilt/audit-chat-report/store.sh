@@ -1,3 +1,4 @@
+#!/bin/sh
 # Copyright 2026 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
