@@ -763,7 +763,10 @@ With `gitops_forge = "gitlab"`, set `gitlab_repo` to the GitLab project's full p
 
 `enable_slack = true` writes `slack_bot_token` / `slack_app_token` into the
 credentials Secret and turns on the CR's `slack` section, the same pair
-install.sh collects. Slack needs no GCP resources, so this is
+install.sh collects. If Slack tokens are kept in external Secrets rather than
+the shared credentials Secret, pass `slack_bot_token_secret_name` /
+`slack_app_token_secret_name` (and optional `slack_bot_token_secret_key` /
+`slack_app_token_secret_key`). Slack needs no GCP resources, so this is
 purely configuration — the Slack app itself is a manual step (below).
 
 ### Pub/Sub Platform and Stockout Investigator Plugins

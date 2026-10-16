@@ -110,12 +110,24 @@ locals {
       }
     } : {},
     var.enable_slack ? {
-      slack = {
+      slack = merge({
         enabled         = true
         allowedUsers    = var.slack_allowed_users
         homeChannel     = var.slack_home_channel
         homeChannelName = var.slack_home_channel_name
-      }
+      },
+      (var.slack_bot_token_secret_name != "" || var.slack_bot_token_secret_key != "") ? {
+        botTokenSecretRef = merge(
+          var.slack_bot_token_secret_name != "" ? { name = var.slack_bot_token_secret_name } : {},
+          var.slack_bot_token_secret_key != "" ? { key = var.slack_bot_token_secret_key } : {}
+        )
+      } : {},
+      (var.slack_app_token_secret_name != "" || var.slack_app_token_secret_key != "") ? {
+        appTokenSecretRef = merge(
+          var.slack_app_token_secret_name != "" ? { name = var.slack_app_token_secret_name } : {},
+          var.slack_app_token_secret_key != "" ? { key = var.slack_app_token_secret_key } : {}
+        )
+      } : {})
     } : {},
     local.gitops_is_gitlab ? { forges = local.gitlab_forges } : {},
     local.gitops_is_gitlab ? { repositories = local.gitlab_repositories } : {},
@@ -195,11 +207,15 @@ locals {
   # Slack, it holds the whole agent pod in CreateContainerConfigError. The
   # tokens legitimately arrive after the first apply, because creating the
   # Slack app is a manual step, so an empty value has to reach the Secret as
-  # an empty value.
-  slack_credentials = var.enable_slack ? {
-    SLACK_BOT_TOKEN = var.slack_bot_token
-    SLACK_APP_TOKEN = var.slack_app_token
-  } : {}
+  # an empty value unless an external Secret is referenced.
+  slack_credentials = var.enable_slack ? merge(
+    var.slack_bot_token_secret_name == "" || var.slack_bot_token != "" ? {
+      SLACK_BOT_TOKEN = var.slack_bot_token
+    } : {},
+    var.slack_app_token_secret_name == "" || var.slack_app_token != "" ? {
+      SLACK_APP_TOKEN = var.slack_app_token
+    } : {}
+  ) : {}
 
   credentials = merge(local.optional_credentials, local.slack_credentials)
 
@@ -328,8 +344,11 @@ locals {
 # not being told.
 check "slack_tokens_present" {
   assert {
-    condition     = !var.enable_slack || (var.slack_bot_token != "" && var.slack_app_token != "")
-    error_message = "enable_slack is true but slack_bot_token and/or slack_app_token is empty. The agent pod will start and Slack will stay silent until both tokens are set in the credentials Secret."
+    condition = !var.enable_slack || (
+      (var.slack_bot_token != "" || var.slack_bot_token_secret_name != "") &&
+      (var.slack_app_token != "" || var.slack_app_token_secret_name != "")
+    )
+    error_message = "enable_slack is true but slack_bot_token and/or slack_app_token is empty. The agent pod will start and Slack will stay silent until both tokens are set in the credentials Secret (or referenced via slack_bot_token_secret_name / slack_app_token_secret_name)."
   }
 }
 

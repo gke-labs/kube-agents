@@ -1090,6 +1090,8 @@ load_install_env() {
   # move a GitHub install to a GitHub Enterprise Server. --gitops-forge and
   # --gitops-host are the per-run way in.
   unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
+  # Slack external Secret reference keys.
+  unset SLACK_BOT_TOKEN_SECRET SLACK_BOT_TOKEN_KEY SLACK_APP_TOKEN_SECRET SLACK_APP_TOKEN_KEY
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -3728,6 +3730,42 @@ write_tfvars_from_state() {
         print_info "Recovered ${secret_key} from the live '${PLATFORM_AGENT_SECRET}' Secret (install.env does not persist it)."
       fi
     done
+    if [ -z "${SLACK_BOT_TOKEN_SECRET:-}" ]; then
+      local cr_slack_bot_sec cr_slack_bot_key
+      cr_slack_bot_sec="$({ kubectl get platformagents.kubeagents.x-k8s.io -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" \
+        --context "$expected_ctx" \
+        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
+        -o jsonpath="{.items[0].spec.integration.slack.botTokenSecretRef.name}" 2>/dev/null || true; })"
+      cr_slack_bot_key="$({ kubectl get platformagents.kubeagents.x-k8s.io -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" \
+        --context "$expected_ctx" \
+        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
+        -o jsonpath="{.items[0].spec.integration.slack.botTokenSecretRef.key}" 2>/dev/null || true; })"
+      if [ -n "$cr_slack_bot_sec" ] && [ "$cr_slack_bot_sec" != "${PLATFORM_AGENT_SECRET}" ]; then
+        export SLACK_BOT_TOKEN_SECRET="$cr_slack_bot_sec"
+        print_info "Recovered SLACK_BOT_TOKEN_SECRET='${cr_slack_bot_sec}' from the live PlatformAgent CR."
+        if [ -n "$cr_slack_bot_key" ] && [ "$cr_slack_bot_key" != "SLACK_BOT_TOKEN" ]; then
+          export SLACK_BOT_TOKEN_KEY="$cr_slack_bot_key"
+        fi
+      fi
+    fi
+    if [ -z "${SLACK_APP_TOKEN_SECRET:-}" ]; then
+      local cr_slack_app_sec cr_slack_app_key
+      cr_slack_app_sec="$({ kubectl get platformagents.kubeagents.x-k8s.io -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" \
+        --context "$expected_ctx" \
+        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
+        -o jsonpath="{.items[0].spec.integration.slack.appTokenSecretRef.name}" 2>/dev/null || true; })"
+      cr_slack_app_key="$({ kubectl get platformagents.kubeagents.x-k8s.io -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" \
+        --context "$expected_ctx" \
+        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
+        -o jsonpath="{.items[0].spec.integration.slack.appTokenSecretRef.key}" 2>/dev/null || true; })"
+      if [ -n "$cr_slack_app_sec" ] && [ "$cr_slack_app_sec" != "${PLATFORM_AGENT_SECRET}" ]; then
+        export SLACK_APP_TOKEN_SECRET="$cr_slack_app_sec"
+        print_info "Recovered SLACK_APP_TOKEN_SECRET='${cr_slack_app_sec}' from the live PlatformAgent CR."
+        if [ -n "$cr_slack_app_key" ] && [ "$cr_slack_app_key" != "SLACK_APP_TOKEN" ]; then
+          export SLACK_APP_TOKEN_KEY="$cr_slack_app_key"
+        fi
+      fi
+    fi
   fi
 
   # MEMORY is the one key whose absence from install.env costs DATA rather than
@@ -4183,6 +4221,18 @@ write_tfvars_from_state() {
       echo "slack_bot_token         = $(hcl_str "${SLACK_BOT_TOKEN:-}")"
       echo "slack_app_token         = $(hcl_str "${SLACK_APP_TOKEN:-}")"
     fi
+    if [ -n "${SLACK_BOT_TOKEN_SECRET:-}" ]; then
+      echo "slack_bot_token_secret_name = $(hcl_str "${SLACK_BOT_TOKEN_SECRET}")"
+    fi
+    if [ -n "${SLACK_BOT_TOKEN_KEY:-}" ]; then
+      echo "slack_bot_token_secret_key  = $(hcl_str "${SLACK_BOT_TOKEN_KEY}")"
+    fi
+    if [ -n "${SLACK_APP_TOKEN_SECRET:-}" ]; then
+      echo "slack_app_token_secret_name = $(hcl_str "${SLACK_APP_TOKEN_SECRET}")"
+    fi
+    if [ -n "${SLACK_APP_TOKEN_KEY:-}" ]; then
+      echo "slack_app_token_secret_key  = $(hcl_str "${SLACK_APP_TOKEN_KEY}")"
+    fi
     echo "slack_allowed_users     = $(hcl_csv_list "${SLACK_ALLOWED_USERS:-}")"
     echo "slack_home_channel      = $(hcl_str "${SLACK_HOME_CHANNEL:-}")"
     echo "slack_home_channel_name = $(hcl_str "${SLACK_HOME_CHANNEL_NAME:-}")"
@@ -4279,6 +4329,10 @@ write_tfvars_from_state() {
   export TF_VAR_anthropic_api_key="${ANTHROPIC_API_KEY:-}"
   export TF_VAR_slack_bot_token="${SLACK_BOT_TOKEN:-}"
   export TF_VAR_slack_app_token="${SLACK_APP_TOKEN:-}"
+  export TF_VAR_slack_bot_token_secret_name="${SLACK_BOT_TOKEN_SECRET:-}"
+  export TF_VAR_slack_bot_token_secret_key="${SLACK_BOT_TOKEN_KEY:-}"
+  export TF_VAR_slack_app_token_secret_name="${SLACK_APP_TOKEN_SECRET:-}"
+  export TF_VAR_slack_app_token_secret_key="${SLACK_APP_TOKEN_KEY:-}"
   export TF_VAR_session_kv_api_key="${SESSION_KV_API_KEY:-}"
   export TF_VAR_session_kv_salt="${SESSION_KV_SALT:-}"
 }

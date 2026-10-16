@@ -332,6 +332,8 @@ bootstrap_install_env() {
   # switch a recorded GitHub install's forge for this run. --gitops-forge is
   # the per-run way in.
   unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
+  # Slack external Secret reference keys.
+  unset SLACK_BOT_TOKEN_SECRET SLACK_BOT_TOKEN_KEY SLACK_APP_TOKEN_SECRET SLACK_APP_TOKEN_KEY
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -609,7 +611,11 @@ PARAM_USER_PROFILE_ENABLED="${USER_PROFILE_ENABLED:-}"
 # install recorded rather than clearing it.
 PARAM_ENABLE_SLACK="${SLACK_ENABLED:-}"
 PARAM_SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}"
+PARAM_SLACK_BOT_TOKEN_SECRET="${SLACK_BOT_TOKEN_SECRET:-}"
+PARAM_SLACK_BOT_TOKEN_KEY="${SLACK_BOT_TOKEN_KEY:-}"
 PARAM_SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}"
+PARAM_SLACK_APP_TOKEN_SECRET="${SLACK_APP_TOKEN_SECRET:-}"
+PARAM_SLACK_APP_TOKEN_KEY="${SLACK_APP_TOKEN_KEY:-}"
 PARAM_SLACK_ALLOWED_USERS="${SLACK_ALLOWED_USERS:-}"
 PARAM_SLACK_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}"
 PARAM_SLACK_HOME_CHANNEL_NAME="${SLACK_HOME_CHANNEL_NAME:-}"
