@@ -147,14 +147,15 @@ func TestSlackShortcutInTheBotsDMKeysTheDMThread(t *testing.T) {
 
 func TestSlackShortcutWhereTheBotIsNotTellsOnlyTheClicker(t *testing.T) {
 	for _, tc := range []struct {
-		name, channel string
-		info          *slack.Channel
-		err           error
-		want          string
+		name, channel, chanName string
+		info                    *slack.Channel
+		err                     error
+		want                    string
 	}{
 		{name: "public channel, not a member", channel: "C5", info: &slack.Channel{}, want: "I'm not in <#C5>, so I can't reply there. Invite me with /invite <@UBOT> and ask again."},
 		{name: "private channel", channel: "G5", err: slack.SlackErrorResponse{Err: "channel_not_found"}, want: "I'm not in <#G5>"},
 		{name: "DM between two people", channel: "D5", err: slack.SlackErrorResponse{Err: "channel_not_found"}, want: "I can't post in this conversation"},
+		{name: "group DM without the bot", channel: "G6", chanName: "mpdm-alex--sam-1", err: slack.SlackErrorResponse{Err: "channel_not_found"}, want: "I can't post in this conversation"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			api := &fakeSlackAPI{conversationErr: tc.err}
@@ -162,7 +163,10 @@ func TestSlackShortcutWhereTheBotIsNotTellsOnlyTheClicker(t *testing.T) {
 				api.conversations = map[string]*slack.Channel{tc.channel: tc.info}
 			}
 			a, hooks := newShortcutAdapter(api)
-			if turns := runShortcut(a, shortcutPayload(t, tc.channel, "x", "200.4", alertMessage())); len(turns) != 0 {
+			if tc.chanName == "" {
+				tc.chanName = "x"
+			}
+			if turns := runShortcut(a, shortcutPayload(t, tc.channel, tc.chanName, "200.4", alertMessage())); len(turns) != 0 {
 				t.Fatalf("a conversation the bot cannot post in starts nothing: %+v", turns)
 			}
 			got := hooks.got()
@@ -206,6 +210,33 @@ func TestSlackShortcutDropsWhatIsNotOurs(t *testing.T) {
 		if turns := runShortcut(a, raw); len(turns) != 0 || len(hooks.got()) != 0 {
 			t.Errorf("%s: turns=%+v notes=%+v, want nothing", name, turns, hooks.got())
 		}
+	}
+}
+
+// A second shortcut on a message already waiting as an ask is dropped: the
+// pending entry is keyed by the message, so it would take the first's place
+// and its verdict.
+func TestSlackShortcutOnAMessageAlreadyWaitingIsDropped(t *testing.T) {
+	a, _ := newShortcutAdapter(&fakeSlackAPI{})
+	first := runShortcut(a, shortcutPayload(t, "C1", "oncall", "204.0", alertMessage()))
+	second := runShortcut(a, shortcutPayload(t, "C1", "oncall", "204.1", alertMessage()))
+	if len(first) != 1 || len(second) != 0 {
+		t.Fatalf("first=%d second=%d turns, want 1 and 0", len(first), len(second))
+	}
+	a.InboundVerified(first[0].Conversation, first[0].MessageID, true)
+	if again := runShortcut(a, shortcutPayload(t, "C1", "oncall", "204.2", alertMessage())); len(again) != 1 {
+		t.Errorf("once the first is decided the message takes a shortcut again: turns = %d", len(again))
+	}
+}
+
+func TestSlackShortcutStartsNothingOnShutdown(t *testing.T) {
+	a, _ := newShortcutAdapter(&fakeSlackAPI{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var turns []InboundMessage
+	a.shortcut(ctx, shortcutPayload(t, "C1", "oncall", "205.0", alertMessage()), func(m InboundMessage) { turns = append(turns, m) })
+	if len(turns) != 0 {
+		t.Errorf("a shortcut in flight at shutdown started a turn: %+v", turns)
 	}
 }
 

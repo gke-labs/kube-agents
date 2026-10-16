@@ -77,6 +77,9 @@ const (
 	slackShortcutNotInChannel      = "I'm not in <#%s>, so I can't reply there. Invite me with /invite <@%s> and ask again."
 	slackShortcutNotInConversation = "I can't post in this conversation, so I can't look at this here."
 
+	// slackGroupDMNamePrefix begins the name Slack gives a group DM.
+	slackGroupDMNamePrefix = "mpdm-"
+
 	// slackShortcutCredit names the clicker on the bot's first post in the
 	// thread, so the channel sees who asked: a small line above the post,
 	// the clicker by their Slack name, never a mention.
@@ -168,9 +171,14 @@ func (s *SlackAdapter) shortcut(ctx context.Context, raw json.RawMessage, handle
 	if s.alreadySeen("shortcut:" + p.Channel.ID + "/" + p.ActionTS) {
 		return
 	}
+	runCtx := ctx
 	ctx, cancel := context.WithTimeout(ctx, slackShortcutTimeout)
 	defer cancel()
-	if note := s.shortcutUnreachable(ctx, p.Channel.ID); note != "" {
+	note, ok := s.shortcutUnreachable(ctx, p.Channel.ID, p.Channel.Name)
+	if !ok {
+		return
+	}
+	if note != "" {
 		s.log.Info("slack: shortcut used where the bot cannot post; told the clicker",
 			"channel", p.Channel.ID, "user", p.User.ID)
 		s.respondPrivately(ctx, p.ResponseURL, note)
@@ -195,8 +203,22 @@ func (s *SlackAdapter) shortcut(ctx context.Context, raw json.RawMessage, handle
 		Shortcut: true,
 	}
 	clicker := s.slackUserNameContext(ctx, p.User.ID)
+	if runCtx.Err() != nil {
+		// Shutting down: no new work, as the pump starts none (Run).
+		return
+	}
+	key := slackPendingKey(msg.Conversation, msg.MessageID)
 	s.mu.Lock()
-	s.addPendingLocked(slackPendingKey(msg.Conversation, msg.MessageID), slackPending{conversation: msg.Conversation,
+	if _, waiting := s.uxLocked().pending[key]; waiting {
+		// The message is already an ask waiting on the gateway's word on its
+		// sender (another shortcut on it, or the typed ask it is): the pending
+		// entry is keyed by the message, so a second would take the first's
+		// place and its verdict, crediting or refusing the wrong member.
+		s.mu.Unlock()
+		s.log.Info("slack: dropping a shortcut on a message already waiting as an ask", "channel", p.Channel.ID, "ts", p.Message.TS)
+		return
+	}
+	s.addPendingLocked(key, slackPending{conversation: msg.Conversation,
 		author: msg.AuthorID, text: quoted, shortcut: true, responseURL: p.ResponseURL, clicker: clicker})
 	s.mu.Unlock()
 	handler(msg)
@@ -205,21 +227,25 @@ func (s *SlackAdapter) shortcut(ctx context.Context, raw json.RawMessage, handle
 // shortcutUnreachable is the private note for a conversation the bot cannot
 // post in, or "" when it can or Slack could not say. A failed read is not
 // read as "not a member": the turn goes ahead, and a reply Slack refuses is
-// logged where every refused post is.
-func (s *SlackAdapter) shortcutUnreachable(ctx context.Context, channel string) string {
+// logged where every refused post is. ok is false when the read was cut
+// short by shutdown, and then nothing goes ahead. A DM and a group DM get
+// the note without the invitation, since an app cannot be invited into one.
+func (s *SlackAdapter) shortcutUnreachable(ctx context.Context, channel, name string) (note string, ok bool) {
 	info, err := s.api.GetConversationInfoContext(ctx, &slack.GetConversationInfoInput{ChannelID: channel})
 	var resp slack.SlackErrorResponse
 	switch {
 	case err == nil && (info.IsMember || info.IsIM || info.IsMpIM):
-		return ""
+		return "", true
 	case err == nil, errors.As(err, &resp) && resp.Err == slackChannelNotFound:
-		if strings.HasPrefix(channel, slackDMChannelPrefix) {
-			return slackShortcutNotInConversation
+		if strings.HasPrefix(channel, slackDMChannelPrefix) || strings.HasPrefix(name, slackGroupDMNamePrefix) {
+			return slackShortcutNotInConversation, true
 		}
-		return fmt.Sprintf(slackShortcutNotInChannel, channel, s.botUserID)
+		return fmt.Sprintf(slackShortcutNotInChannel, channel, s.botUserID), true
+	case errors.Is(err, context.Canceled):
+		return "", false
 	}
 	s.log.Warn("slack: could not check the shortcut's conversation; answering there anyway", "channel", channel, "err", err)
-	return ""
+	return "", true
 }
 
 // respondPrivately posts text through a payload's response_url, seen by the
