@@ -11425,13 +11425,29 @@ spec:
                       type: string
                   type: object
                 storageStatus:
-                  description: StorageStatus tracks PVC binding state.
+                  description:
+                    StorageStatus tracks PVC binding state and the data volume's
+                    usage.
                   properties:
                     bound:
                       description:
                         Bound indicates if the primary PVC has been successfully
                         provisioned.
                       type: boolean
+                    capacityBytes:
+                      description: |-
+                        CapacityBytes is the size of the filesystem on the agent's data volume,
+                        as the gateway pod's event watcher last read it. Absent when the watcher
+                        is disabled or the operator has no current reading from it.
+                      format: int64
+                      type: integer
+                    freeBytes:
+                      description: |-
+                        FreeBytes is the space left on the agent's data volume for the agent's
+                        own non-root user, read with CapacityBytes. The DataVolumeNearlyFull
+                        condition is computed from the two.
+                      format: int64
+                      type: integer
                   type: object
                 telemetry:
                   description: Telemetry reports the resolved OpenTelemetry export configuration.

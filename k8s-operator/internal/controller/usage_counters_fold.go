@@ -252,6 +252,9 @@ type usageScrapedPod struct {
 	// Clusters is the watcher's cluster gauges, nil for any pod but a gateway's.
 	// Not folded: the poll projects the largest reading as it stands.
 	Clusters *usageClusterGauges
+	// DataVolume is the watcher's data volume reading, nil for any pod but a
+	// gateway's and for a watcher body that carried none. Not folded either.
+	DataVolume *usageDataVolume
 }
 
 // usageSeed is what a poll that finds no usable document starts from: the

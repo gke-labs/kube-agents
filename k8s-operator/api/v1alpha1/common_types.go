@@ -1921,6 +1921,18 @@ type StorageStatus struct {
 	// Bound indicates if the primary PVC has been successfully provisioned.
 	// +optional
 	Bound bool `json:"bound,omitempty"`
+
+	// CapacityBytes is the size of the filesystem on the agent's data volume,
+	// as the gateway pod's event watcher last read it. Absent when the watcher
+	// is disabled or the operator has no current reading from it.
+	// +optional
+	CapacityBytes *int64 `json:"capacityBytes,omitempty"`
+
+	// FreeBytes is the space left on the agent's data volume for the agent's
+	// own non-root user, read with CapacityBytes. The DataVolumeNearlyFull
+	// condition is computed from the two.
+	// +optional
+	FreeBytes *int64 `json:"freeBytes,omitempty"`
 }
 
 // TelemetryStatus reports the telemetry wiring the operator resolved for this agent.
@@ -2019,7 +2031,7 @@ type AgentStatus struct {
 	// +optional
 	ServiceStatus ServiceStatus `json:"serviceStatus,omitempty"`
 
-	// StorageStatus tracks PVC binding state.
+	// StorageStatus tracks PVC binding state and the data volume's usage.
 	// +optional
 	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
 

@@ -189,7 +189,7 @@ func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []st
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect}
 	}
 	// set's sample is the pod group's first counter; setSample names the rest.
-	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters}
+	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters, DataVolume: reading.DataVolume}
 	for i, counter := range counters {
 		value, named := reading.Samples[counter]
 		if !named && i == 0 {
@@ -251,6 +251,16 @@ func (s *stubUsageSource) setClusters(addr string, registered, monitored int64) 
 	defer s.mu.Unlock()
 	reading := s.readings[addr]
 	reading.Clusters = &usageClusterGauges{Registered: registered, Monitored: monitored}
+	s.readings[addr] = reading
+}
+
+// setDataVolume gives addr's reading the watcher's data volume series, which
+// set leaves in place.
+func (s *stubUsageSource) setDataVolume(addr string, total, free int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reading := s.readings[addr]
+	reading.DataVolume = &usageDataVolume{Total: total, Free: free}
 	s.readings[addr] = reading
 }
 
@@ -332,6 +342,9 @@ type usageHarness struct {
 	pruningGauges bool
 	pruningMerged bool
 	pruningChat   bool
+	// pruningStorage makes the fake behave like a served CRD from before
+	// status.storageStatus carried its byte fields.
+	pruningStorage bool
 }
 
 func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...client.Object) *usageHarness {
@@ -371,6 +384,12 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			}
 			if isAgent && (h.pruningGauges || h.pruningChat) {
 				pa.Status.Usage.ChatMessagesInboundTotal = 0
+			}
+			if err == nil && isAgent && h.pruningStorage {
+				stored := pa.DeepCopy()
+				err = c.SubResource(subResourceName).Patch(ctx, stored, client.RawPatch(types.MergePatchType, []byte(`{"status":{"storageStatus":{"capacityBytes":null,"freeBytes":null}}}`)))
+				pa.Status.StorageStatus.CapacityBytes, pa.Status.StorageStatus.FreeBytes = nil, nil
+				pa.ResourceVersion = stored.ResourceVersion
 			}
 			return err
 		},
@@ -1917,7 +1936,7 @@ func TestUsagePoller_AGaugeServingCRDWithoutTheMergedCounterKeepsTheGaugesFlowin
 	defer mu.Unlock()
 	named := 0
 	for _, l := range lines {
-		if strings.Contains(l, "does not serve a status.usage field") {
+		if strings.Contains(l, "does not serve a status field") {
 			named++
 			if !strings.Contains(l, `"field"="remediationsMergedTotal"`) || strings.Contains(l, "clustersRegistered") {
 				t.Fatalf("the log named the wrong field: %s", l)
@@ -1986,7 +2005,7 @@ func TestUsagePoller_AMergedServingCRDWithoutTheChatCounterKeepsTheOthersFlowing
 	defer mu.Unlock()
 	named := 0
 	for _, l := range lines {
-		if strings.Contains(l, "does not serve a status.usage field") {
+		if strings.Contains(l, "does not serve a status field") {
 			named++
 			if !strings.Contains(l, `"field"="chatMessagesInboundTotal"`) {
 				t.Fatalf("the log named the wrong field: %s", l)

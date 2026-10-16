@@ -5724,3 +5724,103 @@ if __name__ == "__main__":
     finally:
         if os.path.exists(temp_db_path):
             os.remove(temp_db_path)
+
+
+class TestDataVolumeWarning(unittest.TestCase):
+    """The home-channel warning when the data volume fills: once per crossing
+    of DATA_VOLUME_WARN_PERCENT, re-armed below DATA_VOLUME_REARM_PERCENT."""
+
+    TOTAL = 10 * (1 << 30)
+
+    def setUp(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM data_volume_warning")
+        self.used_percent = 0
+        usage = patch.object(
+            session_kv_server,
+            "_data_volume_usage",
+            side_effect=lambda path: (self.TOTAL, self.TOTAL * (100 - self.used_percent) // 100),
+        )
+        usage.start()
+        self.addCleanup(usage.stop)
+        self.post = patch.object(session_kv_server, "_post_initial_alert", return_value="thread-1").start()
+        self.addCleanup(patch.stopall)
+        patch.object(session_kv_server, "enabled_chat_platforms", return_value=["slack"]).start()
+
+    def _check_at(self, percent):
+        self.used_percent = percent
+        session_kv_server.check_data_volume()
+
+    def test_posts_once_per_crossing_and_rearms_below_the_lower_line(self):
+        for percent in (50, 89):
+            self._check_at(percent)
+        self.post.assert_not_called()
+
+        self._check_at(90)
+        self.post.assert_called_once()
+        platform, message = self.post.call_args.args
+        self.assertEqual(platform, "slack")
+        self.assertEqual(
+            message,
+            "The agent's data volume is 90% full (9.0 of 10.0 GiB). "
+            "Remove unused cluster profiles, or ask an admin to enlarge it.",
+        )
+
+        # Above the lower line it stays quiet, however long it sits there.
+        for percent in (95, 100, 87, 85, 92):
+            self._check_at(percent)
+        self.assertEqual(self.post.call_count, 1)
+
+        # Below it, the warning is re-armed and the next crossing posts again.
+        self._check_at(84)
+        self._check_at(89)
+        self.assertEqual(self.post.call_count, 1)
+        self._check_at(91)
+        self.assertEqual(self.post.call_count, 2)
+
+    def test_a_restart_above_the_line_does_not_post_again(self):
+        self._check_at(95)
+        self.assertEqual(self.post.call_count, 1)
+        # The warned flag is on the session database, not in this process.
+        self.assertTrue(session_kv_server._data_volume_warned())
+        self._check_at(95)
+        self.assertEqual(self.post.call_count, 1)
+
+    def test_a_refused_post_is_tried_again_at_the_next_check(self):
+        self.post.return_value = None
+        with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self._check_at(95)
+        self.assertTrue(any("not accepted by any enabled chat platform" in line for line in logs.output))
+        self.assertFalse(session_kv_server._data_volume_warned())
+        self.post.return_value = "thread-2"
+        self._check_at(95)
+        self.assertEqual(self.post.call_count, 2)
+        self.assertTrue(session_kv_server._data_volume_warned())
+
+    def test_no_chat_platform_logs_the_warning_and_stops(self):
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=[session_kv_server.DEFAULT_CHAT_PLATFORM]), \
+                patch.object(session_kv_server, "_chat_platforms_disabled", return_value=True), \
+                self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self._check_at(95)
+            self._check_at(96)
+        self.post.assert_not_called()
+        self.assertEqual(sum("data volume is 95% full" in line for line in logs.output), 1)
+        self.assertTrue(any("in this log and nowhere else" in line for line in logs.output))
+
+    def test_an_unreadable_volume_does_nothing(self):
+        with patch.object(session_kv_server, "_data_volume_usage", return_value=None):
+            session_kv_server.check_data_volume()
+        self.post.assert_not_called()
+        self.assertFalse(session_kv_server._data_volume_warned())
+
+    def test_reads_a_real_filesystem(self):
+        patch.stopall()
+        usage = session_kv_server._data_volume_usage(tempfile.gettempdir())
+        self.assertIsNotNone(usage)
+        total, free = usage
+        self.assertGreater(total, 0)
+        self.assertLessEqual(free, total)
+        self.assertIsNone(session_kv_server._data_volume_usage("/nonexistent/data-volume"))

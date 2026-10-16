@@ -601,6 +601,7 @@ start_event_watcher() {
       /usr/local/bin/k8s-event-watcher \
         --cluster-name="${EVENT_WATCHER_CLUSTER_NAME:-}" \
         --profiles-dir="${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/data}/profiles" \
+        --data-volume="${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/data}" \
         --dedup-persist="${dedup_persist}" \
         --dedup-window="${WATCHER_DEDUP_WINDOW}" \
         --metrics-addr="${metrics_addr}" \
