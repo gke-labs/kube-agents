@@ -455,8 +455,8 @@ func wakeText(state lib.TaskState, childID, ask string, turns []string, result, 
 }
 
 // wakeCardsPendingNote is added to a completed wake when the delegated child
-// handed off to kanban cards that are still running.
-const wakeCardsPendingNote = "A Cluster Agent card is still running, and its report will post into this conversation."
+// handed work to kanban cards whose report posts to the conversation.
+const wakeCardsPendingNote = "The delegated turn handed work to a Cluster Agent card. That card's report posts into this conversation on its own; if it is not above yet, it is still to come."
 
 // cardsPending reports whether a completed task's terminal mark signals that
 // asynchronous kanban cards are still running.

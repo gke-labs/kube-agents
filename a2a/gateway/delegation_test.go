@@ -2712,9 +2712,9 @@ func TestTheWakeWithCardsPendingIncludesNote(t *testing.T) {
 	// Verify over-cap wake still respects DelegateTextCap.
 	big := strings.Repeat("x", lib.DelegateTextCap*2)
 	overCap := wakeText(lib.StateCompleted, "task-1", "", nil, big, "", false, true)
-	rest := strings.TrimPrefix(overCap, "The task you delegated to platform (task task-1) completed.\n"+wakeCardsPendingNote+"\n")
+	rest := strings.TrimPrefix(overCap, "The task you delegated to platform (task task-1) completed.\n")
 	if len(rest) > lib.DelegateTextCap {
-		t.Fatalf("wake after header+note is %d bytes, over cap %d", len(rest), lib.DelegateTextCap)
+		t.Fatalf("wake after header is %d bytes, over cap %d", len(rest), lib.DelegateTextCap)
 	}
 
 	// Verify that a body fitting the exact budget without note reservation when cardsPending=false
