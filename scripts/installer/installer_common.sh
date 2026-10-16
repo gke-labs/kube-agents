@@ -663,16 +663,32 @@ slack_moves_to_a2a_gateway() {
   [ "${1:-}" = "next" ] && is_truthy "${2:-}" && ! is_truthy "${3:-}"
 }
 
-# True when $1 names an external Secret (non-empty and neither the shared Secret nor "default").
+# True when $1 is empty or a valid Kubernetes Secret name (DNS-1123 subdomain, max 253 chars).
+validate_k8s_secret_name() {
+  local name="${1:-}"
+  [ -z "$name" ] && return 0
+  [ "${#name}" -gt 253 ] && return 1
+  [[ "$name" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]
+}
+
+# True when $1 is empty or a valid Kubernetes Secret data key (max 253 chars).
+validate_k8s_secret_key() {
+  local key="${1:-}"
+  [ -z "$key" ] && return 0
+  [ "${#key}" -gt 253 ] && return 1
+  [[ "$key" =~ ^[-._a-zA-Z0-9]+$ ]]
+}
+
+# True when $1 names an external Secret (non-empty, neither the shared Secret nor "default", and valid DNS-1123).
 slack_secret_ref_is_external() {
   local name="${1:-}"
-  [ -n "$name" ] && [ "$name" != "default" ] && [ "$name" != "${PLATFORM_AGENT_SECRET}" ]
+  [ -n "$name" ] && [ "$name" != "default" ] && [ "$name" != "${PLATFORM_AGENT_SECRET}" ] && validate_k8s_secret_name "$name"
 }
 
 # The four Slack Secret ref fields on the PlatformAgent CR in $1 (a `kubectl get -o json` list):
 # "<bot_sec>|<bot_key>|<app_sec>|<app_key>". Delimited by '|' to preserve empty fields.
-# If any field fails Kubernetes Secret name or data key validation (e.g. contains '|'
-# or invalid characters), prints nothing so malformed CR refs cannot shift field delimiters.
+# If any field fails Kubernetes Secret name or data key validation (e.g. contains '|',
+# newlines, or invalid characters), prints nothing so malformed CR refs cannot shift field delimiters.
 slack_secret_refs_on_cr() {
   printf '%s' "${1:-}" | (trap - ERR; python3 -c '
 import json, re, sys
@@ -680,10 +696,10 @@ DNS_1123_SUBDOMAIN_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([
 SECRET_KEY_RE = re.compile(r"^[-._a-zA-Z0-9]+$")
 
 def valid_name(s: str) -> bool:
-    return not s or (len(s) <= 253 and bool(DNS_1123_SUBDOMAIN_RE.match(s)))
+    return not s or (len(s) <= 253 and bool(DNS_1123_SUBDOMAIN_RE.fullmatch(s)))
 
 def valid_key(s: str) -> bool:
-    return not s or (len(s) <= 253 and bool(SECRET_KEY_RE.match(s)))
+    return not s or (len(s) <= 253 and bool(SECRET_KEY_RE.fullmatch(s)))
 
 items = (json.load(sys.stdin) or {}).get("items") or []
 if items:
@@ -3799,6 +3815,25 @@ write_tfvars_from_state() {
       fi
     fi
   fi
+
+  for var_name in SLACK_BOT_TOKEN_SECRET SLACK_APP_TOKEN_SECRET; do
+    local sec_val="${!var_name:-}"
+    if [ -n "$sec_val" ] && [ "$sec_val" != "default" ] && [ "$sec_val" != "${PLATFORM_AGENT_SECRET}" ]; then
+      if ! validate_k8s_secret_name "$sec_val"; then
+        print_error "${var_name} is set to '${sec_val}', which is not a valid Kubernetes Secret name and not a sentinel ('default' or '${PLATFORM_AGENT_SECRET}'). Secret names must be valid DNS-1123 subdomains (lowercase alphanumeric, '-', '.', max 253 characters)."
+        return 1
+      fi
+    fi
+  done
+  for var_name in SLACK_BOT_TOKEN_KEY SLACK_APP_TOKEN_KEY; do
+    local key_val="${!var_name:-}"
+    if [ -n "$key_val" ]; then
+      if ! validate_k8s_secret_key "$key_val"; then
+        print_error "${var_name} is set to '${key_val}', which is not a valid Kubernetes Secret data key. Secret keys must match '^[-._a-zA-Z0-9]+$' (max 253 characters)."
+        return 1
+      fi
+    fi
+  done
 
   local slack_bot_sec="${SLACK_BOT_TOKEN_SECRET:-}"
   local slack_bot_key="${SLACK_BOT_TOKEN_KEY:-}"

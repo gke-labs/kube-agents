@@ -135,3 +135,35 @@ run "slack_with_inline_tokens_only" {
     error_message = "slack_credentials missing SLACK_APP_TOKEN"
   }
 }
+
+run "slack_shared_secret_name_is_rejected" {
+  command = plan
+  variables {
+    enable_slack                = true
+    slack_bot_token_secret_name = "platform-agent-secrets"
+  }
+  expect_failures = [
+    var.slack_bot_token_secret_name,
+  ]
+}
+
+run "slack_token_and_secret_name_conflict_warns" {
+  command = plan
+  variables {
+    enable_slack                = true
+    slack_bot_token             = "xoxb-test"
+    slack_bot_token_secret_name = "custom-secret"
+    slack_app_token             = "xapp-test"
+  }
+  expect_failures = [
+    check.slack_token_and_secret_name_conflict,
+  ]
+  assert {
+    condition     = !contains(keys(local.slack_credentials), "SLACK_BOT_TOKEN")
+    error_message = "slack_credentials unexpectedly holds SLACK_BOT_TOKEN when external secret name is provided"
+  }
+  assert {
+    condition     = local.platform_agent_integration.slack.botTokenSecretRef.name == "custom-secret"
+    error_message = "botTokenSecretRef missing custom-secret"
+  }
+}

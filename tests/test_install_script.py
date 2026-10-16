@@ -7811,12 +7811,32 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
 
     def test_slack_secret_refs_on_cr_rejects_delimiter_injection(self):
         """A '|' or newline inside a Slack Secret ref field on the CR fails validation and emits nothing."""
+        for bad_key in ["a|b", "SLACK_BOT_TOKEN\n", "my-key\r", "bad key"]:
+            script = (
+                f'cr_json=\'{{"items": [{{"spec": {{"integration": {{"slack": {{\n'
+                f'  "botTokenSecretRef": {{"name": "my-secret", "key": {json.dumps(bad_key)}}},\n'
+                f'  "appTokenSecretRef": {{"name": "app-secret", "key": "valid-key"}}\n'
+                f'}}}}}}]}}\'\n'
+                f'slack_secret_refs_on_cr "$cr_json"\n'
+            )
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nsource "{_INSTALLER_COMMON}"\n{script}'],
+                capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                env=get_isolated_test_env(),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "", f"Expected empty output for bad_key={bad_key!r}, got: {proc.stdout!r}")
+
+    def test_slack_secret_ref_validation_and_sentinel_handling(self):
+        """slack_secret_ref_is_external and write_tfvars_from_state reject mis-cased sentinels and invalid names (#3275)."""
         script = (
-            'cr_json=\'{"items": [{"spec": {"integration": {"slack": {\n'
-            '  "botTokenSecretRef": {"name": "my-secret", "key": "a|b"},\n'
-            '  "appTokenSecretRef": {"name": "app-secret", "key": "valid-key"}\n'
-            '}}}}]}\'\n'
-            'slack_secret_refs_on_cr "$cr_json"\n'
+            'validate_k8s_secret_name "Default" && echo "Default valid" || echo "Default invalid"\n'
+            'validate_k8s_secret_name "Platform-Agent-Secrets" && echo "PAS valid" || echo "PAS invalid"\n'
+            'validate_k8s_secret_name "valid-secret-name" && echo "valid-secret-name valid" || echo "valid-secret-name invalid"\n'
+            'slack_secret_ref_is_external "Default" && echo "ext Default" || echo "not ext Default"\n'
+            'slack_secret_ref_is_external "default" && echo "ext default" || echo "not ext default"\n'
+            'slack_secret_ref_is_external "platform-agent-secrets" && echo "ext pas" || echo "not ext pas"\n'
+            'slack_secret_ref_is_external "my-secret" && echo "ext my-secret" || echo "not ext my-secret"\n'
         )
         proc = subprocess.run(
             ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nsource "{_INSTALLER_COMMON}"\n{script}'],
@@ -7824,7 +7844,25 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             env=get_isolated_test_env(),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout, "")
+        self.assertIn("Default invalid", proc.stdout)
+        self.assertIn("PAS invalid", proc.stdout)
+        self.assertIn("valid-secret-name valid", proc.stdout)
+        self.assertIn("not ext Default", proc.stdout)
+        self.assertIn("not ext default", proc.stdout)
+        self.assertIn("not ext pas", proc.stdout)
+        self.assertIn("ext my-secret", proc.stdout)
+
+    def test_write_tfvars_from_state_refuses_invalid_slack_secret_name(self):
+        """write_tfvars_from_state rejects non-DNS-1123 secret names in SLACK_BOT_TOKEN_SECRET."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, self._COORDINATES + "SLACK_ENABLED=true\nSLACK_BOT_TOKEN_SECRET=Default\n")
+            dest = path.parent / "terraform.tfvars"
+            proc = _installer_common_tests.InstallerCommonTest._run(
+                self,
+                f'load_install_env "{path}"; write_tfvars_from_state "{dest}"',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("SLACK_BOT_TOKEN_SECRET is set to 'Default'", proc.stderr)
 
     def test_bootstrap_install_env_file_records_slack_secret_refs(self):
         """A first install records SLACK_BOT_TOKEN_SECRET and SLACK_APP_TOKEN_SECRET into install.env (#3275)."""

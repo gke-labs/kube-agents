@@ -116,18 +116,9 @@ locals {
         homeChannel     = var.slack_home_channel
         homeChannelName = var.slack_home_channel_name
         },
-        var.slack_bot_token_secret_name != "" ? {
-          botTokenSecretRef = merge(
-            { name = var.slack_bot_token_secret_name },
-            var.slack_bot_token_secret_key != "" ? { key = var.slack_bot_token_secret_key } : {}
-          )
-        } : {},
-        var.slack_app_token_secret_name != "" ? {
-          appTokenSecretRef = merge(
-            { name = var.slack_app_token_secret_name },
-            var.slack_app_token_secret_key != "" ? { key = var.slack_app_token_secret_key } : {}
-          )
-      } : {})
+        local.slack_bot_token_ref != null ? { botTokenSecretRef = local.slack_bot_token_ref } : {},
+        local.slack_app_token_ref != null ? { appTokenSecretRef = local.slack_app_token_ref } : {}
+      )
     } : {},
     local.gitops_is_gitlab ? { forges = local.gitlab_forges } : {},
     local.gitops_is_gitlab ? { repositories = local.gitlab_repositories } : {},
@@ -208,11 +199,24 @@ locals {
   # tokens legitimately arrive after the first apply, because creating the
   # Slack app is a manual step, so an empty value has to reach the Secret as
   # an empty value unless an external Secret is referenced.
+  slack_bot_token_is_external = var.slack_bot_token_secret_name != "" && var.slack_bot_token_secret_name != "platform-agent-secrets"
+  slack_app_token_is_external = var.slack_app_token_secret_name != "" && var.slack_app_token_secret_name != "platform-agent-secrets"
+
+  slack_bot_token_ref = local.slack_bot_token_is_external ? merge(
+    { name = var.slack_bot_token_secret_name },
+    var.slack_bot_token_secret_key != "" ? { key = var.slack_bot_token_secret_key } : {}
+  ) : null
+
+  slack_app_token_ref = local.slack_app_token_is_external ? merge(
+    { name = var.slack_app_token_secret_name },
+    var.slack_app_token_secret_key != "" ? { key = var.slack_app_token_secret_key } : {}
+  ) : null
+
   slack_credentials = var.enable_slack ? merge(
-    var.slack_bot_token_secret_name == "" ? {
+    !local.slack_bot_token_is_external ? {
       SLACK_BOT_TOKEN = var.slack_bot_token
     } : {},
-    var.slack_app_token_secret_name == "" ? {
+    !local.slack_app_token_is_external ? {
       SLACK_APP_TOKEN = var.slack_app_token
     } : {}
   ) : {}
@@ -349,6 +353,16 @@ check "slack_tokens_present" {
       (var.slack_app_token != "" || var.slack_app_token_secret_name != "")
     )
     error_message = "enable_slack is true but slack_bot_token and/or slack_app_token is empty. The agent pod will start and Slack will stay silent until both tokens are set in the credentials Secret (or referenced via slack_bot_token_secret_name / slack_app_token_secret_name)."
+  }
+}
+
+check "slack_token_and_secret_name_conflict" {
+  assert {
+    condition = (
+      (var.slack_bot_token == "" || var.slack_bot_token_secret_name == "") &&
+      (var.slack_app_token == "" || var.slack_app_token_secret_name == "")
+    )
+    error_message = "A Slack token value (slack_bot_token / slack_app_token) and external Secret name (slack_bot_token_secret_name / slack_app_token_secret_name) are both set. The external Secret reference takes precedence and the inline token value is not written to any Secret."
   }
 }
 
@@ -1286,6 +1300,16 @@ resource "helm_release" "kube_agents" {
         (var.slack_app_token_secret_key == "" || var.slack_app_token_secret_name != "")
       )
       error_message = "slack_bot_token_secret_key and slack_app_token_secret_key require the corresponding slack_bot_token_secret_name or slack_app_token_secret_name to be set."
+    }
+
+    # External Secret names must not point to the chart's shared credentials Secret:
+    # to use the shared Secret ('platform-agent-secrets'), leave the secret name empty.
+    precondition {
+      condition = (
+        var.slack_bot_token_secret_name != "platform-agent-secrets" &&
+        var.slack_app_token_secret_name != "platform-agent-secrets"
+      )
+      error_message = "slack_bot_token_secret_name and slack_app_token_secret_name are for external Secrets only; to use the shared credentials Secret ('platform-agent-secrets'), leave them empty."
     }
   }
 }
