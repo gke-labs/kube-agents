@@ -45,9 +45,9 @@ the Dockerfile, would otherwise pass a tree with nothing read.
 
 ``main`` downloads the release ``TIRITH_VERSION`` names into a temporary
 directory, checks the archive against the digest pinned here, points Hermes at
-that binary, and with ``--install-tirith`` installs it into the image on
-``PATH`` (at ``/usr/local/bin/tirith``) so all profiles share the verified
-binary. Raising the pin is a change of its own, with the digests copied from
+that binary, and with ``--install-tirith`` installs the downloaded, verified
+release into the image on ``PATH`` (at ``/usr/local/bin/tirith``) so all
+profiles share the verified binary (refused if combined with ``--tirith-bin``). Raising the pin is a change of its own, with the digests copied from
 that release's ``checksums.txt``; pinning is what keeps a Tirith release from
 failing pull requests that did not touch a skill and ensures reproducible
 runtime behavior across profiles. Two probe commands with a known verdict
@@ -513,9 +513,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--install-tirith",
         type=Path,
-        help="copy the verified Tirith binary to this path after checking",
+        help="copy the downloaded, digest-verified Tirith binary to this path after checking (cannot be combined with --tirith-bin)",
     )
     args = parser.parse_args(argv)
+    if args.install_tirith and args.tirith_bin:
+        print(
+            "ERROR: --install-tirith cannot be combined with --tirith-bin: only "
+            "the downloaded release verified against the pinned digest may be installed.",
+            file=sys.stderr,
+        )
+        return 1
     overlapping = [
         (first, second)
         for index, first in enumerate(args.trees)

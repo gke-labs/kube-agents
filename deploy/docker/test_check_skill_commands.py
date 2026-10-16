@@ -463,11 +463,11 @@ class InstallTirithTest(unittest.TestCase):
             with mock.patch.dict(sys.modules, modules), \
                     mock.patch.dict(check.os.environ), \
                     mock.patch.object(check, "KNOWN_FINDINGS", {}), \
+                    mock.patch.object(check, "install_tirith", return_value=fake_bin), \
                     mock.patch("sys.stdout", new=io.StringIO()), \
                     mock.patch("sys.stderr", new=io.StringIO()):
                 code = check.main([
                     f"agents/platform/skills={tmp}",
-                    "--tirith-bin", str(fake_bin),
                     "--install-tirith", str(dest),
                 ])
 
@@ -475,6 +475,29 @@ class InstallTirithTest(unittest.TestCase):
             self.assertTrue(dest.is_file(), "binary must be copied to --install-tirith destination")
             self.assertEqual(dest.read_bytes(), b"ELF-TIRITH")
             self.assertEqual(dest.stat().st_mode & 0o777, 0o755)
+
+    def test_main_refuses_install_tirith_combined_with_tirith_bin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "usr" / "local" / "bin" / "tirith"
+            fake_bin = Path(tmp) / "fake-tirith"
+            fake_bin.write_bytes(b"ELF-TIRITH")
+            fake_bin.chmod(0o755)
+
+            skill = Path(tmp) / "demo" / "SKILL.md"
+            skill.parent.mkdir(parents=True, exist_ok=True)
+            skill.write_text("```bash\npwd\n```\n")
+
+            with mock.patch("sys.stdout", new=io.StringIO()), \
+                    mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+                code = check.main([
+                    f"agents/platform/skills={tmp}",
+                    "--tirith-bin", str(fake_bin),
+                    "--install-tirith", str(dest),
+                ])
+
+            self.assertEqual(1, code)
+            self.assertFalse(dest.exists(), "--install-tirith must not write unverified binary")
+            self.assertIn("cannot be combined with --tirith-bin", stderr.getvalue())
 
     def test_dockerfile_passes_install_tirith(self):
         dockerfile = (Path(__file__).resolve().parent / "Dockerfile").read_text(encoding="utf-8")
