@@ -122,11 +122,7 @@ def wait(home, job_id, seconds):
         ]
         if ours and ours[-1]["finished_at"]:
             run = ours[-1]
-            state.update(
-                last_run_at=run["finished_at"],
-                status=run["status"],
-                delivery_outcome=run["delivery_outcome"],
-            )
+            state.update(last_run_at=run["finished_at"], delivery_outcome=run["delivery_outcome"])
             _write(home, state)
             print(f"{job_id} finished at {run['finished_at']}: {run['status']}, {run['delivery_outcome']}")
             return

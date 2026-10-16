@@ -2689,7 +2689,7 @@ def _sanitize_label(value: str) -> str:
     return neutralised
 
 
-def _truncate_report(report: str, profile: str, job_id: str) -> tuple[str, str]:
+def _truncate_report(report: str, profile: str, job_id: str, audit_record: bool = False) -> tuple[str, str]:
     """Cut an oversized report to the cap. Returns `(report, notice)`.
 
     `notice` is `""` for a report that fits, and otherwise the line that says so,
@@ -2716,11 +2716,19 @@ def _truncate_report(report: str, profile: str, job_id: str) -> tuple[str, str]:
     if len(report) <= CRON_REPORT_MAX_CHARS:
         return report, ""
 
+    # A fleet-audit report is the record `finish` left, not the final message
+    # the scheduler saved, so the notice names the record.
+    saved = (
+        f"The whole report is in `{CHAT_REPORT_FILE.format(audit=job_id)}` in the "
+        f"shell's scratch directory, and its findings are on the ledger issue."
+        if audit_record
+        else f"The whole report was saved by the scheduler under "
+        f"`cron/output/{job_id}/` in the {profile} profile's home."
+    )
     notice = (
         f"[truncated] This report was {len(report)} characters, over the "
         f"{CRON_REPORT_MAX_CHARS}-character chat limit, so what follows is the "
-        f"beginning of it. The whole report was saved by the scheduler under "
-        f"`cron/output/{job_id}/` in the {profile} profile's home.\n\n"
+        f"beginning of it. {saved}\n\n"
     )
     logger.warning(
         f"Relay for {profile}/{job_id}: report is {len(report)} chars, truncating to "
@@ -3641,7 +3649,7 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     from_scheduler = SCHEDULER_LEG_KEY in request_data
     if from_scheduler and _is_fleet_audit_job(profile, job_id) and _is_shipped_audit_job(job_id):
         report, audit_run = audit_chat_report(profile, job_id, title)
-    report, truncation_notice = _truncate_report(report, profile, job_id)
+    report, truncation_notice = _truncate_report(report, profile, job_id, audit_record=bool(audit_run))
 
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     session_id = _cron_report_session_id(profile, job_id, day)

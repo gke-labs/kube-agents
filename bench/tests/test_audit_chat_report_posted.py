@@ -59,8 +59,15 @@ def test_the_report_finish_rendered_passes():
 
 
 def test_every_repositorys_part_is_one_post():
-    status, _ = acr.verdict(gateway(["a\n\nb"]), record(["a", "b"]))
+    posted = "a\n\nb\n\nSecurity & RBAC Posture Audit: 2 repositories reported in this run."
+    status, _ = acr.verdict(gateway([posted]), record(["a", "b"]))
     assert status == "pass"
+
+
+def test_a_closing_line_with_the_wrong_count_fails():
+    posted = "a\n\nb\n\nSecurity & RBAC Posture Audit: 3 repositories reported in this run."
+    status, _ = acr.verdict(gateway([posted]), record(["a", "b"]))
+    assert status == "fail"
 
 
 def test_a_repository_that_did_not_finish_fails():

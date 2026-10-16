@@ -3572,6 +3572,12 @@ class TestAuditChatReport(unittest.TestCase):
         _, sent = self.post()
         self.assertIsNone(session_kv_server.slack_audit_report.ledger_ref(sent[0]))
 
+    def test_a_truncated_audit_report_names_the_record(self):
+        self.leave(["x" * (session_kv_server.CRON_REPORT_MAX_CHARS + 10)])
+        _, sent = self.post()
+        self.assertIn("chat_report_compliance-audit.json", sent[0])
+        self.assertNotIn("cron/output/", sent[0])
+
     def test_a_mid_run_report_to_chat_is_posted_as_written(self):
         self.leave([])
         _, sent = self.post(scheduler=False)

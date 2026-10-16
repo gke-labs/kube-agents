@@ -34,6 +34,7 @@ errors: there is nothing in a channel to grade.
 
 import json
 import math
+import re
 import shlex
 from datetime import datetime
 from typing import Any, Callable, Literal
@@ -55,6 +56,8 @@ CRON_OUTPUT = f"{DATA_ROOT}/profiles/{PROFILE}/cron/output"
 CHAT_REPORT = "/opt/data/scratch/chat_report_{audit}.json"
 # session_kv_server.py: CHAT_REPORT_PARTS_SEPARATOR.
 PARTS_SEPARATOR = "\n\n"
+# session_kv_server.py: AUDIT_REPOS_SUMMARY_LINE.
+REPOS_SUMMARY = re.compile(r": (?P<count>\d+) repositories reported in this run\.\Z")
 SILENT_MARKER = "[SILENT]"
 # The scheduler's `delivery_outcome` for a run whose report reached its leg.
 DELIVERED = "delivered"
@@ -156,6 +159,16 @@ def read_chat_report(shell: Callable[[str, float], str], audit: str, timeout: fl
     return True, record if isinstance(record, dict) else None
 
 
+def _without_summary(text: str, parts: int) -> str:
+    """`text` without the closing line the relay adds after several reports
+    (session_kv_server.py: AUDIT_REPOS_SUMMARY_LINE), when it counts `parts`."""
+    head, _, last = text.rpartition(PARTS_SEPARATOR)
+    match = REPOS_SUMMARY.search(last)
+    if parts > 1 and head and match and int(match.group("count")) == parts:
+        return head
+    return text
+
+
 def _is_silent(response: str | None) -> bool:
     return response is not None and response.strip().strip("*`_ ").upper() == SILENT_MARKER
 
@@ -196,7 +209,7 @@ def verdict(gateway: dict[str, Any], record: dict[str, Any] | None) -> tuple[Ver
     if unfinished:
         return "fail", f"the run did not finish for {', '.join(unfinished)}"
     report = PARTS_SEPARATOR.join(texts)
-    changed = [text for text in posted if text.strip() != report]
+    changed = [text for text in posted if _without_summary(text.strip(), len(texts)) != report]
     if changed:
         return "fail", (
             f"{len(changed)} of {len(posted)} post(s) are not the report finish rendered; "
