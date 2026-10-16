@@ -413,12 +413,13 @@ change of the new release.
   [Recovering `install.env`](#recovering-installenv).
 - **`GITHUB_APP_ID` is not a number.** The token minter needs the GitHub App's numeric ID, the "App
   ID" on the App's General settings page, not its name or slug. `--dry-run` refuses it too.
-- **The move leaves behind a commit marked as a breaking change.** When the installed commit is not
-  an ancestor of the target — a rollback to an older release, or a commit build moved to a release
-  that lacks some of its commits — the run reads the commits the target lacks. It stops before the
-  Secret backfills if any has a `type!:` subject or a `BREAKING CHANGE:` footer, and names each one.
-  Read them, then re-run with `--allow-breaking-downgrade`, in any mode. `--plan` warns instead. See
-  [Rolling back a release](/kube-agents/deploy/rollback/).
+- **The move leaves behind a commit marked as a breaking change.** When the target does not
+  contain the installed commit — a rollback to an older release, or a commit build moved to a
+  release that lacks some of its commits — the run reads the commits the target lacks. It stops
+  before the Secret backfills if any has a `type!:` subject or a `BREAKING CHANGE:` footer, and
+  names each one. Read them, then re-run with `--allow-breaking-downgrade`, in any mode. `--plan`
+  warns instead. A move between two release tags to the newer one is not checked, and neither is a
+  run whose tag is read off the install. See [Rolling back a release](/kube-agents/deploy/rollback/).
 - **No Helm release.** The target namespace has no `kube-agents` release to upgrade.
 - **The memory store cannot be checked and nothing named one.** When the configuration records no
   `MEMORY`, the upgrade asks the cluster whether it runs the Hindsight memory store, so that a store

@@ -340,10 +340,10 @@ Options:
                            does not declare, instead of refusing the upgrade
                            over them. For a rollback to an older release.
   --allow-breaking-downgrade
-                           Roll back to an older release even when a commit
-                           between the installed tag and --image-tag is marked
-                           as a breaking change. Without it, such a rollback is
-                           refused and the refusal names each commit.
+                           Continue a move that leaves behind a commit marked
+                           as a breaking change: a rollback to an older release,
+                           or a commit build moved to a release that lacks it.
+                           Without it the move is refused and each commit named.
   --help, -h               Show this help message
 
 Examples:
@@ -1924,6 +1924,11 @@ main() {
   local target_namespace="${PARAM_AGENT_NAMESPACE:-${NAMESPACE:-$DEFAULT_NAMESPACE}}"
   export NAMESPACE="$target_namespace"
 
+  # A tag read off the install below is not a move, so it is not checked as
+  # one: a tagless plan's state tag trails the running tag on an environment
+  # that tracks main, and checking it would report image lag as a rollback.
+  local target_named_by_run="false"
+  [ -z "$PARAM_IMAGE_TAG" ] || target_named_by_run="true"
   if [ -z "$PARAM_IMAGE_TAG" ] && [ "$PARAM_PLAN" = "true" ]; then
     # A PLAN's reference point is Terraform state, not the cluster, so the tag
     # it plans at has to be the one the last apply RECORDED. The two differ by
@@ -1969,7 +1974,7 @@ main() {
 
   # Before the Secret backfills, the first step that writes to the cluster.
   # Guarded: an older target tree's installer_common.sh may not define it.
-  if declare -F running_image_tag >/dev/null; then
+  if [ "$target_named_by_run" = "true" ] && declare -F running_image_tag >/dev/null; then
     check_downgrade "$repo_dir" "$PARAM_IMAGE_TAG" "$(running_image_tag "$target_namespace")"
   fi
 

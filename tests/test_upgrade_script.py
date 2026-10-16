@@ -4034,6 +4034,15 @@ class DowngradeCheckWiringTest(unittest.TestCase):
         self.assertLess(call, main.index('backfill_session_kv_keys "$target_namespace"'))
         self.assertLess(call, main.index('ensure_clean_helm_release "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"'))
 
+    def test_a_tag_read_off_the_install_is_not_checked(self):
+        # A tagless plan's state tag trails the running tag on an environment that
+        # tracks main; checking it would report image lag as a rollback.
+        main = self.text[self.text.index("main() {"):]
+        named = main.index('[ -z "$PARAM_IMAGE_TAG" ] || target_named_by_run="true"')
+        self.assertLess(named, main.index('PARAM_IMAGE_TAG="$(tf_state_image_tag)"'))
+        self.assertLess(named, main.index('PARAM_IMAGE_TAG="$(running_image_tag "$target_namespace")"'))
+        self.assertIn('if [ "$target_named_by_run" = "true" ] && declare -F running_image_tag', main)
+
     def test_the_flag_is_parsed_and_documented(self):
         proc = subprocess.run(
             ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"; '

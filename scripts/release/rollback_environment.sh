@@ -294,7 +294,9 @@ checkout_at() {
 # drop=true on the rollback leg only: there the keys N recorded that N-1 does
 # not declare are expected, while on the roll-forward a key the candidate no
 # longer declares is a rename the refusal has to surface. The same leg passes
-# the breaking-change bypass, which a roll-forward never needs.
+# the breaking-change bypass. A roll-forward leaves behind only the GA's
+# release-line commits, which carry a breaking change only when one was
+# released by hand there, and then the refusal is worth seeing.
 run_upgrade() {
   local dir="$1" tag="$2" mode="$3" drop="${4:-false}" drop_flag="" allow_flag=""
   local log="${DIAGNOSTICS_DIR}/upgrade-${mode}-${tag}.log"
