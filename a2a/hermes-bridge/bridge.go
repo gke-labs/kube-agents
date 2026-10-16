@@ -1668,6 +1668,7 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 			state, msg = lib.StateFailed, resultPublishFailedReason(err)
 		}
 	}
+	b.publishHandoff(ctx, run, state)
 	err := b.publishTerminal(ctx, run, state, msg)
 	cancel()
 	run.mu.Unlock()
@@ -1717,6 +1718,24 @@ func cardsMark(run *taskRun, state lib.TaskState) (lib.Part, bool) {
 	}
 	part, err := chatmsg.MarkPart(chatmsg.Mark{Ask: run.askKind()})
 	return part, err == nil
+}
+
+// publishHandoff publishes lib.ArtifactHandoff ahead of the terminal of a
+// completed task any of whose turns filed kanban cards whose reports can
+// reach the conversation (the route was recorded): the same task-wide fact
+// cardsMark carries, so the wake's note reads the same on every route. cardsMark carries the same fact only where the cards also settle
+// the ask (Slack with KAGE_SLACK_UX on), so a Google Chat conversation, or
+// Slack with the flag off, would wake a delegating session with the
+// acknowledgement and no word that a card is still running (#3258).
+// Best-effort, like every artifact but the result, and on finalizeResult's
+// ctx, so a stalled bus can't spend time the terminal's publish budget
+// doesn't see.
+func (b *Bridge) publishHandoff(ctx context.Context, run *taskRun, state lib.TaskState) {
+	a := run.act.Load()
+	if state != lib.StateCompleted || a == nil || !a.cardsFiled.Load() || !run.routeRecorded.Load() {
+		return
+	}
+	b.publishArtifactPartsCtx(ctx, run, lib.ArtifactHandoff, lib.Part{Kind: "text", Text: lib.HandoffCards})
 }
 
 // cardsSettleTheAsk reports whether the cards of origin's conversation carry

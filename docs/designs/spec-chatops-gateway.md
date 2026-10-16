@@ -493,7 +493,7 @@ link in the mint's own write, the refusal in its own - so neither path runs a re
 child's result is already posted, so it tells the session to reply with what it means rather than
 repeat it; to a program behind a door, which sees only the wake's reply, it asks for the whole
 answer. Either way it says to state plainly when the child failed or reports more work still
-running. The wake has no delegate tool: a pod spawned for a wake that serves one task gets
+running. When the child handed its work to kanban cards, a line after the header says a Cluster Agent card's report posts into the conversation on its own (#3258). Two signals count: the terminal's chat mark with `ask` set and no `settle` (Slack with `KAGE_SLACK_UX` on), and the `handoff` artifact (spec-a2a-payloads), which the bridge's API executor publishes on any recorded route, Google Chat and Slack with the flag off included. The wake has no delegate tool: a pod spawned for a wake that serves one task gets
 `A2A_DELEGATE_TOOL=off` from the spawner, and a pod that serves every turn has the tool turned
 off by its adapter for each task whose authority block carries `via`, which only a wake's does
 and only the gateway can publish. A wake that could delegate read an interim answer such as "still
