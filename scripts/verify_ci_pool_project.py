@@ -360,6 +360,10 @@ FINDING_HOST_OTEL_SCOPE = "gke/host-otel-scope"
 # this set (scripts/eval_dashboard/pool_state.py `passes_leases`, for
 # health.py's rule 3e) before wording the advice, so a 403 on a project whose
 # findings are all here is reported as the change's to read, not the pool's.
+# One exception, in the nightly alone: observability-trace-latency-brokered
+# (hack/eval/nightly-cases.txt) reads the install's own traces and fails its
+# report check on a host cluster without the scope; a presubmit run still
+# passes such a lease, and the advice is read from presubmit runs only.
 LEASE_SILENT_FINDINGS = frozenset({FINDING_HOST_OTEL_SCOPE})
 
 DEFAULT_GITHUB_APP_ID = 4675512
