@@ -440,7 +440,7 @@ verification_spec:
   #
   # READ THIS CASE'S RECORD WITH THAT IN MIND. The consequence is sharp and was
   # measured on 2026-10-15: a run in which the agent recommended reverting --
-  # restoring a state the cluster had already failed to start three times, so
+  # restoring the one state the kubelet had already refused outright, so
   # advice that takes the workload down if followed -- passed EVERY
   # DETERMINISTIC CHECK below and failed only the judge (OutcomeValidity 0.5,
   # the recommendation bullet 0.4 with every other bullet green). A count is
