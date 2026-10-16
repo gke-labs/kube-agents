@@ -176,8 +176,7 @@ class SharedCasesTest(unittest.TestCase):
         if "url" in given:
             return [_out(chat_message.pr_message(given["url"], given["repo"], given["number"], given["line"]), NOTIFY)]
         if "reply" in given:
-            _bolded, offer = slack_ux_failure.present(given["reply"])
-            return [_out(chat_message.failure_message(given["reply"], bool(offer)), RESULT)]
+            return [_out(slack_ux_failure.layout(given["reply"], True), RESULT)]
         if "report" in given:
             laid_out = slack_ux_incident.chat_triage(given["report"].strip())
             return [_out(laid_out and laid_out[0], NOTIFY)]

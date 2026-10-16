@@ -16,7 +16,9 @@ import (
 //     leads the detail, rather than clipped;
 //   - answerChoices, slack_moments.answer_choices: an answer that ends by
 //     asking which of two to five options to take offers them as choices,
-//     with the explanation under "why".
+//     with the explanation under "why";
+//   - nextStep, slack_moments.next_step: an answer that declares its next
+//     step on a last line of its own offers that step as its one choice.
 const (
 	// clauseScanMax is CLAUSE_SCAN_MAX: how many code points into a first
 	// sentence clauseCut looks for a break.
@@ -70,6 +72,11 @@ var (
 	recommended    = regexp.MustCompile(`(?i)` + pySpace + `*\(` + pySpace + `*recommended` + pySpace + `*\)`)
 	optionNum      = regexp.MustCompile(`(?i)^option` + pySpace + `+(?:\p{Nd}+|[a-z])\b` + pySpace + `*[:.)\-–—]?` + pySpace + `*`)
 	notProse       = regexp.MustCompile(`^` + pySpace + `*[>|]`)
+	// nextStepLine is NEXT_STEP_LINE, matched against a whole line, and
+	// nextStepMarkup is NEXT_STEP_MARKUP: what a declared step's label
+	// cannot hold.
+	nextStepLine   = regexp.MustCompile(`(?i)^[ \t]*\[next:[ \t]*([^\]\n]*?)[ \t]*\][ \t]*$`)
+	nextStepMarkup = regexp.MustCompile("[*_`~<>|\\[\\]]")
 	choiceWord     = regexp.MustCompile(`(?i)\b(?:which|or)\b`)
 	// choiceHint is CHOICE_HINT: words that ask to choose, for a question
 	// with no "which" or "or".
@@ -474,4 +481,28 @@ func answerChoices(rest string) (answerOffer, bool) {
 	offer.shown = strings.Join(shownParts, "\n\n")
 	offer.folded = pyStrip(strings.Join(folded, "\n"))
 	return offer, true
+}
+
+// nextStep is slack_moments.next_step: the one next step an answer declares
+// on its last line, a line of its own reading "[next: <label>]", split off as
+// (the answer above that line, the label). A label that is empty, longer than
+// a button or holds markup, a link or a mention, or a second "[next: ...]"
+// line anywhere, declares none, and the answer is returned as written with
+// an empty label.
+func nextStep(answer string) (string, string) {
+	lines := strings.Split(strings.TrimRightFunc(answer, isPySpace), "\n")
+	m := nextStepLine.FindStringSubmatch(lines[len(lines)-1])
+	if m == nil {
+		return answer, ""
+	}
+	for _, line := range lines[:len(lines)-1] {
+		if nextStepLine.MatchString(line) {
+			return answer, ""
+		}
+	}
+	label := strings.Join(strings.FieldsFunc(m[1], isPySpace), " ")
+	if label == "" || runeLen(label) > buttonTextMax || nextStepMarkup.MatchString(label) {
+		return answer, ""
+	}
+	return strings.TrimRightFunc(strings.Join(lines[:len(lines)-1], "\n"), isPySpace), label
 }

@@ -24,7 +24,10 @@ sentence in bold and, when it ends on one short yes/no question, a choice button
 reading :data:`OFFER_LABEL` ("Try again"), whatever the question's words; the
 question stays in the reply above it. An open question ("Which namespace
 should it use?"), a request ("Could you share the namespace?") or an either/or
-stays text, since it needs a word, not a click. A click is the clicker answering in the thread with the button's text
+stays text, since it needs a word, not a click. A reply that declares its next step on a
+last line of its own (``slack_moments.next_step``: ``[next: check seeded-a]``) gets that
+step as the button instead, whatever its question says, and the line is left out of the
+blocks. A click is the clicker answering in the thread with the button's text
 (``gateway/slack_ux_clicks.py``), so the Planning Agent reads it as the user
 saying yes. The words are the agent's; only how they are drawn changes. The
 ``text`` Slack keeps for notifications and for a later read of the thread is
@@ -86,6 +89,10 @@ try:
     import chat_message as _chat
 except ImportError:  # the scripts directory is not on PYTHONPATH, or predates it
     _chat = None
+try:
+    import slack_moments as _moments
+except ImportError:  # the scripts directory is not on PYTHONPATH
+    _moments = None
 
 SLACK_PLATFORM = "slack"
 
@@ -425,6 +432,19 @@ def _continues(line: str) -> bool:
     )
 
 
+def _next_step(content: str) -> tuple[str, str]:
+    """``slack_moments.next_step``: the reply without its declared step's line, and the step's label."""
+    return _moments.next_step(content) if _moments is not None else (content, "")
+
+
+def layout(content: str, in_thread: bool) -> Optional[dict]:
+    """A failure reply as a ``kube-agents.chat/v1`` message: :func:`present`'s offer, or the
+    declared next step in its place, as its button, only ``in_thread``."""
+    content, step = _next_step(content)
+    _bolded, offer = present(content)
+    return _chat.failure_message(content, bool((step or offer) and in_thread), step)
+
+
 def chat_for(content: str) -> Optional[dict]:
     """The ``kube-agents.chat/v1`` layout of a marked failure reply, or None for any other.
 
@@ -435,26 +455,28 @@ def chat_for(content: str) -> Optional[dict]:
     if thread is None or _chat is None:
         return None
     try:
-        _bolded, offer = present(content)
-        return _chat.failure_message(content, bool(offer and thread))
+        return layout(content, bool(thread))
     except Exception:
         logger.warning("slack_ux_failure: laying out the failure reply failed", exc_info=True)
         return None
 
 
 def maybe_blocks(content: str, render: Callable[[str], Optional[list]]) -> Optional[list]:
-    """``render(content)``, or for a marked reply its :func:`present` form plus the Try again offer."""
+    """``render(content)``, or for a marked reply its :func:`present` form plus its offer: the
+    declared next step, else Try again."""
     thread = _marked.get()
     if thread is None:
         return render(content)
     try:
-        bolded, offer = present(content)
+        shown, step = _next_step(content)
+        bolded, offer = present(shown)
         blocks = render(bolded)
         if blocks is None:
             return render(content)
-        if offer and thread and len(blocks) < MESSAGE_BLOCKS_MAX:
+        label = step or (OFFER_LABEL if offer else "")
+        if label and thread and len(blocks) < MESSAGE_BLOCKS_MAX:
             blocks = list(blocks) + _presenter.blocks_answer(
-                "", choices=[OFFER_LABEL], action_id_prefix=ACTION_ID_PREFIX,
+                "", choices=[label], action_id_prefix=ACTION_ID_PREFIX,
             )
         return blocks
     except Exception:

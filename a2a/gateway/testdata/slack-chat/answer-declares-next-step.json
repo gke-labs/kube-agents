@@ -1,0 +1,55 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "Good news: it's not restarting.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "Both pods have been up for 45h on seeded-a. #oncall may mean payments-api in seeded-debug, which is crashing. Want me to look?",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "elements": [
+          {
+            "action_id": "kage.choice.0",
+            "text": {
+              "emoji": true,
+              "text": "look at payments-api",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "look at payments-api"
+          }
+        ],
+        "type": "actions"
+      }
+    ],
+    "attachments": []
+  }
+]

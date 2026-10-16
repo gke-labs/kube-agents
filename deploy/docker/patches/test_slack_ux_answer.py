@@ -476,6 +476,49 @@ class SendTest(unittest.TestCase):
         self.send(adapter, f"{HEADLINE} Want me to watch it?")
         self.assertEqual([block["type"] for block in adapter.log[0][1]["blocks"]], ["rich_text", "section"])
 
+    def test_a_declared_next_step_is_one_button_after_the_question(self):
+        question = "Want me to scale the pool to 6 nodes?"
+        answer = f"{ANSWER}\n\n{question}\n\n[next: scale the pool to 6 nodes]"
+        adapter = _Adapter()
+        self.send(adapter, answer)
+        post = adapter.log[0][1]
+        self.assertEqual(post["text"], f"mrkdwn({answer})", "the text Slack keeps is the answer as written")
+        _headline, fold, after, actions = post["blocks"]
+        self.assertEqual(fold["child_blocks"], _render_blocks(REST, adapter.format_message))
+        self.assertEqual(after, _render_blocks(question, adapter.format_message)[0])
+        (button,) = actions["elements"]
+        self.assertEqual(
+            (button["text"]["text"], button["value"], button.get("style"), button["action_id"]),
+            ("scale the pool to 6 nodes", "scale the pool to 6 nodes", None, "kage_answer.choice.0"),
+        )
+        self.assertNotIn("[next:", json.dumps(post["blocks"]))
+
+    def test_a_declared_step_on_an_answer_the_fold_refuses_draws_it_whole(self):
+        # One sentence and a step: nothing follows the lead to fold, so upstream's rendering, then the button.
+        adapter = _Adapter()
+        with self.assertLogs(runtime.logger):
+            self.send(adapter, "Checkout is healthy.\n\n[next: check checkout on seeded-b]")
+        whole, actions = adapter.log[0][1]["blocks"]
+        self.assertEqual(whole, _render_blocks("Checkout is healthy.", adapter.format_message)[0])
+        self.assertEqual(actions["elements"][0]["value"], "check checkout on seeded-b")
+
+    def test_options_win_over_a_declared_step(self):
+        answer = f"{HEADLINE} Two ways.\n\n1. **Scale it**\n2. **Shed load**\n\nWhich do you want?\n\n[next: scale it]"
+        adapter = _Adapter()
+        self.send(adapter, answer)
+        actions = adapter.log[0][1]["blocks"][-1]
+        self.assertEqual([b["value"] for b in actions["elements"]], ["Scale it", "Shed load"])
+
+    def test_outside_a_thread_a_declared_step_stays_as_written(self):
+        adapter = _Adapter()
+        wrapped = runtime.adapter_for(
+            adapter, "slack", SimpleNamespace(kind="completed"), SimpleNamespace(), {"chat_id": CHANNEL}
+        )
+        asyncio.run(wrapped.send(CHANNEL, f"{ANSWER}\n\n[next: scale the pool]", metadata={}))
+        blocks = adapter.log[0][1]["blocks"]
+        self.assertNotIn("actions", [block["type"] for block in blocks])
+        self.assertIn("[next: scale the pool]", json.dumps(blocks))
+
     def test_a_top_level_chat_posts_without_a_thread(self):
         adapter = _Adapter()
         wrapped = runtime.adapter_for(

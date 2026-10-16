@@ -725,5 +725,38 @@ class AnswerChoicesTest(unittest.TestCase):
         m.answer_choices("- x\n" * 20000 + "\nWhich one?")
 
 
+class NextStepTest(unittest.TestCase):
+    def test_the_last_line_declares_the_step(self):
+        self.assertEqual(
+            m.next_step("I couldn't find seeded-z. Check it there?\n\n[next: check seeded-a]\n"),
+            ("I couldn't find seeded-z. Check it there?", "check seeded-a"),
+        )
+
+    def test_the_word_and_the_spacing_are_forgiven(self):
+        self.assertEqual(m.next_step("Up.\n  [Next:   look at\tpayments-api ]  "), ("Up.", "look at payments-api"))
+
+    def test_anything_else_declares_none_and_keeps_the_text(self):
+        for text in (
+            "Up.",
+            "Up.\n[next: check seeded-a]\nAnything else?",  # not the last line
+            "Up. [next: check seeded-a]",  # not a line of its own
+            "Up.\n[next: check seeded-b]\n[next: check seeded-a]",  # two steps
+            "Up.\n[next: ]",
+            "Up.\n[next: " + "x" * (p.BUTTON_TEXT_MAX + 1) + "]",
+            "Up.\n[next: check `seeded-a`]",
+            "Up.\n[next: ask <@U1>]",
+            "Up.\n[next: [x] check]",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(m.next_step(text), (text, ""))
+
+    def test_a_label_at_the_button_cap_is_kept(self):
+        label = "x" * p.BUTTON_TEXT_MAX
+        self.assertEqual(m.next_step(f"Up.\n[next: {label}]"), ("Up.", label))
+
+    def test_an_answer_that_is_only_the_step(self):
+        self.assertEqual(m.next_step("[next: check seeded-a]"), ("", "check seeded-a"))
+
+
 if __name__ == "__main__":
     unittest.main()

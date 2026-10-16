@@ -38,7 +38,12 @@ the fold, unfolded, so an offer is never hidden. An answer that ends by asking w
 two to five options to take (``slack_moments.answer_choices``, the rule next's emitter
 applies too) keeps its opening paragraph and the options' shown lines above the fold, the
 question below it, and the options as choice buttons (``kage_answer.choice.<n>``, value
-the label) in a thread, which ``slack_ux_clicks`` answers as the clicker's reply; outside one the options stay text. The folded post
+the label) in a thread, which ``slack_ux_clicks`` answers as the clicker's reply; outside one the options stay text.
+An answer that declares its next step on a last line of its own (``slack_moments.next_step``,
+``[next: check seeded-a]``) gets that step as one such button in a thread, the line left
+out of the blocks, after the question when there is one; an answer the fold refuses is
+then drawn whole, as upstream's renderer draws it, with the button under it. Options the
+answer offers win over a declared step. Outside a thread the line stays as written. The folded post
 carries what upstream's adds: link-preview settings, ``reply_broadcast``, the
 feedback buttons, the status clear and the reply tracking for the thread. An incident report
 that edits its alert never reaches this send, and a report a reply can act on
@@ -331,29 +336,42 @@ class _AnswerFolder:
         # opens on: the predicate the incident editor and the incidents store read it by.
         if actionable_report(content):
             return _refuse("it is a report with options to act on")
-        parts = split(content)
-        if parts is None:
-            return None
-        headline, rest = parts
         adapter = self._adapter
         mrkdwn_fn = getattr(adapter, "format_message", None)
         in_thread = bool(adapter._resolve_thread_ts(None, metadata))
-        offered = _moments.answer_choices(rest, buttons=in_thread)
-        if offered is not None:
-            # An answer asking which of its options to take: the opening paragraph and the
-            # options' shown lines stay in sight, the rest folds, and the options are buttons.
-            shown, rest, question, options = offered
-            detail_blocks = render_fold(shown, mrkdwn_fn) if shown else []
-            # A click answers in the thread it was clicked in, so outside a thread the options
-            # stay in sight as written, as a needs-you question's and a failure reply's offer do.
-            action_blocks = choice_blocks(options) if in_thread else []
+        # A declared next step is a button in a thread, with its line left out of the blocks;
+        # outside one a click has no thread to answer in, so the line stays as written.
+        shown_answer, step = _moments.next_step(content) if in_thread else (content, "")
+        step_blocks = choice_blocks([(step, False)]) if step else []
+        parts = split(shown_answer)
+        if parts is None:
+            if not step:
+                return None
+            # The answer as upstream draws it, without the step's line, and the step's button.
+            whole_blocks = render_fold(shown_answer, mrkdwn_fn)
+            if whole_blocks is None:
+                return None
+            layout = [*whole_blocks, *step_blocks]
         else:
-            rest, question = trailing_question(rest)
-            detail_blocks, action_blocks = [], []
-        fold_blocks = render_fold(rest, mrkdwn_fn) if rest else []
-        question_blocks = render_fold(question, mrkdwn_fn) if question else []
-        if fold_blocks is None or question_blocks is None or detail_blocks is None:
-            return None
+            headline, rest = parts
+            offered = _moments.answer_choices(rest, buttons=in_thread)
+            if offered is not None:
+                # An answer asking which of its options to take: the opening paragraph and the
+                # options' shown lines stay in sight, the rest folds, and the options are buttons,
+                # which a declared step does not join.
+                shown, rest, question, options = offered
+                detail_blocks = render_fold(shown, mrkdwn_fn) if shown else []
+                # A click answers in the thread it was clicked in, so outside a thread the options
+                # stay in sight as written, as a needs-you question's and a failure reply's offer do.
+                action_blocks = choice_blocks(options) if in_thread else []
+            else:
+                rest, question = trailing_question(rest)
+                detail_blocks, action_blocks = [], step_blocks
+            fold_blocks = render_fold(rest, mrkdwn_fn) if rest else []
+            question_blocks = render_fold(question, mrkdwn_fn) if question else []
+            if fold_blocks is None or question_blocks is None or detail_blocks is None:
+                return None
+            layout = blocks_answer(headline, fold_blocks, question_blocks, detail_blocks, action_blocks)
         if adapter._outbound_blocked(self._chat_id, OUTBOUND_LABEL):
             # Upstream's send refuses it as well, and says so in its result.
             return None
@@ -372,9 +390,7 @@ class _AnswerFolder:
         response = await adapter._client_for(channel, metadata).chat_postMessage(
             channel=channel,
             text=mrkdwn_fn(content) if callable(mrkdwn_fn) else content,
-            blocks=adapter._append_feedback_block(
-                blocks_answer(headline, fold_blocks, question_blocks, detail_blocks, action_blocks)
-            ),
+            blocks=adapter._append_feedback_block(layout),
             **kwargs,
         )
         ts = str(response.get("ts") or "")

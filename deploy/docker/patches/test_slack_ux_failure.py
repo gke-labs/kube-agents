@@ -28,6 +28,8 @@ import verify_slack_ux_failure as verifier
 REPLY = (
     "I couldn't find seeded-z. The fleet has seeded-a, -b and -c. checkout-gateway runs on seeded-a. Check it there?"
 )
+#: Mock 06's reply with its next step declared on a last line of its own.
+DECLARED_REPLY = REPLY + "\n\n[next: check seeded-a]"
 SUB = {"task_id": "t_f1", "platform": "slack", "chat_id": "C0KAGE", "thread_id": "1700000000.000100"}
 WAKE = "Task t_f1 gave up."
 FLAG_ENV = "KAGE_SLACK_UX"
@@ -302,6 +304,36 @@ class MarkTest(FlagOn):
         self.assertEqual(chat["choices"], [{"text": "Try again"}])
         self.assertIn("Check it there?", chat["detail"])
         self.assertIsNone(runtime.chat_for(REPLY), "an unmarked reply is not laid out")
+
+    def test_a_declared_next_step_is_the_button_and_its_line_is_not_shown(self):
+        runtime.note_wake(SUB, {"blocked"}, WAKE)
+        blocks = self.draw(_turn(), content=DECLARED_REPLY)
+        (button,) = _buttons(blocks)
+        self.assertEqual((button["text"]["text"], button["value"]), ("check seeded-a", "check seeded-a"))
+        self.assertTrue(blocks[0]["text"]["text"].endswith("Check it there?"))
+        self.assertNotIn("[next:", blocks[0]["text"]["text"])
+
+    def test_a_declared_next_step_needs_no_yes_no_question(self):
+        # An open question gets no Try again, but a declared step is still the button.
+        runtime.note_wake(SUB, {"blocked"}, WAKE)
+        reply = "I couldn't find seeded-z. Which cluster did you mean?\n[next: check seeded-a]"
+        (button,) = _buttons(self.draw(_turn(), content=reply))
+        self.assertEqual(button["value"], "check seeded-a")
+
+    def test_an_unmarked_reply_keeps_its_declared_line(self):
+        # Only a failure wake's reply is drawn here; any other is upstream's, line and all.
+        self.assertEqual(self.draw(_event(), content=DECLARED_REPLY), _render(DECLARED_REPLY))
+
+    def test_under_next_a_declared_next_step_is_the_choice(self):
+        runtime.note_wake(SUB, {"blocked"}, WAKE)
+        token = runtime.begin(_turn())
+        try:
+            chat = runtime.chat_for(DECLARED_REPLY)
+        finally:
+            runtime.end(token)
+        self.assertEqual(chat["choices"], [{"text": "check seeded-a"}])
+        self.assertTrue(chat["detail"].endswith("Check it there?"))
+        self.assertEqual(runtime.layout(DECLARED_REPLY, False).get("choices"), None, "no button outside a thread")
 
     def test_a_reply_needs_its_turn_to_have_claimed_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)

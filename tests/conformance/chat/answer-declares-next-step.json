@@ -1,0 +1,23 @@
+{
+  "name": "answer-declares-next-step",
+  "source": "agents/platform/scripts/test_chat_message.py::NextStepTest.test_mock_03",
+  "notes": "Mock 03: an answer whose last line declares its next step, [next: look at payments-api], offers that step as its one choice, and the line is not shown.",
+  "input": {
+    "markdown": "**Good news: it's not restarting.** Both pods have been up for 45h on seeded-a. #oncall may mean payments-api in seeded-debug, which is crashing. Want me to look?\n\n[next: look at payments-api]"
+  },
+  "expected": [
+    {
+      "carrier": "result",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Good news: it's not restarting.",
+        "detail": "Both pods have been up for 45h on seeded-a. #oncall may mean payments-api in seeded-debug, which is crashing. Want me to look?",
+        "choices": [
+          {
+            "text": "look at payments-api"
+          }
+        ]
+      }
+    }
+  ]
+}

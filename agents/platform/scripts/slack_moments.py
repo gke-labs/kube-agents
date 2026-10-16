@@ -29,7 +29,8 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
 
 A finished answer that ends by asking which of its options to take gets the same
 option rules from :func:`answer_choices`, for ``gateway/slack_ux_answer.py`` under today
-and ``chat_message.answer_message`` under next.
+and ``chat_message.answer_message`` under next. One that declares its next step on a last
+line of its own (:func:`next_step`) gets that step as its one choice button instead.
 
 Both lay out as one block list; ``slack_presenter.with_side_bar`` splits it
 into the headline and the attachment that carries the bar when it is posted.
@@ -294,6 +295,11 @@ SHOWN_OPTION = "{marker} **{label}**"
 SHOWN_SUMMARY = "{line} — {summary}"
 #: A line that is not prose: a quote or a table row, beside the presenter's headings, items and fences.
 NOT_PROSE = re.compile(r"^\s*[>|]")
+#: The next step an answer declares (:func:`next_step`): a line of its own, ``[next: <label>]``.
+NEXT_STEP_LINE = re.compile(r"[ \t]*\[next:[ \t]*([^\]\n]*?)[ \t]*\][ \t]*", re.IGNORECASE)
+#: What a declared step's label cannot hold: markup or a Slack link or mention, which a button
+#: shows as typed, and the brackets of a second step.
+NEXT_STEP_MARKUP = re.compile(r"[*_`~<>|\[\]]")
 
 
 def opened_pr(
@@ -839,3 +845,23 @@ def answer_choices(rest: str, buttons: bool = True) -> tuple[str, str, str, list
     return shown, "\n".join(folded).strip(), question, [
         (label, i == first) for i, (label, _primary, _shown, _whole) in enumerate(options)
     ]
+
+
+def next_step(text: str) -> tuple[str, str]:
+    """``(text, label)``: the one next step an answer declares, split off, or ``(text, "")``.
+
+    The agent declares it on the answer's last line, a line of its own reading
+    ``[next: <label>]``, the words a user would type to ask for it. The label is
+    one line of 1 to ``BUTTON_TEXT_MAX`` characters with no markup, link or
+    mention; the text returned is the answer above that line. Anything else,
+    including a second ``[next: ...]`` line anywhere, declares none and leaves
+    the text as written.
+    """
+    lines = (text or "").rstrip().split("\n")
+    match = NEXT_STEP_LINE.fullmatch(lines[-1])
+    if match is None or any(NEXT_STEP_LINE.fullmatch(line) for line in lines[:-1]):
+        return text, ""
+    label = " ".join(match.group(1).split())
+    if not label or len(label) > _presenter.BUTTON_TEXT_MAX or NEXT_STEP_MARKUP.search(label):
+        return text, ""
+    return "\n".join(lines[:-1]).rstrip(), label
