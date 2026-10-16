@@ -9,6 +9,8 @@ against the real one, on a board built with Hermes' own ``create_task``,
 ``claim_task`` and ``_set_worker_pid``, so what it checks is what the
 dispatcher's board does:
 
+0. the route's own board connection carries Hermes' PRAGMAs, its 3 s busy
+   timeout and Hermes' probe registration;
 1. the open statuses the route archives are Hermes' statuses less the two
    settled ones, so a status added upstream is a decision, not a silent change;
 2. a running parent with a gated todo child, a ready fan-out child under
@@ -23,8 +25,11 @@ dispatcher's board does:
    a running card whose pid belongs to a process without the card's marker is
    archived and that process is not signalled;
 4. ``task_links`` children that wait on our card under another conversation's
-   session and a cron job's are not archived, nor is another conversation's
-   card, and a done card is untouched and reported as settled;
+   session, a cron job's and an alert's are not archived, though Hermes'
+   ``create_task(parents=...)`` and ``link_tasks`` copied our thread's
+   subscription onto them and the route is called with that thread; nor are
+   the cards filed in a branch or by a delegate of the compressed session, nor
+   another conversation's card; a done card is untouched and reported settled;
 5. a second call stops nothing;
 6. a worker pid written onto a card after it was archived (the claim->spawn
    window in ``_set_worker_pid``) is killed and cleared by the late-pid sweep.
@@ -72,6 +77,7 @@ os.environ.pop("HERMES_KANBAN_TASK", None)
 
 CONTEXT = "ctx-verify"
 SESSION = "a2a-ctx-verify"
+CONVERSATION = "slack:C0VERIFY/1700000000.000100"
 MARKER = "HERMES_KANBAN_TASK"
 
 # The conversation's session, compressed once: a card filed after that carries
@@ -82,6 +88,10 @@ _sessions = SessionDB(HOME / "state.db")
 _sessions.create_session(SESSION, "api_server")
 _sessions.end_session(SESSION, "compression")
 _sessions.create_session("verify-cont-1", "api_server", parent_session_id=SESSION)
+# Children of the compressed session that are not its continuation, by
+# Hermes' own rule: a branch and a delegate.
+_sessions.create_session("verify-branch", "api_server", parent_session_id=SESSION, model_config={"_branched_from": SESSION})
+_sessions.create_session("verify-delegate", "api_server", parent_session_id=SESSION, model_config={"_delegate_from": SESSION})
 _sessions.close()
 
 from hermes_cli import kanban_db as kb  # noqa: E402
@@ -142,13 +152,24 @@ try:
         str(inspect.signature(kb.archive_task)),
     )
 
-    check(
-        "the route opens the board with the split module's connect, not the compat shim",
-        skv._hermes_kanban() == (kb, connect),
-    )
-
     conn = connect(DB)
+    from hermes_cli.sqlite_safe_read import connect_tracked  # noqa: E402
+    from hermes_cli.kanban_db_notify import add_notify_sub  # noqa: E402
+
+    check("the route opens its board connections through connect_tracked", skv._hermes_kanban() == (kb, connect_tracked))
+    route_conn = skv._card_stop_connect(connect_tracked, str(DB))
+    pragma_names = [p.split("=")[0] for p in skv.CARD_STOP_BOARD_PRAGMAS]
+    ours = {name: route_conn.execute(f"PRAGMA {name}").fetchone()[0] for name in pragma_names}
+    hermes = {name: conn.execute(f"PRAGMA {name}").fetchone()[0] for name in pragma_names}
+    check("the route's connection carries the PRAGMAs Hermes' connect sets", ours == hermes, f"{ours} != {hermes}")
+    check("with the route's busy timeout, not Hermes' 120 s",
+          route_conn.execute("PRAGMA busy_timeout").fetchone()[0] == int(skv.CARD_STOP_BUSY_TIMEOUT_S * 1000))
+    check("and registered against Hermes' byte-level probes", getattr(route_conn, "_hermes_tracked_path", None) is not None)
+    route_conn.close()
+
     parent = kb.create_task(conn, title="check node pools across the fleet", session_id=SESSION)
+    # The subscription kanban_event_routing.py writes for a card the turn filed.
+    add_notify_sub(conn, task_id=parent, platform="slack", chat_id=SESSION, thread_id=CONVERSATION)
     claimed = kb.claim_task(conn, parent)
     check("the parent card is claimed (running)", claimed is not None and status(parent) == "running")
     worker, worker_child = fake_worker(parent)
@@ -163,6 +184,18 @@ try:
     # Cards that wait on ours but are not ours: another conversation's, a cron job's.
     foreign_conv = kb.create_task(conn, title="waits on it, elsewhere", parents=[parent], session_id="a2a-ctx-other2")
     foreign_cron = kb.create_task(conn, title="nightly, waits on it", parents=[parent], session_id="cron_nightly")
+    foreign_linked = kb.create_task(conn, title="an alert's card, linked later", session_id="k8s-evt-verify")
+    kb.link_tasks(conn, parent, foreign_linked)
+    inherited = {
+        r[0]
+        for r in conn.execute(
+            "SELECT task_id FROM kanban_notify_subs WHERE chat_id = ? AND thread_id = ?", (SESSION, CONVERSATION)
+        )
+    }
+    check("Hermes copied our subscription onto the waiting cards (create_task and link_tasks)",
+          {foreign_conv, foreign_cron, foreign_linked} <= inherited, str(inherited))
+    on_branch = kb.create_task(conn, title="filed in a branch", session_id="verify-branch")
+    on_delegate = kb.create_task(conn, title="filed by a delegate", session_id="verify-delegate")
     # Running, with a pid that a process without the card's marker holds.
     impostor_card = kb.create_task(conn, title="pid reused", session_id=SESSION)
     kb.claim_task(conn, impostor_card)
@@ -180,17 +213,18 @@ try:
         [status(t) for t in tree] == ["running", "todo", "ready", "todo", "ready", "running"],
         str([status(t) for t in tree]),
     )
-    check("the cards waiting on it start todo", (status(foreign_conv), status(foreign_cron)) == ("todo", "todo"))
+    foreign = [foreign_conv, foreign_cron, foreign_linked]
+    check("the cards waiting on it start todo", [status(t) for t in foreign] == ["todo"] * 3, str([status(t) for t in foreign]))
     # Hermes stamps created_at in whole seconds, so every card here ties and the
     # route's tie-break is the random id. Spread them in filing order, parents
     # first, which is the order that promotes a child if the route archived by age.
-    for n, task_id in enumerate([parent, linked, fanned, grand, foreign_conv, foreign_cron, impostor_card, after_compression]):
+    for n, task_id in enumerate([parent, linked, fanned, grand, *foreign, impostor_card, after_compression]):
         conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (1_700_000_000 + n, task_id))
     check("the done card is done", status(done) == "done", status(done))
     last_event = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
 
     print("card stop: the first stop")
-    body = skv.stop_session_cards(SESSION, {"context_id": CONTEXT, "conversation": ""})
+    body = skv.stop_session_cards(SESSION, {"context_id": CONTEXT, "conversation": CONVERSATION})
     stopped = {entry["id"]: entry for entry in body["stopped"]}
     check("every card of the tree is reported stopped", set(stopped) == set(tree), json.dumps(body["stopped"]))
     check("every card of the tree is archived", all(status(t) == "archived" for t in tree), str([status(t) for t in tree]))
@@ -199,9 +233,10 @@ try:
         for r in conn.execute("SELECT task_id FROM task_events WHERE kind = 'promoted' AND id > ?", (last_event,))
     ]
     check("recompute_ready promoted none of them", not set(promoted) & set(tree), str(promoted))
-    check("the cards waiting on it are not archived (and are promoted, as finishing it would have)",
-          (status(foreign_conv), status(foreign_cron)) == ("ready", "ready"),
-          str((status(foreign_conv), status(foreign_cron))))
+    check("the cards waiting on it, carrying our subscription, are not archived (and are promoted, as finishing it would have)",
+          [status(t) for t in foreign] == ["ready"] * 3, str([status(t) for t in foreign]))
+    check("a branch's and a delegate's cards are not the conversation's",
+          (status(on_branch), status(on_delegate)) == ("ready", "ready"), str((status(on_branch), status(on_delegate))))
 
     def termination(task_id):
         row = conn.execute(
@@ -231,10 +266,12 @@ try:
           str((status(other), status(other_child))))
     check("the done card is reported settled, not stopped",
           [entry["id"] for entry in body["settled"]] == [done] and status(done) == "done", json.dumps(body["settled"]))
-    check("nothing failed", body["failed"] == [], json.dumps(body["failed"]))
+    check("nothing failed, pending or unresolved, and no board error",
+          (body["failed"], body["pending"], body["unresolved"], body["errors"]) == ([], [], [], []),
+          json.dumps({k: body[k] for k in ("failed", "pending", "unresolved", "errors")}))
 
     print("card stop: the second stop")
-    again = skv.stop_session_cards(SESSION, {"context_id": CONTEXT, "conversation": ""})
+    again = skv.stop_session_cards(SESSION, {"context_id": CONTEXT, "conversation": CONVERSATION})
     check("a second call stops nothing", again["stopped"] == [] and again["rounds"] == 0, json.dumps(again))
 
     print("card stop: a worker spawned onto an archived card")

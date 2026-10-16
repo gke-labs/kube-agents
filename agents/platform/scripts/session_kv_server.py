@@ -19,7 +19,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, NamedTuple, Optional, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, wait as futures_wait
 from contextlib import closing
 from pathlib import Path
 
@@ -4369,14 +4369,16 @@ def get_task(task_id: str) -> Dict[str, Any]:
 # the conversation and says which.
 #
 # "In the conversation" is: filed under the session or one of its compression
-# continuations, subscribed to this session and thread, or fanned out by such
-# a card (`kanban_worker_children`, or the `created` event's
-# `creator_task_id`), to any depth. A `task_links` child is NOT followed on its
-# own: one that carries this conversation's session is already in the set,
-# and one that carries another session is another conversation's, a cron
-# job's or an alert's card that waits on ours, and is left alone (archiving
-# our card promotes it, as finishing it would have). The links only order the
-# archive.
+# continuations, or fanned out by such a card (`kanban_worker_children`, or
+# the `created` event's `creator_task_id`), to any depth, whatever session the
+# child carries. A card with no session that is subscribed to this session and
+# thread counts too, unless it inherited that subscription from a `task_links`
+# parent. Hermes copies a parent's subscriptions onto every link child
+# (`_inherit_notify_subs`, from `create_task` and `link_tasks`), so a cron
+# job's, an alert's or another conversation's card that waits on ours carries
+# our thread's subscription. Such a card is never stopped, and neither is any
+# `task_links` child under another session: archiving our card promotes it,
+# as finishing it would have. The links only order the archive.
 #
 # It runs here, not in the bridge, because Hermes kills a running card's worker
 # only when the claim lock names this host, and the bridge sidecar has the
@@ -4398,12 +4400,21 @@ def get_task(task_id: str) -> Dict[str, Any]:
 #      was archived. `_set_worker_pid` has no status guard, so a card archived
 #      between `claim_task` and the spawn gets the new worker's pid, and nothing
 #      else ever kills that worker. A card archived while running with no pid
-#      yet is watched for one, every second, until the deadline.
+#      yet is watched for one, every second, until the deadline, and reported
+#      `unresolved` if none appears.
 #
-# Everything runs against one deadline (CARD_STOP_DEADLINE_S): no card's
-# archive starts once less than CARD_STOP_ARCHIVE_RESERVE_S is left, so the
-# answer is back inside the bridge's 30 s request timeout. A card not reached
-# is reported in `failed`, and `deadline` says the budget ran out.
+# The answer has a hard bound, CARD_STOP_WORST_CASE_S (24 s). An archive is not
+# bounded by anything this route controls: Hermes' `write_txn` retries BEGIN
+# and COMMIT five times each under the busy timeout, `archive_task` runs up to
+# three of them, waits ~5 s for a worker, and `_cleanup_workspace` runs git and
+# tmux with timeouts of 5 to 60 s. So every archive runs on a worker thread,
+# and the route waits for them only until CARD_STOP_DEADLINE_S; one still
+# running then is reported `pending` and left to finish on its own. No archive
+# starts with less than CARD_STOP_ARCHIVE_RESERVE_S left, the tree collection
+# stops at the same mark, and the re-scans and the pid watch stop at the
+# deadline. What can still run past it is one statement on the route's own
+# connection, a re-scan read or the pid sweep's UPDATE, which waits at most
+# CARD_STOP_BUSY_TIMEOUT_S. Hence deadline + busy timeout + 1 s of slack.
 #
 # The worker kill goes through a `signal_fn` of ours, which signals a pid only
 # when its environment carries the card's `HERMES_KANBAN_TASK`, and signals
@@ -4435,15 +4446,16 @@ CARD_STOP_RESCAN_ROUNDS = 3
 CARD_STOP_RESCAN_INTERVAL_SECONDS = 2.0
 # How often a card archived mid-claim is checked for a worker pid.
 CARD_STOP_LATE_PID_INTERVAL_SECONDS = 1.0
-# The whole call's budget. The bridge waits 30 s; the worst case is this, plus
-# one statement's busy wait.
+# After this the route starts nothing and waits for nothing.
 CARD_STOP_DEADLINE_S = 20.0
-# No card's archive starts with less than this left: Hermes' ~5 s wait for a
-# worker to exit after SIGTERM, then its SIGKILL.
+# No card's archive starts, and the tree collection stops, with less than this
+# left: Hermes' ~5 s wait for a worker to exit after SIGTERM, then its SIGKILL.
 CARD_STOP_ARCHIVE_RESERVE_S = 6.0
-# The route's own connections give up on a locked board after this, not after
-# Hermes' 120 s default, which alone would outlast the bridge's request.
+# The busy timeout of the route's board connections, in place of Hermes' 120 s.
 CARD_STOP_BUSY_TIMEOUT_S = 3.0
+# The bound on the answer: see the section comment. The bridge's request
+# timeout and the gateway's wait for the control task sit above it.
+CARD_STOP_WORST_CASE_S = CARD_STOP_DEADLINE_S + CARD_STOP_BUSY_TIMEOUT_S + 1.0
 # Between SIGTERM and SIGKILL for what is left of a stopped card's worker group.
 CARD_STOP_KILL_GRACE_SECONDS = 3.0
 CARD_STOP_KILL_POLL_SECONDS = 0.1
@@ -4457,10 +4469,21 @@ CARD_STOP_CHILDREN_TABLE = "kanban_worker_children"
 # Hermes' session store, where a compressed session's continuation names the
 # session it continues (`parent_session_id`, with the parent ended
 # 'compression'); a card filed after a compression carries the continuation's
-# id. Same edge and bound as kanban_event_routing.py, walked the other way.
+# id.
 CARD_STOP_STATE_DB_NAME = "state.db"
-CARD_STOP_COMPRESSION_END_REASON = "compression"
 CARD_STOP_COMPRESSION_WALK_MAX = 32
+# The per-connection PRAGMAs Hermes' `_open_configured` (kanban_db_connect.py)
+# sets on a board connection, less its WAL setup, which belongs to the file
+# and was done by the dispatcher that created it. verify_card_stop.py checks
+# them against a connection Hermes opens.
+CARD_STOP_BOARD_PRAGMAS = (
+    "synchronous=FULL",
+    "wal_autocheckpoint=100",
+    "journal_size_limit=8388608",
+    "foreign_keys=ON",
+    "secure_delete=ON",
+    "cell_size_check=ON",
+)
 # Rows per `IN (...)`, under SQLite's bound-parameter limit on any build.
 CARD_STOP_SQL_CHUNK = 500
 # Test hook, `None` in production: the state.db to read.
@@ -4496,17 +4519,42 @@ class _Budget:
 
 
 def _hermes_kanban():
-    """Hermes' kanban module and its board opener, imported on first use: the
-    gateway venv's, not a test's. The opener is `kanban_db_connect.connect`
-    since the v2026.9.14 split, else the pre-split `kanban_db.connect`, which the
-    split keeps only as a compat shim (as `kanban_guardrail_exit._default_connect`)."""
+    """Hermes' kanban module, and its `connect_tracked` when this Hermes has one,
+    imported on first use: the gateway venv's, not a test's."""
     from hermes_cli import kanban_db
 
     try:
-        from hermes_cli.kanban_db_connect import connect
+        from hermes_cli.sqlite_safe_read import connect_tracked
     except ImportError:
-        connect = kanban_db.connect
-    return kanban_db, connect
+        connect_tracked = None
+    return kanban_db, connect_tracked
+
+
+def _card_stop_connect(connect_tracked, board: str) -> sqlite3.Connection:
+    """A board connection for this route: Hermes' PRAGMAs and our busy timeout.
+
+    Not `kanban_db_connect.connect`: its first call in a process takes a
+    cross-process init flock (up to 10 s), probes the file, and runs `init_db`
+    under Hermes' 120 s busy timeout, all before a PRAGMA of ours could apply.
+    The board exists and the dispatcher initialized it. `connect_tracked`
+    registers the connection, so Hermes' byte-level probes of the file, whose
+    `close()` would drop this connection's POSIX locks, are refused while it is
+    open.
+    """
+    kwargs: Dict[str, Any] = {"timeout": CARD_STOP_BUSY_TIMEOUT_S, "isolation_level": None, "check_same_thread": False}
+    if connect_tracked is not None:
+        conn = connect_tracked(board, connect_fn=sqlite3.connect, **kwargs)
+    else:
+        conn = sqlite3.connect(board, **kwargs)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout = {int(CARD_STOP_BUSY_TIMEOUT_S * 1000)}")
+        for pragma in CARD_STOP_BOARD_PRAGMAS:
+            conn.execute(f"PRAGMA {pragma}")
+    except Exception:
+        conn.close()
+        raise
+    return conn
 
 
 def _card_stop_state_db() -> str:
@@ -4522,11 +4570,30 @@ def _card_stop_state_db() -> str:
     return os.path.join(home, CARD_STOP_STATE_DB_NAME) if home else ""
 
 
+# A compressed session's continuations: Hermes' own rule, `_CHAIN_STEP_SQL` in
+# hermes_state_compression.py (get_compression_chain). A child of a session
+# ended 'compression' is a continuation unless it is a branch (`_branched_from`
+# in its model_config), a delegate (`_delegate_from`) or a tool's session; the
+# JSON lookups are guarded as Hermes' `_sql_json_extract` guards them. Every
+# such child is walked, where Hermes picks the likeliest one as the chain's
+# next step: a second continuation is a retry of the same conversation.
+_CONTINUATIONS_SQL = """
+    SELECT child.id FROM sessions parent
+    JOIN sessions child ON child.parent_session_id = parent.id
+    WHERE parent.id = ?
+      AND parent.end_reason = 'compression'
+      AND json_extract(CASE WHEN json_valid(child.model_config) THEN child.model_config ELSE json_object() END,
+                       '$._branched_from') IS NULL
+      AND json_extract(CASE WHEN json_valid(child.model_config) THEN child.model_config ELSE json_object() END,
+                       '$._delegate_from') IS NULL
+      AND COALESCE(child.source, '') != 'tool'
+"""
+
+
 def _compression_descendants(session_id: str) -> list[str]:
     """The sessions that continue `session_id` through compression, at any depth.
 
-    Fails open to none: the session's own cards are still found, and its
-    subscription rows name the session that holds the route, which is this one.
+    Fails open to none: the session's own cards are still found.
     """
     state_db = _card_stop_state_db()
     if not state_db or not os.path.isfile(state_db):
@@ -4537,11 +4604,7 @@ def _compression_descendants(session_id: str) -> list[str]:
         with closing(_read_only(state_db)) as conn:
             while frontier and len(found) < CARD_STOP_COMPRESSION_WALK_MAX:
                 current = frontier.pop(0)
-                for row in conn.execute(
-                    "SELECT s.id FROM sessions s JOIN sessions p ON p.id = s.parent_session_id "
-                    "WHERE s.parent_session_id = ? AND p.end_reason = ?",
-                    (current, CARD_STOP_COMPRESSION_END_REASON),
-                ):
+                for row in conn.execute(_CONTINUATIONS_SQL, (current,)):
                     if row[0] and row[0] != session_id and row[0] not in found:
                         found.append(row[0])
                         frontier.append(row[0])
@@ -4580,16 +4643,19 @@ _CREATED_BY_SQL = (
 )
 
 
-def _collect_card_tree(conn: sqlite3.Connection, sessions: Sequence[str], session_id: str, conversation: str) -> _CardTree:
+def _collect_card_tree(
+    conn: sqlite3.Connection, sessions: Sequence[str], session_id: str, conversation: str, budget: _Budget
+) -> _CardTree:
     """Every card in the conversation: see the section comment for what that is.
 
     Seeded by `tasks.session_id` over the session and its compression
-    continuations, and by the subscription rows `kanban_event_routing.py` wrote
-    for this session and conversation, which also catch a card filed with
-    another session id that inherited the thread. Then fan-out children, to a
-    fixed point. Settled cards are walked through, so a done parent's running
-    child is found, and returned too: the caller keeps the open ones and names
-    the done ones.
+    continuations, then by the subscription rows `kanban_event_routing.py`
+    wrote for this session and conversation, kept only for a card with no
+    session that did not inherit the row from a `task_links` parent. Then
+    fan-out children, to a fixed point, until CARD_STOP_ARCHIVE_RESERVE_S is
+    all that is left. Settled cards are walked through, so a done parent's
+    running child is found, and returned too: the caller keeps the open ones
+    and names the done ones.
     """
     via: Dict[str, str] = {}
 
@@ -4601,20 +4667,18 @@ def _collect_card_tree(conn: sqlite3.Connection, sessions: Sequence[str], sessio
 
     frontier = reach([r[0] for r in _ids_where_in(conn, "SELECT id FROM tasks WHERE session_id IN ({marks})", sessions)], "session")
     if conversation and _has_table(conn, "kanban_notify_subs"):
-        frontier += reach(
-            [
-                r[0]
-                for r in conn.execute(
-                    "SELECT task_id FROM kanban_notify_subs WHERE chat_id = ? AND thread_id = ?",
-                    (session_id, conversation),
-                )
-            ],
-            "subscription",
+        subscribed = conn.execute(
+            "SELECT s.task_id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
+            "WHERE s.chat_id = ? AND s.thread_id = ? AND t.session_id IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM task_links l JOIN kanban_notify_subs p ON p.task_id = l.parent_id "
+            "                WHERE l.child_id = s.task_id AND p.chat_id = s.chat_id AND p.thread_id = s.thread_id)",
+            (session_id, conversation),
         )
+        frontier += reach([r[0] for r in subscribed], "subscription")
     children_table = _has_table(conn, CARD_STOP_CHILDREN_TABLE)
     truncated = False
     while frontier:
-        if len(via) > CARD_STOP_MAX_VISITED:
+        if len(via) > CARD_STOP_MAX_VISITED or not budget.allows(CARD_STOP_ARCHIVE_RESERVE_S):
             truncated = True
             break
         fanned = _ids_where_in(conn, _CREATED_BY_SQL, frontier)
@@ -4852,17 +4916,33 @@ def _archived_mid_claim(conn: sqlite3.Connection, task_id: str, prior_status: st
     return prior_status == "running" or (row is not None and row[0] is not None)
 
 
-def _card_stop_connect(connect, board: str) -> sqlite3.Connection:
-    conn = connect(Path(board))
-    conn.execute(f"PRAGMA busy_timeout = {int(CARD_STOP_BUSY_TIMEOUT_S * 1000)}")
-    return conn
-
-
-def _archive_card_on_own_connection(kanban_db, connect, board: str, task_id: str, budget: _Budget) -> tuple[str, Dict[str, Any]]:
+def _archive_card_on_own_connection(
+    kanban_db, connect_tracked, board: str, task_id: str, budget: _Budget
+) -> tuple[str, Dict[str, Any]]:
+    """Phase 2: one running card, on a worker thread with its own connection."""
     if not budget.allows(CARD_STOP_ARCHIVE_RESERVE_S):
         return "deadline", {}
-    with closing(_card_stop_connect(connect, board)) as conn:
+    with closing(_card_stop_connect(connect_tracked, board)) as conn:
         return _archive_card(kanban_db, conn, task_id, budget)
+
+
+def _archive_in_order(
+    kanban_db, connect_tracked, board: str, ids: Sequence[str], budget: _Budget, out: list
+) -> None:
+    """Phase 1: the cards that are not running, in order, on one worker thread.
+
+    Each outcome is appended to `out` as it lands, so a caller that stops
+    waiting at the deadline still has every one that did.
+    """
+    with closing(_card_stop_connect(connect_tracked, board)) as conn:
+        for task_id in ids:
+            if not budget.allows(CARD_STOP_ARCHIVE_RESERVE_S):
+                out.append((task_id, "deadline", {}))
+                continue
+            try:
+                out.append((task_id, *_archive_card(kanban_db, conn, task_id, budget)))
+            except Exception as exc:  # noqa: BLE001 - one card's failure must not leave the rest running
+                out.append((task_id, "raised", exc))
 
 
 def _sweep_late_worker_pids(conn: sqlite3.Connection, archived: Sequence[str], budget: _Budget) -> list[Dict[str, Any]]:
@@ -4885,7 +4965,6 @@ def _sweep_late_worker_pids(conn: sqlite3.Connection, archived: Sequence[str], b
             "UPDATE tasks SET worker_pid = NULL WHERE id = ? AND status = 'archived' AND worker_pid = ?",
             (task_id, pid),
         )
-        conn.commit()
         logger.warning("card stop: killed worker %s, spawned onto %s after it was archived", pid, task_id)
         swept.append({"id": task_id, **result})
     return swept
@@ -4896,19 +4975,24 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     """Archive every open card in a gateway conversation; see the section comment.
 
     The hermes-bridge calls this for its own `a2a-*` session, with the context
-    id the gateway's control task carried; as for the route PUT, the session
-    must be the one that context id names, so one conversation cannot reach
-    another's cards. `conversation`, the gateway's key, adds the cards whose
-    subscription rows point at this session and that conversation.
+    id the gateway's control task carried. The session must be the one that
+    context id names, as for the route PUT: a consistency check on what the
+    bridge sends, not an authorization, since any holder of the key can name
+    any context id. `conversation`, the gateway's key, adds the session-less
+    cards subscribed to this session and that conversation.
 
     Returns what was stopped (`via` says how each card was reached: its
     session, its subscription, or as a fan-out `child`; `worker` the processes
     signalled, null for a card with no worker; `late_worker` a worker killed
     after the archive; `note` an error Hermes raised after archiving), what had
-    already finished (`settled`), how many re-scans ran, `truncated` when the
-    set was larger than one pass, `failed` for a card whose archive raised or
-    that the deadline left unreached, and `deadline` when it did. Calling it
-    again stops nothing new, since an archived card is not open.
+    already finished (`settled`), `failed` for a card whose archive raised or
+    that the deadline left unstarted, `pending` for an archive still running
+    at the deadline, `unresolved` for a card archived mid-claim whose worker
+    pid never appeared (a worker may still spawn for it), `errors` for a board
+    error after the first pass, how many re-scans ran, `truncated` when the set
+    was larger than one pass, and `deadline` when the budget ran out. Answers
+    within CARD_STOP_WORST_CASE_S. Calling it again stops nothing new, since
+    an archived card is not open.
     """
     context_id = str(request_data.get("context_id") or "").strip()
     conversation = str(request_data.get("conversation") or "").strip()
@@ -4921,12 +5005,16 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     if session_id != _conversation_session_id(context_id):
         raise HTTPException(status_code=400, detail="context_id is not this session's")
 
+    budget = _Budget()
     result: Dict[str, Any] = {
         "session_id": session_id,
         "board": False,
         "stopped": [],
         "settled": [],
         "failed": [],
+        "pending": [],
+        "unresolved": [],
+        "errors": [],
         "rounds": 0,
         "truncated": False,
         "deadline": False,
@@ -4935,35 +5023,42 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     if not os.path.isfile(board):
         return result
     try:
-        kanban_db, connect = _hermes_kanban()
+        kanban_db, connect_tracked = _hermes_kanban()
     except ImportError as exc:
         raise HTTPException(status_code=503, detail=f"Hermes' kanban module is not importable: {exc}") from None
     result["board"] = True
-    budget = _Budget()
     sessions = [session_id, *_compression_descendants(session_id)]
     stopped: Dict[str, Dict[str, Any]] = {}
     settled: Dict[str, Dict[str, Any]] = {}
     failed: Dict[str, Dict[str, Any]] = {}
+    pending: Dict[str, Dict[str, Any]] = {}
     attempts: Dict[str, int] = {}  # archives that raised, per card; each is retried once
-    watch: set[str] = set()  # archived mid-claim with no worker pid yet
+    watch: Dict[str, str] = {}  # archived mid-claim with no worker pid yet: id -> title
+    # Every archive runs here, and the route never waits on this pool past the
+    # deadline; `shutdown(wait=False)` below leaves a straggler to finish.
+    pool = ThreadPoolExecutor(max_workers=CARD_STOP_PARALLEL)
 
-    def record(task_id: str, outcome: str, entry: Dict[str, Any], card: Dict[str, Any]) -> None:
+    def record(task_id: str, outcome: str, entry: Any, card: Dict[str, Any]) -> None:
+        pending.pop(task_id, None)
         if outcome == "stopped":
             if entry.pop(_CLAIMED_WITHOUT_PID, False):
-                watch.add(task_id)
+                watch[task_id] = card["title"]
             stopped[task_id] = {**entry, "via": card["via"]}
             failed.pop(task_id, None)
         elif outcome == "settled" and task_id not in stopped:
             settled[task_id] = entry
         elif outcome == "deadline":
             failed[task_id] = {"id": task_id, "title": card["title"], "error": "the deadline came before its archive"}
+        elif outcome == "raised":
+            logger.error("card stop: archiving %s failed: %s", task_id, entry)
+            attempts[task_id] = attempts.get(task_id, 0) + 1
+            failed[task_id] = {"id": task_id, "title": card["title"], "error": str(entry)}
 
-    def raised(task_id: str, card: Dict[str, Any], exc: Exception) -> None:
-        logger.error("card stop: archiving %s failed: %s", task_id, exc)
-        attempts[task_id] = attempts.get(task_id, 0) + 1
-        failed[task_id] = {"id": task_id, "title": card["title"], "error": str(exc)}
+    def still_running(task_id: str, card: Dict[str, Any]) -> None:
+        budget.hit = True
+        pending[task_id] = {"id": task_id, "title": card["title"]}
 
-    def stop(conn: sqlite3.Connection, tree: _CardTree) -> bool:
+    def stop(tree: _CardTree) -> bool:
         """Archive the tree's open cards in phases 1 and 2. True when any of them
         had not failed before, which is what earns another re-scan."""
         for task_id, card in tree.cards.items():
@@ -4973,7 +5068,7 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
             (
                 i
                 for i, card in tree.cards.items()
-                if card["status"] not in CARD_STOP_SETTLED_STATUSES and attempts.get(i, 0) < 2
+                if card["status"] not in CARD_STOP_SETTLED_STATUSES and attempts.get(i, 0) < 2 and i not in pending
             ),
             key=lambda i: (tree.cards[i]["created_at"], i),
         )
@@ -4986,63 +5081,111 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
         if not order:
             return False
         fresh = any(i not in attempts for i in order)
-        for task_id in (i for i in order if tree.cards[i]["status"] != "running"):
-            card = tree.cards[task_id]
-            if not budget.allows(CARD_STOP_ARCHIVE_RESERVE_S):
-                record(task_id, "deadline", {}, card)
-                continue
-            try:
-                record(task_id, *_archive_card(kanban_db, conn, task_id, budget), card)
-            except Exception as exc:  # noqa: BLE001 - one card's failure must not leave the rest running
-                raised(task_id, card, exc)
+        idle = [i for i in order if tree.cards[i]["status"] != "running"]
         running = [i for i in order if tree.cards[i]["status"] == "running"]
+        if idle:
+            landed: list = []
+            phase1 = pool.submit(_archive_in_order, kanban_db, connect_tracked, board, idle, budget, landed)
+            try:
+                phase1.result(timeout=max(0.0, budget.left()))
+            except FutureTimeout:
+                pass
+            except Exception as exc:  # noqa: BLE001 - the thread's own connection failed to open
+                for task_id in idle:
+                    record(task_id, "raised", exc, tree.cards[task_id])
+                landed = []
+            done = set()
+            for task_id, outcome, entry in list(landed):
+                record(task_id, outcome, entry, tree.cards[task_id])
+                done.add(task_id)
+            if not phase1.done():
+                for task_id in idle:
+                    if task_id not in done:
+                        still_running(task_id, tree.cards[task_id])
+                # Phase 2 never starts over a phase 1 still archiving: a running
+                # parent archived first would promote its children.
+                for task_id in running:
+                    record(task_id, "deadline", {}, tree.cards[task_id])
+                return fresh
         if running:
-            with ThreadPoolExecutor(max_workers=min(CARD_STOP_PARALLEL, len(running))) as pool:
-                futures = {
-                    task_id: pool.submit(_archive_card_on_own_connection, kanban_db, connect, board, task_id, budget)
-                    for task_id in running
-                }
+            futures = {
+                task_id: pool.submit(_archive_card_on_own_connection, kanban_db, connect_tracked, board, task_id, budget)
+                for task_id in running
+            }
+            futures_wait(futures.values(), timeout=max(0.0, budget.left()))
             for task_id, future in futures.items():
+                card = tree.cards[task_id]
+                if not future.done():
+                    if future.cancel():
+                        record(task_id, "deadline", {}, card)
+                        budget.hit = True
+                    else:
+                        still_running(task_id, card)
+                    continue
                 try:
-                    record(task_id, *future.result(), tree.cards[task_id])
+                    record(task_id, *future.result(), card)
                 except Exception as exc:  # noqa: BLE001
-                    raised(task_id, tree.cards[task_id], exc)
+                    record(task_id, "raised", exc, card)
         return fresh
+
+    def after_first_pass(step: str, action) -> Any:
+        """A board error once cards are archived is reported, not a 503 that
+        would throw away what was stopped."""
+        try:
+            return action()
+        except sqlite3.Error as exc:
+            logger.error("card stop: %s failed: %s", step, exc)
+            result["errors"].append(f"{step}: {exc}")
+            return None
 
     def sweep_late(conn: sqlite3.Connection, ids: Sequence[str]) -> None:
         for swept in _sweep_late_worker_pids(conn, list(ids), budget):
             stopped[swept["id"]]["late_worker"] = {k: v for k, v in swept.items() if k != "id"}
-            watch.discard(swept["id"])
+            watch.pop(swept["id"], None)
 
     try:
-        with closing(_card_stop_connect(connect, board)) as conn:
-            if stop(conn, _collect_card_tree(conn, sessions, session_id, conversation)):
+        try:
+            conn = _card_stop_connect(connect_tracked, board)
+            first = _collect_card_tree(conn, sessions, session_id, conversation, budget)
+        except sqlite3.Error as exc:
+            raise HTTPException(status_code=503, detail=f"the kanban board could not be read: {exc}") from None
+        with closing(conn):
+            if stop(first):
                 for _ in range(CARD_STOP_RESCAN_ROUNDS):
                     if not budget.allows(CARD_STOP_RESCAN_INTERVAL_SECONDS):
                         break
                     _card_stop_sleep(CARD_STOP_RESCAN_INTERVAL_SECONDS)
                     result["rounds"] += 1
-                    sweep_late(conn, list(stopped))
-                    if not stop(conn, _collect_card_tree(conn, sessions, session_id, conversation)):
+                    after_first_pass("the late-pid sweep", lambda: sweep_late(conn, list(stopped)))
+                    tree = after_first_pass(
+                        "a re-scan", lambda: _collect_card_tree(conn, sessions, session_id, conversation, budget)
+                    )
+                    if tree is None:
+                        continue
+                    if not stop(tree):
                         break
             # A worker can take longer than the re-scans to spawn (a worktree
             # checkout); a card archived mid-claim is watched until the deadline.
             # Running out of time here is the plan, not a missed card.
             while watch and budget.left() >= CARD_STOP_LATE_PID_INTERVAL_SECONDS:
                 _card_stop_sleep(CARD_STOP_LATE_PID_INTERVAL_SECONDS)
-                sweep_late(conn, sorted(watch))
-    except sqlite3.Error as exc:
-        raise HTTPException(status_code=503, detail=f"the kanban board could not be updated: {exc}") from None
+                after_first_pass("the late-pid watch", lambda: sweep_late(conn, sorted(watch)))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     result["stopped"] = list(stopped.values())
     result["settled"] = list(settled.values())
     result["failed"] = list(failed.values())
+    result["pending"] = list(pending.values())
+    result["unresolved"] = [{"id": task_id, "title": title} for task_id, title in watch.items()]
     result["deadline"] = budget.hit
     logger.info(
-        "card stop for %s: stopped %d, settled %d, failed %d, %d re-scans%s%s",
+        "card stop for %s: stopped %d, settled %d, failed %d, pending %d, unresolved %d, %d re-scans%s%s",
         session_id,
         len(stopped),
         len(settled),
         len(failed),
+        len(pending),
+        len(watch),
         result["rounds"],
         ", truncated" if result["truncated"] else "",
         ", deadline reached" if budget.hit else "",
