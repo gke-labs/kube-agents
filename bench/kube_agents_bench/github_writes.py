@@ -49,6 +49,11 @@ check an error rather than a clean report: nothing says whose it is. The module
 keeps its name because the check type does: ``github_writes`` is what every
 task and the inject lane's safeguard file spell.
 
+On a GitHub Enterprise Server run (``BENCH_FORGE=github`` with
+``BENCH_GITHUB_HOST`` set) the listings come from api.github.com, or from
+``BENCH_GITHUB_API_ROOT`` when set, and a pull request the reply names is one
+whose URL is on ``BENCH_GITHUB_HOST``.
+
 What it cannot see, and says so: the branch listing wants ``contents: read``,
 which the grading credential does not carry today (docs/ci-pool-projects.md
 5.5), so a listing GitHub refuses leaves ``branches_observed`` false and a
@@ -78,6 +83,7 @@ from kube_agents_bench.forges import (
     GITLAB_HOST_ENV_VAR,
     UnknownForge,
     forge_name,
+    github_api_root,
     gitlab_agent_login,
     gitlab_host,
     gitlab_project_path,
@@ -255,14 +261,19 @@ class GitHubClient:
     forge_label = "GitHub"
     branch_permission = "contents: read"
 
-    def __init__(self, token: str, transport: Transport, timeout: float) -> None:
+    def __init__(
+        self, token: str, transport: Transport, timeout: float, api_root: str = GITHUB_API_ROOT
+    ) -> None:
         self._token = token
         self._transport = transport
         self._timeout = timeout
+        #: api.github.com, or ``BENCH_GITHUB_API_ROOT`` when a run reads
+        #: through another root (see ``kube_agents_bench.forges``).
+        self._root = api_root.rstrip("/")
 
     def get(self, path: str) -> tuple[int, Any]:
         """``(status, decoded body)`` for one API path under the root."""
-        return self._transport(GITHUB_API_ROOT + path, self._token, self._timeout)
+        return self._transport(self._root + path, self._token, self._timeout)
 
     @staticmethod
     def pull_fields(pull: dict[str, Any], repo: str) -> PullFields:
@@ -633,10 +644,11 @@ def client_for(
     timeout: float,
     environ: dict[str, str] | None = None,
 ) -> GitHubClient | GitLabClient:
-    """The client for ``forge``; a GitLab one on ``BENCH_GITLAB_HOST`` when set."""
+    """The client for ``forge``; a GitLab one on ``BENCH_GITLAB_HOST`` when set,
+    a GitHub one on ``BENCH_GITHUB_API_ROOT`` when set."""
     if forge == FORGE_GITLAB:
         return GitLabClient(token, transport, timeout, gitlab_host(environ), agent_login=gitlab_agent_login(environ))
-    return GitHubClient(token, transport, timeout)
+    return GitHubClient(token, transport, timeout, github_api_root(environ))
 
 def proposal_numbers_named(
     text: str, repo: str, forge: str, environ: dict[str, str] | None = None
