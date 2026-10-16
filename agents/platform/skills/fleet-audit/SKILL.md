@@ -82,9 +82,13 @@ Run every script by its full path. A kanban worker starts in its card's workspac
    scope. Where the SOP runs a collector, run it the way the SOP says. Append each check's slug and
    the exact command you issued to that cluster's `checks_run` as the check completes. Content-mode
    reads (`grep`, `list`, `fetch`) and `draft`: `references/lifecycle.md`.
-3. **Write the findings document at `findings_path`.** Fields, validator rules, scope, `declared`
-   and the evidence rules: `references/findings-document.md`. Write every `manifest` remediation
-   file under `workspace` before `finish`.
+3. **Write the findings document at `findings_path`.** On a stream whose SOP runs a collector,
+   start it from the manifest with
+   `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py draft --audit <audit-id> --manifest-file <manifest>`:
+   it fills `scope` and one finding per candidate, and you write each finding's `recommendation`
+   and `remediation`. Fields, validator rules, scope, `declared` and the evidence rules:
+   `references/findings-document.md`. Write every `manifest` remediation file under `workspace`
+   before `finish`.
 4. **`finish`, once your `start` succeeded, `mode: none` included.** With no forge it is what writes
    the findings to the report store; a run that skips it keeps nothing and holds the stream's lease
    for two hours.

@@ -2359,8 +2359,14 @@ def next_steps(audit_id: str, findings_path: str) -> list[str]:
     return [
         f"Read the SOP at {sop_path(audit_id)} in full, then run every check in `checks` "
         "the way it says, recording each check and its command in checks_run as it completes.",
-        f"Write the findings document at {findings_path}. Its rules are in "
-        f"{skill_path(REFERENCES_DIR_NAME, FINDINGS_REFERENCE)}.",
+        f"Write the findings document at {findings_path}"
+        + (
+            f", starting it with {skill_path(SCRIPTS_DIR_NAME, SCRIPT_NAME)} draft --audit {audit_id} "
+            f"--manifest-file {manifest_path_for(audit_id)}"
+            if audit_id in COLLECTOR_AUDITS
+            else ""
+        )
+        + f". Its rules are in {skill_path(REFERENCES_DIR_NAME, FINDINGS_REFERENCE)}.",
         f"Run {finish}. Its output and exit codes are in "
         f"{skill_path(REFERENCES_DIR_NAME, FINISH_REFERENCE)}.",
     ]

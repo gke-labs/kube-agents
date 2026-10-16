@@ -5426,6 +5426,7 @@ class TestStart(HarnessTestCase):
                 steps = payload["next_steps"]
                 self.assertIn(payload["sop"], steps[0])
                 self.assertIn(payload["findings_path"], steps[1])
+                self.assertIn(f"draft --audit {audit_id} --manifest-file", steps[1])
                 self.assertIn(f"finish --audit {audit_id} --findings-file", steps[2])
                 self.assertIn(f"--manifest-file {audit_report.manifest_path_for(audit_id)}", steps[2])
                 named = re.findall(re.escape(prefix) + r"[\w./-]*\w", " ".join(steps))
@@ -16442,6 +16443,7 @@ class TestDispatchAndHandover(unittest.TestCase):
         for needed in (
             f"{script} start --audit",
             f"{script} finish --audit",
+            f"{script} draft --audit",
             "`finish`, once your `start` succeeded, `mode: none` included",
             "`kanban_block`",
             "never `kanban_complete` a card as done",

@@ -85,7 +85,7 @@ branch. It prints exactly one JSON line:
   "checks_contract": "Run every check above against every cluster you can read. …",
   "next_steps": [
     "Read the SOP at /opt/data/profiles/platform/governance/compliance_audit_sop.md in full, then …",
-    "Write the findings document at /opt/data/scratch/findings_compliance-audit.json. Its rules are in …/references/findings-document.md.",
+    "Write the findings document at /opt/data/scratch/findings_compliance-audit.json, starting it with …/scripts/audit_report.py draft --audit compliance-audit --manifest-file /opt/data/scratch/manifest_compliance-audit.json. Its rules are in …/references/findings-document.md.",
     "Run …/scripts/audit_report.py finish --audit compliance-audit --findings-file … --manifest-file /opt/data/scratch/manifest_compliance-audit.json. Its output and exit codes are in …/references/finish.md."
   ]
 }
