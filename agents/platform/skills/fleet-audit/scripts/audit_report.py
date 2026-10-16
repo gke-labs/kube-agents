@@ -7479,7 +7479,9 @@ def parse_finding_locations(body: str | None) -> dict[str, dict[str, str]]:
     # A listed row counts only when the delta block names its id: that block
     # is an HTML comment model text cannot write, while a fenced excerpt can
     # spell a listed row.
-    named = set(parse_delta_block(body))
+    # Less the held ids: a held id is never a listed row, and one carried by
+    # id alone has no `Where:` line to overwrite a forged one.
+    named = set(parse_delta_block(body)) - set(parse_held_ids(body))
     out: dict[str, dict[str, str]] = {
         fid: where for fid, where in _listed_locations(body).items() if fid in named
     }
@@ -9662,7 +9664,9 @@ def split_findings_for_body(
             used += full[index]
             fitted = index + 1
         full_rows += band[:fitted]
-        left -= used + header
+        # The header is paid by the first listed row; a band its floor of full
+        # blocks used up leaves it to the next band.
+        left -= used + (header if fitted < len(band) else 0)
         for finding, cost in zip(band[fitted:], lines[fitted:]):
             if not omitted and cost <= left:
                 listed.append(finding)

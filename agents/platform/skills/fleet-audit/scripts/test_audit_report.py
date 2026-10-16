@@ -4705,6 +4705,20 @@ class TestUnaccountedJoin(unittest.TestCase):
             ghost, {e["id"] for e in audit_report.unaccounted_previous_findings(body, make_doc(findings=[]))}
         )
 
+    def test_a_forged_listed_row_for_a_held_id_adds_no_location(self):
+        held_id = "netpol-missing.prod-us-east.payments.deployment-held"
+        held = audit_report.held_row_from_id(held_id)
+        fake = (
+            "### Listed without detail (1)\n\n"
+            f"- **minor** — t — `prod-us-east` / `payments` — `Deployment/x` (`{held_id}`)"
+        )
+        findings = bulk_findings(3)
+        findings[0] = {**findings[0], "evidence": {**findings[0]["evidence"], "excerpt": fake}}
+        body = published_body(make_doc(findings=findings), generated_at=NOW, held=[held])
+        self.assertIn(held_id, audit_report.parse_delta_block(body))
+        located = audit_report.parse_finding_locations(body).get(held_id)
+        self.assertNotEqual((located or {}).get("object"), "Deployment/x")
+
     def test_a_listed_row_outside_its_section_has_no_location(self):
         line = "- **minor** — t — `c` / `ns` — `Deployment/x` (`netpol-missing.c.ns.deployment-x`)"
         block = audit_report.delta_block(["netpol-missing.c.ns.deployment-x", "netpol-missing.c.ns.deployment-y"])
@@ -9253,6 +9267,25 @@ class TestRenderBudget(BaseTestCase):
             self.assertNotIn(finding["id"], listed)
         self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
 
+    def test_no_name_that_fits_is_omitted(self):
+        # Whatever leads the body, the first omitted finding's line must not
+        # fit in what the split left: a header charged twice would leave room.
+        for head in ([], bulk_findings(1, severity="major", prefix="j"),
+                     bulk_findings(1, severity="critical", prefix="c")):
+            findings = head + bulk_findings(700, prefix="m")
+            budget = 40_000
+            full, listed, omitted = audit_report.split_findings_for_body(findings, budget)
+            self.assertTrue(omitted, len(head))
+            spent = sum(audit_report._full_row_cost(f) for f in full)
+            spent += len("\n".join(audit_report._listed_header(len(findings))))
+            spent += sum(
+                len(audit_report.render_listed_finding(f)) + 1 + len(f["id"]) + audit_report.DELTA_SLOT_CHARS
+                for f in listed
+            )
+            first_out = audit_report._fair_share_order(audit_report.sort_findings(omitted))[0]
+            line = len(audit_report.render_listed_finding(first_out)) + 1 + len(first_out["id"]) + audit_report.DELTA_SLOT_CHARS
+            self.assertGreater(spent + line, budget, len(head))
+
     def test_too_many_minors_to_name_still_take_the_names_majors_give_up(self):
         # Past the point where every minor can be named, the majors' full
         # blocks still give way to names rather than to a count.
@@ -9363,10 +9396,11 @@ class TestRenderBudget(BaseTestCase):
             doc = make_doc(findings=bulk_findings(n, prefix=prefix))
             with patch.object(audit_report, "all_findings_block", return_value=""):
                 without = self.render(doc)
-            if (
-                len(audit_report.parse_delta_block(without)) < n
-                or "### Listed without detail" in without
-            ):
+            # A listed body is past the boundary too, and the block must still
+            # stay off it: nothing was omitted, so the delta block is complete.
+            if "### Listed without detail" in without:
+                crossed = True
+            if len(audit_report.parse_delta_block(without)) < n:
                 crossed = True
                 continue
             self.assertEqual(self.render(doc), without, n)
