@@ -50,6 +50,7 @@ The MVP takes **no dependency on any GitOps tool**. This baseline works on every
 
 - **Rendered manifests.** Where the repo goes through Kustomize or Helm, the file in Git is not the applied object, so the comparison needs a render step first. This is the drift-from-Git long tail the Argo/Flux enrichment covers.
 - **Resources not in Git at all.** There is no desired state to revert to, so the only sound proposals are **codify** or **delete** — never revert. CUJ 1's revert-or-codify assumes a Git-managed resource.
+- **No repository registered with the install.** The agent can't open a pull request at all, so the triage explains the change and proposes nothing until a repository is registered.
 
 ## How we judge the diff (Job B)
 

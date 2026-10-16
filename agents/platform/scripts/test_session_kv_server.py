@@ -4606,6 +4606,7 @@ class TestDriftInject(unittest.TestCase):
         self.assertNotIn("To authorize:", card)
         self.assertNotIn("Option A", card)
         self.assertNotIn("Revert", card)
+        self.assertNotIn("Recommended", card)
         # The audit facts are still the opening of the card.
         self.assertIn(self.DRIFT_PAYLOAD["principal"], card)
         self.assertIn("**Read the live object before you conclude anything.**", card)
@@ -4627,6 +4628,19 @@ class TestDriftInject(unittest.TestCase):
             card = session_kv_server._drift_task_body(self._payload())
         self.assertIn("To authorize:", card)
         self.assertNotIn(session_kv_server.DRIFT_NO_GITOPS_LINE, card)
+
+    def test_a_preflight_that_raises_is_unknown_and_keeps_the_options(self):
+        import gitops_preflight
+
+        with patch.object(gitops_preflight, "preflight", side_effect=RuntimeError("boom")):
+            self.assertIsNone(_REAL_GITOPS_REPO_REGISTERED())
+
+    def test_the_no_repository_line_names_the_registration_paths_the_preflight_names(self):
+        import gitops_preflight
+
+        for path in ("spec.integration.repositories", "--gitops-repo"):
+            self.assertIn(path, gitops_preflight.REGISTRATION_STEPS)
+            self.assertIn(path, session_kv_server.DRIFT_NO_GITOPS_LINE)
 
     def test_the_registration_answer_comes_from_gitops_preflight(self):
         import gitops_preflight

@@ -572,16 +572,20 @@ DRIFT_ALERT_EMOJI = "🔀"
 # group on.
 DRIFT_LEDGER_REASON = "OutOfBandChange"
 
-# What a drift card says when the install has no GitOps repository registered.
-# There is no declared state to revert to and nowhere to codify the change, so
-# the card asks for an explanation only: no options, no "To authorize:" line,
-# and so no buttons a reader could click for an action that can only block on
-# NO_REGISTERED_REPO (gke-labs#3313). The registration paths mirror
-# gitops_preflight.REGISTRATION_STEPS.
+# What a drift card says when the install has no usable GitOps repository
+# registered (gitops_preflight's NO_REGISTERED_REPO, which also covers entries
+# that are all unusable). The object may well be synced from a repository by a
+# GitOps tool; what the install lacks is a repository it can open a pull
+# request against. So the card asks for an explanation only: no options, no
+# "To authorize:" line, and so no buttons a reader could click for an action
+# that can only block (gke-labs#3313). The registration paths are
+# gitops_preflight.REGISTRATION_STEPS'; test_session_kv_server holds the two
+# to the same field and flag.
 DRIFT_NO_GITOPS_LINE = (
-    "No GitOps repository is registered on this install, so there is no declared state to revert this change "
-    "to and nowhere to codify it. Registering one in the PlatformAgent's spec.integration.repositories (or "
-    "re-running the installer with --gitops-repo) gives later drift alerts revert and codify options."
+    "No usable GitOps repository is registered with this install, so the agent cannot open a pull request to "
+    "revert or codify this change. Register one, or fix the existing entry, in the PlatformAgent's "
+    "spec.integration.repositories (or re-run the installer with --gitops-repo) to get those options on later "
+    "drift alerts."
 )
 
 # The `join` value the detector sends when it actually read the live object's
@@ -2138,6 +2142,10 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
     one that should win. That is a decision the reader makes, not a defect the
     agent diagnoses, so the report's job is to establish what changed, whether
     it still stands, and what each answer would cost.
+
+    On an install with no usable GitOps repository the card is
+    :func:`_drift_task_body_without_gitops` instead: an explanation with no
+    options. The bench contract above binds only this, the registered path.
     """
     if _gitops_repo_registered() is False:
         return _drift_task_body_without_gitops(payload)
