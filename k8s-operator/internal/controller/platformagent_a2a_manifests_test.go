@@ -4995,6 +4995,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// Anything outside these shapes has to be argued for in that function's
 	// comment rather than added quietly.
 	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
+	kvFeedback := a2aKVStreamPrefix + a2aFeedbackBucket
 	allowedShapes := map[string]bool{
 		"$JS.API.STREAM.INFO." + a2aTasksStream:              true,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>":   true,
@@ -5004,6 +5005,10 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"$JS.API.DIRECT.GET." + kvSessionState + ".>":        true,
 		"$JS.API.CONSUMER.CREATE." + kvSessionState + ".>":   true,
 		"$JS.API.CONSUMER.DELETE." + kvSessionState + ".*":   true,
+		"$JS.API.STREAM.INFO." + kvFeedback:                  true,
+		"$JS.API.DIRECT.GET." + kvFeedback + ".>":            true,
+		"$JS.API.CONSUMER.CREATE." + kvFeedback + ".>":       true,
+		"$JS.API.CONSUMER.DELETE." + kvFeedback + ".*":       true,
 	}
 	for _, grant := range a2aGatewayJetStreamGrants() {
 		if !allowedShapes[grant] {
@@ -5084,9 +5089,10 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 }
 
 // TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo pins the pair the
-// gateway identity's comment names. The registry's writes are publishes on
-// $KV.<bucket>.>, spelled as a literal in gatewayIdentity; its reads are
-// JetStream API calls on stream KV_<bucket>, built from a2aSessionStateBucket
+// gateway identity's comment names, for each bucket the gateway owns (the
+// session registry and the kept answer ratings). The writes are publishes on
+// $KV.<bucket>.>, spelled as a literal in gatewayIdentity; the reads are
+// JetStream API calls on stream KV_<bucket>, built from the bucket's constant
 // inside a2aGatewayJetStreamGrants. Two spellings of one bucket: change one
 // and the gateway can write the registry and not read it, which is an
 // authorization failure at runtime with nothing failing here to say so.
@@ -5098,22 +5104,25 @@ func TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo(t *testing.T) {
 	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
 	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
 
-	dataPlane := "$KV." + a2aSessionStateBucket + ".>"
-	if !slices.Contains(grants, dataPlane) {
-		t.Errorf("the gateway's publish list has no %q; its JetStream grants name bucket %q, so the two no longer describe one bucket",
-			dataPlane, a2aSessionStateBucket)
+	known := []string{a2aTasksStream}
+	for _, bucket := range []string{a2aSessionStateBucket, a2aFeedbackBucket} {
+		dataPlane := "$KV." + bucket + ".>"
+		if !slices.Contains(grants, dataPlane) {
+			t.Errorf("the gateway's publish list has no %q; its JetStream grants name bucket %q, so the two no longer describe one bucket",
+				dataPlane, bucket)
+		}
+		stream := a2aKVStreamPrefix + bucket
+		if !slices.Contains(grants, "$JS.API.STREAM.INFO."+stream) {
+			t.Errorf("the gateway holds no STREAM.INFO on %s; js.KeyValue binds a bucket by reading its stream, so the bucket cannot open", stream)
+		}
+		if script := a2aProvisionScript(a2aTestAgent()); !strings.Contains(script, "kv add "+bucket+" ") {
+			t.Errorf("the provision script has no %q; the gateway's grant names a bucket nothing creates", "kv add "+bucket)
+		}
+		known = append(known, stream)
 	}
-	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
-	if !slices.Contains(grants, "$JS.API.STREAM.INFO."+kvSessionState) {
-		t.Errorf("the gateway holds no STREAM.INFO on %s; js.KeyValue binds a bucket by reading its stream, so the registry cannot open", kvSessionState)
-	}
-	if script := a2aProvisionScript(a2aTestAgent()); !strings.Contains(script, "kv add "+a2aSessionStateBucket+" ") {
-		t.Errorf("the provision script has no %q; the gateway's grant names a bucket nothing creates", "kv add "+a2aSessionStateBucket)
-	}
-	// Every JetStream grant names TASKS or that bucket's stream, so the two
-	// checks above cover the whole list rather than the entries this test
-	// happens to spell.
-	known := []string{a2aTasksStream, kvSessionState}
+	// Every JetStream grant names TASKS or one of those buckets' streams, so
+	// the checks above cover the whole list rather than the entries this
+	// test happens to spell.
 	for _, grant := range a2aGatewayJetStreamGrants() {
 		if !slices.ContainsFunc(known, func(name string) bool { return strings.Contains(grant, "."+name) }) {
 			t.Errorf("gateway grant %q names a stream outside %v, which is what this pair is held to", grant, known)
