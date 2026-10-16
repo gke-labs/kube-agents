@@ -503,6 +503,10 @@ class TestRegistration(QueueTestCase):
             self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade"})
         with self.assertRaises(fq.FindingError):
             self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": ["upgrade-"]})
+        # One segment and its separator: neither a sub-family nor the bare separator.
+        for prefix in ("upgrade-pool-", "-", "upgrade_"):
+            with self.assertRaises(fq.FindingError):
+                self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": prefix})
         self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 1.0)
         # Folded like the stored check: a capitalised prefix reaches the row.
         result = self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "Upgrade-"})

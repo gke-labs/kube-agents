@@ -353,7 +353,10 @@ class Registration(unittest.TestCase):
         long_name = "a" * (fq.MAX_LABEL_CHARS + 40)
         found = review.budget_findings(member("c", "blocked", pdbs={"blocking": [budget(name=long_name)]}))[0]
         self.assertEqual(len(found["object"]), fq.MAX_LABEL_CHARS)
-        self.assertEqual(review.item_id(found), fq.validate_finding(review.payload(found))["id"])
+        capped = fq.derive_finding_id(found["check"], found["project"], found["cluster"], found["namespace"], long_name[: fq.MAX_LABEL_CHARS])
+        uncapped = fq.derive_finding_id(found["check"], found["project"], found["cluster"], found["namespace"], long_name)
+        self.assertNotEqual(capped, uncapped)
+        self.assertEqual(review.item_id(found), capped)
 
     def test_an_answer_that_is_not_an_object_is_this_batchs_failure(self):
         import io
@@ -558,7 +561,6 @@ class TheRecord(unittest.TestCase):
         self.assertEqual((fake_dir / "latest.md").read_text(encoding="utf-8"), "# fourth\n")
         self.assertEqual(sorted(p.name for p in fake_dir.iterdir()), ["latest.json", "latest.md"])
         os.chmod(fake_dir, review.SANDBOX_COPY_DIR_OPEN_MODE)  # so the fixture's cleanup can remove it
-        os.chmod(fake_dir, review.SANDBOX_COPY_DIR_OPEN_MODE)  # so the fixture's cleanup can remove it
 
     def test_without_an_ssh_sandbox_the_copy_is_a_plain_local_write(self):
         target = Path(self.tmp.name) / "local-copy"
@@ -689,11 +691,32 @@ class TheTick(unittest.TestCase):
         with mock.patch.object(review, "kv_request", side_effect=OSError("HTTP 503 Service Unavailable: the findings queue is busy")):
             code, out = self.run_main()
         self.assertEqual(code, 0)
-        self.assertIn("did not reach the findings queue", out)
+        # seeded-b's five rows failed; seeded-c's clean read sent a claim that failed.
+        self.assertIn(f"{review.LOG_PREFIX}: 5 finding(s) and 1 clean-cluster claim(s) did not reach the findings queue:", out)
         self.assertIn("503", out)
         latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
-        self.assertTrue(latest["registration_errors"])
+        self.assertEqual(len(latest["registration_errors"]), 2)
         self.assertTrue(all(r["outcome"] == review.REGISTRATION_FAILED for r in latest["findings"]))
+
+    def test_the_registration_line_names_three_refusals_and_counts_the_rest(self):
+        blocked = [member(f"c{i}", "blocked", pdbs={"blocking": [budget(name=f"b{i}")]}) for i in range(4)]
+        self.envelope = {"exit": 0, "tables": "", "report": {"members": blocked, "errors": []}}
+        with mock.patch.object(review, "kv_request", side_effect=OSError("HTTP 503 Service Unavailable: the findings queue is busy")):
+            code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn(f"{review.LOG_PREFIX}: 4 finding(s) and 0 clean-cluster claim(s) did not reach the findings queue:", out)
+        self.assertIn(review.OVERFLOW_NOTE.format(count=1), out)
+        self.assertEqual(out.count("HTTP 503"), review.MAX_PROBLEMS_IN_LINE)
+
+    def test_an_all_failed_line_names_six_projects_and_counts_the_rest(self):
+        names = [f"proj-{i}" for i in range(8)]
+        with mock.patch.object(watch, "projects", return_value=names), mock.patch.object(watch, "run_report", side_effect=RuntimeError("sandbox exited 255 without a report")):
+            code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("failed:", out)
+        self.assertEqual(out.count("sandbox exited 255"), review.MAX_NAMES_IN_LINE)
+        self.assertIn(review.OVERFLOW_NOTE_PLAIN.format(count=2), out)
+        self.assertNotIn("in the record", out)
 
     def test_a_project_not_read_is_one_line_and_the_rest_is_registered(self):
         calls = []
@@ -745,10 +768,27 @@ class TheTick(unittest.TestCase):
         with mock.patch.object(watch, "projects", return_value=[PROJECT, numbered]), mock.patch.object(watch, "run_report", side_effect=run_report):
             code, out = self.run_main()
         self.assertEqual(code, 0)
-        self.assertIn(f"1 project(s) not read this week: {numbered}: spelled by number", out)
+        # The listing row's reason comes first; the number guard covers a run with members and no row.
+        self.assertIn(f"1 project(s) not read this week: {numbered}: describe {numbered}: PERMISSION_DENIED", out)
         self.assertFalse(any(f["project"] == numbered for body in self.registered for f in body["findings"]))
         latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
         self.assertIn(numbered, latest["project_failures"])
+
+    def test_a_numbered_project_the_report_resolved_whose_listing_failed_is_not_read(self):
+        numbered = "123456789012"
+
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            if names[0] == numbered:
+                # The report resolved the number to its id and keyed the listing error by the id.
+                return {"exit": 0, "tables": "", "report": {"projects": ["acme-dev"], "members": [], "errors": [{"project": "acme-dev", "location": None, "message": "clusters list: PERMISSION_DENIED"}]}}
+            return self.envelope
+
+        with mock.patch.object(watch, "projects", return_value=[PROJECT, numbered]), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn(f"1 project(s) not read this week: {numbered}: clusters list: PERMISSION_DENIED", out)
+        latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
+        self.assertEqual(latest["project_failures"], {numbered: "clusters list: PERMISSION_DENIED"})
 
     def test_a_clean_project_with_no_clusters_beside_a_failed_one_is_a_partial_run(self):
         def run_report(names, readiness, *, scope, outside_stands, timeout=None):

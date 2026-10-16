@@ -17,7 +17,8 @@ gets the same shape in chat. Read only. Register nothing, decide nothing, upgrad
    - `cat /opt/data/upgrade-readiness/weekly/latest.json` — the summary: `generated_at`, `projects`,
      `clusters` (reviewed, blocked, ready, unknown, unread), `counts`, `findings` (rows with `id`,
      `severity`, `check`, `entry`, `project`, `cluster`, `namespace`, `object`, `title`, `action`,
-     `outcome`), `new_ids`, `suppressed_ids`, `no_longer_reported_ids`, `project_failures`.
+     `outcome`), `new_ids`, `suppressed_ids`, `no_longer_reported_ids`, `project_failures`,
+     `registration_errors`, `report_path`.
    - `cat /opt/data/upgrade-readiness/weekly/latest.md` when a line needs more than the row says.
    - If the asked-for thing is **the report**, print `latest.md` as it is and stop; when the file is
      missing, say the review's copy is not there (the weekly review has not run, or its copy did not
@@ -83,9 +84,11 @@ finding has a decision.` When nothing was found at all, the brief is the headlin
      kills it"), one action (the row's `action`, shortened to the verb and the object).
    - Majors and minors go under **Also this week** as counts by catalogue entry; a `suppressed` row is
      never named. With nothing decided yet, the line is `**Decided earlier:** none yet.`
-   - When `registration_errors` is not empty, or a row's `outcome` is `failed`, the headline says
-     how many findings are in the report but not on the queue, and a critical among them goes under
-     **Decide now** by its object with "not on the queue" after it: there is no id to reply with.
+   - When a row's `outcome` is `failed`, the headline says how many findings are in the report but
+     not on the queue, and a critical among them goes under **Decide now** by its object with "not on
+     the queue" after it: there is no id to reply with. A `registration_errors` entry that says a
+     clean read's claim did not reach the queue is a cluster whose last week's rows stand at full
+     confidence; count those clusters in the headline, not as findings.
    - Every id and every count comes from the summary or the queue; invent nothing, name no CVE,
      recommend no version.
 

@@ -59,9 +59,10 @@ class FindingNotFound(KeyError):
 
 
 SOURCES = ("inventory", "event-watcher", "audit", "upgrade-readiness")
-# A check family is the slug up to and including its first separator (`upgrade-`):
-# what a complete claim may name with `scope.check_prefix`.
+# A check family is the slug's first segment and its separator (`upgrade-`), and
+# nothing shorter or longer: what a complete claim may name with `scope.check_prefix`.
 CHECK_FAMILY_SEPARATOR = "-"
+CHECK_FAMILY_RE = re.compile(r"^[a-z0-9]+-$")
 SEVERITIES = ("critical", "major", "minor")
 REMEDIATION_KINDS = ("manifest", "gcloud", "manual")
 VERIFICATION_KINDS = ("kubectl", "gcloud", "manual")
@@ -826,8 +827,8 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
             raise FindingError("scope.check_prefix must be a string")
         # Folded as the stored check is, so the two sides cannot drift.
         check_prefix = _text(raw_prefix, "scope.check_prefix", required=False).lower()
-        if check_prefix and not check_prefix.endswith(CHECK_FAMILY_SEPARATOR):
-            raise FindingError(f"scope.check_prefix is {_brief(check_prefix)}; a check family ends with '{CHECK_FAMILY_SEPARATOR}', as 'upgrade-' does")
+        if check_prefix and not CHECK_FAMILY_RE.fullmatch(check_prefix):
+            raise FindingError(f"scope.check_prefix is {_brief(check_prefix)}; a check family is one segment and its separator, as 'upgrade-' is")
         if check_prefix and checks and not all(check.startswith(check_prefix) for check in checks):
             raise FindingError("scope.check_prefix names a family the batch did not write; a claim reaches only what the run read")
         named = _text(scope.get("source"), "scope.source", required=False)

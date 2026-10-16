@@ -329,13 +329,15 @@ NUMBERED_PROJECT_DETAIL = "spelled by number and not resolved to an id this run,
 MAX_PROBLEMS_IN_LINE = 3  # of the queue's refusals quoted in the chat line; the record has them all
 MAX_NAMES_IN_LINE = 6  # projects named in the partial line
 OVERFLOW_NOTE = "and {count} more in the record"
+OVERFLOW_NOTE_PLAIN = "and {count} more"  # for the line of a run that wrote no record
+CLAIM_FAILED_MARK = "the clean read's claim did not reach the queue"
 DUPLICATE_DETAIL_SEPARATOR = " | also: "  # two rows of one member that derive one queue id
 SHARED_DETAIL_SEPARATOR = " | also on {member}: "  # two same-named clusters whose objects coincide
 TMP_SUFFIX = watch.LEDGER_TMP_SUFFIX  # a file is written beside its name and renamed over it
 FAILED_LINE = "{prefix}: failed: {detail}"
 RECOVERED_LINE = "{prefix}: runs again after a failure"
 PARTIAL_LINE = "{prefix}: {count} project(s) not read this week: {detail}; their clusters keep last week's findings and are not counted"
-REGISTRATION_FAILED_LINE = "{prefix}: {count} finding(s) did not reach the findings queue: {detail}; they are in the report, not on the queue, and the brief says so"
+REGISTRATION_FAILED_LINE = "{prefix}: {rows} finding(s) and {claims} clean-cluster claim(s) did not reach the findings queue: {detail}; the findings are in the report, not on the queue, and the brief says so; a cluster whose claim did not land keeps last week's rows at full confidence"
 COPY_FAILED_LINE = "{prefix}: the sandbox copy failed: {detail}; the brief reads the previous copy until the next review"
 # A failure is announced once per distinct cause: the marker keeps the failure's text
 # with every number replaced, so a timeout that reads 1187s one week and 1203s the
@@ -781,13 +783,16 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
         read_errors = [e for e in report.get(watch.ERRORS_KEY) or [] if isinstance(e, dict)]
         errors.extend(read_errors)
         tables[project] = str(envelope.get(watch.ENVELOPE_TABLES_KEY) or "")
-        if project in watch.unlisted_projects(read_errors):
+        unlisted = watch.unlisted_projects(read_errors)
+        if unlisted:
             # The sandbox ran but the project's cluster listing failed: the
-            # report says so in an errors row with the project and no location
-            # and returns no member for it. A project not read, as the watch
-            # counts it, not a clean project with no clusters.
+            # report says so in an errors row with a project and no location
+            # and returns no member for it. One project runs at a time, so any
+            # such row is this project's, keyed by the spelling the roster gave
+            # or by the id the report resolved a number to. A project not read,
+            # as the watch counts it, not a clean project with no clusters.
             failures[project] = next(
-                (str(e.get(watch.MESSAGE_KEY) or LISTING_FAILED_DETAIL) for e in read_errors if e.get(watch.MEMBER_ID_KEYS[0]) == project and not e.get(watch.MEMBER_ID_KEYS[1])),
+                (str(e.get(watch.MESSAGE_KEY) or LISTING_FAILED_DETAIL) for e in read_errors if e.get(watch.MEMBER_ID_KEYS[0]) in unlisted and not e.get(watch.MEMBER_ID_KEYS[1])),
                 LISTING_FAILED_DETAIL,
             )
             continue
@@ -856,7 +861,10 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
             try:
                 answer = kv_request(KV_FINDINGS_PATH, body)
             except (urllib.error.URLError, OSError, ValueError) as exc:
-                problems.append(f"{project}/{cluster}: {exc}")
+                # An empty complete batch is the clean read's claim: nothing is
+                # marked failed, and the line counts the claim, since last
+                # week's rows for the cluster keep their confidence.
+                problems.append(f"{project}/{cluster}: {CLAIM_FAILED_MARK}: {exc}" if not chunk else f"{project}/{cluster}: {exc}")
                 for item in chunk:
                     outcomes[item_id(item)] = REGISTRATION_FAILED
                 continue
@@ -1156,12 +1164,12 @@ def copy_to_sandbox(report_md: str, summary_doc: dict) -> str | None:
 # --- the tick ---------------------------------------------------------------------
 
 
-def shown(entries: list[str], limit: int) -> str:
-    """The first ``limit`` entries, then how many more the record holds: a chat
-    line names a few, never a fleet."""
+def shown(entries: list[str], limit: int, tail: str = OVERFLOW_NOTE) -> str:
+    """The first ``limit`` entries, then how many more (the record holds them,
+    where a record was written): a chat line names a few, never a fleet."""
     if len(entries) <= limit:
         return PARTIAL_DETAIL_SEPARATOR.join(entries)
-    return PARTIAL_DETAIL_SEPARATOR.join(entries[:limit] + [OVERFLOW_NOTE.format(count=len(entries) - limit)])
+    return PARTIAL_DETAIL_SEPARATOR.join(entries[:limit] + [tail.format(count=len(entries) - limit)])
 
 
 def failure_signature(detail: str) -> str:
@@ -1219,7 +1227,7 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
 
     members, errors, tables, failures = run_projects(ordered_names(names, previous), scope, on_project=registered)
     if failures and len(failures) == len(set(names)):
-        raise RuntimeError("; ".join(f"{p}: {d}" for p, d in failures.items()))
+        raise RuntimeError(shown([f"{p}: {d}" for p, d in failures.items()], MAX_NAMES_IN_LINE, OVERFLOW_NOTE_PLAIN))
     report_path = home / stamp / REPORT_MD_NAME
     summary_doc = summary(
         stamp=stamp, now=now, names=names, members=members, errors=errors, failures=failures,
@@ -1246,7 +1254,8 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
     # are the week's failures even when the record was written.
     if problems:
         failed_rows = sum(1 for outcome in outcomes.values() if outcome == REGISTRATION_FAILED)
-        lines.append(REGISTRATION_FAILED_LINE.format(prefix=LOG_PREFIX, count=failed_rows, detail=shown(problems, MAX_PROBLEMS_IN_LINE)))
+        failed_claims = sum(1 for problem in problems if CLAIM_FAILED_MARK in problem)
+        lines.append(REGISTRATION_FAILED_LINE.format(prefix=LOG_PREFIX, rows=failed_rows, claims=failed_claims, detail=shown(problems, MAX_PROBLEMS_IN_LINE)))
     if copy_error:
         lines.append(COPY_FAILED_LINE.format(prefix=LOG_PREFIX, detail=copy_error))
     if failures:
