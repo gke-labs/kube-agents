@@ -44,8 +44,9 @@ text. A failure after the request was sent may have posted, so that path can sen
 report twice; see ``_posted_as_blocks``.
 
 Every delivery closes with a short note on the first-run audits, read off the ``oobe`` stage's
-marker by ``_audits_note``: the report's scan leaves the workload checks to those audits, and a
-short report would otherwise read as a healthy fleet. The text path appends it to the report; the
+marker by ``_audits_note``: the report's scan leaves the workload checks to those audits (except
+on an install whose kept marker records an older stage's no-repository skip, where the scan ran
+them), and a short report would otherwise read as a healthy fleet. The text path appends it to the report; the
 card paths print it on their own, since the card leaves closing lines out.
 
 Just before the claim, the run registers the sweep's findings in the
@@ -175,7 +176,15 @@ PRESENTED_PLATFORM = "slack"
 # The note on the first-run audits (_audits_note). The scan leaves their workload checks to them.
 AUDITS_SKIPPED_NOTE = "The first-run audits did not run: {reason}."
 AUDITS_NO_REASON = "no reason was recorded"
-# Every skip leaves the audits to their schedules, and the scan did not run their checks.
+# The reason an older oobe stage recorded when it skipped for no repository. A marker an install
+# kept through the upgrade still carries it, and on such an install the scan ran those checks,
+# unless a repository registered when the sweep was filed was removed before the stage read the list.
+LEGACY_NO_REPOSITORY_REASON = "no GitHub repository in managed_repos for the audits to publish to"
+AUDITS_COVERED_NOTE = (
+    "This scan checked probes, requests and limits, autoscaling, NetworkPolicy and pod security in "
+    "their place, so this report covers them."
+)
+# Every other skip leaves the audits to their schedules, and the scan did not run their checks.
 AUDITS_NOT_COVERED_NOTE = (
     "This scan did not check probes, requests and limits, autoscaling, NetworkPolicy or pod security "
     "either, so this report does not cover them."
@@ -589,6 +598,20 @@ def _presented(content: str) -> str:
         return content
 
 
+def _skip_follows_this_sweep(data_dir: Path, state: dict) -> bool:
+    """Whether oobe recorded its skip after the sweep the report comes from was filed.
+
+    A sweep filed after the skip (onboarding repeated with the stage's marker kept) ran on a later
+    build, whose scan leaves the workload checks to the audits whatever the old skip said.
+    """
+    filed = bootstrap_handoff.read_scan_marker(data_dir / oobe.SCAN_FILED_MARKER)
+    try:
+        skipped_at = float(state.get(oobe.STATE_AT))
+    except (TypeError, ValueError):
+        return False
+    return filed is not None and skipped_at >= filed[1]
+
+
 def _audits_note(data_dir: Path, no_coverage: bool) -> str:
     """The note on the first-run audits the delivery closes with, from oobe's marker.
 
@@ -598,7 +621,12 @@ def _audits_note(data_dir: Path, no_coverage: bool) -> str:
     state = oobe.read_state(data_dir)
     if state.get(oobe.STATE_SKIPPED):
         reason = str(state.get(oobe.STATE_REASON) or AUDITS_NO_REASON)
-        coverage = AUDITS_UNCHECKED_SCHEDULED_NOTE if no_coverage else AUDITS_NOT_COVERED_NOTE
+        if no_coverage:
+            coverage = AUDITS_UNCHECKED_SCHEDULED_NOTE
+        elif reason == LEGACY_NO_REPOSITORY_REASON and _skip_follows_this_sweep(data_dir, state):
+            coverage = AUDITS_COVERED_NOTE
+        else:
+            coverage = AUDITS_NOT_COVERED_NOTE
         return f"{AUDITS_SKIPPED_NOTE.format(reason=reason)} {coverage}"
     fired = [a for a in oobe.FIRST_RUN_AUDITS if a in _list(state.get(oobe.STATE_FIRED))]
     held = state.get(oobe.STATE_HELD) if isinstance(state.get(oobe.STATE_HELD), dict) else {}

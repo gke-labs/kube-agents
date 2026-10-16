@@ -318,25 +318,27 @@ The filter is an environment variable on the agent container:
 | ------------------------ | ----------------------------------------- | ------------------------------------------------- |
 | `EOD_EXCLUDE_NAMESPACES` | `kube-system,kube-public,kube-node-lease` | Comma-separated; an empty value excludes nothing. |
 
-Set it the way the alert ceiling's `ALERT_DAILY_LIMIT_*` are set — on the `PlatformAgent` CR, under
-`spec.deployment.env`:
+Set it through the chart value `platformAgent.deployment.env`, which the chart renders into the
+`PlatformAgent` CR's `spec.deployment.env`. On the Terraform install, put the same block in
+`extra_helm_values`. Do not edit the CR by hand. Each apply that changes the list that the chart
+renders replaces the full list on the CR, and the hand edit is lost.
 
 ```yaml
-spec:
+platformAgent:
   deployment:
     env:
       - name: EOD_EXCLUDE_NAMESPACES
         value: kube-system,kube-public,kube-node-lease,istio-system
 ```
 
-**The CR is the only route that works, and this is why.** Environment on that container is rendered
-by the operator and filtered through `safeSandboxEnvOverrides`, an allowlist — a name that is not on
-it is dropped with no error, no event and no status condition, so the edit appears to succeed and
-changes nothing. `EOD_EXCLUDE_NAMESPACES` is on it. Editing the Deployment with `kubectl set env` is not
-a shortcut: it mutates `spec.template`, so it rolls the pod, and the next reconcile re-renders the
-Deployment from the CR and reverts it.
+**The CR's `spec.deployment.env` is the only source that works, and this is why.** Environment on
+that container is rendered by the operator and filtered through `safeSandboxEnvOverrides`, an
+allowlist — a name that is not on it is dropped with no error, no event and no status condition, so
+the edit appears to succeed and changes nothing. `EOD_EXCLUDE_NAMESPACES` is on it. Editing the
+Deployment with `kubectl set env` is not a shortcut: it mutates `spec.template`, so it rolls the
+pod, and the next reconcile re-renders the Deployment from the CR and reverts it.
 
-Applying the CR change rolls the pod, and the next tick after it comes up uses the new value. The
+A change to the value rolls the pod, and the next tick after it comes up uses the new value. The
 script re-reads it on every run, so nothing further is needed once the pod is up. No value can fail
 the run: `excluded_namespaces()` is a `getenv`, a `split(",")` and a `strip()`, with no parse step
 to reject anything and no fallback behind it. That matters here because this job's stdout is the

@@ -183,6 +183,7 @@ ADDED_AFTER_THE_MOVE = [
     "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
     "not-found-target-stops-as-failure",  # a missing target stops its card on a hard wall, mock 06
     "alert-config-terraform-promql-probe",  # the gke-alert-configuration skill sync
+    "security-chat-request-runs-collector",  # a plain security-posture request runs the compliance collector, #2386
     "chat-failure-reply-declares-next-step",  # a blocked card's reply declares the one next step, mock 06
     "chat-answer-declares-next-step",  # a card's answer declares its one obvious next step, mocks 03 and 07
 ]

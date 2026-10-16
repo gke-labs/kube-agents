@@ -252,6 +252,55 @@ With `KAGE_SLACK_UX` on, Slack gets a card built from the open ledger issue. Its
 
 An audit that could not write its ledger, most often because no GitOps repository is registered, posts one line instead of its report: the first sentence of the report's "What's wrong" section, as the agent wrote it. Under `spec.mode: next` the card and that line go through the A2A gateway, which lays out the same card; the failed audit's report folds under its line, since a reply in the thread does not bring the report back there.
 
+### Daily alert ceiling
+
+Each cluster-event alert and each drift alert spends one unit of a daily budget. When a bucket is spent, the alert does not go to chat, and no triage turn starts. The budget is fleet-wide: one count serves all the clusters that the install watches. It resets at 00:00 UTC. A value of `0` removes the cap for that bucket.
+
+| Bucket        | What it counts                                            | Default | `install.env` key            |
+| ------------- | --------------------------------------------------------- | ------- | ---------------------------- |
+| `Critical`    | Critical cluster events                                   | `10`    | `ALERT_DAILY_LIMIT_CRITICAL` |
+| `Warning`     | Warning cluster events                                    | `5`     | `ALERT_DAILY_LIMIT_WARNING`  |
+| `Info`        | Nothing today: the severity gate drops Info events        | `5`     | `ALERT_DAILY_LIMIT_INFO`     |
+| `GitOpsDrift` | Drift alerts for cluster changes that people make by hand | `20`    | `ALERT_DAILY_LIMIT_DRIFT`    |
+
+[`agents/platform/docs/session_management.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/docs/session_management.md#daily-alert-ceiling) gives the reasons for these defaults and for each bucket.
+
+Set a ceiling in one of these places:
+
+- The `ALERT_DAILY_LIMIT_*` keys in `install.env`. An empty key keeps the default. `install.sh`, the Day-2 menu and `upgrade.sh --upgrade-mode=full` apply these keys. The other modes of `upgrade.sh` use the values that the release recorded. But each `upgrade.sh` run examines the keys, and a value that is not a whole number stops the run.
+- The chart value `platformAgent.deployment.alertDailyLimits`, with the keys `critical`, `warning`, `info` and `drift`.
+- The Terraform variable `alert_daily_limits` in `terraform/examples/full-install`, with the same keys.
+- An `ALERT_DAILY_LIMIT_*` entry in the `PlatformAgent` CR's `spec.deployment.env`, on an install that no chart manages.
+
+Each of the first three routes renders the keys that are set into `spec.deployment.env`. Helm replaces the full `spec.deployment.env` list on the CR at each apply that changes the list that the chart renders. This includes the apply that sets the first key, an apply that changes a value, and the apply that removes the last key. Entries that you added to the CR by hand are then lost. Before you set a key, move a ceiling to its key, and move another name to the chart value `platformAgent.deployment.env` (`extra_helm_values` on the Terraform install).
+
+A change to a ceiling restarts the agent pod and the credential-proxy pod. A re-tag with `upgrade.sh --upgrade-mode=operator` or `harness` to a release whose chart does not declare `alertDailyLimits` needs `--drop-undeclared-values`. The ceilings then go back to the defaults.
+
+#### Reading what the ceiling held back
+
+Suppression is silent in chat. No message says that a bucket is spent. To see the counts, read `/v1/alert-quota` from the agent pod:
+
+```bash
+kubectl -n kubeagents-system exec deployment/platform-agent-gateway -c platform-agent -- \
+  sh -c 'curl -s -H "Authorization: Bearer $SESSION_KV_API_KEY" \
+    http://127.0.0.1:8699/v1/alert-quota'
+```
+
+Add `?day=YYYY-MM-DD` to the URL for an earlier day. The reply gives `limit`, `sent` and `suppressed` for each bucket that has a cap. `suppressed` counts each offer that the ceiling refused. The event watcher offers a refused workload again on its next sighting, so one workload can add many offers to `suppressed`. The event watcher also counts these refusals in the `k8s_event_watcher_events_quota_suppressed_total` metric.
+
+The daily recap has the line "N alerts from M workloads withheld by the daily ceiling and never reached chat". N counts each pod and reason one time, so it can be lower than `suppressed`. M counts the workloads that sent those alerts. The pods of one Deployment are one workload. N is one count for the `Critical` and `Warning` buckets together. The recap runs at 21:00 UTC on weekdays, and each recap covers the time since the previous recap. Thus the recap period is not the UTC day of `/v1/alert-quota`, and the Monday recap covers the weekend. Drift refusals never appear in the recap. The `GitOpsDrift` row of `/v1/alert-quota` and the session server log show them. The drift detector does not offer a refused record again, so that alert is lost from chat.
+
+The recap line "N alerts failed to post to chat" is a different problem. It means that chat refused the post, or did not confirm it. Some of these alerts can be in the channel. A higher ceiling does not change this count. Look in the session server log for the cause.
+
+#### Sizing a bucket
+
+The counter is fleet-wide, so the demand on it increases with the number of clusters. Size each bucket from a week of data. A bucket with a value of `0` counts nothing, and `/v1/alert-quota` does not show it. To measure that bucket, first set a high cap on it for the week.
+
+1. For each of 7 days, read `sent` and `suppressed` for the bucket from `/v1/alert-quota?day=YYYY-MM-DD`. For `Critical` and `Warning`, `suppressed` counts repeat offers, so the sum can be higher than the real demand. For `GitOpsDrift`, `suppressed` has no repeat offers. The recap's withheld line cannot give a count for one bucket or for one UTC day.
+2. Add the `sent` and the `suppressed` counts, and divide the sum by the number of clusters. The result is the demand for each cluster.
+3. Set the bucket to that demand multiplied by the number of clusters that you will run. Do not set it higher than the number of alerts each day that the on-call can act on.
+4. If the demand is higher than that number, reduce the inflow: fix the workloads that alert most. Do not raise the bucket.
+
 ## First-run onboarding
 
 On a fresh install the first chat interaction gets a guided onboarding instead of a cold start. One `no_agent` cron job on the Planning Agent profile (`agents/chat/defaults/cron/jobs.json`), `oobe`, drives it. Every minute it runs three stages: delivery first, then the scan, then the first-run audits. The old `bootstrap-inventory-scan` and `bootstrap-inventory-delivery` entries ship disabled.
