@@ -246,7 +246,7 @@ HELD_OUT_IN_PRESUBMIT = [
 # in the nightly file with its issue above it, as (case, the nightly line it
 # follows). Restoring a case deletes its entry here.
 DEMOTED_AFTER_THE_SPLIT = [
-    ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),  # 2026-10-16, #3269 (seeded-b off-channel)
+    ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),  # 2026-10-16, #3269 (agent reads upgradeTargetVersion)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
 

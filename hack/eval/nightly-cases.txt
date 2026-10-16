@@ -668,12 +668,12 @@
 # shape, unmeasured: priced with the 900s band in unit_cost_hint.
 ./tasks/fleet-cost-idle-pool/task.yaml
 
-# #3269: upgrades-lagging-master-probe demoted 2026-10-16. Seeded-b runs an
-# off-channel patch on the eval pools (1.34.12-gke.1011000 on RAPID, or
-# 1.35.8-gke.1626001, ahead of REGULAR's target) instead of the one-minor-behind
-# version the case grades, so it fails 0/3 on unrelated pull requests. Back on
-# the roster once seeded-b is pinned to a version one minor behind the REGULAR
-# default and the case shows greens (#3269).
+# #3269: upgrades-lagging-master-probe demoted 2026-10-16. The fixture is
+# healthy (seeded-b one minor behind REGULAR's defaultVersion on every pool),
+# but the agent compares seeded-b against the channel's upgradeTargetVersion,
+# the newest patch of its own minor, and reports no lag, so it fails 0/3 on
+# unrelated pull requests. Back on the roster once an agent-side fix has the
+# comparison use the channel default and the case shows greens (#3269).
 ./tasks/upgrades-lagging-master-probe/task.yaml
 
 # Blocker: #1254, for all four fleet-upgrade-verification cases (#1343

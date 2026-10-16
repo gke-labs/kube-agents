@@ -1,5 +1,6 @@
 # NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-10-16,
-# demoted from the blocking roster on #3269 (seeded-b's off-channel version);
+# demoted from the blocking roster on #3269 (the agent compares against the
+# channel's upgradeTargetVersion instead of its defaultVersion);
 # `upgrades` is on the coverage allowlist in docs/designs/domains.yaml until
 # it returns.
 #
