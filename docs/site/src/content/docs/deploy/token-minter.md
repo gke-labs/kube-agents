@@ -77,7 +77,7 @@ Before enabling the token minter, ensure you have:
    - Repository permissions: `Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`.
    - Installed onto the target organization, the GitOps repository, and every repository registered under `context_repos`.
    - If created under a personal user account, "Where can this GitHub App be installed?" must be set to "Any account (Public)".
-4. **App ID:** The numeric App ID from the GitHub App settings page.
+4. **App ID:** The numeric App ID from the GitHub App settings page (**General**, "App ID", a number such as `1234567`), not the App's name or slug. The installer refuses anything else.
 5. **Private Key (`.pem`):** Generated and downloaded from the GitHub App settings page (needed for initial Cloud KMS import).
 6. **Host Requirements:** `go` 1.21+ on the host machine running the import — `minty tools import-pk` builds the Minty CLI, which asks for Go 1.24 and relies on 1.21 onwards fetching that toolchain on demand — and `gcloud` authenticated with Cloud KMS admin permissions on your GCP project.
 

@@ -12,10 +12,17 @@ Upstream, and why it changes
 ----------------------------
 **A pull request opened.** A worker that opens a PR says so in a progress note
 or its report, so the link sits on a plan row or inside the report, where it
-reads like any other step. With the flag on, :func:`pr_opened` also posts it
-as its own message with "Open PR" and "Files changed" buttons, once per PR per
-thread for the life of the process (a restart forgets), since a note and the
-report often both carry it. A GitLab merge request gets the same message, with
+reads like any other step. With the flag on, the PR also posts as its own
+message with "Open PR" and "Files changed" buttons, once per PR per thread for
+the life of the process (a restart forgets). It posts from the card's
+``pr_opened`` event (:func:`pr_event`): the ``pr_opened`` plugin
+(``agents/platform/plugins/pr_opened``) records one on the worker's card
+whenever the broker's ``proposal-create`` answers with a new proposal and the
+forge confirms the agent's own credential authored it, so the worker's
+wording decides nothing. :func:`pr_opened` reads a note or report
+saying a PR was opened, as the fallback for one opened any other way; the two
+share one record of what each thread was shown, so a PR posts once whichever
+path reaches it first. A GitLab merge request gets the same message, with
 "Open MR" for its first button, when it is on gitlab.com or on the host of a
 GitLab entry in the mounted ``managed_repos`` file (the GitOps repository and
 the managed ones), which is read only for a text holding a merge request url.
@@ -305,27 +312,58 @@ def _managed_gitlab_hosts() -> frozenset[str]:
     return frozenset(ref.host for ref in refs if ref and ref.host)
 
 
+async def _announce(adapter: Any, sub: dict, url: str, repo: str, number: str, line: str) -> bool:
+    """Post the PR at ``url`` in the card's thread unless that thread already has it; True when it posted.
+
+    The one place both paths post, so a PR the event announced is never posted
+    again by the prose fallback, nor the other way round.
+    """
+    key = (str(sub.get("chat_id") or ""), str(sub.get("thread_id") or ""), url)
+    if key in _announced:
+        return False
+    if _chat_route(adapter):
+        chat = _chat.pr_message(url, repo, number, line)
+        if not await _send_chat(adapter, sub, _chat.pr_text(url, repo, number, line), chat):
+            return False
+    else:
+        blocks, fallback = _moments.pr_opened(url, repo, number, line)
+        if await _post(adapter, sub, blocks, fallback, _moments.PR_SIDE_BAR) is None:
+            return False
+    _remember(_announced, key, None)
+    return True
+
+
+async def pr_event(adapter: Any, sub: dict, payload: Any, text: str = "") -> bool:
+    """Post the PR a ``pr_opened`` event recorded, once per thread; True when it posted.
+
+    ``payload`` is the event's: the ``url``, ``number`` and ``title`` the forge
+    answered with when the work opened it. No wording is read to decide, and the
+    url must be one :func:`pr_opened` would announce. The evidence line is the
+    first line of ``text`` (the worker's words delivered after the event) naming
+    the PR, else its title.
+    """
+    if not isinstance(payload, dict):
+        return False
+    url = str(payload.get("url") or "")
+    hosts = _managed_gitlab_hosts() if _moments.MR_MARKER in url else frozenset()
+    found = _moments.proposal_ref(url, gitlab_hosts=hosts, github_host=_github_host())
+    if found is None:
+        return False
+    url, repo, number = found
+    line = _moments.evidence_line(text, url, number) or str(payload.get("title") or "").strip()
+    return await _announce(adapter, sub, url, repo, number, line)
+
+
 async def pr_opened(adapter: Any, sub: dict, text: str) -> bool:
-    """Post each PR ``text`` says was opened, once per thread; True when any posted."""
+    """Post each PR ``text`` says was opened, once per thread; True when any posted.
+
+    The fallback for a PR no ``pr_opened`` event recorded (:func:`pr_event`).
+    """
     posted = False
     # The managed list is read only for a text that can hold a merge request.
     hosts = _managed_gitlab_hosts() if _moments.MR_MARKER in str(text or "") else frozenset()
     for url, repo, number, line in _moments.opened_prs(text, gitlab_hosts=hosts, github_host=_github_host()):
-        key = (str(sub.get("chat_id") or ""), str(sub.get("thread_id") or ""), url)
-        if key in _announced:
-            continue
-        if _chat_route(adapter):
-            chat = _chat.pr_message(url, repo, number, line)
-            if not await _send_chat(adapter, sub, _chat.pr_text(url, repo, number, line), chat):
-                continue
-            _remember(_announced, key, None)
-            posted = True
-            continue
-        blocks, fallback = _moments.pr_opened(url, repo, number, line)
-        if await _post(adapter, sub, blocks, fallback, _moments.PR_SIDE_BAR) is None:
-            continue
-        _remember(_announced, key, None)
-        posted = True
+        posted = await _announce(adapter, sub, url, repo, number, line) or posted
     return posted
 
 

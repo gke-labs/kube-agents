@@ -462,6 +462,22 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn('<a href="trend.html#cases=cluster-agent-crashloop-debug"><code>cluster-agent-crashloop-debug</code></a>', app)
         self.assertEqual(app.count('class="tcard"'), 2)
 
+    def test_the_no_domain_group_is_labelled_so_and_its_slug_still_scopes(self):
+        # sparse-case is not in data.json's cases, so its domain is the slug "unknown".
+        tip = 'title="cases with no domain on record"'
+        app = dom_text(self.dense / "trend.html")
+        self.assertIn(f'<button type="button" data-scope="unknown" {tip}>no domain</button>', app)
+        self.assertIn(f'<h3 {tip}><a href="trend.html#domain=unknown">no domain</a>', app)
+        self.assertNotIn(">unknown<", app)
+        app = dom_text(self.dense / "trend.html", fragment="#domain=unknown")
+        self.assertIn("<h1>no domain on main</h1>", app)
+        self.assertIn(f'<button type="button" data-scope="unknown" class="on" {tip}>no domain</button>', app)
+        self.assertIn("<h2>Each case in no domain</h2>", app)
+        self.assertIn('<a href="trend.html#cases=sparse-case"><code>sparse-case</code></a>', app)
+        # The case's own view links back to the group in words that fit it.
+        app = dom_text(self.dense / "trend.html", fragment="#cases=sparse-case")
+        self.assertIn('<a href="trend.html#domain=unknown">every case with no domain →</a>', app)
+
     def test_the_incident_link_from_the_brief_marks_the_night_it_started(self):
         brief_app = dom_text(self.out / "index.html")
         link = "trend.html#since=2026-09-08T09:00:00Z&until=2026-09-08T12:00:00Z&cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom"

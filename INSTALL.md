@@ -185,6 +185,8 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 _(If the Cloud KMS key was already imported Ahead-Of-Time, `--github-pem-path` can be omitted; see [Token Minter Guide](docs/site/src/content/docs/deploy/token-minter.md).)_
 
+`--github-app-id` is the App's number (its settings page, **General**, "App ID"), not its name or slug; the installer refuses anything else, `--dry-run` included. An applying run, or a `--generate-only` handoff, records `GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID` in `install.env`, adding the ones the file lacks and replacing any it records with a different value, so `upgrade.sh`, which renders from the file alone, keeps GitOps on. The PEM path is never recorded: once imported, the key lives in Cloud KMS.
+
 To run pre-flight checks and output configuration state (`terraform.tfvars` and
 `/tmp/kube-agents-install-report.json`) without creating cloud resources — the dry run also
 validates the Terraform configuration, and previews the full resource plan when Application
@@ -1266,7 +1268,7 @@ section describes each stage.
 ### Each morning: the scheduled audits
 
 The Platform Agent runs its fleet audits on a cron schedule in UTC, some daily and some on
-Mondays only. On a new install with a GitOps repository, four of them (security, reliability, cost
+Mondays only. On a new install, four of them (security, reliability, cost
 and capacity) also run once as soon as the first inventory scan finishes, or at a fallback of 90 minutes or more
 after it started if it has not, so their first results do not wait for the schedule. To list every job with its next and last run:
 
@@ -1400,6 +1402,7 @@ When a Slack bot connects or is online in your workspace but never replies to me
   - The `*:history` scopes (`im:history`, `channels:history`, `groups:history`, `mpim:history`) are the most common cause of silent failures: without them, Socket Mode connects successfully, but Slack never forwards message contents to the bot.
   - Omitting `files:write` drops report artifact uploads quietly (logged as a warning).
   - Omitting `reactions:write` silently prevents reaction emoji from appearing on user messages.
+  - Under `spec.mode: next`, the reactions, a question's answered line, Working… and the suggested prompts also need `users:read`, `assistant:write`, the `assistant_thread_started` event (`app_home_opened` on an agent-view app) and interactivity, which the `hermes slack manifest` output carries unless generated with `--no-assistant`; without them the answers still arrive and only those go missing ([ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack)).
   - For the complete manifest, instructions on generating it with `hermes slack manifest`, and event subscriptions, see [Step 5 §2 (Slack Configuration)](#2-slack-configuration-slack_enabledtrue) or run `./scripts/installer/print_instructions_slack.sh`.
 - **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). Under `mode: today` unlisted users are ignored without a reply; under `next` the A2A gateway answers once with a notice naming their member ID. An empty allowlist admits all members in the workspace. Under `spec.mode: next`, the A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list; under `mode: today`, the legacy consumer has no such check: a guest in a shared channel is admitted by the allowlist alone, and under an empty list that is everyone. See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration).
 - **Single-Workspace vs Multi-Workspace (`spec.mode: next`):** Under the unsupported `spec.mode: next` toggle, the A2A gateway takes a single workspace bot token. If your secret holds a comma-separated list of tokens (supported under `mode: today`), Slack rejects it at `auth.test`; the gateway pod stays Running and Ready, retrying the Slack backend on a backoff, and Slack has no consumer until the secret holds one workspace's token or the install goes back to `today`. Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.
@@ -1466,7 +1469,7 @@ When the checks in the entry above pass and a message still gets no reply, follo
 
 ### 7. A Question Gets No Answer Under `spec.mode: next`
 
-The gateway posts a status line for every task ([what a task looks like](docs/site/src/content/docs/concepts/chatops.md#what-a-task-looks-like)); where it stops says what went wrong.
+On Google Chat the gateway posts a status line for every task ([what a task looks like](docs/site/src/content/docs/concepts/chatops.md#what-a-task-looks-like)); where it stops says what went wrong. Slack keeps no status line, so there a task with no answer shows Working… on the thread until it ends; read the checks below by the bridge's and the gateway's logs.
 
 - **It stays at `⏳ submitted…`.** Nothing has taken the task. (A line reading `⏳ **queued** — N requests are ahead of yours` is waiting its turn behind other conversations' tasks, which is not this.) Tasks on the `platform` route are run by the `hermes-bridge` container in the agent's pod, which logs `hermes bridge consuming` when it starts and `task accepted` for each task:
   ```bash

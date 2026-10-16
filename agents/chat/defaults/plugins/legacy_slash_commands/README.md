@@ -77,11 +77,13 @@ to replace `event.text`. Command resolution reads `event.text` afterwards
 (`MessageEvent.get_command()`), so the rewrite lands in time.
 
 The plugin must be enabled on the profile that receives chat ingress — the
-`default` profile. It is listed in `plugins.enabled` in **both**
-`agents/chat/config.yaml` and the operator's `renderConfigYAML`
-(`k8s-operator/internal/controller/platformagent_manifests.go`); the operator's
-copy is authoritative on the deployed default profile, so a change to one
-without the other is a no-op.
+`default` profile. It is listed in `plugins.enabled` in `agents/chat/config.yaml`,
+which is the one writer of the deployed list: the image seeds it onto a fresh
+volume, and the entrypoint's back-fill appends the names it has and a live list
+lacks on an existing one. The operator writes no copy of this list; its overlay
+adds `AgentPlugin` names (and `frontDoorPlugins` under the front-door flag), and
+`DefaultBuiltInPlugins` in `platformagent_manifests.go` is only the roster an
+`AgentPlugin` may not shadow, so a name added there alone loads nothing.
 
 ## Maintenance rules
 

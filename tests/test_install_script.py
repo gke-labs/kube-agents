@@ -6147,7 +6147,8 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
             "tf_compose_dir() { printf '%s' \"$TF_DIR\"; }\n"
             f"{generator}"
             "check_service_account_ownership() { :; }\ngke_dns_endpoint_flag() { :; }\ngcloud() { :; }\n"
-            "refuse_apply_over_undeclared_scope() { :; }\nannounce_platform_agent_mode_for_apply() { :; }\n"
+            "refuse_apply_over_undeclared_scope() { :; }\nrefuse_apply_dropping_live_gitops() { :; }\n"
+            "announce_platform_agent_mode_for_apply() { :; }\n"
             "check_scope_container_access() { :; }\nenable_scope_selector_apis() { :; }\n"
             'apply_crd_upgrades() { echo "APPLIED crds"; }\nrun_lifecycle_apply() { echo "APPLIED terraform"; }\n'
         )
@@ -6162,6 +6163,8 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                 f"{stubs}"
                 + "".join(f"{n}=v-{n}\n" for n in names)
                 + 'permission_set=read-only slack_enabled=true google_chat_enabled=false\n'
+                # An App ID is the App's number; the menu refuses anything else.
+                + 'github_app_id=12345\n'
                 f'TF_DIR="{tf_dir}" SLACK_BOT_TOKEN=""\n'
                 f'mktemp() {{ local p; p="$(command mktemp "$@")" || return; echo "$p" >>"{made}"; printf "%s\\n" "$p"; }}\n'
                 f"_menu_apply() {{\n{text[start:end]}\n}}\n"
@@ -11226,12 +11229,15 @@ class ScopeCheckWiringTest(unittest.TestCase):
         # (Y/n/g) prompt, where its route is known, so the g answer is the same
         # choice as the flag and a Y still refuses before step 12.
         gate_end = self.text.index('refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n  fi\n')
+        # The sink preflight rides the same route, one line under each call.
         preflight = self.text.index(
             'if [ "$PARAM_DRY_RUN" != "true" ]; then\n'
             '    if [ "$PARAM_GENERATE_ONLY" = "true" ]; then\n'
             '      check_scope_container_access "$SCOPE_CHECK_MODE_WARN"\n'
+            '      check_scope_export_sink_access "$SCOPE_CHECK_MODE_WARN"\n'
             '    elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then\n'
             '      check_scope_container_access || exit 1\n'
+            '      check_scope_export_sink_access || exit 1\n'
             '    fi\n'
             '  fi\n')
         summary = self.text.index('print_step "11. Pre-Flight Configuration Summary"')
@@ -11239,9 +11245,9 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertLess(preflight, summary)
         prompt = self.text.index('prompt_read "\\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n/g)"')
         yes = self.text.index('      [Yy])\n', prompt)
-        yes_check = self.text.index('check_scope_container_access || exit 1', yes)
+        yes_check = self.text.index('check_scope_container_access || exit 1\n        check_scope_export_sink_access || exit 1\n', yes)
         g = self.text.index('      [Gg])\n', prompt)
-        g_check = self.text.index('check_scope_container_access "$SCOPE_CHECK_MODE_WARN"', g)
+        g_check = self.text.index('check_scope_container_access "$SCOPE_CHECK_MODE_WARN"\n        check_scope_export_sink_access "$SCOPE_CHECK_MODE_WARN"\n', g)
         step12 = self.text.index('print_step "12. Applying the Install (Terraform + Helm)"')
         self.assertLess(summary, prompt)
         self.assertLess(yes, yes_check)
@@ -11271,11 +11277,13 @@ class ScopeCheckWiringTest(unittest.TestCase):
         fetch = menu.index('gcloud container clusters get-credentials "$cluster_name" --location "$REGION"')
         check = menu.index('refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1')
         preflight = menu.index('check_scope_container_access || exit 1')
+        sinks = menu.index('check_scope_export_sink_access || exit 1')
         crds = menu.index('apply_crd_upgrades "$repo_dir"')
         apply = menu.index('run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-')
         self.assertLess(fetch, check)
         self.assertLess(check, preflight)
-        self.assertLess(preflight, crds)
+        self.assertLess(preflight, sinks)
+        self.assertLess(sinks, crds)
         self.assertLess(crds, apply)
 
     def test_the_selector_apis_are_enabled_where_the_apply_is_about_to_run(self):
@@ -11290,7 +11298,7 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertLess(handoff, step12)
         self.assertLess(step12, enable)
         self.assertLess(enable, apply)
-        menu_check = self.text.index('        check_scope_container_access || exit 1\n        enable_scope_selector_apis "$PROJECT_ID"\n        apply_crd_upgrades "$repo_dir"')
+        menu_check = self.text.index('        check_scope_container_access || exit 1\n        check_scope_export_sink_access || exit 1\n        enable_scope_selector_apis "$PROJECT_ID"\n        apply_crd_upgrades "$repo_dir"')
         self.assertLess(menu_check, handoff)
 
     def test_the_dry_run_skips_its_plan_while_a_selector_api_is_off(self):

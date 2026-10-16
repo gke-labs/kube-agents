@@ -21,9 +21,12 @@ The **gateway Pod** holds the harness and nothing credentialed:
 1. `platform-agent`: the untrusted agent sandbox.
 2. `platform-agent-dashboard`: the optional local dashboard.
 3. `fluent-bit`: log forwarding.
-4. `agent-api-auth`: the PlatformAgent API authenticator and the
+4. `agent-api-auth`: the PlatformAgent API authenticator, the
    `k8s-event-watcher`, which forwards cluster events using a non-secret
-   internal key. It holds no credential path.
+   internal key, and, where enabled, the drift detector. Neither calls Google
+   on the pod's own identity: both make their Google calls through the
+   broker's watcher routes with a token for the `watcher` audience, which is
+   mounted here and in no other container.
 
 The **shell sandbox Pod**, `<agent>-shell`, runs `sshd`, the agent's own tools, a
 durable `/opt/data`, the shims that stand in for `gcloud` and `kubectl`, and a
@@ -229,8 +232,10 @@ pods, which read the counters into the `PlatformAgent`'s `status.usage`
 Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
 audience-bound projected ServiceAccount token (one hour; the audience is per
-pod, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-proxy-chat` for
-the gateway and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`
+caller, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-proxy-chat` for
+the gateway, `kubeagents-credential-proxy-watcher` for the gateway's `agent-api-auth` container
+alone (the event watcher and drift detector, whose fleet and Pub/Sub calls go through the
+broker's watcher routes) and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`
 for the A2A gateway) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
 That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's when it
@@ -314,10 +319,13 @@ read-only in the `platform-agent` container, because that is how the agent
 authenticates to a broker that is not on loopback and how the broker knows it is the
 gateway calling. The event watcher has a separate one-hour token with the Kubernetes
 API's default audience, plus the cluster CA and Pod namespace, mounted at the
-conventional in-cluster path in `agent-api-auth`. Two differently audienced tokens
-therefore sit side by side in the gateway Pod: the broker-audience one, which the
-Kubernetes API will not accept, and the watcher's, which it will. Neither is
-shared with the sandbox or dashboard.
+conventional in-cluster path in `agent-api-auth`, and a third, for the broker's
+`kubeagents-credential-proxy-watcher` audience, mounted in `agent-api-auth` alone: the
+event watcher and drift detector present it to the broker's watcher routes for their
+Google calls. Three differently audienced tokens therefore sit in the gateway Pod: the
+two broker-audience ones, which the Kubernetes API will not accept, and the event
+watcher's Kubernetes token, which it will. None is shared with the sandbox or
+dashboard, and the model's container holds only the chat one.
 Deleting a default token during startup is intentionally not used: projected
 tokens rotate, and mount-time exclusion is reliable.
 
@@ -762,13 +770,21 @@ Consequences:
   `current-context`, a non-GKE context name, or a merged `path1:path2` list — is
   rejected with `400` rather than honored.
 - A cache miss costs one `get-credentials`, preceded by one
-  `clusters describe` to decide whether the control plane should be reached
-  over its DNS endpoint. The common paths warm the cache themselves, since
-  profile scaffolding and context switching both begin with that command. That
-  describe is memoised per cluster for a minute rather than for the life of the
-  broker: the endpoint can be opened or closed on a running cluster, and the
-  proxy is a daemon that would otherwise keep acting on the configuration it
-  first saw.
+  `clusters describe` to decide which control-plane endpoint to reach (DNS,
+  private, or gcloud's default), plus a describe of the agent's own cluster
+  when the private endpoint is a candidate. A caller's
+  own `get-credentials` that names no endpoint flag, and names its cluster
+  and location (the project may come from the broker's own), gets the same
+  decision spliced in, since its output
+  becomes the managed kubeconfig for that cluster;
+  `docs/designs/private-endpoint-selection.md` has the rule. The common paths
+  warm the cache themselves, since profile scaffolding and context switching
+  both begin with that command. The target describe is memoised per cluster
+  for a minute rather than for the life of the broker: the endpoint can be
+  opened or closed on a running cluster, and the proxy is a daemon that would
+  otherwise keep acting on the configuration it first saw. The own-cluster
+  describe is kept for the life of the broker once it has answered, because
+  the install's VPC does not move; a failed one is retried after a minute.
 - `current-context` is read with a real YAML parser, so a valid kubeconfig in
   any legal spelling is recognized, but deliberately with PyYAML's pure-Python
   `safe_load`. The C loader recurses in C and terminates the broker with
@@ -960,8 +976,9 @@ file and never a `.git` it can write into.
   runs under `<agent>-shell`, annotated with nothing.
 - `automountServiceAccountToken: false` applies to the Pod.
 - The event watcher's projected ServiceAccount token is mounted only by
-  `agent-api-auth`. The `platform-agent` container mounts one of its own — the
-  broker-audience token it presents to the broker Service — and the dashboard
+  `agent-api-auth`, and so is the watchers' broker token (audience
+  `kubeagents-credential-proxy-watcher`). The `platform-agent` container mounts one of its own — the
+  chat-audience token it presents to the broker Service — and the dashboard
   mounts none.
 - Secret and credential-state volumes are mounted only in the broker Pod.
 - Every container runs non-root, drops all Linux capabilities, disallows

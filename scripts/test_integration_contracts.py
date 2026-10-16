@@ -74,6 +74,7 @@ FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
     # pull_request_target automations, not checks on the tree.
     "Auto Assign Milestone on Merge",
     "Hold Unresolved Threads",
+    "Merge Gate",
     "Risk Classification",
 )
 SCRIPTS_DIR = REPO_ROOT / "agents" / "platform" / "scripts"

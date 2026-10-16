@@ -32,7 +32,7 @@ platform/
 ├── skills/                  # SKILL.md bundles
 ├── governance/              # SOPs the scheduled governance jobs point at
 ├── cron/jobs.json           # the governance watchdog roster (see below)
-├── plugins/                 # in-tree Hermes plugins (incident_context, memory)
+├── plugins/                 # in-tree Hermes plugins (incident_context, pr_opened, memory)
 ├── docs/                    # workspace docs (glossary, console-link templates)
 └── scripts/                 # in-pod Python MCP servers + kanban helpers
 ```

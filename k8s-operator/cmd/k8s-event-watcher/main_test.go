@@ -24,7 +24,10 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -36,6 +39,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/oauth2"
 	container "google.golang.org/api/container/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/clusterprofiles"
 )
@@ -770,5 +774,62 @@ func TestRealMain_AppliesTheMemoryLimitBeforeStarting(t *testing.T) {
 	}
 	if got := debug.SetMemoryLimit(-1); got != 1073741824 {
 		t.Errorf("runtime soft limit after realMain = %d, want 1073741824", got)
+	}
+}
+
+// With the credential proxy named in the environment, the zero discovery seam
+// describes through the proxy and the client it builds reads events on the
+// proxy's route for the cluster, all with the projected token -- and never
+// reaches Application Default Credentials, pointed at a missing file here.
+func TestDiscoverClusterProfiles_ThroughTheBroker(t *testing.T) {
+	saved := discovery
+	t.Cleanup(func() { discovery = saved })
+	discovery = clusterprofiles.Discoverer{}
+	var (
+		mu       sync.Mutex
+		requests []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path+" "+r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/v1/watcher/gcp/container.googleapis.com/") {
+			// Usable addressing, as a real describe carries: discovery checks it,
+			// and the broker's config ignores it.
+			fmt.Fprint(w, `{"name":"prod","endpoint":"10.0.0.1","controlPlaneEndpointsConfig":{"dnsEndpointConfig":{"allowExternalTraffic":true,"endpoint":"prod.example.internal"}}}`)
+			return
+		}
+		fmt.Fprint(w, `{"kind":"EventList","apiVersion":"v1","metadata":{},"items":[]}`)
+	}))
+	defer srv.Close()
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("sa-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "no-such-adc.json"))
+	t.Setenv(clusterprofiles.BrokerURLEnv, srv.URL)
+	t.Setenv(clusterprofiles.BrokerTokenFileEnv, tokenFile)
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
+
+	clusters, err := discoverClusterProfiles(context.Background(), dir, newMetrics())
+	if err != nil {
+		t.Fatalf("discoverClusterProfiles: %v", err)
+	}
+	if len(clusters) != 1 {
+		t.Fatalf("got %d clusters, want 1", len(clusters))
+	}
+	if _, err := clusters[0].Client.CoreV1().Events("").List(context.Background(), metav1.ListOptions{}); err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	want := []string{
+		"GET /v1/watcher/gcp/container.googleapis.com/v1/projects/projA/locations/us-central1/clusters/prod Bearer sa-token",
+		"GET /v1/k8s/projA/us-central1/prod/api/v1/events Bearer sa-token",
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(requests, "\n") != strings.Join(want, "\n") {
+		t.Errorf("requests:\n%s\nwant:\n%s", strings.Join(requests, "\n"), strings.Join(want, "\n"))
 	}
 }

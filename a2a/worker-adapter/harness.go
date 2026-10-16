@@ -3,7 +3,9 @@
 // subject, publishes the lifecycle events, drives the harness over the
 // headless stream-json contract, forwards steering and follow-ups onto the
 // harness stdin, and exits with a code matching the terminal state. One task
-// per process; the pod exists because the message is already durable.
+// per process, unless the pod is a reused session pod (Config.SessionReuse),
+// which runs each turn of its conversation in turn; either way the pod exists
+// because the message is already durable.
 package workeradapter
 
 import (
@@ -12,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -28,6 +31,11 @@ import (
 const DefaultHarnessPath = "/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude"
 
 const (
+	// harnessResumeFlag continues an earlier harness session by id. The
+	// pinned binary takes it with --print (`claude -p --resume <id>`), and
+	// the agent SDK passes it alongside --input-format stream-json, the
+	// shape harnessCommand builds.
+	harnessResumeFlag = "--resume"
 	// stderrTailBytes is how much of the harness's stderr is kept for a
 	// failure message. A tail rather than the whole stream: the useful part
 	// of a crash is its end, and the value rides a status event onto the bus.
@@ -58,6 +66,25 @@ const (
 	// stderrTailHeading introduces the stderr tail in a failure reason. The
 	// tail is multi-line and read by a person, so it goes on its own lines.
 	stderrTailHeading = "\nstderr tail:\n"
+	// containerInitPID is the adapter's pid when it is the worker
+	// container's entrypoint (Dockerfile.worker's ENTRYPOINT, and the
+	// spawner sets no shareProcessNamespace), which is when killLeftovers
+	// may signal every other process in the pid namespace.
+	containerInitPID = 1
+	// leftoverReapBound caps how long killLeftovers polls for the processes
+	// it killed to exit, so it reaps them rather than leaving zombies.
+	leftoverReapBound = 2 * time.Second
+	// leftoverReapPoll is the interval between those polls.
+	leftoverReapPoll = 10 * time.Millisecond
+)
+
+// The namespace-wide half of killLeftovers, as variables so a test can stand
+// in for being the container's init without signalling every process the
+// test's user owns.
+var (
+	adapterPID         = os.Getpid
+	killEveryoneButMe  = func() { _ = syscall.Kill(-1, syscall.SIGKILL) }
+	reapKilledChildren = reapChildren
 )
 
 // harnessEvent is one stream-json line from the harness stdout. Only the
@@ -396,6 +423,15 @@ func (p *harnessProc) closeStdin() {
 // grace. Timers are retained so the reaper can stop them before the pgid is
 // recycled — the Hermes bridge hit exactly that, killing an unrelated process.
 func (p *harnessProc) kill(grace time.Duration) {
+	// Reaped already (a cancel or eviction that wins the select after the
+	// reap): killLeftovers has emptied the group, so its id may be free for
+	// reuse, and a signal now could reach an unrelated process.
+	p.mu.Lock()
+	reaped := p.reapedAt
+	p.mu.Unlock()
+	if reaped {
+		return
+	}
 	pid := p.cmd.Process.Pid
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 	if grace <= 0 {
@@ -417,6 +453,64 @@ func (p *harnessProc) kill(grace time.Duration) {
 		return
 	}
 	p.killTimers = append(p.killTimers, t)
+}
+
+// killLeftovers SIGKILLs whatever is left in the harness's process group once
+// the harness itself has been reaped, after a clean exit as much as after a
+// kill. A process the model started in the background (the Bash tool's `&`)
+// stays in the group and outlives the harness otherwise, and in a reused pod
+// it would still be running, with the pod's credentials and its scratch
+// directory, during the next turn, which can be another requester's. The
+// escalation timers do not cover it: reaped stops them, and a clean exit arms
+// none.
+//
+// Called right after the reap and before the next turn can start, from the
+// goroutine that reaped. The group's id is the harness's pid, and the kernel
+// does not hand out an id still in use as a live process group's, so while
+// anything is left in the group this reaches only that; with nothing left it
+// finds nothing (ESRCH).
+//
+// The group is not enough for the real harness: its Bash tool spawns every
+// command detached (its own session and process group), so a background
+// command leaves the group at birth. In a worker container the adapter is
+// pid 1, the namespace's init, so it also SIGKILLs every other process in the
+// namespace (kill(-1) skips the caller) and reaps them: between turns
+// nothing but the adapter should be running there. That includes a debug
+// container attached with --target, which shares the namespace. Outside a
+// container (a local run, a test) only the group is signalled: kill(-1)
+// there would reach every process the user owns.
+func (p *harnessProc) killLeftovers() {
+	_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+	if adapterPID() == containerInitPID {
+		killEveryoneButMe()
+		reapKilledChildren(leftoverReapBound)
+	}
+}
+
+// reapChildren waits, for at most bound, for this process's exited children:
+// as pid 1 the adapter inherits every orphan killLeftovers kills, and an
+// unreaped one stays a zombie. It runs only between turns, after the
+// harness's own Wait, when the adapter has no child of its own that os/exec
+// is waiting on, so waiting on any child takes nothing from os/exec.
+func reapChildren(bound time.Duration) {
+	deadline := time.Now().Add(bound)
+	for {
+		var ws syscall.WaitStatus
+		pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
+		switch {
+		case errors.Is(err, syscall.EINTR):
+			continue
+		case err != nil:
+			// ECHILD: no children left at all.
+			return
+		case pid > 0:
+			continue
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(leftoverReapPoll)
+	}
 }
 
 // reaped stops any armed escalation timers; called after Wait so a recycled
@@ -476,4 +570,31 @@ func truncate(s string, n int) string {
 		cut = i
 	}
 	return s[:cut] + "…"
+}
+
+// removeUserSettings deletes the harness's user settings file before a turn
+// in a reused pod (Config.HarnessUserSettings). A file that is not there is
+// the normal case. Anything that cannot be removed (a directory planted at
+// the path, a permission error) is an error, and the turn does not run over
+// it.
+func removeUserSettings(path string) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove the harness's user settings %s: %w", path, err)
+	}
+	return nil
+}
+
+// withResume is argv continuing harness session id, or argv unchanged when
+// there is none. It copies rather than appending in place: argv is the pod's
+// shared Config value, and every task builds its own from it.
+func withResume(argv []string, id string) []string {
+	if id == "" {
+		return argv
+	}
+	out := make([]string, 0, len(argv)+2)
+	out = append(out, argv...)
+	return append(out, harnessResumeFlag, id)
 }
