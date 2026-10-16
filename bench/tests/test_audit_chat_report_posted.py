@@ -88,6 +88,14 @@ def test_an_earlier_runs_report_does_not_count():
     assert status == "fail"
 
 
+def test_a_non_finite_start_stamp_does_not_pass_the_fire_check():
+    rec = record([REPORT])
+    rec["started_at"] = float("inf")
+    status, reason = acr.verdict(gateway([REPORT]), rec)
+    assert status == "fail"
+    assert "left no report from finish" in reason
+
+
 def test_a_silent_run_is_an_error():
     status, _ = acr.verdict(gateway([], response="**[SILENT]**\n"), record([]))
     assert status == "error"

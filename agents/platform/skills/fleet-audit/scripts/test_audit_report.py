@@ -25978,6 +25978,15 @@ class TestChatReport(HarnessTestCase):
         audit_report.open_chat_report(AUDIT, "acme/b", NOW)
         self.assertEqual(self.entries(), [("acme/b", None)])
 
+    def test_a_record_with_no_run_is_replaced(self):
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        record = self.chat_record()
+        del record["run"]
+        Path(audit_report.chat_report_path_for(AUDIT)).write_text(json.dumps(record), encoding="utf-8")
+        audit_report.append_chat_report(AUDIT, "acme/a", "report A", NOW)
+        self.assertTrue(self.chat_record()["run"])
+        self.assertEqual(self.entries(), [("acme/a", "report A")])
+
     def test_a_finish_with_no_start_still_leaves_its_report(self):
         audit_report.append_chat_report(AUDIT, "acme/a", "report A", NOW)
         self.assertEqual(self.entries(), [("acme/a", "report A")])

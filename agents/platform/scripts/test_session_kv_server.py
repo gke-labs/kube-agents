@@ -3520,7 +3520,7 @@ class TestAuditChatReport(unittest.TestCase):
         with open(os.path.join(self.scratch, f"chat_report_{job}.json"), "w", encoding="utf-8") as handle:
             json.dump(record, handle)
 
-    def post(self, fleet_audit=True, send=None, job="compliance-audit", shipped=True):
+    def post(self, fleet_audit=True, send=None, job="compliance-audit", shipped=True, scheduler=True):
         sent = []
 
         def default_send(platform, message, chat_id="", thread_id="", timeout=None):
@@ -3533,7 +3533,10 @@ class TestAuditChatReport(unittest.TestCase):
              patch.object(session_kv_server, "_send_to_chat", side_effect=send or default_send):
             response = self.client.post(
                 "/v1/cron-reports",
-                json={"job_id": job, "title": "Security & RBAC Posture Audit", "report": self.FINAL},
+                json={
+                    "job_id": job, "title": "Security & RBAC Posture Audit", "report": self.FINAL,
+                    **({"also_delivered_to": []} if scheduler else {}),
+                },
             )
         return response, sent
 
@@ -3558,7 +3561,21 @@ class TestAuditChatReport(unittest.TestCase):
     def test_each_repositorys_part_is_posted_in_order(self):
         self.leave(["first part", "second part"])
         _, sent = self.post()
-        self.assertEqual(sent, ["first part\n\nsecond part"])
+        self.assertEqual(
+            sent,
+            ["first part\n\nsecond part\n\n"
+             "Security & RBAC Posture Audit: 2 repositories reported in this run."],
+        )
+
+    def test_a_complete_multi_repository_run_does_not_end_with_a_ledger_link(self):
+        self.leave([self.REPORT, self.REPORT.replace("issues/3", "issues/4")])
+        _, sent = self.post()
+        self.assertIsNone(session_kv_server.slack_audit_report.ledger_ref(sent[0]))
+
+    def test_a_mid_run_report_to_chat_is_posted_as_written(self):
+        self.leave([])
+        _, sent = self.post(scheduler=False)
+        self.assertEqual(sent, [self.FINAL])
 
     def test_a_repository_that_did_not_finish_is_named_after_the_reports(self):
         self.leave([("acme/a", "report A"), ("acme/b", None), ("acme/c", self.REPORT)])

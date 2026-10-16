@@ -218,6 +218,10 @@ CHAT_REPORT_MAX_BYTES = 1024 * 1024
 # its audit stream's id, which is the name `finish` gives the record; a job
 # created at runtime keeps posting its final message.
 IMAGE_PLATFORM_ROSTER = "/opt/platform-template/cron/jobs.json"
+# The field the relay plugin (deploy/docker/plugins/chat/adapter.py) sends on
+# every scheduled delivery and `report_to_chat` never does.
+SCHEDULER_LEG_KEY = "also_delivered_to"
+AUDIT_REPOS_SUMMARY_LINE = "{label}: {count} repositories reported in this run."
 CHAT_REPORT_READ_TIMEOUT_S = 20
 # `audit_report.INFLIGHT_TTL_SECONDS`: no step of a run outlives its stream's
 # lease, so a record whose last step is older than that is an earlier run's.
@@ -3333,13 +3337,15 @@ def audit_chat_report(profile: str, job_id: str, title: str) -> tuple[str, str]:
         return notice, ""
     if run == _last_posted_run(profile, job_id):
         return notice, ""
+    # A closing line after several reports, or after the unfinished line, so
+    # the message does not end with a ledger link and Slack posts it whole: a
+    # headline card shows one repository's ledger and drops the rest.
     if unfinished:
-        # Last, so the message no longer ends with a ledger link and Slack
-        # posts it whole: a headline card would show one repository's ledger
-        # and drop this line.
         finished.append(
             AUDIT_UNFINISHED_REPOS_LINE.format(label=label, repos=", ".join(unfinished), job=job_id)
         )
+    elif len(finished) > 1:
+        finished.append(AUDIT_REPOS_SUMMARY_LINE.format(label=label, count=len(finished)))
     return CHAT_REPORT_PARTS_SEPARATOR.join(finished), run
 
 
@@ -3630,7 +3636,10 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     if not report:
         raise HTTPException(status_code=400, detail="report field is required")
     audit_run = ""
-    if _is_fleet_audit_job(profile, job_id) and _is_shipped_audit_job(job_id):
+    # Only the scheduler's delivery leg sends `also_delivered_to`; a mid-run
+    # `report_to_chat` does not, and its text is posted as written.
+    from_scheduler = SCHEDULER_LEG_KEY in request_data
+    if from_scheduler and _is_fleet_audit_job(profile, job_id) and _is_shipped_audit_job(job_id):
         report, audit_run = audit_chat_report(profile, job_id, title)
     report, truncation_notice = _truncate_report(report, profile, job_id)
 

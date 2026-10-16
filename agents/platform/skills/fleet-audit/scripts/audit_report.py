@@ -2947,6 +2947,9 @@ def _read_chat_record(audit_id: str) -> dict | None:
         return None
     if not math.isfinite(updated):
         return None
+    run = record.get(CHAT_REPORT_RUN_KEY)
+    if not isinstance(run, str) or not run:
+        return None
     if not isinstance(record.get(CHAT_REPORT_PARTS_KEY), list):
         return None
     if not all(isinstance(part, dict) for part in record[CHAT_REPORT_PARTS_KEY]):

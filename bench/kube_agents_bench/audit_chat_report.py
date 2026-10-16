@@ -33,6 +33,7 @@ errors: there is nothing in a channel to grade.
 """
 
 import json
+import math
 import shlex
 from datetime import datetime
 from typing import Any, Callable, Literal
@@ -181,6 +182,8 @@ def verdict(gateway: dict[str, Any], record: dict[str, Any] | None) -> tuple[Ver
     try:
         started = float((record or {}).get("started_at"))
     except (TypeError, ValueError):
+        started = None
+    if started is not None and not math.isfinite(started):
         started = None
     texts = [str(p.get("text") or "").strip() for p in parts or [] if isinstance(p, dict)]
     texts = [t for t in texts if t]

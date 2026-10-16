@@ -233,16 +233,15 @@ posts a one-line notice that the job did not finish in place of whatever the
 scheduler delivered, a final message or its failure summary. A read of the file
 that fails, rather than finding none, posts a second notice naming the failure,
 and leaves the run unposted. `[SILENT]` is unchanged: the scheduler drops a
-silent run before delivery. The substitution is keyed on the job, not the
-caller, so a mid-run `report_to_chat` from a fleet-audit job is replaced the
-same way; no fleet-audit SOP calls it.
+silent run before delivery. Only the scheduler's delivery leg is replaced: the relay plugin sends
+`also_delivered_to` on every delivery and `report_to_chat` never does, so a
+mid-run `report_to_chat` is posted as written.
 
-Each report ends with a `Ledger: <url>` line, which the Slack headline reads. On
-a stream that walks several repositories the headline is built from the last
-report's ledger, and the earlier repositories' lines reach the thread's stored
-report but not the card. The line naming unfinished repositories goes last, so
-a message that carries it does not end with a ledger link and Slack posts it
-whole, with no card.
+Each report ends with a `Ledger: <url>` line, which the Slack headline reads,
+so a run over one repository gets its card. A message that carries the line
+naming unfinished repositories, or several reports followed by a closing line
+that counts them, does not end with a ledger link, and Slack posts it whole with
+no card, because a card shows one repository's ledger and drops the rest.
 
 The substitution applies only to a job the image's Platform Agent roster ships
 with the fleet-audit skill (`/opt/platform-template/cron/jobs.json`), because

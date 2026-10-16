@@ -460,7 +460,8 @@ which holds whatever else the model wrote in its last turn. A run over several
 repositories posts each finished repository's report, then a line naming any it
 did not finish, and a run that finished none posts a one-line notice that it did
 not finish. On Slack the report is then replaced by a headline linking its
-ledger issue, except for a run with that line, which Slack posts whole. It is a delivery mode, not a
+ledger issue when the run covered one repository; a message with that line, or
+with several repositories' reports, is posted whole. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the
 scheduler applies `[SILENT]` and builds the failure summary before delivery is
 reached.
