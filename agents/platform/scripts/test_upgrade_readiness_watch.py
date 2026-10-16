@@ -1628,6 +1628,26 @@ class DeclaredScope(Base):
         self.assertEqual(self.ledger()["standing_outside"], {"p2": []})
         self.assertEqual((self.ledger()["last_tick"], self.ledger()["targets"], self.ledger()["table_runs"]), (None, {}, {}))
 
+    def test_an_all_refused_ticks_failure_line_is_keyed_on_the_refusal_not_its_text(self) -> None:
+        """The failure line names the resolved set, which moves with the scope's
+        membership; the marker is keyed on what the partial line keys a refusal on,
+        the refused projects and their causes, so a project joining the scope beside a
+        standing refusal re-posts nothing, and a changed cause is a new line."""
+        self.declare_scope(["p1"])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p2"}):
+            code, first = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
+            self.assertEqual(code, 0)
+            self.assertIn("does not list p2; it lists p1;", first)
+            self.assertEqual(json.loads(self.marker().read_text()), [watch.FAILURE_KEY_REFUSED, [["p2", watch.REFUSAL_OUTSIDE]]])
+            self.declare_scope(["p1", "p3"])
+            code, second = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
+            self.assertEqual((code, second), (0, ""), "the same refusal with a longer resolved set is not a new line")
+            self.declare_scope(["p1", "p2"], unread=["p2"])
+            code, third = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
+            self.assertEqual(code, 0)
+            self.assertIn("lists p2 but the install could not read it", third)
+            self.assertEqual(json.loads(self.marker().read_text()), [watch.FAILURE_KEY_REFUSED, [["p2", watch.REFUSAL_UNREAD.format(outcome="denied")]]])
+
     def test_an_all_refused_tick_keeps_the_standing_record_so_its_failure_line_holds_across_a_failed_lookup(self) -> None:
         """A folder-scoped install whose roster holds nothing but p2, in no
         part of the declaration: every run is refused, the tick fails in the

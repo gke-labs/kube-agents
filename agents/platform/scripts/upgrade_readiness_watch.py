@@ -357,6 +357,10 @@ UNREAD_REMEDIES = {
 # and what the announcements key it on, so a cause that changes (a project
 # declared and then found unread, a scope that resolves, an exclude entry
 # added or dropped) is news.
+# The failure marker's key for a tick every project of which was refused: the refused
+# projects and their causes, as the partial line keys a refusal, never the line's text,
+# which names the resolved set and so moves with the scope's membership.
+FAILURE_KEY_REFUSED = "refused"
 REFUSAL_OUTSIDE = "outside the resolved scope"
 REFUSAL_OUTSIDE_UNRESOLVED = "outside a scope not yet resolved"
 REFUSAL_EXCLUDED = "excluded by spec.scope.exclude"
@@ -592,11 +596,21 @@ class ReportRefused(RuntimeError):
     for its cause, composed once (``refusal_detail``) so the partial line,
     the ungraded line and the tick's failure line all say the same thing and
     none relays the remedy the script wrote for an agent; ``cause`` is what
-    the announcements key it on, so a changed remedy is a new line."""
+    the announcements key it on, so a changed remedy is a new line.
+    ``signature`` is set where one refusal stands for a whole tick
+    (``versions_by_project``): the refused projects and their causes, the key
+    the tick's failure line is announced under instead of its text."""
 
     def __init__(self, detail: str, cause: str) -> None:
         super().__init__(detail)
         self.cause = cause
+        self.signature: str | None = None
+
+
+def refused_tick_signature(failed: dict) -> str:
+    """The failure marker's key for a tick whose every run was refused: the
+    refused projects and their causes, sorted, under ``FAILURE_KEY_REFUSED``."""
+    return json.dumps([FAILURE_KEY_REFUSED, sorted([project, exc.cause] for project, exc in failed.items() if isinstance(exc, ReportRefused))])
 
 
 class SandboxTimedOut(RuntimeError):
@@ -1572,7 +1586,10 @@ def versions_by_project(
             # a sandbox failure or a timeout on another is what stopped the
             # read this tick, so it is the one named, and a refusal only when
             # every run was refused.
-            raise next((exc for exc in failed.values() if not isinstance(exc, ReportRefused)), next(iter(failed.values())))
+            chosen = next((exc for exc in failed.values() if not isinstance(exc, ReportRefused)), next(iter(failed.values())))
+            if isinstance(chosen, ReportRefused):
+                chosen.signature = refused_tick_signature(failed)
+            raise chosen
         if unresolved:
             raise ProjectUnresolved(
                 UNRESOLVED_TICK_DETAIL.format(reasons=REASONS_SEPARATOR.join(PARTIAL_REASON.format(project=p, message=d) for p, d in unresolved.items()))
@@ -2049,18 +2066,20 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
     return lines
 
 
-def announce_failure_once(detail: str) -> bool:
-    """A failure that persists is posted once per distinct detail and the next
-    clean tick posts a recovery line. The marker lives beside the ledger, to
-    which a failed tick writes nothing but the standing-outside record; a
-    marker that cannot be read or written leaves the line posted every time,
-    since nothing can remember it."""
+def announce_failure_once(detail: str, key: str | None = None) -> bool:
+    """A failure that persists is posted once per distinct key, the detail
+    itself unless the caller hands one (a refused tick's, so the resolved set
+    the detail names can change membership without re-posting a standing
+    refusal), and the next clean tick posts a recovery line. The marker lives
+    beside the ledger, to which a failed tick writes nothing but the
+    standing-outside record; a marker that cannot be read or written leaves
+    the line posted every time, since nothing can remember it."""
     try:
         marker = watch_home() / FAILURE_MARKER_FILE_NAME
-        if marker.exists() and marker.read_text(encoding="utf-8") == detail:
+        if marker.exists() and marker.read_text(encoding="utf-8") == (key or detail):
             return False
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(detail, encoding="utf-8")
+        marker.write_text(key or detail, encoding="utf-8")
     except (OSError, RuntimeError):
         pass
     return True
@@ -2079,7 +2098,8 @@ def main(argv: list[str] | None = None) -> int:
         detail = f"{type(exc).__name__}: {exc}"
         # A dry run changes nothing, the marker included, and is never silenced
         # by it: the operator running one is looking at the failure.
-        if args.dry_run or announce_failure_once(detail):
+        key = exc.signature if isinstance(exc, ReportRefused) else None
+        if args.dry_run or announce_failure_once(detail, key):
             print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_TICK, detail=detail))
         return 0
     for line in lines:
