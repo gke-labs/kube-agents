@@ -190,7 +190,11 @@ func TestPlatformAgentReconciler_Reconcile_HomeChannelUnsetOnADegradedPark(t *te
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	// The APIReader is set, as in production, so syncA2AConditions' live
+	// re-read runs: without the home-channel term in its predicate, a live CR
+	// whose other next-stack conditions are already current reads as
+	// satisfied and the write is skipped on every park after the upgrade.
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
 	ctx := context.Background()
 	for i := 1; i <= 2; i++ {
