@@ -17,7 +17,7 @@ repetition's final report under its grading line (`rep N report:`), the
 collector keeps it as `reps[].excerpt`, and the Brief and the run page show
 it beside the grader's reason (builds graded before 2026-09-15 carry none).
 In the same way, a `rep N timing:` line under each grading line carries the
-repetition's `agent_s` and `turn1_s`, which the Cases and Nightly pages show
+repetition's `agent_s` and `turn1_s`, which the Cases, Nightly and Trend pages show
 ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md) defines them).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
@@ -42,7 +42,8 @@ and incremental) and renders the dashboard's Trend page (`trend.html`,
 `scripts/eval_dashboard/trend.py`): per case and per domain, the pass rate by
 night with the admission window beside it, the judged quality by night with the
 spread the store can support, and a marker on every night the version key
-changed. The Cases page links each case to its trend and the Brief's last
+changed; under each, the opening chat turn and the agent time by night from
+the nightly runs in `data.json` (advisory). The Cases page links each case to its trend and the Brief's last
 incident links to the record around the night it started. What "score" means
 there — the deterministic pass rate is the gate's number, judged quality is
 advisory and never a single point — is defined once, in

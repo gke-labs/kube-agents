@@ -1627,7 +1627,6 @@ class FirstRunAuditsTest(unittest.TestCase):
         """The note for oobe's ``state``."""
         if state is not None:
             oobe.write_state(self.d, state)
-        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n", encoding="utf-8")
         return bootstrap_delivery._audits_note(self.d, no_coverage)
 
     def _skipped(self, reason: str) -> None:
@@ -1659,6 +1658,32 @@ class FirstRunAuditsTest(unittest.TestCase):
                     self._note(),
                     f"The first-run audits did not run: {reason}. {bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}",
                 )
+
+    def test_a_skip_an_older_stage_recorded_for_no_repository_says_the_report_covers_them(self):
+        # Kept through an upgrade: that build's scan ran the audits' workload checks itself.
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=900\n", encoding="utf-8")
+        self._skipped(bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON)
+        self.assertEqual(
+            self._note(),
+            f"The first-run audits did not run: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
+            f"{bootstrap_delivery.AUDITS_COVERED_NOTE}",
+        )
+        # A report no cluster's audit reached covers nothing, whatever the older stage recorded.
+        self.assertEqual(
+            self._note(no_coverage=True),
+            f"The first-run audits did not run: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
+            f"{bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE}",
+        )
+
+    def test_a_sweep_filed_after_an_older_skip_does_not_say_the_report_covers_them(self):
+        # Onboarding repeated with the stage's marker kept: the new scan left those checks to the audits.
+        self._skipped(bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON)
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep2\nfiled_at=2000\n", encoding="utf-8")
+        self.assertEqual(
+            self._note(),
+            f"The first-run audits did not run: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
+            f"{bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}",
+        )
 
     def test_the_not_covered_note_does_not_say_the_report_covers_them(self):
         self.assertNotIn("covers", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE)

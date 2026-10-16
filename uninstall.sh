@@ -925,6 +925,11 @@ main() {
   # The mode, likewise: the generator refuses a value outside the CRD's enum,
   # and the destroy removes the release whichever mode it renders.
   export PLATFORM_AGENT_MODE=""
+  # The daily alert ceilings, likewise: the generator refuses a value that is
+  # not a whole number, and the ceilings go with the release. Each key is
+  # named here, because an older installer_common.sh has no
+  # ALERT_DAILY_LIMIT_KEYS list.
+  export ALERT_DAILY_LIMIT_CRITICAL="" ALERT_DAILY_LIMIT_WARNING="" ALERT_DAILY_LIMIT_INFO="" ALERT_DAILY_LIMIT_DRIFT=""
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

@@ -776,6 +776,25 @@ platformAgent:
     # Prefer telemetry.otlpEndpoint when you do have a collector; this is the
     # off switch, not the way to point at one.
     env: []
+    # The daily alert ceilings, one per bucket: critical, warning, info and
+    # drift. Each key that you set becomes ALERT_DAILY_LIMIT_<KEY> in
+    # spec.deployment.env. A key that you do not set keeps the default in the
+    # agent image. 0 removes the cap for that bucket. The counter is
+    # fleet-wide and resets at 00:00 UTC.
+    #
+    #   alertDailyLimits:
+    #     warning: 15
+    #     drift: 30
+    #
+    # An entry with the same name in env above wins over the key here. A
+    # valueFrom entry for a key that is set fails the render, because the
+    # operator forwards only literal values.
+    #
+    # Each apply that changes the env list that the chart renders replaces
+    # the full env list on the CR. Entries that you added to the CR by hand
+    # are then lost. Move them to env above first. The site's chatops page, "Daily alert ceiling", gives the
+    # buckets and a sizing method.
+    alertDailyLimits: {}
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
     # merges over the operator's defaults (500m CPU and 1Gi requests; 1 CPU,
