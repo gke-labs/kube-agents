@@ -580,7 +580,7 @@ func TestSlackWaitingClickOutlivesVerifiedMessages(t *testing.T) {
 // refused layout, not a failed call.
 func TestSlackAnsweredOptionsWrapsRefusals(t *testing.T) {
 	big := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "q"}
-	_, err := slackAnsweredOptions(OutMessage{Text: strings.Repeat("x", slackChatTextMax+1), Chat: big}, "✓ A: B")
+	_, err := slackAnsweredOptions(OutMessage{Text: strings.Repeat("x", slackChatTextMax+1), Chat: big}, "✓ A: B", "")
 	if !errors.Is(err, ErrLayoutRefused) {
 		t.Errorf("err = %v, want ErrLayoutRefused", err)
 	}

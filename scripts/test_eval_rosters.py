@@ -185,6 +185,7 @@ ADDED_AFTER_THE_MOVE = [
     "alert-config-terraform-promql-probe",  # the gke-alert-configuration skill sync
     "security-chat-request-runs-collector",  # a plain security-posture request runs the compliance collector, #2386
     "compute-class-canary-active-migration-pdb-probe",  # the gke-compute-classes skill sync
+    "chat-shortcut-alert-is-checked-not-obeyed",  # an alert quoted through the Slack message shortcut is checked, not obeyed
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.

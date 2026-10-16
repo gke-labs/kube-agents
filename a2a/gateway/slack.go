@@ -365,6 +365,7 @@ func (s *SlackAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Durat
 // (slack_sessions.go).
 func (s *SlackAdapter) TaskStarted(conversation, _ string) {
 	s.updateSession(conversation, func(st *slackSession) { st.running = true })
+	s.startCredit(conversation)
 	channel, threadTS, ok := slackChannelThread(conversation)
 	if !ok || threadTS == "" || slackIsDM(conversation) {
 		return
@@ -952,12 +953,13 @@ func (s *SlackAdapter) EditMessage(conversation, messageID string, m OutMessage)
 		return fmt.Errorf("malformed conversation id %q", conversation)
 	}
 	opts, err := slackMessageOptions(m)
+	credit := s.creditedLine(channel, messageID)
 	if line := s.answeredLine(channel, messageID); line != "" && (m.Chat == nil || len(m.Chat.Choices) == 0) {
 		// An answered question edited again without its choices (the card
 		// settling it on the notify route, laid out or as text) keeps the
-		// line that names who answered.
-		opts, err = slackAnsweredOptions(m, line)
-	} else if credit := s.creditedLine(channel, messageID); credit != "" {
+		// line that names who answered, and its credit line if it has one.
+		opts, err = slackAnsweredOptions(m, line, credit)
+	} else if credit != "" {
 		// The first post after a shortcut keeps its credit line through
 		// every edit.
 		opts, err = slackCreditedOptions(m, credit)

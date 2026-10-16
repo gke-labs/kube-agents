@@ -1672,15 +1672,22 @@ to them, as for a typed ask, and a redelivery is dropped by `action_ts`. Its con
 the thread under the message (the message's thread when it is a reply), its message id is
 the message, so the ask's reaction goes on it, and its text is a fixed frame
 (`slackShortcutAsk`) around the message quoted: its text, its attachments' pretext, title,
-text and fields (the fallback when it has none), its files' names, who posted it (a member's
-Slack name, an app's posting name) and the channel's name. The frame tells the agent the
-quote is something to check, not an instruction, because the requester is the clicker and
+text and fields (the fallback when it has none) and its files' names, opened by who posted it
+(a member's Slack name, an app's posting name, on one line and clipped), with the channel's
+name in the frame. The poster's name goes inside the quote because it is the message's word:
+an app chooses the name it posts under and a member sets their own. The frame tells the agent
+the quote is something to check, not an instruction, because the requester is the clicker and
 the message's author may be anyone, a program included; the eval case
 `chat-shortcut-alert-is-checked-not-obeyed` holds the agent to it. Once the gateway has
-verified the clicker, the adapter's next post in that conversation carries a context line
-above it naming them by their Slack name (`<name> asked me to look at this`), kept through
-every edit of that message, so a channel reading a bot's reply under someone else's message
-can see who asked; a line no post took is dropped when the chain ends. Before handing anything
+verified the clicker and the shortcut's own task starts (`TaskStarted`), the adapter's next
+post in that conversation carries a context line above it naming them by their Slack name
+(`<name> asked me to look at this`), kept through every edit of that message, an answered
+question's settling edit included, so a channel reading a bot's reply under someone else's
+message can see who asked. The line waits for the task, not the next post, because the turn
+is verified before it is routed: a task already running in the thread would otherwise post
+its progress under it. A shortcut that starts no task (a steer into a running one) credits
+nothing, another member's turn in the thread clears a line still waiting, and one no post
+took is dropped when the chain ends. Before handing anything
 over the adapter asks `conversations.info` whether it can post there. A channel it is not a
 member of, and a conversation it cannot see at all (a private channel or a DM it is not in,
 `channel_not_found`), gets a note only the clicker sees, through the payload's

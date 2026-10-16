@@ -135,9 +135,12 @@ type slackUX struct {
 	// questions is each conversation's open question, the latest posted.
 	questions      map[string]slackQuestion
 	questionsOrder []string
-	// credits is each conversation's shortcut credit line still waiting for
+	// awaiting is each conversation's verified shortcut credit line until the
+	// shortcut's own task starts there; credits is the line from then until
 	// the bot's next post there; credited is the line a post took, by
 	// channel/ts, so an edit of that message keeps it (slack_shortcut.go).
+	awaiting      map[string]string
+	awaitingOrder []string
 	credits       map[string]string
 	creditsOrder  []string
 	credited      map[string]string
@@ -149,7 +152,7 @@ func (s *SlackAdapter) uxLocked() *slackUX {
 	if s.ux == nil {
 		s.ux = &slackUX{pending: map[string]slackPending{}, claims: map[string]bool{},
 			answered: map[string]bool{}, lines: map[string]string{}, questions: map[string]slackQuestion{},
-			credits: map[string]string{}, credited: map[string]string{}}
+			awaiting: map[string]string{}, credits: map[string]string{}, credited: map[string]string{}}
 	}
 	return s.ux
 }
@@ -246,8 +249,9 @@ func (s *SlackAdapter) trackQuestion(conversation, ts string, m OutMessage) {
 // question already answered: the same layout with the answered line added
 // where slackAnsweredLayout would put it, or, for text alone, the text as a
 // section with the line under it (text past a section's cap posts as text
-// alone, without the line).
-func slackAnsweredOptions(m OutMessage, line string) ([]slack.MsgOption, error) {
+// alone, without the line). A credit line, when the message carries one,
+// stays above it all (slackCreditedOptions).
+func slackAnsweredOptions(m OutMessage, line, credit string) ([]slack.MsgOption, error) {
 	text := toMrkdwn(m.Text)
 	note := map[string]any{"type": slackContextBlock, "elements": []any{
 		map[string]any{"type": slackPlainText, "text": line, "emoji": true}}}
@@ -255,8 +259,12 @@ func slackAnsweredOptions(m OutMessage, line string) ([]slack.MsgOption, error) 
 		if utf8.RuneCountInString(text) > slackChatSectionMax {
 			return slackMessageOptions(m)
 		}
-		set, err := slackRawBlocks([]map[string]any{
-			{"type": slackSectionBlock, "text": map[string]any{"type": slackMrkdwnText, "text": text}}, note})
+		blocks := []map[string]any{
+			{"type": slackSectionBlock, "text": map[string]any{"type": slackMrkdwnText, "text": text}}, note}
+		if credit != "" {
+			blocks = append([]map[string]any{slackCreditNote(credit)}, blocks...)
+		}
+		set, err := slackRawBlocks(blocks)
 		if err != nil {
 			return nil, err
 		}
@@ -265,12 +273,9 @@ func slackAnsweredOptions(m OutMessage, line string) ([]slack.MsgOption, error) 
 	}
 	// Refusals wrapped as slackMessageOptions wraps them, so a caller tells
 	// a refused layout from a failed call (ErrLayoutRefused).
-	if utf8.RuneCountInString(text) > slackChatTextMax {
-		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, errSlackChatTooLarge)
-	}
-	layout, err := renderSlackChat(m.Chat, text)
+	layout, err := slackCreditedLayout(m, text, credit)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+		return nil, err
 	}
 	if n := len(layout.Attachments); n > 0 {
 		last := layout.Attachments[n-1]
@@ -406,13 +411,18 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 		s.mu.Unlock()
 		return
 	}
+	if !p.shortcut {
+		// Another turn in the conversation: a shortcut's credit still
+		// waiting for its task is no longer about the next task here.
+		s.unawaitCreditLocked(conversation)
+	}
 	if p.shortcut {
 		// A shortcut answers no question: it is an ask about a message, so
 		// it titles the thread after that message and credits the clicker
 		// on the bot's next post there, and a clicker the gateway refused is
 		// told so where only they can see it.
 		if verified {
-			s.creditLocked(conversation, fmt.Sprintf(slackShortcutCredit, p.clicker))
+			s.awaitCreditLocked(conversation, fmt.Sprintf(slackShortcutCredit, p.clicker))
 			s.mu.Unlock()
 			s.noteAsk(conversation, p.text)
 			return
