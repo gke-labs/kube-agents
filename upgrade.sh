@@ -64,6 +64,16 @@ readonly KUBE_AGENTS_RELEASE_BUNDLE_MARKER=".release-bundle"
 # The schema the re-tag modes filter the release's recorded values against,
 # relative to the sources this run applies.
 readonly KUBE_AGENTS_VALUES_SCHEMA="charts/kube-agents/values.schema.json"
+# What marks a commit as a breaking change: a `type!:` subject or a BREAKING
+# CHANGE footer. The same patterns as commit_messages_have_breaking_change in
+# scripts/release/common.sh, which picks the version bump, held here because
+# the tree this run sources may be an older release's that predates that file's
+# helpers. tests/test_upgrade_script.py checks the two agree.
+readonly BREAKING_CHANGE_SUBJECT_REGEX='^[a-z]+(\([^)]+\))?!:'
+readonly BREAKING_CHANGE_FOOTER_REGEX='^[[:space:]]*BREAKING[ -]CHANGE:[[:space:]]+'
+# The downgrade check reads commit messages and ancestry only, so a history it
+# has to fetch carries commits and no trees or file contents.
+readonly DOWNGRADE_HISTORY_FETCH_FILTER="--filter=tree:0"
 
 # Default CLI Configuration
 PARAM_UPGRADE_MODE="full"
@@ -80,6 +90,10 @@ PARAM_KEEP_IMAGE_TAG="false"
 # renamed setting as a newer release's addition, and dropping it silently would
 # take the setting off the release. A rollback to an older release passes it.
 PARAM_DROP_UNDECLARED_VALUES="false"
+# Off by default: a commit marked breaking can leave state on the cluster that
+# the older release cannot read, so a rollback across one is refused unless
+# the operator has read the commits the refusal names and asks for it.
+PARAM_ALLOW_BREAKING_DOWNGRADE="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
@@ -96,6 +110,8 @@ if [ -z "${IMAGE_TAG:-}" ] && [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
   IMAGE_TAG_DEFAULTED_FROM_BAKED="true"
 fi
 TEMP_REPO_DIR=""
+DOWNGRADE_HISTORY_DIR=""
+DOWNGRADE_HISTORY_SOURCE=""
 # Set when this run detached the install's own checkout onto the target
 # release. Everything that can still refuse the upgrade — the configuration
 # load, the missing-project exit, the credentials fetch, the Helm release
@@ -218,6 +234,9 @@ cleanup() {
   if [ -n "$TEMP_REPO_DIR" ] && [ -d "$TEMP_REPO_DIR" ]; then
     rm -rf -- "$TEMP_REPO_DIR"
   fi
+  if [ -n "$DOWNGRADE_HISTORY_DIR" ] && [ -d "$DOWNGRADE_HISTORY_DIR" ]; then
+    rm -rf -- "$DOWNGRADE_HISTORY_DIR"
+  fi
 }
 trap cleanup EXIT
 
@@ -320,7 +339,12 @@ Options:
                            release's recorded values the target chart's schema
                            does not declare, instead of refusing the upgrade
                            over them. For a rollback to an older release.
-  --help, -h               Show this help message
+  --allow-breaking-downgrade
+                           Roll back to an older release even when a commit
+                           between the installed tag and --image-tag is marked
+                           as a breaking change. Without it, such a rollback is
+                           refused and the refusal names each commit.
+  --help, -h              Show this help message
 
 Examples:
   # Perform full atomic upgrade of harness, operator, and skills
@@ -1162,6 +1186,135 @@ fetch_source_ref() {
   fi
 }
 
+# ─── The downgrade check ──────────────────────────────────────────────────────
+
+is_ga_version() {
+  [[ "${1:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+# Succeeds when GA version $1 is older than GA version $2.
+ga_version_is_older() {
+  local a b i
+  local -a older_parts newer_parts
+  IFS='.' read -r -a older_parts <<<"$1"
+  IFS='.' read -r -a newer_parts <<<"$2"
+  for i in 0 1 2; do
+    a="$((10#${older_parts[$i]}))"
+    b="$((10#${newer_parts[$i]}))"
+    if [ "$a" -ne "$b" ]; then
+      [ "$a" -lt "$b" ]
+      return
+    fi
+  done
+  return 1
+}
+
+# Sets DOWNGRADE_HISTORY_SOURCE to a git directory holding the full history of
+# both refs. The sources this run applies are used when they already do (a full
+# checkout); otherwise a commit-only clone is made, since the fresh clone is one
+# commit deep and a release bundle has no history at all.
+downgrade_history_dir() {
+  local repo_dir="$1" older="$2" newer="$3" ref=""
+  if [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null || echo "")" = "false" ] &&
+    git -C "$repo_dir" rev-parse --verify --quiet "${older}^{commit}" >/dev/null 2>&1 &&
+    git -C "$repo_dir" rev-parse --verify --quiet "${newer}^{commit}" >/dev/null 2>&1; then
+    DOWNGRADE_HISTORY_SOURCE="$repo_dir"
+    return 0
+  fi
+  DOWNGRADE_HISTORY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kube-agents-history.XXXXXX")"
+  git clone --quiet --no-checkout "$DOWNGRADE_HISTORY_FETCH_FILTER" "$KUBE_AGENTS_REPO_URL" "$DOWNGRADE_HISTORY_DIR" >/dev/null 2>&1 || return 1
+  # A commit no branch or tag reaches (a pull request's build) is fetched by name.
+  for ref in "$older" "$newer"; do
+    git -C "$DOWNGRADE_HISTORY_DIR" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1 && continue
+    git -C "$DOWNGRADE_HISTORY_DIR" fetch --quiet origin "$ref" >/dev/null 2>&1 || return 1
+  done
+  DOWNGRADE_HISTORY_SOURCE="$DOWNGRADE_HISTORY_DIR"
+}
+
+# Prints "<short sha> <subject>" for each commit in older..newer that is marked
+# as a breaking change, judged one commit at a time on the same terms as
+# commit_messages_have_breaking_change: the subject line, then the body.
+breaking_commits_between() {
+  local history_dir="$1" older="$2" newer="$3" log="" record="" header="" body=""
+  log="$(trap - ERR; git -C "$history_dir" log --format='%h %s%n%b%x1e' "${older}..${newer}" 2>/dev/null)" || return 1
+  while IFS= read -r -d $'\x1e' record; do
+    record="${record#$'\n'}"
+    header="${record%%$'\n'*}"
+    body="${record#"$header"}"
+    if [[ "${header#* }" =~ $BREAKING_CHANGE_SUBJECT_REGEX ]] ||
+      { [ -n "$body" ] && grep -qE "$BREAKING_CHANGE_FOOTER_REGEX" <<<"$body"; }; then
+      printf '%s\n' "$header"
+    fi
+  done <<<"$log"
+}
+
+# Refuses a move to an older release across a commit marked as a breaking
+# change, naming each one. Returns 0 to let the run continue: the move is not a
+# downgrade, the range is clean, --allow-breaking-downgrade was given, or this
+# is a --plan, which reports the same finding as a warning.
+check_downgrade() {
+  local repo_dir="$1" target="$2" installed="$3"
+  local known_downgrade="false" history_dir="" target_commit="" installed_commit="" blocking="" count="" line=""
+  if [ -z "$installed" ] || [ "$installed" = "$target" ]; then
+    return 0
+  fi
+  if ! validate_immutable_ref "$installed" >/dev/null; then
+    print_info "The install runs image tag '${installed}', which names no release or commit, so the downgrade check is skipped."
+    return 0
+  fi
+  if is_ga_version "$target" && is_ga_version "$installed"; then
+    ga_version_is_older "$target" "$installed" || return 0
+    known_downgrade="true"
+  fi
+
+  if ! downgrade_history_dir "$repo_dir" "$target" "$installed"; then
+    if [ "$known_downgrade" = "true" ] && [ "$PARAM_ALLOW_BREAKING_DOWNGRADE" != "true" ] && [ "$PARAM_PLAN" != "true" ]; then
+      print_error "${target} is older than the installed ${installed}, and the commits between them could not be read from ${KUBE_AGENTS_REPO_URL} to check for breaking changes."
+      print_info "Restore access to it and re-run, or pass --allow-breaking-downgrade to roll back without the check."
+      exit 1
+    fi
+    print_warning "Could not read the history between ${installed} and ${target} from ${KUBE_AGENTS_REPO_URL}; the downgrade check is skipped."
+    return 0
+  fi
+  history_dir="$DOWNGRADE_HISTORY_SOURCE"
+
+  target_commit="$(git -C "$history_dir" rev-parse "${target}^{commit}")"
+  installed_commit="$(git -C "$history_dir" rev-parse "${installed}^{commit}")"
+  [ "$target_commit" != "$installed_commit" ] || return 0
+  if [ "$known_downgrade" != "true" ] &&
+    ! git -C "$history_dir" merge-base --is-ancestor "$target_commit" "$installed_commit" 2>/dev/null; then
+    return 0
+  fi
+
+  if ! blocking="$(trap - ERR; breaking_commits_between "$history_dir" "$target_commit" "$installed_commit")"; then
+    print_error "Could not read the commits between ${target} and the installed ${installed}."
+    exit 1
+  fi
+  if [ -z "$blocking" ]; then
+    print_success "Rolling back from ${installed} to ${target}: no commit between them is marked as a breaking change."
+    return 0
+  fi
+  count="$(printf '%s\n' "$blocking" | wc -l | tr -d '[:space:]')"
+  if [ "$PARAM_ALLOW_BREAKING_DOWNGRADE" = "true" ] || [ "$PARAM_PLAN" = "true" ]; then
+    print_warning "Rolling back from ${installed} to ${target} crosses ${count} commit(s) marked as a breaking change:"
+  else
+    print_error "Rolling back from ${installed} to ${target} crosses ${count} commit(s) marked as a breaking change:"
+  fi
+  while IFS= read -r line; do
+    echo "      ${line}"
+  done <<<"$blocking"
+  if [ "$PARAM_ALLOW_BREAKING_DOWNGRADE" = "true" ]; then
+    print_info "--allow-breaking-downgrade: continuing."
+    return 0
+  fi
+  if [ "$PARAM_PLAN" = "true" ]; then
+    print_info "A real run refuses this rollback unless it is given --allow-breaking-downgrade."
+    return 0
+  fi
+  print_info "Each can leave state on the cluster that ${target} cannot read. Read them, then re-run with --allow-breaking-downgrade to roll back anyway."
+  exit 1
+}
+
 # Move a clone left by an earlier install (or a plain `git clone`) to the
 # requested ref. Only the arm that runs without a checkout calls this: the two
 # arms that run this script from one never move it. A clean kube-agents
@@ -1303,6 +1456,7 @@ parse_args() {
       --plan) PARAM_PLAN="true"; shift ;;
       --keep-image-tag) PARAM_KEEP_IMAGE_TAG="true"; shift ;;
       --drop-undeclared-values) PARAM_DROP_UNDECLARED_VALUES="true"; shift ;;
+      --allow-breaking-downgrade) PARAM_ALLOW_BREAKING_DOWNGRADE="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --gcp-project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
       --gcp-project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
@@ -1807,6 +1961,12 @@ main() {
     # reason to trust it any further.
     validate_immutable_ref "$PARAM_IMAGE_TAG"
     print_success "Using the tag this install is running: ${PARAM_IMAGE_TAG}"
+  fi
+
+  # Before the Secret backfills, the first step that writes to the cluster.
+  # Guarded: an older target tree's installer_common.sh may not define it.
+  if declare -F running_image_tag >/dev/null; then
+    check_downgrade "$repo_dir" "$PARAM_IMAGE_TAG" "$(running_image_tag "$target_namespace")"
   fi
 
   if [ "$PARAM_PLAN" = "true" ]; then

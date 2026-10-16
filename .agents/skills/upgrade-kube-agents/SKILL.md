@@ -114,6 +114,10 @@ plans at the installed tag):
   already serves. It refuses `--image-tag`, because the two ask for opposite things — and a release
   copy carries a version, so it refuses this flag too. It is what a scheduled reconcile of an
   environment that tracks `main` uses, from a checkout.
+- `--allow-breaking-downgrade` lets a move to an older tag continue across a commit marked as a
+  breaking change (`type!:` or a `BREAKING CHANGE:` footer). Without it the run stops before the
+  Secret backfills and names each such commit; `--plan` only warns. Show the user the named commits
+  and get their consent before re-running with it.
 
 When `--keep-image-tag` (or a tagless `--plan` whose state records no tag) reads the running tag off the
 agent Deployment, it validates it exactly as a passed one, so an install serving a mutable ref stops the
