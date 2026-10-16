@@ -303,9 +303,10 @@ class PlanArtifactSafetyTest(unittest.TestCase):
                             re.MULTILINE | re.DOTALL)
         secretish = re.compile(r"(_key|_token|_secret|_password|api_key|salt)$")
         # A KMS key is named by its resource path, not by its material: the path
-        # is not a credential and is worth seeing in a plan. Anything else
+        # is not a credential and is worth seeing in a plan. A Secret key name
+        # within a Secret is also an identifier, not secret material. Anything else
         # ending in _key is.
-        identifier = re.compile(r"kms|encryption")
+        identifier = re.compile(r"kms|encryption|_secret_key$")
         for name, body in blocks:
             if not secretish.search(name) or identifier.search(name):
                 continue
