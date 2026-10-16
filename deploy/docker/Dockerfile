@@ -59,7 +59,8 @@ ARG GOLANG_VERSION=1.27-alpine
 # release into each profile's $HERMES_HOME/bin: that was 38 MiB per scaffolded
 # Cluster Agent profile, 6.5 GiB of a 10 GiB data volume at 209 clusters
 # (gke-labs#3325). Bump the version and both sums together, from the release's
-# checksums.txt.
+# checksums.txt, and the same three in deploy/docker/check_skill_commands.py:
+# deploy/docker/test_check_skill_commands.py holds the two copies equal.
 ARG TIRITH_VERSION=v0.4.2
 ARG TIRITH_SHA256_AMD64=efa6bf414a83dba385d4f13137e8677f850ced9102fe74ebb14c72f31df0dc77
 ARG TIRITH_SHA256_ARM64=c550b1bfb0c8c872ab3421cd6ef756f260f7cf4981a18cedd49f141fa2d77569
@@ -138,7 +139,10 @@ RUN set -eu; \
         arm64) triple=aarch64-unknown-linux-gnu; sum="${TIRITH_SHA256_ARM64}" ;; \
         *) echo "no tirith build pinned for ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    wget -qO /tmp/tirith.tar.gz "https://github.com/sheeki03/tirith/releases/download/${TIRITH_VERSION}/tirith-${triple}.tar.gz"; \
+    for attempt in 1 2 3 4 5; do \
+        wget -qO /tmp/tirith.tar.gz "https://github.com/sheeki03/tirith/releases/download/${TIRITH_VERSION}/tirith-${triple}.tar.gz" && break; \
+        [ "$attempt" -lt 5 ] || exit 1; sleep "$attempt"; \
+    done; \
     echo "${sum}  /tmp/tirith.tar.gz" | sha256sum -c -; \
     mkdir /tmp/tirith; tar -xzf /tmp/tirith.tar.gz -C /tmp/tirith tirith; \
     install -m 0755 /tmp/tirith/tirith /workspace/bin/tirith; \
@@ -2169,7 +2173,7 @@ COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 # in the SKILL.md files and references/*.md pages of the image's three skill
 # trees through Hermes' Tirith scan, which is why the Cluster Agent template is
 # copied above this block rather than below it.
-# It downloads the Tirith release it pins; see its module docstring.
+# It scans with the image's pinned tirith (--tirith-bin), the binary that ships.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
 COPY agents/platform/config.yaml \
      deploy/docker/merge_configs.py \
@@ -2188,6 +2192,7 @@ assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.ma
 assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/platform-config/check_skill_commands.py \
+        --tirith-bin /usr/local/bin/tirith \
         agents/platform/skills=/opt/platform-template/skills \
         agents/cluster/skills=/opt/cluster-template/skills \
         a2a/persona/platform/skills=/opt/a2a-template/skills && \

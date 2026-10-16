@@ -24,6 +24,9 @@ readonly OTEL_FLAG_DISABLED="--disabled"
 # The pinned tirith the image puts on PATH (deploy/docker/Dockerfile, a2a-tools).
 # Step 4.4 removes the per-home copies Hermes downloaded before it was there.
 readonly IMAGE_TIRITH=/usr/local/bin/tirith
+# What a tirith binary prints for --version, and how long step 4.4 waits for it.
+readonly TIRITH_VERSION_LINE='tirith [0-9]+\.[0-9]+\.[0-9]+'
+readonly TIRITH_PROBE_TIMEOUT_SECONDS=5
 
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
@@ -1851,24 +1854,31 @@ if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TERMINAL_ENV_PIN_SCRIPT" ]; then
     fi
 fi
 
-# Everything that writes shared volume state is done; release the bootstrap lock
-# before starting anything long-lived, so a peer container is not blocked behind
-# this one for the life of the pod. Closing the fd releases it too, but do both
-# explicitly — the fd is inherited across the `exec` in step 6 otherwise.
 # 4.4 Reclaim the tirith copies Hermes downloaded into each home before the
 # image carried one on PATH. Hermes' tools/tirith_security looks on PATH first,
 # so with the image's copy there a home's bin/tirith is never used again, and it
 # was 38 MiB per scaffolded profile: 6.5 GiB of a 10 GiB data volume at 209
-# clusters (gke-labs#3325). Only regular files are removed, and only when PATH
-# really resolves the image's copy, so an image without it keeps what it has.
-if [ "$(command -v tirith 2>/dev/null)" = "$IMAGE_TIRITH" ]; then
+# clusters (gke-labs#3325). Removed only when PATH resolves the image's copy, and
+# only a regular file at $TARGET_DIR/bin/tirith or a profile's bin/tirith whose
+# --version reads as a tirith release; each removal is logged with its size, so
+# an operator can see where the space went.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ "$(command -v tirith 2>/dev/null)" = "$IMAGE_TIRITH" ]; then
     for stale_tirith in "$TARGET_DIR/bin/tirith" "$TARGET_DIR"/profiles/*/bin/tirith; do
-        if [ -f "$stale_tirith" ] && [ ! -L "$stale_tirith" ]; then
-            rm -f "$stale_tirith"
+        [ -f "$stale_tirith" ] && [ ! -L "$stale_tirith" ] || continue
+        stale_version="$(timeout "$TIRITH_PROBE_TIMEOUT_SECONDS" "$stale_tirith" --version 2>/dev/null | head -n 1)" || true
+        if printf '%s\n' "$stale_version" | grep -Eqx "$TIRITH_VERSION_LINE"; then
+            stale_bytes="$(stat -c %s "$stale_tirith" 2>/dev/null || echo unknown)"
+            if rm -f "$stale_tirith"; then
+                echo "Reclaimed a per-profile tirith copy: $stale_tirith ($stale_bytes bytes, $stale_version); the image's $IMAGE_TIRITH is on PATH"
+            fi
         fi
     done
 fi
 
+# Everything that writes shared volume state is done; release the bootstrap lock
+# before starting anything long-lived, so a peer container is not blocked behind
+# this one for the life of the pod. Closing the fd releases it too, but do both
+# explicitly — the fd is inherited across the `exec` in step 6 otherwise.
 if [ -n "$BOOTSTRAP_LOCK_FD" ]; then
     flock -u 9 2>/dev/null || true
     exec 9>&-
