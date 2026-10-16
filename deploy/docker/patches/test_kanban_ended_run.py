@@ -312,12 +312,25 @@ class TestWaitingParentRefusal(unittest.TestCase):
         self.assertIn("kanban_comment", text)
         self.assertNotIn("stale run", text)
 
-    def test_the_answer_is_latched(self):
+    def test_the_answer_names_the_dependency_block_as_the_exit(self):
         self.link()
-        first = ker.waiting_parent_refusal(TID, self.conn)
+        text = ker.waiting_parent_refusal(TID, self.conn)
+        self.assertIn('kanban_block(kind="dependency")', text)
+        self.assertNotIn("Don't call kanban_complete or kanban_block", text)
+
+    def test_the_answer_is_not_latched(self):
+        """The parent can go away; a retried completion should then succeed,
+        and the worker's own block must still reach the board."""
+        self.link()
+        self.assertIsNotNone(ker.waiting_parent_refusal(TID, self.conn))
+        self.assertIsNone(ker._LATCHED)
         self.conn.execute("DELETE FROM task_links")
-        self.assertEqual(ker.waiting_parent_refusal(TID, self.conn), first)
-        self.assertEqual(ker.refuse_ended_run(TID, TestEndedRunRefusal.fail_connect), first)
+        self.assertIsNone(ker.waiting_parent_refusal(TID, self.conn))
+
+    def test_an_archived_parent_is_no_answer(self):
+        self.link()
+        self.conn.execute("UPDATE tasks SET status = 'archived' WHERE id = 't_parent'")
+        self.assertIsNone(ker.waiting_parent_refusal(TID, self.conn))
 
     def test_no_parent_is_no_answer(self):
         self.assertIsNone(ker.waiting_parent_refusal(TID, self.conn))

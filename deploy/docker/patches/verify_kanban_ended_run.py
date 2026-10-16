@@ -23,7 +23,8 @@ patched ``block_task`` and tool handlers, with real worker processes:
 
 - a parent linked onto a running card mid-run gets the card's
   ``kanban_complete`` a plain answer that it now waits on that parent, not
-  upstream's "stale run" (#3252).
+  upstream's "stale run"; the worker's dependency block then goes through,
+  and the card is ready again once the parent is done (#3252).
 
 Before the patch the blocked card's worker keeps running, and its
 ``kanban_complete`` is told "If the prior run already did the work, verify it
@@ -209,8 +210,15 @@ try:
     check("kanban_complete is refused saying the card now waits on its new parent",
           f"now waits on {gate_parent}" in err and "kanban_comment" in err, err)
     check("not with upstream's stale-run reason", "stale run" not in err, err)
-    again = json.loads(kt._handle_complete({"summary": "done", "result": "web-7 is fine."}))
-    check("and the answer holds on a retry", again.get("error") == err, str(again))
+    check("the refusal names a dependency block as the exit", 'kanban_block(kind="dependency")' in err, err)
+    blocked = json.loads(kt._handle_block({"reason": f"waits on {gate_parent}", "kind": "dependency"}))
+    check("the worker's dependency block goes through", blocked.get("ok"), str(blocked))
+    check("and the card waits in todo, not counted as a failure", status(linked) == "todo", status(linked))
+    as_operator()
+    conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (gate_parent,))
+    conn.commit()
+    K.recompute_ready(conn)
+    check("once the parent is done the card is ready again", status(linked) == "ready", status(linked))
     ker._LATCHED = None
 
     print("the stopped run's handoffs:")

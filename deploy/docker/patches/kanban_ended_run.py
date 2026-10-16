@@ -75,9 +75,11 @@ What this changes
    whose card gained an unfinished parent mid-run (``link_tasks`` leaves a
    running child running), so ``complete_task`` refuses on
    ``_parents_satisfied``. The worker is told the card now waits on that
-   parent, to save its result with ``kanban_comment`` and end its turn,
-   latched the same way (#3252). The ``kanban_link`` guard (#3248) refuses
-   such a link from an agent; this covers one from the CLI or the dashboard.
+   parent, to save its result with ``kanban_comment`` and block on the
+   dependency, so the card runs again once the parent is done (#3252). Not
+   latched: the parent can go away. The ``kanban_link`` guard planned in
+   #3248 would refuse such a link from an agent; this also covers one from
+   the CLI or the dashboard.
 
 Known windows, each caught by item 2 rather than a stop: a new run claiming
 the card between the outside block's read and its write is blocked unpinned
@@ -195,24 +197,31 @@ def waiting_parent_text(task_id: str, parent_id: str) -> str:
     """The terminal answer for a current run whose card gained a parent."""
     return (
         f"Card {task_id} now waits on {parent_id}, which was linked as its parent "
-        f"after your run started, so it can't be completed yet. Save your result "
-        f"with kanban_comment so it isn't lost, then end your turn. Don't call "
-        f"kanban_complete or kanban_block again."
+        f"after your run started, so it can't be completed until {parent_id} "
+        f"finishes. Save your result with kanban_comment so it isn't lost, then "
+        f"call kanban_block(kind=\"dependency\") and end your turn: the card goes "
+        f"back to the queue and runs again once {parent_id} is done. Don't retry "
+        f"kanban_complete."
     )
 
 
 def waiting_parent_refusal(task_id: str, conn: Any) -> Optional[str]:
-    """The terminal answer if this worker's run is current but its card now
-    has an unfinished parent, else None. Latches like :func:`ended_run_refusal`.
+    """The answer if this worker's run is current but its card now has an
+    unfinished parent, else None.
 
     ``link_tasks`` leaves a running child running on its run, so a parent
-    linked mid-run (from the CLI or the dashboard; the kanban_link guard
-    refuses it from an agent) makes ``complete_task`` refuse on
-    ``_parents_satisfied`` while the run is still current. Upstream's reason
-    is the generic "unknown id, stale run, or already terminal", which
-    invites a retry (#3252).
+    linked mid-run makes ``complete_task`` refuse on ``_parents_satisfied``
+    while the run is still current. Upstream's reason is the generic
+    "unknown id, stale run, or already terminal", which invites a retry
+    (#3252).
+
+    Not latched, unlike the ended-run answer: the parent can go away (an
+    unlink, or it finishes), and then a retried completion should succeed.
+    The exit it names is a dependency block, which the worker's own
+    ``kanban_block`` still reaches: the card waits in ``todo`` and
+    ``recompute_ready`` promotes it when the parent is done. Ending the turn
+    without a handoff instead would be booked as a protocol violation.
     """
-    global _LATCHED
     if _LATCHED is not None:
         return _LATCHED
     run_id = _own_run_id(task_id)
@@ -232,12 +241,11 @@ def waiting_parent_refusal(task_id: str, conn: Any) -> Optional[str]:
         return None
     if row is None or row[0] != "running" or row[1] != run_id or not row[2]:
         return None
-    _LATCHED = waiting_parent_text(task_id, row[2])
     logger.warning(
-        "kanban_ended_run: run %s on %s waits on parent %s linked mid-run; "
-        "refusing its handoffs from now on", run_id, task_id, row[2],
+        "kanban_ended_run: run %s on %s waits on parent %s linked mid-run",
+        run_id, task_id, row[2],
     )
-    return _LATCHED
+    return waiting_parent_text(task_id, row[2])
 
 
 def refuse_ended_run(task_id: str, connect: Callable[[], Any]) -> Optional[str]:
