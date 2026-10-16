@@ -1428,4 +1428,32 @@ func TestBuildLiteLLMNetworkPolicy_CollectorNamespaceAnnotation(t *testing.T) {
 			}
 		}
 	}
+
+	// Case 6: A namespace that is a valid label value but not a DNS-1123 label
+	// (uppercase) is dropped. The peer's kubernetes.io/metadata.name selector is
+	// only ever a namespace's own DNS-1123 name, so emitting a rule for this
+	// value would admit no namespace -- a worse outcome than no rule, since it
+	// reads as configured OTLP egress that silently carries nothing.
+	agentWithNonDNS1123 := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+			Annotations: map[string]string{
+				AnnotationOTLPCollectorNamespace: "Custom-Collector-NS",
+			},
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Telemetry: &agentv1alpha1.TelemetrySpec{
+				OTLPEndpoint: vendorEndpoint,
+			},
+		},
+	}
+	netpolNonDNS1123 := buildLiteLLMNetworkPolicy(agentWithNonDNS1123, profile)
+	for _, rule := range netpolNonDNS1123.Spec.Egress {
+		for _, p := range rule.Ports {
+			if p.Port != nil && (p.Port.IntVal == 4317 || p.Port.IntVal == 4318) {
+				t.Errorf("expected a non-DNS-1123 AnnotationOTLPCollectorNamespace to be dropped, but found OTLP egress port %d", p.Port.IntVal)
+			}
+		}
+	}
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build-time proof that ``deliver: "chat"`` reaches the Chat Agent relay.
+"""Build-time proof that ``deliver: "chat"`` reaches the chat relay.
 
 Run from ``/opt/hermes`` with the plugin already installed under
 ``plugins/platforms/chat/``. Drives the REAL ``_deliver_result`` against a
@@ -153,12 +153,20 @@ def main() -> None:
     #    The two feedback-prompt knobs take the same route: rendered by the
     #    operator's allowlist, then through this scrub to `feedback_prompt.py`.
     #    Scrubbed, `FEEDBACK_PROMPT_ENABLED=false` on the CR would still render
-    #    and the prompt would post on an install that turned it off.
+    #    and the prompt would post on an install that turned it off. The
+    #    findings queue's pacing limits take it to `findings_nudge.py` and to
+    #    `bootstrap_handoff.py`, which hands them to the first inventory
+    #    report's selection; a scrubbed one would silently fall back to its
+    #    default.
     for name in (
         "SESSION_KV_API_KEY",
         "CRON_REPORT_RELAY_URL",
         "FEEDBACK_PROMPT_ENABLED",
         "FEEDBACK_PROMPT_DELAY",
+        "FINDINGS_FIRST_REPORT_CRITICALS",
+        "FINDINGS_DAILY_CRITICALS",
+        "FINDINGS_NONCRITICAL_MAX",
+        "FINDINGS_NONCRITICAL_AFTER_HOUR",
     ):
         child_env = build_subprocess_env(base={**os.environ, name: "sentinel"})
         check(
@@ -208,7 +216,7 @@ def main() -> None:
         )
         check(
             body.get("report") == report,
-            "the Chat Agent gets the report and none of Hermes' wrapper text",
+            "the relay gets the report and none of Hermes' wrapper text",
         )
 
         # 4. `all` reaches the relay once the home channel is set. Asserted

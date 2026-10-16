@@ -24,11 +24,11 @@
 // credential attached.
 //
 // It builds no Kubernetes client. The caller picks the client type, and this
-// package stops at the configuration every client type is built from. Today
-// the only caller is the event watcher, which wants an informer-backed
-// kubernetes.Interface; the drift detector wants a dynamic.Interface from the
-// same scan, and that is the seam this package exists for, but its fan-in is
-// not wired yet (cmd/drift-detector/cluster.go).
+// package stops at the configuration every client type is built from. The
+// event watcher builds an informer-backed kubernetes.Interface from it and the
+// drift detector a dynamic.Interface (cmd/drift-detector/cluster.go); the
+// detector's scope also lists the identities alone, through ReadIdentities,
+// without addressing anything.
 package clusterprofiles
 
 import (
@@ -43,6 +43,11 @@ import (
 // cluster_identity block. Named here because it is the whole contract between
 // this package and the Python side that writes the profiles.
 const profileConfigFile = "config.yaml"
+
+// ProfileConfigFile is profileConfigFile for a caller that needs to look at
+// the file itself, as the drift detector's scope does to word a drop the
+// listing does not report.
+const ProfileConfigFile = profileConfigFile
 
 // Identity is the cluster_identity block the Platform Agent writes into each
 // Cluster Agent profile's config.yaml. sigs.k8s.io/yaml converts YAML to JSON,
@@ -63,9 +68,11 @@ func (i Identity) String() string {
 	return i.Project + "/" + i.Location + "/" + i.Cluster
 }
 
-// complete reports whether all three parts are present. An incomplete block is
-// "not a cluster profile" rather than a broken one, matching what
-// cluster_agent_profile.read_cluster_identity treats as absent.
+// complete reports whether all three parts are present. To ReadIdentity an
+// incomplete block is "not a cluster profile" rather than a broken one,
+// matching what cluster_agent_profile.read_cluster_identity treats as absent;
+// ReadIdentities tells a block with some parts from one with none, and reports
+// the first, because for the scope it is a cluster profile that names nothing.
 func (i Identity) complete() bool {
 	return i.Cluster != "" && i.Project != "" && i.Location != ""
 }
@@ -75,11 +82,9 @@ type profileConfig struct {
 	ClusterIdentity Identity `json:"cluster_identity"`
 }
 
-// ReadIdentity parses the cluster_identity block out of a profile's
-// config.yaml. Returns nil (not an error) when the file is absent or the block
-// is missing or incomplete — that means "not a cluster profile". A config.yaml
-// that exists but cannot be parsed is a real error.
-func ReadIdentity(path string) (*Identity, error) {
+// readProfileConfig reads a profile's config.yaml. Returns nil (not an error)
+// when the file is absent; a file that cannot be read or parsed is an error.
+func readProfileConfig(path string) (*profileConfig, error) {
 	data, err := os.ReadFile(path) // #nosec G304 -- Path to profile config file supplied via flag / discovery
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -90,6 +95,18 @@ func ReadIdentity(path string) (*Identity, error) {
 	var cfg profileConfig
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return &cfg, nil
+}
+
+// ReadIdentity parses the cluster_identity block out of a profile's
+// config.yaml. Returns nil (not an error) when the file is absent or the block
+// is missing or incomplete — that means "not a cluster profile". A config.yaml
+// that exists but cannot be parsed is a real error.
+func ReadIdentity(path string) (*Identity, error) {
+	cfg, err := readProfileConfig(path)
+	if err != nil || cfg == nil {
+		return nil, err
 	}
 	id := cfg.ClusterIdentity
 	if !id.complete() {

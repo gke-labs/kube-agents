@@ -106,9 +106,22 @@ Four exclusions matter, and all of them are load-bearing:
   blocked on the run — has its claim released and a ``timed_out`` charged to its
   failure budget by its own child.
 
-* **The task's own status.** The board is the authority: if the card is no longer
-  ``running``, a terminal tool already moved it and there is nothing to record.
-  This is what makes a false positive impossible rather than merely unlikely.
+* **The task's own status and run.** The board is the authority: if the card is
+  no longer ``running`` under this worker's run (``HERMES_KANBAN_RUN_ID``), a
+  terminal tool already moved it and there is nothing to record.
+
+  The run matters as much as the status. Nothing stops a worker after its own
+  ``kanban_block`` succeeds: the model reads the result and carries on until it
+  ends a turn in text, and ``block_task`` clears ``worker_pid`` without
+  signalling the process. A ``dependency`` block goes to ``todo`` and back to
+  ``ready`` within seconds, so by the time that worker reaches this backstop
+  the card is ``running`` again under a *new* worker's run. A status-only check
+  then charged the ``timed_out`` to the new run — ``_end_run`` closes whatever
+  run is current — and the new worker's ``kanban_complete``, carrying a
+  finished result, was refused with this module's own error text echoed back.
+  Two of those trip the breaker. PR smoke tests from 2026-09-23 to 2026-10-08
+  showed it on 52 cards (``t_5c64b295``, ``t_a256eb14``, ``t_46c49c08``…), and
+  in all but one the charge came from a worker that had already blocked.
 
   It is also the *only* authority consulted, and that is deliberate. This check
   used to be preceded by ``agent.kanban_stop.session_called_kanban_terminal``,
@@ -206,6 +219,13 @@ DEFAULT_MAX_NUDGES = 2
 
 OUTCOME = "timed_out"
 
+#: How ``_record_task_failure`` closes the run when this charge trips the
+#: breaker, instead of ``OUTCOME``.
+TRIPPED_OUTCOME = "gave_up"
+
+#: ``_record_task_failure`` stores ``error[:500]`` on the run it closes.
+RECORDED_ERROR_MAX_CHARS = 500
+
 DETECTOR = "kanban_guardrail_exit"
 
 #: The kind ``block_task`` files a rate-limit exhaustion under. It is in
@@ -246,11 +266,43 @@ GOAL_MODE_ENV = "HERMES_KANBAN_GOAL_MODE"
 #: goal-mode card; anything else, including unset, is a normal worker.
 GOAL_MODE_ON = "1"
 
+#: How the loop spells a model that stopped with a plain-text answer:
+#: ``text_response(finish_reason=<x>)``.
+TEXT_RESPONSE_EXIT_PREFIX = "text_response"
+
+#: How ``last_failure_error`` opens. It is what an operator reads first (the
+#: CLI shows 160 characters), so it says what happened before it says why.
+#: Neither may contain "protocol violation" (upstream's
+#: ``_protocol_violation_streak`` counts it) or a word ``_RESPAWN_BLOCKER_RE``
+#: matches (``auth…``, ``quota``, ``403``…), which would park the card as an
+#: auth blocker. The retry worker also reads this text, under "Prior
+#: attempts"; it describes and does not instruct, because an instruction there
+#: would change what the retry worker does.
+MISSING_TERMINAL_LEAD = "worker ended without a terminal kanban call"
+TEXT_RESPONSE_LEAD = "model replied in text and made no terminal kanban call"
+
+#: What a text-response exit leaves behind, for the operator.
+TEXT_RESPONSE_CONSEQUENCE = (
+    " The card was not closed and the reply was not saved as its result."
+)
+
 _HALT_SUFFIX = (
     "\n\n[System: `{tool}` is exhausted for the rest of this run "
     "({code}) — every further call will be blocked, so do not try again. "
     "Write up what you already have and call `kanban_complete`, or call "
     "`kanban_block` if what you have is genuinely unusable.]"
+)
+# The halt hermes_cli/permission_refusal_stop.py raises: the tool is not
+# exhausted, the change is refused, and the card closes with that fact.
+PERMISSION_REFUSAL_HALT_CODE = "permission_refusal_halt"
+_REFUSAL_HALT_SUFFIX = (
+    "\n\n[System: the command policy refused this change — a permission "
+    "boundary, not an error to work around. Do not try another route. "
+    "If the card asked for a pull request, propose the change through "
+    "`submit-suggestion` and `kanban_complete` with the refusal quoted; "
+    "otherwise call `kanban_block(kind=\"needs_input\", reason=...)` now with "
+    "what was refused, quoting the policy's message, and a note that the "
+    "change can be proposed as a pull request if the requester wants one.]"
 )
 
 
@@ -274,15 +326,28 @@ def guardrail_halt_nudge(build_nudge, *, messages, attempts, decision):
         return None
     tool = getattr(decision, "tool_name", None) or "that tool"
     code = getattr(decision, "code", None) or "tool guardrail"
+    if code == PERMISSION_REFUSAL_HALT_CODE:
+        return base + _REFUSAL_HALT_SUFFIX
     return base + _HALT_SUFFIX.format(tool=tool, code=code)
 
 
-def missing_terminal_error(turn_exit_reason) -> str:
-    """The ``last_failure_error`` text, which names how the turn actually ended."""
-    return (
-        "worker ended without a terminal kanban call "
-        f"(turn_exit_reason={turn_exit_reason})"
-    )
+def missing_terminal_error(turn_exit_reason, stop_nudges=None) -> str:
+    """The ``last_failure_error`` text: what happened and how the turn ended.
+
+    ``stop_nudges`` is ``agent._kanban_stop_nudges``, the count of synthetic
+    "finish on the board" turns the worker got. It is reported rather than
+    assumed: upstream's stop nudge goes silent after any ``kanban_complete``
+    attempt, refused ones included, so a text exit can follow zero or one
+    nudges as easily as two. The halt nudge shares the counter.
+    """
+    reason = str(turn_exit_reason)
+    text_response = reason.startswith(TEXT_RESPONSE_EXIT_PREFIX)
+    lead = TEXT_RESPONSE_LEAD if text_response else MISSING_TERMINAL_LEAD
+    detail = f"turn_exit_reason={reason}"
+    if stop_nudges is not None:
+        detail += f"; kanban nudges sent: {stop_nudges}"
+    consequence = TEXT_RESPONSE_CONSEQUENCE if text_response else ""
+    return f"{lead} ({detail}).{consequence}"
 
 
 def should_record_missing_terminal(
@@ -353,27 +418,32 @@ def card_is_somebody_elses(*, goal_mode, cron_run, delegated_child) -> bool:
     return bool(goal_mode)
 
 
-def task_is_still_running(conn, task_id: str) -> bool:
-    """Whether the board still shows this card as ``running``.
+def task_is_still_running(conn, task_id: str, run_id=None) -> bool:
+    """Whether the board still shows this card as ``running`` — under
+    ``run_id``, when one is given.
 
     ``kanban_complete`` moves it to ``done`` and ``kanban_block`` to ``blocked``,
     so anything else means a terminal tool ran and the transcript check was
     wrong — most plausibly because compaction dropped the tool call out of
-    ``messages``.
+    ``messages``. A ``running`` card whose ``current_run_id`` is not ``run_id``
+    belongs to a newer worker: this one's run already ended. ``run_id=None``
+    asks nothing about the run, as ``expected_run_id=None`` does upstream.
     """
     try:
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
     except Exception:
         return False
     if row is None:
         return False
     try:
-        status = row["status"]
+        status, current_run_id = row["status"], row["current_run_id"]
     except (TypeError, IndexError, KeyError):
-        status = row[0]
-    return str(status or "") == "running"
+        status, current_run_id = row[0], row[1]
+    if str(status or "") != "running":
+        return False
+    return run_id is None or current_run_id == run_id
 
 
 def record_missing_terminal_call(
@@ -385,6 +455,7 @@ def record_missing_terminal_call(
     block_task=None,
     last_api_failure=None,
     run_id=None,
+    stop_nudges=None,
 ) -> bool:
     """Charge a leaked exit to the card's failure budget. Returns whether it did.
 
@@ -392,7 +463,20 @@ def record_missing_terminal_call(
     is ``hermes_cli.kanban_db_dispatch._record_task_failure``, both injected. The
     ``release_claim`` / ``end_run`` pair is the same one the iteration-budget
     path uses: the card is still ``running`` with an open run, and this hands
-    both back.
+    both back. Upstream's ``_record_task_failure`` closes whatever run is
+    current, so the charge is conditioned on this worker's own run
+    (``run_id``, ``HERMES_KANBAN_RUN_ID``): ``apply_kanban_guardrail_exit``
+    gives it an ``expected_run_id`` that it checks inside its own write
+    transaction, as ``block_task`` does, and a card running under a newer
+    worker's run is left alone. The read before it answers the common case
+    without a write; the check inside the transaction covers a hand-over
+    between the two. ``_record_task_failure``'s own return means "tripped the
+    breaker", not "wrote", so whether the charge landed is read back from the
+    board (``charge_landed``): this worker's own run row, closed with this
+    charge's outcome and error text, and nothing else.
+
+    ``stop_nudges`` (``agent._kanban_stop_nudges``) is reported in the error
+    text; see ``missing_terminal_error``.
 
     One exit is not charged but blocked: ``all_retries_exhausted_no_response``
     when ``last_api_failure`` (the ``(reason, summary)`` pair the loop's error
@@ -422,26 +506,60 @@ def record_missing_terminal_call(
         )
     conn = connect()
     try:
-        if not task_is_still_running(conn, task_id):
+        if not task_is_still_running(conn, task_id, run_id):
             return False
+        error = missing_terminal_error(turn_exit_reason, stop_nudges)
         record_failure(
             conn,
             task_id,
-            error=missing_terminal_error(turn_exit_reason),
+            error=error,
             outcome=OUTCOME,
             release_claim=True,
             end_run=True,
+            expected_run_id=run_id,
             event_payload_extra={
                 "turn_exit_reason": str(turn_exit_reason),
                 "detector": DETECTOR,
             },
         )
-        return True
+        return charge_landed(conn, task_id, run_id, error)
     finally:
         try:
             conn.close()
         except Exception:
             pass
+
+
+def charge_landed(conn, task_id: str, run_id, error: str) -> bool:
+    """Whether the charge just attempted was written, read back from the board.
+
+    With ``run_id``, the answer is this worker's own run row: closed with
+    ``OUTCOME`` (or ``TRIPPED_OUTCOME`` when the charge tripped the breaker)
+    and this charge's error text. The card's status cannot answer it: a
+    charge refused because the card changed hands leaves it ``running`` under
+    the newer run, and that worker can close the card before this read, so
+    "not running" says nothing about who moved it. Without ``run_id`` there is
+    no row to ask, and the card leaving ``running`` is the best signal. A read
+    that fails answers ``False``: say nothing was recorded rather than claim it.
+    """
+    if run_id is None:
+        return not task_is_still_running(conn, task_id)
+    try:
+        row = conn.execute(
+            "SELECT outcome, error FROM task_runs WHERE id = ? AND task_id = ?",
+            (run_id, task_id),
+        ).fetchone()
+    except Exception:
+        return False
+    if row is None:
+        return False
+    try:
+        outcome, run_error = row["outcome"], row["error"]
+    except (TypeError, IndexError, KeyError):
+        outcome, run_error = row[0], row[1]
+    return outcome in (OUTCOME, TRIPPED_OUTCOME) and run_error == error[
+        :RECORDED_ERROR_MAX_CHARS
+    ]
 
 
 def is_rate_limit_failure(failure_reason) -> bool:

@@ -430,5 +430,48 @@ class RenderingTest(unittest.TestCase):
         self.assertIn("GEMINI_API_KEY", log)
 
 
+class PlatformAgentModeTest(unittest.TestCase):
+    """PLATFORM_AGENT_MODE, the PlatformAgent's spec.mode, as the installer's install.env key.
+
+    Mapped so a rendered install.env can carry `next`. `today` and unset must
+    render the file an environment rendered before the key was mapped -- the
+    installer reads an absent key as `today` -- and a value that is not a mode
+    must stop the render before it writes anything.
+    """
+
+    def test_today_renders_exactly_what_unset_renders(self):
+        for settings in (_COORDS, {**_COORDS, **_STRICT_OK}):
+            with self.subTest(strict=settings is not _COORDS):
+                strict = settings is not _COORDS
+                rc_unset, log_unset, unset = render(settings, strict=strict)
+                rc_today, log_today, today = render(
+                    {**settings, "PLATFORM_AGENT_MODE": "today"}, strict=strict
+                )
+                self.assertEqual((rc_unset, rc_today), (0, 0), log_today)
+                self.assertEqual(today, unset)
+                # The log names the temporary output path, which differs per run.
+                path = re.compile(r"\S*/install\.env")
+                self.assertEqual(path.sub("OUT", log_today), path.sub("OUT", log_unset))
+                self.assertNotIn("PLATFORM_AGENT_MODE", today)
+
+    def test_next_is_written_under_the_installers_key(self):
+        rc, log, text = render({**_COORDS, "PLATFORM_AGENT_MODE": "next"})
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(parse(text).get("PLATFORM_AGENT_MODE"), "next")
+        _, _, unset = render(_COORDS)
+        self.assertEqual(
+            [line for line in text.splitlines() if line not in unset.splitlines()],
+            ["PLATFORM_AGENT_MODE=next"],
+        )
+
+    def test_a_value_that_is_not_a_mode_is_refused_before_anything_is_written(self):
+        for value in ("Next", "nxt", "today ", "TODAY"):
+            with self.subTest(value=value):
+                rc, log, text = render({**_COORDS, "PLATFORM_AGENT_MODE": value})
+                self.assertEqual(rc, 1)
+                self.assertEqual(text, "")
+                self.assertIn("::error title=PLATFORM_AGENT_MODE is not a mode::", log)
+
+
 if __name__ == "__main__":
     unittest.main()

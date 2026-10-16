@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Wire tools/kanban_children_settled.py into the Hermes source tree.
 
-Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Two anchored
+Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Three anchored
 edits in ``tools/kanban_tools.py`` plus an import trailer:
 
 * the ``kanban_create`` handler gains ``_kanban_record_worker_child`` right
@@ -13,7 +13,10 @@ edits in ``tools/kanban_tools.py`` plus an import trailer:
   ``kanban_result_required``'s result gate — refusing the completion outright
   is the more fundamental answer than critiquing the result's emptiness, and
   going first means the worker's one result-nudge is not spent on a
-  completion that was never going to be accepted.
+  completion that was never going to be accepted;
+* the ``kanban_block`` handler gains the dependency-block gate immediately
+  before upstream's ``kb.block_task`` call, after the kind and goal-mode
+  checks, so a block those would refuse is still refused for their reason.
 
 **Ordering: this applier must run AFTER ``apply_kanban_result_required.py``.**
 The completion anchor IS ``kanban_result_required.NEW_GATE``, imported, so a
@@ -66,6 +69,14 @@ COMPLETE_GATE = (
     "    )\n"
     "    if _children_err:\n"
     "        return tool_error(_children_err)\n"
+    "    # kube-agents patch: a card whose declared steps are not all done has\n"
+    "    # not delivered what it names (#2935, #2939). See\n"
+    "    # tools/kanban_children_settled.py.\n"
+    "    _steps_err = _require_steps_settled(\n"
+    "        tid, _kanban_children_connect, result\n"
+    "    )\n"
+    "    if _steps_err:\n"
+    "        return tool_error(_steps_err)\n"
 )
 
 # Appended rather than inserted: every name is resolved when a tool handler
@@ -74,6 +85,25 @@ COMPLETE_GATE = (
 # hermes_cli.kanban_db_connect, where upstream moved it in the Sep 2026
 # decomposition; the old hermes_cli.kanban_db path is a plugin-compat shim
 # that warns and is scheduled for removal.
+# The kanban_block handler's write: inside `with _board(...) as (kb, conn)`,
+# after the kind and goal-mode checks. Anchored on upstream's line.
+BLOCK_ANCHOR = (
+    "        ok = kb.block_task(conn, tid, reason=reason, kind=kind, "
+    "expected_run_id=_worker_run_id(tid))\n"
+)
+
+BLOCK_GATE = (
+    "        # kube-agents patch: a dependency block on a card with nothing\n"
+    "        # unfinished to wait on re-queues it to a fresh worker that can't\n"
+    "        # see this one's work (#2610, #250/#251). See\n"
+    "        # tools/kanban_children_settled.py.\n"
+    "        _dependency_err = _refuse_idle_dependency_block(\n"
+    "            tid, kind, conn, _worker_run_id(tid)\n"
+    "        )\n"
+    "        if _dependency_err:\n"
+    "            return tool_error(_dependency_err)\n"
+) + BLOCK_ANCHOR
+
 TRAILER = (
     "\n\n# kube-agents patch: see tools/kanban_children_settled.py\n"
     "from hermes_cli.kanban_db_connect import (  # noqa: E402\n"
@@ -81,7 +111,9 @@ TRAILER = (
     ")\n"
     "from tools.kanban_children_settled import (  # noqa: E402\n"
     "    maybe_record_worker_child as _kanban_record_worker_child,\n"
+    "    refuse_idle_dependency_block as _refuse_idle_dependency_block,\n"
     "    require_children_settled as _require_children_settled,\n"
+    "    require_steps_settled as _require_steps_settled,\n"
     ")\n"
 )
 
@@ -95,13 +127,16 @@ def apply(root: Path) -> None:
     patch.refuse_if_patched(
         "_kanban_record_worker_child(conn, new_tid)",
         "_require_children_settled(",
+        "_refuse_idle_dependency_block(",
+        "_require_steps_settled(",
     )
     patch.substitute(CREATE_ANCHOR, CREATE_HOOK, label="create attribution hook")
     patch.substitute(
         RESULT_GATE, COMPLETE_GATE + RESULT_GATE, label="completion gate"
     )
+    patch.substitute(BLOCK_ANCHOR, BLOCK_GATE, label="dependency block gate")
     patch.append(TRAILER)
-    patch.commit("2 anchors")
+    patch.commit("3 anchors")
 
 
 if __name__ == "__main__":

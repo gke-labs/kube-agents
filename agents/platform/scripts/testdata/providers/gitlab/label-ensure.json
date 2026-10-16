@@ -1,0 +1,24 @@
+{
+  "payload": {
+    "name": "status:in-progress",
+    "color": "fbca04",
+    "description": "Being worked by the agent"
+  },
+  "responses": [
+    {
+      "__status__": 404,
+      "__detail__": "404 Label Not Found"
+    },
+    {
+      "id": 41000001,
+      "name": "status:in-progress",
+      "color": "#fbca04",
+      "description": "Being worked by the agent",
+      "text_color": "#333333",
+      "open_issues_count": 0,
+      "open_merge_requests_count": 0,
+      "subscribed": false,
+      "priority": null
+    }
+  ]
+}

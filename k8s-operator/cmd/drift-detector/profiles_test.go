@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -167,7 +169,7 @@ func TestIdentityFromProfileDoesNotTransposeLocationAndCluster(t *testing.T) {
 // treats as fatal. Without the guard a detector that simply did not ask for the
 // fan-in would refuse to start.
 func TestDiscoverProfileClustersWithNoDirectoryConfigured(t *testing.T) {
-	scan, err := discoverProfileClusters(context.Background(), "", "example-project", nil)
+	scan, err := discoverProfileClusters(context.Background(), "", nil)
 	if err != nil {
 		t.Fatalf("discoverProfileClusters(\"\") returned error: %v -- an unset --profiles-dir is not a missing directory", err)
 	}
@@ -184,7 +186,7 @@ func TestDiscoverProfileClustersFatalOnAMissingDirectory(t *testing.T) {
 	stubGKE(t)
 	missing := filepath.Join(t.TempDir(), "not-created-yet")
 
-	_, err := discoverProfileClusters(context.Background(), missing, "example-project", nil)
+	_, err := discoverProfileClusters(context.Background(), missing, nil)
 	if err == nil {
 		t.Fatal("discoverProfileClusters returned no error for a missing --profiles-dir")
 	}
@@ -199,7 +201,7 @@ func TestDiscoverProfileClustersBuildsOneReaderPerProfile(t *testing.T) {
 	writeClusterProfile(t, dir, "cluster-example-project-prod-a-us-central1", "example-project", "prod-a", "us-central1")
 	writeClusterProfile(t, dir, "cluster-example-project-prod-b-europe-west1", "example-project", "prod-b", "europe-west1")
 
-	scan, err := discoverProfileClusters(context.Background(), dir, "example-project", nil)
+	scan, err := discoverProfileClusters(context.Background(), dir, nil)
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v", err)
 	}
@@ -244,7 +246,7 @@ func TestDiscoverProfileClustersLiftsTheClientSideThrottle(t *testing.T) {
 	dir := t.TempDir()
 	writeClusterProfile(t, dir, "cluster-example-project-prod-a-us-central1", "example-project", "prod-a", "us-central1")
 
-	scan, err := discoverProfileClusters(context.Background(), dir, "example-project", nil)
+	scan, err := discoverProfileClusters(context.Background(), dir, nil)
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v", err)
 	}
@@ -264,22 +266,20 @@ func TestDiscoverProfileClustersLiftsTheClientSideThrottle(t *testing.T) {
 	}
 }
 
-// A project-level sink carries records from one project, so a profile for a
-// cluster elsewhere -- which the Platform Agent legitimately writes, since a
-// fleet can span projects -- can never match a record. Registering it would mint
-// a token for a cluster that is unreachable by definition, and hide the case
-// worth seeing: --project pointed at the wrong project.
-func TestDiscoverProfileClustersDropsClustersOutsideTheProject(t *testing.T) {
+// A profile for a cluster in another project is registered like any other.
+// Which projects' records reach the subscription is decided by the sinks
+// feeding it, not by --project, which names the project holding the
+// subscription; a record naming a cluster elsewhere can be joined only through
+// that cluster's profile, which the Platform Agent writes for every cluster the
+// install's scope resolves to. The foreign cluster is addressed -- a GKE
+// describe in its own project -- because the scope grant that let the
+// reconcile write the profile is the one that answers it.
+func TestDiscoverProfileClustersRegistersProfilesFromEveryProject(t *testing.T) {
 	stubGKE(t)
-	// Wrapped so the test can see which clusters were addressed, not only which
-	// were registered. The drop has to happen before the GKE call: the pod's
-	// identity may hold no container.clusters.get in the other project, and a
-	// describe that fails there would be reported as a permission error against
-	// a cluster this detector was going to discard regardless.
-	described := []string{}
+	described := map[string]bool{}
 	inner := profilesDiscovery.Describe
 	profilesDiscovery.Describe = func(ctx context.Context, id clusterprofiles.Identity) (*container.Cluster, error) {
-		described = append(described, id.String())
+		described[id.String()] = true
 		return inner(ctx, id)
 	}
 
@@ -288,28 +288,30 @@ func TestDiscoverProfileClustersDropsClustersOutsideTheProject(t *testing.T) {
 	writeClusterProfile(t, dir, "cluster-example-project-prod-a-us-central1", "example-project", "prod-a", "us-central1")
 	writeClusterProfile(t, dir, "cluster-other-project-prod-b-us-central1", "other-project", "prod-b", "us-central1")
 
-	scan, err := discoverProfileClusters(context.Background(), dir, "example-project", nil)
+	scan, err := discoverProfileClusters(context.Background(), dir, nil)
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v", err)
 	}
-	clusters, skipped := scan.Clusters, scan.Skipped
-	if len(clusters) != 1 {
-		t.Fatalf("discovered %d clusters, want 1 -- the other project's profile was registered", len(clusters))
+	if len(scan.Clusters) != 2 {
+		t.Fatalf("discovered %d clusters, want 2 -- a profile outside the subscription's project was dropped", len(scan.Clusters))
 	}
-	if clusters[0].Identity.Project != "example-project" {
-		t.Errorf("registered %v, want the --project cluster", clusters[0].Identity)
+	registered := map[string]bool{}
+	for _, c := range scan.Clusters {
+		registered[c.Identity.Project] = true
 	}
-	if skipped != 1 {
-		t.Errorf("skipped = %d, want 1 -- a dropped profile has to be counted, or a fan-in that reached one of two looks like a fleet of one", skipped)
+	if !registered["example-project"] || !registered["other-project"] {
+		t.Errorf("registered projects %v, want both example-project and other-project", registered)
 	}
-	for _, want := range []string{"other-project/us-central1/prod-b", "outside --project"} {
-		if !strings.Contains(logs.String(), want) {
-			t.Errorf("log does not mention %q:\n%s", want, logs.String())
+	if scan.Skipped != 0 {
+		t.Errorf("skipped = %d, want 0 -- nothing was declined", scan.Skipped)
+	}
+	if strings.Contains(logs.String(), "outside --project") {
+		t.Errorf("log still reports a drop on the project:\n%s", logs.String())
+	}
+	for _, want := range []string{"example-project/us-central1/prod-a", "other-project/us-central1/prod-b"} {
+		if !described[want] {
+			t.Errorf("GKE describe not called for %s (called for %v) -- the foreign cluster was never addressed", want, described)
 		}
-	}
-	// The point of the Want predicate: the foreign cluster is never addressed.
-	if len(described) != 1 || described[0] != "example-project/us-central1/prod-a" {
-		t.Errorf("GKE describe called for %v, want only the --project cluster -- the drop is happening after the cluster is addressed, not before", described)
 	}
 }
 
@@ -342,7 +344,7 @@ func TestDiscoverProfileClustersDeclinesTheProfileForTheDirectlyReachedCluster(t
 	writeClusterProfile(t, dir, "cluster-example-project-prod-b-europe-west1", "example-project", "prod-b", "europe-west1")
 
 	direct := clusterIdentity{Project: "example-project", Location: "us-central1", Cluster: "prod-a"}
-	scan, err := discoverProfileClusters(context.Background(), dir, "example-project", &direct)
+	scan, err := discoverProfileClusters(context.Background(), dir, &direct)
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v", err)
 	}
@@ -377,7 +379,7 @@ func TestDiscoverProfileClustersKeepsThatProfileWithNoDirectCredentials(t *testi
 	dir := t.TempDir()
 	writeClusterProfile(t, dir, "cluster-example-project-prod-a-us-central1", "example-project", "prod-a", "us-central1")
 
-	scan, err := discoverProfileClusters(context.Background(), dir, "example-project", nil)
+	scan, err := discoverProfileClusters(context.Background(), dir, nil)
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v", err)
 	}
@@ -413,7 +415,7 @@ func TestDiscoverProfileClustersSkipsAProfileWhoseClientWillNotBuild(t *testing.
 	writeClusterProfile(t, dir, "good", "example-project", "prod-a", "us-central1")
 	writeClusterProfile(t, dir, "bad", "example-project", "prod-b", "europe-west1")
 
-	scan, err := discoverProfileClusters(context.Background(), dir, "example-project", nil)
+	scan, err := discoverProfileClusters(context.Background(), dir, nil)
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v -- one bad profile is a skip, not a fatal", err)
 	}
@@ -453,7 +455,7 @@ func TestDiscoverProfileClustersDegradesOnAnUnreadableDirectory(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 
-	scan, err := discoverProfileClusters(context.Background(), dir, "example-project", nil)
+	scan, err := discoverProfileClusters(context.Background(), dir, nil)
 	if err != nil {
 		t.Fatalf("discoverProfileClusters returned error: %v -- an unreadable dir degrades, it is not fatal", err)
 	}
@@ -550,7 +552,7 @@ func TestJoinRoutesEachRecordToItsOwnCluster(t *testing.T) {
 	getterA := &stubGetter{obj: managedFieldsObject(entry("kubectl-edit", "Update", "", `{"f:spec":{}}`, nil))}
 	getterB := &stubGetter{obj: managedFieldsObject(entry("kubectl-edit", "Update", "", `{"f:spec":{}}`, nil))}
 
-	j := newJoiner(map[clusterIdentity]objectGetter{a: getterA, b: getterB}, nil,
+	j := newJoiner(map[clusterIdentity]objectGetter{a: getterA, b: getterB}, nil, nil, nil,
 		func(context.Context, DriftEvent) {})
 
 	recordA := joinRecord()
@@ -581,7 +583,7 @@ func TestJoinRoutesEachRecordToItsOwnCluster(t *testing.T) {
 func TestJoinRefusesAPartialIdentityEvenWhenItIsAKey(t *testing.T) {
 	partial := clusterIdentity{Project: "example-project"}
 	getter := &stubGetter{obj: managedFieldsObject()}
-	j := newJoiner(map[clusterIdentity]objectGetter{partial: getter}, nil, func(context.Context, DriftEvent) {})
+	j := newJoiner(map[clusterIdentity]objectGetter{partial: getter}, nil, nil, nil, func(context.Context, DriftEvent) {})
 
 	record := joinRecord()
 	record.Location = ""
@@ -603,7 +605,7 @@ func TestJoinRefusesAPartialIdentityEvenWhenItIsAKey(t *testing.T) {
 }
 
 func TestUnreachableClustersNamesThemMostFrequentFirst(t *testing.T) {
-	j := newJoiner(nil, nil, func(context.Context, DriftEvent) {})
+	j := newJoiner(nil, nil, nil, nil, func(context.Context, DriftEvent) {})
 
 	record := joinRecord()
 	j.Handle(context.Background(), record)
@@ -624,11 +626,11 @@ func TestUnreachableClustersNamesThemMostFrequentFirst(t *testing.T) {
 }
 
 // An outcome that is not unreachable must not name a cluster: a lookup that
-// failed on RBAC is a cluster the join reached, and listing it under
-// "no credentials and no Cluster Agent profile" would send an operator to
-// onboard a cluster that is already onboarded.
+// failed on RBAC is a cluster the join reached, and listing it among the
+// clusters the join could not read would send an operator to look for a
+// credential a cluster already has.
 func TestUnreachableClustersExcludesTheClustersTheJoinReached(t *testing.T) {
-	j := newJoiner(joinSet(&stubGetter{err: errors.New("forbidden")}), nil, func(context.Context, DriftEvent) {})
+	j := newJoiner(joinSet(&stubGetter{err: errors.New("forbidden")}), nil, nil, nil, func(context.Context, DriftEvent) {})
 	j.Handle(context.Background(), joinRecord())
 
 	if got := j.Counts().Failed; got != 1 {
@@ -644,7 +646,7 @@ func TestUnreachableClustersExcludesTheClustersTheJoinReached(t *testing.T) {
 // behaviour as classify.go's principal list: a cluster already counted keeps
 // counting past the cap, and only a new name folds into the overflow bucket.
 func TestUnreachableClustersCapsTheNameSet(t *testing.T) {
-	j := newJoiner(nil, nil, func(context.Context, DriftEvent) {})
+	j := newJoiner(nil, nil, nil, nil, func(context.Context, DriftEvent) {})
 
 	record := joinRecord()
 	for i := 0; i < maxUnreachableClusters; i++ {
@@ -675,5 +677,78 @@ func TestUnreachableClustersCapsTheNameSet(t *testing.T) {
 	}
 	if strings.Contains(joined, "past-the-cap-") {
 		t.Errorf("a new name past the cap was stored:\n%s", joined)
+	}
+}
+
+// With the credential proxy named in the environment, the zero discovery seam
+// describes through the proxy and each profile cluster's config addresses the
+// proxy's route for it, with the projected token and the join's throttle --
+// and Application Default Credentials, pointed at a missing file, are never
+// read.
+func TestDiscoverProfileClustersThroughTheBroker(t *testing.T) {
+	saved := profilesDiscovery
+	t.Cleanup(func() { profilesDiscovery = saved })
+	profilesDiscovery = clusterprofiles.Discoverer{}
+	var (
+		mu       sync.Mutex
+		requests []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path+" "+r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/v1/watcher/gcp/container.googleapis.com/") {
+			// Usable addressing, as a real describe carries: discovery checks it,
+			// and the broker's config ignores it.
+			fmt.Fprint(w, `{"name":"prod","endpoint":"10.0.0.1","controlPlaneEndpointsConfig":{"dnsEndpointConfig":{"allowExternalTraffic":true,"endpoint":"prod.example.internal"}}}`)
+			return
+		}
+		fmt.Fprint(w, `{"kind":"EventList","apiVersion":"v1","metadata":{},"items":[]}`)
+	}))
+	defer srv.Close()
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("sa-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "no-such-adc.json"))
+	t.Setenv(clusterprofiles.BrokerURLEnv, srv.URL)
+	t.Setenv(clusterprofiles.BrokerTokenFileEnv, tokenFile)
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-example-project-prod-us-central1", "example-project", "prod", "us-central1")
+
+	scan, err := discoverProfileClusters(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatalf("discoverProfileClusters: %v", err)
+	}
+	if scan.Skipped != 0 || len(scan.Clusters) != 1 {
+		t.Fatalf("got %d clusters, %d skipped; want 1 and 0", len(scan.Clusters), scan.Skipped)
+	}
+	cfg := scan.Clusters[0].Config
+	if want := srv.URL + "/v1/k8s/example-project/us-central1/prod"; cfg.Host != want {
+		t.Errorf("Host = %q, want %q", cfg.Host, want)
+	}
+	if cfg.BearerTokenFile != tokenFile || cfg.QPS != joinClientQPS {
+		t.Errorf("BearerTokenFile = %q QPS = %v, want %q and %v", cfg.BearerTokenFile, cfg.QPS, tokenFile, joinClientQPS)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := "GET /v1/watcher/gcp/container.googleapis.com/v1/projects/example-project/locations/us-central1/clusters/prod Bearer sa-token"
+	if len(requests) != 1 || requests[0] != want {
+		t.Errorf("requests = %v, want [%s]", requests, want)
+	}
+}
+
+// Half the pair stops the scan rather than falling back to the pod's own
+// Google identity.
+func TestDiscoverProfileClustersRefusesHalfABroker(t *testing.T) {
+	stubGKE(t)
+	t.Setenv(clusterprofiles.BrokerURLEnv, "")
+	t.Setenv(clusterprofiles.BrokerTokenFileEnv, "/var/run/token")
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-example-project-prod-us-central1", "example-project", "prod", "us-central1")
+	if _, err := discoverProfileClusters(context.Background(), dir, nil); err == nil ||
+		!strings.Contains(err.Error(), clusterprofiles.BrokerURLEnv) {
+		t.Errorf("discoverProfileClusters error = %v, want one naming %s", err, clusterprofiles.BrokerURLEnv)
 	}
 }

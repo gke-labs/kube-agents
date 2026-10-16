@@ -19,6 +19,7 @@ package controller
 import (
 	"fmt"
 	"path"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -652,6 +653,31 @@ func TestShellSandboxCredentialProxyURLIsOptional(t *testing.T) {
 	}
 }
 
+// The collectors cannot see the scope snapshot from this pod, so the operator
+// tells them whether a boundary exists at all: with one, a run without the
+// fleet_scope tool's flags refuses to list rather than sweeping every project
+// the identity can see.
+func TestShellSandboxScopeDeclaredEnv(t *testing.T) {
+	read := func(agent *agentv1alpha1.PlatformAgent) string {
+		sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
+		for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == envScopeDeclared {
+				return env.Value
+			}
+		}
+		t.Fatalf("%s is not set on the sandbox container; the collectors read it", envScopeDeclared)
+		return ""
+	}
+	if got := read(shellSandboxTestAgent()); got != "false" {
+		t.Errorf("%s = %q without a scope block, want false", envScopeDeclared, got)
+	}
+	declared := shellSandboxTestAgent()
+	declared.Spec.Scope = &agentv1alpha1.ScopeSpec{}
+	if got := read(declared); got != "true" {
+		t.Errorf("%s = %q with a present, empty scope block (the host-only boundary), want true", envScopeDeclared, got)
+	}
+}
+
 func TestShellSandboxHostContextAndGKEEnv(t *testing.T) {
 	agent := shellSandboxTestAgent()
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
@@ -1174,10 +1200,13 @@ func TestAgentPodStagesTheClientKey(t *testing.T) {
 	}
 }
 
-// The Hermes base image ships HERMES_WRITE_SAFE_ROOT=/opt/data. Left alone with the
-// sandbox on, agent/file_safety.py refuses every sandbox path and permits only one
-// that does not exist there, so write_file and patch fail for everything — observed
-// on a live install before this was added.
+// The Hermes base image ships HERMES_WRITE_SAFE_ROOT=/opt/data. With the sandbox on,
+// file_safety.py checks the path prefix in the agent process before routing writes.
+// Since durable work is pinned to shellSandboxDataPath (/opt/data) via TERMINAL_CWD,
+// the ephemeral home (/home/agent) is not a durable or supported write destination
+// (see #2180/#2245 for making it root-owned in the image). HERMES_WRITE_SAFE_ROOT
+// names only shellSandboxDataPath (#2284), refusing write attempts naming /home/agent/...
+// upfront at the gateway's prefix check and omitting /home/agent from refusal errors.
 func TestSandboxRepointsTheWriteSafeRoot(t *testing.T) {
 	safeRoot := func(pod corev1.PodSpec) (string, bool) {
 		for _, c := range pod.Containers {
@@ -1198,21 +1227,9 @@ func TestSandboxRepointsTheWriteSafeRoot(t *testing.T) {
 	if !found {
 		t.Fatal("expected HERMES_WRITE_SAFE_ROOT on the sandboxed agent container")
 	}
-	want := shellSandboxDataPath + ":" + shellSandboxHomePath
+	want := shellSandboxDataPath
 	if got != want {
 		t.Errorf("write safe root = %q, want %q", got, want)
-	}
-	// The sandbox's data volume carries the agent pod's /opt/data path on purpose,
-	// so the old check — that the safe root no longer names /opt/data — no longer
-	// distinguishes anything. What still has to hold is that every entry resolves
-	// inside the sandbox: file_safety.py compares the prefix in the agent process,
-	// and a path that exists only in the agent pod would let write_file accept a
-	// write the ssh backend then makes on the far side, or refuse one it should
-	// allow.
-	for _, p := range strings.Split(got, ":") {
-		if p != shellSandboxDataPath && p != shellSandboxHomePath {
-			t.Errorf("write safe root entry %q is not a sandbox path", p)
-		}
 	}
 }
 
@@ -1478,6 +1495,33 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape(
 	}
 }
 
+// TestCredentialProxyNetworkPolicyAdmitsSessionPodsOnlyUnderTheFlag: a third
+// caller peer on the credentialed port, present exactly when the view is on.
+func TestCredentialProxyNetworkPolicyAdmitsSessionPodsOnlyUnderTheFlag(t *testing.T) {
+	agent := shellSandboxTestAgent()
+	agent.Spec.Mode = ptr.To("next")
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 2 {
+		t.Fatalf("flag off: %d caller peers, want 2", got)
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	in := buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0]
+	if len(in.From) != 3 {
+		t.Fatalf("flag on: %d caller peers, want 3", len(in.From))
+	}
+	peer := in.From[2]
+	if peer.PodSelector == nil || peer.NamespaceSelector != nil || peer.IPBlock != nil {
+		t.Fatalf("session peer reaches outside the namespace: %#v", peer)
+	}
+	want := map[string]string{labelPartOf: a2aPartOf, "app.kubernetes.io/component": a2aSessionComponent}
+	if !reflect.DeepEqual(peer.PodSelector.MatchLabels, want) {
+		t.Fatalf("session peer selector = %v, want %v", peer.PodSelector.MatchLabels, want)
+	}
+	if len(in.Ports) != 1 || in.Ports[0].Port.IntValue() != credentialProxyPort {
+		t.Fatalf("session peer admitted on %#v, want %d only", in.Ports, credentialProxyPort)
+	}
+}
+
 func TestCredentialProxyNetworkPolicySelectsItsOwnPod(t *testing.T) {
 	// The policy, the Service, and the Deployment agree on one label set, or the
 	// policy constrains a pod that does not exist while the real one is open.
@@ -1642,6 +1686,9 @@ func TestExtraVolumeMountsCannotNameTheBrokersVolumes(t *testing.T) {
 		"credential-proxy-policy",
 		"credential-proxy-runtime",
 		"credential-proxy-ksa-token",
+		// The watchers' broker token: mounted into the agent container it
+		// would hand the model the broker's watcher role.
+		watcherTokenVolume,
 	} {
 		t.Run(name, func(t *testing.T) {
 			agent := federatedTestAgent()

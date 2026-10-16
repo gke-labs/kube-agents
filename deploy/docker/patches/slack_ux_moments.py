@@ -1,0 +1,726 @@
+"""Post the moments a Slack thread should not miss as messages of their own.
+
+Installed into the image at ``/opt/hermes/gateway/slack_ux_moments.py``.
+``gateway/kanban_progress_lines.py`` calls it for a Slack card when
+``KAGE_SLACK_UX`` is on, and ``apply_slack_ux_moments.py`` has every notifier
+wake's text pass through :func:`wake_text`, flag on or off. That function does
+not read the flag: with it off no question was posted, so the wake text comes
+back unchanged. What the messages look like is
+``agents/platform/scripts/slack_moments.py``.
+
+Upstream, and why it changes
+----------------------------
+**A pull request opened.** A worker that opens a PR says so in a progress note
+or its report, so the link sits on a plan row or inside the report, where it
+reads like any other step. With the flag on, the PR also posts as its own
+message with "Open PR" and "Files changed" buttons, once per PR per thread for
+the life of the process (a restart forgets). It posts from the card's
+``pr_opened`` event (:func:`pr_event`): the ``pr_opened`` plugin
+(``agents/platform/plugins/pr_opened``) records one on the worker's card
+whenever the broker's ``proposal-create`` answers with a new proposal and the
+forge confirms the agent's own credential authored it, so the worker's
+wording decides nothing. :func:`pr_opened` reads a note or report
+saying a PR was opened, as the fallback for one opened any other way; the two
+share one record of what each thread was shown, so a PR posts once whichever
+path reaches it first. A GitLab merge request gets the same message, with
+"Open MR" for its first button, when it is on gitlab.com or on the host of a
+GitLab entry in the mounted ``managed_repos`` file (the GitOps repository and
+the managed ones), which is read only for a text holding a merge request url.
+
+**A question the work waits on.** A card blocked with ``kind: needs_input``
+reaches the thread as "⏸ <head> blocked: <reason>", clipped to 160
+characters, and the ``blocked`` wake has the Planning Agent explain it, so
+the thread gets the question twice, once as a paraphrase. With the flag on,
+:func:`needs_you` instead posts the reason as a question: the first line in
+bold (plain if bold would drop a ``*``), the rest below (clipped at 2,000
+characters), a choice button per option the question ends with, and "waiting
+on you". Buttons need the card's thread, since a click answers in the thread
+it was clicked in; a card with no thread keeps its options as text.
+The wake still runs, since it is how the Planning Agent learns which card an
+answer belongs to, but :func:`wake_text` adds a note that the question is
+already posted, so it says nothing now and only takes the answer, typed or
+clicked (``gateway/slack_ux_clicks.py``), to the card with ``kanban_comment``
+and ``kanban_unblock``, and says nothing after that either: the question
+shows who answered and what. A click's turn names the card, which
+:func:`question_card` looks up. A typed answer can open a session the wake
+never reached, which knows the thread only by reading it back, so the
+question's ``text`` names the card too, above its buttons' "Reply with one
+of:" line: the adapter reads a thread back through ``text``, and Slack does
+not render ``text`` beside the blocks; it is the fallback for notifications
+and anywhere blocks cannot render. Other block kinds keep the line.
+
+When the card moves on, any event of it, :func:`settle_question` takes the
+buttons and "waiting on you" off the question, so a typed answer does not
+leave them live. An event that means the card resumed (:data:`ANSWERED_KINDS`)
+also reads the thread for that answer: the first reply after the question
+from a person the adapter would answer, not a bot, and through its channel gate,
+that no other question in the thread was shown with, and for a question retried
+after the card asked again, before the card's next question it still holds, becomes
+the same "✓ <name>: <words>" line a click leaves (the words as plain text on
+one line, without the agent's own mentions it opens with, any other unlabeled one as ``@`` and
+the person's name, clipped to ``TYPED_ANSWER_MAX``).
+A card that moved on any other way, or with nobody replying, a read that fails, or a question a click answered whose rewrite
+failed (the click posted its line in the thread) settles without the line. A question a click already answered
+was rewritten by the click and is left alone, as is one whose rewrite is still
+in flight, until the card's next event; one whose rewrite failed is settled here. The
+notifier delivers at least once, so a ``blocked`` event replayed after its
+question posted (:func:`asked`) neither settles nor reposts it. A question
+whose settle failed when the card asked again is kept and retried with the
+card's next settle, and one whose card resumed before a failed settle still reads
+its answer on the retry, whatever event brings it. The open questions are held in process, so a restart
+leaves the buttons of any it forgot.
+
+Each moment carries a side bar, green for a PR and yellow for a question: a
+legacy attachment holding every block below the headline. A settle sends the
+attachment again, since ``chat.update`` would otherwise keep the old one, buttons
+and all; a question settled down to its headline alone loses the bar.
+
+Under ``spec.mode: next`` a card reaches the thread through the kanban
+notifier's chat.notify stand-in (``kanban_chat_notify``), which has no Slack
+client. The same moments go out as ``kube-agents.chat/v1`` messages
+(``agents/platform/scripts/chat_message.py``): the PR card once per thread and
+url, and the question with the ``update`` key ``question-<card>-<blocked event id>``, so a
+card that asks again, before or after a restart, posts a new question, whose choices
+reply with the option and the card, as a click does here. Its settle is the
+same key with the choices gone; reading a typed answer back from the thread
+needs a Slack client, so the question settles without the answered line.
+
+Fail-soft: a moment that cannot be posted is logged, and the caller falls back
+to what it did before.
+"""
+
+from __future__ import annotations
+
+import itertools
+import logging
+import os
+import re
+import uuid
+from collections import OrderedDict
+from collections.abc import Iterable
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+try:
+    import slack_moments as _moments
+    import slack_presenter as _presenter
+except ImportError:  # the scripts directory is not on PYTHONPATH
+    _moments = None
+    _presenter = None
+try:
+    import chat_message as _chat
+except ImportError:  # the scripts directory is not on PYTHONPATH, or predates it
+    _chat = None
+
+try:
+    import gitops_workspace as _gitops
+    import repo_ref as _repo_ref
+except ImportError:  # not staged for the image-build check: gitlab.com only
+    _gitops = None
+    _repo_ref = None
+
+#: The ``type`` of a ``managed_repos`` entry on GitLab, as in
+#: ``gitops_workspace.FORGE_PROPOSAL_NOUNS``. The host of each such entry is one
+#: whose merge requests may be announced besides gitlab.com.
+GITLAB_REPO_TYPE = "gitlab"
+
+#: The flag, read here only to word the warning when the renderer is missing.
+FLAG_ENV = "KAGE_SLACK_UX"
+#: Hex characters of the per-process nonce in a question's fallback ``update`` key.
+KEY_NONCE_CHARS = 8
+
+#: ``slack_presenter.FLAG_ON_VALUES``, copied because the warning below fires
+#: exactly when that module cannot be imported. Unset is on there too.
+FLAG_ON_VALUES = frozenset({"1", "true", "yes", "on"})
+
+#: The block kind that asks the user something; the others are not questions.
+NEEDS_INPUT = "needs_input"
+
+#: The event kind a posted question arrives as, and the one its wake is for.
+BLOCKED_KIND = "blocked"
+
+#: Added to the ``blocked`` wake when the question is already posted.
+WAKE_NOTE = (
+    "The specialist's question is already posted to the user as its own message, in the "
+    "specialist's words. Do not restate, paraphrase or acknowledge it. If nothing else "
+    "in this notification needs saying, reply with exactly [SILENT]. When the user answers, "
+    "typed or clicked, carry the answer to the card with kanban_comment, then kanban_unblock."
+)
+#: Added after :data:`WAKE_NOTE` for a question in a thread, the only place its answered line shows.
+WAKE_NOTE_ANSWERED = (
+    "Once kanban_unblock succeeds, reply with exactly [SILENT] unless they also asked something "
+    "else: the question already shows who answered and what. If it failed, say so."
+)
+
+#: The answered line a typed answer gets, as ``slack_ux_clicks.CLICKED``, and the
+#: name it shows when the answerer's name lookup raises.
+ANSWERED = "✓ {who}: {label}"
+NAMELESS = "Someone"
+
+#: The card events that mean its question was answered: it was unblocked, so it resumed.
+#: Any other (archived, dragged to done, gave up) settles the question without a typed line.
+ANSWERED_KINDS = frozenset({"unblocked", "heartbeat"})
+#: What :func:`settle_question` assumes when it is not told the event.
+UNBLOCKED_KIND = "unblocked"
+
+#: A typed answer's words on its answered line are clipped to this.
+TYPED_ANSWER_MAX = 80
+
+#: Slack's most replies one ``conversations.replies`` page returns; the settle reads one
+#: page after a question, looking for its typed answer.
+REPLIES_READ_MAX = 1000
+
+#: The reply subtypes a person typing leaves, besides none: "also send to channel", a file
+#: with a comment, a ``/me``. A join or any other event in the thread is not an answer.
+TYPED_SUBTYPES = frozenset({"thread_broadcast", "file_share", "me_message"})
+
+#: A Slack entity in a reply's text: a link, a mention or a special mention, with an optional label.
+SLACK_ENTITY = re.compile(r"<([^<>|]*)(?:\|([^<>]*))?>")
+
+#: An unlabeled user mention inside a reply's words, shown as ``@`` and the person's name.
+USER_MENTION = re.compile(r"<@([A-Z0-9]+)>")
+#: The most distinct mentions a reply's names are looked up for. Each shows as at least ``@``
+#: and one character, so a later one starts past ``TYPED_ANSWER_MAX`` and is clipped off.
+MENTIONS_NAMED_MAX = TYPED_ANSWER_MAX // 2
+#: The characters that would end an entity's label early, read as spaces in a name put in one.
+MENTION_LABEL_UNSAFE = str.maketrans("|<>", "   ")
+
+#: A user mention a reply opens with, and the separators around it. The agent's, which a
+#: channel may require, addresses the reply and is not part of the answer its line shows.
+LEADING_MENTION = re.compile(r"^[\s,:]*<@([A-Z0-9]+)(?:\|[^<>]*)?>[\s,:]*")
+
+#: Added to a question's ``text``, so a session the wake never reached reads its card in the thread.
+QUESTION_CARD_NOTE = "(Question from card {card}.)"
+
+#: Bound on each in-process map, oldest evicted first.
+ANNOUNCED_MAX = 512
+
+#: ``(channel, thread, pr url)`` already posted.
+_announced: OrderedDict[tuple, None] = OrderedDict()
+#: Subscription -> ``(event id, channel, ts, blocks, text)`` of its open question.
+_questions: OrderedDict[tuple, tuple] = OrderedDict()
+#: ``(subscription, ts)`` -> the entry of a question asked again before its settle succeeded.
+_unsettled: OrderedDict[tuple, tuple] = OrderedDict()
+#: ``(channel, ts)`` of a question whose card resumed but whose settle failed: its retry still reads the answer.
+_resumed: OrderedDict[tuple, None] = OrderedDict()
+#: What names a question's update key when its ``blocked`` event id is unknown (0): this process's
+#: nonce, then a count no question in it repeats. A known id names it otherwise.
+_KEY_NONCE = uuid.uuid4().hex[:KEY_NONCE_CHARS]
+_question_serials = itertools.count(1)
+#: ``(channel, thread, reply ts)`` of a typed reply already shown as a question's answer, never credited twice.
+_credited: OrderedDict[tuple, None] = OrderedDict()
+_warned_missing = False
+
+
+def enabled() -> bool:
+    """Whether ``KAGE_SLACK_UX`` is on and the presenter and renderer are importable."""
+    global _warned_missing
+    if _presenter is not None and _moments is not None:
+        return _presenter.enabled()
+    value = os.environ.get(FLAG_ENV)
+    if (value is None or value.strip().lower() in FLAG_ON_VALUES) and not _warned_missing:
+        _warned_missing = True
+        logger.warning(
+            "slack_ux_moments: %s is on but slack_presenter or slack_moments is not "
+            "importable; treating the flag as off",
+            FLAG_ENV,
+        )
+    return False
+
+
+def _sub_key(sub: dict) -> tuple:
+    """The subscription's identity, as upstream's ``_KanbanNotification.sub_key``."""
+    return (
+        str(sub.get("task_id") or ""),
+        str(sub.get("platform") or ""),
+        str(sub.get("chat_id") or ""),
+        str(sub.get("thread_id") or ""),
+    )
+
+
+def _remember(mapping: OrderedDict, key: tuple, value: Any) -> None:
+    mapping[key] = value
+    mapping.move_to_end(key)
+    while len(mapping) > ANNOUNCED_MAX:
+        mapping.popitem(last=False)
+
+
+async def _post(adapter: Any, sub: dict, blocks: list[dict], text: str, color: str) -> str | None:
+    """Post in the card's thread beside a ``color`` side bar; the message's ts ("" if
+    Slack gave none), None on failure."""
+    chat_id = str(sub.get("chat_id") or "")
+    if not (chat_id and hasattr(adapter, "_get_client")):
+        return None
+    try:
+        client = adapter._get_client(chat_id, team_id=sub.get("team_id") or None)
+        response = await client.chat_postMessage(
+            channel=chat_id,
+            thread_ts=sub.get("thread_id") or None,
+            text=text,
+            **_presenter.with_side_bar(blocks, color, text),
+        )
+    except Exception as exc:  # noqa: BLE001 — the caller falls back
+        logger.warning("slack_ux_moments: posting in %s failed: %s", chat_id, exc)
+        return None
+    try:
+        return str(response.get("ts") or "")
+    except Exception:  # noqa: BLE001 — posted; only the settle needs the ts
+        return ""
+
+
+def _github_host() -> str:
+    """The install's GitHub host, github.com or its GitHub Enterprise Server host,
+    from the gitops-state ConfigMap's ``github_host`` key; github.com without it."""
+    if _gitops is None:
+        return "github.com"
+    try:
+        return _gitops.github_host()
+    except Exception:  # noqa: BLE001 — github.com, as before
+        return "github.com"
+
+
+def _chat_route(adapter: Any) -> bool:
+    """Whether ``adapter`` is the chat.notify stand-in and the chat message composer is importable."""
+    return _chat is not None and callable(getattr(adapter, "send_chat", None))
+
+
+async def _send_chat(adapter: Any, sub: dict, text: str, chat: dict, update: str = "") -> bool:
+    """Send ``chat`` in the card's thread over chat.notify; True when it went out."""
+    chat_id = str(sub.get("chat_id") or "")
+    try:
+        result = await adapter.send_chat(
+            chat_id, text, chat, update, metadata={"thread_id": str(sub.get("thread_id") or "")},
+        )
+    except Exception as exc:  # noqa: BLE001 — the caller falls back
+        logger.warning("slack_ux_moments: posting over chat.notify in %s failed: %s", chat_id, exc)
+        return False
+    if getattr(result, "success", False) is not True:
+        logger.warning("slack_ux_moments: chat.notify refused the post in %s: %s", chat_id, getattr(result, "error", None))
+        return False
+    return True
+def _managed_gitlab_hosts() -> frozenset[str]:
+    """The hosts of the install's managed GitLab repositories, read from the
+    mounted state file each time (kubelet keeps it current); none without it."""
+    if _gitops is None:
+        return frozenset()
+    refs = (
+        _repo_ref.try_parse(entry.get("url"))
+        for entry in _gitops.mounted_repo_entries(_gitops.MANAGED_REPOS_KEY)
+        if entry.get("type") == GITLAB_REPO_TYPE
+    )
+    return frozenset(ref.host for ref in refs if ref and ref.host)
+
+
+async def _announce(adapter: Any, sub: dict, url: str, repo: str, number: str, line: str) -> bool:
+    """Post the PR at ``url`` in the card's thread unless that thread already has it; True when it posted.
+
+    The one place both paths post, so a PR the event announced is never posted
+    again by the prose fallback, nor the other way round.
+    """
+    key = (str(sub.get("chat_id") or ""), str(sub.get("thread_id") or ""), url)
+    if key in _announced:
+        return False
+    if _chat_route(adapter):
+        chat = _chat.pr_message(url, repo, number, line)
+        if not await _send_chat(adapter, sub, _chat.pr_text(url, repo, number, line), chat):
+            return False
+    else:
+        blocks, fallback = _moments.pr_opened(url, repo, number, line)
+        if await _post(adapter, sub, blocks, fallback, _moments.PR_SIDE_BAR) is None:
+            return False
+    _remember(_announced, key, None)
+    return True
+
+
+async def pr_event(adapter: Any, sub: dict, payload: Any, text: str = "") -> bool:
+    """Post the PR a ``pr_opened`` event recorded, once per thread; True when it posted.
+
+    ``payload`` is the event's: the ``url``, ``number`` and ``title`` the forge
+    answered with when the work opened it. No wording is read to decide, and the
+    url must be one :func:`pr_opened` would announce. The evidence line is the
+    first line of ``text`` (the worker's words delivered after the event) naming
+    the PR, else its title.
+    """
+    if not isinstance(payload, dict):
+        return False
+    url = str(payload.get("url") or "")
+    hosts = _managed_gitlab_hosts() if _moments.MR_MARKER in url else frozenset()
+    found = _moments.proposal_ref(url, gitlab_hosts=hosts, github_host=_github_host())
+    if found is None:
+        return False
+    url, repo, number = found
+    line = _moments.evidence_line(text, url, number) or str(payload.get("title") or "").strip()
+    return await _announce(adapter, sub, url, repo, number, line)
+
+
+async def pr_opened(adapter: Any, sub: dict, text: str) -> bool:
+    """Post each PR ``text`` says was opened, once per thread; True when any posted.
+
+    The fallback for a PR no ``pr_opened`` event recorded (:func:`pr_event`).
+    """
+    posted = False
+    # The managed list is read only for a text that can hold a merge request.
+    hosts = _managed_gitlab_hosts() if _moments.MR_MARKER in str(text or "") else frozenset()
+    for url, repo, number, line in _moments.opened_prs(text, gitlab_hosts=hosts, github_host=_github_host()):
+        posted = await _announce(adapter, sub, url, repo, number, line) or posted
+    return posted
+
+
+async def needs_you(adapter: Any, sub: dict, payload: Any, event_id: int = 0) -> bool:
+    """Post a ``needs_input`` block's reason as a question; True when posted.
+
+    False for any other block, an empty reason, or a post that failed, and the
+    caller delivers the blocked line as before. ``event_id`` is the ``blocked``
+    event's, which :func:`wake_text` matches against the wake's events.
+    """
+    if not isinstance(payload, dict) or payload.get("kind") != NEEDS_INPUT:
+        return False
+    if _chat_route(adapter):
+        return await _needs_you_chat(adapter, sub, str(payload.get("reason") or ""), event_id)
+    moment = _moments.needs_you(
+        str(payload.get("reason") or ""), buttons=bool(sub.get("thread_id"))
+    )
+    if moment is None:
+        return False
+    if asked(sub, event_id):
+        return True
+    # The caller settled any earlier question first (kanban_progress_lines.deliver).
+    key = _sub_key(sub)
+    earlier = _questions.get(key)
+    blocks, text = moment
+    text = _with_card(text, key[0], any(b.get("type") == "actions" for b in blocks))
+    ts = await _post(adapter, sub, blocks, text, _moments.NEEDS_YOU_SIDE_BAR)
+    if ts is None:
+        # The earlier question keeps its slot, so it is settled once, from there.
+        return False
+    if earlier is not None:
+        # Still open: its settle failed or never ran. The new question takes the slot, so keep this one for a retry.
+        _remember(_unsettled, (key, earlier[2]), earlier)
+    entry = (int(event_id or 0), str(sub.get("chat_id") or ""), ts, blocks, text)
+    _remember(_questions, key, entry)
+    return True
+
+
+async def _needs_you_chat(adapter: Any, sub: dict, reason: str, event_id: int) -> bool:
+    """:func:`needs_you` over chat.notify: the question as a chat message keyed by its card.
+
+    Kept in ``_questions`` with its chat message where the blocks would be and
+    its update key where the ts would be, so :func:`settle_question` and
+    :func:`wake_text` read it as they read a posted one.
+    """
+    key = _sub_key(sub)
+    chat = _chat.needs_you_message(reason, key[0], buttons=bool(sub.get("thread_id")))
+    if chat is None:
+        return False
+    if asked(sub, event_id):
+        return True
+    earlier = _questions.get(key)
+    serial = int(event_id or 0) or f"{_KEY_NONCE}{next(_question_serials)}"
+    update = _chat.QUESTION_UPDATE.format(card=key[0], serial=serial)
+    text = f"{reason.strip()}\n{QUESTION_CARD_NOTE.format(card=key[0])}" if key[0] else reason.strip()
+    if not await _send_chat(adapter, sub, text, chat, update):
+        return False
+
+    if earlier is not None:
+        _remember(_unsettled, (key, earlier[2]), earlier)
+    _remember(_questions, key, (int(event_id or 0), str(sub.get("chat_id") or ""), update, chat, text))
+    return True
+
+
+def _with_card(text: str, card: str, buttons: bool) -> str:
+    """``text`` naming ``card`` on the line above its buttons' "Reply with one of:" line,
+    or last without buttons: a click's rewrite drops that line only while it is the last."""
+    if not card:
+        return text
+    note = QUESTION_CARD_NOTE.format(card=card)
+    body, _nl, last = text.rpartition("\n")
+    if buttons and body and last.startswith(_presenter.CHOICES_LEAD):
+        return f"{body}\n{note}\n{last}"
+    return f"{text}\n{note}"
+
+
+def asked(sub: dict, event_id: int) -> bool:
+    """Whether the card's open question was posted for the ``blocked`` event ``event_id``:
+    a notifier replay of that event, which must not settle or repost it."""
+    entry = _questions.get(_sub_key(sub))
+    return bool(event_id) and entry is not None and entry[0] == int(event_id)
+
+
+def question_card(channel: str, ts: str) -> str | None:
+    """The card whose open question this process posted as ``ts`` in ``channel``, else None.
+
+    A question kept in ``_unsettled`` for a retry still has live buttons, so it counts too.
+    """
+    entries = [*_questions.items(), *((key[0], entry) for key, entry in _unsettled.items())]
+    for key, (_event_id, posted_channel, posted_ts, _blocks, _text) in entries:
+        if ts and posted_ts == str(ts) and posted_channel == str(channel):
+            return key[0] or None
+    return None
+
+
+def _clicked(channel: str, ts: str, rewritten: bool = True) -> bool:
+    """Whether a click in this process already answered the message, and with ``rewritten`` rewrote it."""
+    try:
+        from gateway import slack_ux_clicks
+    except ImportError:
+        return False
+    try:
+        return bool((slack_ux_clicks.answered if rewritten else slack_ux_clicks.clicked)(channel, ts))
+    except Exception:  # noqa: BLE001 — read as unanswered; the settle is cosmetic
+        return False
+
+
+def _rewriting(channel: str, ts: str) -> bool:
+    """Whether a click in this process answered the message and is still rewriting it."""
+    try:
+        from gateway import slack_ux_clicks
+
+        return bool(slack_ux_clicks.rewriting(channel, ts))
+    except Exception:  # noqa: BLE001 — read as not rewriting, as before the click tracked it
+        return False
+
+
+def _without_choices(text: str) -> str:
+    """The question's ``text`` without its last "Reply with one of:" line, which
+    asks for an answer that has arrived, as ``slack_ux_clicks._answered_text`` drops it."""
+    body, _nl, last = text.rpartition("\n")
+    return body.rstrip("\n") if body and last.startswith(_presenter.CHOICES_LEAD) else text
+
+
+async def _who(adapter: Any, reply: dict, channel: str, team_id: str) -> str:
+    """The answerer's name as a click's answered line gives it: never a mention or their id.
+
+    The reply's own ``user_profile`` stands in for a click's handle when ``users.info``
+    names nobody, which the adapter caches for a user whose lookup once failed.
+    """
+    profile = reply.get("user_profile") or {}
+    shown = profile.get("display_name") or profile.get("real_name") or profile.get("name") or ""
+    try:
+        from gateway import slack_ux_clicks
+
+        return await slack_ux_clicks.clicker_name(
+            adapter, {"user": {"name": str(shown)}}, str(reply["user"]), channel, team_id,
+        )
+    except Exception:  # noqa: BLE001 — the line still names someone
+        return NAMELESS
+
+
+def _after(ts: Any, since: str) -> bool:
+    try:
+        return float(ts) > float(since)
+    except (TypeError, ValueError):
+        return False
+
+
+async def _by_a_person(adapter: Any, reply: Any, channel: str, team_id: str, thread: str) -> bool:
+    """Whether ``reply`` is a person the adapter would answer typing, as a click's check asks it:
+    not a bot, authorized, and through the channel gate with its mention rules. A group DM is asked
+    as a channel, since the subscription does not say which it is, so there it may count too few.
+    Without the clicks module, whose gate check this borrows, no reply counts."""
+    if not (isinstance(reply, dict) and reply.get("user") and str(reply.get("text") or "").strip()):
+        return False
+    if reply.get("bot_id") or (reply.get("subtype") and reply.get("subtype") not in TYPED_SUBTYPES):
+        return False
+    try:
+        from gateway import slack_ux_clicks
+
+        return (
+            not adapter._event_declares_bot_sender(reply)
+            and bool(adapter._is_interactive_user_authorized(reply["user"], channel_id=channel, team_id=team_id))
+            and await slack_ux_clicks._gateway_hears(adapter, reply, channel, team_id, thread, False)
+        )
+    except Exception:  # noqa: BLE001 — not counted; the question settles without the line
+        return False
+
+
+def _plain(text: str) -> str:
+    """``text`` with Slack's entities as their label or inner text, and its three escapes decoded."""
+    text = SLACK_ENTITY.sub(lambda m: m.group(2) or m.group(1), text)
+    for raw, escaped in reversed(_presenter.MRKDWN_ESCAPES):
+        text = text.replace(escaped, raw)
+    return text
+
+
+async def _named_mentions(adapter: Any, text: str, channel: str, team_id: str) -> str:
+    """``text`` with each unlabeled user mention labeled with the person's name, so it reads as ``@name``.
+
+    The adapter's cached ``users.info`` lookup, as for the line's name; a lookup that fails leaves the id,
+    as does a mention past the first :data:`MENTIONS_NAMED_MAX`, which the clip drops anyway.
+    """
+    names = {}
+    for user_id in list(dict.fromkeys(USER_MENTION.findall(text)))[:MENTIONS_NAMED_MAX]:
+        try:
+            names[user_id] = str(await adapter._resolve_user_name(user_id, chat_id=channel, team_id=team_id) or "")
+        except Exception:  # noqa: BLE001 — the mention keeps its id
+            names[user_id] = ""
+
+    def label(match: re.Match) -> str:
+        user_id = match.group(1)
+        name = " ".join(names.get(user_id, "").translate(MENTION_LABEL_UNSAFE).split())
+        return f"<@{user_id}|@{name}>" if name and name != user_id else match.group(0)
+
+    return USER_MENTION.sub(label, text)
+
+
+def _unaddressed(adapter: Any, text: str, team_id: str) -> str:
+    """``text`` less the agent's own mentions it opens with; a reply that is nothing else stays whole."""
+    bot = adapter._team_bot_user_ids.get(team_id, adapter._bot_user_id)
+    rest = text
+    while bot and (match := LEADING_MENTION.match(rest)) and match.group(1) == bot:
+        rest = rest[match.end():]
+    return rest or text
+
+
+async def _typed_note(
+    adapter: Any, client: Any, sub: dict, channel: str, ts: str, until: str = ""
+) -> tuple[str, tuple | None]:
+    """The answered line for the first reply a person typed after the question, and before
+    ``until`` when given, that no other question was credited with, and its :data:`_credited`
+    key, reserved there until the caller releases it; ``("", None)`` for none."""
+    thread = str(sub.get("thread_id") or "")
+    if not thread:
+        return "", None
+    try:
+        response = await client.conversations_replies(channel=channel, ts=thread, oldest=ts, limit=REPLIES_READ_MAX)
+        replies = [
+            r for r in response.get("messages") or []
+            if _after((r or {}).get("ts"), ts) and not (until and not _after(until, r["ts"]))
+        ]
+    except Exception as exc:  # noqa: BLE001 — cosmetic; the question settles without the line
+        logger.info("slack_ux_moments: reading the answer to %s failed: %s", ts, exc)
+        return "", None
+    team_id = str(sub.get("team_id") or "")
+    for reply in sorted(replies, key=lambda r: float(r["ts"])):
+        credit = (channel, thread, str(reply["ts"]))
+        if credit in _credited or not await _by_a_person(adapter, reply, channel, team_id, thread):
+            continue
+        if credit in _credited:
+            # Another card's settle took it during the check.
+            continue
+        _remember(_credited, credit, None)
+        try:
+            text = str(reply["text"])
+            text = await _named_mentions(adapter, _unaddressed(adapter, text, team_id), channel, team_id)
+            words = _presenter._clip(" ".join(_plain(text).split()), TYPED_ANSWER_MAX)
+            who = await _who(adapter, reply, channel, team_id)
+        except BaseException:
+            _credited.pop(credit, None)
+            raise
+        return ANSWERED.format(who=who, label=_presenter._escape(words)), credit
+    return "", None
+
+
+async def _settled(adapter: Any, sub: dict, entry: tuple, kind: str = UNBLOCKED_KIND, until: str = "") -> bool:
+    """Rewrite one question without its buttons, under its typed answer's line; True once it needs nothing more.
+
+    ``until`` is the ts of the card's next question, if it asked again: a reply after it answers that one.
+    """
+    _event_id, channel, ts, blocks, text = entry
+    if isinstance(blocks, dict):
+        # Posted over chat.notify: the same key without the choices. No typed
+        # answer is read back (there is no Slack client); the renderer owns
+        # the answered line.
+        return not ts or await _send_chat(adapter, sub, text, _chat.needs_you_settled(blocks), ts)
+    if not ts or _clicked(channel, ts):
+        return True
+    note, credit, shown = "", None, False
+    try:
+        client = adapter._get_client(channel, team_id=sub.get("team_id") or None)
+        # A click whose rewrite failed posted its own line; a later reply is not the answer.
+        # So does a card that moved on unanswered, unless it resumed on an event whose settle failed.
+        if kind in ANSWERED_KINDS:
+            _remember(_resumed, (channel, ts), None)
+        answered = (channel, ts) in _resumed and not _clicked(channel, ts, rewritten=False)
+        if answered:
+            note, credit = await _typed_note(adapter, client, sub, channel, ts, until)
+        if _clicked(channel, ts):
+            # A click during the read rewrote the question with its own line.
+            return True
+        if _rewriting(channel, ts):
+            # Its rewrite takes the buttons off; one that fails is settled on the card's next event.
+            return False
+        if _clicked(channel, ts, rewritten=False):
+            # One whose rewrite failed posted its line in the thread, and is the answer.
+            note = ""
+        settled_text = _without_choices(text)
+        question_text = f"{note}\n\n{settled_text}" if note else settled_text
+        await client.chat_update(
+            channel=channel,
+            ts=ts,
+            text=question_text,
+            **_presenter.with_side_bar(
+                _moments.needs_you_settled(blocks, note), _moments.NEEDS_YOU_SIDE_BAR, question_text
+            ),
+        )
+        shown = bool(note)
+    except Exception as exc:  # noqa: BLE001 — cosmetic; the next event retries
+        logger.warning("slack_ux_moments: settling the question %s failed: %s", ts, exc)
+        return False
+    finally:
+        if credit is not None and not shown:
+            # Not shown on this question, so the reply is free for another.
+            _credited.pop(credit, None)
+    _resumed.pop((channel, ts), None)
+    return True
+
+
+async def settle_question(adapter: Any, sub: dict, kind: str = UNBLOCKED_KIND, event_id: int = 0) -> None:
+    """Take the buttons and "waiting on you" off the card's open question, if it has one.
+
+    ``kind`` is the card event that moved it on; only one in :data:`ANSWERED_KINDS` puts a
+    typed reply's line on the question. Given the event's ``event_id``, a question posted
+    for that event or a later one is left alone: the event is older than the question.
+
+    The question is forgotten only once the rewrite succeeds (or a click has
+    answered it), so a failed rewrite is retried on the card's next event and
+    a click in between still names the card. Earlier questions of the card
+    whose settle failed are retried too, each reading only the replies before
+    the card asked again.
+    """
+    key = _sub_key(sub)
+    def newer(entry: tuple) -> bool:
+        return bool(event_id) and int(entry[0] or 0) >= int(event_id)
+
+    stales = [item for item in _unsettled.items() if item[0][0] == key]
+    asked_at = [e[2] for _k, e in stales] + [e[2] for e in [_questions.get(key)] if e is not None]
+
+    def next_asked(entry: tuple) -> str:
+        return min((t for t in asked_at if _after(t, entry[2])), key=float, default="")
+
+    for stale_key, stale in stales:
+        if (not newer(stale) and await _settled(adapter, sub, stale, kind, next_asked(stale))
+                and _unsettled.get(stale_key) is stale):
+            _unsettled.pop(stale_key, None)
+    entry = _questions.get(key)
+    if entry is None or newer(entry):
+        return
+    if await _settled(adapter, sub, entry, kind) and _questions.get(key) is entry:
+        _questions.pop(key, None)
+
+
+def wake_text(sub: dict, events: Iterable[Any], wake_kinds: Any, text: str) -> str:
+    """``text`` with :data:`WAKE_NOTE` added when the wake is for a question this posted,
+    and :data:`WAKE_NOTE_ANSWERED` after it when that question is in a thread.
+
+    Matched on the ``blocked`` event's id, so a notifier retry of the same
+    delivery gets the note again and a later block that posted no question
+    does not. Anything else returns ``text`` unchanged.
+    """
+    try:
+        if BLOCKED_KIND not in set(wake_kinds or ()):
+            return text
+        entry = _questions.get(_sub_key(sub))
+        if entry is None or not entry[0]:
+            return text
+        blocked = {
+            int(getattr(ev, "id", 0) or 0)
+            for ev in events or ()
+            if getattr(ev, "kind", None) == BLOCKED_KIND
+        }
+        if entry[0] not in blocked:
+            return text
+        return f"{text}\n\n{WAKE_NOTE} {WAKE_NOTE_ANSWERED}" if sub.get("thread_id") else f"{text}\n\n{WAKE_NOTE}"
+    except Exception:
+        logger.debug("slack_ux_moments: reading the posted question failed", exc_info=True)
+        return text

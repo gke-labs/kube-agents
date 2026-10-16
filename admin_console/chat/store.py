@@ -24,6 +24,9 @@ from admin_console.chat.models import (
 )
 from admin_console.telemetry import redact_evidence
 
+INTERACTION_STATE_ENV = "KUBE_AGENTS_ADMIN_INTERACTION_STATE"
+STATE_FILE_MODE = 0o600
+
 
 class InteractionStoreProtocol(Protocol):
     def create(self, interaction: Interaction) -> Interaction: ...
@@ -190,7 +193,7 @@ class InteractionStore:
 
 
 def interaction_state_path() -> Path:
-    override = os.environ.get("KUBE_AGENTS_ADMIN_INTERACTION_STATE", "").strip()
+    override = os.environ.get(INTERACTION_STATE_ENV, "").strip()
     if override:
         return Path(override).expanduser()
     state_root = os.environ.get("XDG_STATE_HOME", "").strip()
@@ -313,7 +316,7 @@ class SQLiteInteractionStore:
                 );
                 """
             )
-        os.chmod(self.path, 0o600)
+        os.chmod(self.path, STATE_FILE_MODE)
 
     def _condition_for(self, interaction_id: str) -> threading.Condition:
         return self._interaction_conditions.setdefault(
@@ -329,10 +332,21 @@ class SQLiteInteractionStore:
         metadata = self.path.parent.stat()
         if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
             raise RuntimeError("interaction state directory must be owner-only")
+        # Created owner-only before SQLite opens it: a file SQLite creates
+        # takes the umask's mode until __init__ tightens it, and a second
+        # process checking it in that window refuses it. fchmod, because the
+        # umask also filters os.open's mode.
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
         try:
-            database = self.path.lstat()
-        except FileNotFoundError:
-            return
+            descriptor = os.open(self.path, flags, STATE_FILE_MODE)
+        except FileExistsError:
+            pass
+        else:
+            try:
+                os.fchmod(descriptor, STATE_FILE_MODE)
+            finally:
+                os.close(descriptor)
+        database = self.path.lstat()
         if (
             stat.S_ISLNK(database.st_mode)
             or database.st_uid != os.geteuid()

@@ -85,6 +85,119 @@ On the freshly rebuilt computers:
 The rest of this document says, for each of these, how to see it coming, how to recognise it
 afterwards, how to prevent or repair it, and whether Google's own advisor for GKE reports it.
 
+## Status at a glance
+
+One row per entry. The first three tables group the entries by the reader that covers the entry's
+own failure on `main` today: a scheduled audit, one of the `fleet-upgrade-verification` skill's two
+scripts, or the assistant answering a question; the fourth lists all twenty against the two
+scheduled readers, the daily readiness watch on `main` and the upgrade retrospective, whose collector is in review. Entry 10 sits in the second group for its node-pool half, and entries 7 and 11 for
+their rules. Scenario links to the entry's
+section below. Reason says in plain words why the upgrade breaks it. Detection says which reader
+finds it and what a stock install ships for it: the cron jobs in `agents/platform/cron/jobs.json`
+run the audits on a timer, each audit follows a procedure in `agents/platform/governance/` and
+scores its checks with a script under `agents/platform/skills/fleet-audit/scripts/`, and the
+`fleet-upgrade-verification` skill's two scripts run when someone asks: the readiness report (`upgrade_readiness.py`,
+budgets, exclusions, skew, fail-closed webhooks and the per-entry rules the skill's SKILL.md lists), which the daily cron job `upgrade-readiness-watch` also runs
+for a cluster below a version its release channel offers, and the GitOps deprecation scan (`api_deprecation_scan.py`),
+which no cron job runs. A skill is a written procedure the assistant follows; a script is code it runs.
+The entry's own "Read today" line stays the full statement of what is read and unread; this column
+is its summary. Mitigation is the shortest workaround; the entry's section has the full before and
+after. Dev Progress names the file on `main` that reads the signal, the registered case that grades
+it, and the pull request that carries it when it is in review; the
+[Scope table](upgrade-readiness-checks.md#scope) in the readiness requirements is the canonical
+record of what is built, and this column adds the case and the in-review item. The column is re-read
+against `main` at each merge of `main` into a branch that edits it, because a pull request it lists as
+in review can merge under the branch. Every entry has at least one
+nightly evaluation case, registered where the column names one that grades the entry and planned otherwise, and the
+tables under "How each failure is tested" say row by row whether its fixture exists, so the column
+repeats neither. Two
+parts of this section change as work merges: the column's in-review items, and the fourth table,
+"Gap to scheduled coverage", whose cells say what the daily readiness watch (`upgrade-readiness-watch`, on `main`) and the
+upgrade retrospective (#2729, in review) cover before and after an upgrade and what is left to
+build. The column and the table were last reconciled on 2026-10-14.
+
+### A scheduled audit files it, without anyone asking
+
+| Scenario                                                                                       | Reason                                                                                                                                                                    | Detection                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Mitigation                                                                                                                                                                                 | Dev Progress                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [1. A PodDisruptionBudget forbids the eviction](#1-a-poddisruptionbudget-forbids-the-eviction) | A protection rule says the application's only copy may never be taken down, so the machine it runs on cannot be emptied; the upgrade waits, then removes the copy anyway. | Daily obtainability audit files it as `blocking-pdb`; the on-request readiness report grades the cluster `blocked`. Out of the box: the cron job `obtainability-audit` (daily 06:50 UTC, `agents/platform/cron/jobs.json`) runs the `fleet-audit` skill, whose `collect.py` script computes `blocking-pdb`. The readiness report is the `fleet-upgrade-verification` skill's `upgrade_readiness.py` script, run when asked and by the daily cron job `upgrade-readiness-watch` for a cluster below a version its release channel offers. | Give the rule room: allow one copy to be unavailable or run a second copy; for a true singleton, take the outage inside a maintenance window or use a blue-green upgrade with a long soak. | Shipped: `agents/platform/skills/fleet-upgrade-verification/scripts/upgrade_readiness.py`, `agents/platform/governance/obtainability_audit_sop.md` §3.4, `agents/platform/skills/fleet-audit/scripts/patch_readiness.py` check 3.11 `upgrade-blocked` (`agents/platform/governance/security_patch_orchestrator_sop.md` §3.11, the weekly join of the readiness grade to the audit), case `bench/tasks/upgrades-fleet-readiness-exclusion` (nightly), which grades the drain-blocking budget alongside the exclusion, and case `bench/tasks/upgrades-audit-reports-upgrade-blocked` (nightly). |
+| [3. Every replica in one zone or on one node](#3-every-replica-in-one-zone-or-on-one-node)     | Copies meant to back each other up sit on the same machine or in the same zone, so one rebuild takes all of them at once.                                                 | Daily obtainability audit (`rigid-scheduling`, `no-spread`, `spread-not-achieved`). Out of the box: the cron job `obtainability-audit` (daily 06:50 UTC) runs the `fleet-audit` skill's `collect.py`, which computes all three checks.                                                                                                                                                                                                                                                                                                   | Spread rules across zones and machines, plus a budget so the drain waits between copies.                                                                                                   | Shipped: `agents/platform/governance/obtainability_audit_sop.md` §3.7, §3.8, §3.19.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+
+### A script in the `fleet-upgrade-verification` skill covers it, in whole or in part, when someone asks about an upgrade
+
+| Scenario                                                                                                                                   | Reason                                                                                                                                                                         | Detection                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Mitigation                                                                                                                                                      | Dev Progress                                                                                                                                                                                                                                                                                                                                            |
+| ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [5. Maintenance window too short, or an exclusion ends mid-roll](#5-maintenance-window-too-short-or-an-exclusion-ends-mid-roll)            | The upgrade is only allowed in a short daily slot or is held by a calendar freeze, so a pool runs two versions for days, or the freeze ends in the middle of a planned change. | The on-request readiness report grades the covering exclusion; the Monday security-patch audit reads the window and exclusions (`no-maintenance-window`, `blocking-exclusion`). Out of the box: the readiness report is the `fleet-upgrade-verification` skill's `upgrade_readiness.py`, run when asked and by the daily cron job `upgrade-readiness-watch` for a cluster below a version its release channel offers. The cron job `security-patch-orchestrator` (Monday 07:20 UTC) runs `patch_readiness.py`, which scripts both checks; its `blocking-exclusion` never flags `NO_MINOR_UPGRADES`, and flags a `NO_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES` freeze only when it ends more than 30 days out or the cluster already carries a version finding, so the readiness report is the one that grades the covering exclusion against the target. | A window long enough for machine count times drain time; freezes that end outside the planned change; blue-green upgrades where the window is tight.            | Shipped: `upgrade_readiness.py` maintenance rule, `agents/platform/governance/security_patch_orchestrator_sop.md` §3.7, §3.8, case `bench/tasks/upgrades-fleet-readiness-exclusion` (nightly).                                                                                                                                                          |
+| [6. A served API version is removed](#6-a-served-api-version-is-removed)                                                                   | The new control program stops answering an old form of request; tools still asking the old way fail, while running applications are untouched.                                 | The readiness skill's GitOps scan (`api_deprecation_scan.py`), on request; the audit log's `k8s.io/removed-release` stamps are read in conversation, and GKE's deprecation insight is quoted as a command for a human because the agent's `gcloud` allowlist excludes it. Out of the box: the scan is the `fleet-upgrade-verification` skill's `api_deprecation_scan.py`, run when asked over a linked GitOps repository; no cron job runs it. The audit log has no script.                                                                                                                                                                                                                                                                                                                                                                             | Migrate the callers before the upgrade: bump clients, rewrite manifests, rewrite Helm release state with `helm mapkubeapis`.                                    | Shipped: `agents/platform/skills/fleet-upgrade-verification/scripts/api_deprecation_scan.py`; its case `bench/tasks/upgrades-api-deprecation-clean-repo` (nightly) grades the GitOps scan on a linked repository, not this entry's planted caller, whose case is planned.                                                                               |
+| [7. A fail-closed webhook whose backend is not up](#7-a-fail-closed-webhook-whose-backend-is-not-up)                                       | A gatekeeper rejects every request when it cannot be reached; during the rebuild it is unreachable, so replacement pieces are refused and the drain wedges.                    | The on-request readiness report grades it: a fail-closed webhook whose backend the API server cannot reach is `blocked` when its rules reach a write the node drain or join makes or a bootstrap RBAC write a new master reconciles, and a current outage otherwise. Out of the box: the readiness report is the `fleet-upgrade-verification` skill's `upgrade_readiness.py`, run when asked and by the daily cron job `upgrade-readiness-watch` for a cluster below a version its release channel offers; after the fact, the stuck-upgrade steps are prose in the `gke-upgrades` skill, no script.                                                                                                                                                                                                                                                    | Exempt `kube-system`, a timeout of a few seconds, fail-open for hooks that are not security controls, two backend replicas behind a budget.                     | Shipped: `agents/platform/skills/fleet-upgrade-verification/scripts/upgrade_readiness.py` webhook rule (`UPGRADE_PATH_TARGETS`, `CONTROL_PLANE_CLUSTER_WRITES`, `CONTROL_PLANE_KUBE_SYSTEM_WRITES`), case `bench/tasks/upgrades-fleet-readiness-failclosed-webhook` (nightly), and `agents/platform/skills/gke-upgrades/SKILL.md` stuck-upgrade step 4. |
+| [10. Add-on and client skew](#10-add-on-and-client-skew)                                                                                   | Operators and command-line tools each support a range of server versions; the control program moves past that range and they stop working.                                     | The readiness report and the Monday audit (`pool-skew`) cover machine pools too far behind; add-on and client skew in conversation only. Out of the box: the pool half is scripted twice, in `upgrade_readiness.py` (run when asked and by the daily `upgrade-readiness-watch`) and in `patch_readiness.py` under the Monday `security-patch-orchestrator` cron job (`pool-skew`). Add-on and client versions have no script.                                                                                                                                                                                                                                                                                                                                                                                                                           | Upgrade add-ons to a version whose support matrix includes the target before the cluster moves; keep tools within one minor; keep pools inside the skew window. | Shipped (pool half): `upgrade_readiness.py` skew rule, `security_patch_orchestrator_sop.md` §3.2.                                                                                                                                                                                                                                                       |
+| [11. The control plane is unreachable for minutes on a zonal cluster](#11-the-control-plane-is-unreachable-for-minutes-on-a-zonal-cluster) | A single-zone cluster has one control program and it is replaced during the upgrade; anything that does not retry fails for those minutes.                                     | The on-request readiness report carries a zonal control plane as a risk on every member (`zonal-control-plane`), never a blocker, with the retry advice; the cluster inventory audit, run once per cluster by the onboarding sweep, records each control plane's location, and the `gke-upgrades` skill's prose recommends regional control planes when asked. Out of the box: `readiness_rules/zonal_control_plane.py` under the `fleet-upgrade-verification` skill, on request and daily under the `upgrade-readiness-watch` cron job when a cluster is below a version its channel offers.                                                                                                                                                                                                                                                           | A regional cluster for anything automation depends on; retries with backoff in clients that cannot tolerate a few minutes of errors.                            | Shipped: `readiness_rules/zonal_control_plane.py`, the case `bench/tasks/upgrades-zonal-control-plane-outage-warned`, `agents/platform/skills/gke-upgrades/SKILL.md`, `agents/platform/governance/cluster_inventory_audit_sop.md`; `bench/tasks/upgrades-readiness-zonal-control-plane` is registered in the nightly roster, where its record builds.   |
+
+### Only when someone asks about the cluster or the workload
+
+| Scenario                                                                                                       | Reason                                                                                                                                                            | Detection                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Mitigation                                                                                                                                                             | Dev Progress                                                                                                     |
+| -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| [2. No spare capacity for the displaced pods](#2-no-spare-capacity-for-the-displaced-pods)                     | The machine pool is set to remove a machine before its replacement exists, and there is no room elsewhere, so the moved pieces wait with nowhere to run.          | In conversation only. The stockout audit reads quota and autoscaler ceilings (`quota-exhaustion-risk`, `single-zone-nodepool`) but not surge settings or headroom. Out of the box: no cron job detects it. The daily `stockout-prevention` job (09:20 UTC) runs `fleet_stockout.py`, whose `quota-exhaustion-risk` and `single-zone-nodepool` checks read quota and autoscaler ceilings only; surge settings and headroom have no script.                                                                                                                       | Keep GKE's default surge settings (one spare machine first, none unavailable), one machine of headroom, and quota for the extra machine.                               | Shipped (quota half): `agents/platform/governance/stockout_prevention_sop.md` §3.7, §3.9.                        |
+| [4. Data on the node is gone](#4-data-on-the-node-is-gone)                                                     | A rebuilt machine is a new machine; anything kept only on its local disk is lost.                                                                                 | In conversation only. The waste audit reads these volumes for cost (`fleet_waste.py`), not as an upgrade risk. Out of the box: no cron job detects it. The Monday `fleet-wide-cost-analysis` job's `fleet_waste.py` reads these volumes as scale-down blockers only. No script reads them as an upgrade risk.                                                                                                                                                                                                                                                   | Keep state on persistent disks or object storage; use local disk only for what the application can rebuild.                                                            | Nothing shipped.                                                                                                 |
+| [8. A default changes in the new minor](#8-a-default-changes-in-the-new-minor)                                 | The new version turns a rule on by default; a piece accepted yesterday is rejected today although nothing on your side changed.                                   | In conversation only; nothing reads a namespace's admission pin. Out of the box: no cron job and no script; the assistant reasons from the target version's release notes when asked.                                                                                                                                                                                                                                                                                                                                                                           | Read the target version's notes; run Pod Security in warn and audit before enforce; rehearse on a staging cluster at the target version.                               | Nothing shipped.                                                                                                 |
+| [9. A feature is deprecated but still served](#9-a-feature-is-deprecated-but-still-served)                     | Nothing breaks yet; the warning count is the early notice of a removal several versions away.                                                                     | In conversation only; the agent reads the audit log's `k8s.io/deprecated` stamps on request (`gcloud logging read` is on its allowlist). Out of the box: no cron job and no script; the assistant runs the allowed `gcloud logging read` when asked.                                                                                                                                                                                                                                                                                                            | Plan the migration while the feature still works (EndpointSlices for Endpoints, a LoadBalancer Service or the Gateway API for externalIPs).                            | Shipped: fixture role `deprecated-api-caller` (`bench/tf/fleet`).                                                |
+| [12. A node label is removed](#12-a-node-label-is-removed)                                                     | An application insists on machines carrying a label the new machines no longer have, so it is never placed again.                                                 | In conversation only. Out of the box: no cron job and no script.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Replace deprecated labels in selectors with their GA names (`kubernetes.io/arch`, `topology.kubernetes.io/zone`).                                                      | Nothing shipped.                                                                                                 |
+| [13. The container runtime changes](#13-the-container-runtime-changes)                                         | The engine that runs containers moves a major version; agents wired to its old socket or API, and images in an old format, stop working.                          | The Monday security-patch audit flags a pool's stale image type (`stale-image-type`); the compliance audit flags the socket mount as a security finding (`hostpath-mount`); the CRI client itself in conversation only. Out of the box: two halves are scripted: `patch_readiness.py` under the Monday `security-patch-orchestrator` cron job (`stale-image-type`), and `collect.py` under the daily `compliance-audit` job (06:20 UTC, `hostpath-mount`, filed as a security finding). CRI clients, image schemas and containerd configuration have no script. | Move agents to the CRI v1 API, rebuild v1-schema images, drop containerd 1.x configuration overrides.                                                                  | Shipped: `security_patch_orchestrator_sop.md` §3.9, `compliance_audit_sop.md` §2.3.                              |
+| [14. cgroup v2 under a runtime that cannot read it](#14-cgroup-v2-under-a-runtime-that-cannot-read-it)         | Old Java and .NET read their memory limit from a path the new machines no longer have, see the whole machine's memory instead, and are killed for using too much. | In conversation only. Out of the box: no cron job and no script.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | A runtime that reads cgroup v2 (JDK 8u372 or 11.0.16 and later) or explicit heap flags; until 1.35 a pool can be pinned to cgroup v1 to buy time.                      | Nothing shipped.                                                                                                 |
+| [15. The OOM killer starts killing the whole container](#15-the-oom-killer-starts-killing-the-whole-container) | Running out of memory now kills the whole container instead of the one worker that overran, so containers that used to shrug it off die outright.                 | In conversation only. Out of the box: no cron job and no script.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Raise the limit for multi-process containers, split workers into their own containers, or set `singleProcessOOMKill` in the pool's node configuration.                 | Nothing shipped.                                                                                                 |
+| [16. The network dataplane changes](#16-the-network-dataplane-changes)                                         | How traffic rules, DNS or specific flows are handled changes; rules that were never enforced start blocking traffic.                                              | The Monday drift audit compares each cluster's dataplane and network-policy settings with its peers (`datapath-provider`); the compliance audit flags namespaces with no policy (`netpol-missing`); behaviour in conversation only. Out of the box: two facets are scripted: `fleet_drift.py` under the Monday `fleet-consistency-drift` cron job (08:20 UTC, `datapath-provider` and the network-policy settings) and `collect.py` under the daily `compliance-audit` job (`netpol-missing`). How a policy behaves after the change has no script.             | Rehearse the target version on a staging cluster with the same dataplane; keep NetworkPolicy explicit rather than relying on defaults.                                 | Shipped: `agents/platform/governance/fleet_consistency_drift_sop.md` §4.4, §4.9, `compliance_audit_sop.md` §2.6. |
+| [17. A node networking agent fails on the new image](#17-a-node-networking-agent-fails-on-the-new-image)       | The per-machine network plugin depends on the machine's labels or kernel; the new image changes them and traffic to services stops on rebuilt machines.           | In conversation only; the compliance audit flags the agent's host networking and host-path mount as security findings. Out of the box: no cron job and no script read it as an upgrade risk; the daily `compliance-audit` job's `collect.py` flags the host namespace and host-path mount (`host-namespace`, `hostpath-mount`) as security findings.                                                                                                                                                                                                            | Upgrade a canary pool first and watch service routing from inside the cluster; surge upgrades with no unavailability so a broken machine never takes capacity with it. | Nothing shipped as an upgrade risk.                                                                              |
+| [18. GPU driver mismatch](#18-gpu-driver-mismatch)                                                             | The new machine image ships a different GPU driver than the one the job's CUDA build needs, so the GPU cannot be opened.                                          | In conversation only; the upgrade plan hands the driver and CUDA check to the operator. Out of the box: no cron job and no script; the `gke-upgrades` skill's prose hands the check to the operator.                                                                                                                                                                                                                                                                                                                                                            | Match the driver to the images before the upgrade, from GKE's driver-per-version table and NVIDIA's minimum-driver matrix; upgrade a canary GPU pool first.            | Shipped: warnings in `agents/platform/skills/gke-upgrades/SKILL.md`.                                             |
+| [19. In-tree volumes lose their CSI path](#19-in-tree-volumes-lose-their-csi-path)                             | Disks attached the old way only work through a driver add-on; with the add-on off they stop attaching.                                                            | In conversation only; the waste audit reads disks for cost, not for how they are attached. Out of the box: no cron job and no script read attachment; the Monday `fleet-wide-cost-analysis` job's `fleet_waste.py` reads disks for cost only.                                                                                                                                                                                                                                                                                                                   | Enable the PD CSI driver add-on and move StorageClasses to `pd.csi.storage.gke.io`.                                                                                    | Nothing shipped.                                                                                                 |
+| [20. Images on a retired registry](#20-images-on-a-retired-registry)                                           | Old machines had the image cached; new machines must download it from a site that no longer publishes.                                                            | In conversation only; the compliance audit reads image references for floating tags (`image-floating-tag`), not for retired hosts. Out of the box: no cron job and no script read the registry host; the daily `compliance-audit` job's `collect.py` reads image references for floating tags only (`image-floating-tag`).                                                                                                                                                                                                                                      | Mirror every image into a registry you own (`images.json` and `make mirror-images` in this repository); keep egress allowlists in step.                                | Nothing shipped.                                                                                                 |
+
+### Gap to scheduled coverage
+
+The goal is that every entry is caught without a request. Two scheduled readers do that. The daily
+job `upgrade-readiness-watch` (`agents/platform/cron/jobs.json`, 10:10 UTC) runs the readiness report's rules before an
+upgrade, for a cluster below a version its release channel offers. The weekly job `upgrade-retrospective` (its [design](upgrade-retrospective.md) on `main`; collector #2729, in review) runs
+after one; its collector matches symptoms to this list, and it also reads a set of risk shapes on
+every cluster it reviews and writes them as guards for the readiness watch to print. "Rule" means a
+rule in the readiness report, run daily with the target version known; the entry's own section says
+what such a rule reads (its "Before" line), the `fleet-upgrade-verification` skill's `SKILL.md` lists
+the rules built, and the [Scope table](upgrade-readiness-checks.md#scope) credits them. "Signature"
+means a row in the retrospective's symptom table ([its design](upgrade-retrospective.md#34-classification-by-signature-with-the-evidence-attached)). "Shape" means one of the
+collector's static risk reads. The "To build" column names the reader an entry still lacks, with a
+qualifier where one row needs it; the tables under "How each failure is tested" own which fixtures
+exist.
+
+| Entry | Before: daily readiness watch                                         | After: upgrade retrospective                                                                                                                                                                                     | To build                                                                                                                                                     |
+| ----- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1     | Budget rule shipped; the watch runs it.                               | Signature: a budget with no allowance on a drained node.                                                                                                                                                         | Nothing once the collector merges.                                                                                                                           |
+| 2     | No rule: surge settings and headroom are not read.                    | Signature: Pending for capacity after a pool operation.                                                                                                                                                          | Rule (capacity headroom).                                                                                                                                    |
+| 3     | None; the daily obtainability audit files it on its own schedule.     | Signature: every pod of a multi-replica workload on one drained pool, `Available=False` inside the operation ([§3.4](upgrade-retrospective.md#34-classification-by-signature-with-the-evidence-attached)).       | Nothing once the collector merges.                                                                                                                           |
+| 4     | No rule.                                                              | No signature; shape: stateful `emptyDir` and local SSD volumes.                                                                                                                                                  | Rule on the collector's shape, with the target known; the watch prints the collector's guard too.                                                            |
+| 5     | Maintenance rule shipped; the watch runs it.                          | Signature: a pool more than one minor behind its control plane for seven days or longer, from the cluster describe ([§3.4](upgrade-retrospective.md#34-classification-by-signature-with-the-evidence-attached)). | Nothing once the collector merges.                                                                                                                           |
+| 6     | GitOps scan on request only; audit-log stamps read in conversation.   | Signature: `no matches for kind`, a removed API named.                                                                                                                                                           | Rule (the exception below: no fixture of its own can be standing).                                                                                           |
+| 7     | Webhook rule shipped; the watch runs it.                              | Signature: `failed calling webhook`.                                                                                                                                                                             | Nothing once the collector merges.                                                                                                                           |
+| 8     | No rule: nothing reads a namespace's admission pin.                   | No signature.                                                                                                                                                                                                    | Rule (changed defaults at the target minor).                                                                                                                 |
+| 9     | No rule: `k8s.io/deprecated` stamps read in conversation.             | No signature; nothing breaks yet.                                                                                                                                                                                | Rule (deprecated-API callers).                                                                                                                               |
+| 10    | Pool skew rule shipped; client and add-on skew not read.              | No signature.                                                                                                                                                                                                    | Rule (client and add-on skew).                                                                                                                               |
+| 11    | Zonal rule shipped; the watch runs it.                                | No signature.                                                                                                                                                                                                    | Nothing.                                                                                                                                                     |
+| 12    | No rule.                                                              | Signature: a selector miss; shape: deprecated label prefixes.                                                                                                                                                    | Rule (labels the target minor drops).                                                                                                                        |
+| 13    | Monday audit flags a stale image type; the socket client is not read. | No signature; shape: a DaemonSet mounting the container engine socket.                                                                                                                                           | Rule (container runtime change with socket clients).                                                                                                         |
+| 14    | No rule.                                                              | Signature: `OOMKilled` on a cgroup v2 pool; shape: old runtime images.                                                                                                                                           | Rule (runtimes blind to cgroup v2).                                                                                                                          |
+| 15    | No rule.                                                              | Signature: `OOMKilled` on a cgroup v2 pool, reported as 14 or 15.                                                                                                                                                | Rule (multi-process containers; a heuristic, since the process count is not readable from the API).                                                          |
+| 16    | Monday drift audit compares dataplanes; enforcement not read as risk. | No signature.                                                                                                                                                                                                    | Rule (policies present but not enforced).                                                                                                                    |
+| 17    | No rule; the compliance audit flags host networking as security.      | Signature: nodes `NotReady`; shape: `hostNetwork` DaemonSets.                                                                                                                                                    | Rule (node-image-coupled agents).                                                                                                                            |
+| 18    | No rule; the upgrade plan hands the check to the operator.            | Signature: driver and CUDA errors; shape: CUDA pins on GPU workloads.                                                                                                                                            | Rule, covering both directions the entry's section describes: a driver too old for the CUDA build, and forward-compatibility libraries under a newer driver. |
+| 19    | No rule.                                                              | Signature: volume affinity, attach and mount errors; shape: in-tree PDs.                                                                                                                                         | Rule (in-tree persistent disks with the CSI add-on off).                                                                                                     |
+| 20    | No rule; the compliance audit reads floating tags, not retired hosts. | Signature: a pull failure on rebuilt nodes only; shape: retired hosts.                                                                                                                                           | Rule (images on retired registry hosts).                                                                                                                     |
+
+Two things cross every row. The fact tables the rules and the collector's shapes both read (dropped
+labels, runtime floors, retired hosts, driver and CUDA support) go in one module in the
+`fleet-upgrade-verification` skill, built with the first rules. The watch reading the collector's guards is its own change,
+after the collector merges. Every rule lands with unit tests and a nightly case graded on a declared
+line. Entry 6 is the exception: no fixture of its own can be standing (its section says why), so its
+rule is unit-tested on a captured audit-log sample and its live stand-in is entry 9's
+`deprecated-api-caller`. As the work merges, a cell here becomes "Nothing" and the entry's row above moves
+to the reader that files it.
+
 ## The list
 
 A signal marked _before_ is something a read-only check can observe on the cluster, in the GKE
@@ -235,7 +348,8 @@ nodes it can empty, then drains the rest, respecting the budget for up to one ho
   soak, at most seven days in total, on standard blue-green; the wait of up to seven days and then
   an hour's drain on autoscaled blue-green) and the removal that ends it are in GKE's
   [node upgrade strategies](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies).
-  The seeded fleet plants no drain-blocking budget.
+  The seeded fleet plants one: the `readiness-drain-blocked` role, a `maxUnavailable: 0` budget on
+  the one-replica `pinned-batch-runner` Deployment.
 
 ### 2. No spare capacity for the displaced pods
 
@@ -265,7 +379,9 @@ strategy's limitations.
   unavailability, not from an incident, and it does not arise on GKE's default settings. Measured
   on a test cluster whose GPU pool had `maxSurge` 0 and `maxUnavailable` 1: the only L4 node was
   destroyed, the zone had no L4 to replace it for eight minutes, and GKE reported the operation
-  done while the pool was in error. No public story verified and no fixture. Accelerator pools
+  done while the pool was in error. No public story verified; the seeded fleet plants the shape as
+  the `readiness-surge-blocked` role, a `maxSurge` 0 pool, with the `readiness-pinned-workload`
+  role's one workload pinned to it. Accelerator pools
   are the common case because their quota is small.
 
 ### 3. Every replica in one zone or on one node
@@ -281,8 +397,9 @@ node, or a zone whose nodes roll together, the upgrade takes every replica at on
 - Mitigate after: the next rollout re-spreads the pods once the constraints are in place.
 - Read today: the obtainability audit's spread and pinning checks.
 - GKE recommender: none.
-- Why it is on the list: a consequence of scheduling, not an incident; no fixture on the seeded
-  fleet and no public story verified.
+- Why it is on the list: a consequence of scheduling, not an incident; no public story verified.
+  The seeded fleet plants three shapes of it on its multi-zonal cluster (`zonal-skew-scheduling`,
+  `zonal-skew-volume`, `zonal-skew-capacity`).
 
 ### 4. Data on the node is gone
 
@@ -293,12 +410,13 @@ A rebuilt node is a new machine. Local SSD and `emptyDir` contents do not come b
 - After: application errors reading state, empty caches or queues.
 - Mitigate before: state on PersistentVolumes or object storage; Local SSD and `emptyDir` only for what the application can rebuild.
 - Mitigate after: restore from the source of truth.
-- Read today: nothing.
+- Read today: nothing as an upgrade risk; the fleet waste audit reads `emptyDir` and `hostPath`
+  volumes only as scale-down blockers.
 - GKE recommender: none.
 - Why it is on the list: GKE's statement that Local SSD data does not survive a node upgrade is
   quoted at the end of the readiness requirements'
   [incidents section](upgrade-readiness-checks.md#upgrades-that-went-wrong-in-public); no public
-  incident verified.
+  incident verified. The seeded fleet plants it on seeded-a as the `node-local-state` role.
 
 ### 5. Maintenance window too short, or an exclusion ends mid-roll
 
@@ -315,7 +433,7 @@ back the automatic one, while a manual upgrade still runs, and one that ends ins
 - Mitigate before: a window long enough for node count times drain time, exclusions that end outside the planned change, and blue-green upgrades where the window is tight.
 - Mitigate after: extend the window or finish the upgrade manually so the pool stops running two versions.
 - Read today: the readiness mode grades the covering exclusion; the security-patch orchestrator
-  reads the window.
+  reads the window and the exclusions (`no-maintenance-window`, `blocking-exclusion`).
 - GKE recommender: `CLUSTER_MAINTENANCE_WINDOW_AND_EXCLUSIONS` recommends configuring a window and `CLUSTER_RELEASE_CHANNEL_UNSPECIFIED` a channel; neither checks a window's length against the pool.
 - Why it is on the list: a common support case; no single public story verified.
 
@@ -347,7 +465,7 @@ upgrade when a minor reaches the end of its support, and both happen.
 - Why it is on the list: Helm and Spinnaker on 1.25 in the
   [incidents](upgrade-readiness-checks.md#upgrades-that-went-wrong-in-public); the 1.32 removal is
   in GKE's [deprecation notes](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/apis-1-32).
-- Fixture: none in the seeded fleet, and none can be standing. No minor after 1.32 removes a served
+- Fixture: none in the seeded fleet, and none can be standing; `deprecated-api-caller`, stamped deprecated rather than removed, stands in. No minor after 1.32 removes a served
   API, and 1.31, the last minor that serves one, leaves GKE's Extended channel on 2026-10-22, so a
   caller of a removed API cannot be planted for longer than that. Measured on a test cluster built
   for it: a caller writing FlowSchemas through `flowcontrol/v1beta3` on 1.31 was audit-stamped
@@ -369,10 +487,17 @@ case `kube-system`.
 - After: `failed calling webhook` events, Pending pods, drains that never finish.
 - Mitigate before: a `namespaceSelector` that excludes `kube-system`, a timeout of a few seconds, `failurePolicy: Ignore` for webhooks that are not security controls, at least two backend replicas behind a budget, and a valid backend certificate.
 - Mitigate after: set `failurePolicy: Ignore` or remove the webhook configuration to unwedge the cluster, then restore it once the backend is up.
-- Read today: nothing.
+- Read today: the readiness mode of `fleet-upgrade-verification` grades a fail-closed webhook
+  whose backend the API server cannot reach now, `blocked` when its rules reach the upgrade's
+  path or a bootstrap RBAC write a new master reconciles (ClusterRoles and ClusterRoleBindings
+  always; Roles and RoleBindings in `kube-system` or `kube-public` when its namespace selector
+  admits that namespace), and an outage otherwise; the backend that would fail once drained, and the
+  object selector, are unread ([the readiness checks](upgrade-readiness-checks.md)). After the fact, the upgrade
+  skill's stuck-upgrade steps check whether webhooks are rejecting pod creation on new nodes.
 - GKE recommender: `K8S_ADMISSION_WEBHOOK_UNAVAILABLE` flags a webhook whose Service has no endpoints and `K8S_ADMISSION_WEBHOOK_UNSAFE` one that intercepts `kube-system` or cluster-scoped system resources ([webhook insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-webhooks)); the certificate subtypes (`DEPRECATION_K8S_1_23_CERTIFICATE`, `DEPRECATION_K8S_SHA_1_CERTIFICATE`) covered backend certificates the 1.23 and 1.29 removals rejected; `K8S_CRD_WITH_INVALID_CA_BUNDLE` flags CRDs with an invalid CA bundle.
-- Why it is on the list: Jetstack's Open Policy Agent webhook outage in the incidents; no fixture
-  on the seeded fleet.
+- Why it is on the list: Jetstack's Open Policy Agent webhook outage in the incidents. The seeded
+  fleet plants the shape as the `readiness-failclosed-webhook` role on seeded-b, a fail-closed
+  webhook gating ConfigMaps whose Service does not exist.
 
 ### 8. A default changes in the new minor
 
@@ -385,11 +510,12 @@ without anyone changing it.
 - After: rejections at admission, evictions nobody asked for.
 - Mitigate before: read the target minor's notes, run Pod Security Admission in `warn` and `audit` before `enforce`, and rehearse on a staging cluster already at the target version.
 - Mitigate after: the audit log names the rejecting rule; relabel the namespace or adjust the pod.
-- Read today: nothing.
+- Read today: nothing reads a namespace's admission pin; the upgrade plan hands the
+  compatibility check to the operator after at most a quick search.
 - GKE recommender: only where GKE files the default change as a removal, such as `DEPRECATION_K8S_1_25_PODSECURITYPOLICY`, or `EXEC_PROBE_TIMEOUT` for exec probes that overrun their timeout, which GKE enforces from 1.35.
 - Why it is on the list: the PodSecurityPolicy removal in 1.25; the `gitRepo` volume, which the kubelet refuses by
   default from 1.33 (the reproduction's 1.33 node failed the mount) and
-  [1.36](https://kubernetes.io/blog/2026/04/22/kubernetes-v1-36-release/) disables for good.
+  [1.36](https://kubernetes.io/blog/2026/04/22/kubernetes-v1-36-release/) disables for good. The seeded fleet plants its shape on seeded-a as the `moving-admission-default` role.
 
 ### 9. A feature is deprecated but still served
 
@@ -403,7 +529,8 @@ count across runs is what turns a future removal from a surprise into a plan.
 - After: none yet.
 - Mitigate before: plan the migration while the feature still works: EndpointSlices for `Endpoints`, a LoadBalancer Service or the Gateway API for `externalIPs`.
 - Mitigate after: none needed yet.
-- Read today: nothing.
+- Read today: nothing scheduled; the audit log stamps every deprecated call (`k8s.io/deprecated`),
+  and the agent can read it on request.
 - GKE recommender: none; the insights start when the removal is in the next minor.
 - Why it is on the list: the
   [1.36 externalIPs notice](https://kubernetes.io/blog/2026/05/14/kubernetes-v1-36-deprecation-and-removal-of-service-externalips/)
@@ -422,10 +549,12 @@ behind the control plane breaks the kubelet's own contract.
 - After: controller crash loops; reconciles that stop.
 - Mitigate before: upgrade add-ons to a version whose matrix includes the target before the cluster moves; keep `kubectl` within one minor; keep node pools inside the skew window.
 - Mitigate after: upgrade the add-on.
-- Read today: the readiness mode grades node-pool skew; add-on skew is unread.
+- Read today: the readiness mode grades node-pool skew, and the security-patch orchestrator's
+  `pool-skew` check flags a pool too far behind its control plane every Monday; add-on and client
+  skew are unread.
 - GKE recommender: `CLUSTER_VERSION_SKEW_UNSUPPORTED` for node pools too far behind and `CLUSTER_VERSION_END_OF_LIFE` for a control plane past standard support ([versioning](https://docs.cloud.google.com/kubernetes-engine/versioning)); nothing for add-ons.
 - Why it is on the list: the Calico teardown race on GKE 1.22 in the incidents, an add-on known
-  issue.
+  issue. The seeded fleet plants its shape on seeded-a as the `stale-client-skew` role.
 
 ### 11. The control plane is unreachable for minutes on a zonal cluster
 
@@ -440,11 +569,14 @@ that talks to the API without retrying fails for those minutes.
   interval.
 - Mitigate before: a regional cluster for anything automation depends on, and retries with backoff in the clients that cannot tolerate a few minutes of 5xx.
 - Mitigate after: wait for the control plane; GitOps resyncs on its own.
-- Read today: nothing.
+- Read today: the readiness mode of `fleet-upgrade-verification` carries a zonal control plane as a
+  risk on every report, never a blocker, with the retry advice; the cluster inventory audit, run
+  once per cluster by the onboarding sweep, records each control plane's location, and the upgrade
+  skill recommends regional control planes when asked.
 - GKE recommender: none.
 - Why it is on the list: GKE's
   [cluster availability types](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/types-of-clusters)
-  document the behaviour; no public incident verified and no fixture.
+  document the behaviour; no public incident verified; no fixture is needed, since every seeded cluster is zonal.
 
 ### 12. A node label is removed
 
@@ -460,7 +592,7 @@ schedule again.
 - Read today: nothing.
 - GKE recommender: none.
 - Why it is on the list: no GKE label removal verified. The public case, Reddit's 1.24 outage, was
-  a kubeadm label read by a CNI selector rather than a pod selector, and is entry 17's evidence.
+  a kubeadm label read by a CNI selector rather than a pod selector, and is entry 17's evidence. The seeded fleet plants it on seeded-a as the `deprecated-label-selector` role.
 
 ### 13. The container runtime changes
 
@@ -477,9 +609,9 @@ tolerated, which is the runtime change a node pool upgrade can carry.
 - After: crash loops in node agents; `ImagePullBackOff` on images the new runtime refuses.
 - Mitigate before: move agents to the CRI `v1` API, rebuild v1-schema images, drop containerd 1.x configuration overrides.
 - Mitigate after: the same changes, under pressure; a completed node pool can be downgraded in place while GKE still offers the previous version.
-- Read today: the security-patch orchestrator flags a pool whose `config.imageType` the location no longer offers or that names a pre-containerd variant; CRI clients, image schemas and containerd configuration are unread.
+- Read today: the security-patch orchestrator flags a pool whose `config.imageType` the location no longer offers or that names a pre-containerd variant, and the compliance audit's `hostpath-mount` check flags a pod mounting the containerd socket as a security finding; CRI clients, image schemas and containerd configuration are unread as an upgrade risk.
 - GKE recommender: `DEPRECATION_CONTAINERD_V1_SCHEMA_IMAGES` and `DEPRECATION_CONTAINERD_V1ALPHA2_CRI_API`, the two transitions GKE has flagged on real clusters; `DEPRECATION_K8S_1_24_DOCKERSHIM` is the historical one.
-- Why it is on the list: GKE's Linux nodes move to containerd 2.0 at 1.33 and Windows Server nodes at 1.35 ([containerd 2 migration](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/migrate-containerd-2)), and GKE's two containerd insights exist because both breaks happened on real clusters. The [reproduction](../../bench/upgrade-scenarios/README.md) saw a patch upgrade inside 1.31 move a node from containerd 1.7.34 to 2.0.10 and break a `v1alpha2` client, so the before-signal is the containerd version the target node image ships, not the minor.
+- Why it is on the list: GKE's Linux nodes move to containerd 2.0 at 1.33 and Windows Server nodes at 1.35 ([containerd 2 migration](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/migrate-containerd-2)), and GKE's two containerd insights exist because both breaks happened on real clusters. The [reproduction](../../bench/upgrade-scenarios/README.md) saw a patch upgrade inside 1.31 move a node from containerd 1.7.34 to 2.0.10 and break a `v1alpha2` client, so the before-signal is the containerd version the target node image ships, not the minor. The seeded fleet plants it on seeded-a as the `containerd-socket-agent` role.
 
 ### 14. cgroup v2 under a runtime that cannot read it
 
@@ -500,7 +632,7 @@ so for such a pool the flip does arrive with the minor.
 - Read today: nothing.
 - GKE recommender: none verified.
 - Why it is on the list: the Kubernetes cgroup v2 documentation names the runtime versions; no
-  public incident verified.
+  public incident verified. The seeded fleet plants its shape on seeded-a as the `cgroup-blind-runtime` role.
 
 ### 15. The OOM killer starts killing the whole container
 
@@ -528,21 +660,23 @@ misreads its limit.
   [write-up by the opt-out's authors](https://tech.preferred.jp/en/blog/kubernetes-single-process-oom-kill/)
   the explanation, and 2i2c's
   [EKS 1.32 to 1.34 regression](https://2i2c.org/blog/kubernetes-cgroup-changes/), where a node
-  image change turned cgroup v2 on under a kubelet already past 1.28, the incident.
+  image change turned cgroup v2 on under a kubelet already past 1.28, the incident. The seeded fleet plants its shape on seeded-a as the `multi-process-container` role.
 
 ### 16. The network dataplane changes
 
 A new version can change how NetworkPolicy is enforced, which DNS serves the cluster, or how a
 specific flow is handled.
 
-- Before: dataplane and DNS provider, policy count, the known issues for the target version.
-- Where to look: the GKE API for the dataplane and DNS provider; the Kubernetes API for the policy count; the target version's known-issue notes.
+- Before: dataplane and DNS provider, whether the cluster enforces NetworkPolicy today (`networkPolicy.enabled`, or Dataplane V2, which always enforces), the policies present where nothing enforces them, the known issues for the target version.
+- Where to look: the GKE API for the dataplane, the DNS provider and the enforcement setting; the Kubernetes API for the NetworkPolicy objects per namespace; the target version's known-issue notes.
 - After: connection resets, policy drops in flow logs, DNS timeouts.
 - Mitigate before: rehearse the target version on a staging cluster with the same dataplane, and keep NetworkPolicy explicit rather than relying on defaults.
 - Mitigate after: a completed node pool can be downgraded in place to the previous version while GKE still offers it; the control plane cannot go back.
 - Read today: the fleet-consistency drift audit reads each cluster's `datapathProvider` and its
   network-policy settings across the cohort, so a member whose dataplane differs from its peers
-  is reported; how a policy behaves, and the DNS provider, are unread.
+  is reported, and the compliance audit's `netpol-missing` check flags a namespace with no
+  protecting policy without asking whether the cluster enforces any; how a policy behaves, and
+  the DNS provider, are unread.
 - GKE recommender: `NETWORK_POLICIES_UNRECONCILED` flags NetworkPolicy objects that exist but are not enforced, which are the ones that start blocking traffic when a dataplane change turns enforcement on; nothing covers DNS or how a specific flow is handled. The Network Analyzer's separate connectivity insight covers control-plane and node reachability.
 - Why it is on the list: no public incident verified; the per-version known-issue notes are the
   signal.
@@ -560,11 +694,12 @@ CNI's own control components are hit, cluster-wide within minutes.
   VIP probes failing from inside the cluster.
 - Mitigate before: upgrade a canary pool first and watch Service routing from inside the cluster before the rest; surge upgrades with `maxUnavailable` 0 so a broken node never takes capacity with it.
 - Mitigate after: downgrade the pool to the previous version while it is offered, and fix whatever the CNI selected on.
-- Read today: nothing.
+- Read today: nothing as an upgrade risk; the compliance audit flags an agent's host networking
+  and host-path mount as security findings.
 - GKE recommender: none.
 - Why it is on the list: Reddit's 1.24 outage was the CNI losing its route reflectors when a node
   label went away; the Datadog and Heroku outages in the incidents are the same shape, triggered by
-  an OS update rather than an upgrade.
+  an OS update rather than an upgrade. The seeded fleet plants its shape on seeded-a as the `node-image-coupled-agent` role.
 
 ### 18. GPU driver mismatch
 
@@ -580,11 +715,12 @@ older driver, stops working once the node's driver is newer than those libraries
   forward-compatibility libraries are older than the new driver.
 - Mitigate before: match the driver to the images before the upgrade: the GPU how-to page's table gives the driver per GKE version, and NVIDIA's minimum-driver matrix per CUDA major gives the floor the images accept; upgrade a canary GPU pool first.
 - Mitigate after: recreate the pool with the driver version the images need.
-- Read today: nothing.
+- Read today: nothing reads a workload's CUDA pin; the upgrade plan hands the driver and CUDA
+  compatibility check to the operator after at most a quick search.
 - GKE recommender: none.
 - Why it is on the list: frequent on accelerator pools; no public incident verified. The
   [reproduction](../../bench/upgrade-scenarios/README.md) saw the second direction: the 1.34 node image moved the driver from
-  R535 to R580 and both pods carrying forward-compatibility libraries failed with `Error 803`.
+  R535 to R580 and both pods carrying forward-compatibility libraries failed with `Error 803`. The seeded fleet plants its shape on seeded-a as the `cuda-pinned-gpu-job` role.
 
 ### 19. In-tree volumes lose their CSI path
 
@@ -602,13 +738,14 @@ is the same.
   a replacement pod `Pending` with `didn't match PersistentVolume's node affinity`.
 - Mitigate before: enable the PD CSI driver add-on and move StorageClasses to `pd.csi.storage.gke.io`.
 - Mitigate after: enable the add-on; the volumes attach.
-- Read today: nothing.
+- Read today: nothing as an upgrade risk; the fleet waste audit reads disks for cost (orphaned
+  volumes, unattached disks), not for how they are attached.
 - GKE recommender: none.
 - Why it is on the list: the
   [1.25 CSI migration status](https://kubernetes.io/blog/2022/09/26/storage-in-tree-to-csi-migration-status-update-1.25/)
   and GKE's
   [PD CSI driver page](https://cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/gce-pd-csi-driver);
-  no public incident verified and no fixture.
+  no public incident verified. The seeded fleet plants the volume on seeded-a as the `intree-pd-volume` role.
 
 ### 20. Images on a retired registry
 
@@ -621,25 +758,140 @@ stopped publishing, or an egress allowlist admits only the old hostname, only th
 - After: `ImagePullBackOff` only on new nodes.
 - Mitigate before: mirror every image a default install pulls into a registry you own, which is what `images.json` and `make mirror-images` do in this repository, and keep egress allowlists in step.
 - Mitigate after: retag or redirect the reference; the new nodes pull.
-- Read today: nothing.
+- Read today: nothing as an upgrade risk; the compliance audit reads image references for
+  floating tags, not for retired hosts.
 - GKE recommender: none.
 - Why it is on the list: the
   [`k8s.gcr.io` freeze](https://kubernetes.io/blog/2023/02/06/k8s-gcr-io-freeze-announcement/) and
   its [redirect](https://kubernetes.io/blog/2023/03/10/image-registry-redirect/): tags published
-  after the freeze exist only on the new host, and allowlists naming only the old one broke.
+  after the freeze exist only on the new host, and allowlists naming only the old one broke. The seeded fleet plants it on seeded-a as the `retired-registry-image` role.
+
+## How each failure is tested
+
+This section is written for a reader who has never seen the code. For each of the twenty failures
+it answers three questions: what sets the catch off on a real fleet today, which the grouping
+answers and each entry's own "Read today" line details; what we set up on the test fleet to stand
+in for it; and how the nightly test checks the assistant's answer. The entries are grouped by what
+sets the catch off, because that is the difference that matters: a failure caught by a scheduled
+audit is reported without anyone asking, and one caught only in conversation depends on someone
+thinking to ask, even if a skill advises around it.
+
+**How the test fleet works.** Four small clusters run all the time for testing. On them we set up
+a harmless example of each failure: not a live outage, but the condition that would cause one,
+such as a rule that forbids taking an application down, so the fleet stays healthy and the test
+can run every night. The example has to survive the fleet's own machine replacements and its own
+version upgrades, so it is a standing condition, the shape of a workload (its settings, its image,
+its rule) or a setting of the cluster, never data on a machine. Some shapes are the dependency a
+later version, machine image or registry change is designed to end. When that happens, the hourly
+fixture-state scan reports the shape as drifted on every project at once, and the fleet README
+names the exit: one change that retires the role and parks the tests that read it.
+
+**How a nightly test checks the answer.** The test asks the assistant a question in chat, as an
+operator would. The automatic check today is a search for exact phrases anywhere in the reply, with
+a list of accepted spellings where a right answer can be worded two ways and a list of forbidden
+phrases for a wrong verdict; the rest of the answer, the explanation and the advice, is scored by a
+second model. The nightly tests this section plans, one per row, are the series; its one registered test is
+graded that way, and a correct reply has failed it on phrasing; that test asks rows 5's and 1's questions together, grades the calendar hold by name and
+leaves row 1's rule to the second model. The form the rest of the series is designed to use, which some tests
+elsewhere in the harness already ask for, narrows the automatic check: the question ends by asking
+for one short line per cluster in a fixed vocabulary, for example "cluster B: protected
+application: yes; which: batch-runner", the automatic check is a pattern anchored on the cluster's
+name that accepts a right line and refuses the wrong value, and the test names the hedges it
+refuses, such as "probably" or "could not check"; prose stays with the second model. Two guards
+are the designed form for the tests still to be written; no registered test of the series carries either today. A
+test about a planted object carries a check on that object, so a run that
+quietly repairs it fails rather than passes; the check reaches only objects in the cluster that the
+example's entry in the fleet's fixture catalogue lists, so where the condition is a setting of the
+cluster itself, the test carries no such check. For rows 5 and 11 the fleet's Terraform declares the
+setting, so the fleet's own reconcile keeps it in place, and for row 5 a scheduled scan of the
+fixture catalogue's recorded state reports a drift without acting on it; for row 16 nothing declares
+or watches the setting today. The registered test carries no check on row 1's rule
+either, although the rule's catalogue entry lists it and could ground one, as the test's own header
+records. And a test that carries such a check records a broken environment rather than a wrong
+answer when the object's cluster is missing; one that carries none, the registered test today, fails
+as a wrong answer. For the
+protection rule a second audit is to be tested as well: the morning reliability audit is the one that
+files the rule today, and the Monday upgrade audit, which has no budget check yet, is to gain one; once
+it exists, the issue it files must name the cluster whose upgrade would not complete.
+
+**Where the examples stand.** The fixture column says _exists_ for an example on the fleet
+today and _designed_ for one specified here and built next. The table is the plan the tests follow, not a
+status board; engineers find what exists in the fleet's fixture catalogue
+([`bench/tf/fleet/fixtures.json`](../../bench/tf/fleet/fixtures.json)), which tests run in the
+two rosters under `hack/eval/`, how a test is written in the case format
+([`bench-case-format.md`](bench-case-format.md)), and what each audit checks in the governance
+SOPs. What reads each entry's signal today, and what is unread, is the entry's own "Read today"
+line, which the failure column links to; the tables here do not repeat it, and the status table
+above summarises it.
+[`upgrade-failure-reproductions.md`](upgrade-failure-reproductions.md) records the one-off
+reproduction and the fleet verdict behind every row; the tables summarise the fixture and the
+test and send the reader there.
+
+### Caught by a scheduled audit
+
+A scheduled audit is a job that runs on a timer, follows a written procedure, runs a script over
+every cluster, and files what it finds as an issue in the team's GitHub repository. A row is in
+this table when one of those audits, run over the test fleet as it stands, files the planted
+example as the upgrade failure the entry describes: the finding names the failure, not an object
+the failure happens to share. Two do; the entry's "Read today" line names the audit and the check, under the audit's name in its
+procedure document: the morning reliability audit of this section is the obtainability audit there,
+and the Monday upgrade audit is the security-patch orchestrator.
+
+| #   | The failure                                                                                  | What we set up on the test fleet                                                                                                                                                                                          | How the nightly test checks it                                                                                                                                                                     |
+| --- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | [A protection rule forbids taking a pod down](#1-a-poddisruptionbudget-forbids-the-eviction) | _Exists._ One small application on the second cluster whose rule says no copy may ever be unavailable, so the machine it runs on cannot be emptied cleanly for an upgrade; GKE waits, then removes the application anyway | Asked which clusters carry such a rule and which application; must name the cluster, the application and the rule. The registered test asks this today and grades the rule in the judged part only |
+| 3   | [Every replica in one zone or on one node](#3-every-replica-in-one-zone-or-on-one-node)      | _Exists._ On the fourth cluster, three applications whose copies all sit in one zone, each for a different reason: a placement rule, a disk tied to that zone, no room in the other zone                                  | Asked which applications lose every copy when one zone is drained; must name all three and the reason for each                                                                                     |
+
+### Caught only in conversation today
+
+No scheduled audit files the planted example of any entry below as the upgrade failure the entry
+describes, except on a report day, when the daily `upgrade-readiness-watch` runs the readiness
+report and its rules grade entries 5, 7, 10 (the pool half) and 11 without a request. Some of these examples are read by an audit for a reason of its own, as a pool at its
+autoscaling ceiling, a scale-down blocker, a security finding, or the other half of the entry's
+signal, and the entry's "Read today" line says which. The assistant can still find each one when
+asked, from what it can read in the cluster and what it knows, or, where the entry's line names
+one, through a script in the upgrade skill, the written playbook it follows when asked to plan an
+upgrade; the nightly test asks exactly that. Each row without a script is a candidate for one once
+its test shows the assistant finds it reliably.
+
+| #   | The failure                                                                                                                            | What we set up on the test fleet                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | How the nightly test checks it                                                                                                                                                                                                                                                                                                                                                |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2   | [No spare capacity for the displaced pods](#2-no-spare-capacity-for-the-displaced-pods)                                                | _Exists._ A machine pool on the second cluster set to replace its only machine without adding a spare first, with one application pinned to it                                                                                                                                                                                                                                                                                                                                                                         | Asked which pools would take their application down during an upgrade; must name the pool and the application                                                                                                                                                                                                                                                                 |
+| 4   | [Data on the node is gone](#4-data-on-the-node-is-gone)                                                                                | _Exists._ An application on the first cluster that keeps its work queue in a scratch directory on the machine itself, which an upgrade wipes                                                                                                                                                                                                                                                                                                                                                                           | Asked which applications keep state on the machine; must name it                                                                                                                                                                                                                                                                                                              |
+| 5   | [Maintenance window too short, or an exclusion ends mid-roll](#5-maintenance-window-too-short-or-an-exclusion-ends-mid-roll)           | _Exists._ The second cluster is held back from upgrading by a calendar hold with an end date; a cluster setting, so the test carries no check on it and the fleet's reconcile keeps it in place                                                                                                                                                                                                                                                                                                                        | Asked which clusters are held and by what; must name the hold and its scope. Its end time is left to the judged part, because the fleet re-stamps it on every reconcile                                                                                                                                                                                                       |
+| 6   | [A served API version is removed](#6-a-served-api-version-is-removed)                                                                  | _Exists._ A scheduled job on the first cluster that still calls an old interface: one that is deprecated but still works, because a cluster would refuse an interface that is already removed                                                                                                                                                                                                                                                                                                                          | Asked which callers use removed interfaces and which merely deprecated ones; must put this job under deprecated and say nothing calls a removed one                                                                                                                                                                                                                           |
+| 7   | [A fail-closed webhook whose backend is not up](#7-a-fail-closed-webhook-whose-backend-is-not-up)                                      | _Exists._ A gatekeeper on the second cluster that rejects, whenever it cannot be reached, the fleet's own configuration objects created in one namespace, and points at a service that does not exist. It matches no pod, so it is an outage for what it matches and not what stops the upgrade                                                                                                                                                                                                                        | `upgrades-fleet-readiness-failclosed-webhook` (nightly): asked which clusters are ready for their next minor and what stops the rest, with one fixed-form line per object; the gate's line must carry `blocks the upgrade: no` beside `yes` for the budget and the exclusion, the reply must name the missing backend, and the worker's commands must carry the readiness run |
+| 8   | [A default changes in the new minor](#8-a-default-changes-in-the-new-minor)                                                            | _Exists._ A namespace on the first cluster whose admission policy is pinned to "latest", so the rule set applied to its workloads changes under them at every minor, with one compliant application in it. The pin is the condition; nothing is rejected today                                                                                                                                                                                                                                                         | Asked which namespaces would get a new rule set at the next minor without anyone changing them; must name the namespace and the pin                                                                                                                                                                                                                                           |
+| 9   | [A feature is deprecated but still served](#9-a-feature-is-deprecated-but-still-served)                                                | _Exists._ The same scheduled job as entry 6                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Asked which workload on each cluster still calls deprecated interfaces, using the audit log; must name the job and the interface                                                                                                                                                                                                                                              |
+| 10  | [Add-on and client skew](#10-add-on-and-client-skew)                                                                                   | _Exists._ A scheduled job on the first cluster that runs a command-line client several versions older than the cluster it talks to                                                                                                                                                                                                                                                                                                                                                                                     | Asked which clients or add-ons are outside their supported version range; must name the job and the gap                                                                                                                                                                                                                                                                       |
+| 11  | [The control plane is unreachable for minutes on a zonal cluster](#11-the-control-plane-is-unreachable-for-minutes-on-a-zonal-cluster) | _Exists._ Nothing extra: all four test clusters have a single-zone control plane, which is the condition; a cluster setting, so the test carries no check on it and the fleet's reconcile keeps it in place                                                                                                                                                                                                                                                                                                            | Asked whether each cluster's control plane stays reachable while it upgrades; must say no for every cluster and that running applications are unaffected                                                                                                                                                                                                                      |
+| 12  | [A node label is removed](#12-a-node-label-is-removed)                                                                                 | _Exists._ An application on the first cluster that insists on running only on machines carrying a label that has been deprecated for years but is still set today                                                                                                                                                                                                                                                                                                                                                      | Asked which applications depend on deprecated machine labels; must name it                                                                                                                                                                                                                                                                                                    |
+| 13  | [The container runtime changes](#13-the-container-runtime-changes)                                                                     | _Exists._ A per-machine agent on the first cluster that talks to the container engine directly through its socket                                                                                                                                                                                                                                                                                                                                                                                                      | Asked which agents talk to the container engine directly; must name it                                                                                                                                                                                                                                                                                                        |
+| 14  | [cgroup v2 under a runtime that cannot read it](#14-cgroup-v2-under-a-runtime-that-cannot-read-it)                                     | _Exists._ An application on the first cluster whose image carries a Java runtime from before Java learned to read the new memory accounting, under a memory limit; the process inside only sleeps, so the image is the condition                                                                                                                                                                                                                                                                                       | Asked which applications run a runtime that misreads memory on new machines; must name it and the runtime version                                                                                                                                                                                                                                                             |
+| 15  | [The OOM killer starts killing the whole container](#15-the-oom-killer-starts-killing-the-whole-container)                             | _Exists._ An application on the first cluster whose container runs several processes under one memory limit, the shape where the newer kernel behaviour kills all of them instead of one                                                                                                                                                                                                                                                                                                                               | Asked which containers run several processes under one memory limit; must name it                                                                                                                                                                                                                                                                                             |
+| 16  | [The network dataplane changes](#16-the-network-dataplane-changes)                                                                     | _Exists._ Nothing extra: ten of the thirteen test namespaces carry a deny-all network rule, two carry none on purpose and one allows only calls to the control plane, and no test cluster enforces network rules today; nothing declares or watches the enforcement setting today: a fixture-catalogue entry that lists the rules and asserts the setting would put both under the test and the scheduled scan, and a declared network-policy block in the fleet's Terraform would put the setting under the reconcile | Asked whether each cluster enforces its network rules and what turning enforcement on would block; must say none enforces them and name what would start being blocked                                                                                                                                                                                                        |
+| 17  | [A node networking agent fails on the new image](#17-a-node-networking-agent-fails-on-the-new-image)                                   | _Exists._ A per-machine agent on the first cluster in the shape of a network plugin: it uses the machine's own network and mounts the network plugin's configuration directory from the machine                                                                                                                                                                                                                                                                                                                        | Asked which per-machine agents depend on the machine image; must name it                                                                                                                                                                                                                                                                                                      |
+| 18  | [GPU driver mismatch](#18-gpu-driver-mismatch)                                                                                         | _Exists._ A training job on the first cluster that requests a GPU and pins a CUDA version, kept suspended so it never runs or waits for a GPU; its manifest is the condition                                                                                                                                                                                                                                                                                                                                           | Asked which GPU workloads pin a CUDA version the next machine image's driver may not serve; must name it and the version                                                                                                                                                                                                                                                      |
+| 19  | [In-tree volumes lose their CSI path](#19-in-tree-volumes-lose-their-csi-path)                                                         | _Exists._ A disk on the first cluster attached the old way, with an application reading from it                                                                                                                                                                                                                                                                                                                                                                                                                        | Asked which volumes still use the old attachment path; must name it                                                                                                                                                                                                                                                                                                           |
+| 20  | [Images on a retired registry](#20-images-on-a-retired-registry)                                                                       | _Exists._ An application on the first cluster whose image comes from a download site that was retired and now only forwards requests                                                                                                                                                                                                                                                                                                                                                                                   | Asked which images come from retired download sites; must name it                                                                                                                                                                                                                                                                                                             |
 
 ## The order to add checks
 
-The order is by how often each failure appears in the public record and how cheap its signal is to
-read. GKE's recommender comes first, because one call per location returns the deprecation insights
+An entry's own section says what its check reads, and the gap table above says which entries still
+lack a scheduled reader; this section records only the order and why. The order is by how often
+each failure appears in the public record and how cheap its signal is to read. GKE's recommender comes first, because one call per location returns the deprecation insights
 (6) together with the budget (1), webhook (7), skew (10), runtime (13) and network-policy (16)
 insights and the maintenance-window recommendation (5); the readiness requirements'
 [deprecation-insights section](upgrade-readiness-checks.md#gke-deprecation-insights) says what else
-the pause the deprecation family puts on automatic upgrades explains. Fail-closed webhooks (7) and
-the unread half of capacity headroom (2), surge settings and headroom against allocatable, come
-next, because both turn a routine drain into an outage and both are a few list calls. Replica
+the pause the deprecation family puts on automatic upgrades explains. Fail-closed webhooks (7) are
+read. The unread half of capacity headroom (2), surge settings and headroom against allocatable,
+comes next, because it turns a routine drain into an outage and is a few list calls. Replica
 placement (3) is already read. The node-image entries (12 to 20) follow, which need the target
-version to be known before they mean anything. Post-upgrade detection is one mechanism for every
-entry: watch the operation, then compare Pending and crash-looping pod counts and a live service
-probe against the same measurements taken before the upgrade started, as the readiness requirements'
-[rollout section](upgrade-readiness-checks.md#rollout-and-verification) specifies.
+version to be known before they mean anything. After an upgrade, two reads divide the work: the readiness requirements'
+[rollout section](upgrade-readiness-checks.md#rollout-and-verification) specifies the generic one,
+watch the operation and compare Pending and crash-looping pod counts and a live service probe
+against the same measurements taken before the upgrade started, which says that something broke;
+the retrospective's per-entry signatures (the gap table's "After" column) say which entry it was. The [upgrade retrospective](upgrade-retrospective.md) is the scheduled form of the
+pod-count half of that mechanism: it compares pod and node state and events after an operation
+against what was there before it, runs no service probe, and classifies each failure it finds
+against this list.

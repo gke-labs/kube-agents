@@ -1,0 +1,20 @@
+{
+  "id": 60000001,
+  "iid": 1,
+  "project_id": 40000001,
+  "title": "[audit] proto ledger",
+  "description": "ledger body",
+  "state": "closed",
+  "labels": [
+    "agent:audit",
+    "audit:proto",
+    "status:held"
+  ],
+  "author": {
+    "username": "eval-maintainer"
+  },
+  "created_at": "2026-10-01T14:57:34.147Z",
+  "updated_at": "2026-10-01T14:57:36.834Z",
+  "closed_at": "2026-10-01T14:57:36.824Z",
+  "web_url": "https://gitlab.com/example-group/infra/-/work_items/1"
+}

@@ -61,7 +61,8 @@ ever executed beside the credential.
 
 The script is `scripts/vcs.py`. Every subcommand prints one JSON object on
 stdout. `--repo` takes `owner/name` or a full URL, and the broker decides which
-forge that is.
+forge that is. On an install that serves more than one forge, `owner/name` is
+refused: name the repository by its URL.
 
 Verb names are the version-control concept; the spelling you know is an alias.
 `annotate`/`blame`, `log`/`history`, `files`/`manifest`, `grep`/`search`,
@@ -81,10 +82,10 @@ Verb names are the version-control concept; the spelling you know is an alias.
 
 ## When NOT to Use
 
-- **A repository this install does not manage.** Every verb that spends the
-  credential, `clone` and the list/view verbs included, is refused for a
-  repository outside the install's managed list, because the credential is
-  minted per repository; only `capabilities` answers for one. For "how does
+- **A repository this install does not manage.** Every verb, `clone` and the
+  list/view verbs included, is refused for a repository outside the install's
+  managed list, because the broker refuses every verb but `capabilities` for
+  one. For "how does
   upstream implement this", use **inspect-repository**.
 - **A one-off read of a large repository.** `clone` pulls a whole branch's
   history and there is no shallow option; **inspect-repository** pages a
@@ -190,9 +191,13 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   or `git switch -c <name>` (the local git) before the first commit.
 - **`publish` can be refused, and the refusal is the answer.**
   `NOT_FAST_FORWARD` and `BRANCH_DIVERGED` mean your revisions do not build on
-  what the remote has; `BASE_MOVED` means the target branch was rewritten, so
+  what the remote has; `BASE_MOVED` means the target branch was rewritten (or,
+  under a configured base, that the copy was cloned from another branch), so
   the revision you cloned at is not on it any more and there is nothing to build
-  on — clone again and reapply the change. An ordinary push to the target by
+  on — clone again, of the branch the refusal names, and reapply the change.
+  When the target was rewritten, that is usually the branch you cloned before;
+  only in the configured-base case is it the base, which a clone with no
+  `--branch` comes down on. An ordinary push to the target by
   somebody else is _not_ refused: your proposal simply opens with a base behind
   the tip, which is a rebase on the forge and not a problem here. Do not try to
   force any of them. `BRANCH_DIVERGED` on a `platform-agent/` name whose last
@@ -214,11 +219,32 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   turning it away for now: wait, then do the same. A forge without `proposal-list`
   does not list `remote-branch delete` in `capabilities` and refuses it
   `FORGE_UNSUPPORTED`.
+- **A repository can have a configured base, and proposals go onto it.** When
+  the operator configured one, `clone` and `capabilities` answer it as
+  `baseBranch` (it is `null` otherwise), a `clone` with no `--branch` comes
+  down on it, and `publish` and `proposal create` default their target to it.
+  It comes from the broker; nothing in your environment changes it.
+  `TARGET_NOT_BASE` means the target of a new proposal (or of the first
+  `publish` of a branch) is not the configured base, and the message names
+  the base. If you passed `--target`, drop it. If you did not, the copy was
+  cloned before the base was configured or moved: clone again, reapply the
+  change, and publish from the new copy. Do not retry with some other branch,
+  and do not pass the named base as `--target` from the old copy: it was cut
+  from another branch, and the broker answers `BASE_MOVED`. `BASE_BRANCH_MISSING` means the configured base does not
+  exist on the repository; that is for an operator to fix, so report it rather
+  than cloning another branch to propose onto. A later round onto a proposal
+  that is already open (`publish --advance`) keeps whatever target that
+  proposal has. A copy cloned with `--branch` of some other branch has no
+  default target: `publish` with no `--target` is refused before anything is
+  sent, because the copy was cut from that branch while proposals go onto the
+  base. Clone again with no `--branch` to start from the base — unless the
+  copy is of an open proposal's branch, cloned to add a round to it: publish
+  that with `--advance` and the proposal's base as `--target`.
 - **A forge refusal names the code and the next move; do what it says.**
   `FORGE_RATE_LIMITED` means wait and then use fewer, wider calls.
-  `FORGE_UNAUTHENTICATED`, `FORGE_FORBIDDEN` and `FORGE_REJECTED` will answer
-  the same way however many times you repeat the call — report or fix the
-  argument instead. `FORGE_UNAVAILABLE` means retry unchanged in a few minutes.
+  `FORGE_UNAUTHENTICATED`, `FORGE_FORBIDDEN`, `FORGE_REJECTED` and
+  `FORGE_TLS_UNTRUSTED` will answer the same way however many times you repeat
+  the call — report or fix the argument instead. `FORGE_UNAVAILABLE` means retry unchanged in a few minutes.
   `FORGE_NOT_FOUND` does not prove the thing is missing: a private repository
   this install cannot see answers the same way.
 - **`discard` when finished.** It removes the local copy. Nothing is held on the
@@ -228,9 +254,15 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   not the same answer as one that returned nothing because the file has no
   history.
 - **Say which repository and which branch** in anything you report.
-- **`capabilities` before assuming a non-GitHub forge works.** GitLab and
-  Bitbucket parse their specs and then tell you exactly what this install is
-  missing. That is the answer, not a bug to work around.
+- **`capabilities` before assuming a non-GitHub forge works.** Bitbucket, and
+  GitLab on an install that has not configured it, parse their specs and then
+  tell you exactly what this install is missing. That is the answer, not a bug to work around.
+- **Link to a file with `capabilities`' `fileUrl`.** It is the file's web address
+  on this forge, with `{ref}` and `{path}` to fill. Percent-encode each of them
+  and keep the `/` (in Python, `quote(value, safe="/")`): a branch name can hold
+  `#` or `%`, which break a link. Use a commit SHA as `{ref}` for a link that
+  must outlive the branch. Do not build a forge URL
+  yourself, and do not use a bare relative path: in an issue it opens nothing.
 
 ## Reference
 

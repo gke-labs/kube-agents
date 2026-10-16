@@ -22,6 +22,12 @@ import (
 
 var update = flag.Bool("update", false, "update golden files")
 
+// goldenOperatorNamespace stands in for POD_NAMESPACE, which main.go reads
+// off the cluster: the gateway and broker policies admit the operator's pods
+// in it on the metrics ports, and a fixed value keeps the rendered rule
+// deterministic.
+const goldenOperatorNamespace = "kubeagents-system"
+
 // newTestScheme builds a Scheme for one subtest. Per-subtest and not a shared
 // package-level var, because a Scheme is not safe to hand to concurrent fake
 // clients: controller-runtime's fake client lazily registers types it has not
@@ -80,7 +86,7 @@ func TestAgentsGolden(t *testing.T) {
 			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent.yaml"),
 			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
-				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
 			},
 		},
 		{
@@ -89,7 +95,7 @@ func TestAgentsGolden(t *testing.T) {
 			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-tagged.yaml"),
 			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
-				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
 			},
 		},
 		{
@@ -98,16 +104,16 @@ func TestAgentsGolden(t *testing.T) {
 			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-telemetry.yaml"),
 			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
-				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
 			},
 		},
 		{
 			// The scoped service account pool on. Diff this against
 			// platformagent-tagged.yaml and the whole of what
-			// spec.security.scopedServiceAccounts renders is a ConfigMap key,
+			// spec.security.scopedServiceAccountPool renders is a ConfigMap key,
 			// a SubPath mount and two environment variables — which is the
 			// point of the fixture. The exit criterion for that work is that
-			// the cluster-to-account mapping is readable off a manifest rather
+			// the project-to-account mapping is readable off a manifest rather
 			// than inferred from what the broker does at runtime, and a golden
 			// file is the only artifact that can hold that claim honestly.
 			name:         "PlatformAgentScopedServiceAccounts",
@@ -115,7 +121,7 @@ func TestAgentsGolden(t *testing.T) {
 			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-scoped-sa.yaml"),
 			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
-				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
 			},
 		},
 		{
@@ -129,7 +135,7 @@ func TestAgentsGolden(t *testing.T) {
 			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-scope.yaml"),
 			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
-				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
 			},
 		},
 		{
@@ -143,7 +149,7 @@ func TestAgentsGolden(t *testing.T) {
 			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-ha.yaml"),
 			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
-				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
 			},
 		},
 		{
@@ -158,7 +164,7 @@ func TestAgentsGolden(t *testing.T) {
 			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-egress-allowlist.yaml"),
 			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
-				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
 			},
 		},
 	}

@@ -300,6 +300,7 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         TASK_NAMES=(a b w v)
         TASK_REUSE=("" "" "" "")
         TASK_HAS_STACK=("" "" "" "")
+        TASK_STREAMS=("" "" "" "")
         unit_cost_hint() { echo 200; }
         profile_begin() { :; }
         run_one_unit() { echo "START $2 rep $3"; sleep 1; echo "END $2 rep $3"; }

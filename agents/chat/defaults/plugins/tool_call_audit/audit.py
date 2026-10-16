@@ -9,6 +9,7 @@ _PLUGINS_DIR = str(Path(__file__).resolve().parents[1])
 if _PLUGINS_DIR not in sys.path:
     sys.path.insert(0, _PLUGINS_DIR)
 
+from common import audit_sink  # noqa: E402
 from common.audit_schema import envelope  # noqa: E402
 from common.redactor import AuditRedactor  # noqa: E402
 
@@ -57,16 +58,18 @@ def _serialize(value: Any) -> str:
 
 
 def _emit(event: str, fields: Dict[str, Any]) -> None:
-    # One JSON object per line. The envelope (common/audit_schema.py) makes the
-    # record self-describing once the fluent-bit sidecar has lifted it out of
-    # the log line; the fields are what each hook knows.
-    logger.info(json.dumps(envelope(event, fields), default=str, sort_keys=True))
+    # One JSON object per line of the profile's audit file (common/audit_sink.py),
+    # which the fluent-bit sidecar tails as JSON. The envelope
+    # (common/audit_schema.py) makes the record self-describing; the fields are
+    # what each hook knows.
+    audit_sink.emit(envelope(event, fields), logger)
 
 
 def log_pre_tool_call(
     tool_name: str = "",
     args: Optional[Dict[str, Any]] = None,
     task_id: str = "",
+    session_id: str = "",
     **kwargs: Any,
 ) -> None:
     try:
@@ -77,6 +80,11 @@ def log_pre_tool_call(
                 "tool": tool_name,
                 "status": _STATUS_STARTED,
                 "task_id": task_id,
+                # The session the call ran in, which Hermes passes beside
+                # task_id. A reader used to get it from the `[session]` tag in
+                # Hermes' line prefix; the audit file has no prefix, so the
+                # record carries it. Empty for a call outside any session.
+                "session_id": session_id,
                 "args": _serialize(args or {}),
             },
         )
@@ -89,6 +97,7 @@ def log_post_tool_call(
     result: Any = None,
     duration_ms: Optional[float] = None,
     task_id: str = "",
+    session_id: str = "",
     **kwargs: Any,
 ) -> None:
     try:
@@ -99,6 +108,7 @@ def log_post_tool_call(
                 "tool": tool_name,
                 "status": _STATUS_COMPLETED,
                 "task_id": task_id,
+                "session_id": session_id,
                 "duration_ms": duration_ms,
                 "result": _serialize(result),
             },

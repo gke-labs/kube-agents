@@ -1,0 +1,43 @@
+{
+  "name": "inventory-top-two-and-fold-mock-15",
+  "source": "agents/chat/scripts/test_inventory_presenter.py::FoldTest.test_the_chat_message_folds_the_same_rows",
+  "notes": "inventory_presenter.chat: the first inventory's card. The top two listed findings are rows, the other three fold under '3 more worth a look', and the total counts the roll-up.",
+  "input": {
+    "inventory_report": "# GKE Environment Scan\n\nI scanned 3 clusters and 41 workloads.\n\n1. **[critical] seeded-b and -c admit privileged pods**\n   Any workload can escape to the node; enforce baseline Pod Security.\n2. **[major] seeded-c is a minor version behind its channel**\n   Upgrade the control plane before the channel's end of support.\n3. **No PDB on payments-api**\n   A node drain takes every replica down at once.\n4. **[minor] Default namespace holds workloads**\n   Move them into a namespace of their own.\n5. **Workload Identity is off on one node pool**\n   Pods there use the node's service account.\n\nAlso found: 18 more items, tracked in the findings queue.\n"
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "I scanned 3 clusters and 41 workloads and found 23 things to look at.",
+        "note": "Two are worth fixing first:",
+        "rows": [
+          {
+            "text": "seeded-b and -c admit privileged pods",
+            "severity": "critical",
+            "detail": "Any workload can escape to the node; enforce baseline Pod Security."
+          },
+          {
+            "text": "seeded-c is a minor version behind its channel",
+            "severity": "major",
+            "detail": "Upgrade the control plane before the channel's end of support."
+          }
+        ],
+        "fold": {
+          "title": "3 more worth a look",
+          "text": "No PDB on payments-api\nA node drain takes every replica down at once.\n`minor` Default namespace holds workloads\nMove them into a namespace of their own.\nWorkload Identity is off on one node pool\nPods there use the node's service account."
+        },
+        "choices": [
+          {
+            "text": "Fix the first one",
+            "primary": true
+          },
+          {
+            "text": "See all 23"
+          }
+        ]
+      }
+    }
+  ]
+}

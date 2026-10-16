@@ -26,6 +26,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// processStartTimeMetric is the gauge the operator's usage poller reads to
+// tell a watcher that restarted from one whose counter fell for another
+// reason: the same name the Go process collector would export, but captured
+// once at start and never re-derived, because that collector recomputes it
+// from /proc/stat's btime on every scrape and a stepped wall clock moves it by
+// a second under an unchanged process, which the poller would read as a
+// restart. docs/designs/usage-counters-producer.md, "Resets".
+const processStartTimeMetric = "process_start_time_seconds"
+
 // metrics holds the Prometheus counters and gauges for the event watcher.
 //
 // Every CounterVec carries cluster, project and location labels, sourced from
@@ -83,6 +92,10 @@ type metrics struct {
 	// CAs), so watching only one of them leaves half the surface dark.
 	clusterDiscoveryErrors *prometheus.CounterVec
 	clusterUp              *prometheus.GaugeVec
+	// processStart is processStartTimeMetric, set once in newMetrics, which
+	// runs at process start, and constant for the life of the process by
+	// construction.
+	processStart prometheus.Gauge
 }
 
 // newMetrics instantiates and registers all watcher metrics using a custom registry.
@@ -167,7 +180,12 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_cluster_up",
 			Help: "1 once this cluster's informer has completed its initial list and is delivering events; 0 while it has not synced (including a stuck informer retrying an unreachable API server), while the API server refuses its events list or watch with 403 Forbidden and the informer is held between attempts, or once it has stopped.",
 		}, []string{"cluster", "project", "location"}),
+		processStart: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: processStartTimeMetric,
+			Help: "Start time of the process since unix epoch in seconds, captured once at start.",
+		}),
 	}
+	m.processStart.Set(processStartSeconds(time.Now()))
 	reg.MustRegister(
 		m.eventsSeen,
 		m.eventsFiltered,
@@ -181,8 +199,15 @@ func newMetrics() *metrics {
 		m.activeIncidents,
 		m.clusterDiscoveryErrors,
 		m.clusterUp,
+		m.processStart,
 	)
 	return m
+}
+
+// processStartSeconds is t as the gauge exports it: seconds since the epoch,
+// with the sub-second part kept.
+func processStartSeconds(t time.Time) float64 {
+	return float64(t.UnixNano()) / float64(time.Second)
 }
 
 type metricsServer struct {

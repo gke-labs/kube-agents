@@ -1,0 +1,218 @@
+# The first of the upgrade-failure catalogue's scenario cases
+# (docs/designs/upgrade-failure-catalogue.md, entry 11: the control plane is
+# unreachable for minutes on a zonal cluster). Every seeded cluster is zonal,
+# so the fixture is the fleet's own shape and nothing is planted for it.
+#
+# What the case grades is the warning an operator needs before scheduling a
+# control-plane upgrade on a zonal cluster: that the API server goes away for
+# a short window, that running pods are not what goes away, and that the
+# cluster's location is what decides it. The prompt names no outage, no zone
+# and no cluster; it does ask for the answer to end in one declared line per
+# cluster with a fixed vocabulary, and the deterministic objectives read
+# those lines and nothing else. Free prose is the judge's to read: three
+# review rounds of phrase lists and bound patterns over the prose each found
+# a negated or generic sentence that passed and a right sentence that failed,
+# because a substring check cannot tell "will not go down" from "will go
+# down" without re-implementing the language. The declared line has no room
+# for a negation or a generic statement: a value is one of two words, and
+# the line names the cluster it is about.
+#
+# The patterns name the four slots through `{cluster:<slot>}`, which the
+# verifier expands to whatever cluster the runner recorded for the slot in
+# the leased project, so a fleet applied with another prefix is graded on
+# its own names; `seeded-a` to `seeded-d` appear below only in the prompt
+# and the expected output, as the default-prefix rendering. The rule is
+# spelled out beside the verification spec.
+#
+# Isolation class: read-only (chat prompt; no audit helper, no GitOps-repo
+# write). Eligible tier: nightly.
+#
+# No deterministic mutation safeguard, documented. The case plants nothing,
+# so there is no planted object whose state a check could ground on. The
+# residual the prompt's "change and upgrade nothing" guards against is the
+# agent starting the upgrade it was asked to plan: one `gcloud container
+# clusters upgrade --master` on slot b heals the version-laggard defect six
+# registered cases read. The fleet's scheduled reconcile owns that defect's
+# integrity, as upgrades-fleet-version-table's header says for the same
+# residual; this case adds no second owner for it.
+id: upgrades-zonal-control-plane-outage-warned
+name: A zonal cluster's control-plane upgrade is announced as an API outage, not a workload outage
+
+prompt: >-
+  We are scheduling control-plane upgrades for the seeded clusters in this
+  project. For each one, tell me whether the Kubernetes API will stay
+  reachable while its control plane upgrades, what that means for anything
+  that talks to the API during the window, and what to do about it. Read only;
+  change and upgrade nothing. End your answer with one line per cluster in
+  exactly this form, no other words on the line:
+  "<cluster>: control plane is <zonal|regional>; API during its upgrade:
+  <unavailable|available>; running pods: <unaffected|affected>".
+
+expected_output: >-
+  A per-cluster answer that reads each seeded cluster's location and says the
+  seeded clusters are zonal (a single-zone control plane with one replica), so
+  the Kubernetes API is unavailable for a short window while each control
+  plane upgrades. GKE documents the window as up to several minutes; the
+  catalogue's own reproduction saw a gap shorter than its poll interval, so an
+  answer that says "brief" or "minutes at most" is as right as one that says
+  "several minutes". kubectl, controllers, CI and anything else calling the
+  API see errors or timeouts for that window, and node-level actions such as
+  scheduling and autoscaling pause. It separates that from the workloads,
+  which keep running on the nodes through the window. It recommends scheduling
+  inside a maintenance window, retries with backoff in API clients, and
+  announcing the API gap to API callers, and notes that only a regional
+  cluster keeps the API available during a control-plane upgrade, which is a
+  recreate rather than a setting. It ends with the declared line for every
+  seeded cluster, each reading "control plane is zonal; API during its
+  upgrade: unavailable; running pods: unaffected". It cites no CVE
+  identifiers and performs no upgrade.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# No planted defect is read: the case depends on the seeded clusters existing
+# and being zonal, which is the slots' shape (bench/tf/fleet/variables.tf's
+# `zone`), not a role. The four roles below are one per slot, and they are
+# how the declared-line objectives tell a cluster the agent missed from a
+# cluster the project does not have: the runner writes a credential per
+# seeded cluster it reaches (`clusters/<slot>.kubeconfig`) before it confirms
+# any role and records each role's slot, and a slot without a credential
+# makes each of those objectives an `error` about the environment (their
+# `fixture_roles`), never a `fail` charged to the agent. Whether these
+# four defects are planted is not read: healing one does not quiet the case;
+# replacing or retiring the slot's cluster does, which is what a reader of
+# this list is checking.
+fixtures:
+  - crashloop-workload
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
+
+verification_spec:
+  # The declared lines are what the deterministic objectives read: one line
+  # per cluster, fixed vocabulary, the cluster named at the start of the
+  # line. Every pattern below, accepting or forbidding, matches the whole
+  # declared frame ("<cluster>: control plane is ...; api during its
+  # upgrade: ...; running pods: ..."), anchored at both ends of the line, so
+  # prose that happens to open with a slot name ("seeded-b: control plane is
+  # 1.32.4, one minor behind") is neither accepted nor forbidden: it is the
+  # judge's. How the agent decorates the line (indentation, a bullet or a
+  # number, quotes, a link, a trailing stop or mark) is the verifier's to
+  # fold, not the case's to enumerate: `fold_decoration: true` has
+  # `_normalize_lines` strip a line's decoration before any pattern runs.
+  # What the case does allow around the cluster's name is naming rather than
+  # decoration: a qualified id (a project, a location, a kubeconfig context
+  # or a resource path joined to the name by the characters a name may hold)
+  # or a parenthetical after it. Which name is not the case's to guess:
+  # `{cluster:a}` in a pattern expands, at verify time, to the cluster the
+  # runner recorded for slot a in its context file (`cluster.a=`), bare or
+  # as the last `-` or `/`-joined component of a longer id (a kubeconfig
+  # context's `_` counts because the fold has made it a `-`), followed by
+  # nothing or by `-<location>` as the runner recorded it; `{cluster:any}` is
+  # every recorded slot. So `seeded-b-us-central1-a` is slot b where that is
+  # the recorded location, `seeded-a-us-west1` is not slot a (the runner's
+  # own rule reads a slot off a name's end, and a leftover second-region
+  # cluster carries exactly that name), and a fleet applied with another
+  # prefix is graded on the names it has. The four slots are the ones
+  # `bench/tf/fleet` declares, and the first objective needs a line for
+  # each. The host cluster or "clusters in general" does not pass. Each value objective also forbids a declared
+  # frame whose value slot holds anything but the right word, as the exact
+  # negation of what it accepts, so one right line beside a wrong or
+  # off-vocabulary line for another cluster fails.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      # One role per slot (the case's `fixtures:` says why), each resolved
+      # to its slot's own credential, on this and the three value objectives:
+      # a slot whose cluster the runner could not reach before the run is an
+      # `error` here, not a line the agent failed to write.
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      # One pattern, four lookaheads: a declared frame for each of the four
+      # slots, in any order, anywhere in the report.
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)'
+
+  - name: the-declared-lines-say-the-control-plane-is-zonal
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      # The same four slots: on a project missing one, or where the runner
+      # reached none, this is the environment's error, not a value the agent
+      # got wrong.
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control plane is zonal; api during its upgrade: [^;\n]+; running pods: [^\n]+$'
+      # A declared frame whose first value is anything but "zonal" is the
+      # wrong read, whatever the other lines say.
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control plane is (?!zonal;)[^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$'
+
+  - name: the-declared-lines-say-the-api-goes-away
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      # The same four slots: on a project missing one, or where the runner
+      # reached none, this is the environment's error, not a value the agent
+      # got wrong.
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: unavailable; running pods: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: (?!unavailable;)[^;\n]+; running pods: [^\n]+$'
+
+  # The distinction that makes the warning useful: the nodes and their pods
+  # are not what goes away. A report that says "the cluster is down" without
+  # it sends the operator to drain workloads for an upgrade that touches none.
+  - name: the-declared-lines-separate-workloads-from-the-api
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      # The same four slots: on a project missing one, or where the runner
+      # reached none, this is the environment's error, not a value the agent
+      # got wrong.
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: unaffected$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: (?!unaffected$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in an upgrade answer is an invention.
+      forbidden_phrases: ["CVE-"]

@@ -37,6 +37,8 @@ import subprocess
 from collections.abc import Callable, Collection
 from typing import Any, Literal
 
+from kube_agents_bench.board import BOARD_FILE
+from kube_agents_bench.discovery import CLUSTER_KEY_PREFIX, SCAN_MARKER
 from kube_agents_bench.worker_trajectory import DATA_ROOT, FALLBACK_PYTHON, HERMES_PYTHON
 
 __all__ = [
@@ -45,11 +47,17 @@ __all__ = [
     "DELIVERY_JOB_ID",
     "EXECUTIONS_DB",
     "ITEMS_FILE",
+    "PRIORITIZE_KEY",
+    "RAW_FILE",
     "REPORT_FILE",
+    "SCORES_FILE",
     "agent_shell",
     "read_delivery_runs",
     "read_files",
+    "read_handoff_board",
     "read_items",
+    "read_raw_block",
+    "read_scored_report",
     "sandbox_pod",
     "sandbox_shell",
 ]
@@ -86,11 +94,11 @@ FILES_READ = "__ONBOARDING_FILES_READ__"
 FILE_PRESENT = "present"
 FILE_ABSENT = "absent"
 
-# The scheduler's record of each run of the delivery job (bootstrap_delivery.py:
-# DELIVERY_JOB_ID), which Hermes keeps in the agent pod's cron store. Read with
+# The scheduler's record of each run of the job whose delivery stage posts the report
+# (bootstrap_delivery.py: OOBE_JOB_ID), which Hermes keeps in the agent pod's cron store. Read with
 # the agent's own interpreter, falling back to python3 as the other reads do:
 # the agent image ships no sqlite3 binary.
-DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
+DELIVERY_JOB_ID = "oobe"
 EXECUTIONS_DB = f"{DATA_ROOT}/cron/executions.db"
 RUNS_READ = "__ONBOARDING_RUNS_READ__"
 # The job ticks every minute, so this reaches back several hours from the
@@ -136,6 +144,217 @@ if out["marker"] is not None:
                             "error": error, "delivery_outcome": outcome})
 print(sentinel)
 print(json.dumps(out))
+"""
+
+
+# The sweep's raw report and the parser the prioritization stage runs over it,
+# as the sandbox stages them (agents/platform/scripts/inventory_findings.py:
+# DEFAULT_RAW_PATH; the sandbox stages the image's scripts tree under the data
+# root). The sandbox's own copy is the oracle, so the verdict matches what the
+# next stage would make of the file on that install.
+RAW_FILE = f"{DATA_ROOT}/INVENTORY.raw.md"
+PARSER_DIR = f"{DATA_ROOT}/scripts"
+PARSER_MODULE = "inventory_findings"
+SANDBOX_PYTHON = "python3"
+RAW_READ = "__ONBOARDING_RAW_BLOCK__"
+# Parser errors carried into the verdict; the rest are counted.
+MAX_PARSER_ERRORS = 5
+
+# The worker's scores (inventory_findings.py: DEFAULT_SCORES_PATH) and the report
+# it wrote, read together so a check can tell which of the batch's findings the
+# worker scored critical and which of them the report lists. The sandbox's own
+# `build_payloads` and `fq.validate_finding` score the batch, as `register`
+# would, so the severities are the queue's for the same vectors.
+SCORES_FILE = f"{DATA_ROOT}/INVENTORY.scores.json"
+SCORED_READ = "__ONBOARDING_SCORED_REPORT__"
+# Far above the SOP's 4000-character ceiling; the read stops here.
+MAX_REPORT_BYTES = 1 << 16
+SCORED_ROW_FIELDS = ("check_slug", "project", "cluster", "namespace", "object", "severity")
+
+# Runs in the sandbox. Prints the report, delivered copy first, and every row of
+# the batch with the severity the sandbox's scorer gives it, the line it is
+# gathered into (`fq.item_key`) and whether it is rolled up (`fq.rolled_up`), as
+# `select` decides them, or why the batch could not be scored. A scorer that
+# cannot be imported is printed as "error".
+_SCORED_SCRIPT = """
+import json, os, sys
+items_path, scores_path, delivered, report, parser_dir, module, max_bytes, max_errors, sentinel, fields = sys.argv[1:11]
+out = {"report": "absent", "text": None, "rows": None, "errors": None, "error": None}
+for state, path in (("delivered", delivered), ("written", report)):
+    if os.path.lexists(path):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                out["text"] = fh.read(int(max_bytes))
+            out["report"] = state
+        except OSError as exc:
+            out["report"] = "unreadable"
+            out["text"] = str(exc)
+        break
+sys.path.insert(0, parser_dir)
+try:
+    scorer = __import__(module)
+except Exception as exc:
+    out["error"] = "cannot import %s from %s: %s" % (module, parser_dir, exc)
+else:
+    try:
+        with open(items_path, encoding="utf-8") as fh:
+            items = json.load(fh)["items"]
+        with open(scores_path, encoding="utf-8") as fh:
+            scores = json.load(fh)["scores"]
+        payloads = scorer.build_payloads(items, scores)
+        out["rows"] = [
+            dict(
+                {k: row.get(k) for k in fields.split(",")},
+                item_key=list(scorer.fq.item_key(row)),
+                rolled_up=scorer.fq.rolled_up(row),
+            )
+            for row in (scorer.fq.validate_finding(p) for p in payloads)
+        ]
+    except scorer.Failure as exc:
+        out["errors"] = exc.errors[: int(max_errors)]
+    except Exception as exc:
+        out["errors"] = ["%s: %s" % (type(exc).__name__, exc)]
+print(sentinel)
+print(json.dumps(out))
+"""
+
+# bootstrap_scan_gate.py: PRIORITIZE_IDEMPOTENCY_KEY and SCAN_ASSIGNEE, and the
+# word the ranking card title bootstrap_handoff.py files carries.
+PRIORITIZE_KEY = "bootstrap-inventory-prioritize"
+PRIORITIZE_ASSIGNEE = "platform"
+PRIORITIZE_TITLE_WORD = "Prioritize"
+# bootstrap_handoff.py: SETTLED less DONE, the statuses in which a ranking card
+# ranks nothing without a person.
+RANKING_WONT_RUN = ("blocked", "triage", "failed", "cancelled")
+HANDOFF_READ = "__ONBOARDING_HANDOFF_BOARD__"
+# Where the agent pod keeps bootstrap_handoff.py. The board read asks the
+# writer's own finding_lines which clusters it lists, so the check cannot
+# disagree with the writer about which findings belong in the block.
+HANDOFF_MODULE_DIR = f"{DATA_ROOT}/scripts"
+HANDOFF_MODULE = "bootstrap_handoff"
+
+# Runs in the sandbox. Parses the raw report with the sandbox's own parser and
+# prints the items' (cluster, check, object), or the parser's Failure code and
+# errors. A raw file that cannot be read or decoded is reported as such; a
+# parser that cannot be imported is an install fault, printed as "error".
+_RAW_SCRIPT = """
+import json, os, sys
+raw, parser_dir, module, limit, sentinel = sys.argv[1:6]
+out = {"raw": "absent", "items": None, "code": None, "errors": None, "error_count": 0, "error": None}
+if os.path.lexists(raw):
+    out["raw"] = "present"
+    sys.path.insert(0, parser_dir)
+    try:
+        parser = __import__(module)
+    except Exception as exc:
+        out["error"] = "cannot import %s from %s: %s" % (module, parser_dir, exc)
+    else:
+        try:
+            with open(raw, encoding="utf-8") as fh:
+                text = fh.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            out["raw"] = "unreadable"
+            out["errors"] = [str(exc)]
+        else:
+            try:
+                items = parser.parse_block(text)
+            except parser.Failure as exc:
+                out["code"] = exc.code
+                out["errors"] = exc.errors[: int(limit)]
+                out["error_count"] = len(exc.errors)
+            else:
+                out["items"] = [{k: i.get(k) for k in ("cluster", "check", "object")} for i in items]
+print(sentinel)
+print(json.dumps(out))
+"""
+
+# Runs in the agent container against the board, read-only. Reads the sweep
+# named by the gate's marker; every cluster card created at or after it, with
+# the cluster and findings count from the metadata of its latest completed
+# run; the keyed ranking card; and any ranking-titled platform card without
+# the key, so a fail can say the card was filed unkeyed.
+_HANDOFF_SCRIPT = """
+import json, os, re, sqlite3, sys
+root, board, sentinel, marker, prefix, key, assignee, word, module_dir, module = sys.argv[1:11]
+SQLITE_BUSY_TIMEOUT = 10
+out = {"sweep": None, "clusters": [], "keyed": [], "unkeyed": [], "error": None, "writer_error": None}
+
+
+def done(error=None):
+    out["error"] = error
+    print(sentinel)
+    print(json.dumps(out))
+    sys.exit(0)
+
+
+_writer = []
+
+
+def writer():
+    # Imported on first use, so a board on an image without the module still
+    # grades: no clusters listed, and ranking cards with ownership unknown.
+    if not _writer:
+        sys.path.insert(0, module_dir)
+        _writer.append(__import__(module))
+    return _writer[0]
+
+
+try:
+    with open(os.path.join(root, marker)) as fh:
+        lines = fh.readlines()
+except OSError as exc:
+    done("no discovery sweep has been filed: %s" % exc)
+ids = [m.group(1) for m in (re.search(r"(?:^|\\s)task_id\\s*=\\s*(\\S+)", line) for line in lines) if m]
+if not ids or not ids[0]:
+    done("%s names no task_id" % marker)
+try:
+    conn = sqlite3.connect("file:%s/%s?mode=ro" % (root, board), uri=True, timeout=SQLITE_BUSY_TIMEOUT)
+    row = conn.execute("SELECT id, status, created_at FROM tasks WHERE id = ?", (ids[0],)).fetchone()
+    if row is None:
+        done("the sweep card %s named by %s is not on the board" % (ids[0], marker))
+    out["sweep"] = {"id": row[0], "status": row[1]}
+    since = row[2]
+    cards = conn.execute(
+        "SELECT id, status FROM tasks WHERE substr(idempotency_key, 1, ?) = ? AND created_at >= ? ORDER BY created_at, id",
+        (len(prefix), prefix, since)).fetchall()
+    for tid, status in cards:
+        card = {"id": tid, "status": status, "listed": [], "metadata": "none"}
+        if status == "done":
+            run = conn.execute(
+                "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' ORDER BY id DESC LIMIT 1",
+                (tid,)).fetchone()
+            try:
+                meta = json.loads(run[0]) if run and run[0] else None
+            except ValueError:
+                meta = None
+                card["metadata"] = "invalid"
+            if isinstance(meta, dict):
+                card["metadata"] = "present"
+                try:
+                    card["listed"] = sorted({line["cluster"] for line in writer().finding_lines(meta)})
+                except Exception as exc:
+                    out["writer_error"] = "the hand-off module %s from %s failed: %s" % (module, module_dir, exc)
+        out["clusters"].append(card)
+    out["keyed"] = []
+    for tid, status, body in conn.execute(
+            "SELECT id, status, body FROM tasks WHERE idempotency_key = ? AND created_at >= ? ORDER BY created_at, id",
+            (key, since)):
+        try:
+            own = (body or "") == writer()._prioritize_body()
+        except Exception:
+            own = None
+        out["keyed"].append({"id": tid, "status": status, "own": own})
+    out["unkeyed"] = [
+        {"id": tid, "status": status, "title": title, "key": ikey}
+        for tid, status, title, ikey in conn.execute(
+            "SELECT id, status, title, idempotency_key FROM tasks WHERE assignee = ? AND created_at >= ? "
+            "AND instr(title, ?) > 0 AND (idempotency_key IS NULL OR idempotency_key != ?) ORDER BY created_at, id",
+            (assignee, since, word, key))
+    ]
+    conn.close()
+except sqlite3.Error as exc:
+    done("kanban board: %s" % exc)
+done()
 """
 
 
@@ -271,5 +490,112 @@ def read_delivery_runs(shell: Callable[[str, float], str], timeout: float) -> di
     except json.JSONDecodeError:
         return None
     if not isinstance(parsed, dict) or not isinstance(parsed.get("runs"), list):
+        return None
+    return parsed
+
+
+def raw_command() -> str:
+    """The ``sh -c`` line that parses the raw report in the sandbox with the sandbox's parser."""
+    args = " ".join(
+        shlex.quote(a) for a in [RAW_FILE, PARSER_DIR, PARSER_MODULE, str(MAX_PARSER_ERRORS), RAW_READ]
+    )
+    return f"{SANDBOX_PYTHON} -c {shlex.quote(_RAW_SCRIPT)} {args}"
+
+
+def _payload(reply: str, sentinel: str) -> dict[str, Any] | None:
+    # The sentinel's own line, not its last occurrence: the JSON after it is
+    # one line that can carry model-written titles, and json.dumps escapes any
+    # newline in them, so no title can forge a line of its own.
+    lines = reply.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.strip() == sentinel), None)
+    if start is None:
+        return None
+    try:
+        parsed = json.loads("\n".join(lines[start + 1 :]))
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def read_raw_block(shell: Callable[[str, float], str], timeout: float) -> dict[str, Any] | None:
+    """What the sandbox's parser makes of the raw report, or ``None`` if the read failed.
+
+    ``"raw"`` is ``absent``, ``unreadable`` or ``present``; a present file
+    carries ``"items"`` or the parser's ``"code"`` and ``"errors"``. An
+    ``"error"`` is a parser that could not be imported. ``shell`` is
+    :func:`sandbox_shell`, a parameter so the tests can run it locally.
+    """
+    return _payload(shell(raw_command(), timeout), RAW_READ)
+
+
+def handoff_command() -> str:
+    """The ``sh -c`` line that reads the sweep's hand-off off the agent's board."""
+    args = " ".join(
+        shlex.quote(a)
+        for a in [
+            DATA_ROOT,
+            BOARD_FILE,
+            HANDOFF_READ,
+            SCAN_MARKER,
+            CLUSTER_KEY_PREFIX,
+            PRIORITIZE_KEY,
+            PRIORITIZE_ASSIGNEE,
+            PRIORITIZE_TITLE_WORD,
+            HANDOFF_MODULE_DIR,
+            HANDOFF_MODULE,
+        ]
+    )
+    return (
+        f'PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={shlex.quote(FALLBACK_PYTHON)}; '
+        f'"$PY" -c {shlex.quote(_HANDOFF_SCRIPT)} {args}'
+    )
+
+
+def read_handoff_board(shell: Callable[[str, float], str], timeout: float) -> dict[str, Any] | None:
+    """The sweep, its cluster cards and the ranking cards, or ``None`` if the read failed.
+
+    An ``"error"`` is no sweep marker, a sweep the board does not know, or a
+    board that cannot be queried, read from a pod that answered. ``shell`` is
+    :func:`agent_shell`, a parameter so the tests can run it locally.
+    """
+    parsed = _payload(shell(handoff_command(), timeout), HANDOFF_READ)
+    if parsed is None or not isinstance(parsed.get("clusters"), list):
+        return None
+    return parsed
+
+
+def scored_command() -> str:
+    """The ``sh -c`` line that reads the report and scores the batch in the sandbox."""
+    args = " ".join(
+        shlex.quote(a)
+        for a in [
+            ITEMS_FILE,
+            SCORES_FILE,
+            DELIVERED_FILE,
+            REPORT_FILE,
+            PARSER_DIR,
+            PARSER_MODULE,
+            str(MAX_REPORT_BYTES),
+            str(MAX_PARSER_ERRORS),
+            SCORED_READ,
+            ",".join(SCORED_ROW_FIELDS),
+        ]
+    )
+    return f"{SANDBOX_PYTHON} -c {shlex.quote(_SCORED_SCRIPT)} {args}"
+
+
+def read_scored_report(shell: Callable[[str, float], str], timeout: float) -> dict[str, Any] | None:
+    """The report and the batch's scored rows, or ``None`` if the read failed.
+
+    ``"report"`` is ``delivered``, ``written`` (not yet delivered), ``absent``
+    or ``unreadable``, with its text in ``"text"``. ``"rows"`` holds each
+    finding's identity and severity, with its ``"item_key"`` and
+    ``"rolled_up"`` from the sandbox's queue module, or is ``None`` with ``"errors"`` saying
+    why the batch could not be scored. An ``"error"`` is a scorer that could
+    not be imported. ``shell`` is :func:`sandbox_shell`, a parameter so the
+    tests can run it locally.
+    """
+    parsed = _payload(shell(scored_command(), timeout), SCORED_READ)
+    if parsed is None or "rows" not in parsed:
         return None
     return parsed

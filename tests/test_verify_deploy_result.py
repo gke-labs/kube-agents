@@ -78,7 +78,7 @@ class VerifyDeployResultTest(unittest.TestCase):
             "DEPLOY_RESULT": "applied",
         })
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("Target environment (autopush or staging) must be specified", proc.stderr)
+        self.assertIn("Target environment (autopush, autopush-next or staging) must be specified", proc.stderr)
 
     def test_invalid_environment_fails(self):
         proc = self._run(env_overrides={
@@ -94,6 +94,32 @@ class VerifyDeployResultTest(unittest.TestCase):
         })
         self.assertEqual(proc.returncode, 1)
         self.assertIn("DEPLOY_RESULT is required", proc.stderr)
+
+    def test_applied_success_autopush_next(self):
+        proc = self._run(env_overrides={
+            "TARGET_ENVIRONMENT": "autopush-next",
+            "DEPLOY_RESULT": "applied",
+        })
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("autopush-next deployment completed successfully (applied)", proc.stdout)
+
+    def test_skipped_passes_only_when_the_caller_allows_it(self):
+        """An unprovisioned autopush-next skips; nothing else may."""
+        proc = self._run(env_overrides={
+            "TARGET_ENVIRONMENT": "autopush-next",
+            "DEPLOY_RESULT": "skipped",
+            "ALLOW_SKIPPED": "true",
+        })
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("::notice title=Deployment skipped::", proc.stdout)
+
+    def test_skipped_fails_without_allow_skipped(self):
+        proc = self._run(env_overrides={
+            "TARGET_ENVIRONMENT": "autopush",
+            "DEPLOY_RESULT": "skipped",
+        })
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("deployment skipped without ALLOW_SKIPPED=true", proc.stderr)
 
     def test_cli_arguments_supported(self):
         proc = self._run(args=["autopush", "applied"])

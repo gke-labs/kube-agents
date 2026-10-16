@@ -1,14 +1,16 @@
 # FIXTURE NOT READY — a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
 # until the stalled-controller role is applied to pool projects and verified (#1873).
 #
-# Domain: cluster debugging. Journey: the stall watch (#1844) files a card for
-# a namespace whose controller has stopped making progress without erroring,
-# and the Cluster Agent names what it is waiting on.
+# Domain: cluster debugging. Journey: a Cluster Agent is handed a namespace
+# whose controller has stopped making progress without erroring, and names what
+# it is waiting on.
 #
 # The positive half of the gke-stall-detection pair (#1342);
 # cluster-agent-stalled-controller-healthy-silence is the silence half. The
-# prompt is the card body stall_watch.card_body files, so the case grades the
-# brief the cron actually sends.
+# prompt is the brief the stall watch's own card carried before the watch moved
+# onto the inject path (docs/designs/stall-watch-inject.md); the card the alert
+# now produces, and its triage template, are graded by
+# autoops-controller-stall-triage.
 #
 # The card carries no row detail, so the missing ConfigMap is not in the
 # prompt and the agent has to find it. The objective also needs the skill's
@@ -27,7 +29,7 @@
 # namespace seeded-stall on seeded cluster A, envFrom ConfigMap inventory-flags,
 # which does not exist.
 id: cluster-agent-stalled-controller-diagnosis
-name: A stall-watch card for a stalled Deployment is diagnosed to its missing ConfigMap
+name: A stall brief for a stalled Deployment is diagnosed to its missing ConfigMap
 prompt: >-
   The scheduled stall watch found controllers in namespace `seeded-stall` of
   the seeded cluster that carries it that have stopped making progress

@@ -50,6 +50,15 @@
 #      with two readers has its records SPLIT between them, so each install
 #      reports about half the project's drift until one teardown deletes the
 #      three for both. `guard_drift_adoption` refuses the apply instead.
+#  10. Cloud KMS 403s some requests for a few minutes after a project's first
+#      enablement, which this composition (or the installer just before it)
+#      performs in the same apply that creates the key ring and key. The apply
+#      stops there, sometimes with the resource created and tainted, and a bare
+#      re-run replaces it and 409s (1 again). An approved `apply` (-auto-approve,
+#      which the front doors and CI pass) retries on that message after a wait,
+#      untainting first (`adopt_kms`); an unapproved `apply` at a terminal
+#      runs once, and its re-run untaints the same way.
+#      KMS_API_PROPAGATION_ATTEMPTS and KMS_API_PROPAGATION_WAIT_SECONDS size it.
 #
 # Usage:
 #   ./lifecycle.sh apply    [extra terraform args...]
@@ -173,7 +182,37 @@ readonly MINTER_KMS_KEY_ADDRESS="module.github_minter[0].google_kms_crypto_key.m
 # SERVICE_DISABLED where an established one answers NOT_FOUND. Same shape as
 # GCS_OBJECT_ABSENT_PATTERN in scripts/installer/installer_common.sh.
 readonly MINTER_KEY_ABSENT_PATTERN='NOT_FOUND|SERVICE_DISABLED|has not been used in project'
+# Cloud KMS answers some requests with 403 "Google Cloud KMS API has not been
+# used in project <n> before or it is disabled" for a few minutes after a
+# project's FIRST enablement -- which is the enablement main.tf performs in the
+# same apply that creates the key ring and key. It is not a fixed delay:
+# measured on two fresh projects, a crypto key create failed 4s and 82s after
+# the enablement returned while a retry at 37s passed, so the answer depends on
+# which frontend takes the request, and a timer between the two resources does
+# not close it. The google provider (7.46) retries no 403 of this shape, and
+# re-enabling an API a project has used before does not reproduce it, so only
+# a project's first install pays. run_apply therefore retries the apply --
+# which continues where the failed one stopped -- when it failed on exactly this
+# message, after a wait, up to the attempt budget; both knobs are environment
+# overrides so a test runs with no wait. The read-back of a create that
+# succeeded can be the request that fails, which leaves the resource tainted,
+# and adopt_kms untaints it before the next attempt (see there). An ERE, for
+# grep -E: the API has been named "Google Cloud KMS API" and "Cloud Key
+# Management Service (KMS) API" in this message, and both end the same way.
+readonly KMS_API_PROPAGATION_PATTERN='KMS\)? API has not been used in project'
+KMS_API_PROPAGATION_ATTEMPTS="${KMS_API_PROPAGATION_ATTEMPTS:-5}"
+KMS_API_PROPAGATION_WAIT_SECONDS="${KMS_API_PROPAGATION_WAIT_SECONDS:-60}"
+# Where run_apply keeps the apply's output for that grep; set per run.
+APPLY_OUTPUT_FILE=""
+# What Terraform prints when it is interrupted: it traps SIGINT, cancels the
+# walk, prints the diagnostics it had collected -- a 403 among them, if one
+# had landed -- and exits 1 like any failed apply. run_apply reads this line
+# as the operator's decision and retries nothing after it.
+readonly TERRAFORM_INTERRUPT_PATTERN='^(Interrupt received|Two interrupts received)'
 readonly HELM_RELEASE_ADDRESS="helm_release.kube_agents"
+readonly CERT_MANAGER_RELEASE_ADDRESS="helm_release.cert_manager[0]"
+# The releases' own `timeout = 600` in main.tf, for the uninstall that runs ahead of terraform destroy.
+readonly HELM_UNINSTALL_TIMEOUT="10m"
 readonly AGENT_GSA_ADDRESS="module.kube_agents_iam.google_service_account.agent"
 readonly CHAT_SUBSCRIPTION_ADDRESS="module.chat_pubsub[0].google_pubsub_subscription.chat_events"
 readonly STATE_LOCK_MESSAGE_PATTERN='(Acquiring|Releasing) state lock\.'
@@ -222,6 +261,7 @@ readonly DRIFT_ADOPTION_TARGETS=(
 # collection is the last word of the gcloud group above -- topics,
 # subscriptions, sinks -- so the array needs no fourth spelling of it.
 readonly DRIFT_IMPORT_ID_FORMAT='projects/%s/%s/%s'
+readonly K8S_LABEL_VALUE_MAX_LENGTH=63
 
 #
 # One argument, "readonly", suppresses the bucket creation for `plan`. A plan
@@ -350,6 +390,28 @@ load_state() {
 state_changed() { STATE_LIST_FRESH=false; }
 in_state() { grep -Fxq "$1" <<<"$STATE_LIST"; }
 
+# The tainted instances, for adopt_kms alone, which is why this is a second
+# read rather than part of load_state: `state list` does not mark them,
+# `state show` would be a round-trip per address, and `terraform show` prints
+# each tainted instance's header as "# <address>: (tainted)" -- one call,
+# parsed into a list, never printed (the output carries the whole state,
+# helm_release values included), and paid only by the one caller that acts on
+# it. `show` loads every provider's schema, which `state list` does not, so it
+# can fail where the list succeeded; said out loud, because an empty list here
+# means a tainted key ring or key goes to the replacement adopt_kms exists to
+# prevent. Whatever it printed before failing is kept: a header that was read
+# is a taint that is real. An empty state is "No state." and exit 0, not a
+# failure. Read at the first key ring or key found in state and once per
+# adopt_kms, which keeps its own flag for that, so a fresh project never
+# pays it and nothing here needs a cache.
+TAINTED_LIST=""
+load_tainted() {
+  if ! TAINTED_LIST=$(terraform show -no-color 2>/dev/null | sed -n 's/^# \(.*\): (tainted)$/\1/p'); then
+    warn "could not read the state for tainted resources (terraform show failed); a tainted CMEK key ring or key, if any, will be planned for replacement"
+  fi
+}
+in_tainted() { grep -Fxq "$1" <<<"$TAINTED_LIST"; }
+
 # The recorded value of a string attribute of a resource in state, for the
 # guards that compare it against the configuration. `head -1` keeps the
 # resource's own attribute when a nested block repeats the name (a key's
@@ -471,6 +533,26 @@ restore_key_versions() {
   done <<<"$versions"
 }
 
+# Whether the resource behind an adoption target exists in GCP, asked of gcloud
+# by kind. $location and $project are adopt_kms's locals.
+adoption_target_exists() { # <kind> <id>
+  local kind="$1" id="$2"
+  case "$kind" in
+    keyring)      gcloud kms keyrings describe "${id##*/}" --location "$location" \
+                    --project "$project" >/dev/null 2>&1 ;;
+    key)          gcloud kms keys describe "${id##*/}" --location "$location" \
+                    --keyring "$(echo "$id" | sed -E 's|.*/keyRings/([^/]+)/.*|\1|')" \
+                    --project "$project" >/dev/null 2>&1 ;;
+    pubsub_topic) gcloud pubsub topics describe "${id##*/}" \
+                    --project "$project" >/dev/null 2>&1 ;;
+    pubsub_sub)   gcloud pubsub subscriptions describe "${id##*/}" \
+                    --project "$project" >/dev/null 2>&1 ;;
+    logging_sink) gcloud logging sinks describe "${id##*/}" \
+                    --project "$project" >/dev/null 2>&1 ;;
+    *)            return 1 ;;
+  esac
+}
+
 adopt_kms() {
   local project location keyring key
   load_state
@@ -528,27 +610,48 @@ adopt_kms() {
   # empty array expansion as unbound under `set -u`. The ${arr[@]+...} form
   # expands to nothing instead, so the loop runs zero times and the tail below
   # still clears any stale import override and logs what happened.
-  local adopted=0 address kind id
+  # The tainted list is read at the first key ring or key found in state and
+  # once per call: state_changed after an untaint would otherwise have the
+  # next target re-read it, and untainting one address changes no other's.
+  local adopted=0 untainted=0 tainted_read=false address kind id
   for target in ${targets[@]+"${targets[@]}"}; do
     IFS=$'\t' read -r address kind id <<<"$target"
 
     if in_state "$address"; then
+      # In state and tainted: created by an apply whose later read of it
+      # failed -- Cloud KMS's 403 in the minutes after its first enablement
+      # (KMS_API_PROPAGATION_PATTERN) is the known way in. The plan would
+      # replace it, and for a key ring or key that is a destroy GCP refuses
+      # followed by a create that 409s; for a key the destroy also schedules
+      # its versions for destruction first. Untainting says what is true:
+      # Terraform recorded the id, so the create succeeded, and the apply
+      # refreshes and reconciles the resource in place. Were it gone after
+      # all, the refresh drops it from state and the plan is a plain create,
+      # which is where a taint would also end, by the worse route. gcloud is
+      # not asked first: in the same window its describe can draw the same
+      # 403, and "does not exist" from it would let the replacement run.
+      # The stockout trio in the same list is deletable, and `terraform
+      # taint` is how an operator asks for one of those to be rebuilt, so
+      # only the two kinds GCP cannot delete are untainted.
+      if [[ "$kind" == "keyring" || "$kind" == "key" ]]; then
+        [[ "$tainted_read" == "true" ]] || { load_tainted; tainted_read=true; }
+      fi
+      if [[ "$kind" == "keyring" || "$kind" == "key" ]] && in_tainted "$address"; then
+        log "untainting $address: it was created, and replacing it would fail"
+        state_changed
+        if terraform untaint -no-color "$address" >/dev/null 2>&1; then
+          untainted=$((untainted + 1))
+          if [[ "$kind" == "key" ]]; then
+            restore_key_versions "$id" "$location" "$project"
+          fi
+        else
+          warn "could not untaint $address; the apply will plan its replacement"
+        fi
+      fi
       continue
     fi
 
-    case "$kind" in
-      keyring)      gcloud kms keyrings describe "${id##*/}" --location "$location" \
-                      --project "$project" >/dev/null 2>&1 || continue ;;
-      key)          gcloud kms keys describe "${id##*/}" --location "$location" \
-                      --keyring "$(echo "$id" | sed -E 's|.*/keyRings/([^/]+)/.*|\1|')" \
-                      --project "$project" >/dev/null 2>&1 || continue ;;
-      pubsub_topic) gcloud pubsub topics describe "${id##*/}" \
-                      --project "$project" >/dev/null 2>&1 || continue ;;
-      pubsub_sub)   gcloud pubsub subscriptions describe "${id##*/}" \
-                      --project "$project" >/dev/null 2>&1 || continue ;;
-      logging_sink) gcloud logging sinks describe "${id##*/}" \
-                      --project "$project" >/dev/null 2>&1 || continue ;;
-    esac
+    adoption_target_exists "$kind" "$id" || continue
 
     log "adopting pre-existing resource: $id"
     [[ -f "$OVERRIDE_FILE" && -f "$SCOPE_OVERRIDE_FILE" ]] || with_override
@@ -563,7 +666,7 @@ adopt_kms() {
 
   drop_override
   trap - EXIT
-  log "resource adoption complete: $adopted imported"
+  log "resource adoption complete: $adopted imported, $untainted untainted"
 }
 
 # Pub/Sub topics and subscriptions are deletable, so they are not undeletable
@@ -945,6 +1048,10 @@ guard_drift_adoption() {
     IFS='|' read -r addr group noun name <<<"$line"
     warn "  gcloud $group delete $name --project $project"
   done
+  local sink_name
+  sink_name=$(tfvar drift_pubsub_sink)
+  warn "An install with a declared scope also owns a sink named '${sink_name}-${project}' in each project the scope lists, which this guard does not look for. Import or delete those the same way before applying, or the apply stops on a 409 in that project:"
+  warn "  terraform import 'module.drift_pubsub[0].google_logging_project_sink.source_drift_audit[\"<listed project>\"]' projects/<listed project>/sinks/${sink_name}-${project}"
   warn "Or leave the detector off for this install: ENABLE_DRIFT_DETECTOR=false in install.env."
   exit 1
 }
@@ -1066,27 +1173,121 @@ guard_minter_key() {
   exit 1
 }
 
-delete_agent_cr() {
-  local namespace cluster location project names
-  namespace=$(tfvar namespace)
+# Fetches credentials for this install's cluster, once per run, for the
+# in-cluster steps of a destroy, and sets CLUSTER_CONTEXT to the kubeconfig
+# context gcloud writes for it, which every kubectl and helm call after it
+# names. Returns 1 when get-credentials fails.
+#
+# Through the helper, so teardown reaches the cluster over the endpoint the
+# install used. Without the flag a cluster whose IP endpoint this host cannot
+# route to gets that IP written into the kubeconfig, and the callers' guard does
+# not catch it: get-credentials is a describe plus a file write, neither of
+# which touches the control plane, so it exits 0. The kubectl after it then
+# reads an unreachable cluster as a namespace holding no PlatformAgent, and
+# teardown reports success having left the finalizer's cluster-scoped RBAC
+# behind — the objects nothing else garbage-collects.
+CLUSTER_CONTEXT=""
+# The apply itself. An apply that is about to ask someone at a terminal runs
+# unfiltered and once: a terminal on stdin and stdout, and no approval given
+# here or in TF_CLI_ARGS_apply. Its closing "Enter a value: " has no newline
+# and would wait in the line-based filter until answered, and whoever answered
+# it can run it again. Everything else is filtered -- an approved apply
+# (upgrade.sh passes -auto-approve) prints the whole diff without asking, and a
+# pipe (`| tee`), a file or CI is a log -- and retried on Cloud KMS's
+# first-enablement 403 (KMS_API_PROPAGATION_PATTERN): stderr is merged so the
+# message can be read back, tee keeps a copy in a temporary file for that one
+# grep (a copy of stdout through /dev/fd would not do: on Linux tee re-opens
+# the path, which truncates a stdout that is a regular file -- `> apply.log`
+# -- and drops every line written before the apply), and each further attempt
+# waits, re-runs adopt_kms to untaint what the failed one left tainted, and
+# applies again, which continues from where the failed apply stopped. Any
+# other failure, and the last attempt's, return as they are. tee ignores
+# SIGINT (-i) for the reason redact_helm_release_metadata does: on Ctrl-C the
+# tail of the pipeline has to outlive Terraform, or Terraform's next write
+# meets a closed pipe and SIGPIPE kills it before it has saved state and
+# released the lock. Terraform's own exit code is the one returned
+# (PIPESTATUS[0]), as the filter's header promises: a tee that could not write
+# its copy -- a TMPDIR that filled during the apply -- is a warning, not a
+# failed apply, and the retry decision then reads whatever copy there is.
+# Because every process in the pipeline survives Ctrl-C, bash does not stop
+# the script on it; Terraform's own "Interrupt received" line in the output
+# is read as the stop instead (TERRAFORM_INTERRUPT_PATTERN), before any
+# retry, because a 403 collected earlier in the walk is printed beside it.
+# The temporary file goes with the function or with the process: an EXIT
+# trap covers a Ctrl-C in the wait, re-armed each round because adopt_kms
+# clears the trap it sets for its own override file, and the path is a
+# script-level variable because an errexit exit unwinds a local before the
+# trap runs.
+# The terminal case stays outside the loop on purpose: it is the one path
+# that shows Terraform's own colour and prompt, and the operator who answered
+# the prompt is there to run it again; adopt_kms untaints for that re-run.
+run_apply() {
+  if [[ -t 0 && -t 1 && " $* ${TF_CLI_ARGS_apply:-} " != *auto-approve* ]]; then
+    terraform apply "$@"
+    return
+  fi
+  local attempt=1 status copy_status
+  local -a pipe_status
+  APPLY_OUTPUT_FILE=$(mktemp)
+  while :; do
+    trap 'rm -f "$APPLY_OUTPUT_FILE"' EXIT
+    # PIPESTATUS is read in both branches because the if is what keeps a
+    # failed pipeline from tripping errexit, and it is reset by the next
+    # command either way.
+    if terraform apply "$@" 2>&1 | redact_helm_release_metadata | tee -i "$APPLY_OUTPUT_FILE"; then
+      pipe_status=("${PIPESTATUS[@]}")
+    else
+      pipe_status=("${PIPESTATUS[@]}")
+    fi
+    status="${pipe_status[0]}"
+    copy_status="${pipe_status[2]}"
+    if [[ "$copy_status" -ne 0 ]]; then
+      warn "could not keep a full copy of the apply output (tee exited $copy_status: a TMPDIR that filled, or 141 for a stdout closed early); a Cloud KMS retry is decided from what was kept"
+    fi
+    [[ "$status" -ne 0 ]] || break
+    grep -Eq "$TERRAFORM_INTERRUPT_PATTERN" "$APPLY_OUTPUT_FILE" && break
+    grep -Eq "$KMS_API_PROPAGATION_PATTERN" "$APPLY_OUTPUT_FILE" || break
+    if [[ "$attempt" -ge "$KMS_API_PROPAGATION_ATTEMPTS" ]]; then
+      warn "Cloud KMS still rejects requests $attempt attempts after this apply enabled it."
+      warn "Nothing is lost: wait a few minutes and run it again; the apply continues where it stopped."
+      break
+    fi
+    attempt=$((attempt + 1))
+    warn "Cloud KMS was enabled minutes ago and has not finished propagating; it 403s some requests for a few minutes after a project's first enablement."
+    warn "Waiting ${KMS_API_PROPAGATION_WAIT_SECONDS}s, then continuing the apply (attempt $attempt of $KMS_API_PROPAGATION_ATTEMPTS)."
+    sleep "$KMS_API_PROPAGATION_WAIT_SECONDS"
+    state_changed
+    adopt_kms
+    log "terraform apply (attempt $attempt)"
+  done
+  rm -f "$APPLY_OUTPUT_FILE"
+  trap - EXIT
+  return "$status"
+}
+
+fetch_cluster_credentials() {
+  [[ -n "$CLUSTER_CONTEXT" ]] && return 0
+  local cluster location project
   cluster=$(tfvar cluster_name)
   location=$(tfvar location)
   project=$(tfvar project_id)
-
-  # Through the helper, so teardown reaches the cluster over the endpoint the
-  # install used. Without the flag a cluster whose IP endpoint this host cannot
-  # route to gets that IP written into the kubeconfig, and the guard below does
-  # not catch it: get-credentials is a describe plus a file write, neither of
-  # which touches the control plane, so it exits 0. The kubectl after it then
-  # reads an unreachable cluster as a namespace holding no PlatformAgent, and
-  # teardown reports success having left the finalizer's cluster-scoped RBAC
-  # behind — the objects nothing else garbage-collects.
   GKE_DNS_ENDPOINT_FLAG=""
   gke_dns_endpoint_flag "$cluster" "$location" "$project" || true
   # Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
   # shellcheck disable=SC2086
-  if ! gcloud container clusters get-credentials "$cluster" --location "$location" \
-        --project "$project" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1; then
+  gcloud container clusters get-credentials "$cluster" --location "$location" \
+    --project "$project" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || return 1
+  # gcloud's own naming, as installer_common.sh's gke_context_name has it. Named
+  # rather than read back from current-context, which another get-credentials
+  # sharing this kubeconfig can move under a running teardown.
+  CLUSTER_CONTEXT="gke_${project}_${location}_${cluster}"
+}
+
+delete_agent_cr() {
+  local namespace names agent_name inst_label
+  namespace=$(tfvar namespace)
+
+  if ! fetch_cluster_credentials; then
     log "cluster unreachable; nothing to delete in-cluster"
     return 0
   fi
@@ -1095,13 +1296,13 @@ delete_agent_cr() {
   # the chart's default, but extra_helm_values can override it, and the admission
   # webhook allows only one PlatformAgent per cluster — so whatever is in the
   # namespace is the one to delete.
-  names=$(kubectl get platformagent -n "$namespace" -o name 2>/dev/null || true)
+  names=$(kubectl --context "$CLUSTER_CONTEXT" get platformagent -n "$namespace" -o name 2>/dev/null || true)
   [[ -n "$names" ]] || { log "no PlatformAgent to delete"; return 0; }
 
   while read -r ref; do
     [[ -n "$ref" ]] || continue
     log "deleting ${ref} and waiting for its finalizer"
-    if kubectl delete "$ref" -n "$namespace" --wait --timeout=180s >/dev/null 2>&1; then
+    if kubectl --context "$CLUSTER_CONTEXT" delete "$ref" -n "$namespace" --wait --timeout=180s >/dev/null 2>&1; then
       log "${ref} deleted cleanly"
       continue
     fi
@@ -1111,18 +1312,120 @@ delete_agent_cr() {
     # deleting the agent's cluster-scoped RBAC, which no owner reference
     # garbage-collects (docs/site .../install/uninstall.md). The cluster is
     # normally destroyed moments later, but a destroy can stop between the
-    # release and the cluster, so delete the two objects here as well.
+    # release and the cluster, so delete the objects here as well.
     warn "finalizer did not clear in time; removing it so the namespace can terminate"
-    kubectl patch "$ref" -n "$namespace" --type=merge \
+    kubectl --context "$CLUSTER_CONTEXT" patch "$ref" -n "$namespace" --type=merge \
       -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-    # The operator's naming, kubeagents:minimal:<namespace>:<name>, from
-    # k8s-operator/internal/controller/platformagent_manifests.go; a bash
-    # script cannot import it, so this must move when that does.
-    kubectl delete clusterrolebinding "kubeagents:minimal:${namespace}:${ref##*/}" \
+    # The operator's naming from k8s-operator/internal/controller
+    # (platformagent_manifests.go, platformagent_controller.go, and
+    # platformagent_a2a_callout.go): cluster-scoped RBAC and the next-mode
+    # JetStream PVC that no owner reference reaps when the finalizer is stripped.
+    agent_name="${ref##*/}"
+    inst_label="${namespace}-${agent_name}"
+    if [ "${#inst_label}" -gt "$K8S_LABEL_VALUE_MAX_LENGTH" ]; then
+      inst_label="${inst_label:0:$K8S_LABEL_VALUE_MAX_LENGTH}"
+      while [[ "$inst_label" =~ [-_.]$ ]]; do
+        inst_label="${inst_label%?}"
+      done
+    fi
+    kubectl --context "$CLUSTER_CONTEXT" delete clusterrolebinding \
+      "kubeagents:minimal:${namespace}:${agent_name}" \
+      "kubeagents:tokenreview:${namespace}:${agent_name}" \
       --ignore-not-found >/dev/null 2>&1 || true
-    kubectl delete clusterrole "kubeagents:minimal:${namespace}:${ref##*/}" \
+    kubectl --context "$CLUSTER_CONTEXT" delete clusterrolebinding \
+      -l "app.kubernetes.io/instance=${inst_label}" \
+      --field-selector "metadata.name=kubeagents:a2a-callout-tokenreview:${namespace}:${agent_name}" \
       --ignore-not-found >/dev/null 2>&1 || true
+    kubectl --context "$CLUSTER_CONTEXT" delete clusterrole \
+      "kubeagents:minimal:${namespace}:${agent_name}" \
+      "kubeagents:tokenreview:${namespace}:${agent_name}" \
+      --ignore-not-found >/dev/null 2>&1 || true
+    kubectl --context "$CLUSTER_CONTEXT" delete pvc -n "$namespace" \
+      -l "app.kubernetes.io/instance=${inst_label}" \
+      --field-selector "metadata.name=data-${agent_name}-a2a-nats-0" \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
   done <<<"$names"
+}
+
+# Defence in depth for the release teardown on a cluster this state did not
+# create (#2246). terraform destroy uninstalls the releases through the helm
+# provider, and the provider can do nothing and report success: hashicorp/helm
+# 3.x's Delete returns early when its existence check fails, and that check
+# reads ANY error -- a provider with no host, a 403, a timeout -- as "release
+# not found". On a cluster this state created that leak dies with the cluster
+# moments later, so this step only runs when the cluster outlives the destroy.
+# Uninstalled here, the provider's refresh finds the release gone and drops it
+# from state.
+#
+# Only releases this state installed, named from state rather than the
+# configuration: a cert-manager the cluster already ran is not in state and is
+# left alone. kube-agents goes first: its Certificate and Issuer are
+# cert-manager kinds, removed while cert-manager is still running. The
+# PlatformAgent's finalizer is already handled (delete_agent_cr), so the
+# chart's pre-delete hook is a no-op and --wait has nothing left to hang on.
+#
+# helm is not a prerequisite of uninstall.sh or of this script, so a host
+# without it is told and left to Terraform. A cluster that answered gcloud but
+# not Helm stops the destroy here, before Terraform has removed anything:
+# going on would report success over a release that is still running.
+uninstall_helm_releases() {
+  load_state
+  local addr addresses=()
+  for addr in "${CLUSTER_ADDRESSES[@]}"; do
+    in_state "$addr" && return 0
+  done
+  for addr in "$HELM_RELEASE_ADDRESS" "$CERT_MANAGER_RELEASE_ADDRESS"; do
+    in_state "$addr" && addresses+=("$addr")
+  done
+  [[ ${#addresses[@]} -gt 0 ]] || return 0
+
+  if ! command -v helm >/dev/null 2>&1; then
+    warn "helm is not installed; leaving the Helm releases to terraform destroy"
+    return 0
+  fi
+  if ! fetch_cluster_credentials; then
+    warn "could not fetch credentials for the cluster; if it still exists, the Helm releases"
+    warn "this state installed outlive the teardown and need a manual 'helm uninstall'"
+    return 0
+  fi
+
+  local name namespace output line
+  for addr in "${addresses[@]}"; do
+    if ! name=$(state_attr "$addr" name) || ! namespace=$(state_attr "$addr" namespace); then
+      warn "could not read $addr from state (terraform state show failed); re-run destroy, which is safe to re-run"
+      exit 1
+    fi
+    if [[ -z "$name" || -z "$namespace" ]]; then
+      warn "could not read the release name or namespace of $addr from state; leaving it to terraform destroy"
+      continue
+    fi
+    # --all: a release left pending-install or uninstalling is still one to
+    # remove, and the default listing hides it. Exit 0 with no line naming the
+    # release is "not there" (a warning on stderr is not a release); a non-zero
+    # exit is "could not ask". Checked first rather than passing
+    # --ignore-not-found, which older helm 3 releases lack.
+    if ! output=$(helm list --all --short --filter "^${name}\$" \
+                    -n "$namespace" --kube-context "$CLUSTER_CONTEXT" 2>&1); then
+      :
+    elif ! grep -qxF -- "$name" <<<"$output"; then
+      log "Helm release $namespace/$name is already gone"
+      continue
+    elif output=$(helm uninstall "$name" -n "$namespace" --kube-context "$CLUSTER_CONTEXT" \
+                    --wait --timeout "$HELM_UNINSTALL_TIMEOUT" 2>&1); then
+      log "uninstalled Helm release $namespace/$name"
+      continue
+    fi
+    warn "could not uninstall Helm release $namespace/$name from $CLUSTER_CONTEXT; helm said:"
+    while IFS= read -r line; do printf '     %s\n' "$line"; done <<<"$output" >&2
+    warn "This state did not create the cluster, so the release would outlive the teardown."
+    warn "Fix access to the cluster and re-run (destroy is safe to re-run), or remove it by hand:"
+    warn "  helm uninstall $name -n $namespace --kube-context $CLUSTER_CONTEXT --wait"
+    warn "If this host cannot get access back and the cluster's owner will remove the release, drop it"
+    warn "from this install's state instead and re-run destroy: in terraform/examples/full-install, with"
+    warn "the same KUBE_AGENTS_STATE_BUCKET as this run and after a plan has initialised that backend,"
+    warn "  terraform state rm '$addr'"
+    exit 1
+  done
 }
 
 purge_backups() {
@@ -1352,26 +1655,17 @@ case "${1:-}" in
     adopt_pubsub
     log "terraform apply"
     # No -input=false: this prompts like plain `terraform apply` does. Pass
-    # -auto-approve through ARGS for unattended runs.
-    #
-    # Only an apply that is about to ask someone at a terminal runs unfiltered:
-    # a terminal on stdin and stdout, and no approval given here or in
-    # TF_CLI_ARGS_apply. Its closing "Enter a value: " has no newline and would
-    # wait in the line-based filter until answered. Everything else is
-    # filtered: an approved apply (upgrade.sh passes -auto-approve) prints the
-    # whole diff without asking, and a pipe (`| tee`), a file or CI is a log.
-    if [[ -t 0 && -t 1 && " $* ${TF_CLI_ARGS_apply:-} " != *auto-approve* ]]; then
-      terraform apply "$@"
-    else
-      terraform apply "$@" | redact_helm_release_metadata
-    fi
+    # -auto-approve through ARGS for unattended runs. run_apply says which
+    # invocations are filtered and retried and which run once.
+    run_apply "$@"
     ;;
   destroy)
     shift
     ensure_init
     # Confirm before the FIRST side effect, not at terraform's own prompt: by
     # the time `terraform destroy` asks, this script has already deleted the
-    # PlatformAgent CR, permanently deleted every backup the plan owns,
+    # PlatformAgent CR, uninstalled the Helm releases on a cluster this state
+    # did not create, permanently deleted every backup the plan owns,
     # cleared deletion_protection, and forgotten the KMS state entries — and
     # answering "no" there undoes none of it. One gate, up front; once passed,
     # -auto-approve is appended so terraform does not present a second gate
@@ -1381,6 +1675,7 @@ case "${1:-}" in
     if [[ "$auto" != "true" ]]; then
       warn "destroy starts with irreversible steps BEFORE terraform runs:"
       warn "  - delete the live PlatformAgent CR (force-clearing its finalizer if wedged)"
+      warn "  - on a cluster this state did not create, uninstall the Helm releases it installed"
       warn "  - permanently delete EVERY backup the backup plan owns"
       warn "  - clear the cluster's deletion protection"
       warn "  - forget the KMS resources from state (kept in GCP, re-adopted on apply)"
@@ -1396,6 +1691,7 @@ case "${1:-}" in
     # finalizer for terraform destroy to trip over.
     guard_release_namespace
     delete_agent_cr
+    uninstall_helm_releases
     purge_backups
     disable_deletion_protection
     forget_kms
@@ -1411,7 +1707,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,75p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,84p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

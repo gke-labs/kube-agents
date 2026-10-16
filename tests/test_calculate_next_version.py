@@ -646,7 +646,7 @@ class CalculateNextVersionTest(unittest.TestCase):
         self.assertIn("is not a release line", malformed.stderr)
 
     def test_main_ignores_a_line_release_and_bumps_minor_once_the_line_has_a_branch(self):
-        """After 0.2.1 on release/0.2, main's base is still 0.2.0 and a fix-only week is 0.3.0."""
+        """After 0.2.1 on release/0.2, main's base is still 0.2.0 and a fix-only range is 0.3.0."""
         repo_dir, git, shas = self._line_repo()
         git("switch", f"release/{MOCK_TARGET_RELEASE_LINE}")
         (pathlib.Path(repo_dir) / "stamp.txt").write_text("0.2.1\n")

@@ -97,10 +97,10 @@ const (
 //
 // Its credentials are also not equivalent to a profile's. This reaches
 // kubernetes.default.svc as the pod's Kubernetes service account and never
-// leaves the cluster; a profile authenticates as the pod's Google identity
-// against the control-plane endpoint, which an IAM set without
-// roles/container.viewer or a master authorized network excluding the pod's
-// egress can refuse. So when both name the same cluster, this one wins.
+// leaves the cluster; a profile authenticates as a Google identity (the
+// broker's, through the credential proxy, or the pod's without one) against
+// the control-plane endpoint, which an IAM set without roles/container.viewer
+// or a master authorized network excluding that identity's egress can refuse. So when both name the same cluster, this one wins.
 //
 // Returns nil with no error when neither flag is set. A detector without
 // cluster credentials is a supported mode: it is how the binary has run since
@@ -167,7 +167,8 @@ func applyJoinThrottle(cfg *rest.Config) {
 }
 
 // profilesDiscovery is the profile scan discoverProfileClusters runs. Its zero
-// value reaches the real GKE API with this process's own Google credentials;
+// value reaches the real GKE API with this process's own Google credentials, or
+// through the credential proxy when clusterprofiles.BrokerFromEnv names one;
 // the tests replace its Describe and TokenSource fields so the scan needs
 // neither. OnSkip is set per call instead, because the message it writes is
 // this binary's rather than the package's.
@@ -250,8 +251,8 @@ func identityFromProfile(id clusterprofiles.Identity) clusterIdentity {
 }
 
 // discoverProfileClusters turns a Hermes profiles directory into one live-object
-// reader per Cluster Agent profile, dropping the clusters whose records this
-// subscription will never carry and the one the caller already reaches.
+// reader per Cluster Agent profile, whichever project its cluster is in,
+// declining only the one the caller already reaches.
 //
 // directlyReached is the cluster --in-cluster or --kubeconfig serves, or nil
 // when neither is set. Nil rather than a bare identity because the two cases
@@ -259,25 +260,22 @@ func identityFromProfile(id clusterprofiles.Identity) clusterIdentity {
 // is redundant and is declined, and without them it is the only way that cluster
 // is reached at all, so declining it would lose it.
 //
-// project is --project, and the filter is not an optimisation. The subscription
-// is a project-level sink, so every record on it names a cluster in that
-// project; a profile for a cluster elsewhere -- which the Platform Agent
-// legitimately creates, since a fleet can span projects -- produces a client no
-// record can ever match. The drop goes through Discoverer.Want, on the identity
-// and before the cluster is addressed, because dropping it afterwards is not
-// free: Discover asks the GKE API where every cluster is before it returns, so a
-// foreign cluster would cost a describe call into a project this detector is
-// about to discard -- and where the pod's Google identity has no
-// container.clusters.get there, that call fails and the profile is reported as a
-// GKE permission error instead, sending an operator to grant access to a cluster
-// that was going to be dropped regardless. What the drop buys is keeping a real
-// misconfiguration visible -- an operator who pointed --project at the wrong
-// project sees "8 clusters skipped, outside project" instead of a detector that
-// starts cleanly and enriches nothing.
+// Every profile is registered whatever project its cluster is in. Which
+// projects' records reach the subscription is decided by the sinks feeding it,
+// not by --project, which names the project holding the subscription; a record
+// naming a cluster in another project -- which the Platform Agent writes a
+// profile for, since an install's scope can span projects -- can be joined
+// only through that profile. Addressing it costs a GKE describe in that
+// project, and the identity making it (the broker's, or the pod's without
+// one) holds container.clusters.get there by the same scope grant that let the
+// reconcile write the profile, so a describe
+// that fails names a real gap: the profile is skipped and reported with the
+// API's answer like any other.
 //
 // Failure policy is internal/clusterprofiles's, and it is the watcher's: a
-// missing directory is fatal because discovery runs once and a restart fixes
-// it, an unreadable one degrades, and a single bad profile is skipped so that
+// missing directory, or a credential proxy that cannot be reached or answers
+// with an error about itself, is fatal because discovery runs once and a restart
+// fixes it, an unreadable directory degrades, and a single bad profile is skipped so that
 // one unparseable config.yaml cannot cost the whole fleet. What this adds is
 // the second half of that last rule -- a cluster whose dynamic client will not
 // build is skipped too, for the same reason.
@@ -294,7 +292,7 @@ func identityFromProfile(id clusterprofiles.Identity) clusterIdentity {
 // mistake, not a caller's convenience: Discover calls os.ReadDir, "" is ENOENT,
 // and ENOENT is the one condition the package treats as fatal -- so a detector
 // that simply did not ask for the fan-in would refuse to start.
-func discoverProfileClusters(ctx context.Context, dir, project string, directlyReached *clusterIdentity) (profileScan, error) {
+func discoverProfileClusters(ctx context.Context, dir string, directlyReached *clusterIdentity) (profileScan, error) {
 	if dir == "" {
 		return profileScan{}, nil
 	}
@@ -316,10 +314,10 @@ func discoverProfileClusters(ctx context.Context, dir, project string, directlyR
 		log.Printf("%s: skipping profile %s, its cluster will NOT be joined: %v", commandName, profile, err)
 	}
 
-	// Two reasons to decline a profile before it is addressed, and only one of
-	// them is a skip. Discover calls Want once per profile, in order, on the one
-	// goroutine this runs on, so writing to the scan from here is safe. Both
-	// name the identity rather than the profile directory, which Want is not
+	// One reason to decline a profile before it is addressed, and it is not a
+	// skip. Discover calls Want once per profile, in order, on the one
+	// goroutine this runs on, so writing to the scan from here is safe. It
+	// names the identity rather than the profile directory, which Want is not
 	// given -- and which the Platform Agent derives from the triple anyway.
 	want := func(id clusterprofiles.Identity) bool {
 		identity := identityFromProfile(id)
@@ -336,28 +334,29 @@ func discoverProfileClusters(ctx context.Context, dir, project string, directlyR
 		// the ordinary IAM gap, since the direct credential is a Kubernetes
 		// ServiceAccount and needs no Google grant at all -- that describe fails
 		// and the profile is reported as skipped, telling an operator that a
-		// cluster this run enriches normally will NOT be joined. Same argument
-		// as the out-of-project drop below, arriving from the other direction.
+		// cluster this run enriches normally will NOT be joined.
 		if directlyReached != nil && identity == *directlyReached {
 			scan.Absorbed = append(scan.Absorbed, identity.String())
 			return false
 		}
 
-		if id.Project == project {
-			return true
-		}
-		// Counted, because an operator who mistyped --project needs this to show
-		// up in the skip total rather than as a fleet that was always this small.
-		scan.Skipped++
-		log.Printf("%s: skipping the profile for cluster %s: it is outside --project=%s, and this subscription carries no records from it",
-			commandName, identity, project)
-		return false
+		return true
 	}
 
 	// A copy, so setting these does not write to the package-level seam.
 	d := profilesDiscovery
 	d.OnSkip = skip
 	d.Want = want
+	// The credential proxy, as in k8s-event-watcher: when the operator names
+	// one it replaces the pod's Workload Identity for the describe and for
+	// every profile cluster's reads. A Broker already on the seam is a test's.
+	if d.Broker == nil {
+		broker, err := clusterprofiles.BrokerFromEnv()
+		if err != nil {
+			return scan, err
+		}
+		d.Broker = broker
+	}
 	discovered, err := d.Discover(ctx, dir)
 	if err != nil {
 		return scan, err

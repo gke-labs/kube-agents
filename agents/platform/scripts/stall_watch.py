@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""stall_watch.py - post controller stalls that appeared or cleared since the last tick.
+"""stall_watch.py - raise an alert for controller stalls that appeared since the last tick, and close what cleared.
 
 A controller that stops making progress without erroring is invisible to
 everything else on the roster. ``k8s-event-watcher`` opens a triage card
@@ -24,23 +24,33 @@ no model. Each tick:
    ``RECONCILE_EXCLUDE`` or has not yet scaffolded, is left unread: the
    exclusion is the operator keeping a model turn off that cluster, and this
    watch follows the same roster;
-2. per cluster, fetches credentials into a per-cluster kubeconfig and lists
-   the namespaces that are not system namespaces;
+2. per cluster, points a per-cluster kubeconfig at the cluster and lists the
+   namespaces that are not system namespaces. The credentials behind that
+   kubeconfig are fetched on the first tick, again after a day, and again
+   when a read the kubeconfig could not serve says the file or the cluster
+   changed; otherwise the kubeconfig is reused, because a ``get-credentials``
+   through the shim is a real gcloud run at the credential proxy every time
+   and the proxy serves kubectl from its own managed kubeconfig regardless;
 3. per namespace, runs the Cluster Agent's ``stall_report.py --json`` over a
    bounded list of controller kinds;
 4. diffs the rows against the ledger the previous tick left, and on a new
-   stall episode in a namespace opens one kanban card assigned to that
-   cluster's Cluster Agent, telling it to run ``gke-stall-detection`` there
-   and record the finding, so a stall the cron found and a stall a user asked
-   about produce the same card, the same diagnosis and the same chat thread.
-   The card carries a chat subscription row for the home channel, which is
-   what makes the gateway notifier post its progress and completion; a new
-   object in a namespace whose card is still open is a comment on that card;
-   when every object in the namespace has cleared, the card gets a closing
-   comment and is completed. At most ``MAX_CARDS_PER_TICK`` cards open per
-   tick; the namespaces past that wait for the next one. Chat gets one line
-   when a card opens, one when it closes, one when namespaces were held for
-   the next tick, and nothing else.
+   stall episode in a namespace hands it to the Session KV server as a
+   ``controller-stall`` inject: the route ``k8s-event-watcher`` and the drift
+   detector use. The server posts the alert, records its chat thread and
+   starts a Planning Agent turn that files one card to the cluster's Cluster
+   Agent, which runs ``gke-stall-detection`` and reports in the triage
+   template; the report lands in the alert's thread and is saved, so a reply
+   of "apply" reaches the agent that opens the pull request with the report
+   attached (docs/designs/stall-watch-inject.md). The watch files no card
+   itself: a card it filed would have no session, and so no thread. It finds
+   the card by the session that filed it, and from then on a new object in
+   the namespace is a comment on that card, and when every object has
+   cleared the card gets a closing comment and is completed. At most
+   ``MAX_ALERTS_PER_TICK`` alerts are raised per tick; the namespaces past
+   that wait for the next one. Chat gets the alert for a new episode, and the
+   watch's own lines: a stall cleared, namespaces held for the next tick,
+   alerts refused and raised again, the sweep failing and recovering, and the
+   sweep budget exhausted and the fleet fitting in one tick again.
 
 Every ``gcloud``, ``kubectl`` and ``stall_report.py`` call runs in the shell
 sandbox through ``sandbox_exec.run``: the agent container carries no kubectl
@@ -69,12 +79,12 @@ on purpose: a Pod that cannot start raises the Warning reasons the event
 watcher is gated on, and its owner shows here through its own condition or
 reference.
 
-Why a ledger. A stall lasts hours or days, and a watch that filed a card for
-it every thirty minutes would be muted within the hour. The ledger holds one
-entry per row ``stall_report.py`` emits and one episode per namespace with an
-open card: the card opens when a namespace's first row appears and closes
-when its last row clears, a new object in the namespace is a comment on the
-card, and a row that joins an object already on it (a Deployment that adds
+Why a ledger. A stall lasts hours or days, and a watch that raised an alert
+for it every thirty minutes would be muted within the hour. The ledger holds
+one entry per row ``stall_report.py`` emits and one episode per namespace with
+an open alert: the alert is raised when a namespace's first row appears and
+its card closes when its last row clears, a new object in the namespace is a
+comment on the card, and a row that joins an object already on it (a Deployment that adds
 ProgressDeadlineExceeded ten minutes after its dangling reference) is folded
 in silently. A ``repeating-warnings`` row exists only while its event
 recurred inside the script's window, so a warning that comes back every hour
@@ -88,14 +98,22 @@ a missing CRD, and every other row in the namespace is judged as usual); one tha
 them at once, because deleting the namespace is how the motivating case
 usually ends. A listing gcloud itself calls incomplete clears no row for a
 cluster absent from it, and a sweep stops at a wall-clock budget short of
-the schedule and reports what it did not reach, because Hermes kills a
-script that runs an hour and a ledger never written is a tick that never
-happened.
+the schedule, because Hermes kills a script that runs an hour and a ledger
+never written is a tick that never happened. A sweep that stops says what it
+covered: the ledger's budget entry carries the clusters read of the ones it
+could sweep, the namespaces read, the clusters it tried and could not read, and
+the cluster the next tick resumes at, every
+tick it falls short, and chat hears it once, on the tick the sweep first falls
+short, and once more when the fleet fits in one tick again. On a fleet the
+budget does not cover, a cluster is read across consecutive ticks, so the
+interval the operator has is the ticks a full pass takes, not the schedule;
+the budget entry is where to read it.
 """
 
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -104,9 +122,12 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, wait
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Siblings in `$HERMES_HOME/scripts`, this script's own directory and therefore
@@ -212,6 +233,63 @@ TICK_BUDGET_SECONDS = 1500
 #: Ledger key for where an exhausted sweep stopped: the cluster and namespace
 #: the next tick starts from.
 CURSOR_KEY = "cursor"
+#: Ledger key for when each swept cluster's credentials were last fetched, by
+#: cluster id, as the tick's own ISO time. The per-cluster kubeconfig outlives
+#: the tick (the sandbox's `.kubeconfigs`, or the agent home's), and what it
+#: holds is a context name the broker resolves from its own managed
+#: kubeconfig, so a fresh `get-credentials` each tick is a real gcloud run at
+#: the broker that buys nothing after the first. A record is reused until it
+#: is this old, or until a read the kubeconfig could not serve, after which
+#: the tick fetches once more and retries that one call.
+CREDENTIALS_KEY = "credentials"
+CREDENTIALS_REFRESH_SECONDS = 24 * 60 * 60
+#: What a failed first read on a reused kubeconfig says when the kubeconfig
+#: itself is the problem, so one more fetch repairs it: the shim's refusal of
+#: a stub the sandbox lost (`credential_proxy_client.py`, KubeconfigUnreadable,
+#: printed as `credential proxy: kubeconfig ...`), or the reasons kubectl
+#: gives at a recreated cluster, a refused connection at the old endpoint or
+#: a certificate the old CA did not sign. Not kubectl's generic `Unable to
+#: connect to the server:` prefix, which it puts on every connection failure
+#: (an i/o timeout, no such host, a TLS handshake timeout): that is a dark
+#: cluster, which the proxy's `--request-timeout` turns into an exit 1 in
+#: about 30 s, and a fetch would not repair it. A timeout, a proxy refusal or
+#: an API error says nothing about the kubeconfig either, so for all of these
+#: the watch keeps the record and the cluster waits for the next tick. The
+#: cost of that choice: a recreated cluster whose old endpoint times out or
+#: no longer resolves, rather than refusing, gives no signal and is read again
+#: at the daily refresh, not before. Matched on the whole stderr
+#: (`refetch_repairs`), since kubectl prints the reason after its discovery
+#: error.
+REFETCH_SIGNALS = (
+    "credential proxy: kubeconfig",
+    "connect: connection refused",
+    "x509:",
+    "tls:",
+)
+#: Ledger flag for a sweep that stopped at its budget, so chat hears the
+#: coverage once, on the tick the sweep first falls short, and once more when
+#: the fleet fits in one tick again; the ledger's budget entry carries it
+#: every tick.
+BUDGET_EXHAUSTED_KEY = "budget_exhausted"
+#: Beside the flag: the projects the exhausting sweep listed, each with the
+#: clusters it had in play there (`Sweep.view`), so a later sweep that fits
+#: is compared project for project. A project in that view but not in the
+#: fitting sweep's (its listing failed, or the only profiles naming it had no
+#: readable identity) is a part of the fleet the fit says nothing about, so
+#: the flag is held; a project that lists with fewer clusters than before has
+#: shrunk, and the fit counts. None while the flag is down.
+BUDGET_EXHAUSTED_VIEW_KEY = "budget_exhausted_view"
+#: Consecutive fitting ticks on which the flag was held for a project out of
+#: view, and the number of them after which the missing projects count as a
+#: standing fault rather than a transient: the fit stands, recovery posts, and
+#: the next exhaustion is heard. Three ticks is 90 minutes on the schedule,
+#: past any one listing failure or a profile mid-rewrite, and well short of a
+#: revoked grant. The ledger's budget entry says the flag is held and why.
+BUDGET_HELD_TICKS_KEY = "budget_held_ticks"
+BUDGET_HOLD_TICKS = 3
+#: The entry text that follows names the budget and says it was exhausted.
+COVERAGE_EXHAUSTED_PREFIX = "⏳ **Controller stall watch:**"
+COVERAGE_RECOVERED_LINE = "✅ **Controller stall watch** — the fleet is swept in one tick again."
 
 #: The fleet-wide system-namespace set, spelled as the Workload Reliability
 #: Audit's exclusion S1 spells it. `kubeagents-system` is deliberately absent:
@@ -248,8 +326,19 @@ CLUSTER_LIST_TIMEOUT_SECONDS = 120
 #: listing still running at the deadline is unlisted this tick. One at a time,
 #: a hundred projects (the scope's cap) each hanging to the gcloud timeout would
 #: outlast the whole tick.
-LIST_WORKERS = 8
-LIST_BUDGET_SECONDS = 150
+#: Every listing is a gcloud process the credential proxy runs. The pool was
+#: sized to the four requests the proxy admitted at its old 1Gi default
+#: (docs/designs/credential-proxy-child-memory-budget.md §2.2), past which a
+#: listing queues at the proxy and one still waiting at its 60 s admission
+#: bound is refused busy and reads unlisted. At the 2Gi default the proxy's
+#: slot cap of eight binds, and it is shared: while this pool lists, kanban
+#: workers' commands have four slots, and none if cluster_agent_reconcile.py's
+#: four-wide pool is listing at the same time.
+LIST_WORKERS = 4
+#: 12 s per listing at four wide: the per-listing share the 150 s budget gave
+#: at eight. The listing runs inside TICK_BUDGET_SECONDS, so it leaves the
+#: scans at least 1500 - 300 - LIST_GRACE_SECONDS.
+LIST_BUDGET_SECONDS = 300
 LIST_GRACE_SECONDS = 5
 GET_CREDENTIALS_TIMEOUT_SECONDS = 60
 NAMESPACE_LIST_TIMEOUT_SECONDS = 60
@@ -258,13 +347,13 @@ NAMESPACE_SCAN_TIMEOUT_SECONDS = 300
 #: non-zero is a crash, and both leave the namespace unread this tick.
 REPORT_UNREADABLE_EXIT = 2
 
-#: Where the ledger keeps an open card per `cluster/namespace` scope.
+#: Where the ledger keeps an open alert and its card per `cluster/namespace` scope.
 EPISODES_KEY = "episodes"
 #: Only a cluster with a scaffolded Cluster Agent profile is swept, and its
-#: card goes to that profile. A cluster without one, pruned for the scope's
+#: alert names that profile. A cluster without one, pruned for the scope's
 #: exclude.clusters or RECONCILE_EXCLUDE or not yet scaffolded, is neither read nor
-#: filed for: the exclusion is the operator keeping a model turn off that
-#: cluster, and a card would hand its rows to another profile instead.
+#: alerted for: the exclusion is the operator keeping a model turn off that
+#: cluster, and an alert would hand its rows to another profile instead.
 NO_PROFILE_REASON = "no Cluster Agent profile; not read"
 #: A profile whose cluster_identity cannot be read adds no project to the
 #: roster. Its cluster is swept when its project is listed anyway, and otherwise
@@ -272,45 +361,73 @@ NO_PROFILE_REASON = "no Cluster Agent profile; not read"
 NO_IDENTITY_REASON = "no readable cluster_identity; adds no project to the sweep"
 #: The ledger's key for such a profile.
 PROFILE_SCOPE = "profile"
-#: Cards opened per tick. Each is a Cluster Agent turn, and the number of
-#: namespaces with a new stall is chosen by whoever can create namespaces, so
-#: the rest keep their rows and wait, oldest first sighting first: a tenant
-#: filling three fresh namespaces every tick cannot keep an older stall from
-#: its card. The default of github_scan_gate's PR_AGENT_MAX_PER_TICK.
-MAX_CARDS_PER_TICK = 3
-#: Finished cards the board may hand back for one scope in one tick, each
-#: moving the generation on, before the scope waits for the next tick.
-MAX_FINISHED_CARDS_SKIPPED = 5
+#: Alerts raised per tick. Each starts a Planning Agent turn and a Cluster
+#: Agent turn, and the number of namespaces with a new stall is chosen by
+#: whoever can create namespaces, so the rest keep their rows and wait, oldest
+#: first sighting first: a tenant filling three fresh namespaces every tick
+#: cannot keep an older stall from its alert. The default of
+#: github_scan_gate's PR_AGENT_MAX_PER_TICK. A stall claims no alert quota on
+#: the Session KV server, so this is the only bound.
+MAX_ALERTS_PER_TICK = 3
 #: Object names a chat line or card comment spells out before counting the rest.
 MAX_OBJECTS_IN_LINE = 8
-CARD_IDEMPOTENCY_PREFIX = "stall-watch"
-CARD_TITLE_MAX_CHARS = 120
-MAX_ROWS_IN_CARD = 60
-SKILL_NAME = "gke-stall-detection"
-#: A card's status once it is no longer being worked; a new object then opens
-#: a new card rather than commenting on a finished one.
+#: The longest name the Session KV server takes (`DRIFT_MAX_FIELD_CHARS` there).
+#: It refuses a record with a longer namespace or cluster, and drops a longer
+#: object name, so object names are cut to it here: a namespace whose stalled
+#: objects all have longer names would otherwise never be alerted.
+MAX_NAME_CHARS = 200
+#: The HTTP status the server answers a record it refuses with: a fault in that
+#: one record, not in the server.
+HTTP_BAD_REQUEST = 400
+#: Rows one record carries. The card lists sixty of them and counts the rest;
+#: this keeps one namespace with thousands of stalled objects from becoming a
+#: request of the same size.
+MAX_ROWS_IN_RECORD = 500
+#: The Session KV server on the pod's loopback, and the kind its inject route
+#: dispatches a stall on (`INJECT_KIND_STALL` in session_kv_server.py).
+SESSION_KV_URL = "http://127.0.0.1:8699"
+SESSION_KV_AUTH_ENV = "SESSION_KV_API_KEY"
+SESSION_KV_TIMEOUT_SECONDS = 30
+CONTENT_TYPE_HEADER = "Content-Type"
+JSON_CONTENT_TYPE = "application/json"
+AUTH_HEADER = "Authorization"
+BEARER_PREFIX = "Bearer "
+HEALTHZ_PATH = "/healthz"
+SESSIONS_PATH = "/sessions"
+INJECT_SUFFIX = "/inject"
+INJECT_KIND = "controller-stall"
+INJECTED_STATUS = "injected"
+#: The Session KV server's field names: what /healthz lists, what POST
+#: /sessions answers, the inject envelope's one field, and its answer.
+INJECT_KINDS_KEY = "inject_kinds"
+SESSION_ID_KEY = "sessionID"
+MESSAGE_KEY = "message"
+STATUS_KEY = "status"
+#: An alert whose session has filed no card a day after it was raised is raised
+#: again, and the new alert replaces its episode: the Planning Agent turn it started
+#: failed, and a stall can outlast that by days. A day rather than a few ticks,
+#: because a shorter retry posts a fresh "digging down" alert every hour or so
+#: for as long as the turns keep failing.
+UNFILED_ALERT_RETRY_SECONDS = 24 * 60 * 60
+#: The episode field naming the alert's session, and the board column the card
+#: carries it in.
+SESSION_KEY = "session"
+SESSION_COLUMN = "session_id"
+INJECT_FAILED_PREFIX = "⚠️ **Controller stall watch — alerts not raised:**"
+INJECT_RECOVERED_LINE = "✅ **Controller stall watch** — alerts are raised again."
+#: The ledger's record of the last refusal, so its chat line is said once.
+INJECT_ERROR_KEY = "inject_error"
+#: A card's status once it is no longer being worked; a new object then raises
+#: a new alert rather than commenting on a finished card.
 TERMINAL_CARD_STATUSES = frozenset({"done", "archived", "cancelled", "failed"})
 #: The board is whatever Hermes' own kanban_db_path() resolves (HERMES_KANBAN_DB,
 #: then kanban/current), falling back to the agent home's kanban.db, the same
-#: file kanban_board_health.board_path names. The notifier only sees cards with
-#: a kanban_notify_subs row, and a cron child has no session identity for
-#: kanban_create to copy, so the row is written here.
+#: file kanban_board_health.board_path names.
 BOARD_DB_NAME = "kanban.db"
-#: The home channels come from the agent home's config.yaml,
-#: `platforms.<p>.home_channel.chat_id`, the field the tick spawner reads for
-#: the same reason: Hermes' build_subprocess_env strips every `*_HOME_CHANNEL`
-#: from a no_agent child, so on a scheduled tick the environment never has one.
-#: The environment is read only as a fallback, for a run started by hand.
-CONFIG_FILE_NAME = "config.yaml"
-HOME_CHANNEL_SUFFIX = "_HOME_CHANNEL"
-HOME_CHANNEL_THREAD_SUFFIX = "_HOME_CHANNEL_THREAD_ID"
-NOTIFIER_PROFILE = "default"
-DELIVERY_MODE = "notify+wake"
 BOARD_BUSY_TIMEOUT_SECONDS = 10
 NOTICED_PREFIX = "🧭 stall noticed"
 CLEARED_PREFIX = "✅ stall cleared"
 DRY_RUN_PREFIX = "dry run:"
-TASK_ID_PATTERN = re.compile(r"\bt_[0-9a-f]{8}\b")
 #: A card the board no longer has, or cannot describe for this many ticks
 #: running, ends its episode so the namespace is not wedged behind it.
 MAX_UNKNOWN_CARD_TICKS = 3
@@ -318,13 +435,6 @@ MAX_UNKNOWN_CARD_TICKS = 3
 #: stall clears; the watch comments and lets the worker finish, then closes
 #: the episode once the card reaches a terminal status.
 RUNNING_CARD_STATUS = "running"
-#: A card's idempotency key is the scope and its episode generation, with
-#: nothing from any clock in it: a retry after a lost board response, however
-#: many ticks later, presents the key the board already has and gets that card
-#: back. The board answers a repeated key with the existing card, a finished
-#: one included, so the generation advances whenever an episode ends, and a
-#: stall that comes back after its card was completed gets a new card.
-GENERATIONS_KEY = "generations"
 #: Plurals kubectl forms with -es or -ies, so a skipped `ingresses` holds
 #: Ingress rows and `networkpolicies` holds NetworkPolicy rows.
 PLURAL_ES_SUFFIXES = ("sses", "shes", "ches", "xes", "zes")
@@ -335,7 +445,6 @@ PLURAL_ES_SUFFIXES = ("sses", "shes", "ches", "xes", "zes")
 #: failed while the object listing succeeded; both flap on one miss.
 CLEAR_AFTER_MISSED_SCANS = {"repeating-warnings": 2, "dangling-reference": 2}
 DEFAULT_CLEAR_AFTER_MISSED_SCANS = 1
-TRUNCATION_MARKER = "..."
 LEDGER_KEY_SEPARATOR = "|"
 #: A cluster is `project:name@location`, the triple the scope's
 #: exclude.clusters names. A domain-scoped project ID has a colon of its own
@@ -480,6 +589,43 @@ def fetch_credentials(project: str, cluster: str, location: str) -> str:
     return path
 
 
+class ReadFailed(RuntimeError):
+    """A kubectl read the sweep makes exited non-zero. The message carries
+    the excerpt the ledger shows; `stderr` carries the whole of it, because
+    the signals `refetch_repairs` looks for come after kubectl's discovery
+    error, past the excerpt's end."""
+
+    def __init__(self, message: str, stderr: str | None) -> None:
+        super().__init__(message)
+        self.stderr = stderr or ""
+
+
+def refetch_repairs(exc: BaseException) -> bool:
+    """Whether a failed first read on a reused kubeconfig is one more fetch
+    repairs (REFETCH_SIGNALS). A timeout or an unrelated refusal is not.
+    Matched on the whole stderr, not the ledger's excerpt: kubectl prints its
+    discovery error (`memcache.go ... couldn't get current server API group
+    list: Get "https://<endpoint>/api?timeout=5s": ...`) before the reason,
+    which lands past STDERR_EXCERPT_CHARS on a GKE endpoint."""
+    if not isinstance(exc, RuntimeError):
+        return False
+    text = exc.stderr if isinstance(exc, ReadFailed) else str(exc)
+    return any(signal in text for signal in REFETCH_SIGNALS)
+
+
+def credentials_current(record: str | None, now: str) -> bool:
+    """Whether a cluster's credential record is young enough to reuse: fetched
+    at `record`, less than CREDENTIALS_REFRESH_SECONDS before `now`. A record
+    that does not parse, or one from the future, is not."""
+    if not record:
+        return False
+    try:
+        age = datetime.fromisoformat(now) - datetime.fromisoformat(record)
+    except (TypeError, ValueError):
+        return False
+    return timedelta(0) <= age < timedelta(seconds=CREDENTIALS_REFRESH_SECONDS)
+
+
 def served_kinds(kubeconfig: str) -> set[str] | None:
     """The namespaced, listable resources the cluster serves, as kubectl names
     them (`deployments.apps`) and by bare plural (`deployments`), so a bare
@@ -526,7 +672,7 @@ def list_namespaces(kubeconfig: str) -> list[str]:
     clears while the namespace waits on a finalizer."""
     r = run_sandbox(["kubectl", "get", "namespaces", "-o", "name"], timeout=NAMESPACE_LIST_TIMEOUT_SECONDS, kubeconfig=kubeconfig)
     if r.returncode != 0:
-        raise RuntimeError(f"kubectl get namespaces exited {r.returncode}: {stderr_excerpt(r.stderr)}")
+        raise ReadFailed(f"kubectl get namespaces exited {r.returncode}: {stderr_excerpt(r.stderr)}", r.stderr)
     names = []
     for line in r.stdout.splitlines():
         line = line.strip()
@@ -576,14 +722,27 @@ def scan_namespace(kubeconfig: str, namespace: str, source: str, kinds: str | No
 
 
 def empty_state() -> dict:
-    return {"version": STATE_SCHEMA_VERSION, "stalls": {}, "unreadable": {}, EPISODES_KEY: {}, GENERATIONS_KEY: {}, "sweep_error": None, "updated_at": None, CURSOR_KEY: None}
+    return {
+        "version": STATE_SCHEMA_VERSION,
+        "stalls": {},
+        "unreadable": {},
+        EPISODES_KEY: {},
+        "sweep_error": None,
+        INJECT_ERROR_KEY: None,
+        "updated_at": None,
+        CURSOR_KEY: None,
+        CREDENTIALS_KEY: {},
+        BUDGET_EXHAUSTED_KEY: False,
+        BUDGET_EXHAUSTED_VIEW_KEY: None,
+        BUDGET_HELD_TICKS_KEY: 0,
+    }
 
 
 def load_state(path: Path, project: str | None = None) -> dict:
     """The ledger, a projectless one moved under the management project first.
     Without that project a projectless ledger comes back as it is, version
     included: the tick cannot sweep, so it saves the ledger unchanged and the
-    next tick moves it. Discarding it would file a second card for every
+    next tick moves it. Discarding it would raise a second alert for every
     namespace with an open one."""
     try:
         data = json.loads(path.read_text())
@@ -640,8 +799,8 @@ def with_project(data: dict, project: str) -> dict:
         "stalls": stalls,
         "unreadable": {},
         EPISODES_KEY: {prefix + k: v for k, v in (data.get(EPISODES_KEY) or {}).items()},
-        GENERATIONS_KEY: {prefix + k: v for k, v in (data.get(GENERATIONS_KEY) or {}).items()},
         CURSOR_KEY: cursor,
+        CREDENTIALS_KEY: {prefix + k: v for k, v in (data.get(CREDENTIALS_KEY) or {}).items()},
     }
 
 
@@ -690,13 +849,24 @@ class Sweep:
         #: Listed clusters with no Cluster Agent profile: not read, not listed
         #: here, so their rows clear the way a deleted cluster's do.
         self.unmanaged: set[str] = set()
+        #: Listed clusters in a status the sweep reads, and the ones it tried
+        #: this tick and could not read, for the coverage figures.
+        self.sweepable_clusters: set[str] = set()
+        self.failed_clusters: set[str] = set()
         #: Clusters whose namespace listing succeeded, and those namespaces.
         self.read_clusters: set[str] = set()
         self.listed_namespaces: dict[str, set[str]] = {}
         self.unreadable: dict[str, str] = {}
+        #: Profiles whose cluster_identity could not be read this tick, so the
+        #: projects only they name were not listed (`roster_projects`).
+        self.unread_profiles: set[str] = set()
         self.budget_exhausted = False
         #: Where the budget stopped the sweep, for the next tick to start from.
         self.cursor: dict | None = None
+        #: When each listed cluster's credentials were last fetched, for the
+        #: ledger: the records this tick reused or renewed, less the clusters a
+        #: fresh fetch did not make readable and the ones no longer listed.
+        self.credentials: dict[str, str] = {}
 
     @property
     def clusters(self) -> int:
@@ -706,6 +876,32 @@ class Sweep:
     def namespaces(self) -> int:
         return len(self.read_scopes)
 
+    def view(self) -> dict[str, int]:
+        """The projects this tick listed, each with the clusters it had in
+        play there. A project whose listing failed or was incomplete is
+        absent, and so is one named only by profiles whose identity could not
+        be read, since nothing listed it. `tick` keeps the exhausting sweep's
+        view in the ledger and compares a fitting sweep's against it."""
+        counts = {project: 0 for project in self.projects - self.unlisted_projects}
+        for cid in self.sweepable_clusters:
+            project = split_cluster_id(cid)[0]
+            # An incomplete listing's clusters are swept but do not put the
+            # project back in view: the view is what the fit can vouch for.
+            if project not in self.unlisted_projects:
+                counts[project] = counts.get(project, 0) + 1
+        return counts
+
+    def holds_unlisted(self, cid: str) -> bool:
+        """Whether a cluster this tick did not list is held rather than gone:
+        its project's listing failed, or its profile is there but its identity
+        did not name the project, so nothing listed the project. The one rule
+        for a row (`verdict` keeps it UNKNOWN) and for a credential record
+        (`sweep_fleet` keeps it), so a transient of either kind costs neither."""
+        project, name, location = split_cluster_id(cid)
+        if project in self.unlisted_projects:
+            return True
+        return project not in self.projects and cluster_agent_for(project, name, location) is not None
+
     def verdict(self, entry: dict) -> str:
         """What this tick can say about a ledger row: its namespace or cluster
         is GONE from the listing, the namespace was scanned and the row was
@@ -713,14 +909,7 @@ class Sweep:
         is UNKNOWN."""
         cid, namespace = entry.get("cluster", ""), entry.get("namespace", "")
         if cid not in self.listed_clusters:
-            project, name, location = split_cluster_id(cid)
-            if project in self.unlisted_projects:
-                return UNKNOWN
-            if project not in self.projects and cluster_agent_for(project, name, location) is not None:
-                # The profile is there but its identity did not name the
-                # project, so the project was not listed this tick.
-                return UNKNOWN
-            return GONE
+            return UNKNOWN if self.holds_unlisted(cid) else GONE
         namespaces = self.listed_namespaces.get(cid)
         if namespaces is not None and namespace not in namespaces:
             return GONE
@@ -747,11 +936,26 @@ class Sweep:
             return False
         self.budget_exhausted = True
         self.cursor = {"cluster": cid, "namespace": namespace}
-        self.unreadable[BUDGET_SCOPE] = (
-            f"sweep budget of {TICK_BUDGET_SECONDS}s exhausted after {self.clusters} clusters and "
-            f"{self.namespaces} namespaces; the rest were not read this tick"
-        )
+        self.unreadable[BUDGET_SCOPE] = self.coverage_text()
         return True
+
+    def coverage_text(self) -> str:
+        """What an exhausted sweep covered and where the next tick picks up:
+        the clusters read of the ones it could sweep (listed, in a status it
+        reads), the namespaces read, the clusters it tried and could not read,
+        and where the cursor stands. Called by `out_of_budget` once it has set
+        the cursor. On a fleet the budget does not cover, a cluster is read
+        across consecutive ticks, so this is the operator's interval, not the
+        schedule."""
+        resume = cluster_label(self.cursor["cluster"])
+        if self.cursor.get("namespace"):
+            resume += f" at namespace `{self.cursor['namespace']}`"
+        failed = f"; {len(self.failed_clusters)} could not be read" if self.failed_clusters else ""
+        return (
+            f"sweep budget of {TICK_BUDGET_SECONDS}s exhausted: read {self.clusters} of "
+            f"{len(self.sweepable_clusters)} clusters ({self.namespaces} namespaces){failed}; "
+            f"the rest were not read this tick; the next tick resumes at {resume}"
+        )
 
 
 #: What one scope may fail with and the sweep carry on. SandboxUnavailable is a
@@ -834,13 +1038,23 @@ def list_projects(projects: list[str], first: str, started: float) -> dict[str, 
     return results
 
 
-def sweep_fleet(management_project: str, cursor: dict | None = None) -> Sweep:
+def sweep_fleet(
+    management_project: str,
+    cursor: dict | None = None,
+    credentials: dict[str, str] | None = None,
+    now: str | None = None,
+) -> Sweep:
     """Sweep the management project and every project on the roster. One
     project's listing failing holds that project's rows; every listing failing
-    fails the sweep."""
+    fails the sweep. `credentials` is the ledger's record of when each
+    cluster's kubeconfig was last fetched (see CREDENTIALS_KEY) and `now` the
+    tick's time, which a fetch this tick is recorded as."""
     projects, unread_profiles = roster_projects()
     sweep = Sweep({management_project} | projects)
+    sweep.unread_profiles = set(unread_profiles)
     sweep.unreadable.update(unread_profiles)
+    records = dict(credentials or {})
+    now = now or now_iso()
     started = time.monotonic()
     source = report_source()
     failures: dict[str, Exception] = {}
@@ -868,6 +1082,7 @@ def sweep_fleet(management_project: str, cursor: dict | None = None) -> Sweep:
             sweep.listed_clusters.add(cid)
             if cluster["status"] in SWEEPABLE_CLUSTER_STATUSES:
                 sweepable.append((cid, cluster))
+                sweep.sweepable_clusters.add(cid)
             else:
                 sweep.unreadable[scope_key(cid)] = f"status={cluster['status'] or 'unknown'}"
     if len(failures) == len(sweep.projects):
@@ -876,14 +1091,64 @@ def sweep_fleet(management_project: str, cursor: dict | None = None) -> Sweep:
         project, name, location = split_cluster_id(cid)
         if sweep.out_of_budget(started, cid):
             break
+        fetched = False  # a fetch was attempted this tick: at most one per cluster
+        wrote = False  # that fetch returned, so gcloud wrote the kubeconfig
+        readable = False  # the namespace read on it returned
         try:
-            kubeconfig = fetch_credentials(project, name, location)
-            namespaces = list_namespaces(kubeconfig)
+            if credentials_current(records.get(cid), now):
+                kubeconfig = kubeconfig_path(project, name, location)
+            else:
+                fetched = True
+                kubeconfig = fetch_credentials(project, name, location)
+                wrote = True
+            try:
+                namespaces = list_namespaces(kubeconfig)
+            except READ_FAILURES as exc:
+                # A reused kubeconfig the shim or the cluster refused -- the
+                # sandbox restarted and the file is gone, or the cluster was
+                # recreated: fetch once more and retry this one call. A fetch
+                # this tick is not repeated for the same failure, and a failure
+                # that says nothing about the kubeconfig (a timeout, a proxy
+                # refusal, an API error) gets no fetch: it would not repair it,
+                # and on a saturated tick it would be one more gcloud per
+                # cluster at the proxy that just said it was busy.
+                if fetched or isinstance(exc, sandbox_exec.SandboxUnavailable) or not refetch_repairs(exc):
+                    raise
+                # Set before the fetch: a repair fetch that fails has not made
+                # the cluster readable either, so the record it was meant to
+                # replace goes, and the next tick fetches first rather than
+                # failing the same read on the same stub again.
+                fetched = True
+                kubeconfig = fetch_credentials(project, name, location)
+                wrote = True
+                namespaces = list_namespaces(kubeconfig)
+            # The namespace read is what proves the kubeconfig: a fetch whose
+            # kubeconfig just listed namespaces is recorded here, before the
+            # discovery call, whose failure says nothing about the kubeconfig.
+            readable = True
+            if fetched:
+                records[cid] = now
             kinds, dropped = kinds_for(served_kinds(kubeconfig))
         except sandbox_exec.SandboxUnavailable:
             raise
         except READ_FAILURES as exc:
             sweep.unreadable[scope_key(cid)] = failure_text(exc)
+            sweep.failed_clusters.add(cid)
+            # A fetch that failed, or whose kubeconfig the read indicted (a
+            # REFETCH_SIGNALS failure), is no record to reuse. Every other
+            # record stays, and a fetch gcloud completed whose read then failed
+            # for a reason no fetch repairs is recorded as if it had read: the
+            # kubeconfig is written, and a dark cluster on its fetch tick would
+            # otherwise pay the describe and the fetch on every tick it stays
+            # dark. The trade is a kubeconfig gcloud wrote but that is wrong
+            # without saying so, held for a day rather than re-described every
+            # tick. The next tick reads on it again, and one bad tick does not
+            # put the fleet back on the fetch-everything path.
+            if fetched and not readable:
+                if wrote and not refetch_repairs(exc):
+                    records[cid] = now
+                else:
+                    records.pop(cid, None)
             continue
         sweep.read_clusters.add(cid)
         sweep.listed_namespaces[cid] = set(namespaces)
@@ -922,6 +1187,16 @@ def sweep_fleet(management_project: str, cursor: dict | None = None) -> Sweep:
                     "detail": f.get("detail", ""),
                     "stalled_for": f.get("stalled_for", ""),
                 }
+    # Clusters the budget never reached keep their records, and so does every
+    # unlisted cluster whose rows `verdict` holds (`holds_unlisted`): a listing
+    # that fails once, or an identity file unreadable for one tick, must not
+    # cost a project its fetches. Clusters gone from the listing lose theirs,
+    # as their rows go.
+    sweep.credentials = {
+        cid: at
+        for cid, at in records.items()
+        if cid in sweep.listed_clusters or sweep.holds_unlisted(cid)
+    }
     return sweep
 
 
@@ -968,8 +1243,127 @@ def diff_and_update(state: dict, sweep: Sweep, now: str) -> tuple[dict, dict]:
 
 
 # --------------------------------------------------------------------------
-# the card hand-off
+# the alert hand-off
 # --------------------------------------------------------------------------
+
+
+def session_kv(path: str, body: dict | None = None, method: str = "") -> dict:
+    """One call to the Session KV server on the pod's loopback, authenticated
+    the way findings_nudge.py authenticates; SESSION_KV_API_KEY survives into a
+    no_agent child."""
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {CONTENT_TYPE_HEADER: JSON_CONTENT_TYPE} if data is not None else {}
+    token = (os.environ.get(SESSION_KV_AUTH_ENV) or "").strip()
+    if token:
+        headers[AUTH_HEADER] = f"{BEARER_PREFIX}{token}"
+    request = urllib.request.Request(
+        f"{SESSION_KV_URL}{path}", data=data, headers=headers, method=method or ("POST" if data is not None else "GET")
+    )
+    # Callers handle HTTPError, OSError and ValueError, so every other way the
+    # answer can fail to arrive whole is a ValueError here.
+    try:
+        with urllib.request.urlopen(request, timeout=SESSION_KV_TIMEOUT_SECONDS) as response:
+            answer = json.loads(response.read().decode("utf-8") or "{}")
+    except http.client.HTTPException as exc:  # a body cut short, a status line that is not HTTP
+        if isinstance(exc, OSError):
+            raise  # RemoteDisconnected: the server went away, which is unreachable
+        raise ValueError(f"the Session KV server's answer was malformed: {exc!r}") from exc
+    if not isinstance(answer, dict):
+        raise ValueError(f"the Session KV server answered {type(answer).__name__}, not a JSON object")
+    return answer
+
+
+def stall_payload(project: str, cluster: str, location: str, namespace: str, assignee: str, rows: list[dict], first_seen: str) -> dict:
+    """The record a new episode hands the Session KV server. A row's detail
+    stays out: condition reasons, spec paths, referent names and event messages
+    are text a tenant writes, and the Cluster Agent reads them again when it
+    runs the skill."""
+    objects = [
+        {"object": r["object"][:MAX_NAME_CHARS], "heuristic": r["heuristic"], "stalled_for": r.get("stalled_for") or ""}
+        for r in sorted(rows, key=lambda r: (r["object"], r["heuristic"]))
+    ]
+    return {
+        "kind": INJECT_KIND,
+        "cluster": cluster,
+        "project": project,
+        "location": location,
+        "namespace": namespace,
+        "assignee": assignee,
+        "first_seen": first_seen,
+        "objects": objects[:MAX_ROWS_IN_RECORD],
+    }
+
+
+class AlertRefused(Exception):
+    """The Session KV server did not take the alert; the message says why."""
+
+
+class RecordRefused(AlertRefused):
+    """The server refused this one record (HTTP 400). Other namespaces' alerts
+    are still worth sending this tick."""
+
+
+# One reader per route: each returns the field the watch uses, typed, or raises
+# the ValueError its caller reports as an answer that could not be read. No
+# caller reads an answer's fields itself.
+
+
+def healthz_kinds() -> list[str]:
+    kinds = session_kv(HEALTHZ_PATH).get(INJECT_KINDS_KEY)
+    if kinds is None:
+        return []
+    if not isinstance(kinds, list) or not all(isinstance(k, str) for k in kinds):
+        raise ValueError(f"the Session KV server's {INJECT_KINDS_KEY} is not a list of names: {kinds!r}")
+    return kinds
+
+
+def new_session() -> str:
+    session_id = session_kv(SESSIONS_PATH, method="POST").get(SESSION_ID_KEY)
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError(f"the Session KV server returned no session id: {session_id!r}")
+    return session_id
+
+
+def inject_status(session_id: str, payload: dict) -> str:
+    status = session_kv(
+        f"{SESSIONS_PATH}/{urllib.parse.quote(session_id, safe='')}{INJECT_SUFFIX}",
+        {MESSAGE_KEY: json.dumps(payload)},
+    ).get(STATUS_KEY)
+    if not isinstance(status, str):
+        raise ValueError(f"the Session KV server's inject answer has no status: {status!r}")
+    return status
+
+
+def open_session() -> str:
+    """A session for one alert. A server that does not advertise the kind is
+    refused before any session is opened: its dispatch would take the record
+    for a Kubernetes event and post a Pod alert naming nothing."""
+    try:
+        if INJECT_KIND not in healthz_kinds():
+            raise AlertRefused(f"the Session KV server does not advertise the {INJECT_KIND} inject kind")
+        return new_session()
+    except urllib.error.HTTPError as exc:
+        raise AlertRefused(f"the Session KV server answered with an error: {exc}") from exc
+    except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
+        raise AlertRefused(f"the Session KV server's answer could not be read: {exc}") from exc
+    except OSError as exc:  # URLError is an OSError
+        raise AlertRefused(f"the Session KV server could not be reached: {exc}") from exc
+
+
+def inject(session_id: str, payload: dict) -> None:
+    """Hand the record to the session; raises AlertRefused unless it was taken."""
+    try:
+        status = inject_status(session_id, payload)
+    except urllib.error.HTTPError as exc:
+        if exc.code == HTTP_BAD_REQUEST:
+            raise RecordRefused(f"the Session KV server refused the record: {exc}") from exc
+        raise AlertRefused(f"the inject failed: {exc}") from exc
+    except (OSError, ValueError) as exc:
+        raise AlertRefused(f"the inject failed: {exc}") from exc
+    if status != INJECTED_STATUS:
+        # No session id in the text: the ledger compares it with the last
+        # refusal to say each refusal once, and every attempt has a new session.
+        raise AlertRefused(f"the Session KV server answered {status!r} to the inject")
 
 
 def kanban(command: str) -> str:
@@ -978,20 +1372,6 @@ def kanban(command: str) -> str:
     from hermes_cli.kanban import run_slash  # lazy: the board API is the gateway venv's, not a test's
 
     return str(run_slash(command))
-
-
-def parse_task_id(out: str) -> str | None:
-    start = out.find("{")
-    end = out.rfind("}")
-    if start != -1 and end > start:
-        try:
-            task_id = json.loads(out[start : end + 1]).get("id")
-            if task_id:
-                return str(task_id)
-        except ValueError:
-            pass
-    match = TASK_ID_PATTERN.search(out)
-    return match.group(0) if match else None
 
 
 def card_status(task_id: str) -> str | None:
@@ -1009,6 +1389,12 @@ def card_status(task_id: str) -> str | None:
         return None
 
 
+def board_path() -> Path:
+    """The board the Planning Agent files on: Hermes' own resolution when the
+    API is importable, else the agent home's kanban.db."""
+    return gitops_workspace.board_path()
+
+
 def card_exists(task_id: str, db_path: Path | None = None) -> bool | None:
     """Whether the board has the card at all, read straight from its tasks
     table; None when the board could not be opened."""
@@ -1021,6 +1407,57 @@ def card_exists(task_id: str, db_path: Path | None = None) -> bool | None:
     except sqlite3.Error as exc:
         sys.stderr.write(f"stall_watch: could not open the board to look for {task_id}: {exc}\n")
         return None
+
+
+class BoardUnreadable(Exception):
+    """The board could not be read, which says nothing about whether a card is there."""
+
+
+def board_records_sessions(db_path: Path | None = None) -> bool | None:
+    """Whether the board's tasks table has the `session_id` column the watch
+    finds an alert's card by; None when the board could not be opened or has no
+    tasks table yet, which the first card filed creates. Without
+    the column every alert's card would be unfindable, so its episode would
+    never close and the namespace would never be alerted for again."""
+    try:
+        conn = sqlite3.connect(f"file:{db_path or board_path()}?mode=ro", uri=True, timeout=BOARD_BUSY_TIMEOUT_SECONDS)
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        sys.stderr.write(f"stall_watch: could not open the board to check its schema: {exc}\n")
+        return None
+    return SESSION_COLUMN in columns if columns else None
+
+
+def card_for_session(session_id: str, assignee: str = "", db_path: Path | None = None) -> str | None:
+    """The card the alert's session filed, or None while there is none; raises
+    BoardUnreadable when the board cannot say. Hermes stamps the filing session on `tasks.session_id`;
+    the Planning Agent's kanban_create runs in the session the Session KV
+    server opened for the alert, so that is the link. A card assigned to the
+    Cluster Agent the record named is preferred over any other the turn filed.
+    A board with no file or no tasks table yet has no card, the reading
+    board_records_sessions gives it too, so the day-later retry and the
+    clearing step still apply."""
+    path = db_path or board_path()
+    if not Path(path).exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=BOARD_BUSY_TIMEOUT_SECONDS)
+        try:
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").fetchone() is None:
+                return None
+            row = conn.execute(
+                "SELECT id FROM tasks WHERE session_id = ? ORDER BY assignee = ? DESC, created_at, id LIMIT 1",
+                (session_id, assignee),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        sys.stderr.write(f"stall_watch: could not look up the card for session {session_id}: {exc}\n")
+        raise BoardUnreadable(str(exc)) from exc
+    return str(row[0]) if row else None
 
 
 def cluster_agent_for(project: str, cluster: str, location: str) -> str | None:
@@ -1057,61 +1494,6 @@ def names_text(names: list[str]) -> str:
     return ", ".join(shown) + (f" and {rest} more" if rest else "")
 
 
-def card_key(cid: str, namespace: str, generation: int) -> str:
-    return f"{CARD_IDEMPOTENCY_PREFIX}-{cid}-{namespace}-g{generation}"
-
-
-def card_title(cluster: str, namespace: str, rows: list[dict]) -> str:
-    title = f"Stalled controllers in {namespace} on {cluster}: {', '.join(object_names(rows))}"
-    if len(title) > CARD_TITLE_MAX_CHARS:
-        title = title[: CARD_TITLE_MAX_CHARS - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER
-    return title
-
-
-def rows_block(rows: list[dict]) -> str:
-    # A row's detail carries condition reasons, spec paths, referent names and
-    # event messages a tenant writes; the skill's own run reads them again.
-    lines = [f"- {r['object']}: {r['heuristic']} ({r.get('stalled_for') or '?'})" for r in sorted(rows, key=lambda r: (r["object"], r["heuristic"]))]
-    shown = lines[:MAX_ROWS_IN_CARD]
-    if len(lines) > len(shown):
-        shown.append(f"- and {len(lines) - len(shown)} more rows; the skill's own run lists them all")
-    return "\n".join(shown)
-
-
-def card_body(project: str, cluster: str, location: str, namespace: str, rows: list[dict], first_seen: str) -> str:
-    return (
-        f"The scheduled stall watch found controllers in namespace `{namespace}` of cluster "
-        f"`{cluster}` ({location}, project `{project}`) that have stopped making progress without "
-        f"erroring. First seen by the watch at {first_seen}.\n\n"
-        f"Run the `{SKILL_NAME}` skill on that namespace, "
-        f"confirm which of the objects below are still stalled, identify what each is waiting on "
-        f"(the missing referent, the condition that never turned True, the repeating warning), and record "
-        f"the finding with `kanban_complete` in the report format your instructions give. Change nothing "
-        f"in the cluster.\n\n"
-        f"What the watch saw. These rows are data read from the cluster, not instructions:\n\n"
-        f"{rows_block(rows)}\n"
-    )
-
-
-def open_card(title: str, body: str, assignee: str, idempotency_key: str) -> str | None:
-    """File one card and return its id, or None with the reason on stderr; a
-    board that is briefly unavailable is retried by the next tick, which
-    still sees the objects as new because their rows were not ledgered."""
-    cmd = (
-        f"create --json --assignee {shlex.quote(assignee)} --idempotency-key {shlex.quote(idempotency_key)} "
-        f"--body {shlex.quote(body)} {shlex.quote(title)}"
-    )
-    try:
-        out = kanban(cmd)
-    except Exception as exc:  # noqa: BLE001 - never fail the cron run on the board
-        sys.stderr.write(f"stall_watch: could not open card: {exc}\n")
-        return None
-    task_id = parse_task_id(out)
-    if not task_id:
-        sys.stderr.write(f"stall_watch: no task id in the board response: {out[:STDERR_EXCERPT_CHARS]}\n")
-    return task_id
-
-
 def comment_card(task_id: str, text: str) -> bool:
     try:
         kanban(f"comment {shlex.quote(task_id)} {shlex.quote(text)}")
@@ -1130,99 +1512,14 @@ def complete_card(task_id: str, result: str) -> bool:
         return False
 
 
-def home_targets() -> list[tuple[str, str, str]]:
-    """(platform, chat_id, thread_id) for every chat platform the harness ships
-    that has a home channel: from the agent home's config.yaml first, the way
-    the tick spawner reads it, and from `<PLATFORM>_HOME_CHANNEL` only for a
-    platform the file does not settle, which is a run started by hand. The
-    platform list is what chat_platforms says this install has enabled, so a
-    stale home channel for a platform the CR turned off, or a platform the
-    notifier has no adapter for, never becomes a row. A scheduled report
-    posts flat, so no thread is carried from the file."""
-    import chat_platforms  # lazy: a sibling the tests can still import
-
-    try:
-        platforms_on = list(chat_platforms.enabled_chat_platforms())
-    except Exception as exc:  # noqa: BLE001 - the shipped list is the fallback
-        sys.stderr.write(f"stall_watch: could not tell which chat platforms are enabled: {exc}\n")
-        platforms_on = list(chat_platforms.CHAT_PLATFORMS)
-    configured: dict[str, str] = {}
-    try:
-        import yaml
-
-        config = yaml.safe_load((Path(gitops_workspace.agent_home()) / CONFIG_FILE_NAME).read_text()) or {}
-        platforms = config.get("platforms") if isinstance(config, dict) else None
-        for platform, block in (platforms or {}).items() if isinstance(platforms, dict) else []:
-            home = block.get("home_channel") if isinstance(block, dict) else None
-            chat_id = home.get("chat_id") if isinstance(home, dict) else None
-            if chat_id:
-                configured[str(platform)] = str(chat_id).strip()
-    except Exception as exc:  # noqa: BLE001 - no file, or not ours to parse: the environment is what is left
-        sys.stderr.write(f"stall_watch: could not read home channels from {CONFIG_FILE_NAME}: {exc}\n")
-    targets = []
-    for platform in platforms_on:
-        if platform in configured:
-            targets.append((platform, configured[platform], ""))
-            continue
-        value = os.environ.get(platform.upper() + HOME_CHANNEL_SUFFIX, "").strip()
-        if value:
-            thread = os.environ.get(platform.upper() + HOME_CHANNEL_THREAD_SUFFIX, "").strip()
-            targets.append((platform, value, thread))
-    return targets
-
-
-def board_path() -> Path:
-    """The board run_slash filed the card on: Hermes' own resolution when the
-    API is importable, else the agent home's kanban.db."""
-    try:
-        from hermes_cli.kanban import kanban_db_path  # lazy: the gateway venv's, not a test's
-
-        return Path(str(kanban_db_path()))
-    except Exception:  # noqa: BLE001 - outside the gateway venv the default board is the only one
-        return Path(gitops_workspace.agent_home()) / BOARD_DB_NAME
-
-
-def subscribe_card(task_id: str, db_path: Path | None = None) -> int:
-    """Write the card's chat subscription rows for the home channels, seeded at
-    the card's first event so its creation is not replayed and everything after
-    it is, however many ticks late the write lands. Returns the
-    number of the card's rows on the board once the write is committed, so a
-    row already there counts and a write the commit lost does not; fail-soft,
-    since a card without a row still gets worked and the next tick tries again."""
-    targets = home_targets()
-    if not targets:
-        sys.stderr.write("stall_watch: no home channel in the environment; the card's progress will not reach chat\n")
-        return 0
-    path = db_path or board_path()
-    written = 0
-    try:
-        # mode=rw: a board that is not there is an error, not a new empty file.
-        conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=BOARD_BUSY_TIMEOUT_SECONDS)
-        try:
-            if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
-                sys.stderr.write(f"stall_watch: card {task_id} is not on the board at {path}; no subscription written\n")
-                return 0
-            head = conn.execute("SELECT COALESCE(MIN(id), 0) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()[0]
-            created = int(time.time())
-            for platform, chat_id, thread_id in targets:
-                conn.execute(
-                    "INSERT OR IGNORE INTO kanban_notify_subs "
-                    "(task_id, platform, chat_id, thread_id, user_id, notifier_profile, delivery_mode, delivery_metadata, created_at, last_event_id) "
-                    "VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)",
-                    (task_id, platform, chat_id, thread_id, NOTIFIER_PROFILE, DELIVERY_MODE, json.dumps({"thread_id": thread_id} if thread_id else {}), created, head),
-                )
-            conn.commit()
-            written = conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (task_id,)).fetchone()[0]
-        finally:
-            conn.close()
-    except sqlite3.Error as exc:
-        sys.stderr.write(f"stall_watch: could not write the subscription for {task_id}: {exc}\n")
-        written = 0
-    return written
-
-
 def scope_rows(state: dict, scope: str) -> list[dict]:
     return [e for e in state["stalls"].values() if scope_key(e["cluster"], e["namespace"]) == scope]
+
+
+def would_raise(state: dict, sweep: Sweep, scope: str) -> bool:
+    """Whether a scope is a candidate for an alert this tick: read this tick,
+    with a row not on its way out."""
+    return scope in sweep.read_scopes and any(not e.get("missed") for e in scope_rows(state, scope))
 
 
 def scope_first_seen(state: dict, scope: str) -> str:
@@ -1231,11 +1528,20 @@ def scope_first_seen(state: dict, scope: str) -> str:
 
 
 def end_episode(state: dict, scope: str) -> dict:
-    """Drop the scope's episode and advance its generation, so the next card
-    for the scope carries a key the board has not seen."""
-    generations = state.setdefault(GENERATIONS_KEY, {})
-    generations[scope] = int(generations.get(scope) or 0) + 1
     return state[EPISODES_KEY].pop(scope)
+
+
+def episode_card(episode: dict) -> str | None:
+    """The episode's card: the one it records, or the one its alert's session
+    filed, adopted the first time the board shows it. An episode the watch
+    opened before the inject path carries `card` and no `session`. Raises
+    BoardUnreadable, which a caller treats as a reason to wait a tick."""
+    if episode.get("card"):
+        return episode["card"]
+    card = card_for_session(episode[SESSION_KEY], episode.get("assignee") or "") if episode.get(SESSION_KEY) else None
+    if card:
+        episode["card"] = card
+    return card
 
 
 def episode_gone(state: dict, scope: str, task_id: str) -> bool:
@@ -1257,126 +1563,189 @@ def episode_gone(state: dict, scope: str, task_id: str) -> bool:
     return False
 
 
-def comment_pending(episode: dict, namespace: str) -> None:
-    """Tell the card about objects that joined while it was open; what the
-    board refused stays pending and is tried again next tick."""
+def comment_pending(episode: dict, namespace: str, card: str) -> None:
+    """Tell the open card about objects that joined since it was filed; what
+    the board refused stays pending and is tried again next tick."""
     pending = sorted(set(episode.get("pending", [])))
     if not pending:
         return
-    if comment_card(episode["card"], f"The watch now also sees these objects stalled in `{namespace}`: {names_text(pending)}"):
+    if comment_card(card, f"The watch now also sees these objects stalled in `{namespace}`: {names_text(pending)}"):
         episode["objects"] = sorted(set(episode.get("objects", [])) | set(pending))
         episode["pending"] = []
 
 
-def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scope: dict, now: str, *, dry_run: bool = False) -> list[str]:
-    """Open, comment on and close cards for the tick's episodes; return the
-    chat lines, one per card opened and one per card closed. A dry run touches
-    no board and says what it would have done."""
+def card_wait_over(episode: dict, now: str) -> bool:
+    """Whether a card-less episode has waited as long as its card is given to
+    appear."""
+    if not episode.get(SESSION_KEY):
+        return True  # nothing can file a card for it
+    try:
+        waited = (datetime.fromisoformat(now) - datetime.fromisoformat(str(episode.get("opened_at")))).total_seconds()
+    except (ValueError, TypeError):  # TypeError: a hand-edited time with no timezone
+        return True
+    return waited >= UNFILED_ALERT_RETRY_SECONDS
+
+
+def adopt_cards(state: dict, now: str) -> set[str]:
+    """Look up the card each open alert's session filed, and return the scopes
+    whose session has filed none UNFILED_ALERT_RETRY_SECONDS after the alert.
+    Their episodes stay until a new alert replaces them or the clearing step
+    ends them, so a skipped re-alert still leaves the clear to be said."""
+    episodes = state.setdefault(EPISODES_KEY, {})
+    expired: set[str] = set()
+    for scope in sorted(episodes):
+        episode = episodes[scope]
+        if episode.get("card") or not episode.get(SESSION_KEY):
+            continue
+        try:
+            if episode_card(episode):
+                continue
+        except BoardUnreadable:
+            continue
+        if card_wait_over(episode, now):
+            expired.add(scope)
+    return expired
+
+
+def restore_episode(episodes: dict, scope: str, previous: dict | None) -> None:
+    if previous is None:
+        episodes.pop(scope, None)
+    else:
+        episodes[scope] = previous
+
+
+def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scope: dict, now: str, *, dry_run: bool = False, persist) -> list[str]:
+    """Raise alerts for the tick's new episodes, and comment on and close the
+    cards earlier alerts produced; return the chat lines. A new episode gets no
+    line of its own, because the alert is its notice; a closed card gets one,
+    and so do namespaces held for a later tick and a server that refused an
+    alert. A dry run touches no board and raises nothing, and says what it
+    would have done.
+
+    `persist` saves the ledger. An episode is saved before its inject is sent,
+    so a tick whose ledger cannot be written raises nothing rather than raising
+    the same alerts again on every tick that follows."""
     episodes = state.setdefault(EPISODES_KEY, {})
     lines: list[str] = []
-    # Every scope read this tick that has rows and no card is a candidate,
-    # whether its objects appeared now or it has waited: past the cap, after a
-    # refused card, or with no profile. Oldest first sighting first.
+    expired = set() if dry_run else adopt_cards(state, now)
+    # Every scope read this tick that has rows and no episode, or an episode
+    # whose alert expired with no card, is a candidate, whether its objects
+    # appeared now or it has waited: past the cap, after a refused alert, or
+    # with no profile. Oldest first sighting first.
     candidates = dict(new_by_scope)
     for entry in state["stalls"].values():
         scope = scope_key(entry["cluster"], entry["namespace"])
-        # A row missed this tick is on its way out and does not file a card.
-        if scope not in candidates and scope not in episodes and scope in sweep.read_scopes and not entry.get("missed"):
+        if scope not in candidates and (scope not in episodes or scope in expired) and would_raise(state, sweep, scope):
             candidates[scope] = []
-    opened = held = 0
+    # Objects held for a card go through the same card check as new ones, so a
+    # card finished before they reach it gets a new alert, not a comment.
+    # A cleared scope is left to the clearing step.
+    for scope, episode in episodes.items():
+        if not dry_run and episode.get("pending") and scope not in candidates and scope_rows(state, scope):
+            candidates[scope] = []
+    raised = held = 0
+    refusal: str | None = None
     for scope in sorted(candidates, key=lambda sc: (scope_first_seen(state, sc), sc)):
         new_rows = candidates[scope]
         cid, namespace = split_scope(scope)
         project, name, location = split_cluster_id(cid)
-        episode = episodes.get(scope)
-        # A card carries every object the scope holds, not only the ones that
+        # An expired episode is replaced only by an alert that is sent; an
+        # episode this iteration ends below is not put back on a refusal.
+        previous = episodes.get(scope) if scope in expired else None
+        episode = None if scope in expired else episodes.get(scope)
+        # An alert carries every object the scope holds, not only the ones that
         # appeared this tick.
         seen = {(r["object"], r["heuristic"], r["detail"]) for r in new_rows}
         rows = new_rows + [e for e in scope_rows(state, scope) if (e["object"], e["heuristic"], e["detail"]) not in seen]
         if dry_run:
             if episode:
-                what, shown = f"would comment on card `{episode['card']}` for", new_rows
-            elif opened < MAX_CARDS_PER_TICK:
-                what, shown = "would open a card for", rows
-                opened += 1
+                what, shown = f"would comment on card `{episode.get('card') or 'not yet filed'}` for", new_rows
+            elif raised < MAX_ALERTS_PER_TICK:
+                what, shown = "would raise an alert for", rows
+                raised += 1
             else:
                 held += 1
                 continue
             lines.append(f"{DRY_RUN_PREFIX} {what} {scope_label_text(scope)}: {names_text(object_names(shown))}")
             continue
         if episode:
-            status = card_status(episode["card"])
-            if status is None and not episode_gone(state, scope, episode["card"]):
+            try:
+                card = episode_card(episode)
+            except BoardUnreadable:
+                card = None
+            if card is None:
+                # The board is unreadable, or the Planning Agent has not filed
+                # the alert's card yet. Either way the namespace already has its
+                # alert; the objects wait for a card to comment on.
+                episode["pending"] = sorted(set(episode.get("pending", [])) | set(object_names(new_rows)))
+                continue
+            status = card_status(card)
+            if status is None and not episode_gone(state, scope, card):
                 # The rows stay ledgered; the comment waits for a board that answers.
                 episode["pending"] = sorted(set(episode.get("pending", [])) | set(object_names(new_rows)))
                 continue
             if status is not None and status not in TERMINAL_CARD_STATUSES:
                 episode["unknown"] = 0
                 episode["pending"] = sorted(set(episode.get("pending", [])) | set(object_names(new_rows)))
-                comment_pending(episode, namespace)
+                comment_pending(episode, namespace, card)
                 continue
             if status is not None:
-                end_episode(state, scope)
-        if opened >= MAX_CARDS_PER_TICK:
+                # The finished card's episode is replaced only by an alert that
+                # is sent. Until then the new objects wait as pending, which
+                # keeps the scope a candidate, and a clear still finds it.
+                episode["pending"] = sorted(set(episode.get("pending", [])) | set(object_names(new_rows)))
+                previous = episode
+        if not would_raise(state, sweep, scope):
+            continue
+        if refusal is not None:
+            # The server refused this tick's first alert; the rest wait for the
+            # next tick rather than each spending a timeout on the same answer.
+            continue
+        if raised >= MAX_ALERTS_PER_TICK:
             held += 1
             continue
         assignee = cluster_agent_for(project, name, location)
         if assignee is None:
-            # The profile went between the sweep and the card; the next sweep
+            # The profile went between the sweep and the alert; the next sweep
             # leaves the cluster out and its rows clear.
-            sys.stderr.write(f"stall_watch: {cid} has no Cluster Agent profile; no card for {scope}\n")
+            sys.stderr.write(f"stall_watch: {cid} has no Cluster Agent profile; no alert for {scope}\n")
             continue
-        generation = int(state.setdefault(GENERATIONS_KEY, {}).get(scope) or 0)
-        title = card_title(f"{project}/{name}", namespace, rows)
-        body = card_body(project, name, location, namespace, rows, scope_first_seen(state, scope) or now)
-        task_id = open_card(title, body, assignee, card_key(cid, namespace, generation))
-        skipped = 0
-        status = card_status(task_id) if task_id else None
-        while task_id and status in TERMINAL_CARD_STATUSES:
-            # The board handed back a finished card for a key it had seen, as
-            # it does for every generation a lost ledger once used; move the
-            # generation on and file again.
-            generation += 1
-            state[GENERATIONS_KEY][scope] = generation
-            skipped += 1
-            if skipped > MAX_FINISHED_CARDS_SKIPPED:
-                sys.stderr.write(f"stall_watch: the board handed back {skipped} finished cards for {scope}; the next tick continues from generation {generation}\n")
-                task_id = None
-                break
-            task_id = open_card(title, body, assignee, card_key(cid, namespace, generation))
-            status = card_status(task_id) if task_id else None
-        if not task_id:
-            # No card, so nothing to comment on; the rows stay and the next
-            # tick tries the board again.
+        payload = stall_payload(project, name, location, namespace, assignee, rows, scope_first_seen(state, scope) or now)
+        try:
+            if board_records_sessions() is False:
+                raise AlertRefused("the kanban board records no tasks.session_id, so the card an alert produces could not be found")
+            session = open_session()
+            # `card` is present as None because the card-filing watch read it
+            # unguarded: a rollback then ends the episode instead of crashing.
+            episodes[scope] = {SESSION_KEY: session, "card": None, "assignee": assignee, "opened_at": now, "objects": object_names(rows)}
+            # An OSError stops the tick; the scheduler reports the failure.
+            persist()
+            inject(session, payload)
+        except RecordRefused as exc:
+            # This record's fault, not the server's: the next namespace in line
+            # still gets its alert.
+            restore_episode(episodes, scope, previous)
+            sys.stderr.write(f"stall_watch: no alert for {scope}: {exc}\n")
             continue
-        if status is None:
-            # The key may have handed back a finished card; adopt nothing the
-            # board cannot describe, and let the next tick ask again. The card
-            # was filed all the same, so it counts against this tick's ceiling.
-            opened += 1
-            sys.stderr.write(f"stall_watch: could not read the status of card {task_id} for {scope}; the next tick asks again\n")
+        except AlertRefused as exc:
+            restore_episode(episodes, scope, previous)
+            refusal = str(exc)
+            sys.stderr.write(f"stall_watch: no alert for {scope}: {refusal}\n")
             continue
-        opened += 1
-        episodes[scope] = {
-            "card": task_id,
-            "assignee": assignee,
-            "opened_at": now,
-            "objects": object_names(rows),
-            "subscribed": subscribe_card(task_id) > 0,
-        }
-        lines.append(
-            f"{NOTICED_PREFIX} in {cluster_label(cid)} / `{namespace}`: {names_text(object_names(rows))}; "
-            f"card `{task_id}` opened for `{assignee}`"
-        )
+        raised += 1
     if held:
-        text = f"{NOTICED_PREFIX} in {held} more namespace{'s' if held > 1 else ''}; cards follow on later ticks, {MAX_CARDS_PER_TICK} a tick"
+        text = f"{NOTICED_PREFIX} in {held} more namespace{'s' if held > 1 else ''}; alerts follow on later ticks, {MAX_ALERTS_PER_TICK} a tick"
         lines.append(f"{DRY_RUN_PREFIX} {text}" if dry_run else text)
-    if not dry_run:
-        for scope, episode in episodes.items():
-            if not episode.get("subscribed", True):
-                episode["subscribed"] = subscribe_card(episode["card"]) > 0
-            if episode.get("pending") and scope not in new_by_scope:
-                comment_pending(episode, namespace_of(scope))
+    if refusal is not None:
+        if state.get(INJECT_ERROR_KEY) != refusal:
+            lines.append(f"{INJECT_FAILED_PREFIX} {refusal}")
+        state[INJECT_ERROR_KEY] = refusal
+    elif raised and not dry_run:
+        # Only a sent alert shows the server is taking them again; a tick whose
+        # one attempt was a refused record proves nothing either way.
+        if state.get(INJECT_ERROR_KEY):
+            lines.append(INJECT_RECOVERED_LINE)
+        state[INJECT_ERROR_KEY] = None
     open_scopes = {scope_key(e["cluster"], e["namespace"]) for e in state["stalls"].values()}
     for scope in sorted(set(episodes) - open_scopes):
         episode = episodes[scope]
@@ -1387,25 +1756,36 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         else:
             note = f"The watch no longer sees a stall in `{namespace_of(scope)}`: {cleared} cleared at {now}."
         if dry_run:
-            lines.append(f"{DRY_RUN_PREFIX} would close card `{episode['card']}` for {scope_label_text(scope)}")
+            lines.append(f"{DRY_RUN_PREFIX} would close card `{episode.get('card') or 'not yet filed'}` for {scope_label_text(scope)}")
             continue
-        status = card_status(episode["card"])
+        try:
+            card = episode_card(episode)
+        except BoardUnreadable:
+            # Whether a card is open is unknown; ask again next tick.
+            continue
+        if card is None:
+            # No card came of the alert, so there is nothing to close. A card
+            # filed later still runs the scan and reports the recovery itself.
+            end_episode(state, scope)
+            lines.append(f"{CLEARED_PREFIX} in {scope_label_text(scope)}: {cleared}")
+            continue
+        status = card_status(card)
         if status is None:
-            episode_gone(state, scope, episode["card"])
+            episode_gone(state, scope, card)
             continue
         episode["unknown"] = 0
         if status not in TERMINAL_CARD_STATUSES:
             if not episode.get("cleared_at"):
-                if not comment_card(episode["card"], note):
+                if not comment_card(card, note):
                     continue
                 episode["cleared_at"] = now
             if status == RUNNING_CARD_STATUS:
                 # The worker is on it; it completes its own card. Closed next tick.
                 continue
-            if not complete_card(episode["card"], f"{note} Closed by the stall watch."):
+            if not complete_card(card, f"{note} Closed by the stall watch."):
                 continue
         end_episode(state, scope)
-        lines.append(f"{CLEARED_PREFIX} in {scope_label_text(scope)}: {cleared}; card `{episode['card']}` closed")
+        lines.append(f"{CLEARED_PREFIX} in {scope_label_text(scope)}: {cleared}; card `{card}` closed")
     return lines
 
 
@@ -1426,7 +1806,7 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
     try:
         if lookup_error:
             raise lookup_error
-        sweep = sweep_fleet(project, state.get(CURSOR_KEY))
+        sweep = sweep_fleet(project, state.get(CURSOR_KEY), state.get(CREDENTIALS_KEY), now)
     except Exception as exc:  # noqa: BLE001 - a failed sweep is reported once, not raised every tick
         text = failure_text(exc)
         if state.get("sweep_error") != text:
@@ -1438,8 +1818,41 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
             lines.append(SWEEP_RECOVERED_LINE)
         state["sweep_error"] = None
         state[CURSOR_KEY] = sweep.cursor
+        state[CREDENTIALS_KEY] = sweep.credentials
+        view = sweep.view()
+        if sweep.budget_exhausted:
+            if not state.get(BUDGET_EXHAUSTED_KEY):
+                lines.append(f"{COVERAGE_EXHAUSTED_PREFIX} {sweep.unreadable[BUDGET_SCOPE]}")
+            state[BUDGET_EXHAUSTED_KEY] = True
+            state[BUDGET_EXHAUSTED_VIEW_KEY] = view
+            state[BUDGET_HELD_TICKS_KEY] = 0
+        elif state.get(BUDGET_EXHAUSTED_KEY):
+            # The fleet fit in one tick. Compared project for project with the
+            # sweep that exhausted: a project that sweep listed and this one
+            # did not (its listing failed, or its only profiles lost their
+            # identity) is a part of the fleet this fit says nothing about, so
+            # the flag is held and the ledger's budget entry says so; a project
+            # that lists with fewer clusters has shrunk, and counts. A hold
+            # that outlasts BUDGET_HOLD_TICKS is a standing fault, not a
+            # transient, and the fit stands: the exhausting sweep that follows
+            # a real regrowth is then heard, instead of silent under a flag
+            # nobody lowered.
+            missing = sorted(set(state.get(BUDGET_EXHAUSTED_VIEW_KEY) or {}) - set(view))
+            held = state.get(BUDGET_HELD_TICKS_KEY, 0) + 1 if missing else 0
+            if missing and held < BUDGET_HOLD_TICKS:
+                state[BUDGET_HELD_TICKS_KEY] = held
+                sweep.unreadable[BUDGET_SCOPE] = (
+                    f"sweep fit in one tick with {len(sweep.sweepable_clusters)} clusters, but projects the "
+                    f"last exhausted sweep listed were not listed this tick: {', '.join(missing)}; "
+                    f"the budget flag is held, tick {held} of {BUDGET_HOLD_TICKS}"
+                )
+            else:
+                lines.append(COVERAGE_RECOVERED_LINE)
+                state[BUDGET_EXHAUSTED_KEY] = False
+                state[BUDGET_EXHAUSTED_VIEW_KEY] = None
+                state[BUDGET_HELD_TICKS_KEY] = 0
         new_by_scope, cleared_by_scope = diff_and_update(state, sweep, now)
-        lines += episode_lines(state, sweep, new_by_scope, cleared_by_scope, now, dry_run=dry_run)
+        lines += episode_lines(state, sweep, new_by_scope, cleared_by_scope, now, dry_run=dry_run, persist=lambda: save_state(state_path, state))
     if not dry_run:
         save_state(state_path, state)
     return lines
@@ -1447,7 +1860,7 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--dry-run", action="store_true", help="sweep and print; write no state and open no card")
+    parser.add_argument("--dry-run", action="store_true", help="sweep and print; write no state and raise no alert")
     parser.add_argument("--state", type=Path, help=f"ledger path (default: <home>/{PROFILES_DIR}/{PLATFORM_PROFILE}/{CRON_DIR}/{STATE_FILE_NAME}, or ${STATE_PATH_ENV})")
     args = parser.parse_args(argv)
     agent_home = Path(gitops_workspace.agent_home())

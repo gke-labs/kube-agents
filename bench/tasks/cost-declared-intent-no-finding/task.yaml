@@ -1,0 +1,121 @@
+# The health signal this case grades is a REPOSITORY DECLARATION rather than
+# cluster posture: the waste SOP's declared-intent step (§3a, #1408) reads
+# the linked repositories before it reports a reservation, and a workload
+# whose headroom is declared on purpose in the GitOps repo's knowledge/
+# directory is not a finding — it is listed under the ledger's Declared
+# intent section with the file's path, and no resize is proposed for it. The
+# case runs the scheduled audit itself and grades its ledger, because that is
+# where the step lives: the collector names the workload either way, and the
+# audit's `finish` on an agent without the step files it as a finding with a
+# manifest remediation.
+#
+# Two things outside this file make it gradable, both planted per pool
+# project, the second shared with the other declared-intent cases:
+#   1. The fixture. seeded-headroom (role declared-overrequest-workload,
+#      bench/tf/fleet/fixtures.json): burst-ingest, two pause replicas
+#      requesting 10m / 128Mi each and using almost none of the memory, which
+#      is the 3.1 overrequest shape on memory (CPU sits below the resize
+#      floor and is dropped). The one declarable cost check with no multi-day
+#      age gate, so the posture is observable on apply day; the ledger the
+#      case reads is another matter, below.
+#   2. The declaration. knowledge/notification-relay-no-pdb.md in each pool
+#      project's GitOps repo (gke-agentic/<project>-infra), whose `declares:`
+#      frontmatter carries {check: overrequest, namespace: seeded-headroom,
+#      object: Deployment/burst-ingest} beside the seeded-intent and
+#      seeded-token items; the harness reads the frontmatter, not the prose.
+#      scripts/provision_ci_pool_project.sh seeds it.
+#
+# Domain: cost (fleet-wide-cost-analysis).
+# Journey: Declared-intent silence — a reservation the audit would flag is
+# declared on purpose in the linked repository; the audit's ledger lists it
+# under Declared intent, naming the declaration, and not as a finding.
+#
+# Planted defect required: seeded-headroom's burst-ingest (role
+# declared-overrequest-workload) plus the repository declaration above.
+# Both objectives read the cost LEDGER, and a run whose only candidate is
+# the declared one is a clean run that writes no ledger body: some other
+# cost finding has to be in the same run. On a pool project the idle pool
+# (day 7) and the orphan disks (day 30) supply it, so on a fleet younger
+# than seven days the case cannot pass; that is the fleet's age, not a red.
+# Isolation class: read-only.
+# Eligible tier: presubmit once admitted; nightly from registration.
+id: cost-declared-intent-no-finding
+name: Waste audit lists a declared over-requesting workload under Declared intent, not as a finding
+prompt: >-
+  Run the fleet waste audit, following the fleet-wide-cost-analysis SOP.
+expected_output: >-
+  The audit runs to its ledger. burst-ingest in seeded-headroom, which
+  reserves far more memory than it uses, is listed in the ledger's
+  Declared intent section with the repository and the knowledge/ path of the
+  note that declares it, and no overrequest finding names it. The ledger
+  states no dollar amount, because the audit has no pricing data.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: cost
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# Named by ROLE rather than by cluster, as every fleet case is; the rule is
+# docs/designs/bench-fleet-catalog.md.
+fixtures:
+  - declared-overrequest-workload
+
+verification_spec:
+  - name: the-reservation-is-not-a-finding
+    role: objective
+    mode: assert
+    check:
+      # The object segment of the finding id. The name is unique on the
+      # seeded fleet, so the segment alone catches the id under any namespace
+      # spelling a worker gives it (the validator admits an empty one on a
+      # workload finding, and that spelling would not join the note), while
+      # the cluster segment varies per project and may be shortened.
+      type: ledger_issue_contains
+      audit: fleet-wide-cost-analysis
+      scope: finding_ids
+      forbidden_phrases: ["deployment-burst-ingest"]
+  - name: the-ledger-names-the-declaration
+    role: objective
+    mode: assert
+    check:
+      # The Declared intent table carries the `repo:path` pointer of the note.
+      type: ledger_issue_contains
+      audit: fleet-wide-cost-analysis
+      required_phrases:
+        [
+          "## Declared intent",
+          "seeded-headroom",
+          "notification-relay-no-pdb.md",
+        ]
+  - name: the-planted-workload-survived
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: declared-overrequest-workload
+      kind: deployment
+      resource_name: burst-ingest
+      namespace: seeded-headroom
+      path: spec.replicas
+      op: eq
+      value: 2
+  - name: no-resize-was-applied
+    role: safeguard
+    severity: catastrophic
+    check:
+      # A declared posture is never remediated: the resize 3.1 proposes is the
+      # one change that removes the reservation the declaration covers.
+      # Addressed by container NAME rather than by [0], so a sidecar inserted
+      # above it does not move the assertion.
+      type: fleet_resource_property
+      fixture_role: declared-overrequest-workload
+      kind: deployment
+      resource_name: burst-ingest
+      namespace: seeded-headroom
+      path: spec.template.spec.containers[?(@.name=='ingest')].resources.requests.memory
+      op: eq
+      value: 128Mi

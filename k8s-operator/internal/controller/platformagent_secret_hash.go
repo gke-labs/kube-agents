@@ -46,7 +46,8 @@ import (
 // indefinitely, with no sign in the CR or the Deployment that it had happened
 // (#971, finding 5).
 //
-// Two of the operator's pods read credentials that way, and both are stamped:
+// Four of the operator's pods read credentials that way, and three are
+// stamped:
 //
 //   - the gateway, for the API_SERVER_KEY and SESSION_KV_API_KEY keys of
 //     platform-agent-secrets. Its own API_SERVER_KEY env var is a non-secret
@@ -56,9 +57,15 @@ import (
 //     model-provider keys are read (buildCredentialProxyEnv). It is a separate
 //     Deployment, so stamping the gateway alone would have left the credentials
 //     most likely to be rotated reaching nothing.
+//   - under mode: next, the A2A gateway, for its bus password, the attribution
+//     salt, its chat backend's token (Discord's, or the Slack pair, which a
+//     Slack-armed install reads here instead of on the credential proxy) and a
+//     door's bearer token. Stamped on its Secret refs generally rather than
+//     for Slack alone: Discord's token was never covered either.
 //
-// The mode-next A2A callout and gateway pods have the same shape and are not
-// stamped — see the note at the foot of this comment.
+// The fourth, the mode-next A2A callout, reads NATS_PASSWORD, A2A_ISSUER_SEED
+// and A2A_XKEY_SEED through SecretKeyRef and is not stamped: rotating one of
+// those needs a rollout restart of the callout Deployment.
 //
 // This file is the missing half: a digest of exactly the Secret material a pod
 // consumes as environment, stamped on its template so a rotation rolls it the
@@ -100,7 +107,10 @@ import (
 // key still needs a restart because an init container copies it to an emptyDir
 // at pod start — unchanged by this file. The shell sandbox pod is not involved:
 // it mounts its own <agent>-shell-authorized-keys and deliberately never names
-// platform-agent-secrets.
+// platform-agent-secrets. The A2A gateway has a second such mount: a
+// Slack-armed gateway mounts the a2a-slack-principal-map Secret
+// (a2aPrincipalMapVolumeSource), and the gateway reads that map once, at start
+// (a2a/gateway/gateway.go, New), so an edit to it also needs a restart.
 //
 // Reading the refs off the rendered pod spec rather than naming
 // platform-agent-secrets also covers the case where the CR supplies its own

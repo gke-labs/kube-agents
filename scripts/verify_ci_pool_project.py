@@ -222,7 +222,7 @@ REPAIR_CLEANUP_POLICY = "docs/ci-pool-projects.md section 4, Cleanup policy"
 REPAIR_HOST_CLUSTER = "docs/ci-pool-projects.md section 2 by hand, against the project's existing full-install state so its api_server_key is kept (not scripts/provision_ci_pool_project.sh, which must not be re-run on a registered project: section 8)"
 REPAIR_HOST_CMEK = "gcloud container clusters update platform-agent-host --database-encryption-key=<the project's key>, as install.sh does for an existing cluster (docs/ci-pool-projects.md section 2)"
 REPAIR_STATE_BUCKET = "gcloud storage buckets create gs://{project_id}-tf-state --project={project_id} --location=us-central1 --uniform-bucket-level-access && gcloud storage buckets update gs://{project_id}-tf-state --versioning (docs/ci-pool-projects.md section 2; not scripts/provision_ci_pool_project.sh on a registered project: section 8)"
-REPAIR_FLEET_APPLY = "re-apply bench/tf/fleet against {project_id} (bench/tf/fleet/README.md, State and reconcile)"
+REPAIR_FLEET_APPLY = "apply bench/tf/fleet to {project_id} from a main checkout: before registration, python3 hack/fleet_reconcile.py --project {project_id} --no-lease (Boskos does not hold it yet); once registered, the daily reconcile at 08:30 UTC re-applies it, or the same command without --no-lease, leased (bench/tf/fleet/README.md, State and reconcile)"
 # An absent service account. The platform GSA is the full-install
 # composition's; the LiteLLM GSA has a hand repair in the runbook.
 REPAIR_PLATFORM_GSA = "docs/ci-pool-projects.md section 3: the full-install composition creates kubeagents-platform-gsa; re-create it against the project's existing full-install state (not scripts/provision_ci_pool_project.sh on a registered project: section 8)"
@@ -309,6 +309,9 @@ REQUIRED_APIS = {
     "aiplatform.googleapis.com",
     "logging.googleapis.com",
     "monitoring.googleapis.com",
+    # The observability nightly case reads the install's traces through the
+    # broker's relay; the composition enables this for the same reason.
+    "cloudtrace.googleapis.com",
     "iam.googleapis.com",
     "cloudkms.googleapis.com",
 }
@@ -317,8 +320,8 @@ HOST_CLUSTER = "platform-agent-host"
 # seeded-d is deliberately absent. Pool projects applied before bench/tf/fleet
 # grew slot d do not have it, so listing it would make the hourly pool-state
 # scan report every one of them drifted and hold the presubmit gate DEGRADED
-# until the fleet is re-applied across the pool. The weekly reconcile
-# (hack/fleet_reconcile.py --all) creates it in each project it applies to,
+# until the fleet is re-applied across the pool. The reconcile
+# (hack/fleet_reconcile.py --all, on merge and daily) creates it in each project it applies to,
 # since a new cluster plans as a create; add it here once that has reached
 # every project.
 EXPECTED_CLUSTERS = {HOST_CLUSTER, "seeded-a", "seeded-b", "seeded-c"}
@@ -373,38 +376,68 @@ GITOPS_SEED_MESSAGE = "Initial commit"
 GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
 # The declared-intent note provisioning seeds after the first commit
 # (GITOPS_INTENT_NOTE_* in scripts/provision_ci_pool_project.sh); the
-# obtainability-declared-intent-no-finding case fails on a project whose
+# declared-intent cases (GITOPS_INTENT_NOTE_CASES) fail on a project whose
 # repository lacks it.
 GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
-GITOPS_INTENT_NOTE_MESSAGE = "Declare notification-relay's missing PodDisruptionBudget as intended"
+GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, and burst-ingest's headroom, as intended"
 # The script's GITOPS_INTENT_NOTE_CONTENT, byte for byte, so the repair this
 # verifier prints is the note provisioning seeds; a test pins the two copies
 # to each other. The body read back is judged by the audit's parser, not
 # compared to this text.
 GITOPS_INTENT_NOTE_CONTENT = """---
 type: decision
-title: notification-relay runs without a PodDisruptionBudget on purpose
+title: seeded-intent, seeded-token, seeded-c and seeded-headroom carry five postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
     object: Deployment/notification-relay
+  - check: netpol-missing
+    namespace: seeded-intent
+    object: Namespace/seeded-intent
+  - check: default-sa-automount
+    namespace: seeded-token
+    object: Deployment/token-reader
+  - check: no-notifications
+    namespace: ""
+    object: Cluster/seeded-c
+  - check: overrequest
+    namespace: seeded-headroom
+    object: Deployment/burst-ingest
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
 it is a stateless relay whose clients retry, and a budget would only slow node drains. The
-obtainability audit lists this posture under Declared intent rather than as a finding."""
-# The stream whose declared-intent step reads the note; its `declarable` set is
-# the policy the check defers to.
-GITOPS_INTENT_NOTE_AUDIT = "obtainability-audit"
-# The one declaration the audit's parser (audit_report.py parse_declarations)
-# must find in the note's `declares` list. A file that has the path but not
-# this declares nothing, and the case fails on that project with a
+namespace carries no NetworkPolicy by design either: nothing in it accepts traffic. `token-reader`
+in `seeded-token` runs on the default ServiceAccount of its namespace with the token mounted by
+design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
+`seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
+the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory than it uses by
+design: it is sized for an ingest burst the measured week does not show. The obtainability,
+compliance, upgrade readiness and waste audits list the five postures under Declared intent rather
+than as findings."""
+# The declarations the audits' parser (audit_report.py parse_declarations) must
+# find in the note's `declares` list, each with the stream whose `declarable`
+# set is the policy for it. A file that has the path but not these declares
+# nothing, and the declared-intent cases fail on that project with a
 # presence-only check green -- which is why presence alone is not the check.
-GITOPS_INTENT_NOTE_DECLARATION = {
-    "check": "no-pdb",
-    "namespace": "seeded-intent",
-    "object": "Deployment/notification-relay",
-}
+# The nightly cases that fail on a project whose note is missing or unread,
+# named in this check's messages: the declared-intent case of each declaring
+# stream, and the exposure sweep, whose report must name the note's path.
+GITOPS_INTENT_NOTE_CASES = (
+    "obtainability-declared-intent-no-finding",
+    "obtainability-fleet-exposure-sweep",
+    "compliance-declared-intent-no-finding",
+    "compliance-declared-token-shields-siblings",
+    "patch-declared-intent-no-finding",
+    "cost-declared-intent-no-finding",
+)
+GITOPS_INTENT_NOTE_DECLARATIONS = (
+    ("obtainability-audit", {"check": "no-pdb", "namespace": "seeded-intent", "object": "Deployment/notification-relay"}),
+    ("compliance-audit", {"check": "netpol-missing", "namespace": "seeded-intent", "object": "Namespace/seeded-intent"}),
+    ("compliance-audit", {"check": "default-sa-automount", "namespace": "seeded-token", "object": "Deployment/token-reader"}),
+    ("security-patch-orchestrator", {"check": "no-notifications", "namespace": "", "object": "Cluster/seeded-c"}),
+    ("fleet-wide-cost-analysis", {"check": "overrequest", "namespace": "seeded-headroom", "object": "Deployment/burst-ingest"}),
+)
 
 # Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /
 # RSA_SIGN_PKCS1_2048_SHA256 and import_only, and the KSA that impersonates the
@@ -645,6 +678,12 @@ PROW_RUNNER_ROLES = {
 # docs/ci-pool-projects.md by scripts/test_verify_ci_pool_project.py.
 FLEET_RECONCILER_MEMBER = "serviceAccount:seeded-fleet-reconciler@kube-agents-prow.iam.gserviceaccount.com"
 FLEET_RECONCILER_ROLES = {
+    # instanceAdmin.v1: the stack plants a bare VM (`startup_fail`, main.tf), and
+    # the create needs instances.*, disks.*, images.useReadOnly and subnetworks.use.
+    "roles/compute.instanceAdmin.v1",
+    # securityAdmin: the stack plants a VPC firewall rule (`allow_ssh_from_internet`,
+    # network.tf), and the create needs compute.firewalls.* and compute.networks.updatePolicy.
+    "roles/compute.securityAdmin",
     "roles/compute.storageAdmin",
     "roles/compute.viewer",
     "roles/container.admin",
@@ -695,6 +734,7 @@ PLATFORM_GSA_ROLES = {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/cloudtrace.user",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
@@ -846,8 +886,8 @@ _UNREAD_PATTERNS = (
     re.compile(r"problem refreshing your current auth tokens", re.I),
     re.compile(r"reauthentication (?:required|failed)", re.I),
     # A retry-later reply, or gcloud's busy credential store, is not absence;
-    # the scan runs seven projects at once, and one wave of 429s would read
-    # as three drifted. gRPC's retryable statuses, as gcloud prints them
+    # the scan runs eight projects at once, and one wave of 429s would read
+    # as several drifted. gRPC's retryable statuses, as gcloud prints them
     # (upper case, so a lower-case "unknown" in a message is not one); a
     # resource named kube-agents-evals-500 does not match.
     re.compile(r"RESOURCE_EXHAUSTED|DEADLINE_EXCEEDED|\bUNAVAILABLE\b|\bINTERNAL\b|\bABORTED\b|\bUNKNOWN\b|\bCANCELLED\b|database is locked"),
@@ -924,7 +964,7 @@ _FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
 # reason and to the same effect, and so is one skipped because a temporary file
 # could not be created, or dropped because the file gcloud wrote could not be
 # rewritten to the reader's exec credential (a local fault, not a pool state).
-# Sources: the three per-cluster WARNING lines in hack/fleet-kubeconfigs.sh.
+# Sources: the three per-cluster WARNING lines and the per-role read failure in hack/fleet-kubeconfigs.sh.
 #
 # One of these, or _FLEET_COULD_NOT_LOOK, must be present before an unresolved
 # role may be excused: excusing on the *absence* of a "looked and found wrong"
@@ -934,7 +974,7 @@ _FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
 # the script names a slot no labelled cluster resolved to, and that warning is
 # in the list above, where it fails the check whatever else went unreached.
 _FLEET_UNREACHABLE = re.compile(
-    r"no credentials for seeded cluster|could not create a temporary file|kubeconfig could not be rewritten to",
+    r"no credentials for seeded cluster|could not create a temporary file|kubeconfig could not be rewritten to|could not be read from",
     re.I,
 )
 
@@ -2507,52 +2547,55 @@ def _load_audit_report():
 
 
 def _note_declaration_problem(body: str, repo_slug: str, audit=None) -> Optional[str]:
-    """Why the audit would not join `body`'s declaration to the fixture's finding, or None when it would.
+    """Why an audit would not join one of `body`'s declarations to its fixture finding, or None when every one joins.
 
     Not a copy of the parser: the note goes through the audit's own
-    `parse_declarations` (frontmatter delimiters, YAML and its error classes,
-    `type`, `declares`, the item shape, the `cluster` rule) and the surviving
-    items are compared on the audit's own join key, which folds
+    `parse_declarations` once, over the union of the declarable sets of the streams in GITOPS_INTENT_NOTE_DECLARATIONS
+    (frontmatter delimiters, YAML and its error classes, `type`, `declares`,
+    the item shape, the `cluster` rule, that stream's `declarable` set) and
+    the surviving items are compared on the audit's own join key, which folds
     `Deployment/notification-relay`, `deployment/notification-relay` and
     `Deployment / notification-relay` to one. The join is the audit's too:
     `apply_declarations` files clustered items under their cluster and the
     rest fleet-wide, and a finding falls through to a fleet-wide entry, so a
-    note is good when ANY matching item is fleet-wide, whatever else it lists.
-    A note the parser reads nothing from is explained by the parser itself
-    (`explain_empty_declarations`, the same ladder `parse_declarations`
-    walks), so the reason printed cannot drift from the verdict.
+    declaration is good when ANY matching item is fleet-wide, whatever else
+    the note lists. A note the parser reads nothing from is explained by the
+    parser itself (`explain_empty_declarations`, the same ladder
+    `parse_declarations` walks), so the reason printed cannot drift from the
+    verdict.
     """
     if audit is None:
         audit = _load_audit_report()
-    # The audit's own policy for which slugs a note may justify, not a local
-    # copy of it: if no-pdb ever leaves the obtainability stream's declarable
-    # set, this check rejects the note the day the audit does.
-    declarable = audit.audit_declarable_checks(GITOPS_INTENT_NOTE_AUDIT)
-    entries = audit.parse_declarations(body, repo=repo_slug, path=GITOPS_INTENT_NOTE_PATH, declarable=declarable)
-    if not entries:
+    # One parse over the union of the streams' declarable sets, so the items
+    # are read in one pass and none draws another stream's note on stderr;
+    # each stream's item is then matched among the entries of its own check. The policy is still the audit's: a slug that leaves its stream's
+    # set leaves the union, and this check rejects the note the day the audit does.
+    declarable_by_stream = {stream: audit.audit_declarable_checks(stream) for stream, _ in GITOPS_INTENT_NOTE_DECLARATIONS}
+    for stream, wanted_item in GITOPS_INTENT_NOTE_DECLARATIONS:
+        if wanted_item["check"] not in declarable_by_stream[stream]:
+            return f"{wanted_item['check']} is no longer a check {stream} lets a declaration justify"
+    union = frozenset().union(*declarable_by_stream.values())
+    all_entries = audit.parse_declarations(body, repo=repo_slug, path=GITOPS_INTENT_NOTE_PATH, declarable=union)
+    if not all_entries:
         # The reason is the parser's own (`explain_empty_declarations` walks
         # the ladder `parse_declarations` walks); None means the note had
         # items and the parser skipped every one, logging a WARNING each.
         reason = audit.explain_empty_declarations(body)
-        return reason or (
-            f"no declares item is check {GITOPS_INTENT_NOTE_DECLARATION['check']} for "
-            f"{GITOPS_INTENT_NOTE_DECLARATION['object']} in {GITOPS_INTENT_NOTE_DECLARATION['namespace']} "
-            "(the parser skipped every item; its WARNING lines above say why)"
-        )
-    wanted = audit._declaration_key(GITOPS_INTENT_NOTE_DECLARATION, with_cluster=False)
-    matching = [e for e in entries if audit._declaration_key(e, with_cluster=False) == wanted]
-    if any(audit.DECLARATION_CLUSTER_FIELD not in e for e in matching):
-        return None
-    if matching:
-        clusters = sorted({str(e[audit.DECLARATION_CLUSTER_FIELD]) for e in matching})
-        return (
-            f"its only matching declaration(s) name cluster {', '.join(clusters)}, so the audit joins them to "
-            "that cluster's finding alone; the fixture's note is fleet-wide (an item without `cluster`)"
-        )
-    return (
-        f"no declares item is check {GITOPS_INTENT_NOTE_DECLARATION['check']} for "
-        f"{GITOPS_INTENT_NOTE_DECLARATION['object']} in {GITOPS_INTENT_NOTE_DECLARATION['namespace']}"
-    )
+        return reason or "the parser skipped every declares item (its WARNING lines above say why)"
+    for stream, wanted_item in GITOPS_INTENT_NOTE_DECLARATIONS:
+        entries = [e for e in all_entries if str(e.get("check", "")) == wanted_item["check"]]
+        wanted = audit._declaration_key(wanted_item, with_cluster=False)
+        matching = [e for e in entries if audit._declaration_key(e, with_cluster=False) == wanted]
+        if any(audit.DECLARATION_CLUSTER_FIELD not in e for e in matching):
+            continue
+        if matching:
+            clusters = sorted({str(e[audit.DECLARATION_CLUSTER_FIELD]) for e in matching})
+            return (
+                f"its only matching {wanted_item['check']} declaration(s) name cluster {', '.join(clusters)}, so the "
+                "audit joins them to that cluster's finding alone; the fixture's note is fleet-wide (an item without `cluster`)"
+            )
+        return f"no declares item is check {wanted_item['check']} for {wanted_item['object']} in {wanted_item['namespace'] or '(cluster)'}"
+    return None
 
 
 def _gitops_path_state(repo_slug: str, path: str, raw: bool = False) -> tuple[str, str]:
@@ -2620,7 +2663,7 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
             False,
             f"{repo_slug} has no {GITOPS_INTENT_NOTE_PATH}, or this token cannot read the repository "
             f"(gh answers 404 to both; the github_repo_and_app check, run alongside or with --checks, says which). If the repository is "
-            f"readable, obtainability-declared-intent-no-finding fails on this project until the note "
+            f"readable, {' and '.join(GITOPS_INTENT_NOTE_CASES)} fail on this project until the note "
             f"is seeded: {gitops_note_seed_command(repo_slug)}",
         )
 
@@ -2678,7 +2721,7 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
         return CheckResult(
             name,
             False,
-            f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} but the audit reads no declaration from it: "
+            f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} but the audits do not read every declaration the fixture needs from it: "
             f"{problem}. Replace it: {gitops_note_seed_command(repo_slug, sha)}",
         )
     # The audit reads notes only under the paths `.kube-agents/intent.yaml`
@@ -2756,7 +2799,7 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
         False,
         f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, but its {audit.INTENT_FILE} bounds "
         f"the audit's search to {', '.join(prefixes)}, every one of which exists, so the audit never reads the note and "
-        f"obtainability-declared-intent-no-finding fails on this project. Add `knowledge/` to that file's "
+        f"{' and '.join(GITOPS_INTENT_NOTE_CASES)} fail on this project. Add `knowledge/` to that file's "
         f"`paths`, or move the note under one of them.",
     )
 

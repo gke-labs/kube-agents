@@ -49,8 +49,8 @@ COMPLETE_ANCHOR = (
     '        """Swap the in-progress reaction for a final success/failure reaction."""\n'
 )
 COMPLETE_PATCHED = COMPLETE_ANCHOR + (
-    "        # kube-agents patch: KAGE_SLACK_UX never removes a reaction and\n"
-    "        # defers the settle of delegated work to the kanban notifier; see\n"
+    "        # kube-agents patch: KAGE_SLACK_UX takes the kind reaction off at the\n"
+    "        # answer, deferring delegated work's to the kanban notifier; see\n"
     "        # gateway/slack_ux_reactions.py. Off, upstream's body runs unchanged.\n"
     "        if _kage_slack_ux.enabled():\n"
     "            return await _kage_slack_ux.on_processing_complete(self, event, outcome)\n"

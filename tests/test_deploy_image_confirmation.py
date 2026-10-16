@@ -296,8 +296,8 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
         self.assertIn("--set plugins.<name>.image.tag", result.stdout)
 
     def test_a_sidecar_the_cr_declares_is_not_judged(self):
-        """A `mode: next` install declares the Hermes bridge on
-        spec.deployment.sidecars, a release image (built from the agent image
+        """An install can declare its own Hermes bridge on
+        spec.deployment.sidecars (the operator then renders none), a release image (built from the agent image
         of its own commit) whose tag no deploy of this release sets. It is
         reported and left out of the verdict; the same container with no
         declaration behind it is judged like any other release image.
@@ -322,6 +322,31 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
         other = self._run(listing, declared_sidecars="hermes-bridge", sidecar_owner="other-agent")
         self.assertEqual(other.returncode, 1, other.stdout + other.stderr)
         self.assertIn(f"hermes-bridge: {_GHCR}/hermes-bridge:{_OLD}", other.stdout)
+
+    def test_a_bridge_the_operator_renders_is_judged_and_moves_with_the_agent(self):
+        """Under `mode: next` the operator renders the Hermes bridge itself,
+        from the agent image with the last path segment swapped and the tag
+        kept (a2aBridgeImage), so it is not a declared sidecar: it counts as a
+        release image, and on the deploy's tag it passes.
+        """
+        result = self._run(
+            f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            hermes-bridge={_GHCR}/hermes-bridge:{_TAG}
+            """
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 2 release image(s)", result.stdout)
+        self.assertNotIn("sidecar declared on the PlatformAgent", result.stdout)
+        # The same on a mirror: the operator keeps the agent image's registry.
+        mirrored = self._run(
+            f"""
+            platform-agent={_MIRROR}/platform-agent:{_TAG}
+            hermes-bridge={_MIRROR}/hermes-bridge:{_TAG}
+            """
+        )
+        self.assertEqual(mirrored.returncode, 0, mirrored.stdout + mirrored.stderr)
+        self.assertIn("all 2 release image(s)", mirrored.stdout)
 
     def test_a_plugin_installed_outside_the_release_is_not_judged(self):
         """agentplugins/*/install.sh releases a plugin on its own, at its own tag.

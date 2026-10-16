@@ -172,7 +172,8 @@ func TestTheMixedVersionKnobLetsAnUncapabledSubmissionThrough(t *testing.T) {
 	submitWithAuthority(t, c, session, taskID, "do the thing", nil)
 
 	cfg := adapterConfig(url, taskID, session,
-		stub(t, `echo '{"type":"result","subtype":"success","result":"done"}'`))
+		stub(t, `read first || exit 1
+echo '{"type":"result","subtype":"success","result":"done"}'`))
 	cfg.CapabilityOptional = true
 	out := waitOutcome(t, runAdapter(context.Background(), cfg), 30*time.Second)
 	if out.res.State != lib.StateCompleted {
@@ -222,7 +223,7 @@ func TestAnUnauthorizedTaskIsRefusedBeforeItsContentIsJudged(t *testing.T) {
 	submitWithAuthority(t, c, session, taskID, "", authorityFor(t, forged)) // data-only parts
 
 	refuseAndFold(t, url, c, session, taskID, adapterConfig(url, taskID, session, noHarness))
-	if text := terminalText(t, url, session, taskID); strings.Contains(text, "no text parts") {
+	if text := terminalText(t, url, session, taskID); strings.Contains(text, "no-text-parts") {
 		t.Fatalf("the refusal reported the content check to a caller that was never authorized: %q", text)
 	}
 }

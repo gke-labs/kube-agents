@@ -23,12 +23,26 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --gcp-region="<REGION>"
 ```
 
+On a GitLab install, the installer creates the token Secret, and the CA Secret for a private CA,
+outside the Helm release. A teardown that deletes the cluster deletes them too. On a cluster that
+the teardown keeps, tell the operator that the Secrets stay, and give the command in "What a teardown
+leaves" on the site's uninstall page (`docs/site/src/content/docs/install/uninstall.md`), or tell
+the operator to delete the namespace. That command sources
+the install's `install.env` in a subshell, the same way the installer reads it, so renamed Secrets
+or a non-default namespace are found. Then tell the operator to revoke the token in GitLab.
+
+The installer finds `install.env` in this order: `KUBE_AGENTS_INSTALL_ENV`, beside `install.sh`,
+in the current directory, then the source directory (`$HOME/kube-agents` under `curl … | bash`).
+
+Also tell the operator to revoke the token in GitLab.
+
 The engine is `lifecycle.sh destroy` in `terraform/examples/full-install`, run against the
 install's Terraform state in GCS (bucket `<project>-kube-agents-tfstate`, prefix
 `kube-agents/<cluster>` — derived from the coordinates, so a fresh clone finds it). Before
-`terraform destroy` it handles the four asymmetries a bare destroy trips over: it forgets the
+`terraform destroy` it handles the asymmetries a bare destroy trips over: it forgets the
 undeletable KMS resources from state (kept usable in GCP, re-adopted on the next apply), deletes
-the `PlatformAgent` CR and force-clears its finalizer if the operator is wedged, purges every
+the `PlatformAgent` CR and force-clears its finalizer if the operator is wedged, uninstalls the
+Helm releases with the `helm` CLI on a cluster the install did not create, purges every
 backup the GKE BackupPlan owns, and clears the cluster's deletion protection.
 
 When the command does not run from a local `kube-agents` checkout, the teardown engine is fetched:
@@ -37,6 +51,8 @@ at the script's own baked release when it has one, and from `main` when it does 
 unstamped copy is pointed at the release that was installed.
 
 `terraform` must be on `PATH` — the teardown engine, which this script never installs for you.
+On an install made onto a cluster it did not create, put `helm` on `PATH` too: without it the
+teardown only warns and leaves the releases to Terraform's Helm provider.
 See the site's [uninstall page](../../../docs/site/src/content/docs/install/uninstall.md).
 
 **No Terraform state anywhere** (none in GCS, none locally) means one of two things, and the
@@ -46,6 +62,9 @@ recoverable here — re-run with `--source-ref=<that release>` so that release's
 runs instead. Check whether the cluster exists before reaching for a release tag.
 
 Exit 3 is the one non-zero exit that is not a failure; exit 1 means the teardown could not
-start or started and did not finish. `./uninstall.sh --help` is the contract.
+start or started and did not finish. On a cluster the install did not create, a `helm list` or
+`helm uninstall` failure stops the teardown before Terraform removes anything: restore access to
+the cluster and re-run, or run the `helm uninstall` command it prints. `./uninstall.sh --help` is
+the contract.
 
 Machine-readable JSON status reports are generated at `/tmp/kube-agents-uninstall-report.json`.

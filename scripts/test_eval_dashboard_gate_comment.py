@@ -709,6 +709,14 @@ class NotEvaluatedComment(Harness):
         self.assertTrue(gate_comment.is_red(health.Run(raw)), "without the suite's word it is the hard failure it always was")
         self.assertFalse(health.Run(raw).not_evaluated)
 
+    def test_a_gitlab_lane_red_on_the_pull_request_is_not_the_gates(self):
+        # The lane's run carries the PR number (kube-agents#2394), unlike a
+        # nightly, so only its tier keeps it out of the gate's comment.
+        lane = dict(run(102, 1300, NOW - timedelta(minutes=5), failing=("agent-kanban-smoke",)), tier="gitlab", job="pull-kube-agents-smoke-test-gitlab")
+        earlier = run(100, 1300, NOW - timedelta(minutes=40), failing=("agent-kanban-smoke",))
+        self.assertEqual([r["build_id"] for r in gate_comment.newest_red_per_pr(data(lane, earlier, *green_others()), NOW - timedelta(hours=2), NOW)], ["100"])
+        self.assertEqual(gate_comment.newest_red_per_pr(data(lane, *green_others()), NOW - timedelta(hours=2), NOW), [])
+
     def test_an_aborted_build_carrying_the_field_gets_no_comment_and_keeps_the_earlier_red(self):
         # The suite prints its line minutes before the job ends (artifact
         # dumps, dashboard publish, teardown), so a superseding push in that

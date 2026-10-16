@@ -24,9 +24,10 @@ Three things are checked:
    A card another card's worker created is found through the subscription
    Hermes copies onto it, with that card as its creator.
 3. The runtime module, loaded by path from ``gateway/`` and driven with a stub
-   adapter: flag off it is inert; flag on, an ask gets the arrival reaction for
-   its kind, a direct answer settles at once, a delegated one waits for the
-   notifier, and no call anywhere is a removal.
+   adapter: flag off it is inert; flag on, an ask gets no reaction on arrival
+   or on success, a direct answer that fails gets ❌ at once, a delegated one
+   gets ❌ only when the notifier reports its card gave up, and no call
+   anywhere is a removal.
 
 Every failure here is silent in production — a reaction that does not land
 raises nothing and logs at debug — so the build is where it is caught.
@@ -47,6 +48,8 @@ from types import SimpleNamespace
 ADAPTER = "plugins/platforms/slack/adapter.py"
 RUNTIME = "gateway/slack_ux_reactions.py"
 FLAG_ENV = "KAGE_SLACK_UX"
+#: Unset is on, so the flag-off path needs a value.
+FLAG_OFF = "false"
 
 #: The adapter hooks the patch guards; each guard calls the runtime's function
 #: of the same name.
@@ -340,10 +343,20 @@ def _load_runtime(root: Path):
 
 async def _drive(module) -> None:
     success = SimpleNamespace(value="success")
+    failure = SimpleNamespace(value="failure")
 
-    os.environ.pop(FLAG_ENV, None)
+    def react(emoji: str, remove: bool = False) -> tuple:
+        return (CHANNEL, ASK_TS, emoji, TEAM, remove)
+
+    change, question = react("hammer_and_wrench"), react("eyes")
+    failed = react("x")
+
+    os.environ[FLAG_ENV] = FLAG_OFF
     if module.enabled():
-        raise _fail(f"enabled() is true with {FLAG_ENV} unset")
+        raise _fail(f"enabled() is true with {FLAG_ENV}={FLAG_OFF}")
+    os.environ.pop(FLAG_ENV, None)
+    if not module.enabled():
+        raise _fail(f"enabled() is false with {FLAG_ENV} unset, which is on")
 
     os.environ[FLAG_ENV] = "1"
     boards: list[dict] = []
@@ -357,34 +370,38 @@ async def _drive(module) -> None:
     module.open_cards = open_cards
     module.thread_lineage = thread_lineage
 
-    # A direct answer: arrival by kind, then the settle at once.
-    adapter = _StubAdapter()
-    boards[:] = [{}, {}]
-    await module.on_processing_start(adapter, _event("fix it"))
-    await module.on_processing_complete(adapter, _event("fix it"), success)
-    expected = [
-        (CHANNEL, ASK_TS, "hammer_and_wrench", TEAM, False),
-        (CHANNEL, ASK_TS, "white_check_mark", TEAM, False),
-    ]
-    if adapter.calls != expected:
-        raise _fail(f"direct answer reacted {adapter.calls!r}, expected {expected!r}")
+    # A direct answer: its kind on arrival, off when it answers, with ❌ on failure.
+    for outcome, expected in (
+        (success, [change, react("hammer_and_wrench", True)]),
+        (failure, [change, failed, react("hammer_and_wrench", True)]),
+    ):
+        adapter = _StubAdapter()
+        boards[:] = [{}, {}]
+        await module.on_processing_start(adapter, _event("fix it"))
+        await module.on_processing_complete(adapter, _event("fix it"), outcome)
+        if adapter.calls != expected:
+            raise _fail(f"a direct {outcome.value} reacted {adapter.calls!r}, expected {expected!r}")
 
-    # A delegated answer: nothing at completion; the notifier's terminal event settles it.
-    adapter = _StubAdapter()
+    # A delegated answer keeps its kind past the acknowledgement; the notifier's
+    # terminal event settles it, ⏸️ standing between a block and its unblock.
     # The third read is the settle's look for follow-up cards: none.
-    boards[:] = [{}, {(module.DEFAULT_BOARD, CARD): module._Card("running")}, {}]
-    await module.on_processing_start(adapter, _event("is seeded-a healthy?"))
-    await module.on_processing_complete(adapter, _event("is seeded-a healthy?"), success)
-    if adapter.calls != [(CHANNEL, ASK_TS, "eyes", TEAM, False)]:
-        raise _fail(f"delegated answer settled before the notifier: {adapter.calls!r}")
     sub = {"platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD, "task_id": CARD}
-    await module.settle_delegated(adapter, sub, "completed")
-    expected = [
-        (CHANNEL, ASK_TS, "eyes", TEAM, False),
-        (CHANNEL, ASK_TS, "white_check_mark", TEAM, False),
-    ]
-    if adapter.calls != expected:
-        raise _fail(f"delegated answer reacted {adapter.calls!r}, expected {expected!r}")
+    paused, resumed = react("double_vertical_bar"), react("double_vertical_bar", True)
+    for kinds, expected in (
+        (("completed",), [react("eyes", True)]),
+        (("gave_up",), [failed, react("eyes", True)]),
+        (("blocked", "unblocked", "completed"), [paused, resumed, react("eyes", True)]),
+    ):
+        adapter = _StubAdapter()
+        boards[:] = [{}, {(module.DEFAULT_BOARD, CARD): module._Card("running")}, {}]
+        await module.on_processing_start(adapter, _event("is seeded-a healthy?"))
+        await module.on_processing_complete(adapter, _event("is seeded-a healthy?"), success)
+        if adapter.calls != [question]:
+            raise _fail(f"delegated answer settled before the notifier: {adapter.calls!r}")
+        for kind in kinds:
+            await module.settle_delegated(adapter, sub, kind)
+        if adapter.calls[1:] != expected:
+            raise _fail(f"a delegated answer whose card went {kinds} reacted {adapter.calls!r}, expected {expected!r}")
     os.environ.pop(FLAG_ENV, None)
 
 
@@ -397,7 +414,8 @@ def main(root: Path = Path("/opt/hermes"), *, board_read: bool = True) -> None:
     print(
         "slack_ux_reactions verify: both hooks guarded ahead of upstream's body; "
         "adapter members in the shape the runtime calls; board read finds open cards on every board; "
-        "runtime reacts by kind, settles direct answers, defers delegated ones, never removes"
+        "runtime reacts with the ask's kind until it is answered, at once for a direct answer and at the "
+        "notifier for a delegated one, with ⏸️ while it waits on the user and ❌ left only on failure"
     )
 
 

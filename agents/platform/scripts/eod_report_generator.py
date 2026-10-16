@@ -37,6 +37,8 @@ DEFAULT_EXCLUDE_NAMESPACES = frozenset({"kube-system", "kube-public", "kube-node
 # two spellings agree, so a rename that misses this copy fails there rather than
 # silently folding drift rows back into the watcher's totals.
 DRIFT_LEDGER_REASON = "OutOfBandChange"
+# The same for the stall watch's rows, and copied for the same reason.
+STALL_LEDGER_REASON = "ControllerStall"
 
 
 def excluded_namespaces() -> FrozenSet[str]:
@@ -244,7 +246,8 @@ def load_intercepted_events(
                 # alerts went to chat", the clusters in the fan-in header — and
                 # a drift record is not an event the watcher forwarded. Folding
                 # the two together would inflate all of them with no way for the
-                # reader to separate them again.
+                # reader to separate them again. The stall watch's rows, under
+                # `reason = 'ControllerStall'`, are excluded for the same reason.
                 #
                 # Excluded rather than reported separately because this recap
                 # could not say anything useful about a drift row if it kept it:
@@ -256,9 +259,9 @@ def load_intercepted_events(
                     f"severity, occurrences, notified, created_at, {delivery_col} "
                     "FROM intercepted_events "
                     "WHERE created_at >= datetime('now', ?) "
-                    "AND reason != ? "
+                    "AND reason NOT IN (?, ?) "
                     "ORDER BY created_at DESC",
-                    (f"-{int(window_hours)} hours", DRIFT_LEDGER_REASON),
+                    (f"-{int(window_hours)} hours", DRIFT_LEDGER_REASON, STALL_LEDGER_REASON),
                 )
                 rows = cursor.fetchall()
             finally:
@@ -288,7 +291,7 @@ def load_intercepted_events(
                 "message": r[6] or "",
                 "severity": r[7] or "",
                 "occurrences": int(r[8] or 1),
-                "notified": bool(r[9]),
+                "notified": 2 if r[9] == 2 else bool(r[9]),
                 "created_at": r[10],
                 "delivery_error": r[11] or "",
             }
@@ -353,8 +356,8 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     The headline counts and the workload breakdown are derived from the same
     filtered rows, so they describe one scope: an excluded namespace is absent
-    from both, not from one. `cap_dropped`, `cap_dropped_alerts` and
-    `delivery_failed` are counted over every row instead, so a withheld or
+    from both, not from one. `cap_dropped`, `cap_dropped_alerts`,
+    `cap_dropped_workloads` and `delivery_failed` are counted over every row instead, so a withheld or
     undelivered alert is reported wherever it happened. Anything the namespace filter removed is totalled in
     `excluded_occurrences`, which is what lets the report say it covered part
     of the fleet.
@@ -384,7 +387,15 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     # those two cases. `cap_dropped` rows still veto the all-clear, where any
     # row at all is the whole question.
     cap_dropped_incidents: set = set()
+    # This set gives the second unit of the withheld line: the number of
+    # workloads that sent the withheld alerts. Thirty withheld alerts from one
+    # Deployment need one action. Thirty alerts from thirty workloads need more.
+    # The key does not include `object_kind`, so a Pod event and a Deployment
+    # event with the same workload name count as one workload. SOP: "What this
+    # recap does not report".
+    cap_dropped_workloads: set = set()
     delivery_failed = 0
+    dispatched_headless = 0
     workload_map: Dict[str, Dict[str, Any]] = {}
 
     for event in events:
@@ -438,9 +449,15 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # future writer batches sightings into one row.
         cap_row = False
         event_delivery_failed = bool(event.get("delivery_error"))
+        notified_val = event.get("notified")
         if event_delivery_failed:
             delivery_failed += 1
-        elif event.get("notified"):
+        elif notified_val == 2 and not isinstance(notified_val, bool):
+            # Dispatched on a headless install with no chat platform enabled:
+            # neither a failed chat post nor an alert that "went to chat".
+            if not excluded:
+                dispatched_headless += 1
+        elif notified_val:
             if not excluded:
                 alerts_posted += 1
         elif severity == "Info":
@@ -476,7 +493,29 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # events or as none, while the 📉 total counts one.
         group_key = f"{cluster}/{ns}/{workload}/{reason}/{severity}/{int(bool(event.get('notified')))}"
         if cap_row:
-            cap_dropped_incidents.add((cluster, event.get("object_uid", ""), reason))
+            uid = event.get("object_uid", "") or ""
+            stored_workload = event.get("workload", "") or ""
+            # A row with no UID cannot tell its pods apart, so the alert key
+            # uses the workload in place of the UID. If all those rows had one
+            # empty UID key per reason, three workloads would give "1 alert
+            # from 3 workloads". The key uses the stored name and the
+            # namespace, as the workload key does. Thus N is not less than M
+            # while each object keeps one workload name. If one object is
+            # stored under two names, M can exceed N.
+            if uid:
+                cap_dropped_incidents.add((cluster, uid, reason))
+            else:
+                cap_dropped_incidents.add((cluster, ns, stored_workload, reason))
+            # A row with no workload name counts by its UID, so that nameless
+            # rows of different objects are different workloads and do not all
+            # become one "unknown-workload". A row with no name and no UID has
+            # nothing that tells two workloads apart. Those rows share one key
+            # for each cluster and namespace, so M can be too small for them.
+            # Only one of the last two slots is filled, so a name never
+            # matches a UID.
+            cap_dropped_workloads.add(
+                (cluster, ns, stored_workload, "" if stored_workload else uid)
+            )
         msg = sanitize_chat_message(event.get("message", ""))
 
         if group_key in workload_map:
@@ -540,9 +579,11 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # renders the same way twice for the same day.
         "clusters": sorted(clusters_seen),
         "alerts_posted": alerts_posted,
+        "dispatched_headless": dispatched_headless,
         "suppressed_info": suppressed_info,
         "cap_dropped": cap_dropped,
         "cap_dropped_alerts": len(cap_dropped_incidents),
+        "cap_dropped_workloads": len(cap_dropped_workloads),
         "delivery_failed": delivery_failed,
         "entries": filtered_entries,
     }
@@ -600,7 +641,8 @@ def generate_markdown_report(
     # over every row in scope while the listing below them holds `Info` alone.
     # A delivered alert is already accounted for in words — "*N alerts* went to
     # chat", "*Alerts Raised:* N" — so the residue that nothing explains is the
-    # ceiling drop and the failed delivery, and those two are the gate. Without
+    # ceiling drop, the failed delivery, and a headless dispatch (`notified = 2`,
+    # where no chat post was attempted), and those three are the gate. Without
     # it a day of 30 cap-dropped Criticals reports 30 events across 30 groups
     # over a listing naming none of them, and the reader who tries to reconcile
     # the two is reading a card whose numbers do not add up.
@@ -614,7 +656,11 @@ def generate_markdown_report(
     # on a day whose whole traffic was excluded — and a note printed three
     # times is read none.
     qualifiers: List[str] = []
-    if summary.get("cap_dropped") or summary.get("delivery_failed"):
+    if (
+        summary.get("cap_dropped")
+        or summary.get("delivery_failed")
+        or summary.get("dispatched_headless")
+    ):
         qualifiers.append("Counts cover every severity; only informational events are listed.")
     if summary.get("excluded_occurrences"):
         qualifiers.append("Namespaces in `EOD_EXCLUDE_NAMESPACES` are outside this recap's scope.")
@@ -628,7 +674,10 @@ def generate_markdown_report(
     # not report", which owns the naming/counting line.
     #
     # Both counts are also read for a second purpose: they veto the ✅ all-clear and
-    # the 🟢 header. Not reporting an alert is the choice; asserting it did not
+    # the 🟢 header (`dispatched_headless` deliberately does not veto `all_clear`,
+    # because on a headless install the triage turn was dispatched as intended and
+    # nothing was held back from or refused by chat). Not reporting an alert is the
+    # choice; asserting it did not
     # happen is a different thing, and a recap that prints "nothing was held back
     # from chat" over a day the ceiling ate 30 Criticals is not silent about them,
     # it denies them.
@@ -704,7 +753,8 @@ def generate_markdown_report(
     if not problems:
         if summary.get("cap_dropped"):
             lines.append(
-                f"⚠️ *{_plural(summary['cap_dropped_alerts'], 'alert')} withheld by the daily "
+                f"⚠️ *{_plural(summary['cap_dropped_alerts'], 'alert')} from "
+                f"{_plural(summary['cap_dropped_workloads'], 'workload')} withheld by the daily "
                 "ceiling and never reached chat.*"
             )
         if summary.get("delivery_failed"):

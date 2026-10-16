@@ -4,7 +4,7 @@
 Run: cd scripts && python3 -m unittest test_pin_smoke_status
 
 Every wrong answer here fails green: a status that should have been pinned is
-left stale and Tide quietly re-runs a 1.5-3.5h job; a status that should have
+left stale and Tide quietly re-runs the job; a status that should have
 been left alone -- a red, a newer `pending` -- is overwritten with a success.
 So the guards get one test each, and the description builder is driven with
 what crier and the override plugin actually write, U+2001 padding included.

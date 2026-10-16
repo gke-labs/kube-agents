@@ -137,7 +137,7 @@ class WatchCase(unittest.TestCase):
         self.forge = FakeForge()
         for owner, target, value in (
             (cdw.forge, "call", self.forge),
-            (cdw.gitops_workspace, "get_managed_github_repos", lambda: [LEDGER_REPO]),
+            (cdw.gitops_workspace, "get_managed_github_repo_names", lambda: [LEDGER_REPO]),
             (cdw.gitops_workspace, "agent_home", lambda: str(self.home)),
         ):
             patcher = mock.patch.object(owner, target, value)
@@ -462,7 +462,7 @@ class TickTest(WatchCase):
         self.assertEqual(cdw.threshold(), cdw.THRESHOLD_DEFAULT)
 
     def test_no_forge_means_log_only(self) -> None:
-        with mock.patch.object(cdw.gitops_workspace, "get_managed_github_repos", lambda: []):
+        with mock.patch.object(cdw.gitops_workspace, "get_managed_github_repo_names", lambda: []):
             self.write_store(job("a", RUN_1, HARD_ERROR))
             self.run_tick()
             self.write_store(job("a", RUN_2, HARD_ERROR))
@@ -474,9 +474,9 @@ class TickTest(WatchCase):
 
     def test_a_failing_repo_discovery_still_writes_the_log_line(self) -> None:
         def broken() -> list[str]:
-            raise AttributeError("module has no attribute get_managed_github_repos")
+            raise AttributeError("module has no attribute get_managed_github_repo_names")
 
-        with mock.patch.object(cdw.gitops_workspace, "get_managed_github_repos", broken):
+        with mock.patch.object(cdw.gitops_workspace, "get_managed_github_repo_names", broken):
             self.write_store(job("a", RUN_1, HARD_ERROR))
             self.run_tick()
             self.write_store(job("a", RUN_2, HARD_ERROR))
@@ -501,7 +501,7 @@ class TickTest(WatchCase):
         self.assertNotIn("platform/a", self.state_data()["jobs"])
 
     def test_several_managed_repositories_without_an_override_is_log_only(self) -> None:
-        with mock.patch.object(cdw.gitops_workspace, "get_managed_github_repos", lambda: ["z/two", "a/one"]):
+        with mock.patch.object(cdw.gitops_workspace, "get_managed_github_repo_names", lambda: ["z/two", "a/one"]):
             self.write_store(job("a", RUN_1, HARD_ERROR))
             self.run_tick()
             self.write_store(job("a", RUN_2, HARD_ERROR))
@@ -588,7 +588,7 @@ class TickTest(WatchCase):
         self.write_store(job("a", RUN_2, HARD_ERROR))
         self.run_tick()
         self.assertEqual(self.forge.verbs()[-1], "issue-create")
-        with mock.patch.object(cdw.gitops_workspace, "get_managed_github_repos", lambda: ["a/one", "z/two"]):
+        with mock.patch.object(cdw.gitops_workspace, "get_managed_github_repo_names", lambda: ["a/one", "z/two"]):
             self.write_store(job("a", RUN_3))
             rc, out = self.run_tick()
         self.assertEqual(self.forge.verbs()[-2:], ["issue-close", "issue-comment"])

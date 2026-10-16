@@ -21,7 +21,7 @@ every cron delivery in::
 The first message a new Slack user reads is the first-install inventory report,
 and it opened with that header. On Slack the report goes out as
 ``cron.wrap_response: false`` would send it. The switch itself stays on: the
-Chat Agent relay (``deploy/docker/plugins/chat/adapter.py``) reads the job id
+chat relay (``deploy/docker/plugins/chat/adapter.py``) reads the job id
 back out of the header, and it and every non-Slack target keep the wrapper. The
 choice is per target, so one delivery to both Slack and the relay wraps the
 relay's copy only.
@@ -96,7 +96,7 @@ except ImportError:  # the scripts directory is not on PYTHONPATH
 FLAG_ENV = "KAGE_SLACK_UX"
 
 #: ``slack_presenter.FLAG_ON_VALUES``, copied because the warning below fires
-#: exactly when that module cannot be imported.
+#: exactly when that module cannot be imported. Unset is on there too.
 FLAG_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 
 #: The platform name cron targets and message sources carry for Slack.
@@ -248,10 +248,11 @@ def enabled() -> bool:
     global _warned_missing
     if _presenter is not None:
         return _presenter.enabled()
-    if os.environ.get(FLAG_ENV, "").strip().lower() in FLAG_ON_VALUES and not _warned_missing:
+    value = os.environ.get(FLAG_ENV)
+    if (value is None or value.strip().lower() in FLAG_ON_VALUES) and not _warned_missing:
         _warned_missing = True
         logger.warning(
-            "slack_boilerplate: %s is set but slack_presenter is not importable; "
+            "slack_boilerplate: %s is on but slack_presenter is not importable; "
             "treating the flag as off", FLAG_ENV,
         )
     return False

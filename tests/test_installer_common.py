@@ -154,6 +154,7 @@ class InstallerCommonTest(unittest.TestCase):
         describe_stub='echo "ERROR: (gcloud.container.clusters.describe) NOT_FOUND" >&2; exit 1',
         kms_versions="",
         sa_describe_stub="exit 1",
+        sa_list_stub="exit 1",
         gcloud_stderr=None,
         gcloud_extra_cases="",
         get_credentials_stub=None,
@@ -197,6 +198,7 @@ class InstallerCommonTest(unittest.TestCase):
                 f"{get_cred_case}"
                 f"  *\"keys versions list\"*) printf '%s' '{kms_versions}'; exit 0 ;;\n"
                 f"  *\"service-accounts describe\"*) {sa_describe_stub} ;;\n"
+                f"  *\"service-accounts list\"*) {sa_list_stub} ;;\n"
                 "esac\n"
                 f"printf '%s' '{gcloud_stderr}' >&2\n"
                 f"[ -f '{state_file}' ] && cat '{state_file}'\n"
@@ -228,6 +230,16 @@ class InstallerCommonTest(unittest.TestCase):
                     # Blanking it is "unset", which that arm wants: `:-` takes
                     # the default for an empty value as well as an absent one.
                     "ENABLE_DRIFT_DETECTOR": "",
+                    # Same again for the scoped pool's two keys, read as
+                    # ${VAR:-} and refused (rc=1, no tfvars) on a malformed
+                    # value: a shell exporting SCOPED_SA_POOL_MAX_ACCOUNTS=0
+                    # would otherwise fail every generator case that does not
+                    # set them, and SCOPED_SA_POOL_ENABLED=true would arm the
+                    # pool in every file the cases read.
+                    "SCOPED_SA_POOL_ENABLED": "",
+                    "SCOPED_SA_POOL_MAX_ACCOUNTS": "",
+                    # And the mode, refused on a value outside the CRD's enum.
+                    "PLATFORM_AGENT_MODE": "",
                     **(env or {}),
                 },
                 bin_dir=str(bin_dir),
@@ -707,6 +719,23 @@ class InstallerCommonTest(unittest.TestCase):
             proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
             self.assertIn("P=from-the-file X=unset C=unset M=300", proc.stdout, proc.stderr)
 
+    def test_load_install_env_drops_a_shell_exported_pool_switch(self):
+        # Same rule as the scope keys: the pool's switch renders into the
+        # PlatformAgent and arms the broker, and a pre-change install.env
+        # records neither key, so an inherited SCOPED_SA_POOL_ENABLED=true
+        # would arm the pool for one upgrade.sh run on accounts the next run
+        # from a clean shell deletes again.
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text("PROJECT_ID=p\n")
+            stray = {"SCOPED_SA_POOL_ENABLED": "true", "SCOPED_SA_POOL_MAX_ACCOUNTS": "250"}
+            probe = 'echo "E=${SCOPED_SA_POOL_ENABLED:-unset} N=${SCOPED_SA_POOL_MAX_ACCOUNTS:-unset}"'
+            proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
+            self.assertIn("E=unset N=unset", proc.stdout, proc.stderr)
+            env_file.write_text("PROJECT_ID=p\nSCOPED_SA_POOL_ENABLED=false\nSCOPED_SA_POOL_MAX_ACCOUNTS=120\n")
+            proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
+            self.assertIn("E=false N=120", proc.stdout, proc.stderr)
+
     def test_service_account_ownership_still_refuses_on_a_clean_absence(self):
         proc = self._run(
             self._SHOW_REMEDY,
@@ -754,6 +783,59 @@ class InstallerCommonTest(unittest.TestCase):
         )
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("LITELLM_GSA_NAME", proc.stderr)
+
+    # A `service-accounts list` stub that answers only a filter carrying this
+    # install's marker, the way the real API applies the --filter: a member
+    # whose description names another install's agent is never listed.
+    _POOL_MEMBER_EMAIL = "ka-team-alpha-0ed42166@test-project.iam.gserviceaccount.com"
+    _POOL_LIST_STUB = (
+        '[[ "$*" == *"email:ka-*"* && "$*" == *"Pool member of kubeagents-platform-gsa for "* ]]'
+        f' && {{ echo "{_POOL_MEMBER_EMAIL}"; exit 0; }}; exit 0'
+    )
+
+    def test_service_account_ownership_refuses_a_pool_member_this_state_does_not_own(self):
+        # The lost-state re-install: the agent's account is gone (describe
+        # misses) but the pool members it derived are still there, so the
+        # refusal lists them by the marker their description carries.
+        proc = self._run(
+            self._SHOW_REMEDY,
+            gcloud_exit=1,
+            sa_list_stub=self._POOL_LIST_STUB,
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("a scoped pool member", proc.stderr)
+        self.assertIn(f"gcloud iam service-accounts delete {self._POOL_MEMBER_EMAIL}", proc.stderr)
+        self.assertIn("PLATFORM_AGENT_GSA_NAME", proc.stderr)
+
+    def test_service_account_ownership_passes_a_pool_member_this_state_owns(self):
+        proc = self._run(
+            'check_service_account_ownership; echo "rc=$?"',
+            gcloud_stdout=_service_account_state("kubeagents-platform-gsa", "ka-team-alpha-0ed42166"),
+            sa_describe_stub="exit 0",
+            sa_list_stub=self._POOL_LIST_STUB,
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+
+    def test_service_account_ownership_ignores_another_installs_pool_members(self):
+        # The filter names this install's agent, so a member marked for
+        # kubeagents-platform-gsa is not this install's business.
+        proc = self._run(
+            'check_service_account_ownership; echo "rc=$?"',
+            gcloud_exit=1,
+            sa_list_stub=self._POOL_LIST_STUB,
+            env={"PLATFORM_AGENT_GSA_NAME": "other-agent-gsa"},
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("ka-team-alpha", proc.stderr)
+
+    def test_service_account_ownership_treats_a_failing_list_as_no_members(self):
+        proc = self._run(
+            'check_service_account_ownership; echo "rc=$?"',
+            gcloud_exit=1,
+            sa_list_stub='echo "ERROR: (gcloud.iam.service-accounts.list) PERMISSION_DENIED" >&2; exit 1',
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("ERROR: Service account", proc.stderr)
 
     # ── hcl_csv_list: --custom-roles documents "space- or comma-separated" ──
 
@@ -1064,6 +1146,78 @@ class InstallerCommonTest(unittest.TestCase):
                     self.assertIn("rc=0", proc.stdout, proc.stderr)
                     self.assertIn(expected, dest.read_text())
 
+    def test_tfvars_carry_the_scoped_sa_pool(self):
+        # The switch is always written, false by default, so the file states
+        # whether the pool is armed; the cap only when set, like the scope's.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, expected, absent in (
+                ({}, "scoped_pool_enabled      = false\n", "scoped_pool_max_accounts"),
+                ({"SCOPED_SA_POOL_ENABLED": "off", "SCOPED_SA_POOL_MAX_ACCOUNTS": "50"},
+                 "scoped_pool_enabled      = false\nscoped_pool_max_accounts = 50\n", None),
+                ({"SCOPED_SA_POOL_ENABLED": "yes", "SCOPED_SA_POOL_MAX_ACCOUNTS": "250"},
+                 "scoped_pool_enabled      = true\nscoped_pool_max_accounts = 250\n", None),
+                ({"SCOPED_SA_POOL_ENABLED": "true"},
+                 "scoped_pool_enabled      = true\n", "scoped_pool_max_accounts"),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    content = dest.read_text()
+                    self.assertIn(expected, content)
+                    if absent:
+                        self.assertNotIn(absent, content)
+
+    def test_tfvars_refuse_scoped_sa_pool_values_terraform_cannot_take(self):
+        # upgrade.sh regenerates from install.env without install.sh's checks,
+        # so the generator names the key and writes nothing; a misspelt switch
+        # is refused rather than read as off.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for key, value, message in (
+                ("SCOPED_SA_POOL_ENABLED", "ture", "is neither true nor false"),
+                ("SCOPED_SA_POOL_ENABLED", "armed", "is neither true nor false"),
+                ("SCOPED_SA_POOL_MAX_ACCOUNTS", "0", "is not a whole number of at least 1"),
+                ("SCOPED_SA_POOL_MAX_ACCOUNTS", "lots", "is not a whole number of at least 1"),
+                ("SCOPED_SA_POOL_MAX_ACCOUNTS", "2.5", "is not a whole number of at least 1"),
+            ):
+                with self.subTest(key=key, value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", key: value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"{key}='{value}'", proc.stderr + proc.stdout)
+                    self.assertIn(message, proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
+    def test_the_scoped_sa_pool_cap_is_a_whole_number_of_at_least_one(self):
+        for bad in ("0", "00", "abc", "2.5", "-3", " 12", "1e3"):
+            with self.subTest(bad=bad):
+                proc = subprocess.run(
+                    ["bash", "-c",
+                     'print_error() { echo "ERROR: $*"; }; print_info() { :; }; print_warning() { :; }; print_success() { :; }\n'
+                     f'source "{_INSTALLER_COMMON}"\nrequire_scoped_sa_pool_max_accounts {shlex.quote(bad)}; echo "rc=$?"'],
+                    capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn(f"SCOPED_SA_POOL_MAX_ACCOUNTS='{bad}' is not a whole number of at least 1", proc.stdout)
+                self.assertIn("default (100)", proc.stdout)
+        for good in ("", "1", "100", "0250", "5000"):
+            with self.subTest(good=good):
+                proc = subprocess.run(
+                    ["bash", "-c",
+                     'print_error() { echo "ERROR: $*"; }; print_info() { :; }; print_warning() { :; }; print_success() { :; }\n'
+                     f'source "{_INSTALLER_COMMON}"\nrequire_scoped_sa_pool_max_accounts {shlex.quote(good)}; echo "rc=$?"'],
+                    capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+
     def test_tfvars_escape_litellm_redaction_rules_for_hcl(self):
         # A regular expression may hold ${ or %{, which HCL reads as a
         # template, as well as backslashes and quotes.
@@ -1132,6 +1286,438 @@ class InstallerCommonTest(unittest.TestCase):
         )
         self.assertIn("rc=1 out=[]", proc.stdout)
         self.assertIn("LITELLM_REDACTION_RULES is not valid JSON", proc.stderr)
+
+    # ── PLATFORM_AGENT_MODE: the PlatformAgent's spec.mode ──────────────────
+
+    def test_tfvars_carry_the_platform_agent_mode(self):
+        # Written on every run, the default included, so upgrade.sh carries the
+        # recorded mode forward; the composition renders nothing for "today".
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, expected in (
+                ({}, 'platform_agent_mode = "today"\n'),
+                ({"PLATFORM_AGENT_MODE": "today"}, 'platform_agent_mode = "today"\n'),
+                ({"PLATFORM_AGENT_MODE": "next"}, 'platform_agent_mode = "next"\n'),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
+    def test_tfvars_refuse_a_platform_agent_mode_outside_the_crd_enum(self):
+        # upgrade.sh and the menu regenerate from install.env without
+        # install.sh's check: the generator names the key and writes nothing.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("Next", "later", "today "):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_MODE": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"PLATFORM_AGENT_MODE='{value}' is not one of today, next. Fix it in install.env.", proc.stderr)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
+    def test_load_install_env_reads_the_mode_from_the_file_alone(self):
+        # An inherited PLATFORM_AGENT_MODE would switch the install for one run;
+        # the file's own key still loads.
+        with tempfile.TemporaryDirectory() as tmp:
+            silent = pathlib.Path(tmp) / "silent.env"
+            silent.write_text("PROJECT_ID=p\n")
+            recorded = pathlib.Path(tmp) / "recorded.env"
+            recorded.write_text("PLATFORM_AGENT_MODE=next\n")
+            for file, expected in ((silent, "MODE=[]"), (recorded, "MODE=[next]")):
+                with self.subTest(file=file.name):
+                    proc = self._run(
+                        f'load_install_env "{file}"; echo "MODE=[${{PLATFORM_AGENT_MODE:-}}]"',
+                        env={"PLATFORM_AGENT_MODE": "next" if file is silent else "today"},
+                    )
+                    self.assertIn(expected, proc.stdout, proc.stderr)
+
+    def test_a_recorded_mode_is_carried_into_the_regenerated_tfvars(self):
+        # upgrade.sh's full path, and the menu's: load install.env, then
+        # regenerate. The recorded mode reaches the tfvars; an exported one
+        # over a file that records none does not.
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "terraform.tfvars"
+            recorded = pathlib.Path(tmp) / "recorded.env"
+            recorded.write_text("PLATFORM_AGENT_MODE=next\n")
+            silent = pathlib.Path(tmp) / "silent.env"
+            silent.write_text("PROJECT_ID=test-project\n")
+            for file, exported, expected in (
+                (recorded, "", 'platform_agent_mode = "next"\n'),
+                (recorded, "today", 'platform_agent_mode = "next"\n'),
+                (silent, "next", 'platform_agent_mode = "today"\n'),
+            ):
+                with self.subTest(file=file.name, exported=exported):
+                    proc = self._run(
+                        f'load_install_env "{file}"; write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_MODE": exported},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
+    _CONTEXT_KUBECTL = '#!/usr/bin/env bash\ncase "$*" in *"config get-contexts"*) exit 0 ;; esac\nexit 1\n'
+
+    # A CR list as `kubectl get platformagents -o json` prints it: no CR, a CR
+    # with no mode, or a CR with the mode given.
+    @staticmethod
+    def _cr_list(mode=None, present=True):
+        if not present:
+            return '{"items": []}'
+        spec = f'{{"mode": "{mode}"}}' if mode else "{}"
+        return f'{{"items": [{{"metadata": {{"name": "platform-agent"}}, "spec": {spec}}}]}}'
+
+    _NO_TYPE = "error: the server doesn't have a resource type platformagents"
+    _UNREACHABLE = "Unable to connect to the server: dial tcp: i/o timeout"
+
+    @staticmethod
+    def _cr_kubectl(listing, exit_code=0, stderr=""):
+        """A kubectl with this cluster's context whose CR read prints
+        `listing` (and `stderr`) and exits `exit_code`. Every CR read leaves a
+        line in $KUBECTL_LOG when the caller sets one."""
+        return (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"config get-contexts"*) exit 0 ;;\n'
+            '  *"get platformagents"*) [ -n "${KUBECTL_LOG:-}" ] && echo cr >> "$KUBECTL_LOG"\n'
+            f"    printf '%s' '{listing}'; printf '%s' \"{stderr}\" >&2; exit {exit_code} ;;\n"
+            "esac\nexit 1\n"
+        )
+
+    # A helm stub, as a function: `history` prints the revisions given, `get
+    # values` the values of the revision asked for, or `latest` without
+    # --revision. A value of None fails that read; `latest="norelease"` is
+    # Helm's missing-release answer. Each call leaves a line in $HELM_LOG.
+    @staticmethod
+    def _helm(history, values_by_revision, latest="{}"):
+        history_arm = (
+            "echo 'Error: Kubernetes cluster unreachable' >&2; return 1"
+            if history is None else f"printf '%s' '{history}'"
+        )
+
+        def arm(vals):
+            if vals is None:
+                return "echo 'Error: Kubernetes cluster unreachable' >&2; return 1"
+            if vals == "norelease":
+                return "echo 'Error: release: not found' >&2; return 1"
+            return f"printf '%s' '{vals}'"
+        cases = "".join(
+            f'      *"--revision {rev}"*) {arm(vals)} ;;\n' for rev, vals in values_by_revision.items()
+        )
+        return (
+            "helm() {\n"
+            '  [ -n "${HELM_LOG:-}" ] && echo "$*" >> "$HELM_LOG"\n'
+            '  case "$1" in\n'
+            f"    history) {history_arm} ;;\n"
+            '    get) case "$*" in\n'
+            f"{cases}"
+            '      *"--revision"*) return 1 ;;\n'
+            f"      *) {arm(latest)} ;;\n"
+            "    esac ;;\n"
+            "    *) return 1 ;;\n"
+            "  esac\n"
+            "}\n"
+        )
+
+    _HEALTHY = '[{"revision": 1, "status": "superseded"}, {"revision": 2, "status": "deployed"}]'
+
+    @staticmethod
+    def _no_helm(log):
+        """A helm that must not run: each call leaves a line in `log`, which
+        a command substitution cannot swallow the way it swallows stdout, so
+        the case asserts `log` was never created."""
+        return f'helm() {{ echo "$*" >> "{log}"; return 99; }}\n'
+    _LOUD_PRINTS = 'print_warning() { echo "WARN: $*"; }\nprint_info() { echo "INFO: $*"; }\n'
+
+    def _announce(self, kubectl, helm_stub, key="next", call=None):
+        call = call or f"announce_platform_agent_mode_for_apply kubeagents-system {key}"
+        return self._run(f"{self._LOUD_PRINTS}{helm_stub}{call}", kubectl_script=kubectl)
+
+    def test_the_notice_compares_the_cr_with_the_served_revision(self):
+        failed_latest = '[{"revision": 1, "status": "deployed"}, {"revision": 2, "status": "failed"}]'
+        for kubectl, helm_stub, expect in (
+            # Installed today; the key now asks for next.
+            (self._cr_kubectl(self._cr_list()), self._helm(self._HEALTHY, {}, latest="{}"),
+             "WARN: This apply switches the install from spec.mode today to next"),
+            # A failed latest revision records next, but Helm patches from the
+            # one that served, which has no mode: still a switch.
+            (self._cr_kubectl(self._cr_list()),
+             self._helm(failed_latest, {1: "{}"}, latest='{"platformAgent":{"mode":"next"}}'),
+             "WARN: This apply switches the install from spec.mode today to next"),
+            # Recorded and running next: a re-apply says nothing.
+            (self._cr_kubectl(self._cr_list("next")),
+             self._helm(self._HEALTHY, {}, latest='{"platformAgent":{"mode":"next"}}'), None),
+        ):
+            with self.subTest(helm_stub=helm_stub, kubectl=kubectl):
+                proc = self._announce(kubectl, helm_stub)
+                if expect is None:
+                    self.assertEqual(proc.stdout, "", proc.stderr)
+                else:
+                    self.assertIn(expect, proc.stdout, proc.stderr)
+
+    def test_a_first_install_is_quiet(self):
+        # Nothing to switch: no PlatformAgent type, no CR, or no release. A
+        # first install's missing cluster is the TFVARS_CLUSTER_EXISTS=false
+        # case below, which reads nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "helm-must-not-run.log"
+            for kubectl, helm_stub, helm_runs in (
+                (self._cr_kubectl("", exit_code=1, stderr=self._NO_TYPE), self._no_helm(log), False),
+                (self._cr_kubectl(self._cr_list(present=False)), self._helm(self._HEALTHY, {}, latest="norelease"), True),
+                (self._cr_kubectl(self._cr_list()), self._helm(self._HEALTHY, {}, latest="norelease"), True),
+            ):
+                with self.subTest(kubectl=kubectl, helm_stub=helm_stub):
+                    log.unlink(missing_ok=True)
+                    proc = self._announce(kubectl, helm_stub)
+                    self.assertEqual(proc.stdout, "", proc.stderr)
+                    if not helm_runs:
+                        self.assertFalse(log.exists(), log.read_text() if log.exists() else "")
+
+    def test_a_cluster_with_no_context_says_the_check_did_not_run(self):
+        # The generator found the cluster, but the kubeconfig has no context
+        # for it (kubectl absent, or a get-credentials that did not land, on
+        # the --dry-run and --generate-only routes the scope check skips). Not
+        # a first install, so the notice says it did not run, with the fix.
+        with tempfile.TemporaryDirectory() as tmp:
+            hlog = pathlib.Path(tmp) / "helm.log"
+            proc = self._run(
+                f"{self._LOUD_PRINTS}{self._no_helm(hlog)}"
+                "TFVARS_CLUSTER_EXISTS=true announce_platform_agent_mode_for_apply kubeagents-system next\n",
+                kubectl_script=None,
+            )
+            self.assertIn("WARN: The mode-switch check did not run: the kubeconfig has no context", proc.stdout, proc.stderr)
+            self.assertIn("gcloud container clusters get-credentials", proc.stdout)
+            self.assertFalse(hlog.exists())
+
+    def test_a_cluster_the_generator_found_absent_is_not_read(self):
+        # A reinstall under a name used before: the tfvars generator's describe
+        # said NOT_FOUND (TFVARS_CLUSTER_EXISTS=false), but the kubeconfig
+        # still has the old install's context, whose endpoint is gone. Nothing
+        # is asked and nothing is said; with the cluster there, the same
+        # failed read still says the check did not run.
+        unreachable = self._cr_kubectl("", exit_code=1, stderr=self._UNREACHABLE)
+        with tempfile.TemporaryDirectory() as tmp:
+            klog = pathlib.Path(tmp) / "kubectl.log"
+            hlog = pathlib.Path(tmp) / "helm.log"
+            proc = self._run(
+                f'export KUBECTL_LOG="{klog}"\n{self._LOUD_PRINTS}{self._no_helm(hlog)}'
+                "TFVARS_CLUSTER_EXISTS=false announce_platform_agent_mode_for_apply kubeagents-system next\n",
+                kubectl_script=unreachable,
+            )
+            self.assertEqual(proc.stdout, "", proc.stderr)
+            self.assertFalse(klog.exists(), "the PlatformAgent was read through a stale context")
+            self.assertFalse(hlog.exists())
+            loud = self._run(
+                f"{self._LOUD_PRINTS}{self._no_helm(hlog)}"
+                "TFVARS_CLUSTER_EXISTS=true announce_platform_agent_mode_for_apply kubeagents-system next\n",
+                kubectl_script=unreachable,
+            )
+            self.assertIn("WARN: The mode-switch check did not run: the PlatformAgent", loud.stdout, loud.stderr)
+
+    def test_a_read_that_fails_says_the_check_did_not_run(self):
+        # Told apart from no CR by kubectl's and helm's exit status: the apply
+        # goes on, so the run says the notice was not weighed.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log = pathlib.Path(tmp.name) / "helm-must-not-run.log"
+        failed_next = '{"platformAgent":{"mode":"next"}}'
+        for kubectl, helm_stub, what in (
+            (self._cr_kubectl("", exit_code=1, stderr=self._UNREACHABLE),
+             self._no_helm(log),
+             "the PlatformAgent in namespace 'kubeagents-system' could not be read (Unable to connect to the server"),
+            (self._cr_kubectl(self._cr_list()), self._helm(self._HEALTHY, {}, latest=None),
+             "the values of release 'kube-agents' in namespace 'kubeagents-system' could not be read (Error: Kubernetes cluster unreachable"),
+            (self._cr_kubectl(self._cr_list()),
+             self._helm('[{"revision": 1, "status": "deployed"}, {"revision": 2, "status": "failed"}]', {1: None}),
+             "the values of release 'kube-agents' in namespace 'kubeagents-system' could not be read (revision 1, the last one that served, did not answer)"),
+            # The history that names the served revision: without it the
+            # notice would model from the latest revision (a failed one that
+            # recorded next) and announce a switch to today that Helm, diffing
+            # the served revision, does not make.
+            (self._cr_kubectl(self._cr_list("next")), self._helm(None, {}, latest=failed_next),
+             "the values of release 'kube-agents' in namespace 'kubeagents-system' could not be read (the release history did not answer: Error: Kubernetes cluster unreachable)"),
+            (self._cr_kubectl(self._cr_list("next")), self._helm("not json", {}, latest=failed_next),
+             "the values of release 'kube-agents' in namespace 'kubeagents-system' could not be read (the release history did not answer: Traceback"),
+        ):
+            with self.subTest(what=what):
+                log.unlink(missing_ok=True)
+                proc = self._announce(kubectl, helm_stub, key="today")
+                self.assertIn(f"WARN: The mode-switch check did not run: {what}", proc.stdout, proc.stderr)
+                self.assertIn("renders spec.mode from PLATFORM_AGENT_MODE=today in install.env", proc.stdout)
+                # The by-hand check names the context the reads asked.
+                self.assertIn(
+                    "kubectl get platformagents -n kubeagents-system"
+                    " --context gke_test-project_us-central1_test-cluster -o jsonpath=",
+                    proc.stdout,
+                )
+                self.assertNotIn("This apply switches", proc.stdout)
+                self.assertFalse(log.exists(), log.read_text() if log.exists() else "")
+
+    def test_the_reads_ask_this_clusters_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "helm.log"
+            self._announce(
+                self._cr_kubectl(self._cr_list()),
+                f'HELM_LOG="{log}"\n'
+                + self._helm('[{"revision": 1, "status": "deployed"}, {"revision": 2, "status": "failed"}]', {1: "{}"}),
+            )
+            calls = log.read_text()
+        ctx = "--kube-context gke_test-project_us-central1_test-cluster"
+        self.assertIn(f"get values kube-agents -n kubeagents-system {ctx} -o json", calls)
+        self.assertIn(f"history kube-agents -n kubeagents-system {ctx} -o json", calls)
+        self.assertIn(f"get values kube-agents -n kubeagents-system {ctx} --revision 1 -o json", calls)
+
+    def test_the_notice_takes_the_scope_checks_reads(self):
+        # The scope check beside it has just read the CR and the release: the
+        # notice asks neither again, and a later notice (the menu's next
+        # apply) reads afresh.
+        with tempfile.TemporaryDirectory() as tmp:
+            klog = pathlib.Path(tmp) / "kubectl.log"
+            hlog = pathlib.Path(tmp) / "helm.log"
+            proc = self._run(
+                f'export KUBECTL_LOG="{klog}"; HELM_LOG="{hlog}"\n'
+                + self._LOUD_PRINTS
+                + 'print_error() { echo "ERR: $*"; }\n'
+                + self._helm(self._HEALTHY, {}, latest="{}")
+                + "refuse_apply_over_undeclared_scope kubeagents-system; echo \"scope rc=$?\"\n"
+                + 'echo "after scope: $(wc -l < "$KUBECTL_LOG") $(wc -l < "$HELM_LOG")"\n'
+                + "announce_platform_agent_mode_for_apply kubeagents-system next\n"
+                + 'echo "after notice: $(wc -l < "$KUBECTL_LOG") $(wc -l < "$HELM_LOG")"\n'
+                + "announce_platform_agent_mode_for_apply kubeagents-system next >/dev/null\n"
+                + 'echo "after second notice: $(wc -l < "$KUBECTL_LOG") $(wc -l < "$HELM_LOG")"\n',
+                kubectl_script=self._cr_kubectl(self._cr_list()),
+            )
+        out = proc.stdout
+        self.assertIn("scope rc=0", out, proc.stderr)
+        before = re.search(r"after scope: +(\d+) +(\d+)", out)
+        after = re.search(r"after notice: +(\d+) +(\d+)", out)
+        again = re.search(r"after second notice: +(\d+) +(\d+)", out)
+        self.assertIsNotNone(before, out)
+        self.assertEqual(before.groups(), after.groups(), out)
+        self.assertIn("WARN: This apply switches the install from spec.mode today to next", out)
+        self.assertGreater(int(again.group(1)), int(after.group(1)), out)
+
+    def test_the_notice_names_the_extra_helm_values_caveat(self):
+        for args in ("unset unset next", "unset next today"):
+            with self.subTest(args=args):
+                proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
+                self.assertIn("This compares PLATFORM_AGENT_MODE in install.env with the cluster.", proc.stdout)
+                self.assertIn("extra_helm_values wins over the key", proc.stdout)
+        proc = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied unset unset next harness")
+        self.assertIn("extra_helm_values wins over the key", proc.stdout)
+
+    def test_a_mode_switch_is_announced_from_what_the_cr_runs(self):
+        # record, live CR, key -> what the warning says.
+        for args, expect in (
+            # Installed today through the installer; the key now asks for next.
+            ("unset unset next", ("WARN: This apply switches the install from spec.mode today to next",
+                                  "renders the NATS bus and the A2A gateway", "Google Chat moves")),
+            # Installed next through the installer; the key now asks for today,
+            # which renders nothing and so removes the recorded field.
+            ("next next today", ("WARN: This apply switches the install from spec.mode next to today",
+                                 "retires the A2A stack", "set PLATFORM_AGENT_MODE=next in install.env")),
+            # A render that drops a recorded today removes the field from a CR
+            # patched to next since.
+            ("today next today", ("WARN: This apply switches the install from spec.mode next to today",)),
+        ):
+            with self.subTest(args=args):
+                proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
+                for line in expect:
+                    self.assertIn(line, proc.stdout)
+                self.assertIn("docs/designs/spec-mode-switch.md", proc.stdout)
+
+    def test_an_ungated_switch_does_not_offer_run_again(self):
+        # upgrade.sh's full arm, the menu's apply and install.sh -y apply with
+        # no confirmation after the notice: "run again" is not a way out there.
+        for args in ("next next today", "unset unset next"):
+            with self.subTest(args=args):
+                gated = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
+                self.assertIn("in install.env and run again.", gated.stdout)
+                ungated = self._run(
+                    f'{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args} "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"'
+                )
+                self.assertIn("WARN: This apply switches the install", ungated.stdout)
+                self.assertIn("This run applies it without asking first", ungated.stdout)
+                self.assertIn("stop it now (Ctrl-C)", ungated.stdout)
+                self.assertIn("./upgrade.sh --plan previews", ungated.stdout)
+                self.assertNotIn("run again", ungated.stdout)
+        # And through the front door's call, which passes its third argument on.
+        proc = self._announce(
+            self._cr_kubectl(self._cr_list()),
+            self._helm(self._HEALTHY, {}, latest="{}"),
+            call='announce_platform_agent_mode_for_apply kubeagents-system next "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"',
+        )
+        self.assertIn("This run applies it without asking first", proc.stdout, proc.stderr)
+
+    def test_a_re_apply_and_an_unread_install_are_silent(self):
+        for args in ("unset unset today", "next next next", "unset next next", '"" unset next', 'unset "" next'):
+            with self.subTest(args=args):
+                proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
+                self.assertEqual(proc.stdout, "")
+
+    def test_a_mode_set_by_hand_is_named_rather_than_announced_as_a_switch(self):
+        # The release renders the key already, so Helm sends no change and a
+        # mode set on the CR by hand stays: a CR patched to next under a
+        # record with no mode, and one patched back to today under a record
+        # of next (a rollback round trip's state).
+        for args, running, key in (("unset next today", "next", "today"), ("next today next", "today", "next"), ("next unset next", "today", "next")):
+            with self.subTest(args=args):
+                proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
+                self.assertNotIn("This apply switches", proc.stdout)
+                self.assertIn(
+                    f"WARN: install.env sets PLATFORM_AGENT_MODE={key}, but the PlatformAgent carries spec.mode {running}, set outside this installer",
+                    proc.stdout,
+                )
+
+    def test_a_retag_says_what_a_full_upgrade_would_do(self):
+        proc = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied unset unset next harness")
+        self.assertIn("WARN: install.env sets PLATFORM_AGENT_MODE=next, but this --upgrade-mode=harness run", proc.stdout)
+        self.assertIn("leaves it at spec.mode today", proc.stdout)
+        self.assertIn("A full upgrade applies the switch to next", proc.stdout)
+        # Quiet where a full upgrade would not move the CR either: the same
+        # mode, a hand-set mode the key cannot reach, or nothing read.
+        for args in ("next next next harness", "unset unset today operator", "unset next today harness", "next today next harness", '"" unset next operator', 'unset "" next operator'):
+            with self.subTest(args=args):
+                quiet = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied {args}")
+                self.assertEqual(quiet.stdout, "")
+
+    def test_the_retag_note_reads_the_record_from_the_retag_values(self):
+        # The values the retag re-applies are the record a later full upgrade
+        # diffs against, so they are passed in and helm is not asked again.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log = pathlib.Path(tmp.name) / "helm-must-not-run.log"
+        no_helm = self._no_helm(log)
+        for kubectl, values, key, expect in (
+            (self._cr_kubectl(self._cr_list()), "{}", "next", "WARN: install.env sets PLATFORM_AGENT_MODE=next, but this --upgrade-mode=harness run"),
+            (self._cr_kubectl(self._cr_list("next")), '{"platformAgent":{"mode":"next"}}', "next", None),
+            # The record decides here: a recorded next that the key drops is a
+            # switch a full upgrade makes; with no recorded mode it would make none.
+            (self._cr_kubectl(self._cr_list("next")), '{"platformAgent":{"mode":"next"}}', "today", "A full upgrade applies the switch to today"),
+            (self._cr_kubectl(self._cr_list("next")), "{}", "today", None),
+            (self._cr_kubectl(self._cr_list(present=False)), "{}", "next", None),
+            (self._cr_kubectl("", exit_code=1, stderr=self._UNREACHABLE), "{}", "next",
+             "INFO: Whether a full upgrade would switch spec.mode was not checked: the PlatformAgent in namespace 'kubeagents-system' could not be read (Unable to connect"),
+        ):
+            with self.subTest(values=values, key=key, kubectl=kubectl):
+                log.unlink(missing_ok=True)
+                proc = self._announce(
+                    kubectl, no_helm,
+                    call=f"note_platform_agent_mode_for_retag kubeagents-system {key} harness '{values}'",
+                )
+                self.assertFalse(log.exists(), log.read_text() if log.exists() else "")
+                if expect is None:
+                    self.assertEqual(proc.stdout, "", proc.stderr)
+                else:
+                    self.assertIn(expect, proc.stdout, proc.stderr)
 
     def test_tfvars_gvisor_on_autopilot_asks_for_runtime_class_only(self):
         # enable_gvisor_node_pool fails the plan on Autopilot, which ships the
@@ -2899,14 +3485,14 @@ class ToleratedProbesClearErrTrapTest(unittest.TestCase):
         (_INSTALLER_COMMON, 'response=$(trap - ERR; curl ', 1),
         (_INSTALLER_COMMON, 'image="$(trap - ERR; kubectl get deployment ', 1),
         (_INSTALLER_COMMON, 'status_json="$(trap - ERR; helm status ', 1),
-        (_INSTALLER_COMMON, 'history_json="$(trap - ERR; helm history ', 2),
+        (_INSTALLER_COMMON, 'history_json="$(trap - ERR; helm history ', 3),
         (_INSTALLER_COMMON, 'last_good_rev="$(trap - ERR; printf ', 1),
         (_INSTALLER_COMMON, 'out="$({ trap - ERR; kubectl get ', 1),
         (_GKE_DNS_ENDPOINT, 'described=$(trap - ERR; gcloud container clusters describe ', 1),
-        (_INSTALLER_COMMON, 'cr_json="$(trap - ERR; kubectl --context ', 1),
-        (_INSTALLER_COMMON, 'record_json="$(trap - ERR; helm get values ', 1),
-        (_INSTALLER_COMMON, 'served_rev="$(trap - ERR; helm history ', 1),
-        (_INSTALLER_COMMON, 'served_json="$(trap - ERR; helm get values ', 1),
+        (_INSTALLER_COMMON, 'PLATFORM_AGENT_CR_JSON="$(trap - ERR; kubectl --context ', 1),
+        (_INSTALLER_COMMON, 'PLATFORM_AGENT_RECORD_JSON="$(trap - ERR; helm get values ', 1),
+        (_INSTALLER_COMMON, 'served_rev="$(trap - ERR; printf ', 1),
+        (_INSTALLER_COMMON, 'PLATFORM_AGENT_SERVED_JSON="$(trap - ERR; helm get values ', 1),
         (_INSTALLER_COMMON, 'verdict="$(trap - ERR; printf ', 1),
     )
 
@@ -3150,7 +3736,10 @@ class PreApplyScopeCheckTest(unittest.TestCase):
             env = {"PROJECT_ID": "test-project", "CLUSTER_NAME": "test-cluster", "REGION": "us-central1",
                    "SCOPE_PROJECTS": "", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
                    "SCOPE_SHARED_VPC_HOSTS": "", "SCOPE_METRICS_SCOPES": "",
-                   "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
+                   "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": "",
+                   # Read as ${VAR:-} like the scope keys: a developer's exported
+                   # switch must not arm the declaration a case compares against.
+                   "SCOPED_SA_POOL_ENABLED": ""}
             env.update(keys or {})
             body = (
                 "set -u\n"
@@ -3242,6 +3831,60 @@ class PreApplyScopeCheckTest(unittest.TestCase):
                                                            "SCOPE_MAX_PROJECTS": "250"})
         self._assert_rc(proc, 1)
         self.assertIn('INFO:   SCOPE_MAX_PROJECTS=""', proc.stdout)
+
+    def test_an_armed_pool_alone_on_a_scope_less_cr_is_a_hand_edit(self):
+        # spec.security.scopedServiceAccountPool.enabled is part of the declaration the
+        # apply replaces: the generator writes scoped_pool_enabled from
+        # SCOPED_SA_POOL_ENABLED alone, false when the key is absent, so a live true
+        # the key does not record is disarmed by the next full apply -- its members
+        # destroyed and the broker put on the ambient credential. It is refused with
+        # the key among the lines, and an armed pool alone is not "nothing live to
+        # protect" even with no scope block beside it. The members list is derived
+        # from the scope, so only the switch is compared.
+        armed_only = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"security":{"scopedServiceAccountPool":'
+                      '{"enabled":true,"serviceAccounts":[{"projectId":"p2-project","serviceAccountEmail":"ka-x@p.iam.gserviceaccount.com"}]}}}}]}')
+        proc = self._run(armed_only, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_PROJECTS=""', proc.stdout)
+        self.assertIn('INFO:   SCOPED_SA_POOL_ENABLED="true"', proc.stdout)
+        self._assert_rc(self._run(armed_only, "norelease", keys={"SCOPED_SA_POOL_ENABLED": "true"}), 0)
+        self._assert_rc(self._run(armed_only, "norelease", keys={"SCOPED_SA_POOL_ENABLED": "yes"}), 0)
+        for label, disarmed in (
+            ("enabled false", armed_only.replace('"enabled":true', '"enabled":false')),
+            ("an empty pool block", '{"items":[{"metadata":{"name":"platform-agent"},"spec":{"security":{"scopedServiceAccountPool":{}}}}]}'),
+            ("no security block", '{"items":[{"metadata":{"name":"platform-agent"},"spec":{}}]}'),
+        ):
+            with self.subTest(case=label):
+                proc = self._run(disarmed, "norelease")
+                self._assert_rc(proc, 0)
+                self.assertNotIn("ERROR", proc.stdout)
+                self.assertNotIn("WARN", proc.stdout)
+
+    def test_an_armed_pool_beside_a_scope_is_a_hand_edit_until_the_key_records_it(self):
+        # The switch is weighed with the lists and the cap: a CR armed by hand beside a
+        # scope the record accounts for is refused on the switch alone, passes once the
+        # key records it, and passes when the record carries it (the installer armed it).
+        armed = _LIVE_SCOPE_CR.replace('"spec":{"scope"', '"spec":{"security":{"scopedServiceAccountPool":{"enabled":true}},"scope"')
+        record = ('{"platformAgent":{"scope":{"projects":["p2-project","p3-project"],"exclude":{"projects":[],'
+                  '"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}')
+        scope_keys = {"SCOPE_PROJECTS": "p2-project p3-project", "SCOPE_EXCLUDE_CLUSTERS": "p2-project/us-central1/c1"}
+        proc = self._run(armed, record)
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPED_SA_POOL_ENABLED="true"', proc.stdout)
+        self._assert_rc(self._run(armed, record, keys={**scope_keys, "SCOPED_SA_POOL_ENABLED": "true"}), 0)
+        armed_record = record.replace('{"platformAgent":{', '{"platformAgent":{"security":{"scopedServiceAccountPool":{"enabled":true}},')
+        self._assert_rc(self._run(armed, armed_record), 0)
+        # A record and keys that arm it beside a CR disarmed by hand refuse on the switch
+        # alone, and the line is blank: the lines never reproduce the false the apply
+        # would render, nor the true that was refused.
+        proc = self._run(_LIVE_SCOPE_CR, armed_record, keys={**scope_keys, "SCOPED_SA_POOL_ENABLED": "true"})
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPED_SA_POOL_ENABLED=""', proc.stdout)
+        # And the switch is among the lines of every refusal, blank when the live
+        # pool is off, beside the cap.
+        proc = self._run(_LIVE_SCOPE_CR, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPED_SA_POOL_ENABLED=""', proc.stdout)
 
     def test_a_scope_the_installer_wrote_may_be_changed_or_emptied(self):
         # L == R: the record shows the installer rendered it; the keys are the
@@ -3414,9 +4057,13 @@ class ScopeSelectorApisTest(unittest.TestCase):
     APIs the plan-time resolution of that selector reads is off (Resource
     Manager and Monitoring for a Metrics Scope, Compute for a Shared VPC host,
     the composition's own split), since the reads run in the plan and the
-    composition enables the APIs only in the apply that follows. Nothing is
-    called when they are on; a listing that fails enables every API the
-    declared selectors read; an enable that fails is a warning, not an abort."""
+    composition enables the APIs only in the apply that follows. The scoped
+    service account pool armed beside a folder or organisation counts as a
+    third kind: the plan lists the container's members through the Asset API,
+    so that API is enabled first too, with the pool's listing as the reason.
+    Nothing is called when they are on; a listing that fails enables every
+    API the declared selectors and the pool read; an enable that fails is a
+    warning, not an abort."""
 
     ALL = "cloudresourcemanager.googleapis.com monitoring.googleapis.com compute.googleapis.com"
 
@@ -3435,7 +4082,12 @@ class ScopeSelectorApisTest(unittest.TestCase):
                 "esac\nexit 1\n"
             )
             (bin_dir / "gcloud").chmod(0o755)
+            # Every key the helper reads is blanked here, the pool's switch and
+            # the container keys beside the selectors', so a developer's shell
+            # (`set -a; source install.env`) cannot arm the pool in a case that
+            # did not; each case sets its own.
             env = {"PROJECT_ID": "test-project", "SCOPE_SHARED_VPC_HOSTS": "", "SCOPE_METRICS_SCOPES": "",
+                   "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "", "SCOPED_SA_POOL_ENABLED": "",
                    "GCLOUD_LOG": str(log)}
             env.update(keys)
             body = (
@@ -3499,24 +4151,100 @@ class ScopeSelectorApisTest(unittest.TestCase):
         self.assertIn("WARN: Could not enable cloudresourcemanager.googleapis.com in project 'test-project'", proc.stdout)
         self.assertIn("gcloud services enable cloudresourcemanager.googleapis.com --project=test-project", proc.stdout)
 
+    # The scoped service account pool lists a declared folder's or
+    # organisation's members at plan time through the Asset API, which the
+    # composition enables only in the apply that follows, so the pool armed
+    # beside a container is the third reason the plan needs an API on first.
+    POOL_REASON = "lists the declared folder's or organisation's members for the scoped service account pool"
+
+    def test_the_pool_armed_beside_a_container_enables_the_asset_api_and_names_the_pool(self):
+        for keys in ({"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_FOLDERS": "123456789012"},
+                     {"SCOPED_SA_POOL_ENABLED": "yes", "SCOPE_ORGANIZATIONS": "987654321098"},
+                     {"SCOPED_SA_POOL_ENABLED": "True", "SCOPE_FOLDERS": " 123456789012, 123456789013 "}):
+            with self.subTest(keys=keys):
+                proc, calls = self._run(keys)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertEqual(calls, "services enable cloudasset.googleapis.com --project=test-project\n")
+                self.assertIn("INFO: Enabling cloudasset.googleapis.com in project 'test-project'", proc.stdout)
+                self.assertIn(self.POOL_REASON, proc.stdout)
+                self.assertNotIn("Shared VPC host", proc.stdout)
+
+    def test_the_pool_armed_beside_a_container_and_a_selector_enables_both_and_names_both(self):
+        proc, calls = self._run({"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_FOLDERS": "123456789012",
+                                 "SCOPE_SHARED_VPC_HOSTS": "shared-net-host"}, enabled="monitoring.googleapis.com")
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, "services enable compute.googleapis.com cloudasset.googleapis.com --project=test-project\n")
+        self.assertIn("INFO: Enabling compute.googleapis.com, cloudasset.googleapis.com in project 'test-project'", proc.stdout)
+        self.assertIn("Shared VPC host or Metrics Scope", proc.stdout)
+        self.assertIn(self.POOL_REASON, proc.stdout)
+
+    def test_the_pool_armed_beside_a_container_with_the_asset_api_on_calls_nothing(self):
+        proc, calls = self._run({"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_FOLDERS": "123456789012"},
+                                enabled="cloudasset.googleapis.com")
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, "")
+        self.assertNotIn("INFO", proc.stdout)
+
+    def test_a_listing_that_fails_with_the_pool_armed_beside_a_container_enables_the_asset_api(self):
+        proc, calls = self._run({"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_FOLDERS": "123456789012"}, list_fails=True)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, "services enable cloudasset.googleapis.com --project=test-project\n")
+        self.assertIn("could not be listed", proc.stdout)
+        self.assertIn(self.POOL_REASON, proc.stdout)
+
+    def test_the_pool_armed_without_a_container_calls_nothing(self):
+        # Explicit projects and selector members need no Asset read: the
+        # resolver lists a selector through its own API, and a project is
+        # named already.
+        for keys in ({"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_PROJECTS": "p2-project"},
+                     {"SCOPED_SA_POOL_ENABLED": "true"},
+                     {"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_FOLDERS": " , "}):
+            with self.subTest(keys=keys):
+                proc, calls = self._run(keys, list_fails=True)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertEqual(calls, "")
+                self.assertNotIn("INFO", proc.stdout)
+
+    def test_a_container_with_the_pool_off_calls_nothing(self):
+        # The composition enables the Asset API for the reconcile's container
+        # search in the apply; the plan reads nothing under a container unless
+        # the pool is armed, so there is nothing to enable first.
+        for keys in ({"SCOPED_SA_POOL_ENABLED": "false", "SCOPE_FOLDERS": "123456789012"},
+                     {"SCOPED_SA_POOL_ENABLED": "", "SCOPE_ORGANIZATIONS": "987654321098"},
+                     {"SCOPE_FOLDERS": "123456789012", "SCOPE_ORGANIZATIONS": "987654321098"}):
+            with self.subTest(keys=keys):
+                proc, calls = self._run(keys, list_fails=True)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertEqual(calls, "")
+                self.assertNotIn("INFO", proc.stdout)
+
 
 class ScopeContainerPreflightTest(unittest.TestCase):
     """check_scope_container_access: silent with no container; with one, the
     Asset API must be enabled in the host project or no effective policy may
     deny it, and the applying identity must hold setIamPolicy on every
-    container, asked through testIamPermissions. Every failure is named
-    before the refusal; a probe that cannot decide warns and lets the apply
-    speak; "warn" turns the refusal into a warning."""
+    container, asked through testIamPermissions, and, while the scoped
+    service account pool is armed, cloudasset.assets.searchAllResources there
+    too, since the plan lists the container's members for the pool. Every
+    failure is named before the refusal; a probe that cannot decide warns and
+    lets the apply speak; "warn" turns the refusal into a warning."""
 
     def _run(self, keys=None, mode="", api_enabled=True, policy=None, policy_error=False,
-             probe=None, token=True, curl_present=True, strict=False, env_extra=None, policy_garbage=False):
+             probe=None, token=True, curl_present=True, strict=False, env_extra=None, policy_garbage=False,
+             search_probe=None):
         """probe: a dict from resource ("folders/1") to what curl answers:
         "granted", "denied", "forbidden", "service-disabled", "missing",
-        "garbage", "down". The stubs record what they saw in a log the test
-        folds into proc.stderr: the bearer curl read from its stdin (-H @-),
-        the impersonation flag gcloud saw, the first bytes of a key file it
-        was pointed at, and any CLOUDSDK_AUTH_* override that reached it."""
+        "garbage", "down". search_probe: the same, answered only to a request
+        for the pool's cloudasset.assets.searchAllResources on that resource
+        ("granted" or "denied"); a resource absent from it answers from
+        probe, whose granted body holds setIamPolicy alone. The stubs record
+        what they saw in a log the test folds into proc.stderr: the bearer
+        curl read from its stdin (-H @-), every permission it was asked
+        (PROBED:<permission>), the impersonation flag gcloud saw, the first
+        bytes of a key file it was pointed at, and any CLOUDSDK_AUTH_*
+        override that reached it."""
         probe = probe or {}
+        search_probe = search_probe or {}
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
@@ -3547,6 +4275,12 @@ class ScopeContainerPreflightTest(unittest.TestCase):
             )
             if curl_present:
                 cases = []
+                # The request body (-d) precedes the URL on curl's argv, so a
+                # search case matches the permission then the resource, and
+                # sits before the resource-only cases.
+                for resource, answer in search_probe.items():
+                    body = {"granted": '{"permissions":["cloudasset.assets.searchAllResources"]}', "denied": "{}"}[answer]
+                    cases.append(f"  *\"cloudasset.assets.searchAllResources\"*\"/{resource}:testIamPermissions\"*) printf '%s\\n%s' '{body}' 200; exit 0 ;;")
                 for resource, answer in probe.items():
                     body, status = {
                         "granted": ('{"permissions":["%s"]}' % ("resourcemanager.folders.setIamPolicy" if resource.startswith("folders") else "resourcemanager.organizations.setIamPolicy"), 200),
@@ -3567,7 +4301,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                 (bin_dir / "curl").write_text(
                     "#!/usr/bin/env bash\n"
                     'case "$*" in *"Bearer "*) echo "TOKEN-ON-ARGV" >>"$SCOPE_PROBE_LOG"; exit 99 ;; esac\n'
-                    'for a in "$@"; do case "$a" in @-) echo "BEARER:$(sed -n \'s/^Authorization: Bearer //p\')" >>"$SCOPE_PROBE_LOG" ;; @*) echo "BEARER-FROM-FILE" >>"$SCOPE_PROBE_LOG" ;; esac; done\n'
+                    'for a in "$@"; do case "$a" in @-) echo "BEARER:$(sed -n \'s/^Authorization: Bearer //p\')" >>"$SCOPE_PROBE_LOG" ;; @*) echo "BEARER-FROM-FILE" >>"$SCOPE_PROBE_LOG" ;; "{\\"permissions\\""*) echo "PROBED:$(printf \'%s\' "$a" | sed \'s/.*\\["\\(.*\\)"\\].*/\\1/\')" >>"$SCOPE_PROBE_LOG" ;; esac; done\n'
                     "case \"$*\" in\n" + "\n".join(cases) + "\nesac\nexit 22\n")
             # env is an external binary whose argv any local user can read: the
             # stub records what it was handed, then hands over to the real one.
@@ -3587,7 +4321,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
             # gcloud's credential variables straight from the environment, so a
             # developer's shell must not reach them; each case sets its own.
             env = {"PROJECT_ID": "test-project", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
-                   "SCOPE_PROBE_LOG": str(probe_log)}
+                   "SCOPED_SA_POOL_ENABLED": "", "SCOPE_PROBE_LOG": str(probe_log)}
             env.update({name: "" for name in _GOOGLE_CREDENTIAL_VARIABLES})
             env.update(keys or {})
             env.update(env_extra or {})
@@ -3641,6 +4375,50 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         self.assertIn("INFO: Nothing was changed.", proc.stdout)
         # An organisation is always warned about, bindable or not.
         self.assertIn("WARN: SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation", proc.stdout)
+
+    def test_the_pool_armed_beside_a_folder_the_identity_cannot_search_names_the_viewer_role(self):
+        # The plan lists the folder's members for the pool, so setIamPolicy
+        # alone is not enough: the search permission is probed too, and a
+        # folder lacking it is reported with the role that grants it.
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012", "SCOPED_SA_POOL_ENABLED": "true"},
+                         probe={"folders/123456789012": "granted"},
+                         search_probe={"folders/123456789012": "denied"})
+        self._assert_rc(proc, 1)
+        self.assertIn("ERROR: Refusing to apply: the Application Default Credentials (the identity Terraform applies with) cannot list the members of folders/123456789012 (cloudasset.assets.searchAllResources)", proc.stdout)
+        self.assertIn("roles/cloudasset.viewer on the folder for that identity", proc.stdout)
+        self.assertIn("scoped service account pool", proc.stdout)
+        self.assertNotIn("cannot set IAM policy on folders/123456789012", proc.stdout)
+        self.assertIn("PROBED:resourcemanager.folders.setIamPolicy\n", proc.stderr)
+        self.assertIn("PROBED:cloudasset.assets.searchAllResources\n", proc.stderr)
+        # An organisation reads the same way, and the warn mode warns instead.
+        proc = self._run(keys={"SCOPE_ORGANIZATIONS": "987654321098", "SCOPED_SA_POOL_ENABLED": "yes"}, mode="warn",
+                         probe={"organizations/987654321098": "granted"},
+                         search_probe={"organizations/987654321098": "denied"})
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: An applying run would be refused: the Application Default Credentials (the identity Terraform applies with) cannot list the members of organizations/987654321098 (cloudasset.assets.searchAllResources)", proc.stdout)
+        self.assertIn("roles/cloudasset.viewer on the organisation for that identity", proc.stdout)
+
+    def test_the_pool_armed_beside_a_folder_the_identity_can_bind_and_search_passes_silently(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012", "SCOPED_SA_POOL_ENABLED": "true"},
+                         probe={"folders/123456789012": "granted"},
+                         search_probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("WARN", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+        self.assertIn("PROBED:cloudasset.assets.searchAllResources\n", proc.stderr)
+
+    def test_the_pool_off_never_probes_the_search_permission(self):
+        # With the pool off the plan reads no container, so the only
+        # permission asked is setIamPolicy, whatever the search probe would say.
+        for armed in ("false", ""):
+            with self.subTest(armed=armed):
+                proc = self._run(keys={"SCOPE_FOLDERS": "123456789012", "SCOPED_SA_POOL_ENABLED": armed},
+                                 probe={"folders/123456789012": "granted"},
+                                 search_probe={"folders/123456789012": "denied"})
+                self._assert_rc(proc, 0)
+                self.assertNotIn("ERROR", proc.stdout)
+                probed = [line for line in proc.stderr.splitlines() if line.startswith("PROBED:")]
+                self.assertEqual(["PROBED:resourcemanager.folders.setIamPolicy"], probed, proc.stderr)
 
     def test_the_probe_uses_the_credentials_the_provider_would(self):
         # GOOGLE_OAUTH_ACCESS_TOKEN as is; GOOGLE_IMPERSONATE_SERVICE_ACCOUNT
@@ -3890,6 +4668,571 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         self.assertIn("WARN: An applying run would be refused: the Application Default Credentials (the identity Terraform applies with) cannot set IAM policy on folders/123456789012", proc.stdout)
         self.assertNotIn("ERROR", proc.stdout)
 
+
+class ScopeExportSinkPreflightTest(unittest.TestCase):
+    """check_scope_export_sink_access: silent while the apply creates no drift
+    audit-log sink beyond the host (the detector off, no SCOPE_PROJECTS entry
+    past the host and the exclusions); otherwise the applying identity must
+    hold logging.sinks.create in every project the composition will list,
+    asked through testIamPermissions on the project. Every project that lacks
+    it is named before the refusal; a probe that cannot decide warns and lets
+    the apply speak; "warn" turns the refusal into a warning."""
+
+    def _run(self, keys=None, mode="", probe=None, token=True, curl_present=True, strict=False, env_extra=None, cwd=None,
+             state=None, state_unreadable=False, get_probe=None):
+        """probe: a dict from project ID to what curl answers for
+        projects/<id>:testIamPermissions: "granted", "denied", "forbidden",
+        "service-disabled", "scope-insufficient", "unauthenticated",
+        "missing", "garbage", "down". get_probe: the same, answered only to a
+        request for logging.sinks.get on that project ("granted" or
+        "denied"); a project absent from it answers from probe, whose granted
+        body holds sinks.create alone. cwd: where the check runs (the
+        repository root unless a case plants files to be globbed). state: the
+        Terraform state document `gcloud storage cat` answers with; None is
+        no state object, and state_unreadable a 5xx. The stubs record
+        what they saw in a log the test folds into proc.stderr: the bearer
+        curl read from its stdin, every permission it was asked
+        (PROBED:<permission>) and every resource (RESOURCE:<path>)."""
+        probe = probe or {}
+        get_probe = get_probe or {}
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            if state_unreadable:
+                state_case = '  *"storage cat"*) echo "ERROR: HTTPError 503: Service Unavailable" >&2; exit 1 ;;\n'
+            elif state is None:
+                state_case = '  *"storage cat"*) echo "ERROR: matched no objects" >&2; exit 1 ;;\n'
+            else:
+                state_case = f"  *\"storage cat\"*) printf '%s' '{state}'; exit 0 ;;\n"
+            (bin_dir / "gcloud").write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                + state_case
+                + ('  *"application-default print-access-token"*) echo "tok"; exit 0 ;;\n' if token else
+                   '  *"application-default print-access-token"*) exit 1 ;;\n')
+                + '  *"config get-value account"*) echo "tester@example.com"; exit 0 ;;\n'
+                + '  *"config get-value auth/impersonate_service_account"*) echo ""; exit 0 ;;\n'
+                + '  *"config get-value auth/access_token_file"*) echo ""; exit 0 ;;\n'
+                "esac\nexit 1\n"
+            )
+            if curl_present:
+                cases = []
+                # The request body (-d) precedes the URL on curl's argv, so a
+                # get case matches the permission then the project, and sits
+                # before the project-only cases.
+                for project, answer in get_probe.items():
+                    body = {"granted": '{"permissions":["logging.sinks.get"]}', "denied": "{}"}[answer]
+                    cases.append(f"  *\"logging.sinks.get\"*\"/projects/{project}:testIamPermissions\"*) printf '%s\\n%s' '{body}' 200; exit 0 ;;")
+                for project, answer in probe.items():
+                    body, status = {
+                        "granted": ('{"permissions":["logging.sinks.create"]}', 200),
+                        "denied": ("{}", 200),
+                        "forbidden": ('{"error":{"code":403,"status":"PERMISSION_DENIED"}}', 403),
+                        "service-disabled": ('{"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"reason":"SERVICE_DISABLED"}]}}', 403),
+                        "scope-insufficient": ('{"error":{"code":403,"message":"Request had insufficient authentication scopes.","status":"PERMISSION_DENIED","details":[{"reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}', 403),
+                        "unauthenticated": ('{"error":{"code":401,"status":"UNAUTHENTICATED"}}', 401),
+                        "missing": ('{"error":{"code":404}}', 404),
+                        "garbage": ("<html>", 200),
+                        "down": ("", None),
+                    }[answer]
+                    if status is None:
+                        cases.append(f'  *"/projects/{project}:testIamPermissions"*) exit 7 ;;')
+                    else:
+                        cases.append(f"  *\"/projects/{project}:testIamPermissions\"*) printf '%s\\n%s' '{body}' '{status}'; exit 0 ;;")
+                (bin_dir / "curl").write_text(
+                    "#!/usr/bin/env bash\n"
+                    'case "$*" in *"Bearer "*) echo "TOKEN-ON-ARGV" >>"$SCOPE_PROBE_LOG"; exit 99 ;; esac\n'
+                    'for a in "$@"; do case "$a" in @-) echo "BEARER:$(sed -n \'s/^Authorization: Bearer //p\')" >>"$SCOPE_PROBE_LOG" ;; "{\\"permissions\\""*) echo "PROBED:$(printf \'%s\' "$a" | sed \'s/.*\\["\\(.*\\)"\\].*/\\1/\')" >>"$SCOPE_PROBE_LOG" ;; https://*:testIamPermissions) echo "RESOURCE:${a#*/v3/}" >>"$SCOPE_PROBE_LOG" ;; esac; done\n'
+                    "case \"$*\" in\n" + "\n".join(cases) + "\nesac\nexit 22\n")
+            for stub in ("gcloud",) + (("curl",) if curl_present else ()):
+                path = bin_dir / stub
+                path.chmod(path.stat().st_mode | stat.S_IEXEC)
+            probe_log = pathlib.Path(tmp) / "probe.log"
+            probe_log.write_text("")
+            env = {"PROJECT_ID": "test-project", "CLUSTER_NAME": "test-cluster", "REGION": "us-central1",
+                   "SCOPE_PROJECTS": "", "SCOPE_EXCLUDE_PROJECTS": "",
+                   "ENABLE_DRIFT_DETECTOR": "", "TF_VAR_enable_drift_pubsub": "",
+                   "TF_VAR_drift_pubsub_source_exclude_projects": "", "SCOPE_PROBE_LOG": str(probe_log)}
+            env.update({name: "" for name in _GOOGLE_CREDENTIAL_VARIABLES})
+            env.update(keys or {})
+            env.update(env_extra or {})
+            # The strict call also reports a `set -f` the check left on, which
+            # would reach install.sh's main after the (Y/n/g) prompt.
+            call = (f'trap \'echo TRAP-FIRED\' ERR; set -eEo pipefail; check_scope_export_sink_access {mode}; echo "rc=$?"; case "$-" in *f*) echo noglob-left-on ;; esac\n'
+                    if strict else f'check_scope_export_sink_access {mode}; echo "rc=$?"\n')
+            body = (
+                "set -u\n"
+                'print_error() { echo "ERROR: $*"; }; print_info() { echo "INFO: $*"; }\n'
+                'print_warning() { echo "WARN: $*"; }; print_success() { :; }\n'
+                f'source "{_INSTALLER_COMMON}"\n'
+                + call
+            )
+            isolated = get_isolated_test_env(overrides=env, bin_dir=str(bin_dir))
+            if not curl_present:
+                tools = create_minimal_tools_bin(pathlib.Path(tmp) / "tools")
+                (tools / "python3").symlink_to(shutil.which("python3"))
+                isolated["PATH"] = f"{bin_dir}:{tools}"
+            proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True,
+                                  env=isolated, cwd=str(cwd or _REPO_ROOT))
+            proc.stderr += probe_log.read_text()
+            return proc
+
+    def _assert_rc(self, proc, rc):
+        self.assertIn(f"rc={rc}", proc.stdout, proc.stdout + proc.stderr)
+
+    def _probed(self, proc):
+        return [line for line in proc.stderr.splitlines() if line.startswith("RESOURCE:")]
+
+    def test_no_sink_beyond_the_host_is_silent_and_touches_nothing(self):
+        for label, keys in (
+            ("no scope", {}),
+            ("the host alone", {"SCOPE_PROJECTS": "test-project"}),
+            ("the detector off", {"SCOPE_PROJECTS": "a-prod", "ENABLE_DRIFT_DETECTOR": "false"}),
+            ("every project excluded exactly", {"SCOPE_PROJECTS": "a-prod, b-prod", "SCOPE_EXCLUDE_PROJECTS": "a-prod b-prod"}),
+            ("every project excluded by the composition's lever",
+             {"SCOPE_PROJECTS": "a-prod", "TF_VAR_drift_pubsub_source_exclude_projects": "a-prod"}),
+        ):
+            with self.subTest(label=label):
+                proc = self._run(keys=keys, token=False, probe={"a-prod": "denied", "b-prod": "denied"})
+                self._assert_rc(proc, 0)
+                self.assertEqual("rc=0\n", proc.stdout)
+                self.assertEqual([], self._probed(proc))
+
+    def test_the_set_probed_is_the_one_the_composition_lists(self):
+        # SCOPE_PROJECTS less the host, less an exact or glob
+        # SCOPE_EXCLUDE_PROJECTS match (the reconcile's fnmatch: * ? [seq]
+        # [!seq]), less TF_VAR_drift_pubsub_source_exclude_projects, once each.
+        proc = self._run(keys={"SCOPE_PROJECTS": "test-project a-prod b-sandbox c-stage d-stage a-prod e-dev1 e-dev2",
+                               "SCOPE_EXCLUDE_PROJECTS": "*-sandbox c-stage e-dev[!1]",
+                               "TF_VAR_drift_pubsub_source_exclude_projects": "d-stage"},
+                         probe={"a-prod": "granted", "e-dev1": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertEqual(["RESOURCE:projects/a-prod:testIamPermissions", "RESOURCE:projects/e-dev1:testIamPermissions"],
+                         self._probed(proc))
+        self.assertEqual(["PROBED:logging.sinks.create"] * 2,
+                         [line for line in proc.stderr.splitlines() if line.startswith("PROBED:")])
+        self.assertIn("BEARER:tok\n", proc.stderr)
+        self.assertNotIn("TOKEN-ON-ARGV", proc.stderr)
+        self.assertEqual("rc=0\n", proc.stdout)
+        # The detector off in install.env but the ingress on through its own
+        # TF_VAR_ line, which write_tfvars_from_state leaves in force: probed.
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod", "ENABLE_DRIFT_DETECTOR": "false", "TF_VAR_enable_drift_pubsub": "true"},
+                         probe={"a-prod": "granted"})
+        self.assertEqual(["RESOURCE:projects/a-prod:testIamPermissions"], self._probed(proc))
+
+    def test_every_project_without_the_grant_is_named_before_the_refusal(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod, b-prod c-prod"},
+                         probe={"a-prod": "denied", "b-prod": "granted", "c-prod": "missing"})
+        self._assert_rc(proc, 1)
+        self.assertIn("ERROR: Refusing to apply: the Application Default Credentials (the identity Terraform applies with) cannot create a Log Router sink in project 'a-prod' (logging.sinks.create), or the project is not visible to it; an apply that creates the project's drift audit-log sink would fail there", proc.stdout)
+        self.assertIn("Ask for roles/logging.configWriter in project 'a-prod' for that identity. A project that is to have no sink is added to TF_VAR_drift_pubsub_source_exclude_projects in install.env (it stays in the scope) or dropped from SCOPE_PROJECTS; removing a sink it already has needs the same role.", proc.stdout)
+        self.assertIn("cannot create a Log Router sink in project 'c-prod' (logging.sinks.create)", proc.stdout)
+        self.assertNotIn("'b-prod'", proc.stdout)
+        self.assertIn("INFO: Nothing was changed. Fix what is named above, or edit SCOPE_PROJECTS, SCOPE_EXCLUDE_PROJECTS or TF_VAR_drift_pubsub_source_exclude_projects in install.env, and re-run.", proc.stdout)
+        # A 403 that is a permission answer refuses too.
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, probe={"a-prod": "forbidden"})
+        self._assert_rc(proc, 1)
+        self.assertIn("cannot create a Log Router sink in project 'a-prod'", proc.stdout)
+
+    def test_warn_mode_names_the_failures_and_passes(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, mode="warn", probe={"a-prod": "denied"})
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: An applying run would be refused: the Application Default Credentials (the identity Terraform applies with) cannot create a Log Router sink in project 'a-prod' (logging.sinks.create)", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+
+    def test_an_undecided_probe_warns_and_lets_the_apply_speak(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": "garbage", "b-prod": "down"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("ERROR", proc.stdout)
+        self.assertIn("WARN: The scope export preflight could not decide whether the Application Default Credentials (the identity Terraform applies with) can create a Log Router sink in project 'a-prod' (Resource Manager answered 200 with a body that is not the JSON it documents); the apply will report it if it fails.", proc.stdout)
+        self.assertIn("in project 'b-prod' (the request to Resource Manager did not complete)", proc.stdout)
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, probe={"a-prod": "service-disabled"})
+        self._assert_rc(proc, 0)
+        self.assertIn("in project 'a-prod' (Resource Manager answered 403 for its API being off in the credentials' quota project", proc.stdout)
+        # No token, no curl: one warning for the set, naming the remedy.
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, token=False)
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: The scope export preflight could not decide whether the Application Default Credentials (the identity Terraform applies with) can create a Log Router sink in the scope's projects (gcloud could not mint an access token for them; run: gcloud auth application-default login)", proc.stdout)
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, curl_present=False)
+        self._assert_rc(proc, 0)
+        self.assertIn("can create a Log Router sink in the scope's projects (curl is not installed)", proc.stdout)
+        # The identity named is the one the provider would apply with.
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, probe={"a-prod": "denied"},
+                         env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "from-env"})
+        self._assert_rc(proc, 1)
+        self.assertIn("the identity behind GOOGLE_OAUTH_ACCESS_TOKEN (the identity Terraform applies with) cannot create a Log Router sink in project 'a-prod'", proc.stdout)
+        self.assertIn("BEARER:from-env\n", proc.stderr)
+
+    def test_a_request_that_did_not_complete_stops_the_probing_and_names_the_rest(self):
+        # One endpoint answers for every project and each request that does
+        # not complete waits the full timeout, so a scope of many projects
+        # must not wait once per project: the rest are undecided unasked, in
+        # one warning, and a project among them that would have been denied
+        # is not a refusal (the apply speaks).
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod c-prod d-prod"},
+                         probe={"a-prod": "granted", "b-prod": "down", "c-prod": "denied", "d-prod": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("ERROR", proc.stdout)
+        self.assertEqual(["RESOURCE:projects/a-prod:testIamPermissions", "RESOURCE:projects/b-prod:testIamPermissions"],
+                         self._probed(proc))
+        self.assertIn("in project 'b-prod' (the request to Resource Manager did not complete)", proc.stdout)
+        self.assertIn("WARN: The scope export preflight could not decide whether the Application Default Credentials (the identity Terraform applies with) can create a Log Router sink in c-prod d-prod (not asked: the answer above holds for every project); the apply will report it if it fails.", proc.stdout)
+        # The two 403s that are about the credentials, not the project, stop
+        # the probing the same way; a body that is not JSON is about that
+        # answer alone and does not.
+        for answer in ("scope-insufficient", "service-disabled", "unauthenticated"):
+            with self.subTest(answer=answer):
+                proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": answer, "b-prod": "denied"},
+                                 env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "narrow"})
+                self._assert_rc(proc, 0)
+                self.assertEqual(1, len(self._probed(proc)))
+                self.assertIn("in b-prod (not asked: the answer above holds for every project)", proc.stdout)
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": "garbage", "b-prod": "denied"})
+        self._assert_rc(proc, 1)
+        self.assertEqual(2, len(self._probed(proc)))
+
+    def test_a_denied_project_whose_sink_is_in_state_warns_instead_of_refusing(self):
+        # An install made by an owner and upgraded by a narrower identity: the
+        # sink exists, an apply that leaves it alone needs only
+        # logging.sinks.get, so the run goes ahead with a warning that names
+        # the role for a change that would recreate or remove the sink. The
+        # host's own sink, an instance for another project, and a resource
+        # with no instance are not that project's sink.
+        source_sink = {"module": "module.drift_pubsub[0]", "mode": "managed", "type": "google_logging_project_sink",
+                       "name": "source_drift_audit", "instances": [{"index_key": "a-prod", "attributes": {"id": "projects/a-prod/sinks/s"}}]}
+        host_sink = {"module": "module.drift_pubsub[0]", "mode": "managed", "type": "google_logging_project_sink",
+                     "name": "drift_audit", "instances": [{"attributes": {"id": "projects/test-project/sinks/s"}}]}
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": "denied", "b-prod": "granted"},
+                         get_probe={"a-prod": "granted"}, state=_state_doc([host_sink, source_sink]))
+        self._assert_rc(proc, 0)
+        self.assertNotIn("ERROR", proc.stdout)
+        self.assertIn("WARN: An apply that changes an existing sink would fail: the Application Default Credentials (the identity Terraform applies with) cannot create a Log Router sink in project 'a-prod' (logging.sinks.create), and this install's drift audit-log sink there is already in its Terraform state: an apply that leaves the sink as it is goes ahead, and one that changes it, which a release that moves the sink filter does, recreates it or removes it would fail there, after the host's resources and the other projects' sinks have changed. This run applies without a further prompt; to see which this apply is first, stop it and run upgrade.sh --plan, and ask for roles/logging.configWriter in project 'a-prod' for that identity before one that changes it.", proc.stdout)
+        # The sink's read was asked second, once, for the denied project alone.
+        self.assertEqual(["PROBED:logging.sinks.create", "PROBED:logging.sinks.get", "PROBED:logging.sinks.create"],
+                         [line for line in proc.stderr.splitlines() if line.startswith("PROBED:")])
+        # An identity that cannot read the sink either, or cannot see the
+        # project, is refused: the plan's read of the sink fails.
+        for answer in ("denied", "forbidden", "missing"):
+            with self.subTest(answer=answer):
+                proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, probe={"a-prod": answer},
+                                 get_probe={} if answer != "denied" else {"a-prod": "denied"}, state=_state_doc([source_sink]))
+                self._assert_rc(proc, 1)
+                self.assertIn("ERROR: Refusing to apply: the Application Default Credentials (the identity Terraform applies with) cannot read this install's drift audit-log sink in project 'a-prod' (logging.sinks.get), or the project is not visible to it, and cannot create one (logging.sinks.create); the plan reads the sink and would fail there", proc.stdout)
+                self.assertIn("or roles/logging.viewer there for an apply that leaves the sink as it is.", proc.stdout)
+        # Without that project's live instance the refusal stands: the host's
+        # sink alone, another project's instance, no instance, a tainted
+        # instance (the next apply replaces it), a deposed one (the next
+        # apply deletes it), no state, and a state that cannot be read (the
+        # apply would be refused by the lifecycle script in that case, so
+        # this is the safe side).
+        other = dict(source_sink, instances=[{"index_key": "c-prod", "attributes": {}}])
+        empty = dict(source_sink, instances=[])
+        tainted = dict(source_sink, instances=[dict(source_sink["instances"][0], status="tainted")])
+        deposed = dict(source_sink, instances=[dict(source_sink["instances"][0], deposed="00000001")])
+        for label, kwargs in (("host sink only", {"state": _state_doc([host_sink])}),
+                              ("another project", {"state": _state_doc([other])}),
+                              ("no instance", {"state": _state_doc([empty])}),
+                              ("tainted instance", {"state": _state_doc([tainted])}),
+                              ("deposed instance", {"state": _state_doc([deposed])}),
+                              ("no state", {}),
+                              ("unreadable state", {"state_unreadable": True})):
+            with self.subTest(label=label):
+                proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, probe={"a-prod": "denied"}, get_probe={"a-prod": "granted"}, **kwargs)
+                self._assert_rc(proc, 1)
+                self.assertIn("ERROR: Refusing to apply: the Application Default Credentials (the identity Terraform applies with) cannot create a Log Router sink in project 'a-prod'", proc.stdout)
+                self.assertNotIn("PROBED:logging.sinks.get", proc.stderr)
+        # The state is read once, and only on a denial.
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": "granted", "b-prod": "granted"},
+                         state_unreadable=True)
+        self._assert_rc(proc, 0)
+        self.assertEqual("rc=0\n", proc.stdout)
+        self.assertNotIn("Could not read the Terraform state", proc.stderr)
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": "denied", "b-prod": "denied"},
+                         state_unreadable=True)
+        self.assertEqual(1, proc.stderr.count("Could not read the Terraform state"), proc.stderr)
+        # Warn mode (upgrade.sh --plan): the plan that follows is the answer,
+        # so the warning points at it rather than at running --plan.
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, mode="warn", probe={"a-prod": "denied"},
+                         get_probe={"a-prod": "granted"}, state=_state_doc([source_sink]))
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: An apply that changes an existing sink would fail:", proc.stdout)
+        self.assertIn("The plan below shows which this apply is; ask for roles/logging.configWriter in project 'a-prod'", proc.stdout)
+        self.assertNotIn("run upgrade.sh --plan", proc.stdout)
+        self.assertNotIn("would be refused", proc.stdout)
+
+    def test_an_entry_with_a_glob_character_is_probed_verbatim_not_as_the_files_it_matches(self):
+        # The plan refuses such an entry; the preflight must not turn it into
+        # a filename from the working directory first.
+        with tempfile.TemporaryDirectory() as cwd:
+            (pathlib.Path(cwd) / "a-prodzz").write_text("")
+            proc = self._run(keys={"SCOPE_PROJECTS": "a-prod* b-prod"}, probe={"a-prod*": "granted", "b-prod": "granted"}, cwd=cwd)
+        self._assert_rc(proc, 0)
+        self.assertEqual(["RESOURCE:projects/a-prod*:testIamPermissions", "RESOURCE:projects/b-prod:testIamPermissions"],
+                         self._probed(proc))
+
+    def test_a_denied_probe_is_an_answer_under_the_front_doors_strict_shell(self):
+        # upgrade.sh --plan calls the check bare under set -eE with an ERR
+        # trap; a denied or undecided answer must reach the warning rather
+        # than abort the run, and a clean run is silent.
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, mode="warn", strict=True,
+                         probe={"a-prod": "denied", "b-prod": "down"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("TRAP-FIRED", proc.stdout + proc.stderr)
+        self.assertIn("WARN: An applying run would be refused: the Application Default Credentials (the identity Terraform applies with) cannot create a Log Router sink in project 'a-prod'", proc.stdout)
+        self.assertIn("can create a Log Router sink in project 'b-prod'", proc.stdout)
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, strict=True, probe={"a-prod": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertEqual("rc=0\n", proc.stdout)
+        # And no `set -f` leaks out of the probe loop or the set's derivation,
+        # on a clean run or one that stopped early.
+        for probe in ({"a-prod": "granted", "b-prod": "granted"}, {"a-prod": "down", "b-prod": "granted"}):
+            with self.subTest(probe=probe):
+                proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox"}, strict=True, probe=probe)
+                self._assert_rc(proc, 0)
+                self.assertNotIn("noglob-left-on", proc.stdout)
+
+
+class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
+    """refuse_next_slack_gateway_settings (#2812). Under spec.mode next with
+    Slack on and Google Chat off, the A2A gateway takes Slack
+    (a2aSlackArmed in k8s-operator), and three settings that the today path
+    accepts break it:
+
+    - an email in SLACK_ALLOWED_USERS matches nobody, because the list is
+      matched against member IDs exactly;
+    - a SLACK_HOME_CHANNEL that is not a channel id leaves the notify route
+      unarmed;
+    - a comma-separated SLACK_BOT_TOKEN list makes the Slack backend fail
+      at connect.
+
+    With Chat on too, Chat holds the gateway and Slack stays on the today
+    path, so nothing is refused."""
+
+    _DOC = "https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users"
+    _TOKEN = "xoxb-1-secretpart"
+
+    def _run(self, mode="next", slack="true", chat="false", allowlist="", home="", token="", flags=False, cwd=None):
+        args = " ".join(shlex.quote(a) for a in (mode, slack, chat, allowlist, home, token) + (("flags",) if flags else ()))
+        script = (
+            'print_info() { echo "INFO: $*"; }\n'
+            'print_success() { :; }\n'
+            'print_warning() { echo "WARN: $*"; }\n'
+            'print_error() { echo "ERROR: $*"; }\n'
+            f'source "{_INSTALLER_COMMON}"\n'
+            f'rc=0; refuse_next_slack_gateway_settings {args} || rc=$?; echo "rc=$rc"\n'
+            'case "$-" in *f*) echo "noglob-left-on" ;; esac\n'
+        )
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            env=get_isolated_test_env(), cwd=str(cwd or _REPO_ROOT),
+        )
+
+    def _passes(self, **kw):
+        proc = self._run(**kw)
+        self.assertEqual(proc.stdout, "rc=0\n", proc.stderr)
+
+    # ── the allowlist ──
+
+    def test_an_email_is_refused_and_named(self):
+        proc = self._run(allowlist="U0123ABCD,alice@example.com")
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=1", proc.stdout, out)
+        self.assertIn(
+            "ERROR: SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com. "
+            "Under spec.mode next the A2A gateway matches this allowlist against Slack member IDs "
+            "exactly (such as U0123ABCD), so an email matches nobody and the person it names "
+            "would be locked out after this apply.",
+            out,
+        )
+        self.assertIn(
+            "INFO: Find each person's member ID in Slack: open their profile, choose \u22ee (More), "
+            "then Copy member ID. Replace the emails with those IDs in install.env and run again. "
+            f"Slack app setup for next: {self._DOC}",
+            out,
+        )
+
+    def test_every_email_entry_is_named_after_the_allowlists_own_splitting(self):
+        # Commas and whitespace both separate, and empty items drop, the way
+        # hcl_csv_list renders the list into the tfvars.
+        proc = self._run(slack="True", allowlist=" U1 ,alice@example.com  bob@example.com,,\tW2 ")
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("look like emails: alice@example.com, bob@example.com. ", proc.stdout)
+
+    def test_install_sh_names_the_flags_too(self):
+        proc = self._run(allowlist="alice@example.com", home="D0DM", token="a,b", flags=True)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("in install.env or --slack-allowed-users and run again", proc.stdout)
+        self.assertIn("in install.env or --slack-home-channel and run again", proc.stdout)
+        self.assertIn("in install.env or --slack-bot-token and run again", proc.stdout)
+
+    def test_member_ids_pass(self):
+        for allowlist in ("U0123ABCD", "U0123ABCD, W0456EFGH", "U1 W2", ""):
+            with self.subTest(allowlist=allowlist):
+                self._passes(allowlist=allowlist)
+
+    def test_an_entry_is_never_expanded_against_the_working_directory(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            (pathlib.Path(cwd) / "x@example.com").write_text("")
+            proc = self._run(allowlist="*@example.com", cwd=cwd)
+        self.assertIn("look like emails: *@example.com. ", proc.stdout, proc.stderr)
+        self.assertNotIn("noglob-left-on", proc.stdout)
+
+    # ── the home channel ──
+
+    def test_the_home_channel_match_runs_in_the_c_locale(self):
+        # Under a legacy collation (glibc before 2.28) [A-Z] also matches
+        # lowercase, so the match must not use the caller's locale. This host
+        # may not collate that way, so the locale is pinned in the source as
+        # well as checked by behaviour.
+        text = _INSTALLER_COMMON.read_text()
+        body = re.search(r"^slack_home_channel_not_an_id\(\) \{\n(.*?)\n\}", text, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(body)
+        self.assertIsNotNone(re.search(r"^\s*local LC_ALL=C$", body.group(1), re.MULTILINE),
+                             "the match must run in the C locale")
+        for locale in ("en_US.UTF-8", "C"):
+            with self.subTest(locale=locale):
+                proc = subprocess.run(
+                    ["bash", "-c", f'source "{_INSTALLER_COMMON}"; export LC_ALL={locale}; '
+                     'echo "[$(slack_home_channel_not_an_id C0lower)] [$(slack_home_channel_not_an_id C0HOME)] LC_ALL=$LC_ALL"'],
+                    capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                )
+                self.assertIn(f"[C0lower] [] LC_ALL={locale}", proc.stdout, proc.stderr)
+
+    def test_a_home_channel_that_is_not_a_channel_id_is_refused_and_named(self):
+        for home in ("D0123ABCD", "U0123ABCD", "#ops", "general", "c0lower", "C0lower", "Gcore", "C", "C0HOME/1.2"):
+            with self.subTest(home=home):
+                proc = self._run(home=home)
+                out = proc.stdout + proc.stderr
+                self.assertIn("rc=1", proc.stdout, out)
+                self.assertIn(
+                    f"ERROR: SLACK_HOME_CHANNEL is '{home}', which is not a Slack channel id (C... or G...). "
+                    "Under spec.mode next the A2A gateway does not arm its notify route with it, so the "
+                    "agent's proactive posts and every board card's report back stop.",
+                    out,
+                )
+                self.assertIn(
+                    "INFO: Use the channel's id: in Slack, open the channel's details; the id is at the "
+                    "bottom of the About tab. Set it in install.env and run again.",
+                    out,
+                )
+
+    def test_a_channel_id_or_no_home_channel_passes(self):
+        for home in ("C0123ABCD", "G0123ABCD", " C0123ABCD ", "C01", ""):
+            with self.subTest(home=home):
+                self._passes(home=home)
+
+    # ── the bot token ──
+
+    def test_a_list_of_bot_tokens_is_refused_by_count_never_by_value(self):
+        for token, count in (("xoxb-1-secretpart,xoxb-2-secretpart", 2), ("xoxb-1-secretpart, xoxb-2-secretpart,xoxb-3-secretpart", 3)):
+            with self.subTest(count=count):
+                proc = self._run(token=token)
+                out = proc.stdout + proc.stderr
+                self.assertIn("rc=1", proc.stdout, out)
+                self.assertIn(
+                    f"ERROR: SLACK_BOT_TOKEN holds {count} tokens, a list for several workspaces. Under "
+                    "spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, "
+                    "and Slack refuses a list, so that backend retries without end and nothing answers on Slack.",
+                    out,
+                )
+                self.assertIn(
+                    "INFO: Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in install.env "
+                    "and run again, or keep this install on PLATFORM_AGENT_MODE=today.",
+                    out,
+                )
+                self.assertNotIn("secretpart", out)
+
+    def test_one_bot_token_or_none_passes(self):
+        for token in (self._TOKEN, f" {self._TOKEN} ", ""):
+            with self.subTest(token=token.replace("secretpart", "*")):
+                self._passes(token=token)
+
+    def test_one_token_with_a_stray_separator_is_refused(self):
+        # The legacy broker drops the empty piece; the gateway takes the
+        # value whole, and Slack refuses it.
+        for token in (f"{self._TOKEN},", f",{self._TOKEN}", f"{self._TOKEN},,", f"{self._TOKEN} ,"):
+            with self.subTest(token=token.replace("secretpart", "*")):
+                proc = self._run(token=token)
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn("SLACK_BOT_TOKEN holds one token with a comma or space left in it.", proc.stdout)
+                self.assertNotIn("secretpart", proc.stdout + proc.stderr)
+
+    # ── the three together, and when none applies ──
+
+    def test_every_failing_setting_is_reported_in_one_run(self):
+        proc = self._run(allowlist="alice@example.com", home="D0DM", token="a,b")
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        for said in ("look like emails: alice@example.com.", "SLACK_HOME_CHANNEL is 'D0DM'", "SLACK_BOT_TOKEN holds 2 tokens"):
+            self.assertIn(said, proc.stdout)
+
+    def test_warn_mode_names_every_setting_and_refuses_nothing(self):
+        # upgrade.sh --plan and install.sh --dry-run apply nothing, so they
+        # warn the way the scope check does.
+        args = " ".join(shlex.quote(a) for a in ("next", "true", "false", "alice@example.com", "D0DM", "a,b", "", "warn"))
+        script = (
+            'print_info() { echo "INFO: $*"; }\nprint_success() { :; }\n'
+            'print_warning() { echo "WARN: $*"; }\nprint_error() { echo "ERROR: $*"; }\n'
+            f'source "{_INSTALLER_COMMON}"\n'
+            f'rc=0; refuse_next_slack_gateway_settings {args} || rc=$?; echo "rc=$rc"\n'
+        )
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("ERROR:", proc.stdout)
+        for said in (
+            "WARN: An applying run would be refused: SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com.",
+            "WARN: An applying run would be refused: SLACK_HOME_CHANNEL is 'D0DM'",
+            "WARN: An applying run would be refused: SLACK_BOT_TOKEN holds 2 tokens",
+        ):
+            self.assertIn(said, proc.stdout)
+
+    def test_nothing_is_refused_unless_slack_moves_to_the_gateway(self):
+        bad = dict(allowlist="alice@example.com", home="D0DM", token="xoxb-a,xoxb-b")
+        for gate in (
+            dict(mode="today"),
+            dict(mode=""),
+            dict(slack="false"),
+            dict(slack=""),
+            dict(slack="no"),
+            # Chat holds the gateway; Slack stays on the today path.
+            dict(chat="true"),
+            dict(chat="True"),
+        ):
+            with self.subTest(**gate):
+                self._passes(**{**bad, **gate})
+
+
+class SlackHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
+    """The installer refuses a next switch whose SLACK_HOME_CHANNEL the A2A
+    gateway would not arm on (#2812). Its regex copies the gateway's
+    slackIsHomeChannelID and the operator's a2aSlackHomeChannel; this keeps
+    the copy from drifting in either direction (docs/README.md lists the
+    rule's three homes)."""
+
+    def _rule(self, path, func, var, min_const):
+        """The (prefix letters, minimum length) a Go copy of the rule holds,
+        read out of its source, with the alphabet of the rest pinned as
+        both copies spell it."""
+        go = (_REPO_ROOT / path).read_text()
+        min_len = re.search(rf"^\s*{min_const}\s*=\s*(\d+)\s*$", go, re.MULTILINE)
+        self.assertIsNotNone(min_len, f"{min_const} not found in {path}")
+        body = re.search(rf"func {func}\(.*?\n\}}\n", go, re.DOTALL)
+        self.assertIsNotNone(body, f"{func} not found in {path}")
+        letters = sorted(set(re.findall(rf"{re.escape(var)}\[0\] != '([A-Z])'", body.group(0))))
+        self.assertTrue(letters, f"no prefix letters read from {func}")
+        # The whole condition line, so a clause added on either side fails.
+        self.assertIn("\n\t\tif (r < 'A' || r > 'Z') && (r < '0' || r > '9') {\n", body.group(0))
+        return "".join(letters), int(min_len.group(1))
+
+    def test_the_regex_is_the_gateways_rule_and_the_operators(self):
+        shell = (_REPO_ROOT / "scripts/installer/installer_common.sh").read_text()
+        regex = re.search(r"^readonly SLACK_HOME_CHANNEL_ID_RE='([^']+)'$", shell, re.MULTILINE)
+        self.assertIsNotNone(regex, "SLACK_HOME_CHANNEL_ID_RE not found")
+        gateway = self._rule("a2a/gateway/slack.go", "slackIsHomeChannelID", "id", "slackMinChannelIDLen")
+        operator = self._rule("k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+                              "a2aSlackHomeChannel", "home", "a2aSlackMinChannelIDLen")
+        self.assertEqual(gateway, operator, "the gateway's and the operator's rules differ")
+        letters, min_len = gateway
+        self.assertEqual(regex.group(1), f"^[{letters}][A-Z0-9]{{{min_len - 1},}}$")
 
 if __name__ == "__main__":
     unittest.main()

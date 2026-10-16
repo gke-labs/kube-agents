@@ -1,12 +1,16 @@
 """The chart renders a PodMonitoring for each of the agent's pods that serves metrics.
 
-Two today: the gateway pod, where the k8s-event-watcher serves its metrics on the
-agent-api-auth sidecar, and the credential-proxy pod, where the broker serves its
-own on a metrics-only listener. For each, three things have to agree for the
-scrape to work: the port the operator declares on the container, the number in
-the PodMonitoring, and the labels the operator puts on the pod. The chart cannot
-read the operator, so the structural tests hold the template to the operator's
-golden manifest instead. Whether they render at all follows the cluster by
+Three today: the gateway pod, where the k8s-event-watcher serves its metrics on the
+agent-api-auth sidecar; the credential-proxy pod, where the broker serves its
+own on a metrics-only listener; and the A2A gateway pod a `spec.mode: next`
+install runs, which serves its own on a metrics-only listener too. For each,
+three things have to agree for the scrape to work: the port the operator
+declares on the container, the number in the PodMonitoring, and the labels the
+operator puts on the pod. The chart cannot read the operator, so the structural
+tests hold the template to the operator's golden manifest instead. No golden
+renders mode next, so the A2A gateway's row is held to the rendered A2A
+ingress fixture (k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml).
+Whether they render at all follows the cluster by
 default: helm template has no cluster, so the render tests hand it the
 PodMonitoring API with --api-versions where they mean a cluster that serves it.
 The render tests need a helm binary, which the agent-startup job lacks.
@@ -31,6 +35,9 @@ _GOLDEN = (
     _REPO_ROOT / "k8s-operator" / "internal" / "testing" / "testdata" / "platform" / "expected" / "platformagent.yaml"
 )
 _KIND_UP = _REPO_ROOT / "hack" / "kind-up.sh"
+_A2A_FIXTURE = (
+    _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "testdata" / "a2a-gateway-ingress.yaml"
+)
 _REQUIRED = [
     "--set", "platformAgent.harness.clusterName=ci-cluster",
     "--set", "platformAgent.harness.location=us-central1",
@@ -47,8 +54,8 @@ _GATE = '{{- if and .Values.platformAgent.enabled (include "kube-agents.platform
 # One row per scraped pod: the PodMonitoring name suffix, the Deployment and
 # container the golden declares the port on, the port's name there, and the
 # keys of the pod labels the selector has to carry. The values come from the
-# golden, so a label the operator moves fails this test until the template
-# follows.
+# golden or fixture, so a label the operator moves fails this test until the
+# template follows.
 _SCRAPES = (
     {
         "suffix": "-gateway-monitoring",
@@ -57,6 +64,19 @@ _SCRAPES = (
         "port_name": "event-metrics",
         "selector_keys": ("app",),
     },
+    # The chat listener's own PodMonitoring: the chat_metrics plugin on the
+    # platform-agent container, scraped on the leader alone.
+    {
+        # Selects the leader label as well: the chat listener runs on the leader
+        # alone above one replica, and the golden renders one replica, where the
+        # operator puts the label on the template, so the key is read from the
+        # golden like the others.
+        "suffix": "-gateway-chat-monitoring",
+        "deployment": "platformagent-gateway",
+        "container": "platform-agent",
+        "port_name": "chat-metrics",
+        "selector_keys": ("app", "kubeagents.io/is-leader"),
+    },
     {
         "suffix": "-credential-proxy-monitoring",
         "deployment": "platformagent-credential-proxy",
@@ -64,12 +84,29 @@ _SCRAPES = (
         "port_name": "cred-metrics",
         "selector_keys": ("app", "kubeagents.x-k8s.io/component"),
     },
+    # Read from the rendered A2A ingress fixture rather than the golden (see
+    # the module docstring).
+    {
+        "suffix": "-a2a-gateway-monitoring",
+        "fixture": _A2A_FIXTURE,
+        "agent_name": "test-agent",
+        "deployment": "test-agent-a2a-gateway",
+        "container": "gateway",
+        "port_name": "a2a-metrics",
+        "selector_keys": ("app",),
+    },
 )
 
 
-def _golden_port(deployment, container, port_name):
-    """The named containerPort the operator declares, read from the golden render."""
-    for document in yaml.safe_load_all(_GOLDEN.read_text()):
+def _scrape_port(scrape):
+    """The port a row's PodMonitoring has to scrape, from the golden or the A2A fixture."""
+    fixture = scrape.get("fixture", _GOLDEN)
+    return _manifest_port(fixture, scrape["deployment"], scrape["container"], scrape["port_name"])
+
+
+def _manifest_port(fixture, deployment, container, port_name):
+    """The named containerPort the operator declares, read from the golden or fixture render."""
+    for document in yaml.safe_load_all(fixture.read_text()):
         if not isinstance(document, dict) or document.get("kind") != "Deployment":
             continue
         if document["metadata"]["name"] != deployment:
@@ -81,22 +118,34 @@ def _golden_port(deployment, container, port_name):
             for port in candidate.get("ports", []):
                 if port["name"] == port_name:
                     return port["containerPort"]
-    raise AssertionError(f"no {port_name} port on {deployment}/{container} in {_GOLDEN}")
+    raise AssertionError(f"no {port_name} port on {deployment}/{container} in {fixture}")
 
 
-def _golden_pod_labels(deployment):
-    """The pod-template labels the operator puts on the named Deployment, from the golden."""
-    for document in yaml.safe_load_all(_GOLDEN.read_text()):
+def _manifest_pod_labels(fixture, deployment):
+    """The pod-template labels the operator puts on the named Deployment, from the golden or fixture."""
+    for document in yaml.safe_load_all(fixture.read_text()):
         if isinstance(document, dict) and document.get("kind") == "Deployment" and document["metadata"]["name"] == deployment:
             return document["spec"]["template"]["metadata"]["labels"]
-    raise AssertionError(f"no Deployment {deployment} in {_GOLDEN}")
+    raise AssertionError(f"no Deployment {deployment} in {fixture}")
 
 
 def _selector(scrape, name):
-    """The selector the PodMonitoring has to carry for agent `name`: the golden's
-    values for the keys the row names, with the golden's agent name replaced."""
-    labels = _golden_pod_labels(scrape["deployment"])
-    return {key: labels[key].replace(_GOLDEN_AGENT, name) for key in scrape["selector_keys"]}
+    """The selector the PodMonitoring has to carry for agent `name`: the manifest's
+    values for the keys the row names, with the manifest's agent name replaced."""
+    fixture = scrape.get("fixture", _GOLDEN)
+    agent_name = scrape.get("agent_name", _GOLDEN_AGENT)
+    labels = _manifest_pod_labels(fixture, scrape["deployment"])
+    return {key: labels[key].replace(agent_name, name) for key in scrape["selector_keys"]}
+
+
+def _reads_as_non_string(value):
+    """Whether YAML would read the bare value as something other than a string
+    (true, 1, null), which matchLabels, a map of strings, cannot carry unquoted.
+    A value YAML cannot parse at all (a Go template) is a string."""
+    try:
+        return not isinstance(yaml.safe_load(value), str)
+    except yaml.YAMLError:
+        return False
 
 
 class MonitoringShapeTest(unittest.TestCase):
@@ -122,14 +171,20 @@ class MonitoringShapeTest(unittest.TestCase):
         ports = re.findall(r"^\s+- port: (\d+)$", self.template, re.MULTILINE)
         self.assertEqual(
             ports,
-            [str(_golden_port(s["deployment"], s["container"], s["port_name"])) for s in _SCRAPES],
+            [str(_scrape_port(s)) for s in _SCRAPES],
         )
 
     def test_the_selectors_are_the_operators_pod_labels(self):
         for scrape in _SCRAPES:
             with self.subTest(scrape=scrape["suffix"]):
                 for key, value in _selector(scrape, "{{ .Values.platformAgent.name }}").items():
-                    self.assertIn(f"{key}: {value}", self.template)
+                    # A value YAML would read as anything but a string (the
+                    # leader label's "true") must be quoted in the template:
+                    # matchLabels is map[string]string and the apiserver
+                    # rejects a boolean. A plain value must not be, so the
+                    # check is for the one spelling the value requires.
+                    spelled = f'{key}: "{value}"' if _reads_as_non_string(value) else f"{key}: {value}"
+                    self.assertIn(spelled, self.template)
 
     def test_the_gate_asks_the_helper_and_the_helper_asks_the_cluster(self):
         self.assertIn(_GATE, self.template)
@@ -166,23 +221,26 @@ class MonitoringRenderTest(unittest.TestCase):
         # CRD still does not. With the API served, one per scraped pod.
         self.assertEqual(self._monitorings(), {})
         rendered = self._monitorings(*_ON_GKE)
-        self.assertEqual(sorted(rendered), sorted(_AGENT + s["suffix"] for s in _SCRAPES))
-        for scrape in _SCRAPES:
-            with self.subTest(scrape=scrape["suffix"]):
-                monitoring = rendered[_AGENT + scrape["suffix"]]
-                self.assertEqual(monitoring["spec"]["selector"], {"matchLabels": _selector(scrape, _AGENT)})
+        self.assertEqual(sorted(rendered), sorted({_AGENT + s["suffix"] for s in _SCRAPES}))
+        # One PodMonitoring per suffix; its endpoints are the rows that share the
+        # suffix, in _SCRAPES order (one each today).
+        for suffix in dict.fromkeys(s["suffix"] for s in _SCRAPES):
+            rows = [s for s in _SCRAPES if s["suffix"] == suffix]
+            with self.subTest(scrape=suffix):
+                monitoring = rendered[_AGENT + suffix]
+                self.assertEqual(monitoring["spec"]["selector"], {"matchLabels": _selector(rows[0], _AGENT)})
                 self.assertEqual(
                     monitoring["spec"]["endpoints"],
                     [{
-                        "port": _golden_port(scrape["deployment"], scrape["container"], scrape["port_name"]),
+                        "port": _scrape_port(row),
                         "path": "/metrics",
                         "interval": "30s",
-                    }],
+                    } for row in rows],
                 )
 
     def test_the_names_and_selectors_follow_the_agent_name(self):
         rendered = self._monitorings(*_ON_GKE, "--set", "platformAgent.name=custom")
-        self.assertEqual(sorted(rendered), sorted("custom" + s["suffix"] for s in _SCRAPES))
+        self.assertEqual(sorted(rendered), sorted({"custom" + s["suffix"] for s in _SCRAPES}))
         for scrape in _SCRAPES:
             with self.subTest(scrape=scrape["suffix"]):
                 self.assertEqual(
@@ -192,7 +250,7 @@ class MonitoringRenderTest(unittest.TestCase):
 
     def test_true_renders_them_without_asking_the_cluster(self):
         rendered = self._monitorings("--set", "platformAgent.podMonitoring=true")
-        self.assertEqual(sorted(rendered), sorted(_AGENT + s["suffix"] for s in _SCRAPES))
+        self.assertEqual(sorted(rendered), sorted({_AGENT + s["suffix"] for s in _SCRAPES}))
 
     def test_false_renders_nothing_even_where_the_api_is_served(self):
         self.assertEqual(self._monitorings(*_ON_GKE, "--set", "platformAgent.podMonitoring=false"), {})

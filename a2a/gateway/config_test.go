@@ -35,15 +35,23 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_FIRST_EVENT_GRACE", "")
 	t.Setenv("A2A_OWNER_DEPLOYMENT", "")
 	t.Setenv("A2A_MAX_SESSIONS", "")
+	t.Setenv("A2A_DELEGATION_DEPTH_MAX", "")
+	t.Setenv("A2A_BUSY_NOTICE_AT", "")
 	t.Setenv("A2A_IDLE_TTL", "")
 	t.Setenv("A2A_GCHAT_RELAY_URL", "")
 	t.Setenv("A2A_GCHAT_TOKEN_PATH", "")
 	t.Setenv("A2A_GCHAT_ALLOWED_USERS", "")
 	t.Setenv("A2A_GCHAT_ALLOW_ALL_USERS", "")
+	t.Setenv("A2A_SLACK_ALLOWED_USERS", "")
+	t.Setenv("A2A_SLACK_ALLOW_ALL_USERS", "")
 	t.Setenv("A2A_CHAT_DISPLAY_MODE", "")
 	t.Setenv("A2A_INJECT_LISTEN", "")
 	t.Setenv("A2A_INJECT_TOKEN", "")
 	t.Setenv("A2A_INJECT_PRINCIPAL_MAP", "")
+	t.Setenv("A2A_DOOR_LISTEN", "")
+	t.Setenv("A2A_DOOR_TOKEN", "")
+	t.Setenv("A2A_DOOR_PRINCIPAL_MAP", "")
+	t.Setenv("A2A_DOOR_PUBLIC_URL", "")
 }
 
 // TestFromEnvSaltPrecedence: the salt is SESSION_KV_SALT, the one the
@@ -547,6 +555,78 @@ func TestFromEnvGchatBackendSelection(t *testing.T) {
 	}
 }
 
+// TestFromEnvSlackAllowlist: the Slack backend carries its allowlist the way
+// gchat does (TestFromEnvGchatBackendSelection): split on commas, trimmed,
+// empties dropped, case preserved (Slack member ids compare exactly), and
+// allow-all off unless stated.
+func TestFromEnvSlackAllowlist(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-1")
+	t.Setenv("SLACK_APP_TOKEN", "xapp-1")
+	t.Setenv("A2A_SLACK_ALLOWED_USERS", "U1, u2 ,")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.SlackAllowedUsers) != 2 || cfg.SlackAllowedUsers[0] != "U1" || cfg.SlackAllowedUsers[1] != "u2" {
+		t.Fatalf("allowed users = %v", cfg.SlackAllowedUsers)
+	}
+	if cfg.SlackAllowAllUsers {
+		t.Fatal("allow-all must be off unless stated")
+	}
+	t.Setenv("A2A_SLACK_ALLOW_ALL_USERS", "true")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.SlackAllowAllUsers {
+		t.Fatal("A2A_SLACK_ALLOW_ALL_USERS=true not honored")
+	}
+}
+
+// TestFromEnvSlackTokensStripLikeTheBroker: the broker reads the same Secret
+// keys with Python's str.strip() (credential_proxy.py, SLACK_BOT_TOKEN and
+// SLACK_APP_TOKEN), so a value with a trailing newline (a Secret made with
+// --from-file, or an `echo` without -n) worked under `today`. The gateway
+// strips the same set and nothing else: the separators U+001C-U+001F that
+// Python counts as whitespace and Go's unicode.IsSpace does not, and no
+// comma handling (a list stays one token, which auth.test then refuses).
+func TestFromEnvSlackTokensStripLikeTheBroker(t *testing.T) {
+	for _, tc := range []struct {
+		name, bot, app, wantBot, wantApp string
+	}{
+		{"trailing newline", "xoxb-1\n", "xapp-1\n", "xoxb-1", "xapp-1"},
+		{"trailing space", "xoxb-1 ", "xapp-1 ", "xoxb-1", "xapp-1"},
+		{"surrounding mixed", " \txoxb-1\r\n", "\u00a0xapp-1\u3000", "xoxb-1", "xapp-1"},
+		{"python-only separators", "\x1cxoxb-1\x1f", "xapp-1\x1d\x1e", "xoxb-1", "xapp-1"},
+		{"inner text untouched", "xoxb-A, xoxb-B\n", "xapp-1", "xoxb-A, xoxb-B", "xapp-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv("DISCORD_TOKEN", "")
+			t.Setenv("SLACK_BOT_TOKEN", tc.bot)
+			t.Setenv("SLACK_APP_TOKEN", tc.app)
+			cfg, err := FromEnv()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.SlackBotToken != tc.wantBot || cfg.SlackAppToken != tc.wantApp {
+				t.Fatalf("tokens = %q, %q; want %q, %q", cfg.SlackBotToken, cfg.SlackAppToken, tc.wantBot, tc.wantApp)
+			}
+		})
+	}
+	// A whitespace-only value strips to empty, as the broker's does, so it
+	// counts as unset: half a pair is refused rather than armed.
+	setBaseEnv(t)
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-1")
+	t.Setenv("SLACK_APP_TOKEN", " \n")
+	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "arm Slack together") {
+		t.Fatalf("whitespace-only app token: err = %v, want the half-pair refusal", err)
+	}
+}
+
 // TestFromEnvInjectDoorArmsOnItsOwn: the door alone is enough for the gateway
 // to start, which is what makes it the answer for an eval install (#1660) --
 // a gateway with no ingress at all crash-loops, so a `mode: next` install
@@ -870,5 +950,37 @@ func TestAMalformedPodNamespaceIsAGatewayBootFailure(t *testing.T) {
 					tc.namespace, tc.scope, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestDelegationDepthMaxFromEnv: unset means 3; a value below 1 or a
+// non-integer refuses the boot, the way A2A_MAX_SESSIONS does, rather than
+// quietly clamping a typo into a different bound.
+func TestDelegationDepthMaxFromEnv(t *testing.T) {
+	setBaseEnv(t)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DelegationDepthMax != 3 {
+		t.Fatalf("default DelegationDepthMax = %d, want 3", cfg.DelegationDepthMax)
+	}
+
+	t.Setenv("A2A_DELEGATION_DEPTH_MAX", "5")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DelegationDepthMax != 5 {
+		t.Fatalf("DelegationDepthMax = %d, want 5", cfg.DelegationDepthMax)
+	}
+
+	for _, bad := range []string{"0", "-1", "junk"} {
+		t.Setenv("A2A_DELEGATION_DEPTH_MAX", bad)
+		if _, err := FromEnv(); err == nil {
+			t.Fatalf("A2A_DELEGATION_DEPTH_MAX=%q accepted", bad)
+		} else if !strings.Contains(err.Error(), "A2A_DELEGATION_DEPTH_MAX") {
+			t.Fatalf("A2A_DELEGATION_DEPTH_MAX=%q: error %q does not name the variable", bad, err)
+		}
 	}
 }

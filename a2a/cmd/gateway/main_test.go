@@ -1,18 +1,29 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/gateway"
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // startTestServerReadyTimeout bounds how long a test waits for the embedded
@@ -23,6 +34,22 @@ const startTestServerReadyTimeout = 10 * time.Second
 // dials once with no retry-on-failed-connect, so a refused port fails the
 // dial immediately rather than waiting out a timeout.
 const unreachableNATSURL = "nats://127.0.0.1:1"
+
+// TestMain clears every door knob for the package: the cases below pin what
+// changes which FromEnv error fires, and a developer's exported door pair
+// (what running the gateway locally with a door needs) would otherwise skip
+// the "no chat backend" refusal or add a token refusal before the dial. One
+// place, so the next knob cannot reopen this per test.
+func TestMain(m *testing.M) {
+	for _, k := range []string{
+		"A2A_DOOR_LISTEN", "A2A_DOOR_TOKEN", "A2A_DOOR_PRINCIPAL_MAP", "A2A_DOOR_PUBLIC_URL",
+		"A2A_INJECT_LISTEN", "A2A_INJECT_TOKEN", "A2A_INJECT_PRINCIPAL_MAP",
+		"A2A_SPAWN_SESSIONS", "A2A_SESSION_SERVICE_ACCOUNT", "A2A_DEFAULT_ADDRESSEE",
+	} {
+		os.Unsetenv(k)
+	}
+	os.Exit(m.Run())
+}
 
 // realMain's first call is gateway.FromEnv, and every case below is refused
 // there, so none of them dials NATS. Each case pins A2A_CHAT_DISPLAY_MODE to
@@ -172,13 +199,22 @@ func TestRunExitsNonZeroOnConfigError(t *testing.T) {
 // startTestServer starts an embedded, no-auth nats-server on a random port
 // for buildAdapters tests that need a real bus but no gateway config.
 func startTestServer(t *testing.T) *natsserver.Server {
+	return startTestServerWithOptions(t, false)
+}
+
+func startJetStreamTestServer(t *testing.T) *natsserver.Server {
+	return startTestServerWithOptions(t, true)
+}
+
+func startTestServerWithOptions(t *testing.T, jetStream bool) *natsserver.Server {
 	t.Helper()
 	opts := &natsserver.Options{
-		Host:     "127.0.0.1",
-		Port:     -1,
-		NoLog:    true,
-		NoSigs:   true,
-		StoreDir: t.TempDir(),
+		Host:      "127.0.0.1",
+		Port:      -1,
+		JetStream: jetStream,
+		NoLog:     true,
+		NoSigs:    true,
+		StoreDir:  t.TempDir(),
 	}
 	s, err := natsserver.NewServer(opts)
 	if err != nil {
@@ -213,6 +249,14 @@ func (f *fakePrimary) Edit(conversation, messageID, text string) error {
 	return nil
 }
 
+func (f *fakePrimary) PostMessage(conversation string, m gateway.OutMessage) (string, error) {
+	return f.Post(conversation, m.Text)
+}
+
+func (f *fakePrimary) EditMessage(conversation, messageID string, m gateway.OutMessage) error {
+	return nil
+}
+
 func (f *fakePrimary) Roster(conversation string) ([]string, bool, error) {
 	return nil, true, nil
 }
@@ -220,6 +264,9 @@ func (f *fakePrimary) Roster(conversation string) ([]string, bool, error) {
 func (f *fakePrimary) OpenDirect(userID string) (string, error) {
 	return "", nil
 }
+
+func (f *fakePrimary) React(string, string, string) error          { return nil }
+func (f *fakePrimary) RemoveReaction(string, string, string) error { return nil }
 
 // TestBuildAdaptersIncludesTheConsole proves buildAdapters wires both the
 // configured chat backend and the console adapter behind one mux: a post to
@@ -256,6 +303,8 @@ func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
 	}{
 		{"beside discord", &gateway.Config{NATSURL: s.ClientURL(), DiscordToken: "x", InjectListen: "127.0.0.1:0", InjectToken: "token"}, newFakePrimary()},
 		{"inject only", &gateway.Config{NATSURL: s.ClientURL(), InjectListen: "127.0.0.1:0", InjectToken: "token"}, nil},
+		{"both doors beside discord", &gateway.Config{NATSURL: s.ClientURL(), DiscordToken: "x", InjectListen: "127.0.0.1:0", InjectToken: "token", A2ADoorListen: "127.0.0.1:0", A2ADoorToken: "token"}, newFakePrimary()},
+		{"both doors alone", &gateway.Config{NATSURL: s.ClientURL(), InjectListen: "127.0.0.1:0", InjectToken: "token", A2ADoorListen: "127.0.0.1:0", A2ADoorToken: "token"}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			door, err := gateway.NewInjectAdapter(tc.cfg.InjectListen, tc.cfg.InjectToken, time.Second, slog.Default())
@@ -266,7 +315,15 @@ func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
 			if tc.primary != nil {
 				primary = tc.primary
 			}
-			a, err := composeAdapters(tc.cfg, primary, door, nil, slog.Default())
+			doors := []gateway.DoorSpec{gateway.InjectDoorSpec(door)}
+			if tc.cfg.A2ADoorArmed() {
+				a2a, err := gateway.NewA2ADoor(tc.cfg.A2ADoorListen, tc.cfg.A2ADoorToken, gateway.A2ADoorOptions{DefaultAddressee: "platform"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				doors = append(doors, gateway.A2ADoorSpec(a2a))
+			}
+			a, err := composeAdapters(tc.cfg, primary, doors, nil, slog.Default())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -286,6 +343,12 @@ func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
 			if _, err := a.Post("console:tab-1", "hi"); err != nil {
 				t.Errorf("console not wired: %v", err)
 			}
+			if tc.cfg.A2ADoorArmed() {
+				id, err := a.Post("a2a:caller:ctx-1", "hi")
+				if err != nil || !strings.HasPrefix(id, "a2a-") {
+					t.Errorf("a2a post = %q, %v; want the A2A door's own message id", id, err)
+				}
+			}
 			if tc.primary != nil {
 				if _, err := a.Post("discord:g/c", "hi"); err != nil {
 					t.Errorf("primary not wired: %v", err)
@@ -293,6 +356,289 @@ func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
 				if len(tc.primary.posts) != 1 || tc.primary.posts[0] != "discord:g/c" {
 					t.Errorf("primary saw posts %v, want only discord:g/c", tc.primary.posts)
 				}
+			}
+		})
+	}
+}
+
+// syncBuffer is an io.Writer a logger on another goroutine can write to
+// while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// alertErr returns the err attribute of the first metricsUnavailableAlert
+// record in a JSON log, and whether there is one.
+func alertErr(t *testing.T, logged string) (string, bool) {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(logged), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec struct {
+			Level string `json:"level"`
+			Msg   string `json:"msg"`
+			Err   string `json:"err"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line %q is not JSON: %v", line, err)
+		}
+		if rec.Msg == metricsUnavailableAlert && rec.Level == "ERROR" {
+			return rec.Err, true
+		}
+	}
+	return "", false
+}
+
+// A port that will not bind costs the gateway its metrics, not the
+// conversations: serve must log the ALERT line and still run the gateway,
+// and return what the gateway returns rather than the listener's error.
+// The port case holds the metrics port with a listener of the test's own on
+// every interface, as NewMetricsServer binds, so Run's net.Listen fails with
+// EADDRINUSE on its goroutine. The constructor case reaches the other
+// swallowed error, a port NewMetricsServer refuses.
+func TestServeKeepsTheGatewayWhenTheMetricsListenerCannotStart(t *testing.T) {
+	held, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("holding a port: %v", err)
+	}
+	t.Cleanup(func() { held.Close() })
+	heldPort := held.Addr().(*net.TCPAddr).Port
+
+	for _, tc := range []struct {
+		name    string
+		port    int
+		wantErr string
+	}{
+		{"port already bound", heldPort, fmt.Sprintf("metrics listener on :%d", heldPort)},
+		{"port the constructor refuses", 70000, "metrics listener port 70000 is not in"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var logged syncBuffer
+			log := slog.New(slog.NewJSONHandler(&logged, nil))
+			cfg := &gateway.Config{MetricsPort: tc.port}
+
+			// The stub gateway runs until the ALERT is logged (or 10s pass),
+			// so the listener's failure lands while the gateway is running,
+			// which is the production order; then it returns nil, as gw.Run
+			// does on a clean shutdown, and the checks below say which half
+			// is missing.
+			reached := false
+			run := func(context.Context) error {
+				reached = true
+				deadline := time.Now().Add(10 * time.Second)
+				for time.Now().Before(deadline) {
+					if _, ok := alertErr(t, logged.String()); ok {
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				return nil
+			}
+
+			if err := serve(ctx, cfg, gateway.NewMetrics(), log, run); err != nil {
+				t.Fatalf("serve returned %v, want nil: a metrics listener that cannot start must not end the gateway", err)
+			}
+			if !reached {
+				t.Fatal("serve returned without running the gateway")
+			}
+			got, ok := alertErr(t, logged.String())
+			if !ok {
+				t.Fatalf("no %q line logged; log:\n%s", metricsUnavailableAlert, logged.String())
+			}
+			if !strings.Contains(got, tc.wantErr) {
+				t.Errorf("ALERT err = %q, want it to name %q", got, tc.wantErr)
+			}
+		})
+	}
+}
+
+func provisionTasksStream(t *testing.T, url string) {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:      lib.TasksStream,
+		Subjects:  []string{"a2a.tasks.>"},
+		Retention: jetstream.LimitsPolicy,
+		MaxAge:    72 * time.Hour,
+	}); err != nil {
+		t.Fatalf("create TASKS: %v", err)
+	}
+}
+
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("free port: %v", err)
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+// TestRealMainWiresMetrics proves realMain threads one Metrics instance across
+// the adapter, the gateway, and the metrics server: pulls performed by the
+// adapter are reflected on the /metrics listener served by realMain.
+func TestRealMainWiresMetrics(t *testing.T) {
+	s := startJetStreamTestServer(t)
+	url := s.ClientURL()
+	provisionTasksStream(t, url)
+
+	relaySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/chat/a2a/events" && r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"subscription":"projects/p/subscriptions/s"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(relaySrv.Close)
+
+	tokenFile := filepath.Join(t.TempDir(), "chat-token")
+	if err := os.WriteFile(tokenFile, []byte("test-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	metricsPort := freePort(t)
+
+	t.Setenv("NATS_URL", url)
+	t.Setenv("SESSION_KV_SALT", "test-salt")
+	t.Setenv("A2A_GCHAT_RELAY_URL", relaySrv.URL)
+	t.Setenv("A2A_GCHAT_TOKEN_PATH", tokenFile)
+	t.Setenv("A2A_METRICS_PORT", fmt.Sprintf("%d", metricsPort))
+	t.Setenv("A2A_CHAT_DISPLAY_MODE", "")
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "")
+	t.Setenv("SLACK_APP_TOKEN", "")
+	t.Setenv("A2A_SPAWN_SESSIONS", "")
+	t.Setenv("A2A_SESSION_SERVICE_ACCOUNT", "")
+	t.Setenv("A2A_DEFAULT_ADDRESSEE", "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- realMain(ctx, slog.Default())
+	}()
+
+	metricsURL := fmt.Sprintf("http://127.0.0.1:%d/metrics", metricsPort)
+	client := &http.Client{Timeout: 1 * time.Second}
+
+	deadline := time.Now().Add(10 * time.Second)
+	found := false
+	metricPrefix := "kubeagents_a2a_gateway_gchat_pulls_total{outcome=\"empty\"} "
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-errCh:
+			t.Fatalf("realMain exited early while polling /metrics: %v", err)
+		default:
+		}
+		resp, err := client.Get(metricsURL)
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			bodyStr := string(body)
+			if resp.StatusCode == http.StatusOK && strings.Contains(bodyStr, metricPrefix) && !strings.Contains(bodyStr, metricPrefix+"0\n") {
+				found = true
+				break
+			}
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("realMain exited early while polling /metrics: %v", err)
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("realMain returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("realMain did not exit after context cancellation")
+	}
+
+	if !found {
+		t.Fatal("timed out waiting for /metrics to reflect adapter pulls")
+	}
+}
+
+type stubConversations struct{}
+
+func (stubConversations) ConversationContext(context.Context, string) (string, error) { return "", nil }
+func (stubConversations) Post(string, string) (string, error)                         { return "", nil }
+func (stubConversations) PostMessage(string, gateway.OutMessage) (string, error)      { return "", nil }
+func (stubConversations) EditMessage(string, string, gateway.OutMessage) error        { return nil }
+
+// The chat.notify route arms for a Google Chat or Slack backend with or without a home
+// channel, always with the gateway's conversations behind it (a kanban
+// card's report back to its conversation needs them, and with no home channel
+// they are all the route serves); a malformed home channel or another backend
+// arms nothing.
+func TestTheChatNotifyRouteArmsWithConversations(t *testing.T) {
+	gchat, err := gateway.NewGoogleChatAdapter("http://relay.invalid", "/nonexistent/token", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slackBackend, err := gateway.NewSlackAdapter("xoxb-stub", "xapp-stub", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversations := func(gateway.Adapter) gateway.NotifyConversations { return stubConversations{} }
+	for _, tc := range []struct {
+		name    string
+		backend gateway.Adapter
+		home    string
+		armed   bool
+	}{
+		{"chat with a home channel", gchat, "spaces/AAAA", true},
+		{"chat with no home channel", gchat, "", true},
+		{"chat with a malformed home channel", gchat, "spaces/A/threads/B", false},
+		{"another backend", nil, "spaces/AAAA", false},
+		{"slack with a home channel", slackBackend, "C0HOME", true},
+		{"slack with no home channel", slackBackend, "", true},
+		{"slack with a malformed home channel", slackBackend, "#ops", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &gateway.Config{GchatHomeChannel: tc.home}
+			if tc.backend == slackBackend {
+				cfg = &gateway.Config{SlackHomeChannel: tc.home}
+			}
+			n := chatNotifier(cfg, tc.backend, conversations, slog.Default())
+			if (n != nil) != tc.armed {
+				t.Fatalf("armed = %v, want %v", n != nil, tc.armed)
+			}
+			if n != nil && !n.ServesConversations() {
+				t.Fatal("the route armed without the gateway's conversations: every card report would be refused")
 			}
 		})
 	}

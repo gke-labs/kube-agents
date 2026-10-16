@@ -28,9 +28,10 @@ Both are the same missing thing: the run's structured output, kept where it was 
 
 ## 2. The store
 
-`finish` keeps what it publishes. On the exit-0 path only — clean and findings branches alike, never
+`finish` keeps what it publishes. On the exit-0 path only — clean, findings and no-forge branches alike, never
 on `--dry-run`, never after a rejection, never from `remediate` — it writes one envelope under
-`<root>/<audit-id>/<owner>/<name>/`, the directory of the repository the run published to:
+`<root>/<audit-id>/<owner>/<name>/`, the directory of the repository the run published to (a
+no-forge run uses the reserved one below):
 
 - `runs/<finished-at, UTC, filename-safe>.json` — the envelope. The ring prunes to the newest 14 at
   write time: two weeks of a daily stream.
@@ -45,10 +46,25 @@ run whose repository fails that stores nothing. The path is lower-cased, because
 not case-sensitive: an on-demand `--repo Acme/GitOps` and a ConfigMap's `acme/gitops` are one
 ledger, and two directories for it would each trust a memory the other had moved past.
 
+An install that registers no GitOps repository has no ledger to publish to, and the store is then
+the only record of the run. `start` and `finish` take that install from a raw `managed_repos` value
+that is blank or `[]`. A value that does not parse, or whose entries this image cannot serve, still
+fails, and so does one that could not be read. `finish` validates the document as usual, skips every
+forge step, and writes the envelope under the reserved directory `no_forge/local` with `status:
+NO_FORGE`, `issue_number: null` and an empty `ledger_body`. No GitHub owner contains `_`, and a
+first segment without a dot is never another forge's host, so the key cannot name a real
+repository's store. With no public body to check it against, the next no-forge run trusts that
+`latest.json` on its own (its `status`, `repo` and `id_scheme`) and takes the delta from its
+`current_ids`; when `latest.json` is missing or fails those checks, it reads the newest ring entry
+that passes them, since a failed write drops `latest.json` and leaves the ring. A store with no
+envelope is a first run, and one whose envelopes all fail is a lost memory, as in §4. A previous id the collector still flags is held in `current_ids` and not
+counted as resolved, as the ledger holds it.
+
 Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries
 `audit_id`, `repo` and `finished_at`, the run's outcome (`status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, the PR URL lists, `silent_ok`,
-`ledger_held_open`), the collector keys the JSON line carried, the delta as id lists (`new_ids`,
+`ledger_held_open`), the collector keys and the phase timers (`inspect_s`, `publish_s`, `collect_s`)
+the JSON line carried, the delta as id lists (`new_ids`,
 `resolved_ids`, `current_ids`, `id_scheme`), `ledger_body` — the body this run left on the issue —
 and `document`, this run's validated findings document, whole rather than clipped to the body's
 budget. The body's redaction backstop is applied to every string on the way in, so the envelope
@@ -60,15 +76,19 @@ ids.
 The write is best-effort: a store that cannot be written logs a warning and never changes the run's
 exit code. A failed write deletes `latest.json` on its way out, because the file left behind
 describes an older run and nothing in it says so — the next run would trust it, and a reader would
-quote it as current. A held-open clean run is the exception: it only comments, so the body is the
-one the file describes, and a failed write keeps the file rather than cost the next run its memory. An absent store is unknowable, and every reader handles that; a stale one
+quote it as current. A held-open clean run that only comments is the exception: the body is the
+one the file describes, and a failed write keeps the file rather than cost the next run its memory.
+A held-open clean run on a coverage ledger rewrites the body (the refresh below), so it is not this
+exception. An absent store is unknowable, and every reader handles that; a stale one
 passes the issue and repository checks, and only the comparison against the live block in §4 tells
 it from a fresh one. For the same reason `finish` deletes `latest.json` just before each call that
-rewrites the ledger: the findings rewrite and the coverage issue a clean run opens. A run killed
+rewrites the ledger: the findings rewrite, the coverage issue a clean run opens, and the refresh of
+an open coverage ledger. A run killed
 between that call and writing the store leaves no envelope rather than one describing the run before.
-The clean close is the exception, and `finish` deletes the file just after it: a close leaves the
+The clean close is the exception, and `finish` deletes the file just after it: the close leaves the
 body as it was, so until it lands the stored memory is still exactly the open ledger, and a close
-that fails leaves the memory in place. A run killed between the close and the delete, or a close that
+that fails leaves the memory in place. After the close, `finish` adds a banner and a new title to
+the closed issue and keeps the id block. A run killed between the close and the delete, or a close that
 lands on GitHub but reports failure, leaves a record naming an issue that is now closed. A later run
 does not trust it while that issue stays closed, since the trust check needs it to be the open
 ledger; a reader quoting it shows the last findings run as latest until the next run rewrites it.
@@ -83,11 +103,15 @@ rather than trust whichever file exists. Pruning runs in its own `try`: a
 failed prune has not damaged the memory the run just wrote.
 
 `issue_number` and `ledger_body` are a claim about the live ledger, so a clean run that leaves the
-ledger open — over a coverage gap or an unaccounted previous finding — only commented on it, and its
-body still renders the previous run's findings. That path stores the previous body and ids forward
-instead of its own empty set; recording `[]` would hand the next run a trusted memory of an empty
-ledger, and every finding the body carries would be announced as new. The document that body renders
-rides beside it as `ledger_document`, which only `finish` reads, for titles. It is known only from
+ledger open — over a coverage gap or an unaccounted previous finding — and only comments on it
+leaves a body that still renders the previous run's findings. That path stores the previous body
+and ids forward instead of its own empty set; recording `[]` would hand the next run a trusted memory of an empty
+ledger, and every finding the body carries would be announced as new. A clean run with a gap on a
+coverage ledger (a `coverage incomplete` title and no finding id in its block) rewrites the title
+and body from its own document instead. It then stores the body the edit wrote, with no ids, and
+`ledger_held_open` false; when the edit fails, it stores the previous body as above. The result of
+the edit decides this, never the attempt. The document that body renders
+rides beside it as `ledger_document`, which only `finish` reads, for titles and for the wording carry. It is known only from
 a run that wrote the body; after a seed, whose memory has no document, it is absent until a
 findings run rewrites the body, rather than a held-open run's empty document standing in for it. `document` stays this
 run's, because it answers what this run checked and skipped, and a reader asking that must not be
@@ -164,6 +188,16 @@ is how a divergence becomes undetectable.
 
 `start` joins against the same memory for the `carried` list it hands the model, seed included.
 
+`finish` also reads that stored document (`ledger_document` where the body was carried, `document`
+otherwise, or the newest `runs/` ring envelope with a findings document when a held-open
+`latest.json` carries no `ledger_document`) one time before the dry-run split, to keep the previous
+wording of a finding whose evidence did not change
+([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.2). That read checks
+only the envelope's `repo` and `id_scheme`, not the issue. The issue checks above keep the delta
+correct, and the carry counts no ids: it copies words only to a finding with the same id, evidence
+and severity. A dry run does not ask the forge for the open issue, and the preview must show the
+same words as the real run. A missing or unreadable store keeps the model's words.
+
 The issue body is used as the memory once, where the store has never held this ledger (every run
 still reads it, but only for the check above): no directory for the stream
 and repository at all, as on the first run after an upgrade that introduces the store or after the
@@ -185,7 +219,7 @@ empty:
 - The body is rewritten. Freezing it until a run could read its memory would freeze it for good,
   since only a run that writes the body restores the store. Ids held on the lost body are no longer
   carried; with a manifest their pull requests stay protected by the still-flagged set.
-- A clean run never closes. It files a lost-memory coverage gap, stays open, and reports partial:
+- A clean run never closes the ledger and retires no pull request, the compliance shield's close (a fix a declaration forbids) aside. It files a lost-memory coverage gap, stays open, and reports partial:
   the collector's gap while it still flags something the document does not carry, and otherwise the
   gap saying nothing shows whether the ledger's findings were fixed. A manifest covers only the
   collector's checks, and without one there is nothing, while an empty document would close the

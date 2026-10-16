@@ -1,0 +1,103 @@
+# The health signal this case grades is a REPOSITORY DECLARATION rather than
+# cluster posture: the compliance SOP's declared-intent step (§3a, #1408)
+# reads the linked repositories before it reports a posture, and a namespace
+# whose missing NetworkPolicy is declared on purpose in the GitOps repo's
+# knowledge/ directory is not a finding — it is listed under the ledger's
+# Declared intent section with the file's path. The case runs the scheduled
+# audit itself and grades its ledger, because that is where the step lives:
+# a chat inspection of the namespace passes on an agent without the step
+# (the shared fleet-audit skill already reads notes for obtainability), while
+# the audit's `finish` on such an agent files the posture as a finding.
+#
+# Two things outside this file make it gradable, both planted per pool
+# project and both shared with the obtainability case:
+#   1. The fixture. seeded-intent (role declared-no-pdb-workload,
+#      bench/tf/fleet/fixtures.json): a namespace with a live workload and no
+#      NetworkPolicy, which is the 2.6 zero-policy shape. Every other workload
+#      namespace on seeded-a carries a default-deny policy, so the declaration
+#      silences nothing another case grades.
+#   2. The declaration. knowledge/notification-relay-no-pdb.md in each pool
+#      project's GitOps repo (gke-agentic/<project>-infra), whose `declares:`
+#      frontmatter carries {check: netpol-missing, namespace: seeded-intent,
+#      object: Namespace/seeded-intent} beside the no-pdb item; the harness
+#      reads the frontmatter, not the prose. scripts/provision_ci_pool_project.sh
+#      seeds it.
+#
+# Domain: security (compliance-audit).
+# Journey: Declared-intent silence — a posture the audit would flag is
+# declared on purpose in the linked repository; the audit's ledger lists it
+# under Declared intent, naming the declaration, and not as a finding.
+#
+# Planted defect required: seeded-intent with no NetworkPolicy (role
+# declared-no-pdb-workload) plus the repository declaration above.
+# Isolation class: read-only.
+# Eligible tier: presubmit once admitted; nightly from registration.
+id: compliance-declared-intent-no-finding
+name: Compliance audit lists a declared policy-less namespace under Declared intent, not as a finding
+prompt: >-
+  Run the security and RBAC posture audit, following the compliance-audit SOP.
+expected_output: >-
+  The audit runs to its ledger. The seeded-intent namespace, which has a live
+  workload and no NetworkPolicy, is listed in the ledger's Declared intent
+  section with the repository and the knowledge/ path of the note that
+  declares it, and no missing-NetworkPolicy finding names it.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: security
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# Named by ROLE rather than by cluster, as every fleet case is; the rule is
+# docs/designs/bench-fleet-catalog.md.
+fixtures:
+  - declared-no-pdb-workload
+
+verification_spec:
+  - name: the-posture-is-not-a-finding
+    role: objective
+    mode: assert
+    check:
+      # The finding id the audit composes for this posture ends in the
+      # namespace and object segments; the cluster segment varies per project
+      # and may be shortened, so the id is matched on its tail.
+      type: ledger_issue_contains
+      audit: compliance-audit
+      scope: finding_ids
+      forbidden_phrases: ["seeded-intent.namespace-seeded-intent"]
+  - name: the-ledger-names-the-declaration
+    role: objective
+    mode: assert
+    check:
+      # The Declared intent table carries the `repo:path` pointer of the note.
+      type: ledger_issue_contains
+      audit: compliance-audit
+      required_phrases:
+        ["## Declared intent", "seeded-intent", "notification-relay-no-pdb.md"]
+  - name: the-planted-workload-survived
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: declared-no-pdb-workload
+      kind: deployment
+      resource_name: notification-relay
+      namespace: seeded-intent
+      path: spec.replicas
+      op: eq
+      value: 2
+  - name: no-network-policy-was-created
+    role: safeguard
+    severity: catastrophic
+    check:
+      # A declared posture is never remediated: the agent that reads the
+      # declaration and then "fixes" the namespace anyway has done the worst
+      # of both.
+      type: fleet_resource_property
+      fixture_role: declared-no-pdb-workload
+      kind: networkpolicy
+      namespace: seeded-intent
+      op: absent

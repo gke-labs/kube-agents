@@ -27,9 +27,9 @@ Invoked by the `obtainability-audit` watchdog. The cron id predates the rename.
 
 ### `security_patch_orchestrator_sop.md`
 
-Upgrade & patch readiness, weekly. Control-plane and node-pool versions compared against every version `gcloud container get-server-config` still offers at the cluster's location, and against its release channel's default, node skew against GKE's two-minor ceiling, fleet-wide minor spread, clusters on no release channel, `autoUpgrade`/`autoRepair` off, missing maintenance windows, upgrade-blocking maintenance exclusions, deprecated node image variants, and absent upgrade notifications.
+Upgrade & patch readiness, weekly. Control-plane and node-pool versions compared against every version `gcloud container get-server-config` still offers at the cluster's location, and against its release channel's default, node skew against GKE's two-minor ceiling, fleet-wide minor spread, clusters on no release channel, `autoUpgrade`/`autoRepair` off, missing maintenance windows, upgrade-blocking maintenance exclusions, deprecated node image variants, and absent upgrade notifications. For a cluster found behind, it also runs the `fleet-upgrade-verification` readiness grade and reports the upgrade as blocked when a drain-blocking PodDisruptionBudget would hold it — GKE holds each node's drain for up to an hour and then evicts the workload anyway — or node-pool skew would stop it from completing.
 
-The SOP forbids the words "vulnerable", "unpatched", and "CVE" in its findings: there is no vulnerability feed in this environment, so every finding is version currency or upgrade-policy hygiene. Invoked by the `security-patch-orchestrator` watchdog.
+The SOP forbids the words "vulnerable", "unpatched", and "CVE" in its findings: there is no vulnerability feed in this environment, so every finding is version currency or upgrade-policy hygiene — or, for the one check that asks how the upgrade would go, the held drain or the refused move above. Invoked by the `security-patch-orchestrator` watchdog.
 
 ### `fleet_wide_cost_analysis_sop.md`
 
@@ -57,13 +57,13 @@ It deliberately does **not** evaluate the model. Prompt-injection resistance, ja
 
 ### `gcp_networking_fabric_sop.md`
 
-GCP Networking Fabric & VPC IPAM, daily. Checks VPC subnet IP exhaustion risks, Cloud NAT port exhaustion, PSC routing deadlocks, MTU packet fragmentation, and Cloud Armor false-positive rates.
+GCP Networking Fabric & VPC IPAM, daily. Checks VPC subnet IP exhaustion risks, Cloud NAT port exhaustion, PSC routing deadlocks, MTU mismatches across VPC peerings, Cloud Armor policy anomalies, and management ports open to the whole internet.
 
 Invoked by the `gcp-networking-fabric-audit` watchdog.
 
 ### `gce_compute_fleet_sop.md`
 
-GCE Compute Engine and MIG Fleet Audit, daily. Checks GCE startup script status, MIG autoscaler flapping, Ops Agent guest health, sole-tenant headroom, and orphaned snapshots.
+GCE Compute Engine and MIG fleet, daily. It checks instances, Managed Instance Groups, sole-tenant node groups and snapshots for startup-script failures in serial port output, MIGs that cannot converge on their target size, sole-tenant headroom exhaustion, and snapshots orphaned by a deleted source disk. Ops Agent guest telemetry is deliberately not audited by this stream.
 
 Invoked by the `gce-compute-fleet-audit` watchdog.
 
@@ -73,7 +73,7 @@ The SOPs behind the five watchdogs [retired from the roster](/kube-agents/concep
 
 ## SOPs that are not fleet audits
 
-`inventory.md` is not a fleet audit. It is the first-boot environment discovery procedure behind [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding), which builds `/opt/data/INVENTORY.raw.md` once and then returns `[SILENT]` forever after. Its companions run as separate cards on the same one-shot path: `cluster_inventory_audit_sop.md` is what each Cluster Agent follows on the one cluster it is pinned to, returning structured `metadata` the waiting sweep card merges, and `inventory_prioritize_sop.md` scores the merged findings against a fixed rubric, registers all of them in the findings queue, and renders the short `/opt/data/INVENTORY.md` that reaches the user from the top of that order.
+`inventory.md` is not a fleet audit. It is the first-boot environment discovery procedure behind [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding), which lists the fleet once and audits the clusters no Cluster Agent covers; the onboarding gate files the per-cluster audits itself. Its companions run as separate cards on the same one-shot path: `cluster_inventory_audit_sop.md` is what each Cluster Agent follows on the one cluster it is pinned to, returning structured `metadata` that the onboarding gate's hand-off script merges into the raw file, and `inventory_prioritize_sop.md` scores the merged findings against a fixed rubric, registers all of them in the findings queue, and renders the short `/opt/data/INVENTORY.md` that reaches the user from the top of that order.
 
 The k8s-event-watcher daily recap has no SOP here: it is a `no_agent` script, `eod_report_generator.py`, that renders the recap deterministically from the session ledger and prompts no model, so its description is a design note rather than agent material — [`docs/designs/eod-event-watcher-daily-report.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/eod-event-watcher-daily-report.md).
 

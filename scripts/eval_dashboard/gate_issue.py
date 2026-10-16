@@ -181,11 +181,11 @@ The seeded fleet's fixture role(s) below are present but not in the state the ca
 
 {evidence}
 
-**Reconcile:** re-apply `bench/tf/fleet` in each project named (`bench/tf/fleet/README.md`, "State and reconcile"), then wait for the next hourly scan or run `python3 scripts/verify_ci_pool_project.py --project-id <project>`. (For `stalled-controller` drift where the workload started during an in-cluster heal, re-apply plans no changes: delete the pod in `seeded-stall` and if the condition reason remains `NewReplicaSetAvailable`, replace the Deployment rather than `rollout restart`.)
+**Reconcile:** the daily `ci-kube-agents-fleet-reconcile-daily` run re-applies `bench/tf/fleet` in each project named (08:30 UTC; `docs/ci-pool-projects.md` 6.2), and the scan after it confirms. To repair sooner, run `python3 hack/fleet_reconcile.py --project <project>` from a `main` checkout under a Boskos lease (`bench/tf/fleet/README.md`, "State and reconcile"); never apply a branch. (For `stalled-controller` drift where the workload started during an in-cluster heal, re-apply plans no changes: delete the pod in `seeded-stall` and if the condition reason remains `NewReplicaSetAvailable`, replace the Deployment rather than `rollout restart`.)
 
 Incident brief: {brief}
 
-Filed automatically by the smoke health bot; the fleet owner should re-apply the stack in the projects named; the bot will not close it.
+Filed automatically by the smoke health bot; the daily reconcile re-applies the stack in the projects named, and the bot comments here when a scan reads them healthy; the bot will not close it.
 """
 POOL_DRIFT_TITLE = "Pool drift: {findings} on {projects} pool {noun} since {since}"
 # Four finding ids pass GitHub's title limit; the count stands in.

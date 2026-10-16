@@ -24,7 +24,7 @@ Every commit and build progresses through six distinct lifecycle tiers:
 | **RC Validated**           | `rc_YYMMDDHHMM_<SHORT_SHA>_validated` | Successful GKE E2E suite                      | Quality gate: proof that `install.sh` succeeded on a real GKE cluster.                                                                                                      |
 | **Eval Candidate**         | `evalcand_YYMMDDHHMM_<SHORT_SHA>`     | Successful nightly matrix                     | Nomination, not a promotion: starts the agent eval against the candidate's images, over the same case matrix that gates a pull request. Deploys nothing.                    |
 | **Staging Promoted**       | `staging_YYMMDDHHMM_<SHORT_SHA>`      | Green eval on the nomination                  | Quality gate for GA: the nightly E2E matrix and the agent eval both passed. Also the deploy trigger for the staging estate.                                                 |
-| **GA Stable**              | `X.Y.Z` (pure numeric SemVer)         | Weekly cron / manual dispatch                 | Official production release tagged on a stamped commit parented by the target commit (staging-promoted by default), and pushed to the version's release line `release/X.Y`. |
+| **GA Stable**              | `X.Y.Z` (pure numeric SemVer)         | Daily cron / manual dispatch                  | Official production release tagged on a stamped commit parented by the target commit (staging-promoted by default), and pushed to the version's release line `release/X.Y`. |
 
 Only a staging-promoted commit is releasable from `main`; a patch from a release line is gated on
 the `rc_*_validated` tag on the line's head instead. An `rc_*_validated` tag records the narrow
@@ -56,15 +56,22 @@ with manual dispatches available for overrides and off-schedule releases.
 | :-------------------------- | :----------------------------------------------------------------------------------------------------------------------------------- |
 | RC selection and validation | Every three hours, at 17 minutes past. Dispatches nothing when the newest candidate on `main` has already been tried.                |
 | Staging promotion           | Daily at 02:17 UTC, against the newest validated candidate on `main`. One already nominated or promoted is re-tested, not re-tagged. |
-| GA release                  | Weekly on Fridays at 05:17 UTC, or when a maintainer dispatches it.                                                                  |
+| GA release                  | Daily at 06:17 UTC, or when a maintainer dispatches it. A candidate promoted after that tick ships at the next one.                  |
 
 A staging promotion is not finished when its matrix goes green. The eval runs between the
 nomination and the tag and takes hours, so the `staging_*` tag can appear most of a working day
 after the run that produced it started.
 
 Scheduled runs start when GitHub's scheduler picks them up, so the minute is a floor, not a
-promise. A scheduled GA release ships unattended on Fridays if a new staging-promoted
-candidate exists, or maintainers may dispatch the workflow by hand.
+promise. A scheduled GA release ships unattended each day a new staging-promoted
+candidate exists, or maintainers may dispatch the workflow by hand. On other days the run
+publishes nothing. Releases came about once a week up to 0.9.0, and about every two days after it.
+To count the releases between two versions, use the releases page, not the number of days.
+
+Every release from `main` bumps the minor number: a day's range almost always carries a `feat:`,
+and a fix-only range bumps minor too once the previous minor has its release line (see the table
+below). So the minor number advances with each release rather than with how much changed, and the
+release notes are where to read what changed between two versions.
 
 ### What the next release contains
 
@@ -77,6 +84,10 @@ and a catch-all for anything else. The grouping is the label-to-category map in
 so a pull request's labels decide the heading it appears under. Dependabot's pull requests, and any
 labelled `duplicate`, `invalid` or `wontfix`, are left out. Read them on
 [the releases page](https://github.com/gke-labs/kube-agents/releases) once the release exists.
+
+No workflow applies these labels, so today every pull request appears under "Other Changes". The
+titles follow Conventional Commits, and a `!` before the colon marks a breaking change. The Upgrade
+page lists [the breaking changes in recent releases](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases).
 
 Before it exists, the next release from `main` is whatever has merged since the most recent
 release cut from `main`. [The latest release](https://github.com/gke-labs/kube-agents/releases/latest)
@@ -115,7 +126,7 @@ Once `1.0.0` is established, the automated calculator resumes standard SemVer ru
 
 ## Who cuts a release
 
-Maintainers do, on the Friday schedule above or by hand. A patch release, `X.Y.Z+1`, is cut from the release line `release/X.Y` rather than from `main`: fixes are cherry-picked onto the line, its head passes the RC validation, and a maintainer dispatches the release naming the line; once a line has its branch, a fix-only week on `main` releases as the next minor. An emergency hotfix can skip the live-cluster validation gate — reserved for a zero-day vulnerability in a container dependency or a regression prolonging user-facing downtime — but never the build-integrity guarantees below: the images must already exist for the commit, a written justification is required, and a version tag that already points at another commit aborts the release. The dispatch commands, the bypass, and the post-release reconciliation are the maintainers' runbook in [`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release).
+Maintainers do, on the daily schedule above or by hand. A patch release, `X.Y.Z+1`, is cut from the release line `release/X.Y` rather than from `main`: fixes are cherry-picked onto the line, its head passes the RC validation, and a maintainer dispatches the release naming the line; once a line has its branch, a fix-only day on `main` releases as the next minor. An emergency hotfix can skip the live-cluster validation gate — reserved for a zero-day vulnerability in a container dependency or a regression prolonging user-facing downtime — but never the build-integrity guarantees below: the images must already exist for the commit, a written justification is required, and a version tag that already points at another commit aborts the release. The dispatch commands, the bypass, and the post-release reconciliation are the maintainers' runbook in [`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release).
 
 ## Clean promotion and artifact guarantees
 
@@ -140,7 +151,7 @@ Each GA release attaches the following distribution artifacts to the GitHub Rele
 - `kube-agents-<VERSION>.tar.gz` and `kube-agents-<VERSION>.zip`: Complete, self-contained offline distribution bundles containing Terraform provisioning modules (`terraform/`), Kubernetes operator manifests (`k8s-operator/`), deployment configs (`deploy/`), Helm charts (`charts/`), utility scripts (`scripts/`), examples (`examples/`), installer scripts (`install.sh`, `upgrade.sh`, `uninstall.sh`), and the mirrored image catalog (`images.json`). Tracked example files (`terraform.tfvars.example`) are preserved, while sensitive tokens and local caches are sanitized.
 - `kube-agents-<VERSION>.tgz`: Packaged Helm chart with matching `version` and `appVersion`.
 - `kube-agents-<VERSION>.spdx.json` and `kube-agents-<VERSION>.cdx.json`: Software Bill of Materials (SBOM) for the filesystem bundle in SPDX 2.3 and CycloneDX 1.5 JSON formats.
-- `<image>-<VERSION>.spdx.json` for each container image the release ships, the `REQUIRED_RELEASE_IMAGES` list in `scripts/release/common.sh` at the release's own commit (for a release cut from `main` today: `k8s-operator`, `platform-agent`, `credential-proxy`, `agent-sandbox`, `replay-proxy`, `pubsub-platform`, `gke-stockout-investigator`, `a2a-gateway`, `a2a-worker`, `a2a-authcallout`, `hermes-bridge`; a patch cut from an older release line ships the images that line has): Container image SBOMs in SPDX 2.3 JSON format generated by Syft.
+- `<image>-<VERSION>.spdx.json` for each container image the release ships, the `REQUIRED_RELEASE_IMAGES` list in `scripts/release/common.sh` at the release's own commit (for a release cut from `main` today: `k8s-operator`, `platform-agent`, `credential-proxy`, `agent-sandbox`, `replay-proxy`, `pubsub-platform`, `gke-stockout-investigator`, `a2a-gateway`, `a2a-worker`, `a2a-authcallout`, `a2a-console`, `hermes-bridge`; a patch cut from an older release line ships the images that line has): Container image SBOMs in SPDX 2.3 JSON format generated by Syft.
 - `checksums.txt`: SHA256 cryptographic checksums covering all distribution tarballs, zips, charts, and SBOM JSON files.
 - `checksums.txt.bundle`: Keyless Cosign signature bundle attesting to the provenance and authenticity of `checksums.txt` signed via GitHub Actions OIDC.
 

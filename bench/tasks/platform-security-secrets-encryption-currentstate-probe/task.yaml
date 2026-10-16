@@ -1,0 +1,81 @@
+# Skill-guidance probe for gke-platform-security, which this sync extends
+# with application-layer secrets encryption: proving that
+# encryption with a Cloud KMS key has actually completed. The cluster's
+# databaseEncryption.state is the requested setting; the observed state is
+# the output-only databaseEncryption.currentState, whose
+# CURRENT_STATE_ENCRYPTED value (as opposed to CURRENT_STATE_ENCRYPTION_PENDING
+# or CURRENT_STATE_ENCRYPTION_ERROR) is the proof (GKE REST reference,
+# DatabaseEncryption.CurrentState). The skill's command:
+#   gcloud container clusters describe CLUSTER_NAME --location LOCATION \
+#     --format="value(databaseEncryption.currentState)"
+# On main, the fleet consistency SOP reads ".databaseEncryption.state ->
+# ENCRYPTED" as the signal, and GKE's how-to page verifies with
+# databaseEncryption.state too, so the old path ends on the field that only
+# echoes the request.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: platform-security-secrets-encryption-currentstate-probe
+name: Secrets encryption is proven complete by databaseEncryption.currentState
+
+owner: GinnyJI
+domain: security
+
+prompt: >-
+  Yesterday we ran gcloud container clusters update prod-1 --location
+  us-central1 --database-encryption-key with a Cloud KMS key in our separate
+  security project, after granting the GKE service agent
+  roles/cloudkms.cryptoKeyEncrypterDecrypter on it. Our auditor asks us to
+  show that application-layer Secrets encryption is in effect on prod-1
+  today. Give the exact gcloud command we should run and the exact value it
+  must print for us to tell the auditor yes. Load the relevant installed
+  gke-* skill and answer from it before searching documentation. Do not
+  apply anything.
+expected_output: >-
+  Not databaseEncryption.state, which is the requested setting. The observed state
+  is databaseEncryption.currentState: run gcloud container clusters describe
+  prod-1 --location us-central1
+  --format="value(databaseEncryption.currentState)" and show
+  CURRENT_STATE_ENCRYPTED. CURRENT_STATE_ENCRYPTION_PENDING means the
+  rollout is still running and CURRENT_STATE_ENCRYPTION_ERROR that it failed
+  (often the key binding on the service agent of the cluster's project).
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: the-evidence-is-currentstate-encrypted
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # Normalization drops underscores and lowercases both sides, so these
+      # match databaseEncryption.currentState and CURRENT_STATE_ENCRYPTED in
+      # any casing or code formatting.
+      required_phrases: ["currentState", "CURRENT_STATE_ENCRYPTED"]
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # Same delegation-boundary safeguard as knowledge-grounding-sources-probe.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
+  - name: no-worker-spends-an-answer-query-call
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # The quota-limited Developer Knowledge tool the personas forbid; see
+        # knowledge-grounding-sources-probe for why both spellings.
+        - type: tool_called
+          scope: workers
+          tool_names:
+            [
+              "mcp__developer_knowledge__answer_query",
+              "mcp_developer_knowledge_answer_query",
+            ]

@@ -1017,8 +1017,9 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		t.Errorf("policy types = %v, want ingress only", np.Spec.PolicyTypes)
 	}
 
-	if len(np.Spec.Ingress) != 1 {
-		t.Fatalf("expected exactly one ingress rule, got %d: %+v", len(np.Spec.Ingress), np.Spec.Ingress)
+	if len(np.Spec.Ingress) != 2 {
+		t.Fatalf("expected exactly two ingress rules (4222 for bus clients, 9222 for the console server), got %d: %+v",
+			len(np.Spec.Ingress), np.Spec.Ingress)
 	}
 	rule := np.Spec.Ingress[0]
 	if len(rule.Ports) != 1 || rule.Ports[0].Port.IntVal != 4222 || *rule.Ports[0].Protocol != corev1.ProtocolTCP {
@@ -1060,6 +1061,18 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 			t.Errorf("peer %d = %+v, want %v", i, peer.PodSelector, want)
 		}
 	}
+
+	// 9222 has exactly one pod-network peer, the console server. Anything
+	// wider makes the websocket an in-cluster door, which it is not.
+	ws := np.Spec.Ingress[1]
+	if len(ws.Ports) != 1 || ws.Ports[0].Port.IntVal != 9222 || *ws.Ports[0].Protocol != corev1.ProtocolTCP {
+		t.Errorf("second ingress rule is not exactly TCP 9222: %+v", ws.Ports)
+	}
+	if len(ws.From) != 1 || ws.From[0].IPBlock != nil || ws.From[0].NamespaceSelector != nil ||
+		ws.From[0].PodSelector == nil ||
+		!reflect.DeepEqual(ws.From[0].PodSelector.MatchLabels, map[string]string{"app": "test-agent-a2a-console"}) {
+		t.Errorf("9222 peers = %+v, want exactly the same-namespace pod selector app=test-agent-a2a-console", ws.From)
+	}
 }
 
 // The bus fence rides the mode switch exactly like the rest of the next
@@ -1083,6 +1096,7 @@ func TestA2AReleaseImagesFollowTheAgentImage(t *testing.T) {
 		"gateway": {a2aGatewayImageEnvVar, a2aGatewayImage, "a2a-gateway"},
 		"worker":  {a2aWorkerImageEnvVar, a2aWorkerImage, "a2a-worker"},
 		"callout": {a2aCalloutImageEnvVar, a2aCalloutImage, "a2a-authcallout"},
+		"console": {a2aConsoleImageEnvVar, a2aConsoleImage, "a2a-console"},
 	}
 	for label, r := range resolvers {
 		t.Run(label, func(t *testing.T) {
@@ -1146,7 +1160,7 @@ func TestA2AReleaseImagesFollowTheAgentImage(t *testing.T) {
 // TestNoPublicRegistryWhenMirrored states for the agent Deployment.
 func TestNextRenderFollowsTheAgentImageMirror(t *testing.T) {
 	const mirror = "mirror.corp.internal:5000/kube-agents"
-	for _, v := range []string{a2aGatewayImageEnvVar, a2aWorkerImageEnvVar, a2aCalloutImageEnvVar, operatorImageEnvVar} {
+	for _, v := range []string{a2aGatewayImageEnvVar, a2aWorkerImageEnvVar, a2aCalloutImageEnvVar, a2aConsoleImageEnvVar, operatorImageEnvVar} {
 		t.Setenv(v, "")
 	}
 	t.Setenv(platformAgentImageEnvVar, mirror+"/platform-agent:0.3.0")
@@ -1167,6 +1181,10 @@ func TestNextRenderFollowsTheAgentImageMirror(t *testing.T) {
 	callout := buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers[0]
 	if callout.Image != mirror+"/a2a-authcallout:0.3.0" {
 		t.Errorf("callout image %q does not follow the agent image's mirror", callout.Image)
+	}
+	console := buildA2AConsoleDeployment(agent).Spec.Template.Spec.Containers[0]
+	if console.Image != mirror+"/a2a-console:0.3.0" {
+		t.Errorf("console image %q does not follow the agent image's mirror", console.Image)
 	}
 }
 
@@ -1223,6 +1241,35 @@ func TestBuildA2AGatewaySpawnArming(t *testing.T) {
 	}
 	if len(pods.ResourceNames) != 0 {
 		t.Errorf("session-pod rule is pinned by name (%v) — the pods do not exist yet when it creates them", pods.ResourceNames)
+	}
+}
+
+// TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag: the spawner widens
+// the session pod only when the operator says so, and it needs the broker
+// URL to do it.
+func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
+	agent := a2aTestAgent()
+	envOf := func() map[string]corev1.EnvVar {
+		env := map[string]corev1.EnvVar{}
+		for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+			env[e.Name] = e
+		}
+		return env
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	off := envOf()
+	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"} {
+		if _, ok := off[name]; ok {
+			t.Errorf("%s rendered with the flag off", name)
+		}
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	on := envOf()
+	if on["A2A_SESSION_CLUSTER_VIEW"].Value != "true" {
+		t.Errorf("A2A_SESSION_CLUSTER_VIEW = %+v, want true", on["A2A_SESSION_CLUSTER_VIEW"])
+	}
+	if on["A2A_CREDENTIAL_PROXY_URL"].Value != credentialProxyBaseURL(agent) {
+		t.Errorf("A2A_CREDENTIAL_PROXY_URL = %+v, want %s", on["A2A_CREDENTIAL_PROXY_URL"], credentialProxyBaseURL(agent))
 	}
 }
 
@@ -1323,6 +1370,33 @@ func TestBuildA2ASessionNetworkPolicy(t *testing.T) {
 				t.Errorf("egress rule %d crosses namespaces: %+v", i+1, peer)
 			}
 		}
+	}
+}
+
+// TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag: a fourth egress
+// rule, to the broker pod on its one port, present exactly when the view is
+// on; off, the fence is the three rules TestBuildA2ASessionNetworkPolicy pins.
+func TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag(t *testing.T) {
+	agent := a2aTestAgent()
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	if got := len(buildA2ASessionNetworkPolicy(agent, []string{"10.96.0.10"}).Spec.Egress); got != 3 {
+		t.Fatalf("flag off: %d egress rules, want 3", got)
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	np := buildA2ASessionNetworkPolicy(agent, []string{"10.96.0.10"})
+	if len(np.Spec.Egress) != 4 {
+		t.Fatalf("flag on: %d egress rules, want 4", len(np.Spec.Egress))
+	}
+	if len(np.Spec.Ingress) != 0 {
+		t.Fatalf("the view opened ingress: %+v", np.Spec.Ingress)
+	}
+	broker := np.Spec.Egress[3]
+	if len(broker.Ports) != 1 || broker.Ports[0].Port.IntValue() != credentialProxyPort {
+		t.Fatalf("broker rule ports = %+v, want %d only", broker.Ports, credentialProxyPort)
+	}
+	if len(broker.To) != 1 || broker.To[0].PodSelector == nil ||
+		!reflect.DeepEqual(broker.To[0].PodSelector.MatchLabels, credentialProxySelector(agent)) {
+		t.Fatalf("broker rule peer = %+v, want the broker pod selector %v", broker.To, credentialProxySelector(agent))
 	}
 }
 
@@ -1435,15 +1509,15 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	}
 	// Default gateway cap 10 + the fixed headroom for the rest of the
 	// namespace (base stack, rollout surge, race overshoot).
-	if pods.Value() != 25 {
-		t.Fatalf("default quota = %d, want 25 (cap 10 + headroom 15)", pods.Value())
+	if pods.Value() != 26 {
+		t.Fatalf("default quota = %d, want 26 (cap 10 + headroom 16)", pods.Value())
 	}
 
 	two := 2
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &two}}
 	pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
-	if pods.Value() != 17 {
-		t.Fatalf("tuned quota = %d, want 17 (cap 2 + headroom 15)", pods.Value())
+	if pods.Value() != 18 {
+		t.Fatalf("tuned quota = %d, want 18 (cap 2 + headroom 16)", pods.Value())
 	}
 }
 
@@ -1569,6 +1643,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	dep := buildA2AGatewayDeployment(agent)
 	callout := buildA2ACalloutDeployment(agent)
 	verifier := buildA2AVerifierDeployment(agent)
+	console := buildA2AConsoleDeployment(agent)
 
 	cases := []struct {
 		render  string
@@ -1580,6 +1655,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 		{"gateway", "buildA2AGatewayDeployment", dep.Spec.Template.Spec},
 		{"callout", "buildA2ACalloutDeployment", callout.Spec.Template.Spec},
 		{"verifier", "buildA2AVerifierDeployment", verifier.Spec.Template.Spec},
+		{"console", "buildA2AConsoleDeployment", console.Spec.Template.Spec},
 	}
 	builders := make([]string, 0, len(cases))
 	for _, tc := range cases {
@@ -1650,6 +1726,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	dep := buildA2AGatewayDeployment(agent)
 	callout := buildA2ACalloutDeployment(agent)
 	verifier := buildA2AVerifierDeployment(agent)
+	console := buildA2AConsoleDeployment(agent)
 
 	cases := []struct {
 		render    string
@@ -1703,6 +1780,13 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 		// ".". It arrived without the WorkingDir the other two carry, and this
 		// table is what said so.
 		{render: "verifier", builder: "buildA2AVerifierDeployment", container: "verifier", spec: verifier.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
+		// Dockerfile.console ends on the same distroless static nonroot base
+		// as the gateway and the callout: WorkingDir /home/nonroot, User
+		// nonroot, and this pod imposes UID 1000. The server opens its static
+		// dir and credential file by absolute path and writes nothing, so
+		// traversable is enough.
+		{render: "console", builder: "buildA2AConsoleDeployment", container: "console", spec: console.Spec.Template.Spec,
 			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
 	}
 	builders := make([]string, 0, len(cases))
@@ -1992,12 +2076,12 @@ func remedyRecreateWidth(t *testing.T, message string) int {
 }
 
 // TestCleanupA2AResumesAfterAMidPassError is the safety proof for cleanupA2A's
-// early exit. The exit reads seven sentinels and returns when all are absent,
+// early exit. The exit reads nine sentinels and returns when all are absent,
 // which is only sound while nothing it deletes can outlive them: the
 // StatefulSet is deleted last, the gateway Deployment first, the callout
 // keys and config Secrets are the deletable objects the render creates first,
 // the two fences are what the guardrail path writes on a refusal, and the
-// inject fence is what a hand-deleted pair leaves of them.
+// inject and console fences are what a hand-deleted pair leaves of them.
 // TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere holds that soundness
 // one object at a time; this one holds it across a pass that dies partway, and
 // TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall across one that
@@ -2037,11 +2121,12 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	// created and the "it is gone after cleanup" row below asserts the
 	// absence of an object the render never made.
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	// The teardown list carries the inject door's four objects, which render
-	// only under the operator's flag; set it, so the precondition below
-	// covers them rather than failing on objects the render was told not to
-	// make.
+	// The teardown list carries the two doors' four objects each, which
+	// render only under their operator flags; set both, so the precondition
+	// below covers them rather than failing on objects the render was told
+	// not to make.
 	t.Setenv(a2aInjectBackendEnvVar, "true")
+	t.Setenv(a2aAgentDoorEnvVar, "true")
 
 	if _, err := r.reconcileA2A(ctx, agent); err != nil {
 		t.Fatalf("render: %v", err)
@@ -2537,11 +2622,11 @@ func TestHandleDeletionSkipsUnownedCalloutClusterRoleBinding(t *testing.T) {
 	}
 }
 
-// TestCleanupA2ACostsSevenReadsWhenThereIsNothingToClean measures the thing
+// TestCleanupA2ACostsTenReadsWhenThereIsNothingToClean measures the thing
 // the change was for. Counting is the only honest check here: the early exit
 // is a cost optimisation, and a correctness test passes just as well with the
 // reads still happening one object at a time.
-func TestCleanupA2ACostsSevenReadsWhenThereIsNothingToClean(t *testing.T) {
+func TestCleanupA2ACostsTenReadsWhenThereIsNothingToClean(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -2565,21 +2650,26 @@ func TestCleanupA2ACostsSevenReadsWhenThereIsNothingToClean(t *testing.T) {
 	if err := r.cleanupA2A(context.Background(), agent); err != nil {
 		t.Fatalf("cleanupA2A on a never-rendered install: %v", err)
 	}
-	// Seven sentinel Gets and nothing else: no per-object walk, and in
+	// Ten sentinel Gets and nothing else: no per-object walk, and in
 	// particular no Job List, which is the uncached one that ran every
 	// reconcile of every today install before this.
 	//
 	// The literal moved 3 -> 4 when the callout keys Secret joined the
-	// sentinels, 4 -> 6 when the two fences did (#2197), and 6 -> 7 when the
+	// sentinels, 4 -> 6 when the two fences did (#2197), 6 -> 7 when the
 	// inject door's fence did, for the hand-deleted pair that leaves it
-	// standing alone; the fences are Owns kinds, so those three reads come
-	// from the cache and only the two Secrets are uncached. Raising it is a
+	// standing alone, 7 -> 8 when the A2A door's fence did, for the same
+	// pair under the other flag, 8 -> 9 when the console fence did, for
+	// the same reason again, and 9 -> 10 when the gateway's own fence did
+	// (#2473: it now renders on every next gateway, and the same
+	// hand-deleted pair leaves it alone); the fences are Owns kinds, so those
+	// six reads come from the cache and only the two Secrets are uncached.
+	// Raising it is a
 	// real decision — every today install pays it on every reconcile,
 	// forever — so it is spelled out rather than derived. The inequality
 	// below is the part that must hold whatever the literal is: the exit is
 	// only worth having while it costs less than the walk.
-	if gets != 7 {
-		t.Errorf("Gets = %d, want 7 (the sentinels); the per-object walk is running on a no-op", gets)
+	if gets != 10 {
+		t.Errorf("Gets = %d, want 10 (the sentinels); the per-object walk is running on a no-op", gets)
 	}
 	if walk := len(r.a2aNamespacedTeardown(agent)); gets >= walk {
 		t.Errorf("Gets = %d for an exit that saves a %d-object walk; the exit has stopped paying for itself", gets, walk)
@@ -2592,10 +2682,12 @@ func TestCleanupA2ACostsSevenReadsWhenThereIsNothingToClean(t *testing.T) {
 // TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere is the correctness
 // half of the optimisation the test above prices.
 //
-// cleanupA2A answers "is there anything to tear down?" from seven objects: the
-// NATS StatefulSet, the gateway Deployment, the NATS, session and inject
-// fences, and the callout keys and NATS config Secrets. That is sound only
-// while every render that leaves residue leaves at least one of the seven, and
+// cleanupA2A answers "is there anything to tear down?" from ten objects: the
+// NATS StatefulSet, the gateway Deployment, the NATS, session, inject, A2A
+// door, console and gateway fences, and the callout keys and NATS config
+// Secrets. That
+// is sound only while every render that leaves residue leaves at least one of
+// the ten, and
 // the case that breaks it is not a full render -- it is a render that died
 // partway. Miss it and an A2A object stays alive on a today install, which is
 // the darkness property.
@@ -2696,14 +2788,14 @@ func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
 		})
 	}
 
-	for _, door := range []bool{false, true} {
-		t.Run(fmt.Sprintf("guardrail_path_door_armed_%t", door), func(t *testing.T) {
-			if door {
-				t.Setenv(a2aInjectBackendEnvVar, "true")
+	for _, door := range []string{"", a2aInjectBackendEnvVar, a2aAgentDoorEnvVar} {
+		t.Run(fmt.Sprintf("guardrail_path_door_armed_%q", door), func(t *testing.T) {
+			if door != "" {
+				t.Setenv(door, "true")
 			}
 			fences := 0
 			unobstructed := &PlatformAgentReconciler{Client: buildClient(next, 0, &fences), Scheme: scheme}
-			if err := unobstructed.reconcileA2ANetworkFences(context.Background(), next.DeepCopy()); err != nil {
+			if _, err := unobstructed.reconcileA2ANetworkFences(context.Background(), next.DeepCopy()); err != nil {
 				t.Fatalf("unobstructed guardrail render: %v", err)
 			}
 			if fences == 0 {
@@ -2720,7 +2812,7 @@ func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
 					r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 					ctx := context.Background()
 
-					err := r.reconcileA2ANetworkFences(ctx, next.DeepCopy())
+					_, err := r.reconcileA2ANetworkFences(ctx, next.DeepCopy())
 					if n <= fences && err == nil {
 						t.Fatal("want the injected error, got nil: the guardrail render did not die where this case says it did")
 					}
@@ -2768,7 +2860,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall(t *testing.T) {
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(next.DeepCopy()).
 			WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
 		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-		if err := r.reconcileA2ANetworkFences(context.Background(), next.DeepCopy()); err != nil {
+		if _, err := r.reconcileA2ANetworkFences(context.Background(), next.DeepCopy()); err != nil {
 			t.Fatalf("guardrail render: %v", err)
 		}
 		return countA2ALabelled(context.Background(), t, cl)
@@ -2796,7 +2888,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall(t *testing.T) {
 				Build()
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 			ctx := context.Background()
-			if err := r.reconcileA2ANetworkFences(ctx, next.DeepCopy()); err != nil {
+			if _, err := r.reconcileA2ANetworkFences(ctx, next.DeepCopy()); err != nil {
 				t.Fatalf("guardrail render: %v", err)
 			}
 
@@ -2859,6 +2951,10 @@ func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.
 	// with the door unarmed: the ownership rule has to hold on the operator
 	// that was redeployed without the flag and still has the fence.
 	injectFence := buildA2AGatewayNetworkPolicy
+	// The gateway's own fence is the ninth sentinel and keyed on no flag; a
+	// today CR that inherits one under its predecessor's UID is the same
+	// wedge shape.
+	gatewayFence := buildA2AGatewayFencePolicy
 	for _, tc := range []struct {
 		name  string
 		fence func(*agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy
@@ -2871,9 +2967,12 @@ func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.
 		{"NATS fence with no owner at all", natsFence, nil, false},
 		{"session fence with no owner at all", sessionFence, nil, false},
 		{"inject fence with no owner at all", injectFence, nil, false},
+		{"gateway fence under a stale UID", gatewayFence, &staleOwner, false},
+		{"gateway fence with no owner at all", gatewayFence, nil, false},
 		{"control: NATS fence owned by this CR is torn down", natsFence, nil, true},
 		{"control: session fence owned by this CR is torn down", sessionFence, nil, true},
 		{"control: inject fence owned by this CR is torn down", injectFence, nil, true},
+		{"control: gateway fence owned by this CR is torn down", gatewayFence, nil, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := setupScheme()
@@ -3100,6 +3199,8 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 				{Name: "NATS_URL", Value: "nats://attacker.example:443"},
 				{Name: a2aBusUserEnv, Value: "gateway"},
 				{Name: a2aBusTokenFileEnv, Value: "/opt/data/attacker/token"},
+				{Name: a2aNotifyPlatformEnvVar, Value: "google_chat"},
+				{Name: a2aNotifyConversationsEnvVar, Value: "google_chat"},
 				{Name: "NATS_USER", Value: "gateway"},
 				{Name: "NATS_PASSWORD", Value: "hunter2"},
 				{Name: "PLUGIN_OWN_KEY", Value: "kept"},
@@ -3140,7 +3241,11 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	// would choose the principal. And a surviving A2A_BUS_TOKEN_FILE would be
 	// the file the CLI presents as a token instead of the projected one, which
 	// it prefers unconditionally and with no fallback.
-	for _, name := range []string{"NATS_USER", "NATS_PASSWORD", a2aBusTokenFileEnv} {
+	// A2A_NOTIFY_PLATFORM is the fourth: on this install Chat is not armed,
+	// so the operator renders no value, and a plugin's would reroute the
+	// agent's proactive posts to a route with no gateway behind it.
+	// A2A_NOTIFY_CONVERSATIONS is the fifth, for the same reason.
+	for _, name := range []string{"NATS_USER", "NATS_PASSWORD", a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar} {
 		if counts[name] != 0 {
 			t.Errorf("a plugin's %s survived into the agent env under next", name)
 		}
@@ -3154,7 +3259,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	if counts["PLUGIN_OWN_KEY"] != 1 || values["PLUGIN_OWN_KEY"].Value != "kept" {
 		t.Error("the bus-name reservation dropped a plugin variable it has no claim on")
 	}
-	for _, name := range []string{"NATS_URL", a2aBusUserEnv, a2aBusTokenFileEnv, "NATS_USER", "NATS_PASSWORD"} {
+	for _, name := range []string{"NATS_URL", a2aBusUserEnv, a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, "NATS_USER", "NATS_PASSWORD"} {
 		if _, sensitive := agentv1alpha1.SensitiveEnvVars[name]; !sensitive {
 			t.Errorf("%s is not in SensitiveEnvVars; the drop above covers plugin env only, and membership "+
 				"is what keeps the name out of the sidecar containers, which take spec.deployment.env "+
@@ -3181,6 +3286,14 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 		}
 		if !found {
 			t.Error("today dropped a plugin's NATS_URL; the reservation must be gated on the A2A surface")
+		}
+		// The one exception: A2A_NOTIFY_PLATFORM is dropped on today as well,
+		// because there it would reroute every Google Chat post from hermes
+		// send to a chat.notify route the install does not have.
+		for _, e := range c.Env {
+			if e.Name == a2aNotifyPlatformEnvVar || e.Name == a2aNotifyConversationsEnvVar {
+				t.Errorf("a plugin's %s survived on a today install: %q", e.Name, e.Value)
+			}
 		}
 	}
 }
@@ -3349,7 +3462,7 @@ func TestNoAgentSidePrincipalCanPublishToTheDirectory(t *testing.T) {
 	// this test against the two-argument signature on main.
 	agent := a2aTestAgent()
 	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
-	doc, err := renderA2AAuthMap(agent)
+	doc, err := renderA2AAuthMap(agent, nil)
 	if err != nil {
 		t.Fatalf("rendering the auth map: %v", err)
 	}
@@ -3787,6 +3900,7 @@ func TestARefusalDoesNotSuspendTheA2AFences(t *testing.T) {
 				{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace},
 				{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace},
 				{Name: a2aVerifierNetpolName(agent), Namespace: agent.Namespace},
+				{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace},
 			} {
 				err := cl.Get(ctx, fence, &networkingv1.NetworkPolicy{})
 				if !tc.expected {
@@ -3986,6 +4100,41 @@ func TestARefusedFirstReconcileDropsTheA2AFencesOnTheFlipToToday(t *testing.T) {
 // require the inject fence gone and the namespace clean.
 func TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
+	// The console fence is deleted with the pair so the inject fence stands
+	// alone; TestAHandDeletedPairLeavesTheConsoleFenceToDriveTheFlip is the
+	// same hand without the inject flag.
+	handDeletedFenceFlip(t, true,
+		func(agent *agentv1alpha1.PlatformAgent) types.NamespacedName {
+			return types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+		},
+		func(agent *agentv1alpha1.PlatformAgent) []types.NamespacedName {
+			return []types.NamespacedName{{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}}
+		})
+}
+
+// TestAHandDeletedPairLeavesTheConsoleFenceToDriveTheFlip is the hand above on
+// an install whose operator runs without the inject flag. The console fence is
+// the third fence reconcileA2ANetworkFences writes, so deleting the NATS and
+// session fences leaves it alone, and only cleanupA2A's early exit listing it
+// gets the today walk to remove it.
+func TestAHandDeletedPairLeavesTheConsoleFenceToDriveTheFlip(t *testing.T) {
+	handDeletedFenceFlip(t, false,
+		func(agent *agentv1alpha1.PlatformAgent) types.NamespacedName {
+			return types.NamespacedName{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}
+		}, nil)
+}
+
+// handDeletedFenceFlip refuses a next CR, deletes the NATS and session fences
+// (and alsoDelete) through the client with no reconcile in between, flips the
+// CR to today, and requires the sole fence left standing gone and the
+// namespace clean.
+func handDeletedFenceFlip(t *testing.T, injectOn bool,
+	soleFence func(*agentv1alpha1.PlatformAgent) types.NamespacedName,
+	alsoDelete func(*agentv1alpha1.PlatformAgent) []types.NamespacedName) {
+	t.Helper()
+	if injectOn {
+		t.Setenv(a2aInjectBackendEnvVar, "true")
+	}
 	scheme := setupScheme()
 	agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
 		a.Spec.Mode = ptr.To(string(ModeNext))
@@ -4029,8 +4178,13 @@ func TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip(t *testing.T) {
 		{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace},
 		{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace},
 	}
-	inject := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
-	for _, fence := range append(append([]types.NamespacedName{}, pair...), inject) {
+	sole := soleFence(agent)
+	var extra []types.NamespacedName
+	if alsoDelete != nil {
+		extra = alsoDelete(agent)
+	}
+	handDeleted := append(append([]types.NamespacedName{}, pair...), extra...)
+	for _, fence := range append(append([]types.NamespacedName{}, handDeleted...), sole) {
 		if err := cl.Get(ctx, fence, &networkingv1.NetworkPolicy{}); err != nil {
 			t.Fatalf("%s was not rendered on the refusal, so the hand has nothing to delete: %v", fence.Name, err)
 		}
@@ -4039,22 +4193,23 @@ func TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip(t *testing.T) {
 	// The hand. No Reconcile between this and the flip: that is the window
 	// the finding names, and running one here would re-apply the pair and
 	// turn this into the door row of the test above.
-	for _, fence := range pair {
+	for _, fence := range handDeleted {
 		if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: fence.Name, Namespace: fence.Namespace},
 		}); err != nil {
 			t.Fatalf("delete %s by hand: %v", fence.Name, err)
 		}
 	}
-	// The inject fence is what drives the flip, and it has to be the only
-	// thing standing that could: the verifier's own fence survives beside it
-	// because the hand deleted the pair, not the verifier. Named rather than
-	// counted, so a third fence added to the render fails here with its name
-	// instead of moving a number.
+	// The sole fence is what drives the flip, and it has to be the only
+	// sentinel standing that could: the verifier's own fence survives beside
+	// it because the hand deleted the pair, not the verifier, and it is not a
+	// sentinel, so it cannot drive the flip in the sole fence's place. Named
+	// rather than counted, so a fence added to the render fails here with its
+	// name instead of moving a number.
 	survived := map[string]bool{}
 	sweepA2ALabelled(ctx, t, cl, func(kind, name string) { survived[kind+"/"+name] = true })
 	want := map[string]bool{
-		"NetworkPolicy/" + a2aInjectName(agent):         true,
+		"NetworkPolicy/" + sole.Name:                    true,
 		"NetworkPolicy/" + a2aVerifierNetpolName(agent): true,
 	}
 	if !maps.Equal(survived, want) {
@@ -4080,9 +4235,126 @@ func TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip(t *testing.T) {
 		t.Fatalf("the flipped CR is still refused (%s); cleanupA2A never ran and this proves nothing", reason)
 	}
 
-	if err := cl.Get(ctx, inject, &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+	if err := cl.Get(ctx, sole, &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
 		t.Errorf("%s survived the flip to today (err=%v): with the pair deleted by hand it was the only "+
-			"A2A object standing, and cleanupA2A's early exit does not key on it", inject.Name, err)
+			"sentinel standing, and cleanupA2A's early exit does not key on it", sole.Name, err)
+	}
+	var leftovers []string
+	sweepA2ALabelled(ctx, t, cl, func(kind, name string) {
+		leftovers = append(leftovers, kind+"/"+name)
+	})
+	if len(leftovers) > 0 {
+		t.Errorf("these A2A-labelled objects survive the flip to today: %v", leftovers)
+	}
+}
+
+// TestAHandDeletedPairLeavesTheA2ADoorFenceToDriveTheFlip is the test above
+// for the A2A door's fence: with A2A_AGENT_DOOR=true and the inject flag off,
+// the same hand-delete-then-flip leaves `<agent>-a2a-door` as the only A2A
+// object standing, and only its sentinel in cleanupA2A's early exit makes the
+// walk run.
+func TestAHandDeletedPairLeavesTheA2ADoorFenceToDriveTheFlip(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "true")
+	scheme := setupScheme()
+	agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+		a.Spec.Mode = ptr.To(string(ModeNext))
+		a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+			ControlPlaneCIDRs: []string{"0.0.0.0/0"},
+		}
+	})
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(ssaApplyInterceptor()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	readyReason := func() string {
+		t.Helper()
+		stored := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+			t.Fatalf("failed to re-read the agent: %v", err)
+		}
+		for _, condition := range stored.Status.Conditions {
+			if condition.Type == "Ready" {
+				return condition.Reason
+			}
+		}
+		return ""
+	}
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d under next: %v", i+1, err)
+		}
+	}
+	if reason := readyReason(); reason != reasonEgressAllowlistRefused {
+		t.Fatalf("Ready reason = %q, want %s; this test is not exercising the refused shape", reason, reasonEgressAllowlistRefused)
+	}
+
+	pair := []types.NamespacedName{
+		{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace},
+		{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace},
+	}
+	door := types.NamespacedName{Name: a2aDoorName(agent), Namespace: agent.Namespace}
+	// The console fence is deleted with the pair so the door fence stands
+	// alone, as in TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip.
+	handDeleted := append(append([]types.NamespacedName{}, pair...),
+		types.NamespacedName{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace})
+	for _, fence := range append(append([]types.NamespacedName{}, handDeleted...), door) {
+		if err := cl.Get(ctx, fence, &networkingv1.NetworkPolicy{}); err != nil {
+			t.Fatalf("%s was not rendered on the refusal, so the hand has nothing to delete: %v", fence.Name, err)
+		}
+	}
+
+	// The hand. No Reconcile between this and the flip: that is the window
+	// the finding names, and running one here would re-apply the pair and
+	// turn this into the door row of the test above.
+	for _, fence := range handDeleted {
+		if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: fence.Name, Namespace: fence.Namespace},
+		}); err != nil {
+			t.Fatalf("delete %s by hand: %v", fence.Name, err)
+		}
+	}
+	// The door fence is what drives the flip; the verifier's own fence
+	// survives beside it because the hand deleted the pair, not the
+	// verifier. Named, as the inject test names them.
+	survived := map[string]bool{}
+	sweepA2ALabelled(ctx, t, cl, func(kind, name string) { survived[kind+"/"+name] = true })
+	want := map[string]bool{
+		"NetworkPolicy/" + a2aDoorName(agent):           true,
+		"NetworkPolicy/" + a2aVerifierNetpolName(agent): true,
+	}
+	if !maps.Equal(survived, want) {
+		t.Fatalf("A2A-labelled objects after the hand-delete = %v, want %v; "+
+			"this is not the shape the test names", survived, want)
+	}
+
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	fresh.Spec.Mode = nil
+	fresh.Spec.Security.EgressAllowlist = nil
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatalf("flip to today: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d after the flip: %v", i+1, err)
+		}
+	}
+	if reason := readyReason(); reason == reasonEgressAllowlistRefused {
+		t.Fatalf("the flipped CR is still refused (%s); cleanupA2A never ran and this proves nothing", reason)
+	}
+
+	if err := cl.Get(ctx, door, &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+		t.Errorf("%s survived the flip to today (err=%v): with the pair deleted by hand it was the only "+
+			"A2A object standing, and cleanupA2A's early exit does not key on it", door.Name, err)
 	}
 	var leftovers []string
 	sweepA2ALabelled(ctx, t, cl, func(kind, name string) {
@@ -4448,7 +4720,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 // which is how a CONSUMER.CREATE grant becomes a read of a stream the subject
 // list withholds), and no reach into the buckets.
 func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
-	doc, err := renderA2AAuthMap(a2aTestAgent())
+	doc, err := renderA2AAuthMap(a2aTestAgent(), nil)
 	if err != nil {
 		t.Fatalf("rendering the auth map: %v", err)
 	}
@@ -4468,11 +4740,11 @@ func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
 		"a2a.topics.shared.annotations",
 	}
 	wantPublish = append(wantPublish, a2aAgentJetStreamGrants()...)
-	wantPublish = append(wantPublish, "_INBOX."+a2aAgentBusUser+".>")
+	wantPublish = append(wantPublish, "chat.notify.gchat", "chat.notify.slack", "_INBOX."+a2aAgentBusUser+".>")
 	if !reflect.DeepEqual(agent.Grants.Publish, wantPublish) {
 		t.Errorf("agent publish allow-list changed.\n got: %q\nwant: %q", agent.Grants.Publish, wantPublish)
 	}
-	if want := []string{"a2a.topics.>", "_INBOX." + a2aAgentBusUser + ".>"}; !reflect.DeepEqual(agent.Grants.Subscribe, want) {
+	if want := []string{"a2a.topics.>", "chat.notify.reply.agent.>", "_INBOX." + a2aAgentBusUser + ".>"}; !reflect.DeepEqual(agent.Grants.Subscribe, want) {
 		t.Errorf("agent subscribe allow-list changed.\n got: %q\nwant: %q", agent.Grants.Subscribe, want)
 	}
 
@@ -4598,7 +4870,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
 		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
-		"agents.hb.>", "$KV.session-state.>", "chat.console.*.in", "_INBOX.gateway.>",
+		"agents.hb.>", "$KV.session-state.>", "chat.console.*.in", "chat.notify.gchat", "chat.notify.slack", "_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
 	}
@@ -4608,6 +4880,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"a2a.tasks.*.*.supervisor",
 		"$KV.session-state.>",
 		"chat.console.*.out",
+		"chat.notify.reply.agent.>",
 		// The mint, and the whole of it: one token under `root`, which is
 		// the request id. No read of the bucket by any path, and nothing
 		// under `cap.hop.>` -- the gateway mints each successor's root
@@ -5164,7 +5437,7 @@ func checkA2AUserGrants(t a2aGrantReporter, user string, row a2aGrantRow, lists 
 			// Whether a wildcard further in covers a subject the row does
 			// not record is asked by subject matching in the caller.
 			if !grantNamespaceAllowed(g) {
-				t.Errorf("%s %s holds %q, which names no namespace the bus reads and is neither console door subject (%s, %s)", user, section, g, consoleInbound, consoleOutbound)
+				t.Errorf("%s %s holds %q, which names no namespace the bus reads and is none of the chat door subjects %q", user, section, g, chatDoorSubjects)
 				continue
 			}
 			if g == bareJetStreamAPI {
@@ -5429,6 +5702,7 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		"provision Job":      buildA2AProvisionJob(agent).Spec.Template.Spec,
 		"callout Deployment": buildA2ACalloutDeployment(agent).Spec.Template.Spec,
 		"agent pod":          buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec,
+		"console Deployment": buildA2AConsoleDeployment(agent).Spec.Template.Spec,
 	} {
 		for _, ref := range a2aPodSpecEnvSecretRefs(spec) {
 			if ref.secret == credsSecret && (ref.key == a2aSysPasswordKey || ref.key == "*") {
@@ -5592,17 +5866,29 @@ func TestSubjectPatternsOverlap(t *testing.T) {
 }
 
 // The console chat door, in the one spelling every check here shares. Two
-// exact subjects, not a namespace: these are the only chat.* grants the
-// render produces, so admitting the "chat" namespace wholesale in rule 2
-// would be wider than the thing being held.
+// exact subjects, not a namespace: the render's other chat.* grants are the
+// notify route's, held by their own check below, so admitting the "chat"
+// namespace wholesale in rule 2 would be wider than the thing being held.
 const (
 	consoleInbound  = "chat.console.*.in"
 	consoleOutbound = "chat.console.*.out"
 )
 
+// The chat.notify route's two subjects, spelled here independently of the
+// render's constants so a renamed constant cannot carry the check with it.
+const (
+	notifyRequest      = "chat.notify.gchat"
+	notifyRequestSlack = "chat.notify.slack"
+	notifyReply        = "chat.notify.reply.agent.>"
+)
+
+// chatDoorSubjects is every chat.* grant the render may produce, each
+// admitted as an exact subject.
+var chatDoorSubjects = []string{consoleInbound, consoleOutbound, notifyRequest, notifyRequestSlack, notifyReply}
+
 // grantNamespaceAllowed is rule 2's spelling check. A grant's first token
 // must name one of the bus's own namespaces, or the grant must BE one of the
-// two console door subjects.
+// chat door subjects: the console's two and the notify route's two.
 //
 // The door is deliberately not a namespace here. Admitting "chat" would stop
 // refusing chat.gchat.>, chat.console.*.status or chat.console.*.in.x by
@@ -5612,7 +5898,7 @@ const (
 // this one refuses everything in chat.* that is not the door, and the door
 // test decides which principal may hold the door itself.
 func grantNamespaceAllowed(g string) bool {
-	if g == consoleInbound || g == consoleOutbound {
+	if slices.Contains(chatDoorSubjects, g) {
 		return true
 	}
 	first, _, _ := strings.Cut(g, ".")
@@ -5631,6 +5917,9 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 	}{
 		{consoleInbound, true},
 		{consoleOutbound, true},
+		{notifyRequest, true},
+		{notifyRequestSlack, true},
+		{notifyReply, true},
 		{"a2a.task.>", true},
 		{"agents.hb.>", true},
 		{"$JS.API.STREAM.INFO.a2a", true},
@@ -5644,6 +5933,14 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		{"chat.console.*.status", false},
 		{"chat.console.*.in.x", false},
 		{"chat.console.>", false},
+		// The notify route admits its subjects (one per routed backend, and
+		// the reply namespace) and nothing around them: a sibling backend not
+		// yet routed, the namespace wildcard, the reply namespace widened to
+		// every principal, and one literal inside it.
+		{"chat.notify.discord", false},
+		{"chat.notify.>", false},
+		{"chat.notify.reply.>", false},
+		{"chat.notify.reply.agent.x", false},
 		{"chat.>", false},
 		{"chat", false},
 		// And the wildcards that cover every namespace at once.
@@ -5877,12 +6174,14 @@ func TestA2AInjectBackendIsOffWithoutTheFlag(t *testing.T) {
 		if e.Name == a2aInjectListenEnvVar {
 			t.Errorf("%s is rendered without the flag", a2aInjectListenEnvVar)
 		}
-		if e.Name == "A2A_PRINCIPAL_MAP" {
-			t.Errorf("A2A_PRINCIPAL_MAP is repointed without the flag: %+v", e)
+		// The chat map's path is rendered explicitly at the gateway's
+		// default; what the flag must not do is move it.
+		if e.Name == a2aPrincipalMapEnvVar && e.Value != a2aPrincipalMapDir {
+			t.Errorf("%s is repointed without the flag: %+v", a2aPrincipalMapEnvVar, e)
 		}
 	}
-	if len(container.Ports) != 0 {
-		t.Errorf("the gateway publishes %d container ports without the flag", len(container.Ports))
+	if doors := a2aGatewayDoorPorts(container.Ports); len(doors) != 0 {
+		t.Errorf("the gateway publishes %d door ports without the flag", len(doors))
 	}
 	for _, v := range dep.Spec.Template.Spec.Volumes {
 		if strings.Contains(v.Name, "inject") {
@@ -6040,8 +6339,11 @@ func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
 
 // TestA2AInjectFenceDeniesEveryPod: the fence is what keeps every other pod
 // off the door's port, so a leaked token alone reaches nothing; it has to
-// select the gateway pod and admit nobody. An ingress rule appearing here later is a
-// decision someone has to make deliberately.
+// select the gateway pod and admit nobody to the door. The builder's one rule
+// admits the managed-Prometheus collector's namespace to the metrics port
+// alone, and the applied copy adds the operator's (a2aFenceWithOperatorPeer);
+// any other ingress rule appearing here later is a decision someone has to
+// make deliberately.
 func TestA2AInjectFenceDeniesEveryPod(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
 	cl, agent, _, _ := a2aInjectAgentState(t)
@@ -6058,10 +6360,10 @@ func TestA2AInjectFenceDeniesEveryPod(t *testing.T) {
 		t.Errorf("policyTypes = %v, want Ingress alone -- Egress here would cut the gateway off the bus",
 			np.Spec.PolicyTypes)
 	}
-	if len(np.Spec.Ingress) != 0 {
-		t.Errorf("the fence admits %d ingress rules; the inject port must be reachable from no pod, "+
-			"only through the node path a port-forward uses", len(np.Spec.Ingress))
-	}
+	// The inject port must be reachable from no pod, only through the node
+	// path a port-forward uses; the one rule is the collector's, to the
+	// metrics port alone.
+	assertA2AGatewayFenceAdmitsOnlyTheCollector(t, np)
 }
 
 // TestA2AInjectBackendIsRemovedWhenTheFlagGoesOff: unsetting the operator's
@@ -6814,6 +7116,50 @@ func TestTheProvisionJobRunsOnAnOldTemplateReplica(t *testing.T) {
 	}
 }
 
+// ---- the A2A door ---------------------------------------------------------
+//
+// The gateway's A2A door is the inject door's sibling for an agent caller
+// (a2a/gateway/a2adoor.go), and it is confined the same way: rendered only
+// under its own operator flag, a bearer token this operator mints, one eval
+// identity admitted, the gateway pod fenced while it is rendered. The tests
+// below are the inject door's, run against the door's own objects and flag,
+// plus the one property the second door adds: the two are independent.
+
+func a2aDoorRenderedKinds() []client.Object { return a2aInjectRenderedKinds() }
+
+// TestA2AAgentDoorIsOffWithoutTheFlag: an ordinary next install renders no
+// A2A door at all.
+func TestA2AAgentDoorIsOffWithoutTheFlag(t *testing.T) {
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+
+	dep := buildA2AGatewayDeployment(agent)
+	container := dep.Spec.Template.Spec.Containers[0]
+	for _, e := range container.Env {
+		if e.Name == a2aDoorListenEnvVar || e.Name == a2aDoorTokenEnvVar || e.Name == a2aDoorPrincipalMapEnv {
+			t.Errorf("%s is rendered without the flag", e.Name)
+		}
+	}
+	if doors := a2aGatewayDoorPorts(container.Ports); len(doors) != 0 {
+		t.Errorf("the gateway publishes %d door ports without either flag", len(doors))
+	}
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if strings.Contains(v.Name, "a2a-door") {
+			t.Errorf("a door volume is mounted without the flag: %s", v.Name)
+		}
+	}
+
+	cl, agent, _, _ := a2aInjectAgentState(t)
+	ctx := context.Background()
+	name := types.NamespacedName{Name: a2aDoorName(agent), Namespace: agent.Namespace}
+	for _, obj := range a2aDoorRenderedKinds() {
+		if err := cl.Get(ctx, name, obj); !errors.IsNotFound(err) {
+			t.Errorf("%T %s exists without the flag (err=%v)", obj, name.Name, err)
+		}
+	}
+}
+
 // TestTheBridgeSidecarCanResolveItsOwnScope pins the repair for the defect this
 // test's absence allowed: a default install whose bridge refuses every
 // `platform` task.
@@ -6914,6 +7260,213 @@ func TestTheCapabilitySwitchReachesTheDefaultRoute(t *testing.T) {
 		}
 		if got != "true" {
 			t.Errorf("sidecar %q: %s = %q, want the armed default %q", want, a2aCapabilityRequiredEnvVar, got, "true")
+		}
+	}
+}
+
+// TestA2AAgentDoorRendersUnderTheFlag: the listener on loopback, the door's
+// own map beside the chat map, the token from the Secret this operator mints
+// and not optional, a ClusterIP that agrees with the listener.
+func TestA2AAgentDoorRendersUnderTheFlag(t *testing.T) {
+	t.Setenv(a2aAgentDoorEnvVar, "true")
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	cl, agent, _, _ := a2aInjectAgentState(t)
+	ctx := context.Background()
+
+	env := a2aGatewayEnv(t, cl, agent)
+	listen := env[a2aDoorListenEnvVar]
+	if listen.Value != fmt.Sprintf("%s:%d", a2aDoorListenHost, a2aDoorPort) {
+		t.Errorf("%s = %q, want the pod's loopback on the door port", a2aDoorListenEnvVar, listen.Value)
+	}
+	if got := env[a2aDoorPrincipalMapEnv].Value; got != a2aDoorPrincipalMapPath {
+		t.Errorf("%s = %q, want the operator's own map at %q", a2aDoorPrincipalMapEnv, got, a2aDoorPrincipalMapPath)
+	}
+	if got := env["A2A_PRINCIPAL_MAP"].Value; got == a2aDoorPrincipalMapPath {
+		t.Error("the door repointed A2A_PRINCIPAL_MAP, which is the chat backends' map")
+	}
+	if _, armed := env[a2aInjectListenEnvVar]; armed {
+		t.Error("the A2A door's flag armed the inject door too; the two are independent")
+	}
+	tokenRef := env[a2aDoorTokenEnvVar].ValueFrom
+	if tokenRef == nil || tokenRef.SecretKeyRef == nil {
+		t.Fatalf("%s is not read from a Secret: %+v", a2aDoorTokenEnvVar, env[a2aDoorTokenEnvVar])
+	}
+	if tokenRef.SecretKeyRef.Name != a2aDoorName(agent) || tokenRef.SecretKeyRef.Key != a2aDoorTokenKey {
+		t.Errorf("the token comes from %s/%s, want %s/%s", tokenRef.SecretKeyRef.Name,
+			tokenRef.SecretKeyRef.Key, a2aDoorName(agent), a2aDoorTokenKey)
+	}
+	if tokenRef.SecretKeyRef.Optional != nil && *tokenRef.SecretKeyRef.Optional {
+		t.Error("the token reference is optional, so a pod could start with an empty token")
+	}
+
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, dep); err != nil {
+		t.Fatal(err)
+	}
+	container := dep.Spec.Template.Spec.Containers[0]
+	var mounted bool
+	for _, m := range container.VolumeMounts {
+		if m.MountPath == a2aDoorPrincipalMapDir {
+			mounted = true
+			if !m.ReadOnly {
+				t.Error("the door's principal map is mounted writable")
+			}
+		}
+	}
+	if !mounted {
+		t.Errorf("no volume is mounted at %s, so the gateway would read an empty map", a2aDoorPrincipalMapDir)
+	}
+	if doors := a2aGatewayDoorPorts(container.Ports); len(doors) != 1 || doors[0].ContainerPort != a2aDoorPort {
+		t.Errorf("container ports = %+v, want the door port alone beside the metrics port", container.Ports)
+	}
+
+	cm := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aDoorName(agent), Namespace: agent.Namespace}, cm); err != nil {
+		t.Fatalf("door principal map: %v", err)
+	}
+	lines := strings.Fields(strings.TrimSpace(cm.Data[a2aDoorPrincipalMapKey]))
+	if len(cm.Data) != 1 || len(lines) != 2 {
+		t.Fatalf("the map is %q under %d keys, want one prefixed entry", cm.Data[a2aDoorPrincipalMapKey], len(cm.Data))
+	}
+	if lines[0] != a2aDoorPrincipalPrefix+a2aDoorCaller {
+		t.Errorf("the map's key is %q, want it qualified with %q", lines[0], a2aDoorPrincipalPrefix)
+	}
+	if !strings.HasPrefix(lines[1], "eval:") {
+		t.Errorf("the map admits %q, which is not an eval identity", lines[1])
+	}
+
+	secret := &corev1.Secret{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aDoorName(agent), Namespace: agent.Namespace}, secret); err != nil {
+		t.Fatalf("the door's bearer token Secret was not rendered: %v", err)
+	}
+	if len(secret.Data[a2aDoorTokenKey]) != 2*a2aInjectTokenNumBytes {
+		t.Errorf("the token is %d hex characters, want %d", len(secret.Data[a2aDoorTokenKey]), 2*a2aInjectTokenNumBytes)
+	}
+
+	svc := &corev1.Service{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aDoorName(agent), Namespace: agent.Namespace}, svc); err != nil {
+		t.Fatalf("door Service: %v", err)
+	}
+	if svc.Spec.Type != corev1.ServiceTypeClusterIP {
+		t.Errorf("door Service type = %q, want ClusterIP", svc.Spec.Type)
+	}
+	if svc.Spec.Selector["app"] != a2aGatewayName(agent) {
+		t.Errorf("door Service selects %v, want the gateway pod", svc.Spec.Selector)
+	}
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != a2aDoorPort {
+		t.Errorf("door Service ports = %+v, want just the door port", svc.Spec.Ports)
+	}
+	if !strings.HasSuffix(listen.Value, fmt.Sprintf(":%d", svc.Spec.Ports[0].Port)) {
+		t.Errorf("the gateway listens on %q and the Service publishes %d", listen.Value, svc.Spec.Ports[0].Port)
+	}
+
+	np := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aDoorName(agent), Namespace: agent.Namespace}, np); err != nil {
+		t.Fatalf("the gateway fence was not rendered with the door: %v", err)
+	}
+	if np.Spec.PodSelector.MatchLabels["app"] != a2aGatewayName(agent) {
+		t.Errorf("the fence selects %v, want the gateway pod", np.Spec.PodSelector.MatchLabels)
+	}
+	if len(np.Spec.PolicyTypes) != 1 || np.Spec.PolicyTypes[0] != networkingv1.PolicyTypeIngress {
+		t.Errorf("the fence is %+v, want Ingress alone", np.Spec)
+	}
+	assertA2AGatewayFenceAdmitsOnlyTheCollector(t, np)
+}
+
+// TestA2AAgentDoorAndInjectDoorArmTogether: both flags on, both doors
+// rendered, on distinct ports, with distinct maps, and neither flag's removal
+// path touches the other's objects.
+func TestA2AAgentDoorAndInjectDoorArmTogether(t *testing.T) {
+	t.Setenv(a2aAgentDoorEnvVar, "true")
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, r, req := a2aInjectAgentState(t)
+	ctx := context.Background()
+
+	env := a2aGatewayEnv(t, cl, agent)
+	if env[a2aInjectListenEnvVar].Value == "" || env[a2aDoorListenEnvVar].Value == "" {
+		t.Fatalf("both flags on: inject=%q door=%q", env[a2aInjectListenEnvVar].Value, env[a2aDoorListenEnvVar].Value)
+	}
+	if env[a2aInjectListenEnvVar].Value == env[a2aDoorListenEnvVar].Value {
+		t.Error("the two doors listen on the same address")
+	}
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, dep); err != nil {
+		t.Fatal(err)
+	}
+	if ports := dep.Spec.Template.Spec.Containers[0].Ports; len(a2aGatewayDoorPorts(ports)) != 2 {
+		t.Errorf("container ports = %+v, want one per door beside the metrics port", ports)
+	}
+
+	// The inject flag goes off; the A2A door stays whole.
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	doorKey := types.NamespacedName{Name: a2aDoorName(agent), Namespace: agent.Namespace}
+	for _, obj := range a2aDoorRenderedKinds() {
+		if err := cl.Get(ctx, doorKey, obj); err != nil {
+			t.Errorf("%T %s went with the inject flag: %v", obj, doorKey.Name, err)
+		}
+	}
+	injectKey := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	for _, obj := range a2aInjectRenderedKinds() {
+		if err := cl.Get(ctx, injectKey, obj); !errors.IsNotFound(err) {
+			t.Errorf("%T %s survived its own flag going off (err=%v)", obj, injectKey.Name, err)
+		}
+	}
+	env = a2aGatewayEnv(t, cl, agent)
+	if env[a2aInjectListenEnvVar].Value != "" || env[a2aDoorListenEnvVar].Value == "" {
+		t.Errorf("after the inject flag went off: inject=%q door=%q", env[a2aInjectListenEnvVar].Value, env[a2aDoorListenEnvVar].Value)
+	}
+}
+
+// TestA2AAgentDoorIsRemovedWhenTheFlagGoesOff and
+// TestA2AAgentDoorGoesAwayOnAFlipToToday: the inject door's two removal
+// properties, on the door's own objects.
+func TestA2AAgentDoorIsRemovedWhenTheFlagGoesOff(t *testing.T) {
+	t.Setenv(a2aAgentDoorEnvVar, "true")
+	cl, agent, r, req := a2aInjectAgentState(t)
+	ctx := context.Background()
+	key := types.NamespacedName{Name: a2aDoorName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, key, &corev1.Service{}); err != nil {
+		t.Fatalf("the Service was not rendered, so this test proves nothing: %v", err)
+	}
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the flag went off: %v", err)
+	}
+	for _, obj := range a2aDoorRenderedKinds() {
+		if err := cl.Get(ctx, key, obj); !errors.IsNotFound(err) {
+			t.Errorf("%T %s survived the flag going off (err=%v)", obj, key.Name, err)
+		}
+	}
+	if env := a2aGatewayEnv(t, cl, agent); env[a2aDoorListenEnvVar].Value != "" {
+		t.Errorf("the gateway still listens on %q after the flag went off", env[a2aDoorListenEnvVar].Value)
+	}
+}
+
+func TestA2AAgentDoorGoesAwayOnAFlipToToday(t *testing.T) {
+	t.Setenv(a2aAgentDoorEnvVar, "true")
+	cl, agent, r, req := a2aInjectAgentState(t)
+	ctx := context.Background()
+	key := types.NamespacedName{Name: a2aDoorName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, key, &corev1.Service{}); err != nil {
+		t.Fatalf("the Service was not rendered, so this test proves nothing: %v", err)
+	}
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatal(err)
+	}
+	fresh.Spec.Mode = nil
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the flip to today: %v", err)
+	}
+	for _, obj := range a2aDoorRenderedKinds() {
+		if err := cl.Get(ctx, key, obj); !errors.IsNotFound(err) {
+			t.Errorf("%T %s survived the flip to today (err=%v)", obj, key.Name, err)
 		}
 	}
 }
@@ -7030,9 +7583,10 @@ func TestTheExecutorEnvIsNotSharedBetweenSidecars(t *testing.T) {
 // session fence" — a test that spelled the whole order out would go red on
 // every unrelated reordering and teach the next author to re-bless it.
 //
-// The inject door's flag is not read here: a2aNamespacedTeardown lists the
+// The doors' flags are not read here: a2aNamespacedTeardown lists each
 // door's four unconditionally (see its comment), so every fence the operator
-// can render is in the list either way.
+// can render is in the list either way: the NATS, verifier, console and
+// session fences, the inject and A2A door fences, and the gateway's own fence.
 func TestTheSessionFenceIsTheLastFenceTheTeardownDeletes(t *testing.T) {
 	agent := a2aTestAgent()
 	r := &PlatformAgentReconciler{}
@@ -7049,12 +7603,183 @@ func TestTheSessionFenceIsTheLastFenceTheTeardownDeletes(t *testing.T) {
 
 	// Without this the test passes vacuously on a list that lost its fences
 	// entirely, which is a worse bug than the one it is written to catch.
-	if want := 4; fences != want {
+	if want := 7; fences != want {
 		t.Fatalf("the teardown walks %d NetworkPolicies, want %d — if a fence was added or removed, "+
 			"re-read the ordering argument above before changing this number", fences, want)
 	}
 	if got, want := lastFence, a2aSessionNetpolName(agent); got != want {
 		t.Errorf("the last fence the teardown deletes is %q, want %q; a fence deleted after the session "+
 			"fence is left behind forever on an install refused on its first reconcile", got, want)
+	}
+}
+
+// notifyDoorViolations is the chat.notify route's half of the door check:
+// the agent alone may publish a notify and read the answers, and the gateway
+// alone may read a notify and publish the answers. Matched by overlap, so a
+// wildcard that would reach either subject counts as holding it.
+func notifyDoorViolations(ids []a2aIdentity) []string {
+	rules := []struct {
+		verb, pattern, owner string
+		grants               func(a2aIdentity) []string
+	}{
+		{"publish", notifyRequest, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
+		{"publish", notifyRequestSlack, a2aAgentBusUser, func(id a2aIdentity) []string { return id.publish }},
+		{"subscribe", notifyReply, a2aAgentBusUser, func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", notifyRequest, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", notifyRequestSlack, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
+		{"publish", notifyReply, "gateway", func(id a2aIdentity) []string { return id.publish }},
+	}
+	var out []string
+	for _, id := range ids {
+		for _, r := range rules {
+			if id.user == r.owner {
+				continue
+			}
+			for _, g := range r.grants(id) {
+				if subjectPatternsOverlap(g, r.pattern) {
+					out = append(out, fmt.Sprintf("%s %s %q overlaps %s; only %s may %s it", id.user, r.verb, g, r.pattern, r.owner, r.verb))
+				}
+			}
+		}
+	}
+	return out
+}
+
+// TestChatNotifySubjectsHaveExactlyOneWriterAndOneReader is the property the
+// notify route's authorization rests on. The gateway posts what arrives on
+// chat.notify.gchat to the home channel as the install's bot, so only the
+// agent may publish there; the agent reads the answer as the gateway's word
+// on where the post landed, so only the gateway may publish on the reply
+// namespace. And each direction has exactly one reader: a second subscriber
+// on the request would see every proactive post, and one on the replies could
+// tell which threads alerts went to.
+func TestChatNotifySubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
+	ids := a2aIdentities(a2aTestAgent())
+	for _, v := range notifyDoorViolations(ids) {
+		t.Error(v)
+	}
+	holds := func(user, verb, pattern string) bool {
+		for _, id := range ids {
+			if id.user != user {
+				continue
+			}
+			list := id.publish
+			if verb == "subscribe" {
+				list = id.subscribe
+			}
+			return slices.ContainsFunc(list, func(g string) bool { return subjectPatternsOverlap(g, pattern) })
+		}
+		return false
+	}
+	for _, want := range []struct{ user, verb, pattern string }{
+		{a2aAgentBusUser, "publish", notifyRequest},
+		{a2aAgentBusUser, "publish", notifyRequestSlack},
+		{a2aAgentBusUser, "subscribe", notifyReply},
+		{"gateway", "subscribe", notifyRequest},
+		{"gateway", "subscribe", notifyRequestSlack},
+		{"gateway", "publish", notifyReply},
+	} {
+		if !holds(want.user, want.verb, want.pattern) {
+			t.Errorf("%s cannot %s %s; the notify route needs it", want.user, want.verb, want.pattern)
+		}
+	}
+	// The agent must not be able to answer its own notifies: a forged
+	// answer is how a caller would claim a post landed where it did not.
+	if holds(a2aAgentBusUser, "publish", notifyReply) {
+		t.Errorf("the agent can publish on %s", notifyReply)
+	}
+
+	// Mutations: a second writer by literal grant, and a second reader by
+	// wildcard. The same check over each modified set must report it.
+	for _, m := range []struct {
+		user, verb, grant string
+	}{
+		{a2aBridgeUser, "publish", "chat.notify.gchat"},
+		{a2aBridgeUser, "publish", "chat.notify.slack"},
+		{"web", "subscribe", "chat.notify.reply.>"},
+	} {
+		mutated := slices.Clone(ids)
+		found := false
+		for i := range mutated {
+			if mutated[i].user != m.user {
+				continue
+			}
+			found = true
+			if m.verb == "publish" {
+				mutated[i].publish = append(slices.Clone(mutated[i].publish), m.grant)
+			} else {
+				mutated[i].subscribe = append(slices.Clone(mutated[i].subscribe), m.grant)
+			}
+		}
+		if !found {
+			t.Fatalf("no %s identity to mutate", m.user)
+		}
+		if v := notifyDoorViolations(mutated); len(v) != 1 || !strings.Contains(v[0], fmt.Sprintf("%s %s %q", m.user, m.verb, m.grant)) {
+			t.Errorf("%s %s %q was not reported exactly once; got %q", m.user, m.verb, m.grant, v)
+		}
+	}
+}
+
+// TestGatewayRendersThePlatformAllowlists: the CR's Chat and Slack allowlists
+// reach the gateway as two env vars, comma-joined, Chat lowercased; an absent
+// or empty list renders no var at all (absent means all authenticated users).
+func TestGatewayRendersThePlatformAllowlists(t *testing.T) {
+	envOf := func(agent *agentv1alpha1.PlatformAgent) map[string]string {
+		out := map[string]string{}
+		for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+			out[e.Name] = e.Value
+		}
+		return out
+	}
+	agent := a2aTestAgent()
+	if _, ok := envOf(agent)[a2aTargetAllowedUsersGchatEnvVar]; ok {
+		t.Fatal("gchat allowlist rendered with no integration block")
+	}
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		GoogleChat: &agentv1alpha1.GoogleChatSpec{AllowedUsers: []string{"Alice@Example.com", " bob@example.com "}},
+		Slack:      &agentv1alpha1.SlackSpec{AllowedUsers: []string{"U0ABC", "U0DEF"}},
+	}
+	env := envOf(agent)
+	if got := env[a2aTargetAllowedUsersGchatEnvVar]; got != "alice@example.com,bob@example.com" {
+		t.Fatalf("gchat = %q", got)
+	}
+	if got := env[a2aTargetAllowedUsersSlackEnvVar]; got != "U0ABC,U0DEF" {
+		t.Fatalf("slack = %q", got)
+	}
+	// Absent, and the allow-all spelling [""] the legacy consumer reads as
+	// such, render nothing: all authenticated users.
+	agent.Spec.Integration.GoogleChat.AllowedUsers = nil
+	agent.Spec.Integration.Slack.AllowedUsers = []string{""}
+	env = envOf(agent)
+	for _, name := range []string{a2aTargetAllowedUsersGchatEnvVar, a2aTargetAllowedUsersSlackEnvVar} {
+		if _, ok := env[name]; ok {
+			t.Fatalf("%s rendered for an allow-all list", name)
+		}
+	}
+}
+
+// TestGatewayRendersABlankPlatformAllowlistAsNobody: a CR list that is present
+// but blank after trimming, and not the allow-all spelling, renders the var
+// empty. The gateway reads set-but-empty as a list with no members, so the
+// list admits nobody (#2207's rule for the Chat ingress list) rather than
+// quietly widening to everyone.
+func TestGatewayRendersABlankPlatformAllowlistAsNobody(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		GoogleChat: &agentv1alpha1.GoogleChatSpec{AllowedUsers: []string{"  "}},
+		Slack:      &agentv1alpha1.SlackSpec{AllowedUsers: []string{"", " "}},
+	}
+	env := map[string]corev1.EnvVar{}
+	for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+		env[e.Name] = e
+	}
+	for _, name := range []string{a2aTargetAllowedUsersGchatEnvVar, a2aTargetAllowedUsersSlackEnvVar} {
+		e, ok := env[name]
+		if !ok {
+			t.Fatalf("%s not rendered for a blank list; the gateway would read no list as everyone", name)
+		}
+		if e.Value != "" || e.ValueFrom != nil {
+			t.Fatalf("%s = %+v, want rendered empty", name, e)
+		}
 	}
 }

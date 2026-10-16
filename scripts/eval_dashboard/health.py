@@ -213,6 +213,24 @@ STORM_COOLDOWN = timedelta(minutes=30)
 # in a run are background noise on any day and must not hold GREEN off.
 STORM_RUN_SIGNATURE_REPS = 5
 
+# --- Replay errors (#2328) ---------------------------------------------------
+# A card-wake replay whose plant or turn failed in the image (ReplayBroken) or
+# whose directive/prompt was invalid returns an errored result; at bench-gate
+# it blocks at rung 3. The reason carries "the record is not evidence of a real
+# agent run" and "trajectory is empty", which STORM_REASON_RE matches;
+# recognised before the storm check so a broken replay is classified as a
+# graded fail rather than a storm repetition.
+REPLAY_ERROR_RE = re.compile(
+    r"ReplayBroken"
+    r"|ReplayMismatch"
+    r"|failure wake:"
+    r"|question wake:"
+    r"|thread context:"
+    r"|replay declares"
+    r"|\[bench:(?:card-failure|slack-question)-wake\]",
+    re.IGNORECASE,
+)
+
 # --- Rule 2b: delegation ceiling -> DEGRADED (#1874, #1879) -------------------
 # Incident: the platform agent's kanban dispatcher stalls under load ("ready
 # queue non-empty ... 0 workers spawned", 23 warnings on the 2026-09-21
@@ -401,9 +419,9 @@ RECOVERY_GREEN_RUNS = 3
 # The rule: the median wall clock of the newest SLOW_RUNS full runs -- a
 # concluded run of at least SLOW_MIN_TASKS cases (one fewer than the
 # presubmit file lists, read from hack/eval/presubmit-cases.txt: 13 for the
-# fourteen the presubmit runs since 2026-09-29 (twelve on the roster plus the
-# two held-out seats, the compliance canary, #2013, and pdb-remediation-pr,
-# #2016; twelve from 2026-09-22, when it became the
+# fourteen the presubmit runs since 2026-09-29: thirteen roster cases and the
+# held-out compliance canary (#2013) since 2026-10-14, twelve and two seats
+# before that (#2016); twelve from 2026-09-22, when it became the
 # blocking roster only, #1023, having run 18-19 before); a run Prow cut short
 # at its ceiling recorded fewer and is not one; the floor was a literal 15
 # until the roster shrank under it, which would have made every run since a
@@ -439,6 +457,25 @@ SLOW_BASELINE = timedelta(days=7)
 SLOW_BASELINE_MIN_RUNS = 20
 SLOW_FACTOR = 1.2
 SLOW_CLEAR_FACTOR = 1.1
+
+# --- Rule 7b: near deadline -> a note beside the state, never a state (#2873) -
+# Prow kills pull-kube-agents-smoke-test at PROW_JOB_TIMEOUT (360 min today).
+# Rule 7 (slow gate) measures relative increase against a 7-day baseline and
+# misses gradual creep; rule 3d (deadline_kill) fires only after 3+ runs have
+# already been killed. This note warns when completed runs get close to the
+# ceiling while the gate is GREEN.
+#
+# Headroom thresholds follow PROW_JOB_TIMEOUT:
+# - Fire when the slowest qualifying run in the last 24h >= timeout - 60m (300m).
+# - Clear when the slowest qualifying run in the last 24h < timeout - 80m (280m).
+# A run qualifies if it meets slow_gate()'s filter (SUCCESS or FAILURE, at least
+# SLOW_MIN_TASKS tasks, non-null wall_clock) with storm_reps == 0, or is a
+# deadline_kill with tasks recorded (run.full) and storm_reps == 0; a kill
+# finished at or before the current GREEN episode began does not count.
+NEAR_DEADLINE_WINDOW = timedelta(hours=24)
+NEAR_DEADLINE_HEADROOM = timedelta(minutes=60)
+NEAR_DEADLINE_CLEAR_HEADROOM = timedelta(minutes=80)
+NEAR_DEADLINE_HEADROOM_FIRE = NEAR_DEADLINE_HEADROOM
 
 # --- Rule 8: a backed-up pool -> a note beside the state, never a state (#1607)
 # Runs are timed from their start, so nothing else here sees a run that sat in
@@ -515,7 +552,7 @@ ADVICE_LOST_PODS = (
 UNKNOWN_NODE = "(name unknown)"
 ADVICE_FIXTURE_DRIFT = (
     "A red on a case that depends on {roles} from a run that leased {projects} is the fixture, not your change;"
-    " retest once the fleet owner has re-applied bench/tf/fleet there (README, State and reconcile)."
+    " retest after the daily reconcile has re-applied bench/tf/fleet there (08:30 UTC) and the scan that follows reads it healthy."
 )
 ADVICE_POOL_DRIFT = (
     "A 403 or a missing-resource red from a run that leased {projects} is the pool project's shape, not your change"
@@ -565,9 +602,9 @@ STEP_RE = re.compile(r"(\d+)([mh])")
 # fixture is a week of real data.json, ten times smaller compressed.
 GZIP_SUFFIX = ".gz"
 # How many characters of a repetition's reason the fixture trimmer keeps:
-# every phrase STORM_REASON_RE matches sits inside the first 96 characters
-# of the harness's phrasings, and the dashboard keeps 300.
-TRIM_REASON_CHARS = 96
+# every phrase STORM_REASON_RE and REPLAY_ERROR_RE matches sits inside the
+# first 128 characters of the harness's phrasings, and the dashboard keeps 300.
+TRIM_REASON_CHARS = 128
 # The optional run fields (SCHEMA.md) the trimmer carries when the source has
 # them; absent stays absent: how the build ended, and the eval's own verdict,
 # which is what tells a deadline kill from a long red.
@@ -620,15 +657,19 @@ def rep_kind(rep: dict) -> str:
     `storm` is what the harness could not grade: an `infra` verdict, or a
     `fail` whose reason is one of the never-ran phrasings (graded `fail`
     before #1184, classified `infra` after it -- the text is the same).
+    A harness-declared replay error (#2328) is a graded fail, not a storm.
     """
     result = rep.get("result")
     if result == REP_RESULT_PASS:
         return REP_PASS
-    if DELEGATION_CEILING_MARKER in (rep.get("reason") or ""):
+    reason = rep.get("reason") or ""
+    if DELEGATION_CEILING_MARKER in reason:
         return REP_CEILING
+    if result != REP_RESULT_INFRA and "KUBE_AGENTS_INFRA_FAILURE" not in reason and REPLAY_ERROR_RE.search(reason):
+        return REP_FAIL
     if result == REP_RESULT_INFRA:
         return REP_STORM
-    if STORM_REASON_RE.search(rep.get("reason") or ""):
+    if STORM_REASON_RE.search(reason):
         return REP_STORM
     return REP_FAIL
 
@@ -1135,6 +1176,8 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
         "unknown": False,
         "scanned_at": None,
         "unread_units": 0,
+        "absent_units": 0,
+        "absent_projects": 0,
         "roles": [],
         "projects": [],
         "drift": {},
@@ -1168,6 +1211,10 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     out["partial"] = bool(scope_key) and state_doc.get(scope_key) == getattr(module, "SCOPE_SELECTED", None)
     out["checked"] = module.checked_projects(state_doc)
     out["unread_units"] = module.unread_units(state_doc)
+    # The fleet scan tells a fixture the stack has not planted from a read
+    # that failed; the pool scan has no such state.
+    out["absent_units"] = module.absent_units(state_doc) if hasattr(module, "absent_units") else 0
+    out["absent_projects"] = module.absent_projects(state_doc) if hasattr(module, "absent_projects") else 0
     if scanned_at is None or now - scanned_at > FIXTURE_STATE_MAX_AGE:
         out["stale"] = True
         age = f"{int((now - scanned_at).total_seconds() // 3600)}h" if scanned_at else "of unknown age"
@@ -1375,6 +1422,117 @@ def slow_evidence(slow: dict) -> str:
     )
 
 
+def near_deadline(
+    full_runs, now: datetime, prev: dict | None, non_green_end: datetime | None = None
+) -> dict | None:
+    """The note's numbers while runs are close to PROW_JOB_TIMEOUT, else None.
+
+    Measures the slowest run among qualifying runs finished in the last 24h.
+    A run qualifies if it finished in (now - 24h, now], has non-null wall_clock,
+    has 0 storm repetitions, and either completed at least SLOW_MIN_TASKS tasks
+    with SUCCESS/FAILURE or was killed at the deadline with at least one task
+    recorded; a kill finished at or before the current GREEN episode began does
+    not count. If the window has no qualifying runs (weekends), keeps the
+    previous note unchanged.
+    """
+    window_start = now - NEAR_DEADLINE_WINDOW
+    qualifying = [
+        run
+        for run in full_runs
+        if run.wall_clock is not None
+        and run.storm_reps == 0
+        and run.finished is not None
+        and window_start < run.finished <= now
+        and (non_green_end is None or not run.deadline_kill or run.finished > non_green_end)
+        and (
+            (run.result in (RUN_SUCCESS, RUN_FAILURE) and len(run.tasks) >= SLOW_MIN_TASKS)
+            or (run.deadline_kill and run.full)
+        )
+    ]
+    if not qualifying:
+        return prev
+
+    slowest = max(qualifying, key=lambda r: r.wall_clock)
+    max_s = int(slowest.wall_clock.total_seconds())
+    fire_threshold_s = int((PROW_JOB_TIMEOUT - NEAR_DEADLINE_HEADROOM).total_seconds())
+    clear_threshold_s = int((PROW_JOB_TIMEOUT - NEAR_DEADLINE_CLEAR_HEADROOM).total_seconds())
+
+    if prev is not None:
+        if max_s < clear_threshold_s:
+            return None
+    else:
+        if max_s < fire_threshold_s:
+            return None
+
+    deadline_s = int(PROW_JOB_TIMEOUT.total_seconds())
+    headroom_s = max(0, deadline_s - max_s)
+    kills = sum(1 for r in qualifying if r.deadline_kill)
+
+    return {
+        "since": (prev or {}).get("since") or iso(now),
+        "runs": len(qualifying),
+        "max_s": max_s,
+        "max_build": slowest.build_id,
+        "deadline_s": deadline_s,
+        "headroom_s": headroom_s,
+        "kills": kills,
+        "max_killed": slowest.deadline_kill,
+    }
+
+
+def near_deadline_margin(nd: dict) -> str:
+    """The margin beside the slowest run for evidence and chat alert."""
+    max_s = nd.get("max_s", 0)
+    deadline_s = nd.get("deadline_s", int(PROW_JOB_TIMEOUT.total_seconds()))
+    headroom_s = nd.get("headroom_s")
+    if headroom_s is None:
+        headroom_s = max(0, deadline_s - max_s)
+    max_killed = bool(nd.get("max_killed", False))
+    timeout_min = minutes_text(deadline_s)
+    headroom_min = int(headroom_s // SECONDS_PER_MINUTE)
+    overrun_min = int((max_s - deadline_s) // SECONDS_PER_MINUTE) if max_s > deadline_s else 0
+
+    if headroom_min > 0:
+        return f"{headroom_min} min under the {timeout_min}-minute Prow timeout"
+    if max_killed:
+        if overrun_min > 0:
+            return f"{overrun_min} min past the {timeout_min}-minute Prow timeout"
+        return "killed at the deadline"
+    if overrun_min > 0:
+        return f"{overrun_min} min past the {timeout_min}-minute Prow timeout"
+    return f"at the {timeout_min}-minute Prow timeout"
+
+
+def near_deadline_headroom_text(nd: dict) -> str:
+    """The headroom phrase for timeline entries and daily digests."""
+    max_s = nd.get("max_s", 0)
+    deadline_s = nd.get("deadline_s", int(PROW_JOB_TIMEOUT.total_seconds()))
+    headroom_s = nd.get("headroom_s")
+    if headroom_s is None:
+        headroom_s = max(0, deadline_s - max_s)
+    max_killed = bool(nd.get("max_killed", False))
+    headroom_min = int(headroom_s // SECONDS_PER_MINUTE)
+    overrun_min = int((max_s - deadline_s) // SECONDS_PER_MINUTE) if max_s > deadline_s else 0
+
+    if headroom_min > 0:
+        return f"{headroom_min} min of headroom"
+    if max_killed:
+        if overrun_min > 0:
+            return f"{overrun_min} min past the timeout"
+        return "killed at the deadline"
+    if overrun_min > 0:
+        return f"{overrun_min} min past the timeout"
+    return "at the timeout"
+
+
+def near_deadline_evidence(nd: dict) -> str:
+    max_min = minutes_text(nd.get("max_s"))
+    return (
+        f"close to deadline: slowest run {max_min} min in the last 24h"
+        f" ({near_deadline_margin(nd)}; {nd['runs']} runs)"
+    )
+
+
 def _as_seconds(minutes) -> int | None:
     """pool-pressure.json reports minutes; health.json stores seconds.
 
@@ -1522,8 +1680,9 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
     pool = _section(artifact, "pool")
     thresholds = _section(artifact, "thresholds")
     # The numbers that justify the verdict, not the window's. The periodic
-    # breaches on a single day's row or on a run waiting past p95 right now
-    # (pool_pressure.py's `breached_days or live_breach`) and never on the
+    # breaches on a single day's row, on a run waiting past p95 right now, or
+    # on a run refused a project in its recent window (pool_pressure.py's
+    # `breached_days or live_breach or recent_failed`) and never on the
     # seven-day aggregate, which after one bad day sits back inside its own
     # limit -- printing it under "onboard a project" contradicts the alert.
     #
@@ -1538,6 +1697,9 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
     day = {} if quotable else (_worst_breached_day(trend, thresholds) or {})
     source = recent if quotable else day
     longest = _longest_wait_s(_section(artifact, "queue"))
+    # The waits count from the moment Deck was read, which a live run stamps
+    # in the queue block; it falls after window_end, the sweep's bound.
+    queue_read_at = parse_iso(_section(artifact, "queue").get("read_at")) or measured
     limit_p50 = _as_seconds(thresholds.get("p50_minutes"))
     backlog = None if longest is None or limit_p50 is None else longest > limit_p50
     return note | {
@@ -1556,18 +1718,38 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         # When this backlog began, not when the episode did: the verdict spans
         # a week, so "waiting since Monday" can stand over a Thursday jam. The
         # oldest queued run dates it, and only while there is one.
-        "waiting_since": iso(measured - timedelta(seconds=longest)) if backlog else None,
+        "waiting_since": iso(queue_read_at - timedelta(seconds=longest)) if backlog else None,
         "over_threshold": _section(artifact, "queue").get("over_threshold") or 0,
         "threshold_p50_s": limit_p50,
         "threshold_p95_s": _as_seconds(thresholds.get("p95_minutes")),
         "free": pool.get("free"),
         "total": pool.get("total"),
+        # The periodic's third trigger and what it names: runs refused a
+        # project in its recent window, and the projects leased under an owner
+        # that names no build (a person's repair, or a job that forgot the
+        # convention). None from an artifact written before the fields existed.
+        "lease_failures": _count(recent.get("lease_failures")),
+        "lease_failures_hours": _count(recent.get("hours")),
+        "no_build_id": _held_count(artifact.get("no_build_id")),
         "cause": artifact.get("cause"),
         # The cap the newest run in the window ran under. Only the
         # CONCURRENCY_CAP message quotes it, and without it that message
         # cannot say what to raise the cap from.
         "max_concurrency": artifact.get("max_concurrency"),
     }
+
+
+def _count(value) -> int | None:
+    """A non-negative integer from the artifact, or None for anything else."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _held_count(held) -> int | None:
+    """How many projects `no_build_id` (owner to count) adds up to."""
+    if not isinstance(held, dict):
+        return None
+    counts = [_count(v) for v in held.values()]
+    return None if any(c is None for c in counts) else sum(counts)
 
 
 def pool_wait_p50_s(artifact: dict | None, now: datetime) -> int | None:
@@ -1583,6 +1765,10 @@ def pool_wait_p50_s(artifact: dict | None, now: datetime) -> int | None:
         return None
     measured = parse_iso(artifact.get("window_end"))
     if measured is None or now - measured > POOL_STALE_AFTER:
+        return None
+    # An UNMEASURED artifact still carries the days that did read; the headline
+    # must not quote one above the note that says the wait is unknown.
+    if artifact.get("verdict") == POOL_UNMEASURED:
         return None
     # The newest judged row, not the newest row. The producer withholds a
     # verdict below its sample floor, and at 13:00 UTC today's row holds only
@@ -1617,6 +1803,8 @@ def pool_evidence(pool: dict) -> str:
     # the breach that most wants explaining. Say the wait and stop.
     counted = pool["free"] is not None and pool["total"] is not None
     projects = f"; {pool['free']} of {pool['total']} projects free" if counted else ""
+    if counted and pool.get("no_build_id"):
+        projects += f", {pool['no_build_id']} leased with no build ID in the owner"
     return f"backed-up pool: {pool_measurement(pool)}{projects}"
 
 
@@ -1655,7 +1843,12 @@ def pool_measurement(pool: dict) -> str:
             f"{pool['over_threshold']} run{'' if pool['over_threshold'] == 1 else 's'}"
             f" waiting now past {minutes_text(pool['threshold_p95_s'])} min"
         )
-    # A BREACH always has one or the other; this is what a contract violation
+    refused = pool.get("lease_failures")
+    if refused:
+        hours = pool.get("lease_failures_hours")
+        stretch = f" in the last {hours}h" if hours else ""
+        parts.append(f"{refused} run{'' if refused == 1 else 's'} refused a project{stretch}")
+    # A BREACH always has one of the three; this is what a contract violation
     # reads as, rather than a sentence with a blank in it.
     return "; ".join(parts) or "the periodic reported a breach with no measured stretch and no live queue"
 
@@ -2281,6 +2474,23 @@ def adjudicate(
     slow = slow_gate(assessed["full_runs"], now, (prev or {}).get("slow") or None) if decided["state"] == GREEN else None
     if slow:
         evidence.append(slow_evidence(slow))
+    non_green_end = (
+        now
+        if prev and prev.get("state") != GREEN
+        else ((prev.get("since") if isinstance(prev.get("since"), datetime) else parse_iso((prev or {}).get("since"))) if prev and prev.get("state") == GREEN else None)
+    )
+    near_deadline_note = (
+        near_deadline(
+            assessed["full_runs"],
+            now,
+            (prev or {}).get("near_deadline") or None,
+            non_green_end=non_green_end,
+        )
+        if decided["state"] == GREEN
+        else None
+    )
+    if near_deadline_note:
+        evidence.append(near_deadline_evidence(near_deadline_note))
     # Rule 8 rides beside the state in every state, unlike rule 7: the wait is
     # a different job's measurement of different data, so it cannot be this
     # incident's own symptom, and when leases are the incident it is the
@@ -2327,7 +2537,8 @@ def adjudicate(
     # and the poster, which keys on the verdict, does not re-announce one it
     # has told.
     streaks = periodics.streaks(readings, (prev or {}).get("periodics_streaks"))
-    watched = periodics.assess(readings, pool_clock, prev_notes, streaks=streaks if prev is not None else None)
+    superseded = periodics.superseded_jobs(readings, (prev or {}).get("periodics_superseded"))
+    watched = periodics.assess(readings, pool_clock, prev_notes, streaks=streaks if prev is not None else None, superseded=superseded)
     evidence.extend(periodics.evidence(note) for _, note in sorted(watched.items()))
     # Per job: a job read this tick keeps its start only while it is noted;
     # a job with no reading this tick keeps whatever start it had.
@@ -2359,10 +2570,12 @@ def adjudicate(
         "fixture_state": fixture_state_block(assessed["fixture"]),
         "pool_state": scan_block(assessed["pool_state"]),
         "slow": slow,
+        "near_deadline": near_deadline_note,
         "pool": pool,
         "periodics": watched,
         "periodics_read": sorted(readings),
         "periodics_runs": periodics.runs(readings),
+        "periodics_superseded": superseded,
         "periodics_streaks": streaks,
         "periodics_since": periodics_since,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
@@ -2399,6 +2612,8 @@ def scan_block(scan_result: dict) -> dict | None:
         "projects": scan_result["total"],
         "checked": scan_result["checked"],
         "unread_units": scan_result.get("unread_units", 0),
+        "absent_units": scan_result.get("absent_units", 0),
+        "absent_projects": scan_result.get("absent_projects", 0),
         "drifted": scan_result["current"],
         "passes_leases": scan_result.get("passes_leases", []),
         "reds_runs": scan_result.get("reds_runs", []),
@@ -2453,7 +2668,8 @@ def timeline(ticks, every: bool = False) -> list[dict]:
     last = None
     for now, health in ticks:
         slow = health.get("slow") or None
-        key = (health["state"], health["condition"], tuple(health["failing_cases"]), bool(slow))
+        nd = health.get("near_deadline") or None
+        key = (health["state"], health["condition"], tuple(health["failing_cases"]), bool(slow), bool(nd))
         if every or key != last:
             out.append(
                 {
@@ -2464,6 +2680,16 @@ def timeline(ticks, every: bool = False) -> list[dict]:
                     "failing_cases": health["failing_cases"],
                     "recovering": health["recovering"],
                     "slow": {"since": slow["since"], "median_s": slow["median_s"], "baseline_p50_s": slow["baseline_p50_s"]} if slow else None,
+                    "near_deadline": {
+                        "since": nd["since"],
+                        "max_s": nd["max_s"],
+                        "max_build": nd["max_build"],
+                        "runs": nd["runs"],
+                        "deadline_s": nd["deadline_s"],
+                        "headroom_s": nd.get("headroom_s", max(0, nd["deadline_s"] - nd["max_s"])),
+                        "kills": nd.get("kills", 0),
+                        "max_killed": nd.get("max_killed", False),
+                    } if nd else None,
                 }
             )
             last = key
@@ -2477,6 +2703,9 @@ def format_timeline(entries: list[dict]) -> str:
         slow = entry.get("slow")
         if slow:
             flag += f" (slow since {slow['since']}: median {slow['median_s'] // 60} min against {slow['baseline_p50_s'] // 60})"
+        nd = entry.get("near_deadline")
+        if nd:
+            flag += f" (near deadline since {nd['since']}: slowest run {minutes_text(nd['max_s'])} min, {near_deadline_headroom_text(nd)})"
         lines.append(f"{entry['at']}  {entry['state']:<8}  {entry['cause']}{flag}")
     return "\n".join(lines)
 

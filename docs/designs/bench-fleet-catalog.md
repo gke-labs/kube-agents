@@ -48,10 +48,11 @@ zone and its nodes span a second, `var.second_zone`. The clusters also carry
 
 The rule is about where a check points, not about every string in the file. A case may
 require a rendered cluster name in a phrase list (`seeded-b` in the upgrade cases,
-`seeded-c` in `consistency-drift-outlier`) when the claim being graded is that the audit
-named the right cluster; `bench/tasks/DRAFTS.md` records those names as a contract with
-`bench/tf/fleet/`, and the cases that rely on it say so in a comment beside the phrase
-(`grep -l 'required_phrases:.*"seeded-' bench/tasks/*/task.yaml` lists them). That is a
+`seeded-c` in `consistency-drift-outlier` and `patch-declared-intent-no-finding`) when the
+claim being graded is that the audit named the right cluster; `bench/tasks/DRAFTS.md`
+records those names as a contract with `bench/tf/fleet/`, and the cases that rely on it say
+so in a comment beside the phrase (`grep -l '"seeded-[bc]"' bench/tasks/*/task.yaml` lists
+them). That is a
 different thing
 from addressing a fixture: the phrase survives the prefix being the default it has always
 been, and it breaks loudly and correctly if the prefix ever changes. What must never
@@ -93,9 +94,9 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Eighteen fixtures: seventeen across the four cluster slots and one project-scoped. Most in-cluster
-fixtures are on slot `a`, across the seven seeded namespaces `seeded-debug`,
-`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent` and `seeded-stall`, plus both
+Thirty-three fixtures: thirty across the four cluster slots and three project-scoped. Most in-cluster
+fixtures are on slot `a`, across the eleven seeded namespaces `seeded-debug`,
+`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-stall`, `seeded-shapes` and `seeded-defaults`, plus both
 defect node pools. Slot `c` carries a GKE-level defect only and no workloads at all: it is the
 configuration outlier. Slot `b` is the held-back control plane, and also carries the
 upgrade-readiness drain defects, which belong with the cluster whose subject is upgrading. Slot
@@ -108,26 +109,41 @@ baseline. **Slot `d` carries it too, and has to**: `hack/fleet-kubeconfigs.sh` d
 filtering on that label together with `managed-by`, so a cluster without it is never listed and
 its roles are never published.
 
-| Role                           | Slot    | Day | What is planted                                                                                                                                                                              |
-| ------------------------------ | ------- | --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `rbac-overgrant`               | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA                                                                                                        |
-| `no-pdb-workload`              | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB                                                                                                                  |
-| `declared-no-pdb-workload`     | a       | 0   | `deployment/notification-relay` in `seeded-intent`, two replicas, no PDB, declared on purpose in the GitOps repository's `knowledge/`                                                        |
-| `stalled-controller`           | a       | 0   | `deployment/inventory-api` in `seeded-stall`, CreateContainerConfigError, ProgressDeadlineExceeded                                                                                           |
-| `crashloop-workload`           | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                                                                        |
-| `hpa-saturated`                | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                                        |
-| `deprecated-api-caller`        | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight                |
-| `idle-nodepool`                | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                                                                          |
-| `orphan-disks`                 | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                                                                             |
-| `version-laggard`              | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                                                                                   |
-| `drift-outlier`                | c       | 1   | Master authorized networks absent, where a, b and d carry an open block                                                                                                                      |
-| `readiness-surge-blocked`      | b       | 0   | `no-surge-pool`, `maxSurge 0` / `maxUnavailable 1`, tainted `seeded-role=no-surge`                                                                                                           |
-| `readiness-pinned-workload`    | b       | 0   | `deployment/pinned-batch-runner` in `seeded-upgrade`, one replica pinned to that pool                                                                                                        |
-| `readiness-drain-blocked`      | b       | 0   | `poddisruptionbudget/pinned-batch-runner` in `seeded-upgrade`, `maxUnavailable: 0`, so `disruptionsAllowed` is 0 permanently                                                                 |
-| `readiness-failclosed-webhook` | b       | 0   | `seeded-fail-closed-gate`, `failurePolicy: Fail` with a 30-second timeout and no backend                                                                                                     |
-| `zonal-skew-scheduling`        | d       | 0   | `deployment/zone-pinned-api` in `seeded-topology`, two replicas, `ScheduleAnyway` zonal spread plus a required single-zone nodeAffinity                                                      |
-| `zonal-skew-volume`            | d       | 0   | `statefulset/zone-bound-store` in `seeded-topology`, two replicas on `seeded-zonal-pd`, a class pinned to the first zone                                                                     |
-| `zonal-skew-capacity`          | d       | 0   | `deployment/capacity-starved-worker` in `seeded-topology`, four replicas at 500m against an e2-small the sponge keeps full and an e2-standard-2 that fits one to three, so some stay Pending |
+| Role                            | Slot    | Day | What is planted                                                                                                                                                                                                                   |
+| ------------------------------- | ------- | --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rbac-overgrant`                | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA                                                                                                                                             |
+| `no-pdb-workload`               | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB                                                                                                                                                       |
+| `declared-no-pdb-workload`      | a       | 0   | `deployment/notification-relay` in `seeded-intent`, two replicas, no PDB, in a namespace with no NetworkPolicy; both declared on purpose in the GitOps repository's `knowledge/`                                                  |
+| `declared-token-workload`       | a       | 0   | `deployment/token-reader` and `deployment/token-sidecar` in `seeded-token`, on the default ServiceAccount with the token mounted; `token-reader` declared on purpose in the GitOps repository's `knowledge/`, `token-sidecar` not |
+| `declared-overrequest-workload` | a       | 0   | `deployment/burst-ingest` in `seeded-headroom`, two pause replicas requesting `10m` / `128Mi` each and using almost none of the memory; declared on purpose in the GitOps repository's `knowledge/`                               |
+| `stalled-controller`            | a       | 0   | `deployment/inventory-api` in `seeded-stall`, CreateContainerConfigError, ProgressDeadlineExceeded                                                                                                                                |
+| `crashloop-workload`            | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                                                                                                             |
+| `hpa-saturated`                 | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                                                                             |
+| `deprecated-api-caller`         | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight                                                     |
+| `idle-nodepool`                 | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                                                                                                               |
+| `orphan-disks`                  | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                                                                                                                  |
+| `startup-fail-vm`               | project | 0   | `startup-fail-<prefix>`, a standalone e2-micro in `var.zone` whose startup script exits 1 on every boot                                                                                                                           |
+| `world-open-ingress`            | project | 0   | `world-open-2379-<prefix>`, tcp:2379 open to the internet on `world-open-<prefix>`, a VM with an external IP in `var.zone`; nothing listens on 2379, and a deny rule blocks tcp:22 and tcp:3389                                   |
+| `version-laggard`               | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                                                                                                                        |
+| `drift-outlier`                 | c       | 1   | Master authorized networks absent, where a, b and d carry an open block                                                                                                                                                           |
+| `readiness-surge-blocked`       | b       | 0   | `no-surge-pool`, `maxSurge 0` / `maxUnavailable 1`, tainted `seeded-role=no-surge`                                                                                                                                                |
+| `readiness-pinned-workload`     | b       | 0   | `deployment/pinned-batch-runner` in `seeded-upgrade`, one replica pinned to that pool                                                                                                                                             |
+| `readiness-drain-blocked`       | b       | 0   | `poddisruptionbudget/pinned-batch-runner` in `seeded-upgrade`, `maxUnavailable: 0`, so `disruptionsAllowed` is 0 permanently                                                                                                      |
+| `readiness-failclosed-webhook`  | b       | 0   | `seeded-fail-closed-gate`, `failurePolicy: Fail` with a 30-second timeout and no backend                                                                                                                                          |
+| `zonal-skew-scheduling`         | d       | 0   | `deployment/zone-pinned-api` in `seeded-topology`, two replicas, `ScheduleAnyway` zonal spread plus a required single-zone nodeAffinity                                                                                           |
+| `zonal-skew-volume`             | d       | 0   | `statefulset/zone-bound-store` in `seeded-topology`, two replicas on `seeded-zonal-pd`, a class pinned to the first zone                                                                                                          |
+| `zonal-skew-capacity`           | d       | 0   | `deployment/capacity-starved-worker` in `seeded-topology`, four replicas at 500m against an e2-small the sponge keeps full and an e2-standard-2 that fits one to three, so some stay Pending                                      |
+| `node-local-state`              | a       | 0   | `deployment/cache-on-emptydir` in `seeded-shapes`, one replica whose queue directory is an `emptyDir`                                                                                                                             |
+| `deprecated-label-selector`     | a       | 0   | `deployment/arch-pinned-worker` in `seeded-shapes`, a `nodeSelector` on `beta.kubernetes.io/arch`                                                                                                                                 |
+| `containerd-socket-agent`       | a       | 0   | `daemonset/node-runtime-probe` in `seeded-shapes`, the containerd socket mounted read-only from the host                                                                                                                          |
+| `intree-pd-volume`              | a       | 0   | `persistentvolume/intree-pd` on the in-tree `gcePersistentDisk` plugin, bound by `persistentvolumeclaim/intree-pd` and mounted by `deployment/intree-pd-reader` in `seeded-shapes`                                                |
+| `retired-registry-image`        | a       | 0   | `deployment/legacy-registry-pull` in `seeded-shapes`, `k8s.gcr.io/pause:3.9` pulled with `imagePullPolicy: Always`                                                                                                                |
+| `moving-admission-default`      | a       | 0   | `namespace/seeded-defaults` pinned to Pod Security `baseline` at version `latest`, with `deployment/baseline-edge-worker` admitted by today's rule set                                                                            |
+| `stale-client-skew`             | a       | 0   | `cronjob/stale-kubectl-client` in `seeded-shapes`, `kubectl` v1.29.0 against the control plane every ten minutes                                                                                                                  |
+| `cgroup-blind-runtime`          | a       | 0   | `deployment/cgroup-blind-jvm` in `seeded-shapes`, the eclipse-temurin 8u302 image under a 192Mi limit, a sleep as the process                                                                                                     |
+| `multi-process-container`       | a       | 0   | `deployment/multi-process-worker` in `seeded-shapes`, two forked workers under one 32Mi limit                                                                                                                                     |
+| `node-image-coupled-agent`      | a       | 0   | `daemonset/cni-shaped-agent` in `seeded-shapes`, host networking plus `/etc/cni/net.d` mounted read-only                                                                                                                          |
+| `cuda-pinned-gpu-job`           | a       | 0   | `cronjob/cuda-pinned-trainer` in `seeded-shapes`, suspended, one `nvidia.com/gpu` on an `nvidia-l4` selector with a CUDA 12.2 image                                                                                               |
 
 The `inference-server` HPA under `hpa-saturated` does not compute a stable desired
 replica count. Read on 2026-08-24, `status.desiredReplicas` on `seeded-a` was 3 in
@@ -149,7 +165,7 @@ neither is going to be obvious from a slug.
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
 `seeded-role=idle-batch` on the idle pool's taint, and `bench/tf/fleet/defects-b.tf`
-`seeded-role=no-surge` on the no-surge pool's — so three of the sixteen roles are called one
+`seeded-role=no-surge` on the no-surge pool's — so three of the thirty roles are called one
 thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the
@@ -210,7 +226,9 @@ one zone" is a true statement about a real cluster, and the second is a size up 
 capacity fixture needs one node that is always full and one that is always roomier, which no
 placement of GKE's own pods can be trusted to produce; every shared-core E2 size reports the same
 allocatable CPU, so the step up has to be to a dedicated-core size. Still two nodes' worth of
-standing cost rather than a regional control plane's.
+standing cost rather than a regional control plane's. What the fleet must grow beyond slot `d`
+before the rest of the anomaly-detection checks can be built eval-first, and which checks it cannot
+serve at all, is [`anomaly-fleet-fixtures.md`](anomaly-fleet-fixtures.md).
 
 Carrying the label makes `d` a fourth voter in the drift cohort, so the arithmetic is worked
 rather than avoided. The planted facet is `authorized-networks`, base `critical`, and the ladder
@@ -242,11 +260,15 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Fifteen of the seventeen are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
-`declared-no-pdb-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the four
-`readiness-*` roles on slot `b` and the three `zonal-skew-*` roles on slot `d`, covering
-security, reliability, cluster debugging, remediation, capacity, upgrades, upgrade readiness,
-API deprecation and zonal skew between them. A corpus that leans on these can go green the day the fleet
+Twenty-eight of the thirty are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
+`declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the four
+`readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
+upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
+`containerd-socket-agent`, `intree-pd-volume`, `retired-registry-image`, `moving-admission-default`,
+`stale-client-skew`, `cgroup-blind-runtime`, `multi-process-container`, `node-image-coupled-agent`,
+`cuda-pinned-gpu-job`), covering
+security, reliability, cluster debugging, remediation, capacity, cost, upgrades, upgrade readiness,
+API deprecation, zonal skew and the upgrade-failure shapes between them. A corpus that leans on these can go green the day the fleet
 applies; the caller's first run is a Job the apply itself waits on, so its audit trail
 exists before the apply returns.
 
@@ -272,7 +294,9 @@ operations the API keeps are finite and an old fixture pool falls back to its cl
 `orphan-disks` waits thirty, and that one is real: the unattached-disk collector filters
 server-side on the immutable `creationTimestamp<-P30D`. It is the longest gate in the
 fleet and the one most easily lost, because `fleet-cost-idle-pool` needs both of its
-fixtures — so the cost case waits 30 days, not 7.
+fixtures — so that case waits 30 days, not 7. `cost-declared-intent-no-finding`'s posture is
+observable on apply day, but the case reads the cost ledger, which exists only once some other
+cost finding does, so it waits for the idle pool's day 7.
 
 The clock is per project, not per fleet. Each project's gates open from the day its own
 stack was applied, so the earliest a fleet-wide assertion can hold is the newest project's
@@ -296,16 +320,20 @@ documented background ones, and nothing else — that is what lets a case assert
 finding set rather than a substring. One fixture used to break it, and the upgrade SOP's
 rule now keeps it intact.
 
-The pin in `bench/tf/fleet/main.tf` is drawn from the location-wide `valid_master_versions`
-rather than REGULAR's own list, so `seeded-b` can sit on a version absent from REGULAR's
-`validVersions` — for example `1.34.10-gke.1106000`, on RAPID's roster as measured 2026-09-23. The check once read
+The pin in `bench/tf/fleet/main.tf` is drawn from REGULAR's own `validVersions` by
+`seeded_b_pin.py`, so in steady state `seeded-b` sits on a version its channel carries. It
+can still sit on one absent from REGULAR's roster: a patch REGULAR dropped between reconciles,
+or the hold the pin keeps while the running patch is one REGULAR does not carry (on 2026-10-14,
+`1.34.12-gke.1011000` from RAPID's roster; the pin used to be drawn from the location-wide
+`valid_master_versions`, which is how it got there). The check once read
 that absence as branch (a) of upgrade SOP check 3.1 and graded the cluster critical. Branch
 (a) now fires only when a version is offered by no route at the location: not by the
 cluster's channel, not by any other channel, and not by `validMasterVersions`. The pin stays
 offered for as long as `validMasterVersions` or any channel's roster carries it, so branch
-(a) does not fire and `seeded-b` carries the intended branch (b) at major. If GKE drops the
-pinned version from all of them before the next reconcile re-draws it, branch (a) fires, and
-correctly.
+(a) does not fire and `seeded-b` carries the intended branch (b) at major. A held pin is not
+re-drawn: each reconcile returns the running version until REGULAR ships a patch above it, so
+if every roster drops that version meanwhile, branch (a) fires on every project, and correctly,
+until REGULAR catches up or the cluster is destroyed and re-created.
 
 A case touching `version-laggard` may assert that branch (a) is absent, and
 `upgrades-master-behind-offered-elsewhere` does: slot `b` graded critical is the defect it

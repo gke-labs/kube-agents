@@ -5,15 +5,17 @@ name: Smoke Test Sticky Status
 # Tide credits a presubmit only against the base SHA it ran on, which crier
 # records as a `BaseSHA:<sha>` suffix on the commit status. Every merge to
 # `main` therefore turns every other pull request's green smoke run stale, and
-# the 1.5-3.5h job runs again for a pull request whose head has not changed
-# (#1179, #1202). `scripts/pin_smoke_status.py` re-pins that suffix to the new
+# the job runs again for a pull request whose head has not changed (#1179,
+# #1202) -- a retest step 0 (`hack/ci-revalidate.sh`) answers in minutes from
+# the head's own green, where it once cost the 1.5-3.5h matrix; the re-pin is
+# what spares even that. `scripts/pin_smoke_status.py` re-pins that suffix to the new
 # head of `main` -- for every open pull request on each push to `main`, and for
 # one commit when its green arrives after `main` has already moved (or with no
 # base at all, as the override plugin's own status does) -- so a pull
 # request green at its own head merges without a fresh-base retest. What that
 # gives up is testing the combination with the `main` it lands on before the
-# merge; until a scheduled eval run on `main` exists, a bad combination is
-# found by the next smoke run that actually starts after it, on whichever pull
+# merge; the nightly eval on `main` is what finds a bad combination, as is
+# the next smoke run that actually starts after it, on whichever pull
 # request that is. docs/pull-request-workflow.md "How a
 # change merges" owns that statement; the script's docstring says why this is
 # a BaseSHA pin and not Prow's `[prow:skip-retest]` sentinel, and when to swap.
@@ -26,7 +28,9 @@ name: Smoke Test Sticky Status
 # An admin `/override` is re-pinned like a green -- crier stamps the same
 # `BaseSHA:` suffix on it -- so a plain `/override` holds for the head it was
 # given until a push whenever the sweep wins the race below; when it loses,
-# the overridden job reruns, reds, and the override has to be repeated.
+# step 0 reads the override off the head and reuses it as it does a green,
+# so the override holds either way until a push (this Prow has no
+# `/override-cancel`; step 0 would honour one).
 # Upstream's `/override-sticky` has no race, and this Prow does not have it.
 #
 # It races Tide's sync loop: a sync that sees the stale statuses before the

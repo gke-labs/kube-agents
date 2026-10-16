@@ -49,8 +49,8 @@ only — anything that renames, removes or re-types a field bumps
   ],
   "coverage": {
     "domains_total": 11,
-    "domains_covered": 9,
-    "uncovered": ["fleet-audits", "remediation"]
+    "domains_covered": 10,
+    "uncovered": ["fleet-audits"]
   }
 }
 ```
@@ -61,21 +61,29 @@ only — anything that renames, removes or re-types a field bumps
 
 Parsed from `build-log.txt` plus Prow's `started.json`/`finished.json`.
 A build with no `finished.json` is still running and is skipped entirely.
-One job feeds it today, the presubmit gate (`pull-kube-agents-smoke-test`,
-one build per pull-request push). The collector also reads a second, the
-nightly periodic (`ci-kube-agents-eval-nightly`, `EVAL_TIER=nightly` in the
-same `hack/ci-eval-pr.sh`, against `main`, no pull request), which archives
-the same layout and is collected from the moment it starts running.
+Three jobs feed it, each a source with a watermark of its own: the
+presubmit gate (`pull-kube-agents-smoke-test`, one build per pull-request
+push), the nightly periodic (`ci-kube-agents-eval-nightly`,
+`EVAL_TIER=nightly` in the same `hack/ci-eval-pr.sh`, against `main`, no
+pull request; a night split across two pool projects adds the nightly's
+writers periodic, `ci-kube-agents-eval-nightly-writers`, the cases that
+request a pull request, whose runs are `nightly` runs too, told apart by
+`job`) and the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, a
+pull-request build against a GitLab repository). All archive the same
+layout and are collected from the moment they start running.
 
 - `build_id` — the Prow build directory name, as a **string** (the ids
   overflow 53-bit JSON-consumer integers).
-- `tier` — **optional, additive**: `"presubmit"` or `"nightly"`, from the
+- `tier` — **optional, additive**: `"presubmit"`, `"nightly"` or `"gitlab"`, from the
   source the build was discovered through, never from the build's own
   metadata. **Absent means `presubmit`** — every run written before the
   field existed was one — and consumers read it through `tiers.py`'s
-  `run_tier` / `presubmit_runs` / `nightly_runs`. A value outside the two
-  is neither tier and counts nowhere: a run tagged some new way is never
-  the gate's by default. Every gate verdict — the
+  `run_tier` / `presubmit_runs` / `nightly_runs` / `gitlab_runs`. A value
+  outside the three is no tier and counts nowhere: a run tagged some new
+  way is never the gate's by default. A `gitlab` run is the GitLab lane's
+  (`pull-kube-agents-smoke-test-gitlab`, `--gitlab-pr-glob`): listed in
+  `brief.json`'s `gitlab` block and the Brief's "GitLab lane" section,
+  in no case history and no gate number. Every gate verdict — the
   health adjudicator's rules and 24-hour metrics, `classify.py`'s "is this
   mine?" (other PRs, the only-this-PR passes, the 30-day pass rate), the
   red comment's "runs from other PRs" count (`gate_comment.py`), the
@@ -86,7 +94,10 @@ the same layout and is collected from the moment it starts running.
   and `classify.py`'s per-case `nightly_failed_recent` note.
 - `job` — **optional, additive**: the Prow job name, read from the build
   directory's URL (the segment before the build id) or overridden by
-  `--nightly-job`. `null` for a `--from-dir` build, which has no URL.
+  `--nightly-job`. `null` for a `--from-dir` build, which has no URL. On a
+  nightly run it names the part of the night the build ran
+  (`nightly.py`'s `night_part`): `ci-kube-agents-eval-nightly-writers` is
+  the writers part, any other job the main part.
 - `pr` — `started.json`'s `pull`, falling back to the number in the GCS
   path. `null` when neither is available, and **always `null` on a
   `nightly` run**: a periodic runs `main`, whatever its metadata carries.
@@ -116,8 +127,8 @@ the same layout and is collected from the moment it starts running.
 - `duration_s` — the `Total Duration` of the final
   `PR Smoke Test Evaluation Succeeded/Failed` line (eval loop only). A
   truncated log has no verdict line — and neither does a `SUCCESS` build that
-  `hack/ci-eval-pr.sh`'s step-0 revalidation ended before the eval loop; then
-  it falls back to `finished − started` (which also counts provisioning).
+  step 0 (`hack/ci-revalidate.sh`) ended before the eval loop; then
+  it falls back to `finished − started` (which also counts provisioning, when there was any).
 - `tasks[]` — one entry per `Task <name> Result:` line, in log order (a
   verdict outside the vocabulary below — `[EXPECTED_FAIL]`, which no
   `task.yaml` sets, and `[NOT_GRADED_ON_TRANSPORT]`, the inject lane's word
@@ -139,7 +150,8 @@ the same layout and is collected from the moment it starts running.
     entry per indented `rep N: <verdict> -- <text>` grading line under the
     task's verdict line, in log order:
     `{"n": <1-based int>, "result": "pass"|"fail"|"infra", "reason": <string|null>}`,
-    plus `"excerpt": <string>` when the log carried one (below).
+    plus `"excerpt": <string>` when the log carried one, and `"agent_s"` /
+    `"turn1_s"` when the log carried them (below).
     - `result` maps the grading verdict token: `pass` → `pass`; `infra` →
       `infra`, as is any **non-pass** rep whose line carries the literal
       `KUBE_AGENTS_INFRA_FAILURE` marker; anything else (`fail`, `blocked`,
@@ -153,6 +165,11 @@ the same layout and is collected from the moment it starts running.
       `delegation-ceiling`. The run page, the PR view and the PR comment's
       result cell count it in a case's total and name it apart; the Cases
       page's per-run counts (`render.rep_counts`) still fold it into `infra`.
+      Similarly, a harness-declared card-wake replay error (`ReplayMismatch`
+      or `ReplayBroken`, e.g. `failure wake:`, `question wake:`, `thread context:`
+      in the reason) is recognized by `classify.py` and `health.py` as `fail`,
+      not `storm`: a broken replay is a defect in the image under test, not
+      infrastructure weather (#2328).
     - `reason` — the free text after the first space-padded `--` separator
       (later separators belong to the reason — fail reasons contain the
       delimiter themselves), with the trailing `[OutcomeScore=…]` metrics
@@ -180,6 +197,22 @@ the same layout and is collected from the moment it starts running.
       excerpt is the one the row is about, link included). The PR gate comment's Reason line stays the grader's
       `reason` and falls back to the excerpt only for a rep that has no
       reason at all.
+    - `agent_s`, `turn1_s` — **optional, additive**: how long the
+      repetition took, in seconds, from the
+      `rep N timing: agent_s=<x> turn1_s=<y>` line `bench-gate case` prints
+      right under the grading line (before any `rep N report:` line), one
+      decimal each. `agent_s`
+      is the agent run's wall clock (`results.json`'s `latency`, which
+      devops-bench takes around the harness run: the delegation wait is in
+      it, provisioning, fixtures, verification and the judge are not); `turn1_s` is the opening chat turn on the api transport,
+      the attempt that succeeded only, with no retry, backoff or status
+      poll in it (none on the inject transport). The collector consumes the
+      line whole, like the report line; it keeps only these two keys, as
+      floats, when the value is a finite number above zero, and skips an
+      unknown key or a value that does not parse. Each key is **absent**
+      when the line did not carry it, when the log has no such line (every
+      build graded before it existed), or when the line follows no grading
+      line of that repetition: absence means unknown.
     - **Omission semantics:** the key is absent — never `[]` — when the log
       has no `rep N:` grading lines for the task: single-repetition-era
       builds (branches predating the multi-repetition eval of 2026-08-28;
@@ -283,7 +316,7 @@ never an error. A task line whose name matches nothing under `bench/tasks/`
 on the current checkout still parses; only its domain lookup degrades (see
 below).
 
-### `cases[]` — one entry per task name seen in any run of either tier, sorted by name
+### `cases[]` — one entry per task name seen in any presubmit or nightly run, sorted by name
 
 The per-case fields are the **presubmit's** record, exactly as they were
 before the nightly existed; the nightly's record sits beside them under
@@ -323,6 +356,14 @@ side.
   graded). Present on every case, zeros and `null` when the nightly has
   not run it. The renderer's per-tier 7- and 30-day rates are computed
   from `runs[]` at rep level, not from this block.
+- `latency` — **optional, additive**: the presubmit reps' timing,
+  `{n_turn1, turn1_p50_s, turn1_p95_s, n_agent, agent_p50_s}` over the reps
+  on record whose `result` is not `infra` and that carry `turn1_s` (the
+  `turn1` keys) or `agent_s` (the `agent` keys): `n_*` the count,
+  `*_p50_s` / `*_p95_s` the nearest-rank percentile (`nightly.percentile`,
+  the rule of `health.percentile`). The keys of a value no rep carries are
+  absent, and the whole key is absent when no rep carries either.
+  Advisory: no rule, gate or state reads it.
 - **Known gap:** multi-repetition verdict lines carry no task-level
   duration or OutcomeValidity, so `durations` and `ov_history` accrue only
   from single-repetition-era runs and freeze once those age out of the
@@ -344,9 +385,12 @@ Additive, optional, and safe to omit — consumers must default them.
   they are not in `runs[]` and do not raise the watermark. Entries are
   `{"build_id": "<id>", "first_seen": "<iso8601>"}`, plus `"tier": "nightly"`
   and `"log_url"` (Spyglass's page for the build directory, as for
-  `runs[].log_url`) when the nightly periodic's listing named the build
-  (absent: the presubmit's, as for `runs[].tier`; both are kept across
-  scans), lowest
+  `runs[].log_url`) when either nightly periodic's listing (the main or
+  the writers job) named the build, or `"tier": "gitlab"` when the GitLab
+  lane's did (absent: the presubmit's, as for `runs[].tier`; all are kept
+  across scans, and each source retries its own). `nightly.py` reads a
+  running nightly build's part from the job segment of its `log_url`; an
+  entry without one counts as the main part. Lowest
   id first; `first_seen` is when the collector first listed the build. The next
   incremental scan re-reads exactly these ids even though they sit at or
   below the watermark, and drops an entry once it is recorded or once
@@ -525,6 +569,38 @@ what the renderer does with them.
   build deferred to `pending_builds`. The refresh workflow greps for either
   line and does not publish, so a stall is never republished under a fresh
   `generated_at`.
+- `--gitlab-pr-glob <gs glob>` (repeatable) — the GitLab lane's build-dir
+  glob (`.../pull-kube-agents-smoke-test-gitlab/*`), read through the job's
+  directory index derived from it, above the lane's own watermark when a
+  lane run is on record and whole (under `--since-days`) when none is; the
+  glob itself is listed only when no index is derivable from it, or
+  `--index-prefix ""` disabled the index. Every run is tagged
+  `tier: "gitlab"` and its unfinished builds the same on `pending_builds`.
+  The presubmit's watermark ignores the lane's ids and the lane's ignores
+  the presubmit's, as the nightly's does. An explicit `--index-prefix` is
+  the presubmit's; the lane's index is always derived from its own glob.
+  The lane takes its index on the cold path too, unlike the presubmit,
+  because the archive-wide glob walks every pull request's directory on
+  every tick until the lane's first run is on record (minutes, and past
+  the listing timeout as the archive grows), while the index answers
+  "nothing yet" in one flat listing. The lane, like the nightly, must never
+  stop the gate's dashboard publishing, so it follows the nightly's rule:
+  with no lane run on record any listing that fails is a
+  `note: directory index ... did not list` line (`note: glob ...` on the
+  glob fallback) and nothing from it (the job may not exist yet); with
+  one, a listing that matched no objects (the
+  index purged or moved, the job renamed, while a run from before sits on
+  record) is the same note, and any other failure is the refusal line, as
+  it is for the presubmit. A listing that hangs past `GSUTIL_TIMEOUT_S` is
+  the refusal line either way, as for the nightly.
+- `--gitlab-nightly-prefix [<gs prefix>]` — the GitLab lane's nightly
+  periodic (`ci-kube-agents-eval-nightly-gitlab`, the lane's list once a
+  night), read as `--nightly-prefix` is (the prefix is its index, `pr`
+  null, `log_url` set, the nightly's rule on a listing that fails) but
+  tagged `tier: "gitlab"`, above the nights' own watermark: the lane's
+  pull-request builds and its nights are two sources of one tier, told
+  apart by `pr`. Given without a value it is
+  `gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/`.
 - `--nightly-prefix [<gs prefix>]` — the nightly periodic's Prow log
   prefix, `gs://<bucket>/logs/<job>/`. For a periodic that prefix **is**
   the directory index: one `<build_id>/` directory per build beside a
@@ -554,6 +630,15 @@ what the renderer does with them.
   call is.
 - `--nightly-job <name>` — the `job` recorded on nightly runs; default
   derived from the prefix.
+- `--nightly-writers-prefix [<gs prefix>]` — the same for the nightly's
+  writers periodic; given without a value it is
+  `gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/`.
+  Read the three ways above against its own watermark (below), so until a
+  writers build is on record any listing failure other than a hang is the
+  note. Its runs' `job` is always the prefix's last segment, and they count
+  as the writers part only when that segment is
+  `ci-kube-agents-eval-nightly-writers` (`nightly.NIGHTLY_WRITERS_JOB`);
+  any other is warned about and reported as the main part.
 - `--from-dir <dir>` — local `<build_id>/` subdirectories with the same
   files; the offline/testing path. Its runs are the presubmit with
   `job: null`.
@@ -571,7 +656,9 @@ what the renderer does with them.
   terminal), and skip every GCS build whose id is ≤ the newest
   **numeric** `build_id` on record **for that source** — the presubmit
   scan resumes above the newest presubmit run, the nightly scan above the
-  newest nightly run; Prow's ids are one global sequence, so the newest
+  newest nightly run, and the writers scan above the newest nightly run of
+  the writers job (which the main nightly scan's watermark leaves out);
+  Prow's ids are one global sequence, so the newest
   presubmit id is normally far above every nightly id and a shared
   watermark would skip every night — except the
   ids on the prior's `pending_builds`, which are re-read regardless (the
@@ -603,14 +690,14 @@ what the renderer does with them.
 America/Toronto ("ET"), formatted in the browser with
 `Intl.DateTimeFormat`; URL parameters stay ISO 8601 UTC.
 
-| Page           | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `index.html`   | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, the runs in the window with a "See it in the grid" link, and the last release-candidate eval runs (`releases[]`). Healthy: the last 24 hours in numbers and the last incident.                                                                                                                                                                                                                                                  |
-| `run.html`     | **The PR view**, `run.html#build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link, a link to its row on the Cases page and a one-line Do; a "what to do" box.                                                                                                                                                                                                                                     |
-| `grid.html`    | **The Grid**: one row per case (blocking cases by domain, then the held-out ones, folded away when they passed everything in the window), one column per presubmit run in a window of 6 h, 24 h, 36 h or 7 days (header: PR # and ET start; a green run that recorded no cases gets no column); cells passed / failed all reps / failed some / quota-infra / died before the cases / still running (`pending_builds`); merges to main and incident starts and ends marked between the columns; a cell opens that run's detail for the case. |
-| `cases.html`   | **The Cases page** ("How reliable is each test?"): one row per case by domain — its last `STRIP_RUNS` presubmit outcomes, pass rate over reps at 7 and 30 days for the presubmit and the nightly apart (`—` when a tier has no graded run), its roster status (blocking / held out / demoted with its date / nightly only / not in any matrix), its last failure with the grader's reason, and its issues from `case-notes.yaml`.                                                                                                           |
-| `nightly.html` | **The Nightly report**: last night's run of the nightly tier (or the night `#build=` names) — its wall clock and whether it ran to the end, the counts (passed all reps / partial / failed / infra), what is newly failing against the night before and what passes again, every case by domain with its state, reps, the grader's reason and a transcript link, and the other nights on record. The Brief's "Last night's run" block and the 9 AM Chat digest link here. `nightly.py` derives it.                                          |
-| `trend.html`   | **The Trend page** ("Scores over time on main"): the store's nightly records per case and domain — pass rate by night with the trailing admission window and the bar, judged quality by night with the spread the store supports (a case: the range of its nightly means over seven nights at one key; a domain: the range across its cases), a marker on each night the version key changed, a table under each chart, a banner when the store was not read. `#cases=`, `#domain=`, `#since=` (incident). `trend.py`, from `store.json`.   |
+| Page           | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `index.html`   | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, the runs in the window with a "See it in the grid" link, the GitLab lane's last runs (`brief.json` `gitlab`), and the last release-candidate eval runs (`releases[]`). Healthy: the last 24 hours in numbers and the last incident.                                                                                                                                                                                                                                                                                                 |
+| `run.html`     | **The PR view**, `run.html#build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link, a link to its row on the Cases page and a one-line Do; a "what to do" box.                                                                                                                                                                                                                                                                                                                                         |
+| `grid.html`    | **The Grid**: one row per case (blocking cases by domain, then the held-out ones, folded away when they passed everything in the window), one column per presubmit run in a window of 6 h, 24 h, 36 h or 7 days (header: PR # and ET start; a green run that recorded no cases gets no column); cells passed / failed all reps / failed some / quota-infra / died before the cases / still running (`pending_builds`); merges to main and incident starts and ends marked between the columns; a cell opens that run's detail for the case.                                                                                                     |
+| `cases.html`   | **The Cases page** ("How reliable is each test?"): one row per case by domain — its last `STRIP_RUNS` presubmit outcomes, pass rate over reps at 7 and 30 days for the presubmit and the nightly apart (`—` when a tier has no graded run), its roster status (blocking / held out / demoted with its date / nightly only / not in any matrix), its last failure with the grader's reason, its presubmit timing, and its issues from `case-notes.yaml`.                                                                                                                                                                                         |
+| `nightly.html` | **The Nightly report**: last night's run of the nightly tier (or the night `#build=` names) — its wall clock and whether it ran to the end, the counts (passed all reps / partial / failed / infra), what is newly failing against the night before and what passes again, every case by domain with its state, reps, timing medians and p90s, the grader's reason and a transcript link, a turn-1 latency tile, the timing night over night (the night's turn-1 p50 and p95, and each case `#cases=` names), and the other nights on record. The Brief's "Last night's run" block and the 9 AM Chat digest link here. `nightly.py` derives it. |
+| `trend.html`   | **The Trend page** ("Scores over time on main"): the store's nightly records per case and domain — pass rate by night with the trailing admission window and the bar, judged quality by night with the spread the store supports (a case: the range of its nightly means over seven nights at one key; a domain: the range across its cases), a marker on each night the version key changed, a table under each chart, a banner when the store was not read. Under each card and for all cases: turn 1 p50/p95, agent p50/p90 by night, advisory. `#cases=`, `#domain=`, `#since=` (incident). `trend.py`, from `store.json` and `data.json`.  |
 
 The pages render in the browser from `brief.json` (below),
 which `render.py` inlines into each page as
@@ -641,7 +728,7 @@ the question imports it.
 `run.html#build=<prow build id>`
 `grid.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]`
 `cases.html#<case id>`, or `cases.html#sort=worst|domain|name&show=all|blocking|held`
-`nightly.html[#build=<prow build id>]`
+`nightly.html[#build=<prow build id>&cases=a,b]` (either key may be left out)
 `trend.html#cases=a,b`, or `trend.html#domain=<domain>`, each `[&metric=<judged metric>][&since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>]]`
 
 Every parameter travels in the URL fragment as `key=value` pairs joined
@@ -658,7 +745,7 @@ local render); a key present in both places is read from the query.
 `linkState()` in `template/pages.js` is the one parser;
 `post_health.dashboard_link` / `run_link` (Python: the Chat messages, the
 gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
-/ `caseHref` / `nightHref` (the pages' own links; `incidentHref` and
+/ `caseHref` / `nightHref` / `nightTimingHref` (the pages' own links; `incidentHref` and
 `numbersHref` wrap the first) are the writers. A writer omits an empty parameter.
 
 - `cases`, `since`, `until` scope the Brief to that incident (a past one
@@ -680,9 +767,15 @@ gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
   grammar and the `Z` form need none).
 - `run.html#build=<digits>`; an id not in `brief.json` shows a
   not-found page naming the window (`RUN_VIEW_DAYS`, 14 days).
-- `nightly.html#build=<digits>` opens that night instead of the newest;
+- `nightly.html#build=<digits>` opens that night instead of the newest
+  (either part's build opens a split night);
   an id not among the `nightly.nights[]` on record says so and links
   last night's.
+- `nightly.html#cases=a,b` adds a table per case under "Timing, night over
+  night" (state, reps, turn-1 and agent p50 and p90 for each night on the
+  page) and scrolls there; a case row's "timing" link
+  (`nightTimingHref`) writes it with the night's `build`, and a night in
+  those tables links with the same `cases`.
 - `window`, `rows`, `sort` and `show` are the Grid's and the Cases page's
   chips as parameters; a value outside the vocabulary is the default.
 - On the Trend page `cases` scopes to those cases (the case-id grammar
@@ -695,7 +788,7 @@ gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
 
 `{schema_version, generated_at, stale_after_s, run_days, rate_windows_days,
 strip_runs, admitted[], health, history, merges, catches, cases{}, runs[],
-pending[], releases[], nightly{}, trend{}}`. `runs[]` is the **presubmit's** last `run_days` of
+pending[], releases[], nightly{}, gitlab{}, trend{}}`. `runs[]` is the **presubmit's** last `run_days` of
 `data.json`, oldest first — a nightly run is nobody's pull request and is
 not listed — each carrying its identity and timing plus
 `classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
@@ -721,10 +814,10 @@ graded the case and failed / did not fail it on every repetition, `null`
 when none did — evidence about `main`, shown beside the case, never a tag.
 
 `cases{}` is, per case, `{active, nightly_active, admitted, domain, status,
-demoted_on, note, issues[], rates, strip[], last_failure}`. `status` is
+demoted_on, note, issues[], rates, strip[], last_failure, latency}`. `status` is
 `blocking` (active and in `hack/eval/blocking-roster.txt`), `held_out`
 (active, off the roster, no demotion date: the held-out seat a coverage tracker takes in the
-presubmit file, which is what pdb-remediation-pr shows while seated; a dated one reads
+presubmit file, which is what pdb-remediation-pr showed while seated, 2026-09-28 to 10-14; a dated one reads
 `demoted`, which is what the compliance canary shows while seated),
 `demoted` (off the roster, active or nightly-only, with `demoted_on` read from the hold-out
 entry in `docs/eval-gate-roster.md` that says `demoted YYYY-MM-DD`; a case demoted under the
@@ -742,6 +835,8 @@ or `partial` appearance — the presubmit's, else the nightly's — as `{tier,
 build, pr, at, state, reps, reason, excerpt, cls, also_failing_prs, event}`
 (`cls` and `also_failing_prs` from the Brief's classification of that run
 when it is in `runs[]`, else `null` and `0`), or `null` when there is none.
+`latency` is data.json's `cases[].latency`, its keys with finite numbers
+only, or `null` when it is absent or has none.
 
 `pending[]` is `pending_builds` as `{build, first_seen}`, the Grid's "still
 running" columns — the presubmit's entries only (a night in flight,
@@ -759,29 +854,82 @@ when the checkout is shallow or has no git; the Brief then omits "what
 changed right before" and the Grid its merge markers).
 
 `nightly` is `{job, nights[], running[]}` from `nightly.py`: `job` the
-periodic's name as the newest nightly run carries it (the default when none
-is on record),
-`nights[]` the last `NIGHTS_ON_RECORD` (14) nightly runs **newest first**,
+periodic's name as the newest main-part nightly run carries it (the default
+when none is on record),
+`nights[]` the last `NIGHTS_ON_RECORD` (14) nights **newest first**,
 each `{build, job, head_sha, project, started, finished, duration_s, result,
 log_url, truncated, complete, counts{expected, recorded, passed, partial,
 failed, infra, missing}, missing[], newly_failing[], fixed[],
-previous_build, cases[]}`. `cases[]` is every task row the night measured,
+previous_build, parts[], missing_parts[], running_parts[], turn1_p50_s,
+turn1_p95_s, cases[]}`. A
+night is one nightly run, or the main and writers parts' runs of one date:
+a run's date is the UTC date of its start plus 15 minutes
+(`NIGHT_START_GRACE`; both periodics start at 00:00 UTC, so a run that
+starts a moment early still joins its night). A second run of the main part that date is a night of its
+own, and reports as its writers part the writers run of the newest other
+night of its date that has one (`parts[].from_night`), counted in its
+`cases[]`, `counts`, `missing[]`, `newly_failing`, `fixed` and `complete`
+as its own and compared with the writers run before that one; the
+borrowed run stays filed under its own night, so every reader that counts
+runs (the Cases page's rates and last failure, the Trend page's nights)
+counts it once. A writers run joins the night of its date, still without
+a writers part, whose main part started closest to it; a second run of
+the writers part does that, or takes the writers part of the date's
+newest night, only if it beats the date's writers run already filed: it
+graded more cases (`pass`, `partial` or `fail`; an `infra` case is no
+verdict), or as many and was not cut short where the incumbent finished;
+`build`, `job`, `head_sha`, `project`, `result` and `log_url` are the main
+part's (the writers part's when there is no main part), `started` and
+`finished` the earliest and latest of the parts, `duration_s` the longest
+part's, a borrowed part left out of all three. `parts[]` is each run the
+night has, main first, as `{part, build, job, result, truncated, started,
+finished, duration_s, log_url, recorded, from_night}` with `part` `main`
+or `writers`, `recorded` the cases it recorded, and `from_night` the
+`build` of the night a borrowed part is filed under (`null` for the
+night's own).
+`missing_parts[]` names a part the night should have and does not, and
+`running_parts[]` one that is still in flight (a `running[]` entry of that
+part first seen on the night's date, dated the same way). A part that ran
+that date in another night is neither. The main part is expected beside a
+writers part; the writers part only when a case the night is missing is one
+a writers run of that date or earlier recorded. So a night of the main job
+alone before the split has neither; once the main job runs the whole matrix
+again, a night short of a main case is incomplete without naming a part,
+and one short of a former writers case reports the writers part missing.
+`cases[]` is every task row the night measured,
 sorted by domain then name, as `{case, domain, state, reps{pass, fail,
-infra}, reason, transcript_url}` with `state` in `pass|partial|fail|infra`
+infra}, reason, transcript_url, turn1_p50_s, turn1_p90_s, agent_p50_s, agent_p90_s}` with `state` in `pass|partial|fail|infra`
 by the strip's rule over the task's reps (no `reps` key: the task's result
-is one rep) and `reason` the first failing rep's grader text (`null` on a
-pass). `expected` counts the cases `nightly_active` on this checkout;
+is one rep), `reason` the first failing rep's grader text (`null` on a
+pass), and `turn1_p50_s` / `agent_p50_s` the median of the task's reps'
+`turn1_s` / `agent_s` over its reps that are not `infra` (nearest rank, as
+`cases[].latency`; `null` when no such rep carries it), and `turn1_p90_s` /
+`agent_p90_s` the same reps' 90th percentile (`SLOW_PCT`, nearest rank). The night's
+`turn1_p50_s` and `turn1_p95_s` are the same percentiles of `turn1_s` over
+every rep of the night's `cases[]` that is not `infra` (`null` when none
+carries it). They are advisory: the page and the digest show the p95 beside
+the chat-turn target, p95 under 10 s (`TURN1_P95_TARGET_S`, from
+`docs/architecture/05-system-architecture.md`), and nothing judges the
+night on it. `expected` counts the cases `nightly_active` on this checkout;
 `missing[]` names the expected cases the night did not record.
 `truncated` is a night Prow ended before its verdict: `result == "ABORTED"`
 (an interrupt), or any other non-`SUCCESS` result with `eval_verdict`
 `null` — the periodic's deadline arrives as SIGTERM and Prow records
 `FAILURE`, so `ABORTED` alone would miss it; a record without the field
-is unknown, not truncated. `complete` is neither truncated nor missing
-anything. `newly_failing`
-is every `fail` tonight that was not `fail` on `previous_build`, the night
-before it on record (the one past the window included), `fixed` every
-`fail` then that is `pass` now; both `[]` on the first night, when
-`previous_build` is `null`. `log_url` and `transcript_url` point at
+is unknown, not truncated. `parts[].truncated` is that test on each part's
+run. The night's `truncated` is its main part's (every part's when it has
+no main part), so a writers part at its deadline leaves the main part's
+numbers standing. `complete` is no part
+truncated, no case missing, and no part missing or running. A case recorded
+by both parts counts once, as the main part recorded it. `newly_failing`
+is every `fail` tonight that was not `fail` the night before, `fixed` every
+`fail` then that is `pass` now. The night before is per part: each part's
+run from the newest earlier night on record that has that part (the one
+past the window included), and a case both of those runs recorded reads as
+the newer one did, or the main part on the same night; `previous_build`
+names the main part's build (the writers part's when no earlier night has a
+main part). `newly_failing` and `fixed` are both `[]` on the first night,
+when `previous_build` is `null`. `log_url` and `transcript_url` point at
 Spyglass under `logs/<job>/<build>`, a periodic's path, in the bucket the
 run's `runs[].log_url` names (without it: `gs://kube-agents-prow`, the
 bucket before 2026-09-15). The nights are
@@ -791,6 +939,24 @@ and Prow's time to write `finished.json`) of `generated_at`, oldest first,
 each `{build, first_seen, log_url}` — a night in flight, which the Brief's
 block, the report page and the digest say instead of "no night".
 
+`gitlab` is `{job, runs[], running[], counts{on_record, green, red},
+nightly_job, nights[], night_counts{...}}` from `forge_lane.py`: the GitLab
+lane's pull-request runs (`runs[].tier == "gitlab"` with a `pr`) **newest
+first**, the last `RUNS_LISTED` (20), each `{build, job, pr, head_sha,
+project, log_url, started, finished, duration_s, result, eval_verdict, green,
+tasks{pass, fail, infra}}`; `nights[]` the same shape for the lane's nightly
+runs (`pr` null, `log_url` the periodic's Spyglass page), `nightly_job` the
+newest night's job else the default, `night_counts` over every night on
+record (`green` is Prow's `SUCCESS`; `tasks` counts the
+run's task rows by result); `running[]` the lane's `pending_builds` as
+`{build, first_seen}`, only those first seen inside `RUNNING_MAX_AGE` (8 h,
+the presubmit's ceiling plus upload time) of the reference time, as the Grid's
+columns and the nightly's `running[]` are bounded; `counts` over every lane
+pull-request run on record. `job` is the
+name the newest lane pull-request run carries, else the default. The Brief's "GitLab
+lane" section is this block and nothing else reads it: the lane's runs are
+in no gate number, no case history and no digest line.
+
 `trend` is `null` in the published `brief.json` (every page polls that
 file every minute and only the Trend page reads the block, which grows a
 night's records every night); the block is inlined into `trend.html` and
@@ -798,7 +964,8 @@ published beside `brief.json` as **`trend.json`**, which the Trend page
 polls. It is `trend.py`'s block from `store.json` (below), the evidence
 store's read: `{source, read_at, error, window_days, lead_days, max_objects,
 truncated{case: n}, partial, warnings[], records, metrics[], default_metric,
-spread_nights, bar{rate, min_runs}, keys{}, nights[], cases{}, domains{}}`.
+spread_nights, bar{rate, min_runs}, keys{}, nights[], cases{}, domains{},
+latency{}}`.
 Without a `--store` every field is empty or `null` and the page says the
 store was not read; `error` set means the last read failed or was not
 attempted and the rest is the read before it. The page draws the
@@ -810,7 +977,8 @@ spreads and appear nowhere else (not as points, nights, key changes or in
 five components. `nights[]` is every night inside the drawn window the
 store holds a record for, oldest first, `{id, at, build, commit, started, log_url, cases}` — `id` is
 `build:<prow build id>` from the object name (or `at:<recorded_at>` for a
-record without one), `started` and `log_url` the collector's when that
+record without one; the records of a split night's two builds share the
+build `nightly.nights[]` files that night by), `started` and `log_url` the collector's when that
 build is a nightly run in `data.json` (`null` otherwise); the page dates
 every night by `at`, the stamp its points and markers are placed by, and
 uses `build` only for the link to the report. `cases{}` is per case `{domain, points[],
@@ -835,6 +1003,31 @@ points[], key_changes[]}` with `points[]` the cases pooled per night
 high, cases}}}` (`mean` weighted by `n`, `low`/`high` the range of the
 cases' means). Only nightly records exist in the store (a pull request's
 run never writes it), so nothing here is a presubmit's.
+
+`latency{}` is the one part of the block not read from the store, which
+carries no timing: it is from `data.json`'s nightly runs inside the same
+drawn window (empty without a `--store`, like the rest), each night filed
+as `nightly.filed_nights` files it, from its own main and writers parts
+only (a case both parts recorded counts as the main part recorded it; a
+main re-run night does not borrow its date's writers part, so writers reps
+count once). The page draws a scope's points under its card, and `all[]`
+above the domain cards on the all-domains view, each row with its own
+latency table. `{target_s, pct{turn1, agent}, nights[], all[], domains{domain:
+points[]}, cases{case: points[]}}`: `target_s` is the advisory chat-turn
+target (p95, nothing gates on it) and `pct` each series' slow percentile
+(`turn1` 95, the target's `TURN1_TARGET_PCT`; `agent` 90, `SLOW_PCT`), as
+`nightly.py` has them; `nights[]` is `{id, at, build}`
+oldest first, `id` the same `build:<main part's build>` as the store's
+`nights[].id`, `at` that night's `at` when the store holds it, else the
+newest finish (or start) of its parts. Each scope (`all[]` every case,
+`domains{}` a domain's cases, `cases{}` one case) has one point per night
+it recorded a repetition, oldest first: `{night, at, n_turn1, turn1_p50_s,
+turn1_p95_s, n_agent, agent_p50_s, agent_p90_s}`, the nearest-rank p50 and
+`pct` percentile of `turn1_s` and `agent_s` over the scope's reps
+whose `result` is not `infra`, and `n_*` how many such reps carry each. A
+night the scope ran with no timed rep that counts (none timed, or every
+timed rep `infra`) has `n_*` 0 and `null` percentiles, which the page draws
+as a gap.
 
 ### `store.json` (written by `store.py`, read by `render.py --store`)
 
@@ -878,7 +1071,7 @@ read is final.
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
 (`shared_break|storm|setup_deaths|lost_pods|fixture_drift|pool_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
-`slow`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
+`slow`, `near_deadline`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
 and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
@@ -905,26 +1098,35 @@ scan found a pool project no longer shaped as the verifier requires;
 docs/ci-health.md, "The pool-state scan") is the same shape: `roles` are the
 verifier's finding ids, `incident` also carries `repairs` (`{project: {finding:
 command}}`), and the `pool_state` block beside `fixture_state` summarises the
-scan; `pool-state.json` is its document, which no page reads: `scope` (`pool` for the hourly job's whole mapping, `selected` for a hand run's `--projects`, on both scan documents; the health rule reads a project absent from a `pool` document as retired from the mapping and one absent from a `selected` document as not read), then per project, per check, `state`, `detail`, and for a healthy or drifted check `unread`, the reads the verifier could not make, which is what keeps a check out of the incident's `reads` exit. Both blocks also carry `unread_units`, how many roles or checks were not read in full on projects that were checked (not checked, or read in part with the rest refused), which the pool digest line reports instead of calling the pool clean. Both scan
+scan; `pool-state.json` is its document, which no page reads: `scope` (`pool` for the hourly job's whole mapping, `selected` for a hand run's `--projects`, on both scan documents; the health rule reads a project absent from a `pool` document as retired from the mapping and one absent from a `selected` document as not read), then per project, per check, `state`, `detail`, and for a healthy or drifted check `unread`, the reads the verifier could not make, which is what keeps a check out of the incident's `reads` exit. Both blocks also carry `unread_units`, how many roles or checks were not read in full on projects that were checked (not checked, or read in part with the rest refused), which the pool digest line reports instead of calling the pool clean; both also carry `absent_units` and `absent_projects`, meaningful on the fleet block only: the fixtures the stack has not planted (a rollout the next reconcile finishes), which the fleet digest line says apart from the reads that failed. Both scan
 incidents carry `reads` (`{project: [what a later scan must read again]}`). `slow` is `null` or, on a `GREEN` tick, the slow-gate note
 (`{since, runs, min_s, median_s, max_s, baseline_days, baseline_runs,
 baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
 gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
 `baseline_days` for the one sentence the Brief's healthy headline adds while
-it is set.
+it is set. `near_deadline` is `null` or, on a `GREEN` tick, the near-deadline note
+(`{since, runs, max_s, max_build, deadline_s, headroom_s, kills, max_killed}`, `docs/ci-health.md`, "Close to the
+deadline").
 
 `pool` is `null` or the pool-pressure note (`docs/ci-health.md`, "A backed-up
 pool"): `{since, verdict, breach_seen, measured_at}` always, plus `{day,
 window_hours, p50_s, p95_s, waiting_longest_s, waiting_now, waiting_since, over_threshold,
-threshold_p50_s, threshold_p95_s, free, total, cause, max_concurrency}` when
-`verdict` is `BREACH` or `UNMEASURED`. `waiting_longest_s` is how long the
+threshold_p50_s, threshold_p95_s, free, total, lease_failures, lease_failures_hours,
+no_build_id, cause, max_concurrency}` when
+`verdict` is `BREACH` or `UNMEASURED`. `lease_failures` is how many runs Boskos
+refused a project in the periodic's recent window of `lease_failures_hours`
+hours, and `no_build_id` how many projects are leased under an owner that is
+neither a Prow run nor a known job's fixed owner; `lease_failures` and
+`no_build_id` are `null` under these names from an
+artifact written before the
+periodic reported them. `waiting_longest_s` is how long the
 longest run has been waiting for a project right now, `0` for an empty queue
 and `null` when Deck was not read; `over_threshold` is the count already past
 the p95 limit. `waiting_now` is whether that wait is past the p50 limit — a
 live backlog — and `null` when Deck was unread or no limit was given. A verdict
 lasts a week, so every present-tense reader asks it: the alert is withheld on
-`false`, `CONTROL_PLANE` drops its diagnosis on `null`, and the digest and
-Brief go past tense on either. `waiting_since` dates the backlog from its
+`false` unless `lease_failures` is non-zero, `CONTROL_PLANE` drops its
+diagnosis on `null`, and the digest and Brief go past tense on either. `waiting_since` dates the backlog from its
 oldest queued run, and is `null` when there is none; the Brief's present-tense
 sentence prefers it to `since`, which can be days older.
 `breach_seen` says whether the open episode has ever measured a breach, and
@@ -932,20 +1134,23 @@ sentence prefers it to `since`, which can be days older.
 a stretch that only ever said the queue could not be read. `metrics` carries
 both across a tick that read no artifact, as `pool_since` and
 `pool_breach_seen`. The two
-figures are never the seven-day window's — the periodic breaches on a day's row
-or on runs queued past p95 right now, and the window sits back inside its own
-limit after one bad day. Exactly one of `window_hours` and `day` says which
+figures are never the seven-day window's — the periodic breaches on a day's row,
+on runs queued past p95 right now, or on a run refused a project in its recent
+window, and the seven-day window sits back inside its own limit after one bad
+day. Exactly one of `window_hours` and `day` says which
 stretch they cover: the periodic's recent window when it had the runs to judge
 it and went over a limit, the worst breached day otherwise. A verdict lasts a
 week, so the recent window comes first — a Thursday incident evidenced by
 Monday reads as a contradiction — but a compliant stretch is the same
-contradiction, only newer. Both are `null` when only the live queue breached;
-`over_threshold` counts those runs. A `STALE` verdict carries no numbers: the
+contradiction, only newer. Both are `null` when only the live queue or only a
+refusal breached; `over_threshold` counts the queued runs and `lease_failures`
+the refused ones. A `STALE` verdict carries no numbers: the
 periodic stopped publishing, and the last reading is not evidence about now.
 Unlike `slow` it is set in every state, and the pages read `verdict`, `since`,
-`measured_at`, `day`, `window_hours`, `p50_s`, `p95_s`, `over_threshold`,
-`threshold_p50_s` and `threshold_p95_s` for one sentence on the Brief's healthy
-headline and on the last-24-hours view.
+`measured_at`, `day`, `window_hours`, `p50_s`, `p95_s`, `waiting_now`,
+`waiting_since`, `over_threshold`, `threshold_p50_s`, `threshold_p95_s`,
+`lease_failures` and `lease_failures_hours` for one sentence on the Brief's
+healthy headline and on the last-24-hours view.
 `metrics.queue_wait_p50_s` is the same job's median wait over the last day, or
 `null`; it is not derived from the runs. `metrics.queue_wait_read` says whether
 the artifact was there at all. Nothing else answers that: `pool` is `null` for a
@@ -964,24 +1169,41 @@ and any run-based condition take over as before.
 
 `periodics` is the watched Prow periodics' notes, by job name, one for each job
 whose latest finished build failed (`verdict: FAILED`) or is older than the
-job's stale window, or carries no readable finish time (`STALE`): `{job, label, verdict, since, build,
+job's stale window, or carries no readable finish time (`STALE`), or passed
+while its GitLab sweep report names a token that is due, dead or unreadable
+(`TOKEN`, the sweep only; its `detail` is those token lines, its `summary`
+"the run passed; N token(s) to rotate", and its `absence`, `effect` and
+`runbook` are the credential's words rather than the sweep's): `{job, label, verdict, since, build,
 finished_at, result, stale_after_h, dry_run, detail[], summary, history_url,
-place, absence, does, effect, runbook}`. `detail` (on `FAILED` only)
+place, absence, does, effect, runbook}`. `detail` (on `FAILED`, and the token lines on `TOKEN`)
 is the report's lines, the projects capped at five (then `and N more`) and the
 run's lines after the cap: for the reconcile the
-projects it refused, failed or was interrupted in, then the run's own `error`
-line; for the sweep the projects whose sweep failed with GitHub's answer, then
+projects it refused, failed or was interrupted in, each with its one next
+step, then how many it did not reach and why, then (only for an `--all`
+run whose `visited` reached `mapped` and whose every visited project carries
+an allowlist verdict) the allowlist entries no plan needed, then the
+run's own `error` line; for the sweep the projects whose sweep failed with GitHub's answer, then
 the writes left for the next run under its budget, then the projects held and
 released unswept after the run stopped, then why the run ended early or its
 `error` line; either says when the report was not a JSON object.
-`summary` (on `FAILED` only) is one clause on what the run did ("failed in 11
+`summary` (on `FAILED`, and "the run passed; N token(s) to rotate" on `TOKEN`) is one clause on what the run did ("failed in 11
 of 11 project(s)", "3 applied, 9 unchanged"); `since` is carried from the
 previous `health.json`;
 `place`, `absence`, `does`, `effect` and `runbook` are the words and
 the link the message is built from, from `WATCHED`. The reconcile's report,
 `fleet-reconcile.json` from `hack/fleet_reconcile.py --report`, is
-`{schema_version, mode, dry_run, started_at, finished_at, exit, exit_code,
-error, outcomes{project: {outcome, detail}}, summary}`; the sweep's,
+`{schema_version, mode, dry_run, commit, fleet_tree, build, job, workers,
+budget_seconds, ceiling_seconds, main_ref, main_check_error, started_at,
+finished_at, exit, exit_code, error, mapped, visited, outcomes{project:
+{outcome, detail, started_at?, finished_at?, allowlist_unused[]?}}, summary}`
+(`mapped` is how many projects the run set out to visit and `visited` how
+many it held; a held project carries its times, and `allowlist_unused` only
+when its plan was read; `fleet_tree` is the hash `hack/fleet_reconcile.py` computes
+over the stack's inputs (`docs/ci-pool-projects.md` §6.2 names them; reports
+from before #2645 carry the git tree id of `bench/tf/fleet` instead);
+`main_check_error` is set when the moved-check could
+not read main; outcomes are applied, converged, unchanged, planned, busy,
+refused, failed, interrupted, not_reached); the sweep's,
 `pull-sweep.json` from `hack/ci_sweep_agent_pulls.py --report`, is
 `{schema_version, mode, dry_run, started_at, finished_at, exit, exit_code,
 error, ended_early, projects, closed, failed, unmapped[], skipped[],
@@ -992,15 +1214,37 @@ and `left_for_next_run` the writes the budget deferred (a pull request left
 unclosed counts its close and its delete, and its label when it carries
 `audit:remediation`). `periodics_read` names the jobs a
 reading arrived for this tick, whether or not they are noted; the poster clears
-a told job only on a reading that shows it clean. `periodics_runs` is, per read
-job, `{build, finished_at, passed, summary}` of its latest finished build, what
-the recovery message says. `periodics_streaks` is, per watched job, `{build,
+a told job on a reading that shows it clean, or when `periodics_superseded`
+marks it recovered. That map is `{job: {build, recovery[, by]}}` for the jobs
+whose latest failed build a later build of the job that supersedes them (the
+daily, for the postsubmit reconcile) has dealt with: `recovery` true when the
+daily passed having reached every project the failed build named, at the same
+`fleet_tree` (a failed build's pre-input-hash git id against the daily's hash
+is not compared; a project a whole pass no longer lists has left the pool and
+counts; a failed build naming no project needs a whole pass), false when it
+failed itself, so its own note is the current story and nothing clears; `by`
+is the daily run a recovery was decided on (`build`, `finished_at`,
+`summary`), what the clear cites. A failed build whose report is absent or
+cut short is never recovered by a pass, and a silence ends when a later daily
+passes without reaching the projects. The
+entry is carried from the previous tick while `build` is still the job's
+latest, unchanged on a tick blind to either job, so neither re-opens the
+failure, and a silence becomes a recovery once a later pass reaches the
+projects.
+`periodics` notes every watched job whose latest build failed or is stale,
+less those superseded. `periodics_runs` is, per read
+job, `{build, finished_at, passed, summary, dry_run}` of its latest finished build, what
+the recovery message and the digest's reconcile run line say, plus
+`tokens_current` for the sweep: true when its GitLab report was read and
+names no token to rotate, false when it names one, null when the report was
+not read. `periodics_streaks` is, per watched job, `{build,
 projects{project: n}, runs}`: the last build counted, each project's
 consecutive failed checks (dropped at zero; every count cleared by a clean
 build) and the run's; a failed build is a note only once the run's count
 reaches the job's threshold (two consecutive checks for the sweep, the first
 failure for the reconciles), and the poster treats a told job as recovered only
-on a build that passed (`periodics_runs`), not on a sub-threshold failure. `periodics_since` is each open note's start, kept
+on a build that passed (`periodics_runs`), not on a sub-threshold failure, and
+a told `TOKEN` note only on a passed build whose `tokens_current` is true. `periodics_since` is each open note's start, kept
 for a job across the ticks with no reading for it (which write no note for it)
 and dropped once a tick with a reading for it writes no note
 (`scripts/eval_dashboard/periodics.py` owns the notes).
@@ -1112,7 +1356,7 @@ them on 2026-09-08 — and the fields the health adjudicator reads (`build_id`,
 carries one, the how-it-ended fields — `has_build_log`, the `pod_*` trio,
 `merge_conflict`, `eval_verdict` — when the source has them, and per task
 `name`, `result`, `reps[].result` and the first
-96 characters of `reps[].reason`);
+128 characters of `reps[].reason`);
 its `trimmed` key records the source and the cut. Six of its zero-task runs
 carry `result: "failure"` in lowercase, as Prow wrote them on 2026-09-05 —
 the one departure from the `result` vocabulary above seen in the wild, so
@@ -1138,6 +1382,10 @@ is the same cut for [2026-09-22 12:00Z, 2026-09-23 20:00Z) — 183 runs, 33 of
 them killed at the deadline with `eval_verdict: null` (#1880, #1894); the
 test asserts the `deadline_kill` OUTAGE from the third kill and a lull
 reading as recovering.
+`testdata_health/near-deadline-2026-09-17.json.gz` is a synthetic scenario modeling
+the timeline of [2026-09-17 04:00Z, 2026-09-17 16:30Z) — four runs concluding on the afternoon
+a 356-minute run finished with the gate staying GREEN (#2873); the test
+asserts the `near_deadline` note from 16:00Z that day and none at 04:00Z.
 
 `testdata_store/` holds four **real** objects from the evidence store's
 first recording night (2026-09-17, build 2100374258805903360, commit

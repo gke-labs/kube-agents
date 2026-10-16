@@ -57,11 +57,20 @@ if str(_SCRIPTS_DIR) not in sys.path:
 # invisible precondition that turns into a skipped test later.
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
+import mcp_policy  # noqa: E402
+import watcher_policy  # noqa: E402
 
 # The name the gateway redactor is registered under in sys.modules when a test
 # imports it by path. Distinct from the callback's own registration name so
 # the two copies never shadow each other inside one interpreter.
 GATEWAY_REDACTOR_MODULE_NAME = "kube_agents_gateway_redactor"
+SKILL_OVERLAY_MODULE_NAME = "kube_agents_skill_overlay"
+
+# The same, for the Slack click handler imported by path.
+SLACK_UX_CLICKS_MODULE_NAME = "kube_agents_slack_ux_clicks"
+
+# The same, for the image build's config merge.
+MERGE_CONFIGS_MODULE_NAME = "kube_agents_merge_configs"
 
 # The published site's content tree. A directory rather than a file, so it is
 # not a Source: D2's assertion is about every page, and a registry would need
@@ -112,7 +121,28 @@ SOURCES: dict[str, Source] = {
             "def _sanitize_for_logging(",
             "def blocked_by(",
             "os.umask(0o177)",
+            "DESTRUCTIVE_SLACK_VERBS",
+            "SLACK_REMOVE_ALLOWLIST",
+            "SLACK_METHOD_SHAPE",
         ),
+    ),
+    # B1 imports this module: the per-tool allowlist the broker applies to
+    # every remote MCP call.
+    "mcp_policy": Source(
+        "agents/platform/scripts/mcp_policy.py",
+        ("GKE_READ_TOOLS", "MCP_SERVERS", "def evaluate(", "MCP_RELAY_PREFIX"),
+    ),
+    # C1 imports this module: what the broker relays for the gateway's
+    # watchers under the watcher role.
+    "watcher_policy": Source(
+        "agents/platform/scripts/watcher_policy.py",
+        ("def evaluate_k8s(", "def evaluate_gcp(", "REFUSED_RESOURCES", "WATCHER_K8S_PREFIX", "def project_cluster("),
+    ),
+    # C1 holds the operator's copy of the drift detector's default
+    # subscription to the detector's own.
+    "drift_detector_main_go": Source(
+        "k8s-operator/cmd/drift-detector/main.go",
+        ("defaultSubscriptionName =",),
     ),
     "session_kv_server": Source(
         "agents/platform/scripts/session_kv_server.py",
@@ -152,7 +182,8 @@ SOURCES: dict[str, Source] = {
     ),
     "broker_split_go": Source(
         "k8s-operator/internal/controller/platformagent_broker_split.go",
-        ("buildCredentialBrokerTokenReviewRole", "tokenreviews"),
+        ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath =",
+         "driftDetectorDefaultSubscription =", "credentialProxyWatcherAudience ="),
     ),
     "manifest_helpers_go": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
@@ -241,6 +272,16 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
         ("func buildA2ASessionNetworkPolicy", "a2aSessionComponent", "a2aPartOf ="),
     ),
+    # The A2A gateway's rendered ingress: its three fences and the gateway
+    # container's declared ports, written by an operator Go test
+    # (TestRenderedA2AGatewayIngressMatchesTheConformanceFixture) because no
+    # golden renders mode next. The anchors are the collector's namespace and
+    # the metrics port's name: lose either and C1's assertion has nothing to
+    # hold the fences to.
+    "a2a_gateway_ingress_fixture": Source(
+        "k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml",
+        ("kind: NetworkPolicy", "gke-gmp-system", "name: a2a-metrics"),
+    ),
     # The eval-only inject door. Two files, two modules: the operator decides
     # whether the door is rendered at all (Go module k8s-operator) and the
     # gateway decides what it does once it is (Go module a2a). A3's darkness
@@ -260,15 +301,89 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveInjectPrincipal", "injectEvalPrincipalPrefix"),
     ),
+    # The operator-rendered Hermes bridge: built from the agent container, so
+    # what it drops from that copy is the whole of what keeps it a separate
+    # principal from the agent beside it.
+    "a2a_bridge_render": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
+        ("func buildA2ABridgeContainer(", "func a2aBridgeOwnEnv(", "var a2aBridgeDroppedAgentEnv"),
+    ),
+    # The A2A door is the inject door's sibling for an agent caller, gated and
+    # resolved the same way; A3 reads the same two seams for it.
+    "a2a_door_render": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        (
+            "func a2aAgentDoorEnabled",
+            ") applyA2AAgentDoor(",
+            "a2aAgentDoorEnvVar =",
+        ),
+    ),
+    "a2a_door_identity": Source(
+        "a2a/gateway/gchat.go",
+        ("func (g *Gateway) resolveA2APrincipal", "a2aPrincipalPrefix + authorID"),
+    ),
+    # The A2A door's developer class: the verifier, the gateway's resolver
+    # for what it verified, the eval-caller grammar the class's prefix is
+    # disjoint from, and the roster arm that keeps it off the chat map.
+    "a2a_door_google": Source(
+        "a2a/gateway/a2adoor_google.go",
+        ("func (v *googleTokenVerifier) check", "a2aGoogleCallerPrefix =", ") identify("),
+    ),
+    "a2a_door_google_identity": Source(
+        "a2a/gateway/gchat.go",
+        ("func (g *Gateway) resolveA2AGooglePrincipal", "a2aGoogleCallerPrefix"),
+    ),
+    "a2a_door_callers": Source(
+        "a2a/gateway/a2adoor.go",
+        ("func callerOf(",),
+    ),
+    "a2a_door_roster": Source(
+        "a2a/gateway/gateway.go",
+        ("func (g *Gateway) rosterResolver", "a2aGoogleBackend"),
+    ),
+    # The gateway's Slack identity rule: the allowlist gates, the map
+    # overrides, and the member id is the principal otherwise.
+    "a2a_slack_ingress": Source(
+        "a2a/gateway/slack.go",
+        ("func (s *SlackAdapter) inbound(", "func (s *SlackAdapter) foreignSender(", "func (s *SlackAdapter) otherWorkspace("),
+    ),
+    "a2a_slack_identity": Source(
+        "a2a/gateway/gchat.go",
+        ("func (g *Gateway) slackPrincipal(", "slackMemberPrincipalPrefix"),
+    ),
     # labelPartOf lives here rather than beside the fence, so resolving the
     # operator's side of the pair needs both files.
     "operator_labels": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("labelPartOf",),
     ),
+    "operator_metrics_peer": Source(
+        "k8s-operator/internal/controller/platformagent_manifests.go",
+        ("operatorPodNameLabel", "operatorPodNameValue"),
+    ),
     "a2a_spawner": Source(
         "a2a/gateway/spawn.go",
-        ("partOfValue", "sessionRole", "AutomountServiceAccountToken"),
+        ("partOfValue", "sessionRole", "AutomountServiceAccountToken", "credentialProxySessionAudience"),
+    ),
+    # The broker's shim, which the worker image carries as kubectl/gcloud and
+    # the spawner configures through three env names it spells itself.
+    "credential_proxy_client": Source(
+        "agents/platform/scripts/credential_proxy_client.py",
+        ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME"),
+    ),
+    # The gateway's env contract with the operator (module a2a reading what
+    # module k8s-operator renders). C1 pins the cluster-view names across the
+    # boundary; the anchors are the two names and a long-standing neighbour.
+    "a2a_gateway_config": Source(
+        "a2a/gateway/config.go",
+        ("A2A_DEFAULT_ADDRESSEE", "A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"),
+    ),
+    # The platform agent's allowlists as the gateway reads them: the per-target
+    # check a session's delegation is held to. The names cross the module
+    # boundary from the operator's render; C1 pins the pair.
+    "a2a_gateway_allowlist": Source(
+        "a2a/gateway/allowlist.go",
+        ("EnvTargetAllowedUsersGchat", "EnvTargetAllowedUsersSlack", "func (g *Gateway) targetAllows"),
     ),
     # --- model egress -----------------------------------------------------
     # The redactor the chart mounts into the LiteLLM gateway. It is a copy of
@@ -296,6 +411,18 @@ SOURCES: dict[str, Source] = {
     "a2a_callout_rbac": Source(
         "k8s-operator/internal/controller/platformagent_a2a_callout.go",
         ("func buildA2ASessionServiceAccount", "Subjects: []rbacv1.Subject{"),
+    ),
+    # A3 on a Slack button click (KAGE_SLACK_UX): the handler that turns a
+    # click on our choice buttons into the clicker's turn. The anchors are the
+    # call into the adapter's own interactive authorization and the return on
+    # its refusal, which is everything the A3 click test depends on.
+    "slack_ux_clicks": Source(
+        "deploy/docker/patches/slack_ux_clicks.py",
+        (
+            "def register(adapter",
+            "started = await adapter._begin_interaction(",
+            "if started is None:",
+        ),
     ),
     # A3's task-plane writer sets, and A5's split of the shared `worker`
     # credential into a callout principal for the agent container and a static
@@ -335,7 +462,13 @@ SOURCES: dict[str, Source] = {
     ),
     "a2a_session_grants": Source(
         "a2a/authcallout/session.go",
-        ("func sessionGrants", "lib.TaskEventsSubject(pod,"),
+        ("func sessionGrants", "func executorGrants", "lib.TaskEventsSubject(addressee,"),
+    ),
+    # The other narrowing that starts from executorGrants: an AgentProfile's
+    # pods (the A2A profile resource, not a Hermes profile directory).
+    "a2a_profile_grants": Source(
+        "a2a/authcallout/profile_narrowing.go",
+        ("func profileGrants", "executorGrants(profile, pod)"),
     ),
     # What the server actually loads, as opposed to what the Go builders say.
     # The writer-set tests read both and assert they agree: the Go map is what
@@ -356,6 +489,9 @@ SOURCES: dict[str, Source] = {
             "a2aBusTokenAudience",
             "a2aBusTokenPath",
             "a2aBusTokenFile",
+            "a2aCalloutReservedPrincipalsEnvVar = ",
+            "a2aCalloutReservedAddresseesEnvVar = ",
+            "func buildA2ACalloutDeployment(",
             "a2aBusTokenVolume",
             "func a2aBusTokenVolumeSource(",
             "func a2aStripBusTokenMounts(",
@@ -407,10 +543,114 @@ SOURCES: dict[str, Source] = {
         "a2a/cmd/a2a/main.go",
         ("func busUser(", "lib.EnvBusUser", "lib.WithKSAToken"),
     ),
+    # --- the delegation primitive ------------------------------------------
+    # The reserved artifact name and its data shape, defined once so the
+    # worker-adapter and the gateway relay never spell either by hand (C1's
+    # "the delegate artifact is spelled once").
+    "a2a_payload": Source(
+        "a2a/lib/payload.go",
+        ('ArtifactDelegate = "delegate"', "type DelegateRequest struct {", "DelegateTextCap = "),
+    ),
+    # The worker-adapter's publish site: the one place a session's delegate
+    # ask becomes the reserved artifact on the bus.
+    "a2a_worker_adapter": Source(
+        "a2a/worker-adapter/adapter.go",
+        ("func (a *adapter) publishDelegate(", "func (a *adapter) publishArtifactPart("),
+    ),
+    # The worker-adapter's own share of the delegate-request check: the
+    # length cap, read through the shared constant rather than a hand-copied
+    # number, so the adapter and the gateway's second check (below) cannot
+    # silently disagree on what "too long" means.
+    "a2a_worker_adapter_delegate": Source(
+        "a2a/worker-adapter/delegate.go",
+        ("func validateDelegate(", "text is too long for a delegation"),
+    ),
+    # The MCP tool schema the session's harness is actually handed. It cannot
+    # reference lib.DelegateRequest's json tags -- it is a map[string]any
+    # literal, by necessity, since that is what go over stdio as the tool
+    # definition -- so its field names and lib.DelegateRequest's are two
+    # independent spellings of the same wire shape, and only a conformance
+    # test can hold them equal.
+    "a2a_worker_adapter_mcp": Source(
+        "a2a/worker-adapter/mcp.go",
+        ("var delegateToolSchema", '"required": []string{"addressee", "text"}'),
+    ),
+    # The gateway's side of the delegate artifact: the switch that routes it
+    # off the ordinary chat-rendering path, and the gateway's own copy of the
+    # length check the adapter already enforces (a defence that matters
+    # exactly because the adapter's is bypassable by anything that can reach
+    # the bus directly).
+    "a2a_gateway_relay": Source(
+        "a2a/gateway/relay.go",
+        ("g.handleDelegateRequest(ctx, rec, subject, taskID, a.Artifact.Parts)", "func (g *Gateway) applyArtifact("),
+    ),
+    "a2a_gateway_delegation": Source(
+        "a2a/gateway/delegation.go",
+        ("func (g *Gateway) handleDelegateRequest(", "lib.DelegateTextCap"),
+    ),
+    # The callout's reader of the static principal list and the fixed-name
+    # addressee list the operator renders into its Deployment. The operator
+    # half is operator_a2a_callout above (a2aCalloutReservedPrincipalsEnvVar,
+    # a2aCalloutReservedAddresseesEnvVar); the two modules cannot import each
+    # other, so C1 compares the two literals of each pair.
+    "a2a_callout_main": Source(
+        "a2a/cmd/authcallout/main.go",
+        (
+            "envReservedPrincipals = ",
+            "os.LookupEnv(envReservedPrincipals)",
+            "envReservedAddressees = ",
+            "os.LookupEnv(envReservedAddressees)",
+            "func run(",
+        ),
+    ),
+    # --- the agent's MCP servers ------------------------------------------
+    # B1 reads the `gke` server's tool filter from the config each profile runs
+    # with. The Platform Agent's is built by merging the shared defaults with
+    # its overlay, and the Cluster Agent's template is copied as it is; the
+    # Dockerfile anchors pin that model of the build, so the test cannot keep
+    # asserting against a merge the image no longer does.
+    # The same three files are where B1 reads that every remote MCP server
+    # goes through the credential proxy's relay, so the anchor is the relay's
+    # variable rather than a Google URL.
+    "shared_defaults_config": Source(
+        "deploy/shared/defaults/config.yaml",
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
+    ),
+    "platform_config": Source(
+        "agents/platform/config.yaml",
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
+    ),
+    "cluster_config": Source(
+        "agents/cluster/config.yaml",
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
+    ),
+    "merge_configs": Source("deploy/docker/merge_configs.py", ("def merge(",)),
+    "dockerfile_profile_configs": Source(
+        "deploy/docker/Dockerfile",
+        (
+            "COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml",
+            "merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml",
+            "COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/",
+        ),
+    ),
     # --- supply chain -----------------------------------------------------
+    # The tool that keeps the mirrored gke-* skills, and the CI step that runs
+    # its offline check. C4 reads the pin and the checksum from the first and
+    # that they are enforced from the second.
     "skill_sync": Source(
-        "scripts/sync-upstream-skills.py",
-        ("UPSTREAM_REPO", "--depth"),
+        "scripts/skill_overlay.py",
+        ("def cmd_check(", "def verify_copy(", "def tree_sha256("),
+    ),
+    "validate_workflow": Source(
+        ".github/workflows/validate.yml",
+        ("Mirrored skills match their upstream copy and overlay",),
+    ),
+    "makefile": Source("Makefile", ("skills-check:", "SKILL_OVERLAY :=")),
+    # One member of the mirrored-skill set C4 walks, so the self-check names
+    # the set when the skills or their overlays move.
+    "skill_lock_gke_basics": Source(
+        "agents/platform/skill-overlays/gke-basics/upstream.lock",
+        ("commit:", "sha256:"),
     ),
     "tags_env": Source("tags.env", ("HERMES_AGENT_TAG",)),
     # `repository:` is C4's read. The platformAgent block is D2's: it is
@@ -597,6 +837,41 @@ def gateway_redactor_module():
     # declares a dataclass, and dataclasses resolve the defining module through
     # sys.modules while the class body is being processed.
     sys.modules[GATEWAY_REDACTOR_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def skill_overlay_module():
+    """The mirrored-skill tool, imported by path for its pure helpers (tree_sha256)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(SKILL_OVERLAY_MODULE_NAME, path_of("skill_sync"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def merge_configs_module():
+    """The merge the image build runs on profile configs, imported by path."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(MERGE_CONFIGS_MODULE_NAME, path_of("merge_configs"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def slack_ux_clicks_module():
+    """The Slack click handler the gateway runs, imported from the patch by path.
+
+    The image installs it as ``gateway/slack_ux_clicks.py``; the file it is
+    copied from is the one a test of who may click has to read.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(SLACK_UX_CLICKS_MODULE_NAME, path_of("slack_ux_clicks"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[SLACK_UX_CLICKS_MODULE_NAME] = module
     spec.loader.exec_module(module)
     return module
 

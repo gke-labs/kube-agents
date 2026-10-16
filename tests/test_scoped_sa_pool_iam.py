@@ -3,8 +3,8 @@
 The pool exists because impersonation constrains only the RBAC half of GKE's
 IAM-or-RBAC union: an identity holding `roles/container.viewer` reads objects in
 every cluster in the project no matter how narrow its Kubernetes RBAC is. One
-account per cluster was meant to move that read authority off the agent's own
-identity and onto something per-cluster.
+account per project in scope was meant to move that read authority off the
+agent's own identity and onto something narrower than the fleet.
 
 As of 2026-08-12 it does not. The IAM Condition each member was scoped by grants
 nothing for Kubernetes object operations, and the un-conditioned binding is
@@ -382,33 +382,78 @@ class ScopedPoolCeilingTest(unittest.TestCase):
         )
 
     def test_the_pool_key_is_the_brokers_key(self):
-        """Terraform and the broker must spell a cluster identically.
+        """Terraform and the broker must key a member identically.
 
-        This is what survived the condition's removal. The key is the pool's index
-        -- the broker looks a member up by it and Terraform files a member under
-        it -- so a drift between the two spellings means every request for that
-        cluster is refused. It imports the broker's own function rather than
-        restating the format, because a second copy of the format here would only
-        make the test agree with itself.
+        This is what survived the condition's removal. The key is the pool's
+        index -- the broker looks a member up by it and Terraform files a member
+        under it -- so a drift between the two means every request for that
+        project is refused. The key is the bare project id (design §6): Terraform
+        derives the pool from the projects the plan lists in the scope, and the
+        broker validates each `projectId` with its `_COMPONENT` pattern, so this
+        pins both ends: the for_each keys on the listed project id with nothing
+        reshaping it, the account id hashes the install's service_account_id
+        with the project's resource name (so two installs in one host project
+        derive different members), and
+        every id the module's own `scope.projects` pattern admits is one the
+        broker accepts as a key.
         """
         scoped_sa_pool = _import_broker_module("scoped_sa_pool")
 
         source = (IAM_MODULE / "scoped_pool.tf").read_text(encoding="utf-8")
-        key_template = re.search(
-            r'for cluster in var\.scoped_clusters :\s*\n\s*"([^"]+)"', source
+        for_each = re.search(
+            r"for (\w+) in local\.scoped_pool_projects :\s*\n\s*(\w+) =>", source
         )
-        self.assertIsNotNone(key_template, "the scope key template moved")
-
-        rendered_key = (
-            key_template.group(1)
-            .replace("${cluster.project_id}", "kagents-dev")
-            .replace("${cluster.location}", "us-east4")
-            .replace("${cluster.cluster_name}", "ka-test")
+        self.assertIsNotNone(for_each, "the pool no longer iterates local.scoped_pool_projects")
+        # The pool's set is what the plan lists for the resolved-set count plus
+        # the containers' members the resolver listed while the pool is armed
+        # (design §6), as one setunion: a member reaches the pool through this
+        # and nothing else, so a container's member gets an account and no
+        # per-project binding, and scope_listed_projects stays what the
+        # resolved-set cap counts.
+        pool_projects = re.search(
+            r"^\s*scoped_pool_projects\s*=\s*setunion\(\s*local\.scope_listed_projects,\s*local\.scoped_pool_container_members,?\s*\)",
+            source,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(
+            pool_projects,
+            "local.scoped_pool_projects is no longer setunion(local.scope_listed_projects,"
+            " local.scoped_pool_container_members): a container's listed members would"
+            " then miss the pool, or reach it beside the listed set some other way",
+        )
+        self.assertIn(
+            "lookup(var.scope_container_members, key, [])",
+            source,
+            "the container members are not read from var.scope_container_members by the"
+            " declared container's key",
         )
         self.assertEqual(
-            scoped_sa_pool.scope_key("kagents-dev", "us-east4", "ka-test"),
-            rendered_key,
+            for_each.group(1),
+            for_each.group(2),
+            "the pool's key is something other than the listed project id itself",
         )
+        self.assertIn(
+            'sha256("${var.service_account_id}/projects/${' + for_each.group(1) + '}")',
+            source,
+            "the account id does not hash the install's service_account_id with the"
+            " project: two installs in one host project would then derive the same"
+            " member id for a project both list and the second apply would 409",
+        )
+
+        component = getattr(scoped_sa_pool, "_COMPONENT", None)
+        self.assertIsNotNone(component, "the broker's _COMPONENT pattern moved or was renamed")
+        variables = (IAM_MODULE / "variables.tf").read_text(encoding="utf-8")
+        project_pattern = re.search(
+            r'for project in var\.scope\.projects : can\(regex\("([^"]+)", project\)\)', variables
+        )
+        self.assertIsNotNone(project_pattern, "the scope.projects validation pattern moved")
+        for project_id in ("kagents-dev", "abc123", "team-alpha-0"):
+            with self.subTest(project_id=project_id):
+                self.assertRegex(project_id, project_pattern.group(1))
+                self.assertIsNotNone(
+                    component.fullmatch(project_id),
+                    "a project id the module admits is one the broker refuses as a key",
+                )
 
     def test_the_pool_is_disarmed_by_default(self):
         """Off until a member can actually do something.
@@ -435,89 +480,90 @@ class ScopedPoolCeilingTest(unittest.TestCase):
         """The other half of the disarm, and the one an install actually hits.
 
         `pool_enabled` is the broker's default, and the operator overrides it: a
-        PlatformAgent listing scoped accounts renders
-        CREDENTIAL_PROXY_SCOPED_SA_POOL=1. The composition fills that list from
-        `scoped_clusters`, so a default that named the cluster it provisions arms
-        the pool on every stock apply -- past the broker's default entirely, and
-        straight into the outage the guard test above exists to prevent.
+        PlatformAgent whose `scopedServiceAccountPool.enabled` is true renders
+        CREDENTIAL_PROXY_SCOPED_SA_POOL=1. The composition sets that field from
+        `scoped_pool_enabled`, and the module derives the members from the scope
+        only while the same switch is on, so a default of true -- or a scope
+        that armed the pool on its own -- would arm it on every stock apply,
+        past the broker's default entirely, and straight into the outage the
+        guard test above exists to prevent.
 
-        The defect has two halves and an earlier version of this test pinned one.
-        Asserting `default = []` leaves the other open: a coalescing local
-        substitutes a cluster when the variable is empty, the variable's own
-        spelling never changes, and every stock apply is armed again.
-
-        So this traces the value instead of reading the declaration. There are
-        exactly two paths out of `scoped_clusters` -- into the module, which
-        provisions the accounts, and into the chart values, which arm the broker
-        -- and both are pinned to expressions that are empty when the variable
-        is. Nothing between them is left free to substitute.
+        So this traces the value instead of reading one declaration. There are
+        exactly two paths out of `scoped_pool_enabled` -- into the module,
+        which provisions the accounts, and into the chart values, which arm the
+        broker -- and both are pinned to the variable itself, with the module's
+        pool local pinned empty while it is false. Nothing between them is left
+        free to substitute, and declaring `scope.projects` reaches neither.
         """
+        module_vars = (IAM_MODULE / "variables.tf").read_text(encoding="utf-8")
+        pool = (IAM_MODULE / "scoped_pool.tf").read_text(encoding="utf-8")
         variables = (FULL_INSTALL / "variables.tf").read_text(encoding="utf-8")
         main = (FULL_INSTALL / "main.tf").read_text(encoding="utf-8")
 
-        # 1. The variable is empty, and cannot be null -- so there is nothing
-        #    for a `!= null` coalesce to catch either.
-        block = re.search(
-            r'variable "scoped_clusters" \{(.*?)\n\}', variables, re.DOTALL
-        )
-        self.assertIsNotNone(block, "the scoped_clusters variable moved or was renamed")
-        default = re.search(r"^\s*default\s*=\s*(.+)$", block.group(1), re.MULTILINE)
-        self.assertIsNotNone(default, "scoped_clusters declares no default")
-        self.assertEqual("[]", default.group(1).strip())
+        # 1. The switch is false and cannot be null, in the module and in the
+        #    composition -- so there is nothing for a coalesce to catch either.
+        for label, source in (("module", module_vars), ("composition", variables)):
+            block = re.search(r'variable "scoped_pool_enabled" \{(.*?)\n\}', source, re.DOTALL)
+            self.assertIsNotNone(block, f"the {label}'s scoped_pool_enabled variable moved or was renamed")
+            default = re.search(r"^\s*default\s*=\s*(.+)$", block.group(1), re.MULTILINE)
+            self.assertIsNotNone(default, f"the {label}'s scoped_pool_enabled declares no default")
+            self.assertEqual("false", default.group(1).strip(), f"the {label} arms the pool by default")
+            self.assertIsNotNone(
+                re.search(r"^\s*nullable\s*=\s*false\s*$", block.group(1), re.MULTILINE),
+                f"the {label}'s scoped_pool_enabled is nullable, so null is a third state "
+                "this test does not cover and a coalesce can act on",
+            )
+
+        # 2. The module's pool is empty while the switch is off, whatever the
+        #    scope lists: the local is a conditional on the variable with {}
+        #    as its false arm.
         self.assertIsNotNone(
-            re.search(r"^\s*nullable\s*=\s*false\s*$", block.group(1), re.MULTILINE),
-            "scoped_clusters is nullable, so null is a third state this test does "
-            "not cover and a coalesce can act on",
+            re.search(r"^\s*scoped_pool\s*=\s*var\.scoped_pool_enabled\s*\?\s*\{", pool, re.MULTILINE),
+            "local.scoped_pool is no longer gated on var.scoped_pool_enabled",
+        )
+        self.assertIsNotNone(
+            re.search(r"^\s*\}\s*:\s*\{\}\s*$", pool, re.MULTILINE),
+            "local.scoped_pool's disarmed arm is something other than an empty map",
         )
 
-        # 2. First path: nothing sits between the variable and the module that
+        # 3. First path: nothing sits between the variable and the module that
         #    provisions the accounts.
-        module_block = re.search(
-            r'module "kube_agents_iam" \{(.*?)\n\}', main, re.DOTALL
-        )
+        module_block = re.search(r'module "kube_agents_iam" \{(.*?)\n\}', main, re.DOTALL)
         self.assertIsNotNone(module_block, "the kube_agents_iam module call moved")
-        argument = re.search(
-            r"^\s*scoped_clusters\s*=\s*(.+?)\s*$", module_block.group(1), re.MULTILINE
-        )
-        self.assertIsNotNone(
-            argument, "the composition no longer passes scoped_clusters to the module"
-        )
+        argument = re.search(r"^\s*scoped_pool_enabled\s*=\s*(.+?)\s*$", module_block.group(1), re.MULTILINE)
+        self.assertIsNotNone(argument, "the composition no longer passes scoped_pool_enabled to the module")
         self.assertEqual(
-            "var.scoped_clusters",
+            "var.scoped_pool_enabled",
             argument.group(1),
-            "something transforms scoped_clusters between the variable and the "
-            "module. Whatever it substitutes when the variable is empty is what "
+            "something transforms scoped_pool_enabled between the variable and the "
+            "module. Whatever it substitutes when the variable is false is what "
             "every stock apply provisions a pool from.",
         )
 
-        # 3. Second path: the chart values, which are what actually arm the
-        #    broker. Keyed off the module's output, so an empty variable gives an
-        #    empty map gives an empty CR list -- and the rejoin table is iterated
-        #    from the variable rather than from anything substituted for it.
-        helm_value = re.search(
-            r"scopedServiceAccounts\s*=\s*\[(.*?)\n(\s*)\]", main, re.DOTALL
-        )
-        self.assertIsNotNone(
-            helm_value, "the chart values no longer carry scopedServiceAccounts"
+        # 4. Second path: the chart values, which are what actually arm the
+        #    broker. `enabled` is the variable itself, and the list is keyed off
+        #    the module's output, so a false switch gives an empty map gives an
+        #    empty CR list under enabled = false.
+        helm_value = re.search(r"scopedServiceAccountPool\s*=\s*\{(.*?)\n(\s*)\}", main, re.DOTALL)
+        self.assertIsNotNone(helm_value, "the chart values no longer carry scopedServiceAccountPool")
+        enabled = re.search(r"^\s*enabled\s*=\s*(.+?)\s*$", helm_value.group(1), re.MULTILINE)
+        self.assertIsNotNone(enabled, "scopedServiceAccountPool renders no enabled field")
+        self.assertEqual(
+            "var.scoped_pool_enabled",
+            enabled.group(1),
+            "the CR's arming switch is set from something other than the variable",
         )
         self.assertIn(
             "module.kube_agents_iam.scoped_service_accounts",
             helm_value.group(1),
-            "the CR's scopedServiceAccounts list is built from something other "
-            "than the module's output, so it can be non-empty while the pool is "
-            "not provisioned -- which arms the broker onto accounts that do not "
-            "exist",
+            "the CR's serviceAccounts list is built from something other than the "
+            "module's output, so it can be non-empty while the pool is not "
+            "provisioned -- which arms the broker onto accounts that do not exist",
         )
-        entries = re.search(
-            r"^\s*scoped_pool_entries\s*=\s*\{\s*\n\s*for \w+ in (\S+)\s*:",
+        self.assertNotIn(
+            "scopedServiceAccounts =",
             main,
-            re.MULTILINE,
-        )
-        self.assertIsNotNone(entries, "local.scoped_pool_entries moved or was renamed")
-        self.assertEqual(
-            "var.scoped_clusters",
-            entries.group(1),
-            "the rejoin table is built from something other than the variable",
+            "the composition still renders the retired per-cluster scopedServiceAccounts list",
         )
 
 

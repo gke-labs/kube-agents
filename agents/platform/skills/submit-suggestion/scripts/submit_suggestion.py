@@ -143,12 +143,6 @@ def check_branch(branch_name: str, base_branch: str | None = None) -> str:
 
     short = _short_branch(branch)
     protected = set(PROTECTED_BRANCHES)
-    override = (
-        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
-        or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
-    )
-    if override:
-        protected.add(_short_branch(override))
     if base_branch:
         protected.add(_short_branch(base_branch))
     if short in protected or any(short.startswith(p) for p in PROTECTED_BRANCH_PREFIXES):
@@ -160,10 +154,11 @@ def check_branch(branch_name: str, base_branch: str | None = None) -> str:
 
 
 def validate_repo(repo: str) -> str:
-    """Ensure repo is formatted as owner/name and is in the managed repos allowlist if configured."""
+    """Ensure repo is a repository name and is in the managed repos allowlist if configured."""
     if not repo or not gitops_workspace.is_valid_repo_slug(repo):
-        raise ValueError(f"Invalid repository format: {repo!r}. Expected 'owner/name'.")
-    managed = gitops_workspace.get_managed_github_repos()
+        raise ValueError(f"Invalid repository format: {repo!r}. Expected 'owner/name', or '<host>/<path>' for a repository on another forge.")
+    managed = gitops_workspace.get_managed_repos()
+    repo = gitops_workspace.qualify(repo, managed)
     if managed and repo not in managed:
         raise ValueError(
             f"Repository {repo!r} is not in the managed repositories list: {managed}"
@@ -515,7 +510,7 @@ def handle_prepare(args) -> int:
     # fleet whose cards target several GitOps repositories writes every
     # suggestion to whichever one `resolve_repo` happens to answer with.
     repo = args.repo or gitops_workspace.resolve_repo()
-    validate_repo(repo)
+    repo = validate_repo(repo)
 
     proposal = open_proposal(repo, branch)
     if proposal:
@@ -538,6 +533,9 @@ def handle_prepare(args) -> int:
         # same repository gets a tree of its own rather than colliding here.
         cloned = vcs_client.clone(repo, force=args.force, key=branch)
         with _nothing_left_behind(repo, branch):
+            # The branch the copy came down on: a clone with no branch named
+            # comes down on the base the broker pins this repository to when it
+            # pins one, else on the remote's default.
             base = cloned["branch"]
             if spent:
                 # After the clone, not before it: the question is whether the base
@@ -547,7 +545,7 @@ def handle_prepare(args) -> int:
                 if in_the_way:
                     clear_spent_branch(repo, branch, spent, in_the_way, base)
             # Before the switch below, not after it. The branch the copy came down
-            # on is the remote's default, and `check_branch` cannot know its name:
+            # on is the pinned base or the remote's default, and `check_branch` cannot know its name:
             # a fleet whose trunk is `release-trunk` gets past the list of three.
             refuse_branch_on_its_own_base(branch, base, "prepare")
             # `branch` reports a failed switch rather than raising on one, and the
@@ -627,7 +625,7 @@ def handle_submit(args) -> int:
     # got past the check below and then died on "no local copy".
     copy_key = vcs_client.key_of(session)
     repo = args.repo or session["spec"]
-    validate_repo(repo)
+    repo = validate_repo(repo)
 
     current = vcs_client.current_branch(session)
     if current != branch:
@@ -708,8 +706,16 @@ def handle_submit(args) -> int:
 
     # What the change merges into. From the open proposal when there is one,
     # because that is where it already says it is going and moving it is not
-    # this script's call; from the branch the copy came down on otherwise.
-    base = args.base or (proposal or {}).get("target") or session["branch"]
+    # this script's call; otherwise the base the broker pins this repository
+    # to, else the branch the copy came down on. A `--base` other than the
+    # pinned one is the broker's to refuse (`TARGET_NOT_BASE`), before the
+    # publish lands anything.
+    base = (
+        args.base
+        or (proposal or {}).get("target")
+        or session.get("baseBranch")
+        or session["branch"]
+    )
     if args.base and proposal and args.base != proposal.get("target"):
         # Said for the same reason `--title` above is: the publish honours it
         # and the proposal does not. `proposal-update` carries a title, a body
@@ -997,7 +1003,7 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument(
         "--base", default=None,
         help="The branch this merges into (default: the open proposal's, else "
-             "the branch the copy was taken of)",
+             "the base the broker pins, else the branch the copy was taken of)",
     )
 
     for command in (prepare, submit):

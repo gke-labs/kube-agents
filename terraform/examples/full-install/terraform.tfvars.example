@@ -83,6 +83,11 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # reach. Off by default; see the README before turning it on.
 # allow_external_dns_traffic = true
 
+# The PlatformAgent's spec.mode: "today" (the default, which renders no mode
+# field) or "next", which also renders the NATS bus and the A2A gateway, a
+# development stack. Changing it later is a mode switch; see variables.tf.
+# platform_agent_mode = "today"
+
 # Optional Google Chat backend (Pub/Sub topic + subscription, Chat APIs);
 # the CR's googleChat integration is wired to the created topic/subscription
 # automatically. Only the Chat-app registration in the console stays manual
@@ -123,6 +128,23 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # Optional GitHub integration and token minter backend (GSA + KMS signing key).
 # enable_github_minter = true
 # github_repo          = "my-github-org/my-repo"
+# On a GitHub Enterprise Server: its hostname, github_repo as owner/name on the
+# instance, and the App created there. The Secret holding a private CA under
+# the key `ca.crt` (install.sh writes it from --gitops-ca-file); restart the
+# minter after the Secret changes.
+# gitops_host           = "github.example.com"
+# github_ca_secret_name = "github-forge-ca"
+
+# Or a GitOps project on GitLab instead (no GitHub App, no minter). The token is
+# never a variable: create Secret gitlab_token_secret_name, key `token`, in the
+# agent's namespace.
+# gitops_forge              = "gitlab"
+# gitops_host               = "gitlab.example.com" # omit for gitlab.com
+# gitlab_repo               = "platform/infra/gitops"
+# gitlab_token_secret_name  = "gitlab-forge-token"
+# A self-managed instance behind a private CA: the Secret holding that CA
+# under the key `ca.crt` (install.sh writes it from --gitops-ca-file).
+# gitlab_ca_secret_name     = "gitlab-forge-ca"
 
 # Optional Slack integration. Needs no GCP resources: the tokens go into the
 # credentials Secret and the CR's slack section turns on. Creating the Slack
@@ -201,6 +223,20 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 #     ]
 #   }
 # }
+
+# The scoped service account pool: one reader service account per project the
+# plan can list in scope above (project_id, projects less an exact exclude,
+# selector members, and, while the pool is armed, each folder's and
+# organisation's members as the scope resolver lists them), created in
+# project_id and handed to the credential broker as its mapping. Off by
+# default and independent of scope: the members hold no IAM grant yet, so an
+# armed pool turns every cluster read into a Forbidden. max_accounts is the
+# bound you declare on the pool from the service-account quota headroom
+# project_id has free; a pool past it is refused at plan. Its default of 100
+# is GCP's default quota, which the agent's own accounts share, not the
+# headroom, so a large pool at the default can still meet the quota mid-apply.
+# scoped_pool_enabled      = false
+# scoped_pool_max_accounts = 100
 
 # Optional scheduled backups of the release namespace. Off by default in both
 # install paths: Backup for GKE bills per backed-up pod and per GB of snapshot

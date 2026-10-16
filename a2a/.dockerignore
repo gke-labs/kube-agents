@@ -1,0 +1,4 @@
+# A local node_modules is platform-specific and large, and dist is rebuilt
+# inside the image. Neither belongs in any a2a build context.
+web/node_modules
+web/dist

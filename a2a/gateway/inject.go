@@ -433,6 +433,12 @@ type probeReport struct {
 	SubmittedAt  string `json:"submittedAt,omitempty"`
 	AgeSeconds   int    `json:"ageSeconds,omitempty"`
 	Detached     bool   `json:"detached,omitempty"`
+	// ContextID is the conversation's A2A contextId, from its session
+	// record; absent when there is no record. An executor keys its state on
+	// it (the bridge's api executor runs every task of the conversation in
+	// the Hermes session derived from it), which is how a harness finds the
+	// kanban cards a turn filed without asking the agent.
+	ContextID string `json:"contextId,omitempty"`
 	// ExecutorState is "" when the stream holds no event for the task.
 	ExecutorState string `json:"executorState,omitempty"`
 	Final         bool   `json:"final,omitempty"`
@@ -692,17 +698,19 @@ func NewInjectAdapter(listen, token string, firstEventGrace time.Duration, log *
 // oracle for a caller who can time it. The scheme is matched
 // case-insensitively, as RFC 7235 requires.
 func (a *InjectAdapter) authorized(w http.ResponseWriter, r *http.Request) bool {
-	header := r.Header.Get(authorizationHeader)
-	if len(header) > len(bearerScheme) && strings.EqualFold(header[:len(bearerScheme)], bearerScheme) {
-		presented := strings.TrimSpace(header[len(bearerScheme):])
-		if subtle.ConstantTimeCompare([]byte(presented), []byte(a.token)) == 1 {
-			return true
-		}
+	return bearerAuthorized(w, r, a.token, "the inject door requires a bearer token")
+}
+
+// bearerAuthorized is the one bearer-token check both doors run: constant
+// time on the credential, case-insensitive on the scheme, and a 401 whose
+// body says a token is required and never whether one was presented or how
+// it was wrong.
+func bearerAuthorized(w http.ResponseWriter, r *http.Request, token, refusal string) bool {
+	if presented, ok := bearerOf(r); ok && subtle.ConstantTimeCompare([]byte(presented), []byte(token)) == 1 {
+		return true
 	}
-	// No detail: the refusal says a token is required, never whether one was
-	// presented or how it was wrong.
 	w.Header().Set("WWW-Authenticate", "Bearer")
-	injectError(w, http.StatusUnauthorized, "the inject door requires a bearer token")
+	injectError(w, http.StatusUnauthorized, refusal)
 	return false
 }
 
@@ -789,6 +797,17 @@ func (a *InjectAdapter) Edit(conversation, messageID, text string) error {
 	return nil
 }
 
+// PostMessage and EditMessage record text only: a chat message falls back
+// to its text (ErrTextOnly), so a transcript reads as it did before chat
+// messages existed.
+func (a *InjectAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	return postTextOnly(a.Post, conversation, m)
+}
+
+func (a *InjectAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	return editTextOnly(a.Edit, conversation, messageID, m)
+}
+
 // Roster is the requester alone, complete. A synthetic conversation has
 // exactly one participant -- the author who injected into it -- and
 // reporting it complete is the truth rather than a degradation: there is no
@@ -806,6 +825,11 @@ func (a *InjectAdapter) Roster(conversation string) ([]string, bool, error) {
 	}
 	return []string{conv.requester}, true, nil
 }
+
+// React and RemoveReaction: a program reads no reactions, so the door draws
+// no mark (Adapter).
+func (a *InjectAdapter) React(string, string, string) error          { return nil }
+func (a *InjectAdapter) RemoveReaction(string, string, string) error { return nil }
 
 // OpenDirect is the DM-switch primitive, and on this door it returns the
 // conversation the user is already in. Every synthetic conversation has one
@@ -1467,7 +1491,7 @@ func (a *InjectAdapter) forgetDirectLocked(author string) {
 // on the conversation.
 //
 // A route rather than the text path. The gateway reaches cancel from a
-// message whose whole text is "stop" (text.go), which is the right
+// message whose whole text is "stop" (chattext.IsStop), which is the right
 // affordance for a human and the wrong one for a program: it makes a control
 // action depend on a phrase list, it cannot be told apart from a user asking
 // the agent to stop something in the world, and a caller that means "cancel"
@@ -1860,6 +1884,7 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string) *probe
 		Backend:        state.Backend,
 		InjectOnly:     state.InjectOnly,
 		GraceSeconds:   int(state.Grace / time.Second),
+		ContextID:      state.ContextID,
 		Active:         state.Active,
 		TaskID:         state.TaskID,
 		AgeSeconds:     int(state.Age / time.Second),

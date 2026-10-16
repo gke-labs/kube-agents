@@ -7,7 +7,9 @@ status-check timeout. Nothing else notices the trigger going missing: a
 workflow edited without it still runs on every pull request exactly as before.
 This roster is the ten required contexts as of the Tide-to-merge-queue
 migration (gke-labs/kube-agents#1363), less `cla/google`, which is an external
-app's commit status rather than a workflow.
+app's check run rather than a workflow, plus `Run A2A Module Tests`, which
+became required on 2026-10-13. `merge-gate.yml` posts the two checks that
+stand in for Tide in the queue, and is held to the same trigger.
 """
 
 import pathlib
@@ -20,6 +22,7 @@ _WORKFLOWS = _REPO_ROOT / ".github" / "workflows"
 
 _MERGE_GROUP = "merge_group"
 _REQUIRED_CHECK_WORKFLOWS = (
+    "a2a-test.yml",
     "actionlint.yml",
     "docker-build.yml",
     "docs-check.yml",
@@ -45,6 +48,9 @@ def _triggers(path: pathlib.Path) -> set[str]:
         return {str(item) for item in on}
     return {str(key) for key in on}
 
+
+#: The queue's own gate checks. `main`-only, so the release-line test below does not apply.
+_GATE_WORKFLOW = "merge-gate.yml"
 
 _PULL_REQUEST = "pull_request"
 _RELEASE_LINE_GLOB = "release/**"
@@ -72,6 +78,10 @@ class MergeGroupTriggerTest(unittest.TestCase):
                 branches = (on[_PULL_REQUEST] or {}).get("branches")
                 if branches is not None:
                     self.assertIn(_RELEASE_LINE_GLOB, branches, f"{name} filters pull_request to {branches}")
+
+    def test_the_gate_workflow_runs_on_merge_group_for_main(self) -> None:
+        on = _on(_WORKFLOWS / _GATE_WORKFLOW)
+        self.assertEqual((on[_MERGE_GROUP] or {}).get("branches"), ["main"])
 
     def test_merge_group_stays_on_main(self) -> None:
         """The merge queue is `main`'s; a release line merges through Tide alone."""

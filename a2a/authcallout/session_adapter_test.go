@@ -69,6 +69,7 @@ func TestASessionAdapterRunsAWholeTaskUnderItsOwnGrants(t *testing.T) {
 		Session:      podA,
 		Scope:        adapterScope,
 		HarnessCommand: harnessStub(t, `
+read first || exit 1
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working on it"}]}}'
 echo '{"type":"result","subtype":"success","result":"the thing is done"}'
 `),
@@ -216,6 +217,7 @@ func TestASessionAdapterRunsAWholeTaskAtTheNamedOriginSequence(t *testing.T) {
 		OriginSeq:       originSeq,
 		OriginSeqStated: true,
 		HarnessCommand: harnessStub(t, `
+read first || exit 1
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working on it"}]}}'
 echo '{"type":"result","subtype":"success","result":"the thing is done"}'
 `),

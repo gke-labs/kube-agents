@@ -120,6 +120,9 @@ DEFAULT_CONTAINER = STORE_CONTAINERS[0]
 # the longest observed audit run is ~20 minutes, so an hour of slack flags
 # real silence without paging on a slow morning.
 STALE_SLACK = timedelta(hours=1)
+# How this CLI asks for more room, for the note under a table that dropped
+# columns to fit.
+WIDER_HINT = "--width for a wider table"
 # The zone the cron fields are read in when `--timezone` is not given: the
 # pod's own default, since the chart does not set TZ.
 DEFAULT_SCHEDULE_TIMEZONE = "UTC"
@@ -149,10 +152,12 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 #: Every outcome `finish` stores. Anything else is styled as a warning rather
 #: than as a success -- an outcome this view has never heard of is exactly the
 #: one a reader should look at, and green would hide it. HELD is a clean run
-#: the ledger stayed open over, which is a reason to look, not a success.
+#: the ledger stayed open over, which is a reason to look, not a success, and
+#: NO_FORGE a run with nowhere to publish, whose findings only the store holds.
 STATUS_STYLE = {
     "CLEAN": "green",
     "HELD": "yellow",
+    "NO_FORGE": "yellow",
     "OPENED": "cyan",
     "UPDATED": "cyan",
     "never ran": "dim",
@@ -1003,7 +1008,7 @@ def render(
     out += ["", palette("STREAMS", "head")]
     out += render_table(
         COLUMNS, [entry["row"] for entry in shown], palette,
-        width if width else UNBOUNDED, box,
+        width if width else UNBOUNDED, box, wider_hint=WIDER_HINT,
     )
     # Rows, not streams: the note fires on hidden rows, and a stream on two
     # repositories can lose one of them to --stream or --flagged.
@@ -1041,6 +1046,7 @@ def render(
                     for label, _, (scope, text) in gaps
                 ],
                 palette, width if width else UNBOUNDED, box, separator="blank",
+                wider_hint=WIDER_HINT,
             )
         else:
             out.append(palette("  " + count + "; --gaps for the text", "yellow"))

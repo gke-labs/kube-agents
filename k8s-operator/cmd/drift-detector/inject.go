@@ -580,14 +580,21 @@ type injectCounts struct {
 	// Failed is events whose inject did not land. They were acked regardless,
 	// so this counter is the only record that they existed.
 	Failed int
+
+	// OutOfScope is events the joiner marked DriftEvent.OutOfScope: logged
+	// with injectHeldOutOfScopeMarker and held here before a session was
+	// opened. Not a failure and not a delivery, and not Suppressed either --
+	// that is the daemon declining a card this binary sent, and this is a card
+	// never sent, so the day's budget is untouched.
+	OutOfScope int
 }
 
 // String renders the tally, always printing every field. A zero that is absent
 // reads as a category that did not apply; a printed zero reads as one that did
 // not happen, and those differ.
 func (c injectCounts) String() string {
-	return fmt.Sprintf("injected=%d suppressed=%d duplicate=%d failed=%d",
-		c.Injected, c.Suppressed, c.Duplicate, c.Failed)
+	return fmt.Sprintf("injected=%d suppressed=%d duplicate=%d failed=%d out_of_scope=%d",
+		c.Injected, c.Suppressed, c.Duplicate, c.Failed, c.OutOfScope)
 }
 
 // insertIDSet remembers the audit entries this process has already injected,
@@ -604,6 +611,13 @@ type insertIDSet struct {
 // newInsertIDSet returns a set bounded at the given size.
 func newInsertIDSet(capacity int) *insertIDSet {
 	return &insertIDSet{seen: make(map[string]struct{}, capacity), cap: capacity}
+}
+
+// Has reports whether an id is remembered, without recording it. An empty id
+// is never remembered, for the reason Add gives.
+func (s *insertIDSet) Has(id string) bool {
+	_, dup := s.seen[id]
+	return id != "" && dup
 }
 
 // Add records an id, reporting false when it was already present.
@@ -645,7 +659,14 @@ func newDriftInjectHandler(inject *driftInjector) *driftInjectHandler {
 	return &driftInjectHandler{inject: inject, seen: newInsertIDSet(seenInsertIDsCap)}
 }
 
-// Handle logs the event and then injects it.
+// AlreadyInjected reports whether a card was already sent for an insertId, for
+// the joiner to ask before it marks a record held: see joiner.injected.
+func (h *driftInjectHandler) AlreadyInjected(insertID string) bool {
+	return h.inject != nil && h.seen.Has(insertID)
+}
+
+// Handle logs the event, then injects it -- unless there is no injector, the
+// joiner marked it out of scope, or its insertId was already sent.
 //
 // The log comes first and unconditionally. It is the record that the detector
 // saw this change, and it has to survive a daemon that is down -- an operator
@@ -664,6 +685,36 @@ func (h *driftInjectHandler) Handle(ctx context.Context, event DriftEvent) {
 		return
 	}
 
+	// The seen set is asked first and written last, and the hold sits between.
+	// A record whose id was already injected is a duplicate whatever the
+	// scope says now: a redelivery after the reconcile offboarded its cluster
+	// would otherwise be logged as "not sent" when a card for that id was,
+	// and counted held rather than duplicate. A held record is never marked,
+	// because nothing is sent: marking it would turn a later in-scope record
+	// carrying the id into a "duplicate" of a card that never existed.
+	record := event.Record
+	if h.seen.Has(record.InsertID) {
+		// Logged rather than silent: a run whose duplicate count is climbing is
+		// a run whose batches are being redelivered, which points at the ack
+		// deadline and not at the cluster.
+		h.counts.Duplicate++
+		log.Printf("%s: already injected insert_id=%s (redelivered by the subscription), not opening a second session", commandName, record.InsertID)
+		return
+	}
+
+	// Read off the event rather than off the outcome, since joinUnreachable
+	// alone does not say whether a profile names the cluster --
+	// DriftEvent.OutOfScope is the joiner's answer to that, and the cases it
+	// leaves unmarked (a profiled cluster the join could not read, an unknown
+	// scope) are the ones that must keep sending so a detector that was meant
+	// to reach a cluster stays loud about it.
+	if event.OutOfScope {
+		h.counts.OutOfScope++
+		log.Printf("%s: inject held for insert_id=%s cluster=%s (outside the install's scope: no readable Cluster Agent profile names it); the %s card was not sent and no alert budget was spent",
+			commandName, record.InsertID, record.Cluster, injectKindDrift)
+		return
+	}
+
 	// Marked seen before the send, not after, so a record whose inject failed
 	// is not retried on redelivery either. The alternative loses more than it
 	// saves: the case it would rescue (a failed send whose batch is then
@@ -674,15 +725,7 @@ func (h *driftInjectHandler) Handle(ctx context.Context, event DriftEvent) {
 	// DRIFT line, which is what makes the trade survivable; a run whose
 	// duplicate count and failure count climb together is the shape to look
 	// for.
-	record := event.Record
-	if !h.seen.Add(record.InsertID) {
-		// Logged rather than silent: a run whose duplicate count is climbing is
-		// a run whose batches are being redelivered, which points at the ack
-		// deadline and not at the cluster.
-		h.counts.Duplicate++
-		log.Printf("%s: already injected insert_id=%s (redelivered by the subscription), not opening a second session", commandName, record.InsertID)
-		return
-	}
+	h.seen.Add(record.InsertID)
 
 	// Derived from the handler's context rather than replacing it, so a SIGTERM
 	// or an exhausted batch budget still cuts the escalation short: this caps

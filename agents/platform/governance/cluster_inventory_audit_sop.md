@@ -1,25 +1,23 @@
 # Single-Cluster Inventory Audit (`bootstrap-inventory-cluster-<profile>`)
 
 **Purpose:** The per-cluster half of first-time environment discovery, performed by a Cluster Agent
-on the one cluster it is pinned to. The Platform Agent fans this out during
-`bootstrap-inventory-scan` (`inventory.md`) and aggregates the results; this SOP covers only what
-one Cluster Agent does with its own cluster.
+on the one cluster it is pinned to. The onboarding gate files this card, one per Cluster Agent, during
+`bootstrap-inventory-scan`, and collects the results from every card; this SOP covers only what one
+Cluster Agent does with its own cluster.
 
 You are one of several agents auditing in parallel. **Report your findings on your card and write
 nothing to shared state.** Specifically: do not write `/opt/data/INVENTORY.raw.md` or
 `/opt/data/INVENTORY.md`, do not create kanban cards, and do not check whether either file already
-exists. Those steps belong to the Platform Agent, and running them here means several agents
-writing one path at once.
+exists. Those steps belong to the hand-off, and running them here means several writers on one
+path at once.
 
 **Never block this card, whatever fails** — not for a failed `cluster_preflight.sh`, denied
 permissions, a cluster in `ERROR`, credentials that will not mint, or an MCP tool that errors. This
 overrides `SOUL.md` §6 step 2, your own `AGENTS.md` ("Fail loud, never silent"), and `SOUL.md` §2.
-The platform card that fanned this one out waits for it to reach `done` or `archived` before it
-compiles the fleet report (and a pre-#1010 aggregation card, where one is still in flight, lists
-this card in its `parents`, which `claim_task` enforces the same way). A block is not `done`, nothing re-arms
-`.bootstrap_scan_filed`, and the notifier reaches nobody on a card the cron gate filed — so one
-blocked card costs the fleet report permanently and silently. Record what failed in `gaps`, and
-complete.
+The hand-off waits for this card to finish (`done`, `blocked`, `triage`, `failed` or `cancelled`) and then reads its `metadata`. A blocked
+card has none, so the report names its cluster as a gap carrying only the block reason, and nothing
+re-arms `.bootstrap_scan_filed` to try again — onboarding runs once. Record what failed in `gaps`,
+and complete: the report then shows what you did find and what you could not do.
 
 **A preflight failure other than check 5 means you audit nothing.** Complete with the failure in
 `gaps` and every other field empty. The script stops at the first failure, so a failure in checks
@@ -28,8 +26,9 @@ from the `check` field the script reports, not the remediation text: a missing `
 missing kubeconfig both say "Re-scaffold the profile", and both leave you as unidentified as a
 context mismatch does. An
 unpinned `kubectl` resolves to the credential proxy's own context, the management cluster, so an
-audit run anyway files another cluster's workloads under your name. Aggregation copies `metadata`
-verbatim and the Platform Agent is forbidden to re-audit, so nothing downstream catches it.
+audit run anyway files another cluster's workloads under your name. The hand-off copies your
+`metadata` into the report verbatim and the ranking stage runs no tooling, so nothing downstream
+catches it.
 
 Check `5`, "Cannot reach the target cluster's API server", is the exception: your identity is
 established and the cluster is simply unreachable, so record it in `gaps` and complete like any
@@ -76,23 +75,19 @@ from the environment.
 Across all namespaces on this cluster:
 
 1. **Multi-Tenancy & Governance:** List all non-system namespaces (`kubectl get ns`). Verify whether
-   ResourceQuotas, LimitRanges, and NetworkPolicies are configured to enforce boundary defense.
-2. **Workload Health & QoS:**
+   ResourceQuotas and LimitRanges are configured to enforce boundary defense.
+2. **Workloads:**
    - List all Deployments, StatefulSets, DaemonSets, and Jobs
      (`kubectl get deployments,statefulsets,daemonsets,jobs -A`).
-   - **Probes:** Verify that every workload has `livenessProbe`, `readinessProbe`, and
-     `startupProbe` configured.
-   - **Resource Management:** Verify that containers define explicit `requests` and `limits` (record
-     the Quality of Service class: `Guaranteed`, `Burstable`, or `BestEffort`).
-   - **Scaling:** Audit Horizontal Pod Autoscaler settings (`minReplicas`, `maxReplicas`, metrics
-     targets).
-   - **Security Context:** Verify whether workloads run as non-root (`runAsNonRoot: true`) and use
-     read-only root filesystems (`readOnlyRootFilesystem: true`). Check `privileged`, `hostPID`,
-     `hostNetwork`, `hostIPC`, and added `capabilities` in the same pass, and record any workload
-     that sets one as a **high** severity finding naming that workload. Those five grant escape from
-     the container to the node, which is a different class of problem from a writable root
-     filesystem; scored alongside missing probes they read as one more hardening gap and the report
-     ranks them out of sight.
+   - **Startup probes:** Verify whether every workload has a `startupProbe` configured.
+   - **Security Context:** Verify whether workloads use read-only root filesystems
+     (`readOnlyRootFilesystem: true`). Check added `capabilities` in the same pass, and record any
+     workload that adds one other than `SYS_ADMIN` as a **high** severity finding naming that
+     workload and the capabilities it adds. An added capability widens what the container can do to
+     the node, which is a different class of problem from a writable root filesystem; scored
+     alongside missing probes it reads as one more hardening gap and the report ranks it out of
+     sight. An added `SYS_ADMIN` is not this check: it counts as a privileged container, which
+     Step 5 leaves to the first-run audits.
 3. **Core Infrastructure Addons:** Check for ingress controllers (GKE Gateway API, NGINX),
    cert-manager, OpenTelemetry collectors (`gke-managed-otel`), and identity integration endpoints
    (`github-token-minter` / `minty`). Record which deployment toolchain manages the cluster —
@@ -100,8 +95,8 @@ Across all namespaces on this cluster:
    the fleet report has a column for it and no other stage can see your cluster.
 
 **A pod list is not this audit.** `kubectl get pods` reports phase, and every gap above sits in a
-workload's spec rather than its phase — a Deployment with no probes, no resource requests, and no
-security context runs perfectly and reports `Running`. Read the specs
+workload's spec rather than its phase — a Deployment with no startup probe and a writable root
+filesystem runs perfectly and reports `Running`. Read the specs
 (`kubectl get deployments -A -o json` and friends), or the audit will report a clean cluster it
 never checked.
 
@@ -124,16 +119,15 @@ Google Cloud and GKE best practices where it helps.
    thresholds.
 3. **Security Hardening:** Verify whether pods reaching Google Cloud APIs use Workload Identity
    (`serviceAccountName` with an `iam.gke.io/gcp-service-account` annotation) rather than static
-   keys. On Standard clusters, evaluate Shielded GKE Nodes, Dataplane V2, node auto-upgrades, and
-   Pod Security Admission.
+   keys. On Standard clusters, evaluate Shielded GKE Nodes, Dataplane V2, and node auto-upgrades.
 
 ---
 
 ## Step 5: Report on your card
 
 Complete the card with `kanban_complete`, supplying **both** a human-readable `result` and a
-structured `metadata` object. The Platform Agent's waiting sweep card reads `metadata` verbatim off
-this card and builds the fleet tables from it, so a finding that appears only in `result` prose is a
+structured `metadata` object. The onboarding hand-off reads `metadata` verbatim off this card and
+builds the fleet tables and the findings block from it, so a finding that appears only in `result` prose is a
 finding the report loses.
 
 `metadata` must have this shape:
@@ -159,16 +153,10 @@ finding the report loses.
       "name": "…",
       "kind": "Deployment",
       "replicas": "1/1",
-      "probes": { "liveness": false, "readiness": false, "startup": false },
-      "resources": { "requests": false, "limits": false, "qos": "BestEffort" },
-      "hpa": false,
+      "probes": { "startup": false },
       "telemetry": "otlp | prometheus-scrape | none",
       "security_context": {
-        "run_as_non_root": false,
         "read_only_root_fs": false,
-        "privileged": false,
-        "host_pid": false,
-        "host_network": false,
         "added_capabilities": []
       }
     }
@@ -177,12 +165,12 @@ finding the report loses.
     {
       "namespace": "…",
       "resource_quota": false,
-      "limit_range": false,
-      "network_policy": false
+      "limit_range": false
     }
   ],
   "findings": [
     {
+      "check": "probes-startup",
       "severity": "high|medium|low",
       "area": "security|reliability|observability",
       "namespace": "…",
@@ -195,13 +183,41 @@ finding the report loses.
 }
 ```
 
+`check` is a lowercase hyphenated slug naming the condition, stable across sweeps: with the project,
+cluster, namespace and workload it is the finding's identity in the findings queue. These are the
+audit streams' own slugs where a stream has one (`probes-startup`, `readonly-root-fs`, `no-resourcequota`, `static-sa-key` and `added-capabilities` have none yet); use one where it fits. Using them means the same
+problem carries one identity whichever source found it, and a finding promoted out of the queue
+routes to the stream that owns the check.
+
+| what you found                   | check slug           |
+| -------------------------------- | -------------------- |
+| missing `startupProbe`           | `probes-startup`     |
+| ResourceQuota and LimitRange     | `no-resourcequota`   |
+| missing `readOnlyRootFilesystem` | `readonly-root-fs`   |
+| Shielded Nodes                   | `shielded-nodes`     |
+| Dataplane V2                     | `datapath-provider`  |
+| Managed Service for Prometheus   | `managed-prometheus` |
+| node auto-upgrade                | `no-autoupgrade`     |
+| pods on static Google Cloud keys | `static-sa-key`      |
+| added capabilities               | `added-capabilities` |
+
+Checks the first-run audits own (cost, security, reliability and capacity: liveness and readiness
+probes, requests and limits, HPA, NetworkPolicy, the cluster's Workload Identity setting
+(`workload-identity-off`; a pod's static keys are `static-sa-key` above), pod security, privileged
+and host-namespace workloads, and an added `SYS_ADMIN` among them) are not reported here, under any
+slug. Those audits report them with their own evidence,
+and a second copy from this card reaches the user as a separate problem.
+
+For anything else, write a lowercase hyphenated slug naming the condition, and keep it stable: it
+is the row's identity across every later sweep.
+
 One `findings` entry names one workload. `"workload": "multiple workloads"`, a comma-separated list,
-or `"e.g. networking-dra-driver"` all collapse on the way through aggregation into a line the user
+or `"e.g. networking-dra-driver"` all collapse on the way into the report into a line the user
 cannot act on; file one entry per affected workload instead, even when the issue and the
 recommendation repeat verbatim.
 
 `workloads` must hold one entry per workload Step 3 listed — every Deployment, StatefulSet,
-DaemonSet, and Job, including the ones with no findings. The aggregation stage has no way to go back
+DaemonSet, and Job, including the ones with no findings. The hand-off has no way to go back
 for the rest, and a summary row (`"workload": "multiple"`) is not one of them: the report cannot name
 what to fix from it. Before you complete the card, compare `len(workloads)` against the count Step 3
 produced; if it is short, either finish the enumeration or record the difference and the reason in

@@ -102,15 +102,15 @@ def test_the_stack_and_the_reader_spell_the_items_file_as_the_script_does() -> N
     assert "INVENTORY.items.json" in (RAW.parent / "main.tf").read_text()
 
 
-def test_the_stack_files_the_card_the_gate_and_the_sweep_sop_name() -> None:
+def test_the_stack_files_the_card_the_gate_and_the_hand_off_name() -> None:
     main_tf = (RAW.parent / "main.tf").read_text()
     gate = (REPO / "agents" / "chat" / "scripts" / "bootstrap_scan_gate.py").read_text()
-    sop = (REPO / "agents" / "platform" / "governance" / "inventory.md").read_text()
+    handoff = (REPO / "agents" / "chat" / "scripts" / "bootstrap_handoff.py").read_text()
     assert 'PRIORITIZE_IDEMPOTENCY_KEY = "bootstrap-inventory-prioritize"' in gate
     assert 'SCAN_ASSIGNEE = "platform"' in gate
     assert 'card_key      = "bootstrap-inventory-prioritize"' in main_tf
     assert 'card_assignee = "platform"' in main_tf
-    assert "Prioritize the onboarding inventory report" in sop
+    assert 'PRIORITIZE_TITLE = "Prioritize the onboarding inventory report"' in handoff
     assert 'card_title    = "Prioritize the onboarding inventory report"' in main_tf
 
 
@@ -174,7 +174,7 @@ def test_the_extracted_findings_pass(items: Path) -> None:
     _extract(items)
     result = _verify()
     assert result.status == "pass", result.reason
-    assert "holds the 6 expected finding(s)" in result.reason
+    assert "holds the 7 expected finding(s)" in result.reason
 
 
 def test_no_items_file_fails(items: Path) -> None:
@@ -185,11 +185,11 @@ def test_no_items_file_fails(items: Path) -> None:
 
 def test_a_missing_finding_is_named(items: Path) -> None:
     written = _extract(items)
-    written["items"] = [i for i in written["items"] if i["object"] != "cart"]
+    written["items"] = [i for i in written["items"] if i["object"] != "gift-cards"]
     items.write_text(json.dumps(written))
     result = _verify()
     assert result.status == "fail"
-    assert "missing [('probes-readiness', 'cart')]" in result.reason
+    assert "missing [('probes-readiness', 'gift-cards')]" in result.reason
 
 
 def test_a_finding_the_report_does_not_carry_is_named(items: Path) -> None:
@@ -207,18 +207,18 @@ def test_a_duplicated_finding_fails(items: Path) -> None:
     items.write_text(json.dumps(written))
     result = _verify()
     assert result.status == "fail"
-    assert "('sa-key-in-secret', 'checkout')" in result.reason
+    assert "('sa-key-in-secret', 'invoice-worker')" in result.reason
 
 
 def test_a_file_that_is_not_json_fails(items: Path) -> None:
-    items.write_text("extracted 6 findings\n")
+    items.write_text("extracted 7 findings\n")
     result = _verify()
     assert result.status == "fail"
     assert "is not JSON" in result.reason
 
 
 def test_json_without_an_items_list_fails(items: Path) -> None:
-    items.write_text(json.dumps([{"check": "sa-key-in-secret", "object": "checkout"}]))
+    items.write_text(json.dumps([{"check": "sa-key-in-secret", "object": "invoice-worker"}]))
     result = _verify()
     assert result.status == "fail"
     assert "no list of items" in result.reason

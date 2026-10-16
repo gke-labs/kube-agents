@@ -1,124 +1,132 @@
 /**
- * Transcript pane, read-only. The demo's input box is gone on purpose: this
- * page holds the `web` credential, which cannot publish, and the pane's
- * footer is the place where that stops being an assertion — the verify
- * button publishes one probe and surfaces the server's refusal (the detail
- * line is reconstructed from the client library's permission event, not the
- * raw -ERR text).
+ * The chat pane: the transcript, an input box for the console user, and a
+ * footer with who we are connected as and the verify button.
  *
- * Entries render by kind: `user` is the ask the gateway echoed onto the bus,
- * `steer` a follow-up into a running task, `answer` the result artifact
- * streaming in, `progress`/`status`/`topic`/`cancel` the quieter lines.
- * Each exchange group gets one correlation chip colored by corrColor.
+ * The input only renders for a user that can publish a turn. As `web` the
+ * pane is read-only, and the footer's verify button is where that stops
+ * being an assertion: it publishes one probe and surfaces the server's
+ * refusal. As `console` the same button proves the credential can't write
+ * anywhere on `a2a.>`.
+ *
+ * Lines are classified before anything touches the bus (commands.ts). The
+ * page's own command words are never published; any other line, `/session`
+ * included, is sent to the gateway.
  */
-import { useEffect, useRef, useState } from "react";
+import { useState, type KeyboardEvent } from "react";
 import type { ChatEntry, ProbeResult } from "./model.ts";
-import { corrColor } from "./model.ts";
-import { DEFAULT_USER } from "./config.ts";
+import { READ_ONLY_USER } from "./config.ts";
+import { classifyInput, tooBigText, type Command } from "./commands.ts";
+import Transcript from "./Transcript.tsx";
+
+const EMPTY_READ_ONLY = "watching the bus - ask the agent something in chat";
+const EMPTY_CONSOLE = "watching the bus - type below to ask the agent something, or /help";
+const INPUT_ROWS = 2;
+/**
+ * Some WebKit versions report `isComposing: false` on the Enter that commits
+ * an IME composition, but still carry the legacy `keyCode` for it - this is
+ * the fallback check for those.
+ */
+const IME_COMMIT_KEYCODE = 229;
 
 interface ChatProps {
   entries: ChatEntry[];
-  /** The connected NATS user — the read-only badge only vouches for `web`. */
+  /** The connected NATS user - the read-only badge only vouches for `web`. */
   user: string;
+  /** The console conversation this tab speaks in; absent for the read-only view. */
+  conversation?: string;
   probe?: ProbeResult;
   probePending?: boolean;
   onProbe: () => void;
+  /** True if the turn was accepted; the box is cleared only then. */
+  onSend?: (text: string) => boolean;
+  onCommand?: (command: Command) => void;
 }
-
-const GLYPH: Record<ChatEntry["kind"], string> = {
-  user: "ask>",
-  steer: "steer>",
-  answer: "",
-  progress: "⏳",
-  status: "⋯",
-  topic: "⊙",
-  cancel: "✕",
-  anomaly: "⚠",
-};
 
 function probeText(probe: ProbeResult): string {
   switch (probe.outcome) {
     case "refused":
       return `server refused the publish: ${probe.detail}`;
     case "sent":
-      return `PUBLISH WENT THROUGH — ${probe.detail}`;
+      return `PUBLISH WENT THROUGH - ${probe.detail}`;
     case "error":
       return `probe failed before the server saw it: ${probe.detail}`;
   }
 }
 
-export default function Chat({ entries, user, probe, probePending, onProbe }: ChatProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
+export default function Chat({
+  entries,
+  user,
+  conversation,
+  probe,
+  probePending,
+  onProbe,
+  onSend,
+  onCommand,
+}: ChatProps) {
+  const [draft, setDraft] = useState("");
+  const canSend = onSend !== undefined && user !== READ_ONLY_USER;
 
-  const handleScroll = () => {
-    if (containerRef.current) {
-      const { scrollTop, scrollHeight, clientHeight } = containerRef.current;
-      setShouldAutoScroll(scrollHeight - scrollTop - clientHeight < 10);
+  const submit = () => {
+    const c = classifyInput(draft);
+    switch (c.kind) {
+      case "empty":
+        return;
+      case "tooBig":
+        // Keep the text so it can be cut down.
+        onCommand?.({ name: "error", text: tooBigText(c.bytes) });
+        return;
+      case "command":
+        onCommand?.(c.command);
+        // A usage error keeps its text so it can be fixed.
+        if (c.command.name !== "error") setDraft("");
+        return;
+      case "send":
+        // Only clear the box once the turn was actually accepted - refused
+        // (the link is down) or not, the caller decides, and a refused turn
+        // must stay in the box rather than vanish.
+        if (onSend?.(c.text) === true) setDraft("");
+        return;
     }
   };
 
-  useEffect(() => {
-    if (shouldAutoScroll && containerRef.current) {
-      containerRef.current.scrollTop = containerRef.current.scrollHeight;
-    }
-  }, [entries, shouldAutoScroll]);
-
-  const renderedEntries = entries.map((entry, idx) => {
-    const isFirstInGroup =
-      idx === 0 || entries[idx - 1].correlationId !== entry.correlationId;
-    const corrChip = isFirstInGroup ? (
-      <div
-        className="corr-chip"
-        style={{ backgroundColor: corrColor(entry.correlationId) }}
-        title={`Correlation: ${entry.correlationId.slice(0, 8)}...`}
-        data-corr={entry.correlationId}
-      />
-    ) : null;
-
-    const glyph = GLYPH[entry.kind];
-    return (
-      <div key={entry.id} className="chat-entry-group">
-        {corrChip}
-        <div className={`chat-entry chat-${entry.kind}`}>
-          {glyph !== "" && <span className="chat-glyph">{glyph}</span>}
-          {(entry.kind === "progress" || entry.kind === "topic" || entry.kind === "anomaly") &&
-            entry.session && <span className="chat-session">[{entry.session}]</span>}
-          <span className="chat-text">{entry.text}</span>
-        </div>
-      </div>
-    );
-  });
+  const handleKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // An Enter during IME composition picks a candidate; it is not a submit.
+    // Some WebKit versions clear isComposing early but still report the
+    // legacy keyCode for it.
+    if (e.key !== "Enter" || e.shiftKey || e.nativeEvent.isComposing || e.keyCode === IME_COMMIT_KEYCODE) return;
+    e.preventDefault();
+    submit();
+  };
 
   return (
     <div className="chat-pane">
-      <div
-        className="chat-transcript"
-        ref={containerRef}
-        onScroll={handleScroll}
-      >
-        {renderedEntries.length > 0 ? (
-          renderedEntries
-        ) : (
-          <div className="chat-empty">watching the bus — ask the agent something in chat</div>
-        )}
-      </div>
+      <Transcript entries={entries} empty={canSend ? EMPTY_CONSOLE : EMPTY_READ_ONLY} />
+      {canSend && (
+        <textarea
+          className="chat-input"
+          rows={INPUT_ROWS}
+          value={draft}
+          placeholder="ask the agent, or /help"
+          aria-label="message"
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={handleKey}
+        />
+      )}
       <div className="probe-bar">
         <span className="probe-label">
           connected as <code>{user}</code>
-          {user === DEFAULT_USER ? " · read-only" : ""}
+          {user === READ_ONLY_USER ? " · read-only" : ""}
+          {conversation && (
+            <>
+              {" · conversation "}
+              <code>{conversation}</code>
+            </>
+          )}
         </span>
-        <button
-          type="button"
-          className="probe-button"
-          onClick={onProbe}
-          disabled={probePending}
-        >
+        <button type="button" className="probe-button" onClick={onProbe} disabled={probePending}>
           {probePending ? "verifying…" : "verify"}
         </button>
-        {probe && (
-          <span className={`probe-result probe-${probe.outcome}`}>{probeText(probe)}</span>
-        )}
+        {probe && <span className={`probe-result probe-${probe.outcome}`}>{probeText(probe)}</span>}
       </div>
     </div>
   );

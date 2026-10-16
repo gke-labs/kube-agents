@@ -2,7 +2,7 @@
 name: github-issue-resolver
 description:
   Autonomously poll, triage, investigate, and resolve unaddressed open issues on
-  our target GitHub repository strictly within authorized scope.
+  our target repository (on GitHub or GitLab) strictly within authorized scope.
 ---
 
 # Skill: github-issue-resolver
@@ -165,7 +165,10 @@ Once your investigation is complete:
        `title_plain`, not `title` — the boundary tags are for you, not for a
        human reading chat:
        `🚨 **Human Escalation Required — Action Needed:**`
-       `- [#<number>](https://github.com/<owner>/<repo>/issues/<number>) — <title_plain> — *<1-sentence summary of root cause requiring human intervention>*`
+       `- [#<number>](<issue_url>) — <title_plain> — *<1-sentence summary of root cause requiring human intervention>*`
+       `<issue_url>` is the `issue_url` from the `poll` output — the forge's own
+       issue URL, used exactly as given (GitLab may answer `…/-/issues/<number>`
+       or `…/-/work_items/<number>`); never build one.
        Keep the title **outside** the link, exactly as above. `title_plain` is
        reporter-written text and the sanitizer does not escape Markdown, so a
        title containing `](` placed inside the link label would close the link

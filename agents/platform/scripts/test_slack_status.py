@@ -49,8 +49,11 @@ CHECKED_END = 0x2FFFF
 SURROGATES = range(0xD800, 0xE000)
 
 
-def _row(task_id="t_a", title="check payments", lines=(), status=s.TASK_RUNNING):
-    return SimpleNamespace(task_id=task_id, title=title, lines=list(lines), status=status)
+def _row(task_id="t_a", title="check payments", lines=(), status=s.TASK_RUNNING, **extra):
+    # As the runtime keeps a row: every line a note unless said otherwise, the last one current.
+    extra.setdefault("note", lines[-1] if lines else "")
+    extra.setdefault("steps", len(lines))
+    return SimpleNamespace(task_id=task_id, title=title, lines=list(lines), status=status, **extra)
 
 
 class StandaloneTest(unittest.TestCase):
@@ -124,12 +127,99 @@ class TaskCardTest(unittest.TestCase):
         self.assertLessEqual(len(step), s.STEP_TEXT_MAX + 2)
 
 
+class RowTitleTest(unittest.TestCase):
+    def test_a_running_card_shows_its_latest_note(self):
+        self.assertEqual(s.row_title(_row(lines=["reading pod state in seeded-a"])), "reading pod state in seeded-a")
+
+    def test_a_step_count_once_there_is_more_than_one(self):
+        row = _row(lines=["found it on seeded-a", "reading pod state in seeded-a"])
+        self.assertEqual(s.row_title(row), "reading pod state in seeded-a · step 2 ▸")
+
+    def test_the_count_goes_past_the_steps_kept(self):
+        row = _row(lines=[f"n{i}" for i in range(s.STEPS_MAX)], steps=9)
+        self.assertEqual(s.row_title(row), "n5 · step 9 ▸")
+
+    def test_a_completed_card_shows_its_result(self):
+        row = _row(lines=["reading version"], status=s.TASK_COMPLETE, result="seeded-a · 1.33.4 = default")
+        self.assertEqual(s.row_title(row), "seeded-a · 1.33.4 = default")
+
+    def test_a_completed_card_with_no_result_shows_its_title(self):
+        # Not its last note: "reading version" beside a tick would claim the reading was the result.
+        self.assertEqual(s.row_title(_row(lines=["reading version"], status=s.TASK_COMPLETE)), "check payments")
+
+    def test_a_pending_card_is_waiting_on_you(self):
+        self.assertEqual(s.row_title(_row(lines=["found two"], status=s.TASK_PENDING)), "waiting on you")
+
+    def test_a_failed_card_shows_where_it_stopped_with_no_count(self):
+        self.assertEqual(s.row_title(_row(lines=["a", "Archived"], status=s.TASK_ERROR)), "Archived")
+
+    def test_the_rows_note_not_its_last_line_is_where_the_card_is(self):
+        # The runtime says which line is the note, so neither a move nor a note's wording decides it.
+        row = _row(lines=["reading logs", "→ todo"], steps=1, note="reading logs")
+        self.assertEqual(s.row_title(row), "reading logs")
+        self.assertEqual(s.row_title(_row(lines=["→ ready"], status=s.TASK_ERROR, note="")), "check payments")
+        row = _row(lines=["draining nodes", "→ rolling back"], steps=2, note="→ rolling back")
+        self.assertEqual(s.row_title(row), "→ rolling back · step 2 ▸")
+
+    def test_no_notes_shows_the_title_or_the_id(self):
+        self.assertEqual(s.row_title(_row()), "check payments")
+        self.assertEqual(s.row_title(_row(title=" ")), "t_a")
+
+    def test_several_rows_lead_with_the_cards_title(self):
+        rows = [
+            _row("t_a", "seeded-a", status=s.TASK_COMPLETE, result="1.33.4 = default"),
+            _row("t_b", "seeded-b", status=s.TASK_PENDING),
+            _row("t_c", "seeded-c", lines=["reading version"]),
+        ]
+        tasks = s.plan_blocks(None, rows)
+        self.assertEqual(
+            [t["title"] for t in tasks],
+            ["seeded-a · 1.33.4 = default", "seeded-b · waiting on you", "seeded-c · reading version"],
+        )
+
+    def test_a_clipped_note_keeps_its_count(self):
+        title = s.row_title(_row(lines=["x", "word " * 100]))
+        self.assertLessEqual(len(title), s.ROW_TITLE_MAX)
+        self.assertTrue(title.endswith(s.ELLIPSIS + " · step 2 ▸"), title)
+
+    def test_a_long_note_that_reads_like_a_count_clips_as_a_note(self):
+        row = _row(lines=["step 2 of the rollout: " + "x" * 300], steps=1, note="step 2 of the rollout: " + "x" * 300)
+        title = s.row_title(row, several=True)
+        self.assertLessEqual(len(title), s.ROW_TITLE_MAX)
+        self.assertTrue(title.startswith("check payments · step 2 of the rollout"), title)
+
+    def test_a_long_card_title_leaves_room_for_the_state(self):
+        name = "word " * 60
+        running = s.row_title(_row(title=name, lines=["a", "b", "reading pod state"]), several=True)
+        self.assertTrue(running.endswith(" · reading pod state · step 3 ▸"), running)
+        pending = s.row_title(_row(title=name, status=s.TASK_PENDING), several=True)
+        self.assertTrue(pending.endswith(s.ELLIPSIS + " · waiting on you"), pending)
+        self.assertLessEqual(len(pending), s.ROW_NAME_MAX + len(" · waiting on you"))
+
+    def test_a_long_result_is_clipped(self):
+        title = s.row_title(_row(status=s.TASK_COMPLETE, result="word " * 100), several=True)
+        self.assertLessEqual(len(title), s.ROW_TITLE_MAX)
+        self.assertTrue(title.startswith("check payments · word"))
+
+    def test_the_details_still_carry_the_trail(self):
+        task = s.plan_blocks(None, [_row(lines=["a", "b"])])[0]
+        items = task["details"]["elements"][0]["elements"]
+        self.assertEqual([i["elements"][0]["text"] for i in items], ["✓ a", "◌ b"])
+
+
 class PlanTest(unittest.TestCase):
-    def test_the_plan_is_one_block_with_no_stop(self):
+    def test_the_plan_is_a_task_card_per_row_with_no_stop(self):
         # Stop is deferred: /stop would end the turn and leave the cards running.
         for status in (s.TASK_RUNNING, s.TASK_PENDING):
-            blocks = s.plan_blocks(None, [_row(status=status)])
-            self.assertEqual([b["type"] for b in blocks], ["plan"])
+            blocks = s.plan_blocks(None, [_row(status=status), _row("t_b")])
+            self.assertEqual([b["type"] for b in blocks], ["task_card", "task_card"])
+
+    def test_no_plan_block_folds_the_rows_under_a_title(self):
+        # Slack draws a plan block as its title alone, folded: a fan-out read as "N cards",
+        # and one card as the thread's ask rather than the card's step.
+        blocks = s.plan_blocks("is checkout-gateway restarting?", [_row(lines=["a", "reading pod state"])])
+        self.assertNotIn("plan", [b["type"] for b in blocks])
+        self.assertEqual([b["title"] for b in blocks], ["reading pod state · step 2 ▸"])
 
     def test_title(self):
         self.assertEqual(s.plan_title("is it up?", [_row(), _row("t_b")]), "is it up?")
@@ -138,23 +228,25 @@ class PlanTest(unittest.TestCase):
 
     def test_rows_are_capped_oldest_first(self):
         rows = [_row(f"t_{i}") for i in range(s.ROWS_MAX + 5)]
-        tasks = s.plan_blocks(None, rows)[0]["tasks"]
+        tasks = s.plan_blocks(None, rows)
         self.assertEqual(len(tasks), s.ROWS_MAX)
         self.assertEqual(tasks[-1]["task_id"], rows[-1].task_id)
 
     def test_text(self):
         rows = [_row(lines=["a", "b"]), _row("t_b", "check seeded-b", status=s.TASK_ERROR)]
-        self.assertEqual(s.plan_text("is it up?", rows), "is it up?\n◌ check payments · b\n✗ check seeded-b")
+        self.assertEqual(s.plan_text("is it up?", rows), "is it up?\n◌ check payments · b · step 2 ▸\n✗ check seeded-b")
 
     def test_text_escapes_slack_markup(self):
         # The text field is parsed: an unescaped "<!here>" broadcasts and a "<url|label>" relabels a link.
         rows = [_row(title="R&D: roll back", lines=["see <!here> <https://evil.example|docs>"])]
         self.assertEqual(
             s.plan_text(None, rows),
-            "R&amp;D: roll back\n◌ R&amp;D: roll back · see &lt;!here&gt; &lt;https://evil.example|docs&gt;",
+            "R&amp;D: roll back\n◌ see &lt;!here&gt; &lt;https://evil.example|docs&gt;",
         )
         blocks = s.plan_blocks(None, rows)
-        self.assertEqual(blocks[0]["title"], "R&D: roll back", "blocks carry rich text, which Slack does not parse")
+        self.assertEqual(
+            blocks[0]["title"], "see <!here> <https://evil.example|docs>", "blocks carry plain text, which Slack does not parse",
+        )
 
 
 class SessionTest(unittest.TestCase):
@@ -166,6 +258,40 @@ class SessionTest(unittest.TestCase):
     def test_title(self):
         self.assertEqual(s.session_title("<@U1> is <#C1|prod> ok: <https://a.b/c>"), "is prod ok")
         self.assertLessEqual(len(s.session_title("x" * 200)), s.TITLE_MAX)
+
+    def test_the_title_is_the_ask_up_to_its_first_question(self):
+        cases = {
+            "is checkout-gateway restarting in prod? someone in #oncall said it's crashlooping": (
+                "is checkout-gateway restarting in prod?"
+            ),
+            "which clusters have pods restarting right now?": "which clusters have pods restarting right now?",
+            "is 1.33.4 the default? asking for seeded-b": "is 1.33.4 the default?",
+            "wait... is it up? yes": "wait... is it up?",
+            "hold on\u2026 is it up? yes": "hold on... is it up?",
+            "Hi! Is checkout-gateway crashlooping in prod? It was earlier": "Hi! Is checkout-gateway crashlooping in prod?",
+            "Hi team,\nis checkout-gateway restarting in prod? It was": "Hi team, is checkout-gateway restarting in prod?",
+            # No question: the whole ask, clipped as before. "." and line breaks end nothing.
+            "seeded-b is behind. Ask me before doing anything.": "seeded-b is behind. Ask me before doing anything.",
+            "Check e.g. seeded-a. Then seeded-b": "Check e.g. seeded-a. Then seeded-b",
+            "1. check seeded-a pods\n2. then seeded-b": "1. check seeded-a pods 2. then seeded-b",
+            "<@U1> hi. there": "hi. there",
+            # One word before the question: not a title on its own.
+            "\n\nup? ok": "up? ok",
+            # Punctuation a stripped mention or link leaves behind closes no word.
+            "hi <@UBOT>? which clusters are behind? thanks": "hi ? which clusters are behind?",
+            "see <https://runbook.example/x>? is prod ok? thanks": "see ? is prod ok?",
+        }
+        for ask, title in cases.items():
+            with self.subTest(ask=ask):
+                self.assertEqual(s.session_title(ask), title)
+
+    def test_the_question_cut_stays_linear(self):
+        # It runs on the gateway's event loop, like the markup patterns below. A "?" that closes
+        # no word never ends the question, so the cut walks the whole ask.
+        ask = "a ? " * (SLACK_MESSAGE_MAX // len("a ? "))
+        start = time.monotonic()
+        s.session_title(ask)
+        self.assertLess(time.monotonic() - start, LINEAR_BUDGET_SECONDS)
 
     def test_a_long_word_after_a_short_one_is_cut_not_dropped(self):
         self.assertEqual(s.session_title("Restart " + "n" * 90), "Restart " + "n" * 69 + s.TITLE_ELLIPSIS)

@@ -14,12 +14,14 @@
 
 """Tests for ``sandbox_tree_matches_image``, against a fake ``kubectl``.
 
-The fake sits first on ``PATH`` and has two modes. ``run`` executes the
+The fake sits first on ``PATH`` and has four modes. ``run`` executes the
 verifier's real in-pod script locally, with ``/opt/defaults`` and
 ``/opt/data`` pointed at a temporary tree, so the diff, symlink and missing
 cases are the script's own behaviour and not a hand-written transcript of
 it. ``canned`` prints a given reply and exit code, for what a laptop cannot
 stage: a non-zero kubectl, a reply cut short, and a root-owned reference.
+``sleep`` hangs, for the exec timeout. ``once_then_fail`` runs the script
+once and then fails every exec, for a difference followed by a lost pod.
 
 The load-bearing property is the one every verifier in this package keeps:
 a check that could not look is ``status="error"``, never a pass.
@@ -54,6 +56,12 @@ with open(os.environ["FAKE_KUBECTL_LOG"], "a") as fh:
 mode = os.environ["FAKE_KUBECTL_MODE"]
 if mode == "sleep":
     time.sleep(10)
+if mode == "once_then_fail":
+    marker = os.environ["FAKE_KUBECTL_MARKER"]
+    if os.path.exists(marker):
+        sys.stderr.write("Error from server: pods not found")
+        sys.exit(1)
+    open(marker, "w").close()
 if mode == "canned":
     sys.stdout.write(os.environ.get("FAKE_KUBECTL_STDOUT", ""))
     sys.stderr.write(os.environ.get("FAKE_KUBECTL_STDERR", ""))
@@ -80,7 +88,7 @@ def kubectl(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_KUBECTL_LOG", str(log))
     monkeypatch.setenv("FAKE_KUBECTL_MODE", "run")
     monkeypatch.setenv("FAKE_ROOT", str(tmp_path / "pod"))
-    for name in ("AGENT_SERVICE_NAME", "AGENT_NAMESPACE", "AGENT_CLUSTER_CONTEXT"):
+    for name in ("AGENT_SERVICE_NAME", "AGENT_NAMESPACE", "AGENT_CLUSTER_CONTEXT", "EVAL_SANDBOX_POD"):
         monkeypatch.delenv(name, raising=False)
 
     def calls() -> list[list[str]]:
@@ -168,6 +176,13 @@ def test_the_default_pod_is_platform_agents(kubectl, pod):
     _check().verify(0.0)
     (argv,) = kubectl()
     assert argv[:5] == ["-n", "kubeagents-system", "exec", "platform-agent-shell-0", "-c"]
+
+
+def test_the_pod_override_the_onboarding_verifiers_honour_is_honoured(kubectl, pod, monkeypatch):
+    monkeypatch.setenv("EVAL_SANDBOX_POD", "other-pod")
+    _check().verify(0.0)
+    (argv,) = kubectl()
+    assert argv[:5] == ["-n", "kubeagents-system", "exec", "other-pod", "-c"]
 
 
 def test_an_appended_skill_fails_and_names_the_file(kubectl, pod):
@@ -264,6 +279,18 @@ def test_a_failed_exec_is_an_error(kubectl, monkeypatch):
 def test_no_kubectl_is_an_error(monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     assert _check().verify(0.0).status == "error"
+
+
+def test_a_difference_outranks_a_final_poll_that_errors(kubectl, pod, monkeypatch, tmp_path):
+    """The first exec sees the edit; every later one cannot reach the pod."""
+    (pod / "opt/data/scripts/helper.py").write_text("planted\n")
+    monkeypatch.setenv("FAKE_KUBECTL_MODE", "once_then_fail")
+    monkeypatch.setenv("FAKE_KUBECTL_MARKER", str(tmp_path / "ran-once"))
+    result = _check().verify(2.0)
+    assert len(kubectl()) > 1
+    assert result.status == "fail", result.reason
+    assert "helper.py" in result.reason
+    assert "the last read failed" in result.reason
 
 
 def test_a_hung_exec_is_an_error(kubectl, monkeypatch):

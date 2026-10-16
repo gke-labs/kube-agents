@@ -58,9 +58,61 @@ class Decision:
 
 _ALLOWED = Decision(allowed=True, rule_id="", message="")
 
+# Appended to the categorical refusals. A refusal that only says what was
+# wrong with this argv reads as an error to correct, and a model reading it
+# that way reasonably tries the same action through another verb, another
+# tool, or another identity (#1945). Two spellings because the refusals come
+# in two shapes: an action refusal means a state change is off-limits, while
+# a flag refusal leaves re-running without the flag as the legitimate retry,
+# and only the flag's effect is off-limits. Every claim is conditional on
+# purpose. The read-only fallbacks also fire on unlisted reads -- `kubectl
+# help delete`, `gcloud topic formats`, `cluster-info dump` -- where the
+# permitted outcome is an allowed spelling (`--help` where an escape exists,
+# the granular reads a dump decomposes into) or a report, and an
+# unconditional "never retry however spelled" forbade exactly those
+# permitted retries -- confirmed by executing this module during the pre-PR
+# adversarial passes, not by observing a model. Likewise the flag notice
+# blesses whatever this policy allows rather than naming routes, because the
+# sanctioned route often exists but differs per flag: `get-credentials` then
+# `--context` is the answer to a refused `--server`, and no fixed sentence
+# could name every such route.
+# The two unreadable-command refusals and the asset-search type refusal carry
+# neither notice, on purpose: re-running with a spelling this module accepts is
+# the legitimate outcome there, and calling that a boundary would stop retries
+# the policy permits.
+_ACTION_BOUNDARY_NOTICE = (
+    "This is a permission boundary, not an error to work around: if this "
+    "command would change cluster or cloud state, that change is refused "
+    "however it is attempted, so do not retry it through another command, "
+    "tool, flag, or identity. If it only reads, use a spelling this policy "
+    "allows or report the gap instead of working around it."
+)
+_FLAG_BOUNDARY_NOTICE = (
+    "This is a permission boundary, not an error to work around: the "
+    "command may be retried without the flag, but what the flag itself does "
+    "is withheld, so do not look for another way to do it. Anything this "
+    "policy allows is not a workaround."
+)
+
 # Only these two reach a cluster or a cloud project. Everything else the proxy
 # executes is governed elsewhere.
 _GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
+# kubectl spellings that render or read a manifest without touching the cluster.
+# The policy refuses them like any unlisted verb (the dry-run carve-out was never
+# made, see above); ``local_render`` tells the refusal's readers that nothing was
+# attempted against the cluster, so the agent's runtime does not count it as a
+# refused change. ``--dry-run=server`` and ``--dry-run=none`` are not renders;
+# a help flag is (the verb's usage text, nothing attempted).
+_LOCAL_RENDER_FLAGS = frozenset({"--local", "--list"})
+# kubectl's ``--dry-run`` strategy reaches the server for ``none``, ``server`` and
+# the ParseBool false spellings (``0``, ``f``, ``false``, case-folded); ``client``,
+# the bare flag's ``unchanged``, the true spellings, an empty or unknown value all
+# end on the client (a render, or an error before any request).
+_DRY_RUN_WRITE_VALUES = frozenset({"none", "server", "false", "f", "0"})
+_HELP_FLAGS = frozenset({"-h", "--help"})
+# pflag's true spellings for a boolean flag given a value (``--local=true``), and the bare flag.
+_BOOLEAN_TRUE_SPELLINGS = frozenset({"", "true", "t", "1"})
+_LOCAL_RENDER_SUBCOMMAND = "view-last-applied"
 
 # Verb sequences that only read. Tuples rather than bare strings so a verb whose
 # effect depends on its subcommand can say which subcommand it meant: `rollout
@@ -361,20 +413,23 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # word away -- `instances create`, `delete`, `reset`, `add-metadata` --
         # stay refused, including the `instances reset` the stream emits as a
         # *proposed* remediation, and the tests assert it.
-        # `instances describe` is the SOP's 2.3 read (ops-agent-guest-health)
-        # and the object-scoped counterpart of the `disks describe` and
-        # `forwarding-rules describe` already in this set. Refusing it while
-        # the project-wide `instances list` beside it returns the same fields
-        # for every instance at once forces the broader read, not the narrower
+        # `instances describe` is the object-scoped counterpart of the
+        # `disks describe` and `forwarding-rules describe` already in this set,
+        # and the read behind the judgment SOP 2.1 hands back: a candidate
+        # tagged `needs_triage: gke-managed-node` asks whether one instance is
+        # a Google-managed node or an operator-owned VM, a question about that
+        # instance's metadata keys and labels. Refusing it while the
+        # project-wide `instances list` beside it returns the same fields for
+        # every instance at once forces the broader read, not the narrower
         # one. Pure read; the mutations one word away stay refused and the
         # tests assert it.
         ("compute", "instances", "describe"),
         ("compute", "instances", "get-serial-port-output"),
         ("compute", "instances", "list"),
-        # The same SOP's other reads. 2.2 (mig-autoscaler-flapping) spells
-        # `instance-groups managed describe $MIG`, whose `currentActions`
-        # counters are the whole condition; `list` is how the MIG names get
-        # bound in the first place. 2.4 (sole-tenant-headroom) spells
+        # The same SOP's other reads. 2.2 (mig-convergence-stalled) reads
+        # `instance-groups managed list`, whose `currentActions` counters are
+        # the whole condition; `describe` is the one-group read behind its
+        # `needs_triage: gke-managed-mig` judgment. 2.4 (sole-tenant-headroom) spells
         # `sole-tenancy node-groups list`, and `list-nodes` is the only surface
         # carrying the per-node `totalResources`/`consumedResources` a headroom
         # ratio needs. Reads, all four; the resizes and deletes one word away
@@ -396,7 +451,8 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # alongside every leaf read that needs one; `networks describe` and
         # `routers describe` are the detail reads behind the two lists.
         # `compute project-info describe` is the stockout SOP's quota
-        # remediation read. The writes one word away (networks create,
+        # remediation read and the GCE compute collector's §2.1 read of the
+        # project's common metadata. The writes one word away (networks create,
         # routers create, firewall-rules create, security-policies create,
         # project-info add-metadata) stay refused, and the tests assert it.
         ("compute", "networks", "describe"),
@@ -520,6 +576,11 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         # other advice entries, but with none of its flags listed here every
         # spelling the skill emits was refused -- the --max-run-duration trap
         # again. --machine-type and --region were already present above.
+        # The networking collector reads `routers get-nat-mapping-info` once
+        # per gateway, scoped with --nat-name: unscoped, the read returns every
+        # VM behind every gateway on the router. The verb was allowlisted, but
+        # without this entry the only spelling the collector emits was refused.
+        "--nat-name",
         "--tpu-version", "--chip-count", "--workload-type", "--vm-count",
         "--local-ssd", "--duration-range", "--start-time-range",
         "--end-time-range", "--location-policy",
@@ -646,7 +707,7 @@ _NO_HELP_ESCAPE_SURFACES = frozenset({"auth", "components", "config", "init"})
 
 #: The two spellings gcloud accepts for a documentation read; the same pair is in
 #: _GCLOUD_BOOLEAN_FLAGS so the words walker steps over them.
-_GCLOUD_HELP_FLAGS = frozenset({"--help", "-h"})
+_GCLOUD_HELP_FLAGS = _HELP_FLAGS  # the same two words, read by the gcloud surface walk
 
 #: gcloud's release-track words, which precede the surface rather than being one.
 #:
@@ -660,6 +721,18 @@ _GCLOUD_HELP_FLAGS = frozenset({"--help", "-h"})
 #: not cover, so the prefix defeated the exclusion precisely where it was the
 #: only gate.
 _GCLOUD_RELEASE_TRACKS = frozenset({"alpha", "beta"})
+# How many words of a gcloud argv, past a release track, the refusal's verb tuple
+# keeps: three, so a three-word surface's positional (a disk or cluster name)
+# never reaches the log hint or the shim's verb line (a shorter surface's
+# first positional does). The write surfaces whose verb is the fourth word keep
+# it when that word is one of these, which no positional is named.
+_GCLOUD_VERB_WORDS = 3
+_GCLOUD_FOURTH_WORD_VERBS = frozenset(
+    {"create", "delete", "update", "patch", "resize", "set-autoscaling", "rolling-action",
+     "set-iam-policy", "add-iam-policy-binding", "remove-iam-policy-binding"}
+)
+# The one rule whose refusal carries a render flag (``local_render``).
+KUBERNETES_READ_ONLY_RULE = "kubernetes.read-only"
 
 
 def _gcloud_has_flags_file(argv: list[str]) -> str | None:
@@ -716,6 +789,14 @@ def _asset_search_type(argv: list[str]) -> str | None:
         elif token == _ASSET_SEARCH_TYPE_FLAG and i + 1 < len(argv):
             values.append(argv[i + 1])
     return values[0] if len(values) == 1 else None
+
+
+def _gcloud_verb_tuple(words: list[str]) -> tuple[str, ...]:
+    """The surface words a refusal names: three past a release track, a fourth when it is a
+    write verb that sits that deep (``compute instance-groups managed resize``)."""
+    surface = words[1:] if words and words[0] in _GCLOUD_RELEASE_TRACKS else list(words)
+    keep = _GCLOUD_VERB_WORDS + (1 if len(surface) > _GCLOUD_VERB_WORDS and surface[_GCLOUD_VERB_WORDS] in _GCLOUD_FOURTH_WORD_VERBS else 0)
+    return tuple(surface[:keep])
 
 
 def _gcloud_words_and_flag(argv: list[str]) -> tuple[list[str] | None, str | None]:
@@ -1061,6 +1142,27 @@ def _gcloud_refuses_identity_change(argv: list[str]) -> str | None:
     return None
 
 
+def local_render(argv: list[str]) -> bool:
+    """Whether a kubectl ``argv`` only renders or reads a manifest locally.
+
+    kubectl resolves a repeated flag last-wins, so only the last ``--dry-run``
+    counts: ``--dry-run=client --dry-run=none`` is a write. A render flag
+    given as another flag's value (``--field-manager -h``) reads as a render
+    here; the policy refuses the write either way, the runtime appends
+    guidance instead of halting.
+    """
+    own = argv[: argv.index("--")] if "--" in argv else argv
+    dry_runs = [t for t in own if t == "--dry-run" or t.startswith("--dry-run=")]
+    if dry_runs and dry_runs[-1].partition("=")[2].lower() not in _DRY_RUN_WRITE_VALUES:
+        return True
+    for t in own:
+        flag, _, value = t.partition("=")
+        if flag in _LOCAL_RENDER_FLAGS | _HELP_FLAGS and value.lower() in _BOOLEAN_TRUE_SPELLINGS:
+            return True
+    verb, _ = _kubectl_verb_and_flag(argv)
+    return verb is not None and verb[:2] == ("apply", _LOCAL_RENDER_SUBCOMMAND)
+
+
 def evaluate(argv: list[str]) -> Decision:
     """Allow or refuse a command on read-only grounds.
 
@@ -1076,7 +1178,9 @@ def evaluate(argv: list[str]) -> Decision:
             rule_id="identity.caller-supplied-impersonation",
             message=(
                 "Impersonation is set by the credential proxy, not by the "
-                "caller. Remove --as/--as-group/--impersonate-service-account."
+                "caller. Remove --as, --as-group, --as-uid, --as-user-extra and "
+                "--impersonate-service-account. "
+                + _FLAG_BOUNDARY_NOTICE
             ),
             offending_flag=impersonation_flag,
         )
@@ -1095,7 +1199,8 @@ def evaluate(argv: list[str]) -> Decision:
                     "--kuberc reads options from a file under the agent's control, "
                     "including impersonation defaults that never appear in the "
                     "command line. We cannot read that file without a race "
-                    "condition, so we refuse it outright."
+                    "condition, so we refuse it outright. "
+                    + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=kuberc_flag,
             )
@@ -1109,7 +1214,8 @@ def evaluate(argv: list[str]) -> Decision:
                     "Identity and API server address belong to the broker. Remove "
                     "--server, --token, --user, --client-certificate, "
                     "--insecure-skip-tls-verify and the other credential flags to "
-                    "use the cluster and identity the proxy configured."
+                    "use the cluster and identity the proxy configured. "
+                    + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=identity_flag,
             )
@@ -1120,8 +1226,10 @@ def evaluate(argv: list[str]) -> Decision:
                 allowed=False,
                 rule_id="kubernetes.file-write-forbidden",
                 message=(
-                    "--profile, --profile-output and --cache-dir write to a path of "
-                    "the caller's choosing inside the credential sidecar. Remove them."
+                    "--profile, --profile-output, --cache-dir and --output-directory "
+                    "write to a path of the caller's choosing inside the credential "
+                    "sidecar. Remove them. "
+                    + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=file_write_flag,
             )
@@ -1137,10 +1245,11 @@ def evaluate(argv: list[str]) -> Decision:
         if verb in KUBECTL_REFUSED_SUBCOMMANDS:
             return Decision(
                 allowed=False,
-                rule_id="kubernetes.read-only",
+                rule_id=KUBERNETES_READ_ONLY_RULE,
                 message=(
                     "Agents hold read-only access to Kubernetes. Propose this change "
-                    "as a pull request instead."
+                    "as a pull request instead. "
+                    + _ACTION_BOUNDARY_NOTICE
                 ),
                 verb_tuple=verb,
             )
@@ -1148,10 +1257,11 @@ def evaluate(argv: list[str]) -> Decision:
             return _ALLOWED
         return Decision(
             allowed=False,
-            rule_id="kubernetes.read-only",
+            rule_id=KUBERNETES_READ_ONLY_RULE,
             message=(
                 "Agents hold read-only access to Kubernetes. Propose this change "
-                "as a pull request instead."
+                "as a pull request instead. "
+                + _ACTION_BOUNDARY_NOTICE
             ),
             verb_tuple=verb,
         )
@@ -1165,7 +1275,8 @@ def evaluate(argv: list[str]) -> Decision:
                 message=(
                     "--flags-file reads from a file under the agent's control. "
                     "We cannot read that file without a race condition, so we refuse "
-                    "it outright. Expand flags manually instead of using a file."
+                    "it outright. Expand flags manually instead of using a file. "
+                    + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=flags_file,
             )
@@ -1177,7 +1288,9 @@ def evaluate(argv: list[str]) -> Decision:
                 rule_id="gcp.identity-change-forbidden",
                 message=(
                     "Identity belongs to the broker. Remove --access-token-file, "
-                    "--configuration, and --account to use the default identity."
+                    "--configuration, --account and the other identity flags to "
+                    "use the default identity. "
+                    + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=identity_flag,
             )
@@ -1188,9 +1301,11 @@ def evaluate(argv: list[str]) -> Decision:
                 allowed=False,
                 rule_id="gcp.file-write-forbidden",
                 message=(
-                    "This flag writes a file inside the credential proxy's own "
-                    "container, not the agent workspace. Drop it and redirect "
-                    "the command's stdout instead."
+                    "--output-path and --log-http-log-file write a file inside "
+                    "the credential proxy's own container, not the agent "
+                    "workspace. Drop the flag; where the command offers the same "
+                    "content on standard output, redirect that instead. "
+                    + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=write_flag,
             )
@@ -1252,9 +1367,10 @@ def evaluate(argv: list[str]) -> Decision:
                     "change as a pull request instead. If this is a read the "
                     "product runs on its own, it is missing from "
                     "GCLOUD_READ_COMMANDS in command_policy.py -- report it "
-                    "rather than working around it."
+                    "rather than working around it. "
+                    + _ACTION_BOUNDARY_NOTICE
                 ),
-                verb_tuple=tuple(words[:3]),  # Cap at 3 words to exclude positionals
+                verb_tuple=_gcloud_verb_tuple(words),
             )
         return _ALLOWED
 

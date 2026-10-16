@@ -46,7 +46,7 @@ not a new cron entry. The consequences of dispatching through a card are in
 [`docs/designs/pr-comment-conversation.md`](../../../docs/designs/pr-comment-conversation.md) §2,
 and the env knobs that bound a sweep are in §§2 and 4 of the same document.
 
-## `stall-watch` hands a stall to a Cluster Agent card
+## `stall-watch` hands a stall to the AutoOps pipeline
 
 `stall-watch` is a `no_agent` script: the tick prompts no model. Every thirty
 minutes it lists the clusters of the management project and of every project a
@@ -55,41 +55,80 @@ Cluster Agent profile's `cluster_identity` names, which is how a project
 running or reconciling cluster that has a Cluster Agent profile and is not a
 system namespace, runs the Cluster Agent's `stall_report.py` over a bounded list
 of controller kinds, keeping a ledger of the rows it has seen. On a new stall
-episode it files one kanban card per cluster and namespace, assigned to that
-cluster's Cluster Agent profile, telling it to run `gke-stall-detection` on the
-namespace and record the finding. That is the same card, diagnosis and chat
-thread a user's own question produces, which is the point: one detector and one
-experience whether the cron or a person noticed first. The watch follows the
-reconciler's roster: a cluster with no profile, one `spec.scope.exclude.clusters`
-or `RECONCILE_EXCLUDE` pruned or one not yet scaffolded, is neither read nor filed for, because the exclusion
-is the operator keeping a model turn off that cluster and a card would hand its
-rows to another profile; a cluster, or a whole project, that leaves the roster
-has its rows cleared and its open card completed with a comment saying so. At most three cards open
-per tick (`MAX_CARDS_PER_TICK`, the default of the pull-request poller's
-`PR_AGENT_MAX_PER_TICK`), since each is a Cluster Agent turn and the number of
-namespaces with a new stall is chosen by whoever can create namespaces; the rest
-keep their rows and wait, oldest first sighting first, so a tenant filling three
-fresh namespaces every tick cannot keep an older stall from its card, and chat
-gets one line saying how many wait. A card the board refused leaves its
-namespace waiting the same way. A new object in
-a namespace whose card is still open is a comment on that card; when every
-object in the namespace has cleared, the card gets a closing comment and is
-completed. A `repeating-warnings` or `dangling-reference` row clears only after
-two consecutive scans without it, so a warning that recurs hourly or a referent
-listing that failed once does not close and reopen a card.
+episode it sends the Session KV server a `controller-stall` inject, the route
+`k8s-event-watcher` and the drift detector use
+([design](../../../docs/designs/stall-watch-inject.md)). The server posts the
+alert, records its chat thread, and starts a Planning Agent turn that files one
+card to that cluster's Cluster Agent, which runs `gke-stall-detection` and
+reports in the triage template. The report lands in the alert's thread and is
+saved, so a reply of "apply" there reaches the agent that opens the pull request
+with the report attached, rather than a bare word it has to investigate from
+scratch. The watch files no card itself: a card it filed would have no session,
+and so no thread. It finds the card later by `tasks.session_id`, the session that
+filed it. The watch follows the reconciler's roster: a cluster with no profile,
+one `spec.scope.exclude.clusters` or `RECONCILE_EXCLUDE` pruned or one not yet
+scaffolded, is neither read nor alerted for, because the exclusion is the
+operator keeping a model turn off that cluster and an alert would hand its rows
+to another profile; a cluster, or a whole project, that leaves the roster has its
+rows cleared and its open card completed with a comment saying so. At most three
+alerts are raised per tick (`MAX_ALERTS_PER_TICK`, the default of the
+pull-request poller's `PR_AGENT_MAX_PER_TICK`), since each starts a Planning
+Agent turn and a Cluster Agent turn and the number of namespaces with a new
+stall is chosen by whoever can create namespaces. A stall claims no alert quota
+on the Session KV server, so that cap is the only bound. The rest keep their
+rows and wait, oldest first sighting first, so a tenant filling three fresh
+namespaces every tick cannot keep an older stall from its alert, and chat gets
+one line saying how many wait. An alert the server refused, or a server that
+does not advertise the kind on `/healthz`, leaves the namespace with its rows
+for the next tick, and the tick stops trying the rest rather than spend a
+timeout on each; the "alerts not raised" line below reports them rather than
+the held count. A record the server refuses on its own merits (HTTP 400) skips
+only that namespace, and the next one in line still gets its alert. Object
+names longer than the server's 200-character limit are cut to it in the
+record. A new object in a namespace whose card is still open is a comment on that
+card; when every object in the namespace has cleared, the card gets a closing
+comment and is completed. A `repeating-warnings` or
+`dangling-reference` row clears only after two consecutive scans without it, so
+a warning that recurs hourly or a referent listing that failed once does not
+close and reopen an episode.
 
-The card's progress reaches chat because the script writes the card's
-`kanban_notify_subs` row itself: a cron child has no session identity for
-`kanban_create` to copy, and a card without a row is invisible to the gateway
-notifier. The row targets every shipped chat platform with a home channel in the agent home's `config.yaml` (`platforms.<p>.home_channel.chat_id`, the field the tick spawner reads, because Hermes strips every `*_HOME_CHANNEL` from a `no_agent` child's environment), with the same `notify+wake` delivery a user-filed card gets; `<PLATFORM>_HOME_CHANNEL` in the environment is read only for a platform the file does not settle, which is a run started by hand. A row the board refused is written on a later tick while the card is open. `deliver: chat` then carries three one-liners, "stall noticed in
-`<project>/<cluster>` (`<location>`) / `<namespace>`: `<objects>`; card `<id>` opened for
-`<profile>`", "stall cleared
-...; card `<id>` closed" and "stall noticed in `<n>` more namespaces; cards
-follow on later ticks", each naming at most eight objects, plus the sweep-failed
-and sweep-recovered lines every roster entry owes. A clean tick prints nothing. Anything a tick could not read (a
-cluster that timed out, a namespace whose scan failed, the rows of a kind a scan skipped or the repeating-warnings rows of one that could not read the events, a project whose listing failed or that gcloud called incomplete, a cluster whose profile's `cluster_identity` could not be read and whose project nothing else lists, a sweep that hit its
-25-minute budget) keeps its rows and is recorded in the ledger, not posted, and
-an exhausted sweep resumes where it stopped. One project's listing failing holds
+`deliver: chat` carries the watch's own one-liners: "stall cleared in
+`<project>/<cluster>` (`<location>`) / `<namespace>`: `<objects>`; card `<id>`
+closed" (without the card clause when the alert produced no card; a card
+filed later still reports the recovery in the alert's thread), "stall
+noticed in `<n>` more namespaces; alerts follow on later ticks, 3 a tick", the
+cleared line naming at most eight objects, and an "alerts not raised" line when the Session
+KV server refuses an alert, said once until the reason changes, with a line
+when alerts are raised again. It also carries the sweep-failed and sweep-recovered lines
+every roster entry owes, and the budget lines: the budget-exhausted line, said once on the
+tick a sweep first stops at its 25-minute budget, carrying the clusters read of the
+ones it could sweep, the namespaces read, the clusters it could not read and the cluster the
+next tick resumes at, and "the
+fleet is swept in one tick again" once a sweep completes having listed every project the
+exhausting sweep listed (a sweep that fit without one of them, because its listing failed or an
+identity could not be read, says nothing about the fit and posts nothing, for up to three
+consecutive ticks, after which the missing project counts as a standing fault and the fit
+stands); the ledger's budget entry carries the same coverage on every tick that falls short,
+and says when and why the flag is held. A new stall's notice is the alert the Session KV server
+posts. A namespace whose alert has produced no card a day after it was raised
+(the Planning Agent's turn failed) has its alert raised again, and the new
+alert replaces the episode once it is sent; a shorter retry would post a fresh alert every hour or so
+for as long as the turns kept failing. Alerts are not raised at all on a board
+whose tasks table has no `session_id` column, since the card an alert produces
+could not be found. The watch saves its ledger before each inject and fails
+the tick, with no alert, when the ledger cannot be saved, so a ledger that keeps failing
+to save cannot raise the same alerts every tick. A clean tick prints nothing. Anything a tick
+could not read (a
+cluster that timed out, a namespace whose scan failed, the rows of a kind a scan skipped or the repeating-warnings rows of one that could not read the events, a project whose listing failed or that gcloud called incomplete, a cluster whose profile's `cluster_identity` could not be read and whose project nothing else lists) keeps its rows and is recorded in the ledger, not posted;
+a sweep that hit its 25-minute budget keeps the rows it did not reach the same way, records
+what it covered, posts it on the first tick it falls short, and resumes where it stopped. A cluster's
+credentials are fetched on its first tick, after a day, and after a read that says the kubeconfig
+itself is the problem (the shim refused a stub the sandbox lost, or kubectl met a refused connection or a changed
+certificate at a recreated cluster); otherwise the tick reuses the kubeconfig it has, and a read
+that timed out, that the proxy refused, or that an unanswering control plane failed leaves the
+record for the next tick, and writes one when it followed a fetch (so a recreated cluster whose
+old endpoint times out or no longer resolves, rather than refusing, is read again at the daily
+refresh, not before). One project's listing failing holds
 only that project's rows. The sweep fails, and posts the sweep-failed line, when
 every project's listing fails, when no management project resolves, when
 `stall_report.py` cannot be found, or when the sandbox is lost.
@@ -114,13 +153,125 @@ CR's `spec.deployment.env` never reaches the script. The k8s-event-watcher and
 this job split the work by signal: a Warning whose reason is on the watcher's
 list is the watcher's within seconds; a condition, a reference or an event the
 list never names is this job's within the half hour. It declares `risk: high`
-because every card it files starts a Cluster Agent turn over every namespace of
+because every alert it raises starts a Cluster Agent turn over every namespace of
 every cluster on the Cluster Agent roster, the management cluster included
-unless `spec.scope.exclude.clusters` or `RECONCILE_EXCLUDE` names it. The card body and chat lines carry object
+unless `spec.scope.exclude.clusters` or `RECONCILE_EXCLUDE` names it. The inject record and chat lines carry object
 names, heuristics and durations only, never a row's detail, since condition
 reasons, spec paths and event messages are text a tenant writes; the Cluster
 Agent reads that text again when it runs the skill, and its read-only skill and
 preflight bound what it does with it.
+
+## `upgrade-readiness-watch` reports before anyone asks
+
+The `fleet-upgrade-verification` skill's readiness report grades every cluster
+on what would stop its next upgrade. Until this job it ran only when a user
+asked in chat. `upgrade_readiness_watch.py` runs once a day and asks the cheap
+half first: it runs the skill's version table, with no readiness read, and
+collects the target version each cluster's release channel offers and which
+clusters sit below it. A version a cluster is below is pending; a pending
+version the job's ledger has never seen earns the full readiness report at
+once, and a version already reported is refreshed every seven days while any
+cluster is still pending it. A version no cluster is pending any more is
+retired from the ledger with one line. A tick with nothing due prints nothing,
+so a quiet day costs no message.
+
+Which clusters it reads is decided on the agent pod: `UPGRADE_READINESS_PROJECTS`
+when set, otherwise the management project and every project a Cluster Agent
+profile's identity names, the roster `stall-watch` follows; with neither, the
+sandbox's configured project; and with nothing at all the tick fails closed,
+because the report script's own fallback is every project the credential can
+list. Within those projects the report script
+enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
+Cluster Agent from is still read here. That read is `gcloud` cluster metadata
+for the version table and, on a report day, the readiness report's read set,
+the same as a run on request: one `get-credentials` and six `kubectl get`s
+per cluster (budgets, Deployments and StatefulSets; webhook configurations
+with their Services, EndpointSlices and Namespaces; DaemonSets, CronJobs,
+claims, NetworkPolicies and Namespaces; every pod; the nodes through a
+jsonpath projection; StorageClasses and PersistentVolumes), plus
+`gcloud logging read` over the Admin Activity log when a registered rule reads
+it; the saved report names those objects, pods and nodes among them, and a
+fail-closed webhook with no reachable backend names its configuration and its
+Service, which is tenant-written text, so the entry declares `risk: high` as
+`stall-watch` does. A project
+spelled by its number is keyed by the id `gcloud projects describe` resolves,
+learned on its first table run. A number the credential cannot resolve is
+never a key, so its clusters earn no report until it resolves: when nothing
+was read under a key (it is the only project, or every other is an unresolved
+number too), the tick fails with the reason and the remedy, posted once and
+kept in `last-failure.txt` until the next clean tick posts the recovery;
+beside projects that were keyed, the table is partial, posted once with the
+reason, and the ledger's `table_errors` keeps it. The remedy is
+`resourcemanager.projects.get` on the credential (every read role the install
+binds carries it, as `cluster_agent_reconcile.py` relies on, so a credential
+without it is a custom grant) or the project id in place of the number
+(`spec.harness.projectId` has to be the id; `UPGRADE_READINESS_PROJECTS` for a
+hand run).
+
+It runs the skill the way `stall-watch` runs `stall_report.py`: every module
+under the skill's `scripts/` except its tests, with the data files beside them,
+is read from the agent image's `/opt/platform-template/skills/` copy and handed
+to `python3 -I -` in the sandbox on stdin, behind a loader (a meta-path finder
+serving the shipped set) before running `fleet_upgrade_report.main`. The
+loader gives the report a private `tempfile.mkdtemp` directory for its JSON
+output and rollout record, so nothing the model can write to is on the path
+the result crosses, and removes it afterwards; the sandbox's `/opt/data` is
+not this pod's, so the loader prints the report back as JSON and the job
+writes the files on this side, under `<agent home>/upgrade-readiness/`:
+`ledger.json`, and one dated `.md` and `.json` per report under
+`reports/<version>/`, with `latest.md` pointing at the newest, the ten newest
+kept per version and a retired version's directory removed with it. Each run starts
+from an empty rollout record, so a saved report's progress table is a
+first-run baseline, not a week-over-week comparison. Its stdout, one line per
+report with the pending clusters, the blocked ones, and the file's path on the
+gateway pod, is what `deliver: "chat"` posts; the agent's own tools run in the
+sandbox and cannot open that path, which is why the line carries the verdicts.
+`--dry-run` prints what a tick would do and changes nothing, the failure
+marker included.
+
+Daily at 10:10 UTC, after the morning audits and before the US day; the
+version table is a handful of `gcloud` list calls and the readiness report
+runs only on the day a version appears or its week comes round, once per
+project that holds a pending cluster with its own timeout, so one project the
+sandbox cannot finish leaves only its own clusters ungraded and the others'
+versions still reported. The whole tick keeps to forty-five minutes of the
+hour Hermes gives a `no_agent` script: the version table and the readiness
+runs go project by project, the table within the first fifteen minutes and the
+readiness runs with the rest, each run gets what its share has left, a project
+the budget cannot reach or finish is left unread and named: the partial-table
+line names each project with a read error and its reason (the budget, the
+sandbox's error, a failed listing, an unresolved project number), the
+ledger's `table_errors` keeps the last tick's, and a version's own line names
+the project whose readiness run was not started or was cut short (a version
+none of whose projects ran is not recorded and is retried tomorrow),
+and each sweep runs the projects least recently run first, so a budget that
+never reaches the end of the list does not leave the same project unread
+twice, whichever versions are due. Three guards
+keep the ledger honest: a version is
+retired only when the version table read every project, or read every project
+that still pended it and none does, or a readiness run (which lists every
+cluster of its project, reached by the table or not) showed every cluster
+pending it as no longer below it, a report that
+graded none of a version's pending clusters is written but not recorded (the
+chat line says "none graded" and the version is tried again tomorrow), and the
+weekly comparison carries ten minutes of slack so the tick's own drift cannot
+push a refresh to day eight. A partial table, an ungraded version or a failed
+tick is announced once, not daily: the ledger keeps what was announced (the
+kinds of read error for a partial table; each project and how it went
+ungraded for a version, never the error text, which an outage rewords from
+one run to the next), a
+failed tick (which writes nothing to the ledger) keeps its line in
+`last-failure.txt` beside it, and the next line is the recovery. A version
+none of whose clusters can be read is retried
+three days running and then recorded, so an unreachable cluster costs its
+project one readiness sweep a week rather than one a day; a `blocked` verdict
+the script grades from cluster metadata stands even when the kubectl read
+failed. A hand run in the container finds the ticker's ledger under the
+platform profile, as `feedback-prompt` does, rather than starting a second one
+at the gateway's home. The three
+environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
+`_WATCH_HOME`) are for a run started by hand in the pod; the operator's
+`spec.deployment.env` allowlist does not carry them.
 
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
@@ -134,9 +285,18 @@ path that works. `docs/designs/agent-shell-sandboxing.md` has the account.
 
 It reports nothing on a clean run and only on a run it could not finish, which
 is the same contract `github-repo-watcher` keeps. What it removed goes to
-stderr, where the scheduler logs it: a job announcing its own housekeeping every
+`logs/kanban_workspace_gc.log` in the agent home, which fluent-bit ships to
+Cloud Logging, and not to chat: a job announcing its own housekeeping every
 night is a job the room learns to skip, and the message that must not be skipped
-is the failure.
+is the failure. (Not stderr, which the scheduler keeps nowhere for a zero-exit
+script; see `feedback-prompt` below.)
+
+The same log gets an inventory of the sandbox's profile homes, so that loose
+files a worker leaves there can be seen without exec'ing into the sandbox: each
+home's top-level entries that the product doesn't create, and any home the agent
+pod no longer has a profile for, such as a cluster dropped from scope. That's an
+inventory only: nothing is moved or deleted, and a failure to take it is logged
+there too rather than posted.
 
 Daily is deliberate rather than conservative. The first install to run this had
 accumulated 34 directories and 3.9 MB on the agent pod and 9 directories and
@@ -161,10 +321,11 @@ line the room learns to skip.
 
 Daily, and it repeats: the rule is stateless, so a card still blocked is named
 every morning until someone unblocks, comments on, or archives it. That is the
-intended nag, the same rule `findings-morning-nudge` keeps, and the reason a
-finer cadence buys nothing: the engine's threshold is a day. It fires at 12:35
-UTC, half an hour after that nudge, for the same reason the nudge sits at 12:00:
-an earlier UTC hour is the middle of the night in the US, not a morning.
+intended nag, the same rule `findings-morning-nudge` keeps for the top
+criticals it named, and the reason a finer cadence buys nothing: the engine's threshold is a
+day. It fires at 12:35 UTC, half an hour after that nudge's daily reminder, for
+the same reason the reminder waits for 12:00: an earlier UTC hour is the middle
+of the night in the US, not a morning.
 
 It sits here rather than on the Chat Agent's roster because that roster delivers
 `local`. `PLATFORM_AGENT_HOME`, not `HERMES_HOME`, is how it finds the board:
@@ -179,8 +340,9 @@ agent handing out both when asked. `feedback_prompt.py` is the one place the
 product asks, and it does so once per install: a fixed message in the home
 chat channel carrying the form's short link, the form's disclosure that a
 submission becomes a public issue, and a line saying a reply in the thread
-reaches the agent. `deliver: "chat"` is what makes that last line true; the
-Chat Agent posts the message and owns the thread.
+reaches the agent. `deliver: "chat"` is what makes that last line true: the
+relay stores the message against its thread, so a reply there reaches the Chat
+Agent with it attached.
 
 It is a daily cron entry that fires once, not a Hermes one-shot, and the
 reason is this roster's merge. A shipped entry cannot carry an absolute
@@ -211,8 +373,8 @@ job fails in the direction of at most once: a post the scheduler recorded as
 undelivered is a lost request, which `chat-delivery-watch` counts like any
 other failed delivery, and which an operator sends again by removing
 `.feedback_prompt_sent` from the profile home, after which the next tick
-claims afresh. One Chat Agent composition is all the job ever costs, on the
-one tick that prints. The clock starts at the first
+claims afresh. One post is all the job ever costs, on the one tick that
+prints. The clock starts at the first
 tick, not at any record of when the install finished: nothing in the operator
 status carries a ready-since time, and the Chat Agent's onboarding markers
 live in a different home. An install that predates the entry therefore gets
@@ -278,7 +440,7 @@ with the run still recording `ok`. `check_cron_delivery` in
 `CRON_DELIVER_VALUES` set in that file, bare or as a `platform:chat_id` prefix, so
 the typo fails the pull request instead.
 
-## `deliver: "chat"` — reporting through the Chat Agent
+## `deliver: "chat"` — reports the Chat Agent can answer for
 
 `"all"` gets the words into a channel. It does not make them answerable: the
 process that produced them has exited, and the Chat Agent — which is who the
@@ -289,8 +451,10 @@ where that leaves it another platform to post to; on an install where the cron
 child can address every enabled channel itself, both copies land
 ([design](../../../docs/designs/cron-report-relay.md)).
 
-`deliver: "chat"` hands the run's report to the Chat Agent instead, which posts
-it and thereby owns the thread the user replies in. It is a delivery mode, not a
+`deliver: "chat"` hands the run's report to the relay instead, which posts it as
+written (on Slack, a fleet-audit report is replaced by a headline linking its
+ledger issue) and stores the full report against its thread, so the user's reply there reaches the
+Chat Agent with the report attached. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the
 scheduler applies `[SILENT]` and builds the failure summary before delivery is
 reached.
@@ -307,8 +471,8 @@ that Hermes registers like any other. So it is one target among several — a jo
 on `"chat,slack"` relays _and_ posts, and an unreachable relay records
 `last_delivery_error` rather than falling back. Note that `"all"` now expands to
 include the relay, so `"all"` and `"chat"` together deliver once, not twice, but
-`"all"` alone relays too. The full rationale — why the Chat Agent composes but
-does not send, why the session is per job per day, why a mode rather than an
+`"all"` alone relays too. The full rationale — why the report is posted as the
+job wrote it, why the thread is per job per day, why a mode rather than an
 instruction, and what the plugin route costs — is
 [`docs/designs/cron-report-relay.md`](../../../docs/designs/cron-report-relay.md).
 

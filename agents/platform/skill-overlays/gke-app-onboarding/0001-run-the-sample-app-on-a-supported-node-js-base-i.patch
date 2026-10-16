@@ -1,0 +1,17 @@
+Subject: Run the sample app on a supported Node.js base image
+
+Why: the sample runs the newest Node.js release, ahead of upstream. Dependabot moved the end-of-life `node:18-slim` to `node:26-slim` (#829); upstream has since moved only to `node:22-slim`. Later bumps edit this patch.
+Local-Issue: none (Dependabot bump #829)
+Upstream-Issue: none filed yet
+Retire-When: upstream's sample uses `node:26-slim` or newer
+
+diff --git a/assets/Dockerfile b/assets/Dockerfile
+--- a/assets/Dockerfile
++++ b/assets/Dockerfile
+@@ -1,5 +1,5 @@
+ # Use official lightweight Node.js image
+-FROM node:18-slim
++FROM node:26-slim
+ 
+ # Set working directory
+ WORKDIR /app

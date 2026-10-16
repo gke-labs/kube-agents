@@ -15,13 +15,33 @@ output "members" {
 
 output "uncarriable_members" {
   description = <<-EOT
-    Projects a selector named by an ID the scope cannot carry (a legacy
-    domain-scoped ID): a Shared VPC host's service projects, and a monitored
-    project should the Monitoring API ever name one by such an ID rather than
-    by number; keyed by the selector's snapshot name. Left out of `members`,
-    so bound nowhere, and reported by the module's check block as a warning on
-    every plan they appear in.
+    Projects a selector or a listed container named by an ID the scope
+    cannot carry (a legacy domain-scoped ID): a Shared VPC host's service
+    projects, a monitored project should the Monitoring API ever name one by
+    such an ID rather than by number, and a project under a folder or
+    organization whose clusters the Asset Inventory search named; keyed by
+    the snapshot name of the selector or container. Left out of `members` and
+    `container_members`, so bound nowhere and given no pool account, and
+    reported by the module's check block as a warning on every plan they
+    appear in.
   EOT
-  value       = local.scope_selector_uncarriable
+  value       = local.scope_uncarriable
+}
+
+output "container_members" {
+  description = <<-EOT
+    What each declared folder and organization was listed to at plan time
+    for the scoped service account pool, by project ID, under the snapshot's
+    key for the container (folders/<id>, organizations/<id>): a key per
+    declared container while `list_container_members` is set, an empty list
+    for one with no GKE cluster, and `{}` when it is not, since no container
+    is read then. Less a member an exclude_projects entry names exactly by
+    ID, and less one with an ID the scope cannot carry, which
+    `uncarriable_members` lists. Feeds kube-agents-iam's
+    scope_container_members, the pool alone: a member here gets no binding
+    of its own (the container's is inherited) and no place in the
+    resolved-set cap, which counts containers at runtime.
+  EOT
+  value       = local.scope_container_members
 }
 

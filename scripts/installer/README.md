@@ -23,6 +23,7 @@ their own copies:
 | `DEFAULT_CLUSTER_NAME`                                                    | GKE cluster name (`platform-agent-host`)                                               |
 | `DEFAULT_REGION`                                                          | GCP region (`us-central1`)                                                             |
 | `DEFAULT_CLUSTER_MODE`                                                    | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins |
+| `DEFAULT_PLATFORM_AGENT_MODE`                                             | The PlatformAgent's `spec.mode` (`today`); the composition then renders no mode        |
 | `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                  |
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)            |
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                              |
@@ -46,6 +47,7 @@ their own copies:
 | `is_valid_permission_set <set>`                                           | Accepted GCP IAM permission sets: `read-only`, `custom`                                |
 | `require_supported_permission_set <set>`                                  | The same check, reporting why a rejected value is rejected                             |
 | `is_valid_cluster_mode <mode>`                                            | Accepted cluster shapes: `autopilot`, `standard`                                       |
+| `is_valid_platform_agent_mode <mode>`                                     | Accepted modes, the CRD's `spec.mode` enum: `today`, `next`                            |
 | `derive_kms_location <region>`                                            | Region for Cloud KMS (strips a zone suffix)                                            |
 | `derive_chat_sub_name [topic] [sub]`                                      | Derive Google Chat Pub/Sub subscription (`<topic>-sub`) when topic is custom           |
 | `tf_state_chat_subscription_name`                                         | The subscription name managed by module.chat_pubsub, or empty                          |
@@ -54,6 +56,7 @@ their own copies:
 | `tf_state_has_cluster`                                                    | Whether that state manages THIS cluster (project, location and name all match)         |
 | `check_service_account_ownership`                                         | Refuses an apply that would 409 on a service account another install owns              |
 | `write_tfvars_from_state <dest> [tag]`                                    | The `terraform.tfvars` generator (reads the loaded `install.env` variable set)         |
+| `read_platform_agent_install_state [namespace]`                           | The CR and release reads shared by the scope check and the mode notice                 |
 
 The values themselves live in [`install.defaults.env`](../../install.defaults.env) at the
 repository root, which `installer_common.sh` sources. That file does one job and holds
@@ -108,7 +111,8 @@ menu, and `common.sh`'s `load_state` for the dev scripts — with `set -a` so th
 reach `write_tfvars_from_state` and the `TF_VAR_*` handoff, both of which read the
 environment. Order of authority is **flag, then file, then an exported variable, then
 the defaults above** — `set -a` sourcing means a key the file carries overwrites an
-export of the same name, so a flag is what overrides a recorded value for one run.
+export of the same name, so a flag is what overrides a recorded value for one run. The chat
+flags and `--mode` are the exception: on an existing file they are held to it, as described below.
 One key ignores the environment in every front door: `install.sh`, `upgrade.sh`, and
 `uninstall.sh` clear a shell-exported `NAMESPACE` before reading the file, because kubectl
 tooling exports that name and the value now reaches the Helm release's namespace. The file
@@ -136,11 +140,70 @@ standing in, not whichever one that shared checkout belongs to. The one addition
 `$HOME/kube-agents/install.env` is skipped unless all three of `--gcp-project-id`,
 `--gke-cluster-name`, and `--gcp-region` are given on the command line and match it.
 
-`install.sh` reads it and does not rewrite it. It creates one at the end of a first
-install, when there is nothing there, and never touches it again; the Day-2 menu's
-"Save & Apply" is the one path that edits it, one key at a time, leaving comments and
-ordering intact. That asymmetry is deliberate: a file the documentation tells you to edit
-and the next run overwrites is what made the old `vars.sh` confusing.
+`install.sh` reads it and writes to it only in these cases. The last two happen only when a run
+commits (the apply, or the `--generate-only` handoff; never a declined run or `--dry-run`):
+
+- it creates one at the end of a first install, when there is nothing there;
+- it appends a chat key or `PLATFORM_AGENT_MODE` the file lacks, under the rule below;
+- it records the GitOps keys described under [The GitOps forge](#the-gitops-forge): the forge
+  keys when the run applies a different forge (apply only), and `GITOPS_ORG`, `GITOPS_REPO` and
+  `GITHUB_APP_ID` when one is missing or this run applies a different value (that line only).
+
+Every other line, and the file's comments and ordering, are left as written. The Day-2 menu's
+"Save & Apply" is the path that edits any key, one at a time. That
+asymmetry is deliberate: a file the documentation tells you to edit and the next run
+overwrites is what made the old `vars.sh` confusing.
+
+The chat flags are held to the file rather than overriding it for one run, because
+`upgrade.sh` renders the chat integrations from the file alone and takes none of them, so a
+one-run override would be undone by the next full upgrade without a word. They are
+`--enable-slack`, `--enable-google-chat`, `--slack-allowed-users`, `--slack-home-channel`,
+`--slack-home-channel-name`, `--google-chat-allowed-users`, `--google-chat-home-channel`,
+`--google-chat-mode`, `--chat-topic-name`, `--slack-bot-token` and `--slack-app-token`.
+`--mode` follows the same rule, for the same reason, with `PLATFORM_AGENT_MODE` (below); it
+is not a chat key and brings no other settings with it.
+Against an existing `install.env`, a flag that disagrees with the key the file assigns is
+refused before anything is applied, naming the file and the key: edit the key (or, for
+`GOOGLE_CHAT_ENABLED` and the Google Chat allowlist and home channel, use the Day-2 menu) and
+re-run without the flag. A home channel changed this way does not replace one that `/sethome` or
+the install's first chat message already set; run `/sethome` in the new channel instead. The menu is not offered for the topic, which it does not ask about, or
+for `SLACK_ENABLED`, which it turns on without asking for the tokens; to turn Slack on, set the
+key and re-run with `--slack-bot-token` and `--slack-app-token`. A key with a default (the toggles, the topic, the Chat mode) that
+the file sets empty counts as that default, and the two allowlists compare as the lists they
+render to, so `a,b` and `a, b` agree. `--chat-topic-name=` and `--google-chat-mode=` given an
+empty value are refused, as an empty toggle is, rather than read as the default, and a
+`--google-chat-mode` other than `default` or `debug` is refused before the file is consulted. An
+empty `--slack-bot-token=` or `--slack-app-token=` is no value, as an empty recorded token is: it
+is not compared, and the token is recovered from the live Secret. `--chat-sub-name` is not held: on a running install the
+subscription name comes from Terraform state, ahead of both the flag and the file. A flag
+whose key the file does not assign at all is appended to the file with the value the run
+applies, as the last step before the apply or the `--generate-only` (or `g`) handoff, so a run
+refused, declined or failed before the apply, and a `--dry-run`, leave the file as it was; an apply that
+then fails has recorded what it was applying. Answering `n` at the step-11 confirmation records
+nothing, since it is as often a decline as a hand-off: it prints the `KEY=value` lines it did not
+record (never a token), for an operator who goes on to run `lifecycle.sh apply` by hand to add
+first, so a later `upgrade.sh` renders what they applied. A toggle recorded `true` brings the settings of
+its integration the file also lacks, with the values the run applied: `SLACK_ALLOWED_USERS`,
+`SLACK_HOME_CHANNEL` and `SLACK_HOME_CHANNEL_NAME` for Slack; `ALLOWED_USERS`,
+`CHAT_TOPIC_NAME`, `GOOGLE_CHAT_HOME_CHANNEL` and `GOOGLE_CHAT_MODE` for Google Chat. The
+toggle is written after them, so a record cut short leaves the settings with the integration
+off, never the integration on without its allowlist. Otherwise
+an allowlist given at the prompt or as an export would be left out, and the next upgrade would
+render the integration on with an empty allowlist, which admits everyone. A chat-less install's
+file records both allowlists empty, and `install.sh` does not change a key the file assigns, so to
+turn an integration on later, set its allowlist in the file beside the toggle. A file the run cannot write is refused up front
+when there is a key to record. This is the one write
+`install.sh` makes to a file it did not create, and only of keys the file lacks. A flag that
+agrees changes nothing. The Slack tokens are never appended: their home is the live
+`platform-agent-secrets` Secret, which `write_tfvars_from_state` recovers them from on every
+later run, and `PERSIST_SECRETS_ON_DISK=false` keeps them out of every file. A token the file
+does carry is still held to it. A file `install.sh` wrote assigns every one of these keys but
+the tokens, so on it a chat flag is either refused or a no-op. A file CI renders leaves out a
+key whose variable is empty, and the provisioning script derives each chat flag from the
+variable that renders its key (the Google Chat allowlist flag also reads
+`GOOGLE_CHAT_ALLOWED_USERS` first, which no workflow sets), so on a runner a flag either agrees
+with the rendered key or is appended to the runner's copy, which goes when the runner does. The `--menu` route refuses the chat flags; it
+edits the keys on its own screens.
 
 **`terraform/examples/full-install/terraform.tfvars`** is the derived artifact,
 regenerated on every run from the loaded environment. Nobody edits it.
@@ -173,7 +236,10 @@ and drops the custom roles; `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATI
 renders an empty list for it in the scope block, which revokes the read roles in every project,
 folder, organisation or selector member it named and retires those projects' Cluster Agent profiles over the
 reconcile's next two clean runs; `SCOPE_MAX_PROJECTS` absent writes no cap, so the default of 100
-returns and the projects past it read `over-cap` (or the plan is refused, while a selector is declared).
+returns and the projects past it read `over-cap` (or the plan is refused, while a selector is declared);
+`SCOPED_SA_POOL_ENABLED` absent disarms the scoped service account pool, deleting its accounts
+and putting the broker back on the agent's own identity; `PLATFORM_AGENT_MODE` absent resolves
+to `today`, which switches a `next` install back and retires its A2A stack.
 The file `install.sh` writes at the end of a first install carries every one of these, so
 the hazard is a hand edit that deletes a line rather than setting it to `false`. Run
 `./upgrade.sh --plan` before a full upgrade and read any `destroy` line as missing
@@ -190,7 +256,7 @@ second. `VERTEX_MANAGE_SERVING_PROJECT` is the only other key where both hold: a
 re-enables `aiplatform.googleapis.com` and re-grants `roles/aiplatform.user` in the serving
 project. A full
 upgrade over an `install.env` written before the key existed adds the Log Router sink,
-Pub/Sub topic and subscription that carry the project's GKE audit records, and starts the
+Pub/Sub topic and subscription that carry the project's, and each scoped project's, GKE audit records, and starts the
 detector that reads them. That is intended — running an installer is the consent — but it
 means opting out has to be a `ENABLE_DRIFT_DETECTOR=false` line in the file. Only the run
 that creates `install.env` records the flag it was passed; over a file that is already
@@ -201,7 +267,7 @@ an exported `ENABLE_DRIFT_DETECTOR=false` is just as unrecorded and currently wa
 nothing, so the file is the only opt-out that survives the shell it was typed in.
 Setting it to `false` is still the one boolean `write_tfvars_from_state` omits rather than
 writing, so an install carrying a `TF_VAR_enable_drift_pubsub=true` line keeps its ingress
-and only loses the detector — a written `false` would outrank that line and take the sink,
+and only loses the detector — a written `false` would outrank that line and take the sinks,
 topic and subscription with it, up to 31 days of retained messages included.
 
 `MEMORY` is the only one of the keys above that the generator goes and asks the cluster
@@ -221,6 +287,10 @@ Loading the input first is also what fixes non-interactive re-runs (#1060). Ever
 `PARAM_X="${VAR:-}"` seed already knew how to inherit from the environment; giving it a
 file to inherit from makes inheritance the default path rather than something each flag
 has to remember, so the next flag added inherits too.
+
+A key added to `install.env` also needs a row in the Upgrade page's
+[Recovering `install.env`](../../docs/site/src/content/docs/install/upgrade.md#recovering-installenv)
+tables. They map each key back from a live install for an operator who lost the file.
 
 ### What is deliberately not in it
 
@@ -242,6 +312,12 @@ the configured value is discarded — which is what stops a hand-written
 to 0 and turning the next apply into a replacement. Nothing writes the probe's answer
 back, so the file never becomes an input and an output at once.
 
+A GitHub Enterprise Server forge is not in it either: no key selects one, and `install.sh`
+writes only the github.com spelling of a GitHub forge. A GitOps repository on a GitHub
+Enterprise Server is installed through the composition, with the forge in its
+`extra_helm_values`: see
+[GitHub Enterprise Server in INSTALL.md](../../INSTALL.md#github-enterprise-server).
+
 ### Credentials
 
 `PERSIST_SECRETS_ON_DISK=false` keeps them out of every file the installer writes: the
@@ -251,11 +327,79 @@ when kubectl's current context is this install's cluster). `API_SERVER_KEY` is g
 once, when the configuration carries none and none can be recovered — not on every run,
 which used to replace the Secret and restart every pod holding it.
 
+### The GitOps forge
+
+`GITOPS_FORGE` is `github` (the default) or `gitlab`. A github.com install records none of the
+forge keys. A GitHub Enterprise Server install (`--gitops-host` with the github forge) records
+these keys, beside `GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID`, which name the repository and
+the App on the instance:
+
+| Key                | Value                                                                                                        |
+| ------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `GITOPS_FORGE`     | `github`                                                                                                     |
+| `GITOPS_HOST`      | The instance's hostname                                                                                      |
+| `GITOPS_CA_SECRET` | The name of the Secret that holds a private CA (default `github-forge-ca`); set only with `--gitops-ca-file` |
+
+`upgrade.sh` and `uninstall.sh` render the same forge from these keys. The generator writes
+`gitops_host` and `github_ca_secret_name` into `terraform.tfvars`, and the composition declares the
+github forge at that host. After the apply, `install.sh` writes the CA file into the Secret and
+restarts the token minter, which reads the CA when it starts. `--gitops-host=github.com` switches the
+install back to github.com and drops the three keys. The App and its KMS key belong to one GitHub
+host: a switch between github.com and an instance needs the other host's App and a new KMS key
+(`install.sh` refuses a change of host that keeps the recorded `GITHUB_APP_ID` or key), as
+[Switch between github.com and a GitHub Enterprise Server](../../INSTALL.md#switch-between-githubcom-and-a-github-enterprise-server)
+describes.
+
+A GitLab install records these keys:
+
+| Key                   | Value                                                                                                        |
+| --------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `GITOPS_FORGE`        | `gitlab`                                                                                                     |
+| `GITOPS_HOST`         | The self-managed instance's hostname; empty for gitlab.com                                                   |
+| `GITOPS_REPO`         | The project's full path (`group/subgroup/project`)                                                           |
+| `GITLAB_TOKEN_SECRET` | The name of the Secret that holds the token (default `gitlab-forge-token`)                                   |
+| `GITOPS_CA_SECRET`    | The name of the Secret that holds a private CA (default `gitlab-forge-ca`); set only with `--gitops-ca-file` |
+
+The token, and the paths of the token file and the CA file, are never recorded.
+`GITLAB_TOKEN_FILE` and `GITOPS_CA_FILE` in the environment act like `--gitlab-token-file` and
+`--gitops-ca-file` for one run, and are never recorded either. One difference: with gitlab.com as
+the host, `install.sh` drops a `GITOPS_CA_FILE` from the environment, but refuses the flag. With
+github.com, it refuses both.
+
+- `install.sh` records these keys on a first install, and on a later run that goes on to the apply
+  with a different forge, host, project or Secret name.
+- A run that you decline, or that ends with `--generate-only`, does not change them in an existing
+  file.
+- A switch to GitLab drops `GITOPS_ORG`, `GITHUB_APP_ID` and `GITHUB_PEM_PATH`, and a recorded
+  GitHub Enterprise Server host and CA Secret. A switch back to GitHub drops the GitLab keys.
+- A run on GitHub that changes the GitHub host or the CA Secret rewrites `GITOPS_ORG`,
+  `GITOPS_REPO`, `GITHUB_APP_ID`, `KMS_KEYRING` and `KMS_KEY` with the forge keys, and drops
+  `GITHUB_PEM_PATH`.
+- Once `install.env` exists, `install.sh` ignores a `GITOPS_FORGE`, `GITOPS_HOST`,
+  `GITLAB_TOKEN_SECRET` or `GITOPS_CA_SECRET` exported in the shell. Use the flags.
+
+On GitHub with the token minter (`GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID` all set), a run
+that goes on to the apply, or ends with the `--generate-only` handoff, records each of the three
+the file lacks, and replaces one it records
+with a different value (that line only). `upgrade.sh` renders from the file alone, so GitOps set
+up with `--gitops-org`, `--gitops-repo` and `--github-app-id` would otherwise be rendered off by
+the next full upgrade, which would destroy the minter's Cloud KMS key and service account. The PEM
+path is never recorded. A declined run, or `--dry-run`, leaves the file as it was.
+
+Each applying front door (`install.sh`, the Day-2 menu, a full `upgrade.sh`) also refuses an apply
+that would render GitOps off while the minter is running, and prints the lines to set with the
+live values filled in. `install.sh --generate-only` is refused too, and removes the tfvars it
+wrote, since its handoff is `lifecycle.sh apply`; `--plan` and `--dry-run` warn. A minter
+Deployment that cannot be read is refused rather than read as absent. `KUBE_AGENTS_REMOVE_GITOPS=true`
+in the environment removes GitOps on purpose. `GITHUB_APP_ID` must be the App's number (its
+settings page, **General**, "App ID"); `install.sh`, the Day-2 menu and `upgrade.sh` (on a GitHub
+install) refuse anything else.
+
 ### Projects, folders, organisations and selectors in scope
 
 `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS`,
 `SCOPE_METRICS_SCOPES`, `SCOPE_MAX_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS`
-are the `PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the install from
+are the `PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the install, and the drift ingress's list of projects to export, from
 the same value: the generator renders them as the composition's `scope` object, the IAM module binds
 the read roles in every project named, the read roles plus `roles/cloudasset.viewer` on every
 folder and organisation named, and the read roles in every project a Shared VPC host or Metrics
@@ -281,12 +425,35 @@ the plan, before anything is applied, naming the selector, the status and the AP
 needs `compute.projects.get` on a host, to read the Metrics Scope in its scoping project with the
 Monitoring API enabled there, and `resourcemanager.projects.get` on every monitored project; a
 monitored project it cannot name is left out by naming its project number in
-`SCOPE_EXCLUDE_PROJECTS`. That is why no shell preflight probes the two selectors' reads as
-`check_scope_container_access` probes a container: a container's failure lands inside the apply,
+`SCOPE_EXCLUDE_PROJECTS`. That is why no shell preflight probes the two selectors' reads,
+as `check_scope_container_access` probes a container's binding: the binding's failure lands inside the apply,
 after the Asset API is enabled and some containers are bound, while a failed read lands in the plan
-with nothing changed, `upgrade.sh --plan` included. The bindings themselves are the explicit
+with nothing changed, `upgrade.sh --plan` included. The pool's listing of a container's members is
+the exception that check probes too, while the pool is armed, because `install.sh` enables the
+Asset API before that plan and a listing refused there would leave it enabled. The bindings themselves are the explicit
 projects' case: a resolved project the applying identity cannot set IAM policy in fails inside the
-apply, as a `SCOPE_PROJECTS` entry does, and no preflight probes either. What the selectors do not have is a container's
+apply, as a `SCOPE_PROJECTS` entry does, and no preflight probes either. The drift audit-log sink the
+same apply creates in each `SCOPE_PROJECTS` entry is probed, by `check_scope_export_sink_access`
+beside the container preflight and as the same identity: for each entry less the host, less an
+exact or glob `SCOPE_EXCLUDE_PROJECTS` match and less `TF_VAR_drift_pubsub_source_exclude_projects`,
+while the drift ingress is on (`ENABLE_DRIFT_DETECTOR`, or `TF_VAR_enable_drift_pubsub` on its own), it
+asks the project whether the identity holds `logging.sinks.create`, and
+refuses the apply naming every project that lacks it, the role that grants it
+(`roles/logging.configWriter`) and the exclusion lever, because a sink that cannot be created fails
+the apply at that project after the host's resources and the other projects' sinks have changed. It
+warns on the routes the container preflight warns on. A denied project whose sink the install's
+Terraform state already holds, live rather than tainted or deposed, is warned about rather than
+refused when the identity can read it (`logging.sinks.get`, asked second), because an apply that
+leaves the sink as it is needs only that read: that is how an install made by an owner is upgraded
+by a narrower Day-2 identity; one that cannot read it either is refused, since the plan's read
+fails. An apply that changes the sink (a release that moves its filter), recreates it or removes
+it fails there all the same, since the roles that lack `logging.sinks.create` lack update and
+delete too, so the warning says so per route: on `--plan` the plan that follows shows which this
+apply is, and on an applying route, which goes ahead without a further prompt, the way to see first
+is to stop and run `upgrade.sh --plan`. The state is read once, and only on a denial. A
+selector's members are resolved in the
+plan and are not probed; the project's number read and its Logging service agent's mint are left
+to the apply. What the selectors do not have is a container's
 zero-touch onboarding: a service project attached, or a project added to the scope, after the last
 full upgrade reads `denied` in the reconcile's snapshot until the next one binds it. An exclude
 entry that names a Shared VPC service project by ID, or a monitored project by its project number,
@@ -298,7 +465,11 @@ Shared VPC host, which the composition enables in the apply that follows the pla
 So before an `install.sh` apply that carries a selector, `enable_scope_selector_apis` lists the
 project's enabled APIs and enables whichever of the ones the declared selectors read is off, as
 gcloud's active account, like the KMS enablement beside it: nothing is called when they are on, which is every re-run and Day-2 apply of an existing install, and a failure is a
-warning, since the plan reports a disabled API with the same command as its remedy. The
+warning, since the plan reports a disabled API with the same command as its remedy. The scoped
+service account pool armed beside a folder or organisation (`SCOPED_SA_POOL_ENABLED` true with
+`SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` set) counts as a third selector kind there: the plan
+lists the container's members for the pool through `cloudasset.googleapis.com`, so it is enabled
+first the same way, with the pool's listing named as the reason. The
 generate-only handoff prints the command above the apply, `install.sh --dry-run` skips its plan
 with the command while an API a declared selector reads is off (a dry run enables nothing, and its plan would
 otherwise be refused for a reason the real run does not have), and `upgrade.sh` does none of it,
@@ -327,9 +498,87 @@ exceed it (while a selector is declared or the cap is below its default), and re
 check as part of the declaration, so a cap set on the CR by
 hand is reported like any hand edit until the key records it.
 
+`SCOPED_SA_POOL_ENABLED` and `SCOPED_SA_POOL_MAX_ACCOUNTS` are the scoped service account pool,
+derived from the same scope: with the switch on, the IAM module provisions one reader service
+account in the management project per project the plan lists (the management project,
+`SCOPE_PROJECTS` less an exact `SCOPE_EXCLUDE_PROJECTS` entry, each selector's members, and,
+while the pool is armed, each declared folder's or organisation's members, which the plan lists
+through the Asset API `enable_scope_selector_apis` turns on first and which get their accounts on
+that apply; a project created under the container since lags to the next apply, while the
+container-level grant and the reconcile's discovery of it stay zero-touch), and the chart renders the mapping into the CR as
+`spec.security.scopedServiceAccountPool` with `enabled` set from the same key, so declaring
+projects arms nothing on its own. Members carry the install's identity in their description
+(`Pool member of <PLATFORM_AGENT_GSA_NAME> for projects/<id>`), and `check_service_account_ownership`
+lists them by it before every apply, armed or not, so a member left by a lost state is refused
+beside the agent's account rather than 409ing after the agent is deleted. The generator writes `scoped_pool_enabled` on every run, `false`
+by default (a member holds no IAM grant yet, so an armed pool turns every cluster read into a
+`Forbidden`), and `scoped_pool_max_accounts` only when the key is set: the bound on the pool, declared from the
+management project's free service-account quota, 100 (GCP's default quota, not the headroom)
+when unset, with a pool past it refused at plan. `install.sh` takes `--scoped-sa-pool-enabled[=BOOL]` and
+`--scoped-sa-pool-max-accounts=N` and records them on a first install; a flag on a later run
+applies for that run and warns that the next full upgrade regenerates from the file. A misspelt
+switch, or a cap that is not a whole number of at least 1, stops every front door but
+`uninstall.sh`, which exports the switch off and the cap empty before it regenerates, so a typo
+cannot refuse a teardown.
+
+`PLATFORM_AGENT_MODE` is the `PlatformAgent`'s `spec.mode`, `today` or `next`
+([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md) says what each
+renders). The generator writes `platform_agent_mode` on every run, `today` by default, and the
+composition passes the chart nothing for `today`, so the CR carries no mode field. `install.sh`
+takes `--mode` and records it, or the default, on a first install. Over an existing
+`install.env` it is held to the file by the chat flags' rule above: a `--mode` that disagrees
+with what the file resolves to (an empty key is `today`) is refused rather than applied for one
+run, because the next run, and every `upgrade.sh`, which takes no `--mode`, would switch the
+install back; one the file does not assign at all is appended at the same points as a chat key
+(a refused, `--dry-run` or failed-before-apply run leaves the file as it was, and `n` at the
+step-11 confirmation prints the `PLATFORM_AGENT_MODE=` line instead of writing it). From then on the file is the only way in: `bootstrap_install_env` and `load_install_env` drop a value inherited from the
+shell. A switch is an edit to the key. Before an apply the front doors
+read the mode the live CR runs and the one the release's last served revision carries, and say
+when the apply moves the CR (`announce_platform_agent_mode_switch`), from the reads the scope
+check beside it made (`read_platform_agent_install_state`). No cluster (the generator found
+none, so a kubeconfig context an earlier install of that name left is not read), no CR or no
+release is a first install and is quiet; a read that fails, or a kubeconfig with no context for
+a cluster that exists, says the check did not run. Where no confirmation follows the notice
+(`upgrade.sh`'s full arm, the menu's apply, `install.sh -y`) it says the run applies the switch
+without asking, rather than offering "run again". The notice models the
+render from the key alone, so a `platformAgent.mode` in the composition's `extra_helm_values`,
+which wins, is not seen, and every notice says so. Helm patches the CR from
+the difference between that revision's render and the new one, and `today` renders no field,
+so the key removes a recorded mode, and sends no change at all when the record already renders
+it; a mode set on the CR by hand then stays, and the front doors name it rather than announce a
+switch. Only full mode applies the key; the `harness` and `operator` retags reuse the recorded
+values and say when a full upgrade would move the mode. They keep the mode only onto a chart
+whose schema declares `platformAgent.mode`: onto an older one, this `upgrade.sh` refuses a
+recorded `next` rather than drop it (`--drop-undeclared-values` included), since the chart would
+render no mode and Helm would take `spec.mode` off the CR. A full upgrade onto such a chart
+refuses `PLATFORM_AGENT_MODE=next` in `install.env` for the same reason. An older release's own `upgrade.sh`,
+the release rollback runbook's route, has no such refusal and drops it with its generic
+"Dropping" line, so roll a `next` install back only after switching it to `today` on purpose. A value outside the enum stops every front door but `uninstall.sh`, which exports it empty
+before it regenerates.
+
+When `next` hands Slack to the A2A gateway (Slack on, Google Chat off: the operator's
+`a2aSlackArmed`), `install.sh`, the menu's apply and a full upgrade refuse, before their apply,
+three settings the gateway cannot use (`refuse_next_slack_gateway_settings`):
+
+- a `SLACK_ALLOWED_USERS` entry with an `@`, split as the tfvars render the list. The gateway
+  matches member IDs exactly.
+- a `SLACK_HOME_CHANNEL` that is not a channel ID (`C` or `G`, then two or more of `A-Z0-9`).
+  Its notify route does not arm.
+- a `SLACK_BOT_TOKEN` that holds more than one comma-separated token, reported by count, or one
+  token with a comma or space left in it. The gateway takes one token, whole.
+
+A token that only the live Secret holds is checked after the generator recovers it. That
+refusal also removes the `terraform.tfvars` just written, and in the menu restores
+`install.env` as it was before the save. `upgrade.sh --plan` and `install.sh --dry-run` warn
+instead of refusing. An interactive `install.sh` asks for these three in the gateway's terms
+and asks again on an answer the gateway cannot use.
+
 Before a full apply the front doors read the live `PlatformAgent` through the install's own
 kubeconfig context and refuse when it carries a scope that neither the release record nor the
-keys account for, printing the `SCOPE_*` lines that reproduce it; a read that cannot decide (no
+keys account for, printing the `SCOPE_*` lines that reproduce it; the scoped pool's switch
+(`spec.security.scopedServiceAccountPool.enabled`) is weighed with the lists and the cap, so a
+pool armed on the CR that `SCOPED_SA_POOL_ENABLED` does not record is refused the same way, with
+that key among the lines, rather than disarmed by the apply. A read that cannot decide (no
 context, an unreadable CR or release) refuses too, because the apply itself needs no kubeconfig
 and would go ahead over a scope nobody read (`refuse_apply_over_undeclared_scope` in
 `installer_common.sh`; `upgrade.sh --plan` warns instead). An `install.sh` re-run
@@ -342,7 +591,11 @@ host project or no enforced organisation policy (`constraints/gcp.restrictServic
 legacy `constraints/serviceuser.services`; a policy in dry run enforces nothing and is not read)
 denies it, read through gcloud's active account, and that the identity Terraform applies with
 holds `resourcemanager.folders.setIamPolicy` on each folder and
-`resourcemanager.organizations.setIamPolicy` on each organisation, asked through Resource
+`resourcemanager.organizations.setIamPolicy` on each organisation, and, while the scoped service
+account pool is armed (`SCOPED_SA_POOL_ENABLED` true beside a container),
+`cloudasset.assets.searchAllResources` on each of them too, since the plan then lists the
+container's members for the pool and refuses without it, after the Asset API has been enabled
+(the remedy named is `roles/cloudasset.viewer` on that container), each asked through Resource
 Manager's `testIamPermissions` with a token minted for the credentials the google provider will
 read, in its order: `GOOGLE_OAUTH_ACCESS_TOKEN`, else `GOOGLE_CREDENTIALS`,
 `GOOGLE_CLOUD_KEYFILE_JSON` or `GCLOUD_KEYFILE_JSON` (an existing path is a key file, anything
@@ -402,7 +655,7 @@ done
 
 The grants left in the unreachable project are orphaned, not revoked. A `custom` permission set
 made of custom IAM roles cannot declare a scope: a custom IAM role is never carried into scoped
-projects (only the six predefined read roles in `scope.tf`'s allowlist are, those of them the host
+projects (only the predefined read roles in `scope.tf`'s allowlist are, those of them the host
 project holds), and the plan is refused until `PLATFORM_AGENT_CUSTOM_ROLES` carries
 `roles/container.clusterViewer` or `roles/container.viewer`.
 
@@ -480,7 +733,7 @@ is a hand-authored dotenv and a hand may well write `export`.
   the registry prefixes, cluster connection, the step runner. Sources
   `installer_common.sh`, so nothing is defined twice. `hack/ci-deploy.sh` sources
   `scripts/release/common.sh`, not this file.
-- **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. This is the roster the file's own header defers to: `common.sh`, `installer_common.sh`, `install.sh`, `upgrade.sh`, `hack/ci-env.sh`, `scripts/release/common.sh`, `scripts/release/reconcile_environment.sh`, `terraform/examples/full-install/lifecycle.sh`, and the staging-workload scripts all source it. It is kept out of `common.sh` and free of every helper in this directory so that each of them can take the predicate and nothing else — `hack/ci-env.sh` and `lifecycle.sh` want no part of the state file, and `installer_common.sh` is sourced by front doors that load no other helper. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched. `installer_common.sh` and `lifecycle.sh` fall back to a stub setting the same empty value when the file is absent, as `reconcile_environment.sh` does, so a tree without it reaches every cluster with a routable IP endpoint rather than refusing to run.
+- **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. The agent's runtime copy also selects `--internal-ip` for a cluster on its own VPC; this helper does not, for the reason its header gives. This is the roster the file's own header defers to: `common.sh`, `installer_common.sh`, `install.sh`, `upgrade.sh`, `hack/ci-env.sh`, `scripts/release/common.sh`, `scripts/release/reconcile_environment.sh`, `terraform/examples/full-install/lifecycle.sh`, and the staging-workload scripts all source it. It is kept out of `common.sh` and free of every helper in this directory so that each of them can take the predicate and nothing else — `hack/ci-env.sh` and `lifecycle.sh` want no part of the state file, and `installer_common.sh` is sourced by front doors that load no other helper. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched. `installer_common.sh` and `lifecycle.sh` fall back to a stub setting the same empty value when the file is absent, as `reconcile_environment.sh` does, so a tree without it reaches every cluster with a routable IP endpoint rather than refusing to run.
 - **[min_versions.sh](min_versions.sh)**: minimum tool versions, side-effect-free so
   `install.sh` can source it standalone before any checkout exists.
 - **[print_instructions_gchat.sh](print_instructions_gchat.sh)** /

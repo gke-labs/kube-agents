@@ -7,10 +7,13 @@ dump, a truncated one, one cluster's get-credentials failing under
 parallelism, and both never reading as a shorter candidate list.
 """
 
+import errno
 import hashlib
+import importlib
 import inspect
 import io
 import json
+import os
 import re
 import shlex
 import shutil
@@ -18,6 +21,9 @@ import subprocess
 import sys
 import textwrap
 import unittest
+import os
+from contextlib import contextmanager, redirect_stderr
+from unittest import mock
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -25,6 +31,16 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import collect  # noqa: E402
+
+# Every resolver asks the operator's answer when a run passes neither scope flag:
+# the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
+# that carries either (the sandbox session, a developer reproducing the guard)
+# would turn this suite's listing tests into refusals. The suite is about the
+# collector, not the host it runs on, so both are neutralised at import.
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+import fleet_scope_args as _fleet_scope_args  # noqa: E402
+
+_fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 from collect import Run  # noqa: E402
 
 
@@ -409,6 +425,46 @@ def context_of(dump=None, **overrides):
         # else -- pass it outright.
         base["pod_namespaces"] = {wl["ns"] for wl in base["workloads"] if wl["kind"] == "Pod"}
     return base
+
+
+class TestSweepPool(unittest.TestCase):
+    # The credential proxy admits four requests at once under its child memory
+    # budget at the operator's default 1Gi limit
+    # (docs/designs/credential-proxy-child-memory-budget.md §2.2). stall_watch.py and
+    # cluster_agent_reconcile.py pin the same figure for their listing pools; the
+    # broker computes the admitted count at runtime from its container limit and
+    # exposes no constant, so this pins the shared figure the pools agree on at the
+    # default limit -- four -- not the broker's running count. A non-default proxy
+    # limit is the caller's to re-sync (see collect.py and #2639).
+    DEFAULT_LIMIT_ADMITTED_COUNT = 4
+
+    def test_collector_pools_pin_the_default_limit_admitted_count(self):
+        self.assertEqual(collect.MAX_WORKERS, self.DEFAULT_LIMIT_ADMITTED_COUNT)
+        here = Path(__file__).resolve().parent
+        # Every module in this directory that runs a worker pool is a sweep
+        # collector and must be pinned. Discovered by the pool it runs
+        # (ThreadPoolExecutor), not by a constant name the diff happens to use, so
+        # a collector added under MAX_WORKERS, LIST_WORKERS, WORKERS or any other
+        # name fails this test rather than slipping through unpinned.
+        pooled = sorted(
+            path
+            for path in here.glob("*.py")
+            if not path.name.startswith("test_") and "ThreadPoolExecutor(" in path.read_text()
+        )
+        self.assertTrue(pooled, "no pooled collector modules discovered -- did the scan break?")
+        for path in pooled:
+            with self.subTest(collector=path.name):
+                mod = importlib.import_module(path.stem)
+                self.assertTrue(
+                    hasattr(mod, "MAX_WORKERS") and hasattr(mod, "collect_fleet"),
+                    f"{path.name} runs a worker pool but exposes no MAX_WORKERS + collect_fleet to pin; "
+                    "name its pool MAX_WORKERS and its entry collect_fleet, or widen this scan",
+                )
+                self.assertEqual(mod.MAX_WORKERS, collect.MAX_WORKERS)
+                self.assertEqual(
+                    inspect.signature(mod.collect_fleet).parameters["max_workers"].default,
+                    mod.MAX_WORKERS,
+                )
 
 
 class TestNoRequests(unittest.TestCase):
@@ -4208,11 +4264,73 @@ class TestCollectCluster(unittest.TestCase):
             next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == "no-pdb").impact,
         )
 
+    def test_a_no_pdb_candidate_carries_the_workloads_selector_verbatim(self):
+        """`finish` writes the PodDisruptionBudget from it (SOP §3.3)."""
+        workload = deployment("api")
+        workload["spec"]["selector"] = {
+            "matchLabels": {"app": "api"},
+            "matchExpressions": [{"key": "tier", "operator": "In", "values": ["web"]}],
+        }
+        result, _ = self.collect([workload])
+        by_slug = {c["check"]: c for c in result["candidates"]}
+        self.assertEqual(by_slug["no-pdb"]["pod_selector"], workload["spec"]["selector"])
+        self.assertNotIn("pod_selector", by_slug["no-requests"])
+
+    def test_a_selector_that_reaches_another_controllers_pods_is_not_carried(self):
+        """A `maxUnavailable` budget over pods with no scale subresource behind
+        them permits no evictions, so `finish` must not write one."""
+        api = deployment("api")
+        api["spec"]["selector"] = {"matchLabels": {"app": "api"}}
+        other = deployment("api-canary")
+        other["spec"]["template"]["metadata"] = {"labels": {"app": "api", "track": "canary"}}
+        other["spec"]["replicas"] = 1
+        result, _ = self.collect([api, other])
+        found = next(c for c in result["candidates"] if c["check"] == "no-pdb" and c["object"] == "Deployment/api")
+        self.assertNotIn("pod_selector", found)
+        self.assertEqual(found["namespace_pdbs"], [])
+        # Another scalable workload: the budget would be valid, so the worker decides.
+        self.assertNotIn("pod_selector_withheld", found)
+
+    def test_a_selector_that_reaches_pods_with_no_scale_behind_them_is_not_carried(self):
+        """A DaemonSet's pods, or a CronJob's Jobs': the disruption controller
+        cannot count them, so a `maxUnavailable` budget over them blocks drains."""
+        labels = {"app": "api"}
+        daemon = deployment("agent")
+        daemon["kind"] = "DaemonSet"
+        daemon["spec"]["template"]["metadata"] = {"labels": labels}
+        migration = {
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {"name": "migrate", "namespace": "default"},
+            "spec": {"schedule": "0 * * * *", "jobTemplate": {"spec": {"template": {"metadata": {"labels": labels}}}}},
+        }
+        for name, other in (("DaemonSet", daemon), ("CronJob", migration)):
+            with self.subTest(name):
+                api = deployment("api")
+                api["spec"]["selector"] = {"matchLabels": labels}
+                api["spec"]["template"]["metadata"] = {"labels": labels}
+                result, _ = self.collect([api, other])
+                found = next(
+                    c for c in result["candidates"] if c["check"] == "no-pdb" and c["object"] == "Deployment/api"
+                )
+                self.assertNotIn("pod_selector", found)
+                self.assertIn(f"{other['kind']}/{other['metadata']['name']}", found["pod_selector_withheld"])
+
     def test_the_collection_command_is_the_same_across_every_check(self):
         result, _ = self.collect([deployment("api")])
-        commands = {c["command"] for c in result["commands"]}
-        self.assertEqual(len(commands), 1)
-        self.assertIn("kubectl get", next(iter(commands)))
+        dump_commands = {
+            c["command"]
+            for c in result["commands"]
+            if c["check"] != "untargeted-compute-class-workload"
+        }
+        self.assertEqual(len(dump_commands), 1)
+        self.assertIn("kubectl get", next(iter(dump_commands)))
+        cc_cmd = next(
+            c["command"]
+            for c in result["commands"]
+            if c["check"] == "untargeted-compute-class-workload"
+        )
+        self.assertIn("kubectl get computeclasses", cc_cmd)
 
 
 class TestCollectFleet(unittest.TestCase):
@@ -4370,6 +4488,38 @@ class TestCollectFleet(unittest.TestCase):
         self.assertIn("2 cluster(s) collected, 1 other target(s); 3 candidate(s) to report", line)
         self.assertIn("no-pdb: 2; service-selects-nothing: 1", line)
         self.assertIn("clusters[].candidates", line)
+
+    def test_out_writes_the_manifest_to_the_file_and_only_the_summary_to_stdout(self):
+        manifest = {"clusters": [{"name": "p/l/a", "outcome": "collected", "candidates": [{"check": "no-pdb"}]}]}
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.json"
+            with patch.object(collect, "collect_fleet", return_value=manifest), \
+                    patch("sys.stdout", new_callable=io.StringIO) as out, \
+                    patch("sys.stderr", new_callable=io.StringIO):
+                self.assertEqual(collect.main(["obtainability-audit", "--out", str(path)]), 0)
+            self.assertEqual(json.loads(path.read_text()), manifest)
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["manifest.json"])
+        self.assertEqual(out.getvalue().strip(), collect.summary_line(manifest))
+
+    def test_a_write_that_dies_part_way_leaves_no_file(self):
+        """A collector killed mid-write, or a second run beside the first, must
+        not leave two documents spliced into one at the path."""
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.json"
+
+            def interrupted(fd):
+                raise KeyboardInterrupt
+
+            with patch.object(collect.os, "fsync", interrupted):
+                with self.assertRaises(KeyboardInterrupt):
+                    collect.write_manifest_atomically(path, '{"clusters": []}')
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+            path.write_text('{"previous": true}')
+            with patch.object(collect.os, "fsync", interrupted):
+                with self.assertRaises(KeyboardInterrupt):
+                    collect.write_manifest_atomically(path, '{"clusters": []}')
+            self.assertEqual(json.loads(path.read_text()), {"previous": True})
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["manifest.json"])
 
     def test_an_empty_fleet_summary_is_the_count_alone(self):
         manifest = {"clusters": [{"name": "p/l/a", "outcome": "collected", "candidates": []}]}
@@ -7549,6 +7699,40 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertIn("cluster-admin-binding", slugs)
         self.assertIn("netpol-missing", slugs)
         self.assertIn("workload-identity-off", slugs)
+
+    def test_only_netpol_missing_is_marked_default_deny(self):
+        """Its fix writes a default-deny policy, which can cut off callers
+        nobody listed; the marker keeps the sweep from opening it unasked.
+        Every check outside `TRIAGE_BY_SLUG` stays unmarked."""
+        privileged_pod = compliance_pod("bad")
+        privileged_pod["spec"]["containers"][0]["securityContext"] = {"privileged": True}
+        result = self.run_with(
+            workload_items=[privileged_pod],
+            netpol_items=[namespace("default")],
+            describe={"workloadIdentityConfig": {}},
+        )
+        marks = {c["check"]: c["needs_triage"] for c in result["candidates"]}
+        self.assertEqual(marks.pop("netpol-missing"), collect.NETPOL_DEFAULT_DENY_TRIAGE)
+        for slug in collect.TRIAGE_BY_SLUG:
+            marks.pop(slug, None)
+        self.assertTrue(marks)
+        self.assertEqual(set(marks.values()), {None})
+
+    def test_the_default_deny_marker_is_one_the_sweep_withholds(self):
+        """The two files carry the string separately; a drift would mark the
+        finding and let the sweep open it anyway."""
+        import audit_report
+
+        self.assertEqual(collect.NETPOL_DEFAULT_DENY_TRIAGE, "default-deny")
+        self.assertIn(collect.NETPOL_DEFAULT_DENY_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+
+    def test_every_fix_marker_is_one_the_sweep_withholds(self):
+        import audit_report
+
+        for slug, marker in collect.TRIAGE_BY_SLUG.items():
+            with self.subTest(slug=slug):
+                self.assertIn(slug, {spec.slug for spec in collect.OBTAINABILITY_CHECKS + collect.COMPLIANCE_CHECKS})
+                self.assertIn(marker, audit_report.NO_SWEEP_TRIAGE)
 
     def test_a_gate_failure_on_one_source_fails_the_whole_cluster(self):
         def run(argv, **kwargs):
@@ -12226,6 +12410,387 @@ class TestDefaultRun(unittest.TestCase):
         self.assertIsInstance(result.stdout, str)
         self.assertIsInstance(result.stderr, str)
 
+class CredentialsNoteTest(unittest.TestCase):
+    def test_a_refused_directory_is_the_failed_credentials_and_gcloud_is_not_run(self):
+        # `prepare_kubeconfig`'s note is the `get-credentials` result: gcloud is not run through a
+        # directory this run may not write (a root run would otherwise write a kubeconfig wherever a
+        # planted symlink points), and the entry built from the result names the owner or the link.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            owner = kc.parent.stat().st_uid
+            other = owner + 1
+            calls = []
+
+            def recording(argv, env=None, **kwargs):
+                calls.append(argv)
+                return run_of(0)
+
+            with patch.object(collect, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                _, result = collect.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((result.rc, calls), (collect.KUBECONFIG_REFUSED_RC, []))
+            self.assertTrue(result.stderr.startswith(f"{kc.parent} is owned by uid {owner} and this run is uid {other}; it could not be moved aside"), result.stderr)
+            # A symlink planted at the directory's name: refused the same way, nothing run through it,
+            # the target left empty.
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir(0o700)
+            linked = Path(tmp) / "linked" / "kubeconfig_p_c_l.yaml"
+            linked.parent.symlink_to(elsewhere)
+            with patch.object(collect, "KUBECONFIG_DIR", linked.parent):
+                _, result = collect.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((result.rc, calls, sorted(p.name for p in elsewhere.iterdir())), (collect.KUBECONFIG_REFUSED_RC, [], []))
+            self.assertIn("is a symbolic link", result.stderr)
+            # With the directory usable, gcloud runs and its result is returned as is.
+            with patch.object(collect, "KUBECONFIG_DIR", kc.parent):
+                _, ok = collect.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((ok.rc, ok.stderr, len(calls)), (0, "", 1))
+
+@contextmanager
+def owned_by(path, uid):
+    """`Path.stat` and `os.fstat` reporting `uid` as `path`'s owner -- on the path, and on a descriptor
+    opened on it (matched by device and inode) -- the test's own fact rather than the runner's uid, real
+    for every other path: the branch a mocked root takes then does not depend on who runs the suite."""
+    real_stat, real_fstat = Path.stat, os.fstat
+    try:
+        identity = os.lstat(path)
+        same = (identity.st_dev, identity.st_ino)
+    except FileNotFoundError:
+        same = None
+
+    def rewrite(result):
+        return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink, uid, result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime))
+
+    def fake(self, *args, **kwargs):
+        result = real_stat(self, *args, **kwargs)
+        return rewrite(result) if self == path else result
+
+    def fake_fstat(fd):
+        result = real_fstat(fd)
+        return rewrite(result) if same is not None and (result.st_dev, result.st_ino) == same else result
+
+    with patch.object(Path, "stat", fake), patch.object(os, "fstat", fake_fstat):
+        yield
+
+
+class PrepareKubeconfigTest(unittest.TestCase):
+    """The shared `.kubeconfigs` after a hand run as another uid, in either
+    order: root first, or uid 1000 first."""
+
+    def mode(self, path):
+        return path.stat().st_mode & collect.KUBECONFIG_DIR_MODE_MASK
+
+    def test_a_fresh_directory_is_sticky_and_world_writable_whatever_the_umask(self):
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / "home" / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            mask = os.umask(0o077)
+            try:
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            finally:
+                os.umask(mask)
+            # The leaf is the shared directory, chmodded rather than made through a cleared umask (the
+            # umask is process-wide and would race the worker threads); its missing ancestor keeps the
+            # caller's umask.
+            self.assertEqual((self.mode(kc.parent), self.mode(kc.parent.parent)), (collect.KUBECONFIG_DIR_MODE, 0o700))
+
+    def test_this_uids_directory_at_another_mode_is_brought_to_the_mode(self):
+        # uid 1000 first: a 0700 a narrow umask left, or a 0777 or 01777 an operator or an earlier rule
+        # left open to other uids, is brought to 0755, this uid's alone; one already there is left as is.
+        for mode in (0o700, 0o777, 0o1777, 0o755):
+            with self.subTest(mode=oct(mode)), TemporaryDirectory() as tmp:
+                kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+                kc.parent.mkdir()
+                kc.parent.chmod(mode)
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+                self.assertEqual(self.mode(kc.parent), collect.KUBECONFIG_DIR_MODE)
+
+    def test_this_uids_private_directory_whose_mode_cannot_change_is_kept(self):
+        # A filesystem that refuses the chmod (mode bits it does not carry, a read-only mount): a
+        # directory this uid owns, writable and searchable by it and by no other uid, is the one the
+        # old `mkdir` used, and the sticky bit would guard against no other uid there; it is kept at
+        # its mode and the keep is said, so the tick reads its clusters rather than refusing every
+        # one. A mode another uid can write under, one this uid cannot write under, and another
+        # uid's directory from root's side stay the note.
+        refused = OSError(errno.EPERM, "Operation not permitted")
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir()
+            kc.parent.chmod(0o700)
+            # The directory's owner is the test's own fact, this run's euid on the path and on the
+            # opened descriptor alike, so the keep is the branch taken whoever runs the suite.
+            with owned_by(kc.parent, os.geteuid()), patch.object(os, "fchmod", side_effect=refused), redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual(self.mode(kc.parent), 0o700)
+            self.assertIn(collect.KUBECONFIG_MODE_KEPT_FORMAT.format(directory=kc.parent, mode="0o700", wanted=oct(collect.KUBECONFIG_DIR_MODE), error=refused), err.getvalue())
+            for mode in (0o777, 0o555):
+                with self.subTest(mode=oct(mode)):
+                    kc.parent.chmod(mode)
+                    with owned_by(kc.parent, os.geteuid()), patch.object(os, "fchmod", side_effect=refused):
+                        note = collect.prepare_kubeconfig(kc)
+                    self.assertEqual(note, f"{kc.parent} is at mode {oct(mode)}, not {oct(collect.KUBECONFIG_DIR_MODE)}, and could not be changed ({refused})")
+            kc.parent.chmod(0o700)
+            with patch.object(os, "geteuid", return_value=collect.ROOT_UID), owned_by(kc.parent, collect.ROOT_UID + 1), patch.object(os, "fchmod", side_effect=refused):
+                note = collect.prepare_kubeconfig(kc)
+            self.assertEqual(note, f"{kc.parent} is at mode 0o700, not {oct(collect.KUBECONFIG_DIR_MODE)}, and could not be changed ({refused})")
+
+    def test_another_uids_directory_is_moved_aside_and_remade(self):
+        # root first: a 0755 directory a root hand run made, with root's 0600 kubeconfig in it, cannot
+        # hold this uid's files; it is renamed in the parent, which is this uid's, and a fresh one made.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            kc.write_text("root's")
+            other = kc.parent.stat().st_uid + 1
+            with patch.object(os, "geteuid", return_value=other):
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual((self.mode(kc.parent), kc.exists()), (collect.KUBECONFIG_DIR_MODE, False))
+            [aside] = [p for p in Path(tmp).iterdir() if p.name.startswith(".kubeconfigs.unusable-")]
+            self.assertTrue((aside / kc.name).exists())
+            # When the parent refuses the move, the note names the owner instead.
+            with patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                note = collect.prepare_kubeconfig(kc)
+            self.assertIn("could not be moved aside", note)
+            self.assertIn(f"this run is uid {other}", note)
+
+    def test_a_root_run_keeps_another_uids_directory(self):
+        # uid 1000 first, then a root hand run over `kubectl exec`: from root's side the directory is
+        # another uid's, and root keeps it rather than moving it aside, since root can write into it;
+        # the tick's stale file in it is another uid's from root's side too, replaced by a fresh one
+        # rather than written through. Mocked root shows both branches.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            kc.write_text("the tick's")
+            # The directory's owner is the test's own fact (uid 1), so the keep branch is the one
+            # exercised whoever runs the suite, root included; the log shows no move-aside.
+            with patch.object(os, "geteuid", return_value=collect.ROOT_UID), owned_by(kc.parent, collect.ROOT_UID + 1), owned_by(kc, collect.ROOT_UID + 1), redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertNotIn("moved aside", err.getvalue())
+            self.assertEqual((self.mode(kc.parent), kc.exists(), [p.name for p in Path(tmp).iterdir()]), (collect.KUBECONFIG_DIR_MODE, False, [".kubeconfigs"]))
+
+    def test_an_entry_planted_at_the_kubeconfig_name_is_never_used(self):
+        # The names are public and fixed; only this uid's own writable regular file may stand at one.
+        # A directory planted there (the shim's rename over it would fail on every tick) is moved aside
+        # under the directory's aside name and said, never entered; when it cannot be moved the note is
+        # the credentials result and gcloud is not run. Another uid's regular file is removed, not
+        # written through; this uid's own is kept for gcloud to overwrite; a link to a directory is
+        # removed with its target untouched.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
+            kc.mkdir(0o777)
+            (kc / "inside").write_text("planted")
+            with redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            [aside] = [p for p in kc.parent.iterdir() if p.name.startswith(kc.name + ".unusable-")]
+            self.assertEqual((os.path.lexists(kc), (aside / "inside").read_text()), (False, "planted"))
+            self.assertIn(collect.KUBECONFIG_NOT_A_FILE_MOVED_FORMAT.format(path=kc, aside=aside.name), err.getvalue())
+            kc.mkdir(0o777)
+            calls = []
+
+            def recording(argv, env=None, **kwargs):
+                calls.append(argv)
+                return run_of(0)
+
+            with patch.object(collect, "KUBECONFIG_DIR", kc.parent), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                _, result = collect.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((result.rc, calls, result.stderr), (collect.KUBECONFIG_REFUSED_RC, [], collect.KUBECONFIG_NOT_A_FILE_FORMAT.format(path=kc, error="[Errno 13] Permission denied")))
+            kc.rmdir()
+            kc.write_text("another's")
+            kc.chmod(0o666)
+            with owned_by(kc, os.geteuid() + 1):
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertFalse(kc.exists())
+            kc.write_text("mine")
+            with owned_by(kc, os.geteuid()):
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual(kc.read_text(), "mine")
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir(0o700)
+            kc.unlink()
+            kc.symlink_to(elsewhere)
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual((os.path.lexists(kc), elsewhere.is_dir(), self.mode(elsewhere)), (False, True, 0o700))
+
+    def test_a_symlink_at_the_kubeconfig_file_name_is_removed_not_written_through(self):
+        # The directory is the tick's and 01777, so its account can plant a link at the file's name;
+        # `exists()` follows it and root's `os.access` would keep it, and gcloud would then write a
+        # root-owned kubeconfig wherever it points. The rule removes the link (an lstat, before the
+        # access test) so gcloud writes a fresh file; the target is untouched, for the tick and for a
+        # root run over a directory another uid owns.
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target"
+            target.write_text("root's secret")
+            target.chmod(0o600)
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
+            kc.symlink_to(target)
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual((os.path.lexists(kc), target.read_text(), target.stat().st_mode & 0o7777), (False, "root's secret", 0o600))
+            kc.symlink_to(target)
+            with patch.object(os, "geteuid", return_value=collect.ROOT_UID), owned_by(kc.parent, collect.ROOT_UID + 1):
+                self.assertIsNone(collect.prepare_kubeconfig(kc))
+            self.assertEqual((os.path.lexists(kc), target.read_text(), target.stat().st_mode & 0o7777), (False, "root's secret", 0o600))
+
+    def test_a_rename_another_thread_won_is_already_moved_not_a_refusal(self):
+        # The first wave's threads start at once on a directory another uid left: each stats it, one
+        # rename wins, and the others' rename finds the source gone (or, across two runs in the same
+        # second, the aside already holding it). The loser reads what stands there now, the winner's
+        # fresh directory, and reports no refusal, so its cluster is read this run.
+        real_rename = Path.rename
+        for errno_lost, reason in ((errno.ENOENT, "No such file or directory"), (errno.ENOTEMPTY, "Directory not empty")):
+            with self.subTest(errno=errno_lost), TemporaryDirectory() as tmp:
+                kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+                kc.parent.mkdir(0o755)
+                kc.write_text("root's")
+                other = kc.parent.stat().st_uid + 1
+
+                def winner_first(path, target, _errno=errno_lost, _reason=reason):
+                    # The winner moved the directory and remade it between this thread's stat and rename.
+                    real_rename(path, target)
+                    path.mkdir(0o755)
+                    raise OSError(_errno, _reason)
+
+                with patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", winner_first), redirect_stderr(io.StringIO()) as err:
+                    self.assertIsNone(collect.prepare_kubeconfig(kc))
+                self.assertNotIn("could not be moved aside", err.getvalue())
+                [aside] = [p for p in Path(tmp).iterdir() if p.name.startswith(".kubeconfigs.unusable-")]
+                self.assertEqual(((aside / kc.name).read_text(), self.mode(kc.parent), kc.exists()), ("root's", collect.KUBECONFIG_DIR_MODE, False))
+                # Any other failure of the rename is still the refusal, naming the owner.
+                with patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                    self.assertIn("could not be moved aside", collect.prepare_kubeconfig(kc) or "")
+
+    def test_a_symlink_at_the_shared_directory_is_refused_not_followed(self):
+        # The agent's own account can plant `.kubeconfigs` as a symlink; a root hand run must not
+        # chmod or write into whatever it points at. The rule reads the name without following and
+        # refuses it with a note, for root as for the tick; the target is untouched.
+        with TemporaryDirectory() as tmp:
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir(0o700)
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.symlink_to(elsewhere)
+            for euid in (os.geteuid(), collect.ROOT_UID):
+                with self.subTest(euid=euid), patch.object(os, "geteuid", return_value=euid):
+                    note = collect.prepare_kubeconfig(kc)
+                self.assertEqual(note, collect.KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=kc.parent))
+                self.assertEqual((self.mode(elsewhere), kc.parent.is_symlink()), (0o700, True))
+
+    def test_a_directory_this_uid_cannot_stat_is_a_note_not_a_raise(self):
+        # A parent this uid cannot search, or a file where the directory should be: the note the
+        # callers log or report, as for every other refusal; the retrospective's boundary would
+        # otherwise catch it, the readiness reporter's copy has none.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            with patch.object(Path, "stat", side_effect=PermissionError(13, "Permission denied")):
+                note = collect.prepare_kubeconfig(kc)
+            self.assertEqual(note, f"{kc.parent} could not be read ([Errno 13] Permission denied)")
+
+    def test_a_directory_this_uid_cannot_make_is_a_note_not_a_raise(self):
+        # A `$HERMES_HOME` this uid cannot create in: the note, as the reporter's copy of the rule
+        # makes it, rather than a PermissionError out of the collectors' credentials step.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / "home" / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            with patch.object(Path, "mkdir", side_effect=PermissionError(13, "Permission denied")):
+                note = collect.prepare_kubeconfig(kc)
+            self.assertEqual(note, f"{kc.parent} could not be made ([Errno 13] Permission denied)")
+
+    def test_a_stale_kubeconfig_this_uid_cannot_write_is_removed_before_gcloud(self):
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            self.assertIsNone(collect.prepare_kubeconfig(kc))
+            kc.write_text("stale")
+            kc.chmod(0o400)
+            # The keep follows `os.access`, which root alone answers true for a 0400 file: stated as
+            # that answer rather than as the runner's uid, so a mocked euid does not decide it.
+            kept = os.access(kc, os.W_OK)
+            with patch.object(collect, "KUBECONFIG_DIR", kc.parent):
+                path, _ = collect.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
+            self.assertEqual((path, kc.exists()), (kc, kept))
+
+
+def run_of(rc: int, stdout: str = "", stderr: str = "") -> collect.Run:
+    return collect.Run(argv=[], rc=rc, stdout=stdout, stderr=stderr, duration_s=0.0)
+
+
+class DeclaredScopeFromTheToolTest(unittest.TestCase):
+    """The declared scope the agent carries from the platform_control fleet_scope
+    tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
+    an unread declared project is the one note, and without the flags the
+    listing runs as before."""
+
+    def setUp(self):
+        # The variable half of the operator's answer, per test as well as at
+        # import; the file half is pointed at a path that does not exist above.
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        collect.declared_scope.set(None, None)
+
+    def tearDown(self):
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        collect.declared_scope.set(None, None)
+
+    def test_the_declared_scope_is_swept_and_nothing_is_listed(self):
+        def run(argv, **kwargs):
+            raise AssertionError(f"the declared scope is the sweep; nothing should be listed: {argv}")
+
+        collect.declared_scope.set("ops-mgmt,payments-prod", "payments-staging=denied")
+        discovery = collect.discover_fleet(None, run=run)
+        self.assertEqual(discovery.projects, ["ops-mgmt", "payments-prod"])
+        self.assertIsNone(discovery.error)
+        self.assertIn("payments-staging (denied)", discovery.partial)
+        self.assertIn("fleet_scope tool", discovery.partial)
+
+    def test_every_declared_project_read_leaves_no_note(self):
+        collect.declared_scope.set("ops-mgmt payments-prod", "")
+        discovery = collect.discover_fleet(None, run=lambda *a, **k: run_of(1))
+        self.assertEqual((discovery.projects, discovery.partial), (["ops-mgmt", "payments-prod"], None))
+
+    def test_without_the_flags_the_listing_runs_as_before(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"]:
+                return run_of(0, "acme\n")
+            return run_of(0, "acme\nother\n")
+
+        collect.declared_scope.set(None, None)
+        self.assertEqual(collect.discover_fleet(None, run=run).projects, ["acme", "other"])
+
+    def test_a_project_override_inside_the_declared_scope_wins_and_one_outside_is_refused(self):
+        # With a declared scope the override is still a single-project run, but
+        # it cannot name a project the scope does not list, and it cannot run
+        # at all on a scoped sandbox without the tool's flags.
+        collect.declared_scope.set("ops-mgmt,payments-prod", None)
+        self.assertEqual(collect.discover_fleet("payments-prod", run=lambda *a, **k: run_of(1)).projects, ["payments-prod"])
+        outside = collect.discover_fleet("acme-only", run=lambda *a, **k: run_of(1))
+        self.assertEqual(outside.projects, [])
+        self.assertIn("declared scope does not list", outside.error)
+        with mock.patch.dict(os.environ, {"KUBEAGENTS_SCOPE_DECLARED": "true"}):
+            collect.declared_scope.set(None, None)
+            self.assertIn("got no collector_args", collect.discover_fleet("ops-mgmt", run=lambda *a, **k: run_of(1)).error)
+        collect.declared_scope.set(None, None)
+        self.assertEqual(collect.discover_fleet("acme-only", run=lambda *a, **k: run_of(1)).projects, ["acme-only"])
+
+    def test_main_hands_the_flags_to_the_resolver(self):
+        # The wiring the SOP relies on: the two flags main parses reach the
+        # holder the resolver reads, before anything else runs.
+        with mock.patch.object(collect.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
+            collect.main(["compliance-audit", "--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+
+    def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
+        # `--scope-unread` alone (what collector_args carries when no declared
+        # project was readable) is a boundary with nothing inside it: the run
+        # reports that and must not widen to the listing.
+        collect.declared_scope.set("", "payments-staging=denied")
+        discovery = collect.discover_fleet(None, run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed")))
+        self.assertEqual(discovery.projects, [])
+        self.assertIn("no project this install could read", discovery.error)
+
+    def test_the_flags_are_parsed_from_the_command_line(self):
+        proc = subprocess.run([sys.executable, collect.__file__, "--help"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--scope-projects", proc.stdout)
+        self.assertIn("--scope-unread", proc.stdout)
 
 if __name__ == "__main__":
     unittest.main()

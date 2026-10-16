@@ -50,8 +50,8 @@ variable "agent_container" {
   default     = "platform-agent"
 }
 
-# The sweep's worker writes its files through the shell sandbox, so an
-# earlier run's INVENTORY files are cleared there too. An install without a
+# The onboarding reports live on the shell sandbox, so an earlier run's
+# INVENTORY files are cleared there too. An install without a
 # sandbox matches no pod and skips that step.
 variable "sandbox_selector" {
   type        = string

@@ -9,6 +9,7 @@ plugin's side effects (origin binding, delivery trigger, presence marker) and
 the greeting context it returns.
 """
 
+import enum
 import json
 import subprocess
 import sys
@@ -24,6 +25,19 @@ import plugin  # noqa: E402
 
 # The one bench stack that writes the eval seam's marker.
 EVAL_STACK_DIR = "bench/tf/prebuilt/first-install-hello/"
+# The repository copy of the module the image ships at plugin.SANDBOX_EXEC_PATH.
+# A report name the eval seam accepts with from_report.
+BENCH_REPORT = "INVENTORY.bench-done.md"
+REPO_SANDBOX_EXEC = Path(__file__).resolve().parents[4] / "platform" / "scripts" / "sandbox_exec.py"
+
+
+# Hermes' Platform also has non-durable members, so a turn past a regressed
+# allowlist resolves instead of raising.
+class _Platform(enum.Enum):
+    GOOGLE_CHAT = "google_chat"
+    SLACK = "slack"
+    CLI = "cli"
+    API_SERVER = "api_server"
 
 
 def _fake_session_env(**values):
@@ -43,13 +57,24 @@ class PreLlmCallTest(unittest.TestCase):
         (self.data_dir / "onboarding" / "scan_completed.md").write_text(
             "COMPLETED-INSTRUCTIONS", encoding="utf-8"
         )
-        # Point the plugin at the temp workspace.
-        self._env = mock.patch.dict("os.environ", {"HERMES_HOME": str(self.data_dir)})
+        # Point the plugin at the temp workspace, and the real sandbox_exec at
+        # a managed config that is not there: the shell sandbox is off.
+        self._env = mock.patch.dict(
+            "os.environ",
+            {
+                "HERMES_HOME": str(self.data_dir),
+                "HERMES_MANAGED_CONFIG_PATH": str(self.data_dir / "no-managed-config.yaml"),
+            },
+        )
         self._env.start()
         # Inject framework doubles.
-        self.update_job = mock.MagicMock()
+        # A store with oobe only, unless a test says otherwise: update_job answers None for a
+        # job it does not have, as Hermes' does.
+        self.store_ids = {"oobe"}
+        self.update_job = mock.MagicMock(side_effect=lambda job_id, updates: {} if job_id in self.store_ids else None)
         self.trigger_job = mock.MagicMock()
         self._patches = [
+            mock.patch.object(plugin, "SANDBOX_EXEC_PATH", REPO_SANDBOX_EXEC),
             mock.patch.object(plugin, "update_job", self.update_job),
             mock.patch.object(plugin, "trigger_job", self.trigger_job),
             mock.patch.object(
@@ -120,8 +145,8 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertNotIn("COMPLETED-INSTRUCTIONS", result["context"])
         # Presence marker set, delivery bound to origin and triggered.
         self.assertTrue((self.data_dir / ".user_aligned").exists())
-        self.update_job.assert_called_once_with(
-            "bootstrap-inventory-delivery",
+        self.update_job.assert_any_call(
+            "oobe",
             {
                 "deliver": "origin",
                 "origin": {
@@ -131,7 +156,28 @@ class PreLlmCallTest(unittest.TestCase):
                 },
             },
         )
+        self.trigger_job.assert_called_once_with("oobe")
+
+    def test_both_delivery_jobs_present_are_bound_and_only_oobe_triggered(self):
+        # A post-fold install still carries the disabled old entry; binding it keeps the link if
+        # the install is rolled back to an image from before the fold.
+        self.store_ids = {"oobe", "bootstrap-inventory-delivery"}
+        self._call()
+        self.assertEqual([c.args[0] for c in self.update_job.call_args_list], ["oobe", "bootstrap-inventory-delivery"])
+        # Triggering also enables a job; the old entry stays disabled.
+        self.trigger_job.assert_called_once_with("oobe")
+
+    def test_an_install_without_oobe_binds_the_old_delivery_job(self):
+        # oobe removed itself under an earlier image; the old job still delivers.
+        self.store_ids = {"bootstrap-inventory-delivery"}
+        self._call()
+        self.assertTrue((self.data_dir / ".user_aligned").exists())
         self.trigger_job.assert_called_once_with("bootstrap-inventory-delivery")
+
+    def test_no_delivery_job_at_all_primes_nothing(self):
+        self.store_ids = set()
+        self.assertIsNone(self._call())
+        self.assertFalse((self.data_dir / ".user_aligned").exists())
 
     # --- Case B: user connects after scan finished (INVENTORY.md present) -
 
@@ -143,7 +189,83 @@ class PreLlmCallTest(unittest.TestCase):
         # The plugin must NOT inject the inventory itself (delivery is verbatim).
         self.assertNotIn("SECRET-FLEET-DATA", result["context"])
         self.assertTrue((self.data_dir / ".user_aligned").exists())
-        self.trigger_job.assert_called_once_with("bootstrap-inventory-delivery")
+        self.trigger_job.assert_called_once_with("oobe")
+
+    # --- the report on the shell sandbox's volume ------------------------
+
+    def _sandbox(self, read=None):
+        """A sandbox_exec double with the shell sandbox on."""
+        fake = mock.MagicMock()
+        fake.sandbox_enabled.return_value = True
+        fake.read_bytes.side_effect = read or (lambda *a, **k: None)
+        return mock.patch.object(plugin, "_load_sandbox_exec", return_value=fake), fake
+
+    def test_report_on_the_sandbox_greets_as_completed(self):
+        patch, fake = self._sandbox(read=lambda *a, **k: b"#")
+        with patch:
+            result = self._call()
+        self.assertIn("SCAN COMPLETED", result["context"])
+        fake.read_bytes.assert_called_once_with(
+            f"{plugin.SANDBOX_HOME}/{plugin.REPORT_NAME}",
+            max_bytes=1,
+            timeout=plugin.REPORT_CHECK_TIMEOUT_SECONDS,
+        )
+
+    def test_report_on_the_agent_pod_only_is_not_ready_with_the_sandbox_on(self):
+        (self.data_dir / "INVENTORY.md").write_text("STALE", encoding="utf-8")
+        patch, _ = self._sandbox()
+        with patch:
+            result = self._call()
+        self.assertIn("SCAN IN PROGRESS", result["context"])
+
+    def test_sandbox_read_that_fails_greets_as_in_progress_and_still_primes(self):
+        for error in (
+            subprocess.TimeoutExpired(["ssh"], plugin.REPORT_CHECK_TIMEOUT_SECONDS),
+            RuntimeError("ssh failed"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                for marker in (".user_aligned", plugin.GREETED_MARKER):
+                    (self.data_dir / marker).unlink(missing_ok=True)
+                self.trigger_job.reset_mock()
+
+                def read(*a, **k):
+                    raise error
+
+                patch, _ = self._sandbox(read=read)
+                with patch:
+                    result = self._call()
+                self.assertIn("SCAN IN PROGRESS", result["context"])
+                self.assertTrue((self.data_dir / ".user_aligned").exists())
+                self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
+                self.trigger_job.assert_called_once_with("oobe")
+
+    def test_unknown_sandbox_state_falls_back_to_the_local_report(self):
+        (self.data_dir / "INVENTORY.md").write_text("REPORT", encoding="utf-8")
+        with mock.patch.object(plugin, "_load_sandbox_exec", side_effect=RuntimeError("bad config")):
+            result = self._call()
+        self.assertIn("SCAN COMPLETED", result["context"])
+
+    def test_unloadable_sandbox_exec_falls_back_to_the_local_report(self):
+        with mock.patch.object(plugin, "SANDBOX_EXEC_PATH", self.data_dir / "absent.py"):
+            result = self._call()
+        self.assertIn("SCAN IN PROGRESS", result["context"])
+
+    def test_report_is_read_before_delivery_can_claim_it(self):
+        # Delivery moves the report aside once it holds .user_aligned and a trigger.
+        seen = []
+
+        def read(*a, **k):
+            seen.append(((self.data_dir / ".user_aligned").exists(), self.trigger_job.called))
+            return b"#"
+
+        patch, _ = self._sandbox(read=read)
+        with patch:
+            self._call()
+        self.assertEqual(seen, [(False, False)])
+
+    def test_the_repository_sandbox_exec_loads_and_reads_the_sandbox_off(self):
+        module = plugin._load_sandbox_exec()
+        self.assertFalse(module.sandbox_enabled())
 
     def test_origin_binding_happens_before_user_aligned(self):
         # update_job (origin binding) must precede touching .user_aligned so the
@@ -151,9 +273,10 @@ class PreLlmCallTest(unittest.TestCase):
         calls = []
         self.update_job.side_effect = lambda *a, **k: calls.append(
             ("bind", (self.data_dir / ".user_aligned").exists())
-        )
+        ) or {}
         self._call()
-        self.assertEqual(calls, [("bind", False)])
+        self.assertEqual(calls, [("bind", False)] * len(plugin.DELIVERY_JOB_IDS))
+        self.assertTrue((self.data_dir / ".user_aligned").exists())
 
     def test_missing_thread_id_omitted_from_origin(self):
         with mock.patch.object(
@@ -184,7 +307,8 @@ class PreLlmCallTest(unittest.TestCase):
 
         second = self._call(session_id="20260720_130000_efgh5678")
         self.assertIsNone(second)
-        self.update_job.assert_called_once()  # delivery still bound to the first chat
+        # Delivery still bound to the first chat: no bind and no trigger for the second session.
+        self.assertEqual(self.update_job.call_count, len(plugin.DELIVERY_JOB_IDS))
         self.trigger_job.assert_called_once()
 
     def test_greeted_marker_is_written(self):
@@ -220,11 +344,148 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertIsNotNone(self._call())
         self.assertTrue((self.data_dir / ".user_aligned").exists())
 
+    # --- the home channel ------------------------------------------------
+
+    def _arm_home_channel(self, configured=None, persist_error=None):
+        """Install doubles for Hermes' home-channel API; returns (persist, save_env_value).
+
+        HomeChannel is a recorder that returns its keyword arguments, so the
+        persisted value is the exact set of fields the plugin passed.
+        """
+        gateway_config = mock.MagicMock()
+        gateway_config.get_home_channel.return_value = configured
+        self.gateway_config = gateway_config
+        persist = mock.MagicMock(side_effect=persist_error)
+        save_env_value = mock.MagicMock()
+        for name, value in (
+            ("HomeChannel", lambda **fields: fields),
+            ("Platform", _Platform),
+            ("load_gateway_config", mock.MagicMock(return_value=gateway_config)),
+            ("persist_home_channel", persist),
+            ("save_env_value", save_env_value),
+        ):
+            patcher = mock.patch.object(plugin, name, value, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return persist, save_env_value
+
+    def test_first_durable_turn_sets_the_home_channel(self):
+        persist, save_env_value = self._arm_home_channel()
+        self._call()
+        persist.assert_called_once()
+        (home,), _ = persist.call_args
+        self.assertEqual(home["platform"], _Platform.GOOGLE_CHAT)
+        self.assertEqual(home["chat_id"], "spaces/AAA")
+        # Scheduled reports start their own threads, not the opening message's.
+        self.assertNotIn("thread_id", home)
+        save_env_value.assert_any_call("GOOGLE_CHAT_HOME_CHANNEL", "spaces/AAA")
+        save_env_value.assert_any_call("GOOGLE_CHAT_HOME_CHANNEL_THREAD_ID", "")
+
+    def test_slack_turn_sets_the_slack_home_channel(self):
+        persist, save_env_value = self._arm_home_channel()
+        with mock.patch.object(
+            plugin,
+            "get_session_env",
+            _fake_session_env(HERMES_SESSION_PLATFORM="slack", HERMES_SESSION_CHAT_ID="C123"),
+        ):
+            self._call(platform="slack")
+        self.gateway_config.get_home_channel.assert_called_once_with(_Platform.SLACK)
+        (home,), _ = persist.call_args
+        self.assertEqual((home["platform"], home["chat_id"]), (_Platform.SLACK, "C123"))
+        save_env_value.assert_any_call("SLACK_HOME_CHANNEL", "C123")
+
+    def test_configured_home_channel_is_left_alone(self):
+        persist, save_env_value = self._arm_home_channel(configured=mock.sentinel.home)
+        self.assertIsNotNone(self._call())
+        self.gateway_config.get_home_channel.assert_called_once_with(_Platform.GOOGLE_CHAT)
+        persist.assert_not_called()
+        save_env_value.assert_not_called()
+
+    def test_non_durable_turn_sets_no_home_channel(self):
+        persist, save_env_value = self._arm_home_channel()
+        with mock.patch.object(
+            plugin, "get_session_env", _fake_session_env(HERMES_SESSION_PLATFORM="cli", HERMES_SESSION_CHAT_ID="c1")
+        ):
+            self._call(platform="cli")
+        self._call(platform="test-local-surface-01")
+        persist.assert_not_called()
+        save_env_value.assert_not_called()
+
+    def test_failed_bind_sets_no_home_channel(self):
+        persist, save_env_value = self._arm_home_channel()
+        self.update_job.side_effect = RuntimeError("cron store unavailable")
+        self.assertIsNone(self._call())
+        persist.assert_not_called()
+        save_env_value.assert_not_called()
+
+    def test_later_session_sets_no_home_channel(self):
+        persist, _ = self._arm_home_channel()
+        self._call()
+        self._call(session_id="20260720_130000_efgh5678")
+        persist.assert_called_once()
+
+    def test_home_channel_has_every_field_load_gateway_config_reads(self):
+        # HomeChannel.from_dict indexes platform and chat_id; a block missing
+        # one raises out of load_gateway_config for every platform.
+        persist, _ = self._arm_home_channel()
+        with mock.patch.object(
+            plugin,
+            "get_session_env",
+            _fake_session_env(HERMES_SESSION_PLATFORM="google_chat", HERMES_SESSION_CHAT_ID="spaces/AAA"),
+        ):
+            self._call()
+        persist.assert_called_once()
+        (home,), _ = persist.call_args
+        for field in ("platform", "chat_id", "name"):
+            self.assertTrue(home.get(field), f"{field} is empty")
+        self.assertEqual(home["name"], "spaces/AAA")
+
+    # --- the greeting's home-channel sentence ------------------------------
+
+    def test_greeting_says_reports_come_here_when_the_turn_set_the_home_channel(self):
+        self._arm_home_channel()
+        self.assertIn(plugin.HOME_CHANNEL_INSTRUCTION, self._call()["context"])
+
+    def test_completed_greeting_also_gets_the_sentence(self):
+        self._arm_home_channel()
+        (self.data_dir / "INVENTORY.md").write_text("REPORT", encoding="utf-8")
+        context = self._call()["context"]
+        self.assertIn("SCAN COMPLETED", context)
+        self.assertIn(plugin.HOME_CHANNEL_INSTRUCTION, context)
+
+    def test_home_channel_sentence_promises_no_later_post(self):
+        # The completed greeting says the summary is already here, so the
+        # sentence must not promise a later post.
+        self.assertNotIn("I'll post", plugin.HOME_CHANNEL_INSTRUCTION)
+
+    def test_greeting_says_nothing_about_reports_when_a_home_channel_was_configured(self):
+        self._arm_home_channel(configured=mock.sentinel.home)
+        self.assertNotIn(plugin.HOME_CHANNEL_INSTRUCTION, self._call()["context"])
+
+    def test_greeting_says_nothing_about_reports_when_the_write_failed(self):
+        self._arm_home_channel(persist_error=OSError("read-only"))
+        self.assertNotIn(plugin.HOME_CHANNEL_INSTRUCTION, self._call()["context"])
+
+    def test_greeting_says_nothing_about_reports_without_the_home_channel_api(self):
+        # setUp leaves Hermes' home-channel names at None, as on an older Hermes.
+        self.assertNotIn(plugin.HOME_CHANNEL_INSTRUCTION, self._call()["context"])
+
+    def test_home_channel_sentence_names_no_command(self):
+        # The command to move the home channel is different on each platform.
+        self.assertNotIn("/", plugin.HOME_CHANNEL_INSTRUCTION)
+
+    def test_failed_home_channel_write_still_primes_onboarding(self):
+        _, save_env_value = self._arm_home_channel(persist_error=OSError("read-only"))
+        self.assertIn("SCAN IN PROGRESS", self._call()["context"])
+        self.trigger_job.assert_called_once()
+        self.assertTrue((self.data_dir / ".user_aligned").exists())
+        save_env_value.assert_not_called()
+
     # --- the eval seam ----------------------------------------------------
 
-    def _plant(self, variant="in_progress", phrase="just installed you", suffix="-running", age=0):
+    def _plant(self, variant="in_progress", phrase="just installed you", suffix="-running", age=0, **extra):
         marker = self.data_dir / f".bootstrap_greet_eval{suffix}"
-        request = {"variant": variant, "phrase": phrase, "written_at": time.time() - age}
+        request = {"variant": variant, "phrase": phrase, "written_at": time.time() - age, **extra}
         marker.write_text(json.dumps(request), encoding="utf-8")
         return marker
 
@@ -232,6 +493,25 @@ class PreLlmCallTest(unittest.TestCase):
         kwargs = {"platform": "api_server", "user_message": "hi! priya here, just installed you"}
         kwargs.update(overrides)
         return self._call(**kwargs)
+
+    def test_eval_marker_with_home_channel_set_adds_the_sentence(self):
+        self._plant(home_channel_set=True)
+        self.assertIn(plugin.HOME_CHANNEL_INSTRUCTION, self._eval_call()["context"])
+
+    def test_eval_marker_without_home_channel_set_adds_no_sentence(self):
+        self._plant()
+        self.assertNotIn(plugin.HOME_CHANNEL_INSTRUCTION, self._eval_call()["context"])
+
+    def test_eval_marker_home_channel_set_must_be_true_not_truthy(self):
+        self._plant(home_channel_set="true")
+        self.assertNotIn(plugin.HOME_CHANNEL_INSTRUCTION, self._eval_call()["context"])
+
+    def test_eval_marker_with_home_channel_set_writes_no_home_channel(self):
+        persist, save_env_value = self._arm_home_channel()
+        self._plant(home_channel_set=True)
+        self._eval_call()
+        persist.assert_not_called()
+        save_env_value.assert_not_called()
 
     def test_eval_marker_greets_on_a_platform_the_allowlist_excludes(self):
         self._plant()
@@ -245,6 +525,49 @@ class PreLlmCallTest(unittest.TestCase):
         result = self._eval_call()
         self.assertIn("SCAN COMPLETED", result["context"])
         self.assertIn("COMPLETED-INSTRUCTIONS", result["context"])
+
+    def test_eval_marker_from_report_reads_its_own_file_in_the_sandbox(self):
+        self._plant(variant=plugin.EVAL_VARIANT_FROM_REPORT, report=BENCH_REPORT)
+        for report, tag in ((b"#", "SCAN COMPLETED"), (None, "SCAN IN PROGRESS")):
+            with self.subTest(report=report):
+                patch, fake = self._sandbox(read=lambda *a, **k: report)
+                with patch:
+                    result = self._eval_call()
+                self.assertIn(tag, result["context"])
+                fake.read_bytes.assert_called_once_with(
+                    f"{plugin.SANDBOX_HOME}/{BENCH_REPORT}",
+                    max_bytes=1,
+                    timeout=plugin.REPORT_CHECK_TIMEOUT_SECONDS,
+                )
+
+    def test_eval_marker_from_report_never_reads_the_real_report(self):
+        # The real report on the local path, the sandbox off: only the named file counts.
+        (self.data_dir / plugin.REPORT_NAME).write_text("REPORT", encoding="utf-8")
+        self._plant(variant=plugin.EVAL_VARIANT_FROM_REPORT, report=BENCH_REPORT)
+        self.assertIn("SCAN IN PROGRESS", self._eval_call()["context"])
+        (self.data_dir / BENCH_REPORT).write_text("BENCH", encoding="utf-8")
+        self.assertIn("SCAN COMPLETED", self._eval_call()["context"])
+
+    def test_eval_marker_from_report_needs_a_bench_report_name(self):
+        for report in (None, "", plugin.REPORT_NAME, "../INVENTORY.bench-x.md", "/opt/data/INVENTORY.bench-x.md",
+                       "INVENTORY.bench-X.md", ".ssh/id_rsa", "INVENTORY.bench-x.md\n"):
+            with self.subTest(report=report):
+                extra = {} if report is None else {"report": report}
+                self._plant(variant=plugin.EVAL_VARIANT_FROM_REPORT, **extra)
+                patch, fake = self._sandbox(read=lambda *a, **k: b"#")
+                with patch:
+                    self.assertIsNone(self._eval_call())
+                fake.read_bytes.assert_not_called()
+
+    def test_eval_marker_from_report_touches_no_onboarding_state(self):
+        self._plant(variant=plugin.EVAL_VARIANT_FROM_REPORT, report=BENCH_REPORT)
+        patch, _ = self._sandbox(read=lambda *a, **k: b"#")
+        with patch:
+            self.assertIsNotNone(self._eval_call())
+        self.update_job.assert_not_called()
+        self.trigger_job.assert_not_called()
+        self.assertFalse((self.data_dir / ".user_aligned").exists())
+        self.assertFalse((self.data_dir / plugin.GREETED_MARKER).exists())
 
     def test_eval_marker_touches_no_onboarding_state(self):
         self._plant()
@@ -359,7 +682,7 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertIsNone(self._eval_call())
         result = self._call(user_message="hi! priya here, just installed you")
         self.assertIn("SCAN IN PROGRESS", result["context"])
-        self.update_job.assert_called_once()
+        self.assertEqual(self.update_job.call_count, len(plugin.DELIVERY_JOB_IDS))
         self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
 
 

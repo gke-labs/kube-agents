@@ -22,8 +22,10 @@
 #                     does before its first push). Exit 0 means the wiring
 #                     holds end to end. The proxy refuses repositories the
 #                     install does not manage, so this passes only once the
-#                     PlatformAgent's gitRepo names <name> (the wrapper's
-#                     AGENT_STATE_RESET does that before calling it).
+#                     PlatformAgent names <name> as its GitOps repository (the
+#                     github alias's gitRepo, or a repositories[] entry with
+#                     role gitops; the wrapper's AGENT_STATE_RESET writes one
+#                     or the other before calling it).
 #   archive <name>    mark the repository read-only and drop its minter entry.
 #
 # Env. Required, with no defaults, because each names an install or an

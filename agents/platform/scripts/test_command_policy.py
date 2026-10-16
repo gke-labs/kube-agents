@@ -3,9 +3,15 @@ import shlex
 import unittest
 from pathlib import Path
 
+import command_policy
 from command_policy import (
     evaluate,
     GCLOUD_READ_COMMANDS,
+    _GCLOUD_FILE_WRITE_FLAGS,
+    _GCLOUD_IDENTITY_FLAGS,
+    _IMPERSONATION_FLAGS,
+    _KUBECTL_FILE_WRITE_FLAGS,
+    _KUBECTL_IDENTITY_FLAGS,
     _gcloud_asks_for_help,
     _gcloud_words_and_flag,
 )
@@ -1279,6 +1285,14 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
 
+    def test_the_networking_collectors_per_gateway_nat_read_is_allowed(self):
+        # The collector scopes `get-nat-mapping-info` to one gateway with
+        # `--nat-name`; unscoped it returns every VM on the router and each
+        # gateway's ceiling would be compared against another's VMs.
+        argv = ["gcloud", "compute", "routers", "get-nat-mapping-info", "nat-router",
+                "--nat-name=nat-gw", "--region=us-central1", "--project=p", "--format=json"]
+        self.assertTrue(evaluate(argv).allowed)
+
     def test_a_leaf_read_ships_with_the_discovery_read_that_binds_its_argument(self):
         # The allowlist was derived from SOP command spellings, and a SOP
         # spelling arrives with its arguments already bound: check 2.2 reads
@@ -1571,7 +1585,7 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
              "gce-startup-script-status evidence read"),
             (["gcloud", "compute", "instances", "describe", "vm-1",
               "--zone=us-east4-a", "--project=p", "--format=json"],
-             "the SOP's 2.3 ops-agent-guest-health read"),
+             "the gke-managed-node triage read behind SOP 2.1"),
         ):
             with self.subTest(desc=desc):
                 decision = evaluate(argv)
@@ -1826,6 +1840,157 @@ class TheConfigConnectorSkillStaysInsideThePolicy(unittest.TestCase):
         ):
             with self.subTest(desc=desc):
                 self.assertFalse(evaluate(argv).allowed, desc)
+
+
+class RefusalsSayTheBoundaryIsFinal(unittest.TestCase):
+    """Every categorical refusal says it is a boundary, not an error to fix.
+
+    A refusal that only said what was wrong with this argv read as a failed
+    command, and a model retried the same action through another spelling --
+    another verb, another tool, another identity (#1945). The phrase is
+    asserted literally rather than by importing the constant, so rewording
+    the notice away fails here instead of passing tautologically.
+    """
+
+    BOUNDARY_PHRASE = "permission boundary, not an error to work around"
+    # The two shapes permit different retries, and carrying the wrong one is
+    # itself the defect: a verb refusal telling the model "re-run without the
+    # flag" names a flag the argv does not have. Each shape is pinned by a
+    # phrase the other must not carry, so swapping the constants fails here.
+    ACTION_PHRASE = "refused however it is attempted"
+    FLAG_PHRASE = "may be retried without the flag"
+
+    ACTION_REFUSALS = (
+        (["kubectl", "delete", "pod", "web-0"], "kubernetes.read-only"),
+        (["kubectl", "cluster-info", "dump"], "kubernetes.read-only"),
+        (["gcloud", "projects", "delete", "p"], "gcp.read-only"),
+    )
+    FLAG_REFUSALS = (
+        (["kubectl", "get", "pods", "--as", "system:admin"],
+         "identity.caller-supplied-impersonation"),
+        (["kubectl", "--kuberc", "/workspace/kr.yaml", "get", "pods"],
+         "kubernetes.kuberc-forbidden"),
+        (["kubectl", "get", "pods", "--token", "t"],
+         "kubernetes.identity-change-forbidden"),
+        (["kubectl", "get", "pods", "--profile-output", "/workspace/x"],
+         "kubernetes.file-write-forbidden"),
+        (["gcloud", "--flags-file", "/workspace/f.yaml", "info"],
+         "gcp.flags-file-forbidden"),
+        (["gcloud", "info", "--account", "x@example.com"],
+         "gcp.identity-change-forbidden"),
+        (["gcloud", "info", "--log-http-log-file", "/workspace/l"],
+         "gcp.file-write-forbidden"),
+    )
+
+    def test_action_refusals_state_finality_for_the_action(self):
+        for argv, rule_id in self.ACTION_REFUSALS:
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(rule_id, decision.rule_id)
+                self.assertIn(self.BOUNDARY_PHRASE, decision.message)
+                self.assertIn(self.ACTION_PHRASE, decision.message)
+                self.assertNotIn(self.FLAG_PHRASE, decision.message)
+
+    def test_flag_refusals_permit_only_the_flagless_retry(self):
+        for argv, rule_id in self.FLAG_REFUSALS:
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(rule_id, decision.rule_id)
+                self.assertIn(self.BOUNDARY_PHRASE, decision.message)
+                self.assertIn(self.FLAG_PHRASE, decision.message)
+                self.assertNotIn(self.ACTION_PHRASE, decision.message)
+
+    # Every flag refusal, with the set its rule refuses. A rule whose message
+    # names a subset closes the gap with a catch-all phrase; the phrase is
+    # listed here so the test knows which names may be left out and which may
+    # not, and a flag added to a set fails until its message names it or the
+    # message carries the catch-all.
+    FLAG_RULE_SETS = (
+        (["kubectl", "get", "pods", "--as-uid", "1000"], _IMPERSONATION_FLAGS, None),
+        (["kubectl", "--kuberc", "/workspace/kr.yaml", "get", "pods"], {"--kuberc"}, None),
+        (["kubectl", "get", "pods", "--client-key=/k"], _KUBECTL_IDENTITY_FLAGS,
+         "and the other credential flags"),
+        (["kubectl", "get", "pods", "--output-directory=/tmp/x"], _KUBECTL_FILE_WRITE_FLAGS, None),
+        (["gcloud", "--flags-file=/workspace/f.yaml", "info"], {"--flags-file"}, None),
+        (["gcloud", "info", "--credential-file-override=/k.json"], _GCLOUD_IDENTITY_FLAGS,
+         "and the other identity flags"),
+        (["gcloud", "info", "--log-http-log-file=/tmp/l"], _GCLOUD_FILE_WRITE_FLAGS, None),
+    )
+
+    def test_a_flag_refusal_names_every_flag_its_rule_refuses(self):
+        # The notice says "retried without the flag", so the message must let
+        # the caller identify the flag it passed: every flag in the rule's set
+        # is named as a whole word (so `--as` is not satisfied by `--as-uid`),
+        # or the message carries the rule's catch-all phrase.
+        for argv, flags, catch_all in self.FLAG_RULE_SETS:
+            with self.subTest(argv=argv):
+                message = evaluate(argv).message
+                named = {f for f in flags if re.search(rf"(?<![\w-]){re.escape(f)}(?![\w-])", message)}
+                if catch_all is None:
+                    self.assertEqual(set(flags), named, f"unnamed: {sorted(set(flags) - named)}")
+                else:
+                    self.assertIn(catch_all, message)
+                    self.assertTrue(named, "a catch-all is not a substitute for naming none")
+
+    def test_refusals_a_respelling_answers_do_not_claim_a_boundary(self):
+        # Re-running with a spelling the policy accepts is the legitimate
+        # retry for these, so calling them a boundary would stop retries the
+        # policy permits: a readable flag for the first two, the one allowed
+        # asset type for the third.
+        for argv in (
+            ["kubectl", "--unknown-flag", "get", "pods"],
+            ["gcloud", "--unknown-flag", "container", "clusters", "list"],
+            ["gcloud", "asset", "search-all-resources", "--scope=projects/p"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertNotIn(self.BOUNDARY_PHRASE, decision.message)
+
+class LocalRenderTests(unittest.TestCase):
+    def test_client_renders_and_manifest_reads_are_local(self):
+        for argv in (
+            ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client", "-o", "yaml"],
+            ["kubectl", "patch", "--local", "-f", "m.yaml", "-p", "{}", "-o", "yaml"],
+            ["kubectl", "label", "pod", "x", "--list"],
+            ["kubectl", "apply", "view-last-applied", "deploy/x"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=True"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=1"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=T"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=unchanged"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run="],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=Client"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--help=true"],
+            ["kubectl", "patch", "--local=true", "-f", "m.yaml", "-p", "{}", "-o", "yaml"],
+            ["kubectl", "label", "pod", "x", "--list=1"],
+            ["kubectl", "scale", "--help"],
+            ["kubectl", "-n", "kube-system", "patch", "-h"],
+        ):
+            self.assertTrue(command_policy.local_render(argv), argv)
+        # A release track is not part of the verb the shim prints.
+        self.assertEqual(("container", "clusters", "resize"), command_policy.evaluate(["gcloud", "beta", "container", "clusters", "resize", "c", "--size", "3"]).verb_tuple)
+        self.assertEqual(("compute", "disks", "delete"), command_policy.evaluate(["gcloud", "compute", "disks", "delete", "SECRETDISKNAME"]).verb_tuple)
+        self.assertEqual(("compute", "instance-groups", "managed", "resize"), command_policy.evaluate(["gcloud", "compute", "instance-groups", "managed", "resize", "mig-1", "--size", "3", "--zone", "us-central1-a"]).verb_tuple)
+        self.assertEqual(("iam", "service-accounts", "keys", "create"), command_policy.evaluate(["gcloud", "iam", "service-accounts", "keys", "create", "k.json"]).verb_tuple)
+        # kubectl's false dry-run spellings reach the server.
+        for value in ("false", "0", "F", "none", "server"):
+            self.assertFalse(command_policy.local_render(["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=" + value]), value)
+        # The subcommand word counts as apply's subcommand only, not as a resource name.
+        self.assertFalse(command_policy.local_render(["kubectl", "scale", "deployment", "kube-dns", "view-last-applied", "-n", "kube-system", "--replicas=3"]))
+        self.assertFalse(command_policy.local_render(["kubectl", "delete", "deploy", "kube-dns", "view-last-applied"]))
+
+    def test_server_dry_runs_real_writes_and_passthroughs_are_not(self):
+        for argv in (
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=server"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=none"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3"],
+            ["kubectl", "exec", "pod", "--", "kubectl", "apply", "--dry-run=client", "-f", "x"],
+            ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=client", "--dry-run=none"],
+        ):
+            self.assertFalse(command_policy.local_render(argv), argv)
 
 
 if __name__ == "__main__":

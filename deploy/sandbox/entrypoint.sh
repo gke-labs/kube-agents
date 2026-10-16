@@ -56,7 +56,13 @@ PREPARE_IMAGE_TREES_ARG="--prepare-image-trees"
 # home root above, so a home that gains a database gains a tripwire with it.
 AGENT_POD_DATABASES="${AGENT_POD_DATABASES:-kanban.db state.db}"
 AGENT_POD_DATABASE_NOTE="NOT-THE-AGENT-POD-DATABASE.txt"
-SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION"
+# KUBEAGENTS_SCOPE_DECLARED: the operator's one bit about the scope, read by the
+# fleet-audit collectors (fleet_scope_args.py) from the root-owned file below
+# first, then from the session's environment, which it reaches only through this
+# list, as the GKE_* variables do.
+# Where the scope answer is written for the collectors, root-owned (step 4).
+SANDBOX_SCOPE_DECLARED_FILE="/run/kube-agents-sandbox/scope-declared"
+SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED"
 
 # Nearly every name under $DATA is owned by uid 1000 -- the image trees step 1a
 # stages are root's, everything else is the model's -- and all of it survives a
@@ -234,6 +240,16 @@ mount_point_exists() {
   awk -v path="$1" '$5 == path { found = 1 } END { exit !found }' "$SANDBOX_MOUNTINFO"
 }
 
+# Whether $DEFAULTS holds at least one tree. The loops over "$DEFAULTS"/* skip
+# an unmatched glob, so an empty $DEFAULTS would stage nothing and check nothing
+# while every step still reported success.
+defaults_hold_a_tree() {
+  for entry in "$DEFAULTS"/*; do
+    [ -e "$entry" ] && return 0
+  done
+  return 1
+}
+
 # 1. The model's durable directory. A PVC mounts over the image's /opt/data and
 #    arrives owned by root, so the agent could not write to it. Not recursive:
 #    only the mount point needs fixing, and a recursive chown over a volume that
@@ -254,9 +270,9 @@ chown agent:agent "$DATA"
 # It exits before the marker below and before steps 2 to 4, so it writes
 # nothing outside $DATA: no authorized_keys, no host keys, no sshd drop-in.
 if [ "${1:-}" = "$PREPARE_IMAGE_TREES_ARG" ]; then
-  if [ ! -d "$DEFAULTS" ]; then
-    log "no $DEFAULTS in this image: there are no image trees to stage, and the"
-    log "shell container's read-only mounts over them would be empty."
+  if [ ! -d "$DEFAULTS" ] || ! defaults_hold_a_tree; then
+    log "no image trees under $DEFAULTS in this image: there is nothing to stage, and"
+    log "the shell container's read-only mounts over them would be empty."
     exit 1
   fi
   for root in $SANDBOX_HOME_ROOTS; do
@@ -329,6 +345,13 @@ chown agent:agent "$DATA/.sandbox"
 #     by the machine-home path and by the profile-home path the SOPs use. They
 #     are copies rather than symlinks so that each is a real directory the
 #     operator can mount read-only on its own.
+# Under the operator the per-tree check below is the guarantee, and with no
+# tree under $DEFAULTS, missing or empty, it would check nothing and pass.
+if [ "$SANDBOX_IMAGE_TREES" = "$IMAGE_TREES_READ_ONLY_MOUNTS" ] && ! defaults_hold_a_tree; then
+  log "no image trees under $DEFAULTS, so there is nothing to check the read-only"
+  log "mounts against. Refusing to start; the image is broken."
+  exit 1
+fi
 if [ -d "$DEFAULTS" ]; then
   for root in $SANDBOX_HOME_ROOTS; do
     home="$(home_for_root "$root")"
@@ -362,6 +385,13 @@ if [ -d "$DEFAULTS" ]; then
       log "$(cd "$DEFAULTS" && echo *) in $home are read-only mounts"
       ;;
     "")
+      # Outside the operator a broken image only warns, as a missing $DEFAULTS
+      # does below, but it must not report a sync that staged nothing.
+      if ! defaults_hold_a_tree; then
+        log "no image trees under $DEFAULTS — the agent's skills, SOPs and shared"
+        log "scripts will be absent from $home and every skill that names one will fail."
+        continue
+      fi
       for entry in "$DEFAULTS"/*; do
         [ -e "$entry" ] || continue
         stage_image_tree "$home" "$(basename "$entry")"
@@ -585,6 +615,14 @@ install -d -m 0755 /etc/ssh/sshd_config.d
   echo "SetEnv $setenv_args"
 } >"$SANDBOX_SSHD_DROPIN"
 chmod 0644 "$SANDBOX_SSHD_DROPIN"
+# The scope answer as a root-owned file too: the SetEnv above hands sessions a
+# variable they can unset or override in one word, and the fleet-audit
+# collectors (fleet_scope_args.py) read this file before the variable so a run
+# that did would still be refused. Written whatever the value, so a session
+# cannot supply the file either.
+install -d -m 0755 "$(dirname "$SANDBOX_SCOPE_DECLARED_FILE")"
+printf '%s\n' "${KUBEAGENTS_SCOPE_DECLARED:-false}" >"$SANDBOX_SCOPE_DECLARED_FILE"
+chmod 0644 "$SANDBOX_SCOPE_DECLARED_FILE"
 # Fail here rather than in sshd. An invalid drop-in makes sshd exit during
 # startup with a message about /etc/ssh/sshd_config.d/10-sandbox-env.conf, a
 # file that exists in no source tree; `-t` names it while the entrypoint is

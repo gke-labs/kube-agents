@@ -213,7 +213,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 		{Name: "TASKS", Subjects: []string{"a2a.tasks.>"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
 			MaxAge: 72 * time.Hour, MaxBytes: 21474836480, Replicas: 1,
-			MaxConsumers:      a2aTasksMaxConsumersFloor,
+			MaxConsumers:      a2aTasksMaxConsumers(a2aTestAgent()),
 			MaxMsgsPerSubject: a2aTasksMaxMsgsPerSubject, AllowDirect: true},
 		{Name: "DIRECTORY", Subjects: []string{"a2a.agents.>"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,

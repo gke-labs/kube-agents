@@ -18,9 +18,14 @@ from __future__ import annotations
 
 import ast
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+
+import yaml
+from pathlib import Path
 
 from . import _harness as h
 from ._harness import command_policy
@@ -57,6 +62,20 @@ class C1IsolationIsStructural(unittest.TestCase):
         {"envoy-credential-proxy", "agent-api-proxy", "credential-broker"}
     )
 
+    def _one_match(self, pattern: str, text: str, what: str) -> str:
+        """The one match of pattern in text, failing unless there is exactly one.
+
+        Zero matches means the anchor moved and the comparison it feeds would
+        compare nothing; two means the test cannot tell which one is meant.
+        """
+        found = re.findall(pattern, text)
+        self.assertEqual(
+            len(found),
+            1,
+            "%s is not a single match (%d); this test compared nothing" % (what, len(found)),
+        )
+        return found[0]
+
     def test_C1_the_sandbox_identity_carries_no_cloud_annotation(self) -> None:
         """The sharpest assertion in this set after #913, and the one F10 owns.
 
@@ -89,6 +108,112 @@ class C1IsolationIsStructural(unittest.TestCase):
         # The absence above is only meaningful if the function still renders the
         # ServiceAccount the sandbox pod actually names.
         self.assertIn("shellSandboxServiceAccountName(agent)", body)
+
+    _WATCHER_AUDIENCE = "kubeagents-credential-proxy-watcher"
+
+    def test_C1_the_watcher_token_is_mounted_only_in_agent_api_auth(self) -> None:
+        """The watcher role reaches fleet API servers and Pub/Sub through the broker.
+
+        The broker confers the role by audience alone, so the question is where a
+        token for the watcher audience is mounted, under any volume name, in any
+        workload: exactly the gateway's agent-api-auth container. Not the Hermes
+        container beside it, which runs model-chosen tools and holds only the
+        chat token; not the sandbox, where model-authored shell runs; not the
+        broker. Checked on every golden.
+        """
+        for fixture, documents in h.golden_documents().items():
+            mounts = set()
+            gateways = []
+            for workload in h.objects_of_kind(documents, "Deployment") + h.objects_of_kind(documents, "StatefulSet"):
+                name = workload["metadata"]["name"]
+                if workload["kind"] == "Deployment" and name.endswith("-gateway"):
+                    gateways.append(name)
+                spec = workload["spec"]["template"]["spec"]
+                watcher_volumes = {
+                    v["name"]
+                    for v in spec.get("volumes", [])
+                    for source in (v.get("projected") or {}).get("sources", [])
+                    if (source.get("serviceAccountToken") or {}).get("audience") == self._WATCHER_AUDIENCE
+                }
+                for container in h.containers_of(workload):
+                    if any(m["name"] in watcher_volumes for m in container.get("volumeMounts", [])):
+                        mounts.add((name, container["name"]))
+            self.assertEqual(len(gateways), 1, f"{fixture}: expected one gateway Deployment")
+            self.assertEqual(
+                mounts,
+                {(gateways[0], "agent-api-auth")},
+                f"{fixture}: a watcher-audience token is mounted in {sorted(mounts)}",
+            )
+
+    def test_C1_the_watcher_cluster_read_never_relays_a_client_credential(self) -> None:
+        """A GKE clusters.get answer carries masterAuth's client certificate and key
+        on a cluster with issuance on: a credential for that API server, wider
+        than anything the watcher role may do. The broker relays the CA only."""
+        import json
+
+        answer = json.dumps({
+            "name": "c",
+            "masterAuth": {"clusterCaCertificate": "CA", "clientCertificate": "CERT", "clientKey": "KEY",
+                           "username": "admin", "password": "pw"},
+        }).encode()
+        relayed = json.loads(h.watcher_policy.project_cluster(answer))
+        self.assertEqual(relayed["masterAuth"], {"clusterCaCertificate": "CA"})
+
+    def test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads(self) -> None:
+        policy = h.watcher_policy
+        target = "kagents-dev/us-east4/fleet-a/"
+        for method in ("POST", "PUT", "PATCH", "DELETE"):
+            for path in ("api/v1/events", "api/v1/namespaces/default/configmaps/x"):
+                decision = policy.evaluate_k8s(method, target + path, {})
+                self.assertFalse(decision.allowed, f"{method} {path} reaches a fleet API server")
+        for path in (
+            "api/v1/pods",
+            "api/v1/namespaces/default/pods",
+            "api/v1/namespaces/default/pods/x/exec",
+            "api/v1/namespaces/default/serviceaccounts/x/token",
+            "api/v1/namespaces/default/secrets/db",
+            "apis/apps/v1/deployments",
+            # The deprecated watch/<resource> paths the API server still
+            # serves: a watch of anything, Secrets included.
+            "api/v1/watch/secrets",
+            "apis/apps/v1/watch/deployments",
+        ):
+            self.assertFalse(policy.evaluate_k8s("GET", target + path, {}).allowed, f"GET {path} is relayed")
+        self.assertTrue(policy.evaluate_k8s("GET", target + "api/v1/events", {"watch": ["1"]}).allowed)
+
+    def test_C1_the_watcher_pubsub_routes_reach_only_the_configured_subscription(self) -> None:
+        policy = h.watcher_policy
+        configured = "projects/kagents-dev/subscriptions/platform-agent-drift-audit-sub"
+        for other in (
+            "projects/kagents-dev/subscriptions/another-sub",
+            "projects/elsewhere-1/subscriptions/platform-agent-drift-audit-sub",
+        ):
+            decision = policy.evaluate_gcp("POST", policy.PUBSUB_HOST, f"v1/{other}:pull", b"{}", configured)
+            self.assertFalse(decision.allowed, f"the watcher relay pulls {other}")
+        self.assertFalse(
+            policy.evaluate_gcp("POST", policy.PUBSUB_HOST, f"v1/{configured}:pull", b"{}", "").allowed,
+            "with the detector off the relay still reaches Pub/Sub",
+        )
+        self.assertTrue(
+            policy.evaluate_gcp("POST", policy.PUBSUB_HOST, f"v1/{configured}:pull", b'{"maxMessages":1}', configured).allowed
+        )
+
+    def test_C1_only_the_watcher_role_reaches_the_watcher_routes(self) -> None:
+        proxy = h.credential_proxy
+        for prefix in (h.watcher_policy.WATCHER_GCP_PREFIX, h.watcher_policy.WATCHER_K8S_PREFIX):
+            self.assertEqual(proxy.required_roles(prefix + "x"), (proxy.CALLER_ROLE_WATCHER,), prefix)
+
+    def test_C1_the_operator_pins_the_drift_detectors_own_default_subscription(self) -> None:
+        """The broker refuses every subscription but the one the operator names.
+
+        When the CR names none, the operator names the detector's default; the
+        two constants drifting apart would refuse the detector's every pull.
+        """
+        operator = re.search(r'driftDetectorDefaultSubscription = "([^"]+)"', h.text("broker_split_go"))
+        detector = re.search(r'defaultSubscriptionName = "([^"]+)"', h.text("drift_detector_main_go"))
+        self.assertIsNotNone(operator)
+        self.assertIsNotNone(detector)
+        self.assertEqual(operator.group(1), detector.group(1))
 
     def test_C1_the_credential_broker_is_its_own_deployment(self) -> None:
         """Topology, not configuration -- which is the upgrade #913 delivered.
@@ -428,15 +553,25 @@ class C1IsolationIsStructural(unittest.TestCase):
         # satisfy this.
         body = h.go_function_body(fence, "buildA2ASessionNetworkPolicy")
         selector = re.search(
-            r"PodSelector: metav1\.LabelSelector\{\s*MatchLabels: map\[string\]string\{(.+?)\}",
+            r"PodSelector: metav1\.LabelSelector\{\s*MatchLabels: (?:map\[string\]string\{(.+?)\}|(\w+)\(\))",
             body,
             re.DOTALL,
         )
         self.assertIsNotNone(selector, "the session fence no longer has a podSelector")
-
+        if selector.group(1) is not None:
+            literal = selector.group(1)
+        else:
+            # The selector comes from a helper shared with the broker fence's
+            # session peer, so one spelling cannot drift from the other. Read
+            # the helper's body, not its name: the map literal is still the
+            # thing compared, through one more hop.
+            helper = h.go_function_body(fence, selector.group(2))
+            inner = re.search(r"return map\[string\]string\{(.+?)\}", helper, re.DOTALL)
+            self.assertIsNotNone(inner, "the session selector helper %s returns no map literal" % selector.group(2))
+            literal = inner.group(1)
         required = {}
         for key_expr, value_expr in re.findall(
-            r"(\"[^\"]+\"|\w+):\s*(\"[^\"]+\"|\w+),", selector.group(1)
+            r"(\"[^\"]+\"|\w+):\s*(\"[^\"]+\"|\w+),", literal
         ):
             key = key_expr.strip('"') if key_expr.startswith('"') else go_const(fence, key_expr)
             value = value_expr.strip('"') if value_expr.startswith('"') else go_const(fence, value_expr)
@@ -453,11 +588,101 @@ class C1IsolationIsStructural(unittest.TestCase):
             "fences no pod: fence requires %r, spawner stamps %r" % (required, stamped),
         )
 
+    def test_C1_the_a2a_gateway_admits_the_collector_and_the_operator_to_the_metrics_port_and_nobody_else(self) -> None:
+        """The gateway's fences admit two peers, to one port: the collector and the
+        operator's pods, to metrics.
+
+        The A2A gateway's doors listen on loopback, and its fences deny every
+        pod on their ports; a door reached from the pod network is a task
+        submission endpoint guarded by a bearer token alone. The metrics
+        listener is the one port on that pod the pod network is meant to
+        reach, and only from the managed-Prometheus collector's namespace --
+        the credential broker's second rule, copied -- and from the operator's
+        pods in the operator's namespace, which read the gateway's chat counter
+        into status.usage: the rule the broker's and the Hermes gateway's
+        policies carry on their metrics ports. A rule that admits any other
+        peer, or admits either to any other port, widens the gateway past what
+        the metrics listener needed.
+
+        Read from the operator's real render (the fixture its Go test keeps
+        equal to the fences as the reconciler applies them, with the operator
+        in its default namespace), with both doors armed so all three fences
+        exist: each door's, and the gateway's own, which renders on every next
+        gateway door or no door because the metrics listener binds every
+        interface (#2473).
+        """
+        documents = h.yaml_documents("a2a_gateway_ingress_fixture")
+        policies = h.objects_of_kind(documents, "NetworkPolicy")
+        deployments = h.objects_of_kind(documents, "Deployment")
+        self.assertEqual(len(policies), 3, "the fixture no longer renders the three gateway fences")
+        self.assertTrue(
+            any(p["metadata"]["name"].endswith("-a2a-gateway-netpol") for p in policies),
+            "the fixture no longer renders the gateway's own fence, the one no door flag decides",
+        )
+        self.assertEqual(len(deployments), 1, "the fixture no longer carries the gateway's ports")
+
+        gateway = deployments[0]
+        ports = [p for c in h.containers_of(gateway) for p in c.get("ports") or []]
+        metrics = [p["containerPort"] for p in ports if p.get("name") == "a2a-metrics"]
+        doors = {p["containerPort"] for p in ports if p.get("name") != "a2a-metrics"}
+        self.assertEqual(len(metrics), 1, "the gateway declares no single a2a-metrics port")
+        self.assertTrue(doors, "the fixture renders no door port, so nothing here is fenced")
+        self.assertNotIn(metrics[0], doors, "the metrics port is also a door's port")
+        collector = {"matchLabels": {"kubernetes.io/metadata.name": "gke-gmp-system"}}
+        # The operator peer, pinned to the operator's own label constants.
+        labels = h.text("operator_metrics_peer")
+
+        def go_const(name: str) -> str:
+            match = re.search(rf"^\s*(?:const\s+)?{name}\s*=\s*\"([^\"]+)\"", labels, re.MULTILINE)
+            self.assertIsNotNone(match, f"{name} is no longer a string constant")
+            return match.group(1)
+
+        operator = [{
+            "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kubeagents-system"}},
+            "podSelector": {"matchLabels": {go_const("operatorPodNameLabel"): go_const("operatorPodNameValue")}},
+        }]
+        # The labels the gateway pod carries, not the Deployment's name: a
+        # fence requiring a label the pod lacks selects nothing, and the API
+        # server reports that as success.
+        pod_labels = ((gateway["spec"].get("template") or {}).get("metadata") or {}).get("labels") or {}
+        self.assertTrue(pod_labels, "the fixture carries no gateway pod labels, so no selector can be checked")
+
+        for policy in policies:
+            name = policy["metadata"]["name"]
+            spec = policy["spec"]
+            with self.subTest(policy=name):
+                selector = spec.get("podSelector") or {}
+                required = selector.get("matchLabels") or {}
+                self.assertEqual(set(selector), {"matchLabels"}, "the fence's podSelector is not plain matchLabels")
+                self.assertTrue(required, "the fence's podSelector is empty, so it selects every pod")
+                self.assertEqual(
+                    required, {key: pod_labels.get(key) for key in required},
+                    "the fence selects labels the gateway pod does not carry, so it fences no pod: "
+                    "fence requires %r, pod carries %r" % (required, pod_labels),
+                )
+                self.assertIn("Ingress", spec.get("policyTypes") or [], "the fence governs no ingress")
+                rules = spec.get("ingress") or []
+                self.assertEqual(len(rules), 2, "the fence admits more than the collector's rule and the operator's")
+                self.assertEqual(
+                    rules[0].get("from"), [{"namespaceSelector": collector}],
+                    "the first rule admits a peer other than the collector's namespace, alone",
+                )
+                self.assertEqual(
+                    rules[1].get("from"), operator,
+                    "the second rule admits a peer other than the operator's pods in the operator's namespace",
+                )
+                for rule in rules:
+                    self.assertEqual(
+                        rule.get("ports"), [{"port": metrics[0], "protocol": "TCP"}],
+                        "a peer is admitted to a port other than the metrics listener's",
+                    )
+
     def test_C1_a_session_pod_carries_no_kubernetes_identity(self) -> None:
         """The premise the fence's rule set rests on.
 
-        The fence grants DNS, the bus and LiteLLM and nothing else -- no
-        API-server rule, no 443, no metadata rule beyond DNS -- and that is
+        The fence grants DNS, the bus and LiteLLM and nothing else (plus, under
+        the operator's cluster-view flag, the credential broker on its one
+        port) -- no API-server rule, no 443, no metadata rule beyond DNS -- and that is
         only safe while a session pod holds no credential it could use against
         the API server if it found a route.
 
@@ -471,9 +696,13 @@ class C1IsolationIsStructural(unittest.TestCase):
 
         - Automount stays off, so the default-audience token -- the one the API
           server accepts -- is never mounted.
-        - The one token that is mounted is a projected token naming the bus
-          audience. The API server refuses it for anything else, so it is not a
-          cluster credential even though it is a Kubernetes one.
+        - Every token that is mounted is a projected token naming an audience
+          that is not the API server's: the bus, and, under the operator's
+          A2A_SESSION_CLUSTER_VIEW flag, the credential broker's session
+          audience. The API server refuses both for anything else, so neither
+          is a cluster credential even though both are Kubernetes ones; the
+          broker token reaches one pod on one port, where TokenReview and the
+          broker's role table decide what it may run.
         - The ServiceAccount it is minted for is bound to nothing, so even a
           token that reached the API server would authenticate as a principal
           holding no permissions.
@@ -508,6 +737,10 @@ class C1IsolationIsStructural(unittest.TestCase):
             "the session pod projects no ServiceAccount token at all; if the "
             "bus credential moved, this test has to move with it",
         )
+        # The audiences a session pod may hold, by constant name: the bus, and
+        # the broker's session audience that the cluster-view flag projects.
+        # Anything else is a token for a destination the fence never admitted.
+        permitted_audiences = ("lib.BusTokenAudience", "credentialProxySessionAudience")
         for projection in projections:
             with self.subTest(projection=projection.strip()[:80]):
                 self.assertIn(
@@ -517,12 +750,17 @@ class C1IsolationIsStructural(unittest.TestCase):
                     "server, which is the credential the fence assumes the pod "
                     "does not have",
                 )
-                self.assertIn(
-                    "lib.BusTokenAudience",
-                    projection,
+                self.assertTrue(
+                    any(audience in projection for audience in permitted_audiences),
                     "the session pod's token names an audience other than the "
-                    "bus, so it reaches something the fence did not account for",
+                    "bus or the broker's session audience, so it reaches "
+                    "something the fence did not account for",
                 )
+        self.assertTrue(
+            any("lib.BusTokenAudience" in projection for projection in projections),
+            "no projection names the bus audience; the session pod lost its bus "
+            "credential, which is not what this test is for",
+        )
 
         # The identity itself. `a2a_spawner` names the ServiceAccount from
         # config; the operator is what decides whether that name has any
@@ -902,19 +1140,9 @@ class C1IsolationIsStructural(unittest.TestCase):
         api = h.text("operator_bus_api")
         library = h.text("a2a_bus_credentials")
 
-        def one(pattern: str, text: str, what: str) -> str:
-            found = re.findall(pattern, text)
-            self.assertEqual(
-                len(found),
-                1,
-                "%s is not a single string constant (%d matches); this test "
-                "compared nothing" % (what, len(found)),
-            )
-            return found[0]
-
-        mount = one(r'a2aBusTokenPath\s*=\s*"([^"]+)"', operator, "a2aBusTokenPath")
-        filename = one(r'a2aBusTokenFile\s*=\s*"([^"]+)"', operator, "a2aBusTokenFile")
-        reader = one(r'BusTokenPath\s*=\s*"([^"]+)"', library, "lib.BusTokenPath")
+        mount = self._one_match(r'a2aBusTokenPath\s*=\s*"([^"]+)"', operator, "a2aBusTokenPath")
+        filename = self._one_match(r'a2aBusTokenFile\s*=\s*"([^"]+)"', operator, "a2aBusTokenFile")
+        reader = self._one_match(r'BusTokenPath\s*=\s*"([^"]+)"', library, "lib.BusTokenPath")
 
         self.assertEqual(
             mount.rstrip("/") + "/" + filename,
@@ -932,10 +1160,10 @@ class C1IsolationIsStructural(unittest.TestCase):
         # spelling, which is what keeps the literal read here the one the
         # kubelet actually mints under. Comparing the controller constant to
         # the API constant instead would be the same value twice.
-        rendered_audience = one(
+        rendered_audience = self._one_match(
             r'A2ABusTokenAudience\s*=\s*"([^"]+)"', api, "A2ABusTokenAudience"
         )
-        controller_audience = one(
+        controller_audience = self._one_match(
             r"a2aBusTokenAudience\s*=\s*(\S+)", operator, "the controller's audience"
         )
         self.assertEqual(
@@ -946,7 +1174,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             "compared is not the one the projection mints under"
             % controller_audience,
         )
-        demanded_audience = one(
+        demanded_audience = self._one_match(
             r'BusTokenAudience\s*=\s*"([^"]+)"', library, "lib.BusTokenAudience"
         )
         self.assertEqual(
@@ -984,6 +1212,236 @@ class C1IsolationIsStructural(unittest.TestCase):
     # a SensitiveEnvVars key, pinned to the controller constant by
     # TestPluginCannotOverrideBusEnv rather than by this suite.
     BUS_TOKEN_FILE_ENV = "A2A_BUS_TOKEN_FILE"
+
+    def test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary(
+        self,
+    ) -> None:
+        """The cluster view's contract, which sits astride the same boundary.
+
+        The operator renders `credentialProxySessionAudience` into the broker's
+        CREDENTIAL_PROXY_SESSION_AUDIENCE and the gateway projects its own
+        constant of the same name as the audience of every session pod's
+        broker token; the two modules cannot import each other, and each one's
+        tests compare its constant to itself. A rename on either side ships
+        with both Go suites green and every session pod's `kubectl` answered
+        401, because the token names an audience the broker never asks the
+        TokenReview about. The two env names the operator renders onto the
+        gateway and the gateway reads back are the same kind of pair, and a
+        drift there is quieter still: the view reads as off and nothing says
+        so. Both pairs are pinned here. The broker has no constant to pin: it
+        reads CREDENTIAL_PROXY_SESSION_AUDIENCE raw, so the operator's render
+        is the only spelling it ever sees.
+        """
+        operator = h.text("broker_split_go")
+        manifests = h.text("manifests_go")
+        a2a_manifests = h.text("a2a_session_fence")
+        spawner = h.text("a2a_spawner")
+        config = h.text("a2a_gateway_config")
+        rendered = self._one_match(
+            r'credentialProxySessionAudience\s*=\s*"([^"]+)"', operator, "the operator's session audience"
+        )
+        projected = self._one_match(
+            r'credentialProxySessionAudience\s*=\s*"([^"]+)"', spawner, "the spawner's session audience"
+        )
+        self.assertEqual(
+            rendered,
+            projected,
+            "the operator tells the broker to accept audience %r and the spawner "
+            "projects %r: every session pod's broker call is refused as an "
+            "unknown audience on an install whose Go suites are green" % (rendered, projected),
+        )
+        # Both halves use their constant where it matters, so the equality
+        # above is about the strings that actually flow.
+        self._one_match(
+            r'Name:\s*"CREDENTIAL_PROXY_SESSION_AUDIENCE",\s*Value:\s*credentialProxySessionAudience',
+            manifests,
+            "the broker env render of the session audience",
+        )
+        self._one_match(
+            r"Audience:\s+credentialProxySessionAudience,",
+            spawner,
+            "the spawner's projection of the session audience",
+        )
+
+        for name in ("A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"):
+            with self.subTest(env=name):
+                self._one_match(r'Name:\s*"%s"' % name, a2a_manifests, "the operator's render of %s" % name)
+                self._one_match(r'os\.Getenv\("%s"\)' % name, config, "the gateway's read of %s" % name)
+
+        # The shim's half: the spawner sets three names and the client reads
+        # three names, in a Go module and a Python script that share nothing.
+        # A rename on either side ships green and the first kubectl of the
+        # first flag-on session fails with "CREDENTIAL_PROXY_URL is not
+        # configured", a 401, or a kubeconfig filed under /opt/data.
+        shim = h.text("credential_proxy_client")
+        for name in ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME"):
+            with self.subTest(env=name):
+                self._one_match(r'Name:\s*"%s"' % name, spawner, "the spawner's render of %s" % name)
+                self.assertTrue(
+                    re.search(r'environ(?:\.get)?\(\s*"%s"' % name, shim) or re.search(r'getenv\(\s*"%s"' % name, shim),
+                    "the shim no longer reads %s by that name" % name,
+                )
+
+    def test_C1_the_target_allowlist_env_names_agree_across_the_module_boundary(self) -> None:
+        """The platform agent's allowlists cross the same boundary, fail-open.
+
+        The operator renders the CR's integration.{googleChat,slack}.allowedUsers
+        onto the gateway as A2A_TARGET_ALLOWED_USERS_{GCHAT,SLACK}; the gateway
+        reads the same two names and checks a session's request to delegate to
+        the platform agent against them. The gateway reads an absent variable
+        as "all authenticated users", by design (an absent CR list means the
+        same), so a rename on either side is not a refusal anyone sees: every
+        requester is allowed and both Go suites are green. The two spellings
+        are pinned equal here, and the absent-list branch is pinned as allow so
+        a future "fix" that flips it to deny is a visible change.
+        """
+        a2a_manifests = h.text("a2a_session_fence")
+        allowlist = h.text("a2a_gateway_allowlist")
+
+        for const, env in (
+            ("a2aTargetAllowedUsersGchatEnvVar", "EnvTargetAllowedUsersGchat"),
+            ("a2aTargetAllowedUsersSlackEnvVar", "EnvTargetAllowedUsersSlack"),
+        ):
+            with self.subTest(pair=const):
+                rendered = self._one_match(r'%s\s*=\s*"([^"]+)"' % const, a2a_manifests, "the operator's %s" % const)
+                read = self._one_match(r'%s\s*=\s*"([^"]+)"' % env, allowlist, "the gateway's %s" % env)
+                self.assertEqual(
+                    rendered,
+                    read,
+                    "the operator renders %r and the gateway reads %r: every delegation "
+                    "is allowed on an install whose Go suites are green" % (rendered, read),
+                )
+                self._one_match(r"Name:\s*%s," % const, a2a_manifests, "the operator's render of %s" % const)
+                self._one_match(r"os\.(?:Getenv|LookupEnv)\(%s\)" % env, allowlist + h.text("a2a_gateway_config"), "the gateway's read of %s" % env)
+
+        # The absent-list branch is allow, stated in the function that answers.
+        body = _go_code(allowlist, "targetAllows")
+        self.assertIn("if set == nil {", body, "targetAllows lost its absent-list branch")
+        self.assertIn("return true", body.split("if set == nil {")[1].split("}")[0],
+                      "targetAllows answers an absent list with something other than allow")
+
+        # And the membership check under a list is pinned too: a loosened
+        # join (`||` for `&&`, say) or a dropped blank-subject guard would
+        # admit a subject that is not in the compiled set, or the blank
+        # pseudonym TestABlankListIsNobody relies on reading as "nobody" --
+        # neither of which a rename-only reading of this function would
+        # catch, since both sides still agree on the env names.
+        self.assertIn(
+            'return subject != "" && set[subject]',
+            body,
+            "targetAllows's membership check changed; a looser join or a "
+            "dropped blank-subject guard could admit a requester the "
+            "compiled list does not name",
+        )
+
+    def test_C1_the_delegate_artifact_is_spelled_once(self) -> None:
+        """The reserved artifact name crosses a module boundary in two places.
+
+        `lib.ArtifactDelegate` is defined once in `a2a/lib/payload.go`
+        (spec-a2a-payloads.md, "Reserved artifact names"); the worker-adapter
+        publishes it and the gateway relay switches on it to route a
+        session's delegate ask off the ordinary chat-rendering path. Both
+        are meant to reference the constant rather than the literal
+        `"delegate"`: a hand-spelled literal on either side compiles and
+        passes every Go suite today, because a string literal that happens
+        to equal a constant's value is indistinguishable from the constant at
+        every call site -- and stops agreeing with it silently the day
+        lib.ArtifactDelegate's value changes. `"delegated"` text sits beside
+        both consumers (a chat-facing note on each one) and is excluded
+        rather than mistaken for a reserved-name literal.
+        """
+        payload = h.text("a2a_payload")
+        self.assertIn(
+            'ArtifactDelegate = "delegate"',
+            payload,
+            "lib.ArtifactDelegate's definition moved or changed value; this test compared nothing",
+        )
+        for key, what in (
+            ("a2a_worker_adapter", "the worker-adapter's publish site"),
+            ("a2a_gateway_relay", "the gateway relay's switch"),
+        ):
+            src = h.text(key)
+            self.assertIn("lib.ArtifactDelegate", src, f"{what} no longer references the shared constant")
+            hand_spelled = re.sub(r'"delegated[^"]*"', "", src)
+            self.assertNotIn(
+                '"delegate"', hand_spelled,
+                f"{what} spells the reserved artifact name by hand instead of through lib.ArtifactDelegate",
+            )
+
+    def test_C1_the_delegate_text_cap_is_spelled_once(self) -> None:
+        """Both halves of the length check reference the one constant.
+
+        The worker-adapter refuses an over-length delegate request before it
+        reaches the bus (`validateDelegate`); the gateway ignores one that
+        arrives anyway (`handleDelegateRequest`'s own comment: "the adapter
+        holds the same cap", because the adapter's check is bypassable by
+        anything that can reach the bus directly, so this is a second,
+        independent line of defence rather than a redundant one). Both call
+        `lib.DelegateTextCap`; a hand-typed `16 * 1024` or `16384` on either
+        side compiles, passes every Go suite today, and silently stops
+        agreeing with lib.DelegateTextCap's definition the day someone edits
+        only that constant.
+        """
+        payload = h.text("a2a_payload")
+        self.assertIn(
+            "DelegateTextCap = ",
+            payload,
+            "lib.DelegateTextCap's definition moved; this test compared nothing",
+        )
+        magic_number = re.compile(r"\b16\s*\*\s*1024\b|\b16384\b")
+        # Scoped to the function that makes the check, and to its code
+        # without comments (_go_code): elsewhere in delegation.go the wake's
+        # budget and two comments name the constant too, and a comment inside
+        # the function could name it beside a hand-spelled check.
+        for key, function, what in (
+            ("a2a_worker_adapter_delegate", "validateDelegate", "the worker-adapter's validateDelegate"),
+            ("a2a_gateway_delegation", "handleDelegateRequest", "the gateway's handleDelegateRequest"),
+        ):
+            body = _go_code(h.text(key), function)
+            self.assertIn("lib.DelegateTextCap", body, f"{what} no longer references the shared cap")
+            self.assertNotRegex(body, magic_number, f"{what} hand-spells the delegate text cap")
+
+    def test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape(self) -> None:
+        """The MCP tool schema and `lib.DelegateRequest` spell the same two fields.
+
+        The session's harness speaks MCP to the worker-adapter's own server,
+        which answers `tools/list` with `delegateToolSchema` -- a
+        `map[string]any` literal, because that is what an MCP tool definition
+        is on the wire, so it cannot reference `lib.DelegateRequest`'s json
+        tags the way Go code can. The two are independent spellings of one
+        shape: the model calls the tool using the schema's field names, the
+        adapter decodes the call straight into `lib.DelegateRequest`
+        (`callDelegate`'s `Arguments lib.DelegateRequest`), and a rename on
+        either side with nothing on the other is a tool the model calls
+        correctly by its own schema while the adapter quietly reads a field
+        that was never sent -- an empty addressee or an empty text, refused
+        downstream for a reason that looks like a model mistake.
+        """
+        payload = h.text("a2a_payload")
+        struct = payload.split("type DelegateRequest struct {")[1].split("\n}")[0]
+        tags = sorted(re.findall(r'`json:"(\w+)"`', struct))
+        self.assertEqual(
+            ["addressee", "text"],
+            tags,
+            "lib.DelegateRequest's wire shape changed; this test compared nothing",
+        )
+
+        mcp = h.text("a2a_worker_adapter_mcp")
+        schema = mcp.split("var delegateToolSchema")[1].split("\n}\n")[0]
+        properties = sorted(re.findall(r'"(\w+)":\s*map\[string\]any\{"type": "string"', schema))
+        self.assertEqual(
+            tags,
+            properties,
+            "the tool schema's declared properties no longer match lib.DelegateRequest's json tags",
+        )
+        required_block = re.search(r'"required":\s*\[\]string\{([^}]*)\}', schema)
+        self.assertIsNotNone(required_block, "delegateToolSchema's required list moved or changed shape")
+        required = sorted(re.findall(r'"(\w+)"', required_block.group(1)))
+        self.assertEqual(
+            tags,
+            required,
+            "the tool schema's required list no longer matches lib.DelegateRequest's json tags",
+        )
 
     def test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules(
         self,
@@ -1080,6 +1538,177 @@ class C1IsolationIsStructural(unittest.TestCase):
             "buildPodTemplateSpec no longer drops a plugin-supplied "
             "a2aBusTokenFileEnv by that constant; the name this test compared "
             "across the module boundary is not the name the operator refuses",
+        )
+
+    def test_C1_the_rendered_bridge_is_not_the_agent_principal(self) -> None:
+        """The operator renders the bridge from the agent container, and the
+        copy is where the A5 split could be undone without a grant changing.
+
+        The pod's ServiceAccount resolves to the `agent` principal at the
+        callout, so a bridge holding the projected bus token would be a second
+        workload wearing the agent's identity; and the agent's `A2A_BUS_USER`
+        names that principal's inbox, which the bridge's grants do not cover.
+        The bridge is the static `bridge` principal, with the password from its
+        own Secret key. This reads the three places the render decides that:
+        the mount filter, the dropped env names, and the env it adds.
+        """
+        src = h.text("a2a_bridge_render")
+        build = h.go_function_body(src, "buildA2ABridgeContainer")
+        self.assertIn(
+            "!a2aIsBusTokenMount(m)",
+            build,
+            "the rendered bridge copies the agent's mounts without dropping the "
+            "bus token; it would authenticate as the agent principal",
+        )
+        dropped = src[src.index("var a2aBridgeDroppedAgentEnv"):]
+        dropped = dropped[: dropped.index("\n}")]
+        self.assertIn(
+            "a2aBusUserEnv:",
+            dropped,
+            "the rendered bridge inherits the agent's A2A_BUS_USER, the agent "
+            "principal's name and inbox",
+        )
+        own = h.go_function_body(src, "a2aBridgeOwnEnv")
+        self.assertIn("a2aBridgePasswordKey", own, "the rendered bridge is not given the static bridge principal's password")
+        self.assertNotIn("a2aBusToken", own, "the rendered bridge's own env names the bus token")
+
+    # The fourth cross-module literal: the operator renders the static
+    # principal names into the callout under this name, and the callout reads
+    # it back to refuse narrowed pods named after them.
+    RESERVED_PRINCIPALS_ENV = "A2A_RESERVED_PRINCIPALS"
+
+    def test_C1_the_callouts_reserved_principals_env_is_spelled_the_same_in_both_modules(
+        self,
+    ) -> None:
+        """The operator writes the static principal list; the callout reads it.
+
+        The callout refuses a narrowed pod named after a static nats.conf user,
+        and it learns those names only from this variable: they are in no
+        identity map, and the callout does not read nats.conf. Two Go modules,
+        no shared package, so each holds its own literal.
+
+        A drift is loud rather than silent, because the callout refuses to
+        start without the variable. But both Go suites stay green through a
+        rename on one side, and the failure lands at the next operator
+        upgrade: the new callout pods exit, never go Ready, and the rollout
+        stalls on every `spec.mode: next` install.
+        """
+        operator = h.text("operator_a2a_callout")
+        callout = h.text("a2a_callout_main")
+
+        operator_env = re.findall(r'a2aCalloutReservedPrincipalsEnvVar\s*=\s*"([^"]+)"', operator)
+        callout_env = re.findall(r'envReservedPrincipals\s*=\s*"([^"]+)"', callout)
+
+        # Anti-vacuity, both halves.
+        self.assertEqual(
+            len(operator_env),
+            1,
+            "a2aCalloutReservedPrincipalsEnvVar is not a single string constant "
+            "in platformagent_a2a_callout.go; this test compared nothing",
+        )
+        self.assertEqual(
+            len(callout_env),
+            1,
+            "envReservedPrincipals is not a single string constant in "
+            "a2a/cmd/authcallout/main.go; this test compared nothing",
+        )
+
+        self.assertEqual(
+            operator_env[0],
+            callout_env[0],
+            "the operator renders %r and the callout reads %r: the callout "
+            "refuses to start, and the next operator upgrade stalls the callout "
+            "rollout on every spec.mode: next install" % (operator_env[0], callout_env[0]),
+        )
+        self.assertEqual(
+            operator_env[0],
+            self.RESERVED_PRINCIPALS_ENV,
+            "the reserved principals env var was renamed; a callout image and "
+            "an operator from either side of the rename cannot run together",
+        )
+
+        # Both halves use the constant this test compared.
+        self.assertIn(
+            "os.LookupEnv(envReservedPrincipals)",
+            _go_code(callout, "run"),
+            "the callout's run() no longer reads envReservedPrincipals, so the "
+            "name compared here is not the name the callout resolves",
+        )
+        self.assertIn(
+            "Name: a2aCalloutReservedPrincipalsEnvVar",
+            _go_code(operator, "buildA2ACalloutDeployment"),
+            "buildA2ACalloutDeployment no longer renders "
+            "a2aCalloutReservedPrincipalsEnvVar by that constant, so the name "
+            "compared here is not the name the operator writes",
+        )
+
+    # The fifth: the fixed-name addressees, rendered by the operator from the
+    # constant the bridge's grants name and read back by the callout to refuse
+    # a narrowed pod named after one.
+    RESERVED_ADDRESSEES_ENV = "A2A_RESERVED_ADDRESSEES"
+
+    def test_C1_the_callouts_reserved_addressees_env_is_spelled_the_same_in_both_modules(
+        self,
+    ) -> None:
+        """The operator writes the fixed-name addressee list; the callout reads it.
+
+        The callout refuses a narrowed pod named after an addressee whose task
+        subjects a static grant already names (the bridge's `platform`), and
+        it learns those names only from this variable. Two Go modules, no
+        shared package, so each holds its own literal.
+
+        The same failure shape as the reserved principals above: the callout
+        refuses to start without the variable, both Go suites stay green
+        through a rename on one side, and the next operator upgrade stalls the
+        callout rollout on every `spec.mode: next` install.
+        """
+        operator = h.text("operator_a2a_callout")
+        callout = h.text("a2a_callout_main")
+
+        operator_env = re.findall(r'a2aCalloutReservedAddresseesEnvVar\s*=\s*"([^"]+)"', operator)
+        callout_env = re.findall(r'envReservedAddressees\s*=\s*"([^"]+)"', callout)
+
+        # Anti-vacuity, both halves.
+        self.assertEqual(
+            len(operator_env),
+            1,
+            "a2aCalloutReservedAddresseesEnvVar is not a single string constant "
+            "in platformagent_a2a_callout.go; this test compared nothing",
+        )
+        self.assertEqual(
+            len(callout_env),
+            1,
+            "envReservedAddressees is not a single string constant in "
+            "a2a/cmd/authcallout/main.go; this test compared nothing",
+        )
+
+        self.assertEqual(
+            operator_env[0],
+            callout_env[0],
+            "the operator renders %r and the callout reads %r: the callout "
+            "refuses to start, and the next operator upgrade stalls the callout "
+            "rollout on every spec.mode: next install" % (operator_env[0], callout_env[0]),
+        )
+        self.assertEqual(
+            operator_env[0],
+            self.RESERVED_ADDRESSEES_ENV,
+            "the reserved addressees env var was renamed; a callout image and "
+            "an operator from either side of the rename cannot run together",
+        )
+
+        # Both halves use the constant this test compared.
+        self.assertIn(
+            "os.LookupEnv(envReservedAddressees)",
+            _go_code(callout, "run"),
+            "the callout's run() no longer reads envReservedAddressees, so the "
+            "name compared here is not the name the callout resolves",
+        )
+        self.assertIn(
+            "Name: a2aCalloutReservedAddresseesEnvVar",
+            _go_code(operator, "buildA2ACalloutDeployment"),
+            "buildA2ACalloutDeployment no longer renders "
+            "a2aCalloutReservedAddresseesEnvVar by that constant, so the name "
+            "compared here is not the name the operator writes",
         )
 
     def test_C1_the_agent_principal_carries_no_static_bus_password(self) -> None:
@@ -1520,31 +2149,74 @@ class C4ProvenanceOfExecutableContent(unittest.TestCase):
                     unpinned.append(f"{workflow.name}:{number} {reference}")
         self.assertEqual([], unpinned)
 
-    def test_C4_precondition_the_skill_sync_still_clones_upstream(self) -> None:
-        self.assertIn("UPSTREAM_REPO", h.text("skill_sync"))
-        self.assertIn("clone", h.text("skill_sync"))
-
-    @h.known_violation("C4", "04_major_requirements.md C4")
     def test_C4_upstream_skills_are_pinned_and_verified(self) -> None:
-        """KNOWN VIOLATION. Whatever is at upstream HEAD becomes agent instructions.
+        """Whatever is at upstream HEAD must not become agent instructions.
 
-        `sync-upstream-skills.py` shallow-clones the default branch of an
-        upstream repository with no pinned ref, no tag, no commit SHA and no
-        checksum, then `rmtree`s and `copytree`s fifteen skill directories into
-        the agent's skill set verbatim.
+        Every `gke-*` skill under `agents/platform/skills/` is generated by
+        `scripts/skill_overlay.py` from a copy of `google/skills` pinned in an
+        `upstream.lock`: a full 40-hex commit and a sha256 over the copy.
+        `make skills-check` verifies each copy against its lock on every pull
+        request, offline, and an upstream update lands only through a sync
+        someone runs and a pull request someone reviews.
 
         C4 forbids automatic upgrade to unpinned upstream content and makes
-        checksum verification mandatory. The reason this is a class of
-        invariant rather than a CI nicety: the payload lands in content the
-        agent treats as instructions, which is deterministic input reaching the
-        agent outside every model-facing control there is.
+        checksum verification mandatory. The payload lands in content the agent
+        treats as instructions, which is deterministic input reaching the agent
+        outside every model-facing control there is.
         """
-        source = h.text("skill_sync")
-        pins = re.search(r"--branch|--revision|UPSTREAM_REF|[0-9a-f]{40}", source)
-        self.assertIsNotNone(pins, "the upstream clone names no immutable ref")
+        # The refusal, not the presence of the code: run the tool's offline
+        # check on a throwaway repository holding one mirrored skill, and
+        # require it to reject a lock that does not pin a full commit and one
+        # whose sha256 does not match the copy.
+        digest = h.skill_overlay_module().tree_sha256
+        good_commit = "a" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            shutil.copy(h.path_of("skill_sync"), root / "scripts" / "skill_overlay.py")
+            for tree in ("third_party/google-skills/s", "agents/platform/skills/s"):
+                (root / tree).mkdir(parents=True)
+                (root / tree / "SKILL.md").write_text("# s\n")
+            lock = root / "agents/platform/skill-overlays/s/upstream.lock"
+            lock.parent.mkdir(parents=True)
+            good_sha = digest(root / "third_party/google-skills/s")
+            for name, commit, sha, accepted in (
+                ("pinned", good_commit, good_sha, True),
+                ("short commit", good_commit[:-1], good_sha, False),
+                ("wrong sha256", good_commit, "0" * 64, False),
+            ):
+                with self.subTest(lock=name):
+                    lock.write_text(f"commit: {commit}\nsha256: {sha}\n")
+                    result = subprocess.run(
+                        [sys.executable, str(root / "scripts" / "skill_overlay.py"), "check"],
+                        cwd=root, capture_output=True, text=True,
+                    )
+                    self.assertEqual(accepted, result.returncode == 0, result.stdout + result.stderr)
+        # The whole step, parsed, so `|| true`, `continue-on-error` or an `if:`
+        # cannot sit beside the command and keep a failed check green. Parsed
+        # rather than matched line by line: YAML keeps a key in the step across
+        # blank lines and comments at any indent, which a line pattern misses.
+        # yaml.safe_load directly, not yaml_documents(), which refuses the
+        # file's `${{ }}` expressions on purpose.
+        step_name = "Mirrored skills match their upstream copy and overlay"
+        workflow = yaml.safe_load(h.text("validate_workflow"))
+        steps = [
+            s for job in workflow["jobs"].values() for s in job.get("steps", [])
+            if s.get("name") == step_name
+        ]
+        self.assertEqual(1, len(steps), "validate.yml needs exactly one mirrored-skills step")
+        self.assertEqual({"name": step_name, "run": "make skills-check"}, steps[0])
         self.assertRegex(
-            source, r"sha256|hashlib|checksum", "the synced content is not verified"
+            h.text("makefile"), r"(?m)^skills-check:.*\n\t@?\$\(SKILL_OVERLAY\) check$"
         )
+        self.assertRegex(h.text("makefile"), r"(?m)^SKILL_OVERLAY := python3 scripts/skill_overlay\.py$")
+        skills = h.REPO_ROOT / "agents" / "platform" / "skills"
+        overlays = h.REPO_ROOT / "agents" / "platform" / "skill-overlays"
+        mirrored = sorted(p.name for p in skills.glob("gke-*") if p.is_dir())
+        self.assertTrue(mirrored, "no gke-* skills found; the glob is wrong")
+        self.assertIn(h.path_of("skill_lock_gke_basics").parent.name, mirrored)
+        unpinned = [name for name in mirrored if not (overlays / name / "upstream.lock").is_file()]
+        self.assertEqual([], unpinned, "these gke-* skills have no upstream.lock")
 
     def test_C4_the_agent_base_image_is_pinned_by_digest(self) -> None:
         """The one image reference in this repo that is done correctly.

@@ -65,6 +65,20 @@ class FakeBroker:
         raise AssertionError(f"unexpected verb {verb}")
 
 
+class DefaultIntoTest(unittest.TestCase):
+    def test_github_keeps_owner__name_and_another_forge_gets_one_injective_directory(self):
+        with patch.object(inspect_repository, "scratch_root", return_value=Path("/s")):
+            self.assertEqual(Path("/s/acme__fleet"), inspect_repository.default_into("acme/fleet"))
+            self.assertEqual(
+                Path("/s/gitlab.com%2Facme%2Fplatform%2Finfra"),
+                inspect_repository.default_into("gitlab.com/acme/platform/infra"),
+            )
+            self.assertNotEqual(
+                inspect_repository.default_into("gitlab.com/a/b__c"),
+                inspect_repository.default_into("gitlab.com/a__b/c"),
+            )
+
+
 class ContentModeTestCase(unittest.TestCase):
     def setUp(self):
         self.broker = FakeBroker()

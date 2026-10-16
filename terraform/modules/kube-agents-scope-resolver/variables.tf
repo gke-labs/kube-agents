@@ -34,15 +34,66 @@ variable "metrics_scopes" {
   }
 }
 
+variable "folders" {
+  description = <<-EOT
+    Resource Manager folder IDs (`spec.scope.folders`), numeric. Read only
+    while `list_container_members` is set: each is then listed to the projects
+    its GKE clusters are in, through one Cloud Asset Inventory
+    searchAllResources call, the search the reconcile makes each run, for the
+    scoped service account pool alone. The folder's own grant is inherited and
+    is kube-agents-iam's; a member listed here gets a pool account and
+    nothing else.
+  EOT
+  type        = list(string)
+  nullable    = false
+  default     = []
+
+  validation {
+    condition     = alltrue([for entry in var.folders : can(regex("^[0-9]+$", entry))])
+    error_message = "Each folders entry is a numeric Resource Manager folder ID (^[0-9]+$), as spec.scope.folders names one."
+  }
+}
+
+variable "organizations" {
+  description = <<-EOT
+    Resource Manager organization IDs (`spec.scope.organizations`), numeric,
+    read as `folders` are and only while `list_container_members` is set.
+  EOT
+  type        = list(string)
+  nullable    = false
+  default     = []
+
+  validation {
+    condition     = alltrue([for entry in var.organizations : can(regex("^[0-9]+$", entry))])
+    error_message = "Each organizations entry is a numeric Resource Manager organization ID (^[0-9]+$), as spec.scope.organizations names one."
+  }
+}
+
+variable "list_container_members" {
+  description = <<-EOT
+    The scoped service account pool is armed (`scoped_pool_enabled`), so the
+    declared folders' and organizations' members are listed at plan time for
+    it, one Cloud Asset Inventory search per container, and the identity that
+    plans needs roles/cloudasset.viewer on each container and
+    cloudasset.googleapis.com enabled in quota_project. Off, no container is
+    read and `container_members` is empty: the container-level grant and the
+    reconcile's discovery stay zero-touch either way.
+  EOT
+  type        = bool
+  nullable    = false
+  default     = false
+}
+
 variable "quota_project" {
   description = <<-EOT
-    The project the three reads are billed to and whose enabled APIs they
-    use, sent as the x-goog-user-project header: the management project. With
+    The project every read is billed to and whose enabled APIs it uses,
+    sent as the x-goog-user-project header: the management project. With
     it the answer does not depend on the credential's type (a user credential
     has no consumer project of its own; a service account's is its own
     project, which need not be the management project), and the APIs the
-    reads need (cloudresourcemanager, monitoring, compute) are the ones the
-    composition enables there, and install.sh enables before a first apply.
+    reads need (cloudresourcemanager, monitoring, compute; cloudasset while
+    containers are listed) are the ones the composition enables there, and
+    install.sh enables before a first apply.
     The identity needs serviceusage.services.use on it, which an identity
     that applies the composition holds; a plan-only identity without it is
     refused with that grant named (USER_PROJECT_DENIED), not with the API's
@@ -63,11 +114,13 @@ variable "quota_project" {
 
 variable "exclude_projects" {
   description = <<-EOT
-    The scope's `exclude.projects` entries. Only an entry that is a bare
-    project number acts here: a monitored project the Monitoring API returned
+    The scope's `exclude.projects` entries. Two kinds of entry act here. A
+    bare project number: a monitored project the Monitoring API returned
     under that number is neither named nor listed, and the reconcile matches
     the number on every row a scope named by it, so the member leaves the set
-    whether or not a run had named it before. IDs and globs are the caller's to
+    whether or not a run had named it before. An exact project ID naming a
+    container's member: it is dropped from `container_members`, so it gets no
+    pool account. For the selectors, IDs and globs are the caller's to
     apply (kube-agents-iam withholds the grant of a Shared VPC service project
     an entry names by ID and keeps a monitored project's, which the reconcile's
     naming call needs; the reconcile evaluates globs).
@@ -79,13 +132,15 @@ variable "exclude_projects" {
 
 variable "member_cap" {
   description = <<-EOT
-    The most projects one selector may resolve to: the resolved-set cap the
+    The most projects one selector, or one listed container, may resolve to: the resolved-set cap the
     reconcile lists per run (spec.scope.maxProjects; kube-agents-iam's
     scope.max_projects), since a single selector past it cannot fit whatever
     else the scope declares, and refusing it at the read spares the naming
     reads the whole-set check would otherwise wait for. The reconcile's
     default, 100, when not given. A Shared VPC host is also bounded by one
-    page of the Compute API's answer, 500 service projects, whatever this is.
+    page of the Compute API's answer, 500 service projects, and a listed
+    container by one page of the Asset Inventory search, 500 clusters,
+    whatever this is.
   EOT
   type        = number
   nullable    = false

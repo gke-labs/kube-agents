@@ -17,8 +17,8 @@ limitations under the License.
 package controller
 
 import (
-	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -156,9 +156,14 @@ func TestBuildConfigMap(t *testing.T) {
 	// them has to reach the sandbox over ssh, and the managed scope is the only
 	// place that binds all of them. Its profile-shaped leaf, `terminal.cwd`, is
 	// the one renderConfigYAML deliberately leaves out.
+	//
+	// `kanban:` is not on it either, for the same reason in a narrower form. The
+	// board is shared by every profile, so its worker cap is pinned here; the rest of
+	// the block is the gateway's home profile's own.
+	// TestMaxInProgressIsPinnedInTheManagedScope holds the block to that one leaf.
 	for _, forbidden := range []string{
 		"mcp_servers:", "platform_toolsets:", "toolsets:", "disabled_toolsets:",
-		"environment_probe:", "kanban:", "memory:", "plugins:",
+		"environment_probe:", "memory:", "plugins:",
 		"leader_election:", "web:",
 	} {
 		if strings.Contains(yamlContent, forbidden) {
@@ -1292,8 +1297,8 @@ func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	}
 	// Drift bills a bucket of its own rather than the Warning one it displays
 	// as, so its ceiling is a fourth variable and has to be overridable by the
-	// same route. Off the allowlist, one multi-object `kubectl apply` spends
-	// the default of 5 and every later drift record that day is lost for good
+	// same route. Off the allowlist, one large `kubectl apply` can spend
+	// the default and every later drift record that day is lost for good
 	// — the detector cannot re-offer one — with no way to raise the cap short
 	// of a new image.
 	if values["ALERT_DAILY_LIMIT_DRIFT"] != "50" {
@@ -1357,9 +1362,9 @@ func TestSafeSandboxEnvOverridesPassesSlackUxFlag(t *testing.T) {
 	// The Slack UX flag is read by the gateway's Slack adapter and kanban
 	// notifier, both in this container. Off the allowlist, the documented
 	// `spec.deployment.env` override renders on the CR and never reaches them,
-	// so the feature cannot be turned on at all.
+	// so the feature, on by default, cannot be turned off at all.
 	custom := []corev1.EnvVar{
-		{Name: "KAGE_SLACK_UX", Value: "1"},
+		{Name: "KAGE_SLACK_UX", Value: "false"},
 		{
 			Name: "KAGE_SLACK_UX",
 			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
@@ -1370,8 +1375,8 @@ func TestSafeSandboxEnvOverridesPassesSlackUxFlag(t *testing.T) {
 	}
 
 	got := safeSandboxEnvOverrides(custom)
-	if len(got) != 1 || got[0].Name != "KAGE_SLACK_UX" || got[0].Value != "1" || got[0].ValueFrom != nil {
-		t.Errorf("expected only the literal KAGE_SLACK_UX=1 to pass, got %#v", got)
+	if len(got) != 1 || got[0].Name != "KAGE_SLACK_UX" || got[0].Value != "false" || got[0].ValueFrom != nil {
+		t.Errorf("expected only the literal KAGE_SLACK_UX=false to pass, got %#v", got)
 	}
 }
 
@@ -1416,6 +1421,51 @@ func TestSafeSandboxEnvOverridesPassesFeedbackPromptKnobs(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesFindingsPacingLimits(t *testing.T) {
+	// The findings queue's pacing limits are read from the environment on
+	// every nudge run. Off the allowlist, the documented override renders on
+	// the CR and never reaches the script. 0 means "add none of that kind",
+	// so it must survive as a literal.
+	custom := []corev1.EnvVar{
+		{Name: "FINDINGS_FIRST_REPORT_CRITICALS", Value: "1"},
+		{Name: "FINDINGS_DAILY_CRITICALS", Value: "4"},
+		{Name: "FINDINGS_NONCRITICAL_MAX", Value: "0"},
+		{Name: "FINDINGS_NONCRITICAL_AFTER_HOUR", Value: "9"},
+		{Name: "FINDINGS_QUEUE_DB_PATH", Value: "/tmp/elsewhere.db"},
+		{
+			Name: "FINDINGS_DAILY_CRITICALS",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+				Key:                  "k",
+			}},
+		},
+	}
+
+	got := safeSandboxEnvOverrides(custom)
+	values := map[string]string{}
+	for _, e := range got {
+		if e.ValueFrom != nil {
+			t.Errorf("ValueFrom must never survive the allowlist, got %#v", e)
+		}
+		values[e.Name] = e.Value
+	}
+
+	for name, want := range map[string]string{
+		"FINDINGS_FIRST_REPORT_CRITICALS": "1",
+		"FINDINGS_DAILY_CRITICALS":        "4",
+		"FINDINGS_NONCRITICAL_MAX":        "0",
+		"FINDINGS_NONCRITICAL_AFTER_HOUR": "9",
+	} {
+		if v, ok := values[name]; !ok || v != want {
+			t.Errorf("expected %s=%q to pass, got %q (present=%v)", name, want, v, ok)
+		}
+	}
+	// A neighbour sharing the prefix is not on the list.
+	if _, ok := values["FINDINGS_QUEUE_DB_PATH"]; ok {
+		t.Errorf("FINDINGS_QUEUE_DB_PATH must not pass, got %#v", got)
+	}
+}
+
 func TestBuildCredentialProxyContainer(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
@@ -1449,13 +1499,14 @@ func TestBuildCredentialProxyContainer(t *testing.T) {
 	// whatever the builder renders, so a request that drifted back down would
 	// otherwise pass every test. 500m is what lets a mint finish inside its
 	// five-second timeouts while an evicted pod's replacement warms up, and
-	// 512Mi is the memory Autopilot admits a 500m pod at, declared so the
-	// rendered request is the admitted one on both cluster modes.
+	// 1Gi is the memory the child memory budget needs when Autopilot without
+	// bursting makes the request the limit: above the 512Mi the CPU:memory
+	// band would admit a 500m pod at, and above the budget's 672Mi floor.
 	if got := container.Resources.Requests.Cpu().String(); got != "500m" {
 		t.Errorf("expected a 500m CPU request on the proxy container, got %s", got)
 	}
-	if got := container.Resources.Requests.Memory().String(); got != "512Mi" {
-		t.Errorf("expected a 512Mi memory request on the proxy container, got %s", got)
+	if got := container.Resources.Requests.Memory().String(); got != "1Gi" {
+		t.Errorf("expected a 1Gi memory request on the proxy container, got %s", got)
 	}
 	if got := container.Resources.Limits.Cpu().String(); got != "1" {
 		t.Errorf("expected the proxy CPU limit left at 1, got %s", got)
@@ -1522,6 +1573,7 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 					Env: []corev1.EnvVar{
 						{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "1024"},
 						{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: "64"},
+						{Name: credentialProxyMemoryLimitEnv, Value: "1"},
 						{Name: "UNRESERVED_PASSENGER", Value: "arrived"},
 					},
 				},
@@ -1568,7 +1620,7 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	// hold it. credential_proxy.py reads a command's output as it streams,
 	// keeps at most the cap per stream and bounds the decoded text to the
 	// same size, so what the broker holds per in-flight request is about six
-	// times the cap, transiently: the two capped stream buffers, their decoded
+	// times the cap (credentialProxyOutputCopiesPerCommand), transiently: the two capped stream buffers, their decoded
 	// text, and the JSON body and its encoding (measured at 48 MiB per request
 	// against the 8 MiB cap for text, 37 MiB for bytes that are not UTF-8).
 	// A request holds its slot until its response is written, and concurrency
@@ -1579,21 +1631,18 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	// or an OOMKill takes gcloud, kubectl, gh and git away from every agent
 	// the proxy serves.
 	//
-	// The children -- one kubectl or gcloud per in-flight command -- are
-	// outside this arithmetic. A kubectl listing thousands of objects runs to
-	// hundreds of MiB on its own, and the rest of the limit is what holds it.
+	// The children are the second assertion below, in the broker's own terms.
 	//
 	// The resting footprint is the container's own memory request rather than
 	// a measured constant: the ~250Mi the old sidecar held steady was mostly
 	// the event watcher's informer caches, which stayed in the gateway Pod
 	// when #913 moved the proxy out, and the request is upstream's statement
 	// of what this pod holds with nothing in flight.
-	const copiesPerCommand = 6
 	inFlight, err := strconv.ParseInt(env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"], 10, 64)
 	if err != nil || inFlight < 1 {
 		t.Fatalf("proxy concurrency cap %q is not a positive integer", env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"])
 	}
-	burst := int64(capBytes) * copiesPerCommand * inFlight
+	burst := int64(capBytes) * credentialProxyOutputCopiesPerCommand * inFlight
 	steadyStateBytes := proxy.Resources.Requests.Memory().Value()
 	if steadyStateBytes == 0 {
 		t.Fatal("the proxy container declares no memory request, so the burst below has no resting footprint to add to")
@@ -1602,6 +1651,48 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	if burst+steadyStateBytes > limit {
 		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands (CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS), which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit, or lower one of the two caps",
 			capBytes, burst, inFlight, limit, steadyStateBytes)
+	}
+
+	// The child term (docs/designs/credential-proxy-child-memory-budget.md
+	// §2.5), in the broker's own arithmetic: the limit, less the broker's
+	// two fixed reserves, has to admit at least two requests at once, each
+	// with its child reserve and its output allowance, or a listing phase
+	// cannot parallelise at all. The slot cap above is an upper bound on the
+	// count and enters this rule only as that. The four figures and the
+	// floor are declared in credential_proxy_manifests.go as copies of the
+	// broker's (credential_proxy.py: BROKER_RESIDENT_RESERVE_BYTES,
+	// CONTENT_WORKSPACE_RESERVE_BYTES, REQUEST_CHILD_MEMORY_RESERVE_BYTES,
+	// OUTPUT_COPIES_PER_COMMAND, BUDGET_MINIMUM_ADMITTED_REQUESTS), and
+	// tests/test_credential_proxy_sizing_parity.py fails when the two drift.
+	admitted := credentialProxyAdmittedRequests(limit, int64(capBytes))
+	if admitted < credentialProxyMinimumAdmittedRequests {
+		t.Errorf("the proxy's %d-byte limit admits %d requests at once under the child memory budget (%d MiB resident + %d MiB workspace reserves, %d MiB per request plus %d x %d-byte output); at least %d are needed — raise the limit or lower the output cap",
+			limit, admitted, credentialProxyResidentReserveBytes>>20, credentialProxyWorkspaceReserveBytes>>20, credentialProxyRequestReserveBytes>>20, credentialProxyOutputCopiesPerCommand, capBytes, credentialProxyMinimumAdmittedRequests)
+	}
+	if minimum := credentialProxyMinimumMemoryLimitBytes(int64(capBytes)); minimum > limit {
+		t.Errorf("the child memory budget's floor is %d bytes and the proxy's limit is %d", minimum, limit)
+	}
+
+	// The broker budgets against the limit it actually has, read once at start
+	// through the Downward API rather than copied from the Resources block, so
+	// a limit moved by whatever recreates the pod
+	// (spec.deployment.credentialProxy.resources, a VPA eviction) is the one
+	// it budgets against. A literal here would be the drift the
+	// design forbids.
+	var limitEnv *corev1.EnvVar
+	for i := range proxy.Env {
+		if proxy.Env[i].Name == credentialProxyMemoryLimitEnv {
+			limitEnv = &proxy.Env[i]
+		}
+	}
+	if limitEnv == nil {
+		t.Fatalf("the proxy container does not carry %s, so the broker cannot budget its children", credentialProxyMemoryLimitEnv)
+	}
+	if limitEnv.Value != "" || limitEnv.ValueFrom == nil || limitEnv.ValueFrom.ResourceFieldRef == nil {
+		t.Fatalf("%s must be a resourceFieldRef on the container's own limit, got %#v", credentialProxyMemoryLimitEnv, limitEnv)
+	}
+	if ref := limitEnv.ValueFrom.ResourceFieldRef; ref.ContainerName != credentialProxyContainerName || ref.Resource != containerMemoryLimitResource || ref.Divisor.String() != "1" {
+		t.Errorf("%s reads %s/%s with divisor %s; want %s/%s with divisor 1", credentialProxyMemoryLimitEnv, ref.ContainerName, ref.Resource, ref.Divisor.String(), credentialProxyContainerName, containerMemoryLimitResource)
 	}
 }
 
@@ -2454,79 +2545,354 @@ func TestBuildFluentBitConfigMap(t *testing.T) {
 	}
 }
 
-// The audit lift: the sidecar recognises a tool_call_audit or chat_message_audit
-// line, captures its JSON object and decodes it into top-level fields, in that
-// order and before the record modifier stamps the record. The regex is checked
-// against a line Hermes actually wrote, with fluent-bit's `(?<name>` group syntax
-// translated to Go's, since the two engines agree on everything else in it.
-// Those lines are frozen here: the test holds the regex to the format as
-// sampled and cannot notice a Hermes release that changes it. That check is a
-// live one after an agent image change: jsonPayload.audit_event in Logs
-// Explorer, a key the broker's own records do not carry, as the observability
-// page says.
-func TestFluentBitLiftsAuditRecordsIntoFields(t *testing.T) {
+// The audit trail: the sidecar tails the file the two emitters write, as JSON,
+// with no regex over Hermes' log line anywhere in the configuration. The input
+// has to name every profile's file, so that turning an emitter on for a profile
+// needs no change here, and the json decoder has to be in parsers.conf, because
+// this mount replaces the sidecar's own parsers file and a built-in name would
+// not resolve. Hermes' own log keeps its text input exactly as it was.
+func TestFluentBitTailsTheAuditFileAsJSON(t *testing.T) {
 	cm := buildFluentBitConfigMap(&agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 	})
 	fbConf := cm.Data["fluent-bit.conf"]
 	parsers := cm.Data["parsers.conf"]
 
-	order := []string{"Parser        gchat_event", "Parser        hermes_audit_line", "Key_Name      audit_json", "Parser        audit_json", "Name              record_modifier"}
-	last := -1
-	for _, needle := range order {
-		at := strings.Index(fbConf, needle)
-		if at < 0 {
-			t.Fatalf("fluent-bit.conf lacks %q", needle)
-		}
-		if at < last {
-			t.Errorf("%q is out of order in fluent-bit.conf; the lift has to capture before it decodes and decode before the record is stamped", needle)
-		}
-		last = at
+	// [SERVICE] names this parsers.conf and only this one: the mount replaces the
+	// sidecar's built-in parsers file, so a second Parsers_File line would pull in
+	// another that audit_json or gchat_event could resolve against instead.
+	services := fluentBitSections(fbConf, "[SERVICE]")
+	if len(services) != 1 {
+		t.Fatalf("fluent-bit.conf has %d [SERVICE] sections, want 1:\n%s", len(services), fbConf)
 	}
-	if !strings.Contains(parsers, "Name    audit_json\n    Format  json") {
-		t.Errorf("parsers.conf lacks the json decoder the lift needs; the sidecar's own parsers.conf is replaced by this mount, so a built-in name would not resolve")
+	if pf := fluentBitValues(services[0], "Parsers_File"); len(pf) != 1 || pf[0] != "parsers.conf" {
+		t.Errorf("[SERVICE] Parsers_File is %v, want exactly [parsers.conf]:\n%s", pf, services[0])
 	}
 
-	var expr string
-	for _, line := range strings.Split(parsers, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "Regex   ^") {
-			expr = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "Regex"))
+	inputs := fluentBitSections(fbConf, "[INPUT]")
+	if len(inputs) != 2 {
+		t.Fatalf("fluent-bit.conf has %d [INPUT] sections, want 2 (Hermes' logs and the audit file):\n%s", len(inputs), fbConf)
+	}
+	var audit, logs string
+	for _, section := range inputs {
+		switch fluentBitField(section, "Tag") {
+		case "agent.audit":
+			audit = section
+		case "agent.logs":
+			logs = section
 		}
 	}
-	if expr == "" {
-		t.Fatal("parsers.conf has no anchored Regex line for hermes_audit_line")
+	if audit == "" || logs == "" {
+		t.Fatalf("fluent-bit.conf lacks the agent.audit or the agent.logs input:\n%s", fbConf)
 	}
-	re := regexp.MustCompile(strings.ReplaceAll(expr, "(?<", "(?P<"))
-	const sample = `2026-09-28 15:45:43,391 INFO hermes.plugin.tool_call_audit: {"audit_event": "tool_call_end", "duration_ms": 53, "result": "{\"ok\": true}", "task_id": "k8s-evt-a9c4f17a", "tool_name": "kanban_create"}`
-	match := re.FindStringSubmatch(sample)
-	if match == nil {
-		t.Fatalf("the audit regex does not match a line Hermes wrote: %q", sample)
+	for _, want := range []struct{ key, val string }{
+		{"Name", "tail"},
+		{"Path", fluentBitAuditTailPath},
+		{"Parser", "audit_json"},
+		{"Path_Key", "file_path"},
+		{"Read_from_Head", "On"},
+	} {
+		if got := fluentBitField(audit, want.key); got != want.val {
+			t.Errorf("the audit input's %s is %q, want %q:\n%s", want.key, got, want.val, audit)
+		}
 	}
-	captured := match[re.SubexpIndex("audit_json")]
-	var decoded map[string]any
-	if err := json.Unmarshal([]byte(captured), &decoded); err != nil {
-		t.Fatalf("the capture is not the JSON object: %v (%q)", err, captured)
+	if ps := fluentBitValues(audit, "Parser"); len(ps) != 1 {
+		t.Errorf("the audit input has %d Parser lines %v, want exactly 1 (audit_json); a second would override it:\n%s", len(ps), ps, audit)
 	}
-	if decoded["tool_name"] != "kanban_create" {
-		t.Errorf("decoded record = %v, want the plugin's fields", decoded)
+	if p := fluentBitField(logs, "Parser"); p != "" {
+		t.Errorf("the agent.logs input parses its lines with parser %q; Hermes' log stays text:\n%s", p, logs)
 	}
-	if re.MatchString(`2026-09-28 15:45:43,376 WARNING tools.kanban_event_routing: kanban event routing: {"not": "an audit record"}`) {
-		t.Error("the audit regex matches a line from another logger; only the two audit emitters may be lifted")
+	if got, want := fluentBitField(logs, "Path"), fluentBitDataMount+"/logs/*.log"; got != want {
+		t.Errorf("the agent.logs input reads %q, not the front door's logs %q:\n%s", got, want, logs)
 	}
-	if !re.MatchString(`2026-09-28 15:45:43,391 INFO hermes.hook.chat_message_audit: {"audit_event": "chat_message_end"}`) {
-		t.Error("the audit regex does not match the chat_message_audit hook's lines")
+	dbs := regexp.MustCompile(`DB\s+(\S+)`).FindAllStringSubmatch(fbConf, -1)
+	if len(dbs) != 2 || dbs[0][1] == dbs[1][1] {
+		t.Errorf("the two tail inputs must keep their positions in two DB files, got %v", dbs)
 	}
-	// Hermes tags a record emitted on a thread holding a session context with
-	// ` [<session id>]` between the level and the logger name; the tools it
-	// runs inline on the turn thread log that way, and an unmatched line passes
-	// through the sidecar unlifted with no signal.
-	tagged := `2026-09-28 15:45:43,391 INFO [20260928_154543_50074bf0] hermes.plugin.tool_call_audit: {"audit_event": "tool_call_end", "tool_name": "clarify"}`
-	match = re.FindStringSubmatch(tagged)
-	if match == nil {
-		t.Fatalf("the audit regex does not match a session-tagged line: %q", tagged)
+
+	// The path reaches the front door's file and any named profile's, and
+	// nothing else: not Hermes' log, not a rotated backup.
+	for _, path := range []string{
+		"/opt/data/logs/audit.jsonl",
+		"/opt/data/profiles/platform/logs/audit.jsonl",
+		"/opt/data/profiles/cluster-prod-a/logs/audit.jsonl",
+	} {
+		if !fluentBitPathMatches(t, fluentBitAuditTailPath, path) {
+			t.Errorf("the audit input does not reach %s", path)
+		}
 	}
-	if !strings.HasPrefix(match[re.SubexpIndex("audit_json")], `{"audit_event": "tool_call_end"`) {
-		t.Errorf("the capture on a tagged line is not the JSON object: %q", match[re.SubexpIndex("audit_json")])
+	for _, path := range []string{
+		"/opt/data/logs/agent.log",
+		"/opt/data/logs/audit.jsonl.1",
+		"/opt/data/logs/audit.jsonl.lock",
+		"/opt/data/profiles/platform/logs/agent.log",
+	} {
+		if fluentBitPathMatches(t, fluentBitAuditTailPath, path) {
+			t.Errorf("the audit input reaches %s, which is not an audit file", path)
+		}
+	}
+	// Nor does Hermes' text input reach the audit file, its backups or the
+	// emitters' lock file beside it.
+	for _, path := range []string{
+		"/opt/data/logs/audit.jsonl",
+		"/opt/data/logs/audit.jsonl.1",
+		"/opt/data/logs/audit.jsonl.lock",
+	} {
+		if fluentBitPathMatches(t, "/opt/data/logs/*.log", path) {
+			t.Errorf("the agent.logs input reaches %s", path)
+		}
+	}
+
+	// The section counts are fixed: every section the config has is vetted
+	// below, so a new one -- a reinstated regex lift among them -- has to be
+	// added here first and explained. Counted across every ConfigMap key, case-
+	// insensitively, so a section @INCLUDEd from another key or spelled
+	// [filter] is counted too.
+	for _, want := range []struct {
+		header string
+		count  int
+	}{
+		{"[SERVICE]", 1},
+		{"[INPUT]", 2},
+		{"[FILTER]", 2},
+		{"[OUTPUT]", 1},
+		{"[PARSER]", 2},
+	} {
+		if got := fluentBitCount(cm.Data, want.header); got != want.count {
+			t.Errorf("the ConfigMap has %d %s sections across all keys, want %d; a new section must be vetted in this test", got, want.header, want.count)
+		}
+	}
+
+	// The audit input names audit_json; parsers.conf has to decode it as JSON,
+	// not lift fields with a regex. The sidecar's own parsers.conf is replaced
+	// by this mount, so a built-in name would not resolve.
+	var auditParser string
+	for _, section := range fluentBitSections(parsers, "[PARSER]") {
+		if fluentBitField(section, "Name") == "audit_json" {
+			auditParser = section
+		}
+	}
+	if auditParser == "" {
+		t.Errorf("parsers.conf lacks the audit_json parser the audit input names:\n%s", parsers)
+	} else if f := fluentBitField(auditParser, "Format"); !strings.EqualFold(f, "json") {
+		t.Errorf("the audit_json parser's Format is %q, want json; the audit records are JSON, not lifted:\n%s", f, auditParser)
+	}
+	for name, data := range cm.Data {
+		for _, gone := range []string{"hermes_audit_line", "Key_Name      audit_json"} {
+			if strings.Contains(data, gone) {
+				t.Errorf("%s still carries %q; the regex lift is gone and the records are not in Hermes' log", name, gone)
+			}
+		}
+	}
+
+	// No regex lifts fields out of the audit records, under any name: the
+	// records are JSON, decoded by the json parser on the input, and the only
+	// regex is Hermes' own log line. Assert the class over every [FILTER], by
+	// Name -- an unexpected Name is a section this test has not vetted and
+	// fails closed, not a continue that hides a lift.
+	parserFilters, recordModifierFilters := 0, 0
+	for _, section := range fluentBitSections(fbConf, "[FILTER]") {
+		switch name := fluentBitField(section, "Name"); name {
+		case "parser":
+			parserFilters++
+			if match := fluentBitField(section, "Match"); match != "agent.logs" {
+				t.Errorf("a parser FILTER matches %q; a regex parser must not reach the audit records:\n%s", match, section)
+			}
+			if ps := fluentBitValues(section, "Parser"); len(ps) != 1 || ps[0] != "gchat_event" {
+				t.Errorf("a parser FILTER has Parser lines %v, want exactly [gchat_event]; a second parser would run over the stream and the audit lift must not return:\n%s", ps, section)
+			}
+		case "record_modifier":
+			recordModifierFilters++
+			if match := fluentBitField(section, "Match"); match != "agent.*" {
+				t.Errorf("the record_modifier FILTER matches %q, want agent.* (both streams stamped):\n%s", match, section)
+			}
+		default:
+			t.Errorf("unexpected [FILTER] Name %q; a new filter must be vetted here -- is it a regex lift on the audit stream?:\n%s", name, section)
+		}
+	}
+	// Exactly one of each: the [FILTER] count is 2, but that alone allows two
+	// parser filters and no record_modifier -- a second gchat_event parser retagged
+	// onto agent.audit among them. Pin the split.
+	if parserFilters != 1 {
+		t.Errorf("fluent-bit.conf has %d parser [FILTER]s, want exactly 1 (gchat_event over agent.logs)", parserFilters)
+	}
+	if recordModifierFilters != 1 {
+		t.Errorf("fluent-bit.conf has %d record_modifier [FILTER]s, want exactly 1 (stamping agent.*)", recordModifierFilters)
+	}
+	// gchat_event is the only regex-format parser; every other [PARSER] decodes
+	// rather than lifts.
+	for _, section := range fluentBitSections(parsers, "[PARSER]") {
+		name := fluentBitField(section, "Name")
+		if format := fluentBitField(section, "Format"); strings.EqualFold(format, "regex") && name != "gchat_event" {
+			t.Errorf("parsers.conf has a regex parser %q besides gchat_event; the audit records are JSON, not lifted:\n%s", name, section)
+		}
+	}
+
+	// gchat_event is trusted by name above, so its regex is pinned verbatim: a
+	// change to what it captures -- widening it to lift an audit field through the
+	// one parser the guard exempts -- has to be re-vetted here, not merged silently.
+	var gchatParser string
+	for _, section := range fluentBitSections(parsers, "[PARSER]") {
+		if fluentBitField(section, "Name") == "gchat_event" {
+			gchatParser = section
+		}
+	}
+	if gchatParser == "" {
+		t.Errorf("parsers.conf lacks the gchat_event parser:\n%s", parsers)
+	} else if got, want := fluentBitField(gchatParser, "Regex"), `User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)`; got != want {
+		t.Errorf("gchat_event Regex is %q, want %q; a change to the one trusted regex must be re-vetted here", got, want)
+	}
+
+	// No parser merges a decoded field back into the record, and nothing selects a
+	// stream by regex. Decode_Field / Decode_Field_As json <field> takes a JSON
+	// object a line carries and lifts its keys into the record -- the audit lift by
+	// another name; Match_Regex selects streams by pattern where this config matches
+	// by exact tag, so it could reach the audit stream a plain Match does not. The
+	// records are decoded whole by the json-format audit_json parser on the input.
+	// Fail closed on either key across every ConfigMap value.
+	for name, data := range cm.Data {
+		for _, line := range strings.Split(data, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "#") {
+				continue
+			}
+			if f := strings.Fields(line); len(f) >= 1 {
+				switch strings.ToLower(f[0]) {
+				case "decode_field", "decode_field_as":
+					t.Errorf("%s carries %q; a Decode_Field merge lifts a field into the record, the audit records are JSON on the input:\n%s", name, strings.TrimSpace(line), data)
+				case "match_regex":
+					t.Errorf("%s carries %q; a Match_Regex selects streams by regex and this config matches by exact tag -- it could reach the audit stream a plain Match does not:\n%s", name, strings.TrimSpace(line), data)
+				}
+			}
+		}
+	}
+
+	// Both streams are shipped: exactly one stdout output, covering agent.*.
+	outputs := fluentBitSections(fbConf, "[OUTPUT]")
+	if len(outputs) != 1 {
+		t.Fatalf("fluent-bit.conf has %d [OUTPUT] sections, want 1:\n%s", len(outputs), fbConf)
+	}
+	if name := fluentBitField(outputs[0], "Name"); name != "stdout" {
+		t.Errorf("the output is %q, want stdout:\n%s", name, outputs[0])
+	}
+	if match := fluentBitField(outputs[0], "Match"); match != "agent.*" {
+		t.Errorf("the output matches %q, want agent.* (both streams shipped):\n%s", match, outputs[0])
+	}
+}
+
+// fluentBitHeaderRe matches a section-start line and captures its name. fluent-bit
+// opens a section on any line whose first non-space byte is '[', taking the name
+// up to the first ']' and ignoring the rest of the line, so this is a prefix match,
+// not the whole line: [FILTER] # lift opens a live filter and has to be seen as
+// one. A key line never begins with '[' -- a key whose value carries a bracket
+// still starts with the key -- so a prefix match cannot mistake a value for a header.
+var fluentBitHeaderRe = regexp.MustCompile(`^\[([A-Za-z0-9_]+)\]`)
+
+// fluentBitSections returns every section of conf whose header names header
+// (e.g. "[FILTER]"), case-insensitively. A section runs from its header line to
+// the line before the next header, so a blank line, a comment, trailing text
+// after the ']' or the header's casing between sections cannot hide one:
+// fluent-bit opens a section on any line that starts [NAME], needs no separator,
+// ignores what follows the ']', and reads the header case-insensitively.
+func fluentBitSections(conf, header string) []string {
+	var sections []string
+	var cur []string
+	inWanted := false
+	flush := func() {
+		if inWanted && len(cur) > 0 {
+			sections = append(sections, strings.Join(cur, "\n"))
+		}
+	}
+	for _, line := range strings.Split(conf, "\n") {
+		if m := fluentBitHeaderRe.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
+			flush()
+			inWanted = strings.EqualFold("["+m[1]+"]", header)
+			cur = nil
+		}
+		if inWanted {
+			cur = append(cur, line)
+		}
+	}
+	flush()
+	return sections
+}
+
+// fluentBitCount returns how many sections with the given header appear across
+// every value in data. Counting over all keys fails closed when a section is
+// added under any of them, including one @INCLUDEd from another file.
+func fluentBitCount(data map[string]string, header string) int {
+	n := 0
+	for _, conf := range data {
+		n += len(fluentBitSections(conf, header))
+	}
+	return n
+}
+
+// fluentBitValues returns every value set for key in a fluent-bit section, in
+// order, whatever whitespace separates key and value and whatever case the key
+// is written in. Comment lines are skipped. A repeated key -- a second Parser on
+// an input, a second Parsers_File in [SERVICE] -- yields more than one value, so
+// a caller pinning a single-valued key can assert there is exactly one rather
+// than read only the first and miss a duplicate fluent-bit would honour.
+func fluentBitValues(section, key string) []string {
+	var values []string
+	for _, line := range strings.Split(section, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && strings.EqualFold(fields[0], key) {
+			values = append(values, strings.Join(fields[1:], " "))
+		}
+	}
+	return values
+}
+
+// fluentBitField returns the first value fluentBitValues finds for key in a
+// fluent-bit section, or "" if the key is absent. fluent-bit's classic-format
+// keys are case-insensitive, so the test reads them that way.
+func fluentBitField(section, key string) string {
+	if values := fluentBitValues(section, key); len(values) > 0 {
+		return values[0]
+	}
+	return ""
+}
+
+// fluentBitPathMatches reports whether a comma-separated fluent-bit tail Path
+// reaches path. The plugin globs each pattern the way a shell would, which is
+// what filepath.Match implements.
+func fluentBitPathMatches(t *testing.T, patterns, path string) bool {
+	t.Helper()
+	for _, pattern := range strings.Split(patterns, ",") {
+		ok, err := filepath.Match(pattern, path)
+		if err != nil {
+			t.Fatalf("bad tail pattern %q: %v", pattern, err)
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+// The sidecar tails the file by the name the emitters write it under. The two
+// are in different languages, so this holds the Go constant to the Python one.
+func TestFluentBitAuditFileNameMatchesTheEmitters(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "agents", "chat", "defaults", "plugins", "common", "audit_sink.py")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	for _, want := range []string{
+		fmt.Sprintf("AUDIT_FILE_NAME = %q", auditFileName),
+		`LOGS_DIR_NAME = "logs"`,
+		// The lock file beside the audit file has to stay outside both tail globs
+		// above, which the negative cases in TestFluentBitTailsTheAuditFileAsJSON
+		// check against this suffix.
+		`AUDIT_LOCK_FILE_SUFFIX = ".lock"`,
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("%s does not declare %s; the sidecar would tail a file the emitters never write", path, want)
+		}
 	}
 }
 
@@ -4072,6 +4438,7 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 			Env: []corev1.EnvVar{
 				{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
 				{Name: "CREDENTIAL_PROXY_URL", Value: "http://attacker.invalid"},
+				{Name: "KUBE_AGENTS_MCP_RELAY_URL", Value: "http://attacker.invalid/v1/mcp"},
 				{Name: "PATH", Value: "/tmp/hijacked/bin:/usr/bin"},
 				{Name: "AGENT_SHARED_STATE_SETUP", Value: "skip"},
 				{Name: "HERMES_MANAGED_DIR", Value: "/opt/data/managed"},
@@ -4099,6 +4466,13 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	// leave the plugin as the only writer.
 	if value, ok := env["CREDENTIAL_PROXY_URL"]; !ok || value != "" {
 		t.Errorf("plugin must not be able to set CREDENTIAL_PROXY_URL, got %q (present=%v)", value, ok)
+	}
+
+	// KUBE_AGENTS_MCP_RELAY_URL is appended after the merge too. A plugin that
+	// could set it would point every mcp-remote child at a listener of its own,
+	// which would then receive the projected token mcp-remote presents.
+	if value := env["KUBE_AGENTS_MCP_RELAY_URL"]; value != mcpRelayURL(agent) {
+		t.Errorf("plugin must not be able to set KUBE_AGENTS_MCP_RELAY_URL, got %q", value)
 	}
 
 	// PATH is appended by the same mechanism and for the same reason, and it is
@@ -4949,39 +5323,63 @@ func TestDefaultTuningReachesTheDefaultOverlayOnly(t *testing.T) {
 	}
 }
 
-// spec.harness.tuning.maxInProgress travels the same road, and only when the CR sets it:
-// an unset one must leave agents/chat/config.yaml's cap in force rather than have the
-// operator restate the same number on every reconcile.
-func TestMaxInProgressReachesTheDefaultOverlay(t *testing.T) {
-	if got := buildConfigMapData(newTestPlatformAgent(), nil)[profileOverlayKey(defaultProfileName)]; strings.Contains(got, "max_in_progress") {
-		t.Errorf("an untuned CR must not render a cap, got:\n%s", got)
+// spec.harness.tuning.maxInProgress is pinned in the managed scope, always: the CR's value,
+// or defaultKanbanMaxInProgress when it says nothing.
+//
+// It used to ride the default profile's overlay, and only when the CR set it, deferring the
+// untuned case to agents/chat/config.yaml. That left the cap to whatever the agent's own
+// config.yaml already held: the image template reaches an existing volume only for missing
+// keys, so a volume seeded at 2 kept 2 after the operator's default rose to 6, and an override
+// set and then removed left its value behind. A managed-scope leaf is applied over the
+// persisted config on every load, so neither history matters.
+func TestMaxInProgressIsPinnedInTheManagedScope(t *testing.T) {
+	managedCap := func(t *testing.T, agent *agentv1alpha1.PlatformAgent) any {
+		t.Helper()
+		var managed map[string]any
+		if err := yaml.Unmarshal([]byte(buildConfigMapData(agent, nil)[managedConfigKey]), &managed); err != nil {
+			t.Fatalf("unmarshal managed scope: %v", err)
+		}
+		kanban, ok := managed["kanban"].(map[string]any)
+		if !ok {
+			t.Fatalf("the managed scope carries no kanban block, got:\n%v", managed)
+		}
+		if len(kanban) != 1 {
+			// Only the cap is board-wide. The rest of the block (tick, wake set, stale
+			// timeout) belongs to whichever profile the gateway is homed at.
+			t.Errorf("the managed scope must pin kanban.max_in_progress alone, got %v", kanban)
+		}
+		return kanban["max_in_progress"]
 	}
 
-	eight := 8
-	if eight == defaultKanbanMaxInProgress {
-		t.Fatalf("test value %d must differ from the image's default to prove the override", eight)
-	}
-	agent := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: &eight})
-
-	var overlay map[string]any
-	if err := yaml.Unmarshal([]byte(buildConfigMapData(agent, nil)[profileOverlayKey(defaultProfileName)]), &overlay); err != nil {
-		t.Fatalf("unmarshal default overlay: %v", err)
-	}
-	kanban, _ := overlay["kanban"].(map[string]any)
-	if fmt.Sprint(kanban["max_in_progress"]) != "8" {
-		t.Errorf("max_in_progress = %v, want 8", kanban["max_in_progress"])
+	if got := managedCap(t, newTestPlatformAgent()); fmt.Sprint(got) != fmt.Sprint(defaultKanbanMaxInProgress) {
+		t.Errorf("untuned max_in_progress = %v, want the operator default %d", got, defaultKanbanMaxInProgress)
 	}
 
-	// Raising the cap and lowering it must both work — a one-sided test would pass even
-	// if the render silently took the minimum of the CR and the image's default.
-	one := 1
-	lowered := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: &one})
-	if err := yaml.Unmarshal([]byte(buildConfigMapData(lowered, nil)[profileOverlayKey(defaultProfileName)]), &overlay); err != nil {
-		t.Fatalf("unmarshal default overlay: %v", err)
+	// Raising the cap and lowering it must both work: a one-sided test would pass even if
+	// the render silently took the minimum or the maximum of the CR and the default.
+	for _, want := range []int{8, 1} {
+		if want == defaultKanbanMaxInProgress {
+			t.Fatalf("test value %d must differ from the default to prove the override", want)
+		}
+		agent := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: ptr.To(want)})
+		if got := managedCap(t, agent); fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("max_in_progress = %v, want the CR's %d", got, want)
+		}
 	}
-	kanban, _ = overlay["kanban"].(map[string]any)
-	if fmt.Sprint(kanban["max_in_progress"]) != "1" {
-		t.Errorf("max_in_progress = %v, want 1", kanban["max_in_progress"])
+}
+
+// The cap has exactly one route. A copy in the default profile's overlay as well would be
+// merged into the agent's config.yaml and then overruled by the pin, which is the
+// "nothing the operator renders may appear in both" rule buildConfigMapData states. The
+// overlay record would also outlive the CR field, as the old route's did.
+func TestMaxInProgressIsNotInTheDefaultOverlay(t *testing.T) {
+	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
+		"untuned": newTestPlatformAgent(),
+		"tuned":   agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: ptr.To(8), Default: limits(3, 40)}),
+	} {
+		if got := buildConfigMapData(agent, nil)[profileOverlayKey(defaultProfileName)]; strings.Contains(got, "max_in_progress") {
+			t.Errorf("%s: the default overlay must not carry the cap, got:\n%s", name, got)
+		}
 	}
 }
 
@@ -5011,16 +5409,15 @@ func TestRenderConfigYAMLNoTuningLeavesHermesDefaults(t *testing.T) {
 	}
 }
 
-// Dispatch concurrency is capped, and the cap is the image's.
+// Dispatch concurrency is capped even without the operator.
 //
 // Upstream leaves it unbounded, which lets a burst of queued cards spawn one full agent
 // process per card until the cgroup OOM killer takes them — a failure that produces no
-// container restart and no Kubernetes event, only a stranded card. The operator used to
-// render the cap; it no longer can (the managed scope is machine-global and kanban is
-// profile-shaped), so agents/chat/config.yaml carries the untuned default and this test
-// is what keeps it there. spec.harness.tuning.maxInProgress overrides it through the
-// default profile's overlay — see TestMaxInProgressReachesTheDefaultOverlay — and this
-// number must stay equal to defaultKanbanMaxInProgress, which that test compares against.
+// container restart and no Kubernetes event, only a stranded card. On an operator install
+// the managed scope pins the cap (TestMaxInProgressIsPinnedInTheManagedScope), so the
+// image's line is what applies only where the image runs without the operator. It must
+// still be there, and it must equal defaultKanbanMaxInProgress, so the two kinds of
+// install run the same board.
 //
 // wake_on_events is asserted here too. The front door is woken for a follow-up turn only
 // by terminal events it can act on; `completed` is not one of them, because the notifier
@@ -5042,7 +5439,7 @@ func TestChatConfigCapsTheBoardAndWakesOnFailuresOnly(t *testing.T) {
 
 	cap, ok := kanban["max_in_progress"]
 	if !ok {
-		t.Fatalf("%s must cap max_in_progress — nothing else does now; got kanban block %v", path, kanban)
+		t.Fatalf("%s must cap max_in_progress — nothing else caps an install without the operator; got kanban block %v", path, kanban)
 	}
 	// A 0 would be worse than no key at all: Hermes ignores anything below 1, so the
 	// file would read as a capped board while behaving as an unbounded one.
@@ -6073,6 +6470,23 @@ func TestPlatformFrontDoorOverlayKeepsTargetedPlugins(t *testing.T) {
 	}
 }
 
+// TestPlatformFrontDoorOverlayEnablesBackfillPlugins: an existing front-door volume never
+// gains a list entry from the image's config.yaml, so the overlay is what turns these on.
+func TestPlatformFrontDoorOverlayEnablesBackfillPlugins(t *testing.T) {
+	agent := frontDoorAgent("fd-backfill", 1, true)
+	overlay := map[string]any{}
+	raw := buildConfigMapData(agent, nil)[profileOverlayKey(platformProfileName)]
+	if err := yaml.Unmarshal([]byte(raw), &overlay); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v\n%s", err, raw)
+	}
+	enabled := sortedStrings(t, listAt(t, overlay, []string{"plugins", "enabled"}))
+	for _, want := range append(slices.Clone(frontDoorPlugins), "pr_opened") {
+		if !slices.Contains(enabled, want) {
+			t.Errorf("plugins.enabled = %v, missing %q", enabled, want)
+		}
+	}
+}
+
 // TestPlatformFrontDoorOverlayMergesTargetedPluginToolsets guards the second half of the
 // clobber TestPlatformFrontDoorOverlayKeepsTargetedPlugins covers for plugins.enabled.
 //
@@ -6116,11 +6530,14 @@ func TestPlatformFrontDoorOverlayMergesTargetedPluginToolsets(t *testing.T) {
 // The dispatcher and the notifier run in the gateway process and read `kanban` through
 // load_config(), which resolves from get_hermes_home() — so the block has to be on whichever
 // profile the gateway is homed at, and it has to say the same thing there. The image copy
-// lives in agents/chat/config.yaml and reaches the default profile only; neither
-// agents/platform/config.yaml nor the managed scope declares the key, so a block that fails
-// to follow the gateway does not fall back to the chat profile's: it falls back to upstream,
-// where dispatch is unbounded, the tick is 60s, and spec.harness.tuning.maxInProgress
-// silently stops meaning anything.
+// lives in agents/chat/config.yaml and reaches the default profile only, and
+// agents/platform/config.yaml declares no `kanban` key, so a block that fails to follow the
+// gateway does not fall back to the chat profile's: it falls back to upstream, where the
+// tick is 60s and `completed` is back in the wake set.
+//
+// max_in_progress is the one key that is not compared. It is pinned in the managed scope,
+// which is machine-global and so lands on the platform profile as it lands on the default
+// one (TestMaxInProgressIsPinnedInTheManagedScope); the overlay must not carry a second copy.
 //
 // The comparison is against the image file rather than against the default profile's
 // overlay because the operator does not render the block there at all — it defers to
@@ -6147,9 +6564,12 @@ func TestFrontDoorKanbanMatchesChatConfig(t *testing.T) {
 		t.Fatal("the front-door overlay carries no kanban block, so the dispatcher reverts to " +
 			"upstream's unbounded behaviour")
 	}
-	if !reflect.DeepEqual(got, image.Kanban) {
+	want := maps.Clone(image.Kanban)
+	delete(want, "max_in_progress")
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("the front door's kanban block differs from the one the chat profile gets "+
-			"from %s:\n  overlay: %v\n  image:   %v", path, got, image.Kanban)
+			"from %s (less max_in_progress, which the managed scope pins):\n  overlay: %v\n  image:   %v",
+			path, got, want)
 	}
 
 	// Issue #1880: bound kanban stale running timeout to 30m (1800s) to prevent
@@ -6159,22 +6579,30 @@ func TestFrontDoorKanbanMatchesChatConfig(t *testing.T) {
 			got["dispatch_stale_timeout_seconds"])
 	}
 
-	// The CR field is the reason equality with the image is not enough on its own: it is
-	// documented as "board-wide cap on concurrent kanban workers", and reaching only a
-	// profile the gateway is not homed at is the same as not reaching anything.
+	// The CR field is documented as a "board-wide cap on concurrent kanban workers", and
+	// reaching only a profile the gateway is not homed at is the same as not reaching
+	// anything. It reaches the front door through the managed scope, so the overlay stays
+	// silent on it and the pin carries the CR's value.
 	withCap := frontDoorAgent("fd-kanban-cap", 1, true)
 	withCap.Spec.Harness.Tuning = &agentv1alpha1.TuningSpec{MaxInProgress: ptr.To(7)}
 	capped, _ := platformOverlay(t, withCap)["kanban"].(map[string]any)
-	if capped["max_in_progress"] != 7 {
-		t.Errorf("max_in_progress = %v, want spec.harness.tuning.maxInProgress (7) to reach the "+
-			"profile the gateway runs as", capped["max_in_progress"])
+	if v, ok := capped["max_in_progress"]; ok {
+		t.Errorf("the front-door overlay carries max_in_progress = %v; the managed scope pins it "+
+			"and nothing the operator renders may appear in both", v)
+	}
+	var managed map[string]any
+	if err := yaml.Unmarshal([]byte(buildConfigMapData(withCap, nil)[managedConfigKey]), &managed); err != nil {
+		t.Fatalf("unmarshal managed scope: %v", err)
+	}
+	if pinned, _ := managed["kanban"].(map[string]any); fmt.Sprint(pinned["max_in_progress"]) != "7" {
+		t.Errorf("managed kanban = %v, want max_in_progress 7 from spec.harness.tuning.maxInProgress", pinned)
 	}
 }
 
 // TestFrontDoorPluginsMatchChatConfig is the drift guard frontDoorPlugins names.
 //
 // The list is derived, not chosen: every ingress plugin the chat profile enables, less the
-// two named below, less the three agents/platform/config.yaml already enables. Adding an
+// two named below, less the ones agents/platform/config.yaml already enables. Adding an
 // ingress plugin to the chat profile and not here is the drift that matters — it hooks a
 // message the front door is the one receiving, so the behaviour is simply lost, with
 // nothing logged.

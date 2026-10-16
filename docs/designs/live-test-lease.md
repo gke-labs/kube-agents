@@ -51,12 +51,13 @@ separate holder. The parent-pid fallback is a last resort — it makes the key s
 shell rather than across a session — which is why another harness should set
 `KUBE_AGENTS_LEASE_SESSION` explicitly.
 
-**Not every holder is a person.** The nightly reconcile of `autopush` and `staging`
+**Not every holder is a person.** The reconcile of `autopush`, `autopush-next` and `staging`
 (`scripts/release/reconcile_environment.sh`) takes the same lease before it applies, under
-`KUBE_AGENTS_LEASE_SESSION=gha-<run_id>`, and defers to the next night rather than overwriting an
-agent's evidence mid-run. So a lease held by `gha-…` is a scheduled infrastructure apply, not a
-colleague: it releases itself when the run ends, and the run it names is readable in the Actions
-tab. Do not `steal` one — the apply it is protecting is a `terraform apply` against a live cluster.
+`KUBE_AGENTS_LEASE_SESSION=gha-<run_id>`, and defers or fails, per its lease policy, rather than
+overwriting an agent's evidence mid-run. So a lease held by `gha-…` is an automated infrastructure
+apply, not a colleague: it releases itself when the run ends, and the run it names is readable in
+the Actions tab. Do not `steal` one — the apply it is protecting is a `terraform apply` against a
+live cluster.
 
 Losing the local token does not lose the install. The record also carries the session id, so the
 hook can tell "another agent holds this" from "you hold this, under a token this machine no longer

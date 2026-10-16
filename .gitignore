@@ -19,6 +19,9 @@ install.env
 !*.env.example
 k8s-operator/cover.out
 
+# Scratch space for scripts/skill_overlay.py: the upstream cache and in-progress syncs
+.skill-sync/
+
 # Python artifacts
 __pycache__/
 *.py[cod]
@@ -83,6 +86,7 @@ k8s-operator/cmd/k8s-event-watcher/k8s-event-watcher
 a2a/a2a
 a2a/cmd/a2a/a2a
 a2a/cmd/authcallout/authcallout
+a2a/cmd/console/console
 a2a/cmd/gateway/gateway
 a2a/cmd/hermes-bridge/hermes-bridge
 a2a/cmd/worker-adapter/worker-adapter

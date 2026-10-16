@@ -1,5 +1,5 @@
 name: chat_message_audit
-description: Logs every chat message the Platform Agent receives and responds to, tied to the sending user.
+description: Appends a record for every chat message the Platform Agent receives and responds to, tied to the sending user, to the profile's audit file.
 events:
   - agent:start
   - agent:end

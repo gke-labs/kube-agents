@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import os
 import tempfile
 import unittest
+from concurrent.futures import wait
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -38,6 +40,7 @@ from admin_console.agent_runtime import (
     KanbanBoardResult,
     KanbanDelivery,
     KanbanEvent,
+    KanbanRelatedTask,
     KanbanRun,
     KanbanTaskDetail,
     KanbanTaskSummary,
@@ -50,12 +53,14 @@ from admin_console.telemetry import TelemetrySnapshot, TelemetrySourceState
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 APP_PATH = REPO_ROOT / "admin_console" / "app.py"
-CONNECTION_PAGE_PATH = REPO_ROOT / "admin_console" / "pages" / "connections.py"
+CONNECTION_PAGE_PATH = REPO_ROOT / "admin_console" / "views" / "connections.py"
 PROJECT = "test-project-01"
 CLUSTER = "test-cluster-01"
 LOCATION = "us-east4"
 NAMESPACE = "kubeagents-system"
 TARGET = DeploymentTarget(PROJECT, CLUSTER, LOCATION, NAMESPACE)
+# The Task Kanban page shows parents and children in tables with these columns.
+RELATED_COLUMNS = ["Task", "Status", "Assignee", "Title"]
 
 
 def query_param(app: AppTest, key: str) -> str:
@@ -403,6 +408,51 @@ class FakePaginatedHistoryProvider(FakeHistoryProvider):
         return replace(detail, task=task, body=f"Details for {task_id}")
 
 
+class FakeCardStateHistoryProvider(FakeHistoryProvider):
+    def list_kanban_tasks(self, agent: str, *, limit: int = 500) -> KanbanBoardResult:
+        base = self.kanban_task()
+        return KanbanBoardResult(
+            (
+                replace(
+                    base,
+                    task_id="t_gaveup01",
+                    status="blocked",
+                    block_kind="needs_input",
+                    gave_up=True,
+                ),
+                replace(
+                    base,
+                    task_id="t_needs001",
+                    status="blocked",
+                    block_kind="needs_input",
+                ),
+                replace(base, task_id="t_donepr01", has_pr=True),
+                replace(base, task_id="t_done0001"),
+            ),
+            False,
+        )
+
+    def get_kanban_task(self, agent: str, task_id: str) -> KanbanTaskDetail:
+        detail = super().get_kanban_task(agent, task_id)
+        task = next(
+            task
+            for task in self.list_kanban_tasks(agent).tasks
+            if task.task_id == task_id
+        )
+        parent = KanbanRelatedTask(
+            "t_parent01", "Parent", "platform", "done", has_pr=True
+        )
+        child = KanbanRelatedTask(
+            "t_child001",
+            "Child",
+            "platform",
+            "blocked",
+            block_kind="needs_input",
+            gave_up=True,
+        )
+        return replace(detail, task=task, parents=(parent,), children=(child,))
+
+
 class FakePortalHistoryProvider(FakeHistoryProvider):
     def list_conversations(self, agent: str, *, cutoff, limit: int = 200) -> HistoryResult:
         conversation = AgentConversation(
@@ -526,6 +576,25 @@ class FakeReviewTaskHistoryProvider(FakeActiveTaskHistoryProvider):
             limit=limit,
         )
         return TaskUpdateResult((replace(result.tasks[0], status="review"),), False)
+
+
+class FakeGaveUpTaskHistoryProvider(FakeActiveTaskHistoryProvider):
+    def get_task_updates(
+        self,
+        agent: str,
+        *,
+        session_id: str,
+        limit: int = 100,
+    ) -> TaskUpdateResult:
+        result = super().get_task_updates(
+            agent,
+            session_id=session_id,
+            limit=limit,
+        )
+        task = replace(
+            result.tasks[0], status="blocked", block_kind="needs_input", gave_up=True
+        )
+        return TaskUpdateResult((task,), False)
 
 
 class FakeChatProvider:
@@ -652,14 +721,19 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         return app.session_state[CONNECTION_CONTROLLER_KEY]
 
     def finish_connection_job(self, app: AppTest) -> AppTest:
-        """Wait on the dependency itself, then let the UI consume its result."""
+        """Wait on the dependency itself, then let the UI consume its result.
+
+        A future that finished with an exception counts as done: the UI, not
+        the test, is what reads it, so the helper does not re-raise it.
+        """
         if CONNECTION_CONTROLLER_KEY not in app.session_state:
             app = app.run()
         controller = self.controller(app)
         if controller.job is None:
             return app
         job = controller.job
-        job.future.result(timeout=20)
+        done, _ = wait([job.future], timeout=20)
+        self.assertIn(job.future, done, "connection job did not finish in time")
         return app.run()
 
     def connect_project(self, app: AppTest) -> AppTest:
@@ -678,13 +752,28 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         ).click().run()
         return self.finish_connection_job(app)
 
+    def test_a_switched_page_still_runs_the_app_shell(self):
+        """The sidebar, the connection poll and the sign-in caption come from
+        app.py. A pages/ folder beside app.py turns on streamlit's legacy
+        multipage layout, and AppTest then reruns a page without app.py
+        (#3044). On streamlit 1.66 the connect-job tests catch that; on 1.65
+        only this test does.
+        """
+        self.assertFalse((APP_PATH.parent / "pages").exists())
+        app = self.app().run().switch_page("views/kanban.py").run()
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(
+            any("Signed in as admin@example.com" in item.value for item in app.sidebar.caption)
+        )
+
     def test_provider_backed_pages_stay_visible_before_connection(self):
         for page, title in (
-            ("pages/chat.py", "Chat"),
-            ("pages/overview.py", "Overview"),
-            ("pages/activity.py", "Activity Explorer"),
-            ("pages/kanban.py", "Task Kanban"),
-            ("pages/autonomous.py", "Scheduled Cron"),
+            ("views/chat.py", "Chat"),
+            ("views/overview.py", "Overview"),
+            ("views/activity.py", "Activity Explorer"),
+            ("views/kanban.py", "Task Kanban"),
+            ("views/autonomous.py", "Scheduled Cron"),
         ):
             with self.subTest(page=page):
                 app = self.app().run().switch_page(page).run()
@@ -789,7 +878,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         ):
             app = self.connect_project(self.app().run())
             app = self.connect_cluster(app)
-            app = app.switch_page("pages/kanban.py").run()
+            app = app.switch_page("views/kanban.py").run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(len(app.info), 0)
@@ -1005,6 +1094,12 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         )
 
     def test_revalidation_exception_retains_suspended_target(self):
+        release_check = Event()
+
+        def crashed_check(*args, **kwargs):
+            release_check.wait(timeout=20)
+            raise RuntimeError("probe crashed")
+
         app = self.app(connected=True)
         self.controller(app).verified_at = datetime(2020, 1, 1, tzinfo=UTC)
         save_connection(
@@ -1014,9 +1109,12 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         )
         with patch(
             "admin_console.connections.run_connection_checks",
-            side_effect=RuntimeError("probe crashed"),
+            side_effect=crashed_check,
         ):
             app = app.run()
+            self.assertIsNotNone(self.controller(app).job)
+            release_check.set()
+            app = self.finish_connection_job(app)
 
         self.assertIsNone(self.controller(app).connected_target)
         saved = load_connection("admin@example.com")
@@ -1339,7 +1437,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_runtime.AgentRuntimeProvider",
             FakeHistoryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/chat.py").run()
+            app = self.app(connected=True).run().switch_page("views/chat.py").run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(len(app.chat_message), 2)
@@ -1380,7 +1478,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_runtime.AgentRuntimeProvider",
             FakePaginatedHistoryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/chat.py").run()
+            app = self.app(connected=True).run().switch_page("views/chat.py").run()
             self.assertEqual(
                 app.dataframe[0].value.iloc[0]["Session"],
                 "Task Kanban · t_00000000",
@@ -1405,7 +1503,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_runtime.AgentRuntimeProvider",
             FakeActiveTaskHistoryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/chat.py").run()
+            app = self.app(connected=True).run().switch_page("views/chat.py").run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(len(app.status), 1)
@@ -1425,7 +1523,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_runtime.AgentRuntimeProvider",
             FakeCompletingTaskHistoryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/chat.py").run()
+            app = self.app(connected=True).run().switch_page("views/chat.py").run()
             for _ in range(3):
                 app = app.run()
 
@@ -1444,13 +1542,23 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_runtime.AgentRuntimeProvider",
             FakeReviewTaskHistoryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/chat.py").run()
+            app = self.app(connected=True).run().switch_page("views/chat.py").run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertTrue(
             next(iter(dict(app.session_state.portal_task_polling).values()))
         )
         self.assertTrue(any("review" in item.value for item in app.markdown))
+
+    def test_chat_task_card_shows_the_kanban_label(self):
+        with patch(
+            "admin_console.agent_runtime.AgentRuntimeProvider",
+            FakeGaveUpTaskHistoryProvider,
+        ):
+            app = self.app(connected=True).run().switch_page("views/chat.py").run()
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertIn("**platform** · failed after all attempts", [item.value for item in app.markdown])
 
     def test_connected_cluster_survives_navigation_query_reset(self):
         provisioned_default = DeploymentTarget(
@@ -1468,7 +1576,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         ):
             app = self.app(connected=True).run()
             app.query_params.clear()
-            app = app.switch_page("pages/chat.py").run()
+            app = app.switch_page("views/chat.py").run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(self.controller(app).selected_target.cluster_name, CLUSTER)
@@ -1482,7 +1590,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         ):
             app = self.app(connected=True)
             app.query_params["chat_session"] = "default:portal_saved"
-            app = app.run().switch_page("pages/chat.py").run()
+            app = app.run().switch_page("views/chat.py").run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(len(app.chat_message), 2)
@@ -1511,7 +1619,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_chat.AgentChatProvider",
             FakeChatProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/chat.py").run()
+            app = self.app(connected=True).run().switch_page("views/chat.py").run()
             next(button for button in app.button if button.label == "New chat").click().run()
             app.chat_input[0].set_value("Build Battleship").run()
 
@@ -1528,7 +1636,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.agent_runtime.AgentRuntimeProvider",
             FakeHistoryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/kanban.py").run()
+            app = self.app(connected=True).run().switch_page("views/kanban.py").run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(app.title[0].value, "Task Kanban")
@@ -1538,13 +1646,102 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         )
         self.assertNotIn("Inspect task", [item.label for item in app.selectbox])
         self.assertIn("selection_mode: SINGLE_ROW", str(app.dataframe[0].proto))
+        self.assertEqual(
+            [item.label for item in app.metric][:5],
+            ["Tasks", "Active", "Waiting on input", "Failed", "Done"],
+        )
+        self.assertIn("0 with a pull request", [item.value for item in app.caption])
+
+    def test_kanban_shows_card_state_labels_counts_and_filter(self):
+        def status_filter(app: AppTest):
+            return next(item for item in app.selectbox if item.label == "Status")
+
+        def board_rows(app: AppTest) -> dict[str, str]:
+            frame = app.dataframe[0].value
+            return dict(zip(frame["Task"], frame["Status"]))
+
+        def open_board() -> AppTest:
+            app = self.app(connected=True).run().switch_page("views/kanban.py").run()
+            self.assertEqual(len(app.exception), 0)
+            return app
+
+        with patch(
+            "admin_console.agent_runtime.AgentRuntimeProvider",
+            FakeCardStateHistoryProvider,
+        ):
+            app = open_board()
+            self.assertEqual(
+                {item.label: item.value for item in app.metric[:5]},
+                {
+                    "Tasks": "4",
+                    "Active": "0",
+                    "Waiting on input": "1",
+                    "Failed": "1",
+                    "Done": "2",
+                },
+            )
+            self.assertIn("1 with a pull request", [item.value for item in app.caption])
+            self.assertEqual(
+                board_rows(app),
+                {
+                    "t_gaveup01": "failed after all attempts",
+                    "t_needs001": "blocked · needs input",
+                    "t_donepr01": "done · with a pull request",
+                    "t_done0001": "done",
+                },
+            )
+            self.assertEqual(
+                status_filter(app).options,
+                [
+                    "All",
+                    "blocked",
+                    "blocked · needs input",
+                    "done",
+                    "done · with a pull request",
+                    "failed after all attempts",
+                ],
+            )
+            # The first card failed after all attempts. Its detail chip shows red.
+            self.assertIn("failed after all attempts", [item.value for item in app.error])
+            # The Parents and Children tables show the labels too.
+            related = [
+                dict(zip(frame.value["Task"], frame.value["Status"]))
+                for frame in app.dataframe
+                if list(frame.value.columns) == RELATED_COLUMNS
+            ]
+            self.assertEqual(
+                related,
+                [{"t_parent01": "done · with a pull request"}, {"t_child001": "failed after all attempts"}],
+            )
+
+            expected = {
+                "failed after all attempts": ["t_gaveup01"],
+                "blocked · needs input": ["t_needs001"],
+                "done · with a pull request": ["t_donepr01"],
+                "blocked": ["t_gaveup01", "t_needs001"],
+                "done": ["t_donepr01", "t_done0001"],
+            }
+            for selected, task_ids in expected.items():
+                with self.subTest(selected=selected):
+                    # A new session for each pick: the filter's widget
+                    # identity includes the index from the URL.
+                    app = open_board()
+                    status_filter(app).set_value(selected).run()
+                    self.assertEqual(len(app.exception), 0)
+                    self.assertEqual(list(board_rows(app)), task_ids)
+
+            app = open_board()
+            status_filter(app).set_value("blocked · needs input").run()
+            self.assertIn(
+                "blocked · needs input", [item.value for item in app.warning]
+            )
 
     def test_kanban_paginates_tasks_and_selects_page_details(self):
         with patch(
             "admin_console.agent_runtime.AgentRuntimeProvider",
             FakePaginatedHistoryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/kanban.py").run()
+            app = self.app(connected=True).run().switch_page("views/kanban.py").run()
             next(
                 button for button in app.button if button.label == "Next"
             ).click().run()
@@ -1563,8 +1760,8 @@ class AdminPortalFunctionalTest(unittest.TestCase):
 
     def test_each_activity_page_owns_its_scope_controls(self):
         for page, title in (
-            ("pages/overview.py", "Overview"),
-            ("pages/activity.py", "Activity Explorer"),
+            ("views/overview.py", "Overview"),
+            ("views/activity.py", "Activity Explorer"),
         ):
             with self.subTest(page=page), patch(
                 "admin_console.activity_scope.CloudTelemetryProvider",
@@ -1583,7 +1780,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.activity_scope.CloudTelemetryProvider",
             FakeLargeTelemetryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/activity.py").run()
+            app = self.app(connected=True).run().switch_page("views/activity.py").run()
             self.assertEqual(len(app.dataframe[0].value), 50)
             next(button for button in app.button if button.label == "Next").click().run()
 
@@ -1598,7 +1795,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.activity_scope.CloudTelemetryProvider",
             FakeTelemetryProvider,
         ):
-            app = self.app(connected=True).run().switch_page("pages/activity.py").run()
+            app = self.app(connected=True).run().switch_page("views/activity.py").run()
             next(
                 button
                 for button in app.button
@@ -1618,7 +1815,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             app = (
                 self.app(connected=True)
                 .run()
-                .switch_page("pages/autonomous.py")
+                .switch_page("views/autonomous.py")
                 .run()
             )
 
@@ -1656,11 +1853,49 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             try:
                 os.chdir(temporary_directory)
-                app = self.app().run().switch_page("pages/connections.py").run()
+                app = self.app().run().switch_page("views/connections.py").run()
             finally:
                 os.chdir(original_cwd)
 
         self.assertEqual(len(app.exception), 0)
+
+
+class ProductTerminologyTest(unittest.TestCase):
+    """The console names the product, not the agent runtime it is built on (#1864)."""
+
+    def test_console_strings_do_not_show_the_runtime_name(self):
+        console = REPO_ROOT / "admin_console"
+        modules = sorted(
+            path
+            for path in console.rglob("*.py")
+            if "tests" not in path.relative_to(console).parts
+        )
+        self.assertTrue(modules)
+        for module in modules:
+            tree = ast.parse(module.read_text(encoding="utf-8"))
+            # Only real docstrings are skipped: Streamlit renders any other
+            # bare string statement on the page.
+            docstrings = {
+                id(node.body[0].value)
+                for node in ast.walk(tree)
+                if isinstance(
+                    node,
+                    (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
+                )
+                and node.body
+                and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+            }
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and id(node) not in docstrings
+                ):
+                    # Case-sensitive on purpose: lowercase "hermes" is the
+                    # runtime's install path and OTel attribute prefix.
+                    with self.subTest(module=module.name, line=node.lineno):
+                        self.assertNotIn("Hermes", node.value)
 
 
 if __name__ == "__main__":

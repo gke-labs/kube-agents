@@ -1,0 +1,32 @@
+Subject: Point Workload Identity at gke-workload-identity
+
+Why: upstream's Workload Identity split moved WI routing out of gke-workload-security in the skills' descriptions only; the bodies an agent reads after routing still sent it there and taught GSA impersonation as the recommended path, which gke-workload-identity calls legacy. The patch points the bodies at gke-workload-identity.
+Local-Issue: none (#2357)
+Upstream-Issue: none filed yet
+Retire-When: upstream's skill bodies route Workload Identity to gke-workload-identity
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -20,9 +20,9 @@ metadata:
+ 
+ This reference covers platform-level security hardening and cluster
+ configuration for Google Kubernetes Engine (GKE). For workload-level security
+-controls (such as Workload Identity Service Account bindings,
+-SecretProviderClass volume mounts, Network Policies, and Pod Security
+-Standards), refer to the `gke-workload-security` skill.
++controls (such as SecretProviderClass volume mounts, Network Policies, and Pod
++Security Standards), refer to the `gke-workload-security` skill; for Workload
++Identity Service Account bindings, the `gke-workload-identity` skill.
+ 
+ > **MCP Tools:** `gke:get_cluster`, `k8s:check_k8s_auth`,
+ > `k8s:get_k8s_resource`, `k8s:apply_k8s_manifest`, `gke:update_cluster`
+@@ -163,7 +163,7 @@ The five most common predefined IAM roles for GKE platform and cluster access:
+     `roles/logging.logWriter`) and assign it at node pool creation time.
+ -   **Workload Identity**: For binding Google Service Accounts to Kubernetes
+     Service Accounts (`roles/iam.workloadIdentityUser`), refer to the
+-    `gke-workload-security` skill.
++    `gke-workload-identity` skill.
+ 
+ ## Cross-Service Authentication Patterns
+ 

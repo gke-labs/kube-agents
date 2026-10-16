@@ -34,6 +34,25 @@ from typing import Any
 
 import pytest
 
+#: The variables that select and configure a GitLab forge. Every check
+#: reads them from the process environment, so a developer's shell that
+#: exports them (as a GitLab dev install is told to) would turn the GitHub
+#: tests' answers into GitLab's. Cleared before every test; a GitLab test's
+#: own fixture sets back what it needs.
+FORGE_ENV_VARS = (
+    "BENCH_FORGE",
+    "BENCH_GITLAB_HOST",
+    "BENCH_GITLAB_TOKEN",
+    "BENCH_GITLAB_AGENT_LOGIN",
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_forge_from_the_shell(monkeypatch):
+    for name in FORGE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
 FIXTURE_RUNS = Path(__file__).parent / "fixtures" / "runs"
 TASKS = Path(__file__).resolve().parents[1] / "tasks"
 

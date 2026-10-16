@@ -1,26 +1,32 @@
 # Producing the PlatformAgent Usage Counters
 
-**Status:** design; the poller is not implemented yet.
+**Status:** implemented. The facts table below is the tree as read on 2026-10-01, before the poller; the sections after it describe what ships.
 
 ## Summary
 
 `PlatformAgent.status.usage` declares cumulative counters, `sessionsTotal`, `eventsIngestedTotal`,
-`toolExecutionsTotal`, `remediationsProposedTotal` and `remediationsAppliedTotal`, and a
-`lastActiveTime`, and nothing writes them. The schema shipped that way on purpose: the agent's
+`toolExecutionsTotal`, `remediationsProposedTotal`, `remediationsMergedTotal`,
+`chatMessagesInboundTotal` and `remediationsAppliedTotal`, and a `lastActiveTime`, and until the poller this document describes nothing wrote them. The schema shipped that way on purpose: the agent's
 ServiceAccount holds no write verb on the status, and the operator, which does, saw no session,
-event or tool call. Two of the counters now have an in-cluster source. The credential broker
-serves `kubeagents_tool_invocations_total` on its metrics-only listener, and the event watcher
-serves `k8s_event_watcher_events_injected_total` on the gateway pod's `agent-api-auth` sidecar,
-both for the managed-Prometheus collector.
+event or tool call. All but two of those now have an in-cluster source, and the watcher's per-cluster gauge gives two more fields a reading. The credential broker
+serves `kubeagents_tool_invocations_total`, `kubeagents_vcs_requests_total` and
+`kubeagents_vcs_proposals_merged_total` on its metrics-only listener, and the event watcher serves `k8s_event_watcher_events_injected_total` on the gateway
+pod's `agent-api-auth` sidecar, and the `chat_metrics` plugin serves
+`kubeagents_chat_messages_inbound_total` on the `platform-agent` container, all for the
+managed-Prometheus collector.
 
 This document settles how the operator turns those series into the status fields: a poller
-that runs on the leader off the reconcile path, scrapes the two endpoints over a NetworkPolicy
+that runs on the leader off the reconcile path, scrapes the three endpoints over a NetworkPolicy
 rule that admits the operator's pods and nothing else new, accumulates per-pod deltas into
 totals it keeps beside their baseline in a ConfigMap, so the counters stay monotonic across pod,
 process and operator restarts, and patches the status at most once per interval, only when the
-status is behind. `toolExecutionsTotal`, `eventsIngestedTotal` and `lastActiveTime` land this
-way. `sessionsTotal`, `remediationsProposedTotal` and `remediationsAppliedTotal` stay unwritten
-until a series exists for each, and the last section says what that series is.
+status is behind. `toolExecutionsTotal`, `eventsIngestedTotal`, `remediationsProposedTotal`,
+`remediationsMergedTotal`, `chatMessagesInboundTotal` and `lastActiveTime` land this way, the proposals counters from the
+broker's version-control series, and `clustersRegistered` and `clustersMonitored` ride the same
+poll as gauges: the watcher's `k8s_event_watcher_cluster_up` series counted and projected as the
+latest reading, outside the ConfigMap. `sessionsTotal` and `remediationsAppliedTotal` stay
+unwritten until a series exists for each, and the section on what stays unwritten says what that
+series is.
 
 ## What was verified
 
@@ -54,30 +60,32 @@ These are the facts the design rests on.
 
 A `UsageCounterPoller`, a manager `Runnable` beside the RBAC self-check, with
 `NeedLeaderElection` returning true: the counters are per cluster, so exactly one operator
-replica advances them. After the manager's first reconcile pass over the CRs, so that the
-rules that admit the operator have been rendered before the first scrape, and then every
+replica advances them. One interval after the leader's election, by which time the first
+reconcile pass has rendered the rules that admit the operator, and then every
 `usageCountersPollInterval` (five minutes, the
 interval the controller already uses for the RBAC re-probe and the pruned-status re-probe, on
 the same reasoning: one status write per interval is a cost nobody notices) it lists the
 `PlatformAgent`s from the cache and, for each:
 
-1. lists the pods the two policies select, in the CR's namespace: `app: <name>-gateway` for the
-   gateway, and for the broker the two labels `credentialProxySelector` returns,
+1. lists the pods the policies select, in the CR's namespace: `app: <name>-gateway` for the
+   gateway, twice, once per listener on that pod; `app: <name>-a2a-gateway` for the A2A gateway a `next`
+   install runs, which selects no pod elsewhere; and for the broker the two labels `credentialProxySelector` returns,
    `app: <name>-credential-proxy` and `kubeagents.x-k8s.io/component: credential-proxy`. When
-   `eventWatcherEnabled` is false for the CR, the gateway pods are left out: the entrypoint
+   `eventWatcherEnabled` is false for the CR, the gateway pods' watcher target is left out: the entrypoint
    starts no watcher, so nothing listens on `event-metrics`, and a refused connection there
-   would be the install's choice, not a failure;
-2. for each running pod, finds the container port by name, `event-metrics` on the gateway pod
+   would be the install's choice, not a failure; the chat target has no such switch, since the plugin is part of the chat profile;
+2. for each running pod, finds the container port by name, `event-metrics` and `chat-metrics` on the gateway pod
    and `cred-metrics` on the broker pod, looking through `initContainers` as well as
-   `containers` because the sidecar is a native one, and reads `/metrics` at the pod IP and that port, joined with
+   `containers` because the watcher's sidecar is a native one while the chat plugin runs in the `platform-agent` container, and reads `/metrics` at the pod IP and that port, joined with
    `net.JoinHostPort` so an IPv6 pod IP works, with a short deadline. The body is not parsed
    whole: the watcher's exposition grows with the fleet, clusters times the namespaces that
    ever raised a warning times the reasons, per family, for the life of the process, so a
    ceiling on the body would be a bound sized against no population, and `expfmt`
    materialises every family of whatever it is handed. The reader scans the body line by
-   line and keeps none of it: a line of the two families the design wants, or of the start-time
-   gauge, is parsed on its own with `expfmt` and its sample folded into the running per-pod
-   sum as it is read, and every other line is skipped unread. The one bound is
+   line and keeps none of it: a line of a family the design wants, each counter's own, the
+   start-time gauge, and for the watcher's body its per-cluster up gauge, is parsed on its own
+   with `expfmt` and folded as it is read, the counter's sample into the running per-pod sum
+   and the up gauge into two per-pod counts, and every other line is skipped unread. The one bound is
    `usageScrapeMaxLineBytes` per line, and a line past it is a failed scrape; a bound on the
    number of lines would be a bound on the kept family's cardinality, which is the product the
    sentence above says cannot be sized, and a fleet that crossed it would freeze the counter
@@ -91,17 +99,24 @@ the same reasoning: one status write per interval is a cost nobody notices) it l
    policy does not have, anywhere else. Selecting the port by its name means a renumbering in
    the manifests moves the scrape with it;
 3. sums the series it wants over every label set as the lines are folded (the next
-   section says which), and takes one sample per pod per counter. A sample that is negative or
-   not finite is a failed scrape for that pod: it contributes nothing, and the log line names the
+   section says which), and takes one sample per pod per counter, and from the watcher's body
+   its two cluster counts, the up-gauge series present and those at `1`. A sample that is
+   negative or not finite is a failed scrape for that pod, as is a body with more up-gauge
+   series than `usageClusterGaugeCeiling`: it contributes nothing, and the log line names the
    pod. What a body may add to a total in one poll is bounded in the resets section, and that
    bound, not the sample, is the one that matters;
 4. folds the samples into the totals through the per-pod baseline described below. Totals and
    baseline live together in one ConfigMap, which is the accumulator's source of truth; the
-   status is a projection of it;
+   counters in the status are a projection of it. The cluster counts are not folded and not
+   stored: the poll keeps the largest of each across the gateway pods it read, as the reading
+   to project;
 5. writes the ConfigMap when a total or the baseline changed, recording with the totals the
    time of the poll that moved them, then patches `status.usage` when the status is behind the
    ConfigMap, copying its totals and that time as `lastActiveTime`. The order, ConfigMap first,
-   is deliberate; the resets section says why.
+   is deliberate; the resets section says why. The same patch carries the two cluster gauges
+   when this poll's reading differs from the status in either direction, a zero reading
+   included; clears them to absent when the watcher is off, and on the second poll in a row in
+   which no gateway pod could be read; and leaves them as they were on the first such poll.
 
 Nothing in `Reconcile`'s accounting changes: the reconcile loop keeps writing `activeInterfaces`
 through the Ready writer as it does today, the poller never touches that field, and the Ready
@@ -111,11 +126,15 @@ share is the echo check in the served-CRD section, generalised so that both call
 
 ## Counter sources
 
-| Status field          | Series                                                       | Aggregation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| --------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `toolExecutionsTotal` | `kubeagents_tool_invocations_total`, broker pod              | Sum over `tool` and `subcommand`, over `status` in `success` and `error`: the commands the broker ran to an exit. `blocked` and `busy` are refusals that never ran. `abandoned` is left out because the series cannot say whether the command had started: the broker records it for a command killed mid-run and for a caller that left the queue before the start. `error` also covers a rejected request and a broker fault, so the count is the broker's view of "ran", a little wide. |
-| `eventsIngestedTotal` | `k8s_event_watcher_events_injected_total`, every gateway pod | Within a pod, sum over every label: cluster, project, location, reason and namespace. Across gateway pods, the largest per-pod delta in the poll rather than the sum: each replica's watcher works the same event stream, so the sum would count an event once per replica. With one pod the two are the same.                                                                                                                                                                             |
-| `lastActiveTime`      | derived                                                      | The time of the last poll in which any total moved: a command ran, or an event was accepted for triage. The field's documented meaning is the most recent interaction or event triage; until `sessionsTotal` lands, a chat turn that runs no brokered command does not move it, and the CRD description the implementation ships says so.                                                                                                                                                  |
+| Status field                              | Series                                                                                                                                                                                                                                                                                              | Aggregation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `toolExecutionsTotal`                     | `kubeagents_tool_invocations_total`, broker pod                                                                                                                                                                                                                                                     | Sum over `tool` and `subcommand`, over `status` in `success` and `error`: the commands the broker ran to an exit. `blocked` and `busy` are refusals that never ran. `abandoned` is left out because the series cannot say whether the command had started: the broker records it for a command killed mid-run and for a caller that left the queue before the start. `error` also covers a rejected request and a broker fault, so the count is the broker's view of "ran", a little wide.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `eventsIngestedTotal`                     | `k8s_event_watcher_events_injected_total`, every gateway pod                                                                                                                                                                                                                                        | Within a pod, sum over every label: cluster, project, location, reason and namespace. Across gateway pods, the largest per-pod delta in the poll rather than the sum: each replica's watcher works the same event stream, so the sum would count an event once per replica. With one pod the two are the same.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `remediationsProposedTotal`               | `kubeagents_vcs_requests_total`, broker pod                                                                                                                                                                                                                                                         | Sum over `verb="proposal-create"` and `status="success"` alone: the proposals the forge accepted. The same body as `toolExecutionsTotal`, read once and folded into the broker's counters, each with its own baseline entry under the pod; the other verbs and outcomes stay in Prometheus.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `remediationsMergedTotal`                 | `kubeagents_vcs_proposals_merged_total`, broker pod                                                                                                                                                                                                                                                 | Summed whole; the series carries no label. The broker counts, once each per broker process, the proposals of its own that one of its reads, `proposal-list` or `proposal-view`, shows merged, under three rules that need no store: the author is the credential's login, the merge time is not before the process started (so a restart counts no merge the previous process could have), and each proposal counts once. A merge no read ever shows is not counted, and a credential whose login the broker cannot name counts nothing (the broker logs that once per process), so the field under-counts rather than over-counts and stays absent on such an install; it is the forge's word, where `remediationsAppliedTotal` is the install's. The restart rule holds to within the forge's and the pod's clocks agreeing. `proposal-acknowledge` is not a counting point: its answer is a reaction's result and carries no proposal state, so the remediation SOP's acknowledge step, which views the proposal first, is what makes a merge the broker never reads again rare, and no scheduled `proposal-list` is added.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `chatMessagesInboundTotal`                | `kubeagents_chat_messages_inbound_total`, every gateway pod, on the `chat_metrics` plugin's listener (port `chat-metrics`, 9097, on the `platform-agent` container); and on a `next` install `kubeagents_a2a_gateway_messages_inbound_total`, the A2A gateway pod, on its `a2a-metrics` port (9096) | Summed over the `platform` label and across pods. Under `spec.mode: next` Chat ingress is the A2A gateway's, a separate program, and a message that becomes an A2A task never reaches the plugin's hook; the A2A gateway counts it where every adapter meets (`handleInbound`), before the sender is verified, under the same label vocabulary extended for its adapters (`googlechat`, `slack`, `discord`, `console`, `other`; a door's turns are programs', not chat, and are not counted), and the poller reads that pod as a fourth target into the same counter, with an entry and a streak of its own; its body carries `process_start_time_seconds` as every listener's does, so an in-place restart of the gateway container is told from a fall. The selector matches no pod on a `today` install. Read from the pod that runs Hermes: above one replica the container runs `leader_elect.py`, which starts the gateway on the lease holder alone and labels it `kubeagents.io/is-leader`, so the standby has nothing on the port by design, stays live and is not read; leadership moves between pods, so each pod's own count is summed. A new leader that predates the document but whose Hermes started after it was first recorded adds its whole first sample, so the messages it took between the lease and the first poll are counted; a leader whose Hermes predates the document is baselined at its first sample, as any such pod is. Counted on `pre_gateway_dispatch`, the hook the gateway runs once per inbound event after dropping its own internal events and before it checks the sender against the allowlist, so an unlisted user's message counts and nothing the gateway never hands to the hook does. Labelled by the platform Hermes names the event with, `googlechat`, `slack`, `teams`, `api` (the gateway's own API port) or `other`; the dashboard is not a platform Hermes names on a gateway event. The gateway pod now carries two listeners, read as two targets with a failure streak each. |
+| `clustersRegistered`, `clustersMonitored` | `k8s_event_watcher_cluster_up`, every gateway pod                                                                                                                                                                                                                                                   | Gauges, not counters, read from the same body as the injected series: the number of `cluster_up` series the watcher exports is the clusters it built a client for, and the number at `1` the clusters whose informer is delivering events. Across gateway pods, the largest of each: every replica's watcher builds the same fleet, so a replica mid-startup reports fewer, not others. The latest poll's reading, projected as it stands: they fall after a restart without a cluster, are cleared when the watcher is disabled, are left as they were by one poll that could read no replica, and are cleared to absent by the second such poll in a row, because the operator then has no current reading and an absent field says so where a held one would read as current; whether the watcher is down, its pod not running, or merely unreachable is for the CR's events and the pod's state to say. The fields are pointers so that a zero, the watcher's fleet built and nothing synced yet, is written as a reading rather than serialised away. They do not move `lastActiveTime`. The watcher discovers its fleet once per process, so the registered count is the fleet as of the watcher's last start: a cluster that joins or leaves is counted after the gateway pod restarts.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `lastActiveTime`                          | derived                                                                                                                                                                                                                                                                                             | The time of the last poll in which any total moved: a command ran, a proposal was opened or merged, a chat message arrived, or an event was accepted for triage. The field's documented meaning is the most recent interaction or event triage, and a chat turn that runs no brokered command now moves it through `chatMessagesInboundTotal`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 `eventsIngestedTotal` counts the events the watcher accepted for triage, past its reason filter
 and its dedup window and not turned away by the daemon, not the events it observed. The observed series,
@@ -141,8 +160,10 @@ handling below runs first, so a new pod's whole sample competes with an old pod'
 and the larger wins, which is still the better estimate of the two. A replica whose entry is behind
 its sibling's marker when it next advances is reset without adding and takes the sibling's
 marker, as the resets section says, so one straddle does not cost the next lone advance, and
-that rule reads the stored markers alone, so it holds across a leader change. It
-makes the layout under-count rather than over-count: informer skew that straddles a poll
+that rule reads the stored markers alone, so it holds across a leader change between
+replicas that both stay live; a former leader that terminates mid-straddle is the exception, in
+the resets section below. It makes the layout under-count rather than over-count: informer skew that
+straddles a poll
 boundary, one replica ahead at one poll and the other catching up by the next, drops the
 catch-up instead of counting it twice, and a replica's events its sibling did not inject, a
 sibling whose daemon dropped them on its daily ceiling or whose dedup snapshot was kept while
@@ -154,33 +175,33 @@ rule.
 
 ## Reach: how the operator gets to the endpoints
 
-The scrape is a direct read of the pod IP, and today the two policies admit the metrics ports
-from the collector's namespace alone. The implementation adds one ingress rule to each policy,
+The scrape is a direct read of the pod IP, and before the poller the policies admitted the
+metrics ports from the collector's namespace alone. The implementation adds one ingress rule to each policy that fences a metrics port (the gateway's, the broker's, and the A2A gateway's three fences on a `next` install),
 the same shape as the collector's rule beside it: the operator's namespace by its
 `kubernetes.io/metadata.name` label, and within it pods with
 `app.kubernetes.io/name: kube-agents-operator`, on the metrics port only. The operator renders
-these policies, so it can write the rule once it is told its own namespace, which today it is
-not: the namespace-file read in `main.go` serves image discovery, runs only when the chart has
+these policies, so it can write the rule once it is told its own namespace, which until the
+poller it was not: the namespace-file read in `main.go` serves image discovery, runs only when the chart has
 not set `OPERATOR_IMAGE`, and keeps nothing, and the renderers take the CR and the start-up
 flags alone. Both install paths therefore set a Downward-API `POD_NAMESPACE` on the manager
 container, the pattern the operator already renders for its own callout; `main.go` reads it once
 and hands it to the reconciler beside the other render inputs, and the golden tests fix it to a
 constant so the rendered policies stay deterministic. When it is unset, as under `make run` off
-the cluster, the rule is omitted and one start-up line says so; nothing off the cluster could
+the cluster, the rule is omitted, one start-up line says so and the poller is not started; nothing off the cluster could
 reach a pod IP in any case. The label is the one both install paths put on its pod. A
 deployment that relabels the operator pod breaks the scrape and nothing else; the failure
 section says how that shows.
 
 The rule is narrower than the obvious alternative of admitting the agent's namespace, which
-would open both listeners to the shell sandbox and to anything else that lands in the
+would open every listener to the shell sandbox and to anything else that lands in the
 namespace. The listeners serve counters whose labels are tool, subcommand and status names on the
 broker's side and cluster, project, location, namespace and reason names on the watcher's,
 nothing secret, but the broker's metrics listener was admitted past the broker's own
 reachable-off-pod refusal on the argument that it serves counters to a collector; a pod
 selector keeps that argument true.
 
-Two documents state the current peer set as a security property rather than as a description:
-`docs/security-requirements.md` and `docs/credential-isolation-design.md` both say the broker
+Two documents stated the pre-poller peer set as a security property rather than as a description:
+`docs/security-requirements.md` and `docs/credential-isolation-design.md` both said the broker
 opens 8766 to the collector's namespace and to no other peer. The rule here adds one peer, and
 the implementation rewrites those sentences to say so, with the pod selector as the reason the
 property holds in substance: the listener reaches the collector and the operator, both readers
@@ -195,15 +216,22 @@ A Prometheus counter is the life of one process. The broker's restarts with its 
 its container; the watcher's with the gateway pod, with its sidecar container, and with every
 restart the entrypoint's supervisor performs in place. A status counter that copied the sample
 would fall back to zero on every one of those. The poller therefore keeps, per CR, a baseline:
-the last sample it took from each pod, keyed by pod UID, per counter. On a poll it adds, for
-each pod it scraped:
+the last sample it took from each pod, keyed by pod UID and counter, since the broker's one
+body feeds several counters (document layout version 2; a version-1 document, or one that predates a counter, is migrated in place on the first poll, its totals and baseline kept, so an upgrade loses nothing: a total the document lacked starts at the status floor, so a rollback and return does not have the read-back refuse the document, and when that floor is zero the counter is recorded as unfolded in the document, so the first sample of each pod read in the poll that first records a pod for it adds whole, whether that is the migrating poll or a later one, since no document and no status has seen any of it; the counter leaves the set in that poll, and a pod first read later is baselined like any pod older than the document). On
+a poll it adds, for each pod and counter it scraped:
 
 - the difference from the pod's last sample, when the pod UID is known, the body's start time
   is the recorded one, and the sample is not below the last one;
 - the whole sample, when the pod UID is new, which means created after the document was first
   recorded and not merely absent from it (a new pod starts from zero, so everything it has
-  counted is new), or the body's start time is present and later than the recorded one (the
-  process restarted inside the same pod);
+  counted is new), unless a live gateway sibling's marker is later than the pod's creation,
+  in which case the sibling supplied the events this pod injected in the meantime and the pod
+  is recorded at its sample with the sibling's marker, adding nothing, as a known replica behind
+  its sibling would be; or the body's start time is present and later than the recorded one
+  (the process restarted inside the same pod); or, for a Sum counter, when the pod UID is new
+  and the body's start time is later than the document was first recorded, whatever the pod's
+  own age (the standby that took the lease: its Hermes began after the baseline did, so none of
+  its count was seen);
 - nothing, when the body carries a start time earlier than the recorded one, or shows the
   sample falling under an unchanged start time: a counter cannot fall inside one process, so
   each of those is a body that is not the listener's. The body is refused, and because it
@@ -252,18 +280,35 @@ each pod it scraped:
   marker is reset whether its body is an advance or a restart with a later start time, recorded
   at its new sample and start time, taking the sibling's marker and adding nothing, because the
   events its new process replayed are the ones the sibling already supplied. In a poll where
-  both replicas moved, the one whose delta the total took moves its marker; the other's
-  baseline moves to its sample, so its delta is not re-presented, but its marker stays, so its
-  later catch-up is reset rather than counted on top of what the total already took from its
-  sibling. The broker's one pod, and a single gateway pod, have no sibling and
+  both replicas moved, the one whose delta the total took moves its marker, and so does a
+  replica whose delta equalled it, since both injected the same events and neither has a
+  catch-up pending; a replica whose delta was smaller moves its baseline to its sample, so its
+  delta is not re-presented, but its marker stays, so its later catch-up is reset rather than
+  counted on top of what the total already took from its sibling. The broker's one pod, and a single gateway pod, have no sibling and
   always add the difference across a gap. The error this leaves is an under-count, named in the
   sources section: a replica's events that its sibling did not inject are lost whenever it was
-  quiet, or missed, for a poll in which the sibling moved.
+  quiet, or missed, for a poll in which the sibling moved; and a replica reset in a poll in
+  which its sibling was taken keeps the sibling's marker as it was read, one poll behind, until
+  it advances in a poll the sibling does not, so its events in a poll the sibling was missed are
+  lost too. A terminating pod is never read again, so it is not live: its entry is dropped and
+  its marker suppresses no sibling, which is what keeps a rollout from losing the new replica's
+  intervals. The drop runs before the markers are snapshotted, so it has a cost in the
+  mirror case: a replica trailing a leader that then terminates is never reset against the gone
+  leader's marker, and its pending catch-up -- the events the leader already counted -- is taken
+  a second time when it next advances, an over-count of one straddle's events and one of the two
+  places this layout over-counts rather than under-counts -- the re-seed skew straddle below is the
+  other. That cost is accepted: snapshotting the
+  departed markers would close it, but a departed sibling would then suppress a genuinely new
+  replica's first advance when it is read late in a rollout, and a real interval would be lost
+  for good; a bounded one-time double count is preferred to a permanent loss. A reset that took
+  the sibling's marker after the poll would close the missed-sibling
+  loss as well and open an over-count instead, a replica trailing its sibling by one poll having
+  its catch-up counted whenever the sibling is quiet, and the under-count is the one preferred.
 
 Entries for pods that no longer exist are dropped when the baseline is next written; their
 counts are already in the totals.
 
-The start time is why both listeners gain `process_start_time_seconds`, as a gauge each
+The start time is why every listener gains `process_start_time_seconds`, as a gauge each
 captures once when its process starts, `time.Now()` at `main` and nothing re-derived after, so
 it is constant for the life of the process by construction; the Go client's process collector
 is not used for it, because it recomputes the value from the kernel's boot time on every
@@ -288,8 +333,8 @@ section rather than designed away, because closing it means authenticating the l
 
 The totals and the baseline live together in a ConfigMap, `<name>-usage-counters`, in the CR's
 namespace, holding one JSON document: the time the document was first recorded, the running total per
-counter, the time of the last poll that moved a total, and per pod UID the pod's name for a reader, its last sample per counter,
-its last start time, and the poll at which its entry last supplied a delta the total took,
+counter, the time of the last poll that moved a total, and per pod UID and counter the pod's name for a reader, its last sample,
+its last start time, and the poll at which the entry last supplied a delta the total took,
 which for the broker's one pod and a single gateway pod is every poll it advanced, or the
 sibling's marker it was last reset against, which is not the poll it was last read at: a quiet
 poll changes nothing in the document, so a quiet install writes nothing, and the marker still
@@ -300,11 +345,17 @@ carries an owner reference to the CR, without the controller flag, so it is coll
 CR but does not re-enqueue it: the controller `Owns` ConfigMaps with no predicate, and a
 controller-owned one would cost a reconcile on every write. The document also records the UID
 of the CR it was accumulated for, and the poller compares it, and the owner reference's UID,
-with the CR's. A mismatch is treated as absent and overwritten: it is what a CR deleted and
-re-applied under the same name sees while the collector has not yet removed the old ConfigMap,
-or was kept from removing it, and without the check the new CR would inherit a predecessor's
-totals, through the status patch that fires whenever the status is behind. A name is not
-ownership; the finalizer applies the same rule to the data volume. What the poller reads back
+with the CR's. A mismatch means the document is treated as absent and its counters re-seeded,
+and the ConfigMap holding it overwritten: it is what a CR deleted and re-applied under the same
+name sees while the collector has not yet removed the old ConfigMap, or was kept from removing
+it, and without the check the new CR would inherit a predecessor's totals, through the status
+patch that fires whenever the status is behind. The overwrite is gated on ownership: the poller
+rewrites a ConfigMap under the name only when it is the operator's own -- carrying the instance
+label, or an owner reference naming a PlatformAgent of this name, which a predecessor's does on
+a delete-and-recreate. A ConfigMap another writer parked under the name has neither; the poller
+leaves it untouched, records a `UsageConfigMapForeign` Warning on the CR, and `status.usage`
+stays where it was until the object is removed. A name is not ownership; the finalizer applies
+the same rule to the data volume. What the poller reads back
 is bounded before it is used, with a bound of its own for the totals, which honestly outgrow
 any per-pod or per-poll figure: every sample non-negative and finite, every total non-negative,
 finite and below the `int64` headroom the status field has, no total below the status it
@@ -328,20 +379,36 @@ written poll and this one, once, rather than over-counting everything the pods h
 On a fresh install, or the first poll after the upgrade that brings the poller, the status
 carries nothing and the counters start at zero from this poll: a pod older than the poller has
 a history the counters never saw, and whether it fits the ceiling says nothing about whether
-it should be counted. The whole-sample branch therefore applies only to a pod created after the document was
-first recorded, where "a new pod starts from zero" is true: the document carries the time it
-was first recorded, and a pod's `creationTimestamp` from the list in step 1 is compared with
-it. Every poll that treats the document as absent, the first poll and each re-seed after a
+it should be counted. The whole-sample branch therefore applies to a pod created after the document was
+first recorded, where "a new pod starts from zero" is true, and, for a Sum counter, to a
+never-read pod whose body carries a process start time later than that: the document carries
+the time it was first recorded, and a pod's `creationTimestamp` from the list in step 1, or the
+start time in the body, is compared with it. A process younger than the document on an older
+pod is the standby that took the lease; its count began from zero after the baseline did, and
+a pod keeps its entry once read, so a restart inside a known pod takes the later-start branch
+above and never this one. Every poll that treats the document as absent, the first poll and each re-seed after a
 mismatch or a failed bound, records its own time there rather than carrying a predecessor's
-forward: "a new pod starts from zero and none of it was counted" holds only for pods created
-after the last point at which every pod was re-baselined, and a time carried forward would
+forward: "a new pod starts from zero and none of it was counted" holds only for pods, or
+processes, started after the last point at which every pod was re-baselined, and a time carried forward would
 make a pod the re-seed could not scrape "new" on its next scrape, with its lifetime counted
 once more on top of totals that already hold it. Absence from the document is not newness: a pod
-the first poll could not scrape, or that one of the two policies kept out while the other
+the first poll could not scrape, or that one of the policies kept out while another
 already admitted the operator, is recorded on its next scrape and adds nothing. `lastActiveTime`
 is first stamped by a poll in which something ran. What a fresh install loses is the count
 between each pod's start and the first poll after it, the under-count this document prefers
 everywhere else.
+
+Recording every pod level is right only where the replicas are level. A re-seed that scrapes two
+gateway replicas at different samples -- informer skew on the shared stream -- records both at the
+seed poll's own time and takes the larger delta on the next joint advance. Where the larger delta
+belongs to a replica catching up from before the seed, it carries that pre-seed backlog on top of
+the interval's own events, and the maximum counts the backlog once. The fold cannot tell that from
+its mirror -- a smaller delta from a replica lagging after the seed on ordinary skew, where the
+larger delta is the true interval and the maximum is exactly right -- because the two produce the
+same deltas; no rule on the deltas separates them, so the plain maximum is the honest choice,
+counting the backlog in the first case rather than losing a real interval in the second. The
+residual is bounded -- one straddle's backlog, counted once -- and is the second place this layout
+over-counts rather than under-counts, beside the terminating-leader straddle earlier in this section.
 
 The ConfigMap is written before the status. A crash between the two leaves the status one poll
 behind the totals, and the next poll repairs it, because the status patch is issued whenever the
@@ -350,14 +417,18 @@ time the ConfigMap recorded, not its own, so `lastActiveTime` says when the coun
 rather than when the status caught up. That time is in the ConfigMap for this reason: in the
 poller's memory alone it would die with the process that took it. The other order would
 leave the totals behind the status after a crash, and the next poll would add the interval's
-deltas a second time. Under-counting until the next poll is the error this document prefers
-everywhere; an over-count is permanent.
+deltas a second time. Under-counting until the next poll is the error this document prefers where
+the over-count it trades against would be permanent, as this crash's double-add would be. Two cases
+run the other way, each accepting a bounded over-count because there it is the under-count that
+would be permanent: the terminating-leader straddle and the re-seed skew straddle, both above.
 
 ## Write cadence and the status writers
 
 The status is written with `Status().Patch` and a merge patch from the CR as read, touching only
-the counters and `lastActiveTime`, at most once per poll and only when the status is behind the
-ConfigMap's totals. Every status write re-enqueues the CR through the unfiltered `PlatformAgent`
+the counters, the two cluster gauges and `lastActiveTime`, at most once per poll and only when the
+status is behind the ConfigMap's totals or a gauge differs from this poll's reading in either
+direction. The gauges are not in the ConfigMap: they are a reading, not an accumulation, so an
+operator restart re-reads them on its first poll and loses nothing. Every status write re-enqueues the CR through the unfiltered `PlatformAgent`
 watch, which is why the write is bounded by the interval and never issued from `Reconcile`: a
 busy install costs one reconcile per five minutes, and the ConfigMap's non-controller owner
 reference keeps it at one rather than two; a quiet one costs none.
@@ -382,16 +453,27 @@ totals accumulated since the operator was upgraded, not since the last interval,
 the last of them moved. After its own
 patch the poller reads the echo the same way `noteUsageStatusEcho` does: counters it wrote that
 come back absent mean the pruning, recorded in the shared map; counters that come back clear it.
-The echo check moves from a function that knows about `activeInterfaces` to one that takes the
-fields a writer expects to see, and both writers call it.
+The fields added after `status.usage`'s first schema, the two cluster gauges,
+`remediationsMergedTotal` and `chatMessagesInboundTotal`, have a record each, in the poller, because a CRD at a previous
+schema prunes some or all of those and serves the first three counters (every CRD with
+`status.usage` has carried `remediationsProposedTotal`), the shared record would hold those back
+for the interval too, and one record for all the newer fields would hold the gauges back on the CRD
+from the release between them, which serves the gauges and prunes the counter; each field is
+probed again after the same interval, and a difference in it alone waits on its record rather
+than re-patching every poll, while the others keep landing. The log line names the field.
+The echo check moves from a function that knows about `activeInterfaces` to one that takes
+whether the fields a writer wrote came back, and both writers call it.
 
 ## Failure behaviour
 
 The schema has no field for an error, by design: static enums and integer counts only. An
 install that switched the watcher off is not a failure: the poller reads the same switch the
-reconciler does, scrapes no gateway pod while it is off, and records nothing. The first poll after a start
-waits for the reconcile pass that renders the rules admitting the operator, and a streak
-shorter than two polls records no event, so an upgrade leaves no Warning on a healthy CR.
+reconciler does, scrapes no gateway pod while it is off, moves no counter, and writes once to
+clear the two cluster gauges if they were set. The first poll after a start
+runs one interval after election, after the initial reconcile pass has rendered the rules
+admitting the operator; a CR the poll reaches before its rules are applied costs one failed
+poll, and a streak shorter than two polls records no event, so an upgrade leaves no Warning on a
+healthy CR.
 Listeners from a release before this one are not a failure either: the operator moves before the harness on an
 upgrade, and an install can pin the harness image behind the operator, so the first polls after
 an upgrade land on listeners that send no start time; the resets section reads them under the
@@ -404,39 +486,47 @@ the pod and the error type, never the body. The visible symptom of a standing fa
 NetworkPolicy regime that blocks the rule, a relabelled operator pod, a listener that moved, a
 proxy environment on the operator pod that a client without the no-proxy transport would obey, is
 a `lastActiveTime` that stops advancing while commands are plainly running and events are
-plainly being triaged. A `kubectl describe`
-of the CR shows the operator's events; the implementation records one warning event per failure
-streak so that the symptom has a cause beside it without a log search.
+plainly being triaged, and, from the second poll on, the two cluster gauges absent while the
+watcher plainly has its fleet: under those causes the operator has no reading, and it says so
+rather than holding the last one. A `kubectl describe`
+of the CR shows the operator's events; the implementation records a warning event from the second
+failing poll of a streak onward, re-recorded every poll with a stable message so the recorder folds
+the repeats into one event with a rising count and a refreshed timestamp, keeping the cause beside
+the symptom past the API server's one-hour event retention rather than an hour after a single write.
 
 ## What stays unwritten, and what lands it
 
-| Status field                | Why it stays absent                                                                                                                                                                                                                                                          | The series that lands it                                                                                                                                                                                                                                             |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sessionsTotal`             | The watcher's `k8s_event_watcher_session_creates_total{outcome="ok"}` counts the sessions it opens for triage and nothing else; chat sessions are opened by the gateway, which exports no series for them. A counter named for all sessions that counted half would mislead. | A gateway-side `kubeagents_sessions_total{origin}` beside the watcher's, summed with it. The `session_store` plugin sees every chat session start and is the natural emitter; it needs a listener, which the gateway pod does not have for Hermes-side series today. |
-| `remediationsProposedTotal` | No series counts proposals by verb. The proposal path is the broker's version-control route, through which `proposal-create` reaches the forge provider, and that route is visible only as `kubeagents_credential_proxy_requests_total{endpoint="/v1/vcs"}` by status code.  | A broker series over the version-control route's verbs and the outcomes the forge provider returns, counted the way the exec route counts tool invocations; a `proposal-create` the forge accepted is a proposal.                                                    |
-| `remediationsAppliedTotal`  | An applied remediation is an approved one; approvals are recorded by the `tool_call_audit` plugin's `approval_*` records in the log, not as a metric.                                                                                                                        | Either a Hermes-side series from the same plugin, which has the listener problem above, or a count of the broker's apply-side requests once those are distinguishable from reads. This is the least settled of the three and the last to land.                       |
+| Status field               | Why it stays absent                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | The series that lands it                                                                                                                                                                                                                                                                                                                                            |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sessionsTotal`            | The watcher's `k8s_event_watcher_session_creates_total{outcome="ok"}` counts the sessions it opens for triage and nothing else; chat sessions are opened by the Hermes gateway on `today`, which exports no series for them, and by the A2A gateway on `next`, which allocates every session and could. A counter named for all sessions that counted half would mislead. The fold also aggregates per counter, Max for the watcher's replicas and Sum for everything else, and a counter fed by the watcher and a gateway at once needs the aggregation to follow the source pod, which the fold does not do yet. | A gateway-side `kubeagents_sessions_total{origin}` beside the watcher's, summed with it: on `next` the A2A gateway's, in `mintSession`; on `today` the `session_store` plugin's, on the listener the `chat_metrics` plugin now has. And per-source aggregation in the fold, so the watcher's half takes the largest replica and the gateways' half the sum (#3011). |
+| `remediationsAppliedTotal` | An applied remediation is an approved one; approvals are recorded by the `tool_call_audit` plugin's `approval_*` records in the profile's audit file (`logs/audit.jsonl`), not as a metric.                                                                                                                                                                                                                                                                                                                                                                                                                        | Either a Hermes-side series from the same plugin, served from the `chat_metrics` listener, or a count of the broker's apply-side requests once those are distinguishable from reads. This is the least settled of the two and the last to land.                                                                                                                     |
 
 Each lands on the poller's existing path: a new row in the source table, a new series summed,
 and the CRD description changed from "nothing writes it yet". None needs a second mechanism.
 
 ## Security and privacy
 
-Zero external egress: the operator reads two in-cluster listeners over the pod network and
+Zero external egress: the operator reads three in-cluster listeners over the pod network, four on a `next` install, and
 writes two objects in the cluster. Zero PII or secret exposure: the status receives integer
-totals and one timestamp; label values are summed away and never written anywhere, and the
+totals, two integer gauges and one timestamp; label values are summed away and never written anywhere, and the
 baseline ConfigMap holds pod UIDs, pod names and integers. The new NetworkPolicy rules admit
-the operator's pods on the two metrics ports and nothing else; the collector's rule is
+the operator's pods on the metrics ports, three on a `today` install and the A2A gateway's fourth on `next`, and nothing else; the collector's rule is
 unchanged. No new RBAC: pods are listed and ConfigMaps managed with verbs the ClusterRole
 already grants, and the status subresource is already the operator's to write. No credential
-of any kind is involved; both listeners are unauthenticated by design, as they are for the
+of any kind is involved; the listeners are unauthenticated by design, as they are for the
 collector, and for the same reason the operator treats what it reads as untrusted. The gateway
 pod shares its network namespace across the agent container, the sidecar and any container
 `spec.deployment.sidecars` adds, and the watcher's port is free whenever its process is down, so
-a body on either port can come from something other than the two listeners. Folding each line as
+a body on any of the ports can come from something other than the listeners. Folding each line as
 it is read keeps the operator's memory per poll at one line, under its 128Mi limit whatever the
 fleet's exposition grows to, and the per-poll ceiling bounds what one body can do to a total; neither makes the body more trusted. What is left is stated
 rather than hidden: a workload in the pod can refuse the operator a count, can raise one by at
-most `usageDeltaCeiling` per poll for as long as it holds the port, and can never set one. At
+most `usageDeltaCeiling` per poll for as long as it holds the port, and can never set one. The
+two cluster gauges are the exception, by their nature: they are a reading, not an accumulation,
+so a body on the watcher's port sets them to whatever up-gauge series it serves, up to
+`usageClusterGaugeCeiling`, past which the body is refused whole. Nothing reads them for a
+decision; a value no fleet could have is the same visible drift as a counter rising on a quiet
+install, and the same authentication would be the only way to close it. At
 twelve polls an hour that is a visible drift, a counter rising on an install whose log shows no
 commands and no triage, not a value chosen; closing it would mean authenticating the listeners,
 which the collector's scrape does not do either. The scrape is therefore not the grant the
@@ -447,9 +537,10 @@ One more residual sits in the peer selector. The chart renders the CR into the o
 namespace, and above one replica the agent's Role holds `get` and `patch` on every pod there,
 because RBAC cannot say "only your own pod"; so on an HA chart install anything running as the
 agent's ServiceAccount can put the operator's label on a pod of its choosing, the sandbox
-included, and that pod is then admitted to both metrics ports. What it gains is the two
-listeners' counters, which the agent container already reads over its own pod's loopback, and
-the same grant already lets it swap a sibling's image, so the selector argument above holds in
+included, and that pod is then admitted to the three metrics ports. What it gains is the
+listeners' counters: the watcher's and the chat plugin's, which the agent container already reaches over its own pod's
+loopback, and the broker's, to which it has no route today, integers under closed label
+vocabularies; and the same grant already lets it swap a sibling's image, so the selector argument above holds in
 full on the single-replica default and in substance above it; the pages the implementation
 rewrites say so rather than "nothing else".
 
@@ -503,10 +594,12 @@ them.
 
 ## Testing
 
+What shipped beside the poller, kept as the record of what each test is for.
+
 Unit tests, beside the poller, one per branch of the resets section as it stands, each asserting
 the poll after as well as the poll itself: the difference branch (a known pod, the recorded
-start time, a sample not below the last); the whole-sample branch (a pod created after the document was first recorded; a later start
-time), including such a pod above the ceiling, which is recorded and adds nothing, the first
+start time, a sample not below the last); the whole-sample branch (a pod created after the document was first recorded; a never-read
+pod whose process started after it, on a Sum counter; a later start time), including such a pod above the ceiling, which is recorded and adds nothing, the first
 poll with no ConfigMap, which records every pod and adds nothing whatever the samples, and a
 pod that first poll could not scrape, created before the document, recorded on its next scrape
 and adding nothing, on the first poll and on a re-seed alike, the re-seed recording its own
@@ -530,34 +623,44 @@ that the reset pod takes the sibling's marker and the sibling's next lone advanc
 a partial straddle, both replicas moving by different amounts and the lagger catching up alone
 the poll after, asserting the catch-up is reset and the total took the larger delta once; an in-place restart
 of the lagging replica with a later start time, reset rather than taken whole; the
-largest-delta rule across two gateway pods and its agreement with the sum for one; the
-baseline-absent-with-counters-present case; a ConfigMap whose recorded CR UID is not the CR's
+largest-delta rule across two gateway pods and its agreement with the sum for one; the cluster
+gauges (written on the first poll, falling with the watcher's reading, left as they were by one
+failed scrape and cleared by the second in a row, the largest of each across two replicas, cleared when the watcher is off, and
+never moving `lastActiveTime`, a newer-field probe under a CRD without `status.usage` recorded in
+the newer fields' own record and not the counters', and a CRD at a previous schema pruning the
+gauges and the merged counter while the first three counters keep landing); the watcher's body yielding a zero gauge reading and the
+broker's none, and one past `usageClusterGaugeCeiling` refused; a re-seed that
+scrapes two replicas at different samples, taking the larger delta on the next advance and counting
+the furthest replica's pre-seed backlog once; the baseline-absent-with-counters-present case; a ConfigMap whose recorded CR UID is not the CR's
 or whose values fail the read-back bounds, including a total above the `int64` headroom, one
 below the status, and a first-recorded time in the future (treated as absent); a quiet poll writing no ConfigMap; the disabled-watcher
-case (no gateway scrape, no log line); the series selection (the `status` values summed and the
+case (no gateway scrape, no log line); one broker body folded into three counters, each with its own baseline entry, through a restart; the gateway pod's two listeners read as two targets, the chat counter summed across replicas, a failing chat listener with a streak and a Warning of its own and no effect on the gauges, the A2A gateway pod read as a fourth target into the chat counter with an entry, a streak and a Warning of its own; a current-layout document that predates a counter gaining its total rather than being re-seeded; a version-1 document migrated in place under a pruning CRD with its totals kept, the interval's deltas added and the new counter's first sample added whole, one whose migrating poll could not read the broker, so the unfolded counter is written with the document and the broker's first sample adds whole on the poll that reads it, and one migrated under a status that already carries the new counter, which starts at that floor and is not re-seeded; the Warning from a failing broker naming each of its fields; the Warning naming each status field a pod's counters project to; the series selection (the `status` values summed and the
 three excluded; the injected series and not the observed one); and the port-by-name lookup when
 the port sits on a native sidecar among several containers. The accumulator takes samples and
 the ConfigMap's document and returns the next document, so none of these needs a socket.
 
 An envtest, beside the existing `usage_status_envtest_test.go`: a `PlatformAgent` served by
 this release's CRD receives one patch per poll in which a stub source moves and none in which
-it does not; a ConfigMap written with the non-controller owner reference enqueues no reconcile;
-a status left behind the ConfigMap (the crash between the two writes, staged by hand) is
+it does not; a status left behind the ConfigMap (the crash between the two writes, staged by hand) is
 repaired by the next poll without the totals moving and with `lastActiveTime` set to the time
 the ConfigMap recorded, not the repair's; under the CRD without `status.usage`, the
-poller writes the status once per `usageStatusReprobeInterval`, shares the pruning record with
-the Ready writer, and keeps the ConfigMap current throughout.
+poller writes the status once while the pruning record is fresh and once more when it has
+expired, shares that record with the Ready writer, and keeps the ConfigMap current throughout.
+That a ConfigMap written with the non-controller owner reference enqueues no reconcile is a
+unit test against the owner handler `Owns` uses, which needs no API server.
 
-A live check, which is the acceptance criterion: on an install built from the branch,
-`toolExecutionsTotal` rises after commands run from the sandbox and `eventsIngestedTotal` after
-events the watcher accepts arrive; a broker pod restart, a gateway pod restart, a restart of the
-watcher process alone (the supervisor's), and an operator restart each leave both counters where
-they were and they keep rising afterwards, the watcher's restart in particular adding nothing for
-the replay of the retained Events; a quarter of an hour with no command and no accepted event
-produces no status write; and the two policies show the new rule with the operator pod as the
+On the broker's side, `test_credential_proxy_metrics.py` holds the version-control counter to its verb vocabulary and its five outcomes, one test per outcome the route reports, and renders the merged counter as one unlabelled sample; `test_vcs_broker.py` holds the merged count to its three rules: counted once across a list and a view and however the repository is spelled, not for another author, not for a merge before the process started, not for an open or closed proposal, and the identity asked once per repository and never for old merges. A live check, which is the acceptance criterion: on an install built from the branch, `remediationsProposedTotal` rises after a proposal the forge accepts and `remediationsMergedTotal` after a read shows it merged,
+`toolExecutionsTotal` rises after commands run from the sandbox, `eventsIngestedTotal` after
+events the watcher accepts arrive and `chatMessagesInboundTotal` after a chat message reaches the gateway; a broker pod restart, a gateway pod restart, a restart of the
+watcher process alone (the supervisor's), and an operator restart each leave the counters
+where they were and they keep rising afterwards, the watcher's restart in particular adding nothing for
+the replay of the retained Events; a quarter of an hour with no command, no accepted event and no chat message
+produces no status write; and the policies show the new rule with the operator pod as the
 only peer added.
 
 ## Documents the implementation changes
+
+Each of these landed with the poller; the list is the record of where the facts moved, and the proposals counters, the two cluster gauges and the chat counter followed later through the same pages.
 
 - The CRD reference's `status.usage` rows for the two counters and `lastActiveTime`, from
   "declared; nothing writes it yet" to what they count and how often they move, including that

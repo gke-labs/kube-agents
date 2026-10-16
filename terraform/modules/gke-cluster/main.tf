@@ -50,6 +50,19 @@ resource "google_kms_crypto_key_iam_member" "gke_kms_binding" {
   member        = "serviceAccount:${google_project_service_identity.gke_service_agent[0].email}"
 }
 
+
+# The ordering gate for var.create_after. A resource rather than a bare
+# reference because only the cluster resources may carry the edge: hanging it
+# on the module instead -- `depends_on = [module.drift_pubsub]` on the call --
+# defers every data source in here, data.google_container_cluster.existing
+# included, and an unknown cluster_endpoint leaves provider "helm" without a
+# host. A helm provider that cannot reach the cluster reports every release as
+# absent, so the plan plans them as creates and the apply trips over names
+# still in use. terraform_data holds no state of its own and talks to nothing.
+resource "terraform_data" "create_after" {
+  input = var.create_after
+}
+
 resource "google_container_cluster" "autopilot" {
   #checkov:skip=CKV_GCP_12:GKE Autopilot manages Dataplane V2 network policies automatically
   #checkov:skip=CKV_GCP_13:Client certificate authentication disabled by default in Autopilot
@@ -137,7 +150,8 @@ resource "google_container_cluster" "autopilot" {
   }
 
   depends_on = [
-    google_kms_crypto_key_iam_member.gke_kms_binding
+    google_kms_crypto_key_iam_member.gke_kms_binding,
+    terraform_data.create_after
   ]
 }
 
@@ -236,7 +250,8 @@ resource "google_container_cluster" "standard" {
   }
 
   depends_on = [
-    google_kms_crypto_key_iam_member.gke_kms_binding
+    google_kms_crypto_key_iam_member.gke_kms_binding,
+    terraform_data.create_after
   ]
 }
 
@@ -341,11 +356,25 @@ locals {
     data.google_container_cluster.existing[*].name,
   ))
 
-  cluster_endpoint = one(concat(
-    google_container_cluster.autopilot[*].endpoint,
-    google_container_cluster.standard[*].endpoint,
-    data.google_container_cluster.existing[*].endpoint,
-  ))
+  # Picked by the variables rather than folded like cluster_name, because the
+  # endpoint and the CA certificate (outputs.tf) configure the composition's
+  # helm provider, which runs during `terraform destroy`. Since Terraform 1.14
+  # (hashicorp/terraform#37370) a count-0 resource evaluates as unknown, not as
+  # an empty list, in a destroy. A fold with any count-0 member is then unknown,
+  # which is always, so the provider has no host, and hashicorp/helm 3.x's
+  # Delete reads "cluster unreachable" as "already gone" and reports the
+  # release destroyed while it keeps running (#2246). Only the selected branch
+  # of a conditional is evaluated, so [0] on the count-0 side is never indexed.
+  # The conditions mirror the three resources' count expressions. On a cluster
+  # this state did not create the selected branch is the data source, which a
+  # destroy reads only in its refresh, so `terraform destroy -refresh=false`
+  # still leaves the provider without a host; lifecycle.sh destroy uninstalls
+  # the releases with the helm CLI first for that reason.
+  cluster_endpoint = (
+    !var.create_cluster ? data.google_container_cluster.existing[0].endpoint :
+    var.cluster_mode == "autopilot" ? google_container_cluster.autopilot[0].endpoint :
+    google_container_cluster.standard[0].endpoint
+  )
 
   # Which of the control plane's two endpoints `endpoint` gave us, and so which
   # certificate a client dialling it will be offered.

@@ -24,7 +24,10 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -36,6 +39,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/oauth2"
 	container "google.golang.org/api/container/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/clusterprofiles"
 )
@@ -143,6 +147,36 @@ func stubGKE(t *testing.T) map[string]error {
 	return failures
 }
 
+// autopilotClusters makes stubGKE's describe answer an Autopilot block for the
+// named clusters and an explicitly disabled one for the rest, so a test can
+// tell the bit travelling from the bit being the zero value everywhere. Call
+// after stubGKE, whose Cleanup restores the whole seam including this wrapper.
+//
+// The event watcher's FailedScheduling gate reads this bit off the event to
+// tell an Autopilot cluster the product has scaled to zero nodes from a
+// Standard cluster whose nodes have gone. It crosses four hops between the
+// describe call and the filter, every one a single field copy in a struct
+// literal, and the gate's own tests construct the event directly — so without
+// an assertion on the way through, dropping any hop leaves the whole Go suite
+// green while every cluster in production reads as Standard.
+func autopilotClusters(t *testing.T, names ...string) {
+	t.Helper()
+	enabled := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		enabled[name] = struct{}{}
+	}
+	base := discovery.Describe
+	discovery.Describe = func(ctx context.Context, id clusterprofiles.Identity) (*container.Cluster, error) {
+		cluster, err := base(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		_, on := enabled[id.Cluster]
+		cluster.Autopilot = &container.Autopilot{Enabled: on}
+		return cluster, nil
+	}
+}
+
 // writeClusterProfile creates a Cluster Agent profile directory the way
 // cluster_agent_profile.py does: a config.yaml carrying a cluster_identity
 // block. No kubeconfig.yaml — since the shell moved into its own pod, the one
@@ -183,6 +217,7 @@ func writeNonClusterProfile(t *testing.T, base, profile string) {
 
 func TestDiscoverClusterProfiles_BuildsAClientPerCluster(t *testing.T) {
 	stubGKE(t)
+	autopilotClusters(t, "prod")
 	dir := t.TempDir()
 	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
 	writeClusterProfile(t, dir, "cluster-projB-staging-europe-west1", "projB", "staging", "europe-west1")
@@ -215,8 +250,20 @@ func TestDiscoverClusterProfiles_BuildsAClientPerCluster(t *testing.T) {
 	if prod.Profile != "cluster-projA-prod-us-central1" {
 		t.Errorf("prod profile = %q; want the directory name", prod.Profile)
 	}
-	if _, ok := byName["staging"]; !ok {
-		t.Errorf("missing cluster %q; got %v", "staging", clusterNames(clusters))
+	staging, ok := byName["staging"]
+	if !ok {
+		t.Fatalf("missing cluster %q; got %v", "staging", clusterNames(clusters))
+	}
+	// The Autopilot bit is part of that identity, and this is the hop every
+	// profile cluster takes — the scaled-to-zero Autopilot cluster the
+	// FailedScheduling gate exists for is a profile cluster, not the direct
+	// one. Both directions, so the assertion fails on a dropped copy rather
+	// than passing on the zero value.
+	if !prod.Autopilot {
+		t.Error("prod is an Autopilot cluster but reached targetCluster as Standard; the FailedScheduling gate would never hold its scale-to-zero events")
+	}
+	if staging.Autopilot {
+		t.Error("staging is a Standard cluster but reached targetCluster as Autopilot")
 	}
 }
 
@@ -343,6 +390,7 @@ func TestDiscoverClusterProfiles_UnreadableDirIsCountedUnderNoProfile(t *testing
 // could not be denied was discarded.
 func TestBuildWatchSet_ProfileDuplicateIsDroppedAndItsIdentityKept(t *testing.T) {
 	stubGKE(t)
+	autopilotClusters(t, "mgmt")
 	dir := t.TempDir()
 	writeClusterProfile(t, dir, "cluster-projA-mgmt-us-central1", "projA", "mgmt", "us-central1")
 	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
@@ -382,6 +430,13 @@ func TestBuildWatchSet_ProfileDuplicateIsDroppedAndItsIdentityKept(t *testing.T)
 	// would blank the payload's project/location and every metric label.
 	if mgmt[0].ProjectID != "projA" || mgmt[0].Location != "us-central1" {
 		t.Errorf("direct entry is stamped %s, want projA/us-central1/mgmt from the profile it absorbed", mgmt[0].identity())
+	}
+	// The Autopilot bit travels with that triple. The direct entry has no
+	// cluster_identity of its own and so no describe behind it, but the
+	// profile it absorbed does, and dropping the copy would leave the one
+	// cluster the watcher knows most about reading as Standard.
+	if !mgmt[0].Autopilot {
+		t.Error("the absorbed profile's Autopilot bit did not reach the direct entry")
 	}
 	// Absorbing one profile must not disturb the others.
 	if clusters[0].Name != "prod" || clusters[0].Profile != "cluster-projA-prod-us-central1" {
@@ -719,5 +774,62 @@ func TestRealMain_AppliesTheMemoryLimitBeforeStarting(t *testing.T) {
 	}
 	if got := debug.SetMemoryLimit(-1); got != 1073741824 {
 		t.Errorf("runtime soft limit after realMain = %d, want 1073741824", got)
+	}
+}
+
+// With the credential proxy named in the environment, the zero discovery seam
+// describes through the proxy and the client it builds reads events on the
+// proxy's route for the cluster, all with the projected token -- and never
+// reaches Application Default Credentials, pointed at a missing file here.
+func TestDiscoverClusterProfiles_ThroughTheBroker(t *testing.T) {
+	saved := discovery
+	t.Cleanup(func() { discovery = saved })
+	discovery = clusterprofiles.Discoverer{}
+	var (
+		mu       sync.Mutex
+		requests []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path+" "+r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/v1/watcher/gcp/container.googleapis.com/") {
+			// Usable addressing, as a real describe carries: discovery checks it,
+			// and the broker's config ignores it.
+			fmt.Fprint(w, `{"name":"prod","endpoint":"10.0.0.1","controlPlaneEndpointsConfig":{"dnsEndpointConfig":{"allowExternalTraffic":true,"endpoint":"prod.example.internal"}}}`)
+			return
+		}
+		fmt.Fprint(w, `{"kind":"EventList","apiVersion":"v1","metadata":{},"items":[]}`)
+	}))
+	defer srv.Close()
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("sa-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "no-such-adc.json"))
+	t.Setenv(clusterprofiles.BrokerURLEnv, srv.URL)
+	t.Setenv(clusterprofiles.BrokerTokenFileEnv, tokenFile)
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
+
+	clusters, err := discoverClusterProfiles(context.Background(), dir, newMetrics())
+	if err != nil {
+		t.Fatalf("discoverClusterProfiles: %v", err)
+	}
+	if len(clusters) != 1 {
+		t.Fatalf("got %d clusters, want 1", len(clusters))
+	}
+	if _, err := clusters[0].Client.CoreV1().Events("").List(context.Background(), metav1.ListOptions{}); err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	want := []string{
+		"GET /v1/watcher/gcp/container.googleapis.com/v1/projects/projA/locations/us-central1/clusters/prod Bearer sa-token",
+		"GET /v1/k8s/projA/us-central1/prod/api/v1/events Bearer sa-token",
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(requests, "\n") != strings.Join(want, "\n") {
+		t.Errorf("requests:\n%s\nwant:\n%s", strings.Join(requests, "\n"), strings.Join(want, "\n"))
 	}
 }

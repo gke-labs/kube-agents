@@ -159,7 +159,7 @@ admin_console/
     kubectl_local.py       transitional local-only transport
   clients/
     portal_api.py          typed client used by Streamlit
-  pages/                   Streamlit pages; API clients only
+  views/                   Streamlit pages; API clients only
 ```
 
 The central interface is `ChatService`, not FastAPI and not Streamlit. It owns:
@@ -754,10 +754,12 @@ override identity or correlation fields.
   initial reads, refreshes, and incremental source pages. Logging and Trace
   retain opaque continuation cursors only inside the Streamlit session, append
   two bounded pages per load, and preserve successful earlier pages when a
-  later page fails. Logging uses two queries (the lifted-field form of a record,
-  and the wrapped text form of one the sidecar did not lift; the text query
-  excludes lifted records, and a record both still return is merged by
-  `insertId`) with 500-record pages and a 60-second request timeout; Trace and
+  later page fails. Logging uses two queries (records whose keys are
+  `jsonPayload` fields of their own, the tailed audit file, records lifted
+  before it existed and a record the agent printed to its stdout when the file
+  could not take it, and the wrapped text form of a record in `agent.log`; the
+  text query excludes the field-form records, and a record both still return is
+  merged by `insertId`) with 500-record pages and a 60-second request timeout; Trace and
   each Logging query stop after ten pages, and both sources share a 90-second
   load deadline. Source pagination and ledger pagination remain separate concerns.
 - **Scheduled Cron:** live Hermes job definitions, scheduler heartbeat state,
@@ -900,6 +902,10 @@ present time-adjacent records as proven causality.
 - Task Kanban inspection uses the same fixed in-pod read mechanism. Queries are
   capped at 500 tasks, 100 runs, 500 events, 200 comments, and 100 attachments;
   delivery destinations and attachment storage paths are deliberately omitted.
-  Production requires a paginated, policy-aware Kanban read API.
+  Session KV also exposes authenticated read-only HTTP endpoints
+  (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`,
+  `GET /v1/tasks`, and `GET /v1/tasks/{task_id}`) backed by `?mode=ro` SQLite
+  reads for headless and non-chat installs. Production requires a paginated,
+  policy-aware Kanban read API.
 - The interfaces in `admin_console/domain.py` are the intended seams for the
   production providers.

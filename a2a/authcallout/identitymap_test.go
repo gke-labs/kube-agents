@@ -74,6 +74,24 @@ func TestParseIdentityMapRejectsMapsItCannotServe(t *testing.T) {
 			want: "has no user",
 		},
 		{
+			// A dotted user's inbox `_INBOX.a.b.>` sits inside the grant of
+			// a pod named `a`, which the exact reserved-name check would
+			// not refuse.
+			name: "a dotted NATS user",
+			raw:  `{"version":"v1","identities":[{"serviceAccount":"system:serviceaccount:ns:a","user":"a.b","account":"APP","grants":{"publish":["x.>"],"subscribe":["s.>"]}}]}`,
+			want: "single lowercase DNS-1123 label",
+		},
+		{
+			name: "an uppercase NATS user",
+			raw:  `{"version":"v1","identities":[{"serviceAccount":"system:serviceaccount:ns:a","user":"Agent","account":"APP","grants":{"publish":["x.>"],"subscribe":["s.>"]}}]}`,
+			want: "single lowercase DNS-1123 label",
+		},
+		{
+			name: "an underscored NATS user",
+			raw:  `{"version":"v1","identities":[{"serviceAccount":"system:serviceaccount:ns:a","user":"a_b","account":"APP","grants":{"publish":["x.>"],"subscribe":["s.>"]}}]}`,
+			want: "single lowercase DNS-1123 label",
+		},
+		{
 			name: "no account",
 			raw:  `{"version":"v1","identities":[{"serviceAccount":"system:serviceaccount:ns:a","user":"a","grants":{"publish":["x.>"],"subscribe":["s.>"]}}]}`,
 			want: "has no account",

@@ -26,8 +26,10 @@ single-option shape is those two bullets and nothing else — which is why
 ``_drift_task_body``, in the same module, writes the card for an out-of-band
 change to a live object and reaches the same contract by its own route: same
 three ``##`` sections, same two shapes, same authorize bullet, different prose
-around all of it. It is a second source of the same literals rather than a
-caller of the first, so every join below is per template, and a case is pinned
+around all of it. ``_stall_task_body`` does the same for a namespace whose
+controllers stopped making progress. Each is a separate source of the same
+literals rather than a caller of the first, so every join below is per
+template, and a case is pinned
 to whichever template writes the card it grades. Pinning them all to one would
 pass for as long as the two agreed on the phrase in question and stop asserting
 anything on the day they did not — which is the day the join was supposed to
@@ -49,7 +51,7 @@ agents/platform/scripts/test_triage_reply_roundtrip.py, which calls the real
 ``_triage_task_body`` and drives ``actionable_report`` on both shapes; it runs
 on every pull request. For ``_drift_task_body`` there is no such test, so the
 notifier assertions below are that template's only hold on the notifier rather
-than a cross-check. The half nobody held is task.yaml↔template — a reword
+than a cross-check. ``_stall_task_body`` has one in the roundtrip module. The half nobody held is task.yaml↔template — a reword
 there leaves the eval check asserting a string nothing writes, and a check no
 report can satisfy reds the case rather than the reword, so the diagnosis lands
 a long way from the edit. That is what this module is for.
@@ -108,6 +110,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE_MODULE = REPO_ROOT / "agents" / "platform" / "scripts" / "session_kv_server.py"
 TRIAGE_TEMPLATE = "_triage_task_body"
 DRIFT_TEMPLATE = "_drift_task_body"
+STALL_TEMPLATE = "_stall_task_body"
 
 #: The cases whose delivery objective this module pins, each with the template
 #: that writes its card. Named, not globbed: a glob over the directory would
@@ -124,6 +127,7 @@ CONTRACTS = [
     (TASKS / "autoops-crashloop-config-triage" / "task.yaml", TRIAGE_TEMPLATE),
     (TASKS / "gitops-drift-out-of-band-triage" / "task.yaml", DRIFT_TEMPLATE),
     (TASKS / "gitops-drift-noise-filtered-triage" / "task.yaml", DRIFT_TEMPLATE),
+    (TASKS / "autoops-controller-stall-triage" / "task.yaml", STALL_TEMPLATE),
 ]
 CHECK_NAME = "triage-delivers-an-actionable-report"
 
@@ -157,6 +161,7 @@ WHAT_TO_DO_HEADING = f"## {WHAT_TO_DO_PHRASE}"
 LETTERED_END_ANCHORS = {
     TRIAGE_TEMPLATE: "\U0001f517",  # the console-links line that follows the section
     DRIFT_TEMPLATE: "\n\n---",  # the rule before the "Who acts on this" footer
+    STALL_TEMPLATE: "\n\n---",  # the same rule, the stall template having no console link either
 }
 
 #: A report the front door might deliver instead of the card's own: true about

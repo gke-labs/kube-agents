@@ -1,0 +1,1027 @@
+{
+  "_comment": "Shared cases for the bridge's ports of slack_presenter.split_answer, _plain and arrival_reaction (a2a/hermes-bridge/chat.go). Expected values are the Python presenter's; agents/platform/scripts/test_chat_message.py fails when they drift from it.",
+  "split_answer": [
+    {
+      "in": "checkout-gateway is crashlooping on an OOM. It hit its 256Mi limit.\n\nRaise it to 512Mi.",
+      "headline": "checkout-gateway is crashlooping on an OOM.",
+      "body": ["It hit its 256Mi limit.", "Raise it to 512Mi."]
+    },
+    {
+      "in": "**The pod is OOMKilled!**, because its memory limit is 64Mi while the busybox command reads /dev/zero without bound, which exhausts it within seconds of each restart.",
+      "headline": "The pod is OOMKilled!",
+      "body": [
+        "Because its memory limit is 64Mi while the busybox command reads /dev/zero without bound, which exhausts it within seconds of each restart."
+      ]
+    },
+    {
+      "in": "**Is the HPA the cause of the payments-api restarts?** because it scales to zero overnight and the readiness probe then fails for every new pod for several minutes after the morning traffic arrives.",
+      "headline": "Is the HPA the cause of the payments-api restarts?",
+      "body": [
+        "Because it scales to zero overnight and the readiness probe then fails for every new pod for several minutes after the morning traffic arrives."
+      ]
+    },
+    {
+      "in": "## **Yes**, [seeded-a](https://x) is `healthy`\n- one\n- two",
+      "headline": "Yes, seeded-a is healthy",
+      "body": ["- one\n- two"]
+    },
+    {
+      "in": "",
+      "headline": "",
+      "body": []
+    },
+    {
+      "in": "   \n\n ",
+      "headline": "",
+      "body": []
+    },
+    {
+      "in": "Here it is.\n\n```\na\n\nb\n```\n\nDone.",
+      "headline": "Here it is.",
+      "body": ["```\na\n\nb\n```", "Done."]
+    },
+    {
+      "in": "```\nkubectl get pods\n```",
+      "headline": "",
+      "body": ["```\nkubectl get pods\n```"]
+    },
+    {
+      "in": "Pods fail readiness, e.g. checkout-gateway in ns. prod.",
+      "headline": "Pods fail readiness, e.g. checkout-gateway in ns. prod.",
+      "body": []
+    },
+    {
+      "in": "Pods fail readiness, e.g. Checkout in prod.",
+      "headline": "Pods fail readiness, e.g. Checkout in prod.",
+      "body": []
+    },
+    {
+      "in": "Deployments, StatefulSets, etc. All fail readiness. Node-a is cordoned.",
+      "headline": "Deployments, StatefulSets, etc. All fail readiness.",
+      "body": ["Node-a is cordoned."]
+    },
+    {
+      "in": "payments-api keeps crashing: secret\npayments-db-creds is missing. Since 14:02.\n- one",
+      "headline": "payments-api keeps crashing: secret payments-db-creds is missing.",
+      "body": ["Since 14:02.\n- one"]
+    },
+    {
+      "in": "payments-api is crashlooping with:\n```\nOOMKilled. Exit 137\n```\nSince 14:02.",
+      "headline": "payments-api is crashlooping with:",
+      "body": ["```\nOOMKilled. Exit 137\n```\nSince 14:02."]
+    },
+    {
+      "in": "```payments-api``` is crashlooping on OOM.\n\nRaise the limit.",
+      "headline": "payments-api is crashlooping on OOM.",
+      "body": ["Raise the limit."]
+    },
+    {
+      "in": "The pod logs `connection refused. Retrying` on every start. Since 14:02.",
+      "headline": "The pod logs connection refused. Retrying on every start.",
+      "body": ["Since 14:02."]
+    },
+    {
+      "in": "`__init__.py` is missing.",
+      "headline": "__init__.py is missing.",
+      "body": []
+    },
+    {
+      "in": "##\tSummary\nCheckout is down. Since 14:02.",
+      "headline": "Summary",
+      "body": ["Checkout is down. Since 14:02."]
+    },
+    {
+      "in": "**Checkout is crashlooping on OOM. Raise the limit.**",
+      "headline": "Checkout is crashlooping on OOM.",
+      "body": ["**Raise the limit.**"]
+    },
+    {
+      "in": "**Checkout is down.** Raise the limit.",
+      "headline": "Checkout is down.",
+      "body": ["Raise the limit."]
+    },
+    {
+      "in": "*It is down. Restart it.*",
+      "headline": "It is down.",
+      "body": ["*Restart it.*"]
+    },
+    {
+      "in": "_It is down. Restart it._",
+      "headline": "It is down.",
+      "body": ["_Restart it._"]
+    },
+    {
+      "in": "Use *one* of them. Next *two*.",
+      "headline": "Use one of them.",
+      "body": ["Next *two*."]
+    },
+    {
+      "in": "The env var DB__HOST is unset. Pods crashloop.",
+      "headline": "The env var DB__HOST is unset.",
+      "body": ["Pods crashloop."]
+    },
+    {
+      "in": "Memory is 2**20 bytes. Raise it.",
+      "headline": "Memory is 2**20 bytes.",
+      "body": ["Raise it."]
+    },
+    {
+      "in": "DB__HOST or DB__PORT is unset.",
+      "headline": "DB__HOST or DB__PORT is unset.",
+      "body": []
+    },
+    {
+      "in": "**Pod**s are down. Restart them.",
+      "headline": "Pods are down.",
+      "body": ["Restart them."]
+    },
+    {
+      "in": "Node pool np-1 at rev. 7 is cordoned.",
+      "headline": "Node pool np-1 at rev. 7 is cordoned.",
+      "body": []
+    },
+    {
+      "in": "Certs expired Sept. 30 on seeded-a.",
+      "headline": "Certs expired Sept. 30 on seeded-a.",
+      "body": []
+    },
+    {
+      "in": "Several pods fail (e.g. Checkout) in prod. Raise it.",
+      "headline": "Several pods fail (e.g. Checkout) in prod.",
+      "body": ["Raise it."]
+    },
+    {
+      "in": "Pods fail (i.e. Checkout). Raise it.",
+      "headline": "Pods fail (i.e. Checkout).",
+      "body": ["Raise it."]
+    },
+    {
+      "in": "Ticket No. 3 is open. Second sentence.",
+      "headline": "Ticket No. 3 is open.",
+      "body": ["Second sentence."]
+    },
+    {
+      "in": "payments-api fails readiness since deploy No. 42. Restore the secret.",
+      "headline": "payments-api fails readiness since deploy No. 42.",
+      "body": ["Restore the secret."]
+    },
+    {
+      "in": "See No. 3. Second sentence.",
+      "headline": "See No. 3.",
+      "body": ["Second sentence."]
+    },
+    {
+      "in": "Filed under #No. 7 on seeded-a. Then wait.",
+      "headline": "Filed under #No. 7 on seeded-a.",
+      "body": ["Then wait."]
+    },
+    {
+      "in": "Use the default, ex. Checkout. More.",
+      "headline": "Use the default, ex. Checkout.",
+      "body": ["More."]
+    },
+    {
+      "in": "Disk is at 90% (approx. Two hours left). Then it fills.",
+      "headline": "Disk is at 90% (approx. Two hours left).",
+      "body": ["Then it fills."]
+    },
+    {
+      "in": "Latency is high vs. Yesterday. Scale up.",
+      "headline": "Latency is high vs. Yesterday.",
+      "body": ["Scale up."]
+    },
+    {
+      "in": "Replicas are at max. Raise the HPA ceiling.",
+      "headline": "Replicas are at max.",
+      "body": ["Raise the HPA ceiling."]
+    },
+    {
+      "in": "Restarted after 5 min. Raise it.",
+      "headline": "Restarted after 5 min.",
+      "body": ["Raise it."]
+    },
+    {
+      "in": "The answer is no. Checkout is down.",
+      "headline": "The answer is no.",
+      "body": ["Checkout is down."]
+    },
+    {
+      "in": "The pool is at its max. 4 pods are pending. Raise it.",
+      "headline": "The pool is at its max. 4 pods are pending.",
+      "body": ["Raise it."]
+    },
+    {
+      "in": "Keep min. 2 replicas on seeded-a. Then drain.",
+      "headline": "Keep min. 2 replicas on seeded-a.",
+      "body": ["Then drain."]
+    },
+    {
+      "in": "Hello \u00005\u0000 world. More.",
+      "headline": "Hello 5 world.",
+      "body": ["More."]
+    },
+    {
+      "in": "The answer is no. 3 pods are down.",
+      "headline": "The answer is no. 3 pods are down.",
+      "body": []
+    },
+    {
+      "in": "a \u00005\u0000 b. c",
+      "headline": "a 5 b. c",
+      "body": []
+    },
+    {
+      "in": "Run ```a` now. Next.",
+      "headline": "Run ```a` now.",
+      "body": ["Next."]
+    },
+    {
+      "in": "Done.) Next.",
+      "headline": "Done.) Next.",
+      "body": []
+    },
+    {
+      "in": "Done.\" Next.",
+      "headline": "Done.\" Next.",
+      "body": []
+    },
+    {
+      "in": "Mr. Smith says hi. Next.",
+      "headline": "Mr.",
+      "body": ["Smith says hi. Next."]
+    },
+    {
+      "in": "1. Checkout is crashlooping on OOM. It hit 256Mi.",
+      "headline": "Checkout is crashlooping on OOM.",
+      "body": ["It hit 256Mi."]
+    },
+    {
+      "in": "~~~\nkubectl get pods\n~~~",
+      "headline": "",
+      "body": ["~~~\nkubectl get pods\n~~~"]
+    },
+    {
+      "in": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word ",
+      "headline": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word…",
+      "body": []
+    },
+    {
+      "in": "**Yes.** checkout-gateway in seeded-a restarted 14 times in the last hour, OOMKilled each time.\n\n| pod | restarts |\n|---|---|\n| checkout-gateway-7d9 | 14 |\n\nRaise the memory limit to 512Mi.",
+      "headline": "Yes. checkout-gateway in seeded-a restarted 14 times in the last hour, OOMKilled each time.",
+      "body": [
+        "| pod | restarts |\n|---|---|\n| checkout-gateway-7d9 | 14 |",
+        "Raise the memory limit to 512Mi."
+      ]
+    },
+    {
+      "in": "Three clusters have pods restarting right now: seeded-a, seeded-b and seeded-c.\n\n- seeded-a: checkout-gateway (14)\n- seeded-b: cart (3)",
+      "headline": "Three clusters have pods restarting right now: seeded-a, seeded-b and seeded-c.",
+      "body": ["- seeded-a: checkout-gateway (14)\n- seeded-b: cart (3)"]
+    },
+    {
+      "in": "Écoute: le pod redémarre. Ensuite rien.",
+      "headline": "Écoute: le pod redémarre.",
+      "body": ["Ensuite rien."]
+    },
+    {
+      "in": "# Summary\nThe pod restarted.",
+      "headline": "Summary",
+      "body": ["The pod restarted."]
+    },
+    {
+      "in": "١. Checkout is down. More follows.",
+      "headline": "Checkout is down.",
+      "body": ["More follows."]
+    },
+    {
+      "in": "Pods restart. Then\u001cmore.",
+      "headline": "Pods restart.",
+      "body": ["Then\u001cmore."]
+    },
+    {
+      "in": "See [logs](https://x.io/a b) now. Next.",
+      "headline": "See [logs](https://x.io/a b) now.",
+      "body": ["Next."]
+    },
+    {
+      "in": "The `checkout-gateway` deployment in seeded-a is restarting every few minutes because its readiness probe times out under load, which the HPA then reads as missing capacity. Raise the probe timeout.",
+      "headline": "The checkout-gateway deployment in seeded-a is restarting every few minutes.",
+      "body": [
+        "Because its readiness probe times out under load, which the HPA then reads as missing capacity. Raise the probe timeout."
+      ]
+    },
+    {
+      "in": "The payments-api workload is CrashLooping due to an OOMKill (exit code 137) caused by the container running tail /dev/zero in a loop that never ends and never frees what it reads.",
+      "headline": "The payments-api workload is CrashLooping.",
+      "body": [
+        "Due to an OOMKill (exit code 137) caused by the container running tail /dev/zero in a loop that never ends and never frees what it reads."
+      ]
+    },
+    {
+      "in": "Every node pool on seeded-b is on a release channel two minors behind the control plane — the auto-upgrade window was disabled in March and nobody turned it back on. Re-enable it.",
+      "headline": "Every node pool on seeded-b is on a release channel two minors behind the control plane.",
+      "body": [
+        "The auto-upgrade window was disabled in March and nobody turned it back on. Re-enable it."
+      ]
+    },
+    {
+      "in": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word end.",
+      "headline": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word…",
+      "body": []
+    },
+    {
+      "in": "Three pods restarted (checkout, payments, inventory, search, cart, and the ledger worker that feeds them all every hour) on seeded-a overnight and none of them has recovered since then at all.",
+      "headline": "Three pods restarted (checkout, payments, inventory, search, cart, and the ledger worker that feeds them all every hour) on seeded-a overnight and…",
+      "body": []
+    },
+    {
+      "in": "The `payments-api` workload is CrashLooping due to an OOMKill (exit code 137) caused by the container running `tail /dev/zero`, which rapidly exhausts its `64Mi` memory limit. The `payments-api` workload in the `seeded-debug` namespace is failing to start and is stuck in `CrashLoopBackOff` due to being `OOMKilled` (exit code 137).\n\n## Root Cause\nThe container is executing a command that consumes infinite memory unbounded until it hits its limit. Specifically, the deployment runs:\n```yaml\n      containers:\n      - command:\n        - sh\n        - -c\n        - tail /dev/zero\n```\nRunning `tail` on `/dev/zero` continually reads null bytes into memory. The container is configured with a strict memory limit of `64Mi`, which is exhausted almost immediately upon startup, leading the node to kill the process.\n\n## Evidence\n- The pod is in `CrashLoopBackOff` state.\n- Inspecting the previous container termination state:\n  ```json\n  {\"exitCode\":137,\"finishedAt\":\"2026-10-14T16:58:24Z\",\"reason\":\"OOMKilled\"}\n  ```\n- The deployment manifest defines the memory limit at `64Mi`.\n\n## Remediation Options\nTo fix the restarts, we need to address the root cause of the memory exhaustion.\n\n1. **Option 1 (Recommended): Fix the command**\n   If the container's purpose is simply to stay alive for debugging (which is common for `busybox` images), the command should be changed to one that does not consume memory.\n   Change the command in the deployment manifest to `tail -f /dev/null` or `sleep infinity`.\n2. **Option 2: Increase the memory limit**\n   If reading from `/dev/zero` is a legitimate requirement for this workload, the memory limit of `64Mi` needs to be significantly increased to accommodate the data being buffered.\n3. **Option 3: Change the workload image and logic**\n   If this is supposed to be the actual `payments-api` service, the image is currently set to `busybox:1.36` and running a shell command. The manifest should be updated to use the correct application image and start command.\n\nWhich of these options would you like to proceed with?",
+      "headline": "The payments-api workload is CrashLooping.",
+      "body": [
+        "Due to an OOMKill (exit code 137) caused by the container running `tail /dev/zero`, which rapidly exhausts its `64Mi` memory limit. The `payments-api` workload in the `seeded-debug` namespace is failing to start and is stuck in `CrashLoopBackOff` due to being `OOMKilled` (exit code 137).",
+        "## Root Cause\nThe container is executing a command that consumes infinite memory unbounded until it hits its limit. Specifically, the deployment runs:\n```yaml\n      containers:\n      - command:\n        - sh\n        - -c\n        - tail /dev/zero\n```\nRunning `tail` on `/dev/zero` continually reads null bytes into memory. The container is configured with a strict memory limit of `64Mi`, which is exhausted almost immediately upon startup, leading the node to kill the process.",
+        "## Evidence\n- The pod is in `CrashLoopBackOff` state.\n- Inspecting the previous container termination state:\n  ```json\n  {\"exitCode\":137,\"finishedAt\":\"2026-10-14T16:58:24Z\",\"reason\":\"OOMKilled\"}\n  ```\n- The deployment manifest defines the memory limit at `64Mi`.",
+        "## Remediation Options\nTo fix the restarts, we need to address the root cause of the memory exhaustion.",
+        "1. **Option 1 (Recommended): Fix the command**\n   If the container's purpose is simply to stay alive for debugging (which is common for `busybox` images), the command should be changed to one that does not consume memory.\n   Change the command in the deployment manifest to `tail -f /dev/null` or `sleep infinity`.\n2. **Option 2: Increase the memory limit**\n   If reading from `/dev/zero` is a legitimate requirement for this workload, the memory limit of `64Mi` needs to be significantly increased to accommodate the data being buffered.\n3. **Option 3: Change the workload image and logic**\n   If this is supposed to be the actual `payments-api` service, the image is currently set to `busybox:1.36` and running a shell command. The manifest should be updated to use the correct application image and start command.",
+        "Which of these options would you like to proceed with?"
+      ]
+    },
+    {
+      "in": "**The payments-api deployment in the seeded-debug namespace is repeatedly restarting due to an OOMKill (Exit Code 137) because it is running the `tail /dev/zero` command, which exhausts its `64Mi` limit.** The pod has restarted 1088 times.",
+      "headline": "The payments-api deployment in the seeded-debug namespace is repeatedly restarting due to an OOMKill (Exit Code 137).",
+      "body": [
+        "**Because it is running the `tail /dev/zero` command, which exhausts its `64Mi` limit.** The pod has restarted 1088 times."
+      ]
+    },
+    {
+      "in": "The ingress controller on seeded-c keeps dropping long-lived websocket connections at startup, *because the node pool has no headroom left* today, so the HPA cannot add a replica. Raise the pool.",
+      "headline": "The ingress controller on seeded-c keeps dropping long-lived websocket connections at startup, because the node pool has no headroom left today.",
+      "body": ["So the HPA cannot add a replica. Raise the pool."]
+    },
+    {
+      "in": "If the pool is full, the HPA cannot add a replica and the queue keeps growing until the ingress controller on seeded-c drops long-lived websocket connections at startup. Raise the pool.",
+      "headline": "If the pool is full, the HPA cannot add a replica and the queue keeps growing until the ingress controller on seeded-c drops long-lived websocket…",
+      "body": ["Raise the pool."]
+    },
+    {
+      "in": "The checkout-gateway rollout on seeded-a is stuck, with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting forever. Roll back.",
+      "headline": "The checkout-gateway rollout on seeded-a is stuck.",
+      "body": [
+        "With pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting with pods waiting forever. Roll back."
+      ]
+    },
+    {
+      "in": "The ingress on seeded-c drops connections *because the pool has no headroom, so the HPA so the HPA so the HPA so the HPA so the HPA so the HPA so the HPA so the HPA so the HPA so the HPA so the HPA so the HPA cannot add a replica* and the queue keeps growing. Raise it.",
+      "headline": "The ingress on seeded-c drops connections because the pool has no headroom, so the HPA so the HPA so the HPA so the HPA so the HPA so the HPA so the…",
+      "body": ["Raise it."]
+    }
+  ],
+  "plain": [
+    {
+      "in": "Set DB__HOST and DB__PORT",
+      "out": "Set DB__HOST and DB__PORT"
+    },
+    {
+      "in": "2**20 and 2**30 bytes",
+      "out": "2**20 and 2**30 bytes"
+    },
+    {
+      "in": "**Checkout** and __payments__ are down",
+      "out": "Checkout and payments are down"
+    },
+    {
+      "in": "**Pod**s are down",
+      "out": "Pods are down"
+    },
+    {
+      "in": "It re**start**ed twice",
+      "out": "It restarted twice"
+    },
+    {
+      "in": "**3**x faster",
+      "out": "3x faster"
+    },
+    {
+      "in": "snake__case__name",
+      "out": "snake__case__name"
+    },
+    {
+      "in": "x**2 and y**2",
+      "out": "x**2 and y**2"
+    },
+    {
+      "in": "`x` \u00000\u0000 and \u00009\u0000",
+      "out": "x 0 and 9"
+    },
+    {
+      "in": "___x___",
+      "out": "___x___"
+    },
+    {
+      "in": "******a.",
+      "out": "******a."
+    },
+    {
+      "in": "__foo__bar__",
+      "out": "__foo__bar__"
+    },
+    {
+      "in": "***bold*** and __init__",
+      "out": "bold and init"
+    },
+    {
+      "in": "`__init__.py` is missing",
+      "out": "__init__.py is missing"
+    },
+    {
+      "in": "Delete `__pycache__` and **this**",
+      "out": "Delete __pycache__ and this"
+    },
+    {
+      "in": "Remove *.log,*.tmp",
+      "out": "Remove *.log,*.tmp"
+    },
+    {
+      "in": "Scale replicas 2*3 → 6",
+      "out": "Scale replicas 2*3 → 6"
+    },
+    {
+      "in": "Delete *.tmp under /var/cache",
+      "out": "Delete *.tmp under /var/cache"
+    },
+    {
+      "in": "**Bold**, *italic*, _also_ and `code`",
+      "out": "Bold, italic, also and code"
+    },
+    {
+      "in": "see [logs](https://x/query=(k8s_container)) now",
+      "out": "see logs now"
+    }
+  ],
+  "ask_kind": [
+    {
+      "in": "is checkout-gateway restarting? it looks like it's crashlooping?",
+      "kind": "investigate"
+    },
+    {
+      "in": "why is the node pool at 90%?",
+      "kind": "investigate"
+    },
+    {
+      "in": "what are these 502 errors on checkout?",
+      "kind": "investigate"
+    },
+    {
+      "in": "is checkout crashlooping?",
+      "kind": "investigate"
+    },
+    {
+      "in": "diagnose the pending pods on seeded-a",
+      "kind": "investigate"
+    },
+    {
+      "in": "which clusters have pods restarting right now?",
+      "kind": "fleet"
+    },
+    {
+      "in": "check all clusters for unready nodes",
+      "kind": "fleet"
+    },
+    {
+      "in": "is ingress healthy across the fleet?",
+      "kind": "fleet"
+    },
+    {
+      "in": "<@U0KAGE> list each of our clusters",
+      "kind": "fleet"
+    },
+    {
+      "in": "<@U0KAGE> what version is seeded-b on",
+      "kind": "upgrade"
+    },
+    {
+      "in": "upgrade seeded-c to 1.31",
+      "kind": "upgrade"
+    },
+    {
+      "in": "which clusters are behind their release channel default?",
+      "kind": "upgrade"
+    },
+    {
+      "in": "is anything out of date?",
+      "kind": "upgrade"
+    },
+    {
+      "in": "what did seeded-a cost last month?",
+      "kind": "cost"
+    },
+    {
+      "in": "where is our GKE spend going?",
+      "kind": "cost"
+    },
+    {
+      "in": "are we over budget on all clusters?",
+      "kind": "cost"
+    },
+    {
+      "in": "run a security audit on seeded-b",
+      "kind": "security"
+    },
+    {
+      "in": "any CVEs in the checkout image?",
+      "kind": "security"
+    },
+    {
+      "in": "who has cluster-admin? check the RBAC",
+      "kind": "security"
+    },
+    {
+      "in": "is the dashboard exposed to the internet?",
+      "kind": "security"
+    },
+    {
+      "in": "check the ingress certs on seeded-a",
+      "kind": "question"
+    },
+    {
+      "in": "how many nodes does seeded-a have?",
+      "kind": "question"
+    },
+    {
+      "in": "fix it",
+      "kind": "change"
+    },
+    {
+      "in": "can you fix the crashlooping pod?",
+      "kind": "change"
+    },
+    {
+      "in": "bump the image to 1.4.2",
+      "kind": "change"
+    },
+    {
+      "in": "roll back checkout to yesterday's release",
+      "kind": "change"
+    },
+    {
+      "in": "please rollback the deploy",
+      "kind": "change"
+    },
+    {
+      "in": "open a PR for the memory limit",
+      "kind": "change"
+    },
+    {
+      "in": "open a pull request with that change",
+      "kind": "change"
+    },
+    {
+      "in": "scale the web deployment down to 2",
+      "kind": "change"
+    },
+    {
+      "in": "fix the version skew on seeded-c",
+      "kind": "change"
+    },
+    {
+      "in": "board",
+      "kind": "board"
+    },
+    {
+      "in": "what's running right now?",
+      "kind": "board"
+    },
+    {
+      "in": "status of the fleet audit",
+      "kind": "board"
+    },
+    {
+      "in": "checkout is down",
+      "kind": "incident"
+    },
+    {
+      "in": "we're paging on payments",
+      "kind": "incident"
+    },
+    {
+      "in": "sev1 outage in us-east4",
+      "kind": "incident"
+    },
+    {
+      "in": "payments pods in crashloopbackoff",
+      "kind": "incident"
+    },
+    {
+      "in": "thanks",
+      "kind": "question"
+    },
+    {
+      "in": "",
+      "kind": "question"
+    },
+    {
+      "in": "",
+      "kind": "question"
+    },
+    {
+      "in": "the prefix looks odd",
+      "kind": "question"
+    },
+    {
+      "in": "downstream latency",
+      "kind": "question"
+    },
+    {
+      "in": "the statusline plugin",
+      "kind": "question"
+    },
+    {
+      "in": "the costume party",
+      "kind": "question"
+    },
+    {
+      "in": "an oomph of bloom",
+      "kind": "question"
+    },
+    {
+      "in": "the clusterrole binding",
+      "kind": "question"
+    },
+    {
+      "in": "prod is down, roll back now",
+      "kind": "change"
+    },
+    {
+      "in": "should we scale down?",
+      "kind": "change"
+    },
+    {
+      "in": "is checkout-gateway restarting in seeded-a?",
+      "kind": "investigate"
+    },
+    {
+      "in": "which clusters have pods restarting right now?",
+      "kind": "fleet"
+    },
+    {
+      "in": "which clusters are restarting?",
+      "kind": "fleet"
+    },
+    {
+      "in": "fixé the pod",
+      "kind": "question"
+    },
+    {
+      "in": "le pod redémarre, pourquoi?",
+      "kind": "question"
+    },
+    {
+      "in": "checkout　is down",
+      "kind": "incident"
+    },
+    {
+      "in": "upgradé seeded-a",
+      "kind": "question"
+    },
+    {
+      "in": "Ünd all clusters?",
+      "kind": "fleet"
+    },
+    {
+      "in": "café costs?",
+      "kind": "cost"
+    },
+    {
+      "in": "fıx it",
+      "kind": "change"
+    },
+    {
+      "in": "ſcale the pool",
+      "kind": "change"
+    },
+    {
+      "in": "Kubernetes upgrade",
+      "kind": "upgrade"
+    },
+    {
+      "in": "which\u000bclusters are down",
+      "kind": "fleet"
+    },
+    {
+      "in": "why\u001dis it slow",
+      "kind": "investigate"
+    },
+    {
+      "in": "İs checkout down",
+      "kind": "incident"
+    },
+    {
+      "in": "ıs checkout down",
+      "kind": "incident"
+    },
+    {
+      "in": "ſhould we page",
+      "kind": "incident"
+    },
+    {
+      "in": "roll bacK now",
+      "kind": "change"
+    },
+    {
+      "in": "oomKilled again",
+      "kind": "investigate"
+    }
+  ],
+  "answer_chat": [
+    {
+      "in": "The `payments-api` workload is CrashLooping due to an OOMKill (exit code 137) caused by the container running `tail /dev/zero`, which rapidly exhausts its `64Mi` memory limit. The `payments-api` workload in the `seeded-debug` namespace is failing to start and is stuck in `CrashLoopBackOff` due to being `OOMKilled` (exit code 137).\n\n## Root Cause\nThe container is executing a command that consumes infinite memory unbounded until it hits its limit. Specifically, the deployment runs:\n```yaml\n      containers:\n      - command:\n        - sh\n        - -c\n        - tail /dev/zero\n```\nRunning `tail` on `/dev/zero` continually reads null bytes into memory. The container is configured with a strict memory limit of `64Mi`, which is exhausted almost immediately upon startup, leading the node to kill the process.\n\n## Evidence\n- The pod is in `CrashLoopBackOff` state.\n- Inspecting the previous container termination state:\n  ```json\n  {\"exitCode\":137,\"finishedAt\":\"2026-10-14T16:58:24Z\",\"reason\":\"OOMKilled\"}\n  ```\n- The deployment manifest defines the memory limit at `64Mi`.\n\n## Remediation Options\nTo fix the restarts, we need to address the root cause of the memory exhaustion.\n\n1. **Option 1 (Recommended): Fix the command**\n   If the container's purpose is simply to stay alive for debugging (which is common for `busybox` images), the command should be changed to one that does not consume memory.\n   Change the command in the deployment manifest to `tail -f /dev/null` or `sleep infinity`.\n2. **Option 2: Increase the memory limit**\n   If reading from `/dev/zero` is a legitimate requirement for this workload, the memory limit of `64Mi` needs to be significantly increased to accommodate the data being buffered.\n3. **Option 3: Change the workload image and logic**\n   If this is supposed to be the actual `payments-api` service, the image is currently set to `busybox:1.36` and running a shell command. The manifest should be updated to use the correct application image and start command.\n\nWhich of these options would you like to proceed with?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "The payments-api workload is CrashLooping.",
+        "detail": "Due to an OOMKill (exit code 137) caused by the container running `tail /dev/zero`, which rapidly exhausts its `64Mi` memory limit. The `payments-api` workload in the `seeded-debug` namespace is failing to start and is stuck in `CrashLoopBackOff` due to being `OOMKilled` (exit code 137).\n\n1. **Fix the command** — If the container's purpose is simply to stay alive for debugging (which is common for `busybox` images), the command should be changed to one that does not consume memory.\n2. **Increase the memory limit** — If reading from `/dev/zero` is a legitimate requirement for this workload, the memory limit of `64Mi` needs to be significantly increased to accommodate the data being buffered.\n3. **Change the workload image and logic** — If this is supposed to be the actual `payments-api` service, the image is currently set to `busybox:1.36` and running a shell command.\n\nWhich of these options would you like to proceed with?",
+        "fold": {
+          "title": "why",
+          "text": "## Root Cause\nThe container is executing a command that consumes infinite memory unbounded until it hits its limit. Specifically, the deployment runs:\n```yaml\n      containers:\n      - command:\n        - sh\n        - -c\n        - tail /dev/zero\n```\nRunning `tail` on `/dev/zero` continually reads null bytes into memory. The container is configured with a strict memory limit of `64Mi`, which is exhausted almost immediately upon startup, leading the node to kill the process.\n\n## Evidence\n- The pod is in `CrashLoopBackOff` state.\n- Inspecting the previous container termination state:\n  ```json\n  {\"exitCode\":137,\"finishedAt\":\"2026-10-14T16:58:24Z\",\"reason\":\"OOMKilled\"}\n  ```\n- The deployment manifest defines the memory limit at `64Mi`.\n\n## Remediation Options\nTo fix the restarts, we need to address the root cause of the memory exhaustion.\n\n1. **Option 1 (Recommended): Fix the command**\n   If the container's purpose is simply to stay alive for debugging (which is common for `busybox` images), the command should be changed to one that does not consume memory.\n   Change the command in the deployment manifest to `tail -f /dev/null` or `sleep infinity`.\n2. **Option 2: Increase the memory limit**\n   If reading from `/dev/zero` is a legitimate requirement for this workload, the memory limit of `64Mi` needs to be significantly increased to accommodate the data being buffered.\n3. **Option 3: Change the workload image and logic**\n   If this is supposed to be the actual `payments-api` service, the image is currently set to `busybox:1.36` and running a shell command. The manifest should be updated to use the correct application image and start command."
+        },
+        "choices": [
+          {
+            "text": "Fix the command",
+            "primary": true
+          },
+          {
+            "text": "Increase the memory limit"
+          },
+          {
+            "text": "Change the workload image and logic"
+          }
+        ]
+      }
+    },
+    {
+      "in": "The `checkout-gateway` deployment in seeded-a is restarting every few minutes because its readiness probe times out under load, which the HPA then reads as missing capacity. Raise the probe timeout.",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "The checkout-gateway deployment in seeded-a is restarting every few minutes.",
+        "detail": "Because its readiness probe times out under load, which the HPA then reads as missing capacity. Raise the probe timeout."
+      }
+    },
+    {
+      "in": "Two clusters run checkout-gateway. It is healthy on one.\n\nWhich one do you want me to look at?\n- seeded-reliability\n- seeded-debug",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Two clusters run checkout-gateway.",
+        "detail": "It is healthy on one.\n\nWhich one do you want me to look at?",
+        "choices": [
+          {
+            "text": "seeded-reliability"
+          },
+          {
+            "text": "seeded-debug"
+          }
+        ]
+      }
+    },
+    {
+      "in": "The pool is at its limit. It has 4 nodes.\n\n- Scale the pool to 6 nodes.\n- Then watch p99 latency.\n\nWant me to scale it?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "The pool is at its limit.",
+        "detail": "It has 4 nodes.\n\n- Scale the pool to 6 nodes.\n- Then watch p99 latency.\n\nWant me to scale it?"
+      }
+    },
+    {
+      "in": "I can fix it two ways.\n\n1. **Raise the limit**\n2. **Fix the command**\n\nShall I proceed?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "I can fix it two ways.",
+        "detail": "1. **Raise the limit**\n2. **Fix the command**\n\nShall I proceed?"
+      }
+    },
+    {
+      "in": "I can fix it two ways.\n\n1. **Raise the limit**\n2. **Fix the command**\n\nShall I raise the limit or fix the command?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "I can fix it two ways.",
+        "detail": "Shall I raise the limit or fix the command?",
+        "choices": [
+          {
+            "text": "Raise the limit"
+          },
+          {
+            "text": "Fix the command"
+          }
+        ]
+      }
+    },
+    {
+      "in": "Pick one.\n\n1. **Option 1: do thing 1**\n2. **Option 2: do thing 2**\n3. **Option 3: do thing 3**\n4. **Option 4: do thing 4**\n5. **Option 5: do thing 5**\n6. **Option 6: do thing 6**\n\nWhich one?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Pick one.",
+        "detail": "1. **Option 1: do thing 1**\n2. **Option 2: do thing 2**\n3. **Option 3: do thing 3**\n4. **Option 4: do thing 4**\n5. **Option 5: do thing 5**\n6. **Option 6: do thing 6**\n\nWhich one?"
+      }
+    },
+    {
+      "in": "Only one fix.\n\n1. **Raise the limit**\n\nWhich one?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Only one fix.",
+        "detail": "1. **Raise the limit**\n\nWhich one?"
+      }
+    },
+    {
+      "in": "Two choices.\n\n1. **stop**\n2. **Keep going**\n\nWhich do you want?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Two choices.",
+        "detail": "1. **stop**\n2. **Keep going**\n\nWhich do you want?"
+      }
+    },
+    {
+      "in": "Two choices.\n\n1. **Raise it**\n2. **Raise it**: again\n\nWhich do you want?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Two choices.",
+        "detail": "1. **Raise it**\n2. **Raise it**: again\n\nWhich do you want?"
+      }
+    },
+    {
+      "in": "The disk is full on seeded-c.\n\n- **Expand the volume**: grow the PVC to 50Gi. It takes a minute.\n- **Prune old logs** — delete `/var/log/app/*.gz` older than a week.\n\nWhich would you like?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "The disk is full on seeded-c.",
+        "detail": "- **Expand the volume** — grow the PVC to 50Gi.\n- **Prune old logs** — delete `/var/log/app/*.gz` older than a week.\n\nWhich would you like?",
+        "fold": {
+          "title": "why",
+          "text": "- **Expand the volume**: grow the PVC to 50Gi. It takes a minute.\n- **Prune old logs** — delete `/var/log/app/*.gz` older than a week."
+        },
+        "choices": [
+          {
+            "text": "Expand the volume"
+          },
+          {
+            "text": "Prune old logs"
+          }
+        ]
+      }
+    },
+    {
+      "in": "Two fixes.\n\n1. **Raise the limit (recommended)**\n   It is quick.\n2. **Option B (Recommended): Fix the command**\n   It is right.\n\nWhich should I do?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Two fixes.",
+        "detail": "1. **Raise the limit** — It is quick.\n2. **Fix the command** — It is right.\n\nWhich should I do?",
+        "fold": {
+          "title": "why",
+          "text": "1. **Raise the limit (recommended)**\n   It is quick.\n2. **Option B (Recommended): Fix the command**\n   It is right."
+        },
+        "choices": [
+          {
+            "text": "Raise the limit",
+            "primary": true
+          },
+          {
+            "text": "Fix the command"
+          }
+        ]
+      }
+    },
+    {
+      "in": "The rollout is stuck.\n\n## Why\nThe new pods fail readiness.\n\n1. **Roll back**\n   - to revision 41\n   - keeps traffic up\n2. **Fix forward**\n   ```yaml\n   readinessProbe:\n     timeoutSeconds: 5\n   ```\n\nHow would you like to proceed?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "The rollout is stuck.",
+        "detail": "How would you like to proceed?",
+        "fold": {
+          "title": "why",
+          "text": "## Why\nThe new pods fail readiness.\n\n1. **Roll back**\n   - to revision 41\n   - keeps traffic up\n2. **Fix forward**\n   ```yaml\n   readinessProbe:\n     timeoutSeconds: 5\n   ```"
+        },
+        "choices": [
+          {
+            "text": "Roll back"
+          },
+          {
+            "text": "Fix forward"
+          }
+        ]
+      }
+    },
+    {
+      "in": "Which namespace should I check?\n- payments\n- checkout\n- inventory",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Which namespace should I check?",
+        "detail": "- payments\n- checkout\n- inventory"
+      }
+    },
+    {
+      "in": "Pick one.\n\nWhich?\n- xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n- short",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Pick one.",
+        "detail": "Which?\n- xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n- short"
+      }
+    },
+    {
+      "in": "Done.\n\n1. **Raise it**\n2. **Fix it**",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Done.",
+        "detail": "1. **Raise it**\n2. **Fix it**"
+      }
+    },
+    {
+      "in": "**The payments-api deployment in the seeded-debug namespace is repeatedly restarting due to an OOMKill (Exit Code 137) because it is running the `tail /dev/zero` command, which exhausts its `64Mi` limit.** The pod has restarted 1088 times.",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "The payments-api deployment in the seeded-debug namespace is repeatedly restarting due to an OOMKill (Exit Code 137).",
+        "detail": "**Because it is running the `tail /dev/zero` command, which exhausts its `64Mi` limit.** The pod has restarted 1088 times."
+      }
+    },
+    {
+      "in": "Two pods are unhealthy.\n\n- pod-a is OOMKilled\n- pod-b is Pending\n\nAnything else you want me to look at?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Two pods are unhealthy.",
+        "detail": "- pod-a is OOMKilled\n- pod-b is Pending\n\nAnything else you want me to look at?"
+      }
+    },
+    {
+      "in": "It broke. Two ways.\n\n- **A**: Do x. Then also y.\n- **B**: Do z. Then also w.\n\nWhich?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "It broke.",
+        "detail": "Two ways.\n\n- **A** — Do x.\n- **B** — Do z.\n\nWhich?",
+        "fold": {
+          "title": "why",
+          "text": "- **A**: Do x. Then also y.\n- **B**: Do z. Then also w."
+        },
+        "choices": [
+          {
+            "text": "A"
+          },
+          {
+            "text": "B"
+          }
+        ]
+      }
+    },
+    {
+      "in": "Two ways.\n\n- **Roll back**\n- **Fix forward**: patch it.\n\nWhich?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Two ways.",
+        "detail": "Which?",
+        "fold": {
+          "title": "why",
+          "text": "- **Roll back**\n- **Fix forward**: patch it."
+        },
+        "choices": [
+          {
+            "text": "Roll back"
+          },
+          {
+            "text": "Fix forward"
+          }
+        ]
+      }
+    },
+    {
+      "in": "Two ways.\n\n- **word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word **\n- **short**\n\nWhich one?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Two ways.",
+        "detail": "Which one?",
+        "fold": {
+          "title": "why",
+          "text": "- **word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word **\n- **short**"
+        },
+        "choices": [
+          {
+            "text": "word word word word word word word word word word word word word word…"
+          },
+          {
+            "text": "short"
+          }
+        ]
+      }
+    },
+    {
+      "in": "Two fixes.\n\n1. **Fix the command** (Recommended): change it to `sleep infinity`.\n2. **Raise the limit**: give it 512Mi.\n\nWhich should I do?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Two fixes.",
+        "detail": "1. **Fix the command** — change it to `sleep infinity`.\n2. **Raise the limit** — give it 512Mi.\n\nWhich should I do?",
+        "choices": [
+          {
+            "text": "Fix the command",
+            "primary": true
+          },
+          {
+            "text": "Raise the limit"
+          }
+        ]
+      }
+    }
+  ]
+}

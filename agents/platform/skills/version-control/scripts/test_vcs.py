@@ -44,6 +44,9 @@ sys.path.insert(
 import vcs  # noqa: E402
 import vcs_client  # noqa: E402
 
+#: The real `call`, which the setUp replaces with the stub broker; the record tests put it back.
+REAL_CALL = vcs_client.call
+
 GIT_ENV = {
     "GIT_AUTHOR_NAME": "Test",
     "GIT_AUTHOR_EMAIL": "test@example.com",
@@ -85,6 +88,10 @@ class Broker:
         self.calls: list[tuple[str, dict]] = []
         self.answers: dict[str, dict] = {}
         self.fail: dict[str, str] = {}
+        # The base the operator configured for this repository, or None. The
+        # refusals it brings are the broker's own: a clone with no branch named
+        # comes down on it, and a new proposal may target nothing else.
+        self.base_branch: str | None = None
 
     def __call__(self, verb: str, payload: dict) -> dict:
         self.calls.append((verb, payload))
@@ -93,6 +100,10 @@ class Broker:
         if verb == "clone":
             return self._clone(payload)
         if verb == "publish":
+            if not payload.get("advance"):
+                # A later round adds to a proposal that already exists; only
+                # the first publish starts one, so only it is held to the base.
+                self._refuse_off_base(payload["target"])
             return {
                 "forge": "local",
                 "repo": "acme/infra",
@@ -106,11 +117,33 @@ class Broker:
                 "proposalNoun": "change proposal",
                 "verbs": ["clone", "publish"],
                 "missing": [],
+                "baseBranch": self.base_branch,
             }
+        if verb == "proposal-create":
+            self._refuse_off_base(payload["target"])
         return self.answers.get(verb, {"forge": "local", "repo": "acme/infra"})
 
+    def _refuse_off_base(self, target: str) -> None:
+        if self.base_branch is not None and target != self.base_branch:
+            raise vcs.VcsError(
+                f"acme/infra takes proposals onto {self.base_branch} only, the base "
+                f"branch this install is configured with, and {target} is not it. "
+                f"Use {self.base_branch} as the target.",
+                code="TARGET_NOT_BASE",
+            )
+
     def _clone(self, payload: dict) -> dict:
-        branch = payload.get("branch") or self.branch
+        branch = payload.get("branch")
+        if branch is None and self.base_branch is not None:
+            if git(self.origin, "rev-parse", "--verify", "--quiet",
+                   f"refs/heads/{self.base_branch}", check=False).returncode != 0:
+                raise vcs.VcsError(
+                    f"acme/infra has no branch {self.base_branch}, the base branch "
+                    "this install is configured with.",
+                    code="BASE_BRANCH_MISSING",
+                )
+            branch = self.base_branch
+        branch = branch or self.branch
         bundle = self.origin.parent / "served.bundle"
         git(self.origin, "bundle", "create", str(bundle), "HEAD", branch)
         blob = bundle.read_bytes()
@@ -121,6 +154,7 @@ class Broker:
             "revision": git(self.origin, "rev-parse", branch).stdout.strip(),
             "size": len(blob),
             "bundleBase64": base64.b64encode(blob).decode("ascii"),
+            "baseBranch": self.base_branch,
         }
 
     def _tip_of(self, payload: dict) -> str:
@@ -703,6 +737,35 @@ class CollaborationTest(VcsTestCase):
         self.assertEqual(payload["target"], "main")
         self.assertEqual(payload["title"], "Raise replicas")
 
+    def test_proposal_create_records_the_proposal_on_stderr_and_keeps_stdout_json(self):
+        # `vcs_client.call` itself, with only the broker under it stubbed: the record
+        # goes to stderr for the agent pod's pr_opened plugin, and stdout stays the
+        # one JSON document the model reads.
+        url = "https://github.com/acme/infra/pull/12"
+        self.broker.answers["proposal-create"] = {
+            "proposal": {"number": 12, "title": "Raise replicas", "url": url, "state": "open"},
+        }
+        self.run_vcs("branch", "fix/replicas")
+        stderr = io.StringIO()
+        with mock.patch.object(vcs_client, "call", REAL_CALL), \
+                mock.patch.object(vcs_client, "_call", self.broker), \
+                redirect_stderr(stderr):
+            code, out = self.run_vcs("proposal", "create", "--title", "Raise replicas")
+        self.assertEqual(code, 0)
+        self.assertEqual(out["proposal"]["url"], url)
+        self.assertEqual(
+            [json.loads(line) for line in stderr.getvalue().splitlines()],
+            [{"kube-agents.event": "proposal-opened", "proposal": {"url": url, "number": 12, "title": "Raise replicas"}}],
+        )
+
+    def test_a_proposal_read_records_nothing(self):
+        stderr = io.StringIO()
+        with mock.patch.object(vcs_client, "call", REAL_CALL), \
+                mock.patch.object(vcs_client, "_call", self.broker), \
+                redirect_stderr(stderr):
+            self.run_vcs("proposal", "list")
+        self.assertEqual(stderr.getvalue(), "")
+
     def test_pr_and_mr_reach_the_same_verb(self):
         # The neutral noun is the command; a caller who knows one forge's word
         # for it should not have to unlearn it.
@@ -868,6 +931,109 @@ class CollaborationTest(VcsTestCase):
         code, answer = self.run_vcs("issue", "view", "4")
         self.assertEqual(code, 1)
         self.assertIn("pull request", answer["error"])
+
+
+class ConfiguredBaseTest(VcsTestCase):
+    """A repository the operator pinned to `release`, as the broker reports it."""
+
+    def setUp(self):
+        super().setUp()
+        git(self.origin, "branch", "release", "main")
+        git(self.origin, "branch", "fix/under-review", "main")
+        self.broker.base_branch = "release"
+
+    def start_a_change(self) -> None:
+        self.clone()
+        self.run_vcs("branch", "fix/replicas")
+        (self.tree() / "inventory/clusters.yaml").write_text("replicas: 5\n")
+        self.run_vcs("commit", "-m", "raise it")
+
+    def test_a_clone_comes_down_on_the_base_and_says_which_it_is(self):
+        answer = self.clone()
+        self.assertEqual(answer["branch"], "release")
+        self.assertEqual(answer["baseBranch"], "release")
+
+    def test_with_nothing_configured_the_base_is_null(self):
+        self.broker.base_branch = None
+        answer = self.clone()
+        self.assertEqual(answer["branch"], "main")
+        self.assertIsNone(answer["baseBranch"])
+
+    def test_capabilities_answers_the_base_with_no_copy(self):
+        code, answer = self.run_vcs("capabilities", "--repo", "local.test/acme/infra")
+        self.assertEqual(code, 0, answer)
+        self.assertEqual(answer["baseBranch"], "release")
+
+    def test_publish_and_proposal_create_default_to_the_base(self):
+        self.start_a_change()
+        code, answer = self.run_vcs("publish")
+        self.assertEqual(code, 0, answer)
+        self.assertEqual(self.broker.payload("publish")["target"], "release")
+        code, answer = self.run_vcs("proposal", "create", "--title", "Raise replicas")
+        self.assertEqual(code, 0, answer)
+        self.assertEqual(self.broker.payload("proposal-create")["target"], "release")
+
+    def test_a_proposal_from_a_copy_of_another_branch_still_goes_onto_the_base(self):
+        # The copy came down on fix/under-review, so the branch it was cloned
+        # from is not the base. Defaulting to that branch would propose onto
+        # fix/under-review, which the broker refuses; the default is the base.
+        self.clone("--branch", "fix/under-review")
+        code, answer = self.run_vcs("proposal", "create", "--title", "t")
+        self.assertEqual(code, 0, answer)
+        self.assertEqual(self.broker.payload("proposal-create")["source"], "fix/under-review")
+        self.assertEqual(self.broker.payload("proposal-create")["target"], "release")
+
+    def test_a_copy_of_another_branch_is_refused_a_default_publish_locally(self):
+        # Defaulted onto release, the broker would compare the copy's clone
+        # point (main's tip) with release and answer BASE_MOVED, a refusal that
+        # names the wrong cause. The copy knows both branches and says so.
+        self.clone("--branch", "main")
+        self.run_vcs("branch", "fix/x")
+        (self.tree() / "inventory/clusters.yaml").write_text("replicas: 7\n")
+        self.run_vcs("commit", "-m", "raise it")
+        code, answer = self.run_vcs("publish")
+        self.assertEqual(code, 1)
+        self.assertIn("cloned from main", answer["error"])
+        self.assertIn("go onto release", answer["error"])
+        self.assertIn("Clone again with no branch", answer["error"])
+        self.assertNotIn("publish", self.broker.verbs)
+
+    def test_with_nothing_configured_a_copy_of_any_branch_publishes_onto_it(self):
+        self.broker.base_branch = None
+        self.clone("--branch", "fix/under-review")
+        self.run_vcs("branch", "fix/x")
+        (self.tree() / "inventory/clusters.yaml").write_text("replicas: 7\n")
+        self.run_vcs("commit", "-m", "raise it")
+        code, answer = self.run_vcs("publish")
+        self.assertEqual(code, 0, answer)
+        self.assertEqual(self.broker.payload("publish")["target"], "fix/under-review")
+
+    def test_another_target_for_a_new_proposal_is_refused_naming_the_base(self):
+        self.start_a_change()
+        for argv in (
+            ("publish", "--target", "main"),
+            ("proposal", "create", "--title", "t", "--target", "main"),
+        ):
+            with self.subTest(argv=argv):
+                code, answer = self.run_vcs(*argv)
+                self.assertEqual(code, 1)
+                self.assertEqual(answer["code"], "TARGET_NOT_BASE")
+                self.assertIn("release", answer["error"])
+
+    def test_a_later_round_keeps_the_target_its_proposal_already_has(self):
+        self.clone("--branch", "fix/under-review")
+        (self.tree() / "inventory/clusters.yaml").write_text("replicas: 6\n")
+        self.run_vcs("commit", "-m", "another round")
+        code, answer = self.run_vcs("publish", "--target", "main", "--advance")
+        self.assertEqual(code, 0, answer)
+        self.assertEqual(self.broker.payload("publish")["target"], "main")
+
+    def test_a_base_the_remote_does_not_have_is_refused_by_name(self):
+        self.broker.base_branch = "nope"
+        code, answer = self.run_vcs("clone", "local.test/acme/infra")
+        self.assertEqual(code, 1)
+        self.assertEqual(answer["code"], "BASE_BRANCH_MISSING")
+        self.assertIn("nope", answer["error"])
 
 
 # ---------------------------------------------------------------------------

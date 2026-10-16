@@ -643,6 +643,35 @@ harness_retag_keys() {
 # Assigns rather than prints, for the reasons recorded_plugin_image_tag_keys
 # gives. Arguments: release, namespace, schema path.
 RETAG_VALUES_JSON=""
+# refuse_full_apply_dropping_next <schema>: a full apply renders the CR from
+# the target tree's composition, and a chart that predates platformAgent.mode
+# renders no mode, so Helm takes spec.mode off the CR and the operator retires
+# the A2A stack. retag_values refuses the same drop on the other two arms; this
+# is the full arm's half, keyed on what the apply would render (install.env's
+# PLATFORM_AGENT_MODE), since a full apply does not reuse the recorded values.
+# Read inline for retag_values' reason: installer_common.sh is the target
+# tree's, and a target that predates the key predates its helpers too.
+refuse_full_apply_dropping_next() {
+  local schema="$1"
+  [ "${PLATFORM_AGENT_MODE:-}" = "next" ] || return 0
+  if [ "$(trap - ERR; python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        schema = json.load(f)
+except (OSError, ValueError):
+    sys.stdout.write("unreadable")
+    sys.exit(0)
+props = ((schema.get("properties") or {}).get("platformAgent") or {}).get("properties") or {}
+sys.stdout.write("declared" if "mode" in props else "absent")
+' "$schema" 2>/dev/null || true)" != "absent" ]; then
+    return 0
+  fi
+  print_error "install.env sets PLATFORM_AGENT_MODE=next, and the chart this run applies predates spec.mode support (its values.schema.json does not declare platformAgent.mode). The apply would render no mode, take spec.mode off the PlatformAgent and switch the install back to today."
+  print_info "Upgrade to a release whose chart declares platformAgent.mode, or, to leave next on purpose, set PLATFORM_AGENT_MODE=today in install.env and run again."
+  return 1
+}
+
 retag_values() {
   local release="$1" namespace="$2" schema="$3" revision values stderr_file dropped_file key
   RETAG_VALUES_JSON=""
@@ -745,6 +774,25 @@ sys.stdout.buffer.write(text.encode("utf-8"))
   if [ ! -s "$dropped_file" ]; then
     rm -f "$dropped_file"
     return 0
+  fi
+  # A recorded `next` on a chart that predates platformAgent.mode is never
+  # dropped, with the flag or without: the chart would render no mode, Helm
+  # would take spec.mode off the CR, and the operator would retire the A2A
+  # stack on a run that only re-tags images. A recorded `today` drops freely,
+  # since an absent mode is today. Read here, not through installer_common.sh's
+  # helpers: that file is the target tree's, and a target that predates the key
+  # predates them too.
+  if grep -qxF 'platformAgent.mode' "$dropped_file" &&
+    [ "$(printf '%s' "$values" | (trap - ERR; python3 -c '
+import json, sys
+values = json.loads(sys.stdin.buffer.read()) or {}
+sys.stdout.write(str((values.get("platformAgent") or {}).get("mode") or ""))
+' 2>/dev/null) || true)" = "next" ]; then
+    RETAG_VALUES_JSON=""
+    rm -f "$dropped_file"
+    print_error "The release records platformAgent.mode: next, and the chart this run applies predates spec.mode support (its values.schema.json does not declare the key). Dropping it would take spec.mode off the PlatformAgent and switch the install back to today on a re-tag."
+    print_info "Re-tag to a release whose chart declares platformAgent.mode, or, to leave next on purpose, set PLATFORM_AGENT_MODE=today in install.env and run --upgrade-mode=full first, then re-tag."
+    return 1
   fi
   if [ "$PARAM_DROP_UNDECLARED_VALUES" != "true" ]; then
     RETAG_VALUES_JSON=""
@@ -1615,6 +1663,14 @@ main() {
   # the chart and the generator read. Derived here, after the load and before
   # anything reads it.
   normalize_memory_vars
+  # A GITHUB_APP_ID that is a name rather than the App's number leaves the
+  # token minter crash-looping behind Helm's rollout wait (#3076); refused here,
+  # --dry-run included. Guarded: an older target's helpers lack it.
+  # GitHub only: a GitLab install does not read the key (install.sh drops a
+  # leftover one the same way).
+  if declare -F validate_github_app_id >/dev/null && [ "${GITOPS_FORGE:-github}" = "github" ]; then
+    validate_github_app_id "${GITHUB_APP_ID:-}" "GITHUB_APP_ID in ${install_env_file:-install.env}" || exit 1
+  fi
 
   local target_project="${PARAM_PROJECT_ID:-${PROJECT_ID:-}}"
   local target_cluster="${PARAM_CLUSTER_NAME:-${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}}"
@@ -1848,6 +1904,30 @@ main() {
     # a policy that forbids the Asset API).
     refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"
     check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
+    # And the sink preflight (a listed project this identity cannot create
+    # a drift audit-log sink in). Guarded: an older target's helpers lack it.
+    if declare -F check_scope_export_sink_access >/dev/null; then
+      check_scope_export_sink_access "$SCOPE_CHECK_MODE_WARN"
+    fi
+    # A live GitHub minter this render would destroy (#3075), warned here as
+    # the scope check is. Guarded: an older target's helpers lack it.
+    if declare -F refuse_apply_dropping_live_gitops >/dev/null; then
+      refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}" "$SCOPE_CHECK_MODE_WARN"
+    fi
+    # Each mode call is guarded: installer_common.sh is the target tree's,
+    # and one from before spec.mode support (this script piped, or run with
+    # --image-tag onto an older release) defines neither the notice nor
+    # DEFAULT_PLATFORM_AGENT_MODE, so the run skips the notice rather than
+    # abort. retag_values' refusal of a dropped `next` lives in this file and
+    # still runs there.
+    if declare -F announce_platform_agent_mode_for_apply >/dev/null; then
+      announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+    fi
+    # The Slack settings the full arm refuses when next hands Slack to the
+    # A2A gateway, warned here, as the scope check is.
+    if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then
+      refuse_next_slack_gateway_settings_from_env "" "$SCOPE_CHECK_MODE_WARN"
+    fi
     print_info "Comparing this checkout's composition against the install's Terraform state."
     local plan_status=0
     run_lifecycle "${repo_dir}/terraform/examples/full-install" \
@@ -1891,6 +1971,14 @@ main() {
     operator)
       print_step "4. Upgrading Kubernetes Operator (CRDs & Controller Manager)"
       retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
+      # The mode: a retag re-applies the recorded values, mode included, onto
+      # a chart that declares platformAgent.mode (retag_values refuses a
+      # recorded next the target chart does not declare, rather than drop it),
+      # and says when a full upgrade would move it (from the values just read).
+      # Guarded, as at the plan's notice: an older target's helpers lack it.
+      if declare -F note_platform_agent_mode_for_retag >/dev/null; then
+        note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"
+      fi
       UPGRADE_APPLY_STARTED="true"
       apply_crd_upgrades "$repo_dir"
       helm_retag "operator.image.tag"
@@ -1911,6 +1999,10 @@ main() {
       # calls, not substitutions: a failed read stops the run here, once, with
       # its own message shown.
       retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
+      # Guarded, as at the plan's notice: an older target's helpers lack it.
+      if declare -F note_platform_agent_mode_for_retag >/dev/null; then
+        note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"
+      fi
       harness_retag_keys "$RETAG_VALUES_JSON"
       # After the reads, not before them: they are the last things this arm
       # does that can fail without having changed anything.
@@ -1928,11 +2020,56 @@ main() {
       # the live CR, and a scope the CR carries that neither the release
       # record nor the keys account for is refused here rather than replaced.
       refuse_apply_over_undeclared_scope "$target_namespace" || exit 1
+      # And a live GitHub minter this render would destroy: an install.env
+      # that lacks the GitOps keys (install.sh's flags were not recorded
+      # before #3075) renders GitOps off. Guarded as above.
+      if declare -F refuse_apply_dropping_live_gitops >/dev/null; then
+        # A refusal removes the tfvars the generator just wrote, which render
+        # the minter off, as install.sh does and the Slack check below does.
+        if ! refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}"; then
+          rm -f "$tfvars_file"
+          exit 1
+        fi
+      fi
+      # install.env's next onto a chart that predates platformAgent.mode is
+      # refused, not dropped, as retag_values does on the other two arms. Ahead
+      # of the notice below, which an older target's helpers cannot print.
+      refuse_full_apply_dropping_next "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}" || exit 1
+      # If this apply moves Slack to the A2A gateway (next, Slack on, Chat
+      # off), the Slack settings the gateway cannot use are refused: an email
+      # in the allowlist, a home channel that is not a channel id, a list of
+      # bot tokens. The generator above has already recovered a token the
+      # live Secret holds. Guarded: a target tree whose installer_common.sh
+      # predates the check does not define it.
+      # A refusal removes the tfvars the generator just wrote, which render
+      # the refused settings, as install.sh does; a moved checkout's previous
+      # tfvars come back from restore_moved_checkout.
+      if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then
+        if ! refuse_next_slack_gateway_settings_from_env; then
+          rm -f "$tfvars_file"
+          exit 1
+        fi
+      fi
+      # The mode. A full apply carries PLATFORM_AGENT_MODE forward from
+      # install.env, so a key edited since the last apply switches the install
+      # here, and the run says so first, from the reads the scope check made.
+      # Nothing asks between here and the apply, so the notice says that.
+      # Guarded, as at the plan's notice: an older target's helpers lack it.
+      if declare -F announce_platform_agent_mode_for_apply >/dev/null; then
+        announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
+      fi
       # And the container preflight: the apply binds a declared folder or
       # organisation with this identity and enables the Asset API in the host
       # project, so a container it cannot bind, or a policy that forbids the
       # API, is refused here rather than failing the apply partway.
       check_scope_container_access || exit 1
+      # And the sink preflight: the apply creates a drift audit-log sink in
+      # each project the scope lists with this identity, so a project it
+      # cannot create one in is refused here rather than failing the apply
+      # after the host's resources have changed. Guarded as above.
+      if declare -F check_scope_export_sink_access >/dev/null; then
+        check_scope_export_sink_access || exit 1
+      fi
       # install.sh's post-generation minter guard, without its import step:
       # an upgrade never imports the App key, so an install.env that enables the
       # minter against a key with no ENABLED version would wedge the apply on

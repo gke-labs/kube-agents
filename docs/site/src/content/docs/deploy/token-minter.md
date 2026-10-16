@@ -5,6 +5,10 @@ sidebar:
   order: 3
 ---
 
+:::note
+Only an install whose GitOps repository is on GitHub uses Minty. A GitLab install has no GitHub App, no token minter and no Cloud KMS key: the credential broker holds a GitLab access token in a Kubernetes Secret. See [GitLab as the GitOps forge](/kube-agents/install/gitlab/).
+:::
+
 Minty is the GitHub Token Minter — an in-cluster service that mints short-lived (1-hour) repository-scoped GitHub App installation tokens on demand for the Platform Agent's `submit-suggestion`, `fleet-audit`, and `github-issue-resolver` skills, and read-only tokens for the credential broker's own clones of the repositories registered as context. The GitHub App's private key never leaves GCP KMS.
 
 GCP half (minter GSA, Workload Identity binding, import-only KMS signing key): [`terraform/modules/github-minter`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter).
@@ -35,6 +39,29 @@ A repository registered under `context_repos` — a Terraform repository an audi
 
 The GitHub App must be installed on each context repository, as it must on each managed one; a private repository the App is not installed on fails to clone as before. A cross-organization entry is skipped with an operator log line. A rule ConfigMap whose `default.yaml` predates the read scope renders no context policies — upgrade the chart or the kustomize template to get it.
 
+## GitHub Enterprise Server
+
+When the install's GitHub forge is at a GitHub Enterprise Server host, Minty mints on that instance instead of on github.com. The chart does this from the forge declaration in `platformAgent.integration.forges`; there is no separate `githubMinter.*` value for it. An install serves one GitHub host, github.com or one GitHub Enterprise Server, so one Minty serves it.
+
+- **API URL.** The chart sets `SOURCE_SYSTEM_API_BASE_URL=https://<host>/api/v3` on the Minty container. Minty then calls the instance's REST API, where it calls `api.github.com` on github.com. A github.com install does not get the variable.
+- **Private CA.** When the GitHub forge names `caBundleRef`, the chart mounts that key of the Secret into the Minty pod at `/etc/kube-agents/minter-ca/ca.crt` and sets `SSL_CERT_DIR=/etc/kube-agents/minter-ca`. Minty is a Go program that uses the default HTTP transport, so it reads the system roots: the CA bundle in its image, and each certificate file in the directories that `SSL_CERT_DIR` names. Minty trusts the configured CA beside the image's bundle, for all of its outbound calls (the instance, and the Google APIs it calls). The CA is one that you trust and install. It is the same Secret that the credential broker reads, in the release namespace. The mount is optional: until the Secret exists, Minty starts, and its calls to the instance fail on TLS. Minty reads `SSL_CERT_DIR` once, when it starts, so after you create or rotate the Secret, restart it: `kubectl rollout restart deployment/github-token-minter -n kubeagents-system`. The credential broker reads the CA on each call and needs no restart; the difference is intended, because the broker reads the CA file on each call, while Go loads its system roots once per process.
+- **Egress.** Minty's NetworkPolicy (`githubMinter.networkPolicy`, on by default) allows TCP port 443 to any address, private ranges included. So Minty reaches an instance on a private network on port 443, if the cluster's network can route to it. An instance on another port is not supported. A firewall or a VPC route outside the cluster is yours to open.
+- **GitHub App.** Create the App on the instance, not on github.com: an App and its installation belong to one GitHub host. Give it the same repository permissions as on github.com (`Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`), and install it on the organization, the GitOps repository and each context repository. The repository must be owned by an organization, for the reason above.
+- **Key import.** `minty tools import-pk` imports the App's private key into the Cloud KMS key, and it calls only Cloud KMS, so the import is the same for an App on a GitHub Enterprise Server. `install.sh` runs it from `--github-pem-path`, as on github.com, into a key that has no `ENABLED` version yet. On the Terraform + Helm method, import the key before the apply, because the apply waits for the minter, which is not Ready without it. With the composition's default names and the minty version `install.sh` pins:
+
+  ```bash
+  git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git ~/minty
+  (cd ~/minty && go run ./cmd/minty tools import-pk -project-id=PROJECT_ID -location=REGION \
+    -key-ring=github-token-minter-keyring -key=github-token-minter-key -private-key=@/path/to/app.pem)
+  ```
+
+  The key ring and the import-only key must exist first; the `gcloud kms` commands that create them are in INSTALL.md. On a new key, the import makes key version `1`, the version the chart uses (`githubMinter.kms.keyVersion`, default `"1"`). When the key already exists (a switch from github.com, or a reinstall in the same project), skip the create commands, read the new version with `gcloud kms keys versions list --key=github-token-minter-key --keyring=github-token-minter-keyring --location=REGION --project=PROJECT_ID --filter=state=ENABLED --format='value(name)'` (the last path segment of the newest version is `N`), and set `githubMinter = { kms = { keyVersion = "N" } }` in `extra_helm_values`. With `install.sh`, give a new key name with `--kms-key` instead, so that the import makes version `1` of a new key.
+
+- **Readiness.** Minty's readiness probe asks its own `/version` route, and minty `v2.7.1` calls the instance only when it mints. So the pod becomes Ready without the CA Secret or a route to the instance; a mint then fails until both are in place.
+- **Extra repositories.** Register another repository on the instance by its full URL, `https://<host>/owner/name`, with `"type": "github"`. A bare `owner/name` or a github.com URL is skipped on a GitHub Enterprise Server install, by the operator's policy sync and by the agent, so it gets no policy.
+
+- **Install.** `install.sh --gitops-host=<host>` installs it, with `--gitops-ca-file` for a private CA; `upgrade.sh` and `uninstall.sh` read the forge from `install.env`. After the apply, `install.sh` writes the CA into the Secret `github-forge-ca` and restarts the minter, which reads its CA when it starts. The Terraform + Helm method sets `gitops_host` and `github_ca_secret_name` in `terraform.tfvars`. See [GitHub Enterprise Server in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#github-enterprise-server).
+
 ## Setup and Key Provisioning
 
 Minty requires a GitHub App private key imported into Google Cloud KMS as an asymmetric signing key (`rsa-sign-pkcs1-2048-sha256` or `rsa-sign-pkcs1-4096-sha512`). You can either let the `kube-agents` installer import the key automatically during initial setup, or pre-provision it Ahead-Of-Time (AOT).
@@ -50,7 +77,7 @@ Before enabling the token minter, ensure you have:
    - Repository permissions: `Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`.
    - Installed onto the target organization, the GitOps repository, and every repository registered under `context_repos`.
    - If created under a personal user account, "Where can this GitHub App be installed?" must be set to "Any account (Public)".
-4. **App ID:** The numeric App ID from the GitHub App settings page.
+4. **App ID:** The numeric App ID from the GitHub App settings page (**General**, "App ID", a number such as `1234567`), not the App's name or slug. The installer refuses anything else.
 5. **Private Key (`.pem`):** Generated and downloaded from the GitHub App settings page (needed for initial Cloud KMS import).
 6. **Host Requirements:** `go` 1.21+ on the host machine running the import — `minty tools import-pk` builds the Minty CLI, which asks for Go 1.24 and relies on 1.21 onwards fetching that toolchain on demand — and `gcloud` authenticated with Cloud KMS admin permissions on your GCP project.
 

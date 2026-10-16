@@ -1,12 +1,12 @@
 /*
  * Mission control, instrument-panel dialect. Lifted from the demo UI.
  *
- * The rail is the only lit surface in the room: near-black field, one white-hot
- * trace with a cold halo, everything else in silkscreen grey. Hue is reserved —
- * correlation ids own the spectrum (via corrColor), and amber is spent on
- * exactly one thing, the browser's own link being down. Lifecycle is
- * otherwise expressed in luminance: active is bright, idle and done are dim,
- * closed fades off the trace.
+ * The dashboard is the only lit surface in the room: near-black field, one
+ * white-hot trace with a cold halo, everything else in silkscreen grey. Hue
+ * is reserved — correlation ids own the spectrum (via corrColor), and amber
+ * is spent on exactly one thing, the browser's own link being down.
+ * Lifecycle is otherwise expressed in luminance: active is bright, idle and
+ * done are dim, closed fades off the trace.
  */
 
 :root {
@@ -52,284 +52,40 @@ body {
   width: 100%;
 }
 
-.app-topology {
-  flex: 0 0 45%;
+.app-main {
+  flex: 1 1 auto;
   min-height: 0;
-  border-bottom: 1px solid var(--edge);
-  background:
-    radial-gradient(120% 90% at 50% 0%, #101520 0%, var(--panel) 55%, var(--void) 100%);
+  display: flex;
+  flex-direction: column;
+}
+
+.app-body {
+  flex: 0 0 auto;
+  min-height: 0;
   overflow: hidden;
 }
 
+.app-band {
+  flex: 0 0 6px;
+  border-top: 1px solid var(--edge);
+  border-bottom: 1px solid var(--edge);
+  background: var(--panel);
+  cursor: row-resize;
+  touch-action: none;
+}
+
+.app-band:hover,
+.app-band:focus-visible {
+  background: var(--edge);
+  outline: none;
+}
+
 .app-chat {
-  flex: 1 1 55%;
+  flex: 1 1 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
   background: var(--void);
-}
-
-/* --- rail panel ----------------------------------------------------------- */
-
-.rail-panel {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  padding: 18px 0 12px;
-}
-
-.rail-head,
-.rail-foot {
-  display: flex;
-  align-items: baseline;
-  gap: 14px;
-  padding: 0 24px;
-  font-family: var(--mono);
-  font-size: 10px;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-}
-
-.rail-title {
-  color: var(--ink-bright);
-  font-weight: 600;
-}
-
-.rail-subject {
-  color: var(--ink-dim);
-  letter-spacing: 0.08em;
-  text-transform: none;
-}
-
-/* Centred in whatever height the panel has: the trace should sit on the
-   panel's optical midline, not float under the title. */
-.rail-svg {
-  display: block;
-  flex: 0 0 auto;
-  margin: auto 0;
-  width: 100%;
-  overflow: visible;
-}
-
-.rail-foot {
-  justify-content: space-between;
-  color: var(--ink-dim);
-  letter-spacing: 0.08em;
-  text-transform: none;
-}
-
-.rail-replay {
-  color: var(--ink);
-  letter-spacing: 0.1em;
-  text-transform: none;
-}
-
-/* --- the trace ------------------------------------------------------------ */
-
-.rail-trace {
-  stroke: var(--trace);
-  stroke-width: 1.25;
-  opacity: 0.9;
-}
-
-.rail-trace-halo {
-  stroke: var(--halo);
-  stroke-width: 9;
-  filter: blur(4px);
-}
-
-.rail-terminator {
-  stroke: var(--trace);
-  stroke-width: 1;
-  opacity: 0.35;
-}
-
-/* --- taps ----------------------------------------------------------------- */
-
-.tap {
-  animation: tap-arrive 420ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
-}
-
-@keyframes tap-arrive {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-}
-
-.tap-lead {
-  stroke: var(--ink-dim);
-  stroke-width: 1;
-}
-
-.tap-dot {
-  fill: var(--trace);
-}
-
-.tap-port {
-  fill: none;
-  stroke: var(--trace);
-  stroke-width: 1.25;
-}
-
-.tap-hub {
-  fill: none;
-  stroke: var(--trace);
-  stroke-width: 1;
-  opacity: 0.3;
-}
-
-.tap-ripple {
-  fill: none;
-  stroke: var(--trace);
-  stroke-width: 1;
-}
-
-.tap-name {
-  fill: var(--ink-bright);
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.02em;
-}
-
-.tap-status {
-  fill: var(--ink-dim);
-  font-family: var(--mono);
-  font-size: 9.5px;
-  letter-spacing: 0.06em;
-}
-
-/* lifecycle, in luminance */
-
-.tap-done .tap-dot,
-.tap-absent .tap-dot {
-  fill: var(--ink-dim);
-}
-
-.tap-done .tap-name,
-.tap-absent .tap-name {
-  fill: var(--ink);
-}
-
-.tap-done,
-.tap-absent {
-  opacity: 0.62;
-}
-
-/* Idle is quieter than active but not retired: the pod is there, the bus is
-   just silent. */
-.tap-idle {
-  opacity: 0.8;
-}
-
-.tap-idle .tap-dot {
-  fill: var(--ink);
-}
-
-.tap-stale {
-  opacity: 0.75;
-}
-
-.tap-stale .tap-dot {
-  fill: var(--warn);
-}
-
-.tap-stale .tap-name,
-.tap-stale .tap-status {
-  fill: var(--warn);
-}
-
-.tap-closed {
-  animation: tap-retire 2s ease-in forwards;
-}
-
-@keyframes tap-retire {
-  0% {
-    opacity: 0.6;
-  }
-  100% {
-    opacity: 0;
-    transform: translateY(14px);
-  }
-}
-
-.tap-clickable {
-  cursor: pointer;
-}
-
-.tap-clickable:hover .tap-dot {
-  r: 5.5;
-}
-
-.tap-clickable:hover .tap-name {
-  fill: #fff;
-}
-
-.tap-clickable:focus {
-  outline: none;
-}
-
-.tap-clickable:focus-visible .tap-name {
-  fill: #fff;
-}
-
-.tap-clickable:focus-visible .tap-dot,
-.tap-clickable:focus-visible .tap-port {
-  stroke: var(--trace);
-  stroke-width: 1;
-  paint-order: stroke;
-}
-
-.tap-clickable:focus-visible .tap-lead {
-  stroke: var(--trace);
-}
-
-/* --- pulses --------------------------------------------------------------- */
-
-.pulse-wake {
-  stroke-linecap: round;
-  opacity: 0.38;
-}
-
-.pulse-ghost .pulse-wake,
-.pulse-ghost .pulse-head {
-  stroke: var(--ghost);
-  fill: var(--ghost);
-}
-
-/* --- ghost replay strip ---------------------------------------------------- */
-
-.ghost-strip {
-  animation: strip-in 220ms ease-out both;
-}
-
-@keyframes strip-in {
-  from {
-    opacity: 0;
-    transform: translateY(-6px);
-  }
-}
-
-.chip rect {
-  fill: #141b25;
-  stroke: #38424f;
-  stroke-width: 1;
-}
-
-.chip text {
-  fill: #8d97a6;
-  font-family: var(--mono);
-  font-size: 9px;
-  letter-spacing: 0.06em;
-}
-
-.chip-on rect {
-  fill: #202b3a;
-  stroke: #7d8898;
-}
-
-.chip-on text {
-  fill: var(--ink-bright);
 }
 
 /* --- chat ------------------------------------------------------------------ */
@@ -400,7 +156,8 @@ body {
   color: var(--ink-dim);
 }
 
-.chat-user {
+.chat-user,
+.chat-sent {
   color: #fff;
 }
 
@@ -435,6 +192,27 @@ body {
   font-size: 11px;
   color: var(--ink-dim);
   letter-spacing: 0.02em;
+}
+
+.chat-pending .chat-text {
+  color: var(--ink-dim);
+  font-style: italic;
+}
+
+.chat-notice {
+  color: var(--ink-dim);
+}
+
+.chat-local {
+  color: var(--ghost);
+  white-space: pre-wrap;
+}
+
+.chat-note {
+  display: block;
+  margin-top: 2px;
+  color: var(--warn);
+  font-size: 11px;
 }
 
 /* The progress glyph is the one full-colour emoji on the page; drain it. */
@@ -495,6 +273,62 @@ body {
 .probe-button:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+.chat-input {
+  margin: 0;
+  padding: 6px 10px;
+  border: 0;
+  border-top: 1px solid var(--edge);
+  background: var(--void);
+  color: var(--ink-bright);
+  font-family: var(--mono);
+  font-size: 13px;
+  resize: none;
+}
+
+.chat-input:focus {
+  outline: none;
+  border-top-color: var(--halo);
+}
+
+.session-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.session-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--edge);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.session-back {
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.session-back:hover {
+  border-color: var(--halo);
+}
+
+.session-name {
+  color: var(--ink-bright);
+}
+
+.session-type,
+.session-status {
+  color: var(--ink-dim);
 }
 
 /* --- crash pane ------------------------------------------------------------- */
@@ -597,32 +431,7 @@ body {
 
 .connect-hint code {
   color: var(--ink);
-}
-
-.connect-form label {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--ink-dim);
-}
-
-.connect-form input {
-  background: var(--void);
-  border: 1px solid var(--edge);
-  border-radius: 2px;
-  padding: 9px 12px;
-  color: var(--ink-bright);
-  font-family: var(--mono);
-  font-size: 12px;
-}
-
-.connect-form input:focus {
-  outline: none;
-  border-color: #2c3644;
-  box-shadow: 0 0 0 1px rgba(126, 178, 255, 0.18);
+  overflow-wrap: anywhere;
 }
 
 .connect-form button {
@@ -650,31 +459,257 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* --- status strip --------------------------------------------------------- */
+
+.status-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--edge);
+  background: var(--panel);
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 96px;
+  padding: 6px 10px;
+  border: 1px solid var(--edge);
+  border-radius: 4px;
+  background: var(--void);
+  color: var(--ink-bright);
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.tile:hover,
+.tile:focus-visible {
+  border-color: var(--halo);
+  outline: none;
+}
+
+.tile-warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.tile-label {
+  color: var(--ink-dim);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.tile-value {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tile-type {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.tile-count {
+  color: var(--ink);
+}
+
+.led {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ink-dim);
+  animation: led-blink 600ms ease-out;
+}
+
+.led[data-pulses="0"] {
+  animation: none;
+}
+
+@keyframes led-blink {
+  from {
+    background: var(--trace);
+    box-shadow: 0 0 6px var(--trace);
+  }
+  to {
+    background: var(--ink-dim);
+    box-shadow: none;
+  }
+}
+
+/* --- dashboard ------------------------------------------------------------ */
+
+.dashboard {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  /* Rows take their content height and the dashboard scrolls. With the
+   * default auto rows a short body squeezes the sessions panel first: it
+   * scrolls sideways, so its minimum height in the grid is zero. */
+  grid-auto-rows: max-content;
+  gap: 8px;
+  padding: 8px 10px;
+  overflow: auto;
+  height: 100%;
+  background:
+    radial-gradient(120% 90% at 50% 0%, #101520 0%, var(--panel) 55%, var(--void) 100%);
+}
+
+.panel {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--edge);
+  border-radius: 4px;
+  background: rgba(7, 8, 10, 0.6);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+/* The sessions panel is first and has the widest rows (task ids, and the
+ * longer liveness sentences); giving it the full row instead of one grid
+ * cell is what keeps it from outgrowing a 340px-minimum cell. */
+[data-panel="sessions"] {
+  grid-column: 1 / -1;
+  overflow-x: auto;
+}
+
+.cell-nowrap {
+  white-space: nowrap;
+}
+
+.panel-focused {
+  border-color: var(--halo);
+  box-shadow: 0 0 0 1px var(--halo);
+}
+
+.panel-title {
+  margin: 0 0 6px;
+  color: var(--ink-dim);
+  font-size: 10px;
+  font-weight: normal;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.panel-empty {
+  margin: 0;
+  color: var(--ink-dim);
+}
+
+.panel table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.panel th {
+  color: var(--ink-dim);
+  font-weight: normal;
+  text-align: left;
+}
+
+.panel td,
+.panel th {
+  padding: 2px 6px 2px 0;
+  vertical-align: top;
+}
+
+.row-click {
+  cursor: pointer;
+}
+
+.row-click:hover td {
+  color: var(--ink-bright);
+}
+
+.row-click:focus-visible {
+  outline: 1px solid var(--halo);
+  outline-offset: -1px;
+}
+
+.row-failed td {
+  color: var(--warn);
+}
+
+.live-live {
+  color: var(--trace);
+}
+
+.live-quiet,
+.live-gone,
+.live-error {
+  color: var(--warn);
+}
+
+.corr-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
+  border-radius: 50%;
+}
+
+.conv-group h3 {
+  margin: 4px 0 2px;
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: normal;
+}
+
+.conv-row,
+.topic-row,
+.anomaly-row,
+.cap-row {
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  padding: 1px 0;
+}
+
+.cap-row {
+  justify-content: flex-start;
+  align-items: center;
+}
+
+.cap-bar {
+  flex: 0 0 60px;
+  height: 6px;
+  border: 1px solid var(--edge);
+  border-radius: 2px;
+}
+
+.cap-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--ink);
+}
+
+.cap-warn {
+  color: var(--warn);
+}
+
+.cap-warn .cap-bar > span {
+  background: var(--warn);
+}
+
+.cap-tbd {
+  color: var(--ink-dim);
+}
+
 /* --- narrow screens -------------------------------------------------------- */
 
 @media (max-width: 720px) {
-  .rail-head,
-  .rail-foot,
   .chat-pane {
     padding-left: 14px;
     padding-right: 14px;
   }
-
-  .rail-foot {
-    flex-direction: column;
-    gap: 4px;
-    align-items: flex-start;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .tap,
-  .ghost-strip,
-  .tap-closed {
-    animation-duration: 1ms;
-  }
-
-  .tap-closed {
-    opacity: 0;
-  }
+  .led { animation: none; }
 }

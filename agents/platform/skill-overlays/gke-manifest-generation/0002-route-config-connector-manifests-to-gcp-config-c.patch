@@ -1,0 +1,19 @@
+Subject: Route Config Connector manifests to gcp-config-connector
+
+Why: the frontmatter description is what the router reads, and it has to route Config Connector manifests to gcp-config-connector, a skill this repository has and upstream does not. The description is a folded YAML scalar, so the sentence is replaced.
+Local-Issue: #1344 (fixed in #1370)
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; gcp-config-connector is this repository's skill
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -3,7 +3,7 @@ name: gke-manifest-generation
+ metadata:
+   category: Containers
+ description: >-
+-  Generates and updates secure, production-ready Kubernetes YAML manifests optimized for GKE Autopilot and GKE Standard clusters. Use when creating or modifying GKE deployment manifests, configuring container security contexts, setting CPU/memory resource limits, defining readiness/liveness/startup probes, mounting secrets and volumes, configuring GKE Gateway API routes, targeting Spot VMs, or deploying AI model inference workloads (vLLM, TGI, Gemma). Don't use for live cluster operations, pod troubleshooting (use gke-workload-troubleshooting), or cluster infrastructure provisioning (use gke-cluster-creation).
++  Generates and updates secure, production-ready Kubernetes YAML manifests optimized for GKE Autopilot and GKE Standard clusters. Use when creating or modifying GKE deployment manifests, configuring container security contexts, setting CPU/memory resource limits, defining readiness/liveness/startup probes, mounting secrets and volumes, configuring GKE Gateway API routes, targeting Spot VMs, or deploying AI model inference workloads (vLLM, TGI, Gemma). Don't use for live cluster operations, pod troubleshooting (use gke-workload-troubleshooting), cluster infrastructure provisioning (use gke-cluster-creation), or Google Cloud resources as Config Connector manifests (use gcp-config-connector).
+ ---
+ 
+ # GKE Manifest Generation Skill

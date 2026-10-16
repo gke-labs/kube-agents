@@ -346,7 +346,7 @@ class CallerKeysTest(unittest.TestCase):
         # A guard against the walker silently matching nothing.
         self.assertIn(("platformAgent", "harness", "clusterName"), paths)
         self.assertIn(("global", "imagePullSecrets"), paths)
-        self.assertIn(("platformAgent", "security", "scopedServiceAccounts", _ITEM, "projectId"), paths)
+        self.assertIn(("platformAgent", "security", "scopedServiceAccountPool", "serviceAccounts", _ITEM, "projectId"), paths)
         schema = _load_schema()
         for path in sorted(paths):
             with self.subTest(path=".".join(path)):

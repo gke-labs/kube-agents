@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 const (
@@ -37,8 +40,8 @@ const (
 	// sits well above both.
 	gchatRelayTimeout = 45 * time.Second
 	// gchatRelayEventsPath is the A2A-dedicated event route — its own
-	// GoogleChatRelay instance on its own subscription, so this consumer
-	// never splits deliveries with the legacy chat path.
+	// GoogleChatRelay instance, the only one the operator arms under next, so
+	// this consumer never splits deliveries with the legacy chat path.
 	gchatRelayEventsPath    = "/v1/chat/a2a/events"
 	gchatRelayEventsAckPath = "/v1/chat/a2a/events/ack"
 	// gchatPullRetryDelay paces re-polls after a pull error, so a relay
@@ -55,6 +58,28 @@ const (
 	// unbounded map would only ever be a leak, one entry per message for
 	// the pod's lifetime.
 	gchatSeenCap = 4096
+	// gchatEventCountInterval paces the received-events summary line. An
+	// install whose Chat events never arrive pulls empty forever, and an
+	// empty pull logs nothing, so this line is the only place "zero events"
+	// shows. Fifteen minutes gives four lines in the hour a human looks back
+	// over after Chat says "not responding", and 96 lines a day per gateway
+	// pod, which is quieter than the per-event lines a busy install already
+	// writes. Shorter is noise on a healthy install; an hour would leave a
+	// fresh install with no line at all for its first hour.
+	gchatEventCountInterval = 15 * time.Minute
+	// gchatRelayDetailMaxBytes bounds any one string taken from a relay
+	// response body into a log line or an error. The longest it has to hold
+	// is a full subscription path: "projects/" + a 30-character project id +
+	// "/subscriptions/" + a 255-character name, 309 bytes.
+	gchatRelayDetailMaxBytes = 320
+	// gchatRelayErrorBodyMaxBytes bounds the read of a failed pull's body.
+	// The relay's error bodies are a few hundred bytes; this only stops a
+	// misbehaving relay from making one failed pull an unbounded read.
+	gchatRelayErrorBodyMaxBytes = 4096
+	// gchatSubscriptionUnreported stands in for the subscription in the
+	// summary line until the relay names one, on a served pull or a refused
+	// one; a relay that predates naming it never does.
+	gchatSubscriptionUnreported = "(not reported by the relay)"
 )
 
 const (
@@ -83,8 +108,9 @@ const (
 
 // Conversation key prefixes for the Google Chat adapter. A space is not a
 // session; a conversation in it is — and what counts as the conversation
-// depends on the surface: a thread in a threaded space, the whole space in a
-// DM or in a space whose threading state does not support replies
+// depends on the surface: a thread in a threaded space; in a DM, the whole
+// space for top-level messages and the thread for a reply typed inside one;
+// the whole space in a space whose threading state does not support replies
 // (spec-chatops-gateway.md, "The Google Chat adapter").
 const (
 	gchatKeyPrefix      = "gchat:"
@@ -119,6 +145,10 @@ func verifiedByFor(backend string) string {
 	case consoleBackend:
 		return consoleVerifiedBy
 	case slackBackend:
+		// The map-joined case. A Slack requester's mechanism depends on its
+		// principal, so the authority path asks verifiedByOf, which sends
+		// Slack to slackVerifiedByFor; this arm is what a caller with no
+		// principal in hand gets.
 		return slackVerifiedBy
 	case injectBackend:
 		// Its own value, not "principal-map" and deliberately nothing a real
@@ -128,49 +158,72 @@ func verifiedByFor(backend string) string {
 		// a Chat message verified by the IAM-locked topic, which is the
 		// whole point of recording the mechanism rather than the table.
 		return injectVerifiedBy
+	case a2aBackend:
+		// The A2A door's own token, and its own value for the same reason:
+		// an external agent's submission and an eval harness's must be
+		// distinguishable downstream even though both resolve through a
+		// door-scoped map into the eval namespace.
+		return a2aVerifiedBy
+	case a2aGoogleBackend:
+		// What checked the caller is Google, through the door's tokeninfo
+		// call: neither the door's static token nor a map.
+		return a2aGoogleVerifiedBy
 	}
 	return "principal-map"
 }
 
 // unverifiedRemedyFor names what an admin edits to admit a sender — the
-// allowlist on gchat, the door's own map on inject, nothing at all on the
-// console, the mapping table everywhere else (Discord's ConfigMap, Slack's
-// a2a-slack-principal-map Secret).
+// allowlist on gchat and on Slack (where the principal map is an override,
+// not a gate, except that a reserved-prefix entry refuses), the door's own
+// map on inject, nothing at all on the console, the mapping table
+// everywhere else (Discord's ConfigMap).
 func unverifiedRemedyFor(backend string) string {
 	switch backend {
 	case gchatBackend:
 		return "the allowed users list"
+	case slackBackend:
+		// The list is the gate; the map is named too for the one refusal it
+		// still makes, a listed member whose entry carries the reserved
+		// slack: prefix (resolveSlackPrincipal).
+		return "the allowed users list (or correct their principal map entry)"
 	case consoleBackend:
 		// Cannot happen from a real console frame; a spoofed author id can.
 		return "nothing - only the console credential's own frames are accepted here"
 	case injectBackend:
 		return "the inject door's principal map"
+	case a2aBackend:
+		return "the A2A door's principal map"
+	case a2aGoogleBackend:
+		return "the A2A door's allowed users list"
 	}
 	return "the principal map"
 }
 
 // gchatLinkRe matches markdown links for rewriteLinks to turn into Chat's
-// <url|text> form. The URL class excludes `<`, `>` and `|` so a crafted
-// markdown link cannot close the generated sequence early and pick its own
-// display text; none of the three is legal in a URL unencoded, so refusing
-// them costs nothing real. It admits one level of balanced parentheses, as
-// slackLinkRE does and for the same reason: a `.../wiki/Foo_(bar)`
-// destination otherwise ends at the first `)`.
-var gchatLinkRe = regexp.MustCompile(`\[([^\]]+)\]\((https?://(?:[^()\s<>|]|\([^()\s<>|]*\))+)\)`)
+// <url|text> form. The URL class (chatLinkURLPattern, which the executor's
+// own <url|text> links are read with too) excludes `<`, `>` and `|` so a
+// crafted markdown link cannot close the generated sequence early and pick
+// its own display text; none of the three is legal in a URL unencoded, so
+// refusing them costs nothing real. It admits one level of balanced
+// parentheses, as slackLinkRE does and for the same reason: a
+// `.../wiki/Foo_(bar)` destination otherwise ends at the first `)`.
+var gchatLinkRe = regexp.MustCompile(`\[([^\]]+)\]\((` + chatLinkURLPattern + `)\)`)
 
 // gchatPipeRe matches Chat's other in-text control sequence, the <url|text>
-// link, closed or not. The segment before the pipe must be non-empty and
-// space-free, which is the shape Chat linkifies; prose like `a < b | c >` is
-// left alone. An opener the executor never closed counts too: the adapter
+// link, closed or not, for the defang. A closed one that the adapter would
+// have made from a markdown link never reaches it (toGchatText); every other
+// one does, and is defanged. The segment before the pipe must be non-empty
+// and space-free, which is the shape Chat linkifies; prose like `a < b | c >`
+// is left alone. An opener the executor never closed counts too: the adapter
 // writes its own <url|text> for every markdown link that follows, and that
 // link's `>` would close the executor's opener around it, making one link to
 // the executor's host with the adapter's link inside its text. The text
 // before the `>` admits no `<` either, so an opener nested inside another's
-// text is a sequence of its own and is defanged as one, rather than read
-// over as the outer sequence's text. Where the two readings are ambiguous
-// this errs towards defanging: the cost of that error is one visible space,
-// and the cost of the other is a link whose visible text names a host it
-// does not open.
+// text is a sequence of its own and is defanged as one, rather than read over
+// as the outer sequence's text. Where the two readings are ambiguous this
+// errs towards defanging: the cost of that error is one visible space, and
+// the cost of the other is a link whose visible text names a host it does not
+// open.
 var gchatPipeRe = regexp.MustCompile(`<[^\s<>|]+\|(?:[^<>]*>)?`)
 
 // gchatSpace, gchatSender and gchatMessage are the Chat resources both event
@@ -207,7 +260,15 @@ type gchatMessage struct {
 	Thread       struct {
 		Name string `json:"name"`
 	} `json:"thread"`
-	Sender gchatSender `json:"sender"`
+	// ThreadReply is Chat's own answer to "was this typed inside an
+	// existing thread": true for a reply in a thread, false (omitted on
+	// the wire) for a top-level message, even though Chat attaches the
+	// thread it auto-created for that message (Chat API Message resource,
+	// field threadReply; measured in testdata/gchat: the in-thread DM reply
+	// carries it, the top-level DMs do not). Chat sets it false in a space
+	// that does not support reply threading.
+	ThreadReply bool        `json:"threadReply"`
+	Sender      gchatSender `json:"sender"`
 }
 
 // gchatEvent is one Chat event normalized to the legacy field layout: Type
@@ -275,14 +336,24 @@ type GoogleChatAdapter struct {
 	// inverse, for OpenDirect.
 	userIDs    map[string]string
 	userEmails map[string]string
-	// dmThreads remembers, per DM space, the thread of the latest inbound
-	// message. A DM is one session for the whole space (the key never
-	// carries a thread), but a DM space is threaded and a reply belongs
-	// where the ask was made — measured live: without this the answer to
-	// a question asked inside a thread lands top-level in the DM. This is
-	// presentation, not identity: the conversation key and the session
-	// are unchanged by it.
-	dmThreads map[string]string
+
+	// countInterval paces the received-events summary line
+	// (gchatEventCountInterval; tests shorten it). subscription is the Chat
+	// subscription the relay last said it pulls. Both are read and written
+	// only by Run's goroutine.
+	countInterval time.Duration
+	subscription  string
+
+	// metrics counts each pull by outcome beside the summary line's counts
+	// (SetMetrics; nil counts nothing).
+	metrics *Metrics
+}
+
+// SetMetrics gives the adapter the gateway's counters, so each pull is
+// counted by outcome where the summary line counts it. Called once, before
+// Run.
+func (a *GoogleChatAdapter) SetMetrics(m *Metrics) {
+	a.metrics = m
 }
 
 // NewGoogleChatAdapter builds the adapter against the credential proxy's
@@ -303,7 +374,8 @@ func NewGoogleChatAdapter(relayURL, tokenPath string, log *slog.Logger) (*Google
 		seen:       map[string]bool{},
 		userIDs:    map[string]string{},
 		userEmails: map[string]string{},
-		dmThreads:  map[string]string{},
+
+		countInterval: gchatEventCountInterval,
 	}, nil
 }
 
@@ -365,9 +437,11 @@ func (a *GoogleChatAdapter) relayPost(path string, payload []byte) ([]byte, erro
 		return nil, fmt.Errorf("gchat: reading relay response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		// The relay scrubs Chat error bodies before they get here; carrying
-		// the status forward is enough to tell a refusal from an outage.
-		return nil, fmt.Errorf("gchat: relay %s answered %d", path, resp.StatusCode)
+		// The relay scrubs Chat error bodies before they get here, down to
+		// the Chat status and reason, and those are carried forward: a 502
+		// alone cannot tell a 403 (the app's grant) from a 404 (a space the
+		// app is not in) from an outage.
+		return nil, gchatRelayError(fmt.Sprintf("gchat: relay %s answered %d", path, resp.StatusCode), buf.Bytes())
 	}
 	return buf.Bytes(), nil
 }
@@ -381,11 +455,6 @@ func (a *GoogleChatAdapter) Post(conversation, text string) (string, error) {
 	}
 	body := map[string]any{"text": toGchatText(text)}
 	arguments := map[string]any{"parent": space, "body": body}
-	if thread == "" && strings.HasPrefix(conversation, gchatDMKeyPrefix) {
-		a.mu.Lock()
-		thread = a.dmThreads[space]
-		a.mu.Unlock()
-	}
 	if thread != "" {
 		body["thread"] = map[string]any{"name": thread}
 		arguments["messageReplyOption"] = gchatReplyOption
@@ -397,6 +466,33 @@ func (a *GoogleChatAdapter) Post(conversation, text string) (string, error) {
 		return "", err
 	}
 	return created.Name, nil
+}
+
+// PostNotify writes text into space, as a new thread when thread is empty or
+// as a reply on thread, and returns the created message's resource name and
+// the thread it landed in. It is Post for a caller with no conversation key
+// (the chat.notify route, notify.go), which also needs the thread back so the
+// next notify can reply on it.
+func (a *GoogleChatAdapter) PostNotify(space, thread, text string) (message, landed string, err error) {
+	if !gchatIsSpaceName(space) {
+		return "", "", fmt.Errorf("gchat: not a space name: %q", space)
+	}
+	body := map[string]any{"text": toGchatText(text)}
+	arguments := map[string]any{"parent": space, "body": body}
+	if thread != "" {
+		body["thread"] = map[string]any{"name": thread}
+		arguments["messageReplyOption"] = gchatReplyOption
+	}
+	var created struct {
+		Name   string `json:"name"`
+		Thread struct {
+			Name string `json:"name"`
+		} `json:"thread"`
+	}
+	if err := a.apiCall([]string{"spaces", "messages"}, "create", arguments, &created); err != nil {
+		return "", "", err
+	}
+	return created.Name, created.Thread.Name, nil
 }
 
 // Edit replaces the text of a previously posted message (Adapter.Edit) — the
@@ -411,6 +507,16 @@ func (a *GoogleChatAdapter) Edit(conversation, messageID, text string) error {
 		"body":       map[string]any{"text": toGchatText(text)},
 	}
 	return a.apiCall([]string{"spaces", "messages"}, "patch", arguments, nil)
+}
+
+// PostMessage and EditMessage post text only: a chat message falls back to
+// its text (ErrTextOnly) until this adapter renders cards.
+func (a *GoogleChatAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	return postTextOnly(a.Post, conversation, m)
+}
+
+func (a *GoogleChatAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	return editTextOnly(a.Edit, conversation, messageID, m)
 }
 
 // Roster returns one page of the space's membership (Adapter.Roster):
@@ -461,6 +567,12 @@ func (a *GoogleChatAdapter) Roster(conversation string) ([]string, bool, error) 
 	}
 	return ids, out.NextPageToken == "", nil
 }
+
+// React and RemoveReaction draw no mark on Google Chat: its relay holds app
+// credentials, and Chat's reaction API takes user credentials only, so a nil
+// no-op (Adapter).
+func (a *GoogleChatAdapter) React(string, string, string) error          { return nil }
+func (a *GoogleChatAdapter) RemoveReaction(string, string, string) error { return nil }
 
 // OpenDirect returns the DM conversation for a user (Adapter.OpenDirect).
 // userID is the Google-asserted email; the Chat API accepts the email alias
@@ -522,16 +634,39 @@ type gchatEnvelope struct {
 // seam's recorded hole is a poison message that is never settled and
 // redelivers forever (tests/integration/test_seam_chat_ingress.py), and an
 // acked-away poison event beats an inbox wedged on one.
+//
+// Run names the relay route it pulls when it starts, the subscription the
+// first time the relay reports one (a refused pull's answer counts), and
+// every countInterval the number of events received: an install that Chat
+// publishes nothing to pulls empty forever, and those lines are what tell it
+// from a quiet one.
 func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
+	a.log.Info("gchat event pull starting",
+		"relay", a.relayURL+gchatRelayEventsPath, "summaryEvery", a.countInterval)
+	windowStart := time.Now()
+	var received, emptyPulls, failedPulls int
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if elapsed := time.Since(windowStart); elapsed >= a.countInterval {
+			subscription := a.subscription
+			if subscription == "" {
+				subscription = gchatSubscriptionUnreported
+			}
+			a.log.Info("gchat events received",
+				"events", received, "emptyPulls", emptyPulls, "failedPulls", failedPulls,
+				"interval", elapsed.Round(time.Second), "subscription", subscription)
+			windowStart = time.Now()
+			received, emptyPulls, failedPulls = 0, 0, 0
 		}
 		env, err := a.pullEvent(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			failedPulls++
+			a.metrics.gchatPull(gchatPullFailed)
 			a.log.Warn("gchat event pull failed", "err", err)
 			select {
 			case <-ctx.Done():
@@ -541,6 +676,8 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 			continue
 		}
 		if env == nil {
+			emptyPulls++
+			a.metrics.gchatPull(gchatPullEmpty)
 			// Usually the server-side long poll has already paced this;
 			// the delay only bites on an early-empty synchronous pull.
 			select {
@@ -550,6 +687,8 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 			}
 			continue
 		}
+		received++
+		a.metrics.gchatPull(gchatPullEvents)
 		ev, decodeErr := decodeGchatEvent(env.Data)
 		// Acked before the handler runs, which makes ingress at-most-once —
 		// a deliberate, recorded decision, not an oversight. Acking after a
@@ -593,15 +732,106 @@ func (a *GoogleChatAdapter) pullEvent(ctx context.Context) (*gchatEnvelope, erro
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("gchat: event pull answered %d", resp.StatusCode)
+		// A read error leaves a partial body, which gchatRelayError reads as
+		// nothing; the status alone still goes out.
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, gchatRelayErrorBodyMaxBytes))
+		// The proxy names the subscription on a refused pull too, and an
+		// install whose every pull is refused never sees a 200 to learn it
+		// from.
+		var refused struct {
+			Subscription string `json:"subscription"`
+		}
+		if json.Unmarshal(errBody, &refused) == nil {
+			a.noteSubscription(refused.Subscription)
+		}
+		return nil, gchatRelayError(fmt.Sprintf("gchat: event pull answered %d", resp.StatusCode), errBody)
 	}
 	var body struct {
-		Event *gchatEnvelope `json:"event"`
+		Event        *gchatEnvelope `json:"event"`
+		Subscription string         `json:"subscription"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, fmt.Errorf("gchat: decoding pulled event: %w", err)
 	}
+	a.noteSubscription(body.Subscription)
 	return body.Event, nil
+}
+
+// noteSubscription records the subscription the relay reported pulling and
+// logs it the first time and whenever it changes. The gateway is configured
+// with the relay URL alone; the subscription is the proxy's
+// (A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME), so this is where it learns it.
+func (a *GoogleChatAdapter) noteSubscription(reported string) {
+	subscription := gchatRelayDetail(reported)
+	if subscription == "" || subscription == a.subscription {
+		return
+	}
+	a.subscription = subscription
+	a.log.Info("gchat relay pulls subscription", "subscription", subscription)
+}
+
+// gchatRelayError builds a relay failure from its status line and the error body
+// the credential proxy answered with. The proxy puts the Chat API status and
+// reason under "chat" on a refused API call, and the subscription and the
+// Pub/Sub error type and status on a failed pull; whichever is present is
+// appended, so "answered 502" reads "answered 502: chat 403 Forbidden". A
+// body that is not that shape adds nothing.
+func gchatRelayError(status string, body []byte) error {
+	var parsed struct {
+		Chat *struct {
+			Status int    `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"chat"`
+		Subscription string `json:"subscription"`
+		Pubsub       *struct {
+			Type string `json:"type"`
+			Code int    `json:"code"`
+		} `json:"pubsub"`
+	}
+	if len(body) == 0 || json.Unmarshal(body, &parsed) != nil {
+		return errors.New(status)
+	}
+	var details []string
+	if parsed.Chat != nil && parsed.Chat.Status != 0 {
+		detail := "chat " + strconv.Itoa(parsed.Chat.Status)
+		if reason := gchatRelayDetail(parsed.Chat.Reason); reason != "" {
+			detail += " " + reason
+		}
+		details = append(details, detail)
+	}
+	if parsed.Pubsub != nil {
+		detail := "pubsub"
+		if kind := gchatRelayDetail(parsed.Pubsub.Type); kind != "" {
+			detail += " " + kind
+		}
+		if parsed.Pubsub.Code != 0 {
+			detail += " " + strconv.Itoa(parsed.Pubsub.Code)
+		}
+		if detail != "pubsub" {
+			details = append(details, detail)
+		}
+	}
+	if subscription := gchatRelayDetail(parsed.Subscription); subscription != "" {
+		details = append(details, "subscription "+subscription)
+	}
+	if len(details) == 0 {
+		return errors.New(status)
+	}
+	return errors.New(status + ": " + strings.Join(details, ", "))
+}
+
+// gchatRelayDetail makes one string from a relay response body safe to log: no
+// control, format, or line/paragraph-separator characters (a body that could
+// break a line could forge the next one), cut at gchatRelayDetailMaxBytes
+// with an ellipsis marking the cut.
+func gchatRelayDetail(s string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
+			return -1
+		}
+		return r
+	}, s)
+	return truncateRunes(strings.TrimSpace(cleaned), gchatRelayDetailMaxBytes)
 }
 
 // settle acks one pulled event. Failing to ack only means a redelivery the
@@ -666,35 +896,47 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 // the one it opens. The defusing is a visible space, not an invisible
 // character.
 //
-// The defang runs first, the way the Slack adapter escapes first: every
-// <users/…> anywhere in the text, and every <url|text the executor opened
-// outside a closed code span, whether or not the executor closed it, is
-// defused before the markdown rules see it, and the markdown link's
-// destination class excludes `<`, so the <url|text> rewriteLinks generates
-// afterwards is the adapter's own — which is the distinction the <users/…>
-// defang already drew, applied to the sequence next to it. The markdown
-// rules (bold pairs, code spans, links, the label-host refusal) are the
-// ones markdown.go holds for both chat surfaces.
+// One <url|text> the executor wrote is not defanged: a closed one, in prose,
+// whose URL is http(s) with no whitespace, angle bracket or pipe and whose
+// text does not name another host (keepChatLinks). That is the link
+// rewriteLinks would have written from [text](url), refused on the same
+// label-host ground, so the visible text still cannot name a host the link
+// does not open, and a model that writes Chat's form instead of markdown gets
+// a link instead of a broken one. It is passed through as written, and the
+// markdown rules read it as the link it is (rewriteMarkdown).
+//
+// Around those, the defang runs first, the way the Slack adapter escapes
+// first: every <users/…> anywhere in the text, and every other <url|text the
+// executor opened outside a closed code span, whether or not the executor
+// closed it, is defused before the markdown rules see it, and the markdown
+// link's destination class excludes `<`, so the <url|text> rewriteLinks
+// generates afterwards is the adapter's own — which is the distinction the
+// <users/…> defang already drew, applied to the sequence next to it. The kept
+// link's text admits no `<`, so no mention rides out in it. The markdown
+// rules (bold pairs, code spans, links, the label-host refusal) are the ones
+// markdown.go holds for both chat surfaces.
 func toGchatText(s string) string {
-	return rewriteMarkdown(defangGchatControls(s), gchatLinkRe)
+	return rewriteMarkdown(keepChatLinks(s, defangGchatControls, func(dest, label string) string {
+		return chatLinkOpen + dest + chatLinkSep + label + chatLinkClose
+	}), gchatLinkRe)
 }
 
 // defangGchatControls neutralizes Chat's in-text control sequences in a span
-// the adapter did not author, so the text renders as itself. The mention pass
-// runs first and over the whole text, code included: a ping-all that Chat
-// honoured from inside a code span would be loud, and the cost of defusing
-// one that it would not is a space in a code span that was quoting a
-// mention's resource name. Running it first also splits any angle pair that
-// wraps a mention so the link pass sees both. The link pass reads only
-// outside code spans and fenced blocks (rewriteOutsideCode): its shape is a
-// shell's as well -- `cat <(gen)|wc -l`, `sort <f|uniq` -- and a space in
-// a quoted command is an altered answer, where the opener it is defending
-// against is one the next markdown link's `>` would close, and that link is
-// made in prose. An opener in prose keeps being defanged when a code span
-// cuts its text short, since the opener alone is the match, and an opener
-// after a fence that never closes is defanged too: this adapter posts a
-// result in chunks, so the fence is as likely the closing one of a block
-// the chunker cut as an opener (rewriteOutsideCode).
+// the adapter did not author and did not keep as a link (toGchatText), so the
+// text renders as itself. The mention pass runs first and over the whole
+// text, code included: a ping-all that Chat honoured from inside a code span
+// would be loud, and the cost of defusing one that it would not is a space in
+// a code span that was quoting a mention's resource name. Running it first
+// also splits any angle pair that wraps a mention so the link pass sees both.
+// The link pass reads only outside code spans and fenced blocks
+// (rewriteOutsideCode): its shape is a shell's as well -- `cat <(gen)|wc -l`,
+// `sort <f|uniq` -- and a space in a quoted command is an altered answer,
+// where the opener it is defending against is one the next markdown link's
+// `>` would close, and that link is made in prose. An opener in prose keeps
+// being defanged when a code span cuts its text short, since the opener alone
+// is the match, and an opener after a fence that never closes is defanged
+// too: this adapter posts a result in chunks, so the fence is as likely the
+// closing one of a block the chunker cut as an opener (rewriteOutsideCode).
 func defangGchatControls(s string) string {
 	s = strings.ReplaceAll(s, "<users/", "< users/")
 	return rewriteOutsideCode(s, func(prose string) string {
@@ -753,14 +995,19 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	if ev.Space.SpaceThreadingState == gchatThreadingUnthreaded || ev.Space.SpaceType == gchatSpaceTypeGroupChat {
 		thread = ""
 	}
+	// A DM is threaded too, but Chat attaches a thread to every message: a
+	// top-level DM carries the thread Chat auto-created for it. Only a
+	// message typed inside an existing thread (threadReply) is a side
+	// thread with its own conversation, answered in that thread; top-level
+	// DMs share the space's one conversation and are answered top-level.
+	// This is the default-mode Hermes Google Chat rule (main flow versus
+	// side thread), read from Chat's own flag rather than an inbound count
+	// (spec-chatops-gateway.md, "The Google Chat adapter").
+	if kind == "dm" && !ev.Message.ThreadReply {
+		thread = ""
+	}
 
 	a.mu.Lock()
-	if kind == "dm" && ev.Message.Thread.Name != "" {
-		if len(a.dmThreads) >= gchatSeenCap {
-			a.dmThreads = map[string]string{}
-		}
-		a.dmThreads[ev.Space.Name] = ev.Message.Thread.Name
-	}
 	if strings.HasPrefix(sender.Name, gchatUsersToken) {
 		// Bounded by the same cap as the dedupe memory: one entry per
 		// human who has spoken, evicted wholesale rather than leaked.
@@ -800,17 +1047,26 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 // resolvePrincipal establishes the requester's principal from the backend's
 // identity mechanism. On gchat the Google-asserted email IS the principal,
 // gated by the allowlist (the mapping table other backends need is exactly
-// what that backend exists to not have). On the console the NATS grant is
+// what that backend exists to not have). On Slack the same kind of allowlist
+// is the gate, and the principal map, when it names the sender, overrides
+// the member-id principal (resolveSlackPrincipal).
+// On the console the NATS grant is
 // the mechanism: only the console credential can publish on the console
 // subject, so the author is the console principal - but only on a console
 // conversation, so the string "console" arriving on any other backend is
 // just an unmapped id. The inject door has a map, but its own and prefixed
-// (resolveInjectPrincipal), never this one. Everything else goes through the
-// principal map. Empty means drop.
+// (resolveInjectPrincipal), never this one; the A2A door has its own too
+// (resolveA2APrincipal), and its Google-verified callers resolve as Chat's do,
+// the email gated by the door's own allowlist (resolveA2AGooglePrincipal).
+// Everything else goes through the principal map. Empty means drop.
 func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 	switch backend {
 	case injectBackend:
 		return g.resolveInjectPrincipal(authorID)
+	case a2aBackend:
+		return g.resolveA2APrincipal(authorID)
+	case a2aGoogleBackend:
+		return g.resolveA2AGooglePrincipal(authorID)
 	case consoleBackend:
 		if authorID == consoleAuthor {
 			return consolePrincipal
@@ -826,8 +1082,66 @@ func (g *Gateway) resolvePrincipal(backend, authorID string) string {
 			return authorID
 		}
 		return ""
+	case slackBackend:
+		return g.resolveSlackPrincipal(authorID)
 	}
 	return g.pm.Resolve(authorID)
+}
+
+// resolveSlackPrincipal is Chat's allowlist rule carried to Slack
+// (spec.integration.slack.allowedUsers), which is the only admission gate,
+// as on the legacy path. A listed sender (or any sender under allow-all) is
+// then attributed by the principal map when it names them - the IdP
+// identity an admin joined to the member id - and otherwise by the member id
+// itself, qualified slackMemberPrincipalPrefix, as Chat attributes by the
+// email Google asserts. The map is an optional override, not a second gate.
+// Exact match, no case fold: a Slack member id is an opaque token, not an
+// address. A map value carrying the reserved prefix is refused, which makes
+// a mistaken entry a lockout rather than a principal that misstates how it
+// was established. Empty means drop.
+func (g *Gateway) resolveSlackPrincipal(authorID string) string {
+	principal, reserved := g.slackPrincipal(authorID)
+	if reserved {
+		g.log.Error("the Slack principal map maps a member to a principal carrying the reserved member-id prefix; refusing it",
+			"member", authorID, "prefix", slackMemberPrincipalPrefix)
+	}
+	return principal
+}
+
+// slackRosterPrincipal is the same rule for a roster member, silently: the
+// roster resolves every channel member twice on every turn, and a refusal
+// there is not an admission decision (the member is recorded by raw id), so
+// logging it would repeat one mistaken map entry on every turn in every
+// channel the member is in. The requester path logs it once per message.
+func (g *Gateway) slackRosterPrincipal(authorID string) string {
+	principal, _ := g.slackPrincipal(authorID)
+	return principal
+}
+
+// slackPrincipal is the Slack rule both paths share: empty for an unlisted
+// member or a refused map entry, and reserved reports the second.
+func (g *Gateway) slackPrincipal(authorID string) (principal string, reserved bool) {
+	if authorID == "" || (!g.slackAllowAll && !g.slackAllowed[authorID]) {
+		return "", false
+	}
+	if mapped := g.pm.Resolve(authorID); mapped != "" {
+		if strings.HasPrefix(mapped, slackMemberPrincipalPrefix) {
+			return "", true
+		}
+		return mapped, false
+	}
+	return slackMemberPrincipalPrefix + authorID, false
+}
+
+// slackVerifiedByFor names the mechanism behind one Slack principal: the
+// map's join when the map named the sender, the member id alone when it did
+// not. The prefix decides, and it can only come from resolveSlackPrincipal,
+// which refuses a map value that carries it.
+func slackVerifiedByFor(principal string) string {
+	if strings.HasPrefix(principal, slackMemberPrincipalPrefix) {
+		return slackMemberVerifiedBy
+	}
+	return slackVerifiedBy
 }
 
 // resolveInjectPrincipal resolves an author the side door delivered, and it
@@ -865,15 +1179,60 @@ func (g *Gateway) resolveInjectPrincipal(authorID string) string {
 	return principal
 }
 
+// resolveA2APrincipal is the same construction for the A2A door: its own
+// map, the a2a: prefix on the lookup, the eval namespace on the value, and a
+// refusal for anything else. The caller named itself in a header or the
+// message metadata, so the map is the only thing standing between a
+// bearer-token holder and a principal of their choosing, exactly as on the
+// inject door. The developer and unattended identity classes, when they
+// land, resolve through a verifier beside this and never through this map.
+func (g *Gateway) resolveA2APrincipal(authorID string) string {
+	if g.a2aPM == nil {
+		return ""
+	}
+	principal := g.a2aPM.Resolve(a2aPrincipalPrefix + authorID)
+	if principal == "" {
+		return ""
+	}
+	if !strings.HasPrefix(principal, injectEvalPrincipalPrefix) {
+		g.log.Error("the A2A door's principal map maps a caller to a principal that is not an eval identity; refusing it",
+			"caller", authorID, "wantPrefix", injectEvalPrincipalPrefix)
+		return ""
+	}
+	return principal
+}
+
+// resolveA2AGooglePrincipal resolves a caller the A2A door verified with
+// Google. The door has already checked the token; what is left is the
+// gateway's own gate, the same one Chat applies to a Google-asserted email:
+// the email is the principal, admitted only if it is on the door's
+// allowlist. The author must carry the class's prefix, so an id that did
+// not come through the door's Google check resolves to nothing even on this
+// arm. The email is returned as Google sent it, case-preserved, for the
+// reason the gchat arm keeps the case: the audit join hashes that string.
+func (g *Gateway) resolveA2AGooglePrincipal(authorID string) string {
+	email, ok := strings.CutPrefix(authorID, a2aGoogleCallerPrefix)
+	if !ok || email == "" {
+		return ""
+	}
+	if !g.a2aGoogleAllowed[strings.ToLower(email)] {
+		return ""
+	}
+	return email
+}
+
 // gchatConversationID mints the session key for one inbound message. space is
 // the Chat space resource name ("spaces/AAA"), thread the thread resource name
-// ("spaces/AAA/threads/BBB", empty when the surface has none), kind "dm" or
-// "group".
+// ("spaces/AAA/threads/BBB", empty when the message binds the whole space),
+// kind "dm" or "group". A DM side thread keeps the DM prefix, so the key
+// says what the record's Kind says.
 func gchatConversationID(space, thread, kind string) string {
-	if kind == "dm" {
+	switch {
+	case kind == "dm" && thread == "":
 		return gchatDMKeyPrefix + space
-	}
-	if thread == "" {
+	case kind == "dm":
+		return gchatDMKeyPrefix + thread
+	case thread == "":
 		return gchatSpaceKeyPrefix + space
 	}
 	return gchatKeyPrefix + thread
@@ -882,25 +1241,36 @@ func gchatConversationID(space, thread, kind string) string {
 // gchatSpaceThread inverts gchatConversationID: the space to post into and
 // the thread to reply on (empty when the conversation is the whole space).
 func gchatSpaceThread(conversation string) (space, thread string, ok bool) {
-	rest, found := strings.CutPrefix(conversation, gchatDMKeyPrefix)
-	if !found {
-		rest, found = strings.CutPrefix(conversation, gchatSpaceKeyPrefix)
-	}
-	if found {
+	if rest, found := strings.CutPrefix(conversation, gchatSpaceKeyPrefix); found {
 		if !gchatIsSpaceName(rest) {
 			return "", "", false
 		}
 		return rest, "", true
 	}
-	rest, found = strings.CutPrefix(conversation, gchatKeyPrefix)
+	if rest, found := strings.CutPrefix(conversation, gchatDMKeyPrefix); found {
+		// A DM binds the whole space (top-level messages, and the
+		// thread-less key every pre-side-thread record carries) or one
+		// side thread.
+		if gchatIsSpaceName(rest) {
+			return rest, "", true
+		}
+		return gchatThreadName(rest)
+	}
+	rest, found := strings.CutPrefix(conversation, gchatKeyPrefix)
 	if !found {
 		return "", "", false
 	}
-	space, threadID, hasThread := strings.Cut(rest, gchatThreadsToken)
+	return gchatThreadName(rest)
+}
+
+// gchatThreadName splits a bare thread resource name ("spaces/AAA/threads/BBB",
+// nothing nested under it) into its space and the thread itself.
+func gchatThreadName(s string) (space, thread string, ok bool) {
+	space, threadID, hasThread := strings.Cut(s, gchatThreadsToken)
 	if !hasThread || !gchatIsSpaceName(space) || threadID == "" || strings.Contains(threadID, "/") {
 		return "", "", false
 	}
-	return space, rest, true
+	return space, s, true
 }
 
 // gchatIsSpaceName reports whether s is a bare space resource name

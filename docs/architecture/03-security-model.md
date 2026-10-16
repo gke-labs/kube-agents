@@ -105,22 +105,22 @@ is not narrowed per requester; access is instead limited to trusted humans (§4a
 down-scoping to the requesting human is deferred hardening (§4a, [08](08-agent-runtime-and-identity.md)
 §5).
 
-Exactly **one agent runs per scope** — 1 Platform Agent per **project**, 1 Cluster Admin Agent per
+Exactly **one agent runs per scope** — 1 Platform Agent per **install** (over a declared scope of one or more projects), 1 Cluster Admin Agent per
 **cluster**, 1 Developer Team Agent per **namespace** — and each is read-only within **exactly its own
 level**:
 
-| Tier                                   | Kubernetes API (read-only)                                     | Cloud API (read-only) | Only write path                      | May NOT                                                                         |
-| -------------------------------------- | -------------------------------------------------------------- | --------------------- | ------------------------------------ | ------------------------------------------------------------------------------- |
-| **Platform Agent** (1/project)         | Read within **its one project** (the project's clusters/fleet) | Project-scoped read   | GitOps repo (PRs) via brokered token | Any direct cluster/cloud write; operate tenant workloads; **any other project** |
-| **Cluster Admin Agent** (1/cluster)    | Read **its one cluster only**                                  | Cluster-scoped read   | GitOps repo (PRs)                    | Any direct write; **any other cluster**; project scope                          |
-| **Developer Team Agent** (1/namespace) | Read **its one namespace only**                                | Namespace-scoped read | GitOps repo (PRs)                    | Any direct write; **any other namespace**; cluster/project scope                |
+| Tier                                   | Kubernetes API (read-only)                                                                                         | Cloud API (read-only)               | Only write path                      | May NOT                                                                                     |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------- |
+| **Platform Agent** (1/install)         | Read within **its declared scope** (the clusters of the projects `spec.scope` resolves to; one project by default) | Read roles in each project in scope | GitOps repo (PRs) via brokered token | Any direct cluster/cloud write; operate tenant workloads; **any project outside its scope** |
+| **Cluster Admin Agent** (1/cluster)    | Read **its one cluster only**                                                                                      | Cluster-scoped read                 | GitOps repo (PRs)                    | Any direct write; **any other cluster**; project scope                                      |
+| **Developer Team Agent** (1/namespace) | Read **its one namespace only**                                                                                    | Namespace-scoped read               | GitOps repo (PRs)                    | Any direct write; **any other namespace**; cluster/project scope                            |
 
 **The controller enforces this ceiling.** For each `Agent` CR, the kube-agents controller sets the pod's
 `serviceAccountName` to exactly this SA ([08](08-agent-runtime-and-identity.md)), and the SA's RBAC +
 Workload-Identity binding are pre-created read-only and scoped to the tier's level. So the read scope is
 enforced by **Kubernetes RBAC + IAM**, not by agent goodwill: a **Developer Team Agent's pod cannot read
 another namespace**, a **Cluster Admin Agent's cannot reach another cluster**, and a **Platform Agent's
-cannot reach another project**.
+cannot reach a project outside its declared scope**.
 
 **Agents hold no write RBAC on the cluster or cloud.** The actual tenant/cloud writes are performed by
 the **actuation pipeline** (the customer's CI/CD — GitHub Actions, CircleCI, …) acting only on reviewed,
@@ -378,7 +378,7 @@ iterates until all pass:
 - **Read-only, per tier (SAR):** for each agent SA, `kubectl auth can-i create|update|delete <res> --as=<agent-sa>`
   returns **no** for every resource; `get|list|watch` returns **yes** only within its tier scope. A
   Developer Team SA returns **no** for reads in any other namespace; a Cluster Admin SA **no** for any
-  other cluster; a Platform SA **no** for any other project.
+  other cluster; a Platform SA **no** for any project outside its scope.
 - **No write tools:** no write-capable MCP tool reaches the agent — no cluster-creating tool
   (`create_cluster` not exposed), the `gke` MCP is read-only, and the `platform_mcp_server.py`
   `apply_manifest` / `delete_cluster_manifest` helpers are removed — grep **both** the operator-rendered

@@ -241,7 +241,7 @@ func deriveAgentImageFromOperator(operatorImage string) string {
 // the second caller: it is an image from the same workflow and the same
 // commit, so an install that mirrored the operator has mirrored it too, and
 // reaching ghcr.io for it on a private-registry install is the same failure
-// this derivation exists to avoid for the agent. The three A2A next-stack
+// this derivation exists to avoid for the agent. The four A2A next-stack
 // images are the third, through a2aReleaseImage, which passes OPERATOR_IMAGE
 // when set and the resolved agent image otherwise; the substitution is the
 // same.
@@ -524,8 +524,13 @@ func resolveResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceR
 	// container being scheduled with shares it cannot work with.
 	//
 	// Memory goes to 8Gi because the pod's idle working set already measures
-	// 1.80GiB sandbox-wide; the previous 4Gi limit left roughly 2.2GiB to cover
-	// five concurrent workers, each carrying a Python and two node runtimes.
+	// 1.80GiB sandbox-wide; the previous 4Gi limit left roughly 2.2GiB for
+	// concurrent workers, each carrying a Python and two node runtimes. One
+	// worker measured about 430 MiB on a live install (hermes chat 207 MiB, two
+	// node MCP proxies about 100 MiB each, supervisor and ssh), so the default
+	// kanban cap of six is about 2.6 GiB over the idle set, and 8Gi leaves room
+	// for coordinators that wait on their children while resident without
+	// holding a slot: about fourteen workers at that size in all.
 	// Requests stay at 2Gi, so scheduling is unchanged either way.
 	return corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{

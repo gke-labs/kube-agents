@@ -213,14 +213,19 @@ one from the mirror through its own chart's values.
 The agent's baked default model endpoint is
 `http://inference-gateway.<namespace>.svc.cluster.local/v1`, so the chart deploys the
 LiteLLM gateway by default (`litellm.enabled=true`), mirroring
-`k8s-operator/config/integrations/litellm/base`. `litellm.modelProvider`
+`k8s-operator/config/integrations/litellm/base` and its provider overlays. `litellm.modelProvider`
 (gemini/anthropic/openai/vertex_ai) picks which provider `model-default` routes to
 — the matching API key must be in the credentials Secret, except `vertex_ai`, which
 uses Workload Identity (below); `litellm.modelDefaultName`
 overrides the per-provider default model; `litellm.maxTokens` (default `0`,
 meaning none) puts a `max_tokens` under every alias for a request that names
 none, which a self-hosted backend with one combined prompt-plus-output budget
-needs — a request's own `max_tokens` still wins. Set `litellm.enabled=false`
+needs — a request's own `max_tokens` still wins. On a Claude model the gateway
+drops `temperature`, `top_p` and `top_k` from every request
+([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
+and only a Claude model gets the prompt-caching breakpoints
+([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching)).
+Set `litellm.enabled=false`
 only if you operate your own gateway at that address. LLM-call telemetry is
 opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS
@@ -238,7 +243,7 @@ states the trade in full.
 
 `litellm.redaction.enabled=true` makes the gateway redact every request body
 before it reaches the provider: the ConfigMap gains the shared redactor module,
-a LiteLLM pre-call hook and a `redaction.yaml` rule file, all mounted beside
+the redaction pre-call hook and a `redaction.yaml` rule file, all mounted beside
 `/app/config.yaml`, and the gateway container gets `KUBE_AGENTS_REDACTION_CONFIG`
 plus an optional `SESSION_KV_SALT` from the credentials Secret to salt the
 pseudonyms. `litellm.redaction.ip.action` (`pseudonym`, `mask`, `"off"` — quoted,
@@ -360,6 +365,13 @@ Deployment passes its readiness probe. The chart never imports it;
 `install.sh --github-pem-path` does, or you import it yourself Ahead-Of-Time —
 see the [Token minter guide](https://gke-labs.github.io/kube-agents/deploy/token-minter/).
 
+When the GitHub forge in `platformAgent.integration.forges` is at a GitHub
+Enterprise Server host, the minter mints there, from the forge declaration
+alone: no `githubMinter.*` value repeats the host or the CA. What the chart
+sets, and the restart a new or rotated CA Secret needs, are in
+[GitHub Enterprise Server](https://gke-labs.github.io/kube-agents/deploy/token-minter/#github-enterprise-server)
+in the token minter guide.
+
 ### Telemetry
 
 `telemetry.otlpEndpoint` (default `""`) is the OTLP/HTTP collector base URL.
@@ -395,11 +407,15 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 
 `platformAgent.podMonitoring` renders a `PodMonitoring` for each of the agent's
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
-event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's
-port 9095, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
-tool-invocation and request metrics from its metrics-only port 8766. The
-operator's policies on both pods admit the collector's namespace, `gke-gmp-system`,
-on those ports either way; the value only decides whether a scrape is configured.
+event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_messages_inbound_total` from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
+tool-invocation, request and version-control metrics from its metrics-only port 8766, and the A2A
+gateway pod a `spec.mode: next` install runs, so it scrapes the gateway's inbound-message,
+task terminal and Google Chat pull counters from its metrics-only port 9096 (elsewhere
+that one selects no pod). The operator's policies on all three pods admit the
+collector's namespace, `gke-gmp-system`, and the operator's own pods on those ports
+either way; the value only decides
+whether a scrape is configured, and the operator's own read of the counters and
+cluster gauges into `status.usage` does not depend on it.
 It is a tri-state: `null`,
 the default, renders them when the cluster serves the `PodMonitoring` API and
 nothing elsewhere, so an install off GKE, or on a GKE cluster with Managed
@@ -477,15 +493,39 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `platformAgent.integration.repositories` the repositories on them (`forge`,
   `repository`, optional `namespace`, and `role`: `gitops` for the one the
   agent publishes to, `managed` for others it may change, `context` for
-  read-only reference). `provider` defaults to `github`, the only one
-  registered today, and `credentialsRef` is ignored for it. A GitHub forge's
-  `host` must be a GitHub spelling (`github.com`, `www.github.com`,
-  `ssh.github.com`), and a repository must name a declared forge.
+  read-only reference). `provider` is `github` or `gitlab`. If you omit it, it is `github`. A forge at a host other than github.com must name it. `credentialsRef` is
+  ignored for `github` and required for `gitlab`: a Secret holding the access
+  token under the key `token`, mounted into the credential broker only. A
+  `gitlab` forge's `host` is gitlab.com by default or a self-managed instance,
+  never a GitHub name, and one `gitlab` forge per host. A `github` forge's
+  `host` is github.com by default or a GitHub Enterprise Server instance,
+  never a host under a domain where GitHub runs its own services (such as
+  `api.github.com` or `<name>.ghe.com`). An install serves one GitHub host:
+  a second `github` forge at another host, or one host for two providers,
+  fails the render. A self-managed
+  instance whose certificate a private CA signed also sets `caBundleRef`
+  (`name`, and an optional `key` that defaults to `ca.crt`): a Secret that
+  holds the CA, which the broker trusts for that host only. On a GitHub
+  Enterprise Server forge, the token minter also gets the CA, and it trusts
+  the CA for all of its outbound calls (see the token minter guide). A Secret, so
+  changing the CA needs the same rights as changing the token. It is for a
+  forge at a self-managed host, GitLab or GitHub Enterprise Server, never
+  gitlab.com or github.com. With a `gitlab` forge
+  declared beside GitHub, a bare `owner/name` still works for a GitHub
+  repository that the install registered by URL. Name a GitLab repository, or
+  a GitHub repository that the install did not register, by its URL. Apply `crds/` before upgrading
+  to a release that adds a provider, since `helm upgrade` does not update CRDs. A GitHub forge's
+  `host` is a spelling of github.com (`github.com`, `www.github.com`,
+  `ssh.github.com`) or a GitHub Enterprise Server hostname, as above, and a
+  repository must name a declared forge.
   `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
   alias for one GitHub forge and its gitops repository — set the lists or the
-  alias, not both. The alias is still what `install.sh` and the
-  `full-install` Terraform composition write. One GitHub forge with no
-  `credentialsRef` and at most one repository, the gitops one, with no
+  alias, not both. For a github.com GitOps repository, the alias is still what
+  `install.sh` and the `full-install` Terraform composition write. For a
+  GitLab or GitHub Enterprise Server GitOps repository, they write the
+  `forges` and `repositories` lists. One GitHub forge with no
+  `credentialsRef`, no `caBundleRef`, no host other than a spelling of
+  github.com, and at most one repository, the gitops one, with no
   namespace of its own, renders as `github`, whichever key set it, because
   `helm upgrade` does not update CRDs — provided the forge declares a
   namespace or the repository, and the repository is one the operator would
@@ -495,6 +535,15 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   declared and none is GitHub fails the render, since minty issues GitHub App
   tokens only.
   GitOps repositories can also be registered in the ConfigMap by cluster administrators.
+  `platformAgent.integration.repositories[].baseBranch`, on a gitops or
+  managed repository, names the branch every pull request onto it must
+  target, enforced by the credential broker; unset means the repository's
+  own default branch. A context repository may not set it. The alias has no
+  place for it, so a repository that sets one renders as the lists, and on a
+  live install the render fails unless the installed CRD has the field. A
+  repository registered only in the ConfigMap is not pinned. The
+  [PlatformAgent CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/)
+  describes what the broker does with it.
 
 Chat, Slack, and Teams each need a one-time manual registration that no install
 automation can perform (the Chat app on the Chat API console page pointed at
@@ -503,6 +552,19 @@ registration & Teams App manifest) —
 [INSTALL.md § Enable Chat Integrations](../../INSTALL.md) and
 [Microsoft Teams ChatOps Guide](../../docs/chatops/microsoft-teams.md) are the
 canonical walkthroughs.
+
+### Component stack (`platformAgent.mode`)
+
+`platformAgent.mode` is the CR's `spec.mode`: `today`, or `next`, which also
+renders the NATS bus and the A2A gateway, a development stack
+([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md)).
+It defaults to `null`, which renders no field, and the operator reads an absent
+mode as `today`. Because Helm patches the CR from the difference between its
+renders, a mode set on the CR by hand stays while the value is `null`, and a
+value set and later cleared removes the field again. Changing it on a running
+release is a mode switch rather than a setting: the operator rolls the agent
+and renders or retires the A2A stack. `platformAgent.harness.tuning.maxSessions`
+caps the A2A session pods a `next` install runs at once and renders only when set.
 
 ### Agent runtime knobs
 
@@ -513,6 +575,31 @@ field of the CR without editing it by hand. Each one defaults
 to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
 means zero rather than unset.
+
+`platformAgent.deployment.credentialProxy.resources` sizes the credential-proxy
+container, the broker that runs every credentialed command in a pod of its own.
+It is forwarded to the CR's `spec.deployment.credentialProxy.resources` when any
+key is set, and the operator merges it over its defaults per key, so
+`limits: {memory: 3Gi}` raises the memory limit and keeps the rest. The
+[`spec.deployment` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specdeployment)
+is canonical for the defaults, what the operator refuses and how it reports it,
+and the Autopilot warnings;
+[the child memory budget design](../../docs/designs/credential-proxy-child-memory-budget.md)
+has the arithmetic behind the memory floor. The chart fails the render on an
+override the operator would refuse, on a quantity it cannot read, and on any key
+under `resources` other than `requests`, `limits` and `claims` (`limit:` for
+`limits:`), which the CRD would prune silently. A quantity with more than 15
+significant digits is refused at render as well: the chart compares quantities as
+float64, scaled in decimal arithmetic, so `1005m` equals `1.005` and the
+comparison matches the operator's for every decimal value within the cap. A
+binary-suffixed value within float64 rounding (about one part in 10^16) of a
+decimal one can compare equal to it; the operator decides that pair. The quota
+preflight sums the
+override merged over the operator's defaults. On an existing install, apply the
+chart's `crds/` before setting the value (`helm upgrade` does not, `upgrade.sh`
+does): against a CRD that predates `spec.deployment.credentialProxy`, the API
+server would prune the value silently while the release record kept it, so the
+chart looks up the installed CRD and fails the upgrade instead.
 
 #### PlatformAgent annotations
 
@@ -610,15 +697,30 @@ When `plugins.stockoutInvestigator.enabled=true`, the chart automatically seeds 
 
 ### Scoped service accounts
 
-`platformAgent.security.scopedServiceAccounts` maps each GKE cluster the agent
-may read to the Google service account that reads it. Empty is the default and
-should stay empty: the accounts hold no IAM grant as of 2026-08-12, so a
-non-empty list arms the credential broker onto identities that can read
-nothing, and every cluster read fails — a mapped cluster gets a powerless
-token and a `Forbidden` from GKE, an unmapped one is refused by the broker
-before any GKE call. The
-`terraform/examples/full-install` composition fills it in from its
-`scoped_service_accounts` output when `scoped_clusters` is set. See the site's
+`platformAgent.security.scopedServiceAccountPool` maps each GCP project the
+agent may read to the Google service account that reads its clusters, and
+`enabled` under it arms the credential broker onto that mapping. The list
+alone arms nothing: the `terraform/examples/full-install` composition fills
+`serviceAccounts` in from its `scoped_service_accounts` output and passes
+`scoped_pool_enabled` through as `enabled`, so the mapping can be declared
+while the switch stays off. Off is the default and should stay off: the
+accounts hold no IAM grant as of 2026-08-12, so an armed pool puts the broker
+onto identities that can read nothing, and every cluster read fails — a mapped
+project gets a powerless token and a `Forbidden` from GKE, an unmapped one is
+refused by the broker before any GKE call. `enabled: true` with an empty list
+is refused at install. So is `enabled: true` against a live `PlatformAgent` CRD
+that predates the field: `helm upgrade` does not apply `crds/`, and an older
+CRD would admit the CR with the block pruned, leaving the broker on the agent's
+own identity while the release record says armed, so the chart looks the CRD
+up and fails the render until `kubectl apply --server-side -f
+charts/kube-agents/crds/` has run. One retired key is tolerated for a
+release: every release the composition applied before the pool moved to
+projects recorded `platformAgent.security.scopedServiceAccounts: []`, and a
+harness- or operator-mode retag re-applies the recorded values over this
+chart after checking them against its schema, so the schema admits that key
+only as an empty list, which renders nothing, and refuses a populated one by
+name — that was a pool armed under the old per-cluster field, and the install
+takes `--upgrade-mode=full` so `install.env` renders the new one. See the site's
 [security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
 for what the pool does and does not bound.
 
@@ -683,7 +785,12 @@ have no replica count to multiply, and the pre-delete cleanup hook Job (one pod,
 sizes come from `files/footprint.yaml` because the chart cannot render them itself. The agent
 pod is multiplied by `platformAgent.deployment.availability.replicas`; the shell sandbox, the
 credential proxy and the PersistentVolumeClaims are not, because they do not scale with
-it. A replica count of `0` costs nothing, and a `resources` key you have pruned
+it. The credential proxy is counted with `platformAgent.deployment.credentialProxy.resources`
+merged over its footprint entry per key, as the operator renders it, so a raised limit is
+summed at the raised figure, and an override setting only `limits.ephemeral-storage` is counted
+as a request of that size too, because the operator renders no ephemeral-storage request and
+the API server defaults it to the limit; a `PlatformAgent` edited by hand after the install is
+outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
 (`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
 though note that if a namespace ResourceQuota restricts that compute resource (such as
 `limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to

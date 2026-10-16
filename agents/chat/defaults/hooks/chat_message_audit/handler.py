@@ -1,4 +1,3 @@
-import json
 import logging
 import sys
 from pathlib import Path
@@ -12,6 +11,7 @@ _PLUGINS_DIR = str(Path(__file__).resolve().parents[2] / "plugins")
 if _PLUGINS_DIR not in sys.path:
     sys.path.insert(0, _PLUGINS_DIR)
 
+from common import audit_sink  # noqa: E402
 from common.audit_schema import envelope  # noqa: E402
 from common.redactor import AuditRedactor  # noqa: E402
 
@@ -27,7 +27,7 @@ def _truncate(value: Any) -> str:
     return text
 
 
-def _emit(audit_event: str, context: Dict[str, Any]) -> None:
+def _record(audit_event: str, context: Dict[str, Any]) -> Dict[str, Any]:
     ctx = context or {}
     # On Google Chat the user field is the user's address, so it needs the same
     # pseudonymisation the tool-call audit applies; `principal` is the same
@@ -50,7 +50,15 @@ def _emit(audit_event: str, context: Dict[str, Any]) -> None:
         record["iteration"] = ctx.get("iteration")
     if "tool_names" in ctx:
         record["tool_names"] = ctx.get("tool_names")
-    logger.info(json.dumps(record, default=str, sort_keys=True))
+    return record
+
+
+def _emit(audit_event: str, context: Dict[str, Any]) -> None:
+    # One JSON object per line of the profile's audit file (common/audit_sink.py),
+    # which the fluent-bit sidecar tails as JSON. This hook runs on the gateway's
+    # event loop; the sink sees the running loop and hands the write to its
+    # writer thread, having resolved the profile on this thread first.
+    audit_sink.emit(_record(audit_event, context), logger)
 
 
 async def handle(event_type: str, context: Dict[str, Any]) -> None:

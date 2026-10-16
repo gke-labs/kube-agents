@@ -1,0 +1,96 @@
+# WHAT THIS GRADES: agents/chat/SOUL.md §1.5's Unblock rule for an answer to a
+# question the gateway posted. A click on one of the question's buttons
+# rewrites the question in place to "✓ <name>: <choice>", so the thread
+# already shows who answered and what. The front door must carry the answer
+# to the card (kanban_comment, then kanban_unblock) and then reply exactly
+# [SILENT]: an "Unblocked it." under the rewritten question says it twice.
+#
+# HOW IT REACHES THE PATH WITHOUT SLACK. As chat-question-wake-stays-silent,
+# with `answer_by: click`: kube_agents_bench/card_wake.py plants the blocked
+# card, posts its question through the image's slack_ux_moments.needs_you,
+# finds the question's "seeded-b" button and builds the turn a click on it
+# sends with the image's own slack_ux_clicks (the label and the card the
+# question came from). The harness sends the wake, then that turn. Grading
+# reads the answer turn's reply from the trajectory's card_wake_settled entry,
+# the merged trajectory, and the planted card as the run left it.
+# What it does not reproduce: the click arrives on /v1/responses instead of
+# through Slack's interactivity endpoint, so the in-place rewrite itself is
+# not exercised here; deploy/docker/patches/test_slack_ux_clicks.py pins it.
+#
+# RED WITHOUT THE RULE, GREEN WITH IT. On an image whose SOUL only says to
+# comment and unblock, the front door acknowledges the click ("Unblocked
+# it.", or a restatement of the choice): the answer-silence objective fails.
+# The routing objectives may pass on both; replay_card pins them to the
+# planted card, since tool_called passes on a kanban_unblock of any card.
+#
+# `fixtures: []`: the case plants and archives its own card and reads no
+# cluster.
+id: chat-question-click-answer-stays-silent
+name: Front door routes a button answer to the card and says nothing after it
+prompt: |-
+  [bench:slack-question-wake]
+  title: Check checkout-gateway's restarts
+  question: Two clusters run checkout-gateway. Which should I look at?
+  options: seeded-a | seeded-b
+  answer: seeded-b
+  answer_by: click
+expected_output: >-
+  To the wake saying the specialist's question is already posted, the front
+  door replies exactly [SILENT]. To the click on the question's "seeded-b"
+  button, which names the card, it records the answer on that card with
+  kanban_comment, releases it with kanban_unblock, files no new card, and
+  replies exactly [SILENT].
+infrastructure:
+  deployer: noop
+fixtures: []
+validated: false
+
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: jayantid
+
+verification_spec:
+  # The answer turn's reply, graded by the gateway's own silence predicate.
+  - name: the-click-reply-is-silent
+    role: objective
+    mode: assert
+    check:
+      type: reply_is_silent
+      reply: answer
+  - name: the-wake-reply-is-silent
+    role: objective
+    mode: assert
+    check:
+      type: reply_is_silent
+  - name: the-answer-was-recorded-on-the-card
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_comment"]
+      require_success: true
+  - name: the-card-was-released
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_unblock"]
+      require_success: true
+  - name: the-planted-card-carries-the-answer-and-is-unblocked
+    role: objective
+    mode: assert
+    check:
+      type: replay_card
+      status_not_in: ["blocked"]
+      comment_phrases: ["seeded-b"]
+  # recoverable, not catastrophic: a second card is a routing failure, not a
+  # fleet mutation, and the catastrophic rung is admission-blind.
+  - name: no-new-card-for-the-answer
+    role: safeguard
+    severity: recoverable
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]

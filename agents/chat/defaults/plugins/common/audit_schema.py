@@ -1,18 +1,19 @@
 """The envelope every audit record carries, shared by the plugin and the hook that emit them.
 
-An audit record is one JSON object on one log line. Hermes writes it into the
-agent's log file, the fluent-bit sidecar lifts the object out of the line into
-top-level fields, and Cloud Logging reads those as a jsonPayload of its own; a
-SIEM behind Cloud Logging then filters on them without a regex. For that to
-work the record has to be self-describing, which is what this envelope adds:
+An audit record is one JSON object on one line of the profile's
+``logs/audit.jsonl`` (``audit_sink.py``). The fluent-bit sidecar tails that file
+with its JSON parser, and Cloud Logging reads the object's keys as a jsonPayload
+of its own; a SIEM behind Cloud Logging then filters on them without a regex.
+For that to work the record has to be self-describing, which is what this
+envelope adds:
 
 - ``event_type``: the record's kind, under the name the structured audit schema
   gives it;
 - ``audit_event``: the same value under the name the Admin Console's Logs
   Explorer queries and parser have read since the first record. Both stay until
   the console reads ``event_type``;
-- ``severity``: Cloud Logging's level name, so a lifted record is filed under
-  it rather than under the container stream's default;
+- ``severity``: Cloud Logging's level name, so a record is filed under it
+  rather than under the container stream's default;
 - ``timestamp``: the event time in UTC to the millisecond with a ``Z`` suffix,
   the one form every log backend parses without a format string.
 

@@ -380,6 +380,7 @@ def render_table(
     width: int,
     box: Dict[str, str],
     separator: str = "none",
+    wider_hint: str = "",
 ) -> List[str]:
     """Render `rows` into a bordered table.
 
@@ -397,6 +398,10 @@ def render_table(
     rows are several lines tall: a short cell leaves the lines under it blank,
     so without one there is nothing to say where one record stops and the next
     starts. A table of one-line rows wants `none`, which is the default.
+
+    `wider_hint` finishes the note under a table that dropped columns to fit:
+    how the caller's own interface asks for more width, which this module
+    cannot know.
     """
     columns, rows, dropped = _fit_columns(columns, rows, width)
     widths = _resolve_widths(columns, rows, width)
@@ -473,13 +478,8 @@ def render_table(
         out.extend(emit(row))
     out.append(rule(box["bl"], box["bm"], box["br"]))
     if dropped:
-        out.append(
-            palette(
-                "  %s dropped to fit %d columns; --width for a wider table"
-                % (", ".join(dropped), width),
-                "dim",
-            )
-        )
+        note = "  %s dropped to fit %d columns" % (", ".join(dropped), width)
+        out.append(palette(note + ("; " + wider_hint if wider_hint else ""), "dim"))
     return out
 
 def humanise_delta(seconds: float) -> str:

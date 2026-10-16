@@ -1,0 +1,353 @@
+{
+ "t_d9c96cd4": {
+  "namespace_governance": [
+   {
+    "namespace": "agent-system",
+    "resource_quota": true,
+    "network_policy": false,
+    "limit_range": false
+   },
+   {
+    "limit_range": false,
+    "namespace": "batch-workloads",
+    "resource_quota": true,
+    "network_policy": false
+   }
+  ],
+  "location": "us-central1",
+  "workloads": [
+   {
+    "security_context": {
+     "privileged": false,
+     "added_capabilities": [],
+     "host_network": false,
+     "run_as_non_root": true,
+     "host_pid": false,
+     "read_only_root_fs": true
+    },
+    "resources": {
+     "requests": true,
+     "qos": "Burstable",
+     "limits": true
+    },
+    "telemetry": "none",
+    "probes": {
+     "startup": false,
+     "readiness": false,
+     "liveness": true
+    },
+    "hpa": false,
+    "namespace": "cert-manager",
+    "kind": "Deployment",
+    "replicas": "1/1"
+   },
+   {
+    "security_context": {
+     "added_capabilities": [],
+     "host_network": false,
+     "privileged": false,
+     "run_as_non_root": true,
+     "read_only_root_fs": true,
+     "host_pid": false
+    },
+    "telemetry": "none",
+    "replicas": "1/1",
+    "probes": {
+     "liveness": false,
+     "readiness": false,
+     "startup": false
+    },
+    "kind": "Deployment",
+    "resources": {
+     "limits": true,
+     "requests": true,
+     "qos": "Burstable"
+    },
+    "hpa": false,
+    "namespace": "cert-manager"
+   }
+  ],
+  "topology": {
+   "dataplane_v2": true,
+   "observability": "gke-managed-otel",
+   "deployment_toolchain": "none observed",
+   "workload_identity": true,
+   "k8s_version": "1.31.5-gke.1014000",
+   "node_pools": [
+    {
+     "nodes": 3,
+     "machine_type": "e2-standard-4",
+     "autoscaling": "enabled",
+     "name": "default-pool"
+    }
+   ]
+  },
+  "findings": [
+   {
+    "recommendation": "Define explicit CPU limits for opentelemetry-collector containers to comply with the baseline-quota.",
+    "issue": "ReplicaFailure: failed quota: baseline-quota: must specify limits.cpu for: opentelemetry-collector,token-broker-adc-init",
+    "severity": "high",
+    "area": "reliability",
+    "namespace": "gke-managed-otel"
+   },
+   {
+    "issue": "ReplicaFailure: failed quota: baseline-quota: must specify limits.cpu for: operator",
+    "severity": "high",
+    "recommendation": "Define explicit CPU limits for the operator container to comply with the baseline-quota.",
+    "area": "reliability",
+    "namespace": "gmp-system"
+   },
+   {
+    "namespace": "multiple",
+    "recommendation": "Consolidate and standardize ResourceQuota configurations across namespaces to avoid conflicts.",
+    "severity": "medium",
+    "area": "reliability",
+    "issue": "Workloads running with overlapping ResourceQuotas in multiple namespaces (e.g., agent-system, default, dice-app, payment). Overlapping quotas can lead to unpredictable scheduling failures."
+   }
+  ],
+  "cluster": "agent-harness-dev-cluster",
+  "gaps": [],
+  "project": "example-project"
+ },
+ "t_ccbfda55": {
+  "topology": {
+   "deployment_toolchain": "none observed",
+   "dataplane_v2": true,
+   "workload_identity": true,
+   "node_pools": [
+    {
+     "machine_type": "e2-medium",
+     "autoscaling": "none",
+     "nodes": 1,
+     "name": "default-pool"
+    },
+    {
+     "nodes": 1,
+     "autoscaling": "none",
+     "name": "pinned-inference-pool",
+     "machine_type": "e2-small"
+    }
+   ],
+   "observability": "gke-managed-otel",
+   "k8s_version": "v1.35.8-gke.1225000"
+  },
+  "location": "us-central1-a",
+  "workloads": [
+   {
+    "security_context": {
+     "added_capabilities": [],
+     "host_network": false,
+     "run_as_non_root": true,
+     "read_only_root_fs": true,
+     "privileged": false,
+     "host_pid": false
+    },
+    "namespace": "gmp-system",
+    "name": "gmp-operator",
+    "resources": {
+     "requests": true,
+     "qos": "Burstable",
+     "limits": true
+    },
+    "telemetry": "none",
+    "replicas": "1/1",
+    "hpa": false,
+    "kind": "Deployment",
+    "probes": {
+     "liveness": true,
+     "readiness": true,
+     "startup": false
+    }
+   },
+   {
+    "kind": "Deployment",
+    "replicas": "0/0",
+    "hpa": false,
+    "security_context": {
+     "host_pid": false,
+     "host_network": false,
+     "added_capabilities": [],
+     "privileged": false,
+     "run_as_non_root": false,
+     "read_only_root_fs": false
+    },
+    "namespace": "gmp-system",
+    "name": "rule-evaluator",
+    "probes": {
+     "startup": false,
+     "readiness": false,
+     "liveness": false
+    },
+    "resources": {
+     "qos": "BestEffort",
+     "limits": false,
+     "requests": false
+    },
+    "telemetry": "none"
+   }
+  ],
+  "cluster": "seeded-a",
+  "gaps": [],
+  "findings": [
+   {
+    "severity": "medium",
+    "recommendation": "Configure comprehensive health probes.",
+    "issue": "Workload 'inference-server' lacks liveness/readiness/startup probes.",
+    "namespace": "seeded-capacity",
+    "area": "reliability"
+   },
+   {
+    "issue": "Workload 'payments-api' lacks liveness/readiness/startup probes.",
+    "recommendation": "Configure comprehensive health probes.",
+    "area": "reliability",
+    "severity": "medium",
+    "namespace": "seeded-debug"
+   },
+   {
+    "namespace": "seeded-reliability",
+    "severity": "medium",
+    "recommendation": "Configure comprehensive health probes.",
+    "issue": "Workload 'checkout-gateway' lacks liveness/readiness/startup probes.",
+    "area": "reliability"
+   }
+  ],
+  "project": "example-project",
+  "namespace_governance": [
+   {
+    "limit_range": false,
+    "namespace": "default",
+    "network_policy": false,
+    "resource_quota": false
+   },
+   {
+    "resource_quota": false,
+    "namespace": "gke-managed-cim",
+    "network_policy": false,
+    "limit_range": false
+   }
+  ]
+ },
+ "t_5ca49c4e": {
+  "namespace_governance": [],
+  "findings": [],
+  "location": "us-central1-a",
+  "project": "example-project",
+  "workloads": [],
+  "gaps": [],
+  "cluster": "seeded-b",
+  "topology": {
+   "node_pools": [
+    {
+     "nodes": 1,
+     "name": "default-pool",
+     "autoscaling": "unknown",
+     "machine_type": "unknown"
+    }
+   ],
+   "deployment_toolchain": "none observed",
+   "workload_identity": true,
+   "dataplane_v2": true,
+   "observability": "gke-managed-otel",
+   "k8s_version": "1.34.11-gke.1209000"
+  }
+ },
+ "t_3849261c": {
+  "namespace_governance": [
+   {
+    "limit_range": false,
+    "namespace": "default",
+    "resource_quota": false,
+    "network_policy": false
+   },
+   {
+    "resource_quota": false,
+    "namespace": "buildkit",
+    "limit_range": false,
+    "network_policy": false
+   }
+  ],
+  "workloads": [
+   {
+    "hpa": false,
+    "kind": "Deployment",
+    "resources": {
+     "qos": "Guaranteed",
+     "requests": true,
+     "limits": true
+    },
+    "namespace": "buildkit",
+    "name": "gke0",
+    "replicas": "1/1",
+    "security_context": {
+     "run_as_non_root": false,
+     "privileged": true,
+     "read_only_root_fs": false,
+     "host_network": false,
+     "host_pid": false,
+     "added_capabilities": []
+    },
+    "telemetry": "none",
+    "probes": {
+     "readiness": true,
+     "liveness": true,
+     "startup": false
+    }
+   }
+  ],
+  "cluster": "platform-agent-host",
+  "gaps": [],
+  "location": "us-east4",
+  "project": "example-project",
+  "findings": [
+   {
+    "namespace": "buildkit",
+    "issue": "Deployment 'buildkit/gke0' runs with privileged=true.",
+    "area": "security",
+    "recommendation": "Remove privileged mode if not strictly required, or implement additional Pod Security Admissions/PSP constraints.",
+    "severity": "high"
+   },
+   {
+    "issue": "Multiple workloads in 'kube-system' namespace (e.g., 'anetd', 'gke-metadata-server', 'pdcsi-node', 'nvidia-gpu-device-plugin-large-cos') run with privileged=true or added capabilities.",
+    "namespace": "kube-system",
+    "recommendation": "Audit privileged workloads in system namespaces and minimize privileges where possible.",
+    "severity": "medium",
+    "area": "security"
+   },
+   {
+    "recommendation": "Define liveness and readiness probes for all production workloads to ensure health checks.",
+    "severity": "medium",
+    "area": "reliability",
+    "issue": "Many DaemonSets (e.g., 'event-exporter-gke', 'filestore-lock-release-controller', 'konnectivity-agent-autoscaler') and some Deployments lack liveness or readiness probes.",
+    "namespace": "kube-system"
+   },
+   {
+    "issue": "Many namespaces lack NetworkPolicies, allowing unrestricted pod-to-pod communication within those namespaces.",
+    "namespace": "default",
+    "recommendation": "Implement default-deny NetworkPolicies for all non-system namespaces.",
+    "severity": "medium",
+    "area": "security"
+   }
+  ],
+  "topology": {
+   "observability": "gke-managed-otel",
+   "workload_identity": true,
+   "deployment_toolchain": "none observed",
+   "dataplane_v2": true,
+   "k8s_version": "1.35.8-gke.1036000",
+   "node_pools": [
+    {
+     "name": "default-pool",
+     "machine_type": "e2-standard-4",
+     "autoscaling": "true",
+     "nodes": 3
+    },
+    {
+     "autoscaling": "true",
+     "name": "gvisor-pool",
+     "nodes": 3,
+     "machine_type": "e2-standard-4"
+    }
+   ]
+  }
+ }
+}

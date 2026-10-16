@@ -105,6 +105,21 @@ type a2aAuthMapIdentity struct {
 	// is set, the callout ignores Grants entirely and derives them from the
 	// claim it attested — and refuses the map if Grants is not empty.
 	Narrowing string `json:"narrowing,omitempty"`
+
+	// Profile and Topics are set only on an AgentProfile's entry, which
+	// narrows on "profile": the callout derives the task subjects from
+	// Profile and the topic subjects from Topics (written the way the
+	// profile writes them, without the a2a.topics. prefix), and the
+	// consumer names and inbox from the attested pod. Omitted elsewhere, so
+	// adding them changed no other entry's bytes.
+	Profile string            `json:"profile,omitempty"`
+	Topics  *a2aAuthMapTopics `json:"topics,omitempty"`
+}
+
+// a2aAuthMapTopics mirrors the callout's TopicGrants.
+type a2aAuthMapTopics struct {
+	Publish   []string `json:"publish,omitempty"`
+	Subscribe []string `json:"subscribe,omitempty"`
 }
 
 type a2aAuthMapDocument struct {
@@ -121,7 +136,11 @@ type a2aAuthMapDocument struct {
 // is the two agreeing. Without a version the ordering question — "is the
 // callout serving the entry this workload is about to need?" — has no
 // answerable form, and the alternative is the race the spec set out to remove.
-func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent) (a2aAuthMapDocument, error) {
+//
+// profiles are the AgentProfiles bound to this agent. Their entries follow the
+// PlatformAgent's own, in name order, and a profile the operator refuses is
+// left out rather than failing the render (agentProfileMapEntries).
+func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (a2aAuthMapDocument, error) {
 	identities := make([]a2aAuthMapIdentity, 0)
 	for _, id := range calloutIdentities(agent) {
 		identities = append(identities, a2aAuthMapIdentity{
@@ -135,6 +154,7 @@ func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent) (a2aAuthMapDocument, e
 			Narrowing: id.narrowing,
 		})
 	}
+	identities = append(identities, agentProfileMapEntries(agent, profiles)...)
 
 	// Refuse here what the callout would refuse there.
 	//
@@ -175,8 +195,8 @@ func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent) (a2aAuthMapDocument, e
 
 // buildA2AAuthMapConfigMap renders the map into the object the callout watches,
 // and returns the version it rendered.
-func buildA2AAuthMapConfigMap(agent *agentv1alpha1.PlatformAgent) (*corev1.ConfigMap, string, error) {
-	doc, err := renderA2AAuthMap(agent)
+func buildA2AAuthMapConfigMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (*corev1.ConfigMap, string, error) {
+	doc, err := renderA2AAuthMap(agent, profiles)
 	if err != nil {
 		return nil, "", err
 	}
@@ -274,10 +294,18 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 		if id.User == "" {
 			return fmt.Errorf("identity %d: serviceAccount %q has no user", i, id.ServiceAccount)
 		}
+		// The callout's rule: the user becomes the _INBOX.<user>.> prefix,
+		// so it is one lowercase DNS-1123 label.
+		if !isDNS1123LabelToken(id.User) {
+			return fmt.Errorf("identity %d: user %q must be a single lowercase DNS-1123 label, because it becomes the _INBOX.<user>.> prefix", i, id.User)
+		}
 		if id.Account != a2aAccountApp {
 			return fmt.Errorf("identity %d: user %q names account %q, which the callout will not mint into (only %q is mintable)", i, id.User, id.Account, a2aAccountApp)
 		}
 		hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
+		if id.Narrowing != a2aNarrowingProfile && (id.Profile != "" || id.Topics != nil) {
+			return fmt.Errorf("identity %d: user %q carries profile or topics but narrows on %q; only %q reads them", i, id.User, id.Narrowing, a2aNarrowingProfile)
+		}
 		switch id.Narrowing {
 		case "":
 			// Per side, because nats-server is per side. An empty allow
@@ -296,6 +324,26 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 			if hasGrants {
 				return fmt.Errorf("identity %d: user %q narrows on %q, so its grants are derived from the attested claim and the map must carry none; it carries %d publish and %d subscribe",
 					i, id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
+			}
+		case a2aNarrowingProfile:
+			if hasGrants {
+				return fmt.Errorf("identity %d: user %q narrows on %q, so its grants are derived from the profile and the attested pod and the map must carry none; it carries %d publish and %d subscribe",
+					i, id.User, id.Narrowing, len(id.Grants.Publish), len(id.Grants.Subscribe))
+			}
+			if !isDNS1123LabelToken(id.Profile) {
+				return fmt.Errorf("identity %d: user %q narrows on %q but names profile %q, which is not a dot-free DNS-1123 label", i, id.User, id.Narrowing, id.Profile)
+			}
+			if id.Topics != nil {
+				for _, t := range append(append([]string(nil), id.Topics.Publish...), id.Topics.Subscribe...) {
+					if !agentProfileTopicRE.MatchString(t) {
+						return fmt.Errorf("identity %d: user %q: topic grant %q is not shared.{topic} or agent.{agent}.{topic}", i, id.User, t)
+					}
+				}
+				for _, t := range id.Topics.Publish {
+					if !ownsAgentTopic(id.Profile, t) {
+						return fmt.Errorf("identity %d: user %q may not publish %q: an agent-scoped topic has one writer, the agent it names", i, id.User, t)
+					}
+				}
 			}
 		default:
 			return fmt.Errorf("identity %d: user %q names narrowing %q, which the callout does not implement", i, id.User, id.Narrowing)

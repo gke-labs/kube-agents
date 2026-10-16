@@ -22,11 +22,13 @@ _An SRE asks for a fleet self-health check; the agent answers in the thread. An 
 
 Each of these is a single chat message. The agent answers in the thread from read-only reads of the fleet, the GCP projects it monitors, and the linked GitOps repositories, and it recommends changes without applying them.
 
-1. **"Which clusters are behind their release channel, and what would block upgrading them?"** — Every cluster's control-plane and node-pool versions against the channel default, with what would stop the upgrade named: drain-blocking PodDisruptionBudgets, maintenance exclusions, and node-pool version skew. Name a target version and it also scans the GitOps manifests for the `apiVersions` that version removes. ([`fleet-upgrade-verification`](agents/platform/skills/fleet-upgrade-verification/SKILL.md))
+1. **"Which clusters are behind their release channel, and what would block upgrading them?"** — Every cluster's control-plane and node-pool versions against the channel default, with what would stop the upgrade named: drain-blocking PodDisruptionBudgets, fail-closed admission webhooks with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), maintenance exclusions, node-pool version skew, and the blockers the per-entry rules of the upgrade-failure catalogue file, with the risks that do not block listed beside them. Name a target version and it also scans the GitOps manifests for the `apiVersions` that version removes. ([`fleet-upgrade-verification`](agents/platform/skills/fleet-upgrade-verification/SKILL.md))
 2. **"Which workloads request far more CPU and memory than they use?"** — Live `kubectl top` readings compared with each workload's requests, so the answer names the over-requested controllers in resource units; a stock install has no billing export to price them. ([`gke-cost-analysis`](agents/platform/skills/gke-cost-analysis/SKILL.md))
 3. **"Design a Standard cluster for 32 A100s in us-central1. Check quota and live obtainability, and give me a ComputeClass fallback. Design only."** — Quota and capacity are checked separately, each against live `gcloud` evidence, and the design names the fallback tiers that change the workload's GPU class or interconnect characteristics. ([`capacity-obtainability`](agents/platform/skills/capacity-obtainability/SKILL.md), [`gke-compute-classes`](agents/platform/skills/gke-compute-classes/SKILL.md))
 4. **"Something in the `payments` namespace on `prod-east` stopped making progress without erroring. Find it."** — The work is delegated to the Cluster Agent for that cluster, which looks for controllers whose `observedGeneration` lags, progress conditions that stopped advancing, repeating warning events, and references to objects that do not exist. ([`gke-stall-detection`](agents/cluster/skills/gke-stall-detection/SKILL.md))
 5. **"`checkout` on `prod-east` has been crash-looping since this morning. What happened?"** — The Cluster Agent for that cluster fixes the time window, reads the container's exit codes and the events around them, tells an OOM kill from an application crash, and proposes the manifest correction without applying it. ([`gke-workload-troubleshooting`](agents/cluster/skills/gke-workload-troubleshooting/SKILL.md))
+
+On an install running the unsupported `spec.mode: next`, the agent still answers these in the thread, with a few differences in how the answer is delivered; [how a chat question is answered under `next`](https://gke-labs.github.io/kube-agents/concepts/chatops/#how-a-chat-question-is-answered-under-next) walks through each step.
 
 ---
 
@@ -38,7 +40,7 @@ The fastest, zero-friction way to install `kube-agents` in **Google Cloud Shell*
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
 ```
 
-_Substitute `<RELEASE_VERSION>` with the desired version tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (for example, `0.4.0`)._
+_Substitute `<RELEASE_VERSION>` with the desired version tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (for example, `0.4.0`; a GitLab install needs `0.9.0` or later)._
 
 This interactive installer (recommended for initial setup) guides you through GCP authentication, project selection, GKE cluster setup (Autopilot or Standard), chat integrations (Google Chat & Slack), and LLM model provider credentials. Sensible defaults are detected from your `gcloud` context, requiring minimal input.
 
@@ -66,7 +68,7 @@ and credential with me. Run install.sh with --dry-run and show me its printed su
 Only run the real install after I say yes.
 ```
 
-The full procedure behind the prompt, including the credential and consent-flag checks, is in [INSTALL.md](INSTALL.md#ai-assisted-installation). An assistant working in a checkout of this repository also picks up the [`install-kube-agents`](.agents/skills/install-kube-agents/SKILL.md) skill, which covers the same install.
+The full procedure behind the prompt, including the credential and consent-flag checks, is in [INSTALL.md](INSTALL.md#ai-assisted-installation). The GitOps repository can be on GitHub or on GitLab (gitlab.com or a self-managed instance); [INSTALL.md](INSTALL.md#non-interactive--ai-agent-execution-mode) gives the flags for each. An assistant working in a checkout of this repository also picks up the [`install-kube-agents`](.agents/skills/install-kube-agents/SKILL.md) skill, which covers the same install.
 
 Prefer to drive the engine by hand? Unpack `kube-agents-<RELEASE_VERSION>.tar.gz` from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (recommended), or clone the repository at an official release tag if a Git checkout is needed:
 
@@ -95,6 +97,51 @@ The harness runs co-located agents in a single operator-deployed pod: the **Plan
 - ⏰ **Autonomous watchdogs** — cron-driven governance jobs in [`agents/platform/cron/jobs.json`](agents/platform/cron/jobs.json) that keep the fleet honest without human prompting. Ticking belongs to the Planning Agent's gateway, the only running one, so a job on its roster advances the Platform Agent's schedule once a minute. See [proactive autonomy](https://gke-labs.github.io/kube-agents/overview/proactive-autonomy/).
 
 The runtime is built on the Hermes agent framework and wires in MCP servers for platform control and GKE's hosted MCP endpoint, so the agent speaks to your clusters through structured tools rather than raw shell access.
+
+For three scenarios from trigger to pull request (a scheduled audit, a crash loop alert, and a chat question), see [A day with kube-agents](https://gke-labs.github.io/kube-agents/overview/day-in-the-life/).
+
+---
+
+## 🧰 Capabilities
+
+The Platform Agent runs these audits on a schedule and posts each report to chat. Each skill is a procedure that the Platform Agent or a Cluster Agent loads when a request or an audit needs it. The [skill catalog](https://gke-labs.github.io/kube-agents/skills/) describes each skill, and the [cron job reference](https://gke-labs.github.io/kube-agents/reference/cron-jobs/) lists every scheduled job.
+
+<!-- BEGIN GENERATED: capabilities -->
+<!-- Regenerate with: make docs-generate -- do not edit by hand. -->
+<!-- prettier-ignore-start -->
+
+### Scheduled governance audits
+
+| Audit | Schedule (UTC) | Procedure |
+| ----- | -------------- | --------- |
+| Security & RBAC Posture Audit | Daily 06:20 | [`compliance_audit_sop.md`](agents/platform/governance/compliance_audit_sop.md) |
+| Workload Reliability Audit | Daily 06:50 | [`obtainability_audit_sop.md`](agents/platform/governance/obtainability_audit_sop.md) |
+| GCE Compute Engine and MIG Fleet Audit | Daily 07:45 | [`gce_compute_fleet_sop.md`](agents/platform/governance/gce_compute_fleet_sop.md) |
+| GCP Networking Fabric & VPC IPAM Audit | Daily 08:00 | [`gcp_networking_fabric_sop.md`](agents/platform/governance/gcp_networking_fabric_sop.md) |
+| AI Workload Security Audit | Daily 08:50 | [`ai_security_audit_sop.md`](agents/platform/governance/ai_security_audit_sop.md) |
+| Fleet Stockout Prevention & Capacity Audit | Daily 09:20 | [`stockout_prevention_sop.md`](agents/platform/governance/stockout_prevention_sop.md) |
+| Upgrade & Patch Readiness Audit | Weekly, Monday 07:20 | [`security_patch_orchestrator_sop.md`](agents/platform/governance/security_patch_orchestrator_sop.md) |
+| Fleet Waste Audit | Weekly, Monday 07:50 | [`fleet_wide_cost_analysis_sop.md`](agents/platform/governance/fleet_wide_cost_analysis_sop.md) |
+| Fleet Consistency Drift Audit | Weekly, Monday 08:20 | [`fleet_consistency_drift_sop.md`](agents/platform/governance/fleet_consistency_drift_sop.md) |
+
+### Skills by area
+
+| Area | Skills |
+| ---- | ------ |
+| Cluster lifecycle | `cluster-agent-lifecycle`, `gke-cluster-creation`, `gke-multitenancy`, `manage-cluster` |
+| Workloads | `gke-app-onboarding`, `gke-batch-hpc`, `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting`, `workload-rebalancing` |
+| Cost and capacity | `capacity-obtainability`, `gce-compute-fleet-audit`, `gke-cluster-autoscaler`, `gke-compute-classes`, `gke-cost-analysis`, `gke-cost-optimization`, `gke-productionize` |
+| Security and compliance | `gke-backup-dr`, `gke-platform-security`, `gke-workload-identity` |
+| Networking and storage | `gcp-networking-fabric-audit`, `gke-networking`, `gke-service-networking`, `gke-storage` |
+| AI and inference | `gke-ai-troubleshooting-handle-disruption-gpu-tpu`, `gke-ai-troubleshooting-jobset-interruption`, `gke-ai-troubleshooting-tpu-vbar-oom`, `gke-golden-path`, `gke-inference`, `gke-tpu-dynamic-slices-monitoring`, `gke-tpu-metrics-monitoring` |
+| Observability | `gke-alert-configuration`, `gke-basics`, `gke-observability`, `kube-agents-observability` |
+| Reliability | `fleet-upgrade-verification`, `gke-reliability`, `gke-upgrades` |
+| Manifests and remediation | `gcp-config-connector`, `gke-manifest-generation`, `submit-suggestion` |
+| Meta | `fleet-audit`, `fleet-audit-reports`, `github-issue-resolver`, `inspect-repository`, `pr-conversation`, `version-control` |
+| Cluster Agent (per-cluster runtime) | `gke-observability`, `gke-reliability`, `gke-stall-detection`, `gke-storage`, `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting` |
+
+<!-- prettier-ignore-end -->
+<!-- END GENERATED: capabilities -->
 
 ---
 

@@ -42,6 +42,95 @@ spec:
                 deployment:
                   description: Deployment abstracts the Kubernetes Pod/Deployment configuration.
                   properties:
+                    agentAPIAuth:
+                      description: |-
+                        AgentAPIAuth configures the agent-api-auth sidecar in the gateway pod, the
+                        native container that authenticates the agent's API-server calls and also
+                        runs the event watcher and the drift detector.
+                      properties:
+                        resources:
+                          description: |-
+                            Resources overrides the agent-api-auth container's requests and limits.
+                            Each key set here replaces the operator's default for that key and the
+                            rest keep their defaults, unlike spec.deployment.resources, which replaces
+                            the agent container's block wholesale: a CR that sets only limits.memory
+                            keeps the default 150m CPU request, 384Mi memory request, 1 CPU limit and
+                            2Gi ephemeral-storage limit. The container runs the event watcher, the
+                            drift detector and the API authenticator together; the event watcher
+                            reads the memory limit through the Downward API and sets its Go soft
+                            memory limit to half of it, so raising the memory limit is the knob for an
+                            install whose fleet of watched clusters outgrows the 2Gi default (#2648).
+                            Only cpu, memory and ephemeral-storage are accepted, the quantities the
+                            container declares. The operator refuses a request above its limit, a
+                            negative quantity, a zero limit, an unrepresentable byte or CPU count and
+                            claims, because the gateway pod declares no resourceClaims. A refused
+                            override, including an edit of one that was valid, renders the sidecar at
+                            the operator's defaults until it is corrected, and the operator reports
+                            Degraded with reason InvalidAgentAPIAuthResources when no higher-ranked
+                            Degraded cause is present, the agent staying Ready, whether or not the
+                            validating webhook is enabled. Where the webhook is on, it refuses the
+                            edit at apply. The webhook warns when memory per CPU on the requests pair
+                            leaves the band GKE Autopilot admits unchanged, and when a cpu or memory
+                            limit is set without the same key under requests, for the reasons the
+                            credential-proxy field documents.
+                          properties:
+                            claims:
+                              description: |-
+                                Claims lists the names of resources, defined in spec.resourceClaims,
+                                that are used by this container.
+
+                                This field depends on the
+                                DynamicResourceAllocation feature gate.
+
+                                This field is immutable. It can only be set for containers.
+                              items:
+                                description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                                properties:
+                                  name:
+                                    description: |-
+                                      Name must match the name of one entry in pod.spec.resourceClaims of
+                                      the Pod where this field is used. It makes that resource available
+                                      inside a container.
+                                    type: string
+                                  request:
+                                    description: |-
+                                      Request is the name chosen for a request in the referenced claim.
+                                      If empty, everything from the claim is made available, otherwise
+                                      only the result of this request.
+                                    type: string
+                                required:
+                                  - name
+                                type: object
+                              type: array
+                              x-kubernetes-list-map-keys:
+                                - name
+                              x-kubernetes-list-type: map
+                            limits:
+                              additionalProperties:
+                                anyOf:
+                                  - type: integer
+                                  - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: |-
+                                Limits describes the maximum amount of compute resources allowed.
+                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                              type: object
+                            requests:
+                              additionalProperties:
+                                anyOf:
+                                  - type: integer
+                                  - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: |-
+                                Requests describes the minimum amount of compute resources required.
+                                If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                              type: object
+                          type: object
+                      type: object
                     availability:
                       description:
                         Availability configures high availability and scheduling
@@ -1077,6 +1166,104 @@ spec:
                       items:
                         type: string
                       type: array
+                    credentialProxy:
+                      description: |-
+                        CredentialProxy configures the credential-proxy container, the broker that
+                        runs every credentialed command on the agent's behalf in a pod of its own.
+                      properties:
+                        resources:
+                          description: |-
+                            Resources overrides the credential-proxy container's requests and limits.
+                            Each key set here replaces the operator's default for that key and the
+                            rest keep their defaults, unlike spec.deployment.resources, which replaces
+                            the agent container's block wholesale: a CR that sets only limits.memory
+                            keeps the default 500m CPU request, 1 CPU limit and 2Gi ephemeral-storage
+                            limit. The broker sizes how many commands it admits at once from the
+                            memory limit, so raising the limit is the one knob for an install whose
+                            fleet outgrows the default; the ephemeral-storage limit bounds the content
+                            workspace the broker clones into; the proxy's state and /tmp emptyDirs
+                            (sizeLimits 5Gi and 2Gi) follow it when it is raised above their
+                            defaults, so the kubelet does not evict the pod at the smaller figure.
+                            Only cpu, memory and ephemeral-storage
+                            are accepted, the quantities the container declares. The operator
+                            refuses a memory limit below what admits two commands at once, a limits
+                            entry set alone below the default request it would cross, a request
+                            above its limit, a negative quantity and a zero limit; `claims` is refused, because the proxy
+                            pod declares no resourceClaims. A refused override, including an edit of
+                            one that was valid, renders the proxy Deployment at the operator's
+                            defaults, not at the last accepted override, until it is corrected,
+                            which on the proxy's Recreate Deployment restarts the proxy once; the
+                            operator reports Degraded with reason InvalidCredentialProxyResources
+                            when no higher-ranked Degraded cause is present, the agent staying
+                            Ready, whether or not the validating webhook is enabled. Where the
+                            webhook is on, it refuses the edit at apply and the running proxy is
+                            untouched. The webhook warns when memory per
+                            CPU on the requests pair leaves the band GKE Autopilot admits unchanged,
+                            because Autopilot then raises the smaller request into the band; it
+                            applies the band to requests only. It also warns for each of cpu and
+                            memory set under limits without the same key under requests, unless the
+                            limit equals the request it would be replaced by: Autopilot
+                            without bursting sets the limits equal to the requests, so there the
+                            proxy runs at the request and the limit has no effect. With bursting the
+                            declared limits stand.
+                          properties:
+                            claims:
+                              description: |-
+                                Claims lists the names of resources, defined in spec.resourceClaims,
+                                that are used by this container.
+
+                                This field depends on the
+                                DynamicResourceAllocation feature gate.
+
+                                This field is immutable. It can only be set for containers.
+                              items:
+                                description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                                properties:
+                                  name:
+                                    description: |-
+                                      Name must match the name of one entry in pod.spec.resourceClaims of
+                                      the Pod where this field is used. It makes that resource available
+                                      inside a container.
+                                    type: string
+                                  request:
+                                    description: |-
+                                      Request is the name chosen for a request in the referenced claim.
+                                      If empty, everything from the claim is made available, otherwise
+                                      only the result of this request.
+                                    type: string
+                                required:
+                                  - name
+                                type: object
+                              type: array
+                              x-kubernetes-list-map-keys:
+                                - name
+                              x-kubernetes-list-type: map
+                            limits:
+                              additionalProperties:
+                                anyOf:
+                                  - type: integer
+                                  - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: |-
+                                Limits describes the maximum amount of compute resources allowed.
+                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                              type: object
+                            requests:
+                              additionalProperties:
+                                anyOf:
+                                  - type: integer
+                                  - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: |-
+                                Requests describes the minimum amount of compute resources required.
+                                If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                              type: object
+                          type: object
+                      type: object
                     defaultStorageClassName:
                       description:
                         DefaultStorageClassName specifies the default storage
@@ -9438,7 +9625,16 @@ spec:
                             every worker it spawns — platform and cluster alike — draws on the same model
                             quota. Setting it to 1 serialises all delegated work.
 
-                            Unset means 2, the operator's default — not Hermes' own behaviour, which does not
+                            One slot is guaranteed to each class of card. At 2 or more, background work (event
+                            triage and cron report relays) may hold every slot but one, so a question asked in
+                            chat starts at once even while triage runs, and user cards may hold every slot but
+                            one, so a door's fan-out cannot silence alerts. The slots between go to whoever is
+                            first, user cards sorting first; at 2 each class gets one. At 1 nothing is held: a
+                            user card still goes ahead of waiting triage but waits for the running card. When
+                            every slot is busy the gateway logs "kanban dispatcher saturated", and a user card
+                            left waiting is told in its thread that it is queued.
+
+                            Unset means 6, the operator's default — not Hermes' own behaviour, which does not
                             cap concurrency at all. The default exists because a worker is a full agent process
                             holding a few hundred MiB for the length of the task: unbounded dispatch lets a
                             burst of queued cards spawn workers until the cgroup OOM killer takes them, and
@@ -9458,12 +9654,27 @@ spec:
                             counters that would settle it — so raising resources is not a guaranteed fix;
                             measure it.
 
+                            The arithmetic behind 6: a worker measured about 430 MiB, so six are about 2.6 GiB
+                            over the gateway's 1.8 GiB idle set, about 4.4 GiB under its 8Gi memory limit; a
+                            coordinator waiting on its own children gives its slot back but stays resident, so
+                            processes can sit above six. The credential proxy at its default 2Gi memory limit
+                            admits 9 brokered commands at once, held to 8 by its slot cap, which the stall
+                            watch's and cluster-agent reconcile's four-wide listings share. Per-install model
+                            rate limits are not measured: a small quota may see 429s at 6, so lower this if
+                            worker logs show them.
+
                             Set it higher once a deployment has measured its own worker footprint and model
-                            quota — a fleet with headroom is throttled by 2. Set it to 1 to serialise all
-                            delegated work. When quota rather than memory binds, note the related failure mode:
-                            workers that exhaust their retry budget exit without calling a terminal kanban
-                            tool, and the dispatcher reports that as a "protocol violation" rather than as the
-                            quota exhaustion it actually is.
+                            quota. The credential proxy sets the ceiling on brokered commands: its default 2Gi
+                            already admits more than its slot cap of 8, so up to about eight workers' worth of
+                            commands fit at the defaults, fewer while the listings above run. Past that the
+                            slot cap binds, and no CR field moves it, so raising the memory limit in
+                            spec.deployment.credentialProxy.resources does not help: a command beyond eight
+                            waits up to 60 s for a slot and is then refused busy. Keep that limit at 2Gi or
+                            more, since below it the memory budget (176 MiB per command after 320 MiB of fixed
+                            reserves) binds first. Set it to 1 to serialise all delegated work. When quota rather than
+                            memory binds, note the related failure mode: workers that exhaust their retry
+                            budget exit without calling a terminal kanban tool, and the dispatcher reports that
+                            as a "protocol violation" rather than as the quota exhaustion it actually is.
                           minimum: 1
                           type: integer
                         maxSessions:
@@ -9480,9 +9691,10 @@ spec:
                             preemption.
 
                             The number lands in three places that deliberately differ. The gateway's
-                            A2A_MAX_SESSIONS env carries it as a usability control: at the cap a new
-                            delegation is refused with a chat reply naming the numbers, never queued,
-                            never dropped. The namespace ResourceQuota is rendered a fixed headroom
+                            A2A_MAX_SESSIONS env carries it as a usability control: at the cap the
+                            gateway first evicts the longest-idle session pod (its conversation is
+                            told); only with none idle is a new turn refused with a chat reply naming
+                            the numbers, never queued, never dropped. The namespace ResourceQuota is rendered a fixed headroom
                             ABOVE it as the enforcement control: a compromised or buggy gateway
                             ignores its own cap and cannot ignore the quota, and keeping the quota
                             above the cap is what makes users hit the honest refusal rather than an
@@ -9501,9 +9713,10 @@ spec:
                             stream is too small for the configured cap makes the provision Job
                             fail rather than letting the shortfall surface later as a legitimate
                             session's consumer create being refused and reported as a task
-                            failure. What that refusal names is the ways out - two, or three for
-                            a CR that declares a bridge sidecar with more workers than the
-                            bridge's default of 2, where declaring it with fewer is offered too -
+                            failure. What that refusal names is the ways out - two, or three when
+                            the bridge runs more workers than its default of 2, where fewer is
+                            offered too (the operator's A2A_BRIDGE_CONCURRENCY for the bridge it
+                            renders, BRIDGE_CONCURRENCY for a bridge sidecar the CR declares) -
                             and none is a stream edit, because max_consumers is the one limit
                             nats-server will not change on a stream that already exists: lower
                             this number (or that worker count) until it fits the stream, or
@@ -9523,9 +9736,10 @@ spec:
 
                             Raising it buys concurrent delegations at the per-pod price plus model
                             concurrency against the shared LiteLLM endpoint; the quota lifts with it.
-                            Lowering it turns busy-hour delegations into refusals sooner - a lower
-                            cap never reaps in-flight sessions, it only blocks new spawns until they
-                            finish. Setting it to 1 serialises delegated SESSION work; kanban worker
+                            Lowering it turns busy-hour delegations into evictions and refusals
+                            sooner - a lower cap never stops a running task: a new spawn at the cap
+                            evicts the session pod idle longest, and is refused only when none is
+                            idle. Setting it to 1 serialises delegated SESSION work; kanban worker
                             concurrency is MaxInProgress above, a different lane.
 
                             The Maximum exists because the quota render adds its headroom to this
@@ -9585,38 +9799,98 @@ spec:
                           repository on another host is refused rather than rewritten into a
                           same-named repository on this one. See
                           docs/designs/version-control-support.md §6.
+
+                          A gitlab forge's credentialsRef is required by the API server too, so it
+                          holds with the webhook off -- the chart ships it off.
                         properties:
+                          caBundleRef:
+                            description: |-
+                              CABundleRef names a Secret in the PlatformAgent's namespace that holds
+                              the PEM CA certificates that signed this forge's TLS certificate:
+                              a self-managed instance behind a private CA. The broker trusts these
+                              certificates for this forge's host only, beside the system bundle, in
+                              its API client and in git. On a GitHub Enterprise Server forge, the
+                              chart also gives them to the token minter, which trusts them for all of
+                              its outbound calls. It is
+                              for a forge at a self-managed host, GitLab or GitHub Enterprise Server: it
+                              is refused when host is empty, gitlab.com or github.com, whose
+                              certificates the public CAs sign.
+
+                              The operator mounts the one key into the credential broker's pod only.
+                              The mount is optional: a missing Secret does not stop the broker, and
+                              calls to this forge answer FORGE_TLS_UNTRUSTED until it exists. The
+                              broker reads the file on each call, so an update reaches it with no
+                              restart.
+                            properties:
+                              key:
+                                default: ca.crt
+                                description: |-
+                                  Key is the Secret key that holds the PEM certificates. Defaults to
+                                  "ca.crt".
+                                maxLength: 253
+                                pattern: ^[-._a-zA-Z0-9]+$
+                                type: string
+                              name:
+                                description:
+                                  "Name is the Secret's name: a lowercase
+                                  DNS subdomain."
+                                maxLength: 253
+                                minLength: 1
+                                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                type: string
+                            required:
+                              - name
+                            type: object
+                            x-kubernetes-validations:
+                              - message: caBundleRef.key may not be . or start with ..
+                                rule: "!has(self.key) || !(self.key == '.' || self.key.startsWith('..'))"
                           credentialsRef:
                             description: |-
                               CredentialsRef names a Secret in the PlatformAgent's namespace holding
                               the credentials for this forge. It is for providers whose credentials an
-                              administrator supplies. GitHub's come from the install's GitHub App
-                              through the token minter, so it is ignored for provider "github", and
-                              admission warns when it is set there.
+                              administrator supplies, and it is required for them. GitHub's come from
+                              the install's GitHub App through the token minter, so it is ignored for
+                              provider "github", and admission warns when it is set there.
+
+                              For GitLab the Secret holds an access token under the key `token`: a
+                              group or project access token, or a dedicated account's personal access
+                              token where the tier offers neither. It is mounted into the credential
+                              broker's pod only, never the agent's or the sandbox's, and read on every
+                              call, so rotating the token is updating the Secret.
                             properties:
                               name:
-                                default: ""
-                                description: |-
-                                  Name of the referent.
-                                  This field is effectively required, but due to backwards compatibility is
-                                  allowed to be empty. Instances of this type with an empty value here are
-                                  almost certainly wrong.
-                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                description:
+                                  "Name is the Secret's name: a lowercase
+                                  DNS subdomain."
+                                maxLength: 253
+                                minLength: 1
+                                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                                 type: string
+                            required:
+                              - name
                             type: object
-                            x-kubernetes-map-type: atomic
                           host:
                             description: |-
                               Host is the forge hostname. Omit it for the provider's default
-                              ("github.com" for GitHub). A host the declared provider does not serve is
-                              rejected, and an alternative spelling of one it does serve resolves to the
-                              provider's canonical host.
+                              ("github.com" for GitHub, "gitlab.com" for GitLab). A host the declared
+                              provider does not serve is rejected, and an alternative spelling of one
+                              it does serve resolves to the provider's canonical host. It may also be a
+                              self-managed instance's hostname: a GitLab instance, or a GitHub
+                              Enterprise Server instance. Every repository on the forge must then name
+                              that host or leave it implied. A host another provider serves is
+                              rejected, and so is a host under a domain where the provider runs its own
+                              services (for GitHub: github.com, githubusercontent.com, ghe.com and
+                              others).
+
+                              An install serves one GitHub host: github.com, or one GitHub Enterprise
+                              Server instance. A second GitHub forge at another host is rejected, and
+                              so is one host declared for two providers.
 
                               The pattern is a DNS name, which every forge's host is; it is here rather
                               than only in the webhook so the API server still refuses whitespace and
                               control characters when the operator runs with ENABLE_WEBHOOKS=false.
                             maxLength: 253
-                            pattern: ^$|^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$
+                            pattern: ^$|^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$
                             type: string
                           name:
                             description: |-
@@ -9638,7 +9912,9 @@ spec:
 
                               On GitHub it is also the organisation the token minter scopes the
                               agent's credentials to; a repository in another organisation is not
-                              given a token.
+                              given a token. On GitLab it, with the group of every repository declared
+                              on the forge, is the set of groups the credential broker serves, so a
+                              token that reaches further is still refused there.
 
                               The schema pattern is every forge's grammar at once, not GitHub's: the
                               tight rule depends on Provider and a CRD pattern cannot dispatch on a
@@ -9650,21 +9926,48 @@ spec:
                             pattern: ^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$
                             type: string
                           provider:
-                            default: github
                             description: |-
                               Provider names the forge's kind. It is the discriminator the operator
                               writes into the gitops-state ConfigMap as each repository's `type`, so
                               the agent reads which forge was declared rather than guessing from the
                               URL's text.
 
-                              Only "github" is registered today; the enum grows with each agent-side
-                              provider. Defaults to "github".
+                              "github" and "gitlab" are registered; the enum grows with each
+                              agent-side provider. Omitted, it is "github".
+
+                              A forge at a host other than a spelling of github.com must name it, so
+                              a forge written for another instance is never read as a GitHub
+                              Enterprise Server by default.
                             enum:
                               - github
+                              - gitlab
                             type: string
                         required:
                           - name
                         type: object
+                        x-kubernetes-validations:
+                          - message:
+                              "a forge at a host other than github.com names its
+                              provider: github for a GitHub Enterprise Server, gitlab
+                              for a GitLab instance"
+                            rule:
+                              has(self.provider) || !has(self.host) || size(self.host)
+                              == 0 || self.host.lowerAscii() in ['github.com', 'www.github.com',
+                              'ssh.github.com']
+                          - message:
+                              "a gitlab forge needs credentialsRef.name: the Secret
+                              holding its access token under the key token"
+                            rule:
+                              "!has(self.provider) || self.provider != 'gitlab'
+                              || has(self.credentialsRef)"
+                          - message:
+                              "caBundleRef is for a self-managed host: gitlab.com
+                              and github.com present a certificate the public CAs sign,
+                              and a private CA must never vouch for it"
+                            rule:
+                              "!has(self.caBundleRef) || (has(self.host) && size(self.host)
+                              > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com',
+                              'github.com', 'www.github.com', 'ssh.github.com']))"
                       maxItems: 16
                       type: array
                       x-kubernetes-list-map-keys:
@@ -9755,6 +10058,58 @@ spec:
                           RepositorySpec declares one repository on a declared forge, and what the
                           agent does with it.
                         properties:
+                          baseBranch:
+                            description: |-
+                              BaseBranch is the branch every pull request onto this repository must
+                              target. The credential broker enforces it: it refuses a proposal onto
+                              any other branch, and a clone that names no branch checks it out. Empty
+                              means the repository's own default branch. It may be set on a "gitops"
+                              or a "managed" repository, not on a "context" one, which is never
+                              written and whose branch pin is the ref in the gitops-state ConfigMap.
+                              The deprecated GitHub alias has no place for it: pinning the GitOps
+                              repository's base takes Forges and Repositories.
+
+                              The schema holds it to the branch names the broker accepts
+                              (providers/validate.validate_branch), because the chart installs the
+                              operator with its webhook off. Like the broker, it also holds it to one
+                              spelling per branch, the name or refs/heads/ and the name: a value
+                              starting with heads/, or with refs/heads/ followed by refs/heads/ or
+                              heads/, is refused, because the broker would read it as another branch.
+                            maxLength: 200
+                            pattern: ^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$
+                            type: string
+                            x-kubernetes-validations:
+                              - message: baseBranch may not be HEAD
+                                rule: self != 'HEAD'
+                              - message:
+                                  baseBranch after refs/heads/ must start with
+                                  a letter or digit and may not be HEAD
+                                rule:
+                                  "!self.startsWith('refs/heads/') || (self.matches('^refs/heads/[A-Za-z0-9]')
+                                  && self != 'refs/heads/HEAD')"
+                              - message:
+                                  "baseBranch may not start with heads/: write
+                                  the branch name, or refs/heads/ and the name"
+                                rule: "!self.startsWith('heads/')"
+                              - message:
+                                  baseBranch may carry one refs/heads/ prefix,
+                                  not refs/heads/ followed by refs/heads/ or heads/
+                                rule:
+                                  "!self.startsWith('refs/heads/refs/heads/') &&
+                                  !self.startsWith('refs/heads/heads/')"
+                              - message:
+                                  "baseBranch must be a git branch name: no '..',
+                                  '/.', '//', '@{' or '.lock/'"
+                                rule:
+                                  "!self.contains('..') && !self.contains('/.')
+                                  && !self.contains('//') && !self.contains('@{')
+                                  && !self.contains('.lock/')"
+                              - message:
+                                  "baseBranch must be a git branch name: it may
+                                  not end in '/', '.' or '.lock'"
+                                rule:
+                                  "!self.endsWith('/') && !self.endsWith('.')
+                                  && !self.endsWith('.lock')"
                           forge:
                             description:
                               Forge is the name of the entry in Forges this
@@ -9792,6 +10147,14 @@ spec:
                           - repository
                           - role
                         type: object
+                        x-kubernetes-validations:
+                          - message:
+                              "baseBranch may not be set on a context repository:
+                              it is never written, and its branch pin is the ref in the
+                              gitops-state ConfigMap"
+                            rule:
+                              "!has(self.baseBranch) || size(self.baseBranch) == 0
+                              || self.role != 'context'"
                       maxItems: 64
                       type: array
                       x-kubernetes-list-type: atomic
@@ -10683,14 +11046,13 @@ spec:
 
                         The allowlist covers DNS, the credential broker, LiteLLM, the namespace
                         of the OpenTelemetry collector the agent resolved, the Hindsight memory
-                        API, and whatever egressAllowlist adds. Everything else the agent
-                        container reaches on its own would go away:
+                        API, and whatever egressAllowlist adds. The gke and developer_knowledge
+                        MCP servers go through the broker and are unaffected. Everything else the
+                        agent container reaches on its own would go away:
 
                           - DuckDuckGo web search, which the shared default config turns on for
                             every profile, and the "browser" toolset, which only the Chat Agent
                             disables;
-                          - the gke and developer_knowledge MCP servers, which proxy
-                            container.googleapis.com and developerknowledge.googleapis.com;
                           - github.com reached directly from the sandbox, though not the gh and
                             git wrappers, which go through the broker;
                           - the metadata lookup in cluster_agent_reconcile.py, which finds that
@@ -10722,98 +11084,112 @@ spec:
                         - None
                         - Allowlist
                       type: string
-                    scopedServiceAccounts:
+                    scopedServiceAccountPool:
                       description: |-
-                        ScopedServiceAccounts maps each GKE cluster the agent may read to the
+                        ScopedServiceAccountPool maps each GCP project the agent may read to the
                         Google service account that reads it. The credential broker mints a
-                        short-lived token for the account a request's cluster maps to, instead of
-                        using the agent's own identity — which, holding a project-level
+                        short-lived token for the account a request's project maps to, instead
+                        of using the agent's own identity — which, holding a project-level
                         roles/container.viewer, can read objects in every cluster in the project.
+
+                        Keyed on the project, not the cluster. One cluster per project is the
+                        shape of the estate this runs over, the project is the IAM unit a
+                        declaration in spec.scope is written in, and two clusters in one project
+                        share an account by design: the account holds no grant of its own, and
+                        what tells two clusters apart is the per-cluster RBAC that arrives with
+                        the token, not the identity presenting it.
 
                         Each account is provisioned by Terraform, never by this operator. A
                         controller must not grant authority beyond its requester's, and minting
                         cloud principals inside the loop that is supposed to bound the agent
                         would put the grant on the wrong side of that boundary.
 
-                        As of 2026-08-12 the accounts hold no IAM grant. They were scoped by an
-                        IAM Condition on the cluster's resource.name, and that was measured to
-                        grant nothing for Kubernetes object operations; removing the condition
-                        without removing the grant would have given every account project-wide
-                        container.viewer. Authority arrives with per-cluster RBAC, and until it
-                        does the pool is off by default.
+                        Arming is explicit and independent of the scope: declaring a project in
+                        spec.scope arms nothing, and listing accounts here arms nothing either.
+                        Only `enabled: true` arms the broker. The composition writes the list
+                        from Terraform's output whether or not the pool is on, so a list that
+                        armed the broker by being non-empty would arm every install that
+                        provisioned an account.
 
-                        A cluster absent from this list is REFUSED, not served by a wider
-                        credential. That is the point of the field, and it is also the first thing
-                        an operator will hit: adding a cluster to the fleet without adding it here
-                        produces a refusal naming the missing scope.
+                        A project absent from this list is REFUSED, never served on the ambient
+                        credential. That is the point of the field, and it is also the first
+                        thing an operator will hit: adding a project to spec.scope without an
+                        account here produces a refusal naming the missing project.
 
-                        Leaving the list empty keeps the previous behaviour — one identity for
-                        every cluster — and renders CREDENTIAL_PROXY_SCOPED_SA_POOL=0 so that the
-                        mode a deployment is in can be read off the Deployment rather than
-                        inferred from what is absent.
+                        Absent, or present with enabled false, keeps the previous behaviour —
+                        one identity for every cluster — and renders
+                        CREDENTIAL_PROXY_SCOPED_SA_POOL=0 so that the mode a deployment is in
+                        can be read off the Deployment rather than inferred from what is absent.
+                      properties:
+                        enabled:
+                          default: false
+                          description: |-
+                            Enabled arms the credential broker: with it true, every cluster read is
+                            made as the account its project maps to, and a project with no entry is
+                            refused. Default false, and it should stay false until the pool's
+                            accounts hold authority.
+                          type: boolean
+                        serviceAccounts:
+                          description: |-
+                            ServiceAccounts is the mapping, one entry per project.
 
-                        Keyed on the cluster tuple by the API server, so a repeated cluster is
-                        rejected at admission. Without that a copy-pasted entry whose clusterName
-                        was never changed is admitted, reconciles, changes the ConfigMap hash and
-                        rolls the broker — which then refuses to start, because the broker will
-                        not resolve one cluster to two accounts by taking whichever came last.
-                        The failure is a crashloop with the cause several layers away, so it is
-                        worth catching in `kubectl apply`. Terraform's scoped_clusters already
-                        validates the same thing on its own path.
-                      items:
-                        description: |-
-                          ScopedServiceAccount binds one GKE cluster to the Google service account
-                          permitted to read it.
+                            Keyed on projectId by the API server, so a repeated project is rejected
+                            at admission. Without that a copy-pasted entry whose projectId was never
+                            changed is admitted, reconciles, changes the ConfigMap hash and rolls
+                            the broker — which then refuses to start, because the broker will not
+                            resolve one project to two accounts by taking whichever came last. The
+                            failure is a crashloop with the cause several layers away, so it is
+                            worth catching in `kubectl apply`.
 
-                          The three cluster fields are a tuple rather than a name because they compose
-                          into the GKE resource name — projects/P/locations/L/clusters/C — which is the
-                          key the credential broker looks the account up by, and the key Terraform
-                          files the account under. Keying on the cluster name alone would let a second
-                          project reusing a name be served by the first project's account.
-
-                          The patterns are the broker's own component regexes, which is the property
-                          that matters: they are narrower than GKE's naming rules in places, and being
-                          identical to what the broker will accept is what stops the API server
-                          admitting an entry the broker then refuses. They are enforced here as well as
-                          there because a separator or a quote in one of them would produce a key that
-                          silently matches nothing.
-                        properties:
-                          clusterName:
-                            description: ClusterName is the GKE cluster's name.
-                            maxLength: 63
-                            pattern: ^[a-z0-9][a-z0-9-]*$
-                            type: string
-                          location:
-                            description: Location is the cluster's region or zone.
-                            maxLength: 63
-                            pattern: ^[a-z0-9][a-z0-9-]*$
-                            type: string
-                          projectId:
+                            No upper bound here: the pool grows with the projects in scope, and the
+                            Terraform module's scoped_pool_max_accounts is the bound an operator
+                            declares on it from the host project's free service-account quota,
+                            which the plan holds the derived set to before any entry reaches this
+                            list. That bound is declared, not read: the quota is shared with the
+                            agent's own accounts and the plan cannot see it.
+                          items:
                             description: |-
-                              ProjectID is the project the cluster lives in, which need not be the
-                              project the agent runs in.
-                            maxLength: 63
-                            pattern: ^[a-z0-9][a-z0-9-]*$
-                            type: string
-                          serviceAccountEmail:
-                            description: |-
-                              ServiceAccountEmail is the account scoped to this cluster. Terraform's
-                              `scoped_service_accounts` output is the source of these values.
-                            pattern: ^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{6,30}\.iam\.gserviceaccount\.com$
-                            type: string
-                        required:
-                          - clusterName
-                          - location
-                          - projectId
-                          - serviceAccountEmail
-                        type: object
-                      maxItems: 100
-                      type: array
-                      x-kubernetes-list-map-keys:
-                        - projectId
-                        - location
-                        - clusterName
-                      x-kubernetes-list-type: map
+                              ScopedServiceAccount binds one GCP project to the Google service account
+                              permitted to read its clusters.
+
+                              The patterns are the broker's own component regexes, which is the property
+                              that matters: they are narrower than GCP's naming rules in places, and being
+                              identical to what the broker will accept is what stops the API server
+                              admitting an entry the broker then refuses. They are enforced here as well as
+                              there because a separator or a quote in one of them would produce a key that
+                              silently matches nothing.
+                            properties:
+                              projectId:
+                                description: |-
+                                  ProjectID is the project whose clusters this account reads, which need
+                                  not be the project the agent runs in.
+                                maxLength: 63
+                                pattern: ^[a-z0-9][a-z0-9-]*$
+                                type: string
+                              serviceAccountEmail:
+                                description: |-
+                                  ServiceAccountEmail is the account scoped to this project. It lives in
+                                  the host project, whatever project it reads; Terraform's
+                                  `scoped_service_accounts` output is the source of these values.
+                                pattern: ^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{6,30}\.iam\.gserviceaccount\.com$
+                                type: string
+                            required:
+                              - projectId
+                              - serviceAccountEmail
+                            type: object
+                          type: array
+                          x-kubernetes-list-map-keys:
+                            - projectId
+                          x-kubernetes-list-type: map
+                      type: object
+                      x-kubernetes-validations:
+                        - message:
+                            scopedServiceAccountPool.enabled requires at least
+                            one serviceAccounts entry; the broker refuses to start on
+                            an empty pool
+                          rule:
+                            "!has(self.enabled) || !self.enabled || (has(self.serviceAccounts)
+                            && size(self.serviceAccounts) > 0)"
                     serviceAccountAnnotations:
                       additionalProperties:
                         type: string
@@ -11087,16 +11463,79 @@ spec:
                         type: string
                       type: array
                       x-kubernetes-list-type: set
+                    chatMessagesInboundTotal:
+                      description: |-
+                        ChatMessagesInboundTotal is the cumulative count of chat messages that
+                        reached the gateway, from every platform it serves: Google Chat, Slack,
+                        Teams and its own API port alike. Counted at the gateway's dispatch
+                        hook, which Hermes runs after dropping its own internal events and
+                        before it checks the sender against the allowlist, so an unlisted
+                        user's message counts and nothing the gateway never hands to the hook
+                        does. Read every five minutes from the chat_metrics plugin's
+                        kubeagents_chat_messages_inbound_total on the platform-agent container
+                        of the gateway pod that runs Hermes (above one replica, the leader
+                        alone), summed across the pods that have led, and, on a next-mode
+                        install, from the A2A gateway's
+                        kubeagents_a2a_gateway_messages_inbound_total as well, since Chat
+                        ingress is that gateway's there; kept monotonic the same way as
+                        ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
+                        brokered command is activity.
+                      format: int64
+                      type: integer
+                    clustersMonitored:
+                      description: |-
+                        ClustersMonitored is how many of ClustersRegistered are delivering
+                        events: the k8s_event_watcher_cluster_up series at 1, whose informer
+                        has completed its initial list. The difference from ClustersRegistered
+                        is the number of clusters silently unwatched, a stuck informer, a 403
+                        on the events list, or a stopped one. A 0 is a reading, and the normal
+                        one while the watcher starts, so read a fall alongside the pod's age.
+                        Absent on the same terms as ClustersRegistered: one poll in which no
+                        gateway replica could be read leaves both where they were, and a
+                        second in a row clears both, because the operator then has no current
+                        reading and an absent field says so.
+                      format: int64
+                      type: integer
+                    clustersRegistered:
+                      description: |-
+                        ClustersRegistered is the number of clusters the event watcher built a
+                        client for at its last start: the management cluster and the Cluster
+                        Agent profiles the GKE API would describe, the management cluster
+                        counted once even where a profile also covers it. Read every five
+                        minutes as the number of k8s_event_watcher_cluster_up series the watcher
+                        exports, the largest reading across gateway replicas. The watcher
+                        discovers its fleet once per process, so a cluster that joins or leaves
+                        is counted after the gateway pod restarts, not before. A gauge, not a
+                        counter: it falls after such a restart. Absent when the operator has no
+                        current reading: before the first poll, while the event watcher is
+                        disabled, and after two polls in a row in which no gateway replica
+                        could be read, whether its listener failed, its pod was not running, or
+                        the operator could not reach it; the CR's events and the gateway pod's
+                        state say which. A 0 is a reading: the watcher answered and exports no
+                        series.
+                      format: int64
+                      type: integer
                     eventsIngestedTotal:
                       description: |-
-                        EventsIngestedTotal is the cumulative count of cluster events ingested and evaluated.
-                        Nothing writes it yet.
+                        EventsIngestedTotal is the cumulative count of cluster events the event
+                        watcher accepted for triage: past its reason filter and its dedup
+                        window, and not turned away by the agent. Read from the watcher's
+                        k8s_event_watcher_events_injected_total every five minutes, kept
+                        monotonic across pod, process and operator restarts, and across gateway
+                        replicas counted once rather than once per replica; it under-counts
+                        rather than over-counts when a listener cannot be read. Events the
+                        watcher merely observed are not counted.
                       format: int64
                       type: integer
                     lastActiveTime:
                       description: |-
-                        LastActiveTime is the timestamp of the most recent interaction or event triage.
-                        Nothing writes it yet.
+                        LastActiveTime is the time of the last poll in which a counter above
+                        moved: a brokered command ran, a proposal was opened or merged, a chat
+                        message reached the gateway, or an event was accepted for triage.
+                        Scheduled maintenance jobs that run brokered commands move it too --
+                        the Controller Stall Watch cron runs some every 30 minutes by default
+                        -- so it marks agent activity of any origin, not human or operator use
+                        alone. Advances at most once per five minutes.
                       format: date-time
                       type: string
                     remediationsAppliedTotal:
@@ -11105,10 +11544,34 @@ spec:
                         Nothing writes it yet.
                       format: int64
                       type: integer
+                    remediationsMergedTotal:
+                      description: |-
+                        RemediationsMergedTotal is the cumulative count of proposals this install
+                        opened that the forge reported merged. The agent never merges, so the
+                        credential broker learns of a merge when one of its own reads of the
+                        proposal, proposal-list or proposal-view, shows the merged state; it
+                        counts each such proposal once per broker process, only when its author
+                        is the broker's own login and it merged no earlier than the broker
+                        process started, so a restart cannot count a merge twice, to within the
+                        forge's and the pod's clocks agreeing. Read from the
+                        broker's kubeagents_vcs_proposals_merged_total every five minutes and
+                        kept monotonic the same way as ToolExecutionsTotal. A merge no read of
+                        the broker's ever shows is not counted, and a credential whose login the
+                        broker cannot name counts nothing (the broker logs that once), so this
+                        under-counts rather than over-counts and stays absent on such an
+                        install; it is the forge's word, where RemediationsAppliedTotal is the
+                        install's. Moves LastActiveTime.
+                      format: int64
+                      type: integer
                     remediationsProposedTotal:
                       description: |-
-                        RemediationsProposedTotal is the cumulative count of remediations generated.
-                        Nothing writes it yet.
+                        RemediationsProposedTotal is the cumulative count of proposals the
+                        credential broker's version-control route opened: proposal-create
+                        requests the forge accepted. Read from the broker's
+                        kubeagents_vcs_requests_total under verb proposal-create and status
+                        success every five minutes and kept monotonic the same way as
+                        ToolExecutionsTotal; a proposal the forge refused or that failed is not
+                        counted. Moves LastActiveTime.
                       format: int64
                       type: integer
                     sessionsTotal:
@@ -11119,8 +11582,12 @@ spec:
                       type: integer
                     toolExecutionsTotal:
                       description: |-
-                        ToolExecutionsTotal is the cumulative count of CLI and diagnostic tool invocations.
-                        Nothing writes it yet.
+                        ToolExecutionsTotal is the cumulative count of CLI and diagnostic tool
+                        invocations the credential broker ran, successful or not, plus requests
+                        it rejected or failed on before running: its success and error outcomes.
+                        Read from the broker's kubeagents_tool_invocations_total every five
+                        minutes and kept monotonic the same way; commands refused by policy,
+                        busy and abandoned are not counted.
                       format: int64
                       type: integer
                   type: object

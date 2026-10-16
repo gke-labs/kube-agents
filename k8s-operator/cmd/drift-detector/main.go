@@ -24,11 +24,14 @@
 // ingestion path (pull and parse), T2 is principal classification (assign a
 // tier, drop the calls that changed nothing), and T3 joins managedFields off
 // the live object -- on the cluster this process holds credentials for, and on
-// every cluster in the project that has a Cluster Agent profile under
-// --profiles-dir. A record naming a cluster in neither is still forwarded, and
+// every cluster that has a Cluster Agent profile under --profiles-dir, whichever
+// project it is in. A record naming a cluster in neither is still forwarded, and
 // counted unreachable. With --daemon-url set, what survives is posted to the
 // core-agent daemon as a gitops-drift inject, which is where the pipeline the
-// design describes takes over: session, agent, chat, human approval, GitOps PR.
+// design describes takes over: session, agent, chat, human approval, GitOps PR
+// -- except an unreachable record from a cluster no readable Cluster Agent
+// profile names, which is outside the install's scope and is logged and held
+// rather than injected (DriftEvent.OutOfScope).
 //
 // The inject is off unless --daemon-url is set, and off is the default. The
 // agent images carry this binary and the credential proxy's entrypoint starts
@@ -88,6 +91,27 @@ const (
 // number rather than a project ID.
 func looksLikeProjectNumber(project string) bool {
 	return project != "" && strings.TrimLeft(project, projectNumberDigits) == ""
+}
+
+// refuseProjectNumber rejects a --project given as a project number while
+// direct credentials are in play, because the two consumers of --project
+// disagree about what it may be. A Pub/Sub resource path accepts a project
+// number as readily as an ID, so the pull works either way, and a detector on
+// the profile fan-in alone is right to take it as given: each profile carries
+// its own project and a record is matched to a profile on the full triple, so
+// --project names nothing there but the subscription. With --in-cluster or
+// --kubeconfig it is also the first third of the identity the join serves that
+// cluster's records under, compared against resource.labels.project_id, which
+// is always the ID. A number therefore matches no record at all, and does it
+// silently -- every lookup is counted unreachable, which is also what a
+// correctly configured single-cluster detector reports for the rest of the
+// project. Nothing distinguishes the two at runtime, so the distinction is
+// made here.
+func refuseProjectNumber(project string, directJoin bool) error {
+	if directJoin && looksLikeProjectNumber(project) {
+		return fmt.Errorf("--project=%s is a project number, but with --in-cluster or --kubeconfig the join matches it against each record's project_id, which is always the project ID: pass the ID, or drop those flags to run on the profile fan-in alone", project)
+	}
+	return nil
 }
 
 // flags holds the parsed command line.
@@ -179,7 +203,7 @@ func parseFlags(args []string) (*flags, error) {
 	f := &flags{}
 
 	fs.StringVar(&f.project, "project", "",
-		"GCP project holding the drift audit subscription. Required. With the join on this must be the project ID and not the project number: a Pub/Sub path accepts either, but the join matches this against each record's project_id, so a number would match nothing.")
+		"GCP project holding the drift audit subscription. Required. With --in-cluster or --kubeconfig this must be the project ID and not the project number: a Pub/Sub path accepts either, but the join matches this against each record's project_id for the directly reached cluster, so a number would match nothing. On --profiles-dir alone it names only the subscription, and either form works.")
 	fs.StringVar(&f.subscription, "subscription", defaultSubscriptionName, "Pub/Sub subscription to pull audit records from.")
 	fs.Int64Var(&f.maxMessages, "max-messages", defaultMaxMessages, "Messages requested per pull.")
 	fs.StringVar(&f.automationPrincipals, "automation-principals", "",
@@ -203,7 +227,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.clusterLocation, "cluster-location", "",
 		"GKE location (region or zone) of --cluster-name. Required with it: a cluster name is unique only within a project and location, so without this a same-named cluster elsewhere would be read as this one.")
 	fs.StringVar(&f.profilesDir, "profiles-dir", "",
-		"Hermes profiles directory (normally /opt/data/profiles). Enables multi-cluster fan-in: every Cluster Agent profile whose cluster is in --project becomes a joinable cluster, addressed by asking the GKE API about that profile's cluster_identity. Combines with --in-cluster / --kubeconfig, which add the directly-reachable cluster on top and win if a profile names the same one.")
+		"Hermes profiles directory (normally /opt/data/profiles). Enables multi-cluster fan-in: every Cluster Agent profile becomes a joinable cluster, whichever project its cluster is in, addressed by asking the GKE API about that profile's cluster_identity. The set of profiles is also the install's scope: an unreachable record from a cluster no readable profile names is logged and held out of the inject. Combines with --in-cluster / --kubeconfig, which add the directly-reachable cluster on top and win if a profile names the same one.")
 	fs.StringVar(&f.gitopsManagers, "gitops-managers", "",
 		"Comma-separated managedFields managers that are the GitOps controller (for example argocd-controller). Matched exactly, and only on writes to the object in a second later than the audited change: a claim made through a subresource such as status does not count, and neither does one sharing the change's own second, which a person applying under the manager's name would produce. Empty means ownership is reported without any reconciliation claim.")
 	fs.DurationVar(&f.batchJoinBudget, "batch-join-budget", defaultBatchJoinBudget,
@@ -230,19 +254,21 @@ func parseFlags(args []string) (*flags, error) {
 // to stay callable from a test that stands up neither. onDrift arrives the same
 // way and for the same reason: building it needs a validated token out of the
 // environment, which a test should not have to set to exercise the wiring.
-func newFilterFromFlags(f *flags, clusters map[clusterIdentity]objectGetter, onDrift driftEventHandler) (*driftFilter, *joiner) {
-	join := newJoiner(clusters, parseGitopsManagers(f.gitopsManagers), onDrift)
+func newFilterFromFlags(f *flags, clusters map[clusterIdentity]objectGetter, onDrift driftEventHandler, alreadyInjected func(insertID string) bool) (*driftFilter, *joiner) {
+	join := newJoiner(clusters, parseGitopsManagers(f.gitopsManagers), newProfileScope(f.profilesDir), alreadyInjected, onDrift)
 	return newDriftFilter(NewClassifier(f.automationPrincipals, f.humanDomains), join.Handle, f.logDropped), join
 }
 
 // directClusterIdentity names the cluster --in-cluster or --kubeconfig reaches.
 //
-// The project is --project rather than a flag of its own: the subscription is a
-// project-level sink, so every cluster it carries records for is in that
-// project. A subscription pointed at another project's sink therefore matches
-// nothing and reports every record unreachable, which is the direction to fail
-// in -- the alternative is enriching one project's records from another's
-// clusters.
+// The project is --project rather than a flag of its own: the directly reached
+// cluster is the one this process runs in, which is the project holding the
+// subscription, and a cluster elsewhere is reached through its profile, which
+// carries its own project. A --project naming some other project therefore
+// matches no record for this cluster and reports its records unreachable,
+// which is the direction to fail in -- the alternative is enriching one
+// project's records from another's clusters -- and verifyClusterIdentity
+// refuses the mismatch outright where the metadata server can answer.
 //
 // A function rather than a literal at the one call site because the three
 // fields are adjacent strings assembled from three flags, which is the
@@ -262,8 +288,8 @@ func directClusterIdentity(f *flags) clusterIdentity {
 // different action, so they are not reported alike: naming --profiles-dir as
 // un-set to someone who set it sends them to check the one thing that is
 // already right, and calling a directory empty when every profile in it failed
-// sends them to cluster-agent-reconcile when the cause is IAM, a mistyped
-// --project, or a GKE API that was down for the seconds this process spent
+// sends them to cluster-agent-reconcile when the cause is IAM or a GKE API that
+// was down for the seconds this process spent
 // starting. The unreadable directory is the same mistake once more: it reaches
 // this function looking exactly like an empty one, no clusters and nothing
 // skipped, and only profileScan.DirUnreadable tells the two apart.
@@ -302,6 +328,33 @@ func joinDisabledReason(profilesDir string, scan profileScan) string {
 	default:
 		return "no cluster credentials (--in-cluster, --kubeconfig or --profiles-dir)"
 	}
+}
+
+// unreachableClustersLine and outOfScopeClustersLine are the shutdown lines
+// naming the clusters the join could not read, one per disposition of their
+// records, so an operator reading either knows what became of the records and
+// what to do about it.
+//
+// The first names the clusters whose records were forwarded without ownership:
+// a profile names them and the join still could not read them (the startup
+// skip lines say why), the scope was unknown -- no --profiles-dir, or a
+// directory the scope could not read, which it logged -- and so there was
+// nothing to hold against, or the record was a redelivery of one the inject had
+// already sent, which is the inject's duplicate rather than a hold. The second names the clusters no readable profile
+// names, whose records the inject held (DriftEvent.OutOfScope); the operator
+// reading it decides between three actions and the line names them: profile
+// the cluster, leave it out, or fix the profile the scope logged by name.
+//
+// Functions rather than branches at the call site for the reason
+// joinDisabledReason is: the wordings can be asserted without a subscription.
+func unreachableClustersLine(unreachable []string) string {
+	return fmt.Sprintf("unreachable clusters (a Cluster Agent profile names them but this run could not join them, the scope was unknown because no --profiles-dir declared it or the directory could not be read, or the record was a redelivery of one already sent; their records were forwarded without ownership): %s",
+		strings.Join(unreachable, unreachableListSeparator))
+}
+
+func outOfScopeClustersLine(held []string) string {
+	return fmt.Sprintf("clusters outside the install's scope (no readable Cluster Agent profile names them; their records were logged and held out of the inject -- profile them with the Cluster Agent reconcile, exclude them, or fix the profile the scope logged by name): %s",
+		strings.Join(held, unreachableListSeparator))
 }
 
 func main() {
@@ -367,25 +420,8 @@ func realMain(argv []string) error {
 	if !hasCredentials && (f.clusterName != "" || f.clusterLocation != "") {
 		return errors.New("--cluster-name or --cluster-location was given without --in-cluster or --kubeconfig, so nothing would read live objects from it")
 	}
-	// Refused only with the join on, because the two consumers of --project
-	// disagree about what it may be. A Pub/Sub resource path accepts a project
-	// number as readily as an ID, so the pull works either way and a detector
-	// with no join is right to take it as given; the join then compares
-	// the same string against resource.labels.project_id, which is always the
-	// ID. A number therefore matches no record at all, and does it silently --
-	// every lookup is counted unreachable, which is also what a correctly
-	// configured single-cluster detector reports for the rest of the project.
-	// Nothing distinguishes the two at runtime, so the distinction is made here.
-	//
-	// Keyed on the join being on at all, not on the direct credentials. The
-	// profile path compares --project twice -- once against each record's
-	// project_id as above, and once against each discovered profile's own project
-	// to decide which clusters to register -- so a number there discards every
-	// profile at discovery and then matches no record either, which reads as an
-	// empty fleet rather than as a bad flag.
-	joinEnabled := hasCredentials || f.profilesDir != ""
-	if joinEnabled && looksLikeProjectNumber(f.project) {
-		return fmt.Errorf("--project=%s is a project number, but the join matches it against each record's project_id, which is always the project ID: pass the ID, or drop --in-cluster/--kubeconfig/--profiles-dir to run without the join", f.project)
+	if err := refuseProjectNumber(f.project, hasCredentials); err != nil {
+		return err
 	}
 
 	// Cancelled on SIGINT or SIGTERM, which stops the pull loop. Settling the
@@ -450,10 +486,11 @@ func realMain(argv []string) error {
 	}
 
 	// Fatal error propagated rather than degraded: internal/clusterprofiles
-	// returns one only for a --profiles-dir that is not there, which discovery
-	// runs once against and a restart fixes. Everything survivable has already
+	// returns one only for a --profiles-dir that is not there, or a credential
+	// proxy that cannot be reached or answers with an error about itself, each of
+	// which discovery runs once against and a restart fixes. Everything survivable has already
 	// been logged and recorded in the scan by this point.
-	scan, err := discoverProfileClusters(ctx, f.profilesDir, f.project, directlyReached)
+	scan, err := discoverProfileClusters(ctx, f.profilesDir, directlyReached)
 	if err != nil {
 		return err
 	}
@@ -496,7 +533,7 @@ func realMain(argv []string) error {
 	}
 
 	injectHandler := newDriftInjectHandler(inject)
-	filter, join := newFilterFromFlags(f, clusters, injectHandler.Handle)
+	filter, join := newFilterFromFlags(f, clusters, injectHandler.Handle, injectHandler.AlreadyInjected)
 
 	// Said at startup, because the difference between the two modes is invisible
 	// in every later line: a run with the inject off emits exactly the DRIFT
@@ -530,13 +567,17 @@ func realMain(argv []string) error {
 		log.Printf("%s: live-object join enabled for %d cluster(s) (direct=%t profiles=%d gitops-managers=%q)",
 			commandName, join.Clusters(), getter != nil, len(scan.Clusters), f.gitopsManagers)
 	}
+	// The hold's mode, for the reason the two lines above exist: a fresh
+	// install holds every record off the joined clusters until the first
+	// reconcile tick, and nothing later says so but the hold lines themselves.
+	log.Printf("%s: %s", commandName, scopeStartupLine(join.scope))
 
 	// Reported whether or not the join ended up with clusters, and separately
 	// from the count above, because a skip is the difference between a fleet of
 	// six and a fleet of seven this run reached six of. The count alone reads
 	// identically either way.
 	if scan.Skipped > 0 {
-		log.Printf("%s: %d profile(s) skipped and will NOT be joined; records from their clusters will be counted unreachable", commandName, scan.Skipped)
+		log.Printf("%s: %d profile(s) skipped and will NOT be joined; records from their clusters will be counted unreachable and forwarded without ownership where the skipped profile names the cluster the records carry -- a profile whose config could not be read or parsed, or whose identity the GKE API found no cluster at (a zone for a regional cluster), names nothing a record carries, and that cluster's records are held as outside the install's scope until the profile is corrected", commandName, scan.Skipped)
 	}
 	// Not a skip: the cluster is joined, through the direct credentials instead.
 	// Logged so that a profile count that does not match the cluster count has
@@ -590,17 +631,25 @@ func realMain(argv []string) error {
 
 	// The unreachable clusters are named on the way out, for the same reason the
 	// unattributed principals below are: the count says the join missed records,
-	// this says which cluster to onboard so that it stops. With one cluster in
-	// the set the list was inferable -- everything else in the project -- and
-	// after the fan-in it is not.
+	// these say which cluster, and on which of two lines, so the action is
+	// readable from the line. With one cluster in the set the list was
+	// inferable -- everything else in the project -- and after the fan-in it is
+	// not.
 	//
-	// Not necessarily a misconfiguration. A project holding a cluster nobody
-	// intends to onboard reports it here every run, which is the honest answer:
-	// the detector cannot tell that cluster from one whose profile failed to
-	// write.
+	// The first line is the clusters a profile names and this run could not
+	// join (or every unreachable cluster, when the scope was unknown: no
+	// --profiles-dir, or a directory the scope could not read); the startup
+	// skip lines say why, and their records went out thin. The second is the
+	// clusters no readable profile names, whose records were held.
+	// Neither is necessarily a misconfiguration: a project holding a cluster
+	// nobody intends to onboard sits on the second line every run, which is the
+	// honest answer, and the detector cannot tell that cluster from one whose
+	// profile failed to write.
 	if unreachable := join.UnreachableClusters(); len(unreachable) > 0 {
-		log.Printf("%s: unreachable clusters (no credentials and no Cluster Agent profile; their records were forwarded without ownership): %s",
-			commandName, strings.Join(unreachable, unreachableListSeparator))
+		log.Printf("%s: %s", commandName, unreachableClustersLine(unreachable))
+	}
+	if held := join.OutOfScopeClusters(); len(held) > 0 {
+		log.Printf("%s: %s", commandName, outOfScopeClustersLine(held))
 	}
 
 	// The unattributed principals are logged by name on the way out, not just

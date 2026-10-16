@@ -146,6 +146,12 @@ func TestTheBrokerIsNotInTheAgentPod(t *testing.T) {
 	if value, _ := brokerEnvValue(agentContainer.Env, "CREDENTIAL_PROXY_TOKEN_FILE"); value != credentialProxyTokenMountPath+"/token" {
 		t.Errorf("expected the agent to present a projected token, got %q", value)
 	}
+	// The remote MCP servers reach Google through the broker, on every install
+	// and in both modes: the address is set unconditionally, unlike the relay
+	// URLs above, which follow the chat backends.
+	if value, _ := brokerEnvValue(agentContainer.Env, mcpRelayURLEnvVar); value != wantURL+"/v1/mcp" {
+		t.Errorf("expected %s to address the broker's MCP relay, got %q", mcpRelayURLEnvVar, value)
+	}
 
 	var mounted bool
 	for _, mount := range agentContainer.VolumeMounts {
@@ -288,12 +294,13 @@ func TestTheBrokerPodAuthenticatesItsCallers(t *testing.T) {
 // scoped-identity path fails at the first read.
 func TestTheBrokerMountsEveryPathItsEnvironmentNames(t *testing.T) {
 	agent := brokerPodAgent()
-	agent.Spec.Security = &agentv1alpha1.SecuritySpec{ScopedServiceAccounts: []agentv1alpha1.ScopedServiceAccount{{
-		ProjectID:           "proj",
-		Location:            "us-central1",
-		ClusterName:         "cluster",
-		ServiceAccountEmail: "scoped-agent@proj.iam.gserviceaccount.com",
-	}}}
+	agent.Spec.Security = &agentv1alpha1.SecuritySpec{ScopedServiceAccountPool: &agentv1alpha1.ScopedServiceAccountPoolSpec{
+		Enabled: true,
+		ServiceAccounts: []agentv1alpha1.ScopedServiceAccount{{
+			ProjectID:           "proj",
+			ServiceAccountEmail: "scoped-agent@proj.iam.gserviceaccount.com",
+		}},
+	}}
 	container := buildCredentialProxyContainer(agent)
 	volumes := buildCredentialProxyRuntimeVolumes(agent)
 
@@ -879,5 +886,101 @@ func TestTheBrokerDeclaresItsMetricsListener(t *testing.T) {
 	}
 	if len(found) != 1 || found[0].Value != "8766" {
 		t.Errorf("spec.deployment.env moved the metrics listener: %#v", found)
+	}
+}
+
+// TestTheSessionCallerIsNamedOnlyUnderTheFlag: the session pod becomes a
+// broker caller when the operator carries A2A_SESSION_CLUSTER_VIEW=true on a
+// mode-next install, and never otherwise.
+func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
+	agent := brokerPodAgent()
+	agent.Spec.Mode = ptr.To("next")
+	// Chat off: under next with Google Chat enabled the A2A gateway is a
+	// caller too (a2aChatArmed), and this test is about the session flag
+	// alone.
+	if agent.Spec.Integration != nil {
+		agent.Spec.Integration.GoogleChat = nil
+	}
+	sessionCaller := "system:serviceaccount:test-ns:test-agent-a2a-session"
+
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	if strings.Contains(allowedBrokerCallers(agent), sessionCaller) {
+		t.Fatal("the session ServiceAccount is a broker caller with the flag unset")
+	}
+	off := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
+	if _, found := brokerEnvValue(off.Env, "CREDENTIAL_PROXY_SESSION_AUDIENCE"); found {
+		t.Fatal("the session audience is rendered with the flag unset")
+	}
+	if _, found := brokerEnvValue(off.Env, "CREDENTIAL_PROXY_SESSION_CALLERS"); found {
+		t.Fatal("the session callers are rendered with the flag unset")
+	}
+
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	want := "system:serviceaccount:test-ns:test-agent,system:serviceaccount:test-ns:test-agent-shell," + sessionCaller
+	if got := allowedBrokerCallers(agent); got != want {
+		t.Fatalf("callers = %q, want %q", got, want)
+	}
+	on := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
+	if v, _ := brokerEnvValue(on.Env, "CREDENTIAL_PROXY_SESSION_AUDIENCE"); v != credentialProxySessionAudience {
+		t.Fatalf("CREDENTIAL_PROXY_SESSION_AUDIENCE = %q, want %q", v, credentialProxySessionAudience)
+	}
+	// The binding: the broker refuses the session ServiceAccount any other
+	// audience, and the session audience to any other caller.
+	if v, _ := brokerEnvValue(on.Env, "CREDENTIAL_PROXY_SESSION_CALLERS"); v != sessionCaller {
+		t.Fatalf("CREDENTIAL_PROXY_SESSION_CALLERS = %q, want %q", v, sessionCaller)
+	}
+	if credentialProxySessionAudience == credentialProxyAudience || credentialProxySessionAudience == credentialProxyChatAudience {
+		t.Fatal("the session audience collides with another; the broker would refuse to confer the role")
+	}
+}
+
+// TestSessionClusterViewIsInertOutsideModeNext: the flag means nothing on a
+// today install, where no session pod exists to be a caller.
+func TestSessionClusterViewIsInertOutsideModeNext(t *testing.T) {
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	agent := brokerPodAgent() // mode unset: today
+	if a2aSessionClusterViewEnabled(agent) {
+		t.Fatal("enabled outside mode next")
+	}
+	if strings.Contains(allowedBrokerCallers(agent), "a2a-session") {
+		t.Fatal("session caller named on a today install")
+	}
+	for _, v := range []string{"", "false", "TRUE", "1"} {
+		t.Setenv(a2aSessionClusterViewEnvVar, v)
+		next := brokerPodAgent()
+		next.Spec.Mode = ptr.To("next")
+		if a2aSessionClusterViewEnabled(next) {
+			t.Errorf("value %q enabled the view; only the literal true may", v)
+		}
+	}
+}
+
+// TestTheBrokerPinsTheDriftDetectorsOwnSubscription: the watcher relay refuses
+// every Pub/Sub call but the subscription named here, so it has to be the one
+// the detector itself resolves (cmd/drift-detector subscriptionPath): a bare
+// name qualified with the harness project, a qualified name kept as it is, and
+// no name meaning the detector's default.
+func TestTheBrokerPinsTheDriftDetectorsOwnSubscription(t *testing.T) {
+	for _, tc := range []struct {
+		name, subscription, want string
+	}{
+		{"default", "", "projects/test-project/subscriptions/" + driftDetectorDefaultSubscription},
+		{"bare", "my-sub", "projects/test-project/subscriptions/my-sub"},
+		{"qualified", "projects/other-project/subscriptions/x-sub", "projects/other-project/subscriptions/x-sub"},
+		{"by number", "projects/123456789/subscriptions/x-sub", "projects/123456789/subscriptions/x-sub"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true), Subscription: tc.subscription})
+			if got := watcherPubsubSubscription(agent); got != tc.want {
+				t.Errorf("watcherPubsubSubscription = %q, want %q", got, tc.want)
+			}
+			if value, found := brokerEnvValue(buildCredentialProxyEnv(agent), watcherSubscriptionEnvVar); !found || value != tc.want {
+				t.Errorf("broker %s = %q (present=%v), want %q", watcherSubscriptionEnvVar, value, found, tc.want)
+			}
+		})
+	}
+	off := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(false)})
+	if _, found := brokerEnvValue(buildCredentialProxyEnv(off), watcherSubscriptionEnvVar); found {
+		t.Errorf("with the detector off the broker must name no subscription, so every Pub/Sub call is refused")
 	}
 }

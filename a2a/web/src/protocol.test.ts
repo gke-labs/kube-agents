@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ProtocolError, parseEnvelope, parseSubject, partsText } from "./protocol.ts";
+import { ProtocolError, authorityOf, parseEnvelope, parseSubject, partsText } from "./protocol.ts";
 
 const valid = {
   protocol: "a2a-jetstream/0.4",
@@ -125,9 +125,9 @@ describe("parseSubject", () => {
     });
     // The supervisor class is a task subject like the other two. Asserted
     // here rather than left to the "anything else" case below, because that
-    // is where it landed: an unknown class parses as `other`, the rail folds
-    // the envelope anyway on its `taskId`, and the only visible effect is a
-    // protocol check quietly not running.
+    // is where it landed: an unknown class parses as `other`, the reducer
+    // folds the envelope anyway on its `taskId`, and the only visible effect
+    // is a protocol check quietly not running.
     expect(parseSubject("a2a.tasks.chat-otter.task-1.supervisor")).toEqual({
       plane: "tasks",
       addressee: "chat-otter",
@@ -163,5 +163,27 @@ describe("partsText", () => {
       partsText([{ kind: "text", text: "a" }, { kind: "data", data: {} }, { text: "b" }]),
     ).toBe("ab");
     expect(partsText(undefined)).toBe("");
+  });
+});
+
+describe("authorityOf", () => {
+  const withAuthority = (authority: unknown) =>
+    parseEnvelope(encode({ ...valid, authority }));
+
+  it("reads backend and conversation off a gateway authority block", () => {
+    const env = withAuthority({
+      requester: { principal: "h1", backend: "console", subject: "h2", verifiedBy: "nats-grant" },
+      audience: { conversation: "console:abc", kind: "dm", roster: ["h2"], rosterComplete: true },
+      grants: null,
+    });
+    expect(authorityOf(env)).toEqual({ backend: "console", conversation: "console:abc" });
+  });
+
+  it("returns empty fields for a missing, null, or malformed block", () => {
+    expect(authorityOf(parseEnvelope(encode(valid)))).toEqual({});
+    expect(authorityOf(withAuthority(null))).toEqual({});
+    expect(authorityOf(withAuthority("console"))).toEqual({});
+    expect(authorityOf(withAuthority({ requester: { backend: 7 }, audience: [] }))).toEqual({});
+    expect(authorityOf(withAuthority({ requester: { backend: "" } }))).toEqual({});
   });
 });

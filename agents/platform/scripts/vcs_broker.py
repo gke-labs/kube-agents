@@ -35,8 +35,10 @@ called `.gitconfig` are all inert as long as nothing materialises them into a
 working copy beside the token. Objects and refs are data; a checkout is what
 turns them into behaviour.
 
-The routes are stateless. There is no handle, nothing survives a request, and
-two concurrent requests share nothing but the lock the HTTP layer holds.
+The routes are stateless to their callers. There is no handle, no answer depends
+on an earlier request, and two concurrent requests share nothing but the lock the
+HTTP layer holds and the merged-proposal count's own, which guards a metric and
+never an answer.
 
 This file names no forge, and a test enforces that. Everything a forge decides
 is behind `providers`; everything here is true whatever forge the URL named.
@@ -66,16 +68,22 @@ import os
 import re
 import subprocess
 import threading
+import datetime
+import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from providers import (
     CliTransport,
+    HttpTransport,
     Forge,
     ForgeUnsupported,
     MAX_PAGE_SIZE,
     Registry,
     Transport,
+    pinned_base,
+    short_branch,
+    tls_refusal as tls_refusal_default,
     validate_branch,
     validate_revision,
 )
@@ -89,6 +97,11 @@ LOGGER = logging.getLogger("credential-proxy.vcs")
 # under everything else.
 DEFAULT_MAX_CLONE_BYTES = 256 << 20  # 256 MiB
 DEFAULT_MAX_BUNDLE_BYTES = 64 << 20  # 64 MiB
+# The in-process API client's bounds when nothing hands it the executor's: the
+# same order as a forge CLI call is given, and a ceiling on one answer that a
+# page of JSON never approaches.
+DEFAULT_HTTP_TIMEOUT_SECONDS = 60.0
+DEFAULT_HTTP_MAX_BYTES = 8 << 20  # 8 MiB
 
 # How many open proposals the `advance` check reads off a branch. One would
 # settle whether any is open; the rest are read because the second half of the
@@ -98,16 +111,33 @@ DEFAULT_MAX_BUNDLE_BYTES = 64 << 20  # 64 MiB
 # not a case this refusal is trying to be exact about.
 OPEN_PROPOSALS_ON_A_BRANCH = 10
 
+# The spellings `_short_ref` reads as the bare branch. Wider than
+# `providers.validate.BRANCH_REF_PREFIXES` on purpose: it feeds the
+# protected-branch check, where reading `heads/main` as `main` refuses more,
+# and the branch verbs. A proposal's target is compared through `short_branch`
+# instead, because a forge opens the proposal on the name it was given.
+_SHORT_REF_PREFIXES = ("refs/heads/", "heads/")
+
 # The ref an incoming bundle is fetched into. Under `refs/vcs/` rather than
 # `refs/heads/` so nothing here can be confused with a branch, and so a publish
 # of a leftover ref cannot happen by naming a plausible branch.
 _INCOMING = "refs/vcs/incoming"
+
+# What `git ls-remote --exit-code` exits with when the remote answered and holds
+# no matching ref; any other failure is a remote it could not ask.
+LS_REMOTE_NO_MATCH_EXIT_CODE = 2
 
 # The namespace every branch this install publishes is named under, and the only
 # one `branch-delete` will touch. Every shipped caller derives its branch as
 # `platform-agent/<change>-<target>`; a branch outside it is a person's, or
 # another tool's, whatever its history says.
 AGENT_BRANCH_PREFIX = "platform-agent/"
+# The neutral proposal state a forge reports once a proposal has merged
+# (`providers/*/translate.py` maps every forge's spelling to it), and the
+# spelling of UTC `datetime.fromisoformat` did not accept before Python 3.11.
+MERGED_PROPOSAL_STATE = "merged"
+ISO_UTC_SUFFIX = "Z"
+ISO_UTC_OFFSET = "+00:00"
 
 # How many of a branch's proposals `branch-delete` reads. It needs all of them:
 # the one that carried the tip, and every other, since a branch any of them
@@ -179,10 +209,36 @@ _AUTOMATION_MARKING = re.compile(r"\[[^\]]*\]$")
 def _short_ref(branch: str) -> str:
     """`refs/heads/x` and `heads/x` name the branch `x`; compare them as `x`."""
     short = branch.strip()
-    for prefix in ("refs/heads/", "heads/"):
+    for prefix in _SHORT_REF_PREFIXES:
         if short.startswith(prefix):
             return short[len(prefix):]
     return short
+
+
+def _base_branch_missing(repo: str, base: str) -> WorkspaceError:
+    return WorkspaceError(
+        f"{repo} has no branch {base}, the base branch this install is "
+        "configured with. Proposals onto this repository can only target that "
+        "branch, so it has to exist on the remote first.",
+        status=409,
+        code="BASE_BRANCH_MISSING",
+    )
+
+
+def _iso_timestamp(value: Any) -> float | None:
+    """An ISO-8601 instant as seconds since the epoch, or None for anything else."""
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    if text.endswith(ISO_UTC_SUFFIX):
+        text = text[: -len(ISO_UTC_SUFFIX)] + ISO_UTC_OFFSET
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.timestamp()
 
 
 def _login_key(login: str) -> str:
@@ -253,7 +309,23 @@ class Binding:
 
     def api(self, method: str, path: str, **kwargs: Any) -> Any:
         self.ensure()
-        return self.transport().api(method, path, **kwargs)
+        return self.refused_drops(lambda: self.transport().api(method, path, **kwargs))
+
+    def whoami(self) -> str:
+        """The transport's login, on the credential made current first."""
+        self.ensure()
+        return self.refused_drops(lambda: self.transport().whoami())
+
+    def refused_drops(self, call: Callable[[], Any]) -> Any:
+        """Run `call`; on a 401, the credential drops a token it cached, so the next call mints anew."""
+        try:
+            return call()
+        except WorkspaceError as refused:
+            if refused.status == 401:
+                invalidate = getattr(self.forge.credential, "invalidate", None)
+                if invalidate is not None:
+                    invalidate(self.repo)
+            raise
 
     def stamp(self, result: dict[str, Any]) -> dict[str, Any]:
         result.update({"forge": self.forge.name, "repo": self.repo})
@@ -264,9 +336,11 @@ class VcsBroker:
     """The verbs, each one request long.
 
     `scratch_root` is on the broker's own volume. Nothing under it outlives a
-    request, which is what makes these routes stateless: there is no handle to
-    leak, no tree to collide with another caller's, and no cleanup an
-    interrupted client can skip.
+    request, which is what makes these routes stateless to their callers: there
+    is no handle to leak, no tree to collide with another caller's, and no
+    cleanup an interrupted client can skip. What the process keeps across
+    requests is the merged-proposal count's seen set and the identity cache
+    beside it (`_count_merges`), which no answer depends on.
     """
 
     def __init__(
@@ -276,11 +350,45 @@ class VcsBroker:
         cli_runner: Callable[..., subprocess.CompletedProcess] | None = None,
         refresh: Callable[[str, str], None] | None = None,
         base_branch: str | None = None,
+        http_timeout: float = DEFAULT_HTTP_TIMEOUT_SECONDS,
+        http_max_bytes: int = DEFAULT_HTTP_MAX_BYTES,
+        http_opener: Callable[..., Any] | None = None,
+        request_deadline: Callable[[], float | None] | None = None,
+        pinned_bases: Mapping[tuple[str, str], str] | None = None,
+        tls_refusal: Callable[[str], WorkspaceError | None] | None = None,
+        merge_observer: Callable[[int], None] | None = None,
+        started_at: float | None = None,
+        mint_write: Callable[[str, str], str] | None = None,
+        drop_write: Callable[[str], None] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
+        # git's output to the FORGE_TLS_UNTRUSTED refusal it stands for, or
+        # None, for the git runs that read a failure themselves rather than
+        # raising it. The broker hands its own, which names a forge's CA
+        # Secret; without one, the shared reading names the cause alone.
+        self._tls_refusal = tls_refusal or tls_refusal_default
+        # The merged-proposal count (`_count_merges`): called with how many
+        # proposals of this install's own a read just showed merged for the
+        # first time in this process. None counts nothing. `started_at` is the
+        # process start the count is bounded by, so a restart counts no merge
+        # the previous process could have counted.
+        self.merge_observer = merge_observer
+        self.started_at = time.time() if started_at is None else started_at
+        self._merged_seen: set[tuple[str, str, Any]] = set()
+        self._merged_lock = threading.Lock()
+        # The credential's login per (forge, repository), asked once per process
+        # and only when a merge could count: the lookup is a forge call. A
+        # lookup that raised is not remembered, so an outage is asked again.
+        self._merged_viewer: dict[tuple[str, str], str] = {}
+        self._merged_nameless_logged = False
         self.scratch_root.mkdir(parents=True, exist_ok=True)
         self._git_runner = git_runner
         self.base_branch = (base_branch or "").strip()
+        # (forge host, path) -> the base every proposal onto that repository
+        # must target (`_pinned_base`), as `parse_pinned_bases` keys it. Each
+        # pinned branch is also one no write door may move, as `base_branch`
+        # is, under the name it is stored by.
+        self.pinned_bases = dict(pinned_bases or {})
         # A CLI transport needs the broker's credential environment but no
         # repository. When the caller does not separate the two, the git runner
         # serves both.
@@ -288,6 +396,15 @@ class VcsBroker:
         # built them, and a second number this class merely stored would read
         # like a bound it enforces.
         self._cli_runner = cli_runner or git_runner
+        # The in-process transport has no runner to carry its bounds, so the
+        # broker hands them over itself; `build_vcs_broker` passes the same
+        # timeout and output ceiling the CLI runner enforces.
+        self._http_timeout = http_timeout
+        self._http_max_bytes = http_max_bytes
+        self._http_opener = http_opener
+        # The deadline of the request slot the calling thread holds: the bound
+        # the CLI runner applies per request, which a per-call timeout is not.
+        self._request_deadline = request_deadline
         self.max_clone_bytes = _positive_int(
             "CREDENTIAL_PROXY_MAX_CLONE_BYTES", DEFAULT_MAX_CLONE_BYTES
         )
@@ -295,7 +412,9 @@ class VcsBroker:
         # The refresh operation is configuration in the sense that matters: it
         # is how this install performs a privileged act, and a forge decides
         # whether its credential strategy has any use for one.
-        self.registry = Registry({"refresh": refresh})
+        # `mint_write` is the second: the in-memory write token a forge with no
+        # CLI behind it presents itself.
+        self.registry = Registry({"refresh": refresh, "mint_write": mint_write, "drop_write": drop_write})
         # Only the counter. Two requests share nothing else -- each gets its own
         # scratch directory and deletes it -- so serialising whole requests
         # would make a clone of one repository wait on a publish of another for
@@ -310,25 +429,46 @@ class VcsBroker:
         return Binding(
             forge,
             repo,
-            lambda: self._transport(forge),
+            lambda: self._transport(forge, repo),
             self._git_for(forge, repo),
         )
 
-    def _transport(self, forge: Forge) -> Transport:
+    def _transport(self, forge: Forge, repo: str) -> Transport:
         """The transport the forge declared, constructed here and never there.
 
         A forge names what it needs; the broker owns everything about how the
-        call is made -- the executable, the timeout, the output ceiling. Only
-        the CLI transport exists so far, because it is the only one a forge in
-        this install declares; the seam is what lets the next one be an
-        in-process HTTP client rather than a second subprocess.
+        call is made -- the executable, the timeout, the output ceiling. A CLI
+        forge gets the runner; an HTTP forge gets an in-process client bounded
+        by the same numbers, presenting its credential's headers for `repo`.
         """
         if forge.transport == "cli" and forge.cli:
             return CliTransport(self._cli_runner, forge.cli, forge.error_overrides)
+        if forge.transport == "http" and forge.api_url:
+            return HttpTransport(
+                forge.api_url,
+                lambda: forge.credential.headers(repo),
+                forge.error_overrides,
+                timeout=self._http_timeout,
+                max_bytes=self._http_max_bytes,
+                whoami_route=forge.whoami_route,
+                whoami_graphql=getattr(forge, "whoami_graphql", ""),
+                opener=self._http_opener,
+                outer_deadline=self._request_deadline,
+                ca_file=forge.ca_file,
+                ca_source=forge.ca_source,
+            )
         raise ForgeUnsupported(
             f"{forge.name} declares the {forge.transport!r} transport, which "
             "this broker does not build."
         )
+
+    def credential_reach(self, forge: Forge) -> tuple[list[str], bool] | None:
+        """What `forge`'s credential can reach, asked through its own transport.
+
+        None when the forge cannot say. Raises what the transport raises; the
+        caller decides what an unanswered question means.
+        """
+        return forge.reach(self._transport(forge, "").api)
 
     def _git_for(self, forge: Forge, repo: str) -> Callable[..., Any]:
         """A git runner carrying whatever config this forge needs on it.
@@ -338,9 +478,11 @@ class VcsBroker:
         invocations, so a credential belonging to one forge is not installed on
         every git in the process.
         """
-        config = tuple(forge.credential.git_config(repo))
-
+        # Read per invocation, not at bind time: a minted credential holds no
+        # token until the verb's `ensure` has run, and a token minted later
+        # than the bind is the one git must present.
         def run(cwd: Path, *args: str, check: bool = True):
+            config = tuple(forge.credential.git_config(repo))
             return self._git_runner(["git", *args], cwd, check, config)
 
         return run
@@ -391,6 +533,44 @@ class VcsBroker:
         local = git(root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
         return (local.stdout or "").strip() or "main"
 
+    def _pinned_base(self, forge: Forge, repo: str) -> str | None:
+        """The branch every proposal onto `repo` must target, or None.
+
+        `repo` is the forge's own reading of the request, which names no host,
+        so it is matched on the host the forge lists first, its canonical one,
+        which is the host every pin is keyed on. A request spelled with another
+        of the forge's hosts is the same repository; the same path on another
+        forge is not.
+        """
+        return pinned_base(self.pinned_bases, forge.hosts[0] if forge.hosts else "", repo)
+
+    def _refuse_off_base(self, forge: Forge, repo: str, target: Any) -> str | None:
+        """Refuse a proposal target that is not `repo`'s pinned base.
+
+        Request-only, so it runs before a credential is made current or the
+        forge is called. Compared exactly once a `refs/heads/` prefix is gone.
+        `Main` is another branch, because git branch names are case-sensitive,
+        and so is `heads/main`. The base goes in the message because the
+        sandbox client keeps only the error text and the code.
+
+        Answers the bare base when the target is it, so the caller sends the
+        forge that name rather than the spelling it was given; None when
+        nothing is pinned for `repo`.
+        """
+        base = self._pinned_base(forge, repo)
+        if base is None:
+            return None
+        target = short_branch(validate_branch(target, "target"))
+        if target != base:
+            raise WorkspaceError(
+                f"{repo} takes proposals onto {base} only, the base branch this "
+                f"install is configured with, and {target} is not it. Use {base} "
+                "as the target.",
+                status=409,
+                code="TARGET_NOT_BASE",
+            )
+        return base
+
     # ---- repository verbs ----------------------------------------------
 
     def capabilities(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -399,6 +579,10 @@ class VcsBroker:
         Answered without making a credential current or touching the network. A
         caller that discovers the gap by failing halfway through a publish has
         already written the revision it cannot deliver.
+
+        `baseBranch` is the repository's pinned base, or None when this install
+        pins none for it. It is the read a caller with no clone uses to learn
+        which branch its proposals must target.
         """
         try:
             forge, repo = self.registry.resolve(payload.get("repository"))
@@ -409,8 +593,11 @@ class VcsBroker:
                 "proposalNoun": None,
                 "verbs": [],
                 "missing": [str(exc)],
+                "baseBranch": None,
             }
-        return forge.capabilities(repo)
+        answer = forge.capabilities(repo)
+        answer["baseBranch"] = self._pinned_base(forge, repo)
+        return answer
 
     def clone(self, payload: dict[str, Any]) -> dict[str, Any]:
         """The repository's history, as a bundle, with nothing left behind.
@@ -425,8 +612,16 @@ class VcsBroker:
         not carry; cloning it fails with "remote did not send all necessary
         objects". Naming a `branch` is the size control that does work, because
         it makes the clone single-branch.
+
+        With no `branch` named, a repository with a pinned base is checked out
+        on that base rather than on the remote's default: the copy is what a
+        proposal is cut from, and the base is the only target the proposal
+        will be accepted onto. A pinned base the remote does not have is
+        refused by name, asked of the remote before anything is cloned.
+        `baseBranch` in the answer is the pinned base, or None.
         """
         bound = self._bind(payload)
+        base = self._pinned_base(bound.forge, bound.repo)
         branch = payload.get("branch")
         branch = validate_branch(branch) if branch is not None else None
         if payload.get("depth") is not None:
@@ -441,12 +636,31 @@ class VcsBroker:
         root = self._scratch("clone")
         bundle = root.parent / f"{root.name}.bundle"
         try:
+            url = bound.forge.clone_url(bound.repo)
+            if branch is None and base is not None:
+                # Asked before the clone, which would fetch the whole
+                # repository only to be thrown away. A remote that could not
+                # be asked falls through to the check after the clone.
+                probe = git(
+                    root, "ls-remote", "--exit-code", "--heads", url,
+                    f"refs/heads/{base}", check=False,
+                )
+                if probe.returncode == LS_REMOTE_NO_MATCH_EXIT_CODE:
+                    raise _base_branch_missing(bound.repo, base)
             argv = ["clone", "--quiet", "--no-recurse-submodules"]
             if branch is not None:
                 argv += ["--single-branch", "--branch", branch]
-            argv += [bound.forge.clone_url(bound.repo), "."]
+            argv += [url, "."]
             git(root, *argv)
             self._enforce_ceiling(root, bound.repo)
+            if branch is None and base is not None:
+                present = git(
+                    root, "rev-parse", "--verify", "--quiet",
+                    f"refs/remotes/origin/{base}", check=False,
+                )
+                if present.returncode != 0:
+                    raise _base_branch_missing(bound.repo, base)
+                branch = base
             if branch is None:
                 branch = self._default_branch(git, root)
             git(root, "checkout", "--force", "-B", branch, f"origin/{branch}")
@@ -475,6 +689,7 @@ class VcsBroker:
                 "revision": head,
                 "size": size,
                 "bundleBase64": blob,
+                "baseBranch": base,
             }
         )
 
@@ -562,6 +777,18 @@ class VcsBroker:
                 status=409,
                 code="TARGET_IS_BRANCH",
             )
+        if not advance:
+            # A first publish is the start of a new proposal, so its target
+            # must be the repository's pinned base, the only one
+            # `proposal-create` will accept. Refused here, before a credential
+            # is spent, rather than after the branch is already on the remote.
+            #
+            # A later round (`advance`) is exempt. It adds to a proposal that
+            # already exists, and its target is that proposal's, which no verb
+            # can move. Refusing it would block every follow-up on a proposal
+            # a person opened onto another branch while leaving the proposal
+            # exactly where it is.
+            self._refuse_off_base(bound.forge, bound.repo, target)
         raw = payload.get("bundleBase64")
         if not isinstance(raw, str) or not raw:
             raise WorkspaceError("bundleBase64 must be a base64 bundle")
@@ -980,6 +1207,9 @@ class VcsBroker:
         if listed.returncode == 2:
             return ""
         if listed.returncode != 0:
+            refusal = self._tls_refusal(listed.stderr or "")
+            if refusal is not None:
+                raise refusal
             raise WorkspaceError(
                 f"could not read {branch} from the remote: "
                 f"{(listed.stderr or '').strip() or 'git exited ' + str(listed.returncode)}",
@@ -1080,11 +1310,12 @@ class VcsBroker:
         Which branch the remote calls its default, from the remote and not from
         the request. The broker enforces protected branch policy across all
         write doors: main, master, production, the remote default branch, any
-        operator-configured base override, and any run/** branch. `publish`
-        refuses a direct push to one and `branch-delete` refuses to remove one.
+        operator-configured base override, every pinned base on every
+        repository, and any run/** branch. `publish` refuses a direct push to
+        one and `branch-delete` refuses to remove one.
         `root` must already have `origin`.
         """
-        default = self._default_branch_of_remote(git, root)
+        default = self._default_branch_of_remote(git, root, self._tls_refusal)
         protected_branches = {"main", "master", "production"}
         if default:
             protected_branches.add(default.casefold())
@@ -1095,6 +1326,11 @@ class VcsBroker:
         )
         if base_override:
             protected_branches.add(_short_ref(base_override).casefold())
+        # A pin is stored in its one canonical spelling, so it is protected
+        # under exactly the name proposals target, not re-read here.
+        protected_branches.update(
+            pinned.casefold() for pinned in self.pinned_bases.values()
+        )
 
         normalized_branch = _short_ref(branch)
         if (
@@ -1108,16 +1344,25 @@ class VcsBroker:
             )
 
     @staticmethod
-    def _default_branch_of_remote(git: Callable, root: Path) -> str:
+    def _default_branch_of_remote(
+        git: Callable,
+        root: Path,
+        tls_refusal: Callable[[str], WorkspaceError | None] = tls_refusal_default,
+    ) -> str:
         """The branch the remote's HEAD points at, or "" if it says nothing.
 
         `ls-remote --symref` prints `ref: refs/heads/<name>\tHEAD` first when
         the remote advertises a symbolic HEAD. A remote that advertises none --
         an empty repository, or a server that hides it -- yields "", and the
         caller treats that as "no default to protect" rather than as a
-        refusal, because there is nothing to compare against.
+        refusal, because there is nothing to compare against. A certificate
+        that fails is not "says nothing": it is raised by its cause.
         """
         listed = git(root, "ls-remote", "--symref", "origin", "HEAD", check=False)
+        if getattr(listed, "returncode", 0) != 0:
+            refusal = tls_refusal(listed.stderr or "")
+            if refusal is not None:
+                raise refusal
         for line in (listed.stdout or "").splitlines():
             if line.startswith("ref: refs/heads/") and line.rstrip().endswith("HEAD"):
                 return line[len("ref: refs/heads/"):].split("\t", 1)[0].strip()
@@ -1234,23 +1479,145 @@ class VcsBroker:
         it is left to the caller to refuse.
         """
         try:
-            return bound.transport().whoami()
+            return bound.whoami()
         except ForgeUnsupported:
             return ""
 
-    def _forge_verb(self, verb: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _forge_verb(
+        self,
+        verb: str,
+        payload: dict[str, Any],
+        pinned_target: bool = False,
+        observe: Callable[[Binding, dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         bound = self._bind(payload)
+        if pinned_target:
+            # Before the method is looked up and before `bound.api`, so a
+            # refused target makes no forge call and spends no credential.
+            base = self._refuse_off_base(bound.forge, bound.repo, payload.get("target"))
+            if base is not None:
+                payload = {**payload, "target": base}
         method = getattr(bound.forge, verb.replace("-", "_"))
-        return bound.stamp(method(bound.api, bound.repo, payload))
+        result = bound.stamp(method(bound.api, bound.repo, payload))
+        if observe is not None:
+            # A reader of the answer, never a party to it: whatever it does
+            # or fails to do, the caller gets the forge's answer.
+            observe(bound, result)
+        return result
 
     def proposal_create(self, payload):
-        return self._forge_verb("proposal-create", payload)
+        return self._forge_verb("proposal-create", payload, pinned_target=True)
 
     def proposal_list(self, payload):
-        return self._forge_verb("proposal-list", payload)
+        return self._forge_verb("proposal-list", payload, observe=self._observe_merged_list)
 
     def proposal_view(self, payload):
-        return self._forge_verb("proposal-view", payload)
+        return self._forge_verb("proposal-view", payload, observe=self._observe_merged_view)
+
+    # -- the merged-proposal count -----------------------------------------
+    #
+    # The agent never merges: a merge is a person's act on the forge, and the
+    # broker learns of it only when a later read shows the proposal in the
+    # merged state. The count therefore rides on the reads the agent already
+    # makes of its proposals, under three rules that keep it from counting a
+    # merge twice without a store: the proposal is this install's own (its
+    # author is the credential's login), it merged no earlier than this process
+    # started (a merge before that was the previous process's to count, or is
+    # lost with it), and each proposal is counted once per process. A merge
+    # this process never reads is not counted: the count under-counts rather
+    # than over-counts, like the operator's totals it feeds.
+
+    def _observe_merged_list(self, bound: Binding, result: dict[str, Any]) -> None:
+        proposals = result.get("proposals")
+        self._count_merges(bound, proposals if isinstance(proposals, list) else [])
+
+    def _observe_merged_view(self, bound: Binding, result: dict[str, Any]) -> None:
+        proposal = result.get("proposal")
+        self._count_merges(bound, [proposal] if isinstance(proposal, dict) else [])
+
+    def _count_merges(self, bound: Binding, proposals: list) -> None:
+        if self.merge_observer is None:
+            return
+        try:
+            # The free rules first -- merged, not before this process started,
+            # not already counted -- so the identity lookup, a forge call, runs
+            # only when something could count, and never for a history of old
+            # merges a `state=all` listing carries on every read.
+            with self._merged_lock:
+                candidates = [
+                    p for p in proposals
+                    if isinstance(p, dict)
+                    and p.get("state") == MERGED_PROPOSAL_STATE
+                    and (closed := _iso_timestamp(p.get("closed"))) is not None
+                    and closed >= self.started_at
+                    and self._merged_key(bound, p.get("number")) not in self._merged_seen
+                ]
+            if not candidates:
+                return
+            viewer = self._merged_viewer_for(bound)
+            if not viewer:
+                return
+            count = 0
+            with self._merged_lock:
+                for proposal in candidates:
+                    if _login_key(str(proposal.get("author") or "")) != _login_key(viewer):
+                        continue
+                    key = self._merged_key(bound, proposal.get("number"))
+                    if key in self._merged_seen:
+                        continue
+                    self._merged_seen.add(key)
+                    count += 1
+            if count:
+                self.merge_observer(count)
+        except Exception as exc:  # noqa: BLE001 -- the count never fails the read
+            LOGGER.debug("merged-proposal count skipped type=%s", type(exc).__name__)
+
+    @staticmethod
+    def _merged_scope(forge: Forge) -> str:
+        """What the merged count and its identity cache are keyed on besides
+        the repository: the forge's canonical host, as `_pinned_base` keys the
+        pins, since one provider serves several hosts (two forges of one
+        provider on different hosts carry the same `name` and may carry the
+        same path) and the same path on another host is another repository
+        with its own credential."""
+        return forge.hosts[0] if forge.hosts else forge.name
+
+    @classmethod
+    def _merged_key(cls, bound: Binding, number: Any) -> tuple[str, str, Any]:
+        """The seen-set key: forge host, repository and number. The repository
+        is casefolded, since a caller may spell `Acme/Infra` and `acme/infra`
+        for the one repository the forge resolves them to, and the count is per
+        proposal, not per spelling."""
+        return (cls._merged_scope(bound.forge), bound.repo.casefold(), number)
+
+    def _merged_viewer_for(self, bound: Binding) -> str:
+        """The credential's login for the count, remembered per repository,
+        keyed the way the seen set is: the login is the credential's, not the
+        spelling's.
+
+        "" is a real answer, a credential that cannot name itself, and is
+        remembered too, with one INFO line per process so that a flat
+        `remediationsMergedTotal` on such an install is explained in the log;
+        a lookup that raises is left to the caller's guard and asked again next
+        time.
+        """
+        key = (self._merged_scope(bound.forge), bound.repo.casefold())
+        with self._merged_lock:
+            if key in self._merged_viewer:
+                return self._merged_viewer[key]
+        viewer = self._viewer(bound)
+        with self._merged_lock:
+            self._merged_viewer[key] = viewer
+            announce = not viewer and not self._merged_nameless_logged
+            if announce:
+                self._merged_nameless_logged = True
+        if announce:
+            LOGGER.info(
+                "merged-proposal count is off for %s: the credential cannot name itself, "
+                "so no proposal can be told to be this install's own",
+                self._merged_scope(bound.forge),
+            )
+        return viewer
 
     def proposal_comment(self, payload):
         return self._forge_verb("proposal-comment", payload)
@@ -1268,7 +1635,14 @@ class VcsBroker:
         return self._forge_verb("issue-comment", payload)
 
     def proposal_update(self, payload):
-        return self._forge_verb("proposal-update", payload)
+        # No adapter moves a proposal's target today, so this is defensive: a
+        # `target` that reaches one is held to the same pinned base as
+        # `proposal-create`, and the rule stays true the day an adapter learns
+        # to retarget.
+        return self._forge_verb(
+            "proposal-update", payload,
+            pinned_target=payload.get("target") is not None,
+        )
 
     def proposal_close(self, payload):
         return self._forge_verb("proposal-close", payload)
@@ -1306,9 +1680,7 @@ class VcsBroker:
         caller hands the fact back rather than a spelling it does not know.
         """
         bound = self._bind(payload)
-        bound.ensure()
-        transport = bound.transport()
-        viewer = transport.whoami()
+        viewer = bound.whoami()
         login = payload.get("login")
         if login is not None and not isinstance(login, str):
             raise WorkspaceError("login must be a string")
@@ -1328,27 +1700,12 @@ class VcsBroker:
         return bound.stamp({"identity": {"login": viewer, "subject": subject, "canWrite": can_write}})
 
 
-# The verbs that leave a mark on the forge, named here so the HTTP layer can
-# refuse an unmanaged repository before one of them runs. The classification
-# lives beside the route table because that is where a new verb gets added, and
-# a verb added to one and not the other is the mistake this placement is meant
-# to make loud.
-#
-# The read verbs are absent from this set on purpose, and what that buys today
-# is narrower than it reads. This set is the HTTP layer's gate, and it covers
-# writes: a write against an unmanaged repository is refused here, before a
-# verb runs. The reads are not gated *here* -- but every verb that spends the
-# credential asks for it through `BrokeredCredential.ensure`, and on the one
-# forge this install ships the credential is minted per managed repository, so
-# the refresh refuses an unmanaged one with the same 403 before any call is
-# made. In practice, then, `capabilities` is the only verb an unmanaged
-# repository can be asked, and `clone`, `proposal-list/view/commits`,
-# `issue-list/view`, `identity` and `branch-view` refuse it too. The intent that reads of a repository this
-# install does not write to should work -- a public upstream, read with no
-# credential at all -- is real and is not implemented by this set; it needs a
-# credential-less read path, which the design lists as open. Until then the
-# managed list is, in effect, a visibility control as well as a write one on
-# that forge, and the test beside this classification says so.
+# The verbs that leave a mark on the forge. Named beside the route table because
+# that is where a new verb gets added, and a verb added to one and not the other
+# is the mistake this placement is meant to make loud. Every one of them, like
+# every read below, is refused at the HTTP layer for a repository this install
+# does not manage; the set is kept because a write is what that refusal exists
+# for, and the classification test reads it.
 WRITE_VERBS = frozenset(
     {
         "publish",
@@ -1362,6 +1719,49 @@ WRITE_VERBS = frozenset(
         "issue-update",
         "issue-close",
         "label-ensure",
+        "branch-delete",
+    }
+)
+
+
+# The verbs the HTTP layer answers for a repository this install does not
+# manage. `capabilities` reports what a forge serves and spends no credential.
+# Every other verb, read or write, is refused at the route first: reads used to
+# be refused only because the one shipped credential asked the managed list
+# while refreshing, and a credential that does not refresh -- a static token
+# scoped to a whole group -- would have been spent on any repository in it.
+# Reading a repository this install does not manage needs a credential-less
+# read path, which the design lists as open; until it exists, the managed list
+# is a visibility control as well as a write one, by design rather than by
+# accident of one forge.
+UNGATED_VERBS = frozenset({"capabilities"})
+
+# Every verb `route_table` serves, as a constant: the closed vocabulary the
+# broker's version-control counter labels a request under, so a caller's path
+# never names a series. `test_the_verb_vocabulary_is_the_route_table` holds the
+# two in step.
+VCS_VERBS = frozenset(
+    {
+        "capabilities",
+        "clone",
+        "publish",
+        "proposal-create",
+        "proposal-list",
+        "proposal-view",
+        "proposal-comment",
+        "issue-create",
+        "issue-list",
+        "issue-view",
+        "issue-comment",
+        "proposal-update",
+        "proposal-close",
+        "proposal-commits",
+        "proposal-acknowledge",
+        "issue-update",
+        "issue-close",
+        "label-ensure",
+        "identity",
+        "branch-view",
         "branch-delete",
     }
 )
@@ -1402,7 +1802,9 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
 __all__ = [
     "Binding",
     "VcsBroker",
+    "VCS_VERBS",
     "AGENT_BRANCH_PREFIX",
+    "UNGATED_VERBS",
     "WRITE_VERBS",
     "max_bundle_bytes",
     "route_table",

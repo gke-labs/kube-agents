@@ -11,6 +11,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -26,7 +28,8 @@ func TestGchatConversationIDRoundTrip(t *testing.T) {
 		want                  string
 		wantSpace, wantThread string
 	}{
-		{"dm binds the space", "spaces/AAA", "spaces/AAA/threads/BBB", "dm", "gchat:dm/spaces/AAA", "spaces/AAA", ""},
+		{"top-level dm binds the space", "spaces/AAA", "", "dm", "gchat:dm/spaces/AAA", "spaces/AAA", ""},
+		{"dm side thread binds the thread", "spaces/AAA", "spaces/AAA/threads/BBB", "dm", "gchat:dm/spaces/AAA/threads/BBB", "spaces/AAA", "spaces/AAA/threads/BBB"},
 		{"threaded space binds the thread", "spaces/AAA", "spaces/AAA/threads/BBB", "group", "gchat:spaces/AAA/threads/BBB", "spaces/AAA", "spaces/AAA/threads/BBB"},
 		{"unthreaded space binds the space", "spaces/CCC", "", "group", "gchat:space/spaces/CCC", "spaces/CCC", ""},
 	}
@@ -41,7 +44,8 @@ func TestGchatConversationIDRoundTrip(t *testing.T) {
 			t.Errorf("%s: gchatSpaceThread(%q) = %q,%q,%v want %q,%q,true", c.name, got, space, thread, ok, c.wantSpace, c.wantThread)
 		}
 	}
-	for _, bad := range []string{"discord:1/2", "slack:C1/1.0", "gchat:", "gchat:dm/", "gchat:space/", "gchat:threads/BBB", "gchat:spaces/AAA", "gchat:spaces/AAA/messages/M"} {
+	for _, bad := range []string{"discord:1/2", "slack:C1/1.0", "gchat:", "gchat:dm/", "gchat:space/", "gchat:threads/BBB", "gchat:spaces/AAA", "gchat:spaces/AAA/messages/M",
+		"gchat:dm/spaces/AAA/threads/", "gchat:dm/spaces/AAA/threads/B/C", "gchat:dm/spaces/AAA/messages/M", "gchat:dm/threads/BBB", "gchat:space/spaces/AAA/threads/BBB"} {
 		if _, _, ok := gchatSpaceThread(bad); ok {
 			t.Errorf("gchatSpaceThread(%q) parsed; must refuse", bad)
 		}
@@ -101,6 +105,16 @@ func TestGchatInboundNormalization(t *testing.T) {
 	}{
 		{"dm delivers on the space", gchatMsg("spaces/D1", "DIRECT_MESSAGE", "", "spaces/D1/threads/T1", "spaces/D1/messages/M1", "hi", "", "u1@example.com", "HUMAN"),
 			true, "gchat:dm/spaces/D1", "dm", "hi"},
+		{"dm thread reply binds its thread", func() *gchatEvent {
+			ev := gchatMsg("spaces/D3", "DIRECT_MESSAGE", "THREADED_MESSAGES", "spaces/D3/threads/T3", "spaces/D3/messages/M11", "and the pods?", "", "u1@example.com", "HUMAN")
+			ev.Message.ThreadReply = true
+			return ev
+		}(), true, "gchat:dm/spaces/D3/threads/T3", "dm", "and the pods?"},
+		{"thread reply in a threaded space binds the thread as before", func() *gchatEvent {
+			ev := gchatMsg("spaces/S4", "SPACE", "THREADED_MESSAGES", "spaces/S4/threads/T4", "spaces/S4/messages/M12", "@Kage more", " more", "u2@example.com", "HUMAN")
+			ev.Message.ThreadReply = true
+			return ev
+		}(), true, "gchat:spaces/S4/threads/T4", "group", "more"},
 		{"legacy DM type field delivers", func() *gchatEvent {
 			ev := gchatMsg("spaces/D2", "", "", "", "spaces/D2/messages/M2", "hi", "", "u1@example.com", "HUMAN")
 			ev.Space.Type = "DM"
@@ -335,6 +349,15 @@ func TestGchatPostThreadsAndTranslates(t *testing.T) {
 		t.Error("DM posts must not set messageReplyOption")
 	}
 
+	if _, err := a.Post("gchat:dm/spaces/D1/threads/T2", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	side := f.call(2)
+	if side.arguments["parent"] != "spaces/D1" || side.arguments["body"].(map[string]any)["thread"].(map[string]any)["name"] != "spaces/D1/threads/T2" ||
+		side.arguments["messageReplyOption"] != gchatReplyOption {
+		t.Errorf("a DM side-thread post must reply in its thread: %+v", side.arguments)
+	}
+
 	if _, err := a.Post("discord:1/2", "x"); err == nil {
 		t.Error("malformed conversation must error")
 	}
@@ -465,18 +488,24 @@ func TestToGchatText(t *testing.T) {
 		// observed Chat rendering <url|text> from a message the app posted,
 		// so one already present in executor output would publish a link
 		// whose visible text names a host it does not open.
+		// One whose text names no host is the link [the doc](url) would
+		// have made, and is kept (TestToGchatTextKeepsAnExecutorsChatLink).
 		"<https://attacker.example/login|https://github.com/gke-labs/kube-agents>": "< https://attacker.example/login|https://github.com/gke-labs/kube-agents>",
-		"see <https://evil.example|the doc>":                                       "see < https://evil.example|the doc>",
+		"see <https://evil.example|the doc>":                                       "see <https://evil.example|the doc>",
 		// A generated link and an injected one in the same message: the
-		// adapter's own survives, the executor's does not.
-		"[real](https://x.example/p) vs <https://evil.example|real>": "<https://x.example/p|real> vs < https://evil.example|real>",
+		// adapter's own survives, and the executor's survives only where
+		// its text names no other host.
+		"[real](https://x.example/p) vs <https://evil.example|https://x.example/p>": "<https://x.example/p|real> vs < https://evil.example|https://x.example/p>",
 		// A mention or an angle pair inside a markdown link's display text
 		// is inside the sequence the adapter generates, so it is defanged
-		// there too rather than riding out on the exemption. The angle pair
-		// also names a host the link does not open, so that link is refused
-		// as well: the markdown stays, defanged, and no <...|...> is made.
-		"[<users/all>](https://x.example/p)":               "<https://x.example/p|< users/all>>",
-		"[<https://evil.example|hi>](https://x.example/p)": "[< https://evil.example|hi>](https://x.example/p)",
+		// there too rather than riding out on the exemption. An angle pair
+		// that names its host in the text gets the label-host refusal on
+		// both links: the markdown stays, defanged, and no <...|...> is
+		// made. One whose text is prose is a kept link of its own, and the
+		// markdown around it is left as written rather than nesting two.
+		"[<users/all>](https://x.example/p)":                              "<https://x.example/p|< users/all>>",
+		"[<https://evil.example|https://x.example>](https://x.example/p)": "[< https://evil.example|https://x.example>](https://x.example/p)",
+		"[<https://evil.example|hi>](https://x.example/p)":                "[<https://evil.example|hi>](https://x.example/p)",
 		// A `|` or an angle bracket in the URL would let a crafted link close
 		// the generated sequence early and choose its own display text. The
 		// URL class refuses them, so the markdown is left as written instead.
@@ -509,6 +538,85 @@ func TestToGchatText(t *testing.T) {
 		// (TestToGchatTextDefangsAfterAChunkedFence), the defang does not
 		// lean on that. The bold and link passes still read it as a fence.
 		"see ``` <https://evil.example|https://good.example>": "see ``` < https://evil.example|https://good.example>",
+	}
+	for in, want := range cases {
+		if got := toGchatText(in); got != want {
+			t.Errorf("toGchatText(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// issue3015Reply is the reply #3015 reported from a next-mode install:
+// the executor wrote the link in Chat's own form, the defang put a space in
+// it, and Chat linkified the URL and `|text` together into a 404.
+const issue3015Reply = "Opened <https://github.com/gke-agentic/kube-agents-autopush-next-infra/pull/3|gke-agentic/kube-agents-autopush-next-infra#3> for review."
+
+// TestToGchatTextKeepsAnExecutorsChatLink: models write Chat's <url|text>
+// as well as markdown links, and the defang used to put a space in every
+// one (#3015). A closed one in prose, with an http(s) URL in the markdown
+// destination class and text that names no other host, is the link the
+// adapter would have made from [text](url), so it is kept as written.
+// Everything else stays defanged: text naming another host (the label-host
+// refusal, whatever the text hides it in), a nested or unclosed opener, a
+// pipe the URL class refuses, a URL that is not http(s), a mention, and
+// anything in code or after a fence that never closes.
+func TestToGchatTextKeepsAnExecutorsChatLink(t *testing.T) {
+	cases := map[string]string{
+		issue3015Reply:                                         issue3015Reply,
+		"<https://x.example/p|the doc>":                        "<https://x.example/p|the doc>",
+		"<https://x.example/p|https://x.example/p>":            "<https://x.example/p|https://x.example/p>",
+		"<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>":        "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>",
+		"<https://x.example/a|a> and [b](https://x.example/b)": "<https://x.example/a|a> and <https://x.example/b|b>",
+		// Text naming another host is refused as the markdown link with
+		// that label is, however it is wrapped, and is defanged.
+		"<https://evil.example/login|https://github.com/x>":        "< https://evil.example/login|https://github.com/x>",
+		"<https://evil.example|**https://good.example**>":          "< https://evil.example|*https://good.example*>",
+		"<https://evil.example|https://good.example@evil.example>": "< https://evil.example|https://good.example@evil.example>",
+		// Markdown link syntax in the text: it is the kept link's text, and
+		// the markdown link it spells overlaps the kept link, so it is not
+		// converted and cannot be joined to a different link; where it
+		// names another host the whole is refused and defanged, and the
+		// markdown link inside converts on its own.
+		"<https://x.example/a|[doc](https://x.example/b)>":                        "<https://x.example/a|[doc](https://x.example/b)>",
+		"<https://x.example/a|x](https://x.example/b) [y>":                        "<https://x.example/a|x](https://x.example/b) [y>",
+		"<https://evil.example|x](https://good.example) [y>":                      "< https://evil.example|x](https://good.example) [y>",
+		"<https://good.example|[x](https://evil.example)>":                        "< https://good.example|<https://evil.example|x>>",
+		"[https://good.example <https://evil.example|doc>](https://evil.example)": "[https://good.example <https://evil.example|doc>](https://evil.example)",
+		// Nested and adjacent sequences: an opener whose text holds another
+		// is not closed, and stays defanged around the inner link.
+		"<https://a.example|<https://b.example|c>>":     "< https://a.example|<https://b.example|c>>",
+		"<https://a.example|a><https://b.example|b>":    "<https://a.example|a><https://b.example|b>",
+		"<https://evil.example|https://good.example|x>": "< https://evil.example|https://good.example|x>",
+		"<https://x.example/a|b|c>":                     "< https://x.example/a|b|c>",
+		// An unclosed opener before a link, Chat's or markdown: the
+		// opener is defanged so the link's `>` cannot close it.
+		"see <https://evil.example|docs: <https://x.example/p|doc>":  "see < https://evil.example|docs: <https://x.example/p|doc>",
+		"see <https://evil.example|docs: [doc](https://x.example/p)": "see < https://evil.example|docs: <https://x.example/p|doc>",
+		// Only an http(s) URL in the markdown destination class.
+		"<ftp://x.example|doc>":           "< ftp://x.example|doc>",
+		"<javascript:alert(1)|doc>":       "< javascript:alert(1)|doc>",
+		"<HTTPS://x.example|doc>":         "< HTTPS://x.example|doc>",
+		"<https://x.example/a)b|doc>":     "< https://x.example/a)b|doc>",
+		"<https://x.example|>":            "< https://x.example|>",
+		"<https://x.example|line\nbreak>": "< https://x.example|line\nbreak>",
+		// A mention in the text is not a kept link's text, and is defanged.
+		"<https://x.example|<users/all>>": "< https://x.example|< users/all>>",
+		// Code is as written; a code span cutting the text short leaves the
+		// opener defanged, and a fence that never closes hides nothing.
+		"`<https://x.example|doc>`":                      "`<https://x.example|doc>`",
+		"```\n<https://x.example|doc>\n```":              "```\n<https://x.example|doc>\n```",
+		"<https://x.example|see `code`>":                 "< https://x.example|see `code`>",
+		"see ``` <https://x.example|doc>":                "see ``` < https://x.example|doc>",
+		"```\nsort <f|uniq\n``` <https://x.example|doc>": "```\nsort <f|uniq\n``` <https://x.example|doc>",
+		// The markdown rules read a kept link as the link it is: a bold
+		// pair around it or in its text converts, a `**` in its URL is not
+		// half of a pair, and a markdown link that overlaps it is refused
+		// rather than nested with it or cut into it.
+		"**<https://x.example|doc>**":                        "*<https://x.example|doc>*",
+		"<https://x.example/p|**doc**>":                      "<https://x.example/p|*doc*>",
+		"**a <https://x.example/**/p|doc> b**":               "*a <https://x.example/**/p|doc> b*",
+		"[see <https://x.example|doc>](https://x.example/p)": "[see <https://x.example|doc>](https://x.example/p)",
+		"<https://x.example|a [b> c](https://x.example/p)":   "<https://x.example|a [b> c](https://x.example/p)",
 	}
 	for in, want := range cases {
 		if got := toGchatText(in); got != want {
@@ -1015,21 +1123,23 @@ func realGchatFixture(t *testing.T, name string) (raw []byte, b64 string) {
 // adapter read only the legacy layout and acked every one of these away
 // without a log line — the test exists so that cannot recur.
 func TestGchatRealAddonPayloads(t *testing.T) {
+	const dm = "gchat:dm/spaces/_c2fixtureAA"
 	cases := []struct {
 		file    string
 		text    string
 		msgName string
+		conv    string
 	}{
-		{"addon-dm-plain.json", "Hi, here's some traffic", "spaces/_c2fixtureAA/messages/BP9QzqU063c.BP9QzqU063c"},
+		{"addon-dm-plain.json", "Hi, here's some traffic", "spaces/_c2fixtureAA/messages/BP9QzqU063c.BP9QzqU063c", dm},
 		// In a DM a typed "@app" is plain text to Chat: argumentText equals
 		// text, nothing is stripped and no mention annotation is attached,
 		// so it is delivered verbatim rather than treated as a bare mention.
-		{"addon-dm-bare-mention-text.json", "@bkd-test", "spaces/_c2fixtureAA/messages/-IovU-AWTYU.-IovU-AWTYU"},
-		{"addon-dm-mention-with-text.json", "@bkd-test what is your name", "spaces/_c2fixtureAA/messages/jhqZwM-35cA.jhqZwM-35cA"},
-		{"addon-dm-hello.json", "hello", "spaces/_c2fixtureAA/messages/wh-7cP8oL1U.wh-7cP8oL1U"},
+		{"addon-dm-bare-mention-text.json", "@bkd-test", "spaces/_c2fixtureAA/messages/-IovU-AWTYU.-IovU-AWTYU", dm},
+		{"addon-dm-mention-with-text.json", "@bkd-test what is your name", "spaces/_c2fixtureAA/messages/jhqZwM-35cA.jhqZwM-35cA", dm},
+		{"addon-dm-hello.json", "hello", "spaces/_c2fixtureAA/messages/wh-7cP8oL1U.wh-7cP8oL1U", dm},
 		// A reply inside a DM thread: threadReply true, the parent's thread
-		// name. A DM binds the whole space, so it lands in the same session.
-		{"addon-dm-thread-reply.json", "@bkd-test thread reply", "spaces/_c2fixtureAA/messages/jhqZwM-35cA.iuosuA3Wo-0"},
+		// name. It is a side thread, its own conversation.
+		{"addon-dm-thread-reply.json", "@bkd-test thread reply", "spaces/_c2fixtureAA/messages/jhqZwM-35cA.iuosuA3Wo-0", dm + "/threads/jhqZwM-35cA"},
 	}
 	for _, c := range cases {
 		t.Run(c.file, func(t *testing.T) {
@@ -1046,7 +1156,7 @@ func TestGchatRealAddonPayloads(t *testing.T) {
 			if reason != "" {
 				t.Fatalf("dropped: %s", reason)
 			}
-			if msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" || msg.Kind != "dm" ||
+			if msg.Conversation != c.conv || msg.Kind != "dm" ||
 				msg.AuthorID != "sender@example.com" || msg.MessageID != c.msgName || msg.Text != c.text {
 				t.Errorf("normalized = %+v", msg)
 			}
@@ -1125,40 +1235,160 @@ func TestGchatRunDeliversBothWireShapes(t *testing.T) {
 	}
 }
 
-// A DM space is threaded, and a reply belongs in the thread the ask was made
-// in — measured live: an answer to a question asked inside a DM thread landed
-// top-level. The session stays the whole space (the key carries no thread);
-// only where the reply renders follows the latest inbound message.
-func TestGchatDMRepliesFollowTheLatestAskThread(t *testing.T) {
-	f := newFakeChatRelay(t)
-	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/R1"}
-	a := newTestGchatAdapterWithRelay(t, f)
-
-	// Nothing seen yet: a DM post is top-level.
-	if _, err := a.Post("gchat:dm/spaces/_c2fixtureAA", "hello"); err != nil {
-		t.Fatal(err)
+// gchatFixtureEvent decodes one captured payload from testdata/gchat,
+// optionally rewritten first (a second message in the same thread is the
+// captured reply under a new message name).
+func gchatFixtureEvent(t *testing.T, name string, rewrite func(string) string) *gchatEvent {
+	t.Helper()
+	raw, _ := realGchatFixture(t, name)
+	text := string(raw)
+	if rewrite != nil {
+		text = rewrite(text)
 	}
-	if body := f.call(0).arguments["body"].(map[string]any); body["thread"] != nil {
-		t.Errorf("first post threaded with nothing seen: %+v", body)
-	}
-
-	_, b64 := realGchatFixture(t, "addon-dm-thread-reply.json")
-	ev, err := decodeGchatEvent(b64)
+	ev, err := decodeGchatEvent(base64.StdEncoding.EncodeToString([]byte(text)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	msg, reason := a.classify(ev)
-	if reason != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" {
-		t.Fatalf("classify: %+v %q", msg, reason)
+	return ev
+}
+
+// A Chat DM matches today's Hermes adapter (main flow versus side thread):
+// top-level messages share the space's one conversation and are answered
+// top-level, even though Chat attaches the thread it auto-created for each;
+// a message typed inside an existing thread (threadReply) is its own
+// conversation, answered in that thread, and later replies there join it.
+// Every event is real captured traffic: the top-level ask whose auto thread
+// is jhqZwM-35cA, and the reply typed in that thread.
+func TestGchatDMSideThreadsMatchToday(t *testing.T) {
+	const (
+		space    = "spaces/_c2fixtureAA"
+		thread   = space + "/threads/jhqZwM-35cA"
+		mainFlow = "gchat:dm/" + space
+		sideKey  = "gchat:dm/" + thread
+	)
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/create"] = map[string]any{"name": space + "/messages/R1"}
+	a := newTestGchatAdapterWithRelay(t, f)
+	calls := 0
+	postTo := func(conv string) relayCall {
+		t.Helper()
+		if _, err := a.Post(conv, "answer"); err != nil {
+			t.Fatal(err)
+		}
+		calls++
+		return f.call(calls - 1)
 	}
-	if _, err := a.Post(msg.Conversation, "answer"); err != nil {
-		t.Fatal(err)
+	threadOf := func(c relayCall) any {
+		body := c.arguments["body"].(map[string]any)
+		if th, ok := body["thread"].(map[string]any); ok {
+			return th["name"]
+		}
+		return nil
 	}
-	c := f.call(1)
-	body := c.arguments["body"].(map[string]any)
-	thread, _ := body["thread"].(map[string]any)
-	if thread["name"] != "spaces/_c2fixtureAA/threads/jhqZwM-35cA" || c.arguments["messageReplyOption"] != gchatReplyOption {
-		t.Errorf("reply must follow the ask's thread: %+v", c.arguments)
+	classify := func(ev *gchatEvent) InboundMessage {
+		t.Helper()
+		msg, reason := a.classify(ev)
+		if reason != "" {
+			t.Fatalf("dropped: %s", reason)
+		}
+		return msg
+	}
+
+	top := classify(gchatFixtureEvent(t, "addon-dm-mention-with-text.json", nil))
+	if top.Conversation != mainFlow {
+		t.Fatalf("top-level DM = %q, want the space's conversation %q", top.Conversation, mainFlow)
+	}
+	if c := postTo(top.Conversation); threadOf(c) != nil || c.arguments["messageReplyOption"] != nil {
+		t.Errorf("a top-level DM must be answered top-level, not in its auto-created thread: %+v", c.arguments)
+	}
+
+	reply := classify(gchatFixtureEvent(t, "addon-dm-thread-reply.json", nil))
+	if reply.Conversation != sideKey || reply.Kind != "dm" {
+		t.Fatalf("in-thread DM reply = %+v, want its own conversation %q", reply, sideKey)
+	}
+	if c := postTo(reply.Conversation); threadOf(c) != thread || c.arguments["messageReplyOption"] != gchatReplyOption {
+		t.Errorf("a side thread must be answered in its thread: %+v", c.arguments)
+	}
+
+	second := classify(gchatFixtureEvent(t, "addon-dm-thread-reply.json", func(s string) string {
+		return strings.ReplaceAll(s, "jhqZwM-35cA.iuosuA3Wo-0", "jhqZwM-35cA.secondRepl0")
+	}))
+	if second.Conversation != sideKey {
+		t.Errorf("a second reply in the same thread = %q, want it to join %q", second.Conversation, sideKey)
+	}
+
+	// Back at the top level after a side thread: the main flow, answered
+	// top-level — nothing about the side thread sticks to the space.
+	again := classify(gchatFixtureEvent(t, "addon-dm-hello.json", nil))
+	if again.Conversation != mainFlow {
+		t.Errorf("top-level DM after a side thread = %q, want %q", again.Conversation, mainFlow)
+	}
+	if c := postTo(again.Conversation); threadOf(c) != nil {
+		t.Errorf("the main flow must stay top-level after a side thread: %+v", c.arguments)
+	}
+}
+
+// The same rule through the gateway: a side thread is a separate session,
+// not a steer of the main flow's running task, and a second reply in the
+// thread steers the side thread's own task.
+func TestGchatDMSideThreadIsItsOwnSession(t *testing.T) {
+	r := startGchatRig(t, nil, true)
+	a := newTestGchatAdapter(t)
+	classify := func(ev *gchatEvent) InboundMessage {
+		t.Helper()
+		msg, reason := a.classify(ev)
+		if reason != "" {
+			t.Fatalf("dropped: %s", reason)
+		}
+		return msg
+	}
+	ctx := context.Background()
+	activeTask := func(conv string) string {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		if rec == nil || rec.ActiveTask == nil {
+			return ""
+		}
+		return rec.ActiveTask.TaskID
+	}
+	// submissions is every message the gateway put on the platform's in
+	// subjects, oldest first: a new task or a steer, told apart by taskId.
+	submissions := func(n int) []*lib.Envelope {
+		t.Helper()
+		var envs []*lib.Envelope
+		waitFor(t, fmt.Sprintf("%d submissions", n), func() bool {
+			envs = envs[:0]
+			for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+				if e.Kind == lib.KindMessage {
+					envs = append(envs, e)
+				}
+			}
+			return len(envs) >= n
+		})
+		return envs
+	}
+
+	top := classify(gchatFixtureEvent(t, "addon-dm-mention-with-text.json", nil))
+	r.adapter.inbox <- top
+	mainTask := submissions(1)[0].TaskID
+	waitFor(t, "main-flow task on the record", func() bool { return activeTask(top.Conversation) == mainTask })
+
+	reply := classify(gchatFixtureEvent(t, "addon-dm-thread-reply.json", nil))
+	r.adapter.inbox <- reply
+	sideTask := submissions(2)[1].TaskID
+	if sideTask == mainTask {
+		t.Fatalf("the in-thread reply steered the main flow's task %q; a side thread is its own session", mainTask)
+	}
+	waitFor(t, "side-thread task on its own record", func() bool { return activeTask(reply.Conversation) == sideTask })
+
+	second := classify(gchatFixtureEvent(t, "addon-dm-thread-reply.json", func(s string) string {
+		return strings.ReplaceAll(s, "jhqZwM-35cA.iuosuA3Wo-0", "jhqZwM-35cA.secondRepl0")
+	}))
+	r.adapter.inbox <- second
+	if got := submissions(3)[2].TaskID; got != sideTask {
+		t.Errorf("a second reply in the thread went to task %q, want a steer on the side thread's %q", got, sideTask)
+	}
+	if got := activeTask(top.Conversation); got != mainTask {
+		t.Errorf("main flow's active task = %q, want %q untouched", got, mainTask)
 	}
 }
 
@@ -1335,6 +1565,15 @@ func TestGchatDefaultDisplayModeRetriesAFailedStateEdit(t *testing.T) {
 	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
 		t.Fatal(err)
 	}
+	// The artifact goes out only once the state edit has been tried and
+	// failed. Published together, the two could reach the relay as one batch,
+	// whose one coalesced edit is the failed one, leaving nothing to retry on:
+	// the test then timed out on about three runs in ten.
+	waitFor(t, "the state edit to fail", func() bool {
+		r.adapter.mu.Lock()
+		defer r.adapter.mu.Unlock()
+		return r.adapter.failEdits == 0
+	})
 	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactProgress, Parts: []lib.Part{{Kind: "text", Text: "step"}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -1377,4 +1616,401 @@ func TestNewDerivesTheBackendFromTheConfig(t *testing.T) {
 	if g.backend != gchatBackend {
 		t.Fatalf("backend = %q; a gchat-armed config must select the gchat identity path", g.backend)
 	}
+}
+
+// gchatLegibilityRelay is an httptest relay for the #2404 log lines: the
+// event route answers with events, then empty pulls naming subscription; the
+// API route answers apiStatus with apiBody; a pull answers pullStatus with
+// pullBody while pullStatus is non-zero.
+type gchatLegibilityRelay struct {
+	mu           sync.Mutex
+	events       []map[string]any
+	subscription string
+	pullStatus   int
+	pullBody     string
+	apiStatus    int
+	apiBody      string
+}
+
+func (f *gchatLegibilityRelay) start(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/chat/a2a/events":
+			if f.pullStatus != 0 {
+				w.WriteHeader(f.pullStatus)
+				_, _ = w.Write([]byte(f.pullBody))
+				return
+			}
+			var ev map[string]any
+			if len(f.events) > 0 {
+				ev, f.events = f.events[0], f.events[1:]
+			}
+			body := map[string]any{"event": ev}
+			if f.subscription != "" {
+				body["subscription"] = f.subscription
+			}
+			_ = json.NewEncoder(w).Encode(body)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/a2a/events/ack":
+			_ = json.NewEncoder(w).Encode(map[string]any{"settled": true})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/api":
+			w.WriteHeader(f.apiStatus)
+			_, _ = w.Write([]byte(f.apiBody))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func newLegibilityAdapter(t *testing.T, relayURL string) (*GoogleChatAdapter, *lockedBuffer) {
+	t.Helper()
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte("tok-1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := &lockedBuffer{}
+	a, err := NewGoogleChatAdapter(relayURL, tokenPath, slog.New(slog.NewTextHandler(logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a, logs
+}
+
+// runUntilLogged runs the adapter until every want substring is in its log
+// output, failing after five seconds, and returns the log.
+func runUntilLogged(t *testing.T, a *GoogleChatAdapter, logs *lockedBuffer, want ...string) string {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx, func(InboundMessage) {}) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	deadline := time.After(5 * time.Second)
+	for {
+		out := logs.String()
+		missing := ""
+		for _, w := range want {
+			if !strings.Contains(out, w) {
+				missing = w
+				break
+			}
+		}
+		if missing == "" {
+			t.Logf("adapter log:\n%s", out)
+			return out
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("log never carried %q; log:\n%s", missing, out)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// TestGchatRunNamesTheRelayAndTheSubscription pins #2404's startup line: an
+// install that Chat publishes nothing to pulls empty forever, so the log has
+// to say what is being pulled before it can say that nothing arrived.
+func TestGchatRunNamesTheRelayAndTheSubscription(t *testing.T) {
+	f := &gchatLegibilityRelay{subscription: "projects/kagents-dev/subscriptions/a2a-chat-sub"}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+
+	out := runUntilLogged(t, a, logs,
+		`msg="gchat event pull starting" relay=`+srv.URL+`/v1/chat/a2a/events`,
+		`msg="gchat relay pulls subscription" subscription=projects/kagents-dev/subscriptions/a2a-chat-sub`)
+	if n := strings.Count(out, "gchat relay pulls subscription"); n != 1 {
+		t.Errorf("subscription logged %d times over repeated empty pulls; want once:\n%s", n, out)
+	}
+}
+
+// TestGchatRunRelogsAChangedSubscription: a proxy restarted onto another
+// subscription while the gateway keeps running is named again, once.
+func TestGchatRunRelogsAChangedSubscription(t *testing.T) {
+	f := &gchatLegibilityRelay{subscription: "projects/p/subscriptions/first"}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx, func(InboundMessage) {}) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	waitFor := func(want string) string {
+		t.Helper()
+		deadline := time.After(5 * time.Second)
+		for {
+			out := logs.String()
+			if strings.Contains(out, want) {
+				return out
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("log never carried %q; log:\n%s", want, out)
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}
+	waitFor("subscription=projects/p/subscriptions/first")
+	f.mu.Lock()
+	f.subscription = "projects/p/subscriptions/second"
+	f.mu.Unlock()
+	waitFor("subscription=projects/p/subscriptions/second")
+	// Two more pulls on the new name, so a repeat would have had its chance.
+	time.Sleep(1200 * time.Millisecond)
+	out := logs.String()
+	if n := strings.Count(out, "gchat relay pulls subscription"); n != 2 {
+		t.Errorf("subscription logged %d times; want once per name:\n%s", n, out)
+	}
+}
+
+// TestGchatRunLogsTheEventCountEachInterval pins #2404's periodic line: the
+// count of events in the interval, zero included, which is how "nothing in
+// the last hour" becomes visible.
+func TestGchatRunLogsTheEventCountEachInterval(t *testing.T) {
+	turn := gchatMsg("spaces/D1", "DIRECT_MESSAGE", "", "", "spaces/D1/messages/M1", "hi", "", "u1@example.com", "HUMAN")
+	f := &gchatLegibilityRelay{
+		subscription: "projects/p/subscriptions/s",
+		events: []map[string]any{
+			{"receipt": "r1", "data": b64GchatEvent(t, turn), "messageId": "1"},
+			{"receipt": "r2", "data": "not!!!base64", "messageId": "2"},
+		},
+	}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+	a.countInterval = 700 * time.Millisecond
+
+	out := runUntilLogged(t, a, logs,
+		`msg="gchat events received" events=2 `,
+		`msg="gchat events received" events=0 `)
+	if !strings.Contains(out, "subscription=projects/p/subscriptions/s") {
+		t.Errorf("summary does not name the subscription:\n%s", out)
+	}
+	if !strings.Contains(out, "summaryEvery=700ms") {
+		t.Errorf("startup line does not state the summary interval:\n%s", out)
+	}
+}
+
+// TestGchatEventCountIntervalIsTheNamedConstant keeps the production pacing
+// on the constant whose comment justifies it.
+func TestGchatEventCountIntervalIsTheNamedConstant(t *testing.T) {
+	a, _ := newLegibilityAdapter(t, "http://relay.invalid")
+	if a.countInterval != gchatEventCountInterval {
+		t.Errorf("countInterval = %v, want gchatEventCountInterval (%v)", a.countInterval, gchatEventCountInterval)
+	}
+}
+
+// TestGchatRelayErrorCarriesTheChatStatus pins #2404's relay error: the
+// proxy answers a refused Chat call 502 with the Chat status in the body,
+// and the error has to keep it, or a missing grant reads like an outage.
+func TestGchatRelayErrorCarriesTheChatStatus(t *testing.T) {
+	f := &gchatLegibilityRelay{
+		apiStatus: http.StatusBadGateway,
+		apiBody:   `{"error":"Google Chat operation failed","chat":{"status":403,"reason":"Forbidden"}}`,
+	}
+	srv := f.start(t)
+	a, _ := newLegibilityAdapter(t, srv.URL)
+
+	_, err := a.Post("gchat:space/spaces/S1", "hello")
+	if err == nil || err.Error() != "gchat: relay /v1/chat/api answered 502: chat 403 Forbidden" {
+		t.Fatalf("Post error = %v, want the Chat status carried", err)
+	}
+}
+
+// TestGchatRelayErrorBoundsAndSanitizesTheBody: what the error takes from
+// the body cannot break a log line or grow it without bound, and a body of
+// any other shape adds nothing.
+func TestGchatRelayErrorBoundsAndSanitizesTheBody(t *testing.T) {
+	long := strings.Repeat("x", 2000)
+	cases := []struct {
+		name, body, want string
+	}{
+		{"newline in reason", `{"chat":{"status":403,"reason":"Forbidden\nlevel=ERROR msg=forged"}}`,
+			"gchat: relay /v1/chat/api answered 502: chat 403 Forbiddenlevel=ERROR msg=forged"},
+		{"separator in reason", `{"chat":{"status":403,"reason":"a\u2028b\u0085c"}}`,
+			"gchat: relay /v1/chat/api answered 502: chat 403 abc"},
+		{"not json", `<html>bad gateway</html>`, "gchat: relay /v1/chat/api answered 502"},
+		{"no chat object", `{"error":"Google Chat operation failed"}`, "gchat: relay /v1/chat/api answered 502"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := gchatRelayError("gchat: relay /v1/chat/api answered 502", []byte(tc.body))
+			if err.Error() != tc.want {
+				t.Errorf("got %q, want %q", err.Error(), tc.want)
+			}
+		})
+	}
+	err := gchatRelayError("s", []byte(`{"chat":{"status":403,"reason":"`+long+`"}}`))
+	if n := len(err.Error()); n > len("s: chat 403 ")+gchatRelayDetailMaxBytes+len("…") {
+		t.Errorf("error is %d bytes; the reason must be cut at gchatRelayDetailMaxBytes", n)
+	}
+}
+
+// TestGchatPullFailureNamesTheSubscriptionAndTheRefusal: a refused pull's
+// warning carries what the proxy said about it, not only "answered 503".
+func TestGchatPullFailureNamesTheSubscriptionAndTheRefusal(t *testing.T) {
+	f := &gchatLegibilityRelay{
+		pullStatus: http.StatusServiceUnavailable,
+		pullBody: `{"error":"a2a chat event pull failed","subscription":"projects/p/subscriptions/s",` +
+			`"pubsub":{"type":"PermissionDenied","code":403}}`,
+	}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+
+	runUntilLogged(t, a, logs,
+		`gchat: event pull answered 503: pubsub PermissionDenied 403, subscription projects/p/subscriptions/s`)
+}
+
+// TestGchatRefusedPullRecordsTheSubscription: in #2404's motivating case
+// every pull is refused (the proxy's credentials lack
+// pubsub.subscriptions.consume), and the proxy names the subscription on the
+// 503 as well. The gateway has to record it from that answer, or the summary
+// says "not reported" about a subscription every warning just named.
+func TestGchatRefusedPullRecordsTheSubscription(t *testing.T) {
+	f := &gchatLegibilityRelay{
+		pullStatus: http.StatusServiceUnavailable,
+		pullBody: `{"error":"a2a chat event pull failed","subscription":"projects/p/subscriptions/s",` +
+			`"pubsub":{"type":"PermissionDenied","code":403}}`,
+	}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+	a.countInterval = 700 * time.Millisecond
+
+	out := runUntilLogged(t, a, logs,
+		`msg="gchat relay pulls subscription" subscription=projects/p/subscriptions/s`,
+		`msg="gchat events received"`)
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, `msg="gchat events received"`) &&
+			!strings.Contains(line, "subscription=projects/p/subscriptions/s") {
+			t.Errorf("summary after refused pulls does not name the subscription: %s", line)
+		}
+	}
+	// Every pull was refused, so every interval counts failed pulls and no
+	// empty ones: that split is what tells a refused proxy from a Chat that
+	// publishes nothing.
+	sums := gchatSummaries(t, out)
+	if len(sums) == 0 {
+		t.Fatalf("no parseable summary line:\n%s", out)
+	}
+	for _, c := range sums {
+		if c.failed == 0 || c.empty != 0 || c.events != 0 {
+			t.Errorf("summary over refused pulls = %+v; want failedPulls>0, emptyPulls=0, events=0", c)
+		}
+	}
+}
+
+// gchatSummaryCounts is one parsed "gchat events received" line.
+type gchatSummaryCounts struct{ events, empty, failed int }
+
+var gchatSummaryRE = regexp.MustCompile(
+	`msg="gchat events received" events=(\d+) emptyPulls=(\d+) failedPulls=(\d+) `)
+
+// gchatSummaries parses every summary line in out, in order. A line that
+// names the summary but does not match the pattern fails the test, so a
+// reworded line cannot leave the counter assertions checking nothing.
+func gchatSummaries(t *testing.T, out string) []gchatSummaryCounts {
+	t.Helper()
+	var sums []gchatSummaryCounts
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, `msg="gchat events received"`) {
+			continue
+		}
+		m := gchatSummaryRE.FindStringSubmatch(line)
+		if m == nil {
+			t.Fatalf("summary line does not carry events=, emptyPulls=, failedPulls=: %s", line)
+		}
+		var c gchatSummaryCounts
+		c.events, _ = strconv.Atoi(m[1])
+		c.empty, _ = strconv.Atoi(m[2])
+		c.failed, _ = strconv.Atoi(m[3])
+		sums = append(sums, c)
+	}
+	return sums
+}
+
+// TestGchatEmptyPullsCountAsEmptyNotFailed: an install that Chat publishes
+// nothing to pulls empty forever, and the summary has to say so as
+// emptyPulls, not failedPulls. Run checks the interval before each pull, so
+// every summary window holds at least one pull: the assertion is >0 versus
+// =0, not an exact count, and does not depend on pacing.
+func TestGchatEmptyPullsCountAsEmptyNotFailed(t *testing.T) {
+	f := &gchatLegibilityRelay{subscription: "projects/p/subscriptions/s"}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+	a.countInterval = 700 * time.Millisecond
+
+	out := runUntilLogged(t, a, logs, `msg="gchat events received"`)
+	sums := gchatSummaries(t, out)
+	if len(sums) == 0 {
+		t.Fatalf("no parseable summary line:\n%s", out)
+	}
+	for _, c := range sums {
+		if c.empty == 0 || c.failed != 0 || c.events != 0 {
+			t.Errorf("summary over empty pulls = %+v; want emptyPulls>0, failedPulls=0, events=0", c)
+		}
+	}
+}
+
+// TestGchatPullCountsResetEachInterval: each summary counts its own
+// interval. The relay goes empty, then refused, then empty again; after each
+// flip a summary has to show the old kind at zero, which a count carried
+// over from the previous interval never does.
+func TestGchatPullCountsResetEachInterval(t *testing.T) {
+	f := &gchatLegibilityRelay{subscription: "projects/p/subscriptions/s"}
+	srv := f.start(t)
+	a, logs := newLegibilityAdapter(t, srv.URL)
+	a.countInterval = 700 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx, func(InboundMessage) {}) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	refuse := func(on bool) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if on {
+			f.pullStatus = http.StatusServiceUnavailable
+			f.pullBody = `{"error":"a2a chat event pull failed","pubsub":{"type":"PermissionDenied","code":403}}`
+		} else {
+			f.pullStatus, f.pullBody = 0, ""
+		}
+	}
+	// waitSummary waits for a summary after the first skip ones that
+	// matches ok, and returns how many summaries the log then holds.
+	waitSummary := func(skip int, what string, ok func(gchatSummaryCounts) bool) int {
+		t.Helper()
+		deadline := time.After(10 * time.Second)
+		for {
+			sums := gchatSummaries(t, logs.String())
+			for _, c := range sums[min(skip, len(sums)):] {
+				if ok(c) {
+					return len(sums)
+				}
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("no summary with %s after the first %d; log:\n%s", what, skip, logs.String())
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}
+
+	n := waitSummary(0, "emptyPulls>0 failedPulls=0",
+		func(c gchatSummaryCounts) bool { return c.empty > 0 && c.failed == 0 })
+	refuse(true)
+	n = waitSummary(n, "failedPulls>0 emptyPulls=0",
+		func(c gchatSummaryCounts) bool { return c.failed > 0 && c.empty == 0 })
+	refuse(false)
+	waitSummary(n, "emptyPulls>0 failedPulls=0",
+		func(c gchatSummaryCounts) bool { return c.empty > 0 && c.failed == 0 })
 }

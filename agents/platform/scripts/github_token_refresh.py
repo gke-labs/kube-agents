@@ -64,11 +64,6 @@ GH_TIMEOUT_RC = 124
 #: resolves there and is the one refresh_git_credentials forwards to.
 SANDBOX_REFRESH_SCRIPT = "/opt/data/scripts/github_token_refresh.py"
 
-#: Bounds the ssh hop around that forward. The broker's own retry budget bounds
-#: the work inside it; this is the 60s the in-pod HTTP branch allows plus room
-#: for the connection.
-SANDBOX_REFRESH_TIMEOUT_SECONDS = 90
-
 #: The two Minty scopes the rule ConfigMap declares (charts/kube-agents/templates/
 #: github-minter.yaml). The write scope is what every managed repository rides;
 #: the read scope grants `contents: read` alone and is minted per clone of a
@@ -81,6 +76,13 @@ MINTY_READ_SCOPE = "platform-agent-read-scope"
 #: for the constant without also importing the CLI side, so the two copies are
 #: kept in step by `test_credential_proxy.py`.
 READ_ONLY_FLAG = "--read-only"
+
+#: The flags that select the write mint for a GitHub Enterprise Server host:
+#: the token and the repositories it covers are printed as JSON, and nothing is
+#: installed. `credential_proxy.FORGE_WRITE_MINT_FLAG` and `FORGE_HOST_FLAG` are
+#: the same strings, kept in step by `test_credential_proxy.py`.
+PRINT_WRITE_FLAG = "--print-write-token"
+HOST_FLAG = "--host"
 
 #: How long one Minty request may take, how long the CLI may take to install
 #: what Minty returned, and how long gcloud may take to print an identity token.
@@ -146,6 +148,77 @@ identity_note = {"minted": "", "fell_through": ""}
 MINTY_MAX_ATTEMPTS = 3
 MINTY_INITIAL_DELAY_SECONDS = 0.5
 MINTY_BACKOFF_FACTOR = 2.0
+
+#: The worst case of the helper the broker runs for a refresh, once it starts,
+#: built from the bounds above so it moves when they do. The identity token is
+#: the slower of its two branches: federation's STS exchange and IAM call, or the
+#: metadata server's attempts followed by both gcloud forms gcloud_identity_token
+#: tries. Then the Minty attempts with their backoff, then the CLI steps
+#: (`gh auth login`, `git config --get-all`, `gh auth setup-git`), each under
+#: CLI_SETUP_TIMEOUT_SECONDS.
+WIF_IDENTITY_CALLS = 2
+GCLOUD_IDENTITY_FORMS = 2
+CLI_SETUP_STEPS = 3
+IDENTITY_TOKEN_BUDGET_SECONDS = max(
+    WIF_IDENTITY_CALLS * wif_credentials.TOKEN_REQUEST_TIMEOUT_SECONDS,
+    METADATA_MAX_ATTEMPTS * METADATA_TIMEOUT_SECONDS
+    + (METADATA_MAX_ATTEMPTS - 1) * METADATA_RETRY_DELAY_SECONDS
+    + GCLOUD_IDENTITY_FORMS * GCLOUD_TIMEOUT_SECONDS,
+)
+MINTY_RETRY_BUDGET_SECONDS = MINTY_MAX_ATTEMPTS * MINTY_REQUEST_TIMEOUT_SECONDS + sum(
+    MINTY_INITIAL_DELAY_SECONDS * MINTY_BACKOFF_FACTOR**retry
+    for retry in range(MINTY_MAX_ATTEMPTS - 1)
+)
+REFRESH_HELPER_BUDGET_SECONDS = (
+    IDENTITY_TOKEN_BUDGET_SECONDS
+    + MINTY_RETRY_BUDGET_SECONDS
+    + CLI_SETUP_STEPS * CLI_SETUP_TIMEOUT_SECONDS
+)
+
+#: How long the broker may hold a refresh at each of its two waits before the
+#: helper starts -- for the refresh lock, then for the child memory budget --
+#: each bounded by `COMMAND_SLOT_WAIT_SECONDS` in credential_proxy.py, which this
+#: mirrors. Declared here rather than imported because this script also runs in
+#: the sandbox image, which does not carry the broker.
+BROKER_ADMISSION_WAIT_SECONDS = 60
+
+#: The broker's wait after a refresh steps aside for a vcs verb's refresh: a
+#: route refresh holding the lock while it waits for the budget yields the lock,
+#: once, to a vcs request that needs a refresh, then waits for that request,
+#: re-takes the lock and, if its re-check is still stale, waits for the budget
+#: a second time without yielding -- all under one bound of
+#: `COMMAND_SLOT_WAIT_SECONDS` from the yield, which this mirrors.
+BROKER_YIELDED_WAIT_SECONDS = 60
+
+#: Room for the connection and the response on top of the waits.
+SIDECAR_REFRESH_MARGIN_SECONDS = 10
+
+#: The client's socket timeout on the refresh POST: every wait the broker may
+#: put a refresh through, then the helper, then the margin. Before its own
+#: helper starts, a refresh waits for the refresh lock behind another refresh,
+#: under a bound of COMMAND_SLOT_WAIT_SECONDS from arrival; then, holding the
+#: lock, for the child memory budget, under a bound of its own; and, if it steps
+#: aside for a vcs verb's refresh during that wait, which it does at most once,
+#: under a third bound counted from the yield, which covers the wait for the
+#: verb, re-taking the lock and any second budget wait. A refresh admitted late
+#: still runs the whole helper and answers 200 once the token has landed, so a
+#: client that gives up sooner reports a refresh that succeeded as failed. A
+#: refresher behind a helper that runs past the lock bound is told busy even
+#: though that helper lands the token seconds later; this client reports that
+#: as a failed refresh, and the next call coalesces on the fresh token.
+SIDECAR_REFRESH_TIMEOUT_SECONDS = (
+    BROKER_ADMISSION_WAIT_SECONDS
+    + BROKER_ADMISSION_WAIT_SECONDS
+    + BROKER_YIELDED_WAIT_SECONDS
+    + REFRESH_HELPER_BUDGET_SECONDS
+    + SIDECAR_REFRESH_MARGIN_SECONDS
+)
+
+#: Bounds the ssh hop around the gateway's forward to the sandbox, which runs
+#: this script there and so waits out the whole sidecar refresh; the margin is
+#: for the ssh connection.
+SANDBOX_HOP_MARGIN_SECONDS = 30
+SANDBOX_REFRESH_TIMEOUT_SECONDS = SIDECAR_REFRESH_TIMEOUT_SECONDS + SANDBOX_HOP_MARGIN_SECONDS
 
 # What `gh` prints when the credential is the problem, as opposed to the
 # repository, the network, or the rate limit. Matched case-insensitively
@@ -620,6 +693,47 @@ def mint_read_only_token(target_repo: str | None) -> str:
     return token
 
 
+def mint_write_token(target_repo: str | None, host: str) -> dict:
+    """A write installation token for one repository on a GitHub Enterprise Server host.
+
+    `{"token": ..., "repositories": [...]}`: the token, and every repository
+    its scope covers as `owner/name`. What the broker presents for a managed
+    repository on a GitHub forge with no CLI behind it (`MintedWriteCredential`).
+    It differs from `refresh_git_credentials` in one way, on purpose: it touches
+    nothing. There is no CLI login, no credential helper and no file; the
+    token goes back to the broker, which keeps it in memory.
+
+    The scope is widened to every managed repository of the same organisation
+    on the same host, as the write refresh widens it, so one token serves the
+    managed repositories a verb run may touch. Repositories on another host are
+    never in it.
+    """
+    repository = target_repo.strip().strip("/") if target_repo else ""
+    if not repo_ref.is_github_slug(repository):
+        raise RuntimeError(
+            f"Could not identify target repository '{repository}'. Must be in 'owner/repo' format."
+        )
+    host = (host or "").strip().lower()
+    if not host or host in repo_ref.GITHUB_HOSTS:
+        raise RuntimeError(f"{PRINT_WRITE_FLAG} mints for a GitHub Enterprise Server host, not {host or 'no host'}")
+    org_name, repo_name = repository.split("/", 1)
+    repositories = [repo_name]
+    try:
+        from gitops_workspace import get_managed_repo_keys
+
+        prefix = f"github:{host}/{org_name.lower()}/"
+        for key in get_managed_repo_keys():
+            if key.startswith(prefix):
+                name = key[len(prefix):]
+                if "/" not in name and name not in {r.lower() for r in repositories}:
+                    repositories.append(name)
+    except Exception as e:
+        log(f"WARNING: Could not expand managed repositories for token scoping: {e}")
+    token = request_minty_token(broker_oidc_token(), org_name, repositories, MINTY_WRITE_SCOPE)
+    log(f"Minted a write installation token for repository {repository} on {host}")
+    return {"token": token, "repositories": [f"{org_name}/{r}".lower() for r in repositories]}
+
+
 class RefreshToken(str):
     """An installation token that carries the repositories it was scoped for."""
 
@@ -633,6 +747,23 @@ class RefreshToken(str):
         obj = super().__new__(cls, token)
         obj.scoped_repositories = tuple(scoped_repositories)
         return obj
+
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    """`: <error>` from the broker's JSON refusal body, or nothing.
+
+    The broker's busy 503 says what held the request (the slot cap, the child
+    memory budget, another refresh); without it the cron log reads only the
+    code. A body that is empty, not JSON, names no error, or is cut short by
+    the connection dropping mid-read adds nothing.
+    """
+    try:
+        raw = exc.read()
+        body = json.loads(raw) if raw else None
+    except (OSError, ValueError, http.client.HTTPException):
+        return ""
+    error = body.get("error") if isinstance(body, dict) else None
+    return f": {error}" if isinstance(error, str) and error else ""
 
 
 def refresh_git_credentials(
@@ -658,20 +789,41 @@ def refresh_git_credentials(
     proxy_url = os.getenv("CREDENTIAL_PROXY_URL", "").strip()
     if proxy_url:
         # In the agent sandbox: delegate to the credential sidecar.
-        # The sidecar manages bounded retries against Minty internally.
-        # The client uses a 60s timeout to allow the sidecar's retry budget
-        # to finish, and fails fast on any error without re-triggering retries.
-        url = proxy_url.rstrip("/") + "/v1/github/refresh"
+        # The sidecar manages bounded retries against Minty internally. The
+        # client waits SIDECAR_REFRESH_TIMEOUT_SECONDS, which covers the
+        # broker's wait for the refresh lock, its admission wait, its wait
+        # for a vcs verb's refresh it stepped aside for, and the helper's
+        # budget after them, and fails fast on any error without
+        # re-triggering retries.
+        # The forge-neutral route, naming the provider and the repository by
+        # its URL rather than as a bare slug: a broker serving more than one
+        # forge refuses a name without a host. `/v1/github/refresh` is kept on
+        # the broker as an alias for agent images older than this.
+        url = proxy_url.rstrip("/") + "/v1/forge/refresh"
+        # On the install's GitHub host: github.com, or the GitHub Enterprise
+        # Server host the repository lists name, which the broker serves
+        # instead of github.com.
+        try:
+            from gitops_workspace import github_host
+
+            host = github_host()
+        except Exception:  # noqa: BLE001 - github.com, as before
+            host = repo_ref.GITHUB_CANONICAL_HOST
         request = urllib.request.Request(
             url,
-            data=json.dumps({"repository": repository}).encode("utf-8"),
+            data=json.dumps(
+                {
+                    "provider": "github",
+                    "repository": f"https://{host}/{repository}",
+                }
+            ).encode("utf-8"),
             # Empty in the sidecar deployment; carries the caller's projected
             # ServiceAccount token when the broker runs in its own Pod.
             headers={"Content-Type": "application/json", **authorization_headers()},
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=SIDECAR_REFRESH_TIMEOUT_SECONDS) as response:
                 if response.status == 200:
                     log(
                         f"GitHub credentials refreshed in credential sidecar for {repository}."
@@ -683,6 +835,7 @@ def refresh_git_credentials(
         except urllib.error.HTTPError as exc:
             raise RuntimeError(
                 f"Credential sidecar failed to refresh GitHub auth: HTTP {exc.code}"
+                f"{_http_error_detail(exc)}"
             ) from exc
         except Exception as exc:
             raise RuntimeError(
@@ -836,8 +989,18 @@ def main():
         help="print a contents:read installation token for the repository on "
         "stdout, installing nothing; the broker's clone of a context repository",
     )
+    parser.add_argument(
+        PRINT_WRITE_FLAG,
+        action="store_true",
+        help="print a write installation token for the repository on a GitHub "
+        "Enterprise Server host, as JSON, installing nothing; the broker keeps it in memory",
+    )
+    parser.add_argument(HOST_FLAG, default="", help="the GitHub Enterprise Server host to mint for")
     args = parser.parse_args()
     try:
+        if args.print_write_token:
+            print(json.dumps(mint_write_token(args.repository, args.host)), end="")
+            return
         if args.read_only:
             print(mint_read_only_token(args.repository), end="")
             return

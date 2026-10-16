@@ -52,7 +52,11 @@
 locals {
   # The read roles a scoped project may carry. tests/test_scope_iam.py holds
   # every entry to the module's default project_roles, so the allowlist cannot
-  # name a role the agent does not hold at home.
+  # name a role the agent does not hold at home, and holds the host-only
+  # roles out: roles/cloudtrace.user is one of those, since Google's Trace
+  # User role carries create, delete and update on Trace-console objects
+  # beside the two trace reads, and the observability helpers that need the
+  # reads look at the host project's own traces (design §6).
   scope_role_allowlist = [
     "roles/container.clusterViewer",
     "roles/container.viewer",
@@ -215,9 +219,11 @@ locals {
   # those projects, and the error names the remedy (drop the entry from
   # scope.projects, which the exclusion makes redundant). A glob is the
   # reconcile's alone, so a set only a glob brings under the cap at runtime is
-  # refused here and wants its entries named exactly. Containers are not counted: their members
-  # are unknown here, they come last in the order, and their binding is one on
-  # the container rather than one per member.
+  # refused here and wants its entries named exactly. Containers are not counted: they come
+  # last in the order and their binding is one on the container rather than
+  # one per member, so a member the resolver listed for the scoped service
+  # account pool (scope_container_members, scoped_pool.tf) joins the pool
+  # and nothing here.
   scope_resolved_set_cap = var.scope.max_projects
   # The cap's default (the reconcile's RESOLVED_SET_CAP, the variable's default): the one
   # declaration the whole-set precondition admitted before the cap was declarable, the

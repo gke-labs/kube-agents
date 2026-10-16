@@ -25,6 +25,7 @@ printed one.
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import os
 import shutil
@@ -123,9 +124,103 @@ class VcsError(RuntimeError):
 #: shape a missing route has and the shape nothing else on these routes wears.
 BROKER_ROUTE_UNSUPPORTED = "BROKER_ROUTE_UNSUPPORTED"
 
+#: Where the broker listens. Unset outside the shell sandbox, which is how a
+#: caller that only wants a hint from the broker tells "no broker here" from a
+#: broker that refused.
+BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
+
+#: The verb that opens a change proposal, and the record `call()` writes to stderr
+#: when the broker answers it with one: a single compact JSON object on its own
+#: line, `{"kube-agents.event": "proposal-opened", "proposal": {url, number,
+#: title}}`. Every caller that opens a pull request or merge request -- `vcs.py`,
+#: submit-suggestion, the fleet audit -- reaches the broker through `call()`, so
+#: this is the one place that knows a proposal was opened, with the forge's own
+#: url. The agent pod's `pr_opened` plugin (agents/platform/plugins/pr_opened)
+#: checks the proposal with the forge, records it on the worker's card and takes
+#: the line out of the terminal output, which is how the thread's PR message is
+#: posted without reading the worker's words. The line proves nothing alone --
+#: any text in the output can take its shape -- which is why the plugin checks. A JSON value rather than a prefixed line, so a pipeline that
+#: merges stderr into `jq` reads one more document instead of failing. The
+#: plugin holds the same three names; its test reads these to keep them equal.
+PROPOSAL_CREATE_VERB = "proposal-create"
+PROPOSAL_OPENED_KEY = "kube-agents.event"
+PROPOSAL_OPENED_EVENT = "proposal-opened"
+PROPOSAL_OPENED_FIELDS = ("url", "number", "title")
+
+
+@functools.lru_cache(maxsize=1)
+def _registered_urls() -> dict[str, str]:
+    """Map each bare `owner/name` to the URL of its GitHub registration.
+
+    The function reads the managed list and the context list from the
+    mounted state file, one time for each process. It applies
+    `gitops_workspace.sendable_github_slugs`. `get_managed_repos` applies the
+    same rule. Thus the client can send each name that the list keeps bare.
+    If the file is missing or unreadable, the map is empty. Then the client
+    sends every name as written, and the refusal of the broker is the
+    answer. The URL is the text of the registration. This client does not
+    make a forge URL, because the allowlist of the broker controls that.
+    """
+    import gitops_workspace
+
+    # The mounted file only: this runs on every verb, and the kubectl fallback
+    # the full readers have would put a subprocess on each one.
+    return gitops_workspace.sendable_github_slugs(
+        gitops_workspace.mounted_repo_entries(gitops_workspace.MANAGED_REPOS_KEY)
+        + gitops_workspace.mounted_repo_entries(gitops_workspace.CONTEXT_REPOS_KEY)
+    )
+
+
+def _on_the_wire(repository: object) -> object:
+    """A bare name registered as GitHub, sent as the URL it was registered by.
+
+    The broker refuses a hostless name whenever it is configured with more
+    than one forge, and the sandbox cannot see that configuration: a second
+    forge can be declared before any repository on it is registered. A name
+    the install registered as GitHub is GitHub's either way, so it travels as
+    its registration spells it; with one forge the broker resolves both alike.
+    """
+    if not isinstance(repository, str) or "://" in repository or repository.count("/") != 1:
+        return repository
+    return _registered_urls().get(repository.lower(), repository)
+
 
 def call(verb: str, payload: dict) -> dict:
-    endpoint = os.environ.get("CREDENTIAL_PROXY_URL", "").strip()
+    """`POST /v1/vcs/<verb>`, and the stderr record of a proposal it opened (`PROPOSAL_OPENED_KEY`)."""
+    answer = _call(verb, payload)
+    if verb.replace("_", "-") == PROPOSAL_CREATE_VERB:
+        _say_opened(answer)
+    return answer
+
+
+def _say_opened(answer: object) -> None:
+    """Write the `PROPOSAL_OPENED_KEY` record for the proposal in `answer`, if it names one.
+
+    Never raises: the proposal is open whatever happens to this line, and a
+    caller told otherwise would try to open it again.
+    """
+    proposal = answer.get("proposal") if isinstance(answer, dict) else None
+    if not isinstance(proposal, dict) or not proposal.get("url"):
+        return
+    record = {
+        PROPOSAL_OPENED_KEY: PROPOSAL_OPENED_EVENT,
+        "proposal": {field: proposal.get(field) for field in PROPOSAL_OPENED_FIELDS},
+    }
+    # A process started with fd 2 closed has no `sys.stderr`, and `print` would then
+    # write to stdout, ahead of the one JSON document the callers print there.
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
+        print(json.dumps(record, separators=(",", ":")), file=stream, flush=True)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _call(verb: str, payload: dict) -> dict:
+    if "repository" in payload:
+        payload = {**payload, "repository": _on_the_wire(payload["repository"])}
+    endpoint = os.environ.get(BROKER_ENDPOINT_VAR, "").strip()
     if not endpoint:
         raise VcsError(
             "CREDENTIAL_PROXY_URL is not set, so there is no broker to ask. "
@@ -535,9 +630,36 @@ def local(session: dict, args: list[str], verb: str) -> dict:
 
 
 def capabilities(repository: str | None = None) -> dict:
-    """What this install can do with a repository, before anything is spent."""
+    """What this install can do with a repository, before anything is spent.
+
+    `fileUrl`, when present, is the web address of a file on this forge, with
+    `{ref}` and `{path}` to fill. Use it for a link to a file, because this
+    client builds no forge URL.
+    """
     spec = repository or resolve_session(None)["spec"]
     return call("capabilities", {"repository": spec})
+
+
+def base_branch(repository: str) -> str | None:
+    """The branch the broker pins every proposal onto `repository` to, or None.
+
+    The broker answers this from its own configuration, which the operator
+    renders and nothing in this container can change, so it is the one source
+    of a base this side may trust. None means the caller keeps its own answer
+    (the repository's default branch): the broker pins nothing for this
+    repository, it is older than the field or the verb, or there is no broker
+    in this environment at all. Any other refusal is raised, because a broker
+    that is there and failing is not one that pins nothing.
+    """
+    if not os.environ.get(BROKER_ENDPOINT_VAR, "").strip():
+        return None
+    try:
+        answer = call("capabilities", {"repository": repository})
+    except VcsError as exc:
+        if exc.code == BROKER_ROUTE_UNSUPPORTED:
+            return None
+        raise
+    return answer.get("baseBranch") or None
 
 
 def _refuse_to_discard(destination: Path, *, force: bool) -> None:
@@ -751,6 +873,12 @@ def clone(
         "repo": answer["repo"],
         "spec": repository,
         "branch": answer["branch"],
+        # The branch the broker pins proposals onto this repository to, or None
+        # when it pins nothing (or is older than the field). `proposal create`
+        # defaults its target to it. `publish` defaults its target to the
+        # branch the copy was cloned from, and refuses a copy cloned from any
+        # branch but this one when no target is named.
+        "baseBranch": answer.get("baseBranch") or None,
         # What this copy is for, and what its directory is named after.
         "key": key,
         # What `publish` proves its revisions descend from. Recorded at clone
@@ -765,6 +893,7 @@ def clone(
         "forge": answer["forge"],
         "repo": answer["repo"],
         "branch": answer["branch"],
+        "baseBranch": answer.get("baseBranch") or None,
         "revision": answer["revision"],
         "path": str(destination),
         "files": len(tracked),
@@ -956,21 +1085,52 @@ def publish(
     branch — without ever checking the objects out. So the revision identifiers
     on the forge are the ones `log` printed here.
 
+    The default `target` is the branch the copy was cloned from. While the
+    broker pins this repository's proposals to a base (`baseBranch` from
+    `clone`), that is the base: a copy cloned of some other branch has no
+    default, because its revisions were cut from that branch, not from the
+    base, so it is refused here, before anything is bundled.
+
     `advance` says this copy was cloned *of* a proposal branch in order to add
     to it, which is the one reason to publish the branch the copy came down on.
     It needs an explicit `target` beside it — the branch the proposal merges
-    into — because the default target is the cloned branch itself.
+    into. The pinned base is not its default: the proposal may have been opened
+    onto another branch, and only the caller knows which.
     """
     session = resolve_session(spec, key=key)
     tree = tree_of(session)
     branch = current_branch(session)
     base = base_for(session, branch)
+    pinned = session.get("baseBranch")
+    off_base_copy = not target and not advance and pinned and session["branch"] != pinned
     target = target or session["branch"]
     count = unpublished_revisions(session, branch)
     if count == 0:
         raise VcsError(
             "there are no new revisions to publish. `vcs.py commit` records "
             "one; `vcs.py status` shows what is still uncommitted."
+        )
+    if off_base_copy:
+        # Defaulted onto the base, the broker would check this copy's clone
+        # point against the base and answer `BASE_MOVED`, which says the base
+        # was rewritten -- it was not, and cloning the same branch again
+        # reproduces the refusal. The copy knows both branches, so it can say
+        # what is actually wrong.
+        # The `--advance` way on is offered only while the copy is still on
+        # the branch it was cloned of: a branch of the caller's own has no open
+        # proposal to add a round to, and the broker would refuse it.
+        advance_hint = (
+            f" -- or, if you cloned {session['branch']} to add to the proposal "
+            "already open on it, say so with `--advance` and name that "
+            "proposal's base as `--target`"
+            if branch == session["branch"]
+            else ""
+        )
+        raise VcsError(
+            f"this copy was cloned from {session['branch']}, while proposals onto "
+            f"{session.get('repo') or session['spec']} go onto {pinned}, the base "
+            "branch this install is configured with. Clone again with no branch "
+            f"to start from {pinned} and make the change there{advance_hint}."
         )
     # Both of these come after the count, not before: on the shared branch with
     # nothing committed, "there is nothing to publish" is the more specific of

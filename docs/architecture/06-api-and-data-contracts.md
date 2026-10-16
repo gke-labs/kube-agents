@@ -43,7 +43,9 @@ metadata:
 spec:
   tier: platform | cluster-admin | developer-team # persona / containment level (immutable)
   scope:
-    projectId: <proj> # all tiers
+    projectId: <proj> # all tiers; the platform tier's management project
+    # platform tier only, optional: the scope declaration, as `spec.scope` on the PlatformAgent
+    # carries it (the CRD reference page owns its keys); absent, the scope is the management project alone
     clusterName: <cluster> # cluster + namespace tiers
     namespace: <ns> # namespace tier only (also the pod's placement namespace)
   parentRef: { name: <parent-agent> } # required for non-platform tiers
@@ -78,15 +80,15 @@ Scion's launch primitive as a Phase-1 integration, [08](08-agent-runtime-and-ide
 
 ### 1.2 Per-tier field usage, cardinality & validation
 
-| `tier`           | Required scope fields                   | `parentRef`             | Cardinality     |
-| ---------------- | --------------------------------------- | ----------------------- | --------------- |
-| `platform`       | `projectId`                             | — (root)                | 1 per project   |
-| `cluster-admin`  | `projectId`, `clusterName`              | parent = platform agent | 1 per cluster   |
-| `developer-team` | `projectId`, `clusterName`, `namespace` | parent = cluster-admin  | 1 per namespace |
+| `tier`           | Required scope fields                                                 | `parentRef`             | Cardinality                                       |
+| ---------------- | --------------------------------------------------------------------- | ----------------------- | ------------------------------------------------- |
+| `platform`       | `projectId` (the management project); the scope declaration, optional | — (root)                | 1 per install (its scope is one or more projects) |
+| `cluster-admin`  | `projectId`, `clusterName`                                            | parent = platform agent | 1 per cluster                                     |
+| `developer-team` | `projectId`, `clusterName`, `namespace`                               | parent = cluster-admin  | 1 per namespace                                   |
 
 **Validation (v1).** The `Agent` CR + its identity manifests are reviewed on the PR (the review-gate).
-**Cardinality — exactly one agent per `(tier, scope)` — is enforced by the controller's validating
-webhook** (a duplicate CR is rejected at apply time), not left to convention. RBAC least-privilege is
+**Cardinality — exactly one platform agent per install (its management cluster), and one agent per
+`(tier, scope)` below it — is enforced by the controller's validating webhook** (a duplicate CR is rejected at apply time), not left to convention. RBAC least-privilege is
 enforced at apply time by an in-tree **`ValidatingAdmissionPolicy`** (denies an agent SA any write verb
 or a wrong-scope binding, [03](03-security-model.md) §4). The cross-object checks (correct parent tier;
 child ⊆ parent attenuation ceiling) are **deferred** to the hardening admission webhook
@@ -126,11 +128,11 @@ ClusterRole and namespace Role (`buildMinimalPlatformRole` / `reconcileRBAC`,
 write verbs" (there are none) but **stop minting RBAC at runtime** and pre-create these as reviewed,
 tier-scoped manifests (per the table below):
 
-| Tier           | K8s permission (pre-created, read-only)                                                                                                                                                                                                       | Cloud SA (Workload Identity)    |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
-| Platform       | `get/list/watch` cluster-wide; `get/list/watch` on `kubeagents.x-k8s.io` (and provisioning CRs such as KCC `*.cnrm.cloud.google.com` where the customer runs them); cloud state read via the read-only cloud SA (**no** create/update/delete) | project-scoped **viewer** roles |
-| Cluster Admin  | `get/list/watch` scoped to its cluster                                                                                                                                                                                                        | cluster-scoped viewer           |
-| Developer Team | `Role` `get/list/watch` in its **one namespace** only                                                                                                                                                                                         | namespace-scoped viewer         |
+| Tier           | K8s permission (pre-created, read-only)                                                                                                                                                                                                       | Cloud SA (Workload Identity)            |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| Platform       | `get/list/watch` cluster-wide; `get/list/watch` on `kubeagents.x-k8s.io` (and provisioning CRs such as KCC `*.cnrm.cloud.google.com` where the customer runs them); cloud state read via the read-only cloud SA (**no** create/update/delete) | the read roles in each project in scope |
+| Cluster Admin  | `get/list/watch` scoped to its cluster                                                                                                                                                                                                        | cluster-scoped viewer                   |
+| Developer Team | `Role` `get/list/watch` in its **one namespace** only                                                                                                                                                                                         | namespace-scoped viewer                 |
 
 The per-request user-permission check (`SubjectAccessReview` + IAM) and its `create` on
 `subjectaccessreviews` grant belong to the **deferred** user-scoped authorization (§2a) — **not in
@@ -209,14 +211,16 @@ gateway C14, [08](08-agent-runtime-and-identity.md) §3.)_
 
 **Handle grammar.** An agent's handle is its `<tier>-<scope>` name (`02` §6.1):
 
-| Tier             | Canonical handle           | Short alias          | Resolves to `(tier, scope)` |
-| ---------------- | -------------------------- | -------------------- | --------------------------- |
-| `platform`       | `@platform-<project>`      | —                    | `(platform, project)`       |
-| `cluster-admin`  | `@cluster-admin-<cluster>` | `@cluster-<cluster>` | `(cluster-admin, cluster)`  |
-| `developer-team` | `@developer-team-<ns>`     | `@devteam-<ns>`      | `(developer-team, ns)`      |
+| Tier             | Canonical handle           | Short alias          | Resolves to `(tier, scope)`                                                            |
+| ---------------- | -------------------------- | -------------------- | -------------------------------------------------------------------------------------- |
+| `platform`       | `@platform-<project>`      | —                    | `(platform, install)`, the management cluster; the handle names its management project |
+| `cluster-admin`  | `@cluster-admin-<cluster>` | `@cluster-<cluster>` | `(cluster-admin, cluster)`                                                             |
+| `developer-team` | `@developer-team-<ns>`     | `@devteam-<ns>`      | `(developer-team, ns)`                                                                 |
 
-The map is **derived** from the same `(tier, scope)` key the cardinality webhook enforces (§1.2) —
-no separate routing registry to maintain or drift.
+The map is **derived** from the same key the cardinality webhook enforces (§1.2: the install for the
+platform tier, `(tier, scope)` below it) — no separate routing registry to maintain or drift. The
+platform handle names the management project; a second install in the same project sets its own
+handle, as it sets its own account and release names.
 
 **Slash-command grammar.** `@kage /<handle> <text>` (e.g. `/cluster-bravo`, `/devteam-charlie`)
 dispatches directly to the named agent — constant-time, no inference. On Google Chat a slash command
@@ -250,7 +254,16 @@ the target CR and checks `allowedUsers` **before** dispatch, with the target pod
 defense-in-depth backstop. An empty/absent `allowedUsers` means "all authenticated users" (today's
 default) — a closed allowlist must be set explicitly. A session-routed turn has no target CR at the
 door: it is gated by the gateway's own ingress allowlist (the adapter's allowed-users setting), and
-the target CR's `allowedUsers` is read when the session asks the gateway to mint a child task to it.
+the target CR's `allowedUsers` is read when the session asks the gateway to mint a child task to it
+(the operator renders those lists to the gateway as `A2A_TARGET_ALLOWED_USERS_GCHAT` / `_SLACK`; the
+gateway compares the turn's pseudonymized backend author id, as the session KV stores it, against
+the list's entries pseudonymized the same way, at the mint of that child task (`a2a/gateway/delegation.go`;
+the delegation primitive, built) — along with every steered author of the turn and every author the
+conversation's current incarnation has seen, same comparison, each capped and refused past its cap;
+an absent list, or one that renders as `[""]`, is all authenticated users, and a list that is blank
+after trimming admits nobody; the A2A door's backend is the exception, where no list is nobody,
+#2478).
+Detail: [spec-chatops-gateway.md](../designs/spec-chatops-gateway.md), "Sessions by default".
 
 ## 3. GitOps repository layout & propose/apply contract
 

@@ -307,6 +307,8 @@ data:
           long_running_notifications: true
           memory_notifications: "off"
           tool_progress: "off"
+    kanban:
+      max_in_progress: 6
     model:
       api_key: none
       api_mode: chat_completions
@@ -402,6 +404,19 @@ data:
         Read_from_Head    On
         Path_Key          file_path
 
+    [INPUT]
+        Name              tail
+        Tag               agent.audit
+        Path              /opt/data/logs/audit.jsonl,/opt/data/profiles/*/logs/audit.jsonl
+        Parser            audit_json
+        DB                /fluent-bit/state/fluent-bit-audit.db
+        Refresh_Interval  5
+        Rotate_Wait       30
+        Mem_Buf_Limit     20MB
+        Skip_Long_Lines   On
+        Read_from_Head    On
+        Path_Key          file_path
+
     [FILTER]
         Name          parser
         Match         agent.logs
@@ -411,41 +426,20 @@ data:
         Preserve_Key  On
 
     [FILTER]
-        Name          parser
-        Match         agent.logs
-        Key_Name      log
-        Parser        hermes_audit_line
-        Reserve_Data  On
-        Preserve_Key  On
-
-    [FILTER]
-        Name          parser
-        Match         agent.logs
-        Key_Name      audit_json
-        Parser        audit_json
-        Reserve_Data  On
-        Preserve_Key  Off
-
-    [FILTER]
         Name              record_modifier
-        Match             agent.logs
+        Match             agent.*
         Record            app agent
         Record            log_source agent-file
 
     [OUTPUT]
         Name              stdout
-        Match             agent.logs
+        Match             agent.*
         Format            json_lines
   parsers.conf: |
     [PARSER]
         Name    gchat_event
         Format  regex
         Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)
-
-    [PARSER]
-        Name    hermes_audit_line
-        Format  regex
-        Regex   ^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} [A-Z]+(?: \[[^\]]*\])? hermes\.(?:plugin\.tool_call_audit|hook\.chat_message_audit): (?<audit_json>\{.*\})$
 
     [PARSER]
         Name    audit_json
@@ -653,6 +647,8 @@ spec:
               value: us-central1-a
             - name: KUBE_CONTEXT_NAME
               value: gke_example-project_us-central1-a_cluster-a
+            - name: KUBEAGENTS_SCOPE_DECLARED
+              value: "false"
             - name: SANDBOX_IMAGE_TREES
               value: read-only-mounts
             - name: SANDBOX_HOME_ROOTS
@@ -999,6 +995,12 @@ spec:
               value: "8388608"
             - name: CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
               value: "8"
+            - name: CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: envoy-credential-proxy
+                  divisor: "1"
+                  resource: limits.memory
             - name: CREDENTIAL_PROXY_STATE_DIR
               value: /var/lib/credential-proxy
             - name: CREDENTIAL_PROXY_UNIX_SOCKET
@@ -1033,6 +1035,8 @@ spec:
               value: kubeagents-credential-proxy-chat
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
               value: system:serviceaccount:kubeagents-system:kubeagents-platform-agent,system:serviceaccount:kubeagents-system:platformagent-shell
+            - name: CREDENTIAL_PROXY_WATCHER_AUDIENCE
+              value: kubeagents-credential-proxy-watcher
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -1080,10 +1084,10 @@ spec:
             limits:
               cpu: "1"
               ephemeral-storage: 2Gi
-              memory: 1Gi
+              memory: 2Gi
             requests:
               cpu: 500m
-              memory: 512Mi
+              memory: 1Gi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -1205,6 +1209,16 @@ spec:
       ports:
         - port: 8766
           protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kube-agents-operator
+      ports:
+        - port: 8766
+          protocol: TCP
   podSelector:
     matchLabels:
       app: platformagent-credential-proxy
@@ -1252,6 +1266,7 @@ spec:
         app.kubernetes.io/managed-by: platformagent-controller
         app.kubernetes.io/name: platform-agent
         app.kubernetes.io/part-of: kube-agents
+        kubeagents.io/is-leader: "true"
     spec:
       automountServiceAccountToken: false
       containers:
@@ -1322,12 +1337,14 @@ spec:
             - name: HERMES_HOME_MODE
               value: "2770"
             - name: HERMES_WRITE_SAFE_ROOT
-              value: /opt/data:/home/agent
+              value: /opt/data
             - name: TERMINAL_CWD
               value: /opt/data
             - name: CREDENTIAL_PROXY_URL
             - name: CREDENTIAL_PROXY_TOKEN_FILE
               value: /var/run/secrets/kubeagents/credential-proxy/token
+            - name: KUBE_AGENTS_MCP_RELAY_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765/v1/mcp
             - name: PATH
               value: /opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: PYTHONPATH
@@ -1341,12 +1358,16 @@ spec:
             - name: API_SERVER_MODEL_NAME
               value: model-default
             - name: HERMES_GATEWAY_PROFILE
+            - name: CHAT_METRICS_PORT
+              value: "9097"
           image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
           imagePullPolicy: IfNotPresent
           name: platform-agent
           ports:
             - containerPort: 8642
               name: api
+            - containerPort: 9097
+              name: chat-metrics
           readinessProbe:
             exec:
               command:
@@ -1610,6 +1631,10 @@ spec:
                   key: SESSION_KV_API_KEY
                   name: platform-agent-secrets
                   optional: true
+            - name: WATCHER_BROKER_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
+            - name: WATCHER_BROKER_TOKEN_FILE
+              value: /var/run/secrets/kubeagents/watcher-proxy/token
             - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
               value: /opt/data
             - name: EVENT_WATCHER_CLUSTER_NAME
@@ -1668,6 +1693,9 @@ spec:
               readOnly: true
             - mountPath: /opt/data
               name: platform-agent-data-vol
+            - mountPath: /var/run/secrets/kubeagents/watcher-proxy
+              name: watcher-credential-proxy-token
+              readOnly: true
       securityContext:
         fsGroup: 10000
         runAsGroup: 10000
@@ -1752,6 +1780,14 @@ spec:
             sources:
               - serviceAccountToken:
                   audience: kubeagents-credential-proxy-chat
+                  expirationSeconds: 3600
+                  path: token
+        - name: watcher-credential-proxy-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-credential-proxy-watcher
                   expirationSeconds: 3600
                   path: token
         - name: sandbox-ssh-secret
@@ -2092,6 +2128,33 @@ spec:
               kubernetes.io/metadata.name: gke-gmp-system
       ports:
         - port: 9095
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kube-agents-operator
+      ports:
+        - port: 9095
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 9097
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kube-agents-operator
+      ports:
+        - port: 9097
           protocol: TCP
   podSelector:
     matchLabels:

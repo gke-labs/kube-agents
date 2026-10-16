@@ -2,8 +2,8 @@
 """Build gate for the kanban scheduling patches.
 
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after
-``apply_kanban_scheduling.py``. The applier only proves six anchors matched
-exactly once. That says nothing about whether the engine those six edits
+``apply_kanban_scheduling.py``. The applier only proves eleven anchors matched
+exactly once. That says nothing about whether the engine those edits
 produce actually schedules correctly, and every fault they fix was emergent
 scheduling behaviour rather than a bad string — so every case below is driven
 against the real patched ``hermes_cli.kanban_db`` / ``kanban_db_dispatch`` on a real board, through the
@@ -109,6 +109,9 @@ from hermes_cli import kanban_db_dispatch as KD  # noqa: E402
 # discriminator's constants can be asserted by name rather than by string.
 from hermes_cli import kanban_scheduling as KS  # noqa: E402
 
+# Edits 7-10's runtime, installed beside it by the same stage.
+from hermes_cli import kanban_priority as KP  # noqa: E402
+
 TMP = Path(tempfile.mkdtemp())
 _BOARDS = itertools.count()
 
@@ -179,9 +182,10 @@ def last_event(conn, tid, kind):
     return json.loads(row["payload"]) if row and row["payload"] else {}
 
 
-def new_card(conn, title, parents=()):
+def new_card(conn, title, parents=(), priority=0):
     task = K.create_task(
-        conn, title=title, assignee="platform", parents=tuple(parents)
+        conn, title=title, assignee="platform", parents=tuple(parents),
+        priority=priority,
     )
     return task.id if hasattr(task, "id") else str(task)
 
@@ -1089,9 +1093,9 @@ def waiting_board():
     return conn
 
 
-def fan_out(conn, creator, title, parents=()):
+def fan_out(conn, creator, title, parents=(), priority=0):
     """A child card, attributed through the writer the worker tool calls."""
-    child = new_card(conn, title, parents=parents)
+    child = new_card(conn, title, parents=parents, priority=priority)
     if not _children.record_worker_child(conn, child, creator):
         raise SystemExit(
             "verify_kanban_scheduling: record_worker_child refused to attribute "
@@ -1183,20 +1187,31 @@ check(
 
 # E5. Two waiters, cap 2: the whole board used to stop. Both are discounted, so
 # the two slots go to children rather than to the cards waiting for them.
+#
+# One waiter of each class (section G). At cap 2 each class is guaranteed
+# exactly one slot and may hold no more, so two user-class waiters with
+# user-class children could only ever get one child running, discount or not:
+# that is the per-class floor working, not the discount failing. One user
+# fan-out and one triage fan-out is the shape that can fill both slots, and
+# only if both waiters are discounted; without the discount nothing spawns.
 conn = waiting_board()
-first = new_card(conn, "Fan-out one")
-second = new_card(conn, "Fan-out two")
+first = new_card(conn, "Fan-out one", priority=KP.USER_PRIORITY)
+second = new_card(conn, "Triage fan-out")
 K.recompute_ready(conn)
 K.claim_task(conn, first)
 K.claim_task(conn, second)
-helpers = [
-    fan_out(conn, first if n < 3 else second, f"helper {n}") for n in range(5)
+user_helpers = [
+    fan_out(conn, first, f"helper {n}", priority=KP.USER_PRIORITY) for n in range(3)
 ]
+triage_helpers = [fan_out(conn, second, f"triage helper {n}") for n in range(2)]
+helpers = user_helpers + triage_helpers
 K.recompute_ready(conn)
 asked = spawns(conn, cap=2)
 check(
     "E5. two waiting coordinators release both slots",
-    len(asked) == 2 and set(asked) <= set(helpers),
+    len(asked) == 2
+    and len(set(asked) & set(user_helpers)) == 1
+    and len(set(asked) & set(triage_helpers)) == 1,
     f"spawned {asked}",
 )
 
@@ -1287,6 +1302,169 @@ check(
     and K.get_task(conn, heartbeating_card).status == "running",
 )
 
+conn.close()
+
+# --- G. One slot held for each class of card -----------------------------------
+#
+# Driven through the real ``dispatch_once`` like section E, with E's
+# ``profile_exists`` stub still in place. Priority 0 is background, as every
+# card on a board was before the create-time stamp; USER_PRIORITY is a user.
+print()
+print("user cards ahead of background triage:")
+
+
+def tick(conn, cap):
+    """One real dispatcher tick. Returns (spawned ids, DispatchResult).
+
+    Unlike section E this runs several ticks on one board, so the spawned
+    "worker" is this process: a live PID keeps the next tick's crash sweep
+    from handing the card back and muddling the slot count.
+    """
+    asked = []
+
+    def spawn_fn(*args, **kwargs):
+        task = kwargs.get("task") or kwargs.get("task_id") or (args[0] if args else None)
+        asked.append(getattr(task, "id", task))
+        return os.getpid()
+
+    res = KD.dispatch_once(conn, spawn_fn=spawn_fn, max_in_progress=cap)
+    return asked, res
+
+
+def queued_events(conn, tid):
+    return [
+        json.loads(r["payload"] or "{}")
+        for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id",
+            (tid, KP.QUEUED_KIND),
+        )
+    ]
+
+
+check(
+    "G0. DispatchResult carries the fields edits 8-10 fill",
+    all(
+        hasattr(KD.DispatchResult(), name)
+        for name in ("skipped_reserved", "saturation", "ready_left", "queued_noticed")
+    ),
+)
+
+# G1. Two background cards ready at a cap of 2: one runs, one is held back.
+conn = fresh()
+bg_a = new_card(conn, "Triage default/Pod/a (CrashLoopBackOff)")
+bg_b = new_card(conn, "Triage default/Pod/b (CrashLoopBackOff)")
+K.recompute_ready(conn)
+asked, res = tick(conn, cap=2)
+check(
+    "G1. two background cards at cap 2: one spawns, one is held for users",
+    len(asked) == 1 and asked[0] in (bg_a, bg_b) and len(res.skipped_reserved) == 1,
+    f"spawned {asked}, reserved {res.skipped_reserved}",
+)
+check(
+    "G1. the held-back tick records saturation, so it is not read as stuck",
+    res.saturation is not None and res.saturation["reserved"] == 1,
+    f"saturation {res.saturation}",
+)
+
+# G2. A user card filed now takes the reserved slot at once.
+user = new_card(conn, "Why is web-7 failing?", priority=KP.USER_PRIORITY)
+K.recompute_ready(conn)
+asked, res = tick(conn, cap=2)
+check(
+    "G2. a user card spawns into the reserved slot while triage holds the other",
+    asked == [user],
+    f"spawned {asked}, reserved {res.skipped_reserved}",
+)
+
+# G3. Both slots full (one triage, one user): the next user card is queued,
+# once, and the full cap is recorded as saturation rather than nothing.
+waiting = new_card(conn, "And what about web-8?", priority=KP.USER_PRIORITY)
+K.recompute_ready(conn)
+asked, res = tick(conn, cap=2)
+check("G3. a full cap spawns nothing", asked == [], f"spawned {asked}")
+sat = res.saturation or {}
+check(
+    "G3. the capped tick records running, limit and the running cards",
+    sat.get("running") == 2 and sat.get("limit") == 2
+    and sat.get("background_running") == 1 and sat.get("user_running") == 1
+    and len(sat.get("cards", ())) == 2 and sat.get("user_waiting") == 1,
+    f"saturation {sat}",
+)
+events = queued_events(conn, waiting)
+check(
+    "G3. the waiting user card gets one queued event with the agreed text",
+    len(events) == 1 and events[0].get("note") == KP.QUEUED_TEXT
+    and res.queued_noticed == [waiting],
+    f"events {events}",
+)
+check(
+    "G3. a background card left waiting gets no queued event",
+    queued_events(conn, bg_a) == [] and queued_events(conn, bg_b) == [],
+)
+asked, res = tick(conn, cap=2)
+check(
+    "G4. the next capped tick does not repeat the notice",
+    len(queued_events(conn, waiting)) == 1 and res.queued_noticed == [],
+    f"events {queued_events(conn, waiting)}",
+)
+conn.close()
+
+# G5. A cap of 1 reserves nothing: a background card still runs alone.
+conn = fresh()
+bg_a = new_card(conn, "Triage one")
+new_card(conn, "Triage two")
+K.recompute_ready(conn)
+asked, res = tick(conn, cap=1)
+check(
+    "G5. at cap 1 a background card spawns and nothing is reserved",
+    len(asked) == 1 and res.skipped_reserved == [],
+    f"spawned {asked}, reserved {res.skipped_reserved}",
+)
+# ... and user cards still sort first.
+conn.close()
+conn = fresh()
+new_card(conn, "Triage first in")
+user = new_card(conn, "User second in", priority=KP.USER_PRIORITY)
+K.recompute_ready(conn)
+asked, res = tick(conn, cap=1)
+check(
+    "G5. at cap 1 a user card filed later still goes first",
+    asked == [user],
+    f"spawned {asked}",
+)
+conn.close()
+
+# G7. The floor is symmetric: at cap 2 two user cards get one slot, and a
+# background card still gets the other.
+conn = fresh()
+u_a = new_card(conn, "Question one", priority=KP.USER_PRIORITY)
+u_b = new_card(conn, "Question two", priority=KP.USER_PRIORITY)
+bg_c = new_card(conn, "Triage alongside")
+K.recompute_ready(conn)
+asked, res = tick(conn, cap=2)
+check(
+    "G7. at cap 2 one user card and one background card run",
+    len(asked) == 2 and bg_c in asked and len(set(asked) & {u_a, u_b}) == 1
+    and len(res.skipped_reserved) == 1,
+    f"spawned {asked}, reserved {res.skipped_reserved}",
+)
+conn.close()
+
+# G6. The background share uses edit 6's discount: a triage coordinator
+# waiting on its own children holds no slot, so one child runs and the
+# reserved slot stays free.
+conn = waiting_board()
+coord = new_card(conn, "Triage fleet event")
+K.recompute_ready(conn)
+K.claim_task(conn, coord)
+kids = [fan_out(conn, coord, f"Triage cluster {n}") for n in range(2)]
+K.recompute_ready(conn)
+asked, res = tick(conn, cap=2)
+check(
+    "G6. a waiting background coordinator is discounted from the share",
+    len(asked) == 1 and asked[0] in kids and len(res.skipped_reserved) == 1,
+    f"spawned {asked}, reserved {res.skipped_reserved}",
+)
 conn.close()
 
 print()

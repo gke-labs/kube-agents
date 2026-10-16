@@ -93,6 +93,9 @@ jobs:
       contents: read
       id-token: write
       actions: read
+    # workflow_run is a low-trust trigger, so this run's cache access already
+    # defaults to read; the cap stops the called workflow requesting write.
+    cache-mode: read
     uses: ./.github/workflows/reconcile-environment.yml # zizmor: ignore[secrets-inherit]
     with:
       github_environment: "autopush"

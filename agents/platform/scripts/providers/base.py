@@ -141,6 +141,32 @@ class Forge:
     # CLI-backed forge grants no forge CLI.
     transport = "http"
     cli = ""
+    # The second half of an "http" declaration: the API root every path is
+    # relative to, per instance because one package serves several hosts, and
+    # the "current user" route with the field that names the login (None when
+    # the forge has no such route). Both are read by the broker, which builds
+    # the transport; nothing here makes a call.
+    api_url = ""
+    whoami_route: tuple[str, str] | None = None
+    # A GraphQL endpoint on the forge's host that answers `viewer { login }`,
+    # for a forge whose REST current-user route refuses its credential. Empty
+    # means `whoami_route` is the route.
+    whoami_graphql = ""
+    # PEM CA certificates this forge's own host is trusted under, beside the
+    # system bundle: a self-managed instance whose certificate a private CA
+    # signed. Empty for every public forge. The broker reads it for both of
+    # its clients, scoped to this forge's hosts.
+    ca_file = ""
+    # Where `ca_file` comes from, as the answer for a missing file names it:
+    # "the Secret <name> or its key <key>". Empty when nothing says.
+    ca_source = ""
+    # The well-known host this forge answers for when an install has not
+    # configured it, and what is missing then. The registry turns them into a
+    # named gap -- "no credential is configured for <host>" -- rather than a
+    # bare "not a forge this install serves", for a forge configured per host
+    # that builds nothing until it is.
+    default_hosts: tuple[str, ...] = ()
+    unconfigured: tuple[str, ...] = ()
     # The few statuses whose shared guidance this forge disagrees with.
     error_overrides: Mapping[int, Override] = {}
     # Whether `proposal-acknowledge` does anything here. A capability rather
@@ -151,6 +177,17 @@ class Forge:
 
     def __init__(self) -> None:
         self.credential: Credential = NoCredential()
+
+    def reach(self, api: Callable) -> tuple[list[str], bool] | None:
+        """The repositories this forge's credential can reach, and whether the
+        list was cut short; None when the forge cannot say.
+
+        Asked once, when the broker starts, so an install can see a token that
+        reaches further than the repositories it manages. A token minted per
+        repository reaches exactly what it was minted for, and its forge has
+        nothing to report.
+        """
+        return None
 
     def read_credential(self, repo: str) -> Credential:
         """A credential that can only read `repo`, for one clone of it.
@@ -197,14 +234,30 @@ class Forge:
         """
         raise NotImplementedError
 
+    def file_url(self, repo: str) -> str | None:
+        """The web address of a file in `repo`, with `{ref}` and `{path}` to fill.
+
+        Composed from the validated repository and this forge's own host, as
+        `clone_url` is, so it needs no credential and no network. The caller
+        percent-encodes `{ref}` and `{path}` and keeps their `/` separators
+        (`quote(value, safe="/")`): a branch name may hold `#` or `%`, which
+        would break the link. A link that must outlive the branch uses a
+        commit SHA as `{ref}`. None when the forge has no such page.
+        """
+        return None
+
     def capabilities(self, repo: str) -> dict[str, Any]:
         """What this install can do here, before anything is spent.
 
         No credential, no network. A caller that discovers the gap by failing
         halfway through a publish has already written the revision it cannot
         deliver.
+
+        `fileUrl` is the web address of a file, from `file_url`. It is in the
+        answer only when the forge gives one, so that a link in an issue or a
+        proposal opens the file on this forge, not a path relative to the page.
         """
-        return {
+        answer = {
             "forge": self.name,
             "repo": repo,
             "proposalNoun": self.proposal_noun,
@@ -219,6 +272,10 @@ class Forge:
             "acknowledge": self.acknowledges,
             "missing": [],
         }
+        url = self.file_url(repo)
+        if url:
+            answer["fileUrl"] = url
+        return answer
 
     def can_write(
         self, api: Callable, repo: str, login: str, bot: bool = False

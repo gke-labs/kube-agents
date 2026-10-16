@@ -1,0 +1,182 @@
+{
+ "apiVersion": "v1",
+ "items": [
+  {
+   "apiVersion": "v1",
+   "kind": "PersistentVolume",
+   "metadata": {
+    "annotations": {
+     "pv.kubernetes.io/bound-by-controller": "yes"
+    },
+    "creationTimestamp": "2026-10-03T10:31:50Z",
+    "finalizers": [
+     "kubernetes.io/pv-protection",
+     "external-attacher/pd-csi-storage-gke-io"
+    ],
+    "labels": {
+     "topology.kubernetes.io/region": "us-central1",
+     "topology.kubernetes.io/zone": "us-central1-a"
+    },
+    "name": "intree-pd",
+    "resourceVersion": "1791346215349151000",
+    "uid": "5b518a15-d831-4140-a3dc-ea6030cdb5e5"
+   },
+   "spec": {
+    "accessModes": [
+     "ReadWriteOnce"
+    ],
+    "capacity": {
+     "storage": "10Gi"
+    },
+    "claimRef": {
+     "apiVersion": "v1",
+     "kind": "PersistentVolumeClaim",
+     "name": "intree-pd",
+     "namespace": "seeded-shapes",
+     "resourceVersion": "1791023510293311019",
+     "uid": "a08152bb-ff21-4047-af17-8d147914a1d0"
+    },
+    "gcePersistentDisk": {
+     "fsType": "ext4",
+     "pdName": "seeded-a-intree-pd"
+    },
+    "nodeAffinity": {
+     "required": {
+      "nodeSelectorTerms": [
+       {
+        "matchExpressions": [
+         {
+          "key": "topology.kubernetes.io/zone",
+          "operator": "In",
+          "values": [
+           "us-central1-a"
+          ]
+         },
+         {
+          "key": "topology.kubernetes.io/region",
+          "operator": "In",
+          "values": [
+           "us-central1"
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    },
+    "persistentVolumeReclaimPolicy": "Retain",
+    "storageClassName": "intree",
+    "volumeMode": "Filesystem"
+   }
+  },
+  {
+   "allowVolumeExpansion": true,
+   "apiVersion": "storage.k8s.io/v1",
+   "kind": "StorageClass",
+   "metadata": {
+    "annotations": {
+     "components.gke.io/component-name": "pdcsi",
+     "components.gke.io/component-version": "1.35.48",
+     "components.gke.io/layer": "addon"
+    },
+    "creationTimestamp": "2026-09-25T16:55:38Z",
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "EnsureExists",
+     "k8s-app": "gcp-compute-persistent-disk-csi-driver"
+    },
+    "name": "dynamic-rwo",
+    "resourceVersion": "1790355338969583004",
+    "uid": "c0375bbb-2110-4d4b-98eb-8f6194155ce8"
+   },
+   "parameters": {
+    "hyperdisk-type": "hyperdisk-balanced",
+    "pd-type": "pd-balanced",
+    "type": "dynamic",
+    "use-allowed-disk-topology": "true"
+   },
+   "provisioner": "pd.csi.storage.gke.io",
+   "reclaimPolicy": "Delete",
+   "volumeBindingMode": "WaitForFirstConsumer"
+  },
+  {
+   "allowVolumeExpansion": true,
+   "apiVersion": "storage.k8s.io/v1",
+   "kind": "StorageClass",
+   "metadata": {
+    "annotations": {
+     "components.gke.io/component-name": "pdcsi",
+     "components.gke.io/component-version": "1.35.48",
+     "components.gke.io/layer": "addon"
+    },
+    "creationTimestamp": "2026-09-25T16:55:38Z",
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "EnsureExists",
+     "k8s-app": "gcp-compute-persistent-disk-csi-driver"
+    },
+    "name": "premium-rwo",
+    "resourceVersion": "1790355338089295012",
+    "uid": "1c146d5c-7d6b-4a0d-91ef-e27485c91073"
+   },
+   "parameters": {
+    "type": "pd-ssd"
+   },
+   "provisioner": "pd.csi.storage.gke.io",
+   "reclaimPolicy": "Delete",
+   "volumeBindingMode": "WaitForFirstConsumer"
+  },
+  {
+   "allowVolumeExpansion": true,
+   "apiVersion": "storage.k8s.io/v1",
+   "kind": "StorageClass",
+   "metadata": {
+    "annotations": {
+     "components.gke.io/component-name": "pdcsi",
+     "components.gke.io/component-version": "1.35.48",
+     "components.gke.io/layer": "addon",
+     "storageclass.kubernetes.io/is-default-class": "false"
+    },
+    "creationTimestamp": "2026-09-25T16:55:38Z",
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "EnsureExists"
+    },
+    "name": "standard",
+    "resourceVersion": "1790355338673391005",
+    "uid": "511dce46-4c29-4ec4-9b6b-a297a6915980"
+   },
+   "parameters": {
+    "type": "pd-standard"
+   },
+   "provisioner": "kubernetes.io/gce-pd",
+   "reclaimPolicy": "Delete",
+   "volumeBindingMode": "Immediate"
+  },
+  {
+   "allowVolumeExpansion": true,
+   "apiVersion": "storage.k8s.io/v1",
+   "kind": "StorageClass",
+   "metadata": {
+    "annotations": {
+     "components.gke.io/component-name": "pdcsi",
+     "components.gke.io/component-version": "1.35.48",
+     "components.gke.io/layer": "addon",
+     "storageclass.kubernetes.io/is-default-class": "true"
+    },
+    "creationTimestamp": "2026-09-25T16:55:38Z",
+    "labels": {
+     "addonmanager.kubernetes.io/mode": "EnsureExists",
+     "k8s-app": "gcp-compute-persistent-disk-csi-driver"
+    },
+    "name": "standard-rwo",
+    "resourceVersion": "1790355338371871007",
+    "uid": "946b96b2-380c-45ed-8f4c-21f0afc78d43"
+   },
+   "parameters": {
+    "type": "pd-balanced"
+   },
+   "provisioner": "pd.csi.storage.gke.io",
+   "reclaimPolicy": "Delete",
+   "volumeBindingMode": "WaitForFirstConsumer"
+  }
+ ],
+ "kind": "List"
+}

@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -99,7 +100,7 @@ func TestNewFilterFromFlagsWiring(t *testing.T) {
 	}
 	// nil getter: this test is about the flags reaching the classifier, and a
 	// nil getter keeps the join from being the thing under test.
-	filter, _ := newFilterFromFlags(f, nil, logDriftEvent)
+	filter, _ := newFilterFromFlags(f, nil, logDriftEvent, nil)
 
 	if !filter.logDropped {
 		t.Error("logDropped did not reach the filter")
@@ -158,7 +159,7 @@ func TestNewFilterFromFlagsWiresTheJoin(t *testing.T) {
 	// takes rather than a shortcut around buildClusterSet.
 	stub := &stubGetter{obj: managedFieldsObject()}
 	clusters := buildClusterSet(stub, directClusterIdentity(f), nil)
-	filter, join := newFilterFromFlags(f, clusters, logDriftEvent)
+	filter, join := newFilterFromFlags(f, clusters, logDriftEvent, nil)
 
 	if got := join.Clusters(); got != 1 {
 		t.Errorf("joiner.Clusters() = %d, want 1 -- the getter did not reach the joiner", got)
@@ -187,6 +188,72 @@ func TestNewFilterFromFlagsWiresTheJoin(t *testing.T) {
 
 	if got := join.Counts().Enriched; got != 1 {
 		t.Errorf("enriched = %d, want 1 -- the filter is not forwarding to the join", got)
+	}
+}
+
+// The scope reaches the joiner through one line of newFilterFromFlags, and
+// every other newJoiner call in the package passes nil for it -- which is also
+// what that line would read if --profiles-dir stopped reaching it. The joiner
+// tests drive the hold through a stub scope and cannot see that, so this one
+// goes from parsed flags to a held record through a real profiles directory.
+func TestNewFilterFromFlagsWiresTheScope(t *testing.T) {
+	dir := t.TempDir()
+	writeScopeProfile(t, dir, "prod-b", clusterIdentity{Project: "example-project", Location: "us-central1", Cluster: "prod-b"})
+	f, err := parseFlags([]string{
+		"--project", "example-project",
+		"--cluster-name", "prod-a",
+		"--cluster-location", "us-central1",
+		"--in-cluster",
+		"--profiles-dir", dir,
+	})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	clusters := buildClusterSet(&stubGetter{obj: managedFieldsObject()}, directClusterIdentity(f), nil)
+	var got []DriftEvent
+	filter, join := newFilterFromFlags(f, clusters, func(_ context.Context, e DriftEvent) { got = append(got, e) }, nil)
+
+	if join.scope == nil {
+		t.Fatal("joiner.scope = nil with --profiles-dir set -- the scope did not reach the joiner, and nothing is ever held")
+	}
+	// The inject's seen set reaches the joiner through the same call.
+	injectHandler := newDriftInjectHandler(nil)
+	if _, j := newFilterFromFlags(f, clusters, injectHandler.Handle, injectHandler.AlreadyInjected); j.injected == nil {
+		t.Error("joiner.injected = nil when the inject handler's hook was passed")
+	}
+	// One record from the cluster the directory names and one from a cluster
+	// it does not; the join reaches neither. Only the second is held.
+	for _, cluster := range []string{"prod-b", "prod-c"} {
+		filter.Handle(context.Background(), AuditRecord{
+			Principal:  "ada@example.com",
+			Project:    "example-project",
+			Location:   "us-central1",
+			Cluster:    cluster,
+			Verb:       "patch",
+			StatusCode: statusCodeOK,
+			Resource:   ResourceRef{Group: "apps", Version: "v1", Namespace: "prod", Resource: "deployments", Name: "api"},
+		})
+	}
+	if len(got) != 2 {
+		t.Fatalf("forwarded %d event(s), want 2", len(got))
+	}
+	if got[0].OutOfScope {
+		t.Error("the prod-b record was held, want forwarded: a profile in --profiles-dir names it")
+	}
+	if !got[1].OutOfScope {
+		t.Error("the prod-c record was not held, want held: no profile in --profiles-dir names it")
+	}
+	if c := join.Counts(); c.Unreachable != 2 || c.OutOfScope != 1 {
+		t.Errorf("counts = %+v, want unreachable=2 out_of_scope=1", c)
+	}
+
+	// And without the flag, no scope: the detector was never told one.
+	f, err = parseFlags([]string{"--project", "example-project", "--cluster-name", "prod-a", "--cluster-location", "us-central1", "--in-cluster"})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if _, join := newFilterFromFlags(f, clusters, logDriftEvent, nil); join.scope != nil {
+		t.Errorf("joiner.scope = %#v without --profiles-dir, want nil", join.scope)
 	}
 }
 
@@ -283,19 +350,8 @@ func TestRealMainRejectsBadConfiguration(t *testing.T) {
 			// unreachable -- which is also what a healthy single-cluster
 			// detector reports for the rest of the project, so nothing at
 			// runtime tells the two apart.
-			name:    "project given as a number with the join enabled",
+			name:    "project given as a number with a direct cluster",
 			argv:    []string{"--project", "123456789012", "--in-cluster", "--cluster-name", "prod-a", "--cluster-location", "us-central1"},
-			wantErr: "is a project number",
-		},
-		{
-			// The same refusal reached through the other credential source. The
-			// profile path compares --project twice -- against each record's
-			// project_id, and against each discovered profile's own project to
-			// decide what to register -- so a number here discards the whole
-			// fleet at discovery and then matches nothing either, which reads as
-			// an empty fleet rather than as a bad flag.
-			name:    "project given as a number with only the profile fan-in",
-			argv:    []string{"--project", "123456789012", "--profiles-dir", "/opt/data/profiles"},
 			wantErr: "is a project number",
 		},
 	}
@@ -310,6 +366,58 @@ func TestRealMainRejectsBadConfiguration(t *testing.T) {
 				t.Errorf("realMain(%v) error = %q, want it to contain %q", tc.argv, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// The refusal above is keyed on the direct credentials, not on the join being
+// on: the profile fan-in reads --project for nothing but the subscription, since
+// each profile carries its own project and a record is matched on the full
+// triple, so a number there is a working configuration and refusing it would
+// reject a local run on the fan-in alone. The table cannot hold that case,
+// because its loop wants an error; TestRealMainTakesAProjectNumberOnTheFanInAlone
+// drives realMain past the check instead.
+func TestRefuseProjectNumber(t *testing.T) {
+	cases := []struct {
+		name       string
+		project    string
+		directJoin bool
+		wantErr    bool
+	}{
+		{"number with a direct cluster", "123456789012", true, true},
+		{"number on the profile fan-in alone", "123456789012", false, false},
+		{"id with a direct cluster", "example-project", true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := refuseProjectNumber(tc.project, tc.directJoin)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("refuseProjectNumber(%q, %v) = %v, want error: %v", tc.project, tc.directJoin, err, tc.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "is a project number") {
+				t.Errorf("error = %q, want it to name the project number", err)
+			}
+		})
+	}
+}
+
+// The wiring, not the helper: realMain has to key the refusal on the direct
+// credentials, and restoring the old key -- the join being on at all -- passes
+// TestRefuseProjectNumber untouched. A missing --profiles-dir is the stop that
+// makes this deterministic: discovery is fatal on it, and it comes after the
+// refusal and before the Pub/Sub client, so the run ends on the directory
+// rather than on credentials this test does not have.
+func TestRealMainTakesAProjectNumberOnTheFanInAlone(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "profiles")
+	argv := []string{"--project", "123456789012", "--profiles-dir", missing}
+	err := realMain(argv)
+	if err == nil {
+		t.Fatalf("realMain(%v) succeeded, want it to stop on the missing profiles directory", argv)
+	}
+	if strings.Contains(err.Error(), "is a project number") {
+		t.Fatalf("realMain(%v) refused the project number with no direct credentials: %v", argv, err)
+	}
+	if !strings.Contains(err.Error(), "does not exist yet") {
+		t.Errorf("realMain(%v) error = %q, want the missing-directory stop, which proves the run got past the project check", argv, err)
 	}
 }
 
@@ -450,6 +558,39 @@ func TestJoinDisabledReason(t *testing.T) {
 				t.Errorf("joinDisabledReason(%q, %+v) = %q, want %q", tc.profilesDir, tc.scan, got, tc.want)
 			}
 		})
+	}
+}
+
+// The two shutdown lines that name the unreachable clusters tell the operator
+// what became of their records, one line per disposition: the first names the
+// clusters a profile names and the run could not join (or every unreachable
+// cluster when the scope was unknown: no --profiles-dir, or a directory the
+// scope could not read), whose records went out thin; the second names the
+// clusters no readable profile names, whose records were held -- profile them,
+// exclude them, or fix the profile the scope logged.
+func TestUnreachableClustersLine(t *testing.T) {
+	names := []string{`"example-project/us-central1/prod-b"=3`}
+	got := unreachableClustersLine(names)
+	for _, want := range []string{"forwarded without ownership", "Cluster Agent profile names them", "could not be read", names[0]} {
+		if !strings.Contains(got, want) {
+			t.Errorf("unreachableClustersLine() = %q, want it to contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, "outside the install's scope") {
+		t.Errorf("unreachableClustersLine() = %q, want it not to claim a hold that did not happen", got)
+	}
+}
+
+func TestOutOfScopeClustersLine(t *testing.T) {
+	names := []string{`"example-project/us-central1/prod-b"=3`}
+	got := outOfScopeClustersLine(names)
+	for _, want := range []string{"outside the install's scope", "no readable Cluster Agent profile names them", "held out of the inject", "exclude them", "fix the profile", names[0]} {
+		if !strings.Contains(got, want) {
+			t.Errorf("outOfScopeClustersLine() = %q, want it to contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, "forwarded without ownership") {
+		t.Errorf("outOfScopeClustersLine() = %q, want it not to say the records were forwarded", got)
 	}
 }
 

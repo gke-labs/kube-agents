@@ -36,8 +36,10 @@ import (
 	nodev1 "k8s.io/api/node/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -49,6 +51,7 @@ import (
 	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -869,6 +872,318 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitRepo(t *testing.T) {
 	}
 }
 
+// reconcileInvalidCredentialProxyResources reconciles a CR whose
+// credential-proxy override the shared validation refuses, against an install
+// whose running proxy Deployment is stale (an older image), and asserts the
+// operator's refusal: the Degraded condition with InvalidCredentialProxyResources
+// while Ready and the phase keep what the workloads say, a Warning event that
+// names the field, and the Deployment applied regardless, at the
+// operator's default resources, so the rest of what it carries keeps flowing.
+// The webhook is not in the loop, as on a chart install, which leaves it off.
+func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.ResourceRequirements, wantField string) string {
+	t.Helper()
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-proxy-resources", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
+				CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: override},
+			}},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+	atDefaults := agent.DeepCopy()
+	atDefaults.Spec.Deployment.CredentialProxy = nil
+	running := buildCredentialProxyDeployment(atDefaults, "policy-hash")
+	staleImage := "example.invalid/stale-credential-proxy:old"
+	running.Spec.Template.Spec.Containers[0].Image = staleImage
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent), running).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	recorder := record.NewFakeRecorder(64)
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: recorder}
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+	ctx := context.Background()
+
+	for i := range 2 {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i+1, err)
+		}
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	// Degraded only: the proxy runs at the defaults, so the phase and Ready
+	// keep what the workloads say (here, not yet ready).
+	if updated.Status.Phase == "Degraded" {
+		t.Errorf("Status.Phase = Degraded; the refusal is reported on the Degraded condition only")
+	}
+	degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonInvalidCredentialProxyResources {
+		t.Fatalf("Degraded condition = %v, want True/%s", degraded, conditionReasonInvalidCredentialProxyResources)
+	}
+	if !strings.Contains(degraded.Message, wantField) {
+		t.Errorf("Degraded message %q does not name %s", degraded.Message, wantField)
+	}
+	if ready := meta.FindStatusCondition(updated.Status.Conditions, "Ready"); ready == nil || ready.Reason == conditionReasonInvalidCredentialProxyResources {
+		t.Errorf("Ready condition = %v; the refusal is reported on Degraded only", ready)
+	}
+
+	// With every workload ready, Ready is True and the phase Ready while
+	// Degraded still carries the refusal. The workloads' status is written
+	// after the reconciles, and the status writer is driven directly.
+	for _, key := range []client.ObjectKey{
+		{Name: agent.Name + "-gateway", Namespace: agent.Namespace},
+		{Name: credentialBrokerName(agent), Namespace: agent.Namespace},
+	} {
+		d := &appsv1.Deployment{}
+		if err := cl.Get(ctx, key, d); err != nil {
+			t.Fatalf("get %s: %v", key.Name, err)
+		}
+		d.Status.ReadyReplicas = 1
+		if err := cl.Status().Update(ctx, d); err != nil {
+			t.Fatalf("mark %s ready: %v", key.Name, err)
+		}
+	}
+	sts := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: shellSandboxName(agent), Namespace: agent.Namespace}, sts); err != nil {
+		t.Fatalf("get shell sandbox: %v", err)
+	}
+	sts.Status.ReadyReplicas = 1
+	if err := cl.Status().Update(ctx, sts); err != nil {
+		t.Fatalf("mark shell sandbox ready: %v", err)
+	}
+	r.APIReader = cl
+	phase, err := r.updateStatusReady(ctx, updated, "", otlpSourceNone, r.resolveNetpolProfile(ctx, updated), a2aStateFrom(t, ctx, r, updated))
+	if err != nil {
+		t.Fatalf("updateStatusReady failed: %v", err)
+	}
+	if phase != "Ready" {
+		t.Errorf("phase with every workload ready = %q, want Ready", phase)
+	}
+	if ready := meta.FindStatusCondition(updated.Status.Conditions, "Ready"); ready == nil || ready.Status != metav1.ConditionTrue {
+		t.Errorf("Ready condition with every workload ready = %v, want True", ready)
+	}
+	if degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded"); degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonInvalidCredentialProxyResources {
+		t.Errorf("Degraded condition with every workload ready = %v, want True/%s", degraded, conditionReasonInvalidCredentialProxyResources)
+	}
+
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(running), dep); err != nil {
+		t.Fatalf("the proxy Deployment is gone: %v", err)
+	}
+	var proxy *corev1.Container
+	for i := range dep.Spec.Template.Spec.Containers {
+		if dep.Spec.Template.Spec.Containers[i].Name == credentialProxyContainerName {
+			proxy = &dep.Spec.Template.Spec.Containers[i]
+		}
+	}
+	if proxy == nil {
+		t.Fatalf("no %s container in the proxy Deployment", credentialProxyContainerName)
+	}
+	if want := resolveCredentialProxyImage(agent.Spec.Deployment); proxy.Image != want || proxy.Image == staleImage {
+		t.Errorf("the proxy container's image = %q, want %q; a refused override must not stop the Deployment being applied", proxy.Image, want)
+	}
+	wantResources := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("1Gi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:              resource.MustParse("1"),
+			corev1.ResourceMemory:           resource.MustParse("2Gi"),
+			corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
+		},
+	}
+	if !equality.Semantic.DeepEqual(proxy.Resources, wantResources) {
+		t.Errorf("the proxy container's resources = %v, want the operator's defaults %v; a refused override is ignored", proxy.Resources, wantResources)
+	}
+
+	close(recorder.Events)
+	var warned bool
+	for event := range recorder.Events {
+		if strings.HasPrefix(event, corev1.EventTypeWarning+" "+conditionReasonInvalidCredentialProxyResources) && strings.Contains(event, wantField) {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("no Warning %s event naming %s", conditionReasonInvalidCredentialProxyResources, wantField)
+	}
+	return degraded.Message
+}
+
+// A memory limit under the floor: rendered, the broker would turn its budget
+// off and admit eight commands into 512Mi.
+func TestPlatformAgentReconciler_Reconcile_CredentialProxyLimitUnderTheFloorIsRefused(t *testing.T) {
+	reconcileInvalidCredentialProxyResources(t, &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
+	}, "spec.deployment.credentialProxy.resources.limits.memory")
+}
+
+// A request above the default limit: rendered, the API server refuses the
+// Deployment as Invalid, which applyCredentialProxyDeployment reads as the
+// immutable-selector case and answers by deleting the running proxy.
+func TestPlatformAgentReconciler_Reconcile_CredentialProxyRequestAboveTheLimitIsRefused(t *testing.T) {
+	reconcileInvalidCredentialProxyResources(t, &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
+	}, "spec.deployment.credentialProxy.resources.requests.memory")
+}
+
+// An undeclared resource name is the author's and unbounded in length; quoted
+// whole, a 33,000-character one would push the Degraded message past the CRD's
+// 32768-character cap and fail every status write. The name is cut where it
+// enters the field path, so the status write succeeds (the helper reads the
+// condition back), the message stays bounded, and the reason after the path
+// survives the cut.
+func TestPlatformAgentReconciler_Reconcile_CredentialProxyRefusalOfALongNameIsBounded(t *testing.T) {
+	name := corev1.ResourceName("example.com/" + strings.Repeat("x", 33000))
+	msg := reconcileInvalidCredentialProxyResources(t, &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{name: resource.MustParse("1")},
+	}, "spec.deployment.credentialProxy.resources.limits.example.com/xxx")
+	fixed := len(invalidCredentialProxyResourcesMsgFmt) - len("%s")
+	if len(msg) > credentialProxyRefusalMessageBudget+fixed {
+		t.Errorf("Degraded message is %d characters, want at most %d", len(msg), credentialProxyRefusalMessageBudget+fixed)
+	}
+	if !strings.Contains(msg, credentialProxyRefusalEllipsis+": ") {
+		t.Errorf("Degraded message does not mark the cut name: %q", msg)
+	}
+	if !strings.Contains(msg, credentialProxyResourceNameRefusal) {
+		t.Errorf("Degraded message dropped the reason: %q", msg)
+	}
+}
+
+// The limit-without-request note is logged once per spec generation, not on
+// every pass: the status write re-enqueues, owned objects change and the
+// steady-state requeue fires, and a note repeated on each of them with no way
+// to acknowledge it is noise. A spec change logs it again.
+func TestPlatformAgentReconciler_Reconcile_CredentialProxyWarningLoggedOncePerGeneration(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-proxy-warning", Namespace: "test-ns", Generation: 1},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
+				CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+				}},
+			}},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+	var logged strings.Builder
+	ctx := logr.NewContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
+	const note = "limits.memory is set without requests.memory"
+
+	for i := range 4 {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i+1, err)
+		}
+	}
+	if got := strings.Count(logged.String(), note); got != 1 {
+		t.Fatalf("the note was logged %d times over four passes of generation 1, want once:\n%s", got, logged.String())
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if updated.Status.ObservedGeneration != 1 {
+		t.Fatalf("status.observedGeneration = %d, want 1", updated.Status.ObservedGeneration)
+	}
+	updated.Generation = 2
+	if err := cl.Update(ctx, updated); err != nil {
+		t.Fatalf("failed to bump the generation: %v", err)
+	}
+	for i := range 2 {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d of generation 2 failed: %v", i+1, err)
+		}
+	}
+	if got := strings.Count(logged.String(), note); got != 2 {
+		t.Errorf("the note was logged %d times in all after the spec changed, want twice:\n%s", got, logged.String())
+	}
+}
+
+// A generation that first went Degraded before the proxy step still logs the
+// note once when it gets there. The RuntimeClass refusal runs earlier and
+// records the generation as observed, so a gate on status.observedGeneration
+// reads the generation as already seen once the RuntimeClass appears.
+func TestPlatformAgentReconciler_Reconcile_CredentialProxyWarningLoggedAfterAnEarlierDegradedPass(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-proxy-warning-rc", Namespace: "test-ns", Generation: 1},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
+				Availability: &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("gvisor")},
+				CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+				}},
+			}},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+	var logged strings.Builder
+	ctx := logr.NewContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
+	const note = "limits.memory is set without requests.memory"
+
+	for i := range 2 {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i+1, err)
+		}
+	}
+	degraded := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, degraded); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	cond := meta.FindStatusCondition(degraded.Status.Conditions, "Ready")
+	if degraded.Status.Phase != "Degraded" || cond == nil || cond.Reason != reasonRuntimeClassNotFound {
+		t.Fatalf("phase %q, Ready condition %+v; want Degraded on %s", degraded.Status.Phase, cond, reasonRuntimeClassNotFound)
+	}
+	if degraded.Status.ObservedGeneration != 1 {
+		t.Fatalf("status.observedGeneration = %d, want 1 after the RuntimeClass refusal", degraded.Status.ObservedGeneration)
+	}
+	if got := strings.Count(logged.String(), note); got != 0 {
+		t.Fatalf("the note was logged %d times before the proxy step was reached, want none:\n%s", got, logged.String())
+	}
+
+	if err := cl.Create(ctx, &nodev1.RuntimeClass{ObjectMeta: metav1.ObjectMeta{Name: "gvisor"}, Handler: "gvisor"}); err != nil {
+		t.Fatalf("failed to create the RuntimeClass: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the RuntimeClass appeared failed: %v", err)
+	}
+	if got := strings.Count(logged.String(), note); got != 1 {
+		t.Fatalf("the note was logged %d times on the first pass to reach the proxy step, want once:\n%s", got, logged.String())
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile of the same generation failed: %v", err)
+	}
+	if got := strings.Count(logged.String(), note); got != 1 {
+		t.Errorf("the note was logged %d times in all after a further pass of the same generation, want once:\n%s", got, logged.String())
+	}
+}
+
 func TestPlatformAgentReconciler_Reconcile_NonGitHubRepo(t *testing.T) {
 	scheme := setupScheme()
 
@@ -1296,8 +1611,8 @@ func TestBuildNetworkPolicy(t *testing.T) {
 	if len(netpol.Spec.PolicyTypes) != 2 {
 		t.Errorf("expected 2 PolicyTypes, got %d", len(netpol.Spec.PolicyTypes))
 	}
-	if len(netpol.Spec.Ingress) != 2 {
-		t.Fatalf("expected 2 Ingress rules (the agent namespace, the managed-Prometheus collector), got %d", len(netpol.Spec.Ingress))
+	if len(netpol.Spec.Ingress) != 3 {
+		t.Fatalf("expected 3 Ingress rules (the agent namespace, the managed-Prometheus collector on the watcher's port and on the chat plugin's), got %d", len(netpol.Spec.Ingress))
 	}
 	if len(netpol.Spec.Ingress[0].Ports) != 3 {
 		t.Errorf("expected 3 ports in agent namespace ingress rule when dashboard enabled, got %d", len(netpol.Spec.Ingress[0].Ports))
@@ -1421,8 +1736,8 @@ func TestBuildNetworkPolicy_DashboardDisabled(t *testing.T) {
 	}
 
 	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
-	if len(netpol.Spec.Ingress) != 2 {
-		t.Fatalf("expected 2 Ingress rules (the agent namespace, the managed-Prometheus collector), got %d", len(netpol.Spec.Ingress))
+	if len(netpol.Spec.Ingress) != 3 {
+		t.Fatalf("expected 3 Ingress rules (the agent namespace, the managed-Prometheus collector on the watcher's port and on the chat plugin's), got %d", len(netpol.Spec.Ingress))
 	}
 	if len(netpol.Spec.Ingress[0].Ports) != 2 {
 		t.Errorf("expected 2 ports in agent namespace ingress rule when dashboard disabled, got %d", len(netpol.Spec.Ingress[0].Ports))
@@ -3347,6 +3662,107 @@ func TestDetectPluginImageFailures_DoesNotBlameSiblingTag(t *testing.T) {
 	}
 	if _, blamed := failures["pluginten"]; !blamed {
 		t.Errorf("expected the plugin using :v10 to be blamed, got %v", failures)
+	}
+}
+
+// The operator owns the gitops-state ConfigMap's github_host key: it is
+// written for a GitHub Enterprise Server host, absent for github.com, and a
+// declaration that moves the host updates it and writes a Warning Event.
+func TestReconcileGitopsStateGitHubHost(t *testing.T) {
+	scheme := setupScheme()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	recorder := record.NewFakeRecorder(8)
+	r := &PlatformAgentReconciler{Client: fakeClient, Scheme: scheme, Recorder: recorder}
+	ctx := context.Background()
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+	declare := func(host string) {
+		agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Host: host, Namespace: "acme"}},
+		}}
+	}
+	cmKey := client.ObjectKey{Name: "test-agent-gitops-state", Namespace: "test-ns"}
+	read := func() (string, bool) {
+		var cm corev1.ConfigMap
+		if err := fakeClient.Get(ctx, cmKey, &cm); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		host, ok := cm.Data[gitopsStateGitHubHostKey]
+		return host, ok
+	}
+	events := func() []string {
+		var out []string
+		for {
+			select {
+			case e := <-recorder.Events:
+				out = append(out, e)
+			default:
+				return out
+			}
+		}
+	}
+
+	declare("")
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if host, ok := read(); ok {
+		t.Errorf("a github.com install carries github_host = %q", host)
+	}
+	declare("GHE.example.com")
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if host, _ := read(); host != "ghe.example.com" {
+		t.Errorf("github_host = %q, expected ghe.example.com", host)
+	}
+	if got := events(); len(got) != 1 || !strings.Contains(got[0], "GitHubHostChanged") ||
+		!strings.Contains(got[0], "from github.com to ghe.example.com") {
+		t.Errorf("events = %v, expected one GitHubHostChanged warning", got)
+	}
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if got := events(); len(got) != 0 {
+		t.Errorf("an unchanged host wrote events: %v", got)
+	}
+	// A typo that validation refuses holds the key: the install does not move
+	// back to github.com.
+	agent.Spec.Integration.Forges[0].CABundleRef = &agentv1alpha1.ForgeCABundleRef{Name: "GHE_CA"}
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if host, _ := read(); host != "ghe.example.com" {
+		t.Errorf("github_host = %q after a refused declaration, expected it held at ghe.example.com", host)
+	}
+	if got := events(); len(got) != 0 {
+		t.Errorf("a refused declaration wrote events: %v", got)
+	}
+	agent.Spec.Integration.Forges[0].CABundleRef = nil
+	// A refusal the schema admits, with a later GitHub forge at github.com:
+	// the first forge still holds the host, so the key stays.
+	agent.Spec.Integration.Forges[0].Namespace = "acme.ops"
+	agent.Spec.Integration.Forges = append(agent.Spec.Integration.Forges,
+		agentv1alpha1.ForgeSpec{Name: "upstream", Namespace: "kubernetes"})
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if host, _ := read(); host != "ghe.example.com" {
+		t.Errorf("github_host = %q with a refused first forge and a github.com forge after it, expected ghe.example.com", host)
+	}
+	if got := events(); len(got) != 0 {
+		t.Errorf("a refused first forge wrote events: %v", got)
+	}
+	agent.Spec.Integration.Forges = agent.Spec.Integration.Forges[:1]
+	agent.Spec.Integration.Forges[0].Namespace = "acme"
+	declare("")
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if host, ok := read(); ok {
+		t.Errorf("github_host = %q stayed after the declaration moved back to github.com", host)
+	}
+	if got := events(); len(got) != 1 || !strings.Contains(got[0], "from ghe.example.com to github.com") {
+		t.Errorf("events = %v, expected one GitHubHostChanged warning", got)
 	}
 }
 
@@ -5844,7 +6260,7 @@ func TestMinterBareReposLogsNoEntryValue(t *testing.T) {
 		`{"type":"github","url":"https://x:` + secret + `@github.com/other-org/app"},` +
 		`{"type":"gitlab","url":"https://x:` + secret + `@gitlab.com/g/p"},` +
 		`{"type":"github","url":"https://github.com/test-org/repo-1"}]`
-	bare, unreadable, err := minterBareRepos(logger, repos, "test-org", gitopsStateManagedReposKey)
+	bare, unreadable, err := minterBareRepos(logger, repos, "test-org", agentv1alpha1.DefaultGitHubHost, gitopsStateManagedReposKey)
 	if err != nil {
 		t.Fatalf("minterBareRepos() = %v", err)
 	}
@@ -5903,7 +6319,7 @@ func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
 		`{"type":"github","url":"https://[x@github.com/test-org/open"},` +
 		`{"type":"github","url":"git+ssh://a]b@github.com/test-org/close"},` +
 		`{"type":"github","url":"https://[TOKEN]@github.com/test-org/paired"}]`
-	bare, unreadable, err := minterBareRepos(logr.Discard(), repos, "test-org", gitopsStateManagedReposKey)
+	bare, unreadable, err := minterBareRepos(logr.Discard(), repos, "test-org", agentv1alpha1.DefaultGitHubHost, gitopsStateManagedReposKey)
 	if err != nil {
 		t.Fatalf("minterBareRepos() = %v", err)
 	}
@@ -5912,6 +6328,46 @@ func TestMinterBareReposReadsWhatTheAgentReads(t *testing.T) {
 	}
 	if want := []string{"managed_repos[10]", "managed_repos[11]", "managed_repos[12]", "managed_repos[13]", "managed_repos[14]", "managed_repos[15]", "managed_repos[16]", "managed_repos[17]"}; !slices.Equal(unreadable, want) {
 		t.Errorf("unreadable = %v, expected %v", unreadable, want)
+	}
+}
+
+// On a GitHub Enterprise Server install the minter mints for the declared
+// host: its entries resolve there; a bare name, which the agent skips, and a
+// github.com entry, which is another host's, are skipped without holding
+// pruning; and an entry on a third host is still unreadable.
+func TestMinterBareReposResolvesOnTheGitHubEnterpriseHost(t *testing.T) {
+	repos := `[{"type":"github","url":"https://ghe.example.com/test-org/repo-1"},` +
+		`{"type":"github","url":"test-org/repo-2"},` +
+		`{"type":"github","url":"https://GHE.example.com/test-org/repo-3.git"},` +
+		`{"type":"github","url":"https://github.com/test-org/dotcom"},` +
+		`{"type":"github","url":"https://ghe.example.com:8443/test-org/with-port"},` +
+		`{"type":"github","url":"https://ghe.other.example/test-org/elsewhere"}]`
+	bare, unreadable, err := minterBareRepos(logr.Discard(), repos, "test-org", "ghe.example.com", gitopsStateManagedReposKey)
+	if err != nil {
+		t.Fatalf("minterBareRepos() = %v", err)
+	}
+	if want := []string{"repo-1", "repo-3"}; !slices.Equal(bare, want) {
+		t.Errorf("bare = %v, expected %v", bare, want)
+	}
+	if want := []string{"managed_repos[5]"}; !slices.Equal(unreadable, want) {
+		t.Errorf("unreadable = %v, expected %v", unreadable, want)
+	}
+}
+
+// The minter's host comes from the declaration: github.com with none, the
+// GitHub Enterprise Server host when a GitHub forge declares one.
+func TestMinterGitHubHost(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{}
+	if got := minterGitHubHost(agent); got != agentv1alpha1.DefaultGitHubHost {
+		t.Errorf("minterGitHubHost(no integration) = %q", got)
+	}
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
+		Forges: []agentv1alpha1.ForgeSpec{
+			{Name: "ghe", Provider: "github", Host: "GHE.example.com", Namespace: "test-org"},
+		},
+	}}
+	if got := minterGitHubHost(agent); got != "ghe.example.com" {
+		t.Errorf("minterGitHubHost(GHES forge) = %q, expected ghe.example.com", got)
 	}
 }
 
@@ -6068,6 +6524,86 @@ func TestReconcile_AnUnreadableEntryReportsTheHeldPruning(t *testing.T) {
 	}
 	if _, ok := minter.Data["repo-x.yaml"]; ok {
 		t.Error("repo-x.yaml was not pruned once every entry read")
+	}
+}
+
+func TestReconcile_AHeldPruningOutranksARefusedCredentialProxyOverride(t *testing.T) {
+	// A refused proxy override leaves the proxy at the operator's defaults; a
+	// held pruning leaves a write policy in place. Degraded carries one
+	// reason, and it is the one that reports lost function. Once the entry is
+	// fixed the proxy refusal surfaces, so it was ranked, not dropped.
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "held", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
+				CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
+				}},
+			}},
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+	state := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "held-gitops-state", Namespace: "test-ns"},
+		Data: map[string]string{
+			"managed_repos": `[{"type":"github","url":"https://x:y@github.com:test-org/repo-y"},{"type":"github","url":"https://github.com/test-org/repo-1"}]`,
+		},
+	}
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "github-token-minter-config",
+			Namespace:   "test-ns",
+			Annotations: map[string]string{AnnotationManagedMinterKeys: "repo-x.yaml"},
+		},
+		Data: map[string]string{"default.yaml": minterTemplateWithReadScope, "repo-x.yaml": "tracked"},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, state, minterCM, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "held", Namespace: "test-ns"}}
+	ctx := context.Background()
+	degradedReason := func() string {
+		t.Helper()
+		for range 2 {
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("Reconcile() = %v", err)
+			}
+		}
+		got := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
+			t.Fatalf("get agent: %v", err)
+		}
+		degraded := meta.FindStatusCondition(got.Status.Conditions, "Degraded")
+		if degraded == nil || degraded.Status != metav1.ConditionTrue {
+			t.Fatalf("Degraded = %v, expected True", degraded)
+		}
+		return degraded.Reason
+	}
+
+	if got := degradedReason(); got != conditionReasonMinterPruningHeld {
+		t.Errorf("Degraded reason = %s, expected %s over the refused proxy override", got, conditionReasonMinterPruningHeld)
+	}
+
+	fixed := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(state), fixed); err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	fixed.Data["managed_repos"] = `[{"type":"github","url":"https://github.com/test-org/repo-1"}]`
+	if err := cl.Update(ctx, fixed); err != nil {
+		t.Fatalf("update state: %v", err)
+	}
+	if got := degradedReason(); got != conditionReasonInvalidCredentialProxyResources {
+		t.Errorf("Degraded reason = %s after the entry was fixed, expected %s", got, conditionReasonInvalidCredentialProxyResources)
 	}
 }
 

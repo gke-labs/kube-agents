@@ -1,0 +1,63 @@
+name: Step 0 on bash 3.2
+
+# hack/ci-revalidate.sh is sourced and executed by tests/test_ci_eval_revalidation.py
+# through whatever `bash` is first on PATH, which on a stock macOS is /bin/bash 3.2;
+# the Prow pod and the Linux unit-test job both run bash 5, so a bash-4 construct in
+# the script passes every other check and fails every macOS contributor at source
+# time (an associative-array cache did exactly that during review of the override
+# reuse). This job is the floor's proof: the whole suite, on the macOS runner, with a
+# directory holding `bash -> /bin/bash` ahead of the Homebrew bash the runner also
+# carries. Nothing here needs a credential, so it runs on forks too.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "hack/ci-revalidate.sh"
+      - "hack/ledger_token_mint.py"
+      - "tests/test_ci_eval_revalidation.py"
+      - "tests/testing/common.py"
+      - ".github/workflows/step0-bash-floor.yml"
+  push:
+    branches: [main]
+    paths:
+      - "hack/ci-revalidate.sh"
+      - "hack/ledger_token_mint.py"
+      - "tests/test_ci_eval_revalidation.py"
+      - "tests/testing/common.py"
+      - ".github/workflows/step0-bash-floor.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  revalidation-suite-on-bash-3-2:
+    name: tests/test_ci_eval_revalidation.py under /bin/bash 3.2
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Put the system bash first on PATH and show its version
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/bash-3-2"
+          ln -s /bin/bash "$RUNNER_TEMP/bash-3-2/bash"
+          echo "$RUNNER_TEMP/bash-3-2" >> "$GITHUB_PATH"
+          /bin/bash --version | head -n 1
+
+      - name: Source the script under /bin/bash 3.2
+        # The entrypoint is guarded on BASH_SOURCE, so sourcing only defines
+        # constants and functions: every top-level construct is exercised.
+        run: /bin/bash -c 'set -euo pipefail; source hack/ci-revalidate.sh; echo "sourced under ${BASH_VERSION}"'
+
+      - name: Run the revalidation suite with bash 3.2 first on PATH
+        run: |
+          command -v bash
+          bash --version | head -n 1
+          python3 -m unittest tests.test_ci_eval_revalidation

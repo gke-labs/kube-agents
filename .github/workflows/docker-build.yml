@@ -43,7 +43,7 @@ jobs:
         run: cat tags.env >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # platforms: linux/amd64 on every deploy/docker/Dockerfile build: the images
       # deploy to amd64 GKE nodes, and the multi-arch bases otherwise resolve to
@@ -105,7 +105,7 @@ jobs:
       # different image. Two images sharing a scope overwrite each other's index and
       # both stop hitting.
       - name: Build Platform Agent
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -137,7 +137,7 @@ jobs:
       # for. The host-side unit tests cannot reach it: see the stage comment in the
       # Dockerfile.
       - name: Verify entrypoint shared-state gate (in-image)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -180,7 +180,7 @@ jobs:
       # the shorter chain of the two and not the one the budget is measured
       # against; building it still proves the stage compiles.
       - name: Build Credential Sidecar
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -192,7 +192,7 @@ jobs:
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
       - name: Build Replay Proxy
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: examples/inference-replay/replay-proxy
           push: false
@@ -202,7 +202,7 @@ jobs:
       # credential-proxy client the agent image does, from its own location.
       # load: true because the next step runs the image, not just builds it.
       - name: Build Agent Sandbox
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/sandbox/Dockerfile

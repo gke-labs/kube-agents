@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "runId": "run_20261005_215541_763063",
+  "t": "2026-10-05T22:50:46Z",
+  "setupId": "gemini-3-7-flash-kubeagents-mcp",
+  "model": "gemini-3.7-flash",
+  "harness": "kubeagents",
+  "augmentation": [
+    "mcp"
+  ]
+}

@@ -5,7 +5,7 @@ The operator falls back to a compiled constant whenever an image env var is
 unset; the ones that are inventory entries are the fluent-bit sidecar, and the
 NATS and nats-box images a `spec.mode: next` install renders. The last two
 reach no chart render, so this check is the only one that sees them. The
-first-party next defaults (gateway, worker, callout) are release images with
+first-party next defaults (gateway, worker, callout, console, Hermes bridge) are release images with
 no fixed tag, so `check_compiled_image_name` holds the operator's bare image
 names to the inventory's entries (and each entry's repository to the name
 beside platform-agent's), and `check_compiled_repository` holds the gateway
@@ -48,6 +48,8 @@ _CALL_SITES = (
     "check_compiled_image_name a2a-gateway k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aGatewayImageName",
     "check_compiled_image_name a2a-worker k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aWorkerImageName",
     "check_compiled_image_name a2a-authcallout k8s-operator/internal/controller/platformagent_a2a_callout.go a2aCalloutImageName",
+    "check_compiled_image_name a2a-console k8s-operator/internal/controller/platformagent_a2a_console.go a2aConsoleImageName",
+    "check_compiled_image_name hermes-bridge k8s-operator/internal/controller/platformagent_a2a_bridge.go a2aBridgeImageName",
     "check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository",
 )
 

@@ -449,7 +449,7 @@ class EveryOutcomeIsAuditedTest(_BrokerWithJsonLog):
         self.assertNotIn("duration_ms", record)
 
     def test_a_scoped_credential_refusal(self):
-        CredentialProxyHandler.executor = self._Refusing(scoped_sa_pool.PoolRefusal("no member covers the scope"))
+        CredentialProxyHandler.executor = self._Refusing(scoped_sa_pool.PoolRefusal("no scoped service account for project p (cluster projects/p/locations/l/clusters/c): refused; the broker will not fall back to the ambient credential. Declare the project in spec.scope and apply, or exclude the cluster."))
         status, body = self.post(["kubectl", "get", "pods"], request_id="req-s1")
         self.assertEqual((403, "gcp.scoped-sa.unmapped-scope"), (status, body["rule"]))
         record = self._last_audit("req-s1")

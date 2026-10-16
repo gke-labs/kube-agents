@@ -29,7 +29,7 @@ SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -119,23 +119,24 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # or carries a `# shellcheck disable=SCnnnn # reason` on the line above, so widening this
 # list is how a real finding gets silenced.
 #
-# The scripts under agents/platform/skills/gke-*/ are left out. Those trees are
-# copies of google/skills that scripts/sync-upstream-skills.py deletes and
-# re-copies wholesale (AGENTS.md, Skills Guidelines), and its substitution
-# hooks rewrite SKILL.md only, so a directive or fix written into one of their
-# .sh files lasts until the next sync and the target goes red on a tree nobody
-# edited by hand. A warning in one of them is fixed upstream, not here.
+# The scripts under agents/platform/skills/gke-*/ are linted like the rest. They
+# are generated from google/skills plus a patch overlay (scripts/skill_overlay.py;
+# AGENTS.md, Skills Guidelines), so a fix, or for a false positive a
+# `# shellcheck disable=SCnnnn # reason`, is recorded as a patch and survives
+# every sync.
 SHELLCHECK_PATHSPEC := *.sh
-SHELLCHECK_SKIP_PATHSPEC := :!agents/platform/skills/gke-*
+# third_party/google-skills/ holds byte-identical copies of upstream's skills, which
+# are never edited; the generated skills in agents/platform/skills/gke-*/ carry any fix.
+SHELLCHECK_SKIP_PATHSPEC := :!third_party/google-skills/*
 SHELLCHECK_SEVERITY := warning
 SHELLCHECK_EXCLUDE := SC1090,SC1091
 
-shellcheck: ## Run shellcheck over every tracked .sh file (upstream-synced gke-* skills excepted) at warning severity.
+shellcheck: ## Run shellcheck over every tracked .sh file (the upstream copies in third_party/ excepted) at warning severity.
 	@command -v shellcheck >/dev/null 2>&1 || { \
 		echo "shellcheck needs the shellcheck binary; install the release .github/workflows/validate.yml pins (https://github.com/koalaman/shellcheck/releases) so local and CI findings match"; \
 		exit 1; \
 	}
-	@git ls-files -z '$(SHELLCHECK_PATHSPEC)' '$(SHELLCHECK_SKIP_PATHSPEC)' | xargs -0 shellcheck -x -S $(SHELLCHECK_SEVERITY) -e $(SHELLCHECK_EXCLUDE)
+	@git ls-files -z '$(SHELLCHECK_PATHSPEC)' $(foreach p,$(SHELLCHECK_SKIP_PATHSPEC),'$(p)') | xargs -0 shellcheck -x -S $(SHELLCHECK_SEVERITY) -e $(SHELLCHECK_EXCLUDE)
 
 # ruff's error-only rules: syntax errors (E9), comparisons that are always
 # wrong (F63), misplaced control flow (F7) and undefined names (F82) -- the
@@ -244,6 +245,59 @@ endif
 # runs in structural too, which is the other half of measuring the same suite.
 PYTHON_TEST_PATH := $(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/pubsub-platform
 
+# The files the sweep hands out first. xargs feeds the workers in list order,
+# and the globs above sort by path, so a long file that sorts late started
+# late: on 2026-10-14 (run 38592675526) every other file had finished at
+# 16:01:24 and tests/test_rollback_roundtrip.py, 182 s on its own and sorted
+# into the last tenth of the list, ran alone until 16:03:32 with three of four
+# workers idle.
+# Longest-first is the schedule that closes that gap, and the simulation over
+# that run's per-file times puts the sweep at its floor, the total divided by
+# the worker count, instead of two minutes above it. These are the files that
+# took over 30 s in that run, longest first; the rest of the sweep is a long
+# tail that no order can move by much. A file named here that no glob reaches
+# fails tests/test_python_test_sweep.py, which is what keeps the list honest
+# when a test moves or is deleted. A file that grows heavy later costs the
+# tail again until someone adds it; the per-file blocks the sweep prints carry
+# the `Ran N tests in S s` line to find it by.
+PYTHON_TEST_HEAVY_FILES := \
+	scripts/test_eval_dashboard_pages.py \
+	tests/test_rollback_roundtrip.py \
+	agents/platform/scripts/test_credential_proxy.py \
+	tests/test_bootstrap_discovery_plant.py \
+	tests/test_fleet_fixture_state.py \
+	scripts/test_task_registration.py \
+	tests/test_install_script.py \
+	tests/test_bootstrap_ranking_plant.py \
+	scripts/test_eval_dashboard_fixture_state.py \
+	tests/test_gitops_fix_cycle_scripts.py \
+	tests/test_python_test_sweep.py \
+	scripts/test_skill_overlay.py \
+	tests/integration/test_seam_injector_kv.py \
+	scripts/test_eval_dashboard_nightly.py \
+	scripts/test_ci_env_agent_pod_diagnostics.py \
+	scripts/test_eval_dashboard_trend.py \
+	scripts/test_eval_dashboard_publish.py \
+	agents/platform/skills/fleet-audit/scripts/test_audit_report.py \
+	tests/test_installer_common.py \
+	agents/platform/scripts/test_credential_proxy_metrics.py
+
+# The order the workers take files in: the heavy files above that are in
+# PYTHON_TEST_FILES, in that order, then every other file in PYTHON_TEST_FILES
+# order. Filtered both ways so it is a permutation of PYTHON_TEST_FILES and
+# nothing more -- a run narrowed with PYTHON_TEST_FILES="..." runs the files
+# it names, not those plus the heavy list. The heavy names are the patterns in
+# both filters and PYTHON_TEST_FILES is only ever the text, because make reads
+# `%` in a pattern word as a wildcard: with the caller's list as the pattern, a
+# typed PYTHON_TEST_FILES='tests/%' pulled every heavy file under tests/ into
+# the feed, where the output loop below, which walks PYTHON_TEST_FILES, would
+# print none of their blocks and read none of their verdicts. This way that
+# word reaches the worker as the literal it is and fails its regular-file
+# check, the same as on any other path that is not a file. Only the feed to
+# xargs reads this; the captured output is still printed in PYTHON_TEST_FILES
+# order, so the blocks read in path order whatever order the files ran in.
+PYTHON_TEST_RUN_ORDER = $(foreach heavy,$(PYTHON_TEST_HEAVY_FILES),$(filter $(heavy),$(PYTHON_TEST_FILES))) $(filter-out $(PYTHON_TEST_HEAVY_FILES),$(PYTHON_TEST_FILES))
+
 # How many of those files `test-python` and `coverage` run at once. They are
 # separate `python3` processes that share nothing -- each cd's into its own
 # directory, servers in the seam tier bind port 0, and fixtures go through
@@ -251,7 +305,8 @@ PYTHON_TEST_PATH := $(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/
 # slowest single directory however many workers there were: on CI's four,
 # tests/ alone took ten of the job's twelve minutes while the other three sat
 # idle. Per file, the shards spread across the workers and the sweep costs
-# about the total divided by this number, down to the slowest single file.
+# about the total divided by this number, down to the slowest single file,
+# provided the long files start first (PYTHON_TEST_RUN_ORDER above).
 #
 # Set it to 1 to serialise. That is for reproducing a failure you suspect is
 # concurrency's doing, or for a machine you need the cores back on -- not for
@@ -281,7 +336,8 @@ PYTHON_TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 # xargs keeps going, and each worker records its own verdict in a file because
 # a variable assigned in a subprocess cannot come back to the parent. And each
 # file's output still arrives as a labelled block, because it is captured to
-# its own file and printed afterwards in PYTHON_TEST_FILES order -- concurrent
+# its own file and printed afterwards in PYTHON_TEST_FILES order, whatever
+# order PYTHON_TEST_RUN_ORDER ran them in -- concurrent
 # writers to one stream interleave mid-line and the "==> file" headers stop
 # meaning anything. What that costs is progress, and a run killed mid-sweep (a
 # CI cancellation, a step timeout) loses the captured output entirely, so each
@@ -308,7 +364,7 @@ define sweep_python_test_files
 work=$$(mktemp -d); \
 trap 'rm -rf "$$work"' EXIT INT TERM; \
 export work; \
-printf '%s\n' $(PYTHON_TEST_FILES) | xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
+printf '%s\n' $(PYTHON_TEST_RUN_ORDER) | xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
 	file="$$1"; \
 	dir="$$(dirname "$$file")"; \
 	name="$$(basename "$$file")"; \
@@ -568,8 +624,50 @@ coverage-check: ## Fail if total Python coverage is below COVERAGE_FLOOR. Run `m
 # specs directly -- the roster-collision sweep in tests/test_verifiers.py,
 # which has to see every task's phrases at once -- so the parser belongs with
 # the test runner. Keep in step with bench/pyproject.toml's `dev` group.
-test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus pytest and pyyaml. Resolves devops-bench from the git SHA pinned in bench/pyproject.toml, so the first run needs network.
-	@python3 -m pip install -e bench/ pytest pyyaml
+#
+# The install is retried because the devops-bench pin is a git clone from
+# github.com, and pip retries its HTTP downloads but not that clone: one
+# GitHub-side 504 on it failed a pull request's bench job outright, and a
+# re-run of the same tree passed. Three attempts a fixed few seconds apart
+# absorb a single bad transfer and little more; each failed attempt is
+# announced on stderr, and the last still exits non-zero so a genuine error --
+# a broken pin, a missing build backend -- stays an error. The loop has the
+# shape of k8s-operator/Makefile's envtest-use macro, with a fixed delay in
+# place of its doubling one, and checks its tunables before reading them for
+# the reason given there: an empty override would otherwise defeat the
+# ceiling and the loop would retry forever. The check is for a run of digits
+# rather than `test`'s integer grammar, which admits a sign or trailing
+# whitespace ("5 ", "-0") that `sleep` rejects; the rejected sleep would then
+# be a message on stderr and no pause, and every attempt would land in the
+# same bad second. BENCH_PIP exists so a test can point the recipe at a stub
+# and count invocations offline.
+BENCH_DEPS_INSTALL_ATTEMPTS ?= 3
+BENCH_DEPS_RETRY_DELAY_SECONDS ?= 5
+BENCH_PIP ?= python3 -m pip
+
+test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus pytest and pyyaml. Resolves devops-bench from the git SHA pinned in bench/pyproject.toml, so the first run needs network; the install is retried up to BENCH_DEPS_INSTALL_ATTEMPTS times.
+	@attempts="$(BENCH_DEPS_INSTALL_ATTEMPTS)"; \
+	delay="$(BENCH_DEPS_RETRY_DELAY_SECONDS)"; \
+	bad=0; \
+	case "$$attempts" in ''|*[!0-9]*) bad=1;; *) [ "$$attempts" -ge 1 ] || bad=1;; esac; \
+	case "$$delay" in ''|*[!0-9]*) bad=1;; esac; \
+	if [ "$$bad" -ne 0 ]; then \
+		echo "Error: BENCH_DEPS_INSTALL_ATTEMPTS must be a whole number of at least 1 and BENCH_DEPS_RETRY_DELAY_SECONDS one of at least 0, digits only; got '$$attempts' and '$$delay'." >&2; \
+		exit 1; \
+	fi; \
+	attempt=1; \
+	while :; do \
+		if $(BENCH_PIP) install -e bench/ pytest pyyaml; then \
+			exit 0; \
+		fi; \
+		if [ "$$attempt" -ge "$$attempts" ]; then \
+			echo "Error: bench deps install failed after $$attempts attempts." >&2; \
+			exit 1; \
+		fi; \
+		echo "bench deps install attempt $$attempt of $$attempts failed; retrying in $${delay}s" >&2; \
+		sleep "$$delay"; \
+		attempt=$$((attempt + 1)); \
+	done
 
 test-bench: ## Run the bench harness tests under pytest.
 	@python3 -m pytest bench/tests/
@@ -606,17 +704,45 @@ test-integration: ## Run just the integration seam tests; CI reaches them throug
 # error. This is the compiler for that layer.
 #
 # Not folded into docs-check: these files are runtime assets rather than
-# documents (the docs map does not inventory them), and the resolution rules are
-# not the same either -- a path here resolves against a profile home and the
-# /opt/defaults layer the entrypoint copies over it, not against the file that
-# cites them. CI runs it as its own job in validate.yml, alongside the other
-# repository-structure invariants.
+# documents, and the resolution rules are not the same either -- a path here
+# resolves against a profile home and the /opt/defaults layer the entrypoint
+# copies over it, not against the file that cites them. CI runs it as its own
+# job in validate.yml, alongside the other repository-structure invariants.
 prompt-check: ## Verify the agent's instructions cite skills and files that exist.
 	@python3 scripts/check_prompt_assets.py
 
+# Mirrored gke-* skills: an exact copy of google/skills at a pinned commit, this repository's
+# changes as patch files, and the generated skill the image ships
+# (docs/designs/upstream-skill-overlays.md). Each target wraps scripts/skill_overlay.py.
+SKILL_OVERLAY := python3 scripts/skill_overlay.py
+
+skills-sync: ## Sync one mirrored skill to google/skills (SKILL=name [REF=commit]); adopts a skill not yet mirrored.
+	@$(SKILL_OVERLAY) sync $(SKILL) $(if $(REF),--ref $(REF))
+
+skills-continue: ## Resume a skill sync that stopped on a conflict (SKILL=name).
+	@$(SKILL_OVERLAY) continue $(SKILL)
+
+skills-import: ## Start mirroring a skill this repository already ships (SKILL=name REF=commit); the shipped skill is unchanged.
+	@$(SKILL_OVERLAY) import $(SKILL) --ref $(REF)
+
+skills-refresh: ## Record edits to a mirrored skill as a patch (SKILL=name [MSG="..."] [PATCH=nnnn to fold]).
+	@$(SKILL_OVERLAY) refresh $(SKILL) $(if $(PATCH),--patch $(PATCH)) $(if $(MSG),--message "$(MSG)")
+
+skills-generate: ## Rebuild a mirrored skill from its upstream copy and overlay (SKILL=name).
+	@$(SKILL_OVERLAY) generate $(SKILL)
+
+skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, offline.
+	@$(SKILL_OVERLAY) check
+
+skills-status: ## List mirrored skills google/skills has moved past, and upstream skills not mirrored.
+	@$(SKILL_OVERLAY) status
+
+skills-verify-upstream: ## Compare each upstream copy with google/skills at its locked commit ([BASE=ref] skips when no copy or lock changed).
+	@$(SKILL_OVERLAY) verify-upstream $(if $(BASE),--changed-since $(BASE))
+
 # Documentation that mirrors a machine-readable source is generated rather than
 # hand-kept: the cron jobs, the skill catalogue and the image inventory as
-# <!-- BEGIN GENERATED --> regions, plus docs/family-roster.txt written whole.
+# <!-- BEGIN GENERATED --> regions.
 # The SOP line numbers each governance cron prompt cites are recomputed first,
 # so the cron-job-example regions below render the prompt with them current.
 docs-generate: ## Regenerate the generated doc regions and files from their sources.
@@ -624,7 +750,7 @@ docs-generate: ## Regenerate the generated doc regions and files from their sour
 	@python3 scripts/generate_docs.py
 
 # Everything CI enforces about the docs, in one command.
-docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget ## Run every documentation check CI runs.
+docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-context-budget ## Run every documentation check CI runs.
 
 docs-check-generated:
 	@python3 scripts/generate_sop_geography.py --check
@@ -635,9 +761,6 @@ docs-check-links:
 
 docs-check-terminology:
 	@./hack/check-docs-terminology.sh
-
-docs-check-map:
-	@python3 scripts/check_docs_map.py
 
 docs-check-audience: ## Fail when a published site page carries a maintainer identifier (shapes: scripts/docs_audience_denylist.txt).
 	@python3 scripts/check_docs_audience.py
@@ -664,10 +787,15 @@ iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy c
 tfvar-check: ## Run lifecycle.sh's tfvar() against a real terraform console for every variable it reads and fail on any unnormalised shape (CI runs this).
 	@./hack/check-tfvar-console.sh
 
-# The version mock_provider needs; the install floor the modules declare is
-# lower, and a binary below this reads two green suites as a parse error, so
+# The version the suites need; the install floor the modules declare is
+# lower, and a binary below this reads a green suite as a parse error, so
 # it is named up front, the way test-python names a missing import.
-TERRAFORM_TEST_MIN_VERSION := 1.7.0
+#
+# mock_provider put this at 1.7. drift-pubsub's suite raised it to 1.11, for
+# `override_during = plan`: a postcondition on a computed attribute is
+# unreachable without it, since the attribute is unknown at plan time and an
+# apply run leaves state behind that the runs after it silently reuse.
+TERRAFORM_TEST_MIN_VERSION := 1.11.0
 
 # Every module and composition that carries a tests/ directory -- the set
 # the validate job initialises -- against mocked providers, so a plan-time
@@ -680,14 +808,14 @@ TERRAFORM_TEST_MIN_VERSION := 1.7.0
 # fails and the failures are named again at the end, for the reason
 # test-python gives: a red run that hides the next suite's result costs a CI
 # round trip to discover.
-terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.7 for mock_provider).
-	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider); none on PATH" >&2; exit 1; }; \
+terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.11, see TERRAFORM_TEST_MIN_VERSION).
+	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider and override_during); none on PATH" >&2; exit 1; }; \
 	version="$$(terraform version 2>/dev/null | sed -n '1s/^Terraform v//p')"; \
 	if [ -z "$$version" ]; then \
 	  echo "terraform-test: could not read a Terraform version from \`terraform version\` (first line is not 'Terraform vX.Y.Z'); is PATH's terraform a shim or another binary?" >&2; exit 1; \
 	fi; \
 	if [ "$$(printf '%s\n' "$(TERRAFORM_TEST_MIN_VERSION)" "$$version" | sort -V | head -n1)" != "$(TERRAFORM_TEST_MIN_VERSION)" ]; then \
-	  echo "terraform-test: terraform $$version is too old; mock_provider needs >= $(TERRAFORM_TEST_MIN_VERSION) (the install floor is lower, the suites are not)" >&2; exit 1; \
+	  echo "terraform-test: terraform $$version is too old; the suites need >= $(TERRAFORM_TEST_MIN_VERSION) for mock_provider and override_during (the install floor is lower, the suites are not)" >&2; exit 1; \
 	fi; \
 	failed=""; for dir in terraform/modules/*/ terraform/examples/*/; do \
 	  if [ -d "$$dir/tests" ]; then \
@@ -702,7 +830,7 @@ terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `te
 	done; \
 	if [ -n "$$failed" ]; then echo "Failing Terraform test directories:$$failed"; exit 1; fi
 
-tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind.
+tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind; an approved apply (ARGS=-auto-approve) retries past Cloud KMS's first-enablement 403.
 	@./terraform/examples/full-install/lifecycle.sh apply $(ARGS)
 
 tf-destroy: ## Destroy terraform/examples/full-install, clearing the finalizer, backups, and deletion protection first.

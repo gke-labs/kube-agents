@@ -513,6 +513,13 @@ class TestShow(StoreTestCase):
         self.assertIn(f"runs/{self.newest}", payload["error"])
         self.assertIn("latest.json in acme/fleet is gone", payload["error"])
 
+    def test_github_named_with_its_host_answers_from_the_same_store(self):
+        # Review round 4: on a mixed install every surface hands out
+        # `github.com/owner/name`, and `--repo` with it was refused as "no
+        # reports" for the store it had just found.
+        payload = self.ok("show", AUDIT, "--repo", f"github.com/{REPO}")
+        self.assertEqual(payload["repo"], REPO)
+
     def test_repository_casing_is_not_a_second_store(self):
         payload = self.ok("show", AUDIT, "--repo", REPO.upper())
         self.assertEqual(payload["repo"], REPO)
@@ -940,6 +947,10 @@ class TestRuns(StoreTestCase):
         self.assertEqual(row["error"], payload["error"])
 
 
+class TestRefusalLiveness(StoreTestCase):
+    """A per-stream refusal carries the stream's liveness, and its reason
+    whenever that liveness is `error`."""
+
     def test_a_refusal_with_an_error_liveness_carries_the_reason(self):
         # A stream directory holding only a stray mixed-case repository has
         # no repository the reader can answer from; the refusal says that,
@@ -957,6 +968,7 @@ class TestRuns(StoreTestCase):
         payload = self.refused("show", AUDIT)
         self.assertEqual(payload["liveness"], "never")
         self.assertNotIn("stream_error", payload)
+
 
 class TestUnusableLeaseTimestamps(StoreTestCase):
     """A lease note's `started_at` is whatever the writer left. One out of

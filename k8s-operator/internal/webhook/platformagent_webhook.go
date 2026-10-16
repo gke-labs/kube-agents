@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
 )
 
 // PreventDeletionAnnotation blocks deletion when set to "true".
@@ -142,6 +143,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	}
 
 	var allErrs field.ErrorList
+	var warnings admission.Warnings
 
 	// 1. Enforce 1 PlatformAgent per cluster limit (enforced at cluster level on the Hub/Management cluster)
 	if v.Client != nil {
@@ -248,6 +250,23 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 			}
 			seenPullSecrets[name] = struct{}{}
 		}
+
+		// 2f. The credential-proxy container's requests and limits, checked as
+		// the operator will render them rather than as written: the override is
+		// merged over the defaults per key, so a CR that raises only
+		// requests.memory collides with a limit it never wrote. The reconciler
+		// runs the same function before it writes the proxy Deployment, so this
+		// refuses at apply what the operator refuses at reconcile anyway.
+		proxyErrs, proxyWarnings := controller.ValidateCredentialProxyResources(platformAgent.Spec.Deployment, depPath.Child("credentialProxy", "resources"))
+		allErrs = append(allErrs, proxyErrs...)
+		warnings = append(warnings, proxyWarnings...)
+
+		// 2g. The agent-api-auth sidecar's requests and limits, checked the same
+		// way: merged over the defaults per key, so the reconciler refuses at
+		// reconcile what this refuses at apply.
+		apiAuthErrs, apiAuthWarnings := controller.ValidateAgentAPIAuthResources(platformAgent.Spec.Deployment, depPath.Child("agentAPIAuth", "resources"))
+		allErrs = append(allErrs, apiAuthErrs...)
+		warnings = append(warnings, apiAuthWarnings...)
 	}
 
 	// 3. Validate Security ServiceAccountName
@@ -272,8 +291,9 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	// applied to everyone. `spec.integration.github` is a deprecated alias that
 	// resolves to the same declaration, so the field paths below are rendered in
 	// whichever spelling was written.
-	gitErrs, warnings := validateGitIntegration(platformAgent.Spec.Integration)
+	gitErrs, gitWarnings := validateGitIntegration(platformAgent.Spec.Integration)
 	allErrs = append(allErrs, gitErrs...)
+	warnings = append(warnings, gitWarnings...)
 
 	if len(allErrs) > 0 {
 		return warnings, apierrors.NewInvalid(
@@ -287,10 +307,10 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 }
 
 // validateReservedVolumeMounts refuses a user-authored container that mounts a
-// volume the operator renders for one specific container of its own. The only
-// member today is the projected bus token; agentv1alpha1.ReservedVolumeNames
-// says what that buys and why the render strips it as well as this rejecting
-// it.
+// volume the operator renders for one specific container of its own: the
+// projected bus token and the watchers' broker token. agentv1alpha1.ReservedVolumeNames
+// says what that buys and why the render strips them as well as this rejecting
+// them.
 // path is the mount LIST's own path, not the container's: the three callers
 // name three different fields (a container's volumeMounts under initContainers
 // or sidecars, and spec.deployment.extraVolumeMounts, which hangs off the

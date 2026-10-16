@@ -59,6 +59,12 @@ jobs:
       - name: Validate Structure
         run: make validate
 
+      # Mirrored gke-* skills (docs/designs/upstream-skill-overlays.md): every
+      # generated skill must equal its upstream copy plus overlay, and every copy
+      # the sha256 in its lock. Offline, so nothing here can fail on GitHub.
+      - name: Mirrored skills match their upstream copy and overlay
+        run: make skills-check
+
       # A step in this job rather than a job of its own, because `validate` is
       # already on main's required-status-checks list and a new job name is
       # not: a check that is not required does not gate, however red it goes.
@@ -514,3 +520,23 @@ jobs:
       # binary before merge; it reuses the composition the loop above initialised.
       - name: Check lifecycle.sh reads terraform console correctly
         run: make tfvar-check
+
+      # Compares each upstream copy with google/skills at its locked commit,
+      # which catches a hand edit to a copy that came with a matching edit to its
+      # lock. It needs the network, so on a pull request or merge-queue run it
+      # skips itself unless the change touches a copy or a lock; a push to main
+      # checks everything. A workflow paths filter would not do: a required
+      # check that never starts waits as "Expected" and blocks every pull
+      # request. The checkout is the PR's (or merge group's) merge commit, so a
+      # diff against the base commit is exactly the change. Last in the job, so
+      # a GitHub outage here hides no other check.
+      - name: Upstream copies match google/skills
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            make skills-verify-upstream BASE="$BASE_SHA"
+          else
+            make skills-verify-upstream
+          fi

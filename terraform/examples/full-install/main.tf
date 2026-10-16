@@ -8,6 +8,10 @@ locals {
     "cloudresourcemanager.googleapis.com",
     "monitoring.googleapis.com",
     "logging.googleapis.com",
+    # The observability skill's trace helpers read Cloud Trace through the
+    # credential broker's relay on the Trace role granted below; the API has
+    # to be on for the grant to buy anything.
+    "cloudtrace.googleapis.com",
     # Unconditional: the cluster is created with the Backup for GKE agent
     # enabled whether or not a BackupPlan follows, and the addon cannot be
     # enabled without the API.
@@ -63,6 +67,69 @@ locals {
   github_org        = length(local.github_repo_parts) == 2 ? local.github_repo_parts[0] : ""
   github_repo_name  = length(local.github_repo_parts) == 2 ? local.github_repo_parts[1] : ""
 
+  # A GitLab GitOps repository is declared through the forges/repositories
+  # lists, never the github alias: one gitlab forge, carrying the Secret the
+  # installer creates, and the repository on it as the gitops role. The
+  # operator derives the broker's allowedPaths from the repository's group.
+  # Two lists, each merged in on its own: one conditional carrying both would
+  # have no single type to unify with its empty arm.
+  gitops_is_gitlab = var.gitops_forge == "gitlab"
+  gitlab_forges = [merge(
+    { name = "gitlab", provider = "gitlab", credentialsRef = { name = var.gitlab_token_secret_name } },
+    var.gitops_host != "" ? { host = var.gitops_host } : {},
+    var.gitlab_ca_secret_name != "" ? { caBundleRef = { name = var.gitlab_ca_secret_name } } : {}
+  )]
+  gitlab_repositories = [{ forge = "gitlab", repository = var.gitlab_repo, role = "gitops" }]
+
+  # A GitHub Enterprise Server GitOps repository: the github forge at
+  # gitops_host, declared through the same lists, because the deprecated
+  # github alias has no host and always means github.com. The organization is
+  # the forge's namespace and the repository is named on it; caBundleRef names
+  # the Secret with the instance's private CA, which the credential broker and
+  # the chart's token minter both read. The chart points the minter at
+  # https://<host>/api/v3 from this declaration. github = null removes the
+  # alias from the release values. A github.com install (gitops_host empty)
+  # renders the alias, as before.
+  gitops_is_ghes = !local.gitops_is_gitlab && var.gitops_host != ""
+  ghes_forges = [merge(
+    { name = "github", provider = "github", host = var.gitops_host, namespace = local.github_org },
+    var.github_ca_secret_name != "" ? { caBundleRef = { name = var.github_ca_secret_name } } : {}
+  )]
+  ghes_repositories = [{ forge = "github", repository = local.github_repo_name, role = "gitops" }]
+
+  # The CR's spec.integration, as one local so the tests can read it.
+  platform_agent_integration = merge(
+    var.enable_google_chat ? {
+      googleChat = {
+        enabled          = true
+        topicName        = module.chat_pubsub[0].topic_name
+        subscriptionName = module.chat_pubsub[0].subscription_name
+        allowedUsers     = var.google_chat_allowed_users
+        homeChannel      = var.google_chat_home_channel
+        mode             = var.google_chat_mode
+      }
+    } : {},
+    var.enable_slack ? {
+      slack = {
+        enabled         = true
+        allowedUsers    = var.slack_allowed_users
+        homeChannel     = var.slack_home_channel
+        homeChannelName = var.slack_home_channel_name
+      }
+    } : {},
+    local.gitops_is_gitlab ? { forges = local.gitlab_forges } : {},
+    local.gitops_is_gitlab ? { repositories = local.gitlab_repositories } : {},
+    local.gitops_is_ghes ? { forges = local.ghes_forges } : {},
+    local.gitops_is_ghes ? { repositories = local.ghes_repositories } : {},
+    local.gitops_is_ghes ? { github = null } : {},
+    (!local.gitops_is_gitlab && !local.gitops_is_ghes && (local.github_org != "" || var.github_repo != "")) ? {
+      github = merge(
+        local.github_org != "" ? { org = local.github_org } : {},
+        var.github_repo != "" ? { gitRepo = var.github_repo } : {}
+      )
+    } : {}
+  )
+
   required_apis = toset(concat(local.base_apis, local.pubsub_apis, local.chat_apis, local.scope_apis, local.selector_apis))
 
   # The agent's GCP IAM permission-set bundle, kept verbatim so the two install
@@ -82,6 +149,7 @@ locals {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/cloudtrace.user",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
@@ -265,6 +333,32 @@ check "slack_tokens_present" {
   }
 }
 
+# A warning rather than a refusal, for the same reason as slack_tokens_present:
+# an exclusion written before its project joins the scope, or left after it
+# leaves, is a legitimate order of operations. A misspelled one is not, and
+# its only other trace is the drift_pubsub_source_projects output: the
+# subtraction removes nothing, and the project's audit logs leave for the
+# host topic against the operator's stated intent, with the apply green.
+# An exclude.projects glob the plan cannot evaluate. regexall errors on a
+# pattern RE2 rejects and on nothing else (zero matches is an empty list), so
+# can() over it is false exactly for the entries the export local would
+# silently match nothing with. A warning rather than a refusal, like the
+# check below: the reconcile may well apply the same glob, and the operator
+# has drift_pubsub_source_exclude_projects to name the project by ID.
+check "drift_scope_exclude_globs_compile" {
+  assert {
+    condition     = alltrue([for pattern in local.drift_pubsub_scope_exclude_patterns : can(regexall(pattern, ""))])
+    error_message = "scope.exclude.projects carries ${join(", ", [for i, pattern in local.drift_pubsub_scope_exclude_patterns : var.scope.exclude.projects[i] if !can(regexall(pattern, ""))])}, which the plan cannot match: its bracket class does not translate to a pattern Terraform's regex accepts (a reversed or empty range, or an unbalanced bracket). The reconcile may still drop the project it means from the scope, while the plan keeps that project's drift sink. Rewrite the entry, or name the project in drift_pubsub_source_exclude_projects."
+  }
+}
+
+check "drift_source_exclusions_name_listed_projects" {
+  assert {
+    condition     = length(setsubtract(local.drift_pubsub_source_exclude_projects, toset(module.kube_agents_iam.scope_export_projects))) == 0
+    error_message = "drift_pubsub_source_exclude_projects names ${join(", ", sort(tolist(setsubtract(local.drift_pubsub_source_exclude_projects, toset(module.kube_agents_iam.scope_export_projects)))))}, which the scope does not list beyond the host (scope_export_projects: ${join(", ", module.kube_agents_iam.scope_export_projects)}), so the entry excludes nothing. A misspelled project ID keeps its sink; check the spelling against SCOPE_PROJECTS."
+  }
+}
+
 # Bearer token for the pod-local Session KV server on 127.0.0.1:8699. Both the
 # sandbox container (which serves and calls it) and the credential-proxy
 # container (whose event watcher posts to it) read this one value.
@@ -326,6 +420,34 @@ module "gke_cluster" {
     "kube-agents-host" = "true"
   }
 
+  # The DESTROY order, not the apply one. Terraform destroys dependents before
+  # dependencies, so the cluster has to depend on the drift ingress for its
+  # teardown to precede the topic's deletion. The control plane emits mutating
+  # audit records for as long as it is up -- measured at ~4 minutes past the
+  # point the topic used to go -- and each one that lands on a missing topic
+  # mails every project owner (#2426). sink_drain cannot cover that: it is a
+  # fixed timer and a teardown's length varies with the cluster.
+  #
+  # Passed as a value rather than named in depends_on, and the difference is
+  # load-bearing. A module-level depends_on defers every data source inside
+  # the module while the target has a planned change. Here that would reach
+  # data.google_container_cluster.existing, which exists when create_cluster
+  # is false and is where cluster_endpoint comes from -- so an ordinary edit
+  # to the ingress would leave provider "helm" (providers.tf) without a host,
+  # and a helm provider that cannot reach the cluster reports every release as
+  # absent: the plan plans helm_release.kube_agents and cert_manager as
+  # creates, and the apply trips over a name still in use. An input reaches
+  # only the gate the two cluster resources depend on, so the data source
+  # stays outside the edge and the destroy order is unchanged.
+  #
+  # try(...[0]..., null), not one(...[*]...): the ingress is count-gated and
+  # this has to resolve to null when it is off, but a splat over the module
+  # reaches its close node and so source_projects, which comes from
+  # kube-agents-iam and therefore from the cluster -- a cycle. Indexing the
+  # single output depends on that output alone, which is why teardown_gate
+  # has to name everything the ordering covers.
+  create_after = try(module.drift_pubsub[0].teardown_gate, null)
+
   depends_on = [google_project_service.required]
 }
 
@@ -342,24 +464,17 @@ module "gke_backup_plan" {
   encryption_key      = var.backup_encryption_key
 }
 
-locals {
-  # Indexed by the same key the kube-agents-iam module uses, so the emails
-  # coming back out of the module can be rejoined with the tuple that produced
-  # them without re-deriving anything.
-  scoped_pool_entries = {
-    for cluster in var.scoped_clusters :
-    "projects/${cluster.project_id}/locations/${cluster.location}/clusters/${cluster.cluster_name}" => cluster
-  }
-}
-
 # The two scope selectors that are not containers, resolved to projects at
-# plan time. Called with no depends_on and no input a managed resource
-# produces, on purpose: module.kube_agents_iam below carries a module-level
-# depends_on, which would defer a data source inside it to apply time on a
-# first install or on any upgrade that enables an API, and the bindings keyed
-# on the resolved projects would then fail the plan as unknown. Here the reads
-# happen on every plan, and a read the planning identity cannot make fails
-# the plan with the selector named, before anything is applied.
+# plan time, and -- while the scoped service account pool is armed -- each
+# declared folder's and organisation's members, listed for the pool with the
+# reconcile's own Asset Inventory search. Called with no depends_on and no
+# input a managed resource produces, on purpose: module.kube_agents_iam below
+# carries a module-level depends_on, which would defer a data source inside it
+# to apply time on a first install or on any upgrade that enables an API, and
+# the bindings keyed on the resolved projects would then fail the plan as
+# unknown. Here the reads happen on every plan, and a read the planning
+# identity cannot make fails the plan with the selector or container named,
+# before anything is applied.
 module "scope_resolver" {
   source = "../../modules/kube-agents-scope-resolver"
 
@@ -367,6 +482,12 @@ module "scope_resolver" {
   metrics_scopes   = var.scope.metrics_scopes
   exclude_projects = var.scope.exclude.projects
   member_cap       = var.scope.max_projects
+  # The containers are read for the pool alone (their grant is on the
+  # container and inherited, so nothing is bound per member): listed only
+  # while the pool is armed, and no container is read while it is off.
+  folders                = var.scope.folders
+  organizations          = var.scope.organizations
+  list_container_members = var.scoped_pool_enabled
   # The consumer project of the reads: the management project, whose APIs
   # this composition enables (and install.sh pre-enables before a first apply,
   # since the reads run in the plan).
@@ -376,15 +497,23 @@ module "scope_resolver" {
 module "kube_agents_iam" {
   source = "../../modules/kube-agents-iam"
 
-  project_id      = var.project_id
-  namespace       = var.namespace
-  project_roles   = local.agent_project_roles
-  scoped_clusters = var.scoped_clusters
-  scope           = var.scope
+  project_id    = var.project_id
+  namespace     = var.namespace
+  project_roles = local.agent_project_roles
+  scope         = var.scope
+  # The scoped service account pool, derived in the module from the same
+  # scope object: armed by the switch alone, never by the scope.
+  scoped_pool_enabled      = var.scoped_pool_enabled
+  scoped_pool_max_accounts = var.scoped_pool_max_accounts
   # What the selectors resolved to, from the module above; the IAM module
   # binds these and refuses a selector with no entry.
   scope_selector_members = module.scope_resolver.members
-  service_account_id     = var.agent_service_account_id
+  # What each declared container held while the pool is armed, from the same
+  # module; the IAM module gives each a pool account and nothing else, and
+  # refuses an armed pool beside a container with no entry. Empty while the
+  # pool is off.
+  scope_container_members = module.scope_resolver.container_members
+  service_account_id      = var.agent_service_account_id
   # The KSA half of the Workload Identity member; the same variable is the
   # chart's platformAgent.security.serviceAccountName below. The variable's
   # description in variables.tf says why it exists and what bounds it.
@@ -469,7 +598,8 @@ module "chat_pubsub" {
 }
 
 # The drift detector's audit-log ingress: Log Router sink, drift-audit topic
-# and pull subscription, and the sink-writer and detector IAM. The three names
+# and pull subscription, and the sink-writer IAM from the module, with the
+# detector's own subscription IAM below rather than inside it. The three names
 # are composition variables, as the stockout trio's are, because a second
 # install in the project has to be able to name its own -- lifecycle.sh's
 # guard_drift_adoption refuses an apply that would otherwise find all three
@@ -484,6 +614,39 @@ module "chat_pubsub" {
 # helm_release precondition below, because the harness block that carries
 # enabled is written only when this flag is on, so the composition would
 # otherwise accept the second variable and silently do nothing with it.
+# The per-project override arrives as a JSON string (the variable says why: a
+# TF_VAR_ line that is blanked exports "", which a map refuses) and the module
+# takes a map; "" is no override.
+locals {
+  # The exclusions as a set, from the comma- or space-separated string a
+  # TF_VAR_ line can carry; blank is none.
+  drift_pubsub_source_exclude_projects = toset([for p in split(",", replace(trimspace(var.drift_pubsub_source_exclude_projects), "/\\s+/", ",")) : p if p != ""])
+  # The scope's own exclusions, globs included. scope_export_projects already
+  # leaves out a project an exact scope.exclude.projects entry names; a glob
+  # it cannot, because the IAM module's set is also what it binds, and a glob
+  # there is the reconcile's to apply at runtime (_excluded_by in
+  # agents/platform/scripts/cluster_agent_reconcile.py, fnmatchcase against
+  # the project ID; docs/designs/multi-project-scope.md section 3). The export
+  # list is a plan-time list of names, so a glob can be matched here, one
+  # anchored regex per entry with fnmatch's * ? [seq] and [!seq] carried
+  # over by substitution, and the project the reconcile drops from the scope
+  # is the one that gets no sink. An exact entry matches its own regex too,
+  # which changes nothing. The substitution is byte-wise, not a translation:
+  # an entry whose bracket class RE2 rejects (a reversed or empty range, an
+  # unbalanced bracket) compiles to nothing and would match nothing in
+  # silence, so check "drift_scope_exclude_globs_compile" names it.
+  drift_pubsub_scope_exclude_patterns = [
+    for entry in var.scope.exclude.projects :
+    "^${replace(replace(replace(entry, "*", ".*"), "?", "."), "[!", "[^")}$"
+  ]
+  drift_pubsub_source_projects = sort([
+    for project in module.kube_agents_iam.scope_export_projects : project
+    if !contains(local.drift_pubsub_source_exclude_projects, project)
+    && !anytrue([for pattern in local.drift_pubsub_scope_exclude_patterns : can(regex(pattern, project))])
+  ])
+  drift_pubsub_source_sink_writer_identity_overrides = trimspace(var.drift_pubsub_source_sink_writer_identity_overrides) == "" ? {} : tomap(jsondecode(var.drift_pubsub_source_sink_writer_identity_overrides))
+}
+
 module "drift_pubsub" {
   source = "../../modules/drift-pubsub"
   count  = var.enable_drift_pubsub ? 1 : 0
@@ -493,7 +656,45 @@ module "drift_pubsub" {
   topic_name                     = var.drift_pubsub_topic
   subscription_name              = var.drift_pubsub_subscription
   sink_name                      = var.drift_pubsub_sink
+  topic_publishers               = var.drift_pubsub_topic_publishers
 
+  # Exposed because the module's sink postcondition names them in its error:
+  # a project whose sink reports some other writer identity fails that check on
+  # every plan from then on, and the operator it tells to set the override has
+  # only this composition to set it in.
+  sink_writer_identity_override = var.drift_pubsub_sink_writer_identity_override
+  sink_drain_duration           = var.drift_pubsub_sink_drain_duration
+
+  # The module's two timers are both chosen margins against something GCP
+  # documents no bound for, so both are exposed: an operator whose apply still
+  # fails on an unbindable Logging agent, or whose teardown still mails, has
+  # only this composition to lengthen them in.
+  logging_identity_propagation_duration = var.drift_pubsub_logging_identity_propagation_duration
+  # The drift ingress follows the scope: one sink per project the plan lists
+  # in it from the declaration alone, into this install's topic, so a change
+  # on a scoped project's cluster reaches the detector like one on the
+  # management cluster's. scope_export_projects, not the pool's set: a
+  # container member the Asset index skips for one plan would otherwise lose
+  # its sink and the records until the next plan (the output's description).
+  # Less the scope's own exclusions, a glob there matched here as the
+  # reconcile matches it, and less drift_pubsub_source_exclude_projects, the
+  # per-project way to keep
+  # reading a project's clusters without exporting its logs, for a project
+  # where the applying identity cannot mint the Logging agent or write the
+  # sink. Empty on an install with no declared scope, where the module creates
+  # the host's sink alone. The per-project override is the host's
+  # sink_writer_identity_override for a source project, keyed by its ID, and
+  # reaches here the same way.
+  source_projects                       = local.drift_pubsub_source_projects
+  source_sink_writer_identity_overrides = local.drift_pubsub_source_sink_writer_identity_overrides
+
+  # Defers data.google_project.this inside the module to apply time whenever
+  # any member of required_apis has a planned change, which makes the sink's
+  # publish grant "(known after apply)" and -- member being ForceNew -- plans
+  # it for replacement while the sink stays live. See the note on the grant in
+  # the module's main.tf; narrowing this list to the three APIs the module
+  # needs does not help, because Terraform resolves an indexed depends_on
+  # reference to the whole resource.
   depends_on = [google_project_service.required]
 }
 
@@ -723,7 +924,10 @@ resource "helm_release" "kube_agents" {
         }
       } : {}
     )
-    platformAgent = {
+    # merge(), so "today" adds no key and the values this composition hands the
+    # chart stay what they were before platform_agent_mode existed; the chart
+    # leaves spec.mode out of the CR while its value is null.
+    platformAgent = merge({
       # The durable record of an adoption that accepted a cluster with no
       # NetworkPolicy enforcement. Derived from what the module read, not from
       # the variable that admitted it: a cluster that later gains Dataplane V2
@@ -790,19 +994,22 @@ resource "helm_release" "kube_agents" {
         serviceAccountAnnotations = {
           "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
         }
-        # The mapping the credential broker selects from. It has to reach the
-        # cluster as data rather than being recomputed there: the broker refuses
-        # a scope it has no entry for, so a second implementation of the naming
-        # rule would turn a mismatch into a refusal at request time instead of a
-        # diff at plan time.
-        scopedServiceAccounts = [
-          for key in sort(keys(module.kube_agents_iam.scoped_service_accounts)) : {
-            projectId           = local.scoped_pool_entries[key].project_id
-            location            = local.scoped_pool_entries[key].location
-            clusterName         = local.scoped_pool_entries[key].cluster_name
-            serviceAccountEmail = module.kube_agents_iam.scoped_service_accounts[key]
-          }
-        ]
+        # The mapping the credential broker selects from, one row per project
+        # the module provisioned a member for. It has to reach the cluster as
+        # data rather than being recomputed there: the broker refuses a
+        # project it has no entry for, so a second implementation of the
+        # naming rule would turn a mismatch into a refusal at request time
+        # instead of a diff at plan time. `enabled` is the arming switch the
+        # operator reads; the list is empty while it is false.
+        scopedServiceAccountPool = {
+          enabled = var.scoped_pool_enabled
+          serviceAccounts = [
+            for project_id in sort(keys(module.kube_agents_iam.scoped_service_accounts)) : {
+              projectId           = project_id
+              serviceAccountEmail = module.kube_agents_iam.scoped_service_accounts[project_id]
+            }
+          ]
+        }
       }
       # The same object the IAM module bound above, so the CR declares no
       # project the module did not also bind. Always rendered, empty lists
@@ -833,33 +1040,10 @@ resource "helm_release" "kube_agents" {
         create = true
         data   = local.credentials
       }
-      integration = merge(
-        var.enable_google_chat ? {
-          googleChat = {
-            enabled          = true
-            topicName        = module.chat_pubsub[0].topic_name
-            subscriptionName = module.chat_pubsub[0].subscription_name
-            allowedUsers     = var.google_chat_allowed_users
-            homeChannel      = var.google_chat_home_channel
-            mode             = var.google_chat_mode
-          }
-        } : {},
-        var.enable_slack ? {
-          slack = {
-            enabled         = true
-            allowedUsers    = var.slack_allowed_users
-            homeChannel     = var.slack_home_channel
-            homeChannelName = var.slack_home_channel_name
-          }
-        } : {},
-        (local.github_org != "" || var.github_repo != "") ? {
-          github = merge(
-            local.github_org != "" ? { org = local.github_org } : {},
-            var.github_repo != "" ? { gitRepo = var.github_repo } : {}
-          )
-        } : {}
-      )
-    }
+      integration = local.platform_agent_integration
+      }, var.platform_agent_mode == "today" ? {} : {
+      mode = var.platform_agent_mode
+    })
     # The minter's Kubernetes half (Deployment, Service, NetworkPolicy, KSA,
     # minty rule ConfigMap, github-app-credentials Secret); the GCP half is
     # module.github_minter above. The App private key still has to be imported
@@ -953,6 +1137,54 @@ resource "helm_release" "kube_agents" {
     precondition {
       condition     = !var.enable_github_minter || (local.github_org != "" && local.github_repo_name != "")
       error_message = "enable_github_minter requires github_repo in owner/repo (or github.com URL) form — the minty rule ConfigMap is scoped to that repository."
+    }
+
+    # A gitlab install has no GitHub App: the minter would mint for a
+    # repository the agent does not use, and github_repo would render the
+    # github alias beside the gitlab lists, which the CRD refuses.
+    precondition {
+      condition     = !local.gitops_is_gitlab || (var.gitlab_repo != "" && var.github_repo == "" && !var.enable_github_minter)
+      error_message = "gitops_forge = \"gitlab\" needs gitlab_repo set, and github_repo and enable_github_minter left unset: a GitLab install has no GitHub App."
+    }
+
+    # The reverse: GitLab inputs under the default forge would be dropped,
+    # applying a CR with no GitOps repository and no error. gitops_host is
+    # the github forge's too: a GitHub Enterprise Server host.
+    precondition {
+      condition     = local.gitops_is_gitlab || (var.gitlab_repo == "" && var.gitlab_ca_secret_name == "")
+      error_message = "gitlab_repo and gitlab_ca_secret_name apply only with gitops_forge = \"gitlab\"; set it, or leave them unset."
+    }
+
+    # A GitHub Enterprise Server's CA belongs to the github forge at a host:
+    # github.com presents a certificate the public CAs sign, and a private CA
+    # must never vouch for it.
+    precondition {
+      condition     = var.github_ca_secret_name == "" || local.gitops_is_ghes
+      error_message = "github_ca_secret_name is for a GitHub Enterprise Server: set gitops_host to its hostname, with gitops_forge = \"github\". github.com uses the public CAs."
+    }
+
+    # The github forge at gitops_host is a GitHub Enterprise Server. A host
+    # where GitHub runs its own services is refused, as the operator refuses
+    # it; github.com is the default and needs no host; and a GitLab host is
+    # not GitHub's.
+    precondition {
+      condition     = !local.gitops_is_ghes || !can(regex("(^|\\.)(github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com)$", var.gitops_host))
+      error_message = "gitops_host with gitops_forge = \"github\" is a GitHub Enterprise Server hostname. Leave it empty for github.com; a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like) or gitlab.com is not one."
+    }
+
+    # On a GitHub Enterprise Server, github_repo is required, as owner/name
+    # on the instance: the forge is declared with the owner as its namespace,
+    # and the composition reads a URL on github.com only.
+    precondition {
+      condition     = !local.gitops_is_ghes || can(regex("^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]+$", var.github_repo))
+      error_message = "With gitops_host set, github_repo is required, as owner/name on the GitHub Enterprise Server, not a URL."
+    }
+
+    # A private CA is for a self-managed GitLab only: gitlab.com presents a
+    # certificate the public CAs sign, and a private CA must never vouch for it.
+    precondition {
+      condition     = var.gitlab_ca_secret_name == "" || !contains(["", "gitlab.com", "www.gitlab.com"], var.gitops_host)
+      error_message = "gitlab_ca_secret_name is for a self-managed GitLab: set gitops_host to its hostname. gitlab.com uses the public CAs."
     }
 
     # What this refuses is an install that asks for the detector without the

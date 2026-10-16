@@ -65,7 +65,10 @@ The same four heuristics apply without Gateway-specific code: a Deployment whose
 
 ## Recording the finding
 
-You are a Cluster Agent under a strict read-only boundary: no patches applied, no Pull Requests opened, nothing passed back through the chat reply. Complete the kanban task you were spawned on, following the shape in `gke-workload-troubleshooting`:
+You are a Cluster Agent under a strict read-only boundary: no patches applied, no Pull Requests opened, nothing passed back through the chat reply. Complete the kanban task you were spawned on.
+
+- A card that gives a report format wins: format `result` exactly as the card says. A stall alert raised through the Session KV server's `controller-stall` inject arrives as such a card, with the `What's wrong` / `Why` / `What to do` template and, when there is a fix, a `To authorize:` line; that shape is what gets the report saved so a reply of "apply" can act on it. Quote the scan's `stalled resources: <count>` line in `Why`.
+- Otherwise, follow the shape in `gke-workload-troubleshooting`:
 
 ```
 kanban_complete(

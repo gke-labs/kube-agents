@@ -125,5 +125,5 @@ that lost Issues: write (422 minting the token), and a GitHub outage.
   `agents/platform/scripts/feedback_prompt.py` posts the link once to every install, and
   remove `FORM_URL` from that script; then delete `tests/test_feedback_reference.py`, which
   fails until the rest of that is done. Running installs keep answering with the link until
-  they take an image built after the change. If this directory goes too, drop its row from
-  `docs/README.md` and its mention in the tree at the top of that file.
+  they take an image built after the change. If this directory goes too, drop its mention
+  from the tree at the top of `docs/README.md`.

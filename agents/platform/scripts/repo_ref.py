@@ -33,7 +33,9 @@ host, because inferring one would read `my.org/repo` as a host and a
 single-segment path — and `my.org` is a legal owner in the bare form the
 operator writes through verbatim. The one exception is `KNOWN_HOSTS`: a
 schemeless value whose first segment is a spelling of a forge this harness
-knows does name that host, which is what keeps `github.com/owner/repo` working.
+knows does name that host, which is what keeps `github.com/owner/repo` working,
+and what makes `gitlab.com/group/project` a gitlab.com project rather than a
+GitHub owner called `gitlab.com`.
 
 That exception is recorded rather than hidden. A ref carries `host_inferred`,
 and the lift is the only thing that sets it, because the shorthand is right for
@@ -86,8 +88,9 @@ FLAG_PREFIX = "-"
 
 #: Every spelling of GitHub that can appear in a remote this install produces.
 #: `ssh.github.com` is GitHub's SSH-over-443 endpoint, which shows up in a clone
-#: URL. An enterprise host is deliberately absent: Minty issues tokens for
-#: github.com installations only.
+#: URL. A GitHub Enterprise Server host is not a spelling of github.com, so it
+#: is absent: it is the install's declared GitHub host, which the broker's
+#: registry and `gitops_workspace.github_host` know and this module does not.
 GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
 
 #: The one spelling that appears in a repository *registration*, as opposed to a
@@ -99,12 +102,21 @@ GITHUB_CANONICAL_HOST = "github.com"
 #: the design moves out of the shared parser, not a property of a repository.
 GITHUB_PATH_DEPTH = 2
 
+#: The default host of the GitLab provider. A self-managed instance's host is
+#: the install's to declare and is not known here.
+GITLAB_CANONICAL_HOST = "gitlab.com"
+
 #: Hosts a schemeless value may name in its first segment — see "On the host".
 #: Spelled out rather than aliased to `GITHUB_HOSTS`: this set is the shorthand
 #: an operator types, not the set of remotes git can produce, and the two grow
 #: for different reasons. Aliasing them would silently extend the schemeless
 #: shortcut to every spelling added for a clone URL's sake.
-KNOWN_HOSTS = frozenset({GITHUB_CANONICAL_HOST})
+#:
+#: One entry per forge the harness serves, each its default host. A
+#: self-managed host is not here: it is lifted by the broker's registry, which
+#: knows the hosts this install configured, and `repo_ref.go` lifts it from the
+#: forge it was declared on.
+KNOWN_HOSTS = frozenset({GITHUB_CANONICAL_HOST, GITLAB_CANONICAL_HOST})
 
 #: Matches `forge.RepoUnparseable`, whose reason codes are operator-facing.
 REASON_UNPARSEABLE = "GIT_REPO_UNPARSEABLE"
@@ -164,6 +176,17 @@ def _safe_segment(segment: str) -> bool:
         and segment not in TRAVERSAL_SEGMENTS
         and not segment.startswith(FLAG_PREFIX)
     )
+
+
+def is_safe_segment(segment: str) -> bool:
+    """`_safe_segment`, for a caller that checks a segment it did not parse.
+
+    A forge that narrows itself to path prefixes checks them with this, so a
+    prefix it accepts is one `parse` could produce, and a prefix `parse` could
+    never produce is refused where it is configured rather than matching
+    nothing at request time.
+    """
+    return _safe_segment(segment)
 
 
 def _trim(path: str) -> str:

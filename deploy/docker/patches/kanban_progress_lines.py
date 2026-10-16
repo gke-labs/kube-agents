@@ -53,10 +53,14 @@ result posts as a message of its own, which is the one that should ping. With
 ``KAGE_SLACK_UX`` on, a Slack card settles to its last line only, a failure
 the creator's wake will explain is held for the wake step rather than posted,
 the card recovering drops a failure line it still holds, no line carries the
-board tag or ``Kanban <id>``, and a card's notes go on its row in the thread's
+board tag or ``Kanban <id>``, a card's notes go on its row in the thread's
 plan (``gateway/slack_ux_status.py``), the rolling line being the plan's
-fallback; :func:`silent_event` carries ``archived`` and ``unblocked``, which
-upstream never posts, to the plan. See :func:`deliver`.
+fallback, an opened pull request and a ``needs_input`` question post as
+messages of their own (``gateway/slack_ux_moments.py``), and any later event
+takes the buttons off the card's open question; :func:`silent_event` carries
+``archived`` and ``unblocked``, which upstream never posts, to the plan and
+the question, and opens a card's row when its first noteless heartbeat says
+it started. See :func:`deliver`.
 
 Three properties of the surrounding code make this nearly free:
 
@@ -88,7 +92,9 @@ lost message would become a stuttering one.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 import unicodedata
 from typing import Any, Optional, Sequence
 
@@ -131,7 +137,103 @@ def progress_note(payload: object, limit: int = DEFAULT_NOTE_LIMIT) -> str:
 #: upstream's ``_EVENT_FORMATTERS["status"]`` renders it. Listing it here means
 #: such a move folds into the card's trail as ``→ <status>`` rather than
 #: posting upstream's ``🔄`` line as a message of its own.
-ROLLING_KINDS = ("heartbeat", "status")
+#:
+#: ``queued`` is the dispatcher's notice that a user card is waiting for a
+#: worker slot (``hermes_cli/kanban_priority.py``). It rolls so the
+#: card's first progress note joins the queued line instead of posting under
+#: it, and so a card queued twice reads as one message.
+ROLLING_KINDS = ("heartbeat", "status", "queued")
+
+#: The rolling kinds whose trail entry is the ``note`` on the event payload.
+NOTE_KINDS = ("heartbeat", "queued")
+
+#: A queued line that opens a card's rolling message is posted bare, without
+#: the card's header, because it is worded for the user as a whole sentence
+#: (bnaylor). The header joins once the worker's first note arrives.
+QUEUED_KIND = "queued"
+
+#: Where a card's map entry remembers which of its trail lines were queued
+#: notices, so the terminal settle can drop them.
+QUEUED_LINES_KEY = "queued_lines"
+
+#: With ``KAGE_SLACK_UX`` on, the blocked kind that may post a question, and
+#: the terminal kind whose report may announce a PR (see ``slack_ux_moments``).
+NEEDS_YOU_KIND = "blocked"
+UNBLOCKED_KIND = "unblocked"
+PR_REPORT_KIND = "completed"
+#: The completed event's payload key holding the worker's one-line status.
+SUMMARY_KEY = "summary"
+
+#: With ``KAGE_SLACK_UX`` on, a card beneath a fan-out folds its report into
+#: its row in the thread's plan rather than posting it, when its nearest
+#: ancestor that created more than one card is still open and subscribed to the
+#: same thread: that card's own completion is the answer, and
+#: ``kanban_children_settled`` holds it until its children settle. That covers
+#: a card a fanned-out card filed in turn, such as a Platform Agent card per
+#: cluster handing its cluster to the Cluster Agent. A chain with no fan-out
+#: above it, a single-cluster delegation, posts its whole report as before.
+#: Only a completion folds; a failure or a question posts.
+FOLDED_KIND = "completed"
+
+#: How many creators up the fold looks for a fan-out. Delegation runs three
+#: deep (Planning Agent, Platform Agent, Cluster Agent); the bound only stops a
+#: malformed chain from walking the board.
+FOLD_ANCESTOR_DEPTH = 8
+
+#: Hermes's hard-wall block kind, as a ``blocked`` event's payload names it:
+#: "no access, missing credentials, an action no agent can do"
+#: (``KANBAN_BLOCK_SCHEMA``), such as a target that does not exist. Such a
+#: card has stopped as a give-up stops, parked at ``blocked`` for a human, so
+#: it settles as one (:func:`settles_as`); ``needs_input`` stays a pause.
+HARD_WALL_BLOCK_KIND = "capability"
+#: The kind a hard-wall block settles as.
+GAVE_UP_KIND = "gave_up"
+#: The most of a hard-wall block's reason its line carries, as
+#: ``slack_ux_moments.needs_you`` clips a question's.
+HARD_WALL_REASON_LIMIT = 2000
+
+#: A card parked by a give-up: still ``blocked``, with a ``gave_up`` or a
+#: hard-wall block as its latest stop, as ``slack_ux_reactions.OPEN_CARDS_SQL``
+#: reads it. ``{card}`` is the alias of its ``tasks`` row.
+GAVE_UP_SQL = (
+    "({card}.status = 'blocked' AND COALESCE((SELECT CASE g.kind WHEN 'blocked' "
+    "THEN json_extract(g.payload, '$.kind') ELSE g.kind END FROM task_events g "
+    "WHERE g.task_id = {card}.id AND g.kind IN ('blocked', 'unblocked', 'gave_up') "
+    "ORDER BY g.id DESC LIMIT 1), '') IN ('" + GAVE_UP_KIND + "', '" + HARD_WALL_BLOCK_KIND + "'))"
+)
+
+#: One row when the card's nearest ancestor that created more than one card is
+#: still open and subscribed to the thread: the creators Hermes stamps on each
+#: ``created`` event (``hermes_cli/kanban_db.py``), walked up from the card,
+#: and the open statuses ``kanban_children_settled`` waits on. Parameters: the
+#: card, the depth bound, then the subscription's platform, chat and thread.
+#: The cards between are not required open: ``kanban_children_settled`` closes
+#: each only after the card beneath it, and usually before its report is
+#: delivered, so requiring them open would post the report again.
+#: A card parked by a give-up, the fan-out or one between, is not open: its
+#: worker will not run again to carry the report up, so the report posts. One
+#: blocked on a question still counts; it resumes on the answer.
+FANNED_OUT_ANCESTOR_SQL = (
+    "WITH RECURSIVE up(id, depth) AS ("
+    "SELECT json_extract(payload, '$.creator_task_id'), 1 FROM task_events "
+    "WHERE task_id = ? AND kind = 'created' "
+    "UNION ALL "
+    "SELECT json_extract(e.payload, '$.creator_task_id'), up.depth + 1 FROM task_events e "
+    "JOIN up ON e.task_id = up.id WHERE e.kind = 'created' AND up.depth < ?"
+    "), fan(id, depth) AS ("
+    "SELECT up.id, up.depth FROM up WHERE up.id IS NOT NULL AND (SELECT count(*) FROM task_events o "
+    "WHERE o.kind = 'created' AND json_extract(o.payload, '$.creator_task_id') = up.id) > 1 "
+    "ORDER BY up.depth LIMIT 1"
+    ") "
+    "SELECT 1 FROM fan JOIN tasks t ON t.id = fan.id "
+    "JOIN kanban_notify_subs s ON s.task_id = t.id "
+    "WHERE t.status NOT IN ('done', 'archived') "
+    "AND NOT " + GAVE_UP_SQL.format(card="t") + " "
+    "AND NOT EXISTS (SELECT 1 FROM up b JOIN tasks m ON m.id = b.id "
+    "WHERE b.depth < fan.depth AND " + GAVE_UP_SQL.format(card="m") + ") "
+    "AND lower(s.platform) = ? AND s.chat_id = ? AND COALESCE(s.thread_id, '') = ? "
+    "LIMIT 1"
+)
 
 #: Leading marker on the rolling message. ``IN_PROGRESS`` while the card runs;
 #: on a terminal event the message is re-rendered with one of the other two so
@@ -192,6 +294,26 @@ MARKER_MAX = 2
 #: card's row in the thread's plan; see :func:`silent_event`.
 SILENT_PLAN_KINDS = ("archived", "unblocked")
 
+#: The kind whose noteless events ``_fmt_heartbeat`` renders as ``None``, so
+#: ``_send_pings`` skips them too. With ``KAGE_SLACK_UX`` on, one opens a Slack
+#: card's row in the thread's plan, running, when the card has none yet: the
+#: worker's first automatic heartbeat, written on its first activity, is the
+#: earliest event of a run the notifier claims, since ``claimed`` and
+#: ``spawned`` are not among its kinds. See :func:`silent_event`.
+STARTED_KIND = "heartbeat"
+
+#: The kind the ``pr_opened`` plugin (``agents/platform/plugins/pr_opened``)
+#: records on a worker's card when the broker opens a proposal for it: the
+#: forge's ``url``, ``number`` and ``title``. Claimed beside ``heartbeat`` and
+#: given no formatter, so it posts no line and wakes no one; with
+#: ``KAGE_SLACK_UX`` on, :func:`silent_event` posts the PR from it.
+PR_OPENED_KIND = "pr_opened"
+
+#: Under ``spec.mode: next``, the terminal kind whose report is laid out as an
+#: answer (its first sentence the headline, the rest the detail) when it goes
+#: out through the chat.notify stand-in (:func:`_with_answer`).
+ANSWER_KIND = "completed"
+
 #: Kinds that settle a plan row past an earlier ``unblocked`` in the same
 #: batch: every kind ``slack_status.TASK_STATUS_BY_KIND`` maps to a status
 #: other than running, plus ``archived``. ``crashed`` and ``timed_out`` are
@@ -207,9 +329,45 @@ SETTLING_KINDS = (
     "review_requested",
 )
 
+#: A Markdown heading's marks, which a completed card's result line drops.
+HEADING_MARKS = re.compile(r"^#{1,6}\s+")
+#: A Markdown link or image, which the result line reduces to its text: the
+#: row's title is plain text, so ``[PR #12](url)`` would land verbatim.
+LINK_MARKS = re.compile(r"!?\[([^\]]+)\]\([^)\s]*\)")
+#: A code span's backticks, which the result line drops.
+CODE_MARKS = re.compile(r"(?<!`)`([^`]+)`(?!`)")
+#: Bold and italic stars around a run of text, which the result line drops. A
+#: star touching a word, a path or a dot is a glob or arithmetic and stays, as
+#: do underscores, so ``logs/*/*.json``, ``2*3`` and ``seeded_a`` survive.
+EMPHASIS_MARKS = re.compile(r"(?<![\w*./])(\*\*|\*)(?=[^\s./*_])(.+?)(?<=\S)\1(?![\w*/])")
+
 #: Attribute the map hangs off on the watcher instance. Same lazily-initialised
 #: pattern as upstream's ``_kanban_sub_fail_counts``.
 _ATTR = "_kanban_progress_messages"
+
+
+def result_line(kind: str, payload: object) -> str:
+    """A completed card's one-line result for its plan row, or ``""``.
+
+    Upstream's ``completed`` event carries the first line of the worker's
+    handoff summary, or of its result when it gave no summary
+    (``_completed_event_payload`` in ``hermes_cli/kanban_db.py``), so the row
+    needs nothing new from the worker. The title it becomes is plain text, so
+    a heading's ``#`` marks, a link's URL and bold, italic and code marks are
+    dropped, a ``#1234`` kept; the line is clipped as a progress note is.
+    """
+    if kind != "completed" or not isinstance(payload, dict):
+        return ""
+    line = HEADING_MARKS.sub("", str(payload.get("summary") or "").strip())
+    line = EMPHASIS_MARKS.sub(r"\2", CODE_MARKS.sub(r"\1", LINK_MARKS.sub(r"\1", line)))
+    return progress_note({"note": line})
+
+
+def settles_as(kind: str, payload: object) -> str:
+    """The kind an event settles its plan row and its ask as: a hard-wall block as a give-up, else its own."""
+    if kind == NEEDS_YOU_KIND and isinstance(payload, dict) and payload.get("kind") == HARD_WALL_BLOCK_KIND:
+        return GAVE_UP_KIND
+    return kind
 
 
 def rolling_line(kind: str, payload: object) -> str:
@@ -221,7 +379,7 @@ def rolling_line(kind: str, payload: object) -> str:
     being non-empty — an event that rolls must not fall through and settle the
     message just because its payload was thin.
     """
-    if kind == "heartbeat":
+    if kind in NOTE_KINDS:
         return progress_note(payload)
     if kind == "status":
         status = payload.get("status") if isinstance(payload, dict) else None
@@ -449,11 +607,118 @@ async def _plan_row(
         return False
 
 
-async def _settle_plan_row(plan: Any, adapter: Any, sub: dict, kind: str) -> None:
+async def _settle_plan_row(
+    plan: Any, adapter: Any, sub: dict, kind: str, result: str = "", title: str = "",
+) -> bool:
+    """Settle the card's plan row; True when the plan now shows it complete."""
     try:
-        await plan.settle_row(adapter, sub, kind)
+        return bool(await plan.settle_row(adapter, sub, kind, result, title))
     except Exception as exc:  # noqa: BLE001 — cosmetic, like the rolling settle
         logger.debug("kanban progress: settling the plan row for %s failed: %s", sub.get("task_id"), exc)
+        return False
+
+
+def _fan_out_open(sub: dict, board: Optional[str]) -> bool:
+    from hermes_cli import kanban_db_connect
+
+    conn = kanban_db_connect.connect(board=board)
+    try:
+        params = (
+            sub["task_id"], FOLD_ANCESTOR_DEPTH,
+            str(sub.get("platform") or "").lower(), sub["chat_id"], sub.get("thread_id") or "",
+        )
+        return conn.execute(FANNED_OUT_ANCESTOR_SQL, params).fetchone() is not None
+    finally:
+        conn.close()
+
+
+async def _folds(sub: dict, board: Optional[str]) -> bool:
+    """Whether the report of a card beneath a fan-out folds into its plan row: see :data:`FOLDED_KIND`.
+
+    A read that fails posts the report, as it did before the plan.
+    """
+    try:
+        return await asyncio.to_thread(_fan_out_open, sub, board)
+    except Exception as exc:  # noqa: BLE001 — fail towards posting the report
+        logger.debug("kanban progress: reading the fan-out above %s failed: %s", sub.get("task_id"), exc)
+        return False
+
+
+def _slack_moments(quiet: Any) -> Any:
+    """``slack_ux_moments`` when ``quiet`` says ``KAGE_SLACK_UX`` is on for this Slack card.
+
+    Imported when a delivery runs, for the reason :func:`_slack_quiet` imports
+    its module then; an image without it reads as flag off.
+    """
+    if quiet is None:
+        return None
+    try:
+        from gateway import slack_ux_moments
+    except ImportError:
+        return None
+    try:
+        return slack_ux_moments if slack_ux_moments.enabled() else None
+    except Exception as exc:  # noqa: BLE001 — presentation must not fail a delivery
+        logger.debug("kanban progress: reading slack_ux_moments failed: %s", exc)
+        return None
+
+
+async def _needs_you(moments: Any, adapter: Any, sub: dict, ev: Any) -> bool:
+    try:
+        return bool(await moments.needs_you(
+            adapter, sub, getattr(ev, "payload", None), int(getattr(ev, "id", 0) or 0),
+        ))
+    except Exception as exc:  # noqa: BLE001 — fall back to the blocked line
+        logger.debug("kanban progress: the question for %s failed: %s", sub.get("task_id"), exc)
+        return False
+
+
+def _asked(moments: Any, sub: dict, event_id: int) -> bool:
+    """Whether the card's open question was posted for this event: a replay of its ``blocked``."""
+    if moments is None or not event_id:
+        return False
+    try:
+        return bool(moments.asked(sub, event_id))
+    except Exception as exc:  # noqa: BLE001 — fail towards settling and posting as before
+        logger.debug("kanban progress: reading the question for %s failed: %s", sub.get("task_id"), exc)
+        return False
+
+
+async def _settle_question(moments: Any, adapter: Any, sub: dict, kind: str, event_id: int = 0) -> None:
+    """Take the buttons off the card's open question: any event moves it on, and ``kind``
+    says whether that event means it was answered. A new question posts after this."""
+    if moments is None:
+        return
+    try:
+        await moments.settle_question(adapter, sub, kind, event_id)
+    except Exception as exc:  # noqa: BLE001 — cosmetic; the card has moved on
+        logger.debug("kanban progress: settling the question for %s failed: %s", sub.get("task_id"), exc)
+
+
+def _with_summary(ev: Any, message: str) -> str:
+    """The completion's message plus the worker's summary when the message dropped it.
+
+    The message can be the result alone, so a PR the summary names is still one this card
+    opened; both completion paths (posted, and folded into a plan row) scan this.
+    """
+    payload = getattr(ev, "payload", None)
+    summary = str(payload.get(SUMMARY_KEY) or "").strip() if isinstance(payload, dict) else ""
+    return message if not summary or summary in message else f"{message}\n{summary}"
+
+
+async def _pr_opened(moments: Any, adapter: Any, sub: dict, text: str, result: Any) -> None:
+    if moments is None or getattr(result, "success", True) is False:
+        return
+    try:
+        await moments.pr_opened(adapter, sub, text)
+    except Exception as exc:  # noqa: BLE001 — the line or report already went out
+        logger.debug("kanban progress: the PR message for %s failed: %s", sub.get("task_id"), exc)
+
+
+def _replayed(notification: Any, ev: Any) -> bool:
+    """Whether a silent event is at or behind the card's recorded ``last_ping_event_id``."""
+    event_id = int(getattr(ev, "id", 0) or 0)
+    return bool(event_id) and event_id <= int(notification.sub.get("last_ping_event_id") or 0)
 
 
 def _overtaken(notification: Any, ev: Any) -> bool:
@@ -469,7 +734,7 @@ def _overtaken(notification: Any, ev: Any) -> bool:
     ``last_ping_event_id`` lags it; a note or a retried failure does not.
     """
     event_id = int(getattr(ev, "id", 0) or 0)
-    if event_id and event_id <= int(notification.sub.get("last_ping_event_id") or 0):
+    if _replayed(notification, ev):
         return True
     batch = getattr(notification, "d", None)
     events = batch.get("events") if isinstance(batch, dict) else None
@@ -480,29 +745,198 @@ def _overtaken(notification: Any, ev: Any) -> bool:
     )
 
 
+def _noted_later(notification: Any, ev: Any) -> bool:
+    """Whether a heartbeat carrying a note follows this event in its batch."""
+    event_id = int(getattr(ev, "id", 0) or 0)
+    batch = getattr(notification, "d", None)
+    events = batch.get("events") if isinstance(batch, dict) else None
+    return any(
+        int(getattr(later, "id", 0) or 0) > event_id
+        and str(getattr(later, "kind", "") or "") == STARTED_KIND
+        and progress_note(getattr(later, "payload", None))
+        for later in events or ()
+    )
+
+
+async def _started(notification: Any, ev: Any) -> None:
+    """Open a Slack card's plan row, running, on a noteless heartbeat: see :data:`STARTED_KIND`.
+
+    Not for one replayed or overtaken in its batch (:func:`_overtaken`): the
+    later event opens the row settled. Nor for one a note follows in its
+    batch, which opens the row itself, in one post rather than a post and an
+    edit. Only with ``KAGE_SLACK_UX`` on for a Slack card, and never raises: it
+    runs inside the send loop.
+    """
+    try:
+        if _overtaken(notification, ev) or _noted_later(notification, ev):
+            return
+        sub = notification.sub
+        adapter = getattr(notification, "adapter", None)
+        plan = _slack_plan(_slack_quiet(sub))
+        if adapter is None or plan is None:
+            return
+        await plan.start_row(adapter, sub, str(getattr(notification, "title", "") or ""))
+    except Exception as exc:  # noqa: BLE001 — never fail a delivery on the plan
+        logger.debug("kanban progress: opening the plan row on a start failed: %s", exc)
+
+
+def _later_words(notification: Any, ev: Any) -> str:
+    """The worker's words after ``ev`` in its batch: each note, and the completion's summary."""
+    event_id = int(getattr(ev, "id", 0) or 0)
+    batch = getattr(notification, "d", None)
+    events = batch.get("events") if isinstance(batch, dict) else None
+    words = []
+    for later in events or ():
+        if int(getattr(later, "id", 0) or 0) <= event_id:
+            continue
+        payload = getattr(later, "payload", None)
+        kind = str(getattr(later, "kind", "") or "")
+        if kind == STARTED_KIND:
+            words.append(progress_note(payload, limit=0))
+        elif kind == PR_REPORT_KIND and isinstance(payload, dict):
+            words.append(str(payload.get(SUMMARY_KEY) or ""))
+    return "\n".join(word for word in words if word)
+
+
+async def _pr_event(notification: Any, ev: Any) -> None:
+    """Post the PR a ``pr_opened`` event recorded: see :data:`PR_OPENED_KIND`.
+
+    Posted whatever the worker says about it, so a note with no "opened" in it
+    ("Both fixes are up for review in PR #99") still gets the PR's message.
+    Its evidence line is the worker's first line naming the PR later in the
+    batch, else the PR's title. A later note or report that also says it
+    opened the PR posts nothing more: ``slack_ux_moments`` keeps one record of
+    each thread's PRs for both paths. Not for a wake-only subscription, which
+    is sent nothing, nor for an event replayed (:func:`_replayed`);
+    one a later event settles past still posts, since the PR was opened. Only
+    with ``KAGE_SLACK_UX`` on for a Slack card, and never raises: it runs
+    inside the send loop.
+    """
+    try:
+        # A wake-only subscription is sent no messages; upstream runs this hook before that check.
+        if _replayed(notification, ev) or getattr(notification, "send_passive", True) is False:
+            return
+        sub = notification.sub
+        adapter = getattr(notification, "adapter", None)
+        moments = _slack_moments(_slack_quiet(sub))
+        if adapter is None or moments is None:
+            return
+        await moments.pr_event(
+            adapter, sub, getattr(ev, "payload", None), _later_words(notification, ev),
+        )
+    except Exception as exc:  # noqa: BLE001 — never fail a delivery on the PR message
+        logger.debug("kanban progress: the PR message for a pr_opened event failed: %s", exc)
+
+
 async def silent_event(notification: Any, ev: Any) -> None:
     """Move a Slack card's plan row on a kind upstream keeps silent.
 
     Called by ``_send_pings`` for an event whose ``format_event`` returned
     ``None``, before it skips the event. :func:`deliver` never sees these, so
     without this a card archived by hand would hold its row running, and the
-    thread's Working…, and an unblocked card would stay waiting on you until
-    its next note. Only :data:`SILENT_PLAN_KINDS`, never one replayed or
-    overtaken (:func:`_overtaken`), only with ``KAGE_SLACK_UX`` on for a Slack
-    card, and never raises: it runs inside the send loop.
+    thread's Working…, and an unblocked card would stay waiting on you, with
+    its question's buttons still live, until its next note, and its ask would
+    keep its ⏸️ (``gateway/slack_ux_reactions.py``). Only
+    :data:`SILENT_PLAN_KINDS`, never one replayed or overtaken
+    (:func:`_overtaken`), only with ``KAGE_SLACK_UX`` on for a Slack card,
+    and never raises: it runs inside the send loop. An ``unblocked`` overtaken
+    in its batch, not replayed, still settles the question it answered, which
+    the later event would settle as unanswered; one posted for that later
+    event is newer than the unblock and left alone. A noteless heartbeat
+    goes to :func:`_started` instead, and touches neither the question nor
+    the ask's reaction. A ``pr_opened`` event goes to :func:`_pr_event`.
     """
     try:
         kind = str(getattr(ev, "kind", "") or "")
-        if kind not in SILENT_PLAN_KINDS or _overtaken(notification, ev):
+        if kind == PR_OPENED_KIND:
+            await _pr_event(notification, ev)
+            return
+        if kind == STARTED_KIND:
+            await _started(notification, ev)
+            return
+        if kind not in SILENT_PLAN_KINDS:
+            return
+        overtaken = _overtaken(notification, ev)
+        if overtaken and (kind != UNBLOCKED_KIND or _replayed(notification, ev)):
             return
         sub = notification.sub
         adapter = getattr(notification, "adapter", None)
-        plan = _slack_plan(_slack_quiet(sub))
+        quiet = _slack_quiet(sub)
+        plan = _slack_plan(quiet)
+        moments = _slack_moments(quiet)
     except Exception as exc:  # noqa: BLE001 — never fail a delivery on the plan
         logger.debug("kanban progress: reading a silent event failed: %s", exc)
         return
-    if plan is not None and adapter is not None:
+    if adapter is None:
+        return
+    if plan is not None and not overtaken:
         await _settle_plan_row(plan, adapter, sub, kind)
+    await _settle_question(moments, adapter, sub, kind, int(getattr(ev, "id", 0) or 0))
+    # An unblocked card no longer waits on the user, so its ask loses its pause.
+    await _settle_reaction(adapter, sub, kind, getattr(notification, "board_slug", None))
+
+
+def _chat_notify() -> Any:
+    """``kanban_chat_notify``, or None in an image without it."""
+    try:
+        from gateway import kanban_chat_notify
+    except ImportError:
+        try:  # Unit tests import the patch modules flat.
+            import kanban_chat_notify
+        except ImportError:
+            return None
+    return kanban_chat_notify
+
+
+def _with_answer(adapter: Any, quiet: Any, kind: str, message: str, metadata: Optional[dict]) -> Optional[dict]:
+    """``metadata`` with a completed card's report, or a hard-wall block's reason, laid out as an answer, for the chat.notify stand-in.
+
+    Under ``spec.mode: next`` the gateway lays the report out from a
+    ``kube-agents.chat/v1`` answer (``chat_message.answer_message``). Only with
+    ``KAGE_SLACK_UX`` on for a Slack card, never for an actionable report,
+    whose call to action stays in view as today, and never raises: anything
+    that goes wrong posts the text alone, as today.
+    """
+    notify = _chat_notify()
+    if quiet is None or kind != ANSWER_KIND or notify is None or not notify.chat_route(adapter):
+        return metadata
+    try:
+        import chat_message
+
+        if quiet.actionable_report(message):
+            return metadata
+        chat = chat_message.answer_message(message)
+    except Exception as exc:  # noqa: BLE001 — presentation must not fail a delivery
+        logger.debug("kanban progress: laying out the answer for chat.notify failed: %s", exc)
+        return metadata
+    if chat is None:
+        return metadata
+    return {**(metadata or {}), notify.CHAT_METADATA_KEY: chat}
+
+
+def hard_wall_line(payload: object, message: str) -> str:
+    """What a hard-wall block posts, if anything does: the worker's own reason, else the notifier's line.
+
+    The notifier's line for a ``blocked`` event reads as a pause; the reason is
+    the worker's sentence saying what it could not find or do.
+    """
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    return clip_handoff(reason, HARD_WALL_REASON_LIMIT) if isinstance(reason, str) and reason.strip() else message
+
+
+def _wake_reply_lost(adapter: Any) -> bool:
+    """Whether a wake for this card is answered where no one sees it.
+
+    Under ``spec.mode: next`` a conversation card's wake is self-posted into
+    the bridge's session and its reply goes nowhere
+    (``kanban_chat_notify.ConversationNotifyAdapter``), so a line held for it
+    would never be told. Only a hard-wall block is posted instead (see
+    :func:`deliver`): a give-up or crash on such a card is still held and
+    dropped, a gap this module leaves to the next-mode wake work.
+    """
+    notify = _chat_notify()
+    stand_in = getattr(notify, "ConversationNotifyAdapter", None) if notify is not None else None
+    return isinstance(stand_in, type) and isinstance(adapter, stand_in)
 
 
 def _explained_by_wake(quiet: Any, sub: dict, kind: str) -> bool:
@@ -598,10 +1032,26 @@ async def deliver(
     ``gateway/kanban_notifier.py`` has the retry and the gaps it leaves. Beyond
     the terminal path, the card's progress goes on its row in the thread's plan rather than in a
     rolling message of its own, with the rolling message as the fallback when
-    the plan cannot be posted; ``title`` is the card's, for the row. See
-    ``gateway/slack_ux_status.py``. Every line it posts, holds or edits keeps
+    the plan cannot be posted; ``title`` is the card's, which the row leads with
+    in a plan of several or falls back to. See
+    ``gateway/slack_ux_status.py``. A card beneath a fan-out still open on the
+    same thread completes into its row and posts nothing, returning
+    ``None``, once the plan shows that row complete (:data:`FOLDED_KIND`).
+    Every line it posts, holds or edits keeps
     the ``@assignee`` and drops the board tag and ``Kanban <id>``
-    (:func:`slack_line`).
+    (:func:`slack_line`), except a hard-wall block's, which is the worker's
+    reason alone. A card blocked on ``needs_input``
+    posts its question instead of the blocked line, once however often the
+    notifier replays the event, and loses that question's buttons at its next
+    event; a PR the card opened, read from its ``pr_opened`` event or, as the
+    fallback, from a note or report saying a PR was opened, is
+    followed by that PR as a message of its own. See
+    ``gateway/slack_ux_moments.py``. A card blocked on Hermes's hard-wall kind
+    (:data:`HARD_WALL_BLOCK_KIND`) asks nothing: its row and its ask settle as
+    a give-up's, red and ❌ (:func:`settles_as`), and the line it holds or posts
+    is the worker's reason (:func:`hard_wall_line`). Under ``spec.mode: next``
+    a conversation card's wake reply is never posted, so that line posts
+    rather than waiting on the wake (:func:`_wake_reply_lost`).
     """
     chat_id = sub["chat_id"]
     tracked = tracked_messages(watcher)
@@ -613,11 +1063,22 @@ async def deliver(
     header, message = _slack_heads(quiet, sub, header, board, message)
 
     if kind not in ROLLING_KINDS:
+        # The row and the ask settle a hard-wall block as a give-up; the
+        # question and the wake's hold still read the event's own kind.
+        settled_as = settles_as(kind, getattr(ev, "payload", None))
+        hard_wall = quiet is not None and settled_as != kind
+        if hard_wall:
+            message = hard_wall_line(getattr(ev, "payload", None), message)
         plan = _slack_plan(quiet)
+        shown = False
         if plan is not None:
-            await _settle_plan_row(plan, adapter, sub, kind)
+            result = result_line(kind, getattr(ev, "payload", None))
+            shown = await _settle_plan_row(plan, adapter, sub, settled_as, result, title)
         if entry and entry["message_id"] and entry["lines"]:
-            settled = entry["lines"][-1:] if quiet else entry["lines"]
+            # A queued line says the card is waiting; once it settles that is
+            # stale, so the settled message keeps only the card's own notes.
+            notes = [line for line in entry["lines"] if line not in entry.get(QUEUED_LINES_KEY, ())]
+            settled = notes[-1:] if quiet else notes
             try:
                 await adapter.edit_message(
                     chat_id,
@@ -630,24 +1091,65 @@ async def deliver(
                     "for %s: %s", sub.get("task_id"), exc,
                 )
         tracked.pop(key, None)
-        if _explained_by_wake(quiet, sub, kind) and _hold(
+        moments = _slack_moments(quiet)
+        if kind == NEEDS_YOU_KIND and _asked(moments, sub, event_id):
+            # An at-least-once replay of the block whose question is up: settling
+            # it would take its buttons off and posting would repeat it.
+            return None
+        await _settle_question(moments, adapter, sub, kind, event_id)
+        if kind == NEEDS_YOU_KIND and moments is not None and await _needs_you(moments, adapter, sub, ev):
+            await _settle_reaction(adapter, sub, settled_as, board)
+            return None
+        if kind == FOLDED_KIND and shown and await _folds(sub, board):
+            # The row says it; the creator's completion carries the answer.
+            await _settle_reaction(adapter, sub, settled_as, board)
+            await _pr_opened(moments, adapter, sub, _with_summary(ev, message), None)
+            return None
+        if not (hard_wall and _wake_reply_lost(adapter)) and _explained_by_wake(quiet, sub, kind) and _hold(
             quiet, watcher, sub, kind, event_id, message, metadata,
         ):
-            await _settle_reaction(adapter, sub, kind, board)
+            await _settle_reaction(adapter, sub, settled_as, board)
             return None
-        result = await adapter.send(chat_id, message, metadata=metadata)
+        laid_out = ANSWER_KIND if hard_wall else kind
+        result = await adapter.send(
+            chat_id, message, metadata=_with_answer(adapter, quiet, laid_out, message, metadata),
+        )
         # A failed post raises in the notifier, which rewinds its claim so the
         # next tick posts again, and that post settles. After the notifier's
         # MAX_SEND_FAILURES it drops the subscription instead, and the ask
-        # keeps its arrival reaction alone.
+        # never settles.
         if getattr(result, "success", True) is not False:
-            await _settle_reaction(adapter, sub, kind, board)
+            await _settle_reaction(adapter, sub, settled_as, board)
+        if kind == PR_REPORT_KIND:
+            await _pr_opened(moments, adapter, sub, _with_summary(ev, message), result)
         return result
 
     payload = getattr(ev, "payload", None)
     line = rolling_line(kind, payload) or message
-    moved = _moved_to(kind, payload)
-    plan = _slack_plan(quiet)
+    if kind == QUEUED_KIND and not entry:
+        header = ""
+    moments = _slack_moments(quiet)
+    await _settle_question(moments, adapter, sub, kind, event_id)
+    result = await _roll(
+        adapter, sub, metadata, header, title, line, _moved_to(kind, payload),
+        _slack_plan(quiet), event_id, tracked,
+    )
+    if kind == QUEUED_KIND and tracked.get(key):
+        tracked[key].setdefault(QUEUED_LINES_KEY, []).append(line)
+    # The whole note, not the clipped line: a url past the clip is cut whole.
+    note = progress_note(payload, limit=0) if kind == "heartbeat" else ""
+    await _pr_opened(moments, adapter, sub, note or line, result)
+    return result
+
+
+async def _roll(
+    adapter: Any, sub: dict, metadata: Optional[dict], header: str, title: str,
+    line: str, moved: Any, plan: Any, event_id: int, tracked: dict,
+) -> Any:
+    """Put one progress line on the card's plan row, or roll it into its message."""
+    chat_id = sub["chat_id"]
+    key = sub_key(sub)
+    entry = tracked.get(key)
     if plan is not None and await _plan_row(plan, adapter, sub, event_id, title, line, moved):
         if moved is None and entry and entry["message_id"] and entry["lines"]:
             # The plan took over a card that rolled while it stood fallen back. A

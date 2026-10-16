@@ -13,7 +13,7 @@
 ## TL;DR
 
 `kube-agents` defines **three agent personas**, one per level of the Kubernetes containment
-hierarchy: the **Platform Agent** (1 per project), the **Cluster Admin Agent** (1 per cluster), and
+hierarchy: the **Platform Agent** (1 per install, over a scope of one or more projects), the **Cluster Admin Agent** (1 per cluster), and
 the **Developer Team Agent** (1 per namespace). Each persona shares a common anatomy — a `SOUL.md`
 identity, a config, a scoped skill set, memory, event triggers with a heartbeat backstop, and a
 controller-reconciled pod — but differs in **scope, authority, skills, and permissions**.
@@ -26,11 +26,11 @@ This is the end-state roster; the Platform Agent exists today, the other two are
 
 ## 1. The roster
 
-| Persona                  | Scope                  | Cardinality     | Owns / governs                                                               | Bounded by                                         |
-| ------------------------ | ---------------------- | --------------- | ---------------------------------------------------------------------------- | -------------------------------------------------- |
-| **Platform Agent**       | GCP/cloud **project**  | 1 per project   | The fleet: clusters, cross-cluster policy, global RBAC, Cluster Admin Agents | Human platform team + project-level approval gates |
-| **Cluster Admin Agent**  | A single **cluster**   | 1 per cluster   | Cluster internals: node pools, add-ons, namespaces, Developer Team Agents    | Platform Agent policy + project guardrails         |
-| **Developer Team Agent** | A single **namespace** | 1 per namespace | Workloads within its namespace                                               | Cluster Admin policy + cluster/project guardrails  |
+| Persona                  | Scope                                      | Cardinality     | Owns / governs                                                               | Bounded by                                         |
+| ------------------------ | ------------------------------------------ | --------------- | ---------------------------------------------------------------------------- | -------------------------------------------------- |
+| **Platform Agent**       | GCP/cloud **scope** (one or more projects) | 1 per install   | The fleet: clusters, cross-cluster policy, global RBAC, Cluster Admin Agents | Human platform team + project-level approval gates |
+| **Cluster Admin Agent**  | A single **cluster**                       | 1 per cluster   | Cluster internals: node pools, add-ons, namespaces, Developer Team Agents    | Platform Agent policy + project guardrails         |
+| **Developer Team Agent** | A single **namespace**                     | 1 per namespace | Workloads within its namespace                                               | Cluster Admin policy + cluster/project guardrails  |
 
 Every persona serves SRE critical user journeys within its own scope (see
 [01-vision-scope.md](01-vision-scope.md) §3); SRE is not a separate persona.
@@ -227,8 +227,8 @@ last):
 **Handles are derived, not a registry.** An agent's handle is its `<tier>-<scope>` name (§6.1) —
 `@platform-<project>`, `@cluster-admin-<cluster>` (short alias `@cluster-<cluster>`), and
 `@developer-team-<namespace>` (short alias `@devteam-<namespace>`). Each handle maps
-deterministically to the unique `(tier, scope)` **`Agent` CR** the controller already keys
-cardinality on (§8), so there is no separate routing table to drift
+deterministically to the unique **`Agent` CR** the controller already keys cardinality on (§8: the
+install for the platform tier, `(tier, scope)` below it), so there is no separate routing table to drift
 ([06](06-api-and-data-contracts.md) §2b).
 
 **Precedence: deterministic over inference.** A slash command (1) or an explicit handle (2) always
@@ -264,14 +264,14 @@ for a delegation too, and the child task's envelope names the target and the sam
 
 ---
 
-## 3. Persona: Platform Agent (project scope)
+## 3. Persona: Platform Agent (scope)
 
-**Cardinality:** 1 per project. **Exists today** (`agents/platform/`).
+**Cardinality:** 1 per install (its management cluster), whatever its scope declares — one project by default, otherwise the projects `spec.scope` resolves to. **Exists today** (`agents/platform/`).
 
 ### Role
 
 The senior custodian and **architect of the fleet and of the other agents**. It is the primary
-human chat entrypoint into the harness and the authority at the project level.
+human chat entrypoint into the harness and the authority at the scope level.
 
 ### Responsibilities
 
@@ -284,8 +284,8 @@ human chat entrypoint into the harness and the authority at the project level.
 
 ### Authority & limits
 
-- **Read-only, scoped to its one project** (the project's clusters/fleet) — it cannot read or reach
-  another project. It proposes changes — including child `Agent` CRs — to the GitOps repo; it holds
+- **Read-only, scoped to its declared scope** (the clusters of the projects `spec.scope` resolves to;
+  one project by default) — it cannot read or reach a project outside its declared scope. It proposes changes — including child `Agent` CRs — to the GitOps repo; it holds
   no direct cluster/cloud write (see §2.2, [03](03-security-model.md) §3).
 - All infrastructure mutation is declarative (git-reviewed + CI/CD pipeline), never direct `kubectl` (per
   `SOUL.md §1`, §3).
@@ -359,7 +359,7 @@ The three personas form a **cascade** that mirrors containment: each layer owns 
 the layer beneath it.
 
 ```
-Platform Agent  (1 / project)
+Platform Agent  (1 / install, over a scope of 1+ projects)
    └─ owns lifecycle of →  Cluster Admin Agent  (1 / cluster)
                               └─ owns lifecycle of →  Developer Team Agent  (1 / namespace)
 ```
@@ -443,16 +443,16 @@ model verified in **[Scion](https://github.com/GoogleCloudPlatform/scion)**
   (Workload-Identity-bound) and the optional gVisor execution sandbox (deferred,
   [08](08-agent-runtime-and-identity.md) §5.1); placement derives from `tier` + `scope`
 
-| `tier`           | Scope key fields                  | Identity scope           | Chat entrypoint / handle (§2.4)         |
-| ---------------- | --------------------------------- | ------------------------ | --------------------------------------- |
-| `platform`       | project                           | project-wide, read fleet | Platform teams — `@platform-<project>`  |
-| `cluster-admin`  | project + cluster                 | single cluster           | Cluster admins — `@cluster-<cluster>`   |
-| `developer-team` | project + cluster + **namespace** | single namespace         | Developer team — `@devteam-<namespace>` |
+| `tier`           | Scope key fields                                                      | Identity scope                    | Chat entrypoint / handle (§2.4)         |
+| ---------------- | --------------------------------------------------------------------- | --------------------------------- | --------------------------------------- |
+| `platform`       | the install (its management cluster); `spec.scope` is its declaration | read across the projects in scope | Platform teams — `@platform-<project>`  |
+| `cluster-admin`  | project + cluster                                                     | single cluster                    | Cluster admins — `@cluster-<cluster>`   |
+| `developer-team` | project + cluster + **namespace**                                     | single namespace                  | Developer team — `@devteam-<namespace>` |
 
 **Why one tier-discriminated CRD:** the personas differ only in `tier` + `scope` + `parentRef` +
 default (read-only) permissions — otherwise identical, so a single `Agent` CRD expresses all three (one
 CR per persona) and the **thin** controller handles pod lifecycle/isolation/identity/sandbox +
-`(tier,scope)` cardinality (it references pre-created identity; it mints no RBAC). The three personas
+cardinality (the install for the platform tier, `(tier,scope)` below it; it references pre-created identity; it mints no RBAC). The three personas
 stay three at the **behavior** layer (`SOUL.md`, skills, scope). Migration: today's `PlatformAgent`
 CRD/operator is **generalized** into the `Agent` CRD + controller, and today's `PlatformAgent` becomes
 the platform-tier instance ([07](07-implementation-roadmap.md)).
@@ -463,7 +463,7 @@ the platform-tier instance ([07](07-implementation-roadmap.md)).
 
 ### Goals
 
-- Define three scope-bounded personas that map 1:1 onto project / cluster / namespace.
+- Define three scope-bounded personas that map 1:1 onto scope / cluster / namespace.
 - Keep every persona the same _kind_ of agent (shared anatomy: `Agent` CR + Hermes harness).
 - Make the cascade explicit: each layer provisions and governs the next, via declarative workflow.
 - Keep SRE as a cross-cutting set of CUJs, not a persona.
@@ -481,10 +481,10 @@ the platform-tier instance ([07](07-implementation-roadmap.md)).
 
 A harness confirms this doc's design with:
 
-- **Cardinality:** `kubectl get pods -l kube-agents/tier=platform` returns exactly **1 per project**;
+- **Cardinality:** `kubectl get pods -l kube-agents/tier=platform` returns exactly **1 per install** (one `PlatformAgent` per management cluster, whatever its scope declares);
   `-l kube-agents/tier=cluster-admin` exactly **1 per cluster**; `-l kube-agents/tier=developer-team`
-  exactly **1 per namespace**. A second `Agent` CR for the same `(tier, scope)` is **rejected by the
-  controller's cardinality webhook**.
+  exactly **1 per namespace**. A second `Agent` CR for the same key — the install (its management cluster) for the platform
+  tier, `(tier, scope)` for the tiers below it — is **rejected by the controller's cardinality webhook**.
 - **Per-persona identity:** each agent pod's `spec.serviceAccountName` is its tier/scope read-only KSA
   (03 §3); labels `kube-agents/tier` and `kube-agents/parent` are set.
 - **Indirect coordination:** assert the four properties in §2.3, not the absence of a channel. No

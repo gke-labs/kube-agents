@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -653,9 +654,11 @@ func TestACalloutCanServeANewGatewayFromOneReadyUpdatedReplica(t *testing.T) {
 // The gateway binary refuses to start without a chat backend, so a next
 // install with no discord-bot Secret and no door armed used to render a
 // Deployment that crash-looped forever. The render now asks first: no
-// backend, no first creation, and the CR says why. Creation only, like the
-// callout gate: a gateway that exists is reconciled whatever happened to its
-// backend.
+// backend, no first creation, and the CR says why. A gateway that already
+// exists is not deleted when its backend goes, since its session pods hang off
+// its UID; it is applied at zero replicas instead (#2481), and the same
+// condition says why. platformagent_a2a_gateway_dark_envtest_test.go walks
+// that round trip against a real API server.
 
 // a2aGateTestReconcilerWithoutABackend is a2aGateTestReconciler minus the
 // discord-bot Secret it seeds, for the tests that are about its absence.
@@ -981,10 +984,19 @@ func TestAHeldProvisionJobReadsProvisioningNamingTheCallout(t *testing.T) {
 	}
 }
 
-// TestARunningGatewayDoesNotReadTheSecret: the backend question costs an
-// uncached Secret read, and it is asked only on the pass that would create
-// the gateway. An install whose gateway exists pays nothing for the gate.
-func TestARunningGatewayDoesNotReadTheSecret(t *testing.T) {
+// TestARunningGatewayReadsTheSecretTwicePerPass: the backend question is
+// asked on every pass now, existing gateway or not, or a running gateway
+// would never see its backend leave (#2481). On an install whose only backend
+// is the discord-bot Secret that is one uncached read per render pass. This
+// counts reconcileA2A's reads only; the status writers do not ask the
+// question, they read the render's answer off a2aProvisionState.
+//
+// The secret-env digest (#2401) reads the same Secret once per pass too,
+// because the rendered gateway takes DISCORD_TOKEN from it as environment
+// (platformagent_secret_hash.go); that read is the stamp's, the one the agent
+// gateway and the broker pay. So a running Secret-only pass reads it exactly
+// twice, the gate's and the stamp's, and either one asked again makes it three.
+func TestARunningGatewayReadsTheSecretTwicePerPass(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	agent := a2aTestAgent()
 	scheme := setupScheme()
@@ -1017,13 +1029,55 @@ func TestARunningGatewayDoesNotReadTheSecret(t *testing.T) {
 	}
 
 	secretReads = 0
-	for i := 0; i < 3; i++ {
+	const passes = 3
+	for i := 0; i < passes; i++ {
 		if _, err := r.reconcileA2A(ctx, agent); err != nil {
 			t.Fatalf("reconcileA2A %d with the gateway running: %v", i+1, err)
 		}
 	}
-	if secretReads != 0 {
-		t.Errorf("a running gateway's reconcile read the discord-bot Secret %d times in three passes, want 0", secretReads)
+	if secretReads != 2*passes {
+		t.Errorf("a running Secret-only gateway's reconcile read the discord-bot Secret %d times in %d passes, want two per pass (the gate's and the digest's)", secretReads, passes)
+	}
+}
+
+// TestARunningDoorGatewayPaysNoSecretRead: the door flags answer the backend
+// question from the operator's environment, so asking it on every pass costs
+// a door install no read of its own. The render still carries the optional
+// discord-bot reference beside the door, so the secret-env digest (#2401)
+// reads that Secret once per pass, found or not; that read is the stamp's,
+// and the gate asking the question too would make it two.
+func TestARunningDoorGatewayPaysNoSecretRead(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	secretReads := 0
+	funcs := fakeServerSideApplyInterceptors()
+	funcs.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*corev1.Secret); ok && key.Name == a2aDiscordBotSecretName {
+			secretReads++
+		}
+		return c.Get(ctx, key, obj, opts...)
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, sandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(funcs).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	const passes = 3
+	for i := 0; i < passes; i++ {
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatalf("reconcileA2A %d: %v", i+1, err)
+		}
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("precondition: the gateway renders on the inject door alone: %v", err)
+	}
+	if secretReads != passes {
+		t.Errorf("a door install read the discord-bot Secret %d times in %d passes, want one per pass (the digest's; the flag answers the backend question)", secretReads, passes)
 	}
 }
 
@@ -1041,8 +1095,10 @@ func TestAGatewayIsNotRenderedWithoutAChatBackend(t *testing.T) {
 	if !state.gatewayDark {
 		t.Fatal("the render did not report the gateway withheld for want of a backend")
 	}
-	if !strings.Contains(state.gatewayDarkReason, a2aDiscordBotSecretName) || !strings.Contains(state.gatewayDarkReason, a2aInjectBackendEnvVar) {
-		t.Errorf("the reason does not name what would render the gateway: %q", state.gatewayDarkReason)
+	for _, remedy := range []string{a2aDiscordBotSecretName, a2aInjectBackendEnvVar, a2aAgentDoorEnvVar} {
+		if !strings.Contains(state.gatewayDarkReason, remedy) {
+			t.Errorf("the reason does not name %s as something that would render the gateway: %q", remedy, state.gatewayDarkReason)
+		}
 	}
 	if state.gatewayHeld {
 		t.Error("the callout gate was consulted for a gateway that is dark; the backend question comes first")
@@ -1096,10 +1152,87 @@ func TestTheInjectDoorRendersTheGatewayWithoutASecret(t *testing.T) {
 	}
 }
 
-// TestAnExistingGatewayKeepsReconcilingWithoutABackend: creation only. Taking
-// the Secret away from a running gateway must not withhold its reconcile,
-// because deleting the Deployment would take every session pod with it.
-func TestAnExistingGatewayKeepsReconcilingWithoutABackend(t *testing.T) {
+// TestTheA2ADoorRendersTheGatewayWithoutASecret: the A2A door is a backend
+// to the render the way the inject door is (gke-labs#2252 step 1). The
+// gateway binary accepts A2A_DOOR_LISTEN as its ingress (a2a/gateway/config.go,
+// "no chat backend"), so an install that arms the door alone must get its
+// gateway, or the door is a flag that renders four objects around a
+// Deployment that never exists.
+func TestTheA2ADoorRendersTheGatewayWithoutASecret(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "true")
+	agent := a2aTestAgent()
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatalf("reconcileA2A: %v", err)
+	}
+	if state.gatewayDark {
+		t.Fatalf("the A2A door is armed and the gateway is reported dark (%q); a door-only install would never get a gateway", state.gatewayDarkReason)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("the gateway Deployment was not rendered with the A2A door armed: %v", err)
+	}
+	// And the door's own objects came with it, so the rendered gateway has
+	// the listener's token, map, Service and fence, not a bare flag.
+	for _, obj := range a2aDoorRenderedKinds() {
+		if err := cl.Get(ctx, types.NamespacedName{Name: a2aDoorName(agent), Namespace: agent.Namespace}, obj); err != nil {
+			t.Errorf("%T %s was not rendered beside the gateway: %v", obj, a2aDoorName(agent), err)
+		}
+	}
+}
+
+// TestADarkPassRemovesTheA2ADoor: the withheld path tears down what the flags
+// no longer arm, for the A2A door as for the inject door. The sequence that
+// reaches it: the door armed, the gateway rendered on it, the Deployment gone
+// (a rollout taken away by hand), then the flag off -- the next pass is dark
+// and must not leave the door's Service, map, token and fence behind.
+func TestADarkPassRemovesTheA2ADoor(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "true")
+	agent := a2aTestAgent()
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	if state, err := r.reconcileA2A(ctx, agent); err != nil || state.gatewayDark {
+		t.Fatalf("precondition: the door-only gateway renders (state=%+v err=%v)", state, err)
+	}
+	gw := &appsv1.Deployment{}
+	key := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, key, gw); err != nil {
+		t.Fatalf("precondition: %v", err)
+	}
+	doorKey := types.NamespacedName{Name: a2aDoorName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, doorKey, &corev1.Service{}); err != nil {
+		t.Fatalf("precondition: the door's Service was not rendered, so this test proves nothing: %v", err)
+	}
+	if err := cl.Delete(ctx, gw); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatalf("reconcileA2A with the flag off and no gateway: %v", err)
+	}
+	if !state.gatewayDark {
+		t.Fatal("the pass after the flag went off is not dark; nothing arms a backend")
+	}
+	for _, obj := range a2aDoorRenderedKinds() {
+		if err := cl.Get(ctx, doorKey, obj); !errors.IsNotFound(err) {
+			t.Errorf("%T %s survived the dark pass (err=%v)", obj, doorKey.Name, err)
+		}
+	}
+}
+
+// TestAnExistingGatewayScalesToZeroWithoutABackend: taking the Secret away
+// from a running gateway neither deletes the Deployment, which would take
+// every session pod with it, nor leaves it at one replica to crash-loop on
+// "no chat backend". It is applied at zero replicas and the pass reports it
+// dark (#2481).
+func TestAnExistingGatewayScalesToZeroWithoutABackend(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	agent := a2aTestAgent()
 	r, cl, _ := a2aGateTestReconciler(t, agent)
@@ -1120,11 +1253,110 @@ func TestAnExistingGatewayKeepsReconcilingWithoutABackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcileA2A after the Secret went away: %v", err)
 	}
-	if state.gatewayDark {
-		t.Error("an existing gateway was reported dark; the rule is creation only")
+	if !state.gatewayDark || !strings.Contains(state.gatewayDarkReason, a2aDiscordBotSecretName) {
+		t.Errorf("an existing gateway with no backend was not reported dark with the remedy (dark=%v reason=%q)", state.gatewayDark, state.gatewayDarkReason)
 	}
-	if err := cl.Get(ctx, key, &appsv1.Deployment{}); err != nil {
+	got := &appsv1.Deployment{}
+	if err := cl.Get(ctx, key, got); err != nil {
 		t.Fatalf("the existing gateway Deployment is gone: %v", err)
+	}
+	if got.Spec.Replicas == nil || *got.Spec.Replicas != 0 {
+		t.Errorf("the gateway Deployment asks for %d replicas with no backend, want 0", ptr.Deref(got.Spec.Replicas, -1))
+	}
+}
+
+// TestADarkPassOnAStaleGatewayHitCreatesNothing: the dark pass reads the
+// gateway from the informer, and a server-side apply of a Deployment the API
+// server no longer holds creates it. An informer that has not yet seen a
+// deleted gateway go must not lead the zero-replica apply to re-create it:
+// a gateway created that way never passed the callout gate, and the wake
+// that later scales it to one replica asks the gate nothing, because the
+// gate never holds a gateway that exists. The existence the zero apply acts
+// on is confirmed live, through a2aReader.
+//
+// The fake client has read-your-writes, so the informer is staged: r.Client
+// answers the gateway's Get with the copy it held before the delete, while
+// APIReader is the store itself.
+func TestADarkPassOnAStaleGatewayHitCreatesNothing(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+	r, cl, _ := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
+	held := &appsv1.Deployment{}
+	if err := cl.Get(ctx, key, held); err != nil {
+		t.Fatalf("precondition: the gateway renders with the Secret present: %v", err)
+	}
+
+	if err := cl.Delete(ctx, held.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Delete(ctx, discordBotSecret(agent)); err != nil {
+		t.Fatal(err)
+	}
+	informer := interceptor.NewClient(cl.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, k client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if dep, ok := obj.(*appsv1.Deployment); ok && k == key {
+				held.DeepCopyInto(dep)
+				return nil
+			}
+			return c.Get(ctx, k, obj, opts...)
+		},
+	})
+	r.APIReader = cl
+	r.Client = informer
+
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatalf("reconcileA2A on the stale gateway hit: %v", err)
+	}
+	if !state.gatewayDark {
+		t.Errorf("a pass with no backend was not reported dark (reason=%q)", state.gatewayDarkReason)
+	}
+	if err := cl.Get(ctx, key, &appsv1.Deployment{}); !errors.IsNotFound(err) {
+		t.Fatalf("a dark pass on an informer still holding a deleted gateway re-created it (Get err=%v); want NotFound", err)
+	}
+}
+
+// TestADarkExistingGatewayKeepsTheReconcileRequeuing: the requeue that brings
+// a withheld gateway's Secret into view brings a scaled-to-zero one's too.
+// Measured as TestADarkGatewayKeepsTheReconcileRequeuing is, on a provisioned
+// bus with the callout serving, so the dark term alone carries it.
+func TestADarkExistingGatewayKeepsTheReconcileRequeuing(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	completeTheProvisionJob(t, ctx, cl, agent)
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, key, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("precondition: the gateway renders with the Secret present: %v", err)
+	}
+	if err := cl.Delete(ctx, discordBotSecret(agent)); err != nil {
+		t.Fatal(err)
+	}
+
+	var res ctrl.Result
+	for i := 0; i < 3; i++ {
+		var err error
+		if res, err = r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d with the gateway's backend gone: %v", i+1, err)
+		}
+	}
+	got := &appsv1.Deployment{}
+	if err := cl.Get(ctx, key, got); err != nil || got.Spec.Replicas == nil || *got.Spec.Replicas != 0 {
+		t.Fatalf("precondition: the gateway is not at zero replicas (err=%v replicas=%d)", err, ptr.Deref(got.Spec.Replicas, -1))
+	}
+	if res.RequeueAfter != 30*time.Second {
+		t.Errorf("a gateway scaled to zero on a provisioned bus requeued after %s, want 30s; nothing watches the discord-bot Secret", res.RequeueAfter)
 	}
 }
 
@@ -1154,5 +1386,79 @@ func TestADiscordSecretWithoutATokenIsNotABackend(t *testing.T) {
 	}
 	if !strings.Contains(state.gatewayDarkReason, a2aDiscordBotTokenKey) {
 		t.Errorf("the reason does not name the missing key: %q", state.gatewayDarkReason)
+	}
+}
+
+// TestChatUnderNextRendersTheGatewayWithoutASecret: the CR's own Chat
+// integration is a backend, so an install that enabled Chat and flipped to
+// next gets its gateway with no discord-bot Secret and no door.
+func TestChatUnderNextRendersTheGatewayWithoutASecret(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := gchatTestAgent("next", true)
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatalf("reconcileA2A: %v", err)
+	}
+	if state.gatewayDark {
+		t.Fatalf("Chat is enabled under next and the gateway is reported dark: %q", state.gatewayDarkReason)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("the gateway Deployment was not rendered with Chat armed: %v", err)
+	}
+}
+
+// TestAChatInstallPaysNoSecretRead: the Chat answer comes from the CR, so the
+// uncached discord-bot read is never made, on the creating pass or after.
+func TestAChatInstallPaysNoSecretRead(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := gchatTestAgent("next", true)
+	scheme := setupScheme()
+	secretReads := 0
+	funcs := fakeServerSideApplyInterceptors()
+	funcs.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*corev1.Secret); ok && key.Name == a2aDiscordBotSecretName {
+			secretReads++
+		}
+		return c.Get(ctx, key, obj, opts...)
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, sandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(funcs).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	for i := 0; i < 2; i++ {
+		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			t.Fatalf("reconcileA2A %d: %v", i+1, err)
+		}
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("precondition: the gateway renders on Chat alone: %v", err)
+	}
+	if secretReads != 0 {
+		t.Errorf("a Chat install read the discord-bot Secret %d times, want 0: the CR answers the backend question", secretReads)
+	}
+}
+
+// TestTheDarkReasonNamesChat: the remedy an admin reads off the condition
+// names every way to give the gateway a backend, the CR field included.
+func TestTheDarkReasonNamesChat(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil || !state.gatewayDark {
+		t.Fatalf("precondition: want a dark gateway (state=%+v err=%v)", state, err)
+	}
+	if !strings.Contains(state.gatewayDarkReason, "spec.integration.googleChat") {
+		t.Errorf("the reason does not name the Chat integration as a backend: %q", state.gatewayDarkReason)
 	}
 }

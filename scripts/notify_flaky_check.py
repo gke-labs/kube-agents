@@ -12,9 +12,11 @@ requests that did not touch Python, each attempt naming a different test of
 the same class, and each re-run was an isolated event until someone read the
 logs together and found one cause behind them.
 
-So this writes it down. `.github/workflows/flaky-check-notify.yml` hands it a
-run id and an attempt number whenever a watched workflow completes an attempt
-after its first, and it decides whether the pair of attempts is a flake:
+So this writes it down. `.github/workflows/flaky-check-notify.yml` runs
+`--sweep` every fifteen minutes: it lists each watched workflow's successful
+runs created in the last few days, and a run whose latest attempt is not its
+first is a re-run that went green. For each one not already on an issue it
+decides whether the pair of attempts is a flake:
 
     attempt N passed, an earlier attempt failed, same commit -> record it
     anything else                                            -> nothing to say
@@ -53,15 +55,27 @@ the same event twice cannot add a second row, and a hand-edited body is restored
 by the next occurrence. The title is written once and left alone after that,
 so a rename that says what the cause turned out to be survives.
 
-What this trusts: that a re-run is a human's decision. The workflow acts on
+What this trusts: that a re-run is a human's decision. The sweep acts on
 `run_attempt > 1`, which only a re-run produces, and this repository re-runs
 nothing automatically. If something ever does, every retry it makes on a real
 break becomes a row here.
 
+Why a sweep and not the `workflow_run` event: the event fires on every
+completion of every watched workflow, pull-request runs included, and the job
+gate skipped six hundred of those runs a day for the one or two that were a
+re-run (gke-labs/kube-agents#2943). The sweep is ninety-six runs a day that
+read a few pages each. What it gives up: a re-run more than `SWEEP_WINDOW_DAYS`
+after its run was created, which the list endpoint, filtering on creation
+alone, cannot be asked for cheaply; and a green re-run that someone re-runs
+again and that fails, since the sweep lists successes and reads a run's latest
+attempt, so that run is not seen until an attempt after the red goes green,
+and then every failed attempt behind it is a row.
+
 Setup: none. It writes to this repository with the workflow's own `GITHUB_TOKEN`
 and creates the `ci:flaky` label the first time it needs it.
 
-Run:  python3 scripts/notify_flaky_check.py --run-id 123456789 --attempt 2 --dry-run
+Run:  python3 scripts/notify_flaky_check.py --sweep --dry-run
+      python3 scripts/notify_flaky_check.py --run-id 123456789 --attempt 2 --dry-run
 Test: cd scripts && python3 -m unittest test_notify_flaky_check
 """
 
@@ -75,14 +89,18 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 from github_api import (
     API_ROOT,
     REQUEST_ATTEMPTS,
     REQUEST_RETRY_SECONDS,
+    SERVER_ERROR_FLOOR,
+    TOO_MANY_REQUESTS,
     GitHubAPI as BaseGitHubAPI,
     _rate_limited,
     _retry_delay,
+    is_refusal,
     log,
 )
 
@@ -207,9 +225,6 @@ FINGERPRINT_DIGEST_LENGTH = 12
 # back to an old recurrence depends on it.
 PAGE_SIZE = 100
 
-# Status codes the log fetch retries, besides what `_rate_limited` names.
-SERVER_ERROR_MIN = 500
-TOO_MANY_REQUESTS = 429
 
 # A job log is read through a redirect to blob storage, and the redirect target
 # is pre-signed: following it with the GitHub token attached is refused with
@@ -237,13 +252,86 @@ LABEL_DESCRIPTION = "A check failed and passed when re-run on the same commit"
 MARKER_PREFIX = "<!-- flaky-check "
 OCCURRENCE_PREFIX = "<!-- flaky-occurrence "
 OCCURRENCE_SUFFIX = " -->"
+# One more hidden line: every (run, failed attempt, green attempt) key the
+# issue has ever held, whichever rows the table still shows. The rows stop at
+# MAX_OCCURRENCES, and the sweep revisits every run in its window on every
+# pass, so a key that left the rows and nothing else would be read in full,
+# added back and announced again four times an hour until it left the window.
+# Keys are a few bytes each; a thousand of them is a fraction of the body
+# limit and more re-runs than any flake has produced.
+SEEN_PREFIX = "<!-- flaky-seen "
+SEEN_KEY_SEPARATOR = ","
+SEEN_FIELD_SEPARATOR = ":"
+# run id, failed attempt, green attempt: what `seen_key` writes, and the only
+# shape `seen_in` admits, so a hand-edited line cannot raise inside the sweep.
+SEEN_KEY_FIELDS = 3
+MAX_SEEN_KEYS = 1000
 
 WORKFLOW_FILE = ".github/workflows/flaky-check-notify.yml"
+
+# The workflows `--sweep` reads, by the `name:` each declares. What may go on
+# the list: a check whose result should not depend on the attempt, which is
+# every check that reads the tree and nothing else. Left off on purpose:
+# `Validate PR Title`, which a title edit legitimately turns green without a
+# commit; `Security Scanning`, whose advisory database moves between attempts,
+# so a green re-run there is the database changing rather than the check
+# flaking; and the `pull_request_target` automations (`Risk Classification`,
+# `Hold Unresolved Threads`, `Auto Assign Milestone on Merge`, `Merge Gate`),
+# which are not checks on the tree at all. `test_integration_contracts.py` holds every
+# pull-request check to this list or to its exclusion list, and
+# `test_notify_flaky_check.py` checks that every name here is a workflow's.
+# A rename silently drops one; the sweep goes red on a name it cannot find.
+WATCHED_WORKFLOWS = (
+    "A2A Module Tests",
+    "Actionlint",
+    "Conformance",
+    "Docker Build",
+    "Docs Build",
+    "Documentation Checks",
+    "Documentation Freshness Check",
+    "Installer Cross-OS Validation Matrix",
+    "Operator Tests",
+    "Prettier Check",
+    "Python Unit Tests",
+    "Step 0 on bash 3.2",
+    "Validate Repo Structure",
+)
+
+# How far back in run creation the sweep lists. A re-run keeps its run's
+# `created_at`, and the list endpoint filters on nothing else. Of the sixteen
+# flakes recorded by 2026-10-13 the latest green came twenty hours after its
+# run was created, the median under one; three days is that with room. The
+# window is listed a day at a time, because the endpoint returns at most
+# `RUNS_LIST_CAP` runs for one query and the busiest workflow's three days
+# were already past half of that.
+SWEEP_WINDOW_DAYS = 3
+SLICE_DAYS = 1
+# The list endpoint returns at most this many runs however many match.
+RUNS_LIST_CAP = 1000
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+# `warn` writes a runner annotation as well as a log line when this is set:
+# the sweep's "left to the next one" outcomes are worth a yellow mark on the
+# job without a red.
+WARNING_PREFIX = "::warning::"
+ANNOTATE_ENV = "FLAKY_CHECK_ANNOTATE"
 
 
 # --------------------------------------------------------------------------- #
 # Deciding whether the pair of attempts is a flake
 # --------------------------------------------------------------------------- #
+
+
+def warn(message):
+    """A log line that, when the workflow asks, also annotates the job. Stdout,
+    where the runner reads workflow commands."""
+    if os.environ.get(ANNOTATE_ENV):
+        print(f"{WARNING_PREFIX}{message}", flush=True)
+    log(message)
+
+
+def _utcnow():
+    return datetime.now(timezone.utc)
 
 
 def failed_before(current, earlier):
@@ -270,7 +358,7 @@ def decide(current, failed_attempts):
     """Why `current` is not a flake, or None when it is one.
 
     `failed_attempts` is what `failed_before` returned for the attempts ahead
-    of it. The reason string is for the log; the workflow's `if:` has already
+    of it. The reason string is for the log; the sweep's success filter has already
     filtered most of these, and reading them back off the API is what makes a
     hand-run on the wrong run id harmless.
     """
@@ -437,28 +525,61 @@ def occurrence_key(record):
     return (record["run_id"], record["failed_attempt"])
 
 
+def seen_key(record):
+    """The compact key the hidden `flaky-seen` line keeps for one record."""
+    return (record["run_id"], record["failed_attempt"], record.get("passed_attempt"))
+
+
+def seen_in(body):
+    """Every key the issue's hidden `flaky-seen` line holds, oldest first."""
+    for line in (body or "").splitlines():
+        line = line.strip()
+        if line.startswith(SEEN_PREFIX) and line.endswith(OCCURRENCE_SUFFIX):
+            raw = line[len(SEEN_PREFIX) : -len(OCCURRENCE_SUFFIX)]
+            found = []
+            for item in filter(None, raw.split(SEEN_KEY_SEPARATOR)):
+                fields = item.split(SEEN_FIELD_SEPARATOR)
+                if len(fields) != SEEN_KEY_FIELDS:
+                    continue
+                try:
+                    found.append(tuple(int(field) for field in fields))
+                except ValueError:
+                    continue
+            return found
+    return []
+
+
 def occurrences_in(body):
-    """The occurrences an issue body already records, oldest first."""
+    """The occurrences an issue body already records, oldest first.
+
+    Only an object carrying the two fields the merge keys on counts; a hand
+    edit can leave anything else, and the sweep must not raise on it.
+    """
     found = []
     for line in (body or "").splitlines():
         line = line.strip()
         if line.startswith(OCCURRENCE_PREFIX) and line.endswith(OCCURRENCE_SUFFIX):
             raw = line[len(OCCURRENCE_PREFIX) : -len(OCCURRENCE_SUFFIX)]
             try:
-                found.append(json.loads(raw))
+                record = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            if isinstance(record, dict) and "run_id" in record and "failed_attempt" in record:
+                found.append(record)
     return found
 
 
-def merge_occurrences(existing, new_records):
+def merge_occurrences(existing, new_records, seen=()):
     """`existing` plus whichever of `new_records` are not already there.
 
     Returns the merged list, oldest first and trimmed to the most recent
     MAX_OCCURRENCES, and the records that were in fact new. Identity is the
     run and its failed attempt, so the same event handled twice is one row.
+    `seen` is the issue's hidden key line: a record whose row the trim took
+    is still known, and is not a new row.
     """
     keys = {occurrence_key(record) for record in existing}
+    keys.update((key[0], key[1]) for key in seen)
     added = []
     for record in new_records:
         if occurrence_key(record) not in keys:
@@ -501,7 +622,7 @@ def render_title(workflow_name, lines):
     return f"🎲 flaky check: {workflow_name}: {first}"
 
 
-def render_body(repo, workflow_name, lines, records, marker, previously=None):
+def render_body(repo, workflow_name, lines, records, marker, previously=None, seen=()):
     """The issue body, rebuilt from scratch on every update."""
     count = len(records)
     plural = "" if count == 1 else "s"
@@ -558,6 +679,13 @@ def render_body(repo, workflow_name, lines, records, marker, previously=None):
         f"{OCCURRENCE_PREFIX}{json.dumps(record, sort_keys=True, ensure_ascii=False)}{OCCURRENCE_SUFFIX}"
         for record in records
     ]
+    # Every key ever held, the rows' included, newest last, bounded on its own.
+    keys = list(dict.fromkeys(list(seen) + [seen_key(record) for record in records]))[-MAX_SEEN_KEYS:]
+    out += [
+        SEEN_PREFIX
+        + SEEN_KEY_SEPARATOR.join(SEEN_FIELD_SEPARATOR.join(str(field) for field in key) for key in keys)
+        + OCCURRENCE_SUFFIX
+    ]
     return "\n".join(out)
 
 
@@ -605,6 +733,39 @@ class GitHubAPI(BaseGitHubAPI):
     def run(self, run_id):
         return self.get(f"/repos/{self.repo}/actions/runs/{run_id}")
 
+    def successful_runs_between(self, workflow_id, start, end):
+        """Successful runs of one workflow created from `start` to `end`
+        inclusive, newest first, every page. Each run carries its latest
+        attempt's fields, so `run_attempt` on one of these is the attempt that
+        went green.
+
+        `created` is the only time filter the endpoint has, and a re-run does
+        not move it, which is why the caller's window is days wide. The
+        endpoint lists at most `RUNS_LIST_CAP` runs however many match, so the
+        caller asks a day at a time; a day that holds more is read to the cap
+        and the log says so.
+        """
+        found = []
+        page = 1
+        while True:
+            query = urllib.parse.urlencode(
+                {"status": SUCCESS, "created": f"{start}..{end}", "per_page": PAGE_SIZE, "page": page}
+            )
+            batch = self.get(f"/repos/{self.repo}/actions/workflows/{workflow_id}/runs?{query}")
+            runs = batch["workflow_runs"]
+            found.extend(runs)
+            if len(runs) < PAGE_SIZE:
+                return found
+            if len(found) >= RUNS_LIST_CAP:
+                # Exactly the cap was read whole; only a larger count lost runs.
+                if (batch.get("total_count") or 0) > RUNS_LIST_CAP:
+                    warn(
+                        f"workflow {workflow_id}: {batch.get('total_count')} successful runs from {start} to {end}, "
+                        f"more than the {RUNS_LIST_CAP} the endpoint lists; the oldest are not swept"
+                    )
+                return found
+            page += 1
+
     def attempt(self, run_id, number):
         """The run as of one attempt. 404 for an attempt that does not exist."""
         return self.get(f"/repos/{self.repo}/actions/runs/{run_id}/attempts/{number}", tolerate=(404,))
@@ -646,7 +807,7 @@ class GitHubAPI(BaseGitHubAPI):
                 if REDIRECT_STATUS_MIN <= error.code <= REDIRECT_STATUS_MAX:
                     location = (getattr(error, "headers", None) or {}).get("Location")
                     break
-                retryable = error.code >= SERVER_ERROR_MIN or error.code == TOO_MANY_REQUESTS or _rate_limited(error)
+                retryable = error.code >= SERVER_ERROR_FLOOR or error.code == TOO_MANY_REQUESTS or _rate_limited(error)
                 if not retryable or attempt == REQUEST_ATTEMPTS:
                     log(f"job {job_id} log: {error.code}; fingerprint falls back to job and step names")
                     return ""
@@ -668,7 +829,7 @@ class GitHubAPI(BaseGitHubAPI):
                 with self.opener(urllib.request.Request(location, headers={"User-Agent": self.user_agent})) as response:
                     return response.read().decode(LOG_ENCODING, DECODE_ERRORS)
             except urllib.error.HTTPError as error:
-                if error.code < SERVER_ERROR_MIN or attempt == REQUEST_ATTEMPTS:
+                if error.code < SERVER_ERROR_FLOOR or attempt == REQUEST_ATTEMPTS:
                     log(f"job {job_id} log redirect: {error.code}; fingerprint falls back to job and step names")
                     return ""
             except urllib.error.URLError as error:
@@ -780,6 +941,34 @@ def workflow_listings(api, workflow_id):
     return api.issues_for_workflow(workflow_id, ISSUE_OPEN), api.issues_for_workflow(workflow_id, ISSUE_CLOSED)
 
 
+def recorded_greens(listings):
+    """Every (run id, green attempt) an occurrence on these issues names,
+    open or closed, from the occurrence rows and from the hidden key line
+    that outlives them.
+
+    The sweep's cheap test for "already handled": a green attempt on any of
+    its workflow's issues was read in full once, and `reconcile` would find
+    every row again. Keyed on the attempt as well as the run so that a run
+    re-run a second time -- red again, then green on a later attempt -- is
+    read again for its new failure. A run recorded under one key and refused
+    under another reads as handled too; the event path had the same gap, and
+    the refusal is a red run both ways. What completes it is a dispatch with
+    that run's id: `record` reconciles every key of the run, and `reconcile`
+    dedupes per issue, so the written key adds nothing and the refused one is
+    written.
+    """
+    found = set()
+    for issues in listings:
+        for issue in issues:
+            body = issue.get("body")
+            for record in occurrences_in(body):
+                if "run_id" in record:
+                    found.add((record["run_id"], record.get("passed_attempt")))
+            # The rows stop at MAX_OCCURRENCES; the key line does not.
+            found.update((key[0], key[-1]) for key in seen_in(body) if len(key) > 1)
+    return found
+
+
 def reconcile(api, repo, workflow_id, workflow_name, lines, records, listings=None):
     """Bring the issue for this fingerprint into line with the new occurrences.
 
@@ -806,12 +995,17 @@ def reconcile(api, repo, workflow_id, workflow_name, lines, records, listings=No
         created = api.create_issue(render_title(workflow_name, lines), body)
         return f"opened #{created['number']}" + (f" (recurrence of #{previously['number']})" if previously else "")
 
-    merged, added = merge_occurrences(occurrences_in(current.get("body")), records)
+    existing = occurrences_in(current.get("body"))
+    # The key line plus the rows: a body written before the line existed, or
+    # hand-edited without it, still knows every row it shows, and the rows
+    # this write trims must leave their keys behind.
+    seen = list(dict.fromkeys(seen_in(current.get("body")) + [seen_key(record) for record in existing]))
+    merged, added = merge_occurrences(existing, records, seen)
     if not added:
         return f"#{current['number']} already records run {records[0]['run_id']}"
     # Body only. The title was written when the issue opened, and whoever
     # renamed it since knows more about the cause than this script does.
-    body = render_body(repo, workflow_name, lines, merged, marker, previously)
+    body = render_body(repo, workflow_name, lines, merged, marker, previously, seen)
     api.update_issue(current["number"], body=body)
     api.comment(current["number"], render_comment(repo, added, len(merged)))
     return f"updated #{current['number']} ({len(merged)} occurrences)"
@@ -824,12 +1018,18 @@ def reconcile(api, repo, workflow_id, workflow_name, lines, records, listings=No
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--run-id", type=int, required=True, help="the workflow run whose latest attempt completed")
+    what = parser.add_mutually_exclusive_group(required=True)
+    what.add_argument("--run-id", type=int, help="one workflow run whose latest attempt completed")
+    what.add_argument(
+        "--sweep",
+        action="store_true",
+        help=f"record every green re-run of a watched workflow created in the last {SWEEP_WINDOW_DAYS} days",
+    )
     parser.add_argument(
         "--attempt",
         type=int,
         default=None,
-        help="the attempt that just completed (default: the run's latest)",
+        help="the attempt to read as the green one (default: the run's latest)",
     )
     parser.add_argument(
         "--repo",
@@ -840,25 +1040,31 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
-def main(argv=None):
-    args = parse_args(argv)
+def record(api, repo, run_id, attempt, dry_run):
+    """Decide whether one run's latest attempt is a flake and write it down.
 
-    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    if not token:
-        log("GITHUB_TOKEN (or GH_TOKEN) is not set")
-        return 1
-
-    api = GitHubAPI(args.repo, token)
-    current = api.attempt(args.run_id, args.attempt) if args.attempt else api.run(args.run_id)
+    `attempt` pins the attempt to read as the green one; None reads the run's
+    latest. The workflow's issues are listed here, just before the first
+    write, never handed in: two runs recorded in one sweep must each see the
+    other's writes. Returns the exit status: 1 when a write was refused, so
+    the run shows it.
+    """
+    current = api.attempt(run_id, attempt) if attempt else api.run(run_id)
     if current is None:
-        log(f"run {args.run_id} attempt {args.attempt} does not exist")
+        log(f"run {run_id} attempt {attempt} does not exist")
         return 0
-    earlier = [api.attempt(args.run_id, number) for number in range(1, current.get("run_attempt", 1))]
+    if current["name"] not in WATCHED_WORKFLOWS:
+        # The sweep only reads watched workflows; a run id typed into the
+        # dispatch can name any. `WATCHED_WORKFLOWS` says why the others are
+        # not watched, and a flake filed for one of them would be wrong.
+        log(f"run {run_id} belongs to {current['name']}, which is not watched; nothing to record")
+        return 0
+    earlier = [api.attempt(run_id, number) for number in range(1, current.get("run_attempt", 1))]
     failed_attempts = failed_before(current, earlier)
 
     reason = decide(current, failed_attempts)
     if reason:
-        log(f"run {args.run_id}: {reason}; nothing to record")
+        log(f"run {run_id}: {reason}; nothing to record")
         return 0
 
     workflow_id = current["workflow_id"]
@@ -873,7 +1079,7 @@ def main(argv=None):
     # rows come out oldest first.
     by_key = {}
     for failed in failed_attempts:
-        jobs = failed_jobs_with_ids(api, args.run_id, failed["run_attempt"])
+        jobs = failed_jobs_with_ids(api, run_id, failed["run_attempt"])
         for key, ids in (keys(jobs) or {None: []}).items():
             by_key.setdefault(key, []).append(occurrence(current, failed, pull_request, ids))
 
@@ -881,21 +1087,126 @@ def main(argv=None):
     # leave the other keys of this run unrecorded, since nothing comes back
     # for them. The run still fails at the end so the refusal is visible.
     failures = 0
-    listings = None if args.dry_run else workflow_listings(api, workflow_id)
+    listings = None if dry_run else workflow_listings(api, workflow_id)
     for key, records in by_key.items():
         lines = [key] if key is not None else []
-        if args.dry_run:
+        if dry_run:
             marker = issue_marker(workflow_id, digest(workflow_id, lines))
             log(f"--dry-run: flake in {workflow_name}, fingerprint {marker}")
-            log(f"\n# {render_title(workflow_name, lines)}\n\n{render_body(args.repo, workflow_name, lines, records, marker)}")
-            log(f"\n--- comment, if an issue is open ---\n{render_comment(args.repo, records, DRY_RUN_COMMENT_COUNT)}")
+            log(f"\n# {render_title(workflow_name, lines)}\n\n{render_body(repo, workflow_name, lines, records, marker)}")
+            log(f"\n--- comment, if an issue is open ---\n{render_comment(repo, records, DRY_RUN_COMMENT_COUNT)}")
             continue
         try:
-            log(reconcile(api, args.repo, workflow_id, workflow_name, lines, records, listings))
+            log(reconcile(api, repo, workflow_id, workflow_name, lines, records, listings))
         except (urllib.error.HTTPError, urllib.error.URLError) as error:
             failures += 1
             log(f"key {key!r}: {error}; not recorded")
     return 1 if failures else 0
+
+
+def sweep(api, repo, dry_run):
+    """Record every green re-run of a watched workflow inside the window.
+
+    Returns the exit status. A watched name no workflow carries is a rename,
+    which silently stops it being swept, so the sweep goes red to say so
+    after sweeping the rest. A read that failed past the client's retries is
+    left to the next sweep with a warning, not a red: an API incident would
+    otherwise red the schedule four times an hour. A request GitHub refused
+    is ours to fix, and reds.
+
+    The workflow list keeps an entry for a file that no longer exists, so a
+    renamed file leaves two workflows carrying one name. Both are listed:
+    the ghost's runs are frozen, so inside the window it costs one request
+    and finds nothing.
+    """
+    now = _utcnow()
+    slices = [
+        (
+            (now - timedelta(days=day + SLICE_DAYS)).strftime(TIMESTAMP_FORMAT),
+            (now - timedelta(days=day)).strftime(TIMESTAMP_FORMAT),
+        )
+        for day in range(0, SWEEP_WINDOW_DAYS, SLICE_DAYS)
+    ]
+    # Only the client's own failures are classified and survived: a refusal
+    # reds, anything transient waits for the next sweep. A defect in this
+    # script on some run's shape raises out and reds the run instead, where
+    # a warning four times an hour on a green job would hide it.
+    try:
+        workflows = api.workflows()
+    except (urllib.error.HTTPError, urllib.error.URLError) as error:
+        if is_refusal(error):
+            log(f"GitHub refused the workflow list ({error}); that is a fault in this repository")
+            return 1
+        warn(f"The workflow list could not be read ({type(error).__name__}: {error}); leaving this sweep to the next one")
+        return 0
+    carriers = {}
+    for workflow in workflows:
+        if workflow["name"] in WATCHED_WORKFLOWS:
+            carriers.setdefault(workflow["name"], []).append(workflow)
+
+    missing = []
+    failed = []
+    broken = []
+    refused_writes = 0
+    for name in WATCHED_WORKFLOWS:
+        if not carriers.get(name):
+            missing.append(name)
+            continue
+        for workflow in carriers[name]:
+            try:
+                # The slices meet at a second a run can sit on, so a run can
+                # list twice; `seen` keeps it to one read.
+                seen = set()
+                candidates = []
+                for start, end in slices:
+                    for run in api.successful_runs_between(workflow["id"], start, end):
+                        if run.get("run_attempt", 1) >= FIRST_RERUN_ATTEMPT and run["id"] not in seen:
+                            seen.add(run["id"])
+                            candidates.append(run)
+                if not candidates:
+                    continue
+                # Newest first is how the endpoint lists; the rows should land
+                # in the order the runs happened.
+                candidates.sort(key=lambda run: run["id"])
+                # Issues are listed only for a workflow with a candidate: every
+                # sweep sees the same re-runs for the whole window, and the
+                # bodies say which it has already read in full. The listing is
+                # not handed on to `record`, which lists again before it
+                # writes: two candidates sharing a fingerprint would otherwise
+                # both see the state before either wrote, and open two issues
+                # for one container.
+                known = recorded_greens(workflow_listings(api, workflow["id"]))
+                for run in candidates:
+                    if (run["id"], run["run_attempt"]) in known:
+                        log(f"{name}: run {run['id']} attempt {run['run_attempt']} is already on an issue; skipping")
+                        continue
+                    log(f"{name}: run {run['id']} went green on attempt {run['run_attempt']}; reading it")
+                    refused_writes += record(api, repo, run["id"], run["run_attempt"], dry_run)
+            except (urllib.error.HTTPError, urllib.error.URLError) as error:
+                log(f"{name}: {type(error).__name__}: {error}")
+                (broken if is_refusal(error) else failed).append(name)
+
+    if missing:
+        log(f"No workflow is named {', '.join(missing)}: renamed or removed, so nothing sweeps it")
+    if failed:
+        warn(f"Sweeping {', '.join(failed)} failed; the rest were swept, and the next sweep retries")
+    if broken:
+        log(f"GitHub refused a request while sweeping {', '.join(broken)}; that is a fault in this repository")
+    return 1 if missing or broken or refused_writes else 0
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if not token:
+        log("GITHUB_TOKEN (or GH_TOKEN) is not set")
+        return 1
+
+    api = GitHubAPI(args.repo, token)
+    if args.sweep:
+        return sweep(api, args.repo, args.dry_run)
+    return record(api, args.repo, args.run_id, args.attempt, args.dry_run)
 
 
 if __name__ == "__main__":

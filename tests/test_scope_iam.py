@@ -40,11 +40,14 @@ DESIGN_ALLOWLIST = [
     "roles/logging.viewer",
     "roles/iam.securityReviewer",
 ]
-# Kept in the host project on purpose (§6): actAs, the MCP server's check, quota.
+# Kept in the host project on purpose (§6): actAs, the MCP server's check,
+# quota, and the Trace role, whose Trace-console writes travel with its reads
+# and whose only consumer reads the host project's own traces.
 HOST_ONLY_ROLES = [
     "roles/iam.serviceAccountUser",
     "roles/mcp.toolUser",
     "roles/serviceusage.serviceUsageConsumer",
+    "roles/cloudtrace.user",
 ]
 # The allowlist entries that carry container.clusters.list AND .get; a scoped
 # project bound with neither cannot be listed or have a profile created.
@@ -199,7 +202,9 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         self.assertIn("condition     = local.scope_selectors_resolved", self.main_tf)
         self.assertIn("kube-agents-scope-resolver", self.main_tf)
 
-    def test_the_reads_are_the_reconciles_three_against_the_apis_it_calls(self):
+    def test_the_reads_are_the_reconciles_against_the_apis_it_calls(self):
+        # Three selector reads, and the container listing for the pool, each
+        # the call the reconcile makes against the same API.
         host = self._data("http", "scope_shared_vpc_host")
         self.assertIn("for_each = local.scope_shared_vpc_hosts", host)
         self.assertIn('url                = "${local.scope_compute_api_url}/projects/${each.key}/getXpnResources?maxResults=${local.scope_xpn_page_size}"', host)
@@ -209,6 +214,10 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         named = self._data("http", "scope_monitored_project")
         self.assertIn("for_each = local.scope_monitored_numbers", named)
         self.assertIn('url                = "${local.scope_resource_manager_api_url}/projects/${each.key}"', named)
+        container = self._data("http", "scope_container")
+        self.assertIn("for_each = local.scope_listed_containers", container)
+        self.assertIn("local.scope_container_url[each.key]", container)
+        self.assertIn('scope_asset_api_url', self.resolver_tf)
         self.assertIn('scope_compute_api_url          = "https://compute.googleapis.com/compute/v1"', self.resolver_tf)
         self.assertIn('scope_monitoring_api_url       = "https://monitoring.googleapis.com/v1"', self.resolver_tf)
         self.assertIn('scope_resource_manager_api_url = "https://cloudresourcemanager.googleapis.com/v3"', self.resolver_tf)
@@ -251,7 +260,8 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
                           'anytrue([for marker in local.scope_api_off_markers : strcontains(self.response_body, marker)]) ? local.scope_api_off_clause[local.')
         for name, api in (("scope_shared_vpc_host", "scope_compute_api_service"),
                           ("scope_metrics_scope", "scope_monitoring_api_service"),
-                          ("scope_monitored_project", "scope_resource_manager_api_service")):
+                          ("scope_monitored_project", "scope_resource_manager_api_service"),
+                          ("scope_container", "scope_asset_api_service")):
             with self.subTest(read=name):
                 self.assertIn("request_headers    = local.scope_resolver_headers", self._data("http", name))
                 self.assertIn(consumer_first + api + '] : ""}', self._data("http", name))
@@ -262,8 +272,11 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
 
     def test_the_http_provider_is_required_and_no_lookup_is_made_without_a_selector(self):
         self.assertIn('source  = "hashicorp/http"', self.versions)
-        self.assertIn("count = local.scope_resolves_selectors ? 1 : 0", self._data("google_client_config", "scope_resolver"))
+        # The token is fetched when a selector is declared or a container is
+        # listed for the pool, and never otherwise.
+        self.assertIn("count = local.scope_reads_apis ? 1 : 0", self._data("google_client_config", "scope_resolver"))
         self.assertIn("scope_resolves_selectors = length(local.scope_shared_vpc_hosts) + length(local.scope_metrics_scopes) > 0", self.resolver_tf)
+        self.assertIn("scope_reads_apis = local.scope_resolves_selectors || length(local.scope_listed_containers) > 0", self.resolver_tf)
 
     def test_a_failed_read_fails_the_plan_and_a_non_host_resolves_to_nothing(self):
         host = self._data("http", "scope_shared_vpc_host")
@@ -308,8 +321,8 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         self.assertIn("scope => [for member in named : member if can(regex(local.scope_project_id_pattern, member))]", self.resolver_tf)
         self.assertIn("scope_selector_uncarriable = merge(local.scope_shared_vpc_uncarriable, local.scope_metrics_scope_uncarriable)", self.resolver_tf)
         self.assertIn('check "selector_members_the_scope_can_carry"', self.resolver_tf)
-        self.assertIn("condition     = length(local.scope_selector_uncarriable) == 0", self.resolver_tf)
-        self.assertIn("value       = local.scope_selector_uncarriable", (_RESOLVER / "outputs.tf").read_text())
+        self.assertIn("condition     = length(local.scope_uncarriable) == 0", self.resolver_tf)
+        self.assertIn("value       = local.scope_uncarriable", (_RESOLVER / "outputs.tf").read_text())
 
     def test_the_members_reach_the_one_project_binding_with_the_lookup_projects_and_less_an_exact_exclude(self):
         self.assertIn("scope_bound_projects = setunion(local.scope_projects, local.scope_selector_projects)", self.scope_tf)
@@ -389,8 +402,9 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         self.assertIn("by ID for an entry in scope.projects or any selector member", self.main_tf)
         self.assertIn("is dropped by the reconcile but counted here", self.main_tf)
         self.assertIn("drop it from scope.projects", self.main_tf)
-        # Containers are not in the count: their members are unknown at plan
-        # time, they are listed last, and their binding is on the container.
+        # Containers are not in the count: their members, listed at plan time
+        # only for an armed pool, come last in the reconcile's order and their
+        # binding is on the container.
         listed = re.search(r"scope_listed_projects = setunion\((.*?)\n  \)", self.scope_tf, re.DOTALL)
         self.assertIsNotNone(listed)
         self.assertNotIn("folders", listed.group(1))
@@ -578,14 +592,22 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         # module output or a local derived from either makes an input unknown
         # on a first install, and the for_each keyed on it fails the plan.
         inputs = re.findall(r"^\s*(\w+)\s*=\s*(.+?)\s*$", body, re.MULTILINE)
-        self.assertEqual({key for key, _ in inputs}, {"source", "shared_vpc_hosts", "metrics_scopes", "exclude_projects", "quota_project", "member_cap"})
+        self.assertEqual({key for key, _ in inputs}, {"source", "shared_vpc_hosts", "metrics_scopes", "folders", "organizations", "list_container_members", "exclude_projects", "quota_project", "member_cap"})
         self.assertIn(("member_cap", "var.scope.max_projects"), inputs)
+        # The containers' members are listed for the scoped service account
+        # pool alone (design §6): the resolver reads a container only while
+        # the pool is armed, and the IAM module takes what it listed as data,
+        # like the selectors' members.
+        self.assertIn(("folders", "var.scope.folders"), inputs)
+        self.assertIn(("organizations", "var.scope.organizations"), inputs)
+        self.assertIn(("list_container_members", "var.scoped_pool_enabled"), inputs)
         for key, value in inputs:
             if key != "source":
                 with self.subTest(input=key):
                     self.assertRegex(value, r"^var\.[A-Za-z0-9_.]+$", f"{key} is fed {value}, not a variable")
         iam = re.search(r'module "kube_agents_iam" \{(.*?)\n\}', self.main_tf, re.DOTALL).group(1)
         self.assertIn("scope_selector_members = module.scope_resolver.members", iam)
+        self.assertIn("scope_container_members = module.scope_resolver.container_members", iam)
         self.assertIn("depends_on = [google_project_service.required, module.gke_cluster]", iam)
 
     def test_the_chart_gets_the_same_object_with_the_crds_keys(self):
@@ -633,6 +655,83 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         self.assertIn('selector_apis = length(var.scope.shared_vpc_hosts) > 0 ? [\n    "compute.googleapis.com",\n  ] : []', self.main_tf)
         self.assertIn("local.scope_apis, local.selector_apis))", self.main_tf)
         self.assertNotIn('"compute.googleapis.com"', re.search(r"base_apis = \[(.*?)\]", self.main_tf, re.DOTALL).group(1))
+
+
+class DriftSinksFollowTheScopeTest(unittest.TestCase):
+    """The drift ingress exports every project the declaration lists (design §8, the
+    drift-pubsub row): the composition feeds the module's source_projects from one IAM-module
+    output, scope_export_projects, which is scope.projects and the selectors' members less the
+    host and never a container's Asset-Inventory members (an index gap would otherwise destroy
+    a sink and lose the records until the next plan), less the operator's per-project
+    exclusions, the way to keep reading a project without exporting its logs."""
+
+    def setUp(self):
+        self.main_tf = (_COMPOSITION / "main.tf").read_text()
+        self.iam_outputs = (_MODULE / "outputs.tf").read_text()
+
+    def test_the_composition_feeds_the_sinks_from_the_iam_modules_listing(self):
+        call = _block(self.main_tf, "module", "drift_pubsub")
+        self.assertIn("source_projects                       = local.drift_pubsub_source_projects", call,
+                      "the drift module's source_projects must come from the composition's export local")
+        export_local = re.search(r"drift_pubsub_source_projects\s*=\s*sort\(\[(.*?)\n  \]\)", self.main_tf, re.DOTALL)
+        self.assertIsNotNone(export_local, "the export local must be a filtered comprehension over the IAM module's listing")
+        self.assertIn("module.kube_agents_iam.scope_export_projects", export_local.group(1),
+                      "the export local must read the IAM module's scope_export_projects; the pool's scope_discovered_projects carries Asset-Inventory members an index can skip for a plan")
+        self.assertIn("local.drift_pubsub_source_exclude_projects", export_local.group(1),
+                      "the export local must subtract the operator's exclusions")
+        self.assertIn("local.drift_pubsub_scope_exclude_patterns", export_local.group(1),
+                      "the export local must match the scope's own exclusions, globs included, as the reconcile does")
+        self.assertRegex(self.main_tf, r'for entry in var\.scope\.exclude\.projects :\s*"\^\$\{replace\(replace\(replace\(entry, "\*", "\.\*"\), "\?", "\."\), "\[!", "\[\^"\)\}\$"',
+                         "each scope.exclude.projects entry becomes one anchored regex with fnmatch's * ? and [!seq] carried over, which is what fleet_scope_targets.py matches at runtime")
+        exclude = _block((_COMPOSITION / "variables.tf").read_text(), "variable", "drift_pubsub_source_exclude_projects")
+        self.assertIn("type        = string", exclude, "the exclusion list is a string so a TF_VAR_ line can carry it and a blanked line reads as none")
+        self.assertIn('default     = ""', exclude)
+        self.assertIn("source_sink_writer_identity_overrides = local.drift_pubsub_source_sink_writer_identity_overrides", call)
+        # A JSON string, decoded here, because the front doors reach it through a TF_VAR_ line
+        # and a blanked line exports "", which a map-typed variable refuses as HCL.
+        self.assertIn('drift_pubsub_source_sink_writer_identity_overrides = trimspace(var.drift_pubsub_source_sink_writer_identity_overrides) == "" ? {} : tomap(jsondecode(var.drift_pubsub_source_sink_writer_identity_overrides))', self.main_tf)
+        variable = _block((_COMPOSITION / "variables.tf").read_text(), "variable", "drift_pubsub_source_sink_writer_identity_overrides")
+        self.assertIn("type        = string", variable, "the composition's override is a string so a blanked TF_VAR_ line reads as no override")
+
+    def test_the_listing_is_the_pools_set_less_the_host(self):
+        output = _block(self.iam_outputs, "output", "scope_discovered_projects")
+        self.assertIn("value       = sort(tolist(setsubtract(local.scoped_pool_projects, toset([var.project_id]))))", output,
+                      "scope_discovered_projects is no longer the pool's set less the host; tests/test_scoped_sa_pool_iam.py pins what that set is")
+
+    def test_the_export_set_is_the_declaration_less_the_host_and_no_index_member(self):
+        output = _block(self.iam_outputs, "output", "scope_export_projects")
+        self.assertIn("value       = sort(tolist(setsubtract(local.scope_listed_projects, toset([var.project_id]))))", output,
+                      "scope_export_projects must be scope_listed_projects (scope.projects and the selectors' members) less the host, and never "
+                      "scoped_pool_projects: a container member the Asset index omits for one plan would lose its sink and its records")
+        self.assertNotIn("scoped_pool", output)
+
+    def test_the_source_projects_are_surfaced(self):
+        outputs = (_COMPOSITION / "outputs.tf").read_text()
+        self.assertIn("value       = try(module.drift_pubsub[0].source_projects, null)", outputs)
+
+    def test_the_installer_probes_sink_create_over_the_same_set_before_the_apply(self):
+        """The installer's pre-apply probe (check_scope_export_sink_access in
+        scripts/installer/installer_common.sh; tests/test_installer_common.py runs
+        it) derives its set from the keys that feed the composition's export
+        local, and asks for the permission the prerequisites table names for
+        the sink, so a project the apply would fail in is refused first."""
+        installer = (_REPO_ROOT / "scripts" / "installer" / "installer_common.sh").read_text()
+        derivation = installer[installer.index("scope_export_projects() {"):installer.index("check_scope_export_sink_access() {")]
+        for key in ("SCOPE_PROJECTS", "PROJECT_ID", "SCOPE_EXCLUDE_PROJECTS",
+                    "TF_VAR_drift_pubsub_source_exclude_projects", "ENABLE_DRIFT_DETECTOR", "TF_VAR_enable_drift_pubsub"):
+            self.assertIn(key, derivation, f"the installer's export set must read {key}, as the composition's does")
+        self.assertNotIn("SCOPE_FOLDERS", derivation, "a container's members get no sink and must not be probed")
+        self.assertIn('readonly SCOPE_SINK_CREATE_PERMISSION="logging.sinks.create"', installer)
+        self.assertIn('readonly SCOPE_SINK_CREATE_ROLE="roles/logging.configWriter"', installer)
+        prerequisites = (_REPO_ROOT / "docs" / "site" / "src" / "content" / "docs" / "install" / "prerequisites.md").read_text()
+        self.assertRegex(prerequisites, r"Log Router sink.*`logging\.sinks\.create`.*`roles/logging\.configWriter`",
+                         "the probe's permission and role are the prerequisites table's for the sink")
+        for front_door in ("upgrade.sh", "install.sh"):
+            lines = (_REPO_ROOT / front_door).read_text().splitlines()
+            calls = lambda name: sum(1 for line in lines if line.strip().startswith(name + " ") or line.strip() == name)
+            self.assertGreater(calls("check_scope_container_access"), 0)
+            self.assertEqual(calls("check_scope_container_access"), calls("check_scope_export_sink_access"),
+                             f"{front_door} must call the sink preflight wherever it calls the container preflight")
 
 
 if __name__ == "__main__":

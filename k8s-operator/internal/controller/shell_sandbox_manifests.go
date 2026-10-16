@@ -45,6 +45,7 @@ import (
 	"os"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -101,6 +102,15 @@ const (
 	envGKEClusterName  = "GKE_CLUSTER_NAME"
 	envGKELocation     = "GKE_LOCATION"
 	envKubeContextName = "KUBE_CONTEXT_NAME"
+	// envScopeDeclared tells the fleet-audit collectors, which run in this pod and
+	// cannot read the reconcile's scope snapshot (the data volume here is not the
+	// agent pod's), whether the CR declares a spec.scope block. "true" means a
+	// collector run without the fleet_scope tool's --scope-projects must refuse to
+	// enumerate projects, since the listing would cross the boundary the block
+	// draws; "false" means no boundary, and the collector lists as it always did.
+	// Read by agents/platform/scripts/fleet_scope_args.py; always set, so that a
+	// value a plugin or an operator env override supplied is never the only one.
+	envScopeDeclared = "KUBEAGENTS_SCOPE_DECLARED"
 
 	// Where deploy/sandbox/entrypoint.sh expects each of them. Changing either
 	// side alone starts a pod that exits with a pointed message rather than one
@@ -127,8 +137,9 @@ const (
 	// dotfiles: every session in the pod shares it, and bash and python3 load
 	// code from it unasked, so a file one session planted there would run in
 	// every later one. Durable work goes to the data volume, which is what
-	// TERMINAL_CWD points at. HERMES_WRITE_SAFE_ROOT in buildPodTemplateSpec still
-	// names it; a write there fails on the mode instead.
+	// TERMINAL_CWD points at. HERMES_WRITE_SAFE_ROOT in buildPodTemplateSpec names
+	// only the data volume (#2284); write attempts naming the home fail fast at
+	// the gateway prefix check.
 	shellSandboxHomePath = "/home/" + shellSandboxUser
 
 	// Hermes' ssh backend keeps a file sync over ~/.hermes: it pushes at connect
@@ -520,6 +531,8 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			corev1.EnvVar{Name: envKubeContextName, Value: fmt.Sprintf("gke_%s_%s_%s", harness.ProjectID, harness.Location, harness.ClusterName)},
 		)
 	}
+
+	env = append(env, corev1.EnvVar{Name: envScopeDeclared, Value: strconv.FormatBool(agent.Spec.Scope != nil)})
 
 	containers := buildShellSandboxContainers(agent, env)
 	volumes := buildShellSandboxVolumes(agent, authorizedKeysSecret)

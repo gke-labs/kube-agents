@@ -1,8 +1,8 @@
 /**
- * The headless rail: the live event-sequence assertion. Attaches to the
+ * The headless page: the live event-sequence assertion. Attaches to the
  * real bus the way the page does (startBus, same taps, same web user), waits
  * for a NEW task to run somewhere on the install, and asserts the sequence
- * the rail would draw — submission first, working before terminal, exactly
+ * the page would draw — submission first, working before terminal, exactly
  * one final, nothing after it, and a non-empty result artifact — then folds
  * every event through the real reducer and asserts the UI model agrees.
  *
@@ -101,7 +101,7 @@ suite("live event sequence (A2A_WS_URL set; needs a task driven on the install)"
 
       const seq = ofTask();
 
-      // 1. The first thing the rail heard about this task is the submission.
+      // 1. The first thing the page heard about this task is the submission.
       expect(seq[0]!.env.kind).toBe("message");
       expect(seq[0]!.live).toBe(true);
 

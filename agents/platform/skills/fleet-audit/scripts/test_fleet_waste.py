@@ -17,6 +17,16 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(__file__))
 import fleet_waste as fw  # noqa: E402
 
+# Every resolver asks the operator's answer when a run passes neither scope flag:
+# the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
+# that carries either (the sandbox session, a developer reproducing the guard)
+# would turn this suite's listing tests into refusals. The suite is about the
+# collector, not the host it runs on, so both are neutralised at import.
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+import fleet_scope_args as _fleet_scope_args  # noqa: E402
+
+_fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
+
 NOW = datetime(2026, 8, 1, tzinfo=timezone.utc)
 
 
@@ -2219,6 +2229,25 @@ class OverrequestTest(unittest.TestCase):
         hits = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=True)
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "major")
+        self.assertTrue(hits[0]["_autopilot_bumped"])
+
+    def test_a_major_the_delta_earned_is_not_marked_as_bumped(self):
+        """Only a grade the bump supplied is held out of the sweep. A delta
+        worth a node is `major` on any cluster and promotes on its own."""
+        pod = self.deployment_pod()
+        peaks = {("default", "api-1"): (0.9, 3072.0)}
+        for autopilot in (False, True):
+            with self.subTest(autopilot=autopilot):
+                [hit] = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=autopilot)
+                self.assertEqual(hit["severity"], "major")
+                self.assertFalse(hit["_autopilot_bumped"])
+
+    def test_a_minor_off_autopilot_is_not_marked_as_bumped(self):
+        pod = self.deployment_pod(cpu_req="3", mem_req="6Gi")
+        peaks = {("default", "api-1"): (0.1, 100.0)}
+        [hit] = fw.check_overrequest({"pods": [pod]}, peaks, now=NOW, autopilot=False)
+        self.assertEqual(hit["severity"], "minor")
+        self.assertFalse(hit["_autopilot_bumped"])
 
     def test_the_excerpt_names_the_window_it_rests_on(self):
         pod = self.deployment_pod()
@@ -2553,13 +2582,17 @@ class OverrequestResizeIsANoOpTest(unittest.TestCase):
 
 
 class IdleWorkloadTest(unittest.TestCase):
-    """§3.13 -- the population §3.1 measures correctly and then cannot act on.
+    """§3.13 -- the population §3.1 measures correctly and then will not act on.
 
     Every fixture here is a controller `check_overrequest` sees, agrees is
-    idle, and drops because `ceil(peak x 2)` clamps up to the 50m/64Mi it
-    already declares. `test_the_partition_with_overrequest_is_exact` is the
-    load-bearing one: the two checks must never both fire on an object, or the
-    report asks a reader to shrink and delete the same Deployment.
+    idle, and proposes no resize for, on one of three arms: the floor-bound
+    arm, where `ceil(peak x 2)` clamps up to the 50m/64Mi (or LimitRange
+    default) it already declares; the materiality arm, where the only
+    dimension it could shrink would save less than 100m/128Mi; and the
+    `Guaranteed` arm, where §3.1 declines to turn a week of idleness into a
+    limit. `test_the_partition_with_overrequest_is_exact` is the load-bearing
+    one: the two checks must never both fire on an object, or the report asks
+    a reader to shrink and delete the same Deployment.
     """
 
     NS = "hello-world"
@@ -3403,12 +3436,13 @@ class UnderrequestTest(unittest.TestCase):
         under its bare name and does not.
         """
         pods = [
-            self.pod(ns="tenant-a", name="redis-0", owner_name="redis"),
-            self.pod(ns="tenant-b", name="redis-0", owner_name="redis"),
+            self.pod(ns="tenant-a", name="redis-0", owner_kind="StatefulSet", owner_name="redis"),
+            self.pod(ns="tenant-b", name="redis-0", owner_kind="StatefulSet", owner_name="redis"),
         ]
         means = {("tenant-a", "redis-0"): 900.0, ("tenant-b", "redis-0"): 900.0}
         hits = self.check(pods, means)
         self.assertEqual(sorted(h["namespace"] for h in hits), ["tenant-a", "tenant-b"])
+        self.assertEqual({h["object"] for h in hits}, {"StatefulSet/redis"})
         # Each finding measures only its own namespace's replica: one pod at
         # 900 MiB against one 512Mi request, not two summed to 1800.
         for hit in hits:
@@ -4083,7 +4117,11 @@ class UnsizedWorkloadTest(unittest.TestCase):
         manifest declares none, so the number is being paid for either way."""
         pod = self.pod()
         peaks = {("argocd", "argocd-repo-server-1"): (0.01, 64.0)}
-        self.assertEqual(self.check([pod], peaks, autopilot=True)[0]["severity"], "major")
+        [hit] = self.check([pod], peaks, autopilot=True)
+        self.assertEqual(hit["severity"], "major")
+        self.assertTrue(hit["_autopilot_bumped"])
+        [hit] = self.check([pod], peaks, autopilot=False)
+        self.assertFalse(hit["_autopilot_bumped"])
 
     def test_it_never_reaches_critical(self):
         """§3 caps a manifest remediation below `critical`, which opens a
@@ -5124,6 +5162,78 @@ class CollectClusterTest(unittest.TestCase):
             with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
                 fw.collect_cluster(self.CLUSTER, run=run, session=usage_session(), now=NOW)
         self.assertIn("ingress", seen[0][2].split(","))
+
+    def bump_candidates(self, autopilot):
+        unsized = UnsizedWorkloadTest().pod()
+        over = OverrequestTest().deployment_pod(cpu_req="3", mem_req="6Gi")
+        session = usage_session(
+            ("argocd", "argocd-repo-server-1", 0.01, 64.0),
+            ("default", "api-1", 0.1, 100.0),
+        )
+        entry, _ = self.run_with(
+            dump_items=[unsized, over],
+            session=session,
+            cluster={**self.CLUSTER, "autopilot": autopilot},
+        )
+        return {c["check"]: c for c in entry["candidates"]}
+
+    def test_an_autopilot_bumped_sizing_finding_is_marked_for_triage(self):
+        """The bump lifts both §3.1 and §3.12 to `major`, which clears the
+        sweep's floor. The marker is what keeps a platform attribute from
+        opening a pull request by itself."""
+        candidates = self.bump_candidates(autopilot=True)
+        for check in ("overrequest", "unsized-workload"):
+            with self.subTest(check=check):
+                self.assertEqual(candidates[check]["severity"], "major")
+                self.assertEqual(candidates[check]["needs_triage"], fw.AUTOPILOT_BUMP_TRIAGE)
+
+    def test_the_same_findings_off_autopilot_carry_no_marker(self):
+        candidates = self.bump_candidates(autopilot=False)
+        for check in ("overrequest", "unsized-workload"):
+            with self.subTest(check=check):
+                self.assertEqual(candidates[check]["severity"], "minor")
+                self.assertIsNone(candidates[check]["needs_triage"])
+
+    def test_the_bump_marker_is_one_the_sweep_withholds(self):
+        """The two files carry the string separately; a drift here would mark
+        the finding and let the sweep open it anyway."""
+        import audit_report
+
+        self.assertEqual(fw.AUTOPILOT_BUMP_TRIAGE, "autopilot-bumped")
+        self.assertIn(fw.AUTOPILOT_BUMP_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+        self.assertIn(fw.IDLE_SERVICE_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+        self.assertEqual(fw.IDLE_STANDDOWN_TRIAGE, "scale-to-zero")
+        self.assertIn(fw.IDLE_STANDDOWN_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+        self.assertEqual(fw.GUARANTEED_QOS_TRIAGE, "guaranteed-qos")
+        self.assertIn(fw.GUARANTEED_QOS_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+
+    def test_a_stand_down_no_service_selects_is_marked_scale_to_zero(self):
+        """No Service means no `service-fronted` marker, but the fix still
+        takes the controller to zero on an idle reading, which is a judgement
+        the sweep must not make for a reader."""
+        idle = IdleWorkloadTest()
+        entry, _ = self.run_with(
+            dump_items=[idle.pod(), obj("Deployment", "hello-world", ns=idle.NS, **{"spec.replicas": 1})],
+            session=usage_session((idle.NS, idle.POD, 0.0021, 6.0)),
+        )
+        found = [c for c in entry["candidates"] if c["check"] == "idle-workload"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["needs_triage"], fw.IDLE_STANDDOWN_TRIAGE)
+
+    def test_a_guaranteed_overrequest_is_marked_guaranteed_qos(self):
+        """Wins over the bump marker on Autopilot, too: the model needs it to
+        publish the fix as `manual`, and both keep it out of the sweep."""
+        over = OverrequestTest().deployment_pod(cpu_req="3", mem_req="6Gi", cpu_lim="3", mem_lim="6Gi")
+        for autopilot in (False, True):
+            with self.subTest(autopilot=autopilot):
+                entry, _ = self.run_with(
+                    dump_items=[over],
+                    session=usage_session(("default", "api-1", 0.1, 100.0)),
+                    cluster={**self.CLUSTER, "autopilot": autopilot},
+                )
+                found = [c for c in entry["candidates"] if c["check"] == "overrequest"]
+                self.assertEqual(len(found), 1)
+                self.assertEqual(found[0]["needs_triage"], fw.GUARANTEED_QOS_TRIAGE)
 
     def test_every_outcome_publishes_the_mode(self):
         # The mode is a cluster property `enumerate_clusters` already resolved,
@@ -7857,6 +7967,176 @@ class ContentModeWorkspaceTest(unittest.TestCase):
                     patch("sys.stdout"):
                 fw.main(["--workspace", str(scratch)])
         self.assertIsNone(seen["w"], "a failed mirror indexes nothing, not the scratch")
+
+
+class DeclaredScopeFromTheToolTest(unittest.TestCase):
+    """The declared scope the agent carries from the platform_control fleet_scope
+    tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
+    an unread declared project is the one note, and without the flags the
+    listing runs as before."""
+
+    def setUp(self):
+        # The variable half of the operator's answer, per test as well as at
+        # import; the file half is pointed at a path that does not exist above.
+        env = patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        fw.declared_scope.set(None, None)
+
+    def tearDown(self):
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        fw.declared_scope.set(None, None)
+
+    def test_the_declared_scope_is_swept_and_nothing_is_listed(self):
+        def run(argv, **kwargs):
+            raise AssertionError(f"the declared scope is the sweep; nothing should be listed: {argv}")
+
+        fw.declared_scope.set("ops-mgmt,payments-prod", "payments-staging=denied")
+        projects, partial = fw.get_target_projects(None, run=run)
+        self.assertEqual(projects, ["ops-mgmt", "payments-prod"])
+        self.assertIn("payments-staging (denied)", partial)
+        self.assertIn("fleet_scope tool", partial)
+
+    def test_every_declared_project_read_leaves_no_note(self):
+        fw.declared_scope.set("ops-mgmt payments-prod", "")
+        self.assertEqual(fw.get_target_projects(None, run=lambda *a, **k: run_of(1)), (["ops-mgmt", "payments-prod"], None))
+
+    def test_without_the_flags_the_listing_runs_as_before(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"]:
+                return run_of(0, "acme\n")
+            return run_of(0, "acme\nother\n")
+
+        fw.declared_scope.set(None, None)
+        self.assertEqual(fw.get_target_projects(None, run=run), (["acme", "other"], None))
+
+    def test_a_project_override_inside_the_declared_scope_wins_and_one_outside_is_refused(self):
+        fw.declared_scope.set("ops-mgmt,payments-prod", None)
+        self.assertEqual(fw.get_target_projects("payments-prod", run=lambda *a, **k: run_of(1))[0], ["payments-prod"])
+        with self.assertRaises(fw.NoProjectInScope) as caught:
+            fw.get_target_projects("acme-only", run=lambda *a, **k: run_of(1))
+        self.assertIn("declared scope does not list", str(caught.exception))
+        with patch.dict(os.environ, {"KUBEAGENTS_SCOPE_DECLARED": "true"}):
+            fw.declared_scope.set(None, None)
+            with self.assertRaises(fw.NoProjectInScope) as caught:
+                fw.get_target_projects("ops-mgmt", run=lambda *a, **k: run_of(1))
+            self.assertIn("got no collector_args", str(caught.exception))
+        fw.declared_scope.set(None, None)
+        self.assertEqual(fw.get_target_projects("acme-only", run=lambda *a, **k: run_of(1))[0], ["acme-only"])
+
+    def test_the_declared_scope_note_is_a_scope_note_not_a_discovery_failure(self):
+        # The unenumerated row that carries the tool's unread projects explains
+        # a partial sweep, not why nothing was collected.
+        note = fw.fleet_scope_args.unread_note([("payments-staging", "denied")])
+        entry = {"name": fw.UNENUMERATED_PROJECTS_TARGET, "error": note}
+        self.assertTrue(fw._only_a_scope_note(entry, None))
+        self.assertFalse(fw._only_a_scope_note({"name": fw.UNENUMERATED_PROJECTS_TARGET, "error": "`gcloud projects list` rc=1: boom"}, None))
+
+    def test_main_hands_the_flags_to_the_resolver(self):
+        # The wiring the SOP relies on: the two flags main parses reach the
+        # holder the resolver reads, before anything else runs.
+        with patch.object(fw.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
+            fw.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+
+    def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
+        # `--scope-unread` alone (what collector_args carries when no declared
+        # project was readable) is a boundary with nothing inside it: the run
+        # reports that and must not widen to the listing.
+        fw.declared_scope.set(None, "payments-staging=denied")
+        with self.assertRaises(fw.NoProjectInScope) as caught:
+            fw.get_target_projects(None, run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed")))
+        self.assertIn("no project this install could read", str(caught.exception))
+
+    def test_the_flags_are_parsed_from_the_command_line(self):
+        proc = subprocess.run([sys.executable, fw.__file__, "--help"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--scope-projects", proc.stdout)
+        self.assertIn("--scope-unread", proc.stdout)
+
+
+class CredentialsNoteTest(unittest.TestCase):
+    def test_a_refused_directory_is_the_failed_credentials_and_gcloud_is_not_run(self):
+        # `prepare_kubeconfig`'s note is the `get-credentials` result: gcloud is not run through a
+        # directory this run may not write (a root run would otherwise write a kubeconfig wherever a
+        # planted symlink points), and the entry built from the result names the owner or the link.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            owner = kc.parent.stat().st_uid
+            other = owner + 1
+            calls = []
+
+            def recording(argv, env=None, **kwargs):
+                calls.append(argv)
+                return run_of(0)
+
+            with patch.object(fw, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=other), patch.object(Path, "rename", side_effect=PermissionError(13, "Permission denied")):
+                _, result = fw.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((result.rc, calls), (fw.KUBECONFIG_REFUSED_RC, []))
+            self.assertTrue(result.stderr.startswith(f"{kc.parent} is owned by uid {owner} and this run is uid {other}; it could not be moved aside"), result.stderr)
+            # A symlink planted at the directory's name: refused the same way, nothing run through it,
+            # the target left empty.
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir(0o700)
+            linked = Path(tmp) / "linked" / "kubeconfig_p_c_l.yaml"
+            linked.parent.symlink_to(elsewhere)
+            with patch.object(fw, "KUBECONFIG_DIR", linked.parent):
+                _, result = fw.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((result.rc, calls, sorted(p.name for p in elsewhere.iterdir())), (fw.KUBECONFIG_REFUSED_RC, [], []))
+            self.assertIn("is a symbolic link", result.stderr)
+            # With the directory usable, gcloud runs and its result is returned as is.
+            with patch.object(fw, "KUBECONFIG_DIR", kc.parent):
+                _, ok = fw.fetch_credentials("p", "c", "l", run=recording)
+            self.assertEqual((ok.rc, ok.stderr, len(calls)), (0, "", 1))
+
+def owned_by(path, uid):
+    """`Path.stat` reporting `uid` as `path`'s owner, the test's own fact rather than the runner's uid,
+    real for every other path: the branch a mocked root takes then does not depend on who runs the suite."""
+    real = Path.stat
+
+    def fake(self, *args, **kwargs):
+        result = real(self, *args, **kwargs)
+        if self == path:
+            return os.stat_result((result.st_mode, result.st_ino, result.st_dev, result.st_nlink, uid, result.st_gid, result.st_size, result.st_atime, result.st_mtime, result.st_ctime))
+        return result
+
+    return patch.object(Path, "stat", fake)
+
+
+class PrepareKubeconfigTest(unittest.TestCase):
+    def test_fetch_credentials_prepares_the_shared_directory(self):
+        # The shared `.kubeconfigs` is prepared by `collect.prepare_kubeconfig`, the one rule for the
+        # fleet-audit collectors, before gcloud runs: this uid's and closed to other uids (0755) whatever
+        # the umask, a directory this uid made at another mode brought to it, a stale kubeconfig this uid
+        # cannot write removed.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            kc.write_text("stale")
+            kc.chmod(0o400)
+            # The keep follows `os.access`, true for a 0400 file to root alone, not the runner's uid.
+            kept = os.access(kc, os.W_OK)
+            mask = os.umask(0o077)
+            try:
+                with patch.object(fw, "KUBECONFIG_DIR", kc.parent):
+                    path, _ = fw.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
+            finally:
+                os.umask(mask)
+            self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists()), (kc, 0o755, kept))
+
+    def test_a_root_run_keeps_another_uids_directory(self):
+        # The tick's directory, then a root hand run: from root's side it is another uid's, and root
+        # keeps it rather than moving it aside, and replaces the tick's stale file rather than writing
+        # through it. Mocked root shows both branches.
+        with TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfigs" / "kubeconfig_p_c_l.yaml"
+            kc.parent.mkdir(0o755)
+            kc.write_text("the tick's")
+            with patch.object(fw, "KUBECONFIG_DIR", kc.parent), patch.object(os, "geteuid", return_value=0), owned_by(kc.parent, 1), owned_by(kc, 1):
+                path, _ = fw.fetch_credentials("p", "c", "l", run=lambda argv, env=None, **kwargs: None)
+            self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists(), [p.name for p in Path(tmp).iterdir()]), (kc, 0o755, False, [".kubeconfigs"]))
 
 if __name__ == "__main__":
     unittest.main()

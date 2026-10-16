@@ -505,19 +505,22 @@ func TestBridgeLookAheadIsInTheA2AModule(t *testing.T) {
 	}
 }
 
-// hack/ci-deploy.sh sizes the eval CR's maxSessions so that the sidecar
-// patch, which re-renders the provision Job with the bridge's worker count,
-// asks for a budget the TASKS the first provision created at the floor
-// already holds (gke-labs/kube-agents#2077). It computes that from four
+// hack/ci-deploy.sh sizes the eval CR's maxSessions so that the budget for
+// the bridge's worker count fits the TASKS the provision Job creates at the
+// floor (gke-labs/kube-agents#2077). The operator renders the bridge now and
+// counts its workers from the first render, so there is one provision Job,
+// and the sizing keeps that single budget at or under the floor. It computes that from four
 // numbers copied from this package -- the floor, the per-session count, and
 // the reserve table's intercept and slope -- because a shell script cannot
 // evaluate Go constants. This holds the four to the constants and the
 // function they stand for, holds the arithmetic they feed to what it
-// promises (at the presubmit's 4 workers and at 6, a first render at the
-// floor and a second budget within it; at 8 the floor cannot hold the
-// reserve, and the lane relies on its Degraded gate), and decodes the patch
-// the script renders into the CR type, so the field path it names is one
-// the API has. Read from the source, for the reason the SessionConsumerRoles
+// promises (at the presubmit's 4 workers and at 6, a budget within the
+// floor, so TASKS is created at it; at 8 the floor cannot hold the
+// reserve, and the lane relies on its Degraded gate), and decodes the values
+// document the script hands the chart into the CR type, so the field path it
+// names is one the API has: under platformAgent the document carries the
+// CR's own spec paths, which the chart renders one for one
+// (tests/test_ci_deploy_mode_next.py renders it to check that half). Read from the source, for the reason the SessionConsumerRoles
 // test gives, and every step fails rather than defaults.
 func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 	script, err := os.ReadFile(ciDeploySource)
@@ -565,9 +568,9 @@ func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 		}
 		return n
 	}
-	format := regexp.MustCompile(`(?m)^readonly MODE_NEXT_PATCH_FORMAT='(.*)'$`).FindSubmatch(script)
+	format := regexp.MustCompile(`(?m)^readonly MODE_NEXT_HELM_VALUES_FORMAT='(.*)'$`).FindSubmatch(script)
 	if format == nil {
-		t.Fatalf("no `readonly MODE_NEXT_PATCH_FORMAT='...'` in %s; it is the patch that carries the mode and the cap", ciDeploySource)
+		t.Fatalf("no `readonly MODE_NEXT_HELM_VALUES_FORMAT='...'` in %s; it is the values document that carries the mode and the cap", ciDeploySource)
 	}
 	for _, tc := range []struct {
 		workers, want int
@@ -581,35 +584,41 @@ func TestCiDeploySizesMaxSessionsToTheTasksFloor(t *testing.T) {
 		if n != tc.want {
 			t.Errorf("at %d workers the script sizes maxSessions=%d, want %d", tc.workers, n, tc.want)
 		}
-		// The first patch, decoded into the CR type with unknown fields
-		// refused: the path is spec.harness.tuning.maxSessions, and the mode
-		// rides in the same merge so the first render sees both.
+		// The first change's values document, its platformAgent object
+		// decoded as the CR's spec with unknown fields refused: the path is
+		// spec.harness.tuning.maxSessions, and the mode rides in the same
+		// upgrade so the first render sees both.
+		var values struct {
+			PlatformAgent json.RawMessage `json:"platformAgent"`
+		}
+		vdec := json.NewDecoder(strings.NewReader(fmt.Sprintf(string(format[1]), n)))
+		vdec.DisallowUnknownFields()
+		if err := vdec.Decode(&values); err != nil || values.PlatformAgent == nil {
+			t.Fatalf("MODE_NEXT_HELM_VALUES_FORMAT is not a document with platformAgent alone at its top (%v)", err)
+		}
 		agent := &agentv1alpha1.PlatformAgent{}
-		dec := json.NewDecoder(strings.NewReader(fmt.Sprintf(string(format[1]), n)))
+		dec := json.NewDecoder(strings.NewReader(`{"spec":` + string(values.PlatformAgent) + `}`))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(agent); err != nil {
-			t.Fatalf("MODE_NEXT_PATCH_FORMAT does not decode into a PlatformAgent: %v", err)
+			t.Fatalf("MODE_NEXT_HELM_VALUES_FORMAT's platformAgent does not decode into a PlatformAgent spec: %v", err)
 		}
 		if agent.Spec.Mode == nil || *agent.Spec.Mode != "next" {
-			t.Errorf("the first patch does not set spec.mode: next (got %v)", agent.Spec.Mode)
+			t.Errorf("the first change does not set spec.mode: next (got %v)", agent.Spec.Mode)
 		}
 		if got := resolveA2AMaxSessions(agent); got != n {
-			t.Errorf("the first patch's maxSessions resolves to %d, want %d: the field path is not the one the operator reads", got, n)
+			t.Errorf("the first change's maxSessions resolves to %d, want %d: the field path is not the one the operator reads", got, n)
 		}
-		// The first render, with no sidecar declared: TASKS is created at the
-		// floor, never wider.
-		if got := a2aTasksMaxConsumers(agent); got != a2aTasksMaxConsumersFloor {
-			t.Errorf("at %d workers the first render creates TASKS at %d consumers, not the floor %d", tc.workers, got, a2aTasksMaxConsumersFloor)
-		}
-		// The second, with the sidecar the script declares at the lane's
-		// worker count, measured against that stream.
-		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{
-			Name: "hermes-bridge", Image: "bridge:dev",
-			Env: []corev1.EnvVar{{Name: a2aBridgeConcurrencyEnvVar, Value: strconv.Itoa(tc.workers)}},
-		}}}
+		// The render, with the bridge concurrency CI passes through the
+		// operator's env: the operator renders the bridge and budgets it
+		// from the first provision, so TASKS is created at the floor while
+		// the budget fits, and wider (the lane's Degraded gate) when not.
+		t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, strconv.Itoa(tc.workers))
 		budget := a2aTasksConsumerBudget(agent)
 		if fits := budget <= a2aTasksMaxConsumersFloor; fits != tc.fits {
-			t.Errorf("at %d workers with maxSessions=%d the second budget is %d against a %d-wide TASKS; fits=%v, want %v", tc.workers, n, budget, a2aTasksMaxConsumersFloor, fits, tc.fits)
+			t.Errorf("at %d workers with maxSessions=%d the budget is %d against a %d-wide TASKS; fits=%v, want %v", tc.workers, n, budget, a2aTasksMaxConsumersFloor, fits, tc.fits)
+		}
+		if got := a2aTasksMaxConsumers(agent); tc.fits && got != a2aTasksMaxConsumersFloor {
+			t.Errorf("at %d workers the render creates TASKS at %d consumers, not the floor %d", tc.workers, got, a2aTasksMaxConsumersFloor)
 		}
 	}
 }

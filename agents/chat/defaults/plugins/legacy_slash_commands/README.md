@@ -2,7 +2,7 @@
 
 A one-hook plugin on the `default` (Chat Agent) profile that turns a **typed**
 `/hermes <subcommand>` message into the real gateway command before the gateway
-resolves it. Without it, `/hermes sethome` — the command Hermes itself tells the
+resolves it, and disables `/undo` (below). Without the rewrite, `/hermes sethome` — the command Hermes itself tells the
 user to run — does nothing.
 
 ## The failure it fixes
@@ -42,11 +42,31 @@ layer earlier, on the inbound `MessageEvent`, so both paths behave identically:
 | `/hermes`                  | `/help`                   |
 | `/hermes what's deployed?` | `what's deployed?` (text) |
 | `/sethome`, `hello`, …     | unchanged                 |
+| `/undo [N]`                | `undo [N]` (text; below)  |
 
 The unknown-subcommand row matters: the prefix is **stripped** rather than
 passed through, because passing it through is exactly what produces the
 unknown-command reply. That matches upstream, which documents `/hermes <free
 text>` as a way to ask a question through a single slash entry point.
+
+## Disabled command: `/undo`
+
+Hermes's `/undo` rewinds the gateway session transcript and re-prompts. On this
+profile that reverses nothing: the work happened behind a specialist, and
+rewinding the chat leaves it done. The hook therefore drops the slash from
+`/undo [N]` (after the `/hermes` unwrap, so `/hermes undo` is covered) and the
+line reaches the model as plain text, which `SOUL.md` §1 tells it to answer
+with "there is no undo, what do you want changed?". Dropping the message
+(`{"action": "skip"}`) would leave the user with no reply at all; a plain-text
+rewrite is the only hook result that produces one.
+
+The disable applies on the Planning Agent profile only. The operator also enables
+this plugin on the platform profile under `experimental.platformFrontDoor`, whose
+persona has no such answer, so there `/undo` passes through to the gateway. The
+plugin tells the two apart by `HERMES_GATEWAY_PROFILE`, which the operator sets to
+the profile the gateway runs as: empty on the Planning Agent, `platform` under the
+flag. The test is for `platform` exactly, as the entrypoint's `platform_is_front_door`
+tests it; any other value is the chat profile.
 
 ## How it is wired
 
@@ -57,17 +77,20 @@ to replace `event.text`. Command resolution reads `event.text` afterwards
 (`MessageEvent.get_command()`), so the rewrite lands in time.
 
 The plugin must be enabled on the profile that receives chat ingress — the
-`default` profile. It is listed in `plugins.enabled` in **both**
-`agents/chat/config.yaml` and the operator's `renderConfigYAML`
-(`k8s-operator/internal/controller/platformagent_manifests.go`); the operator's
-copy is authoritative on the deployed default profile, so a change to one
-without the other is a no-op.
+`default` profile. It is listed in `plugins.enabled` in `agents/chat/config.yaml`,
+which is the one writer of the deployed list: the image seeds it onto a fresh
+volume, and the entrypoint's back-fill appends the names it has and a live list
+lacks on an existing one. The operator writes no copy of this list; its overlay
+adds `AgentPlugin` names (and `frontDoorPlugins` under the front-door flag), and
+`DefaultBuiltInPlugins` in `platformagent_manifests.go` is only the roster an
+`AgentPlugin` may not shadow, so a name added there alone loads nothing.
 
 ## Maintenance rules
 
 - **Keep the vocabulary sourced from `slack_subcommand_map()`.** It is generated
   from `COMMAND_REGISTRY`, so a command added or renamed upstream is picked up
-  for free. Do not hardcode a command list here.
+  for free. Do not hardcode a rewrite list here; `/undo` is named on purpose,
+  as the one command this profile refuses, not as a rewrite target.
 - **Never fail the turn.** The hook runs before auth on every inbound message;
   any exception is caught and returns `None` so a bug here degrades to today's
   behaviour rather than dropping messages.

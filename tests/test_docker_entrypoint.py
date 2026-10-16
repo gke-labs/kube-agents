@@ -647,6 +647,26 @@ class ConfigBackfillTest(unittest.TestCase):
         )
         self.assertIs(live["platforms"]["slack"]["rich_blocks"], False)
 
+    def test_a_plugin_the_template_enables_joins_the_live_list(self):
+        """plugins.enabled is image-owned: a shipped plugin the volume's list predates is
+        appended after the agent's own entries, and nothing the agent listed is removed."""
+        proc, live, _ = self._fill(
+            {"plugins": {"enabled": ["session_store", "chat_metrics"]}},
+            {"plugins": {"enabled": ["session_store", "my_own_plugin"]}},
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(live["plugins"]["enabled"], ["session_store", "my_own_plugin", "chat_metrics"])
+        self.assertIn("plugins.enabled.chat_metrics", proc.stdout)
+
+    def test_a_plugin_list_the_template_already_matches_is_left_alone(self):
+        """Every template name present: no rewrite, so the agent's file keeps its bytes."""
+        live = "plugins:\n  enabled:\n  - chat_metrics\n  - session_store\n"
+        proc, _, unchanged = self._fill({"plugins": {"enabled": ["session_store", "chat_metrics"]}}, live)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged)
+
     def test_a_live_scalar_is_not_descended_into(self):
         """Where the live file holds a scalar and the template a mapping, the agent wins."""
         proc, live, _ = self._fill({"memory": {"provider": "hindsight"}}, {"memory": "none"})
@@ -865,6 +885,64 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         self.assertEqual(live["mcp_servers"]["local"]["args"], "server.py")
         self.assertEqual(live["mcp_servers"]["mine"]["args"][2], "User-Agent: mine/1")
 
+    def _pre_relay_cluster_profile(self, with_filled_env):
+        """A cluster profile scaffolded before the remote servers went through the proxy.
+
+        Each relayed server points straight at its Google endpoint, as every profile on
+        a volume from before the change does. `with_filled_env` is the state the fill
+        leaves it in on the first boot of the new image: the `env` key added, because it
+        is a mapping key the live file lacked, and the Google URL kept, because `args`
+        is a list.
+        """
+        live = self._scaffolded_cluster_profile(self._OLD_HEADER)
+        google = {"gke": "https://container.googleapis.com/mcp",
+                  "developer_knowledge": "https://developerknowledge.googleapis.com/mcp"}
+        for name, url in google.items():
+            server = live["mcp_servers"][name]
+            server["args"] = ["/opt/mcp-remote/dist/proxy.js", "--header", self._OLD_HEADER, url]
+            if with_filled_env:
+                server["env"] = {"MCP_REMOTE_BEARER_FILE": "${CREDENTIAL_PROXY_TOKEN_FILE}"}
+            else:
+                server.pop("env", None)
+        return live
+
+    def test_a_pre_relay_profile_moves_to_the_relay_and_never_pairs_the_token_with_google(self):
+        """The upgrade path for the credential proxy's MCP relay.
+
+        Left to the fill, an old profile ends up holding the proxy token entry and its
+        Google URL together, and the patched mcp-remote would present the gateway's
+        ServiceAccount token to Google. The repair makes the whole argv the template's.
+        """
+        template = yaml.safe_load(self._CLUSTER_TEMPLATE.read_text(encoding="utf-8"))
+        for filled in (True, False):
+            with self.subTest(filled_env=filled):
+                proc, live, _ = self._repair(
+                    self._CLUSTER_TEMPLATE.read_text(encoding="utf-8"),
+                    self._pre_relay_cluster_profile(filled),
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                for name in ("gke", "developer_knowledge"):
+                    server = live["mcp_servers"][name]
+                    self.assertEqual(server["args"], template["mcp_servers"][name]["args"])
+                    self.assertEqual(server["env"], template["mcp_servers"][name]["env"])
+                    self.assertFalse(
+                        any("googleapis.com" in str(arg) for arg in server["args"]),
+                        f"{name} would present the proxy token to Google",
+                    )
+                self.assertEqual(live["cluster_identity"], self._IDENTITY)
+
+    def test_a_relayed_server_keeps_other_env_entries(self):
+        """Only the token entry is image-owned; anything else in `env` stays."""
+        template = yaml.safe_load(self._CLUSTER_TEMPLATE.read_text(encoding="utf-8"))
+        live = self._pre_relay_cluster_profile(True)
+        live["mcp_servers"]["gke"]["env"]["NODE_EXTRA_CA_CERTS"] = "/etc/ca.pem"
+        proc, live, _ = self._repair(template, live)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(live["mcp_servers"]["gke"]["env"]["NODE_EXTRA_CA_CERTS"], "/etc/ca.pem")
+        self.assertEqual(
+            live["mcp_servers"]["gke"]["env"]["MCP_REMOTE_BEARER_FILE"], "${CREDENTIAL_PROXY_TOKEN_FILE}"
+        )
+
     def test_a_live_file_that_is_not_a_mapping_is_skipped(self):
         """A corrupt config must not take the container down; the repair only reports."""
         template = self._CLUSTER_TEMPLATE.read_text(encoding="utf-8")
@@ -947,7 +1025,9 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         )
         self.assertEqual(persona, "persona\n", "the persona copy beside the repair stopped running")
         self.assertIn("config backfill", proc.stdout)
-        self.assertIn("User-Agent repair", proc.stdout)
+        # The shipped template's remote servers go through the credential proxy,
+        # so the repair syncs their whole argv and says so.
+        self.assertIn("MCP relay repair", proc.stdout)
         self.assertNotIn("WARN", proc.stderr)
 
     def test_the_two_profiles_that_are_not_force_synced_both_take_the_repair(self):

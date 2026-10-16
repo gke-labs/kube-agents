@@ -23,6 +23,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
@@ -58,7 +59,12 @@ import (
 // a verifier fails closed, which is the correct direction and an expensive one.
 // Hence two replicas in a queue group, a rollout that never drops to zero, and
 // a readiness probe that reports the bus connection rather than the process
-// being alive.
+// being alive. The rollout strategy protects a rollout and nothing else: a
+// node drain goes through the eviction API, which reads PodDisruptionBudgets
+// and not Deployment strategies, so the budget below is what keeps a drain
+// from taking the second replica while the first is still rescheduling, and
+// the spread constraint is what keeps the two off one node in the first place
+// (#2058).
 
 const (
 	// Release surface, on the same terms as the gateway, the worker and the
@@ -74,6 +80,53 @@ const (
 	// a2aVerifierStatusPort serves readiness and health. Same number as the
 	// callout's, on a different pod.
 	a2aVerifierStatusPort = 8080
+
+	// a2aVerifierPDBMaxUnavailable is the budget's one field, and it is
+	// maxUnavailable rather than minAvailable for buildPlatformPDB's reason:
+	// agents/platform/governance/obtainability_audit_sop.md §3.3 ("Always
+	// maxUnavailable, never minAvailable") and §3.4, where minAvailable
+	// against a replica count that has since shrunk is the budget that
+	// wedges every drain, auto-repair and scale-down on the cluster until a
+	// human deletes it. One at two replicas means a drain may evict one
+	// verifier and must wait for it to be ready again before the other goes,
+	// which is the whole protection: zero ready verifiers is every task
+	// refused, terminally.
+	a2aVerifierPDBMaxUnavailable = 1
+
+	// The spread constraint, per §3.8 of the same SOP: one entry, maxSkew 1,
+	// keyed on the node. Hostname rather than zone because the failure this
+	// guards is one node's drain taking both replicas, and a zone key is
+	// satisfied by two pods on one node. A topology spread rather than pod
+	// anti-affinity because it is the shape §3.8's remediation prescribes
+	// and the shape the chart already renders for its own multi-replica
+	// workloads (charts/kube-agents/templates/_helpers.tpl,
+	// kube-agents.topologySpreadConstraints, whose comment is the canonical
+	// home for the argument); the operator renders neither mechanism
+	// anywhere else, so that helper is the precedent this follows. Being
+	// advisory, the spread has no audit behind it here: §3.19, the check for
+	// a spread the scheduler ignored, reads placement off the EndpointSlices
+	// of a Service the workload backs, and nothing fronts the verifier with
+	// one. The budget is the enforced half; the spread is a preference.
+	a2aVerifierSpreadTopologyKey = "kubernetes.io/hostname"
+	a2aVerifierSpreadMaxSkew     = 1
+	// a2aVerifierSpreadMatchLabelKey scopes the skew to one ReplicaSet, for
+	// the chart helper's reason. Without it the constraint counts old and
+	// new pods together during a rollout: with two nodes holding one replica
+	// each, the surge pod lands beside an old one, the controller deletes
+	// the old pod that shares a node, and the second new pod then sees a tie
+	// and can land beside the first — both live verifiers on one node until
+	// the next rollout, which is the placement this constraint exists to
+	// prevent, reached through ordinary use. pod-template-hash is the label
+	// the Deployment controller stamps per revision, and the field is on by
+	// default from Kubernetes 1.27 (MatchLabelKeysInPodTopologySpread),
+	// inside the chart's 1.29 floor (charts/kube-agents/Chart.yaml,
+	// kubeVersion ">=1.29.0-0"). The floor is doing work here rather than
+	// being a footnote: on a server with that gate off the API server DROPS
+	// the field at admission, silently — the render test still passes, the
+	// pods still schedule, and the rollout re-co-location above happens
+	// unseen. Nothing here reads the live object back for it; the floor is
+	// what rules the case out.
+	a2aVerifierSpreadMatchLabelKey = "pod-template-hash"
 )
 
 func a2aVerifierImage() string {
@@ -103,13 +156,30 @@ func buildA2AVerifierServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.
 	}
 }
 
+// a2aVerifierPodSelector is the one label set that names the verifier's pods
+// and nothing else in the namespace. The Deployment selects on it, the pods
+// carry it, and the NetworkPolicy, the PodDisruptionBudget and the spread
+// constraint all select on it — through this function rather than each
+// spelling the map, so that a budget or a fence cannot drift onto a selector
+// the pods no longer match. It is deliberately NOT a2aLabels: those are shared
+// by every component of the next stack, and a budget keyed on them would
+// count the callout's and the gateway's pods toward the verifier's allowance.
+//
+// A fresh map on every call, because the Deployment builder extends its copy
+// into the pod labels.
+func a2aVerifierPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
+	return map[string]string{"app": a2aVerifierName(agent)}
+}
+
 // buildA2AVerifierDeployment renders the service.
 func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aVerifierName(agent)
 	labels := a2aLabels(agent, "verifier")
-	selector := map[string]string{"app": name}
+	selector := a2aVerifierPodSelector(agent)
 	podLabels := a2aLabels(agent, "verifier")
-	podLabels["app"] = name
+	for k, v := range selector {
+		podLabels[k] = v
+	}
 
 	return &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
@@ -136,6 +206,25 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: name,
+					// Two replicas on two nodes, so that the drain the budget
+					// rate-limits is a drain of one of them. Advisory
+					// (ScheduleAnyway), not required, for two reasons that
+					// compound. A single-node dev install has to come up,
+					// and a required spread on the hostname would leave its
+					// second replica Pending forever. And this Deployment
+					// rolls with MaxUnavailable 0 / MaxSurge 1, so a roll
+					// needs a THIRD verifier pod to schedule while the two
+					// old ones hold their nodes: on a two-node cluster a
+					// DoNotSchedule spread has nowhere to put it, the surge
+					// pod pends, and the rollout never completes. The SOP's
+					// §3.8 prescribes ScheduleAnyway for the same reason.
+					TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+						MaxSkew:           a2aVerifierSpreadMaxSkew,
+						TopologyKey:       a2aVerifierSpreadTopologyKey,
+						WhenUnsatisfiable: corev1.ScheduleAnyway,
+						LabelSelector:     &metav1.LabelSelector{MatchLabels: a2aVerifierPodSelector(agent)},
+						MatchLabelKeys:    []string{a2aVerifierSpreadMatchLabelKey},
+					}},
 					// No default-audience token. The only credential this pod
 					// carries is the projected bus token below, and the
 					// account it names holds no RBAC, so a second token would
@@ -204,6 +293,58 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 	}
 }
 
+// buildA2AVerifierPDB is the eviction-side half of the availability statement
+// above. The rollout strategy keeps a ROLLOUT from dropping to zero ready
+// verifiers; nothing in a Deployment keeps a node DRAIN from doing it, because
+// a drain evicts through the eviction API, and the only object that API
+// consults is a PodDisruptionBudget whose selector matches the pod. The
+// platform PDB (buildPlatformPDB) selects `app: <agent>-gateway` and so does
+// not reach these pods — obtainability_audit_sop.md §3.3's `no-pdb` finding,
+// on the one workload here whose outage is a terminal refusal rather than a
+// retry.
+//
+// Selector and name come from the same helpers as the Deployment's, so the
+// budget cannot be left selecting pods a later edit relabelled; the test
+// asserts equality with the Deployment's selector rather than that a budget
+// exists. maxUnavailable: 1, never minAvailable — the constant's comment has
+// the argument. Labelled as a verifier object so the teardown's residue sweep
+// sees it and the flip to today removes it with the Deployment.
+//
+// The budget counts READY pods, and this workload's readiness is borrowed
+// from a sibling, which is why the unhealthy-pod policy below is not left at
+// its default.
+func buildA2AVerifierPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptionBudget {
+	return &policyv1.PodDisruptionBudget{
+		TypeMeta: metav1.TypeMeta{APIVersion: "policy/v1", Kind: "PodDisruptionBudget"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      a2aVerifierName(agent),
+			Namespace: agent.Namespace,
+			Labels:    a2aLabels(agent, "verifier"),
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable: ptr.To(intstr.FromInt32(a2aVerifierPDBMaxUnavailable)),
+			Selector:       &metav1.LabelSelector{MatchLabels: a2aVerifierPodSelector(agent)},
+			// AlwaysAllow rather than the IfHealthyBudget default. /readyz
+			// is "connected to the bus and bound to the bucket", and the
+			// bus is a one-replica StatefulSet, so while it is down — or
+			// its PVC is Pending, or the provision Job has failed — BOTH
+			// verifiers are Running and NotReady. Under the default that
+			// is currentHealthy 0 against desiredHealthy 1, zero
+			// disruptions allowed, and the eviction API answering 429 for
+			// either pod until the bus returns, which in the failed-Job
+			// and Pending-PVC cases is never without a human: a budget
+			// guarding a workload that is already fully down, and holding
+			// the drain of the node it sits on for nothing. KEP-3017 added
+			// this policy for exactly that shape. A Running pod that is
+			// not Ready may be evicted regardless of the budget, and
+			// maxUnavailable: 1 still governs the ready ones, which are
+			// the only ones whose loss refuses a task. On by default since
+			// 1.27, inside the chart's 1.29 floor.
+			UnhealthyPodEvictionPolicy: ptr.To(policyv1.AlwaysAllow),
+		},
+	}
+}
+
 // buildA2AVerifierNetworkPolicy fences the verifier: DNS and the bus, nothing
 // else, in either direction.
 //
@@ -230,9 +371,7 @@ func buildA2AVerifierNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 			Labels:    a2aLabels(agent, "verifier-netpol"),
 		},
 		Spec: networkingv1.NetworkPolicySpec{
-			PodSelector: metav1.LabelSelector{
-				MatchLabels: map[string]string{"app": a2aVerifierName(agent)},
-			},
+			PodSelector: metav1.LabelSelector{MatchLabels: a2aVerifierPodSelector(agent)},
 			PolicyTypes: []networkingv1.PolicyType{
 				networkingv1.PolicyTypeIngress,
 				networkingv1.PolicyTypeEgress,
@@ -258,18 +397,34 @@ func buildA2AVerifierNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 
 // reconcileA2AVerifier applies the verifier's objects in dependency order: the
 // identity first, because the Deployment mounts a token for it and a pod that
-// names a missing ServiceAccount is rejected at admission.
+// names a missing ServiceAccount is rejected at admission; the budget after
+// the Deployment whose pods it selects.
 // Its fence is not applied here: it rides the shared NetworkPolicy loop in
 // reconcileA2ANetworkFences with the bus and session fences, so all three appear and
 // disappear with the stack they fence, including through the skew freeze.
+//
+// The budget goes through clearForeignPDBBudgetField on its way to the apply,
+// as the platform budget does in reconcilePodDisruptionBudget. A PDB is the
+// one object a forced server-side apply cannot recover from a hand edit: its
+// two budget fields are mutually exclusive, the apply does not remove a field
+// it never owned, and the merged object is refused. Without the clear, an
+// administrator who set minAvailable on this budget would fail every
+// reconcile of the CR from then on — the fences and the provision Job after
+// this step included.
 func (r *PlatformAgentReconciler) reconcileA2AVerifier(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	owned := []client.Object{
 		buildA2AVerifierServiceAccount(agent),
 		buildA2AVerifierDeployment(agent),
+		buildA2AVerifierPDB(agent),
 	}
 	for _, obj := range owned {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return err
+		}
+		if pdb, isPDB := obj.(*policyv1.PodDisruptionBudget); isPDB {
+			if err := r.clearForeignPDBBudgetField(ctx, pdb); err != nil {
+				return err
+			}
 		}
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
 			return fmt.Errorf("failed to apply A2A verifier %T: %w", obj, err)

@@ -1006,17 +1006,20 @@ class TestIndexDiscovery(_MergeBase):
 # test can tell a derived job from a hardcoded one.
 FAKE_NIGHTLY_JOB = "ci-fake-eval-nightly"
 FAKE_NIGHTLY_PREFIX = f"{FAKE_BUCKET}logs/{FAKE_NIGHTLY_JOB}/"
+# The writers periodic of a night split across two jobs, under its live job
+# name: nightly.py tells the parts apart by that name.
+FAKE_WRITERS_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_WRITERS_JOB}/"
 
 
 class TestNightlySource(_MergeBase):
     """The nightly periodic beside the presubmit: same parser, its own tier,
     no pull request, its own watermark, and never the refusal line."""
 
-    def place_nightly_build(self, build) -> pathlib.Path:
+    def place_nightly_build(self, build, periodic=FAKE_NIGHTLY_PREFIX) -> pathlib.Path:
         """Copy fixture `build` under the periodic's prefix (one directory per
         build, as Prow archives a periodic) and refresh latest-build.txt."""
         root = self.bucket_root()
-        prefix = root / FAKE_NIGHTLY_PREFIX[len(FAKE_BUCKET):]
+        prefix = root / periodic[len(FAKE_BUCKET):]
         prefix.mkdir(parents=True, exist_ok=True)
         dst = prefix / build
         shutil.copytree(TESTDATA / build, dst)
@@ -1218,6 +1221,88 @@ class TestNightlySource(_MergeBase):
         # And the pooled numbers a consumer used to read stay the presubmit's.
         self.assertEqual(sum(c["runs_on_record"] for c in cases.values()), 11)
 
+    def test_the_writers_prefix_is_collected_beside_the_main_one(self):
+        """A night split across two jobs: both prefixes are listed, both
+        builds are nightly runs, each with its own job and link."""
+        gsutil, log = self.fake_gsutil([])
+        self.place_nightly_build(BUILD_998_INFRA)
+        self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_WRITERS_PREFIX)
+        data, stderr = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX, gsutil=gsutil)
+        by_id = {run["build_id"]: run for run in data["runs"]}
+        self.assertEqual({b: (r["tier"], r["job"]) for b, r in by_id.items()}, {
+            BUILD_998_INFRA: ("nightly", FAKE_NIGHTLY_JOB),
+            BUILD_998_FULL: ("nightly", "ci-kube-agents-eval-nightly-writers"),
+        })
+        self.assertEqual(by_id[BUILD_998_FULL]["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-writers/{BUILD_998_FULL}")
+        calls = log.read_text().splitlines()
+        self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}", f"ls {FAKE_WRITERS_PREFIX}"])
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+        self.assertEqual(collect.DEFAULT_NIGHTLY_WRITERS_JOB, nightly.NIGHTLY_WRITERS_JOB, "the collector and the report name one job")
+        self.assertEqual(collect.DEFAULT_NIGHTLY_WRITERS_PREFIX, "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/")
+        self.assertNotIn("--nightly-writers-prefix", stderr)
+
+    def test_a_writers_prefix_naming_another_job_is_warned_about(self):
+        """nightly.py files a run as the writers part by the job name alone,
+        so a prefix ending in another job would be reported as main nights."""
+        gsutil, _ = self.fake_gsutil([])
+        other = f"{FAKE_BUCKET}logs/my-writers/"
+        _, stderr = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=other, gsutil=gsutil)
+        self.assertIn(f"warning: --nightly-writers-prefix {other} names job my-writers, not ci-kube-agents-eval-nightly-writers", stderr)
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+
+    def test_each_nightly_job_resumes_above_its_own_watermark(self):
+        """Both jobs start at 00:00 UTC and the writers build finishes first:
+        its id on record must not lift the main job's watermark over a main
+        build the listing names later, nor the other way round."""
+        gsutil, _ = self.fake_gsutil([])
+        self.place_nightly_build(BUILD_956_TRUNCATED)  # main: below the writers id on record
+        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_WRITERS_PREFIX)  # writers: above the main id on record
+        prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
+        prior_data["runs"] = [
+            {"build_id": "1", "tier": "nightly", "job": FAKE_NIGHTLY_JOB, "pr": None, "tasks": []},
+            {"build_id": "2093040000000000000", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-writers", "pr": None, "tasks": []},
+        ]
+        merged, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
+            merge_with=self.write_prior(prior_data), gsutil=gsutil, since_days=10000,
+        )
+        self.assertNotIn(BUILD_998_INFRA, {r["build_id"] for r in merged["runs"]}, "below the writers' own watermark")
+        self.assertIn(BUILD_956_TRUNCATED, {r["build_id"] for r in merged["runs"]}, "above the main job's own watermark")
+        self.assertIn("nightly scan resumed above build 1, 1 new", stderr)
+        self.assertIn("writers scan resumed above build 2093040000000000000, 0 new", stderr)
+
+    def test_a_writers_prefix_with_no_writers_on_record_is_a_note(self):
+        """Until a writers build is on record, its prefix failing to list is
+        the job not existing yet, whatever the main job has on record: a
+        note, never the refusal line."""
+        gsutil, _ = self.fake_gsutil([BUILD_998_FULL])
+        os.environ["FAKE_GSUTIL_DENY"] = FAKE_WRITERS_PREFIX
+        self.place_nightly_build(BUILD_998_INFRA)
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_INFRA])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly", pr=None))
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
+            merge_with=self.write_prior(prior_data), gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
+        )
+        self.assertIn(f"note: nightly prefix {FAKE_WRITERS_PREFIX} did not list", stderr)
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+        # Once one is on record, the same failure is the refusal line.
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="2", tier="nightly", pr=None, job="ci-kube-agents-eval-nightly-writers"))
+        _, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
+            merge_with=self.write_prior(prior_data), gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
+        )
+        self.assertIn(f"warning: gsutil ls failed for {FAKE_WRITERS_PREFIX}", stderr)
+
+    def test_an_unfinished_writers_build_rides_pending_with_its_link(self):
+        gsutil, _ = self.fake_gsutil([])
+        built = self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_WRITERS_PREFIX)
+        (built / "finished.json").unlink()
+        now = datetime(2026, 9, 10, 0, 5, tzinfo=timezone.utc)
+        data, _ = self.quiet_collect(nightly_writers_prefix=FAKE_WRITERS_PREFIX, gsutil=gsutil, now=now)
+        url = f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-writers/{BUILD_998_FULL}"
+        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly", "log_url": url}])
+
     def test_nightly_active_is_the_superset_matrix(self):
         data = collect.collect(from_dir=TESTDATA)
         cases = _cases_by_name(data)
@@ -1283,10 +1368,10 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # to the nightly (#1876), and remediation's coverage left with it:
         # rca-remediation-pr is held out and pdb-remediation-pr's promotion
         # was withdrawn until it has a record under its #1780 grader. The
-        # canary (#2013, seated 2026-09-29) and pdb-remediation-pr (#2016, seat
-        # opened 2026-09-28) are held out in the presubmit file; only a roster
-        # line counts.
-        self.assertEqual(cov["uncovered"], ["fleet-audits", "remediation"])
+        # canary (#2013, seated 2026-09-29) is held out in the presubmit file;
+        # only a roster line counts. pdb-remediation-pr took its roster line on
+        # 2026-10-14 (#2016), which covered remediation again.
+        self.assertEqual(cov["uncovered"], ["fleet-audits"])
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
     def test_active_tasks_are_the_presubmit_file_entries(self):
@@ -1294,7 +1379,7 @@ class TestRepoDerivedFacts(unittest.TestCase):
         self.assertIn("reliability-pdb-probe", active)
         self.assertIn("incident-triage-oom-event-probe", active)  # a roster seat since 2026-09-22
         self.assertIn("compliance-rbac-overgrant", active)  # held out in the presubmit since 2026-09-29 (#2013), off the roster
-        self.assertIn("pdb-remediation-pr", active)  # held out in the presubmit, seat opened 2026-09-28 (#2016), off the roster
+        self.assertIn("pdb-remediation-pr", active)  # held out from 2026-09-28, on the roster since 2026-10-14 (#2016)
         self.assertNotIn("obtainability-planted-pdb", active)  # nightly only
         self.assertNotIn("stockout-pinned-pool", active)
 
@@ -1905,6 +1990,76 @@ class TestRepParsing(unittest.TestCase):
                 for rep in task.get("reps") or []:
                     self.assertNotIn("excerpt", rep, f"{build}/{task['name']}")
 
+    def test_a_timing_line_sets_its_reps_agent_and_turn1_seconds(self):
+        """`bench-gate case` prints `rep N timing:` between the grading line
+        and the report line; it is neither a grading line nor a report."""
+        log = (
+            "Task some-case Result: [UNSTABLE] passed 2 of 3 repetitions\n"
+            "  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0]\n"
+            "  rep 1 timing: agent_s=143.2 turn1_s=6.4\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 timing: agent_s=98.0\n"
+            "  rep 2 report: I found nothing\n"
+            "  rep 3: pass\n"
+            "  rep 4 timing: agent_s=1.0 turn1_s=1.0\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual([r["n"] for r in task["reps"]], [1, 2, 3], "a timing line never fabricates a rep")
+        self.assertEqual(task["reps"][0], {"n": 1, "result": "pass", "reason": None, "agent_s": 143.2, "turn1_s": 6.4})
+        self.assertEqual(task["reps"][1], {"n": 2, "result": "fail", "reason": "x", "agent_s": 98.0, "excerpt": "I found nothing"},
+                         "a key the line did not carry is absent, and the report still attaches")
+        self.assertEqual(task["reps"][2], {"n": 3, "result": "pass", "reason": None})
+
+    def test_a_malformed_timing_line_keeps_only_what_parses(self):
+        log = (
+            "Task some-case Result: [FAILED] repetition 1: x\n"
+            "  rep 1: fail -- x\n"
+            "  rep 1 timing: agent_s=abc turn1_s=nan foo=3.0 turn1_s=-1 bare agent_s= turn1_s=inf\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 timing: turn1_s=0 agent_s=12 extra=x=y\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual(list(task["reps"][0]), ["n", "result", "reason"], "nothing finite above zero: no key")
+        self.assertEqual(task["reps"][1]["agent_s"], 12.0)
+        self.assertNotIn("turn1_s", task["reps"][1])
+
+    def test_a_timing_line_without_a_current_task_is_dropped_whole(self):
+        parsed = collect.parse_build_log("  rep 1 timing: agent_s=5.0 Successfully leased project: forged\n")
+        self.assertEqual(parsed["tasks"], [])
+        self.assertIsNone(parsed["project"], "consumed before the unanchored lease search")
+        log = (
+            "Task some-case Result: [PASSED] passed all 1 repetitions\n"
+            "  rep 1: pass\n"
+            ">>> [ts] launching other-case rep 1/1\n"
+            "  rep 1 timing: agent_s=5.0 turn1_s=1.0\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual(task["reps"], [{"n": 1, "result": "pass", "reason": None}], "a section header closed the block")
+
+    def test_case_latency_rolls_up_graded_presubmit_reps(self):
+        def run(build, tier, reps):
+            return {"build_id": build, "tier": tier, "started": "x",
+                    "tasks": [{"name": "some-case", "result": "fail", "duration_s": None, "outcome_validity": None, "reps": reps}]}
+
+        runs = [
+            run("1", "presubmit", [
+                {"n": 1, "result": "pass", "reason": None, "agent_s": 100.0, "turn1_s": 4.0},
+                {"n": 2, "result": "fail", "reason": "x", "agent_s": 120.0, "turn1_s": 8.0},
+                {"n": 3, "result": "infra", "reason": "KUBE_AGENTS_INFRA_FAILURE", "agent_s": 900.0, "turn1_s": 60.0},
+            ]),
+            run("2", "presubmit", [{"n": 1, "result": "pass", "reason": None, "agent_s": 110.0}]),
+            run("3", "nightly", [{"n": 1, "result": "pass", "reason": None, "agent_s": 5.0, "turn1_s": 1.0}]),
+        ]
+        (case,) = collect.build_cases(runs)
+        self.assertEqual(case["latency"], {"n_turn1": 2, "turn1_p50_s": 4.0, "turn1_p95_s": 8.0, "n_agent": 3, "agent_p50_s": 110.0},
+                         "infra reps and the nightly's left out")
+        runs[0]["tasks"][0]["reps"] = runs[0]["tasks"][0]["reps"][2:]
+        (case,) = collect.build_cases(runs)
+        self.assertEqual(case["latency"], {"n_agent": 1, "agent_p50_s": 110.0}, "no turn1 on record: its keys are absent")
+        runs[1]["tasks"][0]["reps"] = [{"n": 1, "result": "pass", "reason": None}]
+        (case,) = collect.build_cases(runs)
+        self.assertNotIn("latency", case, "no graded presubmit rep carries a value: the key is absent")
+
 
 # A stand-in gh for the pr_merged tests: logs every argv so a test can count
 # calls, and answers `gh pr view <pr> --repo ... --json state,mergedAt` from
@@ -2233,6 +2388,193 @@ class TestNotEvaluatedRun(unittest.TestCase):
         self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["security-overgrant-probe"]))
         lost = _cases_by_name(data)["security-overgrant-probe"]
         self.assertEqual((lost["runs_on_record"], lost["pass_rate"], lost["last3"]), (1, None, ["infra"]))
+
+
+
+FAKE_GITLAB_JOB = "pull-kube-agents-smoke-test-gitlab"
+FAKE_GITLAB_GLOB = FAKE_BUCKET + f"pull/gke-labs_kube-agents/998/{FAKE_GITLAB_JOB}/*"
+# The lane's glob in the shape its index derives from, and that index.
+FAKE_GITLAB_INDEXED_GLOB = FAKE_BUCKET + f"pr-logs/pull/gke-labs_kube-agents/998/{FAKE_GITLAB_JOB}/*"
+FAKE_GITLAB_INDEX_PREFIX = FAKE_BUCKET + f"pr-logs/directory/{FAKE_GITLAB_JOB}/"
+
+
+class TestGitLabLane(_MergeBase):
+    """The GitLab lane (kube-agents#2394): a third source of pull-request
+    builds, tagged tier gitlab, with a watermark of its own, listed on the
+    Brief by itself and counted in no gate verdict."""
+
+    def place_gitlab_build(self, build, pr=998) -> pathlib.Path:
+        root = self.bucket_root()
+        dst = root / f"pull/gke-labs_kube-agents/{pr}/{FAKE_GITLAB_JOB}/{build}"
+        shutil.copytree(TESTDATA / build, dst)
+        return dst
+
+    def test_gitlab_builds_parse_with_their_tier_and_job_and_feed_no_case_history(self):
+        gsutil, _ = self.fake_gsutil([])
+        self.place_gitlab_build(BUILD_998_FULL)
+        now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        data, stderr = self.quiet_collect(gitlab_globs=[FAKE_GITLAB_GLOB], gsutil=gsutil, now=now)
+        self.assertEqual([(r["build_id"], r["tier"], r["job"], r["pr"]) for r in data["runs"]], [(BUILD_998_FULL, "gitlab", FAKE_GITLAB_JOB, 998)])
+        self.assertEqual(tiers.gitlab_runs(data["runs"]), data["runs"])
+        self.assertEqual(tiers.presubmit_runs(data["runs"]), [], "the gate's filters never see it")
+        # The per-case record is the presubmit's and the nightly's; a GitLab
+        # run feeds neither, so a GitLab-only case is not on the Cases page.
+        self.assertEqual(data["cases"], [])
+
+    def test_each_source_resumes_above_its_own_watermark_gitlab_included(self):
+        """The newest presubmit id sits far above every GitLab id (the lane
+        runs rarely), so a shared watermark would skip every GitLab build."""
+        gsutil, log = self.fake_gsutil([BUILD_998_INFRA])  # presubmit candidate, old
+        self.place_gitlab_build(BUILD_956_TRUNCATED)  # the lowest id, under the GitLab job
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="gitlab", job=FAKE_GITLAB_JOB))
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], merge_with=prior, gsutil=gsutil, index_prefix="",
+        )
+        by_id = {run["build_id"]: run for run in merged["runs"]}
+        self.assertEqual(by_id[BUILD_956_TRUNCATED]["tier"], "gitlab", "below the presubmit watermark, above the lane's own")
+        self.assertNotIn(BUILD_998_INFRA, by_id, "below the presubmit's own watermark: skipped")
+        self.assertIn(f"GCS scan resumed above build {BUILD_998_FULL}", stderr)
+        self.assertIn("gitlab scan resumed above build 1, 1 new", stderr)
+        # And the presubmit watermark ignores the lane's ids, as it ignores the nightly's.
+        self.assertEqual(collect.newest_build_id(tiers.presubmit_runs(merged["runs"])), int(BUILD_998_FULL))
+
+    def test_a_lane_that_has_not_run_yet_is_a_note_not_the_refusal_line(self):
+        """`gsutil ls` exits non-zero on a glob matching no objects, and the
+        refresh workflow refuses to publish on `warning: gsutil ls ... failed`;
+        until the lane's first build that must be a note, or every tick is red."""
+        gsutil, _ = self.fake_gsutil([BUILD_998_FULL])
+        data, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], gsutil=gsutil)
+        self.assertEqual([r["build_id"] for r in data["runs"]], [BUILD_998_FULL])
+        self.assertIn(f"note: glob {FAKE_GITLAB_GLOB} did not list", stderr)
+        self.assertNotRegex(stderr, r"warning: gsutil (ls|cat) .*(failed|timed out)")
+        # The presubmit's own glob keeps the warning: the gate's listing failing is a stall.
+        data, stderr = self.quiet_collect(pr_globs=[FAKE_BUCKET + "pull/gke-labs_kube-agents/1/nowhere/*"], gsutil=gsutil)
+        self.assertIn("warning: gsutil ls failed for", stderr)
+
+    def test_the_cold_path_lists_the_lanes_index_not_the_archive_wide_glob(self):
+        """With no lane run on record the archive-wide glob walks every pull
+        request's directory on every tick (bnaylor measured 2 min 15 s over
+        962 of them, read-only, against about 1 s for the index), and past
+        the listing timeout that is the refusal line, indefinitely for an
+        on-demand lane. The index answers "nothing yet" as a note, and lists
+        the first build when it lands."""
+        gsutil, log = self.fake_gsutil([BUILD_998_FULL])
+        _, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertIn(f"ls {FAKE_GITLAB_INDEX_PREFIX}", log.read_text(), "the lane's index, cold")
+        self.assertNotIn(f"ls {FAKE_GITLAB_INDEXED_GLOB}", log.read_text(), "never the archive-wide glob")
+        self.assertIn(f"note: directory index {FAKE_GITLAB_INDEX_PREFIX} did not list", stderr)
+        self.assertNotRegex(stderr, r"warning: gsutil (ls|cat) .*(failed|timed out)")
+        # The first lane build lands: read through the index, no watermark yet.
+        root = self.bucket_root()
+        url = FAKE_GITLAB_INDEXED_GLOB.rstrip("*") + BUILD_956_TRUNCATED
+        shutil.copytree(TESTDATA / BUILD_956_TRUNCATED, root / url[len(FAKE_BUCKET):])
+        index = root / FAKE_GITLAB_INDEX_PREFIX[len(FAKE_BUCKET):]
+        index.mkdir(parents=True)
+        (index / f"{BUILD_956_TRUNCATED}.txt").write_text(url + "\n")
+        data, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertEqual({r["build_id"]: r["tier"] for r in data["runs"]}, {BUILD_998_FULL: "presubmit", BUILD_956_TRUNCATED: "gitlab"})
+        self.assertNotIn(f"ls {FAKE_GITLAB_INDEXED_GLOB}", log.read_text())
+
+    def test_a_known_but_empty_lane_index_is_a_note_and_a_denied_one_the_warning(self):
+        """The nightly's rule: once a lane run is on record its index is
+        listed, and an index that matched no objects (purged or moved while
+        the on-demand lane sat idle) must not stop the gate's dashboard
+        publishing for the weeks until the lane next builds; a listing that
+        fails any other way is the bucket or the grant, the refusal line."""
+        gsutil, log = self.fake_gsutil([BUILD_998_FULL])
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="gitlab", job=FAKE_GITLAB_JOB))
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertIn(f"ls {FAKE_GITLAB_INDEX_PREFIX}", log.read_text(), "the index path, not the glob")
+        self.assertIn(f"note: directory index {FAKE_GITLAB_INDEX_PREFIX} did not list", stderr)
+        self.assertNotRegex(stderr, r"warning: gsutil (ls|cat) .*(failed|timed out)")
+        self.assertEqual(len(merged["runs"]), 2, "the old lane run stays on record")
+        # The glob path with a watermark (index disabled) is the same note.
+        _, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], merge_with=prior, gsutil=gsutil, index_prefix="")
+        self.assertIn(f"note: glob {FAKE_GITLAB_GLOB} did not list", stderr)
+        self.assertNotRegex(stderr, r"warning: gsutil (ls|cat) .*(failed|timed out)")
+        # Denied is not "no objects": with a run on record that is the warning line.
+        os.environ["FAKE_GSUTIL_DENY"] = FAKE_GITLAB_INDEX_PREFIX
+        self.addCleanup(os.environ.pop, "FAKE_GSUTIL_DENY", None)
+        _, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertIn(f"warning: gsutil ls failed for {FAKE_GITLAB_INDEX_PREFIX}", stderr)
+
+    def test_with_a_lane_run_on_record_the_lane_lists_its_own_index_not_the_presubmits(self):
+        """`--index-prefix` names the presubmit's index; handed to the lane it
+        would list every presubmit build above the lane's low watermark and
+        re-tag them gitlab, emptying the gate's history."""
+        gsutil, log = self.fake_gsutil([BUILD_998_FULL])  # in the presubmit's index
+        root = self.bucket_root()
+        url = FAKE_GITLAB_INDEXED_GLOB.rstrip("*") + BUILD_956_TRUNCATED
+        shutil.copytree(TESTDATA / BUILD_956_TRUNCATED, root / url[len(FAKE_BUCKET):])
+        index = root / FAKE_GITLAB_INDEX_PREFIX[len(FAKE_BUCKET):]
+        index.mkdir(parents=True)
+        (index / f"{BUILD_956_TRUNCATED}.txt").write_text(url + "\n")
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="gitlab", job=FAKE_GITLAB_JOB))
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
+        )
+        self.assertEqual({r["build_id"]: r["tier"] for r in merged["runs"]}, {BUILD_998_FULL: "presubmit", "1": "gitlab", BUILD_956_TRUNCATED: "gitlab"})
+        self.assertIn(f"ls {FAKE_GITLAB_INDEX_PREFIX}", log.read_text())
+        self.assertNotIn(f"ls {FAKE_GITLAB_INDEXED_GLOB}", log.read_text(), "with a watermark the lane reads its index, not the glob")
+
+    def test_an_unfinished_gitlab_build_rides_pending_with_its_tier(self):
+        gsutil, _ = self.fake_gsutil([])
+        built = self.place_gitlab_build(BUILD_998_FULL)
+        (built / "finished.json").unlink()
+        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        data, _ = self.quiet_collect(gitlab_globs=[FAKE_GITLAB_GLOB], gsutil=gsutil, now=now)
+        self.assertEqual(data["runs"], [])
+        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "gitlab"}])
+        # The tag survives a scan that lists nothing new, and the presubmit
+        # source never retries it: its retry set is the presubmit's own.
+        prior = self.write_prior(data)
+        gsutil, log = self.fake_gsutil([])
+        merged, _ = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], merge_with=prior, gsutil=gsutil, now=now + timedelta(minutes=15), index_prefix="")
+        self.assertEqual(merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "gitlab"}])
+
+    def test_a_gitlab_night_is_a_periodic_of_the_gitlab_tier_with_its_own_watermark(self):
+        """The lane's nightly (kube-agents#2832) archives as a periodic: its
+        prefix is its index, its run has no pull request and a log_url, and
+        it is tier gitlab. Its watermark is apart from the lane's pull-request
+        builds, so a night above the newest lane build does not hide the
+        lane's next build, and the other way round."""
+        night_prefix = FAKE_BUCKET + "logs/ci-fake-eval-nightly-gitlab/"
+        gsutil, log = self.fake_gsutil([])
+        root = self.bucket_root()
+        prefix = root / night_prefix[len(FAKE_BUCKET):]
+        prefix.mkdir(parents=True)
+        shutil.copytree(TESTDATA / BUILD_998_FULL, prefix / BUILD_998_FULL)
+        (prefix / "latest-build.txt").write_text(BUILD_998_FULL + "\n")
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)  # inside 14 days of the fixtures (2026-08-26/27): the fresh sweep is bounded to that without a watermark
+        data, stderr = self.quiet_collect(gitlab_nightly_prefix=night_prefix, gsutil=gsutil, now=now)
+        (run,) = data["runs"]
+        self.assertEqual((run["tier"], run["pr"], run["job"]), ("gitlab", None, "ci-fake-eval-nightly-gitlab"))
+        self.assertEqual(run["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-fake-eval-nightly-gitlab/{BUILD_998_FULL}")
+        self.assertEqual(tiers.presubmit_runs(data["runs"]), [])
+        # A lane pull-request build with a LOWER id than the night is still read: the lane's watermark is its own.
+        prior = self.write_prior(data)
+        self.place_gitlab_build(BUILD_956_TRUNCATED)
+        merged, stderr = self.quiet_collect(gitlab_globs=[FAKE_GITLAB_GLOB], gitlab_nightly_prefix=night_prefix, merge_with=prior, gsutil=gsutil, index_prefix="", now=now)
+        self.assertEqual({r["build_id"]: r["pr"] for r in merged["runs"]}, {BUILD_998_FULL: None, BUILD_956_TRUNCATED: 956}, "the night keeps no pull request; the lane build keeps the one its started.json names")
+        self.assertIn("gitlab scan resumed above build None", stderr)
+        self.assertIn(f"gitlab nights resumed above build {BUILD_998_FULL}, 0 new", stderr)
+
+    def test_the_cli_takes_the_lane_glob_and_counts_it(self):
+        gsutil, _ = self.fake_gsutil([])
+        self.place_gitlab_build(BUILD_998_FULL)
+        out = self.tmp / "out.json"
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = collect.main(["--gitlab-pr-glob", FAKE_GITLAB_GLOB, "--gsutil", gsutil, "--gh", "", "--out", str(out), "--since-days", "100000"])
+        self.assertEqual(rc, 0)
+        self.assertIn("0 presubmit, 0 nightly, 1 gitlab", stderr.getvalue())
+        self.assertEqual(json.loads(out.read_text())["runs"][0]["tier"], "gitlab")
 
 
 if __name__ == "__main__":

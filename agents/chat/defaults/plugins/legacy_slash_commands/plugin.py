@@ -17,6 +17,7 @@ plain text, on any platform.
 """
 
 import logging
+import os
 import re
 from typing import Any, Dict, Optional
 
@@ -30,6 +31,23 @@ _LEGACY_PREFIX_RE = re.compile(r"^/hermes(?:@\S+)?(?:\s+(?P<rest>.*))?$", re.IGN
 # A leading bot mention Slack prepends when the user @-mentions the bot on the
 # same line ("<@U123> /hermes sethome").
 _LEADING_MENTION_RE = re.compile(r"^<@[UWB][A-Z0-9]+>\s*")
+
+# A typed "/undo [N]" (optionally "/undo@botname"). Hermes's /undo rewinds the gateway
+# session transcript and re-prompts, which reverses nothing a specialist has done, so on
+# this profile it is disabled: the slash is dropped and the line reaches the model as
+# plain text, which SOUL.md §1 tells it to answer with "there is no undo".
+_DISABLED_UNDO_RE = re.compile(r"^/undo(?:@\S+)?(?=\s|$)", re.IGNORECASE)
+_DISABLED_UNDO_TEXT = "undo"
+
+# The disable belongs to the Planning Agent, whose SOUL.md carries the answer. The operator
+# also enables this plugin on the platform profile under `experimental.platformFrontDoor`,
+# and names the profile the gateway runs as in HERMES_GATEWAY_PROFILE: empty on the
+# Planning Agent, "platform" under the flag (k8s-operator/internal/controller/
+# platformagent_manifests.go, gatewayProfileEnvVar). The entrypoint's
+# platform_is_front_door tests for "platform" exactly, and so does this: any other value
+# runs the gateway on the chat profile, whose SOUL.md carries the answer.
+_GATEWAY_PROFILE_ENV = "HERMES_GATEWAY_PROFILE"
+_FRONT_DOOR_PROFILE = "platform"
 
 
 def _subcommand_map() -> Dict[str, str]:
@@ -90,16 +108,39 @@ def rewrite_legacy_hermes_command(text: str) -> Optional[str]:
     return f"{target} {args}".strip()
 
 
+def on_planning_agent_profile() -> bool:
+    """True unless the operator homed the gateway on the platform profile (the front-door flag)."""
+    return os.environ.get(_GATEWAY_PROFILE_ENV, "") != _FRONT_DOOR_PROFILE
+
+
+def disable_undo_command(text: str) -> Optional[str]:
+    """Return the plain text ``/undo …`` should dispatch as, or ``None`` to leave it alone.
+
+    Only on the Planning Agent profile; elsewhere the gateway keeps the command.
+    """
+    if not isinstance(text, str) or not text or not on_planning_agent_profile():
+        return None
+    stripped = _LEADING_MENTION_RE.sub("", text.strip(), count=1).strip()
+    match = _DISABLED_UNDO_RE.match(stripped)
+    if match is None:
+        return None
+    return f"{_DISABLED_UNDO_TEXT}{stripped[match.end():]}"
+
+
 def handle_pre_gateway_dispatch(
     event: Any = None,
     gateway: Any = None,
     session_store: Any = None,
     **kwargs: Any,
 ) -> Optional[Dict[str, str]]:
-    """Unwrap the legacy ``/hermes`` form before the gateway resolves the command."""
+    """Unwrap the legacy ``/hermes`` form, and disable ``/undo``, before the gateway resolves the command."""
     try:
         original = getattr(event, "text", None)
         rewritten = rewrite_legacy_hermes_command(original)
+        # After the legacy unwrap, so "/hermes undo" is disabled the same way "/undo" is.
+        disabled = disable_undo_command(original if rewritten is None else rewritten)
+        if disabled is not None:
+            rewritten = disabled
         if rewritten is None or rewritten == original:
             return None
         logger.info("Rewrote legacy command %r to %r", original, rewritten)

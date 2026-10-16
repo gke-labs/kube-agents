@@ -49,6 +49,28 @@ resource "google_service_account" "agent" {
       condition     = (length(local.scope_selector_names) == 0 && var.scope.max_projects == local.scope_default_cap) || length(local.scope_listed_projects) <= local.scope_resolved_set_cap
       error_message = "The management project, scope.projects and the projects scope.shared_vpc_hosts and scope.metrics_scopes resolve to come to ${length(local.scope_listed_projects)} once each, past the resolved-set cap of ${local.scope_resolved_set_cap} (scope.max_projects, spec.scope.maxProjects on the CR): the reconcile lists the first ${local.scope_resolved_set_cap} of them, in that order, and reads the rest over-cap with nothing created under them, so their read roles would be reach the agent never uses. Raise scope.max_projects, declare fewer projects, a narrower selector, or a folder that holds them (a container's members are listed after these and bound on the container, not one by one). An exclude.projects entry lowers this count only when it names a project exactly: by ID for an entry in scope.projects or any selector member, and by number for a monitored project the selector alone reaches, which the resolver leaves out before naming it. A project both in scope.projects and monitored by a declared Metrics Scope that is excluded by its number alone is dropped by the reconcile but counted here, because the plan does not name a number the exclusion keeps it from reading; drop it from scope.projects, which the exclusion makes redundant. A glob is applied by the reconcile alone."
     }
+    # A container the resolver did not list while the pool is armed: the
+    # composition hands the resolver's container_members in; a caller that
+    # armed the pool beside a folder or organisation and skipped the listing
+    # would otherwise get the container's clusters refused by the broker, one
+    # by one, with Terraform saying nothing.
+    precondition {
+      condition     = !var.scoped_pool_enabled || local.scoped_pool_containers_listed
+      error_message = "scoped_pool_enabled is true and scope.folders or scope.organizations names a container that scope_container_members has no entry for (missing: ${join(", ", [for key in local.scoped_pool_container_keys : key if !contains(keys(var.scope_container_members), key)])}). The composition lists a container's members for the pool through kube-agents-scope-resolver; a module caller that arms the pool beside a container passes its container_members output here (list_container_members = true on the resolver, with folders and organizations set), as terraform/examples/full-install does. A container with no clusters is an empty list, not a missing key."
+    }
+    # The scoped service account pool (scoped_pool.tf) creates one account per
+    # listed project in project_id, against the host project's service-account
+    # quota, which the agent's own accounts, the project's default accounts and
+    # anything else in the project share. The cap is the operator's declared
+    # bound on the pool, not a reading of that quota: at its default of 100,
+    # GCP's default quota, a pool of ninety-odd can still pass here and hit the
+    # quota mid-apply, which is why the variable asks for the headroom the
+    # project actually has free. Held here, once, rather than on each member,
+    # so a pool past the bound is refused once rather than once per member.
+    precondition {
+      condition     = !var.scoped_pool_enabled || length(local.scoped_pool) <= var.scoped_pool_max_accounts
+      error_message = "The scoped service account pool would hold ${length(local.scoped_pool)} accounts (the management project, scope.projects, the projects the selectors resolve to and the members the declared folders and organisations list, once each, less an exact exclude.projects entry), past scoped_pool_max_accounts (${var.scoped_pool_max_accounts}), the bound declared on the pool from the service-account quota headroom ${var.project_id} has free (GCP's default quota is 100 per project, shared with the agent's own accounts and everything else there, and the plan cannot read it). Raise the quota in ${var.project_id} and then scoped_pool_max_accounts to the headroom free, declare fewer projects, or set scoped_pool_enabled = false to run on the agent's own identity."
+    }
   }
 }
 
@@ -67,15 +89,15 @@ locals {
   # is never null and that copy was unreachable -- a role list a reader would
   # take for the granted set while nothing bound it.
   #
-  # This local exists as the seam the scoped_clusters coupling goes back into.
+  # This local exists as the seam the scoped-pool coupling goes back into.
   # It was going to read:
   #
-  #   length(var.scoped_clusters) > 0
+  #   var.scoped_pool_enabled
   #   ? [for role in var.project_roles : role if role != "roles/container.viewer"]
   #   : var.project_roles
   #
-  # so populating scoped_clusters stripped container.viewer from the agent and
-  # relied on the pool to carry it per cluster. roles/container.viewer is what
+  # so arming the pool stripped container.viewer from the agent and relied on
+  # the pool to carry it per project. roles/container.viewer is what
   # lets an identity read Kubernetes objects in every cluster in the project;
   # without it the agent keeps roles/container.clusterViewer, which reaches the
   # Container API control plane -- listing clusters, `get-credentials` -- and

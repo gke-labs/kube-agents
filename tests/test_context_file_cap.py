@@ -19,8 +19,9 @@ Two ways that comes back, one check each:
 
 The rule itself is not restated here: what Hermes does with the pinned value is checked
 against the Hermes the image ships, by the build-time assertion in deploy/docker/Dockerfile
-(the platform stage's last RUN). This file is the half that needs no Hermes, so it runs in
-CI, where hermes-agent is not installed.
+(the platform stage's last RUN). That same RUN also asserts that Hermes auto-titling is
+disabled (_auto_title_enabled() is False) for each profile config (#2523). This file is the
+half that needs no Hermes, so it runs in CI, where hermes-agent is not installed.
 """
 
 import pathlib
@@ -78,6 +79,30 @@ class ContextFileCapTest(unittest.TestCase):
                 # bool is an int subclass, and Hermes would read `true` as a cap of 1.
                 self.assertIs(type(cap), int, f"{CAP_KEY} must be a plain integer, got {cap!r}")
                 self.assertGreater(cap, 0)
+
+    def test_every_profile_disables_auxiliary_title_generation(self):
+        profiles = shipped_profiles()
+        self.assertTrue(profiles, "found no agents/*/config.yaml to check")
+        for profile in profiles:
+            with self.subTest(profile=profile):
+                aux = effective_config(profile).get("auxiliary") or {}
+                title_gen = aux.get("title_generation") or {}
+                self.assertIs(
+                    title_gen.get("enabled"),
+                    False,
+                    f"agents/{profile}/config.yaml does not set auxiliary.title_generation.enabled "
+                    "to false, so Hermes fires a minimal-reasoning title request on every new session (#2523)",
+                )
+
+    def test_shared_defaults_disables_auxiliary_title_generation(self):
+        defaults = _load(SHARED_DEFAULTS)
+        aux = defaults.get("auxiliary") or {}
+        title_gen = aux.get("title_generation") or {}
+        self.assertIs(
+            title_gen.get("enabled"),
+            False,
+            "deploy/shared/defaults/config.yaml does not set auxiliary.title_generation.enabled to false (#2523)",
+        )
 
     def test_every_shipped_context_file_fits_its_profiles_cap(self):
         for profile in shipped_profiles():

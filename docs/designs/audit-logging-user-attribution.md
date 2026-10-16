@@ -56,14 +56,14 @@ Chat history cannot be the only join:
 
 ## 2. Existing Components
 
-| Component                            | Current behavior                                                                                              |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
-| **Managed OpenTelemetry for GKE**    | Provides an in-cluster OTLP endpoint and exports accepted signals to Google Cloud Observability               |
-| **Hermes OTel and session plugins**  | Add `hermes.sender.id`, `user.id`, and `session.id` to spans using authenticated gateway session metadata     |
-| **LiteLLM proxy**                    | Receives agent LLM calls and exports telemetry, but requester fields are a follow-up                          |
-| **Dedicated agent ServiceAccount**   | Gives Kubernetes audit entries a stable workload actor                                                        |
-| **Chat and tool audit records**      | Write structured records to standard output for collection by the platform logging agent                      |
-| **Kubernetes API-server audit logs** | Record the requesting ServiceAccount, verb, target resource, and timestamp independently of workload metadata |
+| Component                            | Current behavior                                                                                                                                                   |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Managed OpenTelemetry for GKE**    | Provides an in-cluster OTLP endpoint and exports accepted signals to Google Cloud Observability                                                                    |
+| **Hermes OTel and session plugins**  | Add `hermes.sender.id`, `user.id`, and `session.id` to spans using authenticated gateway session metadata                                                          |
+| **LiteLLM proxy**                    | Receives agent LLM calls and exports telemetry, but requester fields are a follow-up                                                                               |
+| **Dedicated agent ServiceAccount**   | Gives Kubernetes audit entries a stable workload actor                                                                                                             |
+| **Chat and tool audit records**      | Append structured records to the profile's `logs/audit.jsonl`, which the fluent-bit sidecar tails as JSON and streams to its stdout for the platform logging agent |
+| **Kubernetes API-server audit logs** | Record the requesting ServiceAccount, verb, target resource, and timestamp independently of workload metadata                                                      |
 
 The expensive storage and query pipelines already exist. The remaining work is to use consistent
 identity and correlation fields at each boundary.

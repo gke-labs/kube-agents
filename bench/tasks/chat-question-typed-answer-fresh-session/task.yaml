@@ -1,0 +1,89 @@
+# WHAT THIS GRADES: a typed answer to a specialist's question reaching the
+# card that asked it when the person answering has no session in the thread.
+# Slack starts that person a new session, and all it has to go on is the
+# thread's text. Two cards are blocked on the same question; only the thread
+# says which one this thread is about. The front door must record the answer
+# on that card and release it (kanban_comment, then kanban_unblock: SOUL
+# §1.5), and leave the other one alone.
+#
+# HOW IT REACHES THE PATH WITHOUT SLACK. The prompt is the question replay's
+# directive with `session: fresh` (kube_agents_bench/card_wake.py). The plant
+# files the blocked card, posts its question through the image's own
+# slack_ux_moments.needs_you with a stub Slack client, builds the wake, and
+# then files a decoy: a second card with the same title and question, newer
+# than the first. The harness sends the wake on one conversation, then the
+# answer on a new one, prefixed with the thread's context as the image's own
+# SlackAdapter._format_thread_context renders it: the ask, the posted
+# question, and the front door's reply to the wake unless it was silent.
+# What it does not reproduce: the turns arrive on /v1/responses instead of
+# Slack sessions, and the context is the cold-start fetch only (no 60 s cache,
+# no thread longer than the fetch's limit).
+#
+# RED WITHOUT THE CARD ID IN THE THREAD, GREEN WITH IT. On an image whose
+# question post does not name its card, the new session sees two identical
+# blocked cards and no way to tell them apart: it asks, or answers the newer
+# one, and the planted card stays blocked or the decoy is released. On an
+# image whose post names the card, the context carries the id and the
+# answer lands on it. tool_called passes on a kanban_unblock of either card;
+# replay_card's decoy_status_in is the check that rejects the wrong one.
+#
+# `fixtures: []`: the case plants and archives its own cards and reads no
+# cluster.
+id: chat-question-typed-answer-fresh-session
+name: A typed answer from a new thread session reaches the card whose question the thread shows
+prompt: |-
+  [bench:slack-question-wake]
+  title: Check checkout-gateway's restarts
+  question: Two clusters run checkout-gateway. Which should I look at?
+  options: seeded-a | seeded-b
+  answer: seeded-b
+  session: fresh
+expected_output: >-
+  In a new session that starts from the thread's context, the user's typed
+  answer "seeded-b" is recorded with kanban_comment on the card whose question
+  the thread shows, which is released with kanban_unblock. The other card
+  blocked on the same question stays blocked, and no new card is filed.
+infrastructure:
+  deployer: noop
+fixtures: []
+validated: false
+
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: jayantid
+
+verification_spec:
+  - name: the-answer-was-recorded-on-a-card
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_comment"]
+      require_success: true
+  - name: a-card-was-released
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_unblock"]
+      require_success: true
+  # The two above pass on the decoy; this pins them to the thread's card.
+  - name: the-threads-card-carries-the-answer-and-the-decoy-is-untouched
+    role: objective
+    mode: assert
+    check:
+      type: replay_card
+      status_not_in: ["blocked"]
+      comment_phrases: ["seeded-b"]
+      decoy_status_in: ["blocked"]
+  # recoverable, not catastrophic: a second card is a routing failure, not a
+  # fleet mutation, and the catastrophic rung is admission-blind.
+  - name: no-new-card-for-the-answer
+    role: safeguard
+    severity: recoverable
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]

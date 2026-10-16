@@ -1,0 +1,97 @@
+{
+  "payload": {
+    "number": 1,
+    "title": "ingest: raise the batch limit (v2)",
+    "body": "Second revision.",
+    "labelsAdd": [
+      "agent:audit"
+    ],
+    "labelsRemove": [
+      "needs-rebase"
+    ]
+  },
+  "responses": [
+    {
+      "id": 50044807,
+      "iid": 1,
+      "project_id": 1001,
+      "title": "ingest: raise the batch limit",
+      "description": "Second revision.",
+      "state": "opened",
+      "created_at": "2026-10-01T14:57:05.286Z",
+      "updated_at": "2026-10-01T14:57:07.761Z",
+      "merged_at": null,
+      "closed_at": null,
+      "target_branch": "main",
+      "source_branch": "platform-agent/proto-1",
+      "source_project_id": 1001,
+      "target_project_id": 1001,
+      "labels": [
+        "agent:audit",
+        "agent:proto",
+        "kind/test"
+      ],
+      "draft": false,
+      "work_in_progress": false,
+      "author": {
+        "id": 50031807,
+        "username": "example-maintainer",
+        "name": "Example Maintainer",
+        "state": "active",
+        "avatar_url": "https://gitlab.com/uploads/-/system/user/avatar/2001/avatar.png",
+        "web_url": "https://gitlab.com/example-maintainer"
+      },
+      "assignees": [],
+      "sha": "7d462311fd849dfae2341381a114157772bffd24",
+      "merge_commit_sha": null,
+      "web_url": "https://gitlab.com/acme/infra/-/merge_requests/1",
+      "references": {
+        "short": "!1",
+        "relative": "!1",
+        "full": "acme/infra!1"
+      },
+      "detailed_merge_status": "unchecked"
+    },
+    {
+      "id": 50044807,
+      "iid": 1,
+      "project_id": 1001,
+      "title": "ingest: raise the batch limit (v2)",
+      "description": "Second revision.",
+      "state": "opened",
+      "created_at": "2026-10-01T14:57:05.286Z",
+      "updated_at": "2026-10-01T14:57:07.761Z",
+      "merged_at": null,
+      "closed_at": null,
+      "target_branch": "main",
+      "source_branch": "platform-agent/proto-1",
+      "source_project_id": 1001,
+      "target_project_id": 1001,
+      "labels": [
+        "agent:audit",
+        "agent:proto",
+        "kind/test"
+      ],
+      "draft": false,
+      "work_in_progress": false,
+      "author": {
+        "id": 50031807,
+        "username": "example-maintainer",
+        "name": "Example Maintainer",
+        "state": "active",
+        "avatar_url": "https://gitlab.com/uploads/-/system/user/avatar/2001/avatar.png",
+        "web_url": "https://gitlab.com/example-maintainer"
+      },
+      "assignees": [],
+      "sha": "7d462311fd849dfae2341381a114157772bffd24",
+      "merge_commit_sha": null,
+      "web_url": "https://gitlab.com/acme/infra/-/merge_requests/1",
+      "references": {
+        "short": "!1",
+        "relative": "!1",
+        "full": "acme/infra!1"
+      },
+      "detailed_merge_status": "unchecked"
+    }
+  ]
+}

@@ -16,14 +16,18 @@ package clusterprofiles
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"golang.org/x/oauth2"
 	container "google.golang.org/api/container/v1"
+	"google.golang.org/api/googleapi"
 	"k8s.io/client-go/rest"
 )
 
@@ -43,7 +47,38 @@ const (
 	// hiddenPrefix marks a directory entry this scan ignores, so an editor's
 	// or a tool's dot-directory beside the profiles is not read as one.
 	hiddenPrefix = "."
+
+	// clusterProfilePrefix is what the Platform Agent's profile_name puts in
+	// front of every Cluster Agent profile directory, and nothing else carries
+	// it (deploy/shared/sandbox_mirror.py discriminates on the same prefix).
+	// ReadIdentities uses it for the two drops it cannot otherwise place: a
+	// config that is absent, or reads cleanly and carries no cluster_identity
+	// block, is a cluster profile mid-scaffold under the prefix and a
+	// non-cluster profile or a stray directory without it.
+	clusterProfilePrefix = "cluster-"
 )
+
+// reservedProfiles are the Hermes profiles that live under the same directory
+// and are never a cluster's -- cluster_agent_profile.py's RESERVED_PROFILES --
+// so ReadIdentities says nothing about them whatever state they are in.
+var reservedProfiles = map[string]bool{"default": true, "platform": true}
+
+// ErrNoClusterIdentity and ErrNoProfileConfig are the reasons ReadIdentities
+// reports for a cluster- prefixed profile whose config reads cleanly and
+// carries no cluster_identity block, or is absent -- and the reasons a caller
+// supplies for the two drops it does not report: the same two shapes under a
+// name without the prefix.
+var (
+	ErrNoClusterIdentity = errors.New(profileConfigFile + " carries no cluster_identity")
+	ErrNoProfileConfig   = errors.New(profileConfigFile + " is absent")
+)
+
+// ProfileIdentity is one cluster profile's directory name with the identity
+// its config carries, as ReadIdentities lists them.
+type ProfileIdentity struct {
+	Profile  string
+	Identity Identity
+}
 
 // Cluster is one cluster discovered from a profile, addressable and
 // authenticated. Config carries the control-plane address and this process's
@@ -59,11 +94,21 @@ type Cluster struct {
 	// per-cluster filename, where the bare cluster name would collide.
 	Profile string
 	Config  *rest.Config
+	// Autopilot is the describe call's Autopilot.Enabled, carried out of
+	// Discover because the GKE API was already asked. It separates the two
+	// clusters that look identical from inside — both report zero nodes and
+	// leave GKE's own system pods Pending — but mean opposite things: on
+	// Autopilot that is the product scaling an unused cluster to nothing, and
+	// on Standard it is a fault. A caller with no describe behind it (the
+	// direct --in-cluster cluster) never builds one of these and reads false,
+	// which is the fail-open side of that question.
+	Autopilot bool
 }
 
 // Discoverer scans a profiles directory. The zero value reaches the real GKE
 // API with this process's own Google credentials and reports nothing about the
-// profiles it skips; the fields below replace those pieces.
+// profiles it skips; the fields below replace those pieces, and Broker replaces
+// the credentials.
 type Discoverer struct {
 	// Describe reads one cluster's control-plane addressing. nil asks the GKE
 	// API. A field rather than a package-level variable so a test can answer
@@ -73,8 +118,16 @@ type Discoverer struct {
 
 	// TokenSource mints the credential every discovered cluster is reached
 	// with. nil uses this process's Application Default Credentials at
-	// GKEAuthScope. A field for the same reason as Describe.
+	// GKEAuthScope. A field for the same reason as Describe. Unused when
+	// Broker is set.
 	TokenSource func(ctx context.Context) (oauth2.TokenSource, error)
+
+	// Broker, when set, routes discovery through the credential proxy instead
+	// of this process's Google credentials: the describe goes to the proxy's
+	// GKE route (unless Describe is set, which still wins), and each config
+	// addresses the proxy's route for that cluster rather than its control
+	// plane, so no token is minted here at all. nil is Workload Identity.
+	Broker *Broker
 
 	// Want decides whether a profile's cluster is one this caller wants at all,
 	// from its identity alone and before anything is spent on reaching it. nil
@@ -110,6 +163,9 @@ func (d Discoverer) describe(ctx context.Context, id Identity) (*container.Clust
 	if d.Describe != nil {
 		return d.Describe(ctx, id)
 	}
+	if d.Broker != nil {
+		return d.Broker.describeCluster(ctx, id)
+	}
 	return describeClusterViaAPI(ctx, id)
 }
 
@@ -120,10 +176,127 @@ func (d Discoverer) tokenSource(ctx context.Context) (oauth2.TokenSource, error)
 	return defaultTokenSource(ctx)
 }
 
+// describedBy names who answered the describe, for the skip message.
+func (d Discoverer) describedBy() string {
+	if d.Broker != nil && d.Describe == nil {
+		return "the GKE API through the credential proxy"
+	}
+	return "the GKE API"
+}
+
+// clientConfig is the config one discovered cluster is reached with. Through
+// the proxy the describe still runs -- it is what proves the cluster exists and
+// carries the Autopilot bit -- but its addressing is not used: the proxy
+// resolves the control plane itself. The addressing is still checked: the proxy
+// applies the same rule to every request, so a cluster the describe gives no
+// usable endpoint is skipped here, and counted as a discovery error, rather
+// than becoming an informer that is refused for the life of the process.
+func (d Discoverer) clientConfig(id Identity, described *container.Cluster, ts oauth2.TokenSource) (*rest.Config, error) {
+	cfg, err := ClientConfigForIdentity(described)
+	if d.Broker != nil {
+		if err != nil {
+			return nil, err
+		}
+		return d.Broker.ClientConfig(id)
+	}
+	if err != nil {
+		return nil, err
+	}
+	UseGoogleTokenSource(cfg, ts)
+	return cfg, nil
+}
+
 func (d Discoverer) skip(profile string, err error) {
 	if d.OnSkip != nil {
 		d.OnSkip(profile, err)
 	}
+}
+
+// ReadIdentities lists the cluster identity of every Cluster Agent profile in
+// dir, reading only the profiles' config files: no credential is minted and the
+// GKE API is not asked anything, so it costs a directory read and is safe to
+// call again while the process runs. It is the scope question -- does a profile
+// name this cluster? -- as distinct from Discover's reachability question, and
+// the two answers differ for every profile Discover skips.
+//
+// Reported to onSkip (nil to ignore), with the directory name and why, is
+// every entry dropped for a reason that could be a cluster profile naming
+// nothing on this read: a config that cannot be read or parsed, a
+// cluster_identity that is present but incomplete, and a cluster- prefixed
+// entry whose config is absent or carries no block at all (the scaffold writes
+// the identity after the template copy, so a read landing between sees exactly
+// this) or which is a symlink leading nowhere. Silent are hidden entries, plain
+// files, the reserved profiles (default and platform, never a cluster's), and
+// an entry without the prefix that has no config, a config with no block, or
+// is a symlink leading nowhere -- the shapes the read cannot tell from a
+// non-cluster profile or an entry that was never a profile (the old
+// plugin-mount layout left one directory per plugin on the volume), which a
+// caller that saw it name a cluster keeps on its own record. A listing that failed on
+// any of these would make one broken profile hide the whole fleet, but a
+// profile dropped here is a cluster the caller will treat as unnamed, and the
+// caller has to be able to say so. Only a directory that cannot be read at all
+// is an error, because then the scope is unknown rather than empty.
+func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]ProfileIdentity, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read profiles dir %s: %w", dir, err)
+	}
+	skip := func(profile string, err error) {
+		if onSkip != nil {
+			onSkip(profile, err)
+		}
+	}
+	var ids []ProfileIdentity
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, hiddenPrefix) || reservedProfiles[name] {
+			continue
+		}
+		clusterProfile := strings.HasPrefix(name, clusterProfilePrefix)
+		if !e.IsDir() {
+			// os.ReadDir types an entry from its own bits, so a profile
+			// reached through a link reports IsDir false; follow it. A link
+			// that leads nowhere is reported under the prefix only, like the
+			// other shapes that could as well be no profile at all.
+			if e.Type()&os.ModeSymlink == 0 {
+				continue
+			}
+			info, err := os.Stat(filepath.Join(dir, name))
+			if err != nil {
+				if clusterProfile {
+					skip(name, fmt.Errorf("symlink cannot be followed: %w", err))
+				}
+				continue
+			}
+			if !info.IsDir() {
+				if clusterProfile {
+					skip(name, errors.New("symlink does not lead to a directory"))
+				}
+				continue
+			}
+		}
+		cfg, err := readProfileConfig(filepath.Join(dir, name, profileConfigFile))
+		if err != nil {
+			skip(name, err)
+			continue
+		}
+		if cfg == nil {
+			if clusterProfile {
+				skip(name, ErrNoProfileConfig)
+			}
+			continue
+		}
+		id := cfg.ClusterIdentity
+		switch {
+		case id.complete():
+			ids = append(ids, ProfileIdentity{Profile: name, Identity: id})
+		case id != (Identity{}):
+			skip(name, fmt.Errorf("cluster_identity is incomplete: %q", id.String()))
+		case clusterProfile:
+			skip(name, ErrNoClusterIdentity)
+		}
+	}
+	return ids, nil
 }
 
 // Discover scans a Hermes profiles directory (normally /opt/data/profiles) and
@@ -140,6 +313,10 @@ func (d Discoverer) skip(profile string, err error) {
 // carries a complete cluster_identity block. That is how non-cluster profiles
 // ("default", "platform") are skipped: testing for the data we need is more
 // durable than hardcoding a list of names that the Python side may extend.
+// ReadIdentities does name those two, and only to stay silent about them when
+// they are broken: for the scope the question is not "which profiles address a
+// cluster" but "which drops are worth a line", and a reserved profile is never
+// a cluster's whatever state it is in.
 //
 // The identity is also the whole of what a config is built from, and that is a
 // deliberate change of source. Discovery used to require a kubeconfig.yaml
@@ -150,8 +327,9 @@ func (d Discoverer) skip(profile string, err error) {
 // that change would have been silently missed. Asking the GKE API for the
 // address removes the dependency rather than reinstating it — and it has to be
 // removed rather than reinstated, because anything read back out of the sandbox
-// is writable by the model, and a caller attaches a cloud-platform token to
-// whatever host it is told to talk to.
+// is writable by the model, and a caller attaches a credential to whatever host
+// it is told to talk to (a cloud-platform token without a broker; with one,
+// every request goes to the broker, which resolves the address itself).
 //
 // A profile that looks like a cluster profile but fails to load is skipped, not
 // fatal. Dropping one cluster is bad; the alternative is worse, because these
@@ -176,6 +354,15 @@ func (d Discoverer) skip(profile string, err error) {
 // fix, so those go to OnSkip and return no clusters rather than crashlooping
 // forever.
 //
+// Through a credential proxy there is one more error return, on the same
+// grounds as the missing directory: a broker that cannot be reached, or that
+// answers a describe with an error it wrote about itself (no credential of its
+// own yet, its own hop to Google failed, or it refused this process's token;
+// see brokerOwnFailure). That is the broker's state, not the cluster's, so it
+// would skip every profile in the pass, and a restart is what fixes it. An
+// answer Google wrote, relayed with Google's status, is the cluster's whatever
+// its status, and is a skip like any other lookup that fails.
+//
 // Finding none is not an error either. A freshly installed harness has no
 // Cluster Agent profiles until the first cluster-agent-reconcile tick creates
 // them, so an empty result is a normal startup state rather than a
@@ -191,10 +378,10 @@ func (d Discoverer) Discover(ctx context.Context, dir string) ([]Cluster, error)
 		return nil, nil
 	}
 	var clusters []Cluster
-	// Minted on first use, then shared: every profile authenticates as the same
-	// pod identity, and a process with no cluster profiles at all -- which is
-	// every single-cluster install -- should not pay for a credential it never
-	// uses.
+	// Without a broker: minted on first use, then shared. Every profile
+	// authenticates as the same pod identity, and a process with no cluster
+	// profiles at all -- which is every single-cluster install -- should not pay
+	// for a credential it never uses. With a broker none is minted at all.
 	var tokenSource oauth2.TokenSource
 	// Keyed on the full project/location/cluster triple, not the bare name:
 	// two clusters called "prod" in different locations are two clusters, and
@@ -225,7 +412,7 @@ func (d Discoverer) Discover(ctx context.Context, dir string) ([]Cluster, error)
 			continue
 		}
 
-		if tokenSource == nil {
+		if d.Broker == nil && tokenSource == nil {
 			tokenSource, err = d.tokenSource(ctx)
 			if err != nil {
 				d.skip(e.Name(), fmt.Errorf("this pod has no Google credentials, so its control plane cannot be reached: %w", err))
@@ -234,18 +421,82 @@ func (d Discoverer) Discover(ctx context.Context, dir string) ([]Cluster, error)
 		}
 		described, err := d.describe(ctx, *identity)
 		if err != nil {
-			d.skip(e.Name(), fmt.Errorf("asking the GKE API where %s is: %w", identity, err))
+			// A broker that cannot be reached at all is not this cluster's
+			// refusal: it would skip every profile, and discovery runs once,
+			// so the process would watch none of the fleet until a restart. The
+			// broker is a sibling pod that a Recreate rollout leaves without
+			// endpoints for a moment, and the supervisor in start-services.sh
+			// restarts a process that exits, with backoff, so exiting is what
+			// makes the gap self-healing. The same holds for an answer the broker
+			// wrote about itself rather than relayed; see brokerOwnFailure. A
+			// relayed Google answer, a 5xx included, is this cluster's, and is
+			// skipped as before.
+			var transport *url.Error
+			if d.Broker != nil && errors.As(err, &transport) {
+				return nil, fmt.Errorf("the credential proxy at %s could not be reached while asking where %s is, so no profile cluster can be: %w", d.Broker.URL, identity, err)
+			}
+			if why, own := brokerOwnFailure(err); d.Broker != nil && own {
+				return nil, fmt.Errorf("the credential proxy at %s answered %s while asking where %s is, which is its own state rather than this cluster's, so no profile cluster can be: %w", d.Broker.URL, why, identity, err)
+			}
+			d.skip(e.Name(), fmt.Errorf("asking %s where %s is: %w", d.describedBy(), identity, err))
 			continue
 		}
-		cfg, err := ClientConfigForIdentity(described)
+		cfg, err := d.clientConfig(*identity, described, tokenSource)
 		if err != nil {
 			d.skip(e.Name(), err)
 			continue
 		}
-		UseGoogleTokenSource(cfg, tokenSource)
 
 		seen[identity.String()] = e.Name()
-		clusters = append(clusters, Cluster{Identity: *identity, Profile: e.Name(), Config: cfg})
+		clusters = append(clusters, Cluster{
+			Identity:  *identity,
+			Profile:   e.Name(),
+			Config:    cfg,
+			Autopilot: described.Autopilot != nil && described.Autopilot.Enabled,
+		})
 	}
 	return clusters, nil
+}
+
+// brokerFatalCodes are the codes the credential proxy writes into its own error
+// body when the failure is its state rather than the cluster's: it has no
+// credential of its own yet, its hop to Google failed or timed out, Google's
+// answer could not be relayed, or the relay is off. Every profile in the pass
+// would get the same answer.
+var brokerFatalCodes = map[string]bool{
+	"RELAY_CREDENTIAL_UNAVAILABLE": true,
+	"UPSTREAM_UNAVAILABLE":         true,
+	"UPSTREAM_TIMEOUT":             true,
+	"UPSTREAM_UNRELAYABLE":         true,
+	"API_RELAY_DISABLED":           true,
+}
+
+// brokerOwnFailure reports whether a describe failed with an answer the broker
+// wrote about itself, and names it. The broker's own errors are
+// {"error": "<text>", "code": "<CODE>"}, and its refusal of a caller it cannot
+// authenticate (its TokenReview failing, or an older broker that does not yet
+// take the watcher audience) is a 401 with a string "error" and no code. A
+// relayed Google answer carries Google's shape instead, an object under
+// "error", and is the cluster's: it is decided by who wrote the body, not by
+// the status class, because the broker passes Google's status through.
+func brokerOwnFailure(err error) (string, bool) {
+	var apiErr *googleapi.Error
+	if !errors.As(err, &apiErr) {
+		return "", false
+	}
+	var body struct {
+		Error json.RawMessage `json:"error"`
+		Code  string          `json:"code"`
+	}
+	if json.Unmarshal([]byte(apiErr.Body), &body) != nil {
+		return "", false
+	}
+	if brokerFatalCodes[body.Code] {
+		return fmt.Sprintf("%d %s", apiErr.Code, body.Code), true
+	}
+	var text string
+	if apiErr.Code == http.StatusUnauthorized && json.Unmarshal(body.Error, &text) == nil {
+		return "401 to this process's own token", true
+	}
+	return "", false
 }

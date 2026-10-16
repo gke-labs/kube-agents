@@ -201,6 +201,33 @@ class CausalFlowProjectionTest(unittest.TestCase):
         )
         self.assertFalse(any(label.startswith("unknown") for label in labels))
 
+    def test_chart_labels_runtime_attributes_without_the_runtime_name(self):
+        figure = causality_sankey(
+            [
+                event(
+                    "sender-only",
+                    "model",
+                    span_name="api.model-default",
+                    origin={"otel.hermes.sender.id": "sender-one"},
+                ),
+                event(
+                    "kind-only",
+                    "model",
+                    span_name="api.model-default",
+                    origin={"otel.hermes.session.kind": "session"},
+                ),
+            ]
+        )
+
+        labels = tuple(figure.data[0].node.label)
+        self.assertIn("sender-one (sender.id · 1 session)", labels)
+        self.assertIn("session (session.kind · 1 session)", labels)
+        self.assertFalse(any("hermes" in label for label in labels))
+        detail = figure.data[0].node.customdata[
+            labels.index("sender-one (sender.id · 1 session)")
+        ]
+        self.assertIn("hermes.sender.id=sender-one", detail)
+
 
 if __name__ == "__main__":
     unittest.main()

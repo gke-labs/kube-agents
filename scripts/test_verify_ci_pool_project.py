@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
@@ -239,6 +240,12 @@ class RequiredApisTest(unittest.TestCase):
     def test_compute_api_is_required(self):
         # bench/tf/fleet declares google_compute_disk directly.
         self.assertIn("compute.googleapis.com", checker.REQUIRED_APIS)
+
+    def test_cloudtrace_api_is_required(self):
+        # The observability nightly case reads traces through the broker's
+        # relay on roles/cloudtrace.user; a project with the role and the API
+        # off fails it with SERVICE_DISABLED, which this check exists to catch.
+        self.assertIn("cloudtrace.googleapis.com", checker.REQUIRED_APIS)
 
     def test_all_apis_enabled_passes(self):
         with mock.patch.object(checker, "run_cmd") as run:
@@ -641,6 +648,27 @@ class SeededFleetFixturesTest(unittest.TestCase):
             env = run.call_args_list[1].kwargs["env"]
         self.assertEqual("reader@p.iam.gserviceaccount.com", env["FLEET_READONLY_SA"])
         self.assertNotIn("FLEET_ALLOW_RUNNER_CREDENTIAL", env)
+
+    def test_a_role_the_runner_could_not_read_is_unverified_not_a_failure(self):
+        # The runner counts a role whose presence probe failed for a reason
+        # other than NotFound into the unresolved count and says why; the
+        # check reads that line as a cluster it could not reach, so the
+        # project is not failed for a fixture nobody looked at.
+        warning = (
+            "WARNING: deployment/inventory-api could not be read from a.kubeconfig in kube-agents-evals-5 "
+            "(Error from server (Forbidden): deployments.apps is forbidden), so fixture role 'stalled-controller' "
+            "could not be checked. Its checks will report status=error rather than blaming the run."
+        )
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", warning + "\n" + self._summary(self._roles() - 1, unresolved=1)),
+                (0, "", self._state(self._roles() - 1, unchecked=1)),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertIn("not checked", result.message)
+        self.assertTrue(any("could not be reached" in w for w in result.warnings), result.warnings)
 
     def test_a_reader_the_operator_cannot_mint_is_unverified_not_a_failure(self):
         # The runner's exit 3 carries gcloud's own refusal, which the denial
@@ -1122,7 +1150,7 @@ class SeededFleetFixturesTest(unittest.TestCase):
         wrong = checker._FLEET_LOOKED_AND_FOUND_WRONG.pattern.split("|")
         unreachable = checker._FLEET_UNREACHABLE.pattern.split("|")
         self.assertEqual(5, len(wrong))
-        self.assertEqual(3, len(unreachable))
+        self.assertEqual(4, len(unreachable))
         for phrase in [*wrong, *unreachable, checker._FLEET_COULD_NOT_LOOK.pattern]:
             with self.subTest(phrase=phrase):
                 self.assertRegex(text, phrase)
@@ -1898,7 +1926,7 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             "no declares": "has no `declares` list",
             "other object": "no declares item is check no-pdb",
             "strings but no structure": "not valid YAML",
-            "empty cluster": "the parser skipped every item",
+            "empty cluster": "no declares item is check no-pdb for Deployment/notification-relay in seeded-intent",
             "another cluster": "name cluster seeded-b",
             "unquoted impossible date": "not valid YAML (ValueError)",
             "null declares": "has no `declares` list",
@@ -1913,8 +1941,12 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
                 run.side_effect = [_ok(self._contents(body, sha="deadbeef"))]
                 result = checker.check_gitops_declaration("kube-agents-evals-3")
                 self.assertFalse(result.passed, label)
-                self.assertIn("the audit reads no declaration from it", result.message)
+                self.assertIn("the audits do not read every declaration the fixture needs from it", result.message)
                 self.assertIn(reasons[label], result.message, label)
+                if label == "empty cluster":
+                    # One item skipped, the other parsed: the diagnosis names
+                    # the missing item, never the whole-note fallback.
+                    self.assertNotIn("skipped every item", result.message)
                 self.assertIn("-f sha=deadbeef", result.message)
         # And what the audit accepts, this accepts: the `...` closer and the
         # spellings the join key folds to one.
@@ -2018,11 +2050,27 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         self.assertEqual(checker.GITOPS_INTENT_NOTE_CONTENT + "\n", body)
         self.assertIsNone(checker._note_declaration_problem(body, "gke-agentic/kube-agents-evals-3-infra"))
 
-    def test_the_declarable_set_is_the_audits(self):
-        # The check asks the audit which slugs a note may justify; the fixture's
-        # check has to be one of them, or the note it seeds declares nothing.
+    def test_the_declarable_sets_are_the_audits(self):
+        # The check asks each audit which slugs a note may justify; every
+        # fixture declaration's check has to be in its stream's set, or the
+        # note it seeds declares nothing there.
         audit = checker._load_audit_report()
-        self.assertIn(checker.GITOPS_INTENT_NOTE_DECLARATION["check"], audit.audit_declarable_checks(checker.GITOPS_INTENT_NOTE_AUDIT))
+        for stream, item in checker.GITOPS_INTENT_NOTE_DECLARATIONS:
+            with self.subTest(stream):
+                self.assertIn(item["check"], audit.audit_declarable_checks(stream))
+
+    def test_a_note_missing_one_of_its_declarations_fails(self):
+        # The fixture rests on four postures in one note; a note that declares
+        # only the budget leaves the compliance case failing on that project.
+        good = checker.GITOPS_INTENT_NOTE_CONTENT
+        only_pdb = good.replace("  - check: netpol-missing\n    namespace: seeded-intent\n    object: Namespace/seeded-intent\n", "")
+        self.assertNotEqual(good, only_pdb)
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(only_pdb, sha="deadbeef"))]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+        self.assertIn("no declares item is check netpol-missing for Namespace/seeded-intent in seeded-intent", result.message)
+        self.assertIn("-f sha=deadbeef", result.message)
 
     def test_the_note_the_verifier_names_is_the_one_provisioning_seeds(self):
         # One note, defined twice: the script seeds it, the verifier reads it
@@ -3076,15 +3124,23 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
     """This check must attest the credential hack/ci-eval-pr.sh actually mints.
 
     The App, its installation, and the variable the token lands in are written
-    in three files that do not read each other -- here, hack/ci-eval-pr.sh, and
+    in four files that do not read each other -- here, hack/ci-eval-pr.sh,
+    hack/ledger_token_mint.py (whose defaults are what step 0 mints with, since
+    hack/ci-revalidate.sh exports neither id), and
     bench/kube_agents_bench/verifiers.py. Change one and this check goes on
     reporting a project healthy against a credential CI no longer uses. Parsed
     rather than imported: the verifier is deliberately dependency-free, bench is
-    an installable package, and the third file is shell.
+    an installable package, one file is shell, and the mint runs at import.
     """
 
     def setUp(self):
         self.script = (checker._ROOT / "hack" / "ci-eval-pr.sh").read_text()
+        self.mint = (checker._ROOT / "hack" / "ledger_token_mint.py").read_text()
+
+    def _module_default(self, name):
+        m = re.search(rf'^{name} = "([^"]+)"$', self.mint, re.M)
+        self.assertIsNotNone(m, f"could not find {name} in hack/ledger_token_mint.py")
+        return m.group(1)
 
     def _default(self, name):
         m = re.search(rf'^export {name}="\$\{{{name}:-([^}}]+)\}}"', self.script, re.M)
@@ -3095,6 +3151,12 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
         self.assertEqual(str(checker.LEDGER_APP_ID), self._default("EVAL_LEDGER_APP_ID"))
         self.assertEqual(
             str(checker.LEDGER_INSTALLATION_ID), self._default("EVAL_LEDGER_INSTALLATION_ID")
+        )
+
+    def test_the_app_and_installation_match_the_mint_modules_defaults(self):
+        self.assertEqual(str(checker.LEDGER_APP_ID), self._module_default("DEFAULT_LEDGER_APP_ID"))
+        self.assertEqual(
+            str(checker.LEDGER_INSTALLATION_ID), self._module_default("DEFAULT_LEDGER_INSTALLATION_ID")
         )
 
     def test_the_probe_asks_for_the_reads_the_grading_mint_asks_for(self):
@@ -3120,13 +3182,15 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
         mint = re.search(r"^mint_ledger_token\(\) \{.*?^\}", self.script, re.S | re.M)
         self.assertIsNotNone(mint, "could not find mint_ledger_token in hack/ci-eval-pr.sh")
         body = mint.group(0)
-        failure = re.search(r'^    if \[ "\$\{rc\}".*?^    fi', body, re.S | re.M)
+        failure = re.search(r'^    if \[ "\$\{rc\}" -ne .*?^    fi', body, re.S | re.M)
         self.assertIsNotNone(failure, "could not find the branch that gives up on the mint")
         self.assertNotIn("BENCH_GITHUB_TOKEN", failure.group(0))
         # Non-zero rather than `exit`: the unit call site holds two locks by the
         # time it mints, and exiting there would strand them for lock_acquire's
-        # full timeout. Each caller unwinds its own scope instead.
+        # full timeout. Each caller unwinds its own scope instead. Which
+        # non-zero says whether the last attempt was transient.
         self.assertIn("return 1", failure.group(0))
+        self.assertIn('return "${LEDGER_MINT_RETRYABLE}"', failure.group(0))
         self.assertIsNone(re.search(r"\bexit\b", body))
         # And the token is assigned once, below the retry loop rather than on
         # any path through it. tests/test_ci_eval_ledger_mint.py executes what
@@ -3154,15 +3218,20 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
     def test_a_unit_that_cannot_mint_releases_what_it_holds(self):
         # Returning without releasing would park every sibling for lock_acquire's
         # timeout and grade their repetitions MISSING.
+        # The branch hands skip_unit everything taken before the mint, and
+        # skip_unit releases it; tests/test_ci_eval_ledger_mint.py runs the
+        # pair.
         branch = re.search(
-            r"^  if ! mint_ledger_token .*?^  fi", self._unit(), re.S | re.M
+            r'^  if \[ "\$\{mint_rc\}" -ne 0 \]; then.*?^  fi', self._unit(), re.S | re.M
         )
         self.assertIsNotNone(branch, "could not find the unit's mint-failure branch")
-        # The task lock, the infra lock and, for a ledger-writing case, the
-        # stream lock: everything taken before the mint.
-        self.assertEqual(3, branch.group(0).count("lock_release"))
-        self.assertIn("lock-stream-", branch.group(0))
+        self.assertIn('skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}"', branch.group(0))
         self.assertIn("return 0", branch.group(0))
+        skip = re.search(r"^skip_unit\(\) \{.*?^\}", self.script, re.S | re.M)
+        self.assertIsNotNone(skip, "could not find skip_unit in hack/ci-eval-pr.sh")
+        # The task lock, the infra lock and every stream lock the case holds.
+        self.assertEqual(2, skip.group(0).count("lock_release"))
+        self.assertIn('release_streams "${streams}"', skip.group(0))
 
     def test_every_bench_invocation_is_preceded_by_a_mint(self):
         # #1057 rewrote the serial repetition loop into a fan-out of background
@@ -3788,7 +3857,7 @@ class IamGrantsTest(unittest.TestCase):
 class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
     """PLATFORM_GSA_ROLES must equal the roles the install actually grants.
 
-    Hardcoding the nine roles is what lets this check run without a Terraform
+    Hardcoding the ten roles is what lets this check run without a Terraform
     toolchain, and it is also how the two drift apart. Without this test,
     narrowing the granted set would leave every correctly-provisioned project
     failing verification weeks later, with nothing pointing at Terraform as the
@@ -3878,11 +3947,161 @@ class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
         self.assertEqual(self._loop_members(page, "docs/ci-pool-projects.md"), set(self._MEMBER_VARS))
 
 
+# What each resource and data-source type under bench/tf/fleet needs from the
+# reconciler's project roles. A fixture pull request that adds a type this
+# table does not know is red until its author (1) maps the type here, (2) adds
+# any role it needs to FLEET_RECONCILER_ROLES, the loop in
+# scripts/provision_ci_pool_project.sh and the repair block in
+# docs/ci-pool-projects.md section 3, and (3) has the pool owner grant it on
+# every registered project before the merge. The stack grants the reconciler
+# nothing for itself, by design (a merge to main must not widen the writer),
+# so the role has to be on the project before the first apply that needs it:
+# the stack's startup-fail VM shipped without compute.instanceAdmin.v1 and the
+# first on-merge apply failed on each project it reached.
+# compute.viewer: the GKE provider lists each node pool's instance group
+# managers on refresh (the provisioning script's comment, seen live 2026-09-28),
+# and the compute provider reads the VM's zone and image. iam.serviceAccountUser:
+# every node pool runs as the stack's own node service account, which is an
+# act-as. serviceusage.serviceUsageConsumer is held for the provider itself,
+# whose calls name the project as their quota project (FLEET_PROVIDER_ROLES).
+FLEET_RESOURCE_ROLES = {
+    "google_container_cluster": {"roles/container.admin", "roles/compute.viewer", "roles/iam.serviceAccountUser"},
+    "google_container_node_pool": {"roles/container.admin", "roles/compute.viewer", "roles/iam.serviceAccountUser"},
+    "google_compute_disk": {"roles/compute.storageAdmin"},
+    "google_compute_firewall": {"roles/compute.securityAdmin", "roles/compute.viewer"},
+    "google_compute_instance": {"roles/compute.instanceAdmin.v1", "roles/compute.viewer"},
+    "google_service_account": {"roles/iam.serviceAccountAdmin"},
+    "google_service_account_iam_member": {"roles/iam.serviceAccountAdmin"},
+    "google_project_iam_member": {"roles/resourcemanager.projectIamAdmin"},
+    "terraform_data": set(),
+    # Data sources: reads the plan makes before anything is created. external
+    # runs bench/tf/fleet/seeded_b_pin.py, whose reads are `gcloud container
+    # get-server-config` and `clusters describe` as the reconciler.
+    "external": {"roles/container.admin"},
+    "google_client_config": set(),
+}
+# Every kubernetes_* resource is an in-cluster write, which container.admin
+# grants through the GKE IAM webhook.
+FLEET_KUBERNETES_ROLES = {"roles/container.admin"}
+# Needed by every google_* call regardless of type.
+FLEET_PROVIDER_ROLES = {"roles/serviceusage.serviceUsageConsumer"}
+
+
+class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
+    """Every resource type the fleet stack declares maps to roles the reconciler holds."""
+
+    _FLEET = checker._ROOT / "bench" / "tf" / "fleet"
+    # The scan reads *.tf files through the repository's HCL tokenizer
+    # (tests/test_terraform_module_tests.py: comments dropped, strings and
+    # heredocs one token each, templates followed) and takes the resource and
+    # data blocks at depth 0. Anything else tofu might load is refused rather
+    # than enumerated: a file that is not *.tf and not one of the directory's
+    # known inert files, a top-level block kind that is neither read nor known
+    # to load no provider, and a read block whose header the scan cannot read.
+    # The names tofu's loader skips are skipped here too, so a parked file
+    # neither demands a role nor keeps one accounted for.
+    # seeded_b_pin.py is the program data.external runs, not something tofu
+    # loads; its reads are accounted for on the external type above.
+    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py"}
+    _READ_BLOCKS = {"resource", "data"}
+    # moved renames a state address and declares no resource: the type it
+    # names is read from the resource block it points at.
+    _INERT_BLOCKS = {"terraform", "provider", "variable", "output", "locals", "moved"}
+
+    @staticmethod
+    def _tokenizer():
+        # Imported here, not at module level: the tokenizer lives in a test
+        # module that loads PyYAML, which the rest of this file runs without.
+        if str(checker._ROOT) not in sys.path:
+            sys.path.insert(0, str(checker._ROOT))
+        from tests import test_terraform_module_tests as hcl
+        return hcl
+
+    @staticmethod
+    def _tofu_ignores(name):
+        # configs.IsIgnoredFile in tofu: dot-prefixed, ~-suffixed, #...#.
+        return name.startswith(".") or name.endswith("~") or (name.startswith("#") and name.endswith("#"))
+
+    def _headers(self, fleet=None):
+        """(kind, label tokens) for every top-level block in the stack."""
+        hcl, headers = self._tokenizer(), []
+        for path in sorted((fleet or self._FLEET).glob("*.tf")):
+            if self._tofu_ignores(path.name):
+                continue
+            tokens, depth, start = hcl._tokens(path.read_text()), 0, 0
+            for index, token in enumerate(tokens):
+                if token[0] == hcl._OPEN:
+                    if depth == 0:
+                        # The header is every token since the previous
+                        # top-level block closed: the keyword, then the labels,
+                        # whatever they are (a naked label is a label, not a kind).
+                        head = tokens[start:index]
+                        self.assertTrue(head and head[0][0] == hcl._WORD, f"{path.name}: a top-level block with no keyword before its brace: {head!r}")
+                        headers.append((head[0][1], head[1:]))
+                    depth += 1
+                elif token[0] == hcl._CLOSE:
+                    depth -= 1
+                    if depth == 0:
+                        start = index + 1
+            self.assertEqual(depth, 0, f"{path.name}: unbalanced braces after tokenizing; the scan cannot trust this file")
+        return headers
+
+    def _types(self):
+        hcl, types = self._tokenizer(), set()
+        for kind, labels in self._headers():
+            if kind in self._READ_BLOCKS:
+                self.assertTrue(len(labels) == 2 and all(l[0] == hcl._STR for l in labels), f"a {kind} block whose header the scan cannot read: {labels!r}; write it as tofu fmt does")
+                types.add(labels[0][1])
+        self.assertGreater(len(types), 10)
+        return types
+
+    def _strangers(self, fleet):
+        return sorted(p.name for p in fleet.iterdir() if p.is_file() and not self._tofu_ignores(p.name) and not p.name.endswith(".tf") and p.name not in self._INERT_FILES)
+
+    def test_the_scan_sees_everything_tofu_would_load(self):
+        self.assertEqual(self._strangers(self._FLEET), [], "a file the scan does not read (tofu also loads *.tofu, *.tf.json, *.tofu.json): extend the scan or name it inert here")
+        kinds = sorted({kind for kind, _ in self._headers()} - self._READ_BLOCKS - self._INERT_BLOCKS)
+        self.assertEqual(kinds, [], "a top-level block kind the scan does not read (module, ephemeral, action, ...): extend the scan")
+
+    def test_files_tofu_ignores_do_not_drive_the_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fleet = pathlib.Path(tmp)
+            (fleet / "main.tf").write_text('resource "google_live" "a" {}\n')
+            for parked in (".parked.tf", "main.tf~", "#main.tf#"):
+                (fleet / parked).write_text('resource "google_parked" "b" {}\n')
+            self.assertEqual([labels[0][1] for _, labels in self._headers(fleet)], ["google_live"])
+            self.assertEqual(self._strangers(fleet), [])
+
+    def test_every_type_in_the_stack_is_mapped_and_its_roles_are_held(self):
+        unmapped, unheld = [], []
+        for rtype in sorted(self._types()):
+            needed = FLEET_KUBERNETES_ROLES if rtype.startswith("kubernetes_") else FLEET_RESOURCE_ROLES.get(rtype)
+            if needed is not None and rtype.startswith("google_"):
+                needed = needed | FLEET_PROVIDER_ROLES
+            if needed is None:
+                unmapped.append(rtype)
+            elif not needed <= checker.FLEET_RECONCILER_ROLES:
+                unheld.append((rtype, sorted(needed - checker.FLEET_RECONCILER_ROLES)))
+        self.assertEqual(unmapped, [], "a new resource or data-source type in bench/tf/fleet: follow the three steps in the comment above FLEET_RESOURCE_ROLES")
+        self.assertEqual(unheld, [], "the reconciler lacks a role a mapped type needs")
+
+    def test_the_table_carries_no_type_the_stack_no_longer_uses(self):
+        self.assertEqual(sorted(set(FLEET_RESOURCE_ROLES) - self._types()), [])
+
+    def test_every_granted_role_is_accounted_for_by_a_type_or_the_provider(self):
+        # The reverse direction: a role in the reconciler's set that no type
+        # and not the provider needs is either a stale grant or a type the
+        # table maps too thinly (the leg that would miss compute.viewer gone).
+        accounted = set().union(FLEET_PROVIDER_ROLES, FLEET_KUBERNETES_ROLES, *FLEET_RESOURCE_ROLES.values())
+        self.assertEqual(sorted(checker.FLEET_RECONCILER_ROLES - accounted), [], "a reconciler role no mapped type needs: map the type that needs it, or drop the grant")
+        self.assertLessEqual(FLEET_PROVIDER_ROLES, checker.FLEET_RECONCILER_ROLES)
+
+
 class FleetReconcilerRolesMatchGrantersTest(unittest.TestCase):
     """FLEET_RECONCILER_ROLES and its member must equal the provisioning loop and the runbook's repair block.
 
     Same silent drift as the runners': a role dropped from the script leaves a
-    project the verifier passes and the weekly reconcile fails in.
+    project the verifier passes and the daily reconcile fails in.
     """
 
     _VAR = "FLEET_RECONCILER_SA"
@@ -3907,6 +4126,32 @@ class FleetReconcilerRolesMatchGrantersTest(unittest.TestCase):
         self.assertIn(f"--role={checker.FLEET_RECONCILER_BUCKET_LIST_ROLE} --condition=None", page)
         self.assertIn(f"--role={checker.FLEET_RECONCILER_BUCKET_ROLE} \\\n    --condition=", page)
         self.assertIn(f"/objects/{checker.FLEET_RECONCILER_STATE_PREFIX}", page)
+
+
+class RequiredApisMatchEnableSitesTest(unittest.TestCase):
+    """REQUIRED_APIS must equal what the two enabling sites enable.
+
+    The APIs are written here, in the provisioning script's `gcloud services
+    enable` block, and in the copy of that block on the pool page, and none
+    reads another. The page says the block and this set must agree, and
+    nothing else holds them to it: an API dropped from the script leaves a
+    project the verifier fails on first run, and one dropped from this set
+    leaves a project the verifier passes with the API off, which for
+    cloudtrace.googleapis.com is a nightly case failing on SERVICE_DISABLED.
+    """
+
+    def _enable_block(self, text, what):
+        blocks = re.findall(r"^gcloud services enable \\\n(.*?)^\s*--project=", text, re.S | re.M)
+        self.assertEqual(len(blocks), 1, f"expected exactly one `gcloud services enable` block in {what}")
+        return set(re.findall(r"[\w-]+\.googleapis\.com", blocks[0]))
+
+    def test_matches_the_block_the_provisioning_script_runs(self):
+        script = (checker._ROOT / "scripts" / "provision_ci_pool_project.sh").read_text()
+        self.assertEqual(self._enable_block(script, "provision_ci_pool_project.sh"), checker.REQUIRED_APIS)
+
+    def test_matches_the_block_on_the_prerequisites_page(self):
+        page = (checker._ROOT / "docs" / "ci-pool-projects.md").read_text()
+        self.assertEqual(self._enable_block(page, "docs/ci-pool-projects.md"), checker.REQUIRED_APIS)
 
 
 class FleetReaderGranteeMatchesTerraformTest(unittest.TestCase):
@@ -4881,6 +5126,7 @@ def _without_hcl_comments(text):
     """HCL's three comment forms stripped: `#`, `//` and `/* */`, outside
     string literals (a `principalSet://...` member is not a comment). A role
     commented out in any of them is a role removed."""
+
     out, i, n, in_string = [], 0, len(text), False
     while i < n:
         c = text[i]
@@ -4906,6 +5152,7 @@ def _without_hcl_comments(text):
             out.append(c)
             i += 1
     return "".join(out)
+
 
 
 class PoolStateReaderMatchesTerraformTest(unittest.TestCase):

@@ -40,7 +40,7 @@ func (s *fakeSpawner) LiveSessions(context.Context) (int, error) {
 // spawned or published. When capacity frees, the same conversation
 // delegates normally.
 func TestDelegateRefusedAtSessionCap(t *testing.T) {
-	r, spawn := startRigWithSpawnerCap(t, "platform", 2)
+	r, spawn := startRigWithSpawnerCap(t, "platform", 2, nil)
 	spawn.setLive(2)
 	conv := "discord:g1/thread-cap1"
 	r.adapter.inbox <- InboundMessage{
@@ -79,7 +79,7 @@ func TestDelegateRefusedAtSessionCap(t *testing.T) {
 // pod must not occupy the slot the new one needs - otherwise a full board can
 // never be re-delegated, only abandoned.
 func TestDelegateReplacementNotDoubleCounted(t *testing.T) {
-	r, spawn := startRigWithSpawnerCap(t, "platform", 1)
+	r, spawn := startRigWithSpawnerCap(t, "platform", 1, nil)
 	conv := "discord:g1/thread-cap2"
 	rec := &SessionRecord{
 		Key: conv, ContextID: "ctx-cap2", Kind: "group",
@@ -105,7 +105,7 @@ func TestDelegateReplacementNotDoubleCounted(t *testing.T) {
 // pods, a plain first ask spawns - so the cap must hold there too, or
 // Delegate refusals just push the flood one affordance over.
 func TestSessionRouteRefusedAtSessionCap(t *testing.T) {
-	r, spawn := startRigWithSpawnerCap(t, RouteSession, 1)
+	r, spawn := startRigWithSpawnerCap(t, RouteSession, 1, nil)
 	spawn.setLive(1)
 	conv := "discord:g1/thread-cap3"
 	r.adapter.inbox <- InboundMessage{
@@ -137,7 +137,7 @@ func TestSessionRouteRefusedAtSessionCap(t *testing.T) {
 // cap advisory exactly when the API is misbehaving, and silence is the
 // "looked like a dropped message" shape this branch keeps re-fixing.
 func TestSessionCapCountErrorRefusesHonestly(t *testing.T) {
-	r, spawn := startRigWithSpawnerCap(t, "platform", 2)
+	r, spawn := startRigWithSpawnerCap(t, "platform", 2, nil)
 	spawn.setLiveErr(errors.New("boom"))
 	r.adapter.inbox <- InboundMessage{
 		Conversation: "discord:g1/thread-cap4", Kind: "group",

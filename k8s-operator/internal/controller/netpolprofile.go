@@ -70,6 +70,10 @@ type netpolProfile struct {
 	MetadataDaemonPort   int32
 	MetadataDaemonSource string
 	AdditionalEgress     []networkingv1.NetworkPolicyEgressRule
+	// OperatorNamespace is the reconciler's, carried to buildNetworkPolicy
+	// for the rule admitting the operator's pods on the metrics port; "" renders
+	// none.
+	OperatorNamespace string
 }
 
 // resolveNetpolProfile mirrors resolveOTLPEndpoint's ladder: per-agent
@@ -79,7 +83,8 @@ type netpolProfile struct {
 func (r *PlatformAgentReconciler) resolveNetpolProfile(ctx context.Context, agent *agentv1alpha1.PlatformAgent) netpolProfile {
 	log := logf.FromContext(ctx).WithName("netpol-profile")
 	p := netpolProfile{
-		Generated: true,
+		Generated:         true,
+		OperatorNamespace: r.OperatorNamespace,
 	}
 
 	// If NetworkPolicy is explicitly disabled in spec, skip generation and discovery.

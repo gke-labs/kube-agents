@@ -1,0 +1,18 @@
+# Fleet Inventory Raw Findings
+
+## Cluster: seeded-a (Task: t_ccbfda55)
+- **[MEDIUM] reliability** (Namespace: `seeded-capacity`): Workload 'inference-server' lacks liveness/readiness/startup probes.
+  - Recommendation: Configure comprehensive health probes.
+- **[MEDIUM] reliability** (Namespace: `seeded-debug`): Workload 'payments-api' lacks liveness/readiness/startup probes.
+  - Recommendation: Configure comprehensive health probes.
+- **[MEDIUM] reliability** (Namespace: `seeded-reliability`): Workload 'checkout-gateway' lacks liveness/readiness/startup probes.
+  - Recommendation: Configure comprehensive health probes.
+
+## Cluster: seeded-b (Task: t_5ca49c4e)
+- No findings reported.
+
+## Cluster: seeded-c (Task: t_0b3e2481)
+- **[MEDIUM] reliability** (Namespace: `kube-system`): Missing liveness/readiness probes in multiple workloads.
+  - Recommendation: Configure liveness and readiness probes for event-exporter-gke, konnectivity-agent-autoscaler, and l7-default-backend.
+- **[MEDIUM] reliability** (Namespace: `kube-system`): Missing resource requests/limits in multiple workloads.
+  - Recommendation: Define explicit CPU/memory requests and limits for event-exporter-gke, konnectivity-agent-autoscaler, and l7-default-backend.

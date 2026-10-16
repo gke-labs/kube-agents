@@ -2,13 +2,16 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
 
 // The bus credential must not reach the harness. The worker NATS user is
@@ -91,6 +94,83 @@ func TestDefaultToolSurfaceNeedsNoEgressTheFenceDenies(t *testing.T) {
 	for _, networked := range []string{"WebFetch", "WebSearch", "Bash"} {
 		if strings.Contains(allowed, networked) {
 			t.Errorf("%s is in the default tool surface; the session fence permits only DNS, the bus and LiteLLM", networked)
+		}
+	}
+}
+
+// TestClusterViewAllowsBashAndSaysInspectOnly: A2A_CLUSTER_VIEW=true is the
+// spawner telling the adapter the pod has the broker's read-only wrappers;
+// Bash joins the surface and the system prompt says what the fence is.
+func TestClusterViewAllowsBashAndSaysInspectOnly(t *testing.T) {
+	for _, key := range []string{"A2A_ALLOWED_TOOLS", "A2A_HARNESS_CMD", "A2A_HARNESS_EXTRA_ARGS", "A2A_DELEGATE_TOOL", lib.EnvProfileExecutor} {
+		t.Setenv(key, "")
+		_ = os.Unsetenv(key)
+	}
+	flags := func(argv []string) (allowed, disallowed, prompt string) {
+		for i, arg := range argv {
+			if i+1 >= len(argv) {
+				break
+			}
+			switch arg {
+			case "--allowedTools":
+				allowed = argv[i+1]
+			case "--disallowedTools":
+				disallowed = argv[i+1]
+			case "--append-system-prompt":
+				prompt = argv[i+1]
+			}
+		}
+		return
+	}
+	t.Setenv(lib.EnvClusterView, "")
+	_ = os.Unsetenv(lib.EnvClusterView)
+	allowed, disallowed, prompt := flags(harnessCommand())
+	// The delegate tool is on by default (its switch is A2A_DELEGATE_TOOL,
+	// not the cluster view), so it is expected here too: appended to
+	// allowed, and its prompt is all there is since the view is off.
+	if strings.Contains(allowed, "Bash") || !strings.Contains(disallowed, "Bash") || !strings.Contains(allowed, delegateToolID) || prompt != noClusterPrompt+"\n\n"+delegatePrompt {
+		t.Fatalf("view off: allowed=%q disallowed=%q prompt=%q", allowed, disallowed, prompt)
+	}
+	t.Setenv(lib.EnvClusterView, "true")
+	allowed, disallowed, prompt = flags(harnessCommand())
+	if !strings.Contains(allowed, "Bash(kubectl:*)") || !strings.Contains(allowed, "Bash(gcloud:*)") || strings.Contains(disallowed, "Bash") || !strings.Contains(allowed, delegateToolID) {
+		t.Fatalf("view on: allowed=%q disallowed=%q", allowed, disallowed)
+	}
+	// Confined to the two shims: a bare Bash would let the harness run node,
+	// python3 or a loop against the keyless inference gateway the fence admits.
+	for _, tool := range strings.Split(allowed, ",") {
+		if tool == "Bash" {
+			t.Fatalf("view on allows bare Bash: %q", allowed)
+		}
+	}
+	for _, still := range []string{"Edit", "NotebookEdit"} {
+		if !strings.Contains(disallowed, still) {
+			t.Errorf("view on dropped %s from the disallowed list", still)
+		}
+	}
+	// Both prompts apply with the view on and the delegate tool on (its
+	// default): joined, not one replacing the other.
+	if !strings.Contains(prompt, clusterViewPrompt) || !strings.Contains(prompt, "policy rule") || !strings.Contains(prompt, "delegate") || strings.Contains(prompt, noClusterPrompt) {
+		t.Fatalf("view on prompt = %q", prompt)
+	}
+	// An A2A_ALLOWED_TOOLS override without Bash wins over the view: Bash
+	// stays disallowed, and the view's own prompt is not appended. Nor is
+	// the no-cluster line, since the pod still holds the view's shims. The
+	// delegate tool is unaffected by this override -- A2A_DELEGATE_TOOL is
+	// its only switch -- so it still joins the allowed list and its prompt
+	// is the one that shows up.
+	t.Setenv("A2A_ALLOWED_TOOLS", "Read,Grep")
+	allowed, disallowed, prompt = flags(harnessCommand())
+	if allowed != "Read,Grep,"+delegateToolID || !strings.Contains(disallowed, "Bash") || prompt != delegatePrompt {
+		t.Fatalf("view on, override without Bash: allowed=%q disallowed=%q prompt=%q", allowed, disallowed, prompt)
+	}
+	// One that names Bash, bare or as a pattern, gets the view. The delegate
+	// tool is appended on top of the override either way.
+	for _, override := range []string{"Read,Bash", "Read Bash(kubectl:*)"} {
+		t.Setenv("A2A_ALLOWED_TOOLS", override)
+		allowed, disallowed, prompt = flags(harnessCommand())
+		if allowed != override+","+delegateToolID || strings.Contains(disallowed, "Bash") || !strings.Contains(prompt, clusterViewPrompt) || !strings.Contains(prompt, "delegate") {
+			t.Fatalf("view on, override %q: allowed=%q disallowed=%q prompt=%q", override, allowed, disallowed, prompt)
 		}
 	}
 }
@@ -344,5 +424,175 @@ func TestAMalformedPodNamespaceRefusesToStart(t *testing.T) {
 				t.Errorf("configFromEnv namespace = %q, want %q", cfg.Namespace, tc.namespace)
 			}
 		})
+	}
+}
+
+// TestTheHarnessIsHandedTheDelegateTool: the harness learns about the
+// delegate tool over --mcp-config, pointed at this same binary run as `mcp`
+// (worker-adapter/mcp.go), with --strict-mcp-config so a stray project or
+// user MCP config cannot add tools the gateway never vetted. The tool is
+// appended to --allowedTools regardless of what A2A_ALLOWED_TOOLS already
+// names, because A2A_DELEGATE_TOOL=off -- not the allowed-tools override -- is
+// the one switch for it.
+func TestTheHarnessIsHandedTheDelegateTool(t *testing.T) {
+	for _, key := range []string{"A2A_ALLOWED_TOOLS", "A2A_HARNESS_CMD", "A2A_HARNESS_EXTRA_ARGS", "A2A_DELEGATE_TOOL", lib.EnvClusterView} {
+		t.Setenv(key, "")
+	}
+	argv := harnessCommand()
+	flags := func(name string) string {
+		for i, a := range argv {
+			if a == name && i+1 < len(argv) {
+				return argv[i+1]
+			}
+		}
+		return ""
+	}
+	if !strings.Contains(flags("--allowedTools"), "mcp__a2a__delegate") {
+		t.Fatalf("allowedTools = %q", flags("--allowedTools"))
+	}
+	var mcp struct {
+		Servers map[string]struct {
+			Command string            `json:"command"`
+			Args    []string          `json:"args"`
+			Env     map[string]string `json:"env"`
+		} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal([]byte(flags("--mcp-config")), &mcp); err != nil {
+		t.Fatalf("mcp-config: %v (%q)", err, flags("--mcp-config"))
+	}
+	srv, ok := mcp.Servers[workeradapter.DelegateMCPServer]
+	if !ok || len(srv.Args) != 1 || srv.Args[0] != "mcp" || srv.Env[workeradapter.EnvDelegateSocket] == "" {
+		t.Fatalf("server = %+v", srv)
+	}
+	if !slices.Contains(argv, "--strict-mcp-config") {
+		t.Fatal("strict mcp config missing")
+	}
+	if !strings.Contains(flags("--append-system-prompt"), "delegate") {
+		t.Fatalf("prompt = %q", flags("--append-system-prompt"))
+	}
+	t.Setenv("A2A_DELEGATE_TOOL", "off")
+	argv = harnessCommand()
+	if slices.Contains(argv, "--mcp-config") || strings.Contains(flags("--allowedTools"), "mcp__") {
+		t.Fatal("A2A_DELEGATE_TOOL=off still hands the tool over")
+	}
+}
+
+// TestEveryHarnessArgvKeepsOnDiskConfigOut: both argvs a pod holds -- the
+// one with the delegate tool (a human turn, first or follow-up) and the one
+// without (a wake) -- carry --strict-mcp-config and --setting-sources user,
+// with and without the cluster view and under A2A_DELEGATE_TOOL=off. In a
+// reused pod the cwd and the config dir have hosted an earlier turn's
+// harness, which had Write; the wake's argv has no --mcp-config, so without
+// the strict flag it would load an .mcp.json that turn left in /scratch.
+func TestEveryHarnessArgvKeepsOnDiskConfigOut(t *testing.T) {
+	for _, key := range []string{"A2A_ALLOWED_TOOLS", "A2A_HARNESS_CMD", "A2A_HARNESS_EXTRA_ARGS", "A2A_DELEGATE_TOOL", lib.EnvClusterView} {
+		t.Setenv(key, "")
+	}
+	check := func(name string, argv []string, wantMCP bool) {
+		t.Helper()
+		if !slices.Contains(argv, strictMCPConfigFlag) {
+			t.Errorf("%s: no %s in %q", name, strictMCPConfigFlag, argv)
+		}
+		i := slices.Index(argv, settingSourcesFlag)
+		if i < 0 || i+1 >= len(argv) || argv[i+1] != adapterSettingSources {
+			t.Errorf("%s: want %s %s in %q", name, settingSourcesFlag, adapterSettingSources, argv)
+		}
+		if got := slices.Contains(argv, workeradapter.MCPConfigFlag); got != wantMCP {
+			t.Errorf("%s: --mcp-config present = %v, want %v", name, got, wantMCP)
+		}
+	}
+	for _, view := range []string{"", "true"} {
+		t.Setenv(lib.EnvClusterView, view)
+		check("view="+view+" with the tool", harnessCommand(), true)
+		check("view="+view+" a wake", harnessCommandWithoutDelegate(), false)
+	}
+	t.Setenv(lib.EnvClusterView, "")
+	t.Setenv("A2A_DELEGATE_TOOL", "off")
+	check("A2A_DELEGATE_TOOL=off", harnessCommand(), false)
+}
+
+// TestHarnessUserSettingsFollowsTheConfigDir: the file a reused pod removes
+// before each turn is the one the harness reads as its user settings.
+func TestHarnessUserSettingsFollowsTheConfigDir(t *testing.T) {
+	t.Setenv(claudeConfigDirEnv, "/home/node/.claude")
+	if got := harnessUserSettings(); got != "/home/node/.claude/settings.json" {
+		t.Errorf("with CLAUDE_CONFIG_DIR: %q", got)
+	}
+	t.Setenv(claudeConfigDirEnv, "")
+	t.Setenv("HOME", "/home/x")
+	if got := harnessUserSettings(); got != "/home/x/.claude/settings.json" {
+		t.Errorf("from HOME: %q", got)
+	}
+	t.Setenv("HOME", "")
+	if got := harnessUserSettings(); got != "" {
+		t.Errorf("neither set: %q, want empty", got)
+	}
+}
+
+// TestBothPromptsWhenTheViewAndTheToolAreOn: the cluster-view prompt and the
+// delegate prompt are two different features that can both be on for the
+// same pod, and --append-system-prompt only accepts the flag once, so this
+// pins that the two get joined into a single value rather than the second
+// silently winning.
+func TestBothPromptsWhenTheViewAndTheToolAreOn(t *testing.T) {
+	t.Setenv("A2A_DELEGATE_TOOL", "")
+	t.Setenv(lib.EnvClusterView, "true")
+	t.Setenv("A2A_ALLOWED_TOOLS", "")
+	argv := harnessCommand()
+	var prompt string
+	for i, a := range argv {
+		if a == "--append-system-prompt" {
+			prompt = argv[i+1]
+		}
+	}
+	if !strings.Contains(prompt, "kubectl") || !strings.Contains(prompt, "delegate") {
+		t.Fatalf("prompt = %q", prompt)
+	}
+	if n := strings.Count(strings.Join(argv, " "), "--append-system-prompt"); n != 1 {
+		t.Fatalf("append-system-prompt given %d times", n)
+	}
+}
+
+// A session turn with no cluster view is told it has none and that the pod
+// holds no cluster credentials or tools to search, which is what kept a turn
+// that couldn't reach the cluster (a wake, once its delegate tool is off)
+// from rummaging its filesystem and narrating it into the answer. With the
+// view, the view's own prompt says what it has instead, and an AgentProfile's
+// pod, which reaches clusters its own way, isn't told it has none.
+func TestASessionWithNoClusterViewIsToldNotToSearchThePod(t *testing.T) {
+	for _, key := range []string{"A2A_ALLOWED_TOOLS", "A2A_HARNESS_CMD", "A2A_HARNESS_EXTRA_ARGS", lib.EnvProfileExecutor} {
+		t.Setenv(key, "")
+		_ = os.Unsetenv(key)
+	}
+	prompt := func() string {
+		argv := harnessCommand()
+		for i, arg := range argv {
+			if arg == "--append-system-prompt" && i+1 < len(argv) {
+				return argv[i+1]
+			}
+		}
+		return ""
+	}
+	t.Setenv("A2A_DELEGATE_TOOL", "off") // the wake shape once its tool is off
+	t.Setenv(lib.EnvClusterView, "")
+	if p := prompt(); !strings.Contains(p, noClusterPrompt) || strings.Contains(p, delegatePrompt) {
+		t.Errorf("wake with no view: prompt = %q", p)
+	}
+	t.Setenv(lib.EnvClusterView, "true")
+	if p := prompt(); strings.Contains(p, noClusterPrompt) || !strings.Contains(p, clusterViewPrompt) {
+		t.Errorf("with the view: prompt = %q", p)
+	}
+	// A view pod whose override leaves Bash out still holds the shims, so
+	// it isn't told they're absent.
+	t.Setenv("A2A_ALLOWED_TOOLS", "Read,Grep")
+	if p := prompt(); strings.Contains(p, noClusterPrompt) || strings.Contains(p, clusterViewPrompt) {
+		t.Errorf("view on, override without Bash: prompt = %q", p)
+	}
+	t.Setenv("A2A_ALLOWED_TOOLS", "")
+	_ = os.Unsetenv("A2A_ALLOWED_TOOLS")
+	t.Setenv(lib.EnvClusterView, "")
+	t.Setenv(lib.EnvProfileExecutor, "true")
+	if p := prompt(); strings.Contains(p, noClusterPrompt) {
+		t.Errorf("an AgentProfile's pod was told it has no cluster access: prompt = %q", p)
 	}
 }

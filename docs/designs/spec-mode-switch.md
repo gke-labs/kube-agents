@@ -25,8 +25,9 @@ Mode *string `json:"mode,omitempty"`
 ```
 
 `mode: next` is a dev toggle, not a supported configuration. Same shape as the other
-opt-in toggles on this CRD: optional pointer field, nil-safe helper, deliberately not
-surfaced in the Helm chart. Naming note: the CRD already has a `mode` field on the
+opt-in toggles on this CRD: optional pointer field, nil-safe helper. The install surfaces
+can set it, and each one's default writes no field at all ("Choosing it at install",
+below). Naming note: the CRD already has a `mode` field on the
 Google Chat integration spec (display verbosity, `spec.integration.googleChat.mode`).
 Different path, no schema collision - named here so nobody conflates them.
 
@@ -87,6 +88,14 @@ rollout does replace the agent pods; what preservation guarantees is that the
 replacements keep the credential and the route, so the bridge reconnects instead of
 hanging at the dial. Found live during stage 1 bring-up (8/26).
 
+A deliberate flip back to `today` is the other half, and it does clean up: the A2A stack
+is torn down, with two objects kept so a later flip forward reuses them. The bus creds
+Secret `<agent>-a2a-nats-creds` stays, because re-enabling `next` must not re-roll the
+credentials. The JetStream PVC `data-<agent>-a2a-nats-0` stays, because flipping a mode
+is not license to destroy the file store. `hack/rollback-roundtrip.sh` checks both
+against a live install: it flips `next` to `today` and back, asserts the two keep their
+UIDs and the agent answers on each side, and the next lane runs it after its matrix.
+
 ## What the operator renders
 
 - `today`: exactly what it renders now. A normal install cannot tell this feature exists
@@ -101,7 +110,9 @@ hanging at the dial. Found live during stage 1 bring-up (8/26).
   strips it silently and the author never hears anything. A reservation that only starts
   reserving once the thing exists is not a reservation.
 - `next`: everything above, plus the NATS component and the gateway skeleton. Next is
-  additive - today's path keeps running until stage 4 starts retiring pieces.
+  additive - today's path keeps running until stage 4 starts retiring pieces - with one
+  exception: Google Chat, which `next` moves from the Hermes platform to the A2A gateway
+  (`spec-chatops-gateway.md`, "Coexistence is by mode").
 
 One thing `next` does not ship: long-term audit. The stream is a 72h ring buffer and
 the audit exporter is stage 2 scope, so `next` has no archive - the NATS spec's audit
@@ -134,17 +145,37 @@ that writes it and the helper that reads it. A third hit is a review comment.
 "What mode am I in" gets one answer per agent, computed in one place. This also means the
 delivery mechanism can change later without touching call sites.
 
-## Not in the Helm chart
+## Choosing it at install
 
-The chart does not template `mode` until graduation (stage 4, when `next` becomes the
-default posture). Until then, flipping it is a `kubectl patch` on the PlatformAgent CR.
-Helm 3's three-way merge leaves fields the chart never sets alone, so a patched mode
-should survive chart upgrades.
+Every install surface can set the mode, and every one defaults to rendering no field, so
+an install that never asks renders the CR it did before the surfaces knew the field:
 
-## One thing inside `next` has its own switch
+- The chart's `platformAgent.mode`, `null` by default, which leaves `mode` out of the CR
+  (`""` does the same). `today` and `next` render as themselves; the values schema refuses
+  anything else.
+- The Terraform composition's `platform_agent_mode`, `"today"` by default, which passes
+  the chart nothing; `"next"` passes `platformAgent.mode: next`.
+- `install.sh --mode=today|next`, recorded in `install.env` as `PLATFORM_AGENT_MODE`.
+
+A mode switch on a running install is made by editing `PLATFORM_AGENT_MODE`, not by
+passing `--mode`, which is refused when it disagrees with the file, and the run that
+applies the edit says it is a mode switch first.
+[`scripts/installer/README.md`](../../scripts/installer/README.md) is canonical for the
+key's rules.
+
+Flipping it with `kubectl patch` on the CR still works, and is how the dev installs that
+predate the chart value run. Helm patches a custom resource from the difference between
+its renders, so while the chart value stays `null` a patched mode survives chart
+upgrades; a value set through the chart and later cleared removes the field again, which
+is `today`. The next lane's eval deploy (`hack/ci-deploy.sh`) sets the mode through the
+chart value, so its smoke exercises that route.
+
+## Switches inside `next`
 
 The A2A gateway's inject door (`spec-chatops-gateway.md`, "The test backend") renders only
-when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next`. That is not a
+when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next`, and its A2A
+door for agent callers (`spec-chatops-gateway.md`, "The A2A door") only under
+`A2A_AGENT_DOOR=true`, the same way. That is not a
 second mode mechanism and does not belong in the field this document defines. The door takes the
 principal it acts as out of a request body, so a CRD field would put "render the eval door" in
 the API a cluster's owner edits and the operator would be obliged to honour it. Whether an
@@ -152,6 +183,34 @@ install is an eval install is a property of who deployed the operator, which is 
 image overrides are already decided. The operator's render tests check that the flag unset
 renders no part of the door, and the conformance suite that every render site consults the flag
 and that the flag is not a CRD field.
+
+A second switch of the same kind: `A2A_SESSION_CLUSTER_VIEW=true` on the operator, on top of
+`spec.mode: next`, gives the session pods the gateway spawns a temporary read-only view of the
+clusters. The operator names the session ServiceAccount on the credential broker's allowed
+callers, renders a session audience the broker maps to a role that reaches the exec route for
+`kubectl` and `gcloud` only, binds the two so that ServiceAccount may present only that audience
+and no other caller may present it, opens the broker's ingress and the session pod's egress to each
+other, and tells the gateway, whose spawner projects the audience-bound token and enables the
+worker's shell. The session ServiceAccount gains no RBAC in either state; `kubectl` runs in the
+broker, read-only in verbs, and with the broker's permissions: under a `custom` permission set
+with an admin role the broker's allowlist is the only control and `kubectl get secret` returns
+data, as
+[credential isolation](../site/src/content/docs/reference/credential-isolation.md#pod-anatomy)
+says of the platform agent. A session holds at most `CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS` broker commands at once (default 2; the operator's `spec.deployment.env` reaches it), so a conversation cannot take the whole command pool from the platform agent's shell. Operator-level for the reason above: the pod executes model output, and
+widening its fence is a property of who deployed the operator. Under the flag a session reads clusters with the platform agent's broker scope, and the only gate
+between a person and that read is the gateway's ingress allowlist. That differs from the design of
+record ([architecture 02](../architecture/02-agent-personas.md) §2.4,
+[03](../architecture/03-security-model.md) §4a, and "Sessions by default" in
+`spec-chatops-gateway.md`), where a session reaches cluster data only through a gateway-minted
+child task and the gateway checks the target agent's `AllowedUsers` against the requester first -
+built now: a delegation to `platform` is checked against its `AllowedUsers`, but the view bypasses
+that check entirely, so on an install whose CR narrows the platform agent's allowlist the two gates
+no longer admit the same people. The view retires on the default flip (#2371); until then, on an
+install whose operator has turned the flag on and whose CR narrows the platform agent's allowlist,
+a person the gateway refuses a delegation to `platform` can still read its clusters through a
+session's view. The flag stays off by default for that reason. An install with a single user, or
+whose allowed users are the same people the platform agent admits, can turn it on, and gets
+sessions that answer cluster questions themselves instead of delegating each one.
 
 ## Per-feature overrides - sketched, not built
 

@@ -120,38 +120,52 @@ variable "project_roles" {
   default     = null
 }
 
-variable "scoped_clusters" {
+variable "scoped_pool_enabled" {
   description = <<-EOT
-    GKE clusters to provision a scoped reader service account for -- one account
-    per cluster. Empty, the default, provisions no pool and leaves the agent's
-    single identity in place.
+    Arms the scoped service account pool: one reader service account per
+    project the plan can list in `scope` (project_id, scope.projects less an
+    exact exclude.projects entry, each selector's members, and, while this is
+    true, each folder's and organisation's members as the scope resolver
+    lists them through Cloud Asset Inventory), created in project_id by the
+    kube-agents-iam module and keyed on the project id. A project created
+    under a declared folder since the last apply gets its account on the next.
+    False, the default, provisions no pool and leaves the agent's single
+    identity in place, whatever `scope` declares.
 
-    A non-empty list does two things. It provisions the accounts, and it arms
-    the credential broker: the mapping reaches the PlatformAgent CR, and a
-    request naming a cluster that is not in this list is then refused rather
-    than served by a wider credential.
+    True does two things. It provisions the accounts, and it arms the
+    credential broker: the mapping reaches the PlatformAgent CR as
+    spec.security.scopedServiceAccountPool with enabled = true, and a request
+    naming a cluster in a project with no account -- under a declared folder
+    or organisation, or added to the scope since the last apply -- is then
+    refused rather than served by a wider credential.
 
-    The default is empty because a pool member holds no IAM grant. The IAM
+    The default is false because a pool member holds no IAM grant. The IAM
     Condition that scoped it grants nothing for Kubernetes object operations
     (measured 2026-08-12), and un-conditioned the same binding is project-wide
     container.viewer, so both are gone -- see the kube-agents-iam module's
     scoped_pool.tf. An armed pool therefore selects a powerless identity for
     every request and turns every cluster read into a Forbidden. Set this to
-    exercise the selection, refusal and minting path; the authority arrives with
-    per-cluster RBAC.
-
-    Name each cluster by value rather than from module.gke_cluster's outputs,
-    including this composition's own: the accounts would otherwise depend on the
-    cluster existing and Terraform would refuse to plan the IAM until after it
-    was created.
+    exercise the selection, refusal and minting path; the authority arrives
+    with per-cluster RBAC.
   EOT
-  type = list(object({
-    project_id   = string
-    location     = string
-    cluster_name = string
-  }))
-  nullable = false
-  default  = []
+  type        = bool
+  nullable    = false
+  default     = false
+}
+
+variable "scoped_pool_max_accounts" {
+  description = <<-EOT
+    The most pool members the plan may create in project_id, declared from
+    the service-account quota headroom the project has free: the quota (100
+    per project by GCP's default) is shared with the agent's own accounts and
+    everything else in the project, and the plan cannot read it, so the
+    default of 100 is the quota rather than the headroom. A pool past the
+    declared bound is refused at plan. Read only while scoped_pool_enabled is
+    true.
+  EOT
+  type        = number
+  nullable    = false
+  default     = 100
 }
 
 variable "scope" {
@@ -180,7 +194,8 @@ variable "scope" {
     exclusion changes IAM, except that an `exclude.projects` entry naming a
     Shared VPC service project by ID, or a monitored project by its project
     number, withholds its grant (a monitored project excluded by ID keeps
-    it, for the reconcile's naming call); a glob is the reconcile's alone. `folders`
+    it, for the reconcile's naming call); a glob is the reconcile's alone for
+    IAM, and the drift export matches it too (drift_pubsub_source_projects). `folders`
     and `organizations` are numeric Resource
     Manager IDs: each is bound on the container itself with the same allowlist
     plus roles/cloudasset.viewer, so every project beneath it inherits the
@@ -507,7 +522,7 @@ variable "session_kv_salt" {
 }
 
 variable "slack_allowed_users" {
-  description = "Slack users allowed to talk to the agent (empty list = all users allowed). Only used when enable_slack is true."
+  description = "Slack member IDs (e.g. U0123ABCD; not emails) allowed to talk to the agent (empty list = every workspace member allowed). Only used when enable_slack is true."
   type        = list(string)
   default     = []
 }
@@ -561,13 +576,69 @@ variable "user_profile_enabled" {
 }
 
 variable "github_repo" {
-  description = "Target GitOps repository for the agent's GitHub integration (owner/repo or URL). Empty leaves the GitHub integration unconfigured. Independent of enable_github_minter, which only provisions the minter's GCP identity."
+  description = "Target GitOps repository for the agent's GitHub integration (owner/repo or a github.com URL). On a GitHub Enterprise Server (gitops_host set), owner/repo on the instance, not a URL. Empty leaves the GitHub integration unconfigured. Independent of enable_github_minter, which only provisions the minter's GCP identity."
   type        = string
   default     = ""
 }
 
+variable "gitops_forge" {
+  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter, on github.com or, with gitops_host, on a GitHub Enterprise Server) or gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_token_secret_name names). A gitlab install, and a github install with gitops_host, declare one forge and its gitops repository through spec.integration.forges/repositories. A gitlab install must leave github_repo and enable_github_minter unset."
+  type        = string
+  default     = "github"
+  validation {
+    condition     = contains(["github", "gitlab"], var.gitops_forge)
+    error_message = "gitops_forge must be github or gitlab."
+  }
+}
+
+variable "gitops_host" {
+  description = "Hostname of the forge holding the GitOps repository: with gitops_forge = github, a GitHub Enterprise Server (e.g. github.example.com); with gitops_forge = gitlab, a self-managed GitLab instance (e.g. gitlab.example.com). Empty is the forge's own host (github.com or gitlab.com). A bare hostname: no scheme, path or port. For github, a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like) is refused. On a GitHub Enterprise Server the composition declares the github forge at this host in spec.integration.forges, with github_repo's owner as its namespace, and the chart points the token minter at https://<host>/api/v3."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.gitops_host == "" || can(regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", var.gitops_host))
+    error_message = "gitops_host must be a bare lowercase hostname, with no scheme, path or port."
+  }
+}
+
+variable "gitlab_repo" {
+  description = "The GitOps repository on GitLab, as the project's full path (group/subgroup/project) or its URL. Read only when gitops_forge is gitlab."
+  type        = string
+  default     = ""
+}
+
+variable "gitlab_token_secret_name" {
+  description = "Name of the Kubernetes Secret, in the agent's namespace, holding the GitLab access token under the key `token`. The installer creates it from a prompt or a token file after the apply; Terraform only names it, so the token never reaches the plan or the state. Read only when gitops_forge is gitlab."
+  type        = string
+  default     = "gitlab-forge-token"
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.gitlab_token_secret_name)) && length(var.gitlab_token_secret_name) <= 253
+    error_message = "gitlab_token_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
+  }
+}
+
+variable "gitlab_ca_secret_name" {
+  description = "Name of the Secret, in the agent's namespace, holding the PEM CA that signed a self-managed GitLab's TLS certificate, under the key `ca.crt`. A Secret, so changing the CA needs the same rights as changing the token. The broker trusts it for the GitLab host only. Empty: the system CAs only. The installer creates it from --gitops-ca-file; Terraform only names it. Read only when gitops_forge is gitlab."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.gitlab_ca_secret_name == "" || (can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.gitlab_ca_secret_name)) && length(var.gitlab_ca_secret_name) <= 253)
+    error_message = "gitlab_ca_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
+  }
+}
+
+variable "github_ca_secret_name" {
+  description = "Name of the Secret, in the agent's namespace, holding the PEM CA that signed a GitHub Enterprise Server's TLS certificate, under the key `ca.crt`. The credential broker trusts it for the instance's host only. The chart's token minter trusts it for all of its outbound calls, and reads it when it starts, so restart the minter after the Secret changes. Empty: the system CAs only. The installer creates it from --gitops-ca-file and restarts the minter; Terraform only names it. Read only when gitops_forge is github and gitops_host is set."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.github_ca_secret_name == "" || (can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.github_ca_secret_name)) && length(var.github_ca_secret_name) <= 253)
+    error_message = "github_ca_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
+  }
+}
+
 variable "enable_github_minter" {
-  description = "Provision the GitHub token minter: its GCP resources (service account, KMS key ring and signing key) and, through the chart, its Kubernetes workload. Requires github_repo in owner/repo (or github.com URL) form. The App private key must be imported into the KMS key before the minter goes Ready."
+  description = "Provision the GitHub token minter: its GCP resources (service account, KMS key ring and signing key) and, through the chart, its Kubernetes workload. Requires github_repo in owner/repo (or github.com URL) form. The App private key must be imported into the KMS key before the minter goes Ready. On a GitHub Enterprise Server (gitops_host set) the App is created on the instance, and the chart points the minter at the instance, with the CA that github_ca_secret_name names."
   type        = bool
   default     = false
 }
@@ -669,7 +740,7 @@ variable "stockout_pubsub_sink" {
 }
 
 variable "enable_drift_pubsub" {
-  description = "Provision the drift detector's audit-log ingress (drift-pubsub module): the GKE audit-log Log Router sink, the drift-audit Pub/Sub topic and pull subscription, and the sink-writer publisher and agent-GSA subscriber/viewer IAM. Exports every GKE cluster in the project (the module's cluster_names default). The three names are the drift_pubsub_topic, drift_pubsub_subscription and drift_pubsub_sink variables below; the module's retention, backoff and cluster_names knobs are not re-exposed here. Provisions the detector's input only: k8s-operator/cmd/drift-detector ships in the images and starts when the PlatformAgent sets spec.harness.driftDetector.enabled, which is the enable_drift_detector variable below; with this flag on it passes the subscription's name into that block, so a renamed subscription is the one the detector reads (docs/designs/drift-detection.md). The installer front doors write this variable into terraform.tfvars only when ENABLE_DRIFT_DETECTOR is true, so that an install already turning the ingress on through a TF_VAR_enable_drift_pubsub line in install.env keeps it: a tfvars key beats TF_VAR_, and writing false unconditionally would destroy that install's sink, topic and subscription on its next upgrade."
+  description = "Provision the drift detector's audit-log ingress (drift-pubsub module): the GKE audit-log Log Router sink (and, on an install whose scope lists other projects, one more in each of them, routed into the same topic, which needs logging.sinks.create, the project's number and its Logging service agent there), the drift-audit Pub/Sub topic and pull subscription, and the sink-writer publisher and agent-GSA subscriber/viewer IAM. Exports every GKE cluster in the project (the module's cluster_names default) and in each project the scope lists. The three names are the drift_pubsub_topic, drift_pubsub_subscription and drift_pubsub_sink variables below; the module's retention, backoff and cluster_names knobs are not re-exposed here. Provisions the detector's input only: k8s-operator/cmd/drift-detector ships in the images and starts when the PlatformAgent sets spec.harness.driftDetector.enabled, which is the enable_drift_detector variable below; with this flag on it passes the subscription's name into that block, so a renamed subscription is the one the detector reads (docs/designs/drift-detection.md). The installer front doors write this variable into terraform.tfvars only when ENABLE_DRIFT_DETECTOR is true, so that an install already turning the ingress on through a TF_VAR_enable_drift_pubsub line in install.env keeps it: a tfvars key beats TF_VAR_, and writing false unconditionally would destroy that install's sinks, topic and subscription on its next upgrade."
   type        = bool
   default     = false
 }
@@ -692,10 +763,70 @@ variable "drift_pubsub_sink" {
   default     = "platform-agent-drift-audit-sink"
 }
 
+variable "drift_pubsub_topic_publishers" {
+  description = "IAM members granted roles/pubsub.publisher on the drift topic, on top of the sink's own writer identity. Only used when enable_drift_pubsub is true, and empty on an install: the Log Router is what should be putting audit records on this topic, and a member here can make the detector report a change nobody made. The evaluation pool sets it to its CI runners so a bench case can publish synthetic records and exercise the classifier, which it cannot reach any other way — every identity a bench run can authenticate as is a service account the classifier is right to drop. The agent's own service account does not belong here; it already reads this stream."
+  type        = list(string)
+  default     = []
+}
+
+variable "drift_pubsub_sink_writer_identity_override" {
+  description = "The principal to grant roles/pubsub.publisher on the drift topic, overriding the service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com the drift-pubsub module derives. Include the \"serviceAccount:\" prefix. Only used when enable_drift_pubsub is true. Exists because the module derives that identity rather than reading it off the sink, so the grant can precede the sink: a project where Logging reports some other writer identity fails the sink's postcondition, and with nothing to set here it would fail it on every later plan of this composition too, taking the whole apply with it. The failed apply leaves the sink created and exporting without the publish role, which mails every project owner until this is set or the sink is deleted, so it is the fix to reach for first rather than at leisure. Through the install.sh / upgrade.sh front doors, set it as a TF_VAR_drift_pubsub_sink_writer_identity_override line in install.env rather than in terraform.tfvars: write_tfvars_from_state regenerates that file wholesale on every front-door run and never writes this key, so a hand-added one is lost on the next run and the failure returns. A hand-driven apply sets it in terraform.tfvars instead. Leave null unless an apply has told you to set it; the error names the value to use."
+  type        = string
+  default     = null
+}
+
+variable "drift_pubsub_source_exclude_projects" {
+  description = "Projects the scope lists whose audit logs the drift topic must NOT receive, comma- or space-separated project IDs. Each stays in the scope (its clusters are still read and get Cluster Agent profiles) and gets no drift audit-log sink, no Logging service agent mint and no publish grant: the lever for a project where the identity applying cannot mint the agent or write the sink, which would otherwise stop the apply at that project. Empty, the default, exports every project scope_export_projects lists that no scope.exclude.projects glob matches. Reaches a front-door install as a TF_VAR_drift_pubsub_source_exclude_projects line in install.env."
+  type        = string
+  default     = ""
+  nullable    = false
+
+  validation {
+    condition     = alltrue([for p in split(",", replace(trimspace(var.drift_pubsub_source_exclude_projects), "/\\s+/", ",")) : p == "" || can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", p))])
+    error_message = "drift_pubsub_source_exclude_projects is a comma- or space-separated list of GCP project IDs (6 to 30 characters: lowercase letters, digits and hyphens, starting with a letter)."
+  }
+}
+
+variable "drift_pubsub_source_sink_writer_identity_overrides" {
+  description = "Per project the scope lists, keyed by project ID, the principal to grant roles/pubsub.publisher on the drift topic instead of the service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com the drift-pubsub module derives for that project's sink: drift_pubsub_sink_writer_identity_override for a source project. Only used when enable_drift_pubsub is true and the scope lists projects. A JSON object, {\"<project>\": \"serviceAccount:...\"}, rather than a map, because through the front doors it is a TF_VAR_ line in install.env (TF_VAR_drift_pubsub_source_sink_writer_identity_overrides='{\"<project>\":\"serviceAccount:...\"}') and a blanked line exports \"\", which a map-typed variable refuses as HCL and this one reads as no override, as its string sibling does. Include the \"serviceAccount:\" prefix. Set only when an apply's postcondition has told you to."
+  type        = string
+  default     = ""
+  nullable    = false
+
+  validation {
+    condition     = trimspace(var.drift_pubsub_source_sink_writer_identity_overrides) == "" || (can(tomap(jsondecode(var.drift_pubsub_source_sink_writer_identity_overrides))) && alltrue([for project, member in tomap(jsondecode(var.drift_pubsub_source_sink_writer_identity_overrides)) : member == "" || can(regex("^serviceAccount:.+@.+$", member))]))
+    error_message = "drift_pubsub_source_sink_writer_identity_overrides is a JSON object of project ID to principal, each principal carrying the \"serviceAccount:\" prefix (or empty for no override), or an empty string."
+  }
+}
+
+variable "drift_pubsub_sink_drain_duration" {
+  description = "How long a destroy waits, after deleting the drift sink, before removing the topic and the sink's publish grant, and how long a scope shrink waits between deleting a removed project's sink and revoking its grant. Only used when enable_drift_pubsub is true. Cloud Logging keeps exporting for some minutes after a sink is deleted, and an export that lands in that gap mails every project owner a sink configuration error. The module's 120s default is a chosen margin rather than a measured convergence time, so raise it if the mail still arrives and lower it only to trade that risk for a faster teardown. Through the install.sh / upgrade.sh front doors, set it as a TF_VAR_drift_pubsub_sink_drain_duration line in install.env; the front doors regenerate terraform.tfvars wholesale on every run and never write this key, so a hand-added one does not survive. Setting it is not enough on its own: time_sleep reads destroy_duration from state when it is destroyed, because a provider's delete is handed prior state and no configuration, and uninstall.sh runs no apply before the destroy -- so a value raised and taken straight to uninstall.sh waits the 120s already in state and the mail arrives anyway. Run upgrade.sh (or lifecycle.sh apply) in between. Raising it after a teardown has already mailed is therefore too late for that teardown; the time to set it is at install."
+  type        = string
+  default     = "120s"
+}
+
+variable "drift_pubsub_logging_identity_propagation_duration" {
+  description = "How long the apply waits, after asking Service Usage to mint the project's Logging service agent, before granting it publisher on the drift topic. Only used when enable_drift_pubsub is true. A project that did not already have the agent cannot bind it the instant the call returns, and the apply fails with \"Service account service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com does not exist\" -- about one project in five, leaving the topic created and neither the grant nor the sink. The module's 60s default is a chosen margin rather than a measured propagation time, so raise it if an apply still fails that way; the raised value is paid on the re-apply, because the module keys the wait on this value and not only on the identity. Paid on the first apply that carries the wait -- the first apply with enable_drift_pubsub on, and on an install that already had the ingress, the next apply of any kind after this version lands -- and after that only on an apply that re-mints the Logging identity or changes this value, the two things the wait is keyed on. A project whose Logging agent already exists gains nothing from it, and lowering the value before the first apply that carries the wait is how it keeps the time. Lowering it afterwards refunds nothing: the wait is keyed on this value, so the change re-creates it and pays the new lower figure once, and only later waits are shorter. Through the install.sh / upgrade.sh front doors, set it as a TF_VAR_drift_pubsub_logging_identity_propagation_duration line in install.env; the front doors regenerate terraform.tfvars wholesale on every run and never write this key, so a hand-added one does not survive."
+  type        = string
+  default     = "60s"
+}
+
 variable "enable_drift_detector" {
   description = "Start the drift detector. Sets spec.harness.driftDetector.enabled on the PlatformAgent, which is what makes k8s-operator/cmd/drift-detector run: the binary ships in the images and stays stopped until this is true. Requires enable_drift_pubsub, which a helm_release precondition enforces: the harness block carrying this field is written only when the ingress is on, so without it the composition would accept this variable and render nothing — an apply that succeeds, provisions nothing and starts nothing. Also requires project_id to be the project ID rather than the project number, a second precondition, because the operator refuses to start the detector on a numeric one (driftDetectorEnabled in k8s-operator/internal/controller/platformagent_manifests.go) and the ingress would bill for a stream nothing reads. The installer front doors turn this and enable_drift_pubsub on together from one ENABLE_DRIFT_DETECTOR key; the two variables are separate so that a hand-driven apply can still provision the audit-log ingress on its own."
   type        = bool
   default     = false
+}
+
+variable "platform_agent_mode" {
+  description = "The PlatformAgent's spec.mode: \"today\", the current architecture, or \"next\", which also renders the NATS bus and the A2A gateway, a development stack (docs/designs/spec-mode-switch.md). \"today\" passes nothing to the chart, so the CR carries no mode field, which the operator reads as today, and an install that never sets this renders what it did before the variable existed. Changing it on a running install is a mode switch: the operator rolls the agent and renders or retires the A2A stack. A mode set on the CR by hand with kubectl is left alone while this stays \"today\", because Helm patches only the fields its renders differ in. Mirrors PLATFORM_AGENT_MODE, which install.sh sets from --mode."
+  type        = string
+  default     = "today"
+  nullable    = false
+
+  validation {
+    condition     = contains(["today", "next"], var.platform_agent_mode)
+    error_message = "platform_agent_mode must be \"today\" or \"next\", the PlatformAgent CRD's spec.mode enum."
+  }
 }
 
 variable "extra_helm_values" {

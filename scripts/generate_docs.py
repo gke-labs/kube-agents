@@ -7,13 +7,9 @@ skill catalogue lives in each skill's frontmatter, and the provisioning steps
 live in the scripts themselves. Maintaining those tables by hand guarantees they
 drift. This script regenerates them from the source of truth instead.
 
-There are two kinds of target. Most are a *region* spliced into one or more
-hand-written documents (``BLOCKS``); a region that several pages carry is
-rendered once and spliced into each. One is a *whole file* written verbatim
-from its generator (``FILES``): ``docs/family-roster.txt`` carries no markers,
-has no hand-written part, and is replaced in full on every run.
-
-Each generated region is delimited in its target file by::
+Each target is a *region* spliced into one or more hand-written documents
+(``BLOCKS``); a region that several pages carry is rendered once and spliced
+into each. A region is delimited in its target file by::
 
     <!-- BEGIN GENERATED: <block-id> -->
     <!-- END GENERATED: <block-id> -->
@@ -47,10 +43,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-# The family roster is derived from the same inventory globs the map checker
-# reads, so the two cannot disagree about what a family contains. Both modules
-# live in scripts/, which is sys.path[0] when either is run as a script.
-import check_docs_map
+from generate_sop_geography import SOP_REF_RE
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -83,7 +76,12 @@ WATCHDOGS_PAGE = REPO / "docs/site/src/content/docs/concepts/autonomous-watchdog
 SKILLS_CONCEPT_PAGE = REPO / "docs/site/src/content/docs/concepts/skills.md"
 SKILLS_PAGE = REPO / "docs/site/src/content/docs/skills/index.mdx"
 IMAGES_PAGE = REPO / "docs/site/src/content/docs/deploy/docker-images.md"
-ROSTER_FILE = REPO / "docs/family-roster.txt"
+README = REPO / "README.md"
+# A governance audit is a Platform Agent job that carries the fleet-audit skill;
+# that skill's tests hold this set equal to its audit catalogue. The prompt names
+# the audit's SOP by a path relative to the profile home.
+AUDIT_SKILL = "fleet-audit"
+PLATFORM_HOME = "agents/platform"
 
 GITHUB_BLOB = "https://github.com/gke-labs/kube-agents/blob/main"
 
@@ -119,6 +117,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
     "Security and compliance": [
         "gke-backup-dr",
         "gke-platform-security",
+        "gke-workload-identity",
     ],
     "Networking and storage": [
         "gcp-networking-fabric-audit",
@@ -136,6 +135,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "gke-tpu-metrics-monitoring",
     ],
     "Observability": [
+        "gke-alert-configuration",
         "gke-basics",
         "gke-observability",
         "kube-agents-observability",
@@ -171,6 +171,9 @@ CRON_CADENCE = {
     "20 6 * * *": "Daily 06:20",
     "50 6 * * *": "Daily 06:50",
     "50 8 * * *": "Daily 08:50",
+    "45 7 * * *": "Daily 07:45",
+    "0 8 * * *": "Daily 08:00",
+    "10 10 * * *": "Daily 10:10",
     "0 9 * * *": "Daily 09:00",
     "20 9 * * *": "Daily 09:20",
     "0 10 * * *": "Daily 10:00",
@@ -326,10 +329,8 @@ def _read_skills(skills_dir: Path) -> dict[str, str]:
     return skills
 
 
-def gen_skill_catalog() -> str:
-    skills = _read_skills(SKILLS_DIR)
-    cluster_skills = _read_skills(CLUSTER_SKILLS_DIR)
-
+def group_skills(skills: dict[str, str], cluster_skills: dict[str, str]) -> dict[str, list[str]]:
+    """Return {group: skill names} in catalogue order; empty groups are kept."""
     grouped = {g: [] for g in SKILL_GROUPS}
     grouped["Other"] = []
     for name in sorted(skills):
@@ -338,6 +339,13 @@ def gen_skill_catalog() -> str:
     # Every Cluster Agent skill goes in one persona-scoped group, appended last so
     # the Platform Agent's editorial order above is untouched.
     grouped[CLUSTER_SKILL_GROUP] = sorted(cluster_skills)
+    return grouped
+
+
+def gen_skill_catalog() -> str:
+    skills = _read_skills(SKILLS_DIR)
+    cluster_skills = _read_skills(CLUSTER_SKILLS_DIR)
+    grouped = group_skills(skills, cluster_skills)
 
     def source_dir(group: str) -> str:
         return (
@@ -360,6 +368,76 @@ def gen_skill_catalog() -> str:
             out.append(f"| [`{name}`]({link}) | {md_escape(descriptions[name])} |")
         out.append("")
     return "\n".join(out).rstrip()
+
+
+def run_order(audit: dict[str, str]) -> tuple[bool, bool, int, int]:
+    """Sort key for the audits: daily ones first, then the rest, each by time of day.
+
+    A schedule with no fixed time of day (an interval, a step, a list) sorts
+    after every schedule that has one.
+    """
+    fields = audit["expr"].split()
+    if len(fields) != 5 or not (fields[0].isdecimal() and fields[1].isdecimal()):
+        return True, True, 0, 0
+    minute, hour, *date = fields
+    return date != ["*", "*", "*"], False, int(hour), int(minute)
+
+
+def governance_audits() -> list[dict[str, str]]:
+    """Return the enabled governance audits in the order the README lists them."""
+    audits = []
+    for job in load_roster(PLATFORM_CRON_ROSTER):
+        if not job.get("enabled") or AUDIT_SKILL not in (job.get("skills") or []):
+            continue
+        sop = SOP_REF_RE.search(job.get("prompt") or "")
+        if not sop:
+            raise SystemExit(
+                f"{PLATFORM_CRON_ROSTER.relative_to(REPO)}: audit '{job.get('id')}' "
+                "names no governance SOP in its prompt; the capabilities region "
+                "has nothing to link."
+            )
+        schedule = job.get("schedule") or {}
+        audits.append(
+            {
+                "id": job.get("id", ""),
+                "name": job.get("name") or job.get("id", ""),
+                "expr": schedule.get("expr") or "",
+                "display": schedule.get("display") or "",
+                "sop": sop.group(0),
+            }
+        )
+    return sorted(audits, key=run_order)
+
+
+def gen_capabilities() -> str:
+    """Render the README's capabilities matrix: the scheduled audits, then the skills.
+
+    It is a short index for a first-time reader, so it names things and links to
+    the site pages that describe them rather than repeating those descriptions.
+    """
+    out = [
+        "### Scheduled governance audits\n",
+        "| Audit | Schedule (UTC) | Procedure |",
+        "| ----- | -------------- | --------- |",
+    ]
+    for audit in governance_audits():
+        cadence = CRON_CADENCE.get(audit["expr"]) or f"`{audit['expr'] or audit['display']}`"
+        link = f"{PLATFORM_HOME}/{audit['sop']}"
+        out.append(
+            f"| {md_escape(audit['name'])} | {cadence} | [`{Path(audit['sop']).name}`]({link}) |"
+        )
+
+    out += [
+        "",
+        "### Skills by area\n",
+        "| Area | Skills |",
+        "| ---- | ------ |",
+    ]
+    grouped = group_skills(_read_skills(SKILLS_DIR), _read_skills(CLUSTER_SKILLS_DIR))
+    for group, names in grouped.items():
+        if names:
+            out.append(f"| {group} | {', '.join(f'`{n}`' for n in names)} |")
+    return "\n".join(out)
 
 
 ORIGIN_SECTIONS: list[tuple[str, str, str]] = [
@@ -422,49 +500,6 @@ def gen_container_images() -> str:
     return "\n".join(out).rstrip()
 
 
-def gen_family_roster() -> str:
-    """Return the whole contents of the collapsed-family roster file.
-
-    The globs are read out of the map's own inventory rather than listed here,
-    so a new family row is rostered the moment it is added. The extraction is
-    ``check_docs_map.family_globs`` — the same reader the coverage check uses —
-    so the roster cannot cover a different set of rows than the checker
-    honours.
-    """
-    files = check_docs_map.tracked_docs()
-    text = check_docs_map.MAP.read_text(encoding="utf-8")
-
-    out = [line.rstrip() for line in ROSTER_HEADER.strip("\n").splitlines()]
-    for glob in sorted(check_docs_map.family_globs(text)):
-        out.append("")
-        out.append(glob)
-        for member in sorted(check_docs_map.matches(glob, files)):
-            out.append(f"  {member}")
-    return "\n".join(out) + "\n"
-
-
-ROSTER_HEADER = """
-# Collapsed-family roster -- generated, do not edit by hand.
-# Regenerate with: make docs-generate
-#
-# The documentation map (docs/README.md, section 4) collapses uniform families
-# of documents into a single inventory row whose path cell is a glob. Neither
-# check in check_docs_map.py can see a file DELETED from inside such a family:
-# the glob still matches the survivors, so the map still reads true while it
-# silently describes a document that no longer exists. This file is the
-# snapshot that makes the deletion visible -- `make docs-check` fails until it
-# is regenerated, and the removed path then shows up as a line in the pull
-# request's diff for a reviewer to notice.
-#
-# It lives outside the map on purpose. The map is this repository's most
-# merge-conflict-prone file and a family row deliberately characterises its
-# family rather than enumerating it; per-file churn belongs here instead. A
-# sorted list still collides when two branches insert into the same gap, so
-# .gitattributes hands this file to git's union merge driver -- see the comment
-# there. Anything union merge gets wrong shows up as `make docs-check` failing
-# on a stale roster, and `make docs-generate` writes the correct file.
-"""
-
 # Each region names every file it is spliced into. One generator, one body,
 # however many pages carry it: the job example is the same entry on three
 # pages, and rendering it once is what keeps the three from disagreeing.
@@ -476,13 +511,11 @@ BLOCKS: dict[str, tuple[tuple[Path, ...], Callable[[], str]]] = {
     ),
     "skill-catalog": ((SKILLS_PAGE,), gen_skill_catalog),
     "container-images": ((IMAGES_PAGE,), gen_container_images),
+    "capabilities": ((README,), gen_capabilities),
 }
 
 # Generated artifacts that are a whole file rather than a region inside a
 # hand-written document, written verbatim from their generator.
-FILES = {
-    "family-roster": (ROSTER_FILE, gen_family_roster),
-}
 
 
 # --------------------------------------------------------------------------- #
@@ -551,7 +584,7 @@ def splice(path: Path, block_id: str, body: str, text: str | None = None) -> tup
 Target = tuple[Path, str, bool, str]
 
 
-def collect_targets(blocks=BLOCKS, files=FILES) -> list[Target]:
+def collect_targets(blocks=BLOCKS) -> list[Target]:
     """Return (path, full new contents, changed, block id) for every target.
 
     A region's generator runs once and the one body is spliced into each of
@@ -570,10 +603,6 @@ def collect_targets(blocks=BLOCKS, files=FILES) -> list[Target]:
             changed, new_text = splice(path, block_id, body, pending.get(path))
             pending[path] = new_text
             targets.append((path, new_text, changed, block_id))
-    for block_id, (path, generator) in files.items():
-        new_text = generator()
-        old_text = path.read_text(encoding="utf-8") if path.exists() else None
-        targets.append((path, new_text, new_text != old_text, block_id))
     return targets
 
 

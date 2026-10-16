@@ -3,10 +3,10 @@
 Run: python3 -m unittest agents/chat/scripts/test_bootstrap_onboarding_scripts.py
 
 Covers the deterministic decision + I/O logic of:
-  - bootstrap_delivery.py  (no_agent delivery of INVENTORY.md, exactly once)
-  - bootstrap_scan_gate.py (files the sweep as a kanban task listing a
-                            kanban_create call for each ready Cluster Agent;
-                            stops re-filing)
+  - bootstrap_delivery.py  (no_agent delivery of INVENTORY.md, claimed once)
+  - bootstrap_scan_gate.py (files the sweep as a kanban task listing the
+                            ready Cluster Agents, whose cards the hand-off
+                            files; stops re-filing)
 
 The in-process job removal in bootstrap_delivery._retire_jobs imports
 cron.jobs, which is unavailable here; its import is guarded, so it is a no-op
@@ -24,7 +24,11 @@ again.
 
 import contextlib
 import errno
+import http.server
 import io
+import json
+import threading
+import urllib.error
 import os
 import shutil
 import re
@@ -41,10 +45,17 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 # The gate imports cluster_agent_profile, which the image copies beside it from here.
 sys.path.insert(1, str(Path(__file__).resolve().parents[2] / "platform" / "scripts"))
+# Where each fleet audit's check roster lives (audit_report.AUDITS).
+FLEET_AUDIT_SCRIPTS = Path(__file__).resolve().parents[2] / "platform" / "skills" / "fleet-audit" / "scripts"
+CLUSTER_INVENTORY_SOP = Path(__file__).resolve().parents[2] / "platform" / "governance" / "cluster_inventory_audit_sop.md"
 
 import bootstrap_delivery  # noqa: E402
+import bootstrap_handoff  # noqa: E402
 import bootstrap_scan_gate  # noqa: E402
 import cluster_agent_profile  # noqa: E402
+import findings_queue  # noqa: E402
+import inventory_findings  # noqa: E402
+import oobe  # noqa: E402
 import profile_scaffold  # noqa: E402
 import sandbox_exec  # noqa: E402
 from cluster_agent_reconcile import SCAFFOLD_ARTIFACTS  # noqa: E402
@@ -54,6 +65,39 @@ DELIVERED = "INVENTORY.delivered.md"
 ALIGNED = ".user_aligned"
 COMPLETED = ".bootstrap_completed"
 SCAN_FILED = ".bootstrap_scan_filed"
+SHOWN = "INVENTORY.shown.json"
+SHOWN_DELIVERED = "INVENTORY.shown.delivered.json"
+SHOWN_RECORD = {
+    "items": [
+        {"class": "critical", "ids": ["sa-key.acme.prod.app.sa1", "sa-key.acme.prod.app.sa2"]},
+        {"class": "critical", "ids": ["crashloop.acme.prod.app.api"]},
+    ]
+}
+ITEMS = "INVENTORY.items.json"
+SCORES = "INVENTORY.scores.json"
+SCORE = {
+    "rubric": {"B": 3, "L": 6, "detect": 3, "recover": 2, "C": 1.0},
+    "recommendation": {"action": "add a readinessProbe", "rationale": "traffic", "risk": "5xx"},
+    "remediation": {"kind": "manifest", "path": "k8s/api.yaml", "note": "add the probe"},
+    "verification": {"kind": "kubectl", "command": "kubectl get deploy api", "still_failing_when": "empty"},
+}
+# Two findings on acme/prod and one on acme/dev, as `extract` writes them, and their scores.
+EXTRACTED = {
+    "items": [
+        {"id": "f001", "check": "probes-readiness", "project": "acme", "cluster": "prod",
+         "namespace": "payments", "object": "api", "title": "no readinessProbe on api", "line": 3},
+        {"id": "f002", "check": "probes-readiness", "project": "acme", "cluster": "prod",
+         "namespace": "payments", "object": "web", "title": "no readinessProbe on web", "line": 4},
+        {"id": "f003", "check": "probes-readiness", "project": "acme", "cluster": "dev",
+         "namespace": "payments", "object": "api", "title": "no readinessProbe on api", "line": 5},
+    ]
+}
+SCORED = {"scores": {"f001": SCORE, "f002": SCORE, "f003": SCORE}, "complete_clusters": ["acme/prod"]}
+
+
+def delivered(report: str) -> str:
+    """What delivery prints for a report with no oobe marker beside it: the report, then the audits note."""
+    return report.rstrip("\n") + "\n\n" + bootstrap_delivery.AUDITS_RUNNING_NOTE + "\n"
 
 
 class DeliveryDecisionTest(unittest.TestCase):
@@ -108,8 +152,8 @@ class DeliveryMainTest(unittest.TestCase):
 
         rc, out = self._run()
         self.assertEqual(rc, 0)
-        # Delivered verbatim — byte-for-byte, no reformatting.
-        self.assertEqual(out, report)
+        # The report byte-for-byte, no reformatting, then the audits note.
+        self.assertEqual(out, delivered(report))
         # Concluded: completion marked, report moved out of the scan gate's way.
         self.assertTrue((self.d / COMPLETED).exists())
         self.assertFalse((self.d / INVENTORY).exists())
@@ -174,7 +218,332 @@ class DeliveryMainTest(unittest.TestCase):
         (self.d / ALIGNED).touch()
         rc, out = self._run()
         self.assertEqual(rc, 0)
-        self.assertEqual(out, report)
+        self.assertEqual(out, delivered(report))
+
+
+class DeliveryMarksShownTest(unittest.TestCase):
+    """The report's items are marked shown as the first report, after the claim and before stdout."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+        patcher = mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        self.out = io.StringIO()
+        self.posts = []
+
+        def post(endpoint, finding_id, body):
+            # What had reached stdout when the mark was sent.
+            self.posts.append((finding_id, body, self.out.getvalue()))
+
+        self.post = mock.patch.object(bootstrap_delivery, "_post_surfaced", side_effect=post)
+        self.post.start()
+        self.addCleanup(self.post.stop)
+
+    def _run(self):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(self.out), contextlib.redirect_stderr(err):
+            rc = bootstrap_delivery.main(self.d)
+        return rc, self.out.getvalue(), err.getvalue()
+
+    def _shown(self, record=SHOWN_RECORD):
+        (self.d / SHOWN).write_text(record if isinstance(record, str) else json.dumps(record), encoding="utf-8")
+
+    def test_the_names_are_the_ones_select_writes_and_the_queue_accepts(self):
+        self.assertEqual(bootstrap_delivery.SHOWN_NAME, Path(inventory_findings.DEFAULT_SHOWN_PATH).name)
+        self.assertEqual(
+            (bootstrap_delivery.SHOWN_ITEMS, bootstrap_delivery.SHOWN_CLASS, bootstrap_delivery.SHOWN_IDS),
+            (inventory_findings.SHOWN_ITEMS, inventory_findings.SHOWN_CLASS, inventory_findings.SHOWN_IDS),
+        )
+        self.assertIn(bootstrap_delivery.PUBLISHER, findings_queue.PACED_PUBLISHERS)
+
+    def test_every_row_is_marked_with_one_run_before_the_report_goes_out(self):
+        self._shown()
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        self.assertEqual(
+            [finding_id for finding_id, _, _ in self.posts],
+            ["sa-key.acme.prod.app.sa1", "sa-key.acme.prod.app.sa2", "crashloop.acme.prod.app.api"],
+        )
+        bodies = [body for _, body, _ in self.posts]
+        self.assertEqual({body["publisher"] for body in bodies}, {"first_report"})
+        self.assertEqual({body["added_class"] for body in bodies}, {"critical"})
+        self.assertEqual(len({body["run"] for body in bodies}), 1)
+        self.assertEqual({before for _, _, before in self.posts}, {""})
+        self.assertFalse((self.d / SHOWN).exists())
+        self.assertEqual(json.loads((self.d / SHOWN_DELIVERED).read_text(encoding="utf-8")), SHOWN_RECORD)
+
+    def test_a_queue_that_does_not_answer_is_asked_once_and_the_report_still_goes_out(self):
+        self._shown()
+        self.post.stop()
+        with mock.patch.object(
+            bootstrap_delivery, "_post_surfaced", side_effect=urllib.error.URLError("connection refused")
+        ) as post:
+            rc, out, err = self._run()
+        self.post.start()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        post.assert_called_once()
+        self.assertIn("did not answer", err)
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / SHOWN_DELIVERED).exists())
+
+    def test_a_row_the_queue_refuses_does_not_stop_the_others(self):
+        self._shown()
+        self.post.stop()
+        refused = urllib.error.HTTPError("u", 404, "Not Found", {}, io.BytesIO(b'{"error": "not found"}'))
+        with mock.patch.object(bootstrap_delivery, "_post_surfaced", side_effect=[refused, None, None]) as post:
+            rc, out, err = self._run()
+        self.post.start()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        self.assertEqual(post.call_count, 3)
+        self.assertIn("could not mark sa-key.acme.prod.app.sa1 shown: 404", err)
+
+    def test_a_refusal_whose_body_cannot_be_read_does_not_stop_the_report(self):
+        self._shown()
+        self.post.stop()
+        refused = urllib.error.HTTPError("u", 503, "Unavailable", {}, io.BytesIO(b""))
+        refused.read = mock.Mock(side_effect=TimeoutError("read timed out"))
+        with mock.patch.object(bootstrap_delivery, "_post_surfaced", side_effect=[refused, None, None]) as post:
+            rc, out, err = self._run()
+        self.post.start()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        self.assertEqual(post.call_count, 3)
+        self.assertIn("could not mark sa-key.acme.prod.app.sa1 shown: 503", err)
+
+    def test_no_shown_file_marks_nothing_and_delivers(self):
+        rc, out, err = self._run()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        self.assertEqual(self.posts, [])
+        self.assertIn("no INVENTORY.shown.json", err)
+        self.assertFalse((self.d / SHOWN_DELIVERED).exists())
+
+    def test_an_unreadable_shown_file_marks_nothing_and_delivers(self):
+        for record in ("{not json", json.dumps({"items": [{"ids": ["x"]}]}), json.dumps([1])):
+            with self.subTest(record=record):
+                (self.d / COMPLETED).unlink(missing_ok=True)
+                (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+                self.out = io.StringIO()
+                self._shown(record)
+                rc, out, err = self._run()
+                self.assertEqual((rc, out), (0, delivered("# Report\n")))
+                self.assertEqual(self.posts, [])
+                self.assertIn("is not readable", err)
+
+    def test_a_failure_reading_the_shown_file_never_blocks_delivery(self):
+        self._shown()
+        with mock.patch.object(bootstrap_delivery, "_read_shown", side_effect=RuntimeError("boom")):
+            rc, out, err = self._run()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        self.assertIn("marking nothing: boom", err)
+        # Set aside all the same, so a later report is not marked with these ids.
+        self.assertFalse((self.d / SHOWN).exists())
+        self.assertTrue((self.d / SHOWN_DELIVERED).exists())
+
+    def test_a_report_listing_no_item_marks_nothing(self):
+        self._shown({"items": []})
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        self.assertEqual(self.posts, [])
+        self.assertTrue((self.d / SHOWN_DELIVERED).exists())
+
+    def test_a_racing_run_marks_nothing(self):
+        self._shown()
+        self.assertTrue(bootstrap_delivery._claim_delivery(self.d))
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, ""))
+        self.assertEqual(self.posts, [])
+        self.assertTrue((self.d / SHOWN).exists())
+
+    def test_the_mark_reaches_the_queue_with_the_pods_key(self):
+        received = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                received.append((self.path, self.headers.get("Authorization"), body))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.post.stop()
+        self._shown({"items": [{"class": "critical", "ids": ["a/b"]}]})
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+        with mock.patch.dict(os.environ, {"SESSION_KV_ENDPOINT": endpoint, "SESSION_KV_API_KEY": "k"}):
+            rc, out, _ = self._run()
+        self.post.start()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        [(path, auth, body)] = received
+        self.assertEqual((path, auth), ("/v1/findings/a%2Fb/surfaced", "Bearer k"))
+        self.assertEqual((body["publisher"], body["added_class"]), ("first_report", "critical"))
+
+
+class DeliveryRegistersFindingsTest(unittest.TestCase):
+    """The sweep's findings are registered from this pod before the claim, since the worker's terminal may not reach the queue."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+        patcher = mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        self.sent = []
+
+        def post(endpoint, batch, scope):
+            # Whether the claim had been taken when the batch was sent.
+            self.sent.append(([f["object"] for f in batch], scope, (self.d / COMPLETED).exists()))
+            return {"results": []}
+
+        self.post = mock.patch.object(inventory_findings, "post_batch", side_effect=post)
+        self.post.start()
+        self.addCleanup(self.post.stop)
+        marks = mock.patch.object(bootstrap_delivery, "_post_surfaced")
+        marks.start()
+        self.addCleanup(marks.stop)
+
+    def _write(self, items=EXTRACTED, scores=SCORED):
+        if items is not None:
+            (self.d / ITEMS).write_text(json.dumps(items), encoding="utf-8")
+        if scores is not None:
+            (self.d / SCORES).write_text(json.dumps(scores), encoding="utf-8")
+
+    def _run(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = bootstrap_delivery.main(self.d)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_the_names_are_the_ones_extract_and_the_worker_write(self):
+        self.assertEqual(bootstrap_delivery.ITEMS_NAME, Path(inventory_findings.DEFAULT_ITEMS_PATH).name)
+        self.assertEqual(bootstrap_delivery.SCORES_NAME, Path(inventory_findings.DEFAULT_SCORES_PATH).name)
+
+    def test_every_cluster_is_registered_before_the_claim_with_its_scope(self):
+        self._write()
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        self.assertEqual(
+            self.sent,
+            [
+                (["api"], None, False),
+                (["api", "web"], {"project": "acme", "cluster": "prod", "complete": True}, False),
+            ],
+        )
+
+    def test_a_hand_off_that_filed_no_ranking_card_registers_nothing(self):
+        # A no-coverage sweep writes the report itself; the items and scores are the last sweep's.
+        self._write()
+        (self.d / bootstrap_handoff.HANDOFF_MARKER).write_text(
+            f"sweep=t_sweep\ntask_id={bootstrap_handoff.NO_RANKING}\nfiled_at=1\n", encoding="utf-8"
+        )
+        rc, out, err = self._run()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        self.assertEqual(self.sent, [])
+        self.assertIn("filed no prioritization card", err)
+
+    def test_an_unreadable_hand_off_marker_registers_nothing(self):
+        self._write()
+        (self.d / bootstrap_handoff.HANDOFF_MARKER).write_bytes(b"sweep=t_sweep\ntask_id=\xff\xfe\n")
+        rc, out, err = self._run()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        self.assertEqual(self.sent, [])
+        self.assertIn("could not be read; registering nothing", err)
+
+    def test_a_hand_off_that_filed_a_ranking_card_registers_its_batch(self):
+        self._write()
+        (self.d / bootstrap_handoff.HANDOFF_MARKER).write_text(
+            "sweep=t_sweep\ntask_id=t_rank\nfiled_at=1\n", encoding="utf-8"
+        )
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        self.assertEqual([objects for objects, _, _ in self.sent], [["api"], ["api", "web"]])
+
+    def test_a_row_the_queue_reports_suppressed_is_not_marked_shown(self):
+        # Sandboxed, `select` never learned the user dismissed it, so the report lists it.
+        self._write()
+        (self.d / SHOWN).write_text(json.dumps(SHOWN_RECORD), encoding="utf-8")
+        dismissed = "sa-key.acme.prod.app.sa1"
+        self.post.stop()
+        with mock.patch.object(
+            inventory_findings,
+            "post_batch",
+            side_effect=[{"results": [{"id": dismissed, "outcome": "suppressed"}]}, {"results": []}],
+        ), mock.patch.object(bootstrap_delivery, "_post_surfaced") as mark:
+            rc, out, err = self._run()
+        self.post.start()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        self.assertEqual(
+            [call.args[1] for call in mark.call_args_list],
+            ["sa-key.acme.prod.app.sa2", "crashloop.acme.prod.app.api"],
+        )
+        self.assertIn(f"not marking {dismissed} shown", err)
+
+    def test_a_clean_fleet_registers_nothing_and_needs_no_scores(self):
+        self._write(items={"items": []}, scores=None)
+        rc, out, err = self._run()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        self.assertEqual(self.sent, [])
+        self.assertNotIn("registering nothing", err)
+
+    def test_missing_or_unusable_files_register_nothing_and_deliver(self):
+        cases = (
+            (None, SCORED, "no INVENTORY.items.json"),
+            (EXTRACTED, None, "no INVENTORY.scores.json"),
+            ([1], SCORED, "registering nothing"),
+            (EXTRACTED, {"scores": {"f001": SCORE}}, "unscored: f002, f003"),
+        )
+        for items, scores, expected in cases:
+            with self.subTest(expected=expected):
+                for name in (ITEMS, SCORES, COMPLETED):
+                    (self.d / name).unlink(missing_ok=True)
+                (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+                self._write(items, scores)
+                rc, out, err = self._run()
+                self.assertEqual((rc, out), (0, delivered("# Report\n")))
+                self.assertEqual(self.sent, [])
+                self.assertIn(expected, err)
+
+    def test_a_queue_that_does_not_answer_is_asked_once_and_the_report_still_goes_out(self):
+        self._write()
+        self.post.stop()
+        with mock.patch.object(
+            inventory_findings, "post_batch", side_effect=urllib.error.URLError("connection refused")
+        ) as post:
+            rc, out, err = self._run()
+        self.post.start()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        post.assert_called_once()
+        self.assertIn("did not answer", err)
+
+    def test_a_cluster_the_queue_refuses_does_not_stop_the_others(self):
+        self._write()
+        self.post.stop()
+        refused = urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(b""))
+        with mock.patch.object(inventory_findings, "post_batch", side_effect=[refused, {"results": []}]) as post:
+            rc, out, err = self._run()
+        self.post.start()
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
+        self.assertEqual(post.call_count, 2)
+        self.assertIn("refused acme/dev's findings: 400", err)
+
+    def test_a_racing_run_that_loses_the_claim_only_registers_again(self):
+        self._write()
+        self.assertTrue(bootstrap_delivery._claim_delivery(self.d))
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, ""))
 
 
 class RetireRunTest(unittest.TestCase):
@@ -221,7 +590,7 @@ class RetireRunTest(unittest.TestCase):
         (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
         (self.d / ALIGNED).touch()
         rc, out, _ = self._run()
-        self.assertEqual((rc, out), (0, "# Report\n"))
+        self.assertEqual((rc, out), (0, delivered("# Report\n")))
         self.assertTrue((self.d / COMPLETED).exists())
         self.assertEqual(self.removed, [])
 
@@ -273,6 +642,9 @@ class DeliveryFromSandboxTest(unittest.TestCase):
 
     SANDBOX_REPORT = "/opt/data/INVENTORY.md"
     SANDBOX_DELIVERED = "/opt/data/INVENTORY.delivered.md"
+    SANDBOX_SHOWN = "/opt/data/INVENTORY.shown.json"
+    SANDBOX_ITEMS = "/opt/data/INVENTORY.items.json"
+    SANDBOX_SCORES = "/opt/data/INVENTORY.scores.json"
     _REAL_READ_BYTES = staticmethod(sandbox_exec.read_bytes)
 
     def setUp(self):
@@ -280,11 +652,21 @@ class DeliveryFromSandboxTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.d = Path(self._tmp.name)
         (self.d / ALIGNED).touch()
-        self.read = self._patch("read_bytes", return_value=b"# Sandbox report\n")
+        # The report is the mock's return value; the files beside it are `self.beside`.
+        self.shown = None
+        self.beside = {}
+        self.read = self._patch("read_bytes", return_value=b"# Sandbox report\n", side_effect=self._read)
         self.run_ = self._patch(
             "run", return_value=subprocess.CompletedProcess(["mv"], 0, stdout="", stderr="")
         )
         self._patch("sandbox_enabled", return_value=True)
+
+    def _read(self, path, **_kw):
+        if path == self.SANDBOX_REPORT:
+            return mock.DEFAULT
+        if path == self.SANDBOX_SHOWN:
+            return self.shown
+        return self.beside.get(path)
 
     def _patch(self, name, **kwargs):
         patcher = mock.patch.object(sandbox_exec, name, **kwargs)
@@ -301,14 +683,17 @@ class DeliveryFromSandboxTest(unittest.TestCase):
         (self.d / INVENTORY).write_text("# Stale local copy\n", encoding="utf-8")
         rc, out, _ = self._run()
         self.assertEqual(rc, 0)
-        self.assertEqual(out, "# Sandbox report\n")
+        self.assertEqual(out, delivered("# Sandbox report\n"))
         self.assertTrue((self.d / COMPLETED).exists())
-        self.read.assert_called_once()
-        self.assertEqual(self.read.call_args.args, (self.SANDBOX_REPORT,))
-        self.assertEqual(self.read.call_args.kwargs["max_bytes"], bootstrap_delivery.REPORT_MAX_BYTES + 1)
+        report_read, items_read, shown_read = self.read.call_args_list
+        self.assertEqual(report_read.args, (self.SANDBOX_REPORT,))
+        self.assertEqual(report_read.kwargs["max_bytes"], bootstrap_delivery.REPORT_MAX_BYTES + 1)
+        self.assertEqual(items_read.args, (self.SANDBOX_ITEMS,))
+        self.assertEqual(shown_read.args, (self.SANDBOX_SHOWN,))
         # The read runs as read_bytes' own default login; the rename as the
         # terminal's, which owns the sandbox's /opt/data.
-        self.assertNotIn("principal", self.read.call_args.kwargs)
+        self.assertNotIn("principal", report_read.kwargs)
+        # No shown file, so only the report is set aside.
         self.run_.assert_called_once()
         self.assertEqual(
             self.run_.call_args.args[0], ["/bin/mv", "-f", "--", self.SANDBOX_REPORT, self.SANDBOX_DELIVERED]
@@ -317,6 +702,49 @@ class DeliveryFromSandboxTest(unittest.TestCase):
         # The local copy is not the sandbox's to archive.
         self.assertTrue((self.d / INVENTORY).exists())
         self.assertFalse((self.d / DELIVERED).exists())
+
+    def test_the_sandbox_shown_file_is_marked_and_archived_there(self):
+        self.shown = json.dumps(SHOWN_RECORD).encode("utf-8")
+        with mock.patch.object(bootstrap_delivery, "_post_surfaced") as post:
+            rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, delivered("# Sandbox report\n")))
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(
+            [c.args[0] for c in self.run_.call_args_list],
+            [
+                ["/bin/mv", "-f", "--", self.SANDBOX_REPORT, self.SANDBOX_DELIVERED],
+                ["/bin/mv", "-f", "--", self.SANDBOX_SHOWN, "/opt/data/INVENTORY.shown.delivered.json"],
+            ],
+        )
+        self.assertEqual(
+            {c.kwargs["principal"] for c in self.run_.call_args_list}, {sandbox_exec.TERMINAL_PRINCIPAL}
+        )
+
+    def test_the_sweeps_findings_are_read_from_the_sandbox_and_registered(self):
+        self.beside = {
+            self.SANDBOX_ITEMS: json.dumps(EXTRACTED).encode("utf-8"),
+            self.SANDBOX_SCORES: json.dumps(SCORED).encode("utf-8"),
+        }
+        with mock.patch.object(inventory_findings, "post_batch") as post:
+            rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, delivered("# Sandbox report\n")))
+        self.assertEqual(post.call_count, 2)
+        reads = [c.args[0] for c in self.read.call_args_list]
+        self.assertEqual(reads[1:3], [self.SANDBOX_ITEMS, self.SANDBOX_SCORES])
+        self.assertEqual(
+            {c.kwargs["max_bytes"] for c in self.read.call_args_list[1:3]}, {bootstrap_delivery.BATCH_MAX_BYTES + 1}
+        )
+
+    def test_an_unreachable_sandbox_after_the_claim_still_delivers(self):
+        def read(path, **_kw):
+            if path == self.SANDBOX_SHOWN:
+                raise sandbox_exec.SandboxUnavailable("gone")
+            return b"# Sandbox report\n"
+
+        self.read.side_effect = read
+        rc, out, err = self._run()
+        self.assertEqual((rc, out), (0, delivered("# Sandbox report\n")))
+        self.assertIn("could not read INVENTORY.shown.json", err)
 
     def test_no_human_means_no_sandbox_read(self):
         (self.d / ALIGNED).unlink()
@@ -407,7 +835,7 @@ class DeliveryFromSandboxTest(unittest.TestCase):
         self.read.return_value = b"caf\xe9 report\n"
         rc, out, _ = self._run()
         self.assertEqual(rc, 0)
-        self.assertEqual(out, "caf\ufffd report\n")
+        self.assertEqual(out, delivered("caf\ufffd report\n"))
 
     def test_a_failed_rename_still_counts_as_delivered(self):
         for outcome in (
@@ -419,7 +847,7 @@ class DeliveryFromSandboxTest(unittest.TestCase):
                 self.run_.reset_mock(return_value=True, side_effect=True)
                 self.run_.configure_mock(**outcome)
                 rc, out, err = self._run()
-                self.assertEqual((rc, out), (0, "# Sandbox report\n"))
+                self.assertEqual((rc, out), (0, delivered("# Sandbox report\n")))
                 self.assertTrue((self.d / COMPLETED).exists())
                 self.assertIn("could not archive INVENTORY.md in the sandbox", err)
 
@@ -549,20 +977,19 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(self.filed, [])
         self.assertEqual(out, "")
 
-    def test_body_hands_ranking_to_a_separate_card(self):
-        """Ranking must not happen inside the sweep.
+    def test_body_leaves_the_raw_file_and_ranking_to_the_hand_off(self):
+        """The worker lists the fleet and completes; bootstrap_handoff.py does the rest.
 
-        The delivered report has to be produced from the raw findings alone. A
-        worker that ranks inline ranks against its own sweep transcript too, so
-        the same findings yield a different report depending on how the sweep
-        went — which is exactly what a fresh card prevents.
+        Asked to wait, compile and hand off, the worker had no tool that waits,
+        typed the raw file without its findings block, and filed the ranking card
+        without its key.
         """
         body = bootstrap_scan_gate._task_body()
-        self.assertIn(bootstrap_scan_gate.RAW_INVENTORY_PATH, body)
-        self.assertIn(bootstrap_scan_gate.PRIORITIZE_IDEMPOTENCY_KEY, body)
-        for path in bootstrap_scan_gate.PRIORITIZE_INSTRUCTIONS_PATHS:
-            self.assertIn(path, body)
-        self.assertIn("Do not rank the findings yourself", body)
+        self.assertIn(f"do not write `{bootstrap_scan_gate.RAW_INVENTORY_PATH}`", body)
+        self.assertIn("do not file a ranking card", body)
+        self.assertIn("Do not wait for the per-cluster cards", body)
+        self.assertNotIn("sleep 60", body)
+        self.assertNotIn(bootstrap_scan_gate.PRIORITIZE_IDEMPOTENCY_KEY, body)
 
     def test_child_cards_are_pointed_at_the_per_cluster_audit_sop(self):
         """Without the SOP path the child body is written freehand.
@@ -592,32 +1019,28 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(bootstrap_scan_gate.INVENTORY_PATH, "/opt/data/INVENTORY.md")
         self.assertIn("/opt/data/INVENTORY.md", bootstrap_scan_gate._task_body())
 
-    def test_body_drives_per_cluster_fan_out_and_leaves_no_cluster_uncovered(self):
-        """The sweep must scale per cluster and must not leave a hole.
+    def test_body_leaves_cluster_agents_to_the_gate_and_audits_the_rest(self):
+        """The sweep must not leave a hole.
 
         Cluster Agents are pinned read-only to one cluster each. Which clusters
-        get one is reconcile's decision, not this body's, so the body delegates
-        every cluster on the roster and audits only what the roster missed.
+        get one is reconcile's decision, and the gate files their cards, so the
+        body audits only what the roster missed.
         """
         body = bootstrap_scan_gate._task_body()
         self.assertIn(bootstrap_scan_gate.RECONCILE_SCRIPT_NAME, body)  # roster first
-        self.assertIn("did not cover yourself", body)  # no silent hole
-        self.assertIn("kanban_create", body)  # one child per cluster
-        # The sweep card waits for its children and synthesizes their results
-        # itself; completing on a dispatch receipt is the #1010 defect, and the
-        # retired aggregation-card handoff must not creep back into the body.
-        self.assertIn("wait for the children", body)
-        self.assertIn("kanban_show", body)
+        self.assertIn("audit the clusters the list does not cover", body)  # no silent hole
+        self.assertIn("do not fan out; the gate has", body)  # the gate files one card per cluster
+        # The fleet list is how the hand-off names a cluster nobody reported on.
+        self.assertIn("`fleet`", body)
         self.assertNotIn("aggregation card", body)
         self.assertIn("metadata", body)  # structured child results
 
-    def test_step_2_lists_one_exact_call_per_cluster_agent(self):
+    def test_step_2_lists_each_cluster_agent_the_gate_files(self):
         """The gate reads the roster because the sweep's worker cannot (#1872).
 
         The worker's terminal runs in the shell sandbox, which has no `hermes`,
-        and whose /opt/data/profiles is a mirror without any config.yaml. Sent to
-        read the roster there, the worker blocked on 0.6.0; on main it listed the
-        mirror's directories and fanned out from that.
+        and whose /opt/data/profiles is a mirror without any config.yaml: read
+        there, the roster is either an error or the mirror's directories.
         """
         short = self._cluster_agent("proj", "prod", "us-east4")
         # Long enough that profile_name() truncates and hashes it: the key is the
@@ -628,10 +1051,13 @@ class ScanGateTest(unittest.TestCase):
         self.assertNotIn("us-central1-a", hashed)
         step2 = self._step_2(bootstrap_scan_gate._task_body())
         prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
-        self.assertIn(f"kanban_create(assignee='{short}', idempotency_key='{prefix}{short}'", step2)
-        self.assertIn(f"kanban_create(assignee='{hashed}', idempotency_key='{prefix}{hashed}'", step2)
-        self.assertIn("title='Report cluster inventory: `prod` (`proj`, `us-east4`)'", step2)
-        self.assertEqual(step2.count("kanban_create("), 2)
+        agents = {a["name"]: a for a in bootstrap_scan_gate.cluster_agents()}
+        self.assertEqual(sorted(agents), sorted([short, hashed]))
+        self.assertEqual(agents[short]["key"], f"{prefix}{short}")
+        self.assertEqual(agents[hashed]["key"], f"{prefix}{hashed}")
+        self.assertEqual(agents[short]["title"], "Report cluster inventory: `prod` (`proj`, `us-east4`)")
+        self.assertIn(f"`{short}`", step2)
+        self.assertIn(f"`{hashed}`", step2)
         self.assertNotIn("/opt/hermes", step2)
         self.assertNotIn("profile list", step2)
 
@@ -640,8 +1066,7 @@ class ScanGateTest(unittest.TestCase):
         # shared key hands the second Cluster Agent the first one's card.
         self._cluster_agent("proj-a", "prod", "us-central1")
         self._cluster_agent("proj-b", "prod", "us-central1")
-        step2 = self._step_2(bootstrap_scan_gate._task_body())
-        keys = re.findall(r"idempotency_key='([^']+)'", step2)
+        keys = [a["key"] for a in bootstrap_scan_gate.cluster_agents()]
         self.assertEqual(len(keys), 2)
         self.assertEqual(len(set(keys)), 2)
 
@@ -652,10 +1077,9 @@ class ScanGateTest(unittest.TestCase):
         # directory name differs, which the key must follow.
         first = self._cluster_agent("proj-a", "b", "us-central1")
         second = self._cluster_agent("proj", "a-b", "us-central1", name="cluster-proj-a-b-us-central1-2")
-        step2 = self._step_2(bootstrap_scan_gate._task_body())
         prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
         self.assertEqual(
-            re.findall(r"idempotency_key='([^']+)'", step2), [f"{prefix}{first}", f"{prefix}{second}"]
+            [a["key"] for a in bootstrap_scan_gate.cluster_agents()], [f"{prefix}{first}", f"{prefix}{second}"]
         )
 
     def test_step_2_leaves_out_what_is_not_a_cluster_agent(self):
@@ -674,20 +1098,17 @@ class ScanGateTest(unittest.TestCase):
             (unstamped / marker).write_text("")
         with contextlib.redirect_stderr(io.StringIO()):
             step2 = self._step_2(bootstrap_scan_gate._task_body())
-        self.assertNotIn("kanban_create(", step2)
+            self.assertEqual(bootstrap_scan_gate.cluster_agents(), [])
         self.assertIn("    (none)", step2)
-        self.assertIn("If no calls are listed above", step2)
+        self.assertIn("If the list above is `(none)`", step2)
 
-    def test_the_fan_out_calls_carry_no_parents(self):
-        # A card whose parent is the sweep card cannot start until the sweep card
-        # completes, so the #1174 guard lets the sweep card complete over it: the
-        # sweep closed on a dispatch receipt and nothing read the audits (#1872).
+    def test_the_sweep_is_told_not_to_file_cluster_cards(self):
+        # The gate files them: asked to make the calls itself, the worker once
+        # completed saying it had fanned out to seven clusters and had filed none.
         self._cluster_agent("proj", "prod", "us-east4")
         step2 = self._step_2(bootstrap_scan_gate._task_body())
-        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
-        self.assertEqual(len(calls), 1)
-        self.assertNotIn("parents", calls[0])
-        self.assertIn("Pass no `parents`", step2)
+        self.assertIn("Do not create cluster cards", step2)
+        self.assertNotIn("kanban_create(", step2)
 
     def test_step_2_leaves_out_a_profile_whose_scaffold_did_not_finish(self):
         # Hermes never registered the first, so a card assigned to it is never
@@ -698,10 +1119,8 @@ class ScanGateTest(unittest.TestCase):
         half_built = self._cluster_agent("proj", "half", "us-east4", artifacts=())
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            step2 = self._step_2(bootstrap_scan_gate._task_body())
-        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
-        self.assertEqual(len(calls), 1)
-        self.assertIn(f"assignee='{ready}'", calls[0])
+            names = [a["name"] for a in bootstrap_scan_gate.cluster_agents()]
+        self.assertEqual(names, [ready])
         self.assertIn(f"{unregistered}: scaffold not finished", stderr.getvalue())
         self.assertIn(f"{half_built}: scaffold not finished", stderr.getvalue())
 
@@ -724,10 +1143,8 @@ class ScanGateTest(unittest.TestCase):
         (bad / "config.yaml").write_text("- a\n")
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            step2 = self._step_2(bootstrap_scan_gate._task_body())
-        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
-        self.assertEqual(len(calls), 1)
-        self.assertIn(f"assignee='{good}'", calls[0])
+            names = [a["name"] for a in bootstrap_scan_gate.cluster_agents()]
+        self.assertEqual(names, [good])
         self.assertIn("cluster-broken: ", stderr.getvalue())
         self.assertNotIn("cluster-broken: scaffold not finished", stderr.getvalue())
 
@@ -747,17 +1164,15 @@ class ScanGateTest(unittest.TestCase):
 
         stderr = io.StringIO()
         with mock.patch.object(Path, "is_file", _is_file), contextlib.redirect_stderr(stderr):
-            step2 = self._step_2(bootstrap_scan_gate._task_body())
-        calls = [line for line in step2.splitlines() if "kanban_create(" in line]
-        self.assertEqual(len(calls), 1)
-        self.assertIn(f"assignee='{good}'", calls[0])
+            names = [a["name"] for a in bootstrap_scan_gate.cluster_agents()]
+        self.assertEqual(names, [good])
         self.assertIn(f"skipping Cluster Agent {locked}: [Errno {errno.EACCES}] Permission denied", stderr.getvalue())
 
     def test_the_card_lists_the_roster_the_reconcile_left(self):
         """The roster is read after the gate's own reconcile, not before it.
 
         On a fresh install no profile exists until that reconcile creates it, so
-        a list taken any earlier is empty and the sweep fans out to nobody.
+        a list taken any earlier is empty and no Cluster Agent card is filed.
         """
         bootstrap_scan_gate.file_scan_task = self._orig
         script = self.d / "scripts" / bootstrap_scan_gate.RECONCILE_SCRIPT_NAME
@@ -779,7 +1194,7 @@ class ScanGateTest(unittest.TestCase):
             self._run()
         self.assertEqual(len(filed), 1)
         args = shlex.split(filed[0])
-        self.assertIn(f"kanban_create(assignee='{created[0]}'", args[args.index("--body") + 1])
+        self.assertIn(f"`{created[0]}`", args[args.index("--body") + 1])
 
     def test_body_forbids_improvising_around_a_failed_step(self):
         """The 32-call roster loop is what this prevents.
@@ -792,10 +1207,10 @@ class ScanGateTest(unittest.TestCase):
         body = bootstrap_scan_gate._task_body()
         self.assertIn("treat its answer as empty", body)
         self.assertIn("do not improvise", body.lower())
-        self.assertIn("exactly once", body)
+        self.assertIn("Discovery steps run ONCE", body)
 
     def test_reconcile_runs_before_the_sweep_is_filed(self):
-        """A sweep filed against a not-yet-reconciled roster fans out to nobody.
+        """A sweep filed against a not-yet-reconciled roster gets no Cluster Agent cards.
 
         `cluster-agent-reconcile` is on `11 * * * *` and this gate is on
         `* * * * *`, so on a fresh install the gate reaches an empty roster up to
@@ -1019,7 +1434,7 @@ class ScanGateTest(unittest.TestCase):
         self.assertIn("may be empty or incomplete", body)
         # The degradation has to reach the user: the report is delivered verbatim.
         self.assertIn("names each one as lacking an agent", body)
-        self.assertIn("file it anyway", body)
+        self.assertIn("complete the card anyway", body)
 
     def test_body_degrades_when_no_cluster_agents_exist(self):
         # A single-cluster install reconciles to an empty roster, and that is the
@@ -1027,7 +1442,7 @@ class ScanGateTest(unittest.TestCase):
         # than fanning out to an empty roster and writing nothing.
         body = bootstrap_scan_gate._task_body()
         self.assertIn("there are no Cluster Agents", body)
-        self.assertIn("do the whole sweep yourself", body)
+        self.assertIn("audit every cluster yourself in Step 3", body)
         # The workload checks live only in the single-cluster SOP now, so the solo
         # walk has to be sent there or it produces a topology table with empty
         # workload columns — the empty report this card exists to prevent.
@@ -1037,16 +1452,41 @@ class ScanGateTest(unittest.TestCase):
         # the one path where no Cluster Agent supplies them.
         self.assertIn("Steps 2 to 4 of the single-cluster audit SOP", body)
 
-    def test_body_propagates_idempotency_keys_to_the_fan_out(self):
-        # The root card is guarded by a marker and a key; the cards it spawns
-        # are guarded only by what these instructions tell the worker to set.
-        # (The aggregation card's key went with the fan-in shape, #1010: the
-        # sweep card now waits for its children and writes the findings itself,
-        # so the only spawned cards left are per-cluster and prioritize.)
+    def test_cluster_cards_are_keyed_by_profile_name(self):
+        # The gate re-files a missing card every tick until the hand-off; the
+        # key is what keeps a repeat from duplicating one.
         name = self._cluster_agent("proj", "prod", "us-east4")
-        body = bootstrap_scan_gate._task_body()
-        self.assertIn(f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}", body)
-        self.assertIn(bootstrap_scan_gate.PRIORITIZE_IDEMPOTENCY_KEY, body)
+        keys = [a["key"] for a in bootstrap_scan_gate.cluster_agents()]
+        self.assertEqual(keys, [f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}"])
+
+    def test_a_filed_sweep_runs_the_hand_off_instead_of_filing(self):
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n")
+        with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off") as hand_off:
+            rc, out = self._run()
+        self.assertEqual((rc, out, self.filed), (0, "", []))
+        hand_off.assert_called_once_with(
+            self.d, self.d / SCAN_FILED, bootstrap_scan_gate._parse_task_id, roster=bootstrap_scan_gate.cluster_agents
+        )
+
+    def test_filing_the_sweep_files_the_cluster_cards_in_the_same_tick(self):
+        with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off") as hand_off:
+            self._run()
+        self.assertEqual(len(self.filed), 1)
+        hand_off.assert_called_once()
+        self.assertIs(hand_off.call_args.kwargs["roster"], bootstrap_scan_gate.cluster_agents)
+
+    def test_a_failing_hand_off_does_not_fail_the_cron_run(self):
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n")
+        with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off", side_effect=TypeError("bad metadata")):
+            rc, out = self._run()
+        self.assertEqual((rc, out), (0, ""))
+
+    def test_no_hand_off_once_the_report_is_delivered(self):
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n")
+        (self.d / COMPLETED).write_text("")
+        with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off") as hand_off:
+            self._run()
+        hand_off.assert_not_called()
 
     def test_parses_task_id_from_either_response_shape(self):
         # --json is what we ask for, but run_slash hands back stdout and stderr
@@ -1157,8 +1597,160 @@ class ScopeGapParagraphTest(unittest.TestCase):
         with mock.patch.object(bootstrap_scan_gate, "_data_dir", return_value=data_dir):
             body = bootstrap_scan_gate._task_body()
         self.assertIn("`locked` (denied)", body)
-        # It sits between the roster caveat and Step 2, where the fan-out reads it.
+        # It sits between the roster caveat and Step 2, which lists the roster.
         self.assertLess(body.index("`locked` (denied)"), body.index("**Step 2"))
+
+
+class FirstRunAuditsTest(unittest.TestCase):
+    """The scan leaves the first-run audits' checks to them, and the delivery says so."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+
+    @staticmethod
+    def _slug_table() -> set[str]:
+        """The backticked slugs in the `check slug` column of the cluster inventory SOP's Step 5 table."""
+        text = CLUSTER_INVENTORY_SOP.read_text(encoding="utf-8")
+        rows = [line for line in text[text.index("## Step 5"):].splitlines() if line.startswith("|")]
+        header = next(i for i, line in enumerate(rows) if "check slug" in line)
+        slugs = set()
+        for line in rows[header + 2:]:
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) != 2:
+                break
+            slugs.update(re.findall(r"`([a-z0-9-]+)`", cells[1]))
+        return slugs
+
+    def _note(self, state=None, no_coverage=False) -> str:
+        """The note for oobe's ``state``."""
+        if state is not None:
+            oobe.write_state(self.d, state)
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n", encoding="utf-8")
+        return bootstrap_delivery._audits_note(self.d, no_coverage)
+
+    def _skipped(self, reason: str) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            oobe.skip(self.d, reason, 1000.0)
+
+    def test_the_slug_table_names_no_check_a_first_run_audit_owns(self):
+        sys.path.insert(0, str(FLEET_AUDIT_SCRIPTS))
+        try:
+            import audit_report
+        finally:
+            sys.path.remove(str(FLEET_AUDIT_SCRIPTS))
+        owned = {check for audit in oobe.FIRST_RUN_AUDITS for check in audit_report.AUDITS[audit].checks}
+        slugs = self._slug_table()
+        self.assertIn("probes-startup", slugs)  # the parse found the table
+        self.assertIn("static-sa-key", slugs)  # Step 4's per-pod check; the cluster setting is the audit's
+        self.assertIn("added-capabilities", slugs)  # privileged-container covers only an added SYS_ADMIN
+        self.assertEqual(sorted(slugs & owned), [])
+
+    def test_no_marker_says_the_audits_will_run(self):
+        # The stage writes its marker on its first tick after the ranking card, which delivery can beat.
+        self.assertEqual(self._note(), bootstrap_delivery.AUDITS_RUNNING_NOTE)
+
+    def test_a_skip_says_the_report_does_not_cover_the_checks(self):
+        for reason in (oobe.SKIP_NOT_NEW, oobe.SKIP_UNSETTLED, oobe.SKIP_NO_SWEEP):
+            with self.subTest(reason=reason):
+                self._skipped(reason)
+                self.assertEqual(
+                    self._note(),
+                    f"The first-run audits did not run: {reason}. {bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}",
+                )
+
+    def test_the_not_covered_note_does_not_say_the_report_covers_them(self):
+        self.assertNotIn("covers", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE)
+        self.assertIn("does not cover", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE)
+
+    def test_a_no_coverage_report_after_another_skip_points_at_the_schedules(self):
+        self._skipped(oobe.SKIP_NOT_NEW)
+        self.assertEqual(
+            self._note(no_coverage=True),
+            f"The first-run audits did not run: {oobe.SKIP_NOT_NEW}. {bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE}",
+        )
+
+    def test_the_delivery_reads_no_coverage_off_the_hand_off_marker(self):
+        (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        (self.d / bootstrap_handoff.HANDOFF_MARKER).write_text(
+            f"sweep=t_sweep\ntask_id={bootstrap_handoff.NO_RANKING}\nfiled_at=1\n", encoding="utf-8"
+        )
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n", encoding="utf-8")
+        self._skipped(oobe.SKIP_NOT_NEW)
+        out = io.StringIO()
+        with (
+            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.assertEqual(
+            out.getvalue(),
+            f"# Report\n\nThe first-run audits did not run: {oobe.SKIP_NOT_NEW}. "
+            f"{bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE}\n",
+        )
+
+    def test_a_chain_under_way_says_the_audits_are_running(self):
+        note = self._note({oobe.STATE_FIRED: ["fleet-wide-cost-analysis"], oobe.STATE_DONE: False})
+        self.assertEqual(note, bootstrap_delivery.AUDITS_RUNNING_NOTE)
+
+    def test_a_finished_chain_says_which_audits_ran(self):
+        note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
+        self.assertIn("which have started: `fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, "
+                      "`stockout-prevention`.", note)
+        self.assertIn("Each posts", note)
+        self.assertNotIn("Not run", note)
+
+    def test_held_and_given_up_audits_are_named_as_not_run(self):
+        note = self._note({
+            oobe.STATE_FIRED: ["fleet-wide-cost-analysis", "stockout-prevention"],
+            oobe.STATE_HELD: {"compliance-audit": oobe.HOLD_DISABLED},
+            oobe.STATE_GAVE_UP: ["obtainability-audit"],
+            oobe.STATE_DONE: True,
+        })
+        self.assertIn("which have started: `fleet-wide-cost-analysis`, `stockout-prevention`.", note)
+        self.assertTrue(note.endswith(
+            f"Not run: `compliance-audit` (disabled), `obtainability-audit` ({bootstrap_delivery.AUDITS_GAVE_UP_REASON})."
+        ))
+
+    def test_a_chain_where_every_audit_was_held_or_given_up_says_none_ran(self):
+        for state in (
+            {oobe.STATE_HELD: {a: oobe.HOLD_PAUSED for a in oobe.FIRST_RUN_AUDITS}, oobe.STATE_DONE: True},
+            {oobe.STATE_GAVE_UP: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True},
+        ):
+            with self.subTest(state=state):
+                note = self._note(state)
+                self.assertTrue(note.startswith(bootstrap_delivery.AUDITS_NONE_RAN_NOTE))
+                self.assertIn("Not run: `fleet-wide-cost-analysis` (", note)
+                self.assertNotIn("now running", note)
+                self.assertNotIn("which have started", note)
+
+    def test_a_chain_under_way_names_a_held_audit_as_not_run(self):
+        note = self._note({oobe.STATE_FIRED: ["fleet-wide-cost-analysis"],
+                           oobe.STATE_HELD: {"compliance-audit": oobe.HOLD_MISSING}, oobe.STATE_DONE: False})
+        self.assertEqual(
+            note, f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} Not run: `compliance-audit` ({oobe.HOLD_MISSING})."
+        )
+
+    def test_the_text_delivery_closes_with_the_skip(self):
+        (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n", encoding="utf-8")
+        self._skipped(oobe.SKIP_NOT_NEW)
+        out = io.StringIO()
+        with (
+            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.assertEqual(
+            out.getvalue(),
+            f"# Report\n\nThe first-run audits did not run: {oobe.SKIP_NOT_NEW}. "
+            f"{bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}\n",
+        )
 
 
 if __name__ == "__main__":

@@ -541,6 +541,44 @@ func TestPlatformAgentValidation(t *testing.T) {
 		}
 	})
 
+	// The watchers' broker token is reserved in either mode: any container but
+	// agent-api-auth that holds it holds the broker's watcher role. The render
+	// strips it (TestNoCRSurfaceHandsAContainerTheWatcherToken); this tells the
+	// author why.
+	t.Run("fails if a user-authored surface names the watcher token volume", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+		mount := corev1.VolumeMount{Name: "watcher-credential-proxy-token", MountPath: "/w"}
+		for _, tc := range []struct {
+			name string
+			dep  *agentv1alpha1.DeploymentSpec
+			path string
+		}{
+			{"sidecar", &agentv1alpha1.DeploymentSpec{
+				Sidecars: []corev1.Container{{Name: "helper", VolumeMounts: []corev1.VolumeMount{mount}}},
+			}, "spec.deployment.sidecars[0].volumeMounts[0].name"},
+			{"init container", &agentv1alpha1.DeploymentSpec{
+				InitContainers: []corev1.Container{{Name: "prep", VolumeMounts: []corev1.VolumeMount{mount}}},
+			}, "spec.deployment.initContainers[0].volumeMounts[0].name"},
+			{"extra volume mount", &agentv1alpha1.DeploymentSpec{
+				ExtraVolumeMounts: []corev1.VolumeMount{mount},
+			}, "spec.deployment.extraVolumeMounts[0].name"},
+			{"sidecar volume shadowing the name", &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{Name: "watcher-credential-proxy-token"}},
+			}, "spec.deployment.sidecarVolumes[0].name"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				agent := &agentv1alpha1.PlatformAgent{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+					Spec: agentv1alpha1.PlatformAgentSpec{
+						AgentSpec: agentv1alpha1.AgentSpec{Deployment: tc.dep},
+					},
+				}
+				_, err := val.ValidateCreate(ctx, agent)
+				assertFieldError(t, err, tc.path)
+			})
+		}
+	})
+
 	t.Run("fails if privileged service account is specified", func(t *testing.T) {
 		val := &PlatformAgentCustomValidator{}
 
@@ -1023,8 +1061,14 @@ func TestGitIntegrationAdmission(t *testing.T) {
 			// check has to hold too: a CR applied before the enum narrowed, or one
 			// reaching the webhook by another path, must not reconcile.
 			name: "a provider with no registered rules",
-			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab"}}},
+			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "bb", Provider: "bitbucket"}}},
 			path: "spec.integration.forges[0].provider",
+		},
+		{
+			// The broker would have no token to call GitLab with.
+			name: "a gitlab forge with no credentialsRef",
+			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab"}}},
+			path: "spec.integration.forges[0].credentialsRef",
 		},
 		{
 			name: "a namespace outside GitHub's grammar",
@@ -1071,7 +1115,7 @@ func TestGitIntegrationCredentialsRefOnGitHubWarns(t *testing.T) {
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
 				Forges: []agentv1alpha1.ForgeSpec{{
 					Name: "github", Namespace: "gke-labs",
-					CredentialsRef: &corev1.LocalObjectReference{Name: "forge-token"},
+					CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "forge-token"},
 				}},
 			}},
 		},

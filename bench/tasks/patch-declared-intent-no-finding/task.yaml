@@ -1,0 +1,101 @@
+# The health signal this case grades is a REPOSITORY DECLARATION rather than
+# cluster posture: the upgrade and patch readiness SOP's declared-intent step
+# (§4a, #1408) reads the linked repositories before it reports a posture, and
+# a cluster whose missing upgrade notifications are declared on purpose in the
+# GitOps repo's knowledge/ directory is not a finding — it is listed under the
+# ledger's Declared intent section with the file's path. The case runs the
+# scheduled audit itself and grades its ledger, because that is where the
+# step lives: the audit's `finish` on an agent without the step files the
+# posture as a finding.
+#
+# Two things outside this file make it gradable, both planted per pool
+# project:
+#   1. The fixture. No seeded cluster publishes GKE upgrade notifications
+#      (bench/tf/fleet/README.md lists 3.10 no-notifications as an accepted
+#      finding on every cluster), so seeded-c carries the posture without a
+#      role of its own, and no other case grades that finding.
+#   2. The declaration. knowledge/notification-relay-no-pdb.md in each pool
+#      project's GitOps repo (gke-agentic/<project>-infra), whose `declares:`
+#      frontmatter carries {check: no-notifications, namespace: "",
+#      object: Cluster/seeded-c} beside the other streams' items; the harness
+#      reads the frontmatter, not the prose. scripts/provision_ci_pool_project.sh
+#      seeds it.
+#
+# Domain: upgrades (security-patch-orchestrator).
+# Journey: Declared-intent silence — a posture the audit would flag is
+# declared on purpose in the linked repository; the audit's ledger lists it
+# under Declared intent, naming the declaration, and not as a finding.
+#
+# Planted defect required: seeded-c with no notificationConfig (the fleet's
+# shipped state) plus the repository declaration above.
+# Isolation class: read-only.
+# Eligible tier: presubmit once admitted; nightly from registration.
+id: patch-declared-intent-no-finding
+name: Upgrade readiness audit lists a declared notification-less cluster under Declared intent, not as a finding
+prompt: >-
+  Run the GKE upgrade and patch readiness audit, following the
+  security-patch-orchestrator SOP.
+expected_output: >-
+  The audit runs to its ledger. The seeded-c cluster, which publishes no GKE
+  upgrade notifications, is listed in the ledger's Declared intent section
+  with the repository and the knowledge/ path of the note that declares it,
+  and no missing-notifications finding names it. The other clusters' missing
+  notifications are still findings.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+verification_spec:
+  - name: the-posture-is-not-a-finding
+    role: objective
+    mode: assert
+    check:
+      # The finding id the audit composes for this posture ends in the empty
+      # namespace segment and the object, which already names the cluster;
+      # the cluster segment before them varies per project, so the id is
+      # matched on its tail. At steady state seeded-c carries no other
+      # cluster-scoped finding in this stream, so the tail names this one; the
+      # one known exception is the transient 3.1 master-behind the fleet
+      # README describes between a REGULAR channel bump and the 03:00
+      # maintenance window, which shares the tail and reds this check for
+      # that one night.
+      type: ledger_issue_contains
+      audit: security-patch-orchestrator
+      scope: finding_ids
+      forbidden_phrases: ["._.cluster-seeded-c"]
+  - name: the-other-clusters-are-still-findings
+    role: objective
+    mode: assert
+    check:
+      # The declaration names one cluster. A run that lists no
+      # no-notifications finding at all declared more than the note did, or
+      # never ran the check.
+      type: ledger_issue_contains
+      audit: security-patch-orchestrator
+      scope: finding_ids
+      required_phrases: ["no-notifications."]
+  - name: the-ledger-names-the-declaration
+    role: objective
+    mode: assert
+    check:
+      # The Declared intent table carries the object as `Cluster/seeded-c` and
+      # the `repo:path` pointer of the note. The object spelling, not the bare
+      # cluster name: the Scope table names every audited cluster on every
+      # run, while `Cluster/<name>` appears only in a finding's detail or a
+      # Declared intent row, and the first check rules the finding out. The
+      # rendered cluster name is a contract with bench/tf/fleet/
+      # (bench/tasks/DRAFTS.md), not an address the harness resolves.
+      type: ledger_issue_contains
+      audit: security-patch-orchestrator
+      required_phrases:
+        [
+          "## Declared intent",
+          "Cluster/seeded-c",
+          "notification-relay-no-pdb.md",
+        ]

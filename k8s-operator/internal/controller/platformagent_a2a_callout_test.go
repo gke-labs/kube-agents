@@ -25,6 +25,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -359,6 +360,18 @@ func sweepA2ALabelled(ctx context.Context, t *testing.T, cl client.Client, visit
 	}
 	for i := range sts.Items {
 		visit("StatefulSet", sts.Items[i].Name)
+	}
+
+	// The next stack's budgets, the verifier's and the callout's. A PDB left
+	// behind on a today install is inert until something matching its
+	// selector is scheduled again, which is exactly why a sweep by name would
+	// never notice it.
+	var pdbs policyv1.PodDisruptionBudgetList
+	if err := cl.List(ctx, &pdbs, inNS, hasLabel); err != nil {
+		t.Fatalf("list poddisruptionbudgets: %v", err)
+	}
+	for i := range pdbs.Items {
+		visit("PodDisruptionBudget", pdbs.Items[i].Name)
 	}
 
 	var roles rbacv1.RoleList

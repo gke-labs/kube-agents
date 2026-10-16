@@ -363,6 +363,42 @@ class TriageReplyRoundTripTest(unittest.TestCase):
             )
         )
 
+    # --- the stall watch's card -----------------------------------------------
+
+    STALL_PAYLOAD = {
+        "kind": "controller-stall",
+        "cluster": "prod-us-central1",
+        "project": "example-project",
+        "location": "us-central1",
+        "namespace": "orders",
+        "objects": [{"object": "Deployment/orders-api", "heuristic": "stale-condition", "stalled_for": "3h07m"}],
+    }
+
+    def test_a_stall_report_in_its_templates_shape_reaches_the_reply(self):
+        # Cut from `_stall_task_body`'s own text rather than transcribed, so a
+        # reword of the stall template moves the report with it.
+        body = self.session_kv_server._stall_task_body(self.STALL_PAYLOAD)
+        report = body[body.index("## What's wrong") : body.index("\n\n---")]
+        self.assertTrue(self.deliver(_Task(result=report)))
+        text = self.reply("apply Option A")["text"]
+        self.assertIn("Option A (", text)
+        self.assertIn("stalled resources:", text)
+
+    def test_the_report_the_stall_watch_got_before_the_inject_earns_no_row(self):
+        # The shape gke-stall-detection produced on a card the watch filed
+        # itself (live card t_76348314, abridged): a cause and a patch, and no
+        # "What to do" section. Nothing is saved, so "apply" arrives bare and
+        # the Platform Agent starts the investigation over.
+        report = (
+            "## Root Cause Analysis\n"
+            "The Deployment `checkout-api` has stopped progressing: its envFrom names "
+            "ConfigMap `checkout-feature-flags`, which does not exist.\n\n"
+            "### Proposed Remediation\n"
+            "Create the missing ConfigMap in the `demo-checkout` namespace.\n"
+        )
+        self.assertFalse(self.deliver(_Task(result=report)))
+        self.assertIsNone(self.reply("apply"))
+
     def test_the_lookup_the_plugin_makes_is_the_one_the_server_answers(self):
         # Pins the query contract across the seam: parameter names and route.
         self.deliver()

@@ -16,6 +16,8 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
+from admin_console.theme import active_palette, streamlit_theme_flags
+
 HOP_BY_HOP = {
     "connection",
     "keep-alive",
@@ -68,23 +70,28 @@ async def _wait_for_streamlit(
     raise RuntimeError("Streamlit did not become ready within 30 seconds.")
 
 
+def streamlit_command() -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(APP_PATH),
+        "--server.address=127.0.0.1",
+        f"--server.port={streamlit_port()}",
+        "--server.headless=true",
+        "--server.enableXsrfProtection=true",
+        "--server.enableCORS=true",
+        "--browser.gatherUsageStats=false",
+        *streamlit_theme_flags(active_palette()),
+    ]
+
+
 @asynccontextmanager
 async def portal_lifespan(app: FastAPI):
     environment = os.environ.copy()
     process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "streamlit",
-            "run",
-            str(APP_PATH),
-            "--server.address=127.0.0.1",
-            f"--server.port={streamlit_port()}",
-            "--server.headless=true",
-            "--server.enableXsrfProtection=true",
-            "--server.enableCORS=true",
-            "--browser.gatherUsageStats=false",
-        ],
+        streamlit_command(),
         cwd=PACKAGE_ROOT.parent,
         env=environment,
     )

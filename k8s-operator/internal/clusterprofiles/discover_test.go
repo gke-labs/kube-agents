@@ -20,6 +20,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -164,6 +165,49 @@ func TestDiscoverAttachesTheCredentialToEveryCluster(t *testing.T) {
 	for _, c := range clusters {
 		if c.Config.WrapTransport == nil {
 			t.Errorf("%s carries no credential", c.Identity)
+		}
+	}
+}
+
+// TestDiscoverCarriesTheAutopilotBit pins that the describe call's
+// Autopilot.Enabled reaches the caller. The event watcher's FailedScheduling
+// gate reads it to tell an Autopilot cluster that has scaled itself to zero
+// nodes from a Standard cluster whose nodes have gone, which look identical
+// from inside and mean opposite things. A cluster with no Autopilot block at
+// all — an older API response, a stub that does not set one — must read false
+// rather than panic, since that is the fail-open side of the question.
+func TestDiscoverCarriesTheAutopilotBit(t *testing.T) {
+	enabled := map[string]bool{"p/us-central1/auto": true, "p/us-central1/absent": false}
+	s := newStub()
+	d := s.discoverer()
+	d.Describe = func(_ context.Context, id Identity) (*container.Cluster, error) {
+		c := &container.Cluster{
+			Endpoint:   id.String() + ".example.invalid",
+			MasterAuth: &container.MasterAuth{ClusterCaCertificate: base64.StdEncoding.EncodeToString([]byte("ca-bytes"))},
+		}
+		// "absent" gets no Autopilot block at all, the others an explicit one.
+		if id.Cluster != "absent" {
+			c.Autopilot = &container.Autopilot{Enabled: enabled[id.String()]}
+		}
+		return c, nil
+	}
+
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "cluster-auto", "p", "auto", "us-central1")
+	writeClusterProfile(t, dir, "cluster-standard", "p", "standard", "us-central1")
+	writeClusterProfile(t, dir, "cluster-absent", "p", "absent", "us-central1")
+
+	clusters, err := d.Discover(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(clusters) != 3 {
+		t.Fatalf("got %d clusters (%v), want 3", len(clusters), profiles(clusters))
+	}
+	want := map[string]bool{"auto": true, "standard": false, "absent": false}
+	for _, c := range clusters {
+		if got := c.Autopilot; got != want[c.Identity.Cluster] {
+			t.Errorf("%s Autopilot = %t; want %t", c.Identity, got, want[c.Identity.Cluster])
 		}
 	}
 }
@@ -430,5 +474,76 @@ func TestZeroDiscovererDiscardsSkipsRatherThanPanicking(t *testing.T) {
 	}
 	if len(clusters) != 0 {
 		t.Errorf("got %d clusters, want none", len(clusters))
+	}
+}
+
+func TestReadIdentitiesListsEveryClusterProfileWithoutAddressingIt(t *testing.T) {
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "prod-a", "p1", "prod", "us-central1")
+	writeClusterProfile(t, dir, "prod-b", "p1", "prod", "europe-west1")
+	writeNonClusterProfile(t, dir, "platform")
+	writeProfile(t, dir, "broken", "model: [")
+	writeProfile(t, dir, "partial", "cluster_identity:\n  project: p1\n  cluster: half\n")
+	writeProfile(t, dir, "cluster-p1-new-us-central1", "model:\n  provider: custom\n")
+	if err := os.MkdirAll(filepath.Join(dir, "cluster-p1-newer-us-central1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeProfile(t, dir, ".swap", "cluster_identity:\n  project: p1\n  cluster: hidden\n  location: us-central1\n")
+	// A profile reached through a symlink is a profile: os.ReadDir types the
+	// link, not its target.
+	linked := t.TempDir()
+	writeClusterProfile(t, linked, "prod-c", "p1", "prod", "asia-east1")
+	if err := os.Symlink(filepath.Join(linked, "prod-c"), filepath.Join(dir, "prod-c")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(linked, "vanished"), filepath.Join(dir, "cluster-p1-gone-us-central1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(linked, "vanished"), filepath.Join(dir, "notes")); err != nil {
+		t.Fatal(err)
+	}
+	writeProfile(t, dir, "default", "model: [")
+	if err := os.MkdirAll(filepath.Join(dir, "scratch"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	skipped := map[string]string{}
+	got, err := ReadIdentities(dir, func(profile string, err error) {
+		skipped[profile] = err.Error()
+	})
+	if err != nil {
+		t.Fatalf("ReadIdentities: %v", err)
+	}
+	for profile, want := range map[string]string{
+		"broken":                       "parse ",
+		"partial":                      "cluster_identity is incomplete",
+		"cluster-p1-new-us-central1":   ErrNoClusterIdentity.Error(),
+		"cluster-p1-newer-us-central1": ErrNoProfileConfig.Error(),
+		"cluster-p1-gone-us-central1":  "symlink cannot be followed",
+	} {
+		if !strings.Contains(skipped[profile], want) {
+			t.Errorf("skipped[%s] = %q, want it reported with %q", profile, skipped[profile], want)
+		}
+	}
+	if len(skipped) != 5 {
+		t.Errorf("skipped = %v, want exactly five reports: the platform profile, the broken default profile, the dot-directory, the plain file, the empty unprefixed directory and the unprefixed dangling symlink are silent", skipped)
+	}
+	want := []string{"prod-a=p1/us-central1/prod", "prod-b=p1/europe-west1/prod", "prod-c=p1/asia-east1/prod"}
+	names := make([]string, 0, len(got))
+	for _, p := range got {
+		names = append(names, p.Profile+"="+p.Identity.String())
+	}
+	sort.Strings(names)
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Errorf("ReadIdentities = %v, want %v", names, want)
+	}
+}
+
+func TestReadIdentitiesReportsAnUnreadableDirectory(t *testing.T) {
+	if _, err := ReadIdentities(filepath.Join(t.TempDir(), "absent"), nil); err == nil {
+		t.Fatal("ReadIdentities on a missing directory returned nil error, want one: the caller treats this as scope unknown")
 	}
 }

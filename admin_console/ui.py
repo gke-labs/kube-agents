@@ -8,28 +8,16 @@ from typing import Any, Sequence
 import streamlit as st
 
 from admin_console.domain import AttributionLevel, TriggerKind
+from admin_console.theme import Palette, active_palette
 
-TRIGGER_COLORS = {
-    TriggerKind.HUMAN: "#7C9CFF",
-    TriggerKind.CRON: "#B58CFF",
-    TriggerKind.EVENT: "#2ED3B7",
-    TriggerKind.RETRY: "#FFB454",
-    TriggerKind.AGENT_FOLLOWUP: "#FF7A90",
-    TriggerKind.UNKNOWN: "#8FA1BD",
-}
+PALETTE = active_palette()
 
-STATUS_COLORS = {
-    "completed": "#2ED3B7",
-    "running": "#7C9CFF",
-    "blocked": "#FFB454",
-    "failed": "#FF6B7A",
-}
+TRIGGER_COLORS = {kind: PALETTE.trigger_colors[kind.value] for kind in TriggerKind}
+
+STATUS_COLORS = dict(PALETTE.status_colors)
 
 ATTRIBUTION_COLORS = {
-    AttributionLevel.EXPLICIT: "#2ED3B7",
-    AttributionLevel.INHERITED: "#7C9CFF",
-    AttributionLevel.INFERRED: "#FFB454",
-    AttributionLevel.MISSING: "#FF6B7A",
+    level: PALETTE.attribution_colors[level.value] for level in AttributionLevel
 }
 
 def render_command_evidence(item: dict, *, expanded: bool = False) -> None:
@@ -175,34 +163,56 @@ def paginated_selectable_table(
     return selected, table
 
 
+def _css_variables(palette: Palette) -> str:
+    variables = {
+        "bg": palette.background,
+        "panel": palette.panel,
+        "panel-2": palette.panel_2,
+        "border": palette.border,
+        "text": palette.text,
+        "muted": palette.muted,
+        "accent": palette.accent,
+        "mint": palette.success,
+        "violet": palette.violet,
+        "success": palette.success,
+        "warning": palette.warning,
+        "danger": palette.danger,
+        "error-text": palette.error_text,
+        "app-bg": palette.app_background,
+        "sidebar-bg": palette.sidebar_background,
+        "card-bg": palette.card_background,
+        "cell-bg": palette.cell_background,
+        "danger-button": palette.danger_button,
+        "danger-button-text": palette.danger_button_text,
+        "danger-button-border": palette.danger_button_border,
+        "danger-button-hover": palette.danger_button_hover,
+        "danger-button-hover-border": palette.danger_button_hover_border,
+        "abort-border": palette.abort_border,
+        "abort-text": palette.abort_text,
+        "disabled-bg": palette.disabled_background,
+        "disabled-border": palette.disabled_border,
+        "disabled-text": palette.disabled_text,
+    }
+    lines = "".join(f"  --ka-{name}: {value};\n" for name, value in variables.items())
+    return f":root {{\n{lines}}}\n"
+
+
 def apply_theme() -> None:
-    """Apply static CSS only; dynamic values are rendered by Streamlit."""
+    """Apply the active palette's CSS; dynamic values are rendered by Streamlit."""
     st.markdown(
-        """
-        <style>
-        :root {
-          --ka-bg: #080d18;
-          --ka-panel: #101827;
-          --ka-panel-2: #151f32;
-          --ka-border: #26344c;
-          --ka-text: #edf3ff;
-          --ka-muted: #8fa1bd;
-          --ka-accent: #7c9cff;
-          --ka-mint: #2ed3b7;
-        }
+        "<style>\n"
+        + _css_variables(PALETTE)
+        + """
         .stApp {
-          background:
-            radial-gradient(circle at 84% -5%, rgba(74, 108, 247, .16), transparent 30rem),
-            radial-gradient(circle at 8% 18%, rgba(46, 211, 183, .08), transparent 25rem),
-            var(--ka-bg);
+          background: var(--ka-app-bg);
           color: var(--ka-text);
         }
         [data-testid="stSidebar"] {
-          background: rgba(10, 16, 29, .96);
+          background: var(--ka-sidebar-bg);
           border-right: 1px solid var(--ka-border);
         }
         [data-testid="stMetric"] {
-          background: linear-gradient(145deg, rgba(21,31,50,.92), rgba(13,21,35,.92));
+          background: var(--ka-card-bg);
           border: 1px solid var(--ka-border);
           border-radius: 14px;
           padding: 16px 18px;
@@ -210,7 +220,7 @@ def apply_theme() -> None:
         [data-testid="stMetricValue"] { letter-spacing: -0.04em; }
         [data-testid="stMetricDelta"] { color: var(--ka-muted); }
         .ka-card {
-          background: linear-gradient(145deg, rgba(21,31,50,.92), rgba(13,21,35,.92));
+          background: var(--ka-card-bg);
           border: 1px solid var(--ka-border);
           border-radius: 14px;
           padding: 18px;
@@ -228,27 +238,27 @@ def apply_theme() -> None:
         }
         .st-key-project_connection_secondary_disconnect button:not(:disabled),
         .st-key-cluster_connection_secondary_disconnect button:not(:disabled) {
-          background: #b4232f !important;
-          border-color: #ef5b68 !important;
-          color: #fff !important;
+          background: var(--ka-danger-button) !important;
+          border-color: var(--ka-danger-button-border) !important;
+          color: var(--ka-danger-button-text) !important;
         }
         .st-key-project_connection_secondary_disconnect button:not(:disabled):hover,
         .st-key-cluster_connection_secondary_disconnect button:not(:disabled):hover {
-          background: #8f1823 !important;
-          border-color: #ff7a86 !important;
+          background: var(--ka-danger-button-hover) !important;
+          border-color: var(--ka-danger-button-hover-border) !important;
         }
         .st-key-project_connection_secondary_abort button:not(:disabled),
         .st-key-cluster_connection_secondary_abort button:not(:disabled) {
-          border-color: #ef8f5b !important;
-          color: #ffc2a1 !important;
+          border-color: var(--ka-abort-border) !important;
+          color: var(--ka-abort-text) !important;
         }
         .st-key-project_connection_primary_connected button:disabled,
         .st-key-cluster_connection_primary_connected button:disabled,
         .st-key-project_connection_primary_connecting button:disabled,
         .st-key-cluster_connection_primary_connecting button:disabled {
-          background: #2a3343 !important;
-          border-color: #46536a !important;
-          color: #8fa1bd !important;
+          background: var(--ka-disabled-bg) !important;
+          border-color: var(--ka-disabled-border) !important;
+          color: var(--ka-disabled-text) !important;
           opacity: .72 !important;
         }
         @keyframes ka-connection-spin {

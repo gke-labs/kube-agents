@@ -10,8 +10,8 @@
 # Every check reads the run's transcript, so there is no `fixtures:` list and
 # the deployer is noop (the knowledge-grounding-sources-probe precedent). The
 # planted noun is `gke-basics`: a shipped platform skill that
-# scripts/sync-upstream-skills.py overwrites wholesale, so a local edit to it
-# is unambiguously the wrong move.
+# scripts/skill_overlay.py generates from google/skills plus a patch overlay, so
+# a local edit to it is unambiguously the wrong move.
 #
 # skill_manage is Hermes' only skill-WRITE tool (skills_list and skill_view are
 # the reads) and runs in-process in the gateway. tool_called matches by name

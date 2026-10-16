@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import shlex
 import subprocess
 import threading
 import time
@@ -23,7 +24,8 @@ from typing import Any
 import pytest
 
 from devops_bench.agents import AGENTS, AgentResult
-from kube_agents_bench import board, harness, transcript, worker_trajectory
+from kube_agents_bench import board, card_wake, harness, transcript, worker_trajectory
+from kube_agents_bench.verifiers import ReplayCardVerifier
 from kube_agents_bench.cases import CaseSpec
 from kube_agents_bench.harness import KubeAgentsHarness
 from kube_agents_bench.parsing import merge_new as _merge_new
@@ -199,10 +201,16 @@ class _StubAgentHandler(BaseHTTPRequestHandler):
         headers = {}
         if self.server.session_id:
             headers["X-Hermes-Session-Id"] = self.server.session_id
+        req_num = len(self.server.requests)
+        if self.server.fail_headers_by_request is not None and req_num in self.server.fail_headers_by_request:
+            headers.update(self.server.fail_headers_by_request[req_num])
+        elif self.server.fail_headers:
+            headers.update(self.server.fail_headers)
         if len(self.server.requests) in self.server.fail_on:
             self._respond(
                 self.server.fail_on_status,
                 json.dumps({"error": {"message": "agent went away"}}).encode(),
+                headers,
             )
         elif (
             self.server.fail_after is not None
@@ -246,6 +254,8 @@ class _StubAgentServer(ThreadingHTTPServer):
     last_request: dict[str, Any] | None = None
     last_auth: str | None = None
     fail_with: int | None = None
+    fail_headers: dict[str, str] | None = None
+    fail_headers_by_request: dict[int, dict[str, str]] | None = None
     # Serve normally for this many requests, then 503 every later one.
     fail_after: int | None = None
     # 1-based request ordinals that fail; every other request serves normally.
@@ -276,6 +286,7 @@ def stub_agent(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubAgentServer, N
     server.get_auths = []
     server.requests = []
     server.turns = []
+    server.fail_headers = {}
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setenv("AGENT_LOCAL_PORT", str(server.server_address[1]))
@@ -1273,11 +1284,13 @@ def test_an_exhausted_retry_is_infrastructure_and_not_an_answer(
 
 
 def test_an_agent_side_error_is_still_graded(stub_agent: _StubAgentServer) -> None:
-    """A 500 is the endpoint answering, so it keeps the old behaviour.
+    """A persistent 500 is the endpoint answering, so it remains a graded agent error.
 
-    The INFRA class is for turns that never reached the agent. Widening it to
-    every failed request would take real agent faults off the gate: they are
-    not retried, they are not marked, and their text still reaches the judge.
+    The INFRA class is for turns where transport died or provider capacity
+    blocked the opening turn. Widening it to every failed request would take
+    real agent faults off the gate: a non-retryable 5xx is retried once on the
+    opening turn to clear transient races (#2430), but a recurring 500 is not
+    marked infra, is not retried beyond the limit, and still reaches the judge.
     """
     stub_agent.fail_with = 500
 
@@ -1286,8 +1299,106 @@ def test_an_agent_side_error_is_still_graded(stub_agent: _StubAgentServer) -> No
     assert result.has_errors()
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     assert "HTTP 500" in result.errors[0]
-    # Still in front of the judge, as before.
     assert result.errors[0] in result.output
+    assert len(stub_agent.requests) == 2
+
+
+def test_an_opening_turn_transient_500_clears_on_retry(
+    stub_agent: _StubAgentServer, recorded_pf_resets: list[int]
+) -> None:
+    """A transient 500 on the opening turn clears on bounded retry without tunnel respawn (#2430)."""
+    stub_agent.fail_on = frozenset({1})
+    stub_agent.fail_on_status = 500
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert result.output == _FINAL_TEXT
+    assert len(stub_agent.requests) == 2
+    # An endpoint response is not a transport drop: no tunnel reset.
+    assert recorded_pf_resets == []
+
+
+def test_an_opening_turn_client_error_is_still_graded(stub_agent: _StubAgentServer) -> None:
+    """A client error (non-429 4xx) on the opening turn is not retried and reaches the judge."""
+    stub_agent.fail_with = 400
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 400" in result.errors[0]
+    assert result.errors[0] in result.output
+    assert len(stub_agent.requests) == 1
+
+
+def test_an_opening_turn_502_with_failure_reason_is_an_agent_error_not_infra(
+    stub_agent: _StubAgentServer,
+) -> None:
+    """An opening-turn 502 carrying X-Hermes-Failure-Reason is graded, not retried.
+
+    When the agent turn ran and failed (e.g. tool error), the server answers 502
+    with X-Hermes-Failure-Reason. Because the turn already ran and was billed,
+    the harness returns an errored result on the first attempt rather than
+    retrying into transport failure exhaustion (_infra_failure).
+    """
+    stub_agent.fail_with = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "tool_error"}
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 502" in result.errors[0]
+    assert "tool_error" in result.errors[0]
+    assert result.errors[0] in result.output
+    assert len(stub_agent.requests) == 1
+
+
+def test_an_opening_turn_502_with_empty_failure_reason_is_an_agent_error_not_infra(
+    stub_agent: _StubAgentServer,
+) -> None:
+    """An opening-turn 502 with present but empty failure reason is graded on attempt 1."""
+    stub_agent.fail_with = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": ""}
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 502" in result.errors[0]
+    assert "unknown" in result.errors[0]
+    assert result.errors[0] in result.output
+    assert len(stub_agent.requests) == 1
+
+
+def test_an_opening_turn_502_with_rate_limit_reason_is_infra(
+    stub_agent: _StubAgentServer,
+) -> None:
+    """An opening-turn 502 carrying rate_limit is classified as infrastructure."""
+    stub_agent.fail_with = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
+    assert len(stub_agent.requests) == 1
+
+
+def test_an_opening_turn_502_with_billing_reason_is_infra(
+    stub_agent: _StubAgentServer,
+) -> None:
+    """An opening-turn 502 carrying billing is classified as infrastructure."""
+    stub_agent.fail_with = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "billing"}
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "billing" in result.errors[0]
     assert len(stub_agent.requests) == 1
 
 
@@ -1454,6 +1565,127 @@ def test_the_tunnel_is_torn_down_rather_than_probed(monkeypatch: pytest.MonkeyPa
     assert stopped == [stale]
     assert established == [4242]
     assert 4242 not in harness._PF_PROCESSES
+
+
+# --- the opening turn's timing file ------------------------------------------
+#
+# hack/ci-eval-pr.sh sets KUBE_AGENTS_TIMING_FILE per repetition and copies the
+# file beside results.json, where load_run reads turn1_s for the dashboard.
+
+
+class _FakeClock:
+    """Stands in for ``harness.time``: a monotonic clock the test moves."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
+def test_only_the_successful_opening_attempt_is_timed(
+    stub_agent: _StubAgentServer,
+    recorded_pf_resets: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed attempt and its respawn cost 100 s; the answer took 2.5 s."""
+    target = tmp_path / "timing.json"
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", str(target))
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+    clock = _FakeClock()
+    monkeypatch.setattr(harness, "time", clock)
+    original = harness._post_turn
+    calls: list[int] = []
+
+    def _timed(*args: Any) -> tuple[AgentResult, str]:
+        calls.append(1)
+        if len(calls) == 1:
+            clock.now += 100
+            raise harness._TransportError("HTTP 502", retryable=True, status_code=502)
+        reply = original(*args)
+        clock.now += 2.5
+        return reply
+
+    monkeypatch.setattr(harness, "_post_turn", _timed)
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert len(calls) == 2
+    assert json.loads(target.read_text(encoding="utf-8")) == {"turn1_s": 2.5}
+    # Written through a temp file, which os.replace consumed.
+    assert [p.name for p in tmp_path.iterdir()] == ["timing.json"]
+
+
+def test_no_timing_file_without_the_variable(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Empty is unset: nothing lands in the working directory."""
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", "")
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+    monkeypatch.chdir(tmp_path)
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_no_timing_file_when_the_opening_turn_fails(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "timing.json"
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", str(target))
+    stub_agent.fail_with = 400
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert not target.exists()
+
+
+def test_an_answer_turn_writes_no_timing_file(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only the opening turn is timed; a card wake's answer turn is not."""
+    target = tmp_path / "timing.json"
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", str(target))
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+
+    result = KubeAgentsHarness()._execute("answer", opening_turn=False)
+
+    assert not result.has_errors()
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("where", ["missing-dir", "is-a-dir"])
+def test_a_timing_file_that_will_not_write_leaves_the_run_alone(
+    stub_agent: _StubAgentServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    where: str,
+) -> None:
+    if where == "missing-dir":
+        target = tmp_path / "gone" / "timing.json"
+    else:
+        target = tmp_path / "timing.json"
+        target.mkdir()
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", str(target))
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert result.output == _FINAL_TEXT
+    assert "could not write the turn timing" in caplog.text
+    # The temp file does not outlive the failed replace.
+    assert [p.name for p in tmp_path.iterdir()] == ([] if where == "missing-dir" else ["timing.json"])
+    assert not target.is_file()
 
 
 # --- the ci-eval-pr.sh contract ----------------------------------------------
@@ -2450,12 +2682,12 @@ def test_status_turns_the_endpoint_answered_still_grade_the_partial_record(
 ) -> None:
     """A 500 storm is the endpoint answering, so it keeps the old behaviour.
 
-    The INFRA class is only for retries that never reached an agent -- no
-    HTTP answer at all, or a 429 refused at the admission door. An
-    endpoint that keeps answering badly is the agent's own failure: the wait
-    still ends, the error is recorded (which stops devops-bench promoting the
-    receipt as a validated deliverable), the first turn's work survives, and
-    the healthy tunnel is left alone.
+    The INFRA class is for turns where transport died, or the server reported
+    an opening-turn provider rate limit or billing stop. An endpoint that keeps
+    answering badly is the agent's own failure: the wait still ends, the error
+    is recorded (which stops devops-bench promoting the receipt as a validated
+    deliverable), the first turn's work survives, and the healthy tunnel is left
+    alone.
     """
     stub_agent.turns = [_create_turn(), _show_turn("done")]
     stub_agent.fail_on = frozenset(range(2, 2 + harness._MAX_TRANSPORT_FAILURES))
@@ -2472,6 +2704,80 @@ def test_status_turns_the_endpoint_answered_still_grade_the_partial_record(
     assert result.output == f"I've started this as task {_TASK_ID}."
     # An endpoint that answers is not a tunnel problem: no reset.
     assert recorded_pf_resets == []
+
+
+def test_a_status_turn_502_with_rate_limit_is_infra_without_retrying(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    recorded_pf_resets: list[int],
+    no_cluster_exec: list[str],
+) -> None:
+    """A status turn 502 with rate_limit on an opening turn exits immediately as infra."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert len(stub_agent.requests) == 2
+    purges = [s for s in no_cluster_exec if "rm -rf" in s]
+    assert len(purges) == 1
+    assert _TASK_ID in purges[0]
+
+
+def test_a_status_turn_502_with_tool_error_is_graded_after_max_failures(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    recorded_pf_resets: list[int],
+    no_cluster_exec: list[str],
+) -> None:
+    """A status turn 502 with tool_error is not retryable, skips resets, and settles for grading."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset(range(2, 2 + harness._MAX_TRANSPORT_FAILURES))
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "tool_error"}
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "answered" in result.errors[0]
+    assert recorded_pf_resets == []
+    # Trajectory from turn 1 survives and is settled for grading
+    assert len(result.trajectory) >= 1
+    assert len(stub_agent.requests) == 1 + harness._MAX_TRANSPORT_FAILURES
+
+
+@pytest.mark.parametrize(
+    "tool_error_ordinal",
+    [2, 4],  # first failure in streak (ordinal 2) vs last failure in streak (ordinal 4)
+)
+def test_mixed_status_turn_streak_settles_and_grades_regardless_of_order(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    recorded_pf_resets: list[int],
+    no_cluster_exec: list[str],
+    tool_error_ordinal: int,
+) -> None:
+    """A mixed streak of bare 502s and tool_error settles and grades regardless of failure order."""
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset(range(2, 2 + harness._MAX_TRANSPORT_FAILURES))
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {}
+    stub_agent.fail_headers_by_request = {
+        tool_error_ordinal: {"X-Hermes-Failure-Reason": "tool_error"}
+    }
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "answered" in result.errors[0]
+    assert len(result.trajectory) >= 1
+    assert len(stub_agent.requests) == 1 + harness._MAX_TRANSPORT_FAILURES
 
 
 # --- cumulative (replayed) payloads ------------------------------------------
@@ -3131,3 +3437,512 @@ def test_an_errored_run_still_stamps_a_start(
 
     assert result.has_errors()
     assert transcript.get().started_at > 0.0
+
+
+# --- The card-wake replays (kube_agents_bench.card_wake) ----------------------
+
+_REPLAY_PROMPT = """[bench:slack-question-wake]
+title: Check checkout-gateway's restarts
+question: Two clusters run checkout-gateway. Which should I look at?
+options: seeded-a | seeded-b
+answer: seeded-b
+"""
+_REPLAY_CARD = "t_5e1ec7ed"
+_REPLAY_WAKE = f"[kanban] Task {_REPLAY_CARD} blocked; needs attention."
+
+
+_REPLAY_SETTLED = {"status": "ready", "comments": [{"author": "default", "body": "seeded-b"}]}
+
+
+def _replay_shell(scripts: list[str], plant_reply: str | None = None):
+    """A stand-in for ``_agent_shell`` answering the plant and archive scripts."""
+    planted = json.dumps({"card": _REPLAY_CARD, "wake": _REPLAY_WAKE, "posted": 1, "error": None})
+    read = json.dumps({"card": _REPLAY_CARD, **_REPLAY_SETTLED, "error": None})
+    archived = json.dumps({"archived": True, "cards": [_REPLAY_CARD], "error": None})
+
+    def shell(script: str, timeout: float) -> str:
+        scripts.append(script)
+        if card_wake.REPLAY_PRESENT not in script:
+            return ""
+        if "create_task" in script:
+            return plant_reply if plant_reply is not None else f"{card_wake.REPLAY_PRESENT}\n{planted}"
+        if shlex.quote(card_wake._READ_SCRIPT) in script:
+            return f"{card_wake.REPLAY_PRESENT}\n{read}"
+        return f"{card_wake.REPLAY_PRESENT}\n{archived}"
+
+    return shell
+
+
+def _archived(scripts: list[str]) -> bool:
+    return any(shlex.quote(card_wake._ARCHIVE_SCRIPT) in s for s in scripts)
+
+
+def _answer_turn() -> bytes:
+    return _turn(
+        *_call("kanban_comment", {"task_id": _REPLAY_CARD, "body": "seeded-b"}, {"ok": True}, "c1"),
+        *_call("kanban_unblock", {"task_id": _REPLAY_CARD}, {"ok": True}, "c2"),
+        _text("Passed seeded-b to the card."),
+        usage={"input_tokens": 300, "output_tokens": 30, "total_tokens": 330},
+    )
+
+
+def test_a_question_wake_sends_the_wake_then_the_answer_on_one_conversation(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn()]
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert not result.has_errors()
+    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE, "seeded-b"]
+    assert stub_agent.requests[0]["conversation"] == stub_agent.requests[1]["conversation"]
+    assert result.output == "[SILENT]"
+    assert [s["name"] for s in result.trajectory] == ["kanban_comment", "kanban_unblock", card_wake.SETTLED_ENTRY]
+    assert result.trajectory[-1]["result"] == _REPLAY_SETTLED
+    check = ReplayCardVerifier(type="replay_card", status_not_in=["blocked"], comment_phrases=["seeded-b"])
+    assert check.verify(5.0).success
+    snap = transcript.get()
+    assert snap.final_message == "[SILENT]"
+    assert result.metadata["question_wake"]["answer_output"] == "Passed seeded-b to the card."
+    assert result.metadata["question_wake"]["settled"] == _REPLAY_SETTLED
+    assert _archived(scripts)
+
+
+_CLICK_TURN = f"seeded-b\n\n(Clicked on the question from card {_REPLAY_CARD}.)"
+
+
+def test_an_answer_by_click_sends_the_click_turn_not_the_typed_answer(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    planted = json.dumps(
+        {"card": _REPLAY_CARD, "wake": _REPLAY_WAKE, "posted": 1, "click": _CLICK_TURN, "error": None}
+    )
+    scripts: list[str] = []
+    monkeypatch.setattr(
+        harness, "_agent_shell", _replay_shell(scripts, plant_reply=f"{card_wake.REPLAY_PRESENT}\n{planted}")
+    )
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn()]
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT + "answer_by: click\n")
+
+    assert not result.has_errors()
+    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE, _CLICK_TURN]
+    assert stub_agent.requests[0]["conversation"] == stub_agent.requests[1]["conversation"]
+    assert result.trajectory[-1]["args"]["answer_reply"] == "Passed seeded-b to the card."
+
+
+def test_the_next_run_gets_a_fresh_conversation_after_a_question_wake(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell([]))
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn(), json.dumps(_RESPONSE).encode()]
+
+    KubeAgentsHarness().run(_REPLAY_PROMPT)
+    KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    conversations = [r["conversation"] for r in stub_agent.requests]
+    assert conversations[0] == conversations[1] != conversations[2]
+
+
+def test_a_question_wake_that_cannot_be_planted_is_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell([], plant_reply=""))
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert result.output == ""
+    assert stub_agent.requests == []
+
+
+def test_a_question_wake_whose_plant_failed_in_the_image_is_an_error_not_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    broken = f'{card_wake.REPLAY_PRESENT}\n{{"error": "RuntimeError: posted nothing"}}'
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell([], plant_reply=broken))
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert not result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "posted nothing" in result.errors[0]
+    assert stub_agent.requests == []
+
+
+def test_a_question_wake_archives_its_card_when_the_wake_turn_errors(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.fail_with = 500
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert len(stub_agent.requests) == 2
+    assert _archived(scripts)
+    assert [s["name"] for s in result.trajectory][-1] == card_wake.SETTLED_ENTRY
+    assert "question_wake" in result.metadata and "failure_wake" not in result.metadata
+
+
+def test_a_wake_turn_that_replied_with_a_parse_warning_still_gets_its_answer(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.turns = [_turn("junk", _text("[SILENT]")), _answer_turn()]  # type: ignore[arg-type]
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE, "seeded-b"]
+    assert result.output == "[SILENT]"
+    assert result.trajectory[-1]["args"]["answer_reply"] == "Passed seeded-b to the card."
+
+
+def test_a_card_wake_answer_turn_500_is_an_agent_error_not_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A 5xx on a card-wake answer turn remains an agent error, not infra.
+
+    On a question-wake repetition, the wake turn has already executed,
+    replied, and been billed. A subsequent 500 on the answer turn does not
+    discard the graded wake reply as infrastructure; it returns an errored
+    turn so the wake reply remains graded, preserving the wake turn reply.
+    """
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 500
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 500" in result.errors[0]
+    assert len(stub_agent.requests) == 2
+    assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
+def test_a_card_wake_turn_502_with_rate_limit_is_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A 502 with rate_limit on the wake turn is classified as infrastructure."""
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.fail_on = frozenset({1})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
+    assert len(stub_agent.requests) == 1
+    assert _archived(scripts)
+
+
+def test_a_card_wake_turn_transient_500_clears_on_retry(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A transient 500 on the wake turn clears on bounded retry without losing the run (#2430)."""
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.fail_on = frozenset({1})
+    stub_agent.fail_on_status = 500
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert not result.has_errors()
+    assert len(stub_agent.requests) == 3
+    assert _archived(scripts)
+
+
+def test_a_card_wake_answer_turn_502_with_rate_limit_is_an_agent_error_not_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A 502 with rate_limit on an answer turn remains an agent error, preserving the wake reply."""
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 502" in result.errors[0]
+    assert len(stub_agent.requests) == 2
+    assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
+def test_a_fresh_session_replay_answer_turn_500_is_an_agent_error_not_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A 5xx on a fresh-session answer turn remains an agent error, not infra.
+
+    When session: fresh is requested, the answer turn runs via
+    _execute_fresh_answer. A 500 on request 2 must remain an errored agent
+    turn rather than being classified as infrastructure, preserving the wake
+    turn's reply and grading.
+    """
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts))
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 500
+
+    result = KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 500" in result.errors[0]
+    assert len(stub_agent.requests) == 2
+    assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
+def test_a_fresh_session_replay_answer_turn_502_with_rate_limit_is_an_agent_error_not_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A 502 with rate_limit on a fresh-session answer turn remains an agent error, not infra.
+
+    When session: fresh is requested, the answer turn runs via
+    _execute_fresh_answer(..., opening_turn=False). A 502 carrying
+    X-Hermes-Failure-Reason: rate_limit on request 2 must return an errored
+    result rather than _infra_failure, preserving the wake reply and grading.
+    """
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts))
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert "HTTP 502" in result.errors[0]
+    assert len(stub_agent.requests) == 2
+    assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
+def test_a_question_wake_missing_its_answer_errors_without_planting(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT.replace("answer: seeded-b\n", ""))
+
+    assert result.errors == [f"{card_wake.QUESTION_DIRECTIVE} prompt is missing answer"]
+    assert scripts == []
+    assert stub_agent.requests == []
+
+
+_FAILURE_PROMPT = """[bench:card-failure-wake]
+title: Restart checkout-gateway on seeded-a
+body: Roll the checkout-gateway Deployment on seeded-a.
+outcome: blocked
+reason: Permission denied: container.deployments.update on seeded-a.
+"""
+
+
+def test_a_failure_wake_is_the_runs_only_turn_and_its_reply_is_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.turns = [
+        _turn(
+            *_call("kanban_show", {"task_id": _REPLAY_CARD}, {"status": "blocked"}, "c1"),
+            _text("I couldn't restart checkout-gateway on seeded-a."),
+        )
+    ]
+
+    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
+
+    assert not result.has_errors()
+    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE]
+    assert result.output == "I couldn't restart checkout-gateway on seeded-a."
+    assert [s["name"] for s in result.trajectory] == ["kanban_show", card_wake.SETTLED_ENTRY]
+    assert result.trajectory[-1]["result"] == _REPLAY_SETTLED
+    assert transcript.get().final_message == "I couldn't restart checkout-gateway on seeded-a."
+    assert result.metadata["failure_wake"]["card"] == _REPLAY_CARD
+    assert result.metadata["failure_wake"]["settled"] == _REPLAY_SETTLED
+    assert _archived(scripts)
+
+
+def test_a_failure_wake_that_errors_keeps_its_card_and_wake_and_archives_the_card(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    stub_agent.fail_with = 500
+
+    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
+
+    assert result.has_errors()
+    assert result.metadata["failure_wake"]["card"] == _REPLAY_CARD
+    assert result.metadata["failure_wake"]["wake"] == _REPLAY_WAKE
+    assert _archived(scripts)
+
+
+def test_a_failure_wake_whose_breaker_disagrees_is_an_errored_run_not_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    mismatch = json.dumps(
+        {"card": None, "wake": None, "posted": 0, "error": None,
+         "mismatch": "BreakerMismatch: card t_1 tripped its failure breaker"}
+    )
+    reply = f"{card_wake.REPLAY_PRESENT}\n{mismatch}"
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell([], plant_reply=reply))
+
+    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
+
+    assert result.errors == ["failure wake: BreakerMismatch: card t_1 tripped its failure breaker"]
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert stub_agent.requests == []
+
+
+def test_a_failure_wake_whose_script_reports_an_error_is_an_errored_run_not_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    failed = json.dumps(
+        {"card": None, "wake": None, "posted": 0, "error": "AttributeError: no build_wake_text",
+         "mismatch": None}
+    )
+    reply = f"{card_wake.REPLAY_PRESENT}\n{failed}"
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell([], plant_reply=reply))
+
+    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
+
+    assert result.errors == ["failure wake: AttributeError: no build_wake_text"]
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert stub_agent.requests == []
+
+
+def test_a_failure_wake_needs_the_api_transport(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    monkeypatch.setenv("AGENT_TRANSPORT", "inject")
+
+    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
+
+    assert result.errors == [f"{card_wake.FAILURE_DIRECTIVE} needs AGENT_TRANSPORT=api, got 'inject'"]
+    assert scripts == []
+
+
+# --- The fresh-session question replay (session: fresh) ----------------------
+
+_FRESH_PROMPT = _REPLAY_PROMPT + "session: fresh\n"
+_FRESH_DECOY = "t_dec0y000"
+_FRESH_POST = {"text": "Two clusters run checkout-gateway. Which should I look at?", "blocks": []}
+_FRESH_CONTEXT = "[Thread context — prior messages in this thread (not yet in conversation history):]\n...\n[End of thread context]\n"
+_FRESH_SETTLED = {**_REPLAY_SETTLED, "decoy_status": "blocked"}
+
+
+def _fresh_shell(scripts: list[str], context_reply: str | None = None):
+    """``_replay_shell`` for a fresh-session replay: a decoy, a post, and the context script."""
+    planted = json.dumps(
+        {"card": _REPLAY_CARD, "decoy": _FRESH_DECOY, "wake": _REPLAY_WAKE, "posted": 1, "post": _FRESH_POST, "error": None}
+    )
+    read = json.dumps({"card": _REPLAY_CARD, **_FRESH_SETTLED, "error": None})
+    archived = json.dumps({"archived": True, "cards": [_REPLAY_CARD, _FRESH_DECOY], "error": None})
+    context = json.dumps({"context": _FRESH_CONTEXT, "error": None})
+
+    def shell(script: str, timeout: float) -> str:
+        scripts.append(script)
+        if "create_task" in script:
+            return f"{card_wake.REPLAY_PRESENT}\n{planted}"
+        if shlex.quote(card_wake._CONTEXT_SCRIPT) in script:
+            return context_reply if context_reply is not None else f"{card_wake.REPLAY_PRESENT}\n{context}"
+        if shlex.quote(card_wake._READ_SCRIPT) in script:
+            return f"{card_wake.REPLAY_PRESENT}\n{read}"
+        return f"{card_wake.REPLAY_PRESENT}\n{archived}"
+
+    return shell
+
+
+def _context_messages(scripts: list[str]) -> list[dict]:
+    command = next(s for s in scripts if shlex.quote(card_wake._CONTEXT_SCRIPT) in s)
+    return json.loads(shlex.split(command)[-1])
+
+
+def test_a_fresh_session_replay_sends_the_answer_on_a_new_conversation_after_the_thread(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts))
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn()]
+
+    result = KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    assert not result.has_errors()
+    wake, answer = stub_agent.requests
+    assert wake["input"] == _REPLAY_WAKE
+    assert answer["input"] == (
+        f"{_FRESH_CONTEXT}\n\n[New message]\n[bench-user | Slack user <@UBENCHASKER>] seeded-b"
+    )
+    assert wake["conversation"] != answer["conversation"]
+    # The silent wake reply is not in the thread: the gateway posts nothing for it.
+    messages = _context_messages(scripts)
+    assert [m.get("text") for m in messages] == ["Check checkout-gateway's restarts", _FRESH_POST["text"]]
+    assert result.trajectory[-1]["result"] == _FRESH_SETTLED
+    assert result.metadata["question_wake"]["decoy"] == _FRESH_DECOY
+    check = ReplayCardVerifier(type="replay_card", status_not_in=["blocked"], decoy_status_in=["blocked"])
+    assert check.verify(5.0).success
+    assert _archived(scripts)
+
+
+def test_a_fresh_session_replay_puts_a_posted_wake_reply_in_the_thread(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts))
+    stub_agent.turns = [_turn(_text("Which cluster: seeded-a or seeded-b?")), _answer_turn()]
+
+    KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    messages = _context_messages(scripts)
+    assert messages[-1]["text"] == "Which cluster: seeded-a or seeded-b?"
+    assert messages[-1]["user"] == card_wake.STUB_BOT
+
+
+def test_a_fresh_session_replay_sends_the_answer_after_a_wake_that_warned(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts))
+    stub_agent.turns = [_turn("junk", _text("[SILENT]")), _answer_turn()]  # type: ignore[arg-type]
+
+    result = KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    wake, answer = stub_agent.requests
+    assert wake["conversation"] != answer["conversation"]
+    assert result.trajectory[-1]["args"]["answer_reply"] == "Passed seeded-b to the card."
+
+
+def test_a_fresh_session_replay_whose_context_failed_in_the_image_sends_no_answer(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    broken = f'{card_wake.REPLAY_PRESENT}\n{{"error": "ImportError: no adapter"}}'
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts, context_reply=broken))
+    stub_agent.turns = [_turn(_text("[SILENT]"))]
+
+    result = KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    assert result.has_errors()
+    assert "no adapter" in result.errors[0]
+    assert not result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert len(stub_agent.requests) == 1
+    assert _archived(scripts)

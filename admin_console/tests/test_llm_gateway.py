@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from admin_console.api.authorization import portal_api_headers
 from admin_console.api.app import create_app
+from admin_console.tests.interaction_state import isolate_interaction_state
 from admin_console.kube_access import KubeCommandResult
 from admin_console.llm_gateway import LlmGatewayService
 from admin_console.project_config import (
@@ -282,6 +283,7 @@ class FakeGateway:
 
 class LlmGatewayApiTest(unittest.TestCase):
     def setUp(self):
+        isolate_interaction_state(self)
         self.connection = SimpleNamespace(usable=True, target=TARGET)
         loader = patch(
             "admin_console.api.app.load_connection", return_value=self.connection

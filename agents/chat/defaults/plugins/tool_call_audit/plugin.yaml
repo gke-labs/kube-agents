@@ -1,4 +1,4 @@
 name: tool_call_audit
 version: 0.1.0
-description: Logs every tool call and approval decision to stdout as a structured audit trail.
+description: Appends every tool call and approval decision to the profile's audit file as a structured record.
 kind: standalone
