@@ -289,5 +289,5 @@ is what makes the wait-or-coordinate decision impossible. Do not put anything el
 The ConfigMap is contributor tooling that lives in the install's namespace; `release` removes it,
 and an abandoned one expires rather than lingering as a live claim. Because it is runtime
 coordination rather than declared GitOps state, the drift detector ignores mutating writes to the
-`live-test-lease` ConfigMap (and coordination leases in `kubeagents-system`), ensuring lease
-acquisitions and renewals are never flagged as out-of-band drift or offered for reversion (#3353).
+`live-test-lease` ConfigMap, ensuring lease acquisitions and renewals are never flagged as out-of-band
+drift or offered for reversion (#3353).

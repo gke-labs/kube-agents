@@ -422,24 +422,11 @@ var coordinationConfigMaps = map[string]bool{
 	"live-test-lease": true,
 }
 
-// defaultSystemNamespace is kube-agents' default release namespace.
-const defaultSystemNamespace = "kubeagents-system"
-
 // isCoordinationResource reports whether ref names an in-cluster coordination
 // object that is managed dynamically at runtime rather than declared in Git.
 func isCoordinationResource(ref ResourceRef) bool {
-	// The live-test lease ConfigMap (or Lease) in any namespace (normally kubeagents-system).
-	if (ref.Group == "" || ref.Group == coreGroupAlias) && ref.Resource == "configmaps" && coordinationConfigMaps[ref.Name] {
-		return true
-	}
-	if ref.Resource == "leases" && ref.Name == "live-test-lease" {
-		return true
-	}
-	// Coordination leases in kube-agents' own system namespace.
-	if ref.Namespace == defaultSystemNamespace && ref.Group == "coordination.k8s.io" && ref.Resource == "leases" {
-		return true
-	}
-	return false
+	// The live-test lease ConfigMap in any namespace (normally kubeagents-system).
+	return ref.Group == "" && ref.Resource == "configmaps" && coordinationConfigMaps[ref.Name]
 }
 
 // TierCounts is the per-tier tally, plus the records dropped before a tier

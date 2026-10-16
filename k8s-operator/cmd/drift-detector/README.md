@@ -356,8 +356,8 @@ nobody has seen.
 `live-test-lease` ConfigMap in `kubeagents-system` under a contributor's own credential during live
 testing. Even though the principal is human and the call mutates cluster state, the object is an
 ephemeral developer mutex and not part of the cluster's declared GitOps state. `isCoordinationResource`
-drops writes to the `live-test-lease` ConfigMap as well as coordination leases in `kubeagents-system`,
-counting them as `non_declarative` so they are not flagged as out-of-band drift or offered for reversion.
+drops writes to the `live-test-lease` ConfigMap, counting them as `non_declarative` so they are not
+flagged as out-of-band drift or offered for reversion.
 
 **A failed call is not drift.** The audit log records attempts: writes rejected by RBAC, refused by
 admission, or aborted after losing an optimistic-concurrency race. A 24-hour query for failed

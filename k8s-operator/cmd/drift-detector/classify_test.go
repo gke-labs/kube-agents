@@ -536,10 +536,14 @@ func TestDriftFilterDropsNonDeclarativeSubresources(t *testing.T) {
 // during live testing. Even though the principal is human, coordination objects are
 // ephemeral developer synchronization and not GitOps drift. They must be dropped as
 // non-declarative rather than forwarded to join or inject.
+//
+// Crucially, coordination Leases (such as leader-election locks in kubeagents-system
+// or kube-system) are NOT dropped by this rule: human writes to Leases must reach
+// the detector to catch control plane lock tampering (the Pub/Sub sink carve-out).
 func TestDriftFilterDropsCoordinationResources(t *testing.T) {
 	human := "jayantid@google.com"
 
-	records := []AuditRecord{
+	dropped := []AuditRecord{
 		// The live-test lease ConfigMap in kubeagents-system.
 		{
 			Principal: human,
@@ -560,7 +564,22 @@ func TestDriftFilterDropsCoordinationResources(t *testing.T) {
 				Name:      "live-test-lease",
 			},
 		},
-		// Coordination lease in kubeagents-system.
+	}
+
+	forwardedRecords := []AuditRecord{
+		// Normal declarative write by the same human to show the filter keys on the
+		// coordination object rather than the namespace or configmaps in general.
+		{
+			Principal: human,
+			Resource: ResourceRef{
+				Version:   "v1",
+				Namespace: "kubeagents-system",
+				Resource:  "configmaps",
+				Name:      "platform-agent-config",
+			},
+		},
+		// Coordination lease in kubeagents-system: human write must reach the detector
+		// to catch control plane lock tampering (sink carve-out).
 		{
 			Principal: human,
 			Resource: ResourceRef{
@@ -571,36 +590,43 @@ func TestDriftFilterDropsCoordinationResources(t *testing.T) {
 				Name:      "kube-agents-operator-leader-election",
 			},
 		},
+		// Coordination lease in another namespace (e.g. kube-system): must also reach detector.
+		{
+			Principal: human,
+			Resource: ResourceRef{
+				Group:     "coordination.k8s.io",
+				Version:   "v1",
+				Namespace: "kube-system",
+				Resource:  "leases",
+				Name:      "kube-controller-manager",
+			},
+		},
 	}
 
 	var forwarded []AuditRecord
 	filter := newDriftFilter(NewClassifier("", ""), func(_ context.Context, r AuditRecord) { forwarded = append(forwarded, r) }, false)
 
-	for _, r := range records {
+	for _, r := range dropped {
+		filter.Handle(context.Background(), r)
+	}
+	for _, r := range forwardedRecords {
 		filter.Handle(context.Background(), r)
 	}
 
-	// Normal declarative write by the same human to show the filter keys on the
-	// coordination object rather than the namespace or configmaps in general.
-	filter.Handle(context.Background(), AuditRecord{
-		Principal: human,
-		Resource: ResourceRef{
-			Version:   "v1",
-			Namespace: "kubeagents-system",
-			Resource:  "configmaps",
-			Name:      "platform-agent-config",
-		},
-	})
-
 	counts := filter.Counts()
-	if counts.NonDeclarative != 3 {
-		t.Errorf("NonDeclarative = %d, want 3", counts.NonDeclarative)
+	if counts.NonDeclarative != 2 {
+		t.Errorf("NonDeclarative = %d, want 2", counts.NonDeclarative)
 	}
-	if counts.Actionable != 1 {
-		t.Errorf("Actionable = %d, want 1", counts.Actionable)
+	if counts.Actionable != 3 {
+		t.Errorf("Actionable = %d, want 3", counts.Actionable)
 	}
-	if len(forwarded) != 1 || forwarded[0].Resource.Name != "platform-agent-config" {
-		t.Fatalf("forwarded = %+v, want only platform-agent-config write", forwarded)
+	if len(forwarded) != 3 {
+		t.Fatalf("forwarded len = %d, want 3", len(forwarded))
+	}
+	for i, want := range forwardedRecords {
+		if forwarded[i].Resource != want.Resource {
+			t.Errorf("forwarded[%d] = %+v, want %+v", i, forwarded[i].Resource, want.Resource)
+		}
 	}
 }
 
