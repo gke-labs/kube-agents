@@ -164,7 +164,6 @@ def _clear_mount_skeleton(home: Path) -> bool:
 # while working fine from an interactive shell.
 HERMES_BIN = os.environ.get("HERMES_BIN") or "/opt/hermes/.venv/bin/hermes"
 TIRITH_SYSTEM_BIN: Path = Path("/usr/local/bin/tirith")
-TIRITH_OPT_DATA_BIN: Path = Path("/opt/data/bin/tirith")
 
 
 def run_env(hermes_home: Path | str | None = None, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -200,7 +199,6 @@ def link_shared_profile_resources(home: Path, hermes_home: Path) -> None:
             candidates.append(Path(env_tirith).resolve())
         candidates.append(TIRITH_SYSTEM_BIN.resolve())
         candidates.append((Path(hermes_home) / "bin" / "tirith").resolve())
-        candidates.append(TIRITH_OPT_DATA_BIN.resolve())
         for target in candidates:
             target = target.resolve()
             if target.is_file() and os.access(target, os.X_OK):

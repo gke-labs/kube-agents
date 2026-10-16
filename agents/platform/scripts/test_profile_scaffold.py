@@ -780,6 +780,27 @@ class BackfillCronStoreTest(unittest.TestCase):
         self.assertTrue(any("could not link" in msg and "Tirith binary" in msg for msg in logged_messages))
         self.assertTrue(any("could not link" in msg and "npm cache" in msg for msg in logged_messages))
 
+    def test_link_shared_profile_resources_selects_system_tirith_bin(self):
+        """link_shared_profile_resources selects TIRITH_SYSTEM_BIN (/usr/local/bin/tirith) when present (#3325)."""
+        system_tirith = self.root / "system_bin" / "tirith"
+        system_tirith.parent.mkdir(parents=True, exist_ok=True)
+        system_tirith.write_text("#!/bin/sh\nexit 0\n")
+        system_tirith.chmod(0o755)
+
+        hermes_home = self.root / "hermes_sys"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+
+        home = hermes_home / "profiles" / "test-cluster"
+        home.mkdir(parents=True, exist_ok=True)
+
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(ps, "TIRITH_SYSTEM_BIN", system_tirith):
+            ps.link_shared_profile_resources(home, hermes_home)
+
+        tirith_link = home / "bin" / "tirith"
+        self.assertTrue(tirith_link.is_symlink())
+        self.assertEqual(tirith_link.resolve(), system_tirith.resolve())
+
 
 class RunEnvTest(unittest.TestCase):
     """Tests for run_env injection of NPM_CONFIG_CACHE and TIRITH_BIN."""
@@ -805,6 +826,19 @@ class RunEnvTest(unittest.TestCase):
             env = ps.run_env(Path("/dummy"))
             self.assertEqual(env["NPM_CONFIG_CACHE"], "/custom/cache")
             self.assertEqual(env["TIRITH_BIN"], "/custom/tirith")
+
+    def test_run_env_selects_system_tirith_bin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_home = Path(tmp)
+            system_tirith = hermes_home / "sys_bin" / "tirith"
+            system_tirith.parent.mkdir(parents=True, exist_ok=True)
+            system_tirith.write_text("#!/bin/sh\nexit 0\n")
+            system_tirith.chmod(0o755)
+
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(ps, "TIRITH_SYSTEM_BIN", system_tirith):
+                env = ps.run_env(hermes_home)
+                self.assertEqual(env["TIRITH_BIN"], str(system_tirith))
 
 
 if __name__ == "__main__":

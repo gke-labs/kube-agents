@@ -686,8 +686,7 @@ class CreateProfileTest(unittest.TestCase):
     def test_link_shared_resources_tolerates_missing_tirith(self):
         """Scaffold succeeds and links npm cache even when Tirith binary is not yet present."""
         with mock.patch.dict(os.environ, {}, clear=True), \
-                mock.patch.object(ps, "TIRITH_SYSTEM_BIN", Path("/nonexistent/tirith")), \
-                mock.patch.object(ps, "TIRITH_OPT_DATA_BIN", Path("/nonexistent/opt-data-tirith")):
+                mock.patch.object(ps, "TIRITH_SYSTEM_BIN", Path("/nonexistent/tirith")):
             self.create()
 
         tirith_link = self.profile / "bin" / "tirith"
