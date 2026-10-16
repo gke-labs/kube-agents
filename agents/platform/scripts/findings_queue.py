@@ -62,7 +62,7 @@ SOURCES = ("inventory", "event-watcher", "audit", "upgrade-readiness")
 # A check family is the slug's first segment and its separator (`upgrade-`), and
 # nothing shorter or longer: what a complete claim may name with `scope.check_prefix`.
 CHECK_FAMILY_SEPARATOR = "-"
-CHECK_FAMILY_RE = re.compile(r"^[a-z0-9]+-$")
+CHECK_FAMILY_RE = re.compile(rf"^[a-z0-9]+{re.escape(CHECK_FAMILY_SEPARATOR)}$")
 SEVERITIES = ("critical", "major", "minor")
 REMEDIATION_KINDS = ("manifest", "gcloud", "manual")
 VERIFICATION_KINDS = ("kubectl", "gcloud", "manual")
@@ -539,10 +539,11 @@ def validate_finding(raw: Any) -> dict:
     if source not in SOURCES:
         raise FindingError(f"source is {_brief(source)}; must be one of {list(SOURCES)}")
 
-    # Lower-cased as the derived id is, so a claim's `check_prefix` and a
-    # reader's "starts with `upgrade-`" reach a row however its writer spelled
-    # the check.
-    check = _text(raw.get("check") if raw.get("check") is not None else raw.get("check_slug"), "check").lower()
+    # Folded as the derived id folds it (lower case, every run of other
+    # characters one separator), so a claim's `check_prefix` and a reader's
+    # "starts with `upgrade-`" reach a row however its writer spelled the
+    # check, as the id and the item key already do.
+    check = _id_segment(_text(raw.get("check") if raw.get("check") is not None else raw.get("check_slug"), "check"))
     # Required, not defaulted: cluster names are only unique within a project,
     # so a finding that omits its project is one key collision away from
     # silently overwriting another cluster's row (and keeping its state).

@@ -358,6 +358,22 @@ class Registration(unittest.TestCase):
         self.assertNotEqual(capped, uncapped)
         self.assertEqual(review.item_id(found), capped)
 
+    def test_an_error_body_cut_short_is_still_this_batchs_failure(self):
+        import http.client
+        import urllib.error
+
+        class CutShort:
+            def read(self):
+                raise http.client.IncompleteRead(b"{")
+
+        def refuse(req, timeout):
+            raise urllib.error.HTTPError(req.full_url, 503, "Service Unavailable", {}, CutShort())
+
+        with mock.patch.object(review.urllib.request, "urlopen", refuse):
+            with self.assertRaises(OSError) as caught:
+                review.kv_request(review.KV_FINDINGS_PATH, {"findings": []})
+        self.assertEqual(str(caught.exception), "HTTP 503 Service Unavailable")
+
     def test_an_answer_that_is_not_an_object_is_this_batchs_failure(self):
         import io
 
@@ -758,6 +774,9 @@ class TheTick(unittest.TestCase):
         self.assertEqual(len(self.registered), 2)  # the read project's two members, nothing for the unlisted one
 
     def test_a_project_spelled_by_number_the_report_could_not_resolve_is_not_read(self):
+        # The report records a failed describe as a listing row with no location,
+        # whatever else the envelope carries; that row is what makes the project
+        # not read, so nothing is registered under the number.
         numbered = "123456789012"
 
         def run_report(names, readiness, *, scope, outside_stands, timeout=None):
@@ -768,11 +787,26 @@ class TheTick(unittest.TestCase):
         with mock.patch.object(watch, "projects", return_value=[PROJECT, numbered]), mock.patch.object(watch, "run_report", side_effect=run_report):
             code, out = self.run_main()
         self.assertEqual(code, 0)
-        # The listing row's reason comes first; the number guard covers a run with members and no row.
         self.assertIn(f"1 project(s) not read this week: {numbered}: describe {numbered}: PERMISSION_DENIED", out)
         self.assertFalse(any(f["project"] == numbered for body in self.registered for f in body["findings"]))
         latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
         self.assertIn(numbered, latest["project_failures"])
+
+    def test_a_project_spelled_by_number_and_by_id_is_read_once(self):
+        numbered = "123456789012"
+
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            # The report resolves the number and enumerates under the id, as the id run does.
+            return {"exit": 0, "tables": "| t |", "report": {"projects": [PROJECT], "members": [seeded_b(), member("seeded-c")], "errors": []}}
+
+        with mock.patch.object(watch, "projects", return_value=[numbered, PROJECT]), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "")
+        self.assertEqual(len(self.registered), 2)  # seeded-b's batch and seeded-c's claim, once
+        latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
+        self.assertEqual(len(latest["clusters"]["reviewed"]), 2)
+        self.assertEqual(len(latest["findings"]), len(review.member_findings(seeded_b())))
 
     def test_a_numbered_project_the_report_resolved_whose_listing_failed_is_not_read(self):
         numbered = "123456789012"

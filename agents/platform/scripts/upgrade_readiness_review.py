@@ -325,7 +325,6 @@ NO_PROJECTS_DETAIL = "no project to review: set UPGRADE_READINESS_PROJECTS or de
 BUDGET_EXHAUSTED_DETAIL = "the run's time budget ran out before this project"
 CUT_SHORT_DETAIL = "readiness run cut short by the review's time budget after {seconds}s; it goes first next week"
 LISTING_FAILED_DETAIL = "the project's cluster listing failed"
-NUMBERED_PROJECT_DETAIL = "spelled by number and not resolved to an id this run, so its clusters are not read: spell the project by its id"
 MAX_PROBLEMS_IN_LINE = 3  # of the queue's refusals quoted in the chat line; the record has them all
 MAX_NAMES_IN_LINE = 6  # projects named in the partial line
 OVERFLOW_NOTE = "and {count} more in the record"
@@ -387,7 +386,10 @@ def kv_request(path: str, body: dict) -> dict:
     except urllib.error.HTTPError as exc:
         # The queue says which row or field it refused, or that it is busy, in
         # the body; str(HTTPError) is the status line alone.
-        body = " ".join(exc.read().decode("utf-8", "replace").split())[:KV_ERROR_EXCERPT_CHARS]
+        try:
+            body = " ".join(exc.read().decode("utf-8", "replace").split())[:KV_ERROR_EXCERPT_CHARS]
+        except (OSError, http.client.HTTPException):  # the error body itself cut short
+            body = ""
         raise OSError(f"HTTP {exc.code} {exc.reason}: {body}" if body else f"HTTP {exc.code} {exc.reason}") from None
     except http.client.HTTPException as exc:
         # A response cut short or malformed is a transport failure of this
@@ -760,6 +762,7 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
     errors: list[dict] = []
     tables: dict[str, str] = {}
     failures: dict[str, str] = {}
+    read_ids: set[str] = set()
     deadline = time.monotonic() + TOTAL_BUDGET_SECONDS
     for project in names:
         remaining = deadline - time.monotonic()
@@ -796,12 +799,13 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
                 LISTING_FAILED_DETAIL,
             )
             continue
-        if watch.is_project_number(project) and any(m.get(watch.MEMBER_ID_KEYS[0]) == project for m in found):
-            # A number the report could not resolve to an id this run keys its
-            # members by the number; registered so, they would be a second
-            # identity set the queue never clears. Not read, as the watch counts it.
-            failures[project] = NUMBERED_PROJECT_DETAIL
+        resolved = {str(p) for p in report.get(watch.REPORT_PROJECTS_KEY) or [project]}
+        if resolved & read_ids:
+            # The roster spelled one project twice, by number and by id: the
+            # report resolved both to the same id, and its clusters are already
+            # read and registered under the first run. The second is not.
             continue
+        read_ids |= resolved
         members.extend(found)
         if on_project is not None:
             on_project(found, read_errors)
@@ -860,7 +864,7 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
                 body["scope"] = {"project": project, "cluster": cluster, "complete": True, "check_prefix": CHECK_PREFIX}
             try:
                 answer = kv_request(KV_FINDINGS_PATH, body)
-            except (urllib.error.URLError, OSError, ValueError) as exc:
+            except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
                 # An empty complete batch is the clean read's claim: nothing is
                 # marked failed, and the line counts the claim, since last
                 # week's rows for the cluster keep their confidence.

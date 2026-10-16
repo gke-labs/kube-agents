@@ -513,10 +513,11 @@ class TestRegistration(QueueTestCase):
         self.assertEqual(result["downgraded"], 1)
 
     def test_a_check_is_stored_lower_case_so_the_prefix_reaches_it(self):
-        odd = sample(source="upgrade-readiness", check="Upgrade-Pool-Skew", namespace="", object="old-pool")
+        odd = sample(source="upgrade-readiness", check="Upgrade_Pool Skew", namespace="", object="old-pool")
         self.register(odd)
         odd_id = fq.validate_finding(odd)["id"]
         self.assertEqual(fq.get_finding(self.conn, odd_id)["check"], "upgrade-pool-skew")
+        self.assertTrue(odd_id.startswith("upgrade-pool-skew."))
         result = self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})
         self.assertEqual(result["downgraded"], 1)
 
