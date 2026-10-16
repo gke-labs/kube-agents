@@ -1075,7 +1075,7 @@ MITIGATIONS = {
     3: {
         "title": "Every replica in one zone or on one node",
         "before": "Replicas of one Deployment on one node or in one zone, with no spread or anti-affinity.",
-        "read_today": "the obtainability audit's spread and pinning checks",
+        "read_today": "the obtainability audit's spread and pinning checks, and its `zonal-skew` check, which reads each workload's replicas per zone and names the cause",
         "mitigate_before": "topologySpreadConstraints across zones and hosts, or anti-affinity, and a budget so the drain waits between replicas.",
         "mitigate_after": "The next rollout re-spreads the pods once the constraints are in place.",
     },
