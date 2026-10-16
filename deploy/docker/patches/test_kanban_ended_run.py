@@ -366,8 +366,10 @@ class TestSavedResultBanner(unittest.TestCase):
             "CREATE TABLE tasks (id TEXT, assignee TEXT);"
             "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, started_at INTEGER);"
             "CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT, created_at INTEGER);"
-            "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, created_at INTEGER);")
+            "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, created_at INTEGER);"
+            "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);")
         self.conn.execute("INSERT INTO tasks VALUES (?, 'platform')", (TID,))
+        self.conn.execute("INSERT INTO task_links VALUES ('t_rotate', ?)", (TID,))
         self.conn.execute("INSERT INTO task_runs VALUES (52, ?, 90)", (TID,))
 
     def comment(self, body, at=100, author="platform"):
@@ -382,7 +384,11 @@ class TestSavedResultBanner(unittest.TestCase):
         self.comment(ker.SAVED_RESULT_LEAD + "\nweb-7 logs: no errors\nPR #12 opened")
         self.event(ker.DEPENDENCY_WAIT_EVENT)
         lines = ker.saved_result_banner(self.conn, TID)
-        self.assertIn(ker.SAVED_RESULT_BANNER, lines)
+        banner = ker.banner_text(["t_rotate"])
+        self.assertIn(banner, lines)
+        self.assertIn("before t_rotate was added as a prerequisite", banner)
+        self.assertIn("don't open another", banner)
+        self.assertNotIn("Don't redo the work", banner)
         self.assertIn("> web-7 logs: no errors", lines)
         self.assertIn("> PR #12 opened", lines)
 
