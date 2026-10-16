@@ -16,7 +16,10 @@
 # ci-kube-agents-eval-nightly-writers with EVAL_NIGHTLY_PART=writers, the
 # cases that request a pull request, on a second project (the variable's
 # comment in the script says why). The budget below prices the whole matrix
-# on one job, as it ran before that split.
+# on one job, as it ran before that split. The writers part also waits
+# EVAL_GITHUB_WRITE_SETTLE_SECONDS (30 s) before each of its units, which
+# run one at a time: with six requesting cases at three repetitions, nine
+# minutes a night of pure waiting, beside the 90 s the 5 s stagger cost.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).

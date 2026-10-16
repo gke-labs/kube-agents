@@ -240,10 +240,11 @@ trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
 repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, and `content` asserts over the YAML or text in the files it adds), `github_writes` (every pull request or branch under the agent's
-prefix written to the case's GitOps repository since the repetition started; it
-passes on a write, so a case wraps it in `none` to say the agent wrote nothing
-it was not asked for, and the inject lane appends exactly that entry to every
-case it runs), `worker_commands` (regular expressions over the terminal commands
+prefix written to the case's GitOps repository since the repetition started that
+the repetition's reply, or its or its workers' call that created the write, names
+(a read's arguments do not count), or every one when its window is marked exclusive; it passes on a write, so
+a case wraps it in `none` to say the agent wrote nothing it was not asked for,
+and both lanes append exactly that entry to every case they run), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
 purges it, or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits

@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import urllib.parse
 from collections.abc import Callable
@@ -104,6 +105,7 @@ __all__ = [
     "forge_name",
     "is_gitlab_token_bot",
     "main",
+    "named_in",
     "parse_github_time",
     "proposal_numbers_named",
     "token_env_vars",
@@ -111,7 +113,7 @@ __all__ = [
 ]
 
 #: Where the run learns the case's GitOps repository, ``owner/name``.
-#: ``hack/ci-eval-pr.sh`` exports it on the inject lane from the same
+#: ``hack/ci-eval-pr.sh`` exports it on both lanes from the same
 #: project-to-repository mapping the deploy and the ledger reset read
 #: (``gitops_repo_for_project`` in ``hack/ci-deploy.sh``); a dev install sets
 #: it by hand to the repository its ``EVAL_GITOPS_REPO`` named.
@@ -175,6 +177,62 @@ DEFAULT_CALL_TIMEOUT_SECONDS = 30.0
 #: The length of a bare-year ``--since`` (``2026``), which ``fromisoformat``
 #: refuses and which would otherwise read as seconds since 1970.
 YEAR_DIGITS = 4
+
+#: Where a branch name is found in a text: not before a character that would
+#: continue it (a ``.`` only when a name character follows, so a sentence may
+#: end on it), and not after one that would make it the tail of a longer
+#: name. ``platform-agent/fix`` is not found inside ``platform-agent/fix-oom``,
+#: nor ``fix-oom`` inside ``platform-agent/fix-oom``.
+BRANCH_NAME_AFTER = r"(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_/-])"
+BRANCH_NAME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/-")
+#: The ``/``-ended forms git and the forges print a branch after, which a
+#: ``/`` before the name may close: ``refs/heads/<branch>``,
+#: ``origin/<branch>``, and a web URL's ``/tree/``, ``/commits/`` or
+#: ``/compare/`` path (GitLab's ``/-/tree/`` ends in the same). A ``/`` after
+#: anything else continues a longer name. The bare-word ones must start a
+#: name themselves, so ``myorigin/`` is not ``origin/``.
+BRANCH_PATH_PREFIXES = ("refs/heads/", "origin/", "/tree/", "/commits/", "/compare/")
+#: What closes a range or a compare link, ``main..<branch>`` and
+#: ``main...<branch>``: git refuses ``..`` inside a ref name, so a branch
+#: after it is whole.
+BRANCH_RANGE_SEPARATOR = ".."
+#: How a call names ``version-control``'s script: by its path, or by the
+#: variable its SKILL.md assigns the path to (``V=.../vcs.py`` then
+#: ``python3 $V branch <name>``).
+VCS_SCRIPT = r"(?:\bvcs(?:\.py)?|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)[\"']?"
+#: The commands that create a branch or a pull request, matched against one
+#: shell segment of a call (:func:`writing_segments`): ``submit-suggestion``'s
+#: ``prepare`` and ``submit``, ``version-control``'s ``branch``, ``publish``
+#: and ``proposal create``, and the raw ``git``/``gh``/``glab`` forms. What a
+#: repetition charges itself with by its calls is what these name, never a
+#: read that takes a branch or URL as its argument (``vcs.py clone
+#: --branch``, ``proposal list --source``, ``gh pr view <url>``, ``git fetch
+#: origin <branch>``): a read names another case's pull request as easily as
+#: a listing's result does.
+WRITING_COMMANDS = tuple(
+    re.compile(p)
+    for p in (
+        r"\bsubmit_suggestion(?:\.py)?[\"']?\s+(?:prepare|submit)\b",
+        VCS_SCRIPT + r"\s+(?:branch|publish|push)\b",
+        VCS_SCRIPT + r"\s+(?:proposal|pr|mr)\s+(?:create|open)\b",
+        r"\bgit(?:\s+-[Cc]\s+\S+)*\s+(?:push|branch|checkout\s+(?:-[bB]|--orphan)|switch\s+(?:-[cC]|--create))\b",
+        r"\bgh\b.*\bpr\s+create\b",
+        r"\bglab\b.*\bmr\s+create\b",
+    )
+)
+#: A tool whose name says it creates a branch or a pull request (a forge MCP
+#: server's ``create_pull_request``, ``create_branch``, ``push_files``): every
+#: argument it was handed is what it wrote.
+WRITING_TOOL_NAME = re.compile(r"(?i)(?:create|open)_?(?:pull|merge|branch|proposal)|push")
+#: What separates one command from the next in a shell line, after a
+#: backslash-newline continuation is joined: a heredoc's body, a ``cd`` and a
+#: read chained before the write each fall in a segment of their own.
+SHELL_CONTINUATION = "\\\n"
+SHELL_SEGMENT_SPLIT = re.compile(r"&&|\|\||[;|\n]")
+#: A branch whose name holds none of these is a bare word (``fix``,
+#: ``main``) that a reply's prose carries by accident, so it is attributed
+#: by its pull request's URL alone, never by its name.
+BRANCH_NAME_SEPARATORS = ("/", "-", "_")
 
 Transport = Callable[[str, str, float], tuple[int, Any]]
 
@@ -646,6 +704,63 @@ def proposal_numbers_named(
     of the other forge, names nothing here."""
     return {n for path, n in proposal_refs(text, forge, environ) if path.lower() == repo.lower()}
 
+def named_in(
+    write: GitHubWrite,
+    text: str,
+    repo: str,
+    forge: str,
+    environ: dict[str, str] | None = None,
+) -> bool:
+    """Whether ``text`` -- what one repetition said and sent -- ties
+    ``write`` to that repetition: the pull request's web URL in full, or the
+    branch it was written on, as a whole name with a separator in it.
+
+    What charges a write to the repetition that made it rather than to every
+    repetition whose window it falls in (#2611): the agent links the pull
+    request it opened in its own reply, and its own push or
+    ``submit-suggestion`` call carries the branch. The caller decides what
+    ``text`` holds; the verifier hands it the reply and the writing calls
+    alone (:func:`writing_segments`).
+    """
+    if write.number is not None and write.number in proposal_numbers_named(text, repo, forge, environ):
+        return True
+    branch = write.branch
+    if not branch or not any(sep in branch for sep in BRANCH_NAME_SEPARATORS):
+        return False
+    return any(
+        _starts_a_name(text[: m.start()])
+        for m in re.finditer(re.escape(branch) + BRANCH_NAME_AFTER, text)
+    )
+
+
+def writing_segments(command: str) -> list[str]:
+    """The segments of a shell line that create a branch or a pull request
+    (:data:`WRITING_COMMANDS`), so a write is charged by the call that made
+    it and not by a read chained beside it."""
+    joined = command.replace(SHELL_CONTINUATION, " ")
+    return [s for s in SHELL_SEGMENT_SPLIT.split(joined) if any(p.search(s) for p in WRITING_COMMANDS)]
+
+
+def is_writing_tool(name: str) -> bool:
+    """Whether a tool's name says it creates a branch or a pull request."""
+    return bool(WRITING_TOOL_NAME.search(name or ""))
+
+
+def _starts_a_name(before: str) -> bool:
+    """Whether a branch name that begins right after ``before`` is whole,
+    rather than the tail of a longer name (:data:`BRANCH_PATH_PREFIXES`,
+    :data:`BRANCH_RANGE_SEPARATOR`)."""
+    if not before or before[-1] not in BRANCH_NAME_CHARS:
+        return True
+    if before.endswith(BRANCH_RANGE_SEPARATOR):
+        return True
+    for prefix in BRANCH_PATH_PREFIXES:
+        if before.endswith(prefix):
+            head = before[: -len(prefix)]
+            return prefix.startswith("/") or not head or head[-1] not in BRANCH_NAME_CHARS
+    return False
+
+
 def proposal_refs_elsewhere(
     text: str, repo: str, forge: str, environ: dict[str, str] | None = None
 ) -> dict[int, list[str]]:
@@ -854,7 +969,7 @@ def _parse_since(text: str) -> datetime:
 def main(argv: list[str] | None = None) -> int:
     """List what a run wrote to the repository since an instant.
 
-    ``hack/ci-eval-pr.sh`` runs this after the fan-out on the inject lane so
+    ``hack/ci-eval-pr.sh`` runs this after the fan-out on both lanes so
     the job's log names every pull request and branch the run left behind.
     It closes nothing: the in-job reset (``hack/ci_reset_agent_pulls.py``)
     closes before each unit that may write, and the next lease's reset or the
