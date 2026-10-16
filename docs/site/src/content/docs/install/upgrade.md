@@ -393,7 +393,8 @@ gateway from the agent ServiceAccount (`spec.security.serviceAccountName`, `kube
 by default) to `<name>-gateway-agent`, which the operator creates with no annotation. The agent
 ServiceAccount, its Workload Identity annotation and its IAM binding stay where they are, with the
 credential broker, so neither Terraform nor IAM changes. The new ServiceAccount is bound to the same
-read-only `kubeagents:minimal` ClusterRole and `kubeagents:leader` Role the gateway already used.
+read-only `kubeagents:minimal` ClusterRole and the `kubeagents:local` and `kubeagents:leader` Roles
+the gateway already used.
 
 Two things an install may have added by hand do not follow the gateway:
 

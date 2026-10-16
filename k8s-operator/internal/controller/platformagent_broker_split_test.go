@@ -655,6 +655,16 @@ func TestARefusalStillReconcilesTheAgentsNetworkPolicies(t *testing.T) {
 			},
 			reason: reasonForbiddenVolumeMount,
 		},
+		{
+			name: "an override naming the gateway's ServiceAccount",
+			mutate: func(agent *agentv1alpha1.PlatformAgent) {
+				if agent.Spec.Security == nil {
+					agent.Spec.Security = &agentv1alpha1.SecuritySpec{}
+				}
+				agent.Spec.Security.ServiceAccountName = gatewayServiceAccountName(agent)
+			},
+			reason: reasonReservedServiceAccount,
+		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			agent := brokerPodAgent()
@@ -982,5 +992,38 @@ func TestTheBrokerPinsTheDriftDetectorsOwnSubscription(t *testing.T) {
 	off := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(false)})
 	if _, found := brokerEnvValue(buildCredentialProxyEnv(off), watcherSubscriptionEnvVar); found {
 		t.Errorf("with the detector off the broker must name no subscription, so every Pub/Sub call is refused")
+	}
+}
+
+// TestAnOverrideNamingAnOperatorServiceAccountWritesNoServiceAccount pins that
+// the controller refuses the collision before step 3, with no webhook in
+// front of it: no ServiceAccount of that name is written, and above all not
+// with the broker's Workload Identity annotation, which would hand the gateway
+// the broker's cloud identity.
+func TestAnOverrideNamingAnOperatorServiceAccountWritesNoServiceAccount(t *testing.T) {
+	agent := brokerPodAgent()
+	if agent.Spec.Security == nil {
+		agent.Spec.Security = &agentv1alpha1.SecuritySpec{}
+	}
+	agent.Spec.Security.ServiceAccountName = gatewayServiceAccountName(agent)
+	agent.Spec.Security.ServiceAccountAnnotations = map[string]string{
+		"iam.gke.io/gcp-service-account": "broker@p.iam.gserviceaccount.com",
+	}
+	if msg := ReservedServiceAccountOverride(agent); msg == "" {
+		t.Fatal("the override is not recognised as a collision")
+	}
+	r, cl := newSplitReconciler(t, agent)
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("a refusal is a Degraded status, not a reconcile error: %v", err)
+	}
+	sa := &corev1.ServiceAccount{}
+	err := cl.Get(ctx, types.NamespacedName{Name: gatewayServiceAccountName(agent), Namespace: agent.Namespace}, sa)
+	if err == nil {
+		t.Fatalf("a ServiceAccount named %q was written, annotations %v", sa.Name, sa.Annotations)
+	}
+	if !errors.IsNotFound(err) {
+		t.Fatalf("get: %v", err)
 	}
 }

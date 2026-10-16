@@ -198,23 +198,21 @@ func credentialProxyBaseURL(agent *agentv1alpha1.PlatformAgent) string {
 // Two of them on every install; a third when the next stack takes Chat, and a
 // fourth under the cluster-view flag. The sandbox's is the caller that matters —
 // the shell is where every credentialed command runs, so a broker that served
-// only the agent's identity would answer 401 to all of them. The agent's is
-// there because the gateway's chat relays go through the same listener from
-// the agent Pod.
+// only the gateway's identity would answer 401 to all of them. The gateway's
+// is there because its chat relays and its watchers go through the same
+// listener.
 //
 // Two identities rather than one is not a widening of who may call: both Pods
 // belong to this agent, and neither could reach the broker without a token this
-// namespace mints. What it does not give is a way to tell them apart — the
-// sandbox runs as its own ServiceAccount, but the gateway shares the agent's
-// with the broker, so a username alone cannot say which Pod called. That is
-// what credentialProxyChatAudience is for. The A2A gateway runs as a
-// ServiceAccount of its own, so unlike the first two it is told apart by
-// name as well as by audience.
+// namespace mints. Each runs as a ServiceAccount of its own, so a username
+// says which Pod called; the audience (credentialProxyChatAudience and its
+// siblings) says which role the call is for. The A2A gateway is told apart
+// the same way.
 func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent) string {
 	callers := []string{
 		// The gateway Pod, which presents the chat and watcher tokens. The
-		// broker's own ServiceAccount is not a caller: nothing in the broker Pod
-		// mounts a token for any of these audiences.
+		// broker's own ServiceAccount is not a caller: the broker serves these
+		// routes, it does not call them.
 		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, gatewayServiceAccountName(agent)),
 		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, shellSandboxServiceAccountName(agent)),
 	}

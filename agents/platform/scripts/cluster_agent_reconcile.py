@@ -307,10 +307,15 @@ def _project_source() -> tuple[str | None, bool]:
     operator_project = os.environ.get(OPERATOR_PROJECT_ENV, "").strip()
     if operator_project.isdigit():
         # A harness can carry the project NUMBER (no CRD pattern refuses it).
-        # The snapshot records the project ID, so a number would read as the
-        # management project having changed and retire its profiles; it is
-        # not used as an authoritative answer.
-        operator_project = ""
+        # The snapshot records the project ID, so the number is resolved to
+        # its ID through the broker rather than used as it stands, which would
+        # read as the management project having changed and retire its
+        # profiles. The metadata server that used to answer here is closed to
+        # the gateway, so without this a numeric harness would leave the
+        # management project unresolved on every tick. An ID the scope cannot
+        # carry, or a failed lookup, is not an answer.
+        resolved, outcome = _project_id_of(operator_project)
+        operator_project = resolved if (resolved and outcome == OUTCOME_OK) else ""
     p = (
         os.environ.get("RECONCILE_PROJECT")
         or operator_project

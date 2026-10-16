@@ -68,7 +68,7 @@ ownership check, and pinning it would have encoded that gap as an intention.
 
 ## Known violations are expected failures
 
-Eleven assertions currently fail. They are decorated `@known_violation`, which
+Ten assertions currently fail. They are decorated `@known_violation`, which
 is `unittest.expectedFailure` plus a registration, so CI is green and the gap
 still has a name, a line number and a citation. Fixing the control turns the
 expected failure into an _unexpected success_, which unittest reports as a

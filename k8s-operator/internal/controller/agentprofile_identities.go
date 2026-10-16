@@ -307,6 +307,27 @@ func agentProfileMapEntries(agent *agentv1alpha1.PlatformAgent, profiles []agent
 // names the broker's identity, and naming one of these instead would put the
 // broker (and its cloud binding) on another workload's ServiceAccount; the
 // admission webhook refuses it.
+// ReservedServiceAccountOverride returns a refusal message when
+// spec.security.serviceAccountName names a ServiceAccount the operator creates
+// for another of this agent's workloads, or "" when it does not. The broker
+// runs as that name with its Workload Identity binding, so a collision would
+// hand the other workload (the gateway above all) the broker's cloud identity,
+// and two reconcilers would fight over one ServiceAccount. The webhook refuses
+// it at admission; the controller refuses it too, before any ServiceAccount is
+// written, because the chart ships the webhook off and it fails open.
+func ReservedServiceAccountOverride(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Security == nil || agent.Spec.Security.ServiceAccountName == "" {
+		return ""
+	}
+	sa := agent.Spec.Security.ServiceAccountName
+	for _, minted := range OperatorServiceAccountNames(agent) {
+		if sa == minted {
+			return fmt.Sprintf("%q is a ServiceAccount the operator creates for another of this agent's workloads; the broker's identity needs a name of its own", sa)
+		}
+	}
+	return ""
+}
+
 func OperatorServiceAccountNames(agent *agentv1alpha1.PlatformAgent) []string {
 	// Computed with the override cleared: the broker's own name is the one the
 	// caller is checking, and leaving it set would take it out of the list.

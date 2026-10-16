@@ -3089,10 +3089,23 @@ class ProjectSourceTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "mgmt-project", "RECONCILE_PROJECT": "override"}):
             self.assertEqual(rec._project_source(), ("override", True))
 
-    def test_a_numeric_operator_project_is_not_authoritative(self):
+    def test_a_numeric_operator_project_is_resolved_to_its_id(self):
+        # In the gateway the metadata server is closed, so the number is
+        # resolved through the broker; the metadata answer is never reached.
         with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "123456789012", "RECONCILE_PROJECT": ""}), \
-                mock.patch.object(rec, "_metadata", return_value="mgmt-project"):
+                mock.patch.object(rec, "_project_id_of", return_value=("mgmt-project", rec.OUTCOME_OK)) as resolve, \
+                mock.patch.object(rec, "_metadata", side_effect=AssertionError("metadata is closed")):
             self.assertEqual(rec._project_source(), ("mgmt-project", True))
+        resolve.assert_called_once_with("123456789012")
+
+    def test_a_numeric_operator_project_that_will_not_resolve_is_not_an_answer(self):
+        for outcome in (rec.OUTCOME_DENIED, rec.OUTCOME_UNREACHABLE):
+            with self.subTest(outcome=outcome), \
+                    mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "123456789012", "RECONCILE_PROJECT": ""}), \
+                    mock.patch.object(rec, "_project_id_of", return_value=(None, outcome)), \
+                    mock.patch.object(rec, "_metadata", return_value="mgmt-project"):
+                # Falls through to the next authoritative source, never the number.
+                self.assertEqual(rec._project_source(), ("mgmt-project", True))
 
 
 if __name__ == "__main__":

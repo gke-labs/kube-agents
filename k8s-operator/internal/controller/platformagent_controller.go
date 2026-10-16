@@ -298,6 +298,10 @@ const (
 
 	reasonRuntimeClassNotFound = "RuntimeClassNotFound"
 	reasonForbiddenVolumeMount = "ForbiddenVolumeMount"
+	// reasonReservedServiceAccount: spec.security.serviceAccountName names a
+	// ServiceAccount the operator creates for another workload. See
+	// ReservedServiceAccountOverride.
+	reasonReservedServiceAccount = "ReservedServiceAccountName"
 )
 
 var (
@@ -653,6 +657,24 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				}
 			}
 		}()
+	}
+
+	// 2z. Refuse an override that names one of the operator's own
+	// ServiceAccounts, before step 3 writes it with the broker's Workload
+	// Identity annotation. The webhook refuses it at admission, but the chart
+	// ships the webhook off and it fails open, so this is the check that holds.
+	// The same rescue as the volume refusal below: keep the guardrails, render
+	// no workload.
+	if msg := ReservedServiceAccountOverride(instance); msg != "" {
+		log.Info(msg)
+		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
+		if statusErr := r.updateStatusDegraded(ctx, instance, reasonReservedServiceAccount, msg, workloadNotRendered); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		if guardrailErr != nil {
+			return ctrl.Result{}, guardrailErr
+		}
+		return ctrl.Result{}, nil
 	}
 
 	// 3. Reconcile Service Account (with Workload Identity annotation): the

@@ -119,7 +119,7 @@ Pod-wide `automountServiceAccountToken` is `false` on every pod of today's stack
 
 **The gateway Pod holds no cloud identity.** The broker Pod runs as the Workload Identity-annotated ServiceAccount (`spec.security.serviceAccountName`, `kubeagents-platform-agent` by default), and the gateway Pod runs as `<name>-gateway-agent`, which the operator mints with no annotation. GKE resolves Workload Identity by the Pod's ServiceAccount, so the gateway's metadata server has no Google service account to answer for, and the gateway's NetworkPolicy no longer opens the metadata path at all. Everything in the gateway that called Google — the remote MCP servers, the event watcher and the drift detector — goes through the broker. [`spec.security.workloadIdentityFederation`](#running-the-shell-in-its-own-pod) remains optional hardening for the broker's own credential.
 
-**The sharing that made this a container-boundary problem is gone.** The broker is not in a Pod with anything that runs model-authored code, so there is no shared network namespace, no shared process namespace, and no shared writable volume. [`docs/security-requirements.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/security-requirements.md) tracks the requirement and the remaining gap formally.
+**The sharing that made this a container-boundary problem is gone.** The broker is not in a Pod with anything that runs model-authored code, so there is no shared network namespace, no shared process namespace, and no shared writable volume. [`docs/security-requirements.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/security-requirements.md) tracks the requirement formally.
 
 ### The agent now holds a credential, and that was a choice
 

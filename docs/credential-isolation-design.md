@@ -184,8 +184,6 @@ and the route table it feeds
 - Preventing an approved credentialed command from deliberately copying a
   credential into content it returns. Such credential disclosure and tool side
   effects require a separate approval/policy design.
-- Preventing the gateway Pod from reaching the Pod identity it still shares with
-  the broker, or the metadata server behind it.
 - Arbitrary user-supplied init containers, sidecars, volumes, and mounts. These
   are trusted configuration and may intentionally weaken isolation.
 - General data-exfiltration prevention.
