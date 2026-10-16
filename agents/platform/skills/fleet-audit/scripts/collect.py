@@ -20,7 +20,8 @@ so their candidates carry a marker that keeps the automatic sweep from
 opening them (`TRIAGE_BY_SLUG`). Other streams have their own
 collectors (`fleet_drift.py`, `patch_readiness.py`) or none. The three streams
 collect in different shapes: obtainability answers every check from one
-workload dump plus the reads its declaration fields need; compliance issues
+workload dump plus the reads its declaration fields need, and §3.25 from a
+second, row-shaped pod placement read beside it; compliance issues
 several distinct `kubectl` and `gcloud` reads per cluster, three of them
 best-effort because their CRDs are not installed everywhere; ai-security reads
 a workload dump and a Service dump, the second backing exactly one check
@@ -217,7 +218,8 @@ ZONAL_SKEW_SLUG = "zonal-skew"
 POD_PLACEMENT_FIELD_SELECTOR = "status.phase!=Succeeded,status.phase!=Failed"
 POD_PLACEMENT_JSONPATH = (
     r'{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.nodeName}{"\t"}'
-    r'{.status.phase}{"\t"}{.metadata.ownerReferences[0].kind}{"\t"}{.metadata.ownerReferences[0].name}{"\t"}'
+    r'{.status.phase}{"\t"}{.metadata.deletionTimestamp}{"\t"}'
+    r'{.metadata.ownerReferences[0].kind}{"\t"}{.metadata.ownerReferences[0].name}{"\t"}'
     r'{.status.conditions[?(@.type=="PodScheduled")].reason}{"\t"}'
     r'{.status.conditions[?(@.type=="PodScheduled")].message}{"\n"}{end}'
 )
@@ -226,21 +228,41 @@ POD_PLACEMENT_ARGV = [
     "--field-selector", POD_PLACEMENT_FIELD_SELECTOR,
     "-o", "jsonpath=" + POD_PLACEMENT_JSONPATH,
 ]
-POD_PLACEMENT_FIELDS = 8
+POD_PLACEMENT_FIELDS = 9
+# What the credential proxy prints on stderr when it cut stdout at its cap. A
+# JSON read cut there fails to parse; a row read cut on a line boundary would
+# parse clean and silently lose the tail of the cluster, so the marker is the gate.
+PROXY_TRUNCATED_MARKER = "credential proxy output truncated"
 # The issue's acceptance bar (#1356): the busiest zone holds this many more
-# running replicas than the emptiest. `--zonal-skew-threshold` overrides it.
+# running replicas than the emptiest. `--zonal-skew-threshold` overrides it,
+# never below one: at zero every balanced workload is a finding.
 ZONAL_SKEW_THRESHOLD_DEFAULT = 2
-# Below two running replicas there is no distribution to skew, and below two
-# zones nothing to skew across.
+ZONAL_SKEW_THRESHOLD_MIN = 1
+# Below two running replicas there is no distribution to skew -- unless the
+# missing replicas are Pending for want of room, when one running replica in
+# one zone plus the shortfall is the capacity shape (`ZONAL_SKEW_MIN_RUNNING_STARVED`).
+# Below two zones there is nothing to skew across.
 ZONAL_SKEW_MIN_RUNNING = 2
+ZONAL_SKEW_MIN_RUNNING_STARVED = 1
 ZONAL_SKEW_MIN_ZONES = 2
 POD_PHASE_RUNNING = "Running"
 POD_PHASE_PENDING = "Pending"
 # The scheduler's own word for a pod no node has room for: `Insufficient cpu`,
-# `Insufficient memory`, `Insufficient nvidia.com/gpu`.
+# `Insufficient memory`, `Insufficient nvidia.com/gpu`. Its first sentence is
+# the verdict; what follows `SCHEDULER_SENTENCE_END` is preemption detail.
 SCHEDULER_INSUFFICIENT_MARKER = "Insufficient "
+SCHEDULER_SENTENCE_END = ". "
 SCHEDULER_MESSAGE_CHARS = 120
 REPLICASET_KIND = "ReplicaSet"
+DEPLOYMENT_KIND = "Deployment"
+STATEFULSET_KIND = "StatefulSet"
+DAEMONSET_KIND = "DaemonSet"
+# A volumeClaimTemplate that names no class takes the cluster default.
+DEFAULT_STORAGE_CLASS_NAME = "(default)"
+# A binding zone spread's `maxSkew` when the field is absent (the API default),
+# and the skew a required zone anti-affinity enforces (one pod per zone).
+TOPOLOGY_MAX_SKEW_DEFAULT = 1
+ANTI_AFFINITY_MAX_SKEW = 1
 
 # The manifest contract's outcomes, and the target names a sweep of more than
 # one project needs (§2 of `docs/designs/fleet-audit-collector-manifest.md`).
@@ -1768,6 +1790,7 @@ def build_context(dump: dict, workloads: list[dict]) -> dict:
         "namespaces": [i for i in (dump.get("items") or []) if i.get("kind") == "Namespace"],
         "nodes": [i for i in (dump.get("items") or []) if i.get("kind") == "Node"],
         "node_zones": node_zones(dump),
+        "node_labels": node_labels(dump),
     }
 
 
@@ -2824,27 +2847,41 @@ def check_spread_not_achieved(workload: dict, context: dict) -> dict | None:
 _zonal_skew_threshold = ZONAL_SKEW_THRESHOLD_DEFAULT
 
 
+def zonal_skew_threshold_arg(value: str) -> int:
+    """`--zonal-skew-threshold`'s parser: an integer of at least one."""
+    parsed = int(value)
+    if parsed < ZONAL_SKEW_THRESHOLD_MIN:
+        raise argparse.ArgumentTypeError(
+            f"must be at least {ZONAL_SKEW_THRESHOLD_MIN}; at {parsed} every balanced workload is a finding"
+        )
+    return parsed
+
+
 def set_zonal_skew_threshold(value: int) -> None:
     """`--zonal-skew-threshold`: the skew at which §3.25 fires, for this process."""
     global _zonal_skew_threshold
     _zonal_skew_threshold = value
 
 
-def node_zones(dump: dict) -> dict[str, str]:
-    """Node name -> `topology.kubernetes.io/zone`, for every labelled Node in the dump."""
-    zones: dict[str, str] = {}
+def node_labels(dump: dict) -> dict[str, dict]:
+    """Node name -> labels, for every Node in the dump."""
+    labels: dict[str, dict] = {}
     for item in dump.get("items") or []:
         if item.get("kind") != "Node":
             continue
         meta = item.get("metadata") or {}
-        zone = (meta.get("labels") or {}).get(_ZONE_KEY)
-        if meta.get("name") and zone:
-            zones[meta["name"]] = zone
-    return zones
+        if meta.get("name"):
+            labels[meta["name"]] = dict(meta.get("labels") or {})
+    return labels
+
+
+def node_zones(dump: dict) -> dict[str, str]:
+    """Node name -> `topology.kubernetes.io/zone`, for every labelled Node in the dump."""
+    return {name: labels[_ZONE_KEY] for name, labels in node_labels(dump).items() if labels.get(_ZONE_KEY)}
 
 
 def parse_pod_placements(text: str) -> list[dict] | None:
-    """The placement read's rows, or None when any row is not the eight fields
+    """The placement read's rows, or None when any row is not the fields
     `POD_PLACEMENT_JSONPATH` writes — the same fail-closed gate `run_and_gate`
     applies to a JSON read. Empty output is a failed read too: a cluster always
     has system pods, so a read that names none did not run.
@@ -2856,13 +2893,14 @@ def parse_pod_placements(text: str) -> list[dict] | None:
         parts = line.split("\t", POD_PLACEMENT_FIELDS - 1)
         if len(parts) != POD_PLACEMENT_FIELDS:
             return None
-        ns, name, node, phase, owner_kind, owner_name, reason, message = parts
+        ns, name, node, phase, deleting, owner_kind, owner_name, reason, message = parts
         rows.append(
             {
                 "ns": ns,
                 "name": name,
                 "node": node,
                 "phase": phase,
+                "deleting": bool(deleting),
                 "owner_kind": owner_kind,
                 "owner_name": owner_name,
                 "scheduled_reason": reason,
@@ -2877,19 +2915,20 @@ def _workload_of_pod(row: dict, keys: set[tuple[str, str, str]]) -> tuple[str, s
 
     A StatefulSet owns its pods directly. A Deployment owns them through a
     ReplicaSet named `<deployment>-<pod-template-hash>`, so the Deployment is
-    the owner's name up to its last dash — confirmed against the dump's own
-    workload set rather than trusted, because a ReplicaSet nothing in the dump
-    owns (a bare one, or one under a controller this audit never reads) must
-    not be charged to a Deployment that happens to share a prefix.
+    the owner's name up to its last dash — checked against the dump's own
+    workload set, so a ReplicaSet whose prefix names no Deployment is dropped
+    rather than invented. (The dump has no ReplicaSets, so a bare ReplicaSet
+    that happens to share a Deployment's prefix is charged to it; the cost is
+    one misattributed pod set, and only where someone runs both.)
     """
     kind, owner = row["owner_kind"], row["owner_name"]
-    if kind == "StatefulSet":
+    if kind == STATEFULSET_KIND:
         key = (row["ns"], kind, owner)
     elif kind == REPLICASET_KIND:
         base, sep, _ = owner.rpartition("-")
         if not sep:
             return None
-        key = (row["ns"], "Deployment", base)
+        key = (row["ns"], DEPLOYMENT_KIND, base)
     else:
         return None
     return key if key in keys else None
@@ -2909,8 +2948,8 @@ def _collect_pod_placements(context: dict, commands: dict, kubeconfig: Path, *, 
 
     A single-zone cluster has no zonal distribution, so the check is declared
     inapplicable there without a read. Elsewhere the placement read runs behind
-    its own gate; a failed read leaves the check unevaluated rather than clean,
-    the way the node-pool read does for §3.24.
+    its own gate; a failed or truncated read leaves the check unevaluated
+    rather than clean, the way the node-pool read does for §3.24.
     """
     zones = set((context.get("node_zones") or {}).values())
     if len(zones) < ZONAL_SKEW_MIN_ZONES:
@@ -2921,14 +2960,17 @@ def _collect_pod_placements(context: dict, commands: dict, kubeconfig: Path, *, 
         )
         return
     result = run(POD_PLACEMENT_ARGV, env={**os.environ, "KUBECONFIG": str(kubeconfig)})
-    rows = parse_pod_placements(result.stdout) if result.rc == 0 else None
+    truncated = PROXY_TRUNCATED_MARKER in result.stderr
+    rows = parse_pod_placements(result.stdout) if result.rc == 0 and not truncated else None
     if rows is None:
         commands.pop(ZONAL_SKEW_SLUG, None)
         stderr = result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
-        what = (
-            f"exited {result.rc}" if result.rc != 0
-            else "returned rows that are not the eight fields the read asks for (rc=0)"
-        )
+        if result.rc != 0:
+            what = f"exited {result.rc}"
+        elif truncated:
+            what = "was cut at the credential proxy's output cap (rc=0)"
+        else:
+            what = f"returned rows that are not the {POD_PLACEMENT_FIELDS} fields the read asks for (rc=0)"
         context.setdefault("unevaluated", {})[ZONAL_SKEW_SLUG] = (
             f"{UNDETERMINED_PREFIX} `kubectl get pods -A -o jsonpath=...` {what} ({stderr}), "
             "so pod placement could not be read. This check cleared nothing on this cluster."
@@ -2947,71 +2989,127 @@ _IMPACT_ZONAL_SKEW = (
     "stockout there takes that share down at once."
 )
 _ZONAL_SKEW_CAUSES = {
-    "pinned": (
-        "pinned to {zone} by its own manifest ({pin})",
-        " The manifest put them there and the scheduler cannot move them; the fix is a manifest change.",
-    ),
     "volume": (
         "pinned by its PersistentVolumeClaims: volumeClaimTemplates on StorageClass {classes} bind each replica to the zone of its disk",
         " Their disks are zonal, so the pods cannot move without their data; the fix is a migration, not a scheduling change.",
+    ),
+    "confined": (
+        "confined to {zone} by its node selection ({selection}): no eligible node is in another zone",
+        " Its node selection admits nodes in one zone only, so the scheduler cannot place it elsewhere; the fix is the selection, or a pool in the other zone when a pool label is what confines it.",
     ),
     "capacity": (
         "capacity: {count} replica(s) Pending because no node has room ({message})",
         " The other zone had no room for the rest, which is a capacity shortfall before it is a spreading fault.",
     ),
-    "advisory": (
-        "spreading is advisory ({rules}) and the scheduler did not honour it",
-        " The declared spread is a preference the scheduler was free to ignore, and it did.",
-    ),
     "none": (
         "no spreading declared (no-spread's finding on this object)",
         " Nothing in the manifest asked for spreading.",
+    ),
+    "advisory": (
+        "no rule binds the zone key ({rules}), so the scheduler was free to put them together by zone, and it did",
+        " The declared rules are preferences on the zone key or bind another key; the scheduler was free to ignore them, and it did.",
     ),
     "permitted": (
         "the declared constraints permit it ({rules})",
         " The constraint as written allows this skew.",
     ),
+    "unmet": (
+        "a binding zone rule is declared ({rules}) yet the skew exceeds it: the scheduler's eligible nodes did not span the zones when these pods were placed",
+        " The rule did not hold at placement time -- the other zone's nodes were absent, tainted or full then; check what was eligible when these pods were scheduled.",
+    ),
 }
+_SELECTOR_OP_NOT_IN = "NotIn"
+_SELECTOR_OP_EXISTS = "Exists"
+_SELECTOR_OP_DOES_NOT_EXIST = "DoesNotExist"
 
 
-def _manifest_zone_pin(template: dict) -> str | None:
-    """The one-zone pin §3.7 reads, as a short phrase, or None."""
-    zone = (template.get("nodeSelector") or {}).get(_ZONE_KEY)
-    if zone:
-        return f"nodeSelector {_ZONE_KEY}={zone}"
+def _expression_matches(expr: dict, labels: dict) -> bool:
+    """One `matchExpressions` entry against one node's labels. `Gt`/`Lt` are
+    taken as matching: a wrong "confined" is worse than a missed one."""
+    key, op, values = expr.get("key"), expr.get("operator"), expr.get("values") or []
+    if op == NODE_SELECTOR_OP_IN:
+        return key in labels and labels[key] in values
+    if op == _SELECTOR_OP_NOT_IN:
+        return key not in labels or labels[key] not in values
+    if op == _SELECTOR_OP_EXISTS:
+        return key in labels
+    if op == _SELECTOR_OP_DOES_NOT_EXIST:
+        return key not in labels
+    return True
+
+
+def _node_selection(template: dict) -> tuple[list[str], Callable[[dict], bool]] | None:
+    """The template's required node selection: `(phrases, matches(labels))`,
+    or None when it declares none. `nodeSelector` entries all have to hold;
+    required `nodeAffinity` terms are alternatives, each of whose expressions
+    all have to hold -- the API's own semantics.
+    """
+    selector = template.get("nodeSelector") or {}
     required = ((template.get("affinity") or {}).get("nodeAffinity") or {}).get(
         "requiredDuringSchedulingIgnoredDuringExecution"
     ) or {}
-    for term in required.get("nodeSelectorTerms") or []:
-        for expr in term.get("matchExpressions") or []:
-            values = expr.get("values") or []
-            if expr.get("key") == _ZONE_KEY and expr.get("operator") == NODE_SELECTOR_OP_IN and len(values) == 1:
-                return f"required nodeAffinity {_ZONE_KEY}={values[0]}"
-    return None
+    terms = [t.get("matchExpressions") or [] for t in required.get("nodeSelectorTerms") or []]
+    terms = [t for t in terms if t]
+    if not selector and not terms:
+        return None
+    phrases = [f"nodeSelector {k}={v}" for k, v in sorted(selector.items())]
+    for term in terms:
+        phrases.append(
+            "required nodeAffinity "
+            + " and ".join(
+                f"{e.get('key')} {e.get('operator')}" + (f" {sorted(e.get('values') or [])}" if e.get("values") else "")
+                for e in term
+            )
+        )
+
+    def matches(labels: dict) -> bool:
+        if any(labels.get(k) != v for k, v in selector.items()):
+            return False
+        return not terms or any(all(_expression_matches(e, labels) for e in term) for term in terms)
+
+    return phrases, matches
 
 
-def _zonal_skew_cause(workload: dict, starved: list[dict], crowded: str) -> tuple[str, str]:
+def _eligible_zones(template: dict, context: dict) -> tuple[set[str], list[str]] | None:
+    """The zones holding a node this template may land on, with the selection
+    that decides it; None when the template selects no nodes in particular."""
+    selection = _node_selection(template)
+    if selection is None:
+        return None
+    phrases, matches = selection
+    zones_by_node = context.get("node_zones") or {}
+    eligible = {
+        zones_by_node[name]
+        for name, labels in (context.get("node_labels") or {}).items()
+        if name in zones_by_node and matches(labels)
+    }
+    return eligible, phrases
+
+
+def _zonal_skew_cause(workload: dict, context: dict, starved: list[dict], skew: int) -> tuple[str, str]:
     """`(cause phrase, impact tail)` for a skewed workload, first match wins.
 
-    The order is the order of certainty: a manifest pin and zonal claims are
-    read off the object itself; Pending replicas the scheduler could not place
-    are its own report; the spreading rules only say what was asked for.
+    The order is the order of certainty: zonal claims and a node selection
+    that admits one zone are read off the object and the Nodes; Pending
+    replicas the scheduler could not place are its own report; the spreading
+    rules only say what was asked for. Claims come before the selection
+    because a zone-pinned StatefulSet with zonal disks is pinned by the disks
+    -- the pin is how its author kept it with them -- which is also why §3.7
+    raises nothing on that shape.
     """
     template = workload["template"]
-    pin = _manifest_zone_pin(template)
-    if pin:
-        phrase, tail = _ZONAL_SKEW_CAUSES["pinned"]
-        return phrase.format(zone=crowded, pin=pin), tail
     templates = workload["spec"].get("volumeClaimTemplates") or []
-    if workload["kind"] == "StatefulSet" and templates:
+    if workload["kind"] == STATEFULSET_KIND and templates:
         phrase, tail = _ZONAL_SKEW_CAUSES["volume"]
-        classes = sorted({str((t.get("spec") or {}).get("storageClassName") or "(default)") for t in templates})
+        classes = sorted({str((t.get("spec") or {}).get("storageClassName") or DEFAULT_STORAGE_CLASS_NAME) for t in templates})
         return phrase.format(classes=", ".join(classes)), tail
+    eligible = _eligible_zones(template, context)
+    if eligible is not None and len(eligible[0]) == 1:
+        phrase, tail = _ZONAL_SKEW_CAUSES["confined"]
+        return phrase.format(zone=next(iter(eligible[0])), selection="; ".join(eligible[1])), tail
     if starved:
         phrase, tail = _ZONAL_SKEW_CAUSES["capacity"]
-        # The scheduler's first sentence is the verdict (`0/2 nodes are
-        # available: 2 Insufficient cpu.`); what follows is preemption detail.
-        message = starved[0]["scheduled_message"].split(". ")[0].rstrip(".")[:SCHEDULER_MESSAGE_CHARS]
+        message = starved[0]["scheduled_message"].split(SCHEDULER_SENTENCE_END)[0].rstrip(".")[:SCHEDULER_MESSAGE_CHARS]
         return phrase.format(count=len(starved), message=message), tail
     constraints = template.get("topologySpreadConstraints") or []
     anti_affinity = ((template.get("affinity") or {}).get("podAntiAffinity")) or {}
@@ -3019,7 +3117,7 @@ def _zonal_skew_cause(workload: dict, starved: list[dict], crowded: str) -> tupl
     preferred = anti_affinity.get("preferredDuringSchedulingIgnoredDuringExecution") or []
     rules = [
         f"topologySpreadConstraint on {c.get('topologyKey', '')} is {c.get('whenUnsatisfiable', _SPREAD_BINDING)}"
-        f" with maxSkew {c.get('maxSkew', 1)}"
+        f" with maxSkew {c.get('maxSkew', TOPOLOGY_MAX_SKEW_DEFAULT)}"
         for c in constraints
     ]
     if preferred:
@@ -3029,11 +3127,20 @@ def _zonal_skew_cause(workload: dict, starved: list[dict], crowded: str) -> tupl
     if not rules:
         phrase, tail = _ZONAL_SKEW_CAUSES["none"]
         return phrase, tail
-    binding_on_zone = any(
-        c.get("topologyKey") == _ZONE_KEY and c.get("whenUnsatisfiable", _SPREAD_BINDING) == _SPREAD_BINDING
+    # The tightest skew a binding zone-keyed rule allows, if any binds the zone.
+    allowed = [
+        int(c.get("maxSkew", TOPOLOGY_MAX_SKEW_DEFAULT) or TOPOLOGY_MAX_SKEW_DEFAULT)
         for c in constraints
-    ) or any(entry.get("topologyKey") == _ZONE_KEY for entry in required)
-    key = "permitted" if binding_on_zone else "advisory"
+        if c.get("topologyKey") == _ZONE_KEY and c.get("whenUnsatisfiable", _SPREAD_BINDING) == _SPREAD_BINDING
+    ]
+    if any(entry.get("topologyKey") == _ZONE_KEY for entry in required):
+        allowed.append(ANTI_AFFINITY_MAX_SKEW)
+    if not allowed:
+        key = "advisory"
+    elif skew <= min(allowed):
+        key = "permitted"
+    else:
+        key = "unmet"
     phrase, tail = _ZONAL_SKEW_CAUSES[key]
     return phrase.format(rules="; ".join(rules)), tail
 
@@ -3043,14 +3150,16 @@ def check_zonal_skew(workload: dict, context: dict) -> dict | None:
 
     Fires on the observation, never on the manifest: the running replicas,
     counted per zone off the pod read and the Nodes' zone labels, differ
-    between the busiest and the emptiest zone by the threshold or more. A
-    cluster whose nodes are all in one zone, a workload with fewer than two
-    running replicas, and a pod on a node the dump does not know are all
-    outside it. The excerpt carries the distribution, the share of running
-    replicas the busiest zone holds (the blast radius of losing it), the
-    cause, and the Pending count where there is one.
+    between the busiest and the emptiest zone by the threshold or more -- or,
+    where replicas are Pending for want of room, every running replica (one or
+    more) is in one zone, because the shortfall is where the rest would have
+    gone. A cluster whose nodes are all in one zone, a workload with fewer
+    running replicas than that, a terminating pod and a pod on a node the dump
+    does not know are all outside it. The excerpt carries the distribution, the
+    share of running replicas the busiest zone holds (the blast radius of
+    losing it), the cause, and the Pending count where there is one.
     """
-    if workload["kind"] == "DaemonSet":
+    if workload["kind"] == DAEMONSET_KIND:
         return None
     replicas = workload["spec"].get("replicas", 1) or 1
     if replicas < ZONAL_SKEW_MIN_RUNNING:
@@ -3061,21 +3170,25 @@ def check_zonal_skew(workload: dict, context: dict) -> dict | None:
         return None
     key = (workload["ns"], workload["kind"], workload["name"])
     pods = (context.get("pod_placements_by_workload") or {}).get(key) or []
-    running = [p for p in pods if p["phase"] == POD_PHASE_RUNNING and p["node"] in zones_by_node]
-    if len(running) < ZONAL_SKEW_MIN_RUNNING:
+    running = [
+        p for p in pods if p["phase"] == POD_PHASE_RUNNING and not p.get("deleting") and p["node"] in zones_by_node
+    ]
+    pending = [p for p in pods if p["phase"] == POD_PHASE_PENDING]
+    starved = [p for p in pending if SCHEDULER_INSUFFICIENT_MARKER in p["scheduled_message"]]
+    floor = ZONAL_SKEW_MIN_RUNNING_STARVED if starved else ZONAL_SKEW_MIN_RUNNING
+    if len(running) < floor:
         return None
     per_zone = {zone: 0 for zone in cluster_zones}
     for pod in running:
         per_zone[zones_by_node[pod["node"]]] += 1
     threshold = context.get("zonal_skew_threshold", _zonal_skew_threshold)
     skew = max(per_zone.values()) - min(per_zone.values())
-    if skew < threshold:
-        return None
     crowded = max(cluster_zones, key=lambda zone: per_zone[zone])
+    all_in_one = per_zone[crowded] == len(running)
+    if skew < threshold and not (starved and all_in_one):
+        return None
     share = round(100 * per_zone[crowded] / len(running))
-    pending = [p for p in pods if p["phase"] == POD_PHASE_PENDING]
-    starved = [p for p in pending if SCHEDULER_INSUFFICIENT_MARKER in p["scheduled_message"]]
-    cause, tail = _zonal_skew_cause(workload, starved, crowded)
+    cause, tail = _zonal_skew_cause(workload, context, starved, skew)
     distribution = ", ".join(f"{zone}={per_zone[zone]}" for zone in cluster_zones)
     excerpt = (
         f"replicas={replicas}, {len(running)} running across {len(cluster_zones)} zones: {distribution} "
@@ -3086,7 +3199,7 @@ def check_zonal_skew(workload: dict, context: dict) -> dict | None:
     return {
         "object": f"{workload['kind']}/{workload['name']}",
         "excerpt": excerpt,
-        "severity": "critical" if per_zone[crowded] == len(running) else "major",
+        "severity": "critical" if all_in_one else "major",
         "impact": _IMPACT_ZONAL_SKEW.format(share=share, zone=crowded) + tail,
     }
 
@@ -10602,7 +10715,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--zonal-skew-threshold",
-        type=int,
+        type=zonal_skew_threshold_arg,
         default=ZONAL_SKEW_THRESHOLD_DEFAULT,
         help=(
             "§3.25: flag a workload whose busiest zone holds this many more running "
