@@ -2933,3 +2933,94 @@ func teamOf(m *slackevents.MessageEvent) string {
 	}
 	return m.Message.Team
 }
+
+// TestSlackReplyUnderTheBotsOwnPostIsAddressed: a chat.notify post (an alert,
+// a card's report) roots a thread no task started, so it is never a session
+// thread. A reply there with no mention used to drop without a log line
+// (gke-labs/kube-agents#3246). The root's author, which Slack sends on every
+// reply, now decides it, without asking the registry.
+func TestSlackReplyUnderTheBotsOwnPostIsAddressed(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	reg := &countingLookup{}
+	a.sessions = reg.lookup
+
+	reply := slackMsg("channel", "C1", "U1", "why is it OOMing?", "1792100300.000100", "1792100240.299609")
+	got, ok := a.inboundEvent(context.Background(), reply, "UBOT")
+	if !ok || got.Conversation != "slack:C1/1792100240.299609" || got.Text != "why is it OOMing?" {
+		t.Fatalf("reply under the bot's post: delivered=%v conv=%q text=%q", ok, got.Conversation, got.Text)
+	}
+	if len(reg.asked) != 0 {
+		t.Errorf("the registry was asked %v; the root's author is the answer", reg.asked)
+	}
+	if !got.Unaddressed {
+		t.Error("an unmentioned reply under the bot's post is not marked Unaddressed")
+	}
+	mentioned := slackMsg("channel", "C1", "U1", "<@UBOT> why?", "1792100300.000200", "1792100240.299609")
+	if got, ok := a.inboundEvent(context.Background(), mentioned, "UBOT"); !ok || got.Unaddressed {
+		t.Errorf("a mentioned reply there: delivered=%v unaddressed=%v, want delivered and addressed", ok, got.Unaddressed)
+	}
+}
+
+func TestSlackReplyUnderSomeoneElsesPostStillNeedsAMention(t *testing.T) {
+	for _, parent := range []string{"", "UALICE"} {
+		a := newTestSlackAdapter(&fakeSlackAPI{})
+		a.sessions = noSessions
+		reply := slackMsg("channel", "C1", "U1", "do option 2", "5.0", "200.1")
+		if _, ok := a.inboundEvent(context.Background(), reply, parent); ok {
+			t.Errorf("parent %q: an unmentioned reply in a thread the bot did not root must not deliver", parent)
+		}
+	}
+}
+
+func TestSlackParentUserIDFromTheEventsAPIPayload(t *testing.T) {
+	payload := json.RawMessage(`{"token":"x","team_id":"T1","type":"event_callback","event":` +
+		`{"type":"message","channel":"C1","user":"U1","text":"do option 2","ts":"1792100300.000100",` +
+		`"thread_ts":"1792100240.299609","parent_user_id":"UBOT","channel_type":"channel"}}`)
+	if got := slackParentUserID(payload); got != "UBOT" {
+		t.Errorf("parent_user_id = %q, want UBOT", got)
+	}
+	for _, p := range []json.RawMessage{nil, json.RawMessage(`{`), json.RawMessage(`{"event":{"type":"message"}}`)} {
+		if got := slackParentUserID(p); got != "" {
+			t.Errorf("payload %s: parent = %q, want empty", p, got)
+		}
+	}
+}
+
+// TestSlackPumpPassesTheRootAuthorThrough: the pump reads parent_user_id from
+// the envelope's raw payload and hands it to inboundEvent. Without that
+// wiring the reply-under-our-post rule never fires on a real delivery, and
+// the unit tests above would still pass. A reply with no payload behind it
+// stays dropped; a DM after both is the sentinel that the pump got that far.
+func TestSlackPumpPassesTheRootAuthorThrough(t *testing.T) {
+	srv, unblock := stalledSlackStub(t)
+	defer unblock()
+
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.sessions = noSessions
+	a.sm = socketmode.New(slack.New("xoxb-stub", slack.OptionAPIURL(srv.URL+"/")))
+
+	withRoot := slackEnvelope("Env-root", slackMsg("channel", "C1", "U1", "why is it OOMing?", "700.1", "650.0"))
+	withRoot.Request.Payload = json.RawMessage(`{"type":"event_callback","event":{"type":"message",` +
+		`"channel":"C1","user":"U1","text":"why is it OOMing?","ts":"700.1","thread_ts":"650.0","parent_user_id":"UBOT"}}`)
+	a.sm.Events <- withRoot
+	a.sm.Events <- slackEnvelope("Env-bare", slackMsg("channel", "C1", "U1", "and now?", "700.2", "660.0"))
+	a.sm.Events <- slackEnvelope("Env-dm", slackMsg("im", "D1", "U1", "sentinel", "700.3", ""))
+
+	delivered := make(chan InboundMessage, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Run(ctx, func(m InboundMessage) { delivered <- m }) }()
+
+	var got []string
+	for len(got) < 2 {
+		select {
+		case m := <-delivered:
+			got = append(got, m.MessageID)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("delivered %v, want the reply under our post and the sentinel", got)
+		}
+	}
+	if got[0] != "700.1" || got[1] != "700.3" {
+		t.Errorf("delivered %v, want [700.1 700.3]: the reply under our post, not the reply with no root author", got)
+	}
+}
