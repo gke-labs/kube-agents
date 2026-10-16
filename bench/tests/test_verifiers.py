@@ -8388,6 +8388,14 @@ def test_worker_commands_required_run_succeeded_with_after_result_pattern():
     transcript.set("ok", traj_trailing_nl)
     assert v.verify(5.0).status == "pass"
 
+    # Trajectory entry with && followed by newline continuation passes.
+    traj_multiline_and = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness &&\necho done"}, "result": "done", "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj_multiline_and)
+    assert v.verify(5.0).status == "pass"
+
     # Trajectory entry with status="error" fails.
     traj_error = [
         {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},

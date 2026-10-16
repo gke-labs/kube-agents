@@ -88,7 +88,11 @@ verification_spec:
   # scripts/eval_dashboard/collect.py do not count. The basename must be
   # collect.py, so test_collect.py does not count. A -h or --help call,
   # python3 -c, cat of the script, and an echo or grep that quotes the
-  # command are not runs. bench/tests/test_security_chat_request_runs.py
+  # command are not runs. The check requires succeeded: true (exit 0).
+  # On the card log, any command joined after the collector (such as
+  # && echo "DONE") is collapsed by the logger (+ 1 command), which hides
+  # the join operator and fails the objective; chained commands must appear
+  # on the trajectory path. bench/tests/test_security_chat_request_runs.py
   # pins the samples.
   - name: the-compliance-collector-ran
     role: objective

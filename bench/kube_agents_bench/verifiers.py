@@ -1944,6 +1944,7 @@ _SHELL_EXPANSION_PREFIX = "$"
 _SHELL_COUNT_RE = re.compile(r"^(?:\d+(?:\.\d+)?[smhd]?|infinity)$")
 _COLLAPSED_COMMANDS_RE = re.compile(r"(?:^|\s)\+\s*\d+\s+commands?\b")
 _USAGE_FLAGS = ("-h", "--help")
+_COMMAND_SUBSTITUTION = "command substitution"
 
 
 class WorkerRun(BaseModel):
@@ -1965,10 +1966,12 @@ class WorkerRun(BaseModel):
     word_patterns: list[str] = Field(default_factory=list)
     succeeded: bool = False
     """(For ``required_runs`` only) whether the command must have exited 0 (a non-zero or
-    unrecorded exit does not count; on the trajectory path, trailing operators after the matching
-    segment must be strictly ``&&`` or empty and uncollapsed, so trailing pipes, backgrounding with ``&``,
-    or chains with ``;`` or ``||`` are refused as masked; on the card-log path, any collapsed chain
-    ending in ``+ N command(s)`` is refused because the log format hides whether the join was ``&&``, ``;`` or ``||``)."""
+    unrecorded exit does not count; on the trajectory path, neither preceding ``||`` in the
+    same list nor leading ``!`` may stand ahead of the matching segment, and trailing operators
+    after the matching segment must be strictly ``&&`` or empty and uncollapsed, so trailing pipes,
+    backgrounding with ``&``, or chains with ``;`` or ``||`` are refused as masked; on the card-log
+    path, any collapsed chain ending in ``+ N command(s)`` is refused because the log format hides
+    whether the join was ``&&``, ``;`` or ``||``)."""
 
     @field_validator("word_patterns")
     @classmethod
@@ -2192,51 +2195,87 @@ def _shell_argvs(command: str) -> list[list[str]]:
 
 
 def _is_bare_assignment_argv(argv: list[str]) -> bool:
-    """True when argv consists only of assignments and assignment keywords (no external command word)."""
-    has_assignment = False
+    """True when argv consists only of a single bare assignment (no external command word or declaration keywords)."""
+    # `export`, `local`, `readonly` and `typeset` return their own status (0), not the
+    # substitution's (shellcheck SC2155), so they are command words that mask it here.
+    count = 0
     for word in argv:
         if _is_redirect(word):
             continue
         if _SHELL_ASSIGNMENT_RE.match(word):
-            has_assignment = True
-            continue
-        if word in ("export", "typeset", "local", "readonly"):
+            count += 1
             continue
         return False
-    return has_assignment
+    return count == 1
 
 
-def _shell_argvs_with_operators(command: str) -> list[tuple[list[str], list[str]]]:
+def _is_terminator(w: str, k: int, words: list[str]) -> bool:
+    if w not in (";", _SHELL_LINE_END):
+        return False
+    # Check if there are no subsequent command words, or the immediately next closing delimiter is '}'
+    for j in range(k + 1, len(words)):
+        wj = words[j]
+        if _is_control_operator(wj):
+            continue
+        if _is_redirect(wj) or (j > 0 and _is_redirect(words[j - 1])):
+            continue
+        if wj in ("}", ")"):
+            return True
+        return False
+    return True
+
+
+def _shell_argvs_with_operators(
+    command: str, outer_spans: set[str] | None = None
+) -> list[tuple[list[str], list[str]]]:
     """Each segment of a command line as an argv paired with the control operators that follow it."""
     words, spans = _shell_words_and_spans(command)
-    segments: list[tuple[list[str], int]] = []
+    all_outer_spans = set(spans) if outer_spans is None else (outer_spans | set(spans))
+    segments: list[tuple[list[str], int, int]] = []
     current_argv: list[str] = []
+    first_word_idx = -1
     last_word_idx = -1
     for idx, word in enumerate(words):
         if _is_control_operator(word):
             if current_argv:
-                segments.append((current_argv, last_word_idx))
+                segments.append((current_argv, first_word_idx, last_word_idx))
                 current_argv = []
+                first_word_idx = -1
             continue
+        if not current_argv:
+            first_word_idx = idx
         current_argv.append(word)
         last_word_idx = idx
     if current_argv:
-        segments.append((current_argv, last_word_idx))
+        segments.append((current_argv, first_word_idx, last_word_idx))
 
     result: list[tuple[list[str], list[str]]] = []
-    for seg_argv, last_idx in segments:
-        trailing: list[str] = []
+    for seg_argv, first_idx, last_idx in segments:
+        ops: list[str] = []
+        # Preceding operators: check if preceding || or ! stands in the segment's enclosing list.
+        for k in range(first_idx - 1, -1, -1):
+            w = words[k]
+            if w in (";", _SHELL_LINE_END, "&", "(", ")"):
+                break
+            if w == "||":
+                ops.append("preceding ||")
+                break
+        if (seg_argv and seg_argv[0] == "!") or any(
+            words[k] == "!" for k in range(max(0, first_idx - 1), first_idx)
+        ):
+            ops.append("!")
+
         for k in range(last_idx + 1, len(words)):
             w = words[k]
             if _is_control_operator(w) and w not in ("(", ")"):
-                # If ';' or '\n' has no subsequent command words, it terminates without masking.
-                has_subsequent_command = any(
-                    not _is_control_operator(words[j]) for j in range(k + 1, len(words))
-                )
-                if w in (";", _SHELL_LINE_END) and not has_subsequent_command:
+                # A newline directly following a control operator (e.g. '&& \n') is continuation whitespace.
+                if w == _SHELL_LINE_END and k > 0 and _is_control_operator(words[k - 1]) and words[k - 1] != ")":
                     continue
-                trailing.append(str(w))
-        result.append((seg_argv, trailing))
+                # If ';' or '\n' has no subsequent command words or closes a brace group, it terminates without masking.
+                if _is_terminator(w, k, words):
+                    continue
+                ops.append(str(w))
+        result.append((seg_argv, ops))
 
     handled_spans: set[str] = set()
     for seg_argv, trailing in list(result):
@@ -2245,7 +2284,9 @@ def _shell_argvs_with_operators(command: str) -> list[tuple[list[str], list[str]
             for flag_index in range(index + 1, len(seg_argv) - 1):
                 flag = seg_argv[flag_index]
                 if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
-                    inner_segments = _shell_argvs_with_operators(seg_argv[flag_index + 1])
+                    inner_segments = _shell_argvs_with_operators(
+                        seg_argv[flag_index + 1], outer_spans=all_outer_spans
+                    )
                     for inner_argv, inner_trailing in inner_segments:
                         result.append((inner_argv, trailing + inner_trailing))
                     break
@@ -2254,19 +2295,25 @@ def _shell_argvs_with_operators(command: str) -> list[tuple[list[str], list[str]
                 handled_spans.add(span)
                 inner = _substitution_commands(span)
                 if inner is not None:
-                    is_bare = _is_bare_assignment_argv(seg_argv)
-                    for inner_argv, inner_trailing in _shell_argvs_with_operators(inner):
+                    is_bare = _is_bare_assignment_argv(seg_argv) and (
+                        outer_spans is None or span not in outer_spans
+                    )
+                    for inner_argv, inner_trailing in _shell_argvs_with_operators(
+                        inner, outer_spans=all_outer_spans
+                    ):
                         sub_trailing = trailing + inner_trailing
                         if not is_bare:
-                            sub_trailing = sub_trailing + ["command substitution"]
+                            sub_trailing = sub_trailing + [_COMMAND_SUBSTITUTION]
                         result.append((inner_argv, sub_trailing))
 
     for span in spans:
         if span not in handled_spans:
             inner = _substitution_commands(span)
             if inner is not None:
-                for inner_argv, inner_trailing in _shell_argvs_with_operators(inner):
-                    result.append((inner_argv, inner_trailing + ["command substitution"]))
+                for inner_argv, inner_trailing in _shell_argvs_with_operators(
+                    inner, outer_spans=all_outer_spans
+                ):
+                    result.append((inner_argv, inner_trailing + [_COMMAND_SUBSTITUTION]))
     return result
 
 
@@ -2368,9 +2415,9 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
     turn issued together share it. An argument object clipped in the pod
     arrives as ``{"raw": text}`` and the command is read out of the text, as
     ``tool_called`` reads its arguments, and one clipped inside the command
-    itself keeps the head that survived, which carries the verb. A result
-    that is not text reads as empty; ``failed`` is the pod's verdict on the
-    unclipped result (``status == "error"``), so it survives the clip.
+    itself keeps the head that survived, which carries the verb. A result that is not text reads as empty; ``succ`` is True if the call completed
+    (``status == "completed"``), False if it errored (``status == "error"``), or None if
+    unrecorded (``status == "called"``).
     """
     calls: list[tuple[str, float | None, str, str, bool | None]] = []
     for entry in trajectory:
@@ -2400,8 +2447,9 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
         at = entry.get("at")
         result = entry.get("result")
         status = entry.get("status")
-        failed = entry.get("failed") or status == "error"
-        succ: bool | None = False if failed else True if status == "completed" or (isinstance(result, str) and not failed) else None
+        succ: bool | None = (
+            True if status == "completed" else False if (status == "error" or entry.get("failed")) else None
+        )
         calls.append(
             (
                 str(entry.get("task") or entry.get("session") or ""),
@@ -2493,9 +2541,10 @@ class WorkerCommandsVerifier(BaseVerifier):
     argv, must run it with those flags after it, a word matching each pattern,
     and no ``-h``/``--help`` (:func:`_argv_runs`). When ``succeeded: true``,
     the command must also have exited 0 (a non-zero or unrecorded exit does
-    not count; on the trajectory path, trailing operators after the matching segment must be strictly
-    ``&&`` or empty and uncollapsed, so trailing pipes, backgrounding with ``&``,
-    or chains with ``;`` or ``||`` are refused as masked; on the card-log path, any collapsed chain
+    not count; on the trajectory path, neither preceding ``||`` in the same
+    list nor leading ``!`` may stand ahead of the matching segment, and trailing operators
+    after the matching segment must be strictly ``&&`` or empty and uncollapsed, so trailing pipes,
+    backgrounding with ``&``, or chains with ``;`` or ``||`` are refused as masked; on the card-log path, any collapsed chain
     ending in ``+ N command(s)`` is refused because the log format hides whether the join was ``&&``, ``;`` or ``||``). ``forbidden_runs``: the same
     shape, and no segment may run it. An argv tells a quoted mention of the
     invocation from a run, where a pattern over the text cannot: a forbidden
@@ -2731,10 +2780,15 @@ class WorkerCommandsVerifier(BaseVerifier):
                                 matched_mask_reason = f"{named} ran in a collapsed chain whose exit is the chain's"
                             else:
                                 mask_op = next((op for op in trailing_ops if op != "&&"), "operator")
-                                if mask_op == "command substitution":
+                                if mask_op == _COMMAND_SUBSTITUTION:
                                     matched_mask_reason = f"{named} ran inside a command substitution whose exit is discarded"
+                                elif mask_op == "!":
+                                    matched_mask_reason = f"{named} ran but its exit is inverted by '!'"
+                                elif mask_op == "preceding ||":
+                                    matched_mask_reason = f"{named} ran in an '||' chain whose exit may not be the command's"
                                 else:
-                                    matched_mask_reason = f"{named} ran but its exit is masked by a trailing '{mask_op}'"
+                                    mask_op_display = "\\n" if mask_op == _SHELL_LINE_END else mask_op
+                                    matched_mask_reason = f"{named} ran but its exit is masked by a trailing '{mask_op_display}'"
                 if succeeded:
                     break
             if not succeeded:
