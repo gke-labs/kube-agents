@@ -659,6 +659,21 @@ projects (only the predefined read roles in `scope.tf`'s allowlist are, those of
 project holds), and the plan is refused until `PLATFORM_AGENT_CUSTOM_ROLES` carries
 `roles/container.clusterViewer` or `roles/container.viewer`.
 
+### Daily alert ceilings
+
+`ALERT_DAILY_LIMIT_CRITICAL`, `ALERT_DAILY_LIMIT_WARNING`, `ALERT_DAILY_LIMIT_INFO` and
+`ALERT_DAILY_LIMIT_DRIFT` set the daily alert ceilings. `write_tfvars_from_state` writes each key
+that is set into `alert_daily_limits`, and the chart renders it into the `PlatformAgent`'s
+`spec.deployment.env`. An empty key is not written, so the agent image keeps its default for that
+bucket. For this reason, `install.defaults.env` has no entry for these keys. The generator refuses a
+value that is not a whole number of 0 or more, and names the key. `install.sh` records all four
+keys in a new `install.env`, empty included. No flag sets them. `uninstall.sh` blanks them, so a bad
+value cannot stop a teardown. Only `install.sh`, the Day-2 menu and `upgrade.sh --upgrade-mode=full`
+apply these keys. The operator and harness modes of `upgrade.sh` use the values that the release
+recorded. But each `upgrade.sh` run calls the generator before it selects the mode, so a bad value
+stops the run in every mode. The [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling)
+gives the buckets, the defaults, and what happens to entries added to the CR by hand.
+
 ### Cluster adoption and component toggles
 
 `SKIP_CERT_MANAGER=true` makes the generator emit `enable_cert_manager = false`, for a

@@ -2,8 +2,9 @@
 # Claude Code loads this rule only beside files matching `paths`; Antigravity uses `trigger` and `description`.
 paths:
   - ".github/workflows/**"
+  - ".github/buildkitd.toml"
 trigger: model_decision
-description: "GitHub Actions workflow rules: pinning third-party actions to full commit SHAs, guarding credentialed workflows against forks, collapsing superseded pull-request runs with a concurrency group, and detecting changed files with git rather than the API."
+description: "GitHub Actions workflow rules: pinning third-party actions to full commit SHAs, guarding credentialed workflows against forks, collapsing superseded pull-request runs with a concurrency group, detecting changed files with git rather than the API, and pulling Docker Hub images through mirror.gcr.io."
 ---
 
 # GitHub Actions rules
@@ -85,3 +86,32 @@ paths tests nothing.
 
 A `pull_request_target` workflow is the exemption: there the action runs in the base branch's
 context and refuses an empty token, so it keeps the API path. None uses the action today.
+
+## Pull Docker Hub images through mirror.gcr.io
+
+Docker Hub limits anonymous pulls per source IP, and GitHub-hosted runners share egress IPs, so a
+burst of pull requests fails every job that pulls from Docker Hub at once: on 2026-10-09 every
+failed image build and every failed GHCR publish that day died on it, most within seconds of
+starting. A workflow on a GitHub-hosted runner therefore pulls Docker Hub images through
+`mirror.gcr.io`, which serves public Docker Hub images without that limit and takes no credential,
+so a fork keeps the same path.
+
+- Every `docker/setup-buildx-action` step takes `buildkitd-config: .github/buildkitd.toml`, which
+  mirrors `docker.io` for the builder (a reference the mirror does not hold falls through to
+  Docker Hub), and `driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1`, because the
+  action pulls the builder image on the runner's own daemon before the builder exists, so the
+  config cannot cover it. Both on every step, whether or not the job builds today: a job's build
+  can be a `run:` line, which no check can tell from one that does not.
+- A job `container:`, a `services:` image, a `docker://` action, or a `docker run` or
+  `docker pull` of a Docker Hub image, names it as `mirror.gcr.io/<repository>` with the same tag
+  and digest.
+
+`tests/test_workflow_pins_and_fork_guards.py` checks the buildx steps, job containers, service
+images and `docker://` actions of every workflow against this rule, and that the config file holds
+the mirror.
+
+A floating tag resolves to the manifest the mirror last refreshed, which can trail Docker Hub by
+days; pin a digest where that matters. The kind node image the installer matrix starts is the one
+exception: kind pairs that image with its own release, so naming one on the mirror would also pin
+the Kubernetes version the matrix tests, and that is a separate decision. Cloud Build pulls from
+Google's egress and is out of scope.

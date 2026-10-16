@@ -2703,6 +2703,13 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
   write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
+  # The daily alert ceilings, recorded even when empty. An empty key keeps the
+  # image default, and the line shows where to set the ceiling. A value that
+  # was exported only for this run then also applies on the next upgrade.sh.
+  local alert_key
+  for alert_key in $ALERT_DAILY_LIMIT_KEYS; do
+    write_env_var "$tmp" "$alert_key" "${!alert_key:-}"
+  done
   write_secret_env_var "$tmp" GEMINI_API_KEY "${GEMINI_API_KEY:-}"
   write_secret_env_var "$tmp" OPENAI_API_KEY "${OPENAI_API_KEY:-}"
   write_secret_env_var "$tmp" ANTHROPIC_API_KEY "${ANTHROPIC_API_KEY:-}"

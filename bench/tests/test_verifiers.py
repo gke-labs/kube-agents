@@ -8169,6 +8169,11 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     # a backslash-newline pair is a continuation, gone before the words are read
     assert _shell_argvs("python3 \\\n  f.py \\\n--readiness") == [["python3", "f.py", "--readiness"]]
     assert _shell_argvs("cd /x && \\\n  python3 f.py --readiness") == [["cd", "/x"], ["python3", "f.py", "--readiness"]]
+    # a worker-log row ends at a continuation whose next line it does not carry: the words before it are read
+    assert _shell_argvs("./skills/fleet-audit/scripts/audit_report.py start \\") == [["./skills/fleet-audit/scripts/audit_report.py", "start"]]
+    assert _argv_runs(_shell_argvs("python3 /x/audit_report.py finish --audit a \\")[0],
+                      WorkerRun(script="audit_report.py", word_patterns=["^finish$"]))
+    assert _shell_argvs("echo 'a \\'") == [["echo", "a \\"]]
     # a `#` inside quotes, escaped, or inside a word is part of the word
     assert _shell_argvs("python3 f.py --readiness --output '#1.json'") == [["python3", "f.py", "--readiness", "--output", "#1.json"]]
     assert _shell_argvs('python3 f.py --output "#1.json" --readiness') == [["python3", "f.py", "--output", "#1.json", "--readiness"]]

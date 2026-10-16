@@ -1646,6 +1646,10 @@ def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
                 break
             i = end
             continue
+        if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE and i + 1 == len(command):
+            # A continuation whose next line the row does not carry: a worker log keeps one row
+            # per displayed line, so `audit_report.py start \` is read as the words before it.
+            break
         if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE and i + 1 < len(command):
             if command[i + 1] == _SHELL_LINE_END:
                 # A line continuation: bash removes the pair before it reads a word, so a
