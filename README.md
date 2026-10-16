@@ -18,6 +18,17 @@
 
 _An SRE asks for a fleet self-health check; the agent answers in the thread. An illustrative replay — the names and figures are examples. It runs live at the top of the [documentation site](https://gke-labs.github.io/kube-agents/)._
 
+## What kube-agents Actually Does
+
+kube-agents installs an AI-powered operations agent into your GKE cluster that:
+
+1. **Runs daily automated audits** — Security/RBAC posture at 06:20 UTC (sixteen checks), workload reliability at 06:50 UTC (twenty-three checks)
+2. **Proposes GitOps pull requests for critical findings** — The daily audit writes findings to a standing ledger issue; findings with a manifest fix are proposed as narrow PRs, with critical ones auto-promoted (up to five per run)
+3. **Answers questions via ChatOps** — Ask "why is my deployment failing?" in Slack or Google Chat and get an AI-driven diagnosis with cluster context
+4. **Audits upgrade and patch readiness weekly** — Every Monday at 07:20 UTC, the agent scans for version skew and available upgrades
+5. **Maintains a fleet inventory** — On first install, it scans all clusters in your project and builds a prioritized findings list
+6. **Runs under strict security boundaries** — gVisor sandbox, read-only IAM by default, short-lived brokered credentials (one hour at most); see [Security & IAM](https://gke-labs.github.io/kube-agents/reference/security-and-iam/)
+
 ## 💬 Five things to ask it
 
 Each of these is a single chat message. The agent answers in the thread from read-only reads of the fleet, the GCP projects it monitors, and the linked GitOps repositories, and it recommends changes without applying them.
