@@ -197,23 +197,25 @@ def link_shared_profile_resources(home: Path, hermes_home: Path) -> None:
     if not tirith_bin.exists() and not tirith_bin.is_symlink():
         candidates = []
         if env_tirith := os.environ.get("TIRITH_BIN"):
-            candidates.append(Path(env_tirith))
-        candidates.append(TIRITH_SYSTEM_BIN)
-        candidates.append(Path(hermes_home) / "bin" / "tirith")
-        candidates.append(TIRITH_OPT_DATA_BIN)
+            candidates.append(Path(env_tirith).resolve())
+        candidates.append(TIRITH_SYSTEM_BIN.resolve())
+        candidates.append((Path(hermes_home) / "bin" / "tirith").resolve())
+        candidates.append(TIRITH_OPT_DATA_BIN.resolve())
         for target in candidates:
+            target = target.resolve()
             if target.is_file() and os.access(target, os.X_OK):
                 try:
                     tirith_bin.parent.mkdir(parents=True, exist_ok=True)
                     tirith_bin.symlink_to(target)
                     break
-                except OSError:
+                except OSError as exc:
+                    log(f"WARN: could not link {tirith_bin} -> {target} ({exc}); this profile will download its own Tirith binary")
                     break
 
     shared_cache_dir = (
-        Path(os.environ["NPM_CONFIG_CACHE"])
+        Path(os.environ["NPM_CONFIG_CACHE"]).resolve()
         if os.environ.get("NPM_CONFIG_CACHE")
-        else Path(hermes_home) / ".npm-cache"
+        else (Path(hermes_home) / ".npm-cache").resolve()
     )
     for profile_npm in (home / "home" / ".npm", home / ".npm"):
         if not profile_npm.exists() and not profile_npm.is_symlink():
@@ -221,8 +223,8 @@ def link_shared_profile_resources(home: Path, hermes_home: Path) -> None:
                 shared_cache_dir.mkdir(parents=True, exist_ok=True)
                 profile_npm.parent.mkdir(parents=True, exist_ok=True)
                 profile_npm.symlink_to(shared_cache_dir)
-            except OSError:
-                pass
+            except OSError as exc:
+                log(f"WARN: could not link {profile_npm} -> {shared_cache_dir} ({exc}); this profile will build its own npm cache")
 
 
 def ensure_profile(name: str, description: str, hermes_home: Path) -> Path:

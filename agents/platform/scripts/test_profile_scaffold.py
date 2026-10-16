@@ -729,6 +729,57 @@ class BackfillCronStoreTest(unittest.TestCase):
         self.assertFalse((bare_dir / "bin" / "tirith").exists(), "bare directory must not be linked")
         self.assertFalse((bare_dir / "home" / ".npm").exists(), "bare directory must not be linked")
 
+    def test_link_shared_profile_resources_resolves_relative_env_paths(self):
+        """Relative TIRITH_BIN or NPM_CONFIG_CACHE resolves to absolute targets (#3325)."""
+        hermes_home = self.root / "hermes_rel"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        rel_tirith = hermes_home / "custom_tirith"
+        rel_tirith.write_text("#!/bin/sh\nexit 0\n")
+        rel_tirith.chmod(0o755)
+
+        home = hermes_home / "profiles" / "test-cluster"
+        home.mkdir(parents=True, exist_ok=True)
+
+        rel_tirith_str = os.path.relpath(rel_tirith, os.getcwd())
+        rel_cache_dir = hermes_home / "custom_npm_cache"
+        rel_cache_str = os.path.relpath(rel_cache_dir, os.getcwd())
+
+        with mock.patch.dict(os.environ, {"TIRITH_BIN": rel_tirith_str, "NPM_CONFIG_CACHE": rel_cache_str}, clear=True), \
+                mock.patch.object(ps, "TIRITH_SYSTEM_BIN", Path("/nonexistent/tirith")):
+            ps.link_shared_profile_resources(home, hermes_home)
+
+        tirith_link = home / "bin" / "tirith"
+        self.assertTrue(tirith_link.is_symlink())
+        self.assertTrue(os.path.isabs(os.readlink(tirith_link)), "tirith symlink target must be absolute")
+        self.assertEqual(tirith_link.resolve(), rel_tirith.resolve())
+
+        npm_link = home / "home" / ".npm"
+        self.assertTrue(npm_link.is_symlink())
+        self.assertTrue(os.path.isabs(os.readlink(npm_link)), "npm symlink target must be absolute")
+        self.assertEqual(npm_link.resolve(), rel_cache_dir.resolve())
+
+    def test_link_shared_profile_resources_logs_warning_on_oserror(self):
+        """OSError during linking is caught and logged as a warning (#3325)."""
+        hermes_home = self.root / "hermes_err"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        shared_tirith = hermes_home / "bin" / "tirith"
+        shared_tirith.parent.mkdir(parents=True, exist_ok=True)
+        shared_tirith.write_text("#!/bin/sh\nexit 0\n")
+        shared_tirith.chmod(0o755)
+
+        home = hermes_home / "profiles" / "test-cluster"
+        home.mkdir(parents=True, exist_ok=True)
+
+        logged_messages = []
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(ps, "TIRITH_SYSTEM_BIN", Path("/nonexistent/tirith")), \
+                mock.patch.object(ps, "log", side_effect=logged_messages.append), \
+                mock.patch.object(Path, "symlink_to", side_effect=OSError("permission denied")):
+            ps.link_shared_profile_resources(home, hermes_home)
+
+        self.assertTrue(any("could not link" in msg and "Tirith binary" in msg for msg in logged_messages))
+        self.assertTrue(any("could not link" in msg and "npm cache" in msg for msg in logged_messages))
+
 
 class RunEnvTest(unittest.TestCase):
     """Tests for run_env injection of NPM_CONFIG_CACHE and TIRITH_BIN."""
