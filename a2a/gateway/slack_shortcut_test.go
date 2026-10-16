@@ -296,6 +296,25 @@ func TestSlackShortcutCreditPostsWhenItsTaskStarts(t *testing.T) {
 	}
 }
 
+// The thread is a session thread before the credit's Slack round trip
+// starts, so a reply typed in it meanwhile is a turn, not dropped.
+func TestSlackShortcutCreditPostsAfterTheSessionMark(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newShortcutAdapter(api)
+	turns := runShortcut(a, shortcutPayload(t, "C1", "oncall", "203.4", alertMessage()))
+	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, true)
+	marked := false
+	api.onPost = func() {
+		a.mu.Lock()
+		marked = a.sessionThreads["C1/100.5"]
+		a.mu.Unlock()
+	}
+	a.TaskStarted(turns[0].Conversation, "task-1")
+	if len(api.posted) != 1 || !marked {
+		t.Errorf("posted=%d, thread marked during the post=%v; want the credit posted after the mark", len(api.posted), marked)
+	}
+}
+
 // A shortcut whose turn starts no task (a steer into a running one, a failed
 // mint) credits nothing, and the next verified turn clears its line, so a
 // later member's task never posts under the clicker's name. A refused
@@ -433,6 +452,21 @@ func TestSlackShortcutQuotesRichTextOnce(t *testing.T) {
 	}
 	if got := slackShortcutQuoted(m); got != "is payments down? status\nhttps://dash.example" {
 		t.Errorf("quote = %q", got)
+	}
+}
+
+// The rich_text leaves that name keep the form the message's text gives
+// them, so a mention, a channel, a group, a broadcast and an emoji survive.
+func TestSlackShortcutQuotesRichTextNamesAsTheTextDoes(t *testing.T) {
+	var m slackShortcutMessage
+	if err := json.Unmarshal([]byte(`{"blocks":[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[
+	 {"type":"broadcast","range":"here"},{"type":"text","text":" is "},{"type":"user","user_id":"U2"},
+	 {"type":"text","text":" on "},{"type":"channel","channel_id":"C9"},{"type":"text","text":" with "},
+	 {"type":"usergroup","usergroup_id":"S1"},{"type":"text","text":"? "},{"type":"emoji","name":"fire"}]}]}]}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := slackShortcutQuoted(m), "<!here> is <@U2> on <#C9> with <!subteam^S1>? :fire:"; got != want {
+		t.Errorf("quote = %q, want %q", got, want)
 	}
 }
 

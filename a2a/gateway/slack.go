@@ -369,7 +369,9 @@ func (s *SlackAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Durat
 // Agent Sessions.
 func (s *SlackAdapter) TaskStarted(conversation, _ string) {
 	s.updateSession(conversation, func(st *slackSession) { st.running = true })
-	s.creditShortcut(conversation)
+	// After the mark below: the credit is a Slack round trip, and a reply
+	// typed in the thread meanwhile must find the thread a session thread.
+	defer s.creditShortcut(conversation)
 	channel, threadTS, ok := slackChannelThread(conversation)
 	if !ok || threadTS == "" || slackIsDM(conversation) {
 		return

@@ -72,6 +72,17 @@ const (
 	slackRichTextPre     = "rich_text_preformatted"
 	slackRichTextLeaf    = "text"
 	slackRichTextLink    = "link"
+	// The leaves that name, and the form the message's text gives each.
+	slackRichTextUser          = "user"
+	slackRichTextChannel       = "channel"
+	slackRichTextUsergroup     = "usergroup"
+	slackRichTextBroadcast     = "broadcast"
+	slackRichTextEmoji         = "emoji"
+	slackRichTextUserForm      = "<@%s>"
+	slackRichTextChannelForm   = "<#%s>"
+	slackRichTextUsergroupForm = "<!subteam^%s>"
+	slackRichTextBroadcastForm = "<!%s>"
+	slackRichTextEmojiForm     = ":%s:"
 	// slackShortcutQuotePrefix opens every quoted line.
 	slackShortcutQuotePrefix = "> "
 	// slackShortcutAttached names a file the message carried.
@@ -159,11 +170,18 @@ type slackShortcutMessage struct {
 // object for a section, header or context element), a section's fields,
 // and the elements nested under it (context and rich_text children).
 type slackShortcutBlock struct {
-	Type     string               `json:"type"`
-	Text     json.RawMessage      `json:"text"`
-	URL      string               `json:"url"`
-	Fields   []slackShortcutBlock `json:"fields"`
-	Elements []slackShortcutBlock `json:"elements"`
+	Type string          `json:"type"`
+	Text json.RawMessage `json:"text"`
+	URL  string          `json:"url"`
+	// The rich_text leaves that name rather than say: a member, a channel,
+	// a user group, a broadcast and an emoji.
+	UserID      string               `json:"user_id"`
+	ChannelID   string               `json:"channel_id"`
+	UsergroupID string               `json:"usergroup_id"`
+	Range       string               `json:"range"`
+	Name        string               `json:"name"`
+	Fields      []slackShortcutBlock `json:"fields"`
+	Elements    []slackShortcutBlock `json:"elements"`
 }
 
 // words is the block's text as the member reads it: one line per section,
@@ -188,6 +206,18 @@ func (b slackShortcutBlock) words() []string {
 			own = b.URL
 		}
 		return []string{own}
+	case slackRichTextUser:
+		// As the message's text carries them, so the quote reads the same
+		// whichever form it was built from.
+		return []string{fmt.Sprintf(slackRichTextUserForm, b.UserID)}
+	case slackRichTextChannel:
+		return []string{fmt.Sprintf(slackRichTextChannelForm, b.ChannelID)}
+	case slackRichTextUsergroup:
+		return []string{fmt.Sprintf(slackRichTextUsergroupForm, b.UsergroupID)}
+	case slackRichTextBroadcast:
+		return []string{fmt.Sprintf(slackRichTextBroadcastForm, b.Range)}
+	case slackRichTextEmoji:
+		return []string{fmt.Sprintf(slackRichTextEmojiForm, b.Name)}
 	case slackRichTextSection, slackRichTextQuote, slackRichTextPre:
 		var line strings.Builder
 		for _, e := range b.Elements {

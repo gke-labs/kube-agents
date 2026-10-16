@@ -56,6 +56,9 @@ type fakeSlackAPI struct {
 	userInfoCalls int
 	// prompts records setSuggestedPrompts calls.
 	prompts []slack.AssistantThreadsSetSuggestedPromptsParameters
+	// onPost, when set, runs at the start of every chat.postMessage, so a
+	// test can look at the adapter's state while a post is in flight.
+	onPost func()
 	// conversations and conversationErr answer conversations.info.
 	conversations   map[string]*slack.Channel
 	conversationErr error
@@ -118,6 +121,9 @@ func (f *fakeSlackAPI) AuthTestContext(context.Context) (*slack.AuthTestResponse
 }
 
 func (f *fakeSlackAPI) PostMessage(channelID string, options ...slack.MsgOption) (string, string, error) {
+	if f.onPost != nil {
+		f.onPost()
+	}
 	_, values, err := slack.UnsafeApplyMsgOptions("tok", channelID, "https://slack.example/api/", options...)
 	if err != nil {
 		return "", "", err
