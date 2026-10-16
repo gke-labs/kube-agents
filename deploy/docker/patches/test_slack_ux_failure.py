@@ -321,6 +321,7 @@ class MarkTest(FlagOn):
         self.assertEqual(button["value"], "check seeded-a")
 
     def test_visible_takes_the_line_off_every_chat_final_and_holds_the_step(self):
+        self.addCleanup(runtime._held.set, "")
         for platform in ("slack", "google_chat", "discord"):
             with self.subTest(platform):
                 self.assertEqual(runtime.visible(_event(platform=platform), DECLARED_REPLY), REPLY)
@@ -340,6 +341,21 @@ class MarkTest(FlagOn):
         self.assertEqual(button["value"], "check seeded-a")
         self.assertNotIn("[next:", blocks[0]["text"]["text"])
         self.assertEqual(runtime._held.get(), "", "end drops the held step")
+
+    def test_under_next_a_reply_whose_line_visible_took_off_still_offers_the_held_step(self):
+        runtime.note_wake(SUB, {"blocked"}, WAKE)
+        event = _turn()
+        token = runtime.begin(event)
+        try:
+            chat = runtime.chat_for(runtime.visible(event, DECLARED_REPLY))
+        finally:
+            runtime.end(token)
+        self.assertEqual(chat["choices"], [{"text": "check seeded-a", "next": True}])
+
+    def test_under_next_a_command_word_step_leaves_the_try_again(self):
+        chat = runtime.layout(REPLY + "\n\n[next: stop]", True)
+        self.assertEqual(chat["choices"], [{"text": runtime.OFFER_LABEL}])
+        self.assertNotIn("[next:", chat["detail"])
 
     def test_an_unmarked_reply_keeps_its_declared_line(self):
         # Only a failure wake's reply is drawn here; any other is upstream's, line and all.
@@ -366,7 +382,7 @@ class MarkTest(FlagOn):
         self.assertTrue(blocks[0]["text"]["text"].startswith("**I couldn't find seeded-z.**"))
         self.assertTrue(blocks[0]["text"]["text"].endswith("Check it there?"))
 
-    def test_outside_a_thread_a_declared_step_stays_as_written(self):
+    def test_outside_a_thread_a_declared_step_is_neither_button_nor_text(self):
         runtime.note_wake({**SUB, "thread_id": None}, {"blocked"}, WAKE)
         blocks = self.draw(_turn(thread_id=None), content=DECLARED_REPLY)
         self.assertEqual(_buttons(blocks), [])

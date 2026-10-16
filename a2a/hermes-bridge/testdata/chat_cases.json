@@ -1081,8 +1081,7 @@
       "in": "seeded-c is behind.\n\n[next: upgrade plan for seeded-c]\n[next: check seeded-b]",
       "chat": {
         "schema": "kube-agents.chat/v1",
-        "headline": "seeded-c is behind.",
-        "detail": "[next: upgrade plan for seeded-c]\n[next: check seeded-b]"
+        "headline": "seeded-c is behind."
       }
     },
     {
@@ -1090,15 +1089,14 @@
       "chat": {
         "schema": "kube-agents.chat/v1",
         "headline": "seeded-c is behind.",
-        "detail": "[next: check seeded-b]\n\nOr upgrade it.\n\n[next: upgrade plan for seeded-c]"
+        "detail": "[next: check seeded-b]\n\nOr upgrade it."
       }
     },
     {
       "in": "seeded-c is behind.\n\n[next: upgrade upgrade upgrade upgrade upgrade upgrade upgrade upgrade upgrade upgrade seeded-c]",
       "chat": {
         "schema": "kube-agents.chat/v1",
-        "headline": "seeded-c is behind.",
-        "detail": "[next: upgrade upgrade upgrade upgrade upgrade upgrade upgrade upgrade upgrade upgrade seeded-c]"
+        "headline": "seeded-c is behind."
       }
     },
     {
@@ -1118,16 +1116,14 @@
       "in": "seeded-c is behind.\n\n[next: ask <@U123> about seeded-c]",
       "chat": {
         "schema": "kube-agents.chat/v1",
-        "headline": "seeded-c is behind.",
-        "detail": "[next: ask <@U123> about seeded-c]"
+        "headline": "seeded-c is behind."
       }
     },
     {
       "in": "seeded-c is behind.\n\n[next: ]",
       "chat": {
         "schema": "kube-agents.chat/v1",
-        "headline": "seeded-c is behind.",
-        "detail": "[next: ]"
+        "headline": "seeded-c is behind."
       }
     },
     {
@@ -1142,16 +1138,14 @@
       "in": "The upgrade is running.\n\n[next: stop]",
       "chat": {
         "schema": "kube-agents.chat/v1",
-        "headline": "The upgrade is running.",
-        "detail": "[next: stop]"
+        "headline": "The upgrade is running."
       }
     },
     {
       "in": "The upgrade is running.\n\n[next: what's happening?]",
       "chat": {
         "schema": "kube-agents.chat/v1",
-        "headline": "The upgrade is running.",
-        "detail": "[next: what's happening?]"
+        "headline": "The upgrade is running."
       }
     },
     {
@@ -1207,8 +1201,7 @@
       "in": "seeded-c is behind.\r\n[next: check seeded-b]\r\n[next: upgrade plan for seeded-c]\r\n",
       "chat": {
         "schema": "kube-agents.chat/v1",
-        "headline": "seeded-c is behind.",
-        "detail": "[next: check seeded-b] [next: upgrade plan for seeded-c]"
+        "headline": "seeded-c is behind."
       }
     },
     {
@@ -1254,8 +1247,7 @@
       "in": "Five pods match.\n\n[next: **]",
       "chat": {
         "schema": "kube-agents.chat/v1",
-        "headline": "Five pods match.",
-        "detail": "[next: **]"
+        "headline": "Five pods match."
       }
     },
     {

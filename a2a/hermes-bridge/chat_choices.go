@@ -502,6 +502,15 @@ func visibleText(answer string) string {
 	}
 }
 
+// visibleOr is visibleText, or answer as written when nothing else is left,
+// so an answer that is only a step line still publishes text.
+func visibleOr(answer string) string {
+	if shown := visibleText(answer); shown != "" {
+		return shown
+	}
+	return answer
+}
+
 // nextStep is slack_moments.next_step: the one next step an answer declares
 // on its last line, a line of its own reading "[next: <label>]", split off as
 // (the answer above that line, the label). The label is made plain as an

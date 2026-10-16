@@ -22,7 +22,7 @@ only when it ends on a yes/no question.
 With the flag on, the Slack reply to such a wake is drawn with its first
 sentence in bold and, when it ends on one short yes/no question, a choice button
 reading :data:`OFFER_LABEL` ("Try again"), whatever the question's words; the
-question stays in the reply above it. An open question ("Which namespace
+question stays in the reply above it, and a declared step's line never posts. An open question ("Which namespace
 should it use?"), a request ("Could you share the namespace?") or an either/or
 stays text, since it needs a word, not a click. A reply that declares its next step on a
 last line of its own (``slack_moments.next_step``: ``[next: check seeded-a]``) gets that
@@ -469,10 +469,14 @@ def layout(content: str, in_thread: bool) -> Optional[dict]:
     """A failure reply as a ``kube-agents.chat/v1`` message: :func:`present`'s offer, or the
     declared next step in its place, as its button, only ``in_thread``. The step's line is
     never part of the layout, in a thread or out of one."""
+    # The send's visible() has usually taken the line off already and held the step.
     content, step = _next_step(content)
-    step = step if in_thread else ""
+    step = (step or _held.get()) if in_thread else ""
     content = _moments.visible_text(content) or content if _moments is not None else content
     _bolded, offer = present(content)
+    if step and _chat.command_word(step):
+        # A step the gateway would act on as a command is no choice; the question's Try again stands.
+        step = ""
     return _chat.failure_message(content, bool((step or offer) and in_thread), step)
 
 

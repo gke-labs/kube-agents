@@ -199,13 +199,13 @@ func askIsQuestion(text string) bool {
 
 // answerChat is the result's chat message, or false when the answer posts as
 // text: no headline (one opening on a code fence) or a rest past the fold's
-// cap. An answer that declares its next step (nextStep) is laid out without
-// that line and offers the step as its one choice, unless it offers options,
-// which win; a step the gateway would act on as a command is no choice, and
-// its line stays in the text as written.
+// cap. An answer is laid out without any step-shaped line at its end
+// (visibleText), and the step it declares (nextStep) is its one choice,
+// unless it offers options, which win, or the gateway would act on the step
+// as a command, which makes it no choice.
 func answerChat(answer string) (chatmsg.Message, bool) {
-	written := answer
-	answer, step := nextStep(answer)
+	_, step := nextStep(answer)
+	answer = visibleText(answer)
 	headline, body := splitAnswer(answer)
 	if headline == "" {
 		return chatmsg.Message{}, false
@@ -217,16 +217,8 @@ func answerChat(answer string) (chatmsg.Message, bool) {
 			return offered, true
 		}
 	}
-	if step != "" && chattext.IsCommand(step) {
-		// A step the gateway would act on as a command is no button: the
-		// answer as written.
-		headline, body = splitAnswer(written)
-		if headline == "" {
-			return chatmsg.Message{}, false
-		}
-		rest = pyStrip(strings.Join(body, "\n\n"))
-		msg.Headline = headline
-	} else if step != "" {
+	// A step the gateway would act on as a command is no button.
+	if step != "" && !chattext.IsCommand(step) {
 		msg.Choices = []chatmsg.Choice{{Text: step, Next: true}}
 	}
 	switch n := runeLen(rest); {

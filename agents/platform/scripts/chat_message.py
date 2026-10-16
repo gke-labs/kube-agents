@@ -393,13 +393,14 @@ def answer_message(markdown: str) -> dict | None:
     and the rest goes under "why". A choice the gateway would read as a command,
     or a detail past :data:`DETAIL_MAX`, keeps the layout above.
 
-    An answer that declares its next step (``slack_moments.next_step``) is laid
-    out without that line, and the step is its one choice, unless the answer
-    offers options, which win. A step the gateway would read as a command is
-    no choice, and its line stays in the text as written.
+    An answer is laid out without any step-shaped line at its end
+    (``slack_moments.visible_text``), since the line is plumbing no surface shows.
+    The step it declares (``slack_moments.next_step``) is its one choice, unless
+    the answer offers options, which win, or the gateway would read the step as a
+    command, which makes it no choice.
     """
-    written = markdown
-    markdown, step = _moments.next_step(markdown)
+    step = _moments.next_step(markdown)[1]
+    markdown = _moments.visible_text(markdown)
     headline, body = _presenter.split_answer(markdown)
     if not headline:
         return None
@@ -415,12 +416,6 @@ def answer_message(markdown: str) -> dict | None:
             fold = {"title": FOLD_TITLE_DEFAULT, "text": folded} if folded else None
             return message(headline=headline, detail=detail, fold=fold, choices=choices)
     choice = _choice(step, next_step=True) if step else None
-    if step and choice is None:
-        # A step the gateway would act on as a command is no button: the answer as written.
-        headline, body = _presenter.split_answer(written)
-        text = "\n\n".join(body).strip()
-        if not headline or len(text) > FOLD_TEXT_MAX:
-            return None
     choices = [choice] if choice else None
     if len(text) > DETAIL_MAX:
         return message(headline=headline, fold={"title": FOLD_TITLE_DEFAULT, "text": text}, choices=choices)

@@ -144,9 +144,13 @@ class NextStepTest(unittest.TestCase):
         chat = cm.answer_message("Two ways.\n\n1. **Raise it**\n2. **Roll back**\n\nWhich do you want?\n\n[next: raise it]")
         self.assertEqual(chat["choices"], [{"text": "Raise it"}, {"text": "Roll back"}])
 
-    def test_a_command_word_step_is_no_button_and_keeps_its_line(self):
-        self.assertEqual(cm.answer_message("Running.\n\n[next: stop]"),
-                         {"schema": cm.SCHEMA, "headline": "Running.", "detail": "[next: stop]"})
+    def test_a_command_word_step_is_no_button_and_no_text(self):
+        self.assertEqual(cm.answer_message("Running.\n\n[next: stop]"), {"schema": cm.SCHEMA, "headline": "Running."})
+
+    def test_a_refused_step_is_not_laid_out_as_text(self):
+        chat = cm.answer_message("seeded-c is behind.\n\n[next: a]\n[next: b]")
+        self.assertNotIn("choices", chat)
+        self.assertNotIn("[next:", str(chat))
 
     def test_a_failure_reply_offers_its_step_in_place_of_try_again(self):
         self.assertEqual(cm.failure_message("I couldn't. Check it there?", True, "check seeded-a")["choices"],
