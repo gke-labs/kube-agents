@@ -79,7 +79,6 @@
 ./tasks/reliability-pdb-probe/task.yaml
 ./tasks/capacity-pinned-pool-probe/task.yaml
 ./tasks/security-overgrant-probe/task.yaml
-./tasks/upgrades-lagging-master-probe/task.yaml
 ./tasks/consistency-authorized-networks-probe/task.yaml
 ./tasks/cost-idle-pool-probe/task.yaml
 

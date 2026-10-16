@@ -243,6 +243,16 @@ HELD_OUT_IN_PRESUBMIT = [
 ]
 
 
+# Demoted after the split under docs/eval-gate-roster.md "Demoting a flaky
+# case": the line leaves blocking-roster.txt and presubmit-cases.txt and lands
+# in the nightly file with its issue above it, as (case, the nightly line it
+# follows). Restoring a case deletes its entry here.
+DEMOTED_AFTER_THE_SPLIT = [
+    ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),  # 2026-10-16, #3269 (agent reads upgradeTargetVersion)
+]
+DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
+
+
 def with_insertions(base, insertions):
     """``base`` with each (case, follows) pair inserted after its predecessor."""
     out = list(base)
@@ -299,7 +309,10 @@ class ParserTest(unittest.TestCase):
 
 class SplitLostNothingTest(unittest.TestCase):
     def test_the_presubmit_file_is_the_tasks_array_at_the_split_plus_the_promoted_less_the_held_out(self):
-        expected = [c for c in with_insertions(PRESUBMIT_AT_SPLIT, PROMOTED_AFTER_THE_SPLIT) if c not in HELD_OUT_TO_NIGHTLY]
+        expected = [
+            c for c in with_insertions(PRESUBMIT_AT_SPLIT, PROMOTED_AFTER_THE_SPLIT)
+            if c not in HELD_OUT_TO_NIGHTLY and c not in DEMOTED
+        ]
         self.assertEqual(eval_rosters.presubmit_cases(), with_insertions(expected, HELD_OUT_IN_PRESUBMIT))
 
     def test_the_presubmit_runs_the_blocking_roster_plus_the_held_out_seats_and_nothing_else(self):
@@ -330,7 +343,10 @@ class SplitLostNothingTest(unittest.TestCase):
                 self.assertIn(case, eval_rosters.nightly_cases())
 
     def test_the_blocking_roster_is_bootstrap_admitted_at_the_split_plus_the_admitted(self):
-        self.assertEqual(eval_rosters.blocking_roster(), with_insertions(ROSTER_AT_SPLIT, ADMITTED_AFTER_THE_SPLIT))
+        self.assertEqual(
+            eval_rosters.blocking_roster(),
+            [c for c in with_insertions(ROSTER_AT_SPLIT, ADMITTED_AFTER_THE_SPLIT) if c not in DEMOTED],
+        )
 
     def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases_less_the_promoted_plus_the_held_out(self):
         promoted = {case for case, _ in PROMOTED_AFTER_THE_SPLIT}
@@ -342,12 +358,22 @@ class SplitLostNothingTest(unittest.TestCase):
         ]
         self.assertEqual(
             eval_rosters.nightly_cases(),
-            [
-                c
-                for c in expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
-                if c not in seated and c not in PARKED_AFTER_THE_MOVE
-            ],
+            with_insertions(
+                [
+                    c
+                    for c in expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
+                    if c not in seated and c not in PARKED_AFTER_THE_MOVE
+                ],
+                DEMOTED_AFTER_THE_SPLIT,
+            ),
         )
+
+    def test_a_demoted_case_is_in_the_nightly_only(self):
+        for case in DEMOTED:
+            with self.subTest(case=case):
+                self.assertIn(case, eval_rosters.nightly_cases())
+                self.assertNotIn(case, eval_rosters.presubmit_cases())
+                self.assertNotIn(case, eval_rosters.blocking_roster())
 
     def test_a_promoted_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
         for case, _ in PROMOTED_AFTER_THE_SPLIT:
