@@ -3481,13 +3481,7 @@ func TestStopAfterTheTurnEndedSaysACardKeepsWorking(t *testing.T) {
 
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "c-1", Text: "check the pods on x"}
 	origin := r.awaitTask(t, "platform")
-	exec := r.execFor(t, origin, "platform")
-	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "checking the pods on x"}}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
-		t.Fatal(err)
-	}
+	completeTask(t, r.execFor(t, origin, "platform"), "checking the pods on x")
 	waitFor(t, "the turn's terminal to release the conversation", func() bool {
 		rec, err := r.g.reg.Get(ctx, conv)
 		return err == nil && rec != nil && rec.ActiveTask == nil

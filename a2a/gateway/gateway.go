@@ -44,8 +44,8 @@ const topLevelNothingRunningNotice = "🤷 nothing is running here — each ques
 // cannot tell whether it did, so the reply says "if"; nor where the card's
 // answer lands, which a console conversation never receives), which ends the
 // turn within seconds but is not a task the gateway holds or can cancel. The
-// card keeps working and posts here, so the reply must not read as "nothing
-// is happening" (gke-labs#3263); stopping the card is the follow-up there. A
+// card keeps working, so the reply must not read as "nothing is happening"
+// (gke-labs#3263); stopping the card is the follow-up there. A
 // conversation that never ran a task (a first message, or one refused at the
 // session cap) has no card of its own to mention. Both start with the same
 // text, so readers matching "nothing is running" still do.
