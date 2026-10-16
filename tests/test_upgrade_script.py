@@ -3741,7 +3741,7 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, out)
                 self.assertIn("APPLIED crds\nAPPLIED terraform", proc.stdout, out)
                 self.assertNotIn("look like emails", out)
-                self.assertNotIn("SLACK_HOME_CHANNEL is", out)
+                self.assertNotIn("which is not a Slack channel id", out)
                 self.assertNotIn("SLACK_BOT_TOKEN holds", out)
 
     _PLAN_START = 'if [ "$PARAM_PLAN" = "true" ]; then\n    print_step "4. Planning (read-only)"\n'

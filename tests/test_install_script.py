@@ -5968,7 +5968,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                 out = proc.stdout + proc.stderr
                 self.assertIn("went on", proc.stdout, out)
                 self.assertNotIn("look like emails", out)
-                self.assertNotIn("SLACK_HOME_CHANNEL is", out)
+                self.assertNotIn("which is not a Slack channel id", out)
                 self.assertNotIn("SLACK_BOT_TOKEN holds", out)
 
     def test_main_refuses_after_the_interview_and_again_after_recovery_before_any_write(self):
@@ -6062,7 +6062,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         self.assertIn("USERS=[U0123ABCD] HOME=[C0123ABCD] TOKENS=", proc.stdout)
         self.assertIn("PROMPT: Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)", out)
         self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails)", out)
-        self.assertIn("PROMPT: Slack Home Channel ID (optional, a channel ID such as C0123456789)", out)
+        self.assertIn("PROMPT: Slack Home Channel ID (a channel ID such as C0123456789; alerts and reports post there)", out)
         self.assertNotIn("User IDs / Emails", out)
         self.assertNotIn("comma-separated for several workspaces", out)
         # Each bad answer is named and asked again, once.
@@ -6078,27 +6078,46 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         # Bot token: a stray comma, then one token. Allowlist: emails, then
         # Enter, which keeps the refused list (an empty one would admit
         # everyone) under a default that shows it, then IDs. Home channel: a
-        # DM, then Enter, which clears it.
+        # DM, then Enter, which clears it, and a yes to going on without one
+        # (#3320).
         answers = ["xoxb-1-secretpart,", "xoxb-1-secretpart", "xapp-1",
                    "U0123ABCD,alice@example.com", "<enter>", "U0123ABCD",
-                   "D0123ABCD", "<enter>", "#ops"]
+                   "D0123ABCD", "<enter>", "y", "#ops"]
         proc = self._interview("--mode=next", "", answers)
         out = proc.stdout + proc.stderr
-        self.assertIn("went on ASKED=9", proc.stdout, out)
+        self.assertIn("went on ASKED=10", proc.stdout, out)
         self.assertIn("USERS=[U0123ABCD] HOME=[] TOKENS=", proc.stdout)
         self.assertIn("SLACK_BOT_TOKEN holds a comma or space.", out)
         self.assertEqual(out.count("These look like emails: alice@example.com."), 2)
         self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails) "
                       "[default: U0123ABCD,alice@example.com]", out)
         self.assertNotIn("[default: empty list]", out.split("These look like emails", 1)[1])
-        self.assertIn("PROMPT: Slack Home Channel ID (optional, a channel ID such as C0123456789) [default: ]", out)
+        self.assertIn("PROMPT: Slack Home Channel ID (a channel ID such as C0123456789; alerts and reports post there) [default: ]", out)
         self.assertNotIn("secretpart", out)
+
+    def test_an_empty_home_channel_under_next_is_confirmed_or_asked_again(self):
+        # #3320: under next the gateway posts alerts only to a home channel.
+        # Declining the warning asks again; accepting keeps the empty answer.
+        lead = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD"]
+        proc = self._interview("--mode=next", "", lead + ["", "n", "C0123ABCD", "#ops"])
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=7", proc.stdout, out)
+        self.assertIn("HOME=[C0123ABCD]", proc.stdout, out)
+        self.assertIn("SLACK_HOME_CHANNEL is empty", out)
+        self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+        proc = self._interview("--mode=next", "", lead + ["", "y", "#ops"])
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=6", proc.stdout, out)
+        self.assertIn("HOME=[]", proc.stdout, out)
+        # A home channel given at once is not questioned.
+        proc = self._interview("--mode=next", "", lead + ["C0123ABCD", "#ops"])
+        self.assertNotIn("Continue without a home channel", proc.stdout + proc.stderr)
 
     def test_the_interview_keeps_the_today_prompts_where_slack_stays_on_the_today_path(self):
         answers = ["xoxb-a,xoxb-b", "xapp-1", "alice@example.com", "D0DM", "#ops"]
         for flags, choice in (("", "2"), ("--mode=next", "3")):
             with self.subTest(flags=flags, choice=choice):
-                chat = ["", "", "", ""] if choice == "3" else []
+                chat = ["", "", "", "spaces/AAA"] if choice == "3" else []
                 proc = self._interview(flags, "", chat + answers, choice=choice)
                 out = proc.stdout + proc.stderr
                 self.assertIn(f"went on ASKED={len(chat) + 5}", proc.stdout, out)
