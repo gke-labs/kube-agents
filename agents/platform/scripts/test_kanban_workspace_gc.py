@@ -625,8 +625,6 @@ class HomeInventoryTest(unittest.TestCase):
         self.assertTrue(all(argv[1].startswith(str(self.remote)) for argv, _ in fake.calls))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class CronRunsTest(unittest.TestCase):
@@ -688,6 +686,42 @@ class CronRunsTest(unittest.TestCase):
         self.sweep()
         self.assertTrue((target / "runs" / "x").exists())
 
+    def test_a_stray_file_in_the_runs_root_goes_too(self):
+        stray = self.runs / "note.txt"
+        stray.write_text("x")
+        os.utime(stray, (self.OLD, self.OLD))
+        self.sweep()
+        self.assertFalse(stray.exists())
+
+    def test_an_unreachable_sandbox_is_tried_once_and_reported_once(self):
+        (self.profiles / "cluster-a").mkdir()
+        (self.profiles / "cluster-b").mkdir()
+        calls = []
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            raise sandbox_exec.SandboxUnavailable("no route to host")
+
+        sweep = self.sweep(Path("/sandbox-root"), fake)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len([w for w in sweep.warnings if "sandbox" in w]), 1, sweep.warnings)
+
+    def test_the_nightly_job_prunes_and_logs_it(self):
+        old = self.make_run("compliance-audit_ex1", self.OLD)
+        import io
+        home = self.profiles.parent
+        hermes_cli = type(sys)("hermes_cli")
+        hermes_cli.kanban_db = type("K", (), {"list_boards": staticmethod(lambda: [])})
+        with patch.dict(sys.modules, {"hermes_cli": hermes_cli}), \
+             patch.dict("os.environ", {"PLATFORM_AGENT_HOME": str(home)}), \
+             patch.object(sandbox_exec, "sandbox_enabled", return_value=False), \
+             patch.object(gc.time, "time", return_value=self.NOW), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(gc.main(), 0)
+        self.assertFalse(old.exists())
+        log = (home / gc.LOGS_DIR / gc.LOG_FILE_NAME).read_text(encoding="utf-8")
+        self.assertIn("removed 1 cron run directories", log)
+
     def test_a_homes_cron_dir_is_expected_by_the_inventory(self):
         # session-command.sh creates <home>/cron/runs in the sandbox; the nightly
         # inventory must not report it as residue every night.
@@ -722,3 +756,7 @@ class CronRunsTest(unittest.TestCase):
         sweep = self.sweep(remote, fake)
         self.assertEqual([a for a in calls if a[0] == gc.REMOTE_RM], [])
         self.assertTrue(any("symlink" in w for w in sweep.warnings), sweep.warnings)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

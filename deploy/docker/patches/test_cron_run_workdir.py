@@ -136,6 +136,14 @@ class CronRunWorkdirTest(unittest.TestCase):
         recorded = Path(self.recorded[scope.task_id])
         self.assertEqual(recorded.parent, self.home.joinpath(*RUNS_PARTS))
 
+    def test_the_directory_name_is_what_the_prune_accepts(self):
+        # kanban_workspace_gc.CRON_RUN_NAME is ASCII; a name it refuses is never swept.
+        import re
+        self.apply_quietly()
+        scope = self.scope_class()({"id": "x"}, "審査 audit/1", "ex1")
+        name = Path(self.recorded[scope.task_id]).name
+        self.assertRegex(name, r"^[A-Za-z0-9._-]+$")
+
     def test_a_configured_workdir_is_kept(self):
         self.apply_quietly()
         configured = self.tmp / "configured"

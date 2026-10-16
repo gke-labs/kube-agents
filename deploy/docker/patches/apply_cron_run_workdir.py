@@ -75,7 +75,7 @@ SCOPE_PATCHED = (
     "            # run's own instead of the profile home, so what the model writes\n"
     "            # there is not the next run's input. Tool-layer cwd only; the\n"
     "            # session cwd above, and with it context-file loading, is unchanged.\n"
-    "            _run_key = \"\".join(c if c.isalnum() or c in \"._-\" else \"_\"\n"
+    "            _run_key = \"\".join(c if c.isascii() and (c.isalnum() or c in \"._-\") else \"_\"\n"
     "                               for c in f\"{job_id}_{self.task_id.rsplit(':', 1)[-1]}\")\n"
     f"            _run_dir = _get_hermes_home().joinpath(*{RUNS_PARTS!r}, _run_key)\n"
     "            try:\n"

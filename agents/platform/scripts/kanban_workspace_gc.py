@@ -592,13 +592,20 @@ def _old_local_runs(runs: Path, cutoff: float) -> list[Path]:
 
 
 def _old_remote_runs(runs: Path, cutoff: float, sweep: Sweep) -> list[str]:
-    """Names of old entries under *runs* in the sandbox; [] when it has none."""
+    """Names of old entries under *runs* in the sandbox; [] when it has none.
+
+    Raises `_SandboxGone` when the sandbox did not answer, as `_list` does: every
+    further profile would fail the same way.
+    """
     try:
         result = sandbox_exec.run(
             [REMOTE_FIND, str(runs), "-mindepth", "1", "-maxdepth", "1", "-printf", FIND_FORMAT],
             timeout=LS_TIMEOUT_SECONDS,
             errors="surrogateescape",
         )
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as exc:
+        sweep.warnings.append(f"cron run directories in the sandbox not pruned, it did not answer: {exc}")
+        raise _SandboxGone from exc
     except Exception as exc:  # noqa: BLE001 - a sweep must not die on one root
         sweep.warnings.append(f"listing {runs} in the sandbox failed: {exc}")
         return []
@@ -629,6 +636,16 @@ def sweep_cron_runs(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
         if not local_ok and os.path.lexists(runs):
             sweep.warnings.append(f"{runs} is reached through a symlink or is not a directory; not pruned")
         for path in (_old_local_runs(runs, cutoff) if local_ok else []):
+            if path.is_file() and not path.is_symlink():
+                # _remove_local is the kanban workspace remover, which leaves
+                # files alone; everything under the runs root is scratch.
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    sweep.warnings.append(f"could not remove {path}: {exc}")
+                else:
+                    sweep.cron_runs_removed.append(f"{name}/{path.name}")
+                continue
             before = len(sweep.local_removed)
             _remove_local(path, sweep)
             if len(sweep.local_removed) > before:
@@ -636,7 +653,11 @@ def sweep_cron_runs(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
         if remote_root is None:
             continue
         remote_runs = remote_root.joinpath("profiles", name, *CRON_RUNS_PARTS)
-        old = _old_remote_runs(remote_runs, cutoff, sweep)
+        try:
+            old = _old_remote_runs(remote_runs, cutoff, sweep)
+        except _SandboxGone:
+            remote_root = None
+            continue
         if old and not _real_dirs_remote(_runs_components(remote_root / "profiles" / name), sweep):
             sweep.warnings.append(f"{remote_runs} in the sandbox is reached through a symlink; not pruned")
             old = []
