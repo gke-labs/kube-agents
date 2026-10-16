@@ -20,14 +20,19 @@ gets the same shape in chat. Read only. Register nothing, decide nothing, upgrad
      `outcome`), `new_ids`, `suppressed_ids`, `no_longer_reported_ids`, `project_failures`.
    - `cat /opt/data/upgrade-readiness/weekly/latest.md` when a line needs more than the row says.
    - If the asked-for thing is **the report**, print `latest.md` as it is and stop; when the file is
-     missing, say the weekly review has not run yet and offer the on-request readiness report
-     (`fleet-upgrade-verification`, `--readiness`) instead of composing anything.
+     missing, say the review's copy is not there (the weekly review has not run, or its copy did not
+     land; the review's own chat line, if any, says which) and offer the on-request readiness
+     report (`fleet-upgrade-verification`, `--readiness`) instead of composing anything.
    - If `generated_at` is older than 48 hours, compose from the summary anyway and say its date and
      age in the headline: a stale brief with its date beats none.
-   - If the file is missing, compose a **live brief**: run the `fleet-upgrade-verification` skill
-     with `--readiness` once over every project in scope, treat its blockers and risks as the
-     findings (a budget over one replica, a pool past the skew ceiling and a webhook in the upgrade's
-     path are critical; a budget over several replicas, a webhook refusing only what it matches
+   - If the file is missing, read the queue first (step 2). When it holds `upgrade-` rows, the
+     review ran and its copy did not land: compose from the queue alone, with a headline that says
+     the summary is unavailable, and leave out the counts only the summary gives. Only when the
+     queue holds no `upgrade-` rows either compose a **live brief**: run the
+     `fleet-upgrade-verification` skill with `--readiness` once over every project in scope, treat
+     its blockers and risks as the
+     findings (a budget over a single replica, a pool past the skew ceiling and a webhook in the
+     upgrade's path are critical; a budget over several replicas, a webhook refusing only what it matches
      today and a pool at the ceiling are major; a covering exclusion is minor; a readiness rule's
      risk takes the severity the review's rubric gives its catalogue entry), name objects where the
      queue would give ids, say "live brief, composed now; the weekly review has not run" in the
@@ -61,12 +66,15 @@ gets the same shape in chat. Read only. Register nothing, decide nothing, upgrad
    <for a live brief, instead: "No weekly record yet: the Saturday review registers these on <next Saturday>, and each gets an id you can decide with. Reply "show me the upgrade readiness report" for the table.">
    ```
 
-   - **Decide now** lists the undecided criticals, worst first (the queue's order), one line per
-     cluster and at most ten lines: every critical on one cluster goes in that cluster's line, with
-     each id and object, and its worst finding sets its place. Among the criticals, and only among
-     them, one on the cluster the agent runs on, one whose clock ends within thirty days, or one
-     whose evidence says a serving workload goes down moves up over one on a cluster the summary
-     lists as `unknown`; no major or minor moves up.
+   - **Decide now** lists the undecided criticals, worst first, one line per cluster and at most
+     ten lines: every critical on one cluster is one problem, so the cluster's line names each of
+     its ids and objects, and its worst finding sets its place. The queue's rank order is the
+     default. Depart from it, among the criticals and only among them, when one of these holds: a
+     critical on the cluster the agent runs on outranks the same one elsewhere; a critical whose
+     clock is short (a target or a date within thirty days) outranks one with no date; a critical
+     whose evidence says a serving workload goes down outranks one on a cluster the summary lists
+     as `unknown` or whose evidence is inferred. No major or minor moves up: they have their own
+     line below.
      Never leave the section empty while an undecided critical exists; when every critical row is
      `accepted`, `snoozed` or `dismissed`, the section reads `**Decide now:** nothing; every critical
 finding has a decision.` When nothing was found at all, the brief is the headline and the

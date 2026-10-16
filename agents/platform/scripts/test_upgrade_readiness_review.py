@@ -217,7 +217,8 @@ class TheMapping(unittest.TestCase):
             {"budget-singleton": "critical", "skew-blocks": "critical", "webhook-blocking": "critical", "rule-blocking": "critical", "budget": "major", "skew-ceiling": "major", "webhook-outage": "major", "exclusion": "minor"},
         )
         readme = Path(__file__).resolve().parents[1] / "cron" / "README.md"
-        for document in (SOP, readme):
+        skill = Path(__file__).resolve().parents[1] / "skills" / "upgrade-readiness-brief" / "SKILL.md"
+        for document in (SOP, readme, skill):
             text = " ".join(document.read_text(encoding="utf-8").split())
             critical, rest = text.split("are critical", 1)
             major, rest = rest.split("are major", 1)
@@ -347,6 +348,39 @@ class Registration(unittest.TestCase):
         self.assertEqual(len(calls), 1)  # one POST carries the one finding; the other twin has nothing left to send and no claim
         self.assertEqual(set(outcomes.values()), {"created"})
         self.assertEqual(len(outcomes), 1)
+
+    def test_an_object_past_the_queues_cap_keys_the_same_id_on_both_sides(self):
+        long_name = "a" * (fq.MAX_LABEL_CHARS + 40)
+        found = review.budget_findings(member("c", "blocked", pdbs={"blocking": [budget(name=long_name)]}))[0]
+        self.assertEqual(len(found["object"]), fq.MAX_LABEL_CHARS)
+        self.assertEqual(review.item_id(found), fq.validate_finding(review.payload(found))["id"])
+
+    def test_an_answer_that_is_not_an_object_is_this_batchs_failure(self):
+        import io
+
+        class Answer(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with mock.patch.object(review.urllib.request, "urlopen", lambda req, timeout: Answer(b"[]")):
+            with self.assertRaises(OSError) as caught:
+                review.kv_request(review.KV_FINDINGS_PATH, {"findings": []})
+        self.assertIn("not an object", str(caught.exception))
+
+    def test_twins_rows_count_under_both_members_in_the_record(self):
+        west = member("prod", "blocked", pdbs={"blocking": [budget(name="pinned")]})
+        east = member("prod", "blocked", pdbs={"blocking": [budget(name="pinned")]})
+        east["location"] = "europe-west1"
+        findings = review.fold_shared_ids(review.member_findings(west) + review.member_findings(east))
+        doc = review.summary(stamp="20261018T060000Z", now=NOW, names=[PROJECT], members=[west, east], errors=[], failures={}, findings=findings, outcomes={review.item_id(f): "created" for f in findings}, problems=[], previous=None, report_path=Path("x"))
+        self.assertEqual(doc["findings"][0]["members"], [f"{PROJECT}/us-central1-a/prod", f"{PROJECT}/europe-west1/prod"])
+        report = review.render_report(doc, findings, {}, [])
+        self.assertIn(f"| {PROJECT}/us-central1-a/prod | blocked | 1 | 0 | 0 |", report)
+        self.assertIn(f"| {PROJECT}/europe-west1/prod | blocked | 1 | 0 | 0 |", report)
+        self.assertIn(f"- Where: {PROJECT}/us-central1-a/prod, {PROJECT}/europe-west1/prod", report)
 
     def test_a_row_the_queue_would_refuse_fails_alone(self):
         calls = []
@@ -507,12 +541,17 @@ class TheRecord(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in fake_dir.iterdir()), ["latest.json", "latest.md"])  # no temporary file left behind
         # A write that fails leaves the previous pair whole and the directory closed.
         broken = review.sandbox_copy_program({"latest.md": "# third\n", "latest.json": "{}"}).replace(json.dumps(review.SANDBOX_COPY_DIR), json.dumps(str(fake_dir)))
-        broken = broken.replace("    for name in FILES:", "    raise OSError('disk full')\n    for name in FILES:")
+        # The failure lands after the first temporary is made read-only and
+        # before its rename: the stray the next run has to get past.
+        broken = broken.replace("        os.chmod(os.path.join(DIR, name + TMP), MODE)\n", "        os.chmod(os.path.join(DIR, name + TMP), MODE)\n        raise OSError('ssh dropped')\n", 1)
+        self.assertIn("ssh dropped", broken)
         with self.assertRaises(OSError):
             exec(broken, {})  # noqa: S102 - the program under test
         self.assertEqual((fake_dir / "latest.md").read_text(encoding="utf-8"), "# second\n")
         self.assertEqual(oct(os.stat(fake_dir).st_mode & 0o777), oct(review.SANDBOX_COPY_DIR_CLOSED_MODE))
-        self.assertTrue(any(p.name.endswith(review.TMP_SUFFIX) for p in fake_dir.iterdir()))
+        strays = [p for p in fake_dir.iterdir() if p.name.endswith(review.TMP_SUFFIX)]
+        self.assertEqual(len(strays), 2)  # both temporaries written, one already read-only
+        self.assertIn(oct(review.SANDBOX_COPY_MODE), {oct(os.stat(p).st_mode & 0o777) for p in strays})
         # The next run replaces the strays itself: nobody has to clean up by hand.
         fourth = review.sandbox_copy_program({"latest.md": "# fourth\n", "latest.json": "{}"}).replace(json.dumps(review.SANDBOX_COPY_DIR), json.dumps(str(fake_dir)))
         exec(fourth, {})  # noqa: S102 - the program under test
@@ -531,6 +570,13 @@ class TheRecord(unittest.TestCase):
             self.assertIsNone(review.copy_to_sandbox("# r\n", {"n": 1}))
         self.assertEqual((target / review.LATEST_MD_NAME).read_text(encoding="utf-8"), "# r\n")
         self.assertTrue(os.access(target, os.W_OK))
+        self.assertEqual(sorted(p.name for p in target.iterdir()), ["latest.json", "latest.md"])
+        # A write that fails before both temporaries exist leaves the previous pair whole.
+        (target / (review.LATEST_JSON_NAME + review.TMP_SUFFIX)).mkdir()
+        with mock.patch.object(review.sandbox_exec, "sandbox_enabled", lambda path=None: False), mock.patch.object(review.sandbox_exec, "run", never), mock.patch.object(review, "SANDBOX_COPY_DIR", str(target)):
+            self.assertIsNotNone(review.copy_to_sandbox("# newer\n", {"n": 2}))
+        self.assertEqual((target / review.LATEST_MD_NAME).read_text(encoding="utf-8"), "# r\n")
+        (target / (review.LATEST_JSON_NAME + review.TMP_SUFFIX)).rmdir()
         # The record's own directory is never the copy's target.
         with mock.patch.object(review.sandbox_exec, "sandbox_enabled", lambda path=None: False), mock.patch.object(review.sandbox_exec, "run", never), mock.patch.object(review, "SANDBOX_COPY_DIR", str(review.weekly_home())):
             self.assertIsNone(review.copy_to_sandbox("# r\n", {"n": 1}))
@@ -688,6 +734,41 @@ class TheTick(unittest.TestCase):
         self.assertEqual(latest["project_failures"], {OTHER_PROJECT: "clusters list: PERMISSION_DENIED"})
         self.assertEqual(len(self.registered), 2)  # the read project's two members, nothing for the unlisted one
 
+    def test_a_project_spelled_by_number_the_report_could_not_resolve_is_not_read(self):
+        numbered = "123456789012"
+
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            if names[0] == numbered:
+                return {"exit": 0, "tables": "", "report": {"members": [member("ghost", "blocked", project=numbered, pdbs={"blocking": [budget()]})], "errors": [{"project": "declared-scope", "location": None, "message": "describe 123456789012: PERMISSION_DENIED"}]}}
+            return self.envelope
+
+        with mock.patch.object(watch, "projects", return_value=[PROJECT, numbered]), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn(f"1 project(s) not read this week: {numbered}: spelled by number", out)
+        self.assertFalse(any(f["project"] == numbered for body in self.registered for f in body["findings"]))
+        latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
+        self.assertIn(numbered, latest["project_failures"])
+
+    def test_a_clean_project_with_no_clusters_beside_a_failed_one_is_a_partial_run(self):
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            if names[0] == OTHER_PROJECT:
+                raise RuntimeError("sandbox exited 255 without a report")
+            return {"exit": 0, "tables": "", "report": {"members": [], "errors": []}}
+
+        with mock.patch.object(watch, "projects", return_value=[PROJECT, OTHER_PROJECT]), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("1 project(s) not read this week", out)
+        self.assertNotIn("failed:", out)
+        latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
+        self.assertEqual(latest["project_failures"], {OTHER_PROJECT: "sandbox exited 255 without a report"})
+        self.assertEqual(latest["clusters"]["reviewed"], [])
+
+    def test_the_chat_lines_name_a_few_and_count_the_rest(self):
+        self.assertEqual(review.shown(["a", "b"], 3), "a; b")
+        self.assertEqual(review.shown(["a", "b", "c", "d", "e"], 3), "a; b; c; and 2 more in the record")
+
     def test_a_run_the_budget_cut_short_is_said_as_such(self):
         def run_report(names, readiness, *, scope, outside_stands, timeout=None):
             if names[0] == OTHER_PROJECT:
@@ -748,6 +829,10 @@ class TheRoster(unittest.TestCase):
         self.assertEqual((review_job["deliver"], brief["deliver"]), ("chat", "chat"))
         self.assertIn("governance/upgrade_readiness_brief_sop.md", brief["prompt"])
         self.assertFalse(brief.get("no_agent"))
+        # Both read tenant-written names: the review as the input-threat label a
+        # script carries, the brief as the read-only command policy on the one
+        # model turn over those names.
+        self.assertEqual((review_job["risk"], brief["risk"]), ("high", "high"))
 
     def test_the_skill_carries_the_sop_shape_verbatim(self):
         # The on-request route lives in a skill the worker loads; its template

@@ -88,13 +88,14 @@ verification_spec:
         # One line, one clause: the cluster, the budget and its cost must sit
         # on the same Decide-now line and the cost word inside the first
         # sentence after them (the SOP's "<what blocks and what it costs, one
-        # clause>." ends at a full stop, and the action follows it), so an
-        # action phrased with evict or drain is not taken for the cost clause
-        # however it is introduced; the id's own "drain-blocking" does not
-        # count as one either.
-        - "(?i){cluster:b}[^\\n]{0,400}?pinned-batch-runner[^\\n.]{0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)"
-        - "(?i)pinned-batch-runner[^\\n]{0,400}?{cluster:b}[^\\n.]{0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)"
-        - "(?i){cluster:b}[^\\n.]{0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)[^\\n]{0,400}?pinned-batch-runner"
+        # clause>." ends at a full stop followed by a space, and the action
+        # follows it), so an action phrased with evict or drain is not taken
+        # for the cost clause however it is introduced; a dot inside a token
+        # (a version, a decimal) ends no sentence, and the id's own
+        # "drain-blocking" is not a cost word either.
+        - "(?i){cluster:b}[^\\n]{0,400}?pinned-batch-runner(?:(?!\\.\\s)[^\\n]){0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)"
+        - "(?i)pinned-batch-runner[^\\n]{0,400}?{cluster:b}(?:(?!\\.\\s)[^\\n]){0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)"
+        - "(?i){cluster:b}(?:(?!\\.\\s)[^\\n]){0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)[^\\n]{0,400}?pinned-batch-runner"
   - name: the-webhook-outage-is-not-a-decision
     role: objective
     mode: assert
@@ -113,10 +114,12 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      any_of_phrases:
-        - "upgrade readiness report"
-        - "weekly readiness report"
-        - "upgrade-readiness/weekly/latest.md"
+      any_of_patterns:
+        # The closing line's own words: the sentence that opens the report in
+        # chat, or the report's path. The name of the thing asked about, in a
+        # heading or a restated prompt, is not the way to the report.
+        - "(?i)show me (?:this week.s )?(?:the )?upgrade readiness report"
+        - "upgrade-readiness/weekly/latest\\.md"
   - name: the-brief-names-the-decision-words
     role: objective
     mode: assert

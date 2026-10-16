@@ -151,12 +151,17 @@ its shape is the one in section 3, kept identical by a test.
 
 - **"Show me this week's upgrade readiness report"**, or any ask for the full report → print
   `/opt/data/upgrade-readiness/weekly/latest.md` as it is. Google Chat splits anything past 4,000
-  characters across messages; that is expected. If the file is missing, say the weekly review has
-  not run yet and offer the on-request readiness report (`fleet-upgrade-verification`, `--readiness`).
+  characters across messages; that is expected. If the file is missing, say the review's copy is not
+  there (the weekly review has not run, or its copy did not land; the review's own chat line, if
+  any, says which) and offer the on-request readiness report (`fleet-upgrade-verification`,
+  `--readiness`).
 - **"Give me the upgrade readiness brief"**, or any ask for what needs a decision → steps 1 to 3
   above, and the same shape. If the summary is older than 48 hours, say so in the headline and
   compose from it anyway: a stale brief with its date is better than none. If there is no summary
-  at all (the review has never run on this install), compose a **live brief**: run the readiness
+  at all, read the queue first: when it holds `upgrade-` rows, the review ran and its copy did not
+  land, so compose from the queue alone with a headline that says the summary is unavailable.
+  Only when the queue holds no `upgrade-` rows either (the review has never run on this install)
+  compose a **live brief**: run the readiness
   report yourself over every project in scope (`fleet-upgrade-verification`, `--readiness`, as
   "Check upgrade readiness" in its `SKILL.md` says), take the blockers and risks it names as the
   findings (a drain-blocking budget over a single replica, a pool past the skew ceiling and a

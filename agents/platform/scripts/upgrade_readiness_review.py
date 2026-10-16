@@ -56,7 +56,9 @@ when a user asks for it; the copy is a copy, the record is on this side.
 Stdout is the chat message (``deliver: "chat"``) and is empty on success: the
 brief speaks for the week, and the queue speaks for every finding. A run that
 read some projects and not others prints one line naming the projects it did
-not read, since the brief's counts cannot show them; a run that fails prints
+not read, since the brief's counts cannot show them; a run whose findings the
+queue refused, or whose sandbox copy failed, prints one line for each, since
+both leave the week where the brief cannot act on it; a run that fails prints
 one line saying so, once per distinct failure, and exits 0; the exit is 1 only
 when the record could not be written. ``--dry-run`` runs the
 reports and prints the summary without registering or writing anything.
@@ -151,7 +153,9 @@ DEFAULT_WEBHOOK_CONFIG_KIND = "webhookconfiguration"
 # registration) and written into the summary's rows: cluster names repeat across
 # locations, so project and cluster alone do not name a member.
 MEMBER_FIELD = "_member"
+MEMBERS_FIELD = "_members"  # every member a folded finding stands for
 ROW_MEMBER_KEY = "member"
+ROW_MEMBERS_KEY = "members"
 SKEW_VERDICT_BLOCKS = "blocks"
 SKEW_VERDICT_CEILING = "at ceiling"
 WORKLOAD_REPLICAS_KEY = "replicas"
@@ -321,13 +325,17 @@ NO_PROJECTS_DETAIL = "no project to review: set UPGRADE_READINESS_PROJECTS or de
 BUDGET_EXHAUSTED_DETAIL = "the run's time budget ran out before this project"
 CUT_SHORT_DETAIL = "readiness run cut short by the review's time budget after {seconds}s; it goes first next week"
 LISTING_FAILED_DETAIL = "the project's cluster listing failed"
+NUMBERED_PROJECT_DETAIL = "spelled by number and not resolved to an id this run, so its clusters are not read: spell the project by its id"
+MAX_PROBLEMS_IN_LINE = 3  # of the queue's refusals quoted in the chat line; the record has them all
+MAX_NAMES_IN_LINE = 6  # projects named in the partial line
+OVERFLOW_NOTE = "and {count} more in the record"
 DUPLICATE_DETAIL_SEPARATOR = " | also: "  # two rows of one member that derive one queue id
 SHARED_DETAIL_SEPARATOR = " | also on {member}: "  # two same-named clusters whose objects coincide
 TMP_SUFFIX = watch.LEDGER_TMP_SUFFIX  # a file is written beside its name and renamed over it
 FAILED_LINE = "{prefix}: failed: {detail}"
 RECOVERED_LINE = "{prefix}: runs again after a failure"
 PARTIAL_LINE = "{prefix}: {count} project(s) not read this week: {detail}; their clusters keep last week's findings and are not counted"
-REGISTRATION_FAILED_LINE = "{prefix}: {count} finding batch(es) did not reach the findings queue: {detail}; those findings are in the report, not on the queue, and the brief says so"
+REGISTRATION_FAILED_LINE = "{prefix}: {count} finding(s) did not reach the findings queue: {detail}; they are in the report, not on the queue, and the brief says so"
 COPY_FAILED_LINE = "{prefix}: the sandbox copy failed: {detail}; the brief reads the previous copy until the next review"
 # A failure is announced once per distinct cause: the marker keeps the failure's text
 # with every number replaced, so a timeout that reads 1187s one week and 1203s the
@@ -373,7 +381,7 @@ def kv_request(path: str, body: dict) -> dict:
     req = urllib.request.Request(f"{kv_endpoint()}{path}", data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=KV_TIMEOUT_SECONDS) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            answer = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         # The queue says which row or field it refused, or that it is busy, in
         # the body; str(HTTPError) is the status line alone.
@@ -383,6 +391,10 @@ def kv_request(path: str, body: dict) -> dict:
         # A response cut short or malformed is a transport failure of this
         # batch, as the nudge treats it, not the end of the run.
         raise OSError(f"the queue's answer was cut short: {exc.__class__.__name__}: {exc}") from None
+    if not isinstance(answer, dict):
+        # Something that is not this route answered: a proxy's page, a wrong port.
+        raise OSError(f"the queue answered with {type(answer).__name__}, not an object")
+    return answer
 
 
 # --- the mapping: report rows to findings ------------------------------------
@@ -435,7 +447,7 @@ def finding(
         "project": project,
         "cluster": cluster,
         "namespace": namespace,
-        "object": object_name,
+        "object": object_name[: findings_queue.MAX_LABEL_CHARS],
         "title": clip(title, MAX_TITLE_CHARS),
         "detail": clip(detail),
         "rubric": rubric(rubric_values),
@@ -671,10 +683,14 @@ def fold_shared_ids(items: list[dict]) -> list[dict]:
         fid = item_id(item)
         first = by_id.get(fid)
         if first is None:
+            item.setdefault(MEMBERS_FIELD, [item[MEMBER_FIELD]])
             by_id[fid] = item
             continue
         if item[MEMBER_FIELD] != first[MEMBER_FIELD]:
             first["detail"] = clip(first["detail"] + SHARED_DETAIL_SEPARATOR.format(member=item[MEMBER_FIELD]) + item["detail"])
+            for member in item.get(MEMBERS_FIELD, [item[MEMBER_FIELD]]):
+                if member not in first[MEMBERS_FIELD]:
+                    first[MEMBERS_FIELD].append(member)
         else:
             first["detail"] = clip(first["detail"] + DUPLICATE_DETAIL_SEPARATOR + item["detail"])
         if rank_of(item) > rank_of(first):
@@ -775,6 +791,12 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
                 LISTING_FAILED_DETAIL,
             )
             continue
+        if watch.is_project_number(project) and any(m.get(watch.MEMBER_ID_KEYS[0]) == project for m in found):
+            # A number the report could not resolve to an id this run keys its
+            # members by the number; registered so, they would be a second
+            # identity set the queue never clears. Not read, as the watch counts it.
+            failures[project] = NUMBERED_PROJECT_DETAIL
+            continue
         members.extend(found)
         if on_project is not None:
             on_project(found, read_errors)
@@ -847,7 +869,13 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
 
 
 def item_id(item: dict) -> str:
-    return findings_queue.derive_finding_id(item["check"], item["project"], item["cluster"], item["namespace"], item["object"])
+    """The id the queue gives this row, from the validator that computes it,
+    so the record and the queue never key one finding two ways; a row the
+    validator refuses keeps the plain derivation for its failure entry."""
+    try:
+        return findings_queue.validate_finding(payload(item))["id"]
+    except findings_queue.FindingError:
+        return findings_queue.derive_finding_id(item["check"], item["project"], item["cluster"], item["namespace"], item["object"])
 
 
 def severity_of(item: dict) -> str:
@@ -892,6 +920,7 @@ def summary(
                 "action": item["recommendation"]["action"],
                 "outcome": outcomes.get(fid, ""),
                 ROW_MEMBER_KEY: item[MEMBER_FIELD],
+                ROW_MEMBERS_KEY: list(item.get(MEMBERS_FIELD) or [item[MEMBER_FIELD]]),
             }
         )
     counts = {severity: sum(1 for r in rows if r["severity"] == severity) for severity in SEVERITY_ORDER}
@@ -964,7 +993,8 @@ def render_report(summary_doc: dict, findings: list[dict], tables: dict[str, str
     ]
     rows_by_cluster: dict[str, list[dict]] = {}
     for row in summary_doc["findings"]:
-        rows_by_cluster.setdefault(row[ROW_MEMBER_KEY], []).append(row)
+        for member in row.get(ROW_MEMBERS_KEY) or [row[ROW_MEMBER_KEY]]:
+            rows_by_cluster.setdefault(member, []).append(row)
     verdict_of = {}
     for name, key in ((watch.READINESS_BLOCKED, watch.READINESS_BLOCKED), (watch.READINESS_READY, watch.READINESS_READY), (watch.READINESS_UNKNOWN, watch.READINESS_UNKNOWN), ("not read", UNREAD_KEY)):
         for member in clusters[key]:
@@ -990,7 +1020,7 @@ def render_report(summary_doc: dict, findings: list[dict], tables: dict[str, str
             f"### [{row['severity']}] {row['title']}",
             "",
             f"- Id: `{row['id']}` ({row['outcome'] or 'not registered'})",
-            f"- Where: {row[ROW_MEMBER_KEY]}" + (f", namespace {row['namespace']}" if row["namespace"] else "") + f", {row['object']}",
+            f"- Where: {', '.join(row.get(ROW_MEMBERS_KEY) or [row[ROW_MEMBER_KEY]])}" + (f", namespace {row['namespace']}" if row["namespace"] else "") + f", {row['object']}",
             f"- Evidence: {item.get('detail') or '-'}",
             f"- Do: {row['action']}",
             f"- Verify: {(item.get('verification') or {}).get('command') or '-'}",
@@ -1126,6 +1156,14 @@ def copy_to_sandbox(report_md: str, summary_doc: dict) -> str | None:
 # --- the tick ---------------------------------------------------------------------
 
 
+def shown(entries: list[str], limit: int) -> str:
+    """The first ``limit`` entries, then how many more the record holds: a chat
+    line names a few, never a fleet."""
+    if len(entries) <= limit:
+        return PARTIAL_DETAIL_SEPARATOR.join(entries)
+    return PARTIAL_DETAIL_SEPARATOR.join(entries[:limit] + [OVERFLOW_NOTE.format(count=len(entries) - limit)])
+
+
 def failure_signature(detail: str) -> str:
     return FAILURE_DIGITS.sub(FAILURE_DIGIT_MARK, detail)
 
@@ -1180,7 +1218,7 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
         claimed.update(done)
 
     members, errors, tables, failures = run_projects(ordered_names(names, previous), scope, on_project=registered)
-    if not members and failures:
+    if failures and len(failures) == len(set(names)):
         raise RuntimeError("; ".join(f"{p}: {d}" for p, d in failures.items()))
     report_path = home / stamp / REPORT_MD_NAME
     summary_doc = summary(
@@ -1207,11 +1245,12 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
     # zero-exit script: findings off the queue and a copy the brief cannot read
     # are the week's failures even when the record was written.
     if problems:
-        lines.append(REGISTRATION_FAILED_LINE.format(prefix=LOG_PREFIX, count=len(problems), detail=PARTIAL_DETAIL_SEPARATOR.join(problems)))
+        failed_rows = sum(1 for outcome in outcomes.values() if outcome == REGISTRATION_FAILED)
+        lines.append(REGISTRATION_FAILED_LINE.format(prefix=LOG_PREFIX, count=failed_rows, detail=shown(problems, MAX_PROBLEMS_IN_LINE)))
     if copy_error:
         lines.append(COPY_FAILED_LINE.format(prefix=LOG_PREFIX, detail=copy_error))
     if failures:
-        detail = PARTIAL_DETAIL_SEPARATOR.join(f"{p}: {d}" for p, d in failures.items())
+        detail = shown([f"{p}: {d}" for p, d in failures.items()], MAX_NAMES_IN_LINE)
         lines.append(PARTIAL_LINE.format(prefix=LOG_PREFIX, count=len(failures), detail=detail))
     return lines, 0
 
