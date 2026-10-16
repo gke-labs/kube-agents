@@ -410,6 +410,38 @@ var nonDeclarativeSubresources = map[string]bool{
 	"token":               true,
 }
 
+// coordinationConfigMaps are ConfigMap names used strictly for runtime
+// coordination that are never declared in a GitOps repository.
+//
+// The primary case is "live-test-lease", which scripts/live_test_lease.py
+// creates and updates under contributor credentials during live validation
+// (docs/designs/live-test-lease.md). Because contributors authenticate as
+// humans, these writes are classified as TierHuman, but they represent
+// developer locking rather than GitOps drift.
+var coordinationConfigMaps = map[string]bool{
+	"live-test-lease": true,
+}
+
+// defaultSystemNamespace is kube-agents' default release namespace.
+const defaultSystemNamespace = "kubeagents-system"
+
+// isCoordinationResource reports whether ref names an in-cluster coordination
+// object that is managed dynamically at runtime rather than declared in Git.
+func isCoordinationResource(ref ResourceRef) bool {
+	// The live-test lease ConfigMap (or Lease) in any namespace (normally kubeagents-system).
+	if (ref.Group == "" || ref.Group == coreGroupAlias) && ref.Resource == "configmaps" && coordinationConfigMaps[ref.Name] {
+		return true
+	}
+	if ref.Resource == "leases" && ref.Name == "live-test-lease" {
+		return true
+	}
+	// Coordination leases in kube-agents' own system namespace.
+	if ref.Namespace == defaultSystemNamespace && ref.Group == "coordination.k8s.io" && ref.Resource == "leases" {
+		return true
+	}
+	return false
+}
+
 // TierCounts is the per-tier tally, plus the records dropped before a tier
 // could act on them.
 type TierCounts struct {
@@ -641,6 +673,14 @@ func (d *driftFilter) tally(ctx context.Context, record AuditRecord) {
 		d.counts.NonDeclarative++
 		if d.logDropped {
 			logDroppedRecord(record, tier, fmt.Sprintf("subresource %q changes no declarative state", record.Resource.Subresource))
+		}
+		return
+	}
+
+	if isCoordinationResource(record.Resource) {
+		d.counts.NonDeclarative++
+		if d.logDropped {
+			logDroppedRecord(record, tier, fmt.Sprintf("resource %q is a coordination object that changes no declarative state", record.Resource.String()))
 		}
 		return
 	}

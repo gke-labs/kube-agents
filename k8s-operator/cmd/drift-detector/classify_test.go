@@ -531,6 +531,79 @@ func TestDriftFilterDropsNonDeclarativeSubresources(t *testing.T) {
 	}
 }
 
+// TestDriftFilterDropsCoordinationResources pins issue #3353: scripts/live_test_lease.py
+// creates and updates the "live-test-lease" ConfigMap under contributor credentials
+// during live testing. Even though the principal is human, coordination objects are
+// ephemeral developer synchronization and not GitOps drift. They must be dropped as
+// non-declarative rather than forwarded to join or inject.
+func TestDriftFilterDropsCoordinationResources(t *testing.T) {
+	human := "jayantid@google.com"
+
+	records := []AuditRecord{
+		// The live-test lease ConfigMap in kubeagents-system.
+		{
+			Principal: human,
+			Resource: ResourceRef{
+				Version:   "v1",
+				Namespace: "kubeagents-system",
+				Resource:  "configmaps",
+				Name:      "live-test-lease",
+			},
+		},
+		// The live-test lease in another namespace (custom install namespace).
+		{
+			Principal: human,
+			Resource: ResourceRef{
+				Version:   "v1",
+				Namespace: "custom-system",
+				Resource:  "configmaps",
+				Name:      "live-test-lease",
+			},
+		},
+		// Coordination lease in kubeagents-system.
+		{
+			Principal: human,
+			Resource: ResourceRef{
+				Group:     "coordination.k8s.io",
+				Version:   "v1",
+				Namespace: "kubeagents-system",
+				Resource:  "leases",
+				Name:      "kube-agents-operator-leader-election",
+			},
+		},
+	}
+
+	var forwarded []AuditRecord
+	filter := newDriftFilter(NewClassifier("", ""), func(_ context.Context, r AuditRecord) { forwarded = append(forwarded, r) }, false)
+
+	for _, r := range records {
+		filter.Handle(context.Background(), r)
+	}
+
+	// Normal declarative write by the same human to show the filter keys on the
+	// coordination object rather than the namespace or configmaps in general.
+	filter.Handle(context.Background(), AuditRecord{
+		Principal: human,
+		Resource: ResourceRef{
+			Version:   "v1",
+			Namespace: "kubeagents-system",
+			Resource:  "configmaps",
+			Name:      "platform-agent-config",
+		},
+	})
+
+	counts := filter.Counts()
+	if counts.NonDeclarative != 3 {
+		t.Errorf("NonDeclarative = %d, want 3", counts.NonDeclarative)
+	}
+	if counts.Actionable != 1 {
+		t.Errorf("Actionable = %d, want 1", counts.Actionable)
+	}
+	if len(forwarded) != 1 || forwarded[0].Resource.Name != "platform-agent-config" {
+		t.Fatalf("forwarded = %+v, want only platform-agent-config write", forwarded)
+	}
+}
+
 // TestClassifierHumanDomainsAreCaseInsensitive pins the normalisation in
 // NewClassifier. DNS is case-insensitive and GCP lower-cases principalEmail, so
 // a miscased --human-domains value must still match. Unnormalised, this sends
@@ -592,6 +665,7 @@ func TestDriftFilterLogDroppedDoesNotPanic(t *testing.T) {
 		{Principal: "system:kube-scheduler"},
 		{Principal: "bob@example.com", StatusCode: 7, StatusMessage: "PERMISSION_DENIED"},
 		{Principal: "ada@example.com", Resource: ResourceRef{Version: "v1", Resource: "pods", Name: "api-0", Subresource: "exec"}},
+		{Principal: "ada@example.com", Resource: ResourceRef{Version: "v1", Namespace: "kubeagents-system", Resource: "configmaps", Name: "live-test-lease"}},
 		{Principal: "ada@example.com", Resource: ResourceRef{Version: "v1", Resource: "pods", Name: "api-0"}},
 	}
 	for _, r := range records {
@@ -599,8 +673,8 @@ func TestDriftFilterLogDroppedDoesNotPanic(t *testing.T) {
 	}
 
 	counts := filter.Counts()
-	if counts.Failed != 1 || counts.NonDeclarative != 1 || counts.Actionable != 1 {
-		t.Errorf("failed=%d non_declarative=%d actionable=%d, want 1/1/1",
+	if counts.Failed != 1 || counts.NonDeclarative != 2 || counts.Actionable != 1 {
+		t.Errorf("failed=%d non_declarative=%d actionable=%d, want 1/2/1",
 			counts.Failed, counts.NonDeclarative, counts.Actionable)
 	}
 }
