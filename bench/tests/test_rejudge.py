@@ -1,0 +1,164 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""A missing gated judged score is asked for once more from the saved answer.
+
+The record shape is a trimmed copy of a real ``results.json`` from smoke build
+2110857783178956800 (#3138, ``reliability-pdb-probe`` rep 1), the repetition
+whose missing ``OutcomeValidity`` left rung 6 averaging one score.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from kube_agents_bench import rejudge
+from kube_agents_bench.scoring import INFRA_FAILURE_MARKER
+
+GATED = ("OutcomeValidity",)
+
+
+def _record(**overrides):
+    record = {
+        "input": "Find the cluster checkout-gateway runs on and report whether it survives a node drain.",
+        "output": "checkout-gateway runs on seeded-a with 2 replicas and no PodDisruptionBudget.",
+        "expected_output": "Names seeded-a and the missing PodDisruptionBudget.",
+        "trajectory": [],
+        "error": None,
+        "errors": [],
+        "generation_only": False,
+        "scores": {
+            "ToolInvocation": {"score": 1.0, "success": True, "reason": "ok"},
+            "VerificationCorrectness": 1.0,
+            "OutcomeScore": {"score": 1.0, "version": "v1", "reason": "c=1.000"},
+        },
+    }
+    record.update(overrides)
+    return record
+
+
+def _scored(score):
+    return lambda record, judge: {"score": score, "success": True, "reason": "re-judged"}
+
+
+class _QuotaError(Exception):
+    pass
+
+
+def _raising(record, judge):
+    try:
+        raise _QuotaError("429 RESOURCE_EXHAUSTED")
+    except _QuotaError as cause:
+        raise RuntimeError("judge call failed") from cause
+
+
+def _no_judge():
+    raise AssertionError("the judge was built for a record that needed none")
+
+
+def test_a_missing_score_is_filled_and_marked():
+    record = _record()
+    lines = rejudge.rejudge_record(record, GATED, object, {"OutcomeValidity": _scored(0.8)})
+    assert record["scores"]["OutcomeValidity"]["score"] == 0.8
+    assert record[rejudge.REJUDGED_KEY] == ["OutcomeValidity"]
+    assert rejudge.JUDGE_ERRORS_KEY not in record
+    assert lines == ["OutcomeValidity: re-judged, score 0.8"]
+
+
+def test_a_present_score_is_never_judged_again():
+    record = _record()
+    record["scores"]["OutcomeValidity"] = {"score": 0.4, "success": False, "reason": "first pass"}
+    assert rejudge.rejudge_record(record, GATED, _no_judge, {"OutcomeValidity": _scored(1.0)}) == []
+    assert record["scores"]["OutcomeValidity"]["score"] == 0.4
+    assert rejudge.REJUDGED_KEY not in record
+
+
+def test_a_second_failure_records_the_exception_and_its_root():
+    record = _record()
+    lines = rejudge.rejudge_record(record, GATED, object, {"OutcomeValidity": _raising})
+    assert "OutcomeValidity" not in record["scores"]
+    error = record[rejudge.JUDGE_ERRORS_KEY]["OutcomeValidity"]
+    assert error["type"] == "builtins.RuntimeError"
+    assert error["root_type"].endswith("._QuotaError")
+    assert error["message"] == "judge call failed"
+    assert "still missing after a re-judge" in lines[0]
+
+
+def test_an_infrastructure_record_is_left_alone():
+    record = _record(errors=[f"{INFRA_FAILURE_MARKER}: transport exhausted"])
+    assert rejudge.rejudge_record(record, GATED, _no_judge, {"OutcomeValidity": _scored(1.0)}) == []
+    assert "OutcomeValidity" not in record["scores"]
+
+
+def test_a_record_with_no_scores_is_left_alone():
+    record = _record(scores={})
+    assert rejudge.rejudge_record(record, GATED, _no_judge, {"OutcomeValidity": _scored(1.0)}) == []
+
+
+def test_a_gated_metric_without_a_rejudger_is_reported_not_raised():
+    record = _record()
+    lines = rejudge.rejudge_record(record, ("Grounding",), _no_judge, {})
+    assert lines == ["Grounding: missing, and there is no re-judge for it"]
+
+
+def test_the_file_is_rewritten_only_when_something_changed(tmp_path: Path):
+    complete = _record()
+    complete["scores"]["OutcomeValidity"] = {"score": 1.0, "success": True, "reason": "ok"}
+    path = tmp_path / "results.json"
+    original = json.dumps([complete])
+    path.write_text(original, encoding="utf-8")
+    assert rejudge.rejudge_file(path, GATED, _no_judge) == []
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_the_file_keeps_its_shape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setitem(rejudge.REJUDGERS, "OutcomeValidity", _scored(0.9))
+    path = tmp_path / "results.json"
+    path.write_text(json.dumps([_record()]), encoding="utf-8")
+    rejudge.rejudge_file(path, GATED, object)
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(written, list)
+    assert written[0]["scores"]["OutcomeValidity"]["score"] == 0.9
+
+
+def test_outcome_validity_measures_the_outcome_case_of_the_saved_record(monkeypatch: pytest.MonkeyPatch):
+    # The real devops-bench context builder, a stand-in metric: proves the
+    # pinned devops-bench still has the two names this module reaches for and
+    # that the metric is handed the record's own answer.
+    import devops_bench.metrics.outcome_validity as outcome_validity
+
+    seen = {}
+
+    class _Metric:
+        score = 0.7
+        reason = "grounded"
+
+        def measure(self, case):
+            seen["output"] = case.actual_output
+
+        def is_successful(self):
+            return True
+
+    monkeypatch.setattr(outcome_validity, "build_outcome_validity_metric", lambda judge, generation_only: _Metric())
+    entry = rejudge._outcome_validity(_record(), object())
+    assert entry == {"score": 0.7, "success": True, "reason": "grounded"}
+    assert seen["output"] == _record()["output"]
+
+
+def test_main_reports_an_unreadable_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    assert rejudge.main([str(tmp_path / "absent.json")]) == rejudge.EXIT_UNREADABLE
+    assert "cannot read" in capsys.readouterr().err
