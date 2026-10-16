@@ -960,7 +960,7 @@ def _worker_commands(logs: dict[str, _WorkerLog | None] | None) -> list[dict[str
         for idx, line in enumerate(lines):
             match = _WORKER_COMMAND_RE.search(line)
             if match:
-                if is_truncated and idx == len(lines) - 1:
+                if is_truncated and idx == len(lines) - 1 and not log.body.endswith("\n"):
                     exit_code = None
                 else:
                     exit_str = match.group("exit")

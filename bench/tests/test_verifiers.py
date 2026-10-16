@@ -8396,6 +8396,24 @@ def test_worker_commands_required_run_succeeded_with_after_result_pattern():
     transcript.set("ok", traj_multiline_and)
     assert v.verify(5.0).status == "pass"
 
+    # Multiline with preceding || continuation newline fails under succeeded: true as preceding || chain.
+    traj_multiline_or = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"test -f /tmp/o.json ||\npython3 {_SCRIPT_PATH} --readiness"}, "result": "done", "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj_multiline_or)
+    res_or = v.verify(5.0)
+    assert res_or.status == "fail" and "in an '||' chain whose exit may not be the command's" in res_or.reason
+
+    # Trajectory entry with \n followed by command fails under succeeded: true as masked by trailing \n.
+    traj_multiline_cmd = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness\necho done"}, "result": "done", "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj_multiline_cmd)
+    res_cmd = v.verify(5.0)
+    assert res_cmd.status == "fail" and "masked by a trailing '\\n'" in res_cmd.reason
+
     # Trajectory entry with status="error" fails.
     traj_error = [
         {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},

@@ -199,6 +199,11 @@ def test_collector_run_masked_by_trailing_pipe_or_operator_is_not_credited():
     assert not res_semi.success
     assert "masked by a trailing ';'" in res_semi.reason
 
+    cmd_semi_redirect = f"python3 {COLLECT} compliance-audit; > /tmp/marker"
+    res_sr = _verify(_check(COLLECTOR_CHECK), cmd_semi_redirect, exit_code=0)
+    assert not res_sr.success
+    assert "masked by a trailing ';'" in res_sr.reason
+
     cmd_bg = f"nohup python3 {COLLECT} compliance-audit > /tmp/o.json 2>&1 &"
     res_bg = _verify(_check(COLLECTOR_CHECK), cmd_bg, exit_code=0)
     assert not res_bg.success
@@ -276,11 +281,26 @@ def test_collector_run_masked_by_trailing_pipe_or_operator_is_not_credited():
     assert not res_po.success
     assert "in an '||' chain whose exit may not be the command's" in res_po.reason
 
+    cmd_preceding_or_subshell = f"test -f /tmp/o.json || (python3 {COLLECT} compliance-audit)"
+    res_pos = _verify(_check(COLLECTOR_CHECK), cmd_preceding_or_subshell, exit_code=0)
+    assert not res_pos.success
+    assert "in an '||' chain whose exit may not be the command's" in res_pos.reason
+
+    cmd_preceding_or_subshell_chained = f"test -f /tmp/o.json || (cd /x && python3 {COLLECT} compliance-audit)"
+    res_posc = _verify(_check(COLLECTOR_CHECK), cmd_preceding_or_subshell_chained, exit_code=0)
+    assert not res_posc.success
+    assert "in an '||' chain whose exit may not be the command's" in res_posc.reason
+
     # Leading ! inverts the command exit code.
     cmd_bang = f"! python3 {COLLECT} compliance-audit"
     res_bang = _verify(_check(COLLECTOR_CHECK), cmd_bang, exit_code=0)
     assert not res_bang.success
     assert "inverted by '!'" in res_bang.reason
+
+    cmd_bang_subshell = f"! (python3 {COLLECT} compliance-audit)"
+    res_bs = _verify(_check(COLLECTOR_CHECK), cmd_bang_subshell, exit_code=0)
+    assert not res_bs.success
+    assert "inverted by '!'" in res_bs.reason
 
     # Brace group with required semicolon before closing brace.
     cmd_brace = f"{{ python3 {COLLECT} compliance-audit; }} > /tmp/o.json"
@@ -291,6 +311,9 @@ def test_collector_run_masked_by_trailing_pipe_or_operator_is_not_credited():
 
     cmd_subshell = f'(cd /x && python3 {COLLECT} compliance-audit) > /tmp/o.json'
     assert _passes(_check(COLLECTOR_CHECK), cmd_subshell, exit_code=0)
+
+    cmd_subshell_semi = f'(python3 {COLLECT} compliance-audit;) > /tmp/o.json'
+    assert _passes(_check(COLLECTOR_CHECK), cmd_subshell_semi, exit_code=0)
 
     # Chained && is credited when typed verbatim (as on the trajectory transport),
     # but refused on the card-log transport when collapsed into '+ 1 command'.

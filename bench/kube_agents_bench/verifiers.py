@@ -2212,12 +2212,10 @@ def _is_bare_assignment_argv(argv: list[str]) -> bool:
 def _is_terminator(w: str, k: int, words: list[str]) -> bool:
     if w not in (";", _SHELL_LINE_END):
         return False
-    # Check if there are no subsequent command words, or the immediately next closing delimiter is '}'
+    # Check if there are no subsequent command words, or the immediately next closing delimiter is '}' or ')'
     for j in range(k + 1, len(words)):
         wj = words[j]
-        if _is_control_operator(wj):
-            continue
-        if _is_redirect(wj) or (j > 0 and _is_redirect(words[j - 1])):
+        if wj == _SHELL_LINE_END:
             continue
         if wj in ("}", ")"):
             return True
@@ -2255,14 +2253,27 @@ def _shell_argvs_with_operators(
         # Preceding operators: check if preceding || or ! stands in the segment's enclosing list.
         for k in range(first_idx - 1, -1, -1):
             w = words[k]
-            if w in (";", _SHELL_LINE_END, "&", "(", ")"):
+            if not isinstance(w, _ShellOperator):
+                continue
+            if w == _SHELL_LINE_END and k > 0 and _is_control_operator(words[k - 1]) and words[k - 1] != ")":
+                continue
+            if w in (";", _SHELL_LINE_END, "&", ")"):
                 break
+            if w == "(":
+                continue
             if w == "||":
                 ops.append("preceding ||")
                 break
-        if (seg_argv and seg_argv[0] == "!") or any(
-            words[k] == "!" for k in range(max(0, first_idx - 1), first_idx)
-        ):
+        has_bang = bool(seg_argv and seg_argv[0] == "!")
+        if not has_bang:
+            for k in range(first_idx - 1, -1, -1):
+                w = words[k]
+                if w in ("(", _SHELL_LINE_END):
+                    continue
+                if w == "!":
+                    has_bang = True
+                break
+        if has_bang:
             ops.append("!")
 
         for k in range(last_idx + 1, len(words)):

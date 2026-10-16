@@ -126,6 +126,15 @@ def test_worker_log_exceeding_max_bytes_marks_cut_last_line_exit_none():
     rows3 = harness._worker_commands({"t_exact": exact_log})
     assert rows3 == [{"task": "t_exact", "command": "echo complete", "exit": 0}]
 
+    # When truncation lands exactly on a newline, the last line is complete and keeps its parsed exit.
+    newline_log = harness._WorkerLog(
+        body="  ┊ 💻 $         echo done  0.1s [exit 0]\n",
+        mtime="1758579012",
+        size=str(harness._MAX_WORKER_LOG_BYTES + 10),
+    )
+    rows4 = harness._worker_commands({"t_nl": newline_log})
+    assert rows4 == [{"task": "t_nl", "command": "echo done", "exit": 0}]
+
 
 def test_the_read_returns_text_when_the_output_is_cut_inside_a_glyph(monkeypatch):
     # ``head -c`` can cut a transcript between the bytes of one character. The
