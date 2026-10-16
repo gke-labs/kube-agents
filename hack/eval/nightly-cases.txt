@@ -1074,3 +1074,8 @@
 # deployer: noop, read-only, no fixture: three units at the 200s default,
 # ~10 serial minutes, off the infra lock, main nightly part.
 ./tasks/observability-trace-latency-brokered/task.yaml
+
+# #3371: a zonal seeded cluster asked about by its region must be found, not
+# declared absent. deployer: noop, read-only, one fixture role; three units at
+# the 200s default, main nightly part.
+./tasks/fleet-zonal-cluster-named-by-region/task.yaml
