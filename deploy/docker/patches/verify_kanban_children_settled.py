@@ -21,6 +21,11 @@ worker claims it seconds later; after the patch the block is refused and the
 card stays with its worker. A ``needs_input`` block and a dependency block that
 has something to wait on still go through.
 
+Last it replays #2935 (card ``t_bb95580d``): a card that declares its steps,
+one done and one failed. The completion is refused, again on the retry, and
+the card leaves through a ``needs_input`` block rather than ``done``; a card
+whose steps are all done completes.
+
 Usage::
 
     cd /opt/hermes && python3 verify_kanban_children_settled.py
@@ -283,6 +288,64 @@ check(
     "kanban_block refused" not in lost,
     lost,
 )
+
+# --- 9. The #2935 replay: declared steps hold a card whose install failed -----
+print("the #2935 step replay:")
+
+
+def tool_comment(task_id, body, profile="platform"):
+    # The dispatcher sets HERMES_PROFILE to the card's assignee for its worker;
+    # the handler stamps it as the comment's author. The front door is
+    # ``default``.
+    os.environ["HERMES_PROFILE"] = profile
+    try:
+        out = json.loads(kt._handle_comment({"task_id": task_id, "body": body}))
+    finally:
+        os.environ.pop("HERMES_PROFILE", None)
+    if not out.get("ok"):
+        raise AssertionError(f"kanban_comment failed: {out}")
+
+
+check(
+    "the complete handler resolved the step gate import",
+    hasattr(kt, "_require_steps_settled"),
+    "the trailer import did not execute",
+)
+os.environ.pop("HERMES_KANBAN_TASK", None)
+provision = tool_create(
+    title="Provision new GKE cluster with Agent Substrate installed",
+    body="Create the cluster through a pull request.\nstep cluster: planned\nstep substrate: planned",
+)["task_id"]
+K.claim_task(conn, provision)
+os.environ["HERMES_KANBAN_TASK"] = provision
+tool_comment(provision, "step cluster: done")
+tool_comment(provision, "step substrate: failed - the sandbox has no cluster credentials for helm")
+INCIDENT = "Created the cluster; reported connection context and Agent Substrate installation status."
+held = tool_complete(result=INCIDENT)
+check("completing over a failed step is refused", "kanban_complete refused" in held, held)
+check("the refusal names the failed step", "substrate (failed)" in held, held)
+check("the card stays open", status(provision) == "running", f"status={status(provision)}")
+again = tool_complete(result=INCIDENT)
+check("the refusal is not rationed: the retry is refused too", "kanban_complete refused" in again, again)
+tool_comment(provision, "step substrate: done", profile="default")
+relayed = tool_complete(result=INCIDENT)
+check(
+    "a step line the front door relays does not count",
+    "substrate (failed)" in relayed,
+    relayed,
+)
+blocked = tool_block("needs_input", reason="substrate not installed; cluster c1 created, delete with ...")
+check("a needs_input block is the way out", "refused" not in blocked, blocked)
+check("the card ends blocked, not done", status(provision) == "blocked", f"status={status(provision)}")
+
+os.environ.pop("HERMES_KANBAN_TASK", None)
+delivered = tool_create(title="Provision, delivered", body="step cluster: planned")["task_id"]
+K.claim_task(conn, delivered)
+os.environ["HERMES_KANBAN_TASK"] = delivered
+tool_comment(delivered, "step cluster: done")
+closed = tool_complete(result="Opened the pull request that adds the cluster.")
+check("every step done completes", "refused" not in closed, closed)
+check("the delivered card closed", status(delivered) == "done", f"status={status(delivered)}")
 
 print()
 if FAILURES:

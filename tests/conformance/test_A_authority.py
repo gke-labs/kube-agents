@@ -548,7 +548,10 @@ class A3TheGatewaysSlackPrincipalComesFromSlackOrTheMap(unittest.TestCase):
 
     def test_A3_another_workspaces_member_is_not_a_turn(self) -> None:
         source = h.text("a2a_slack_ingress")
-        inbound = h.go_function_body(source, "inbound")
+        # inbound is a wrapper; the event pump and it both reach inboundEvent,
+        # which carries the admission rule (gke-labs/kube-agents#3246).
+        self.assertIn('return s.inboundEvent(ctx, m, "")', h.go_function_body(source, "inbound"))
+        inbound = h.go_function_body(source, "inboundEvent")
         self.assertRegex(
             inbound,
             r"if s\.foreignSender\(m\) \{\s*return InboundMessage\{\}, false",

@@ -169,6 +169,17 @@ readonly EVAL_GATEWAY_PYTHON="/opt/hermes/.venv/bin/python3"
 readonly EVAL_GATEWAY_HOME="/opt/data"
 readonly EVAL_PLATFORM_RUN_WAIT_SECONDS=7200
 readonly EVAL_PLATFORM_RUN_POLL_SECONDS=30
+# A gateway Deployment kubectl cannot find is an install that is gone, not a
+# pod rolling: on 2026-10-15 a run whose project an earlier tenant's ceiling
+# teardown had emptied retried the exec above every 30 s for the two hours,
+# per repetition (#3129). wait_platform_runs returns EVAL_GATEWAY_GONE_RC at
+# the first such answer; run_one_unit records the repetition as
+# infrastructure, never launches against the missing install, and latches
+# EVAL_INSTALL_GONE_MARKER under STATE_DIR so every later unit, streams or
+# none, records the same way without the exec.
+readonly EVAL_GATEWAY_NOT_FOUND_RE='deployments(\.apps)? "[^"]+" not found'
+readonly EVAL_GATEWAY_GONE_RC=76
+readonly EVAL_INSTALL_GONE_MARKER="install-gone"
 # scheduled_audits: how long one exec that pauses or resumes the clock-started audits
 # may take. Each is a `hermes cron` call of a few seconds, bounded at 30s by the
 # script, so five stalled calls still finish and name themselves inside this.
@@ -1449,7 +1460,8 @@ release_inflight_note() { # <label> <audit-id>
 # not name PROJECT_ID, as release_inflight_note is. Called once the unit holds
 # its stream locks and before the infra lock, so no other unit on the stream
 # starts during the wait and no tofu unit queues behind it.
-# Returns 0 whatever happens; the reason it could not wait is printed.
+# Returns 0 whatever happens, the reason it could not wait printed, with one
+# exception: EVAL_GATEWAY_GONE_RC when the gateway Deployment is not found.
 wait_platform_runs() { # <label> <space-separated audit ids>
   local label="$1" streams="$2" ns ctx out rc=0
   ns="${TARGET_NAMESPACE:-}"
@@ -1484,6 +1496,10 @@ wait_platform_runs() { # <label> <space-separated audit ids>
       return 0
     fi
     [ "${rc}" -eq 124 ] && out="timed out after $((left + EVAL_SANDBOX_EXEC_ROUND_TRIP_SECONDS))s${out:+; ${out}}"
+    if grep -Eq "${EVAL_GATEWAY_NOT_FOUND_RE}" <<<"${out}"; then
+      echo "WARNING: Platform runs (${label}): ${ns}/${AGENT_SERVICE_NAME}-gateway is gone (${out}); the install was removed from under this run, which no retry mends (#3129)" >&2
+      return "${EVAL_GATEWAY_GONE_RC}"
+    fi
     if [ "$((deadline - SECONDS))" -le 0 ]; then
       echo "WARNING: Platform runs (${label}): kubectl exec into ${ns}/${AGENT_SERVICE_NAME}-gateway exited ${rc} (${out}); stopped waiting on ${streams} after ${EVAL_PLATFORM_RUN_WAIT_SECONDS}s" >&2
       return 0
@@ -2676,6 +2692,9 @@ unit_cost_hint() {
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
+    # A plain chat request that runs the compliance collector's sweep (#2386):
+    # the audit band, without the ledger write.
+    security-chat-request-runs-collector) echo 900 ;;
     # Presubmit again since 2026-09-29, held out (#2013 step 2); nightly-only
     # 2026-09-22 to then (#1023; held out on #1171, closed 2026-09-08, the
     # bar now on #2013 step 3). The canary measured 1002s median, 2074s p90,
@@ -3252,7 +3271,31 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     fi
     held="${held} ${s}"
   done
-  wait_platform_runs "${name} rep ${rep}" "${streams}"
+  # The install gone from under the run (#3129): the repetition is recorded
+  # as infrastructure and never launched, and the state is latched so the
+  # units after this one skip the exec and record the same way; the last of a
+  # case's units grades it. Unwound here rather than through skip_unit: no
+  # state or infra lock is held yet, and skip_unit releases the case's state
+  # lock, which another unit sharing it may hold at this moment.
+  local wait_rc=0 gone_reps=0
+  if [ -e "${STATE_DIR}/${EVAL_INSTALL_GONE_MARKER}" ]; then
+    wait_rc="${EVAL_GATEWAY_GONE_RC}"
+  else
+    wait_platform_runs "${name} rep ${rep}" "${streams}" || wait_rc=$?
+  fi
+  if [ "${wait_rc}" -eq "${EVAL_GATEWAY_GONE_RC}" ]; then
+    : >"${STATE_DIR}/${EVAL_INSTALL_GONE_MARKER}"
+    record_unit_not_run "${name}" "${rep}" \
+      "the gateway Deployment ${TARGET_NAMESPACE:-}/${AGENT_SERVICE_NAME:-}-gateway was not found before launch; the install is gone from the leased project (#3129)"
+    gone_reps="$(finished_rep_count "${name}")"
+    release_streams "${streams}"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: the install's gateway is gone" >&2
+    if [ "${gone_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+      finish_case "${task}" "${name}"
+    fi
+    return 0
+  fi
   # A unit without the infra lock waits for its state lock here, once its
   # stream waits are over, so it holds the state only while its stack is in
   # use; a stack-bearing one takes it with the infra lock, below.

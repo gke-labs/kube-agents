@@ -37,7 +37,8 @@ writes six pages and two data files into ``out/``:
   evidence store (``--store``, the ``store.json`` ``store.py`` wrote): per
   case and per domain, the pass rate by night with the trailing admission
   window beside it, the judged quality by night with the spread the store
-  can support, and the nights where the version key changed marked
+  can support, and the nights where the version key changed marked; under
+  each, the latency row from the nightly runs in ``data.json``
   (``trend.py``). Without ``--store`` the page says the store was not read.
 * ``brief.json`` -- what the six pages render from: the per-run
   classification, the per-case record, the current health verdict, the

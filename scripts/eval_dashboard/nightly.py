@@ -151,9 +151,10 @@ REP_TURN1_S = "turn1_s"
 # median hides.
 SLOW_PCT = 90
 # The end-state target for a chat turn, "p95 < 10 s for read/plan"
-# (docs/architecture/05-system-architecture.md, "Chat turn latency"). The
-# digest and the page show the night's turn-1 p95 beside it as advice only:
-# nothing gates on it.
+# (docs/architecture/05-system-architecture.md, "Chat turn latency"), on the
+# TURN1_TARGET_PCT percentile. The digest and the pages show the turn-1 p95
+# beside it as advice only: nothing gates on it.
+TURN1_TARGET_PCT = 95
 TURN1_P95_TARGET_S = 10
 
 UTC = datetime.timezone.utc
@@ -665,7 +666,7 @@ def joined_night_document(night: dict[str, dict], data: dict, previous: dict[str
         # The opening chat turn over every rep of the night that is not
         # infra; advisory beside TURN1_P95_TARGET_S, never a verdict.
         "turn1_p50_s": percentile(turn1, 50),
-        "turn1_p95_s": percentile(turn1, 95),
+        "turn1_p95_s": percentile(turn1, TURN1_TARGET_PCT),
         "cases": cases,
     }
 

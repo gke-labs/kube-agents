@@ -520,9 +520,10 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   repository must name a declared forge.
   `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
   alias for one GitHub forge and its gitops repository — set the lists or the
-  alias, not both. For a GitHub GitOps repository, the alias is still what
+  alias, not both. For a github.com GitOps repository, the alias is still what
   `install.sh` and the `full-install` Terraform composition write. For a
-  GitLab GitOps repository, they write the `forges` and `repositories` lists. One GitHub forge with no
+  GitLab or GitHub Enterprise Server GitOps repository, they write the
+  `forges` and `repositories` lists. One GitHub forge with no
   `credentialsRef`, no `caBundleRef`, no host other than a spelling of
   github.com, and at most one repository, the gitops one, with no
   namespace of its own, renders as `github`, whichever key set it, because
@@ -599,6 +600,18 @@ chart's `crds/` before setting the value (`helm upgrade` does not, `upgrade.sh`
 does): against a CRD that predates `spec.deployment.credentialProxy`, the API
 server would prune the value silently while the release record kept it, so the
 chart looks up the installed CRD and fails the upgrade instead.
+
+`platformAgent.deployment.alertDailyLimits` sets the daily alert ceilings. Its keys are
+`critical`, `warning`, `info` and `drift`, and each key that is set becomes an
+`ALERT_DAILY_LIMIT_<KEY>` entry in the CR's `spec.deployment.env`. A key that is not set keeps the
+default in the agent image, and `0` removes the cap. An entry with the same name in
+`platformAgent.deployment.env` wins over the key. A `valueFrom` entry for a key that is set fails
+the render, because the operator forwards only literal values. Each apply that changes the env list
+that the chart renders replaces the full list on the CR, so entries added to the CR by hand are
+lost. Move them to `platformAgent.deployment.env` first. A re-tag to a chart without the value needs
+`upgrade.sh --drop-undeclared-values`. The
+[chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling) gives
+the buckets, the defaults and a sizing method.
 
 #### PlatformAgent annotations
 

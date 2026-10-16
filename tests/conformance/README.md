@@ -95,8 +95,9 @@ an absence is true of the empty set, so `_workflows()` in
 `test_B_write_path.py` raises on its behalf. C4's SHA-pin sweep keeps its own
 copy of the glob and guards it the same way. C4 is the invariant; its
 stricter form, which also requires the version comment beside each SHA and a
-digest on a `docker://` ref, and the fork-guard check on every auto-triggered
-credentialed workflow, run under `make test-python` in
+digest on a `docker://` ref, the fork-guard check on every auto-triggered
+credentialed workflow, and the check that every Docker Hub pull goes through
+`mirror.gcr.io`, run under `make test-python` in
 `tests/test_workflow_pins_and_fork_guards.py`.
 
 Another is the site's content tree, which D2 walks for the read-only
@@ -296,11 +297,11 @@ python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 harness itself, one pinning a deliberate redundancy in the shorthand
 handling), zero genuine survivors, zero stale — measured 2026-09-25 against
 this branch on `main` at `525b37e7`, plus `A3-slack-click-authorization`,
-KILLED when it was added on 2026-09-30, `D1-gateway-role-reaches-secrets` and
-`D1-platform-role-reaches-secrets`, both KILLED when they were added on 2026-10-05,
-the four `C1-a2a-gateway-*` mutations and the three `B1-slack-*` mutations, all
-KILLED when they were added on 2026-10-06, `B1-slack-method-shape-dropped`, KILLED
-when it was added on 2026-10-07, `A3-agent-answers-its-own-notify` (KILLED) and
+KILLED when it was added on 2026-09-30, `D1-platform-role-reaches-secrets`,
+KILLED when it was added on 2026-10-05, the four `C1-a2a-gateway-*` mutations and
+the three `B1-slack-*` mutations, all KILLED when they were added on 2026-10-06,
+`B1-slack-method-shape-dropped`, KILLED when it was added on 2026-10-07,
+`A3-agent-answers-its-own-notify` (KILLED) and
 `A3-bridge-sends-a-notify` (NOISY: it also trips the served-config precondition) when
 they were added on 2026-10-07, and `A3-session-sends-a-notify` (KILLED) on 2026-10-08, and
 `C4-skills-unchecked`, `C4-skills-check-silenced`, `C4-skills-check-skips-lock` and

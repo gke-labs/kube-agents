@@ -382,12 +382,15 @@ the message a week after the upgrade that brings it.
 
 Every other tick prints nothing and relays nothing, so once the message has
 landed the job costs one silent subprocess a day, like `github-repo-watcher`'s idle
-ticks. Two environment variables, set per install through the CR's
-`spec.deployment.env` and passed to the agent container by the operator's
-allowlist, are the whole configuration surface: `FEEDBACK_PROMPT_ENABLED`
+ticks. Two environment variables, set per install through the chart value
+`platformAgent.deployment.env` (on an `install.sh` install, a
+`TF_VAR_extra_helm_values` line in `install.env`; on a hand-driven Terraform
+apply, `extra_helm_values` in `terraform.tfvars`) and passed to the agent container by the
+operator's allowlist, are the whole configuration surface: `FEEDBACK_PROMPT_ENABLED`
 (default `true`; `false` neither arms nor claims, so an install that turns it
 on later still gets exactly one) and `FEEDBACK_PROMPT_DELAY` (default `7d`;
-`<n>d`, `<n>h` or `<n>m`). A delay that does not parse is a failed run, exit 1
+`<n>d`, `<n>h` or `<n>m`). A hand edit of the CR's `spec.deployment.env` can
+be lost at the next chart apply. A delay that does not parse is a failed run, exit 1
 with the reason on stderr, which the scheduler reports in chat like any other
 script failure until the value is fixed; it does not fall back, because the
 scheduler keeps a zero-exit script's stderr nowhere and a silent fallback
