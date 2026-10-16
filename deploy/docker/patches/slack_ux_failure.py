@@ -31,8 +31,8 @@ blocks. The line itself is plumbing and is never posted as text, on any chat pla
 (:func:`visible`, in the final's send); outside a thread nothing takes its place. A click is the clicker answering in the thread with the button's text
 (``gateway/slack_ux_clicks.py``), so the Planning Agent reads it as the user
 saying yes. The words are the agent's; only how they are drawn changes. The
-``text`` Slack keeps for notifications and for a later read of the thread is
-unchanged, question included.
+``text`` Slack keeps for notifications and for a later read of the thread keeps
+the question, and, like every chat final, has no step line.
 
 Which reply is the wake's: :func:`note_wake` marks the subscription's thread
 when a Slack wake carries ``blocked``, ``crashed``, ``timed_out`` or

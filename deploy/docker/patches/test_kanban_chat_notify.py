@@ -227,7 +227,9 @@ class SendTest(unittest.TestCase):
         return result, calls
 
     def test_the_posted_text_carries_no_step_line(self):
-        _result, calls = self._send(0, b"{}", text="- done\n\n[next: check seeded-a]")
+        # In the image slack_moments sits beside the gateway; here the scripts directory stands in.
+        with mock.patch.object(sys, "path", [str(Path(__file__).resolve().parents[3] / "agents" / "platform" / "scripts"), *sys.path]):
+            _result, calls = self._send(0, b"{}", text="- done\n\n[next: check seeded-a]")
         self.assertEqual(list(calls[0][0])[-2:], ["--", "- done"])
 
     def test_a_threaded_send_ends_the_flags_before_the_text(self):

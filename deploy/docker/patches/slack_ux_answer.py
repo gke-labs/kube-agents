@@ -432,10 +432,11 @@ class _AnswerFolder:
 def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) -> Any:
     """``adapter``, or one whose ``send`` posts a finished card's answer folded.
 
-    The folder is returned only with the flag on, on Slack, for a ``completed``
-    event bound for a chat, through an adapter rendering ``rich_blocks``. Whether
-    an answer folds is decided when it is sent, since that is when its text is
-    known. Everything else, including any error deciding, gets ``adapter`` itself.
+    The folder is returned with the flag on, on Slack, for a ``completed`` event
+    bound for a chat. Through an adapter rendering ``rich_blocks`` it folds; through
+    any other it only takes a declared step's line off the text. Whether an answer
+    folds is decided when it is sent, since that is when its text is known.
+    Everything else, including any error deciding, gets ``adapter`` itself.
     """
     try:
         if not enabled() or str(platform or "").lower() != SLACK:
