@@ -156,12 +156,12 @@ def rejudge_record(
 
 
 def _refresh_outcome_score(scores: dict[str, Any]) -> None:
-    from devops_bench.metrics.pipeline import _finalize_outcome_score
-
     try:
+        from devops_bench.metrics.pipeline import _finalize_outcome_score
+
         _finalize_outcome_score(scores)
-    except Exception:  # noqa: BLE001 - the composite is reported, never gated
-        pass
+    except Exception as exc:  # noqa: BLE001 - the composite is reported, never gated
+        print(f"rejudge: OutcomeScore not recomputed ({type(exc).__name__}: {exc})", file=sys.stderr)
 
 
 def rejudge_file(
@@ -180,8 +180,12 @@ def rejudge_file(
         # the record devops-bench wrote, not a truncated one the grader reads
         # as no run at all.
         partial = path.with_name(path.name + PARTIAL_SUFFIX)
-        partial.write_text(json.dumps(loaded, indent=2), encoding="utf-8")
-        os.replace(partial, path)
+        try:
+            partial.write_text(json.dumps(loaded, indent=2), encoding="utf-8")
+            os.replace(partial, path)
+        except OSError:
+            partial.unlink(missing_ok=True)
+            raise
     return lines
 
 
@@ -194,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             lines = rejudge_file(path, metrics)
         except (OSError, ValueError) as exc:
-            print(f"rejudge: cannot read {path}: {exc}", file=sys.stderr)
+            print(f"rejudge: cannot read or rewrite {path}: {exc}", file=sys.stderr)
             status = EXIT_UNREADABLE
             continue
         for line in lines:

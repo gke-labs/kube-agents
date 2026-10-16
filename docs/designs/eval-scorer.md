@@ -1289,7 +1289,7 @@ is sayable.
 repetitions that were actually **scored** (outcome pass or fail). Blocked and infra repetitions are
 excluded: a judge that scored a run the harness never completed is scoring an artefact. Each metric's
 `n` counts only the repetitions that carry it, so a score the judge failed to return shrinks `n`; the
-presubmit asks for a missing gated score once more before grading (`kube_agents_bench/rejudge.py`).
+eval script (presubmit and nightly) asks for a missing `OutcomeValidity` once more before grading (`kube_agents_bench/rejudge.py`).
 
 **Step 2 — main's number.** `_pool_judged()` combines the `judged` blocks of the pooled baseline
 records into one mean per metric, **weighted by each block's own `n`** so 20 runs of evidence

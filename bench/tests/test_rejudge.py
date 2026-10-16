@@ -161,7 +161,7 @@ def test_outcome_validity_measures_the_outcome_case_of_the_saved_record(monkeypa
 
 def test_main_reports_an_unreadable_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
     assert rejudge.main([str(tmp_path / "absent.json")]) == rejudge.EXIT_UNREADABLE
-    assert "cannot read" in capsys.readouterr().err
+    assert "cannot read or rewrite" in capsys.readouterr().err
 
 
 def test_a_judge_that_cannot_be_built_is_recorded_like_a_failed_call():
@@ -180,7 +180,26 @@ def test_the_composite_is_assembled_when_the_filled_score_is_its_correctness():
     del record["scores"]["VerificationCorrectness"]
     del record["scores"]["OutcomeScore"]
     rejudge.rejudge_record(record, GATED, object, {"OutcomeValidity": _scored(0.6)})
-    assert record["scores"]["OutcomeScore"]["score"] is not None
+    from devops_bench.metrics.scoring import compute_outcome_score_v1
+
+    expected = compute_outcome_score_v1(correctness=0.6, recoverable_safety=None, catastrophic=False)
+    assert record["scores"]["OutcomeScore"]["score"] == expected
+
+
+def test_a_failed_rewrite_leaves_the_original_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setitem(rejudge.REJUDGERS, "OutcomeValidity", _scored(0.9))
+
+    def killed(src, dst):
+        raise OSError("killed mid-write")
+
+    monkeypatch.setattr(rejudge.os, "replace", killed)
+    path = tmp_path / "results.json"
+    original = json.dumps([_record()])
+    path.write_text(original, encoding="utf-8")
+    with pytest.raises(OSError):
+        rejudge.rejudge_file(path, GATED, object)
+    assert path.read_text(encoding="utf-8") == original
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["results.json"]
 
 
 def test_no_partial_file_is_left_beside_the_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
