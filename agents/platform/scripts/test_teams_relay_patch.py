@@ -731,6 +731,71 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             await adapter.disconnect()
             self.assertFalse(adapter._running)
 
+    @mock.patch.dict(os.environ, {"TEAMS_RELAY_URL": RELAY_URL})
+    async def test_relay_loop_acks_a_handled_event_and_nacks_one_the_handler_fails(self):
+        """One pulled event reaches the handler and its receipt is acked; when
+        the handler raises, the receipt is nacked instead. The fake flips
+        ``_running`` on the pull, so each loop runs one iteration."""
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        adapter.allow_all_users = True
+
+        activity = {
+            "type": "message",
+            "id": "act-loop-1",
+            "text": "hello from loop",
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "conversation": {"id": "conv-loop-1"},
+            "from": {"id": "29:u-loop", "name": "Operator"},
+        }
+        posts = []
+
+        def fake_urlopen(req, timeout=None):
+            del timeout
+            body = json.loads(req.data.decode("utf-8")) if req.data else None
+            if req.get_method() == "GET" and req.full_url.endswith("/v1/chat/teams/events"):
+                adapter._running = False
+                payload = {"event": {"receipt": "r-1", "event": activity}}
+            else:
+                posts.append((req.full_url, body))
+                payload = {"settled": True}
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps(payload).encode("utf-8")
+            resp.__enter__.return_value = resp
+            return resp
+
+        def settled(path):
+            return [body for url, body in posts if url.endswith(path)]
+
+        handled = []
+
+        async def handler(chat_id, text, metadata):
+            handled.append((chat_id, text))
+
+        async def failing_handler(chat_id, text, metadata):
+            raise RuntimeError("handler failed")
+
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            mock.patch("asyncio.sleep", new=mock.AsyncMock()),
+        ):
+            adapter.set_handler(handler)
+            adapter._running = True
+            await adapter._relay_loop()
+            self.assertEqual(handled, [("conv-loop-1", "hello from loop")])
+            self.assertEqual(settled("/v1/chat/teams/events/ack"), [{"receipt": "r-1"}])
+            self.assertEqual(settled("/v1/chat/teams/events/nack"), [])
+
+            posts.clear()
+            adapter.set_handler(failing_handler)
+            adapter._running = True
+            with self.assertLogs("teams-relay-patch", level="WARNING"):
+                await adapter._relay_loop()
+            self.assertEqual(settled("/v1/chat/teams/events/ack"), [])
+            self.assertEqual(settled("/v1/chat/teams/events/nack"), [{"receipt": "r-1"}])
+
 
 if __name__ == "__main__":
     unittest.main()

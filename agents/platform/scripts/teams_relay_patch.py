@@ -45,6 +45,11 @@ TEAMS_RELAY_REQUEST_TIMEOUT_SECONDS = 60
 TEAMS_TRUSTED_SERVICE_HOSTS = ("smba.trafficmanager.net", "api.botframework.com")
 
 
+def relay_enabled() -> bool:
+    """Whether this process has a relay URL: what the registry's probes answer."""
+    return bool(os.getenv("TEAMS_RELAY_URL", "").strip())
+
+
 def is_trusted_service_url(service_url: str) -> bool:
     """Return True if service_url uses HTTPS on an official Bot Framework host."""
     if not service_url or not isinstance(service_url, str):
@@ -350,7 +355,7 @@ def install() -> None:
     # Imported unconditionally, as the Slack relay patch does: install() only
     # runs inside a gateway process, and a gateway whose base classes cannot be
     # imported is a failure to see in the log, not one to paper over.
-    from gateway.config import Platform
+    from gateway.config import Platform, PlatformConfig
     from gateway.platforms.base import (
         BasePlatformAdapter,
         MessageEvent,
@@ -416,8 +421,13 @@ def install() -> None:
         def __init__(self, config: Any = None) -> None:
             # ``Platform._missing_`` admits a name the platform registry knows,
             # and install() registers "teams" before anything builds an adapter.
-            super().__init__(config, Platform("teams"))
-            self.config = config if config is not None else {}
+            # A cron send may build the adapter with no config; the base then
+            # sees its own type rather than a bare dict.
+            resolved_config = (
+                config if config is not None else PlatformConfig(enabled=True)
+            )
+            super().__init__(resolved_config, Platform("teams"))
+            self.config = resolved_config
             if isinstance(self.config, dict):
                 raw_extra = self.config.get("extra")
                 typing_text = self.config.get("typing_status_text")
@@ -796,9 +806,9 @@ def install() -> None:
         registered it.
         """
         entry.adapter_factory = lambda cfg: TeamsRelayAdapter(cfg)
-        entry.check_fn = lambda: True
+        entry.check_fn = relay_enabled
         entry.validate_config = None
-        entry.is_connected = lambda _cfg=None: True
+        entry.is_connected = lambda _cfg=None: relay_enabled()
         entry.standalone_sender_fn = _standalone_send
         entry.max_message_length = TEAMS_MAX_MESSAGE_LENGTH
 
@@ -840,8 +850,8 @@ def install() -> None:
                     name="teams",
                     label="Microsoft Teams",
                     adapter_factory=lambda cfg: TeamsRelayAdapter(cfg),
-                    check_fn=lambda: True,
-                    is_connected=lambda _cfg=None: True,
+                    check_fn=relay_enabled,
+                    is_connected=lambda _cfg=None: relay_enabled(),
                     standalone_sender_fn=_standalone_send,
                     max_message_length=TEAMS_MAX_MESSAGE_LENGTH,
                     # What the bundled entry carries, so the two paths match.

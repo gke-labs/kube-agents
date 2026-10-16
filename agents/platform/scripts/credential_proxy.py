@@ -3061,6 +3061,9 @@ TEAMS_ALLOWED_ACTIVITY_PATH_RE = re.compile(
 # How much of a Microsoft error body the broker reads for its log line and the
 # ``teams`` field it answers with: enough for ``error.code`` and ``error.message``.
 TEAMS_UPSTREAM_BODY_MAX_BYTES = 4096
+# Microsoft's client-credentials endpoint; ``{tenant}`` is the bot's tenant,
+# or ``botframework.com`` for a multi-tenant app.
+TEAMS_OAUTH_URL_TEMPLATE = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
 
 
 def is_trusted_teams_service_url(service_url: str) -> bool:
@@ -3224,7 +3227,7 @@ class TeamsRelay:
                 return self._token
 
             tenant = self.tenant_id if self.tenant_id else "botframework.com"
-            token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+            token_url = TEAMS_OAUTH_URL_TEMPLATE.format(tenant=tenant)
             data = urllib.parse.urlencode(
                 {
                     "grant_type": "client_credentials",

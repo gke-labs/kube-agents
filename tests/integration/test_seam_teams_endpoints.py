@@ -8,13 +8,14 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 from _seams import SCRIPTS_DIR
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import credential_proxy
 from credential_proxy import CredentialProxyHandler, TeamsRelay
 
 
@@ -232,6 +233,74 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
         self.assertEqual(status, 502)
         self.assertIn("redirect refused", body["detail"])
         self.assertTrue(any("TeamsUpstreamError" in line for line in logs.output), logs.output)
+
+    def test_api_forwarding_mints_a_bot_token_then_posts_with_it(self):
+        """The two upstream legs over real sockets: the broker exchanges the
+        app credentials for a token at the identity URL, then posts the
+        activity with that token as the bearer. Nothing is mocked below the
+        URL template and the host allowlist, both pointed at a local server."""
+        upstream_requests = []
+
+        class FakeMicrosoft(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                raw_body = self.rfile.read(length).decode("utf-8")
+                upstream_requests.append((self.path, self.headers.get("Authorization"), raw_body))
+                if self.path.endswith("/oauth2/v2.0/token"):
+                    payload = {"token_type": "Bearer", "expires_in": 3600, "access_token": "minted-bot-jwt-99"}
+                elif self.path == "/teams/v3/conversations/123/activities":
+                    payload = {"id": "activity-42"}
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(payload).encode("utf-8"))
+
+            def log_message(self, format, *args):
+                del format, args
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeMicrosoft)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        upstream_base = f"http://127.0.0.1:{upstream.server_port}"
+
+        with (
+            mock.patch.object(
+                credential_proxy,
+                "TEAMS_OAUTH_URL_TEMPLATE",
+                f"{upstream_base}/{{tenant}}/oauth2/v2.0/token",
+            ),
+            mock.patch.object(
+                credential_proxy,
+                "is_trusted_teams_service_url",
+                side_effect=lambda url: url == f"{upstream_base}/teams/",
+            ),
+        ):
+            status, body = self._call(
+                "/v1/chat/teams/api",
+                {
+                    "serviceUrl": f"{upstream_base}/teams/",
+                    "endpoint": "v3/conversations/123/activities",
+                    "method": "POST",
+                    "payload": {"type": "message", "text": "reply"},
+                },
+                method="POST",
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["response"]["id"], "activity-42")
+        self.assertEqual(
+            [(path, auth) for path, auth, _ in upstream_requests],
+            [
+                ("/tenant-allowed-1/oauth2/v2.0/token", None),
+                ("/teams/v3/conversations/123/activities", "Bearer minted-bot-jwt-99"),
+            ],
+        )
+        self.assertIn("client_id=app-id-123", upstream_requests[0][2])
+        self.assertIn("client_secret=secret-password", upstream_requests[0][2])
 
 
 if __name__ == "__main__":
