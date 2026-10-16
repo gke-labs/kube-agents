@@ -8,6 +8,7 @@ import json
 import os
 import hashlib
 import re
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -4353,6 +4354,699 @@ def get_task(task_id: str) -> Dict[str, Any]:
     result = _read_kanban(read)
     if result is None:
         raise HTTPException(status_code=404, detail="no kanban board on this install yet")
+    return result
+
+
+# --------------------------------------------------------------------------
+# Stopping a conversation's cards: POST /v1/sessions/{id}/cards/stop (#3263).
+#
+# `stop` in a gateway conversation cancels the front door's turn, and by then
+# that turn has usually ended. What is still running is the kanban cards it
+# filed: rows on the board that the dispatcher in this container runs as worker
+# processes, which report back through `a2a notify --conversation`. The
+# hermes-bridge calls this route for the conversation's session when the
+# gateway hands it a card-stop control task. It archives every open card in
+# the conversation and says which.
+#
+# "In the conversation" is: filed under the session or one of its compression
+# continuations, subscribed to this session and thread, or fanned out by such
+# a card (`kanban_worker_children`, or the `created` event's
+# `creator_task_id`), to any depth. A `task_links` child is NOT followed on its
+# own: one that carries this conversation's session is already in the set,
+# and one that carries another session is another conversation's, a cron
+# job's or an alert's card that waits on ours, and is left alone (archiving
+# our card promotes it, as finishing it would have). The links only order the
+# archive.
+#
+# It runs here, not in the bridge, because Hermes kills a running card's worker
+# only when the claim lock names this host, and the bridge sidecar has the
+# hostname but not the pid namespace: from there the kill finds nothing, or
+# finds an unrelated process with the same number. Hermes' own `archive_task`
+# does each archive, so the run's close and `recompute_ready` are the
+# dispatcher's own code; nothing here writes a card's status.
+#
+# The order is most of the design. `archive_task` ends with `recompute_ready`,
+# which promotes a todo card once its parents are all done or archived, and the
+# dispatcher claims a ready card on its next tick (5 s). So:
+#
+#   1. every card in the set that is not running, leaves before the cards that
+#      gate them, so no card in the set is ever promoted;
+#   2. the running ones, in parallel, one connection each, since each archive
+#      can wait about 5 s for its worker to exit;
+#   3. up to three re-scans, 2 s apart, for a card a dying worker filed after
+#      the set was collected, and for a worker pid written onto a row after it
+#      was archived. `_set_worker_pid` has no status guard, so a card archived
+#      between `claim_task` and the spawn gets the new worker's pid, and nothing
+#      else ever kills that worker. A card archived while running with no pid
+#      yet is watched for one, every second, until the deadline.
+#
+# Everything runs against one deadline (CARD_STOP_DEADLINE_S): no card's
+# archive starts once less than CARD_STOP_ARCHIVE_RESERVE_S is left, so the
+# answer is back inside the bridge's 30 s request timeout. A card not reached
+# is reported in `failed`, and `deadline` says the budget ran out.
+#
+# The worker kill goes through a `signal_fn` of ours, which signals a pid only
+# when its environment carries the card's `HERMES_KANBAN_TASK`, and signals
+# the marked members of the worker's process group with it: Hermes signals the
+# worker's pid only, and the worker is a session leader
+# (`start_new_session=True`), so what it starts without a session of its own,
+# the ssh client of each terminal command among them, would outlive it. After
+# the archive the group is swept once more for anything left. A process
+# without the marker is never signalled. That excludes the shared ssh
+# ControlMaster, which daemonizes out of the group and serves every worker and
+# the front door at once, and every command Hermes starts with a scrubbed
+# environment. The command an ssh client was running in the shell sandbox is
+# beyond any signal from here.
+# --------------------------------------------------------------------------
+
+# Hermes' terminal statuses. Every other status Hermes declares is open, and
+# open is what gets archived.
+CARD_STOP_SETTLED_STATUSES = frozenset({"done", "archived"})
+# The open cards one call archives in a pass. A conversation's real tree is a
+# handful; past this the response says `truncated`, the pass keeps the deepest
+# cards (so no kept card gates a dropped one), and the re-scans take the rest.
+CARD_STOP_MAX_CARDS = 200
+# The cards the closure visits, settled ones included, before it stops looking.
+CARD_STOP_MAX_VISITED = 2000
+# Running cards archived at once. Each holds a connection and can wait ~5 s in
+# Hermes' `_poll_worker_exit`.
+CARD_STOP_PARALLEL = 8
+CARD_STOP_RESCAN_ROUNDS = 3
+CARD_STOP_RESCAN_INTERVAL_SECONDS = 2.0
+# How often a card archived mid-claim is checked for a worker pid.
+CARD_STOP_LATE_PID_INTERVAL_SECONDS = 1.0
+# The whole call's budget. The bridge waits 30 s; the worst case is this, plus
+# one statement's busy wait.
+CARD_STOP_DEADLINE_S = 20.0
+# No card's archive starts with less than this left: Hermes' ~5 s wait for a
+# worker to exit after SIGTERM, then its SIGKILL.
+CARD_STOP_ARCHIVE_RESERVE_S = 6.0
+# The route's own connections give up on a locked board after this, not after
+# Hermes' 120 s default, which alone would outlast the bridge's request.
+CARD_STOP_BUSY_TIMEOUT_S = 3.0
+# Between SIGTERM and SIGKILL for what is left of a stopped card's worker group.
+CARD_STOP_KILL_GRACE_SECONDS = 3.0
+CARD_STOP_KILL_POLL_SECONDS = 0.1
+# The variable the dispatcher pins into every worker it spawns: the card's id.
+CARD_STOP_WORKER_TASK_ENV = "HERMES_KANBAN_TASK"
+# Fan-out attribution, owned by deploy/docker/patches/kanban_children_settled.py.
+# Both it and the `created` event's `creator_task_id` are read: the table is
+# created on its first write and holds only the fan-outs since, and the event
+# is Hermes' own record of every create that named a creator.
+CARD_STOP_CHILDREN_TABLE = "kanban_worker_children"
+# Hermes' session store, where a compressed session's continuation names the
+# session it continues (`parent_session_id`, with the parent ended
+# 'compression'); a card filed after a compression carries the continuation's
+# id. Same edge and bound as kanban_event_routing.py, walked the other way.
+CARD_STOP_STATE_DB_NAME = "state.db"
+CARD_STOP_COMPRESSION_END_REASON = "compression"
+CARD_STOP_COMPRESSION_WALK_MAX = 32
+# Rows per `IN (...)`, under SQLite's bound-parameter limit on any build.
+CARD_STOP_SQL_CHUNK = 500
+# Test hook, `None` in production: the state.db to read.
+CARD_STOP_STATE_DB_PATH: Optional[str] = None
+PROC_ROOT = "/proc"
+
+
+def _card_stop_sleep(seconds: float) -> None:
+    """The wait between re-scans; a seam so tests can act inside it."""
+    time.sleep(seconds)
+
+
+def _card_stop_clock() -> float:
+    """The deadline's clock; a seam so tests can move it."""
+    return time.monotonic()
+
+
+class _Budget:
+    """The call's deadline. `hit` records that something was not started for it."""
+
+    def __init__(self) -> None:
+        self.deadline = _card_stop_clock() + CARD_STOP_DEADLINE_S
+        self.hit = False
+
+    def left(self) -> float:
+        return self.deadline - _card_stop_clock()
+
+    def allows(self, needed: float) -> bool:
+        if self.left() >= needed:
+            return True
+        self.hit = True
+        return False
+
+
+def _hermes_kanban():
+    """Hermes' kanban module and its board opener, imported on first use: the
+    gateway venv's, not a test's. The opener is `kanban_db_connect.connect`
+    since the v2026.9.14 split, else the pre-split `kanban_db.connect`, which the
+    split keeps only as a compat shim (as `kanban_guardrail_exit._default_connect`)."""
+    from hermes_cli import kanban_db
+
+    try:
+        from hermes_cli.kanban_db_connect import connect
+    except ImportError:
+        connect = kanban_db.connect
+    return kanban_db, connect
+
+
+def _card_stop_state_db() -> str:
+    """Hermes' session store for this server's HERMES_HOME, or "" when unknown."""
+    if CARD_STOP_STATE_DB_PATH is not None:
+        return CARD_STOP_STATE_DB_PATH
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = str(get_hermes_home() or "")
+    except Exception:  # noqa: BLE001 - outside the gateway venv
+        home = os.environ.get("HERMES_HOME", "").strip()
+    return os.path.join(home, CARD_STOP_STATE_DB_NAME) if home else ""
+
+
+def _compression_descendants(session_id: str) -> list[str]:
+    """The sessions that continue `session_id` through compression, at any depth.
+
+    Fails open to none: the session's own cards are still found, and its
+    subscription rows name the session that holds the route, which is this one.
+    """
+    state_db = _card_stop_state_db()
+    if not state_db or not os.path.isfile(state_db):
+        return []
+    found: list[str] = []
+    frontier = [session_id]
+    try:
+        with closing(_read_only(state_db)) as conn:
+            while frontier and len(found) < CARD_STOP_COMPRESSION_WALK_MAX:
+                current = frontier.pop(0)
+                for row in conn.execute(
+                    "SELECT s.id FROM sessions s JOIN sessions p ON p.id = s.parent_session_id "
+                    "WHERE s.parent_session_id = ? AND p.end_reason = ?",
+                    (current, CARD_STOP_COMPRESSION_END_REASON),
+                ):
+                    if row[0] and row[0] != session_id and row[0] not in found:
+                        found.append(row[0])
+                        frontier.append(row[0])
+    except sqlite3.Error as exc:
+        logger.warning("card stop: the compression lineage of %s is unreadable: %s", session_id, exc)
+    return found[:CARD_STOP_COMPRESSION_WALK_MAX]
+
+
+def _ids_where_in(conn: sqlite3.Connection, query: str, ids: Sequence[str], params: Sequence[Any] = ()) -> list[Any]:
+    """Run `query`, whose one `{marks}` is an `IN` list, over `ids` in chunks."""
+    rows: list[Any] = []
+    ids = list(ids)
+    for start in range(0, len(ids), CARD_STOP_SQL_CHUNK):
+        chunk = ids[start:start + CARD_STOP_SQL_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        rows.extend(conn.execute(query.format(marks=marks), (*params, *chunk)).fetchall())
+    return rows
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone() is not None
+
+
+class _CardTree(NamedTuple):
+    cards: Dict[str, Dict[str, Any]]  # id -> title, status, worker_pid, created_at, via
+    links: list[tuple[str, str]]  # (parent, child) task_links edges inside `cards`
+    truncated: bool
+
+
+# A fan-out child's id from its `created` event. `json_valid` inside a CASE,
+# which SQLite evaluates in order: one malformed payload is skipped, not an
+# error for the whole query.
+_CREATED_BY_SQL = (
+    "SELECT task_id FROM task_events WHERE kind = 'created' "
+    "AND CASE WHEN json_valid(payload) THEN json_extract(payload, '$.creator_task_id') END IN ({marks})"
+)
+
+
+def _collect_card_tree(conn: sqlite3.Connection, sessions: Sequence[str], session_id: str, conversation: str) -> _CardTree:
+    """Every card in the conversation: see the section comment for what that is.
+
+    Seeded by `tasks.session_id` over the session and its compression
+    continuations, and by the subscription rows `kanban_event_routing.py` wrote
+    for this session and conversation, which also catch a card filed with
+    another session id that inherited the thread. Then fan-out children, to a
+    fixed point. Settled cards are walked through, so a done parent's running
+    child is found, and returned too: the caller keeps the open ones and names
+    the done ones.
+    """
+    via: Dict[str, str] = {}
+
+    def reach(ids: Sequence[str], how: str) -> list[str]:
+        new = [i for i in dict.fromkeys(ids) if i and i not in via]
+        for i in new:
+            via[i] = how
+        return new
+
+    frontier = reach([r[0] for r in _ids_where_in(conn, "SELECT id FROM tasks WHERE session_id IN ({marks})", sessions)], "session")
+    if conversation and _has_table(conn, "kanban_notify_subs"):
+        frontier += reach(
+            [
+                r[0]
+                for r in conn.execute(
+                    "SELECT task_id FROM kanban_notify_subs WHERE chat_id = ? AND thread_id = ?",
+                    (session_id, conversation),
+                )
+            ],
+            "subscription",
+        )
+    children_table = _has_table(conn, CARD_STOP_CHILDREN_TABLE)
+    truncated = False
+    while frontier:
+        if len(via) > CARD_STOP_MAX_VISITED:
+            truncated = True
+            break
+        fanned = _ids_where_in(conn, _CREATED_BY_SQL, frontier)
+        if children_table:
+            fanned += _ids_where_in(
+                conn, f"SELECT child_id FROM {CARD_STOP_CHILDREN_TABLE} WHERE creator_id IN ({{marks}})", frontier
+            )
+        frontier = reach([r[0] for r in fanned], "child")
+
+    cards: Dict[str, Dict[str, Any]] = {}
+    for row in _ids_where_in(
+        conn, "SELECT id, title, status, worker_pid, created_at FROM tasks WHERE id IN ({marks})", list(via)
+    ):
+        cards[row[0]] = {
+            "title": row[1],
+            "status": row[2],
+            "worker_pid": row[3],
+            "created_at": row[4] or 0,
+            "via": via[row[0]],
+        }
+    links = [
+        (r[0], r[1])
+        for r in _ids_where_in(conn, "SELECT parent_id, child_id FROM task_links WHERE parent_id IN ({marks})", list(cards))
+        if r[1] in cards
+    ]
+    return _CardTree(cards, links, truncated)
+
+
+def _leaves_first(ids: Sequence[str], links: Sequence[tuple[str, str]]) -> list[str]:
+    """`ids` with every card after the cards it gates, so archiving in this order
+    never leaves an archived parent over a todo child of the same set, and any
+    prefix of it holds every child of every card it holds."""
+    members = set(ids)
+    children: Dict[str, list[str]] = {i: [] for i in ids}
+    for parent, child in links:
+        if parent in members and child in members:
+            children[parent].append(child)
+    order: list[str] = []
+    seen: set[str] = set()
+    for root in ids:
+        if root in seen:
+            continue
+        seen.add(root)
+        stack = [(root, iter(children[root]))]
+        while stack:
+            node, pending = stack[-1]
+            nxt = next((c for c in pending if c not in seen), None)
+            if nxt is None:
+                stack.pop()
+                order.append(node)
+            else:
+                seen.add(nxt)
+                stack.append((nxt, iter(children[nxt])))
+    return order
+
+
+def _proc_pids() -> list[int]:
+    try:
+        return [int(name) for name in os.listdir(PROC_ROOT) if name.isdigit()]
+    except OSError:
+        return []
+
+
+def _proc_pgid(pid: int) -> Optional[int]:
+    try:
+        return os.getpgid(pid)
+    except OSError:
+        return None
+
+
+def _proc_environ(pid: int) -> bytes:
+    """A process's environment as the kernel holds it; empty for a zombie or a
+    process this user cannot read."""
+    try:
+        with open(os.path.join(PROC_ROOT, str(pid), "environ"), "rb") as fh:
+            return fh.read()
+    except OSError:
+        return b""
+
+
+def _proc_alive(pid: int) -> bool:
+    """True while `pid` runs; a zombie has exited."""
+    try:
+        with open(os.path.join(PROC_ROOT, str(pid), "stat"), "rb") as fh:
+            return fh.read().rsplit(b")", 1)[1].split()[0] != b"Z"
+    except (OSError, IndexError):
+        return False
+
+
+def _signal_process(pid: int, sig: int) -> bool:
+    try:
+        os.kill(pid, sig)
+        return True
+    except OSError:
+        return False
+
+
+def _carries_card_marker(pid: int, task_id: str) -> bool:
+    return f"{CARD_STOP_WORKER_TASK_ENV}={task_id}".encode() in _proc_environ(pid).split(b"\0")
+
+
+def _card_processes(task_id: str, worker_pid: int) -> list[int]:
+    """The live processes in the worker's process group that carry the card's marker.
+
+    The dispatcher starts every worker as a session leader, so its pid is its
+    group's id, and the group outlives the leader for as long as any member does.
+    """
+    own = os.getpid()
+    return [
+        pid
+        for pid in _proc_pids()
+        if pid != own and _proc_pgid(pid) == worker_pid and _carries_card_marker(pid, task_id)
+    ]
+
+
+class _WorkerSignals:
+    """One card's worker kill: the `signal_fn` Hermes' `archive_task` calls, and
+    the sweep after it. Counts every process signalled, by either."""
+
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+        self.pid: Optional[int] = None
+        self.signalled: set[int] = set()
+        self.killed: set[int] = set()
+        self.refused = False
+
+    def signal_fn(self, pid: int, sig: int) -> None:
+        """Signal the worker and its group's marked members, or refuse.
+
+        A pid without the card's marker raises: ProcessLookupError when it has
+        exited (Hermes records the worker terminated, which it is), and
+        PermissionError when a live process holds it, which Hermes records as
+        a termination it could not do.
+        """
+        pid = int(pid)
+        self.pid = pid
+        if not _carries_card_marker(pid, self.task_id):
+            if not _proc_alive(pid):
+                raise ProcessLookupError(pid)
+            self.refused = True
+            raise PermissionError(f"pid {pid} does not carry {CARD_STOP_WORKER_TASK_ENV}={self.task_id}")
+        sent = self.killed if sig == signal.SIGKILL else self.signalled
+        if not _signal_process(pid, sig):
+            raise ProcessLookupError(pid)
+        sent.add(pid)
+        for member in _card_processes(self.task_id, pid):
+            if member != pid and _signal_process(member, sig):
+                sent.add(member)
+
+    def sweep(self, worker_pid: int, grace: float) -> Dict[str, Any]:
+        """SIGTERM, then SIGKILL after `grace`, whatever of the worker's group
+        still carries the marker. The marker is re-read before every signal, so
+        a pid the kernel has handed to another process in between is never
+        signalled."""
+        self.pid = worker_pid
+        targets = _card_processes(self.task_id, worker_pid)
+        termed = [pid for pid in targets if _carries_card_marker(pid, self.task_id) and _signal_process(pid, signal.SIGTERM)]
+        self.signalled.update(termed)
+        deadline = time.monotonic() + max(0.0, grace)
+        remaining = list(termed)
+        while remaining and time.monotonic() < deadline:
+            time.sleep(CARD_STOP_KILL_POLL_SECONDS)
+            remaining = [pid for pid in remaining if _carries_card_marker(pid, self.task_id)]
+        self.killed.update(
+            pid for pid in remaining if _carries_card_marker(pid, self.task_id) and _signal_process(pid, signal.SIGKILL)
+        )
+        return self.report()
+
+    def report(self) -> Dict[str, Any]:
+        report: Dict[str, Any] = {"pid": self.pid, "signalled": len(self.signalled), "killed": len(self.killed)}
+        if self.refused:
+            report["refused"] = "the pid's process does not carry the card's marker"
+        return report
+
+
+def _kill_grace(budget: _Budget) -> float:
+    return min(CARD_STOP_KILL_GRACE_SECONDS, max(0.0, budget.left()))
+
+
+def _archive_card(kanban_db, conn: sqlite3.Connection, task_id: str, budget: _Budget) -> tuple[str, Dict[str, Any]]:
+    """Archive one card through Hermes and kill its worker's processes.
+
+    Returns ("stopped", entry), ("settled", entry) for a card that finished
+    since the set was collected, or ("gone", {}) for one already archived or
+    deleted. The status and pid are read just before the archive, which takes
+    its own snapshot inside its transaction; a card that completes in between
+    is archived as a done card, and reported as the running card it was.
+
+    `archive_task` commits the archive before it kills the worker and runs
+    `recompute_ready`, so a raise can come after the card is archived. Then the
+    card is still swept and reported stopped, with the error as a note.
+    """
+    row = conn.execute("SELECT title, status, worker_pid FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row[1] == "archived":
+        return "gone", {}
+    if row[1] in CARD_STOP_SETTLED_STATUSES:
+        return "settled", {"id": task_id, "title": row[0], "status": row[1]}
+    signals = _WorkerSignals(task_id)
+    note = None
+    try:
+        if not kanban_db.archive_task(conn, task_id, signal_fn=signals.signal_fn):
+            return "gone", {}
+    except Exception as exc:  # noqa: BLE001 - a raise after the commit still stopped the card
+        after = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if after is None or after[0] != "archived":
+            raise
+        note = f"archived, then Hermes raised: {exc}"
+        logger.warning("card stop: %s was archived, then archive_task raised: %s", task_id, exc)
+    pid = signals.pid or row[2]
+    worker = signals.sweep(int(pid), _kill_grace(budget)) if pid else None
+    entry = {"id": task_id, "title": row[0], "prior_status": row[1], "worker": worker}
+    if note:
+        entry["note"] = note
+    if pid is None and _archived_mid_claim(conn, task_id, row[1]):
+        entry[_CLAIMED_WITHOUT_PID] = True
+    return "stopped", entry
+
+
+# Set on an entry, and taken off before the answer, for a card archived after
+# its claim and before its worker's pid was written.
+_CLAIMED_WITHOUT_PID = "_claimed_without_pid"
+
+
+def _archived_mid_claim(conn: sqlite3.Connection, task_id: str, prior_status: str) -> bool:
+    """Whether the archive closed a run: the card was claimed, whatever this
+    route read a moment earlier. Hermes' `archived` event carries the run it
+    closed, and none for a card never claimed."""
+    try:
+        row = conn.execute(
+            "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'archived' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    except sqlite3.Error:  # a board without the column: what was read is all there is
+        return prior_status == "running"
+    return prior_status == "running" or (row is not None and row[0] is not None)
+
+
+def _card_stop_connect(connect, board: str) -> sqlite3.Connection:
+    conn = connect(Path(board))
+    conn.execute(f"PRAGMA busy_timeout = {int(CARD_STOP_BUSY_TIMEOUT_S * 1000)}")
+    return conn
+
+
+def _archive_card_on_own_connection(kanban_db, connect, board: str, task_id: str, budget: _Budget) -> tuple[str, Dict[str, Any]]:
+    if not budget.allows(CARD_STOP_ARCHIVE_RESERVE_S):
+        return "deadline", {}
+    with closing(_card_stop_connect(connect, board)) as conn:
+        return _archive_card(kanban_db, conn, task_id, budget)
+
+
+def _sweep_late_worker_pids(conn: sqlite3.Connection, archived: Sequence[str], budget: _Budget) -> list[Dict[str, Any]]:
+    """Kill a worker spawned onto a card after this call archived it, then clear its pid.
+
+    A pid whose process does not carry the card's marker is left alone, row
+    and all: it is not this card's worker, or not one this user can see.
+    """
+    swept: list[Dict[str, Any]] = []
+    rows = _ids_where_in(
+        conn,
+        "SELECT id, worker_pid FROM tasks WHERE status = 'archived' AND worker_pid IS NOT NULL AND id IN ({marks})",
+        archived,
+    )
+    for task_id, pid in rows:
+        if not _carries_card_marker(int(pid), task_id):
+            continue
+        result = _WorkerSignals(task_id).sweep(int(pid), _kill_grace(budget))
+        conn.execute(
+            "UPDATE tasks SET worker_pid = NULL WHERE id = ? AND status = 'archived' AND worker_pid = ?",
+            (task_id, pid),
+        )
+        conn.commit()
+        logger.warning("card stop: killed worker %s, spawned onto %s after it was archived", pid, task_id)
+        swept.append({"id": task_id, **result})
+    return swept
+
+
+@app.post("/v1/sessions/{session_id}/cards/stop", dependencies=[Depends(verify_api_key)])
+def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Archive every open card in a gateway conversation; see the section comment.
+
+    The hermes-bridge calls this for its own `a2a-*` session, with the context
+    id the gateway's control task carried; as for the route PUT, the session
+    must be the one that context id names, so one conversation cannot reach
+    another's cards. `conversation`, the gateway's key, adds the cards whose
+    subscription rows point at this session and that conversation.
+
+    Returns what was stopped (`via` says how each card was reached: its
+    session, its subscription, or as a fan-out `child`; `worker` the processes
+    signalled, null for a card with no worker; `late_worker` a worker killed
+    after the archive; `note` an error Hermes raised after archiving), what had
+    already finished (`settled`), how many re-scans ran, `truncated` when the
+    set was larger than one pass, `failed` for a card whose archive raised or
+    that the deadline left unreached, and `deadline` when it did. Calling it
+    again stops nothing new, since an archived card is not open.
+    """
+    context_id = str(request_data.get("context_id") or "").strip()
+    conversation = str(request_data.get("conversation") or "").strip()
+    if not session_id.startswith(CONVERSATION_SESSION_PREFIX):
+        raise HTTPException(status_code=400, detail=f"cards are stopped only for {CONVERSATION_SESSION_PREFIX}* sessions")
+    if not context_id:
+        raise HTTPException(status_code=400, detail="context_id is required")
+    if max(len(conversation), len(context_id)) > CONVERSATION_FIELD_MAX_CHARS:
+        raise HTTPException(status_code=400, detail="conversation or context_id is too long")
+    if session_id != _conversation_session_id(context_id):
+        raise HTTPException(status_code=400, detail="context_id is not this session's")
+
+    result: Dict[str, Any] = {
+        "session_id": session_id,
+        "board": False,
+        "stopped": [],
+        "settled": [],
+        "failed": [],
+        "rounds": 0,
+        "truncated": False,
+        "deadline": False,
+    }
+    board = _kanban_db_path()
+    if not os.path.isfile(board):
+        return result
+    try:
+        kanban_db, connect = _hermes_kanban()
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=f"Hermes' kanban module is not importable: {exc}") from None
+    result["board"] = True
+    budget = _Budget()
+    sessions = [session_id, *_compression_descendants(session_id)]
+    stopped: Dict[str, Dict[str, Any]] = {}
+    settled: Dict[str, Dict[str, Any]] = {}
+    failed: Dict[str, Dict[str, Any]] = {}
+    attempts: Dict[str, int] = {}  # archives that raised, per card; each is retried once
+    watch: set[str] = set()  # archived mid-claim with no worker pid yet
+
+    def record(task_id: str, outcome: str, entry: Dict[str, Any], card: Dict[str, Any]) -> None:
+        if outcome == "stopped":
+            if entry.pop(_CLAIMED_WITHOUT_PID, False):
+                watch.add(task_id)
+            stopped[task_id] = {**entry, "via": card["via"]}
+            failed.pop(task_id, None)
+        elif outcome == "settled" and task_id not in stopped:
+            settled[task_id] = entry
+        elif outcome == "deadline":
+            failed[task_id] = {"id": task_id, "title": card["title"], "error": "the deadline came before its archive"}
+
+    def raised(task_id: str, card: Dict[str, Any], exc: Exception) -> None:
+        logger.error("card stop: archiving %s failed: %s", task_id, exc)
+        attempts[task_id] = attempts.get(task_id, 0) + 1
+        failed[task_id] = {"id": task_id, "title": card["title"], "error": str(exc)}
+
+    def stop(conn: sqlite3.Connection, tree: _CardTree) -> bool:
+        """Archive the tree's open cards in phases 1 and 2. True when any of them
+        had not failed before, which is what earns another re-scan."""
+        for task_id, card in tree.cards.items():
+            if card["status"] == "done":
+                record(task_id, "settled", {"id": task_id, "title": card["title"], "status": "done"}, card)
+        open_ids = sorted(
+            (
+                i
+                for i, card in tree.cards.items()
+                if card["status"] not in CARD_STOP_SETTLED_STATUSES and attempts.get(i, 0) < 2
+            ),
+            key=lambda i: (tree.cards[i]["created_at"], i),
+        )
+        order = _leaves_first(open_ids, tree.links)
+        if len(order) > CARD_STOP_MAX_CARDS:
+            result["truncated"] = True
+            order = order[:CARD_STOP_MAX_CARDS]
+        if tree.truncated:
+            result["truncated"] = True
+        if not order:
+            return False
+        fresh = any(i not in attempts for i in order)
+        for task_id in (i for i in order if tree.cards[i]["status"] != "running"):
+            card = tree.cards[task_id]
+            if not budget.allows(CARD_STOP_ARCHIVE_RESERVE_S):
+                record(task_id, "deadline", {}, card)
+                continue
+            try:
+                record(task_id, *_archive_card(kanban_db, conn, task_id, budget), card)
+            except Exception as exc:  # noqa: BLE001 - one card's failure must not leave the rest running
+                raised(task_id, card, exc)
+        running = [i for i in order if tree.cards[i]["status"] == "running"]
+        if running:
+            with ThreadPoolExecutor(max_workers=min(CARD_STOP_PARALLEL, len(running))) as pool:
+                futures = {
+                    task_id: pool.submit(_archive_card_on_own_connection, kanban_db, connect, board, task_id, budget)
+                    for task_id in running
+                }
+            for task_id, future in futures.items():
+                try:
+                    record(task_id, *future.result(), tree.cards[task_id])
+                except Exception as exc:  # noqa: BLE001
+                    raised(task_id, tree.cards[task_id], exc)
+        return fresh
+
+    def sweep_late(conn: sqlite3.Connection, ids: Sequence[str]) -> None:
+        for swept in _sweep_late_worker_pids(conn, list(ids), budget):
+            stopped[swept["id"]]["late_worker"] = {k: v for k, v in swept.items() if k != "id"}
+            watch.discard(swept["id"])
+
+    try:
+        with closing(_card_stop_connect(connect, board)) as conn:
+            if stop(conn, _collect_card_tree(conn, sessions, session_id, conversation)):
+                for _ in range(CARD_STOP_RESCAN_ROUNDS):
+                    if not budget.allows(CARD_STOP_RESCAN_INTERVAL_SECONDS):
+                        break
+                    _card_stop_sleep(CARD_STOP_RESCAN_INTERVAL_SECONDS)
+                    result["rounds"] += 1
+                    sweep_late(conn, list(stopped))
+                    if not stop(conn, _collect_card_tree(conn, sessions, session_id, conversation)):
+                        break
+            # A worker can take longer than the re-scans to spawn (a worktree
+            # checkout); a card archived mid-claim is watched until the deadline.
+            # Running out of time here is the plan, not a missed card.
+            while watch and budget.left() >= CARD_STOP_LATE_PID_INTERVAL_SECONDS:
+                _card_stop_sleep(CARD_STOP_LATE_PID_INTERVAL_SECONDS)
+                sweep_late(conn, sorted(watch))
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=503, detail=f"the kanban board could not be updated: {exc}") from None
+    result["stopped"] = list(stopped.values())
+    result["settled"] = list(settled.values())
+    result["failed"] = list(failed.values())
+    result["deadline"] = budget.hit
+    logger.info(
+        "card stop for %s: stopped %d, settled %d, failed %d, %d re-scans%s%s",
+        session_id,
+        len(stopped),
+        len(settled),
+        len(failed),
+        result["rounds"],
+        ", truncated" if result["truncated"] else "",
+        ", deadline reached" if budget.hit else "",
+    )
     return result
 
 
