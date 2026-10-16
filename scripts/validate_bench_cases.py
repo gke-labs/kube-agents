@@ -386,6 +386,8 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "any_of_patterns",
         "forbidden_patterns",
     ),
+    # The lines whose times are observation times; with none it can only pass.
+    "report_times_in_window": ("label_patterns",),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.

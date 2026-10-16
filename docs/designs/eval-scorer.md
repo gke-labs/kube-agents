@@ -148,7 +148,7 @@ transport carries the task's lifecycle envelope as its trajectory (`inject.task`
 calls without their results, so it names no card. The delegation wait reads the cards from the
 pod instead, by the Hermes session the bridge's `api` executor ran the turn in, so such a record
 can carry the delegated workers' tagged entries and token counts. The scorer still treats
-`worker_commands`, `worker_agents` and a `tool_called` in the `workers` or `all` scope as blind on
+`worker_commands`, `worker_agents`, `report_times_in_window` and a `tool_called` in the `workers` or `all` scope as blind on
 every such record, a policy that stays until `scoring.py` grades them on records that carry the
 workers ([#2619](https://github.com/gke-labs/kube-agents/issues/2619)); a router-scope `tool_called` is blind only when the
 door showed no trace: the first matrix run through the door (#2007, 2026-09-25) collapsed
