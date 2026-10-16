@@ -17,7 +17,10 @@
 # payments-api at all. The safeguards keep the run read-only.
 #
 # The prompt names no cluster: fixtures.json is the only thing allowed to
-# address a seeded cluster (cluster-agent-crashloop-debug's header).
+# address a seeded cluster (cluster-agent-crashloop-debug's header). It names
+# the seeded-debug namespace so the worker reliably meets payments-api, as
+# mock 03's answer does ("#oncall may mean payments-api in seeded-debug");
+# without it, a run that never looks there passes the negative vacuously.
 #
 # Planted defects required: no-pdb-workload (checkout-gateway, healthy, slot a)
 # and crashloop-workload (payments-api, OOMKilled, slot a). Isolation class:
@@ -25,7 +28,8 @@
 id: chat-answer-tangent-offer-declares-no-step
 name: An answer's offer about a workload the user did not ask about declares no step
 prompt: >-
-  is checkout-gateway restarting? someone in #oncall said it's crashlooping
+  is checkout-gateway restarting? someone in #oncall said it's crashlooping,
+  but they may have mixed it up with something in seeded-debug
 expected_output: >-
   The front door files one card and acks it. The worker finds checkout-gateway
   healthy and not restarting, and may say the workload that is crashlooping is
