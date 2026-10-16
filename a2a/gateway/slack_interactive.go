@@ -142,6 +142,7 @@ type slackUX struct {
 	awaiting      map[string]string
 	awaitingOrder []string
 	credits       map[string]string
+	creditTasks   map[string]string
 	creditsOrder  []string
 	credited      map[string]string
 	creditedOrder []string
@@ -152,7 +153,8 @@ func (s *SlackAdapter) uxLocked() *slackUX {
 	if s.ux == nil {
 		s.ux = &slackUX{pending: map[string]slackPending{}, claims: map[string]bool{},
 			answered: map[string]bool{}, lines: map[string]string{}, questions: map[string]slackQuestion{},
-			awaiting: map[string]string{}, credits: map[string]string{}, credited: map[string]string{}}
+			awaiting: map[string]string{}, credits: map[string]string{}, creditTasks: map[string]string{},
+			credited: map[string]string{}}
 	}
 	return s.ux
 }
@@ -412,9 +414,12 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 		return
 	}
 	if !p.shortcut {
-		// Another turn in the conversation: a shortcut's credit still
-		// waiting for its task is no longer about the next task here.
-		s.unawaitCreditLocked(conversation)
+		// Another member's turn in the conversation, or the clicker's own:
+		// a shortcut's credit line, waiting for its task or for that task's
+		// first post, would otherwise go on this turn's reply (a steer's
+		// ack). Better none than one naming someone for an ask they did not
+		// make.
+		s.uncreditLocked(conversation)
 	}
 	if p.shortcut {
 		// A shortcut answers no question: it is an ask about a message, so

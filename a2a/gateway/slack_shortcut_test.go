@@ -12,6 +12,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/slack-go/slack"
+	"sigs.k8s.io/yaml"
 )
 
 // webhookRecorder fakes response_url posts.
@@ -280,14 +281,14 @@ func TestSlackShortcutVerifiedCreditsTheClickerOnce(t *testing.T) {
 		t.Fatalf("turns = %+v", turns)
 	}
 	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, true)
-	if got := a.takeCredit(turns[0].Conversation); got != "" {
+	if got, _ := a.takeCredit(turns[0].Conversation); got != "" {
 		t.Errorf("a post before the shortcut's own task starts (a running task's progress) took the credit: %q", got)
 	}
 	a.TaskStarted(turns[0].Conversation, "task-1")
-	if got := a.takeCredit(turns[0].Conversation); got != "jayanti asked me to look at this" {
+	if got, _ := a.takeCredit(turns[0].Conversation); got != "jayanti asked me to look at this" {
 		t.Errorf("credit = %q, want the clicker's name in the mock's words", got)
 	}
-	if got := a.takeCredit(turns[0].Conversation); got != "" {
+	if got, _ := a.takeCredit(turns[0].Conversation); got != "" {
 		t.Errorf("a credit goes on one post only; second take = %q", got)
 	}
 }
@@ -302,8 +303,38 @@ func TestSlackShortcutCreditDoesNotPassToALaterAsk(t *testing.T) {
 	a.notePending(typed)
 	a.InboundVerified(typed.Conversation, typed.MessageID, true)
 	a.TaskStarted(turns[0].Conversation, "task-2")
-	if got := a.takeCredit(turns[0].Conversation); got != "" {
+	if got, _ := a.takeCredit(turns[0].Conversation); got != "" {
 		t.Errorf("a later member's ask was credited to the clicker: %q", got)
+	}
+}
+
+// With Agent Sessions there is no placeholder, so the credit waits across the
+// lock for the task's first post. A member's reply in that window is a steer
+// whose ack the gateway posts: it must not carry the clicker's line.
+func TestSlackShortcutCreditDoesNotGoOnASteerAck(t *testing.T) {
+	a, _ := newShortcutAdapter(&fakeSlackAPI{})
+	turns := runShortcut(a, shortcutPayload(t, "C1", "oncall", "203.8", alertMessage()))
+	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, true)
+	a.TaskStarted(turns[0].Conversation, "task-1")
+	typed := InboundMessage{Conversation: turns[0].Conversation, AuthorID: "U3", MessageID: "301.0", Text: "check staging too"}
+	a.notePending(typed)
+	a.InboundVerified(typed.Conversation, typed.MessageID, true)
+	if got, _ := a.takeCredit(turns[0].Conversation); got != "" {
+		t.Errorf("the steer's ack would carry the clicker's line: %q", got)
+	}
+}
+
+// The terminal of a task that predates the shortcut (the heal, or the relay
+// finishing it under the lock) leaves the shortcut's line for its own task.
+func TestSlackShortcutCreditSurvivesAnEarlierTasksTerminal(t *testing.T) {
+	a, _ := newShortcutAdapter(&fakeSlackAPI{})
+	turns := runShortcut(a, shortcutPayload(t, "C1", "oncall", "203.9", alertMessage()))
+	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, true)
+	a.TaskTerminal(turns[0].Conversation, "task-old", lib.StateCompleted, "", "")
+	a.TaskStarted(turns[0].Conversation, "task-new")
+	a.TaskTerminal(turns[0].Conversation, "task-old", lib.StateCompleted, "", "")
+	if got, task := a.takeCredit(turns[0].Conversation); got == "" || task != "task-new" {
+		t.Errorf("credit = %q for %q, want the line for task-new", got, task)
 	}
 }
 
@@ -357,14 +388,14 @@ func TestSlackShortcutRefusedOrEndedLeavesNoCredit(t *testing.T) {
 	a, _ := newShortcutAdapter(&fakeSlackAPI{})
 	turns := runShortcut(a, shortcutPayload(t, "C1", "oncall", "203.1", alertMessage()))
 	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, false)
-	if got := a.takeCredit(turns[0].Conversation); got != "" {
+	if got, _ := a.takeCredit(turns[0].Conversation); got != "" {
 		t.Errorf("a refused clicker is credited: %q", got)
 	}
 	turns = runShortcut(a, shortcutPayload(t, "C1", "oncall", "203.2", alertMessage()))
 	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, true)
 	a.TaskStarted(turns[0].Conversation, "task-1")
 	a.TaskTerminal(turns[0].Conversation, "task-1", lib.StateFailed, "", "")
-	if got := a.takeCredit(turns[0].Conversation); got != "" {
+	if got, _ := a.takeCredit(turns[0].Conversation); got != "" {
 		t.Errorf("a credit outlived its work and could land on a later post: %q", got)
 	}
 }
@@ -374,7 +405,7 @@ func TestSlackShortcutRefusedOrEndedLeavesNoCredit(t *testing.T) {
 func TestSlackCreditLineIsAboveTheFirstPostAndSurvivesItsEdit(t *testing.T) {
 	a, stub := startSlackStubAdapter(t)
 	a.mu.Lock()
-	a.creditLocked("slack:C1/100.5", "jayanti asked me to look at this")
+	a.creditLocked("slack:C1/100.5", "jayanti asked me to look at this", "task-1")
 	a.mu.Unlock()
 	ts, err := a.Post("slack:C1/100.5", "checking payments-api in seeded-debug.")
 	if err != nil {
@@ -448,14 +479,14 @@ func TestSlackShortcutAskIsTheEvalCasesPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lines := strings.Split(turns[0].Text, "\n")
-	for i, line := range lines {
-		if line != "" {
-			lines[i] = "  " + line
-		}
+	var task struct {
+		Prompt string `json:"prompt"`
 	}
-	if want := "prompt: |-\n" + strings.Join(lines, "\n") + "\n"; !strings.Contains(string(raw), want) {
-		t.Errorf("%s's prompt is not the ask the adapter writes; want it to read:\n%s", shortcutEvalCase, want)
+	if err := yaml.Unmarshal(raw, &task); err != nil {
+		t.Fatal(err)
+	}
+	if task.Prompt != turns[0].Text {
+		t.Errorf("%s's prompt is not the ask the adapter writes.\ngot:\n%s\nwant:\n%s", shortcutEvalCase, task.Prompt, turns[0].Text)
 	}
 }
 

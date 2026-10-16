@@ -363,9 +363,9 @@ func (s *SlackAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Durat
 // It also opens the thread's Agent Session, a DM thread's included:
 // processing from here until the chain ends and its card work settles
 // (slack_sessions.go).
-func (s *SlackAdapter) TaskStarted(conversation, _ string) {
+func (s *SlackAdapter) TaskStarted(conversation, taskID string) {
 	s.updateSession(conversation, func(st *slackSession) { st.running = true })
-	s.startCredit(conversation)
+	s.startCredit(conversation, taskID)
 	channel, threadTS, ok := slackChannelThread(conversation)
 	if !ok || threadTS == "" || slackIsDM(conversation) {
 		return
@@ -400,9 +400,9 @@ func (s *SlackAdapter) startedExpiry() time.Time {
 // rather than ride the stale cadence past it. Nothing is unmarked; the
 // re-ask decides. Called on the relay queue under the session lock: record
 // and return.
-func (s *SlackAdapter) TaskTerminal(conversation, _ string, _ lib.TaskState, _ TerminalSource, _ string) {
+func (s *SlackAdapter) TaskTerminal(conversation, taskID string, _ lib.TaskState, _ TerminalSource, _ string) {
 	s.updateSession(conversation, func(st *slackSession) { st.running = false })
-	s.dropCredit(conversation)
+	s.dropCredit(conversation, taskID)
 	channel, threadTS, ok := slackChannelThread(conversation)
 	if !ok || threadTS == "" || slackIsDM(conversation) {
 		return
@@ -712,7 +712,7 @@ func (s *SlackAdapter) Post(conversation, text string) (string, error) {
 	// sign-in page), three or four under every answer.
 	opts := []slack.MsgOption{slack.MsgOptionText(toMrkdwn(text), false)}
 	// The first post after a shortcut carries its credit line.
-	credit := s.takeCredit(conversation)
+	credit, creditTask := s.takeCredit(conversation)
 	if credit != "" {
 		if credited, err := slackCreditedOptions(OutMessage{Text: text}, credit); err == nil {
 			opts = credited
@@ -723,19 +723,19 @@ func (s *SlackAdapter) Post(conversation, text string) (string, error) {
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
 	_, ts, err := s.api.PostMessage(channel, opts...)
-	s.settleCredit(conversation, channel, ts, credit, err)
+	s.settleCredit(conversation, channel, ts, credit, creditTask, err)
 	return ts, err
 }
 
 // settleCredit records the credit line a post carried, or, when the post
 // failed, holds it for the next one (the gateway posts a refused layout's
 // text instead).
-func (s *SlackAdapter) settleCredit(conversation, channel, ts, credit string, err error) {
+func (s *SlackAdapter) settleCredit(conversation, channel, ts, credit, creditTask string, err error) {
 	switch {
 	case credit == "":
 	case err != nil:
 		s.mu.Lock()
-		s.creditLocked(conversation, credit)
+		s.creditLocked(conversation, credit, creditTask)
 		s.mu.Unlock()
 	default:
 		s.noteCredited(channel, ts, credit)
@@ -894,13 +894,13 @@ func (s *SlackAdapter) PostMessage(conversation string, m OutMessage) (string, e
 		return "", fmt.Errorf("malformed conversation id %q", conversation)
 	}
 	// The first post after a shortcut carries its credit line.
-	credit := s.takeCredit(conversation)
+	credit, creditTask := s.takeCredit(conversation)
 	opts, err := slackMessageOptions(m)
 	if credit != "" {
 		opts, err = slackCreditedOptions(m, credit)
 	}
 	if err != nil {
-		s.settleCredit(conversation, channel, "", credit, err)
+		s.settleCredit(conversation, channel, "", credit, creditTask, err)
 		return "", err
 	}
 	opts = append(opts, slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl())
@@ -908,7 +908,7 @@ func (s *SlackAdapter) PostMessage(conversation string, m OutMessage) (string, e
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
 	_, ts, err := s.api.PostMessage(channel, opts...)
-	s.settleCredit(conversation, channel, ts, credit, err)
+	s.settleCredit(conversation, channel, ts, credit, creditTask, err)
 	if err == nil {
 		s.trackQuestion(conversation, ts, m)
 	}

@@ -363,12 +363,27 @@ func slackShortcutQuote(text string) string {
 	return strings.Join(lines, "\n")
 }
 
-// creditLocked holds line for the bot's next post in conversation. Caller
-// holds s.mu.
-func (s *SlackAdapter) creditLocked(conversation, line string) {
+// creditLocked holds line for the bot's next post in conversation, for the
+// task taskID (the chain root TaskStarted named). Caller holds s.mu.
+func (s *SlackAdapter) creditLocked(conversation, line, taskID string) {
 	ux := s.uxLocked()
-	remember(&ux.creditsOrder, conversation, func(k string) { delete(ux.credits, k) })
+	remember(&ux.creditsOrder, conversation, func(k string) {
+		delete(ux.credits, k)
+		delete(ux.creditTasks, k)
+	})
 	ux.credits[conversation] = line
+	ux.creditTasks[conversation] = taskID
+}
+
+// uncreditLocked forgets conversation's credit line, waiting or held for a
+// post. Caller holds s.mu.
+func (s *SlackAdapter) uncreditLocked(conversation string) {
+	ux := s.uxLocked()
+	delete(ux.awaiting, conversation)
+	forget(&ux.awaitingOrder, conversation)
+	delete(ux.credits, conversation)
+	delete(ux.creditTasks, conversation)
+	forget(&ux.creditsOrder, conversation)
 }
 
 // awaitCreditLocked holds line until the shortcut's own task starts in
@@ -383,17 +398,9 @@ func (s *SlackAdapter) awaitCreditLocked(conversation, line string) {
 	ux.awaiting[conversation] = line
 }
 
-// unawaitCreditLocked forgets a credit still waiting for its task. Caller
-// holds s.mu.
-func (s *SlackAdapter) unawaitCreditLocked(conversation string) {
-	ux := s.uxLocked()
-	delete(ux.awaiting, conversation)
-	forget(&ux.awaitingOrder, conversation)
-}
-
 // startCredit moves a waiting credit to the conversation's next post, as the
 // shortcut's task starts (TaskStarted).
-func (s *SlackAdapter) startCredit(conversation string) {
+func (s *SlackAdapter) startCredit(conversation, taskID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ux := s.uxLocked()
@@ -401,32 +408,41 @@ func (s *SlackAdapter) startCredit(conversation string) {
 	if !ok {
 		return
 	}
-	s.unawaitCreditLocked(conversation)
-	s.creditLocked(conversation, line)
+	delete(ux.awaiting, conversation)
+	forget(&ux.awaitingOrder, conversation)
+	s.creditLocked(conversation, line, taskID)
 }
 
 // takeCredit hands over the credit line waiting for conversation's next
-// post, and forgets it: it goes on one message only.
-func (s *SlackAdapter) takeCredit(conversation string) string {
+// post, and the task it is for, and forgets them: it goes on one message
+// only.
+func (s *SlackAdapter) takeCredit(conversation string) (line, taskID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ux := s.uxLocked()
 	line, ok := ux.credits[conversation]
 	if !ok {
-		return ""
+		return "", ""
 	}
+	taskID = ux.creditTasks[conversation]
 	delete(ux.credits, conversation)
+	delete(ux.creditTasks, conversation)
 	forget(&ux.creditsOrder, conversation)
-	return line
+	return line, taskID
 }
 
-// dropCredit forgets a credit line no post took, when the work it was for
-// has ended (TaskTerminal), so it cannot land on a later, unrelated post.
-func (s *SlackAdapter) dropCredit(conversation string) {
-	_ = s.takeCredit(conversation)
+// dropCredit forgets a credit line no post took once the task it was for has
+// ended (TaskTerminal), so it cannot land on a later, unrelated post. A
+// terminal for any other task, one that predates the shortcut, leaves it.
+func (s *SlackAdapter) dropCredit(conversation, taskID string) {
 	s.mu.Lock()
-	s.unawaitCreditLocked(conversation)
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	ux := s.uxLocked()
+	if _, ok := ux.credits[conversation]; ok && ux.creditTasks[conversation] == taskID {
+		delete(ux.credits, conversation)
+		delete(ux.creditTasks, conversation)
+		forget(&ux.creditsOrder, conversation)
+	}
 }
 
 // noteCredited records that the message at channel/ts carries line, so an

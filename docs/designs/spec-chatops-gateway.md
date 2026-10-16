@@ -1686,8 +1686,11 @@ question's settling edit included, so a channel reading a bot's reply under some
 message can see who asked. The line waits for the task, not the next post, because the turn
 is verified before it is routed: a task already running in the thread would otherwise post
 its progress under it. A shortcut that starts no task (a steer into a running one) credits
-nothing, another member's turn in the thread clears a line still waiting, and one no post
-took is dropped when the chain ends. Before handing anything
+nothing. Any other verified turn in the thread before that first post clears the line,
+because under Agent Sessions there is no placeholder and the gateway's reply to that turn (a
+steer's ack) would otherwise take it; a missing line beats one naming someone for an ask they
+did not make. A line no post took is dropped when its own task ends; a terminal for a task
+that predates the shortcut leaves it. Before handing anything
 over the adapter asks `conversations.info` whether it can post there. A channel it is not a
 member of, and a conversation it cannot see at all (a private channel or a DM it is not in,
 `channel_not_found`), gets a note only the clicker sees, through the payload's
