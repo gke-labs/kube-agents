@@ -1938,8 +1938,9 @@ class WorkerRun(BaseModel):
     must match on its own (``^(?:get|describe)$`` for a verb; a resource list such as
     ``pdb,validatingwebhookconfigurations`` is one word, so a pattern over the word reads it
     whole, and a quoted mention of the whole command is one word that is no command), and
-    ``succeeded``, whether the command must have exited 0 (a non-zero or unrecorded exit
-    does not count)."""
+    ``succeeded`` (for ``required_runs`` only), whether the command must have exited 0 (a non-zero
+    or unrecorded exit does not count; reflects the overall command line's exit code, so trailing
+    pipes or commands chained with ``;`` or ``||`` may mask an earlier segment's exit)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2277,8 +2278,8 @@ def _words_after_carry(words: list[str], run: WorkerRun) -> bool:
     return all(flag in words for flag in run.flags) and all(any(re.search(pattern, word) for word in words) for pattern in run.word_patterns)
 
 
-def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str, str, bool]]:
-    """``(card, at, command, result, failed)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
+def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str, str, bool | None]]:
+    """``(card, at, command, result, succ)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
 
     ``card`` is the entry's ``task`` tag (its ``session`` when a card is not
     recorded): the worker the call belongs to. The workers' entries reach
@@ -2294,7 +2295,7 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
     that is not text reads as empty; ``failed`` is the pod's verdict on the
     unclipped result (``status == "error"``), so it survives the clip.
     """
-    calls: list[tuple[str, float | None, str, str, bool]] = []
+    calls: list[tuple[str, float | None, str, str, bool | None]] = []
     for entry in trajectory:
         if not isinstance(entry, dict) or not entry.get("agent") or entry.get("name") not in _CODE_TOOLS:
             continue
@@ -2321,13 +2322,16 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
             continue
         at = entry.get("at")
         result = entry.get("result")
+        status = entry.get("status")
+        failed = entry.get("failed") or status == "error"
+        succ: bool | None = False if failed else True if status == "completed" or (isinstance(result, str) and not failed) else None
         calls.append(
             (
                 str(entry.get("task") or entry.get("session") or ""),
                 float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None,
                 command,
                 result if isinstance(result, str) else "",
-                entry.get("status") == "error",
+                succ,
             )
         )
     calls.sort(key=lambda call: float("-inf") if call[1] is None else call[1])
@@ -2516,6 +2520,13 @@ class WorkerCommandsVerifier(BaseVerifier):
             raise ValueError("forbidden_result_patterns read results inside the window after_result_pattern opens; set both")
         return self
 
+    @model_validator(mode="after")
+    def _forbidden_runs_cannot_require_success(self) -> WorkerCommandsVerifier:
+        for run in self.forbidden_runs:
+            if run.succeeded:
+                raise ValueError("forbidden_runs cannot set succeeded: true; an attempted forbidden command trips the check regardless of exit status")
+        return self
+
     def _without_exempt_text(self, command: str) -> str:
         for pattern in self.exempt_patterns:
             command = re.sub(pattern, "", command)
@@ -2544,7 +2555,10 @@ class WorkerCommandsVerifier(BaseVerifier):
             typed = [row.get("command", "") for row in snap.worker_commands]
             windowed = typed
             command_entries = [
-                (row.get("command", ""), row.get("exit") == 0)
+                (
+                    row.get("command", ""),
+                    True if row.get("exit") == 0 else False if isinstance(row.get("exit"), int) else None,
+                )
                 for row in snap.worker_commands
             ]
         else:
@@ -2564,8 +2578,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                     )
             typed = [command for _, _, command, _, _ in calls]
             command_entries = [
-                (command, not failed)
-                for _, _, command, _, failed in calls
+                (command, succ)
+                for _, _, command, _, succ in calls
             ]
             untimed = [command for _, at, command, _, _ in calls if at is None]
             if untimed:
@@ -2612,41 +2626,45 @@ class WorkerCommandsVerifier(BaseVerifier):
         hits = [(p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)]
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
 
-        def _credited(run: WorkerRun) -> bool:
+        unrun_missing: list[WorkerRun] = []
+        unrun_failed: list[WorkerRun] = []
+        for run in self.required_runs:
+            matched_any = False
+            succeeded = False
             for c, succ in active_entries:
-                if run.succeeded and not succ:
-                    continue
                 for argv in _shell_argvs(c):
                     if _argv_runs(argv, run):
-                        return True
-            return False
+                        matched_any = True
+                        if not run.succeeded or succ is True:
+                            succeeded = True
+                            break
+                if succeeded:
+                    break
+            if not succeeded:
+                if matched_any:
+                    unrun_failed.append(run)
+                else:
+                    unrun_missing.append(run)
 
-        def _forbidden_hit(run: WorkerRun) -> list[list[str]]:
-            hits_found = []
-            for c, succ in command_entries:
-                if run.succeeded and not succ:
-                    continue
-                for argv in _shell_argvs(c):
-                    if _argv_runs(argv, run):
-                        hits_found.append(argv)
-            return hits_found
-
-        unrun = [run for run in self.required_runs if not _credited(run)]
-        ran = [(run, argv) for run in self.forbidden_runs for argv in _forbidden_hit(run)]
+        typed_argvs = [argv for c in typed for argv in _shell_argvs(c)]
+        ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
         # A forbidden command that was read is conclusive whatever else was
         # not; a missing required command, or a clean read, is not when the
         # capture has gaps (the siblings' rule, ``worker_agents`` first).
         partial = self.after_result_pattern is not None and snap.worker_capture_gaps
-        if hits or ran or ((missing or unrun) and not partial):
+        if hits or ran or ((missing or unrun_missing or unrun_failed) and not partial):
             parts = []
             if missing:
                 parts.append(
                     f"no worker command matched required pattern(s) {missing} "
                     f"across {len(commands)} command(s){exempted}"
                 )
-            if unrun:
-                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun)
+            if unrun_missing:
+                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing)
                 parts.append(f"no worker command ran {named} across {len(commands)} command(s)")
+            if unrun_failed:
+                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
+                parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"

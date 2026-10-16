@@ -8348,18 +8348,55 @@ def test_worker_commands_required_run_succeeded_flag():
     # Command exited non-zero fails.
     transcript.set("ok", _TRAJECTORY, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness", "exit": 1}])
     res = v.verify(5.0)
-    assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness" in res.reason
+    assert res.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res.reason
 
     # Command with unrecorded exit fails.
     transcript.set("ok", _TRAJECTORY, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness", "exit": None}])
     res = v.verify(5.0)
-    assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness" in res.reason
+    assert res.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res.reason
 
     # Without succeeded=True (default False), a non-zero exit is credited.
     run_any = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"])
     v_any = WorkerCommandsVerifier(type="worker_commands", required_runs=[run_any])
     transcript.set("ok", _TRAJECTORY, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness", "exit": 1}])
     assert v_any.verify(5.0).status == "pass"
+
+    # Forbidden runs cannot set succeeded=True.
+    with pytest.raises(ValueError, match="forbidden_runs cannot set succeeded: true"):
+        WorkerCommandsVerifier(type="worker_commands", forbidden_runs=[run])
+
+
+def test_worker_commands_required_run_succeeded_with_after_result_pattern():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", required_runs=[run])
+
+    # Trajectory entry with status="completed" passes.
+    traj_completed = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": "done", "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj_completed)
+    assert v.verify(5.0).status == "pass"
+
+    # Trajectory entry with status="error" fails.
+    traj_error = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": "failed", "status": "error", "at": 2.0},
+    ]
+    transcript.set("ok", traj_error)
+    res = v.verify(5.0)
+    assert res.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res.reason
+
+    # Trajectory entry with status="called" (unrecorded result) fails.
+    traj_called = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": None, "status": "called", "at": 2.0},
+    ]
+    transcript.set("ok", traj_called)
+    res = v.verify(5.0)
+    assert res.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res.reason
 
 
 
