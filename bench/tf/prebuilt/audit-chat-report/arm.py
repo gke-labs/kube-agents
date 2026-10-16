@@ -45,6 +45,7 @@ PROFILE_HOME = ("profiles", "platform")
 ROSTER = ("cron", "jobs.json")
 EXECUTIONS = ("cron", "executions.db")
 ACTIVE = ("claimed", "running")
+SKIPPED = "skipped"
 SQLITE_BUSY_TIMEOUT_S = 10
 TRIGGER_SCRIPT = "import sys\nfrom cron.jobs import trigger_job\nsys.exit(0 if trigger_job(sys.argv[1]) else 3)\n"
 TRIGGER_TIMEOUT_S = 60
@@ -97,7 +98,13 @@ def _write(home, state):
 
 
 def fire(home, python, job_id):
-    _job(home, job_id)
+    job = _job(home, job_id)
+    # `trigger_job` re-enables a disabled or paused job, and nothing here would
+    # put it back; hack/ci_platform_runs.py reads the same three markers.
+    if job.get("enabled") is False or job.get("state") == "paused" or job.get("paused_at"):
+        raise SystemExit(
+            f"the {job_id} job is paused or disabled on this install; resume it before running this case"
+        )
     fired_at = datetime.now(timezone.utc).isoformat()
     _write(home, {"job_id": job_id, "fired_at": fired_at})
     env = {**os.environ, "HERMES_HOME": os.path.join(home, *PROFILE_HOME)}
@@ -116,9 +123,11 @@ def wait(home, job_id, seconds):
     fired = datetime.fromisoformat(state["fired_at"])
     deadline = time.monotonic() + float(seconds)
     while True:
+        # A `skipped` row is an occurrence the scheduler dropped, not a run.
         ours = [
             run for run in _executions(home, job_id)
-            if run["claimed_at"] and datetime.fromisoformat(run["claimed_at"]) > fired
+            if run["status"] != SKIPPED
+            and run["claimed_at"] and datetime.fromisoformat(run["claimed_at"]) > fired
         ]
         if ours and ours[-1]["finished_at"]:
             run = ours[-1]

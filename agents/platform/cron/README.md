@@ -457,8 +457,9 @@ child can address every enabled channel itself, both copies land
 
 `deliver: "chat"` hands the run's report to the relay instead, which posts it as
 written and stores the full report against its thread, so the user's reply there reaches the
-Chat Agent with the report attached. A fleet-audit job is the exception: the
-relay posts the report the run's `finish` rendered, never the final message,
+Chat Agent with the report attached. A fleet-audit job the image ships is the
+exception: its scheduled delivery posts the report the run's `finish` rendered,
+not the final message,
 which holds whatever else the model wrote in its last turn. A run over several
 repositories posts each finished repository's report, then a line naming any it
 did not finish, and a run that finished none posts a one-line notice that it did

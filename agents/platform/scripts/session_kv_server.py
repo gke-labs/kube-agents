@@ -222,6 +222,8 @@ IMAGE_PLATFORM_ROSTER = "/opt/platform-template/cron/jobs.json"
 # every scheduled delivery and `report_to_chat` never does.
 SCHEDULER_LEG_KEY = "also_delivered_to"
 AUDIT_REPOS_SUMMARY_LINE = "{label}: {count} repositories reported in this run."
+# `audit_report.CHAT_REPORT_LEDGER_LINE`, read back for a truncation notice.
+AUDIT_LEDGER_LINE_RE = re.compile(r"^Ledger: (\S+)$", re.MULTILINE)
 CHAT_REPORT_READ_TIMEOUT_S = 20
 # `audit_report.INFLIGHT_TTL_SECONDS`: no step of a run outlives its stream's
 # lease, so a record whose last step is older than that is an earlier run's.
@@ -2723,8 +2725,9 @@ def _truncate_report(report: str, profile: str, job_id: str, audit_record: bool 
     cap.
 
     A cut report is worse than a whole one and much better than none. The head
-    survives, and the notice names the directory the scheduler saved the full
-    text to, so nothing is only in the truncated copy.
+    survives, and the notice names where the full text is: the directory the
+    scheduler saved it to, or for a fleet-audit record (`audit_record`) the
+    record and the ledger issues the report links.
 
     Not a link: the file lives on the agent's PVC under
     `$HERMES_HOME/cron/output/<job_id>/<timestamp>.md` and the run's own
@@ -2736,9 +2739,14 @@ def _truncate_report(report: str, profile: str, job_id: str, audit_record: bool 
 
     # A fleet-audit report is the record `finish` left, not the final message
     # the scheduler saved, so the notice names the record.
+    # The ledger lines are what a reader can open; the cut keeps the head and
+    # drops each report's last line, which is where `finish` puts them.
+    ledgers = sorted(set(AUDIT_LEDGER_LINE_RE.findall(report))) if audit_record else []
     saved = (
         f"The whole report is in `{CHAT_REPORT_FILE.format(audit=job_id)}` in the "
-        f"shell's scratch directory, and its findings are on the ledger issue."
+        f"shell's scratch directory, and its findings are on the ledger issue"
+        + (": " + ", ".join(ledgers) if ledgers else "")
+        + "."
         if audit_record
         else f"The whole report was saved by the scheduler under "
         f"`cron/output/{job_id}/` in the {profile} profile's home."
@@ -3020,6 +3028,11 @@ def _is_fleet_audit_job(profile: str, job_id: str) -> bool:
     except Exception as exc:
         logger.warning(f"Audit headline skipped: {profile} cron roster unreadable: {exc}")
         return False
+    return _roster_runs_fleet_audit(store, job_id)
+
+
+def _roster_runs_fleet_audit(store: Any, job_id: str) -> bool:
+    """Whether `job_id` in a cron roster's parsed JSON runs the fleet-audit skill."""
     jobs = store.get("jobs") if isinstance(store, dict) else store
     for job in jobs if isinstance(jobs, list) else []:
         if isinstance(job, dict) and str(job.get("id") or "") == job_id:
@@ -3316,12 +3329,7 @@ def _is_shipped_audit_job(job_id: str) -> bool:
     except (OSError, ValueError) as exc:
         logger.warning(f"Relay for {job_id}: image roster unreadable: {exc}")
         return False
-    jobs = store.get("jobs") if isinstance(store, dict) else store
-    for job in jobs if isinstance(jobs, list) else []:
-        if isinstance(job, dict) and str(job.get("id") or "") == job_id:
-            skills = job.get("skills") or job.get("skill") or []
-            return FLEET_AUDIT_SKILL in ([skills] if isinstance(skills, str) else skills)
-    return False
+    return _roster_runs_fleet_audit(store, job_id)
 
 
 def audit_chat_report(profile: str, job_id: str, title: str) -> tuple[str, str]:

@@ -243,3 +243,32 @@ def test_idle_waits_out_a_running_run(tmp_path):
         raise AssertionError("idle returned while a run was going")
     idle_home = _home(tmp_path / "idle", [("completed", FIRED.isoformat(), FIRED.isoformat(), "delivered")])
     arm.idle(idle_home, "compliance-audit", 0)
+
+
+def test_wait_ignores_a_skipped_occurrence(tmp_path):
+    arm = _arm()
+    home = _home(tmp_path, [
+        ("skipped", (FIRED + timedelta(seconds=5)).isoformat(), (FIRED + timedelta(seconds=5)).isoformat(), None),
+    ])
+    Path(home, arm.STATE_NAME).write_text(json.dumps({"job_id": "compliance-audit", "fired_at": FIRED.isoformat()}))
+    arm.POLL_S = 0
+    try:
+        arm.wait(home, "compliance-audit", 0)
+    except SystemExit as exc:
+        assert "did not finish" in str(exc)
+    else:
+        raise AssertionError("wait took a skipped row as the fired run")
+
+
+def test_fire_refuses_a_disabled_job(tmp_path):
+    arm = _arm()
+    cron = tmp_path / "profiles" / "platform" / "cron"
+    cron.mkdir(parents=True)
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "compliance-audit", "enabled": False}]}))
+    try:
+        arm.fire(str(tmp_path), "python3", "compliance-audit")
+    except SystemExit as exc:
+        assert "paused or disabled" in str(exc)
+    else:
+        raise AssertionError("fire triggered a disabled job")
+    assert not (tmp_path / arm.STATE_NAME).exists()
