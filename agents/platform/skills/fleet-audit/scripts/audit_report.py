@@ -770,6 +770,17 @@ GITOPS_WORKSPACE = os.environ.get("FLEET_AUDIT_GITOPS_ROOT") or "/opt/data/gitop
 # profile home names nothing.
 PLATFORM_PROFILE_SUBDIR = "profiles/platform"
 GOVERNANCE_DIR_NAME = "governance"
+# The skill's own tree under the profile home, named in full for the same reason.
+# Its SKILL.md is the short core; the detail each step needs is a reference file,
+# and `start` names the ones the next steps need so the worker does not have to
+# have read the whole skill to find them.
+SKILL_SUBDIR = "skills/fleet-audit"
+SCRIPTS_DIR_NAME = "scripts"
+REFERENCES_DIR_NAME = "references"
+SCRIPT_NAME = "audit_report.py"
+FINDINGS_REFERENCE = "findings-document.md"
+FINISH_REFERENCE = "finish.md"
+NEXT_STEPS_KEY = "next_steps"
 
 # The report store: what each `finish` published, kept on the PVC beside the
 # run that produced it (docs/designs/fleet-audit-report-store.md). A fixed root
@@ -866,8 +877,8 @@ GLOB_METACHARACTERS = "*?[]"
 # took the id back out of the branch name; it costs nothing and the gate is
 # already in place the day an id returns to a ref.
 #
-# Two documents quote a *normalised* form of this pattern — SKILL.md and the
-# ledger design doc, both with a capturing group and `$` for `\Z`, because
+# Two documents quote a *normalised* form of this pattern — the skill's
+# references/findings-document.md and the ledger design doc, both with a capturing group and `$` for `\Z`, because
 # neither difference means anything to a model reading prose. The governance
 # SOPs no longer quote it at all: the id is derived, so a worker never types
 # one. `hack/check-docs-terminology.sh` derives the normalised form from this
@@ -2328,6 +2339,37 @@ def sop_path(audit_id: str) -> str:
         f"{gitops_workspace.agent_home()}/{PLATFORM_PROFILE_SUBDIR}/"
         f"{GOVERNANCE_DIR_NAME}/{audit_sop(audit_id)}"
     )
+
+
+def skill_path(*parts: str) -> str:
+    """A full path inside this skill's tree, under the agent home `sop_path` uses."""
+    import gitops_workspace
+
+    return "/".join([gitops_workspace.agent_home(), PLATFORM_PROFILE_SUBDIR, SKILL_SUBDIR, *parts])
+
+
+def next_steps(audit_id: str, findings_path: str) -> list[str]:
+    """What `start` tells the worker to do after it, each step with the file it needs."""
+    finish = (
+        f"{skill_path(SCRIPTS_DIR_NAME, SCRIPT_NAME)} finish --audit {audit_id} "
+        f"--findings-file {findings_path}"
+    )
+    if audit_id in COLLECTOR_AUDITS:
+        finish += f" --manifest-file {manifest_path_for(audit_id)}"
+    return [
+        f"Read the SOP at {sop_path(audit_id)} in full, then run every check in `checks` "
+        "the way it says, recording each check and its command in checks_run as it completes.",
+        f"Write the findings document at {findings_path}"
+        + (
+            f", starting it with {skill_path(SCRIPTS_DIR_NAME, SCRIPT_NAME)} draft --audit {audit_id} "
+            f"--manifest-file {manifest_path_for(audit_id)}"
+            if audit_id in COLLECTOR_AUDITS
+            else ""
+        )
+        + f". Its rules are in {skill_path(REFERENCES_DIR_NAME, FINDINGS_REFERENCE)}.",
+        f"Run {finish}. Its output and exit codes are in "
+        f"{skill_path(REFERENCES_DIR_NAME, FINISH_REFERENCE)}.",
+    ]
 
 
 def checks_ran(cluster: object) -> list[str]:
@@ -15175,6 +15217,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
                     "reasons. A check you could have run and did not is not one "
                     "of those; it is a limitations note and a real gap."
                 ),
+                NEXT_STEPS_KEY: next_steps(audit_id, findings_path),
             }
         )
     )
