@@ -35,14 +35,23 @@ one only when all of these hold, so a worker's other cards are left alone:
 - a worker created it (a row in ``kanban_worker_children``, the attribution
   table ``kanban_children_settled`` writes);
 - it's assigned to a Cluster Agent (``cluster-*``);
-- it has no ``parents``, which is how the fan-out guidance files per-cluster
-  cards. A follow-up queued with ``parents=[<own card>]`` is excluded;
+- its creator isn't one of its ``parents``. A follow-up queued with
+  ``parents=[<own card>]`` is excluded. This is the same test
+  ``kanban_children_settled`` and the scheduler use for a live child, so the
+  three never disagree about which cards are fan-out work;
 - a platform worker created it, as part of a burst: at least one other such
   card from the same creator within :data:`FANOUT_BURST_SECONDS` of it. The
   fan-out guidance has a platform worker file every per-cluster card up front,
   in one burst. So a single delegation (one deep RCA on one cluster), two
-  delegations filed minutes apart, a retried creator's separate attempts, and a
-  Cluster Agent's own child cards are all excluded.
+  delegations filed minutes apart, and a Cluster Agent's own child cards are
+  excluded.
+
+The burst is a proxy, and it can be wrong in one direction. A single delegation
+filed within the window of a burst, or a retried creator that re-files inside
+it, counts as fan-out. If such a card runs past the bound it's ended with the
+"unchecked, not clear" text above, which is honest but stops a run that wasn't
+waiting. Marking the fan-out explicitly when the cards are created is the real
+fix and is tracked in #3373.
 
 The card is ended like this: its worker is stopped the way
 upstream stops one past its max runtime (SIGTERM, a short grace, SIGKILL), and
@@ -92,12 +101,14 @@ _OVERDUE_SQL = (
     "WHERE t.status = 'running' "
     "  AND t.assignee LIKE 'cluster-%' "
     "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
-    "  AND NOT EXISTS (SELECT 1 FROM task_links l WHERE l.child_id = t.id) "
+    "  AND NOT EXISTS (SELECT 1 FROM task_links l "
+    "       WHERE l.parent_id = c.creator_id AND l.child_id = c.child_id) "
     "  AND EXISTS (SELECT 1 FROM tasks p WHERE p.id = c.creator_id AND p.assignee = 'platform') "
     f"  AND EXISTS (SELECT 1 FROM {CHILDREN_TABLE} s JOIN tasks st ON st.id = s.child_id "
     "       WHERE s.creator_id = c.creator_id AND s.child_id <> c.child_id "
     "         AND st.assignee LIKE 'cluster-%' "
-    "         AND NOT EXISTS (SELECT 1 FROM task_links sl WHERE sl.child_id = s.child_id) "
+    "         AND NOT EXISTS (SELECT 1 FROM task_links sl "
+    "              WHERE sl.parent_id = s.creator_id AND sl.child_id = s.child_id) "
     f"         AND ABS(s.created_at - c.created_at) <= {FANOUT_BURST_SECONDS})"
 )
 

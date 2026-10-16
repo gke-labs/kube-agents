@@ -150,6 +150,21 @@ class TestOnlyPerClusterFanout(Fixture):
         self.conn.execute("INSERT INTO task_links VALUES (?, ?)", (PARENT, CHILD))
         self.assertEqual(self.reap(), [])
 
+    def test_a_card_gated_on_another_card_is_still_bounded(self):
+        """parents listing only a card that's already done: the completion gate
+        holds the platform card open for it, so the reaper bounds it too."""
+        self.card(CHILD, "seeded-b", started_ago=OVER)
+        self.sibling()
+        self.conn.execute("INSERT INTO task_links VALUES (?, ?)", ("t_done", CHILD))
+        self.conn.execute("INSERT INTO task_links VALUES (?, ?)", ("t_done", "t_seeded_c"))
+        self.assertEqual(self.reap(), [CHILD])
+
+    def test_a_sibling_queued_as_a_follow_up_does_not_make_a_burst(self):
+        self.card(CHILD, "seeded-b", started_ago=OVER)
+        self.sibling()
+        self.conn.execute("INSERT INTO task_links VALUES (?, ?)", (PARENT, "t_seeded_c"))
+        self.assertEqual(self.reap(), [])
+
     def test_a_card_for_a_non_cluster_agent_is_left_alone(self):
         self.card("t_audit", "Run the compliance audit", started_ago=OVER, assignee="platform")
         self.card("t_audit2", "Run the upgrade audit", started_ago=OVER, assignee="platform")
