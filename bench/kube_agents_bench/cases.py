@@ -64,7 +64,8 @@ NOOP_DEPLOYER = "noop"
 # ``tool_called`` in its default ``router`` scope reads the delegating
 # turn's own calls, which the door's trace carries once the executor
 # publishes it (the transport then writes an ``a2a.activity`` marker), so
-# it is set aside only on a record without the marker. ``worker_commands``
+# it is set aside only on a record without the marker -- unless it sets a
+# ``result`` pattern, which the trace cannot serve. ``worker_commands``
 # and ``worker_agents``, and ``tool_called`` in the ``workers`` or ``all``
 # scope, read the delegated cards' logs and the workers' tagged entries,
 # which the trace does not carry -- it holds calls without their results,

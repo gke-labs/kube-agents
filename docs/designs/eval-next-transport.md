@@ -353,7 +353,7 @@ marker reporting no loss retires the set-aside for a `tool_called` in its defaul
 — it states the door's capability to show calls, whether or not the run made one — and nothing
 else: a `tool_called` in the `workers` or `all`
 scope reads the workers' tagged entries, which the trace does not carry, and stays set aside with
-the worker checks
+the worker checks, as does a `tool_called` with a `result` pattern, since the trace records no results
 ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
 cannot show"). A case whose premise
 needs the front door — `agent-kanban-smoke`, which grades

@@ -34,11 +34,11 @@ carve-out (#2039) is the inject lane's: on that transport's record, a check
 that reads what the record cannot show is set aside as not applicable
 before the rungs -- failed or errored, it is neither a graded failure nor a
 rung-2 block there -- and the rungs grade what remains (see
-``_inject_lane_view``). A check that reads the delegated workers is set
-aside on every inject record; a router-scope ``tool_called`` only on one
-from a door that showed no tool-call trace (no ``a2a.activity`` marker),
-and it grades in full on one carrying the marker, whether or not the
-persona made a call.
+``_inject_lane_view``). A check that reads the delegated workers or a
+call's result is set aside on every inject record; any other router-scope
+``tool_called`` only on one from a door that showed no tool-call trace (no
+``a2a.activity`` marker), and it grades in full on one carrying the marker,
+whether or not the persona made a call.
 
 HOW THE JUDGE IS AND IS NOT USED. No judged score is ever compared against an
 absolute threshold, and the reason is measured rather than assumed: three
@@ -242,9 +242,9 @@ A2A_STATE_WORKING = "working"
 #: the persona never made fails there as it would on the api transport,
 #: while a check graded over a trace that lost calls could fail a call
 #: that happened, and a ``none``-wrapped safeguard could pass over one. A
-#: check that reads the delegated workers is set aside on every inject
-#: record, marker or not: the trace carries no card ids and no worker's
-#: entries (``cases.py``, ``worker_blind_checks``). The names are
+#: check that reads the delegated workers or a call's result is set aside
+#: on every inject record, marker or not: the trace carries no card ids,
+#: no worker's entries and no results (``cases.py``, ``worker_blind_checks``). The names are
 #: duplicated rather than imported, like the status entry, and so are the
 #: marker's three loss arguments (``inject_transport.ACTIVITY_LOSS_ARGS``);
 #: ``test_scoring.py`` asserts each agrees with the transport's.
@@ -941,7 +941,8 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
 
     The set-aside is per check family, because the door's trace serves one
     and not the other (``cases.py``, the two sets): a router-scope
-    ``tool_called`` (:attr:`CaseSpec.trace_blind_checks`) is set aside only
+    ``tool_called`` with no ``result`` pattern
+    (:attr:`CaseSpec.trace_blind_checks`) is set aside only
     on an inject record whose door showed no trace (:func:`_inject_blind`),
     and grades in full on one carrying the activity marker; a check that
     reads the delegated workers or a call's result
