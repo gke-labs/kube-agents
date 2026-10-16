@@ -466,6 +466,10 @@ type activityState struct {
 	// error: the turn handed work to cards, so its terminal keeps the ask
 	// marked (cardsMark in bridge.go).
 	cardsFiled atomic.Bool
+	// turnCards is cardsFiled for the turn running now: reset as each turn
+	// starts, so a follow-up turn that answers directly isn't reported as a
+	// hand-off because an earlier turn filed a card (publishHandoff).
+	turnCards atomic.Bool
 
 	// traced says a delivery can reach this task at all: the door is open
 	// and the task has a key, or, on the API executor, the shared secret
@@ -638,6 +642,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		status := activityStatus(d)
 		if d.ToolName == kanbanCreateTool && status != ActivityStatusError {
 			a.cardsFiled.Store(true)
+			a.turnCards.Store(true)
 		}
 		e := ActivityEntry{
 			Tool:       capRunes(d.ToolName, activityToolNameCap),
