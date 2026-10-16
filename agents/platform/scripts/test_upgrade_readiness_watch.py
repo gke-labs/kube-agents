@@ -498,6 +498,19 @@ class Retired(Base):
         self.assertIn("1 ready;", out)
         self.assertNotIn(TARGET, self.ledger()["announced"].get("ungraded", {}))
 
+    def test_a_failed_audit_log_read_leaves_the_member_graded(self) -> None:
+        """The report lists a failed audit-log read under ``readiness.audit_log_failures``,
+        apart from ``errors``, so the watch's reading of a cluster-keyed error as a kubectl
+        read that failed never sees it: the member keeps its verdict."""
+        graded = member("a", "lagging", readiness=watch.READINESS_READY)
+        report = {
+            watch.MEMBERS_KEY: [graded],
+            watch.ERRORS_KEY: [],
+            watch.READINESS_KEY: {"audit_log_failures": [{"project": "p1", "location": "us-central1-a", "cluster": "a", "read": "removed", "message": "timed out"}]},
+        }
+        blocked, ready, unknown, unread = watch.readiness_verdicts(report, [watch.member_key(graded)])
+        self.assertEqual((blocked, ready, unknown, unread), ([], [watch.member_key(graded)], [], []))
+
     def test_a_server_config_failure_leaves_the_location_s_unknown_members_unread(self) -> None:
         readiness = envelope(
             [member("a", "lagging", readiness="unknown")],
@@ -2289,7 +2302,8 @@ class Loader(unittest.TestCase):
     def test_the_loader_registers_the_readiness_module_and_calls_main_in_a_private_directory(self) -> None:
         source = watch.loader_source(["--project", "p1"])
         compile(source, "loader", "exec")
-        self.assertIn('sys.modules["upgrade_readiness"]', source)
+        self.assertIn("sys.meta_path.insert(0, Shipped())", source)
+        self.assertIn('importlib.import_module("fleet_upgrade_report")', source)
         self.assertIn("report.main(ARGV + ", source)
         self.assertIn("tempfile.mkdtemp(", source)
         self.assertIn("shutil.rmtree(private", source)
@@ -2297,13 +2311,28 @@ class Loader(unittest.TestCase):
         self.assertNotIn("/tmp/upgrade-readiness", source)
 
     def test_the_loader_hands_the_sandbox_this_image_s_fleet_scope_args(self) -> None:
-        """The report script formats a refusal with the constants this job
-        parses it by, whatever copy the sandbox image carries."""
-        source = watch.loader_source(["--project", "p1"])
-        self.assertIn('sys.modules["fleet_scope_args"]', source)
-        self.assertIn(json.dumps(str(watch.scope_args_path())), source)
+        """The report script formats a refusal with the constants this job parses it by,
+        whatever copy the sandbox image carries: this image's ``fleet_scope_args`` is in
+        the shipped set, known by its path here (or under a caller's root), and the finder
+        serves it ahead of any copy on the sandbox's path."""
         self.assertEqual(watch.scope_args_path(), Path(watch.__file__).resolve().parent / "fleet_scope_args.py")
-        self.assertLess(source.index('sys.modules["fleet_scope_args"]'), source.index("exec(compile(REPORT_SRC"))
+        source, file, is_package = watch.shipped_modules()[watch.SCOPE_ARGS_MODULE]
+        self.assertEqual((source, file, is_package), (watch.scope_args_path().read_text(encoding="utf-8"), str(watch.scope_args_path()), False))
+        self.assertEqual(watch.shipped_modules(root="/absent")[watch.SCOPE_ARGS_MODULE][1], "/absent/fleet_scope_args.py")
+        self.assertIn(repr(watch.SCOPE_ARGS_MODULE) + ":", watch.loader_source(["--project", "p1"]))
+        program = watch.loader_preamble() + "\n".join(
+            [
+                f"scope_args = importlib.import_module({json.dumps(watch.SCOPE_ARGS_MODULE)})",
+                "print(json.dumps([scope_args.__file__, scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR]))",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as scratch:
+            decoy = Path(scratch) / "fleet_scope_args.py"
+            decoy.write_text("DECLARED_SCOPE_ARGS_MISSING_ERROR = 'the sandbox image copy'\n", encoding="utf-8")
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": scratch, "TMPDIR": scratch, "PYTHONPATH": scratch}
+            completed = subprocess.run([sys.executable, "-", "-c", "pass"], input=program, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout.strip().splitlines()[-1]), [str(watch.scope_args_path()), fleet_scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR])
 
     def test_the_report_argv_carries_the_projects_and_the_sandbox_side_kubeconfig_dir(self) -> None:
         self.assertEqual(
@@ -2330,6 +2359,63 @@ class Loader(unittest.TestCase):
     @staticmethod
     def envelope_of(completed: subprocess.CompletedProcess) -> dict:
         return json.loads(completed.stdout.rsplit(watch.ENVELOPE_SENTINEL, 1)[1])
+
+    def test_the_shipped_set_is_every_skill_module_but_the_tests(self) -> None:
+        shipped = watch.shipped_modules()
+        for name in (watch.REPORT_MODULE, watch.READINESS_MODULE, "readiness_rules", "readiness_rules.audit_log", "readiness_rules.zonal_control_plane", "readiness_rules.finding", "upgrade_shape_tables"):
+            self.assertIn(name, shipped)
+        self.assertEqual([name for name in shipped if name.rsplit(".", 1)[-1].startswith(watch.SKILL_TEST_PREFIX)], [])
+        self.assertTrue(shipped["readiness_rules"][2])
+        self.assertFalse(shipped[watch.REPORT_MODULE][2])
+        self.assertTrue(all(Path(entry[1]).is_file() for entry in shipped.values()))
+        # The data files beside the modules ship too (the removal table), the test fixtures do not.
+        data = watch.shipped_data()
+        self.assertEqual(sorted(Path(path).name for path in data), ["removed_apis.json"])
+        self.assertTrue(all(Path(path).is_file() for path in data))
+        self.assertEqual(sorted(Path(path).name for path in watch.shipped_data(root="/elsewhere")), ["removed_apis.json"])
+        self.assertTrue(all(path.startswith("/elsewhere/") for path in watch.shipped_data(root="/elsewhere")))
+
+    def test_a_replacement_is_read_from_the_shipped_set_alone(self) -> None:
+        """The shape tables read the removal table through their module's loader. With the
+        set re-rooted to a directory that does not exist, as the sandbox's view of the
+        agent-side paths is, the replacement still comes from the shipped data; without
+        the data, the read fails loudly rather than as an empty table."""
+        with tempfile.TemporaryDirectory() as scratch:
+            absent = os.path.join(scratch, "absent")
+            program = watch.loader_preamble(root=absent) + "\n".join(
+                [
+                    "tables = importlib.import_module('upgrade_shape_tables')",
+                    "print(tables.replacement_for('extensions/v1beta1 networkpolicies'))",
+                ]
+            )
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": scratch, "TMPDIR": scratch}
+            completed = subprocess.run([sys.executable, "-I", "-"], input=program, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip().splitlines()[-1], "networking.k8s.io/v1")
+            without_data = program.replace("DATA = {", "DATA = {}  # ", 1)
+            self.assertNotEqual(without_data, program)
+            completed = subprocess.run([sys.executable, "-I", "-"], input=without_data, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("removed_apis.json could not be read beside upgrade_shape_tables", completed.stderr)
+
+    def test_the_report_imports_from_the_shipped_set_alone(self) -> None:
+        """The finder alone, in an empty directory under ``-I``: every import the report
+        makes resolves from the shipped modules (or the shared scripts directory the report
+        appends itself), so a module a later change imports without shipping fails here,
+        not in the daily job."""
+        program = watch.loader_preamble() + "\n".join(
+            [
+                f"report = importlib.import_module({json.dumps(watch.REPORT_MODULE)})",
+                "print(json.dumps(sorted(name for name in sys.modules if name in SOURCES)))",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as scratch:
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": scratch, "TMPDIR": scratch}
+            completed = subprocess.run([sys.executable, "-I", "-"], input=program, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        loaded = json.loads(completed.stdout.strip().splitlines()[-1])
+        for name in (watch.REPORT_MODULE, watch.READINESS_MODULE, "readiness_rules", "readiness_rules.audit_log", "readiness_rules.zonal_control_plane", "upgrade_shape_tables"):
+            self.assertIn(name, loaded)
 
     def test_the_loader_runs_the_checkout_copy_of_the_report_script(self) -> None:
         """End to end against the real scripts, with gcloud answering no

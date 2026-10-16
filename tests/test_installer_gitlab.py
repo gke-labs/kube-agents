@@ -560,10 +560,10 @@ class GitLabPrivateCATest(unittest.TestCase):
         ca = self._tmp / "ca.pem"
         ca.write_text(_PEM)
         proc = self._run_body(
-            # After the source, as the main path sets it: sourcing install.sh
-            # clears an inherited GITOPS_CA_SECRET.
-            f"GITOPS_CA_SECRET=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
-            'create_gitlab_ca_secret agents ctx1; echo "rc=$?"\n',
+            # After the source, as the main path sets them: sourcing install.sh
+            # clears an inherited GITOPS_FORGE and GITOPS_CA_SECRET.
+            f"GITOPS_FORGE=gitlab GITOPS_CA_SECRET=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
+            'create_gitops_ca_secret agents ctx1; echo "rc=$?"\n',
         )
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         log = (self._stub_dir / "kubectl.log").read_text()
@@ -587,8 +587,8 @@ class GitLabPrivateCATest(unittest.TestCase):
                 ca = self._tmp / f"{name}.pem"
                 ca.write_text(content)
                 proc = self._run_body(
-                    f"GITOPS_CA_SECRET=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
-                    'create_gitlab_ca_secret agents ctx1 && rc=0 || rc=$?; echo "rc=$rc"\n',
+                    f"GITOPS_FORGE=gitlab GITOPS_CA_SECRET=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
+                    'create_gitops_ca_secret agents ctx1 && rc=0 || rc=$?; echo "rc=$rc"\n',
                 )
                 # A one-shot source is read after the apply has named the
                 # Secret: refused, nothing stored, the way to create it
@@ -599,19 +599,19 @@ class GitLabPrivateCATest(unittest.TestCase):
                 self.assertEqual([], self._ca_secrets())
 
     def test_without_a_file_a_missing_secret_is_named_and_an_existing_one_kept(self):
-        proc = self._run_body('GITOPS_CA_SECRET=gitlab-forge-ca\n'
-                              'create_gitlab_ca_secret agents ctx1; echo "rc=$?"\n')
+        proc = self._run_body('GITOPS_FORGE=gitlab GITOPS_CA_SECRET=gitlab-forge-ca\n'
+                              'create_gitops_ca_secret agents ctx1; echo "rc=$?"\n')
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertIn("kubectl create secret generic gitlab-forge-ca", proc.stdout + proc.stderr)
         self.assertEqual([], self._ca_secrets())
-        proc = self._run_body('GITOPS_CA_SECRET=gitlab-forge-ca\n'
-                              'create_gitlab_ca_secret agents ctx1; echo "rc=$?"\n',
+        proc = self._run_body('GITOPS_FORGE=gitlab GITOPS_CA_SECRET=gitlab-forge-ca\n'
+                              'create_gitops_ca_secret agents ctx1; echo "rc=$?"\n',
                               STUB_SECRET_EXISTS_RC="0")
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertNotIn("does not exist", proc.stdout + proc.stderr)
 
     def test_an_install_without_a_ca_does_nothing(self):
-        proc = self._run_body('create_gitlab_ca_secret agents ctx1; echo "rc=$?"\n')
+        proc = self._run_body('create_gitops_ca_secret agents ctx1; echo "rc=$?"\n')
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertFalse((self._stub_dir / "kubectl.log").exists())
 
@@ -769,7 +769,8 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
 
     def test_a_switch_to_github_drops_the_recorded_secret(self):
         proc = self._validate_ca(
-            {"PARAM_GITOPS_FORGE": "github", "PARAM_GITOPS_REPO": "infra", "PARAM_GITOPS_CA_SECRET": "gitlab-forge-ca"}
+            {"PARAM_GITOPS_FORGE": "github", "PARAM_GITOPS_REPO": "infra", "PARAM_GITOPS_CA_SECRET": "gitlab-forge-ca",
+             "PARAM_GITOPS_RECORDED_FORGE": "gitlab"}
         )
         self.assertIn("rc=0 cm=", proc.stdout, proc.stderr)
         self.assertNotIn("cm=gitlab-forge-ca", proc.stdout)
@@ -965,8 +966,10 @@ class GitLabInstallEnvTest(unittest.TestCase):
         )
         self.assertIn("rc=0 forge=github host=[]", proc.stdout, proc.stderr)
 
-    def test_a_host_flag_with_github_is_still_refused(self):
-        proc = self._source_with("", "--gitops-forge=github", "--gitops-host=gitlab.example.com")
+    def test_a_gitlab_host_flag_with_github_is_still_refused(self):
+        # Any other host with github is a GitHub Enterprise Server
+        # (test_installer_ghes.py); gitlab.com is never one.
+        proc = self._source_with("", "--gitops-forge=github", "--gitops-host=gitlab.com")
         self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr)
 
     def test_a_shell_export_does_not_choose_install_sh_s_forge(self):
@@ -1061,7 +1064,7 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
         self.assertEqual(sorted(names), ["gitlab_ca_secret_name", "gitlab_repo", "gitlab_token_secret_name"])
 
     def test_gitlab_suppresses_the_github_alias(self):
-        self.assertIn("!local.gitops_is_gitlab && (local.github_org", self.main)
+        self.assertIn("!local.gitops_is_gitlab && !local.gitops_is_ghes && (local.github_org", self.main)
         self.assertIn("credentialsRef = { name = var.gitlab_token_secret_name }", self.main)
         self.assertIn('role = "gitops"', self.main)
 
@@ -1237,7 +1240,7 @@ class GitLabSecretOrderTest(unittest.TestCase):
         start = source.index('create_gitlab_token_secret "$namespace"') - 400
         block = source[start: source.index('create_gitlab_token_secret "$namespace"') + 400]
         self.assertLess(
-            block.index('create_gitlab_ca_secret "$namespace"'),
+            block.index('create_gitops_ca_secret "$namespace"'),
             block.index('create_gitlab_token_secret "$namespace"'),
         )
 

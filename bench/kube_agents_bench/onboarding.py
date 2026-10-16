@@ -301,9 +301,10 @@ def writer():
 
 try:
     with open(os.path.join(root, marker)) as fh:
-        ids = [m.group(1) for m in (re.search(r"(?:^|\\s)task_id\\s*=\\s*(\\S+)", line) for line in fh) if m]
+        lines = fh.readlines()
 except OSError as exc:
     done("no discovery sweep has been filed: %s" % exc)
+ids = [m.group(1) for m in (re.search(r"(?:^|\\s)task_id\\s*=\\s*(\\S+)", line) for line in lines) if m]
 if not ids or not ids[0]:
     done("%s names no task_id" % marker)
 try:

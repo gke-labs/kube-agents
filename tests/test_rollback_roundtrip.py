@@ -1455,6 +1455,7 @@ class CiEvalWiringTest(unittest.TestCase):
             {build}
             profile_begin() {{ echo "PROFILE $*"; }}
             collect_gateway_log() {{ echo COLLECT_GATEWAY; }}
+            collect_credential_proxy_evidence() {{ echo COLLECT_PROXY; }}
             collect_agent_pod_diagnostics() {{
               [ -z "${{AGENT_DIAG_COLLECTED:-}}" ] || return 0
               AGENT_DIAG_COLLECTED=1
@@ -1619,6 +1620,7 @@ class CiEvalWiringTest(unittest.TestCase):
                 EVAL_MODE_NEXT=1
                 profile_begin() {{ :; }}
                 collect_gateway_log() {{ :; }}
+                collect_credential_proxy_evidence() {{ :; }}
                 collect_agent_pod_diagnostics() {{
                   [ -z "${{AGENT_DIAG_COLLECTED:-}}" ] || return 0
                   AGENT_DIAG_COLLECTED=1

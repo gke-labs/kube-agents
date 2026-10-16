@@ -1,0 +1,4 @@
+# BuildKit daemon config for every buildx builder the workflows create.
+# docker-build.yml says why docker.io is mirrored.
+[registry."docker.io"]
+  mirrors = ["mirror.gcr.io"]

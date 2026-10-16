@@ -58,6 +58,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
 import mcp_policy  # noqa: E402
+import watcher_policy  # noqa: E402
 
 # The name the gateway redactor is registered under in sys.modules when a test
 # imports it by path. Distinct from the callback's own registration name so
@@ -131,6 +132,18 @@ SOURCES: dict[str, Source] = {
         "agents/platform/scripts/mcp_policy.py",
         ("GKE_READ_TOOLS", "MCP_SERVERS", "def evaluate(", "MCP_RELAY_PREFIX"),
     ),
+    # C1 imports this module: what the broker relays for the gateway's
+    # watchers under the watcher role.
+    "watcher_policy": Source(
+        "agents/platform/scripts/watcher_policy.py",
+        ("def evaluate_k8s(", "def evaluate_gcp(", "REFUSED_RESOURCES", "WATCHER_K8S_PREFIX", "def project_cluster("),
+    ),
+    # C1 holds the operator's copy of the drift detector's default
+    # subscription to the detector's own.
+    "drift_detector_main_go": Source(
+        "k8s-operator/cmd/drift-detector/main.go",
+        ("defaultSubscriptionName =",),
+    ),
     "session_kv_server": Source(
         "agents/platform/scripts/session_kv_server.py",
         ("/sessions/{session_id}/inject", "trigger_agent_troubleshooter", "_gateway_api_token"),
@@ -169,7 +182,8 @@ SOURCES: dict[str, Source] = {
     ),
     "broker_split_go": Source(
         "k8s-operator/internal/controller/platformagent_broker_split.go",
-        ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath ="),
+        ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath =",
+         "driftDetectorDefaultSubscription =", "credentialProxyWatcherAudience ="),
     ),
     "manifest_helpers_go": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
@@ -287,24 +301,12 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveInjectPrincipal", "injectEvalPrincipalPrefix"),
     ),
-    # D1's identity-table check reads the two Roles the next stack mints that
-    # no golden renders (every golden is `mode: today`): the gateway's and the
-    # callout's. Anchored on the rule each one grants, so the extractor that
-    # reads them cannot return an empty body and pass.
-    "a2a_gateway_role": Source(
-        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
-        ("func buildA2AGatewayRole(", '[]string{"deployments"},', "a2aSlackPrincipalMapSecretName ="),
-    ),
     # The operator-rendered Hermes bridge: built from the agent container, so
     # what it drops from that copy is the whole of what keeps it a separate
     # principal from the agent beside it.
     "a2a_bridge_render": Source(
         "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
         ("func buildA2ABridgeContainer(", "func a2aBridgeOwnEnv(", "var a2aBridgeDroppedAgentEnv"),
-    ),
-    "a2a_callout_role": Source(
-        "k8s-operator/internal/controller/platformagent_a2a_callout.go",
-        ("func buildA2ACalloutRole(", '[]string{"configmaps"},'),
     ),
     # The A2A door is the inject door's sibling for an agent caller, gated and
     # resolved the same way; A3 reads the same two seams for it.
@@ -354,6 +356,10 @@ SOURCES: dict[str, Source] = {
     "operator_labels": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("labelPartOf",),
+    ),
+    "operator_metrics_peer": Source(
+        "k8s-operator/internal/controller/platformagent_manifests.go",
+        ("operatorPodNameLabel", "operatorPodNameValue"),
     ),
     "a2a_spawner": Source(
         "a2a/gateway/spawn.go",

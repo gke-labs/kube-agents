@@ -1,11 +1,15 @@
 package workeradapter
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -112,4 +116,63 @@ func validateDelegate(req lib.DelegateRequest) string {
 		return "text is too long for a delegation"
 	}
 	return ""
+}
+
+// taskSocketSuffixBytes is the random part of a reused pod's per-turn
+// delegate socket name, in bytes (twice as many hex characters).
+const taskSocketSuffixBytes = 8
+
+// taskDelegateSocket is a fresh delegate socket path for one turn of a reused
+// pod: the configured socket's name with a random suffix, in the same
+// directory. The socket itself is 0600 (startDelegateListener); the name keeps
+// a process holding an earlier turn's path, or the configured one, from
+// reaching this turn, but not one running as the pod's user that lists the
+// directory.
+func taskDelegateSocket(base string) (string, error) {
+	suffix := make([]byte, taskSocketSuffixBytes)
+	if _, err := rand.Read(suffix); err != nil {
+		return "", fmt.Errorf("delegate socket name: %w", err)
+	}
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(filepath.Base(base), ext) + "-" + hex.EncodeToString(suffix) + ext
+	return filepath.Join(filepath.Dir(base), name), nil
+}
+
+// withDelegateSocket tells one turn's harness its delegate socket: in the
+// environment, and in the delegate MCP server's own env inside the
+// --mcp-config argument, which is where the harness passes it on to the
+// server (cmd/worker-adapter builds that argument once, with the configured
+// path). An argv with no such entry (an A2A_HARNESS_CMD override) is left as
+// it is, and rewrote reports whether the delegate server's entry was found.
+// Neither input is modified.
+func withDelegateSocket(argv, env []string, socket string) (out, outEnv []string, rewrote bool) {
+	if env == nil {
+		env = os.Environ()
+	}
+	outEnv = append(slices.Clone(env), EnvDelegateSocket+"="+socket)
+	out = slices.Clone(argv)
+	for i := 1; i < len(out); i++ {
+		if out[i-1] != MCPConfigFlag {
+			continue
+		}
+		var cfg map[string]map[string]map[string]any
+		if err := json.Unmarshal([]byte(out[i]), &cfg); err != nil {
+			continue
+		}
+		srv, ok := cfg[MCPServersKey][DelegateMCPServer]
+		if !ok {
+			continue
+		}
+		srvEnv, _ := srv[MCPEnvKey].(map[string]any)
+		if srvEnv == nil {
+			srvEnv = map[string]any{}
+		}
+		srvEnv[EnvDelegateSocket] = socket
+		srv[MCPEnvKey] = srvEnv
+		if b, err := json.Marshal(cfg); err == nil {
+			out[i] = string(b)
+			rewrote = true
+		}
+	}
+	return out, outEnv, rewrote
 }

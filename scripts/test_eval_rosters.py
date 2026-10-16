@@ -171,6 +171,7 @@ ADDED_AFTER_THE_MOVE = [
     "findings-decision-covers-item",  # the findings queue's item-wide decision
     "upgrades-fleet-readiness-failclosed-webhook",  # the readiness report's fail-closed webhook source
     "upgrades-freeze-runbook-probe",  # the gke-upgrades skill sync
+    "fleet-audit-clean-close-reads-clean",  # the clean close's banner, with close_ledger_reads_clean
     "session-crashloop-question-loads-a-skill",  # the session persona's skills, #2858
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
@@ -178,13 +179,15 @@ ADDED_AFTER_THE_MOVE = [
     "gitops-drift-noise-filtered-triage",  # the drift detector's principal classifier, #2739's fixture
     "chat-question-asked-to-choose-pauses",  # an asked-for choice pauses the card on a needs_input question
     "manage-cluster-exclusion-installer-route-probe",  # the exclusion route on an installer-made install
+    "upgrades-readiness-zonal-control-plane",  # catalogue entry 11 through the readiness report's per-entry rules
     "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
+    "not-found-target-stops-as-failure",  # a missing target stops its card on a hard wall, mock 06
+    "alert-config-terraform-promql-probe",  # the gke-alert-configuration skill sync
+    "security-chat-request-runs-collector",  # a plain security-posture request runs the compliance collector, #2386
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
-PARKED_AFTER_THE_MOVE = [
-    "oobe-first-run-audits",  # 2026-10-09: truncated the main nightly, graded blocked
-]
+PARKED_AFTER_THE_MOVE: list[str] = []
 
 # Admitted after the split, each by a pull request that cited the record
 # (docs/eval-gate-roster.md, "Admitted on the record since the split"), as

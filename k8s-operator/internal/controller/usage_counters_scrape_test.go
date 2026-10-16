@@ -260,6 +260,39 @@ func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 	}
 }
 
+// The A2A gateway's body carries the chat counter under its own family name:
+// the fold names it as the chat counter's sibling and sums it the same way,
+// and a body carrying neither family yields zero, not a failure.
+func TestPodUsageSource_ReadsTheA2AGatewaysInboundFamilyAsTheChatCounter(t *testing.T) {
+	body := strings.Join([]string{
+		"# TYPE kubeagents_a2a_gateway_messages_inbound_total counter",
+		`kubeagents_a2a_gateway_messages_inbound_total{platform="discord"} 5`,
+		`kubeagents_a2a_gateway_messages_inbound_total{platform="slack"} 2`,
+		`kubeagents_a2a_gateway_messages_inbound_total{platform="other"} 0`,
+		"# TYPE kubeagents_a2a_gateway_task_terminals_total counter",
+		`kubeagents_a2a_gateway_task_terminals_total{state="completed",source="executor"} 9`,
+		"# TYPE process_start_time_seconds gauge",
+		"process_start_time_seconds 1759400100.5",
+		"",
+	}, "\n")
+	addr := serveBody(t, http.StatusOK, body)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters)
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if reading.Samples[usageCounterChatMessagesInbound] != 7 {
+		t.Fatalf("samples = %v, want 7 inbound messages from the A2A gateway's family alone", reading.Samples)
+	}
+	if reading.StartTime == nil || *reading.StartTime != 1759400100.5 {
+		t.Fatalf("start time = %v, want the gateway's", reading.StartTime)
+	}
+	empty := serveBody(t, http.StatusOK, "# TYPE process_start_time_seconds gauge\nprocess_start_time_seconds 1\n")
+	reading, err = newPodUsageSource().Scrape(context.Background(), empty, usageChatCounters)
+	if err != nil || reading.Samples[usageCounterChatMessagesInbound] != 0 {
+		t.Fatalf("a body with neither family: %v, %v; want 0 and no error", reading.Samples, err)
+	}
+}
+
 // The gateway's chat listener serves one family, summed over its platform
 // label, and no cluster gauge: the chat body is the platform-agent container's,
 // not the watcher's.

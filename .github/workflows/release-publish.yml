@@ -192,9 +192,19 @@ jobs:
           GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: ./scripts/release/tag_ga_release.sh
 
+      # The builder image and config from mirror.gcr.io, as in docker-build.yml:
+      # this step pulls moby/buildkit from Docker Hub on the runner's daemon, which
+      # is the per-IP anonymous pull that failed CI on 2026-10-09 (#2870), and here
+      # it would fail after the GA tag is pushed. Nothing below builds; the promote
+      # script only runs imagetools against GHCR, so the config is read by nothing
+      # today. It is here so every setup-buildx step has one shape, which is what
+      # tests/test_workflow_pins_and_fork_guards.py checks.
       - name: Set up Docker Buildx
         if: steps.verify-eligibility.outputs.skip_release != 'true'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config: .github/buildkitd.toml
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
 
       - name: Log in to GitHub Container Registry
         if: steps.verify-eligibility.outputs.skip_release != 'true'

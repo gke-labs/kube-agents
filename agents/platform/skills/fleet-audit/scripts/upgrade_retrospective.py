@@ -1128,7 +1128,7 @@ MITIGATIONS = {
     11: {
         "title": "The control plane is unreachable for minutes on a zonal cluster",
         "before": "The cluster is zonal; whether its clients retry is not readable from the cluster.",
-        "read_today": "nothing as an upgrade risk; the cluster inventory audit, run once per cluster by the onboarding sweep, records each control plane's location, and the upgrade skill recommends regional control planes when asked",
+        "read_today": "the readiness mode of `fleet-upgrade-verification` carries a zonal control plane as a risk on every report, never a blocker, with the retry advice; the cluster inventory audit, run once per cluster by the onboarding sweep, records each control plane's location, and the upgrade skill recommends regional control planes when asked",
         "mitigate_before": "A regional cluster for anything automation depends on, and retries with backoff in the clients.",
         "mitigate_after": "Wait for the control plane; GitOps resyncs on its own.",
     },

@@ -1297,8 +1297,8 @@ func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	}
 	// Drift bills a bucket of its own rather than the Warning one it displays
 	// as, so its ceiling is a fourth variable and has to be overridable by the
-	// same route. Off the allowlist, one multi-object `kubectl apply` spends
-	// the default of 5 and every later drift record that day is lost for good
+	// same route. Off the allowlist, one large `kubectl apply` can spend
+	// the default and every later drift record that day is lost for good
 	// — the detector cannot re-offer one — with no way to raise the cap short
 	// of a new image.
 	if values["ALERT_DAILY_LIMIT_DRIFT"] != "50" {

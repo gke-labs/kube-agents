@@ -2,7 +2,7 @@
 """Deterministic (no-LLM) delivery for first-time onboarding.
 
 This is the delivery stage of the ``oobe`` cron job (``oobe.py``), which runs
-with ``no_agent: true``. Its stdout is delivered verbatim by the cron
+with ``no_agent: true``. Its stdout is delivered as written by the cron
 scheduler to the job's configured target (``deliver: origin`` — the chat the
 user first spoke in, bound by the ``bootstrap_onboarding`` plugin). It backed
 the ``bootstrap-inventory-delivery`` job before ``oobe`` took it over; that
@@ -24,8 +24,8 @@ sandbox is on, and from ``HERMES_HOME`` when it is off, and only once both
 markers say a delivery is due — the ssh read is the one check with a cost.
 
 When all three hold, the script claims delivery, prints ``INVENTORY.md``
-(verbatim, or reshaped by ``inventory_presenter`` when ``KAGE_SLACK_UX`` is on
-and the job is bound to Slack) and sets the report aside where it was read. Otherwise it
+(as written, or reshaped by ``inventory_presenter`` when ``KAGE_SLACK_UX`` is on
+and the job is bound to Slack) followed by the audits note, and sets the report aside where it was read. Otherwise it
 prints nothing, which the ``no_agent`` cron path treats as a silent run (no
 message). A report it cannot read, or one over ``REPORT_MAX_BYTES``, fails the
 run instead (exit 1), which the scheduler posts as an alert; an unreachable
@@ -39,9 +39,15 @@ total, the top two rows, the rest folded, and "Fix the first one" and "See all N
 buttons), posted here through ``slack_blocks_post`` because the scheduler's delivery
 takes text only. Under ``spec.mode: next`` the same card goes through the A2A
 gateway as a chat message instead (``_posted_through_gateway``).
-Then nothing is printed; any failure prints the text. A failure after the request was
-sent may have posted, so that path can send the report twice; see
-``_posted_as_blocks``.
+Then only the audits note below is printed, as a second message; any failure prints the
+text. A failure after the request was sent may have posted, so that path can send the
+report twice; see ``_posted_as_blocks``.
+
+Every delivery closes with a short note on the first-run audits, read off the ``oobe`` stage's
+marker by ``_audits_note``: the report's scan leaves the workload checks to those audits (except
+on an install whose kept marker records an older stage's no-repository skip, where the scan ran
+them), and a short report would otherwise read as a healthy fleet. The text path appends it to the report; the
+card paths print it on their own, since the card leaves closing lines out.
 
 Just before the claim, the run registers the sweep's findings in the
 findings queue from this pod, from the items and scores the prioritization
@@ -65,9 +71,10 @@ sent the entire onboarding report twice.
 
 Because the prioritization stage writes a finished, presentation-ready
 ``INVENTORY.md``, no LLM is involved in delivery: what that stage produced is
-what the user sees, verbatim or, on Slack with the flag on, laid out again by
-``inventory_presenter`` without a model call. The sweep's complete findings are a different file
-(``INVENTORY.raw.md``) and are never delivered from here.
+what the user sees, as written or, on Slack with the flag on, laid out again by
+``inventory_presenter`` without a model call, followed by the audits note. The
+sweep's complete findings are a different file (``INVENTORY.raw.md``) and are
+never delivered from here.
 """
 
 import contextlib
@@ -83,6 +90,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import bootstrap_handoff  # beside this script in the pod
+import oobe  # beside this script in the pod
 import sandbox_exec
 
 # The two jobs oobe took over, removed once onboarding is done.
@@ -161,8 +170,49 @@ RETIRE_AFTER_SECONDS = 300
 # the rename, as the claim comes first.
 REMOTE_MV = "/bin/mv"
 
-# The only surface the reshaped report is written for; every other one gets it verbatim.
+# The only surface the reshaped report is written for; every other one gets it as written.
 PRESENTED_PLATFORM = "slack"
+
+# The note on the first-run audits (_audits_note). The scan leaves their workload checks to them.
+AUDITS_SKIPPED_NOTE = "The first-run audits did not run: {reason}."
+AUDITS_NO_REASON = "no reason was recorded"
+# The reason an older oobe stage recorded when it skipped for no repository. A marker an install
+# kept through the upgrade still carries it, and on such an install the scan ran those checks,
+# unless a repository registered when the sweep was filed was removed before the stage read the list.
+LEGACY_NO_REPOSITORY_REASON = "no GitHub repository in managed_repos for the audits to publish to"
+AUDITS_COVERED_NOTE = (
+    "This scan checked probes, requests and limits, autoscaling, NetworkPolicy and pod security in "
+    "their place, so this report covers them."
+)
+# Every other skip leaves the audits to their schedules, and the scan did not run their checks.
+AUDITS_NOT_COVERED_NOTE = (
+    "This scan did not check probes, requests and limits, autoscaling, NetworkPolicy or pod security "
+    "either, so this report does not cover them."
+)
+# A skip with the hand-off's no-coverage report (bootstrap_handoff.NO_RANKING).
+AUDITS_UNCHECKED_SCHEDULED_NOTE = (
+    "No cluster was audited either, so this report covers none of probes, requests and limits, "
+    "autoscaling, NetworkPolicy or pod security; those audits check them on their schedules."
+)
+# Also the note before the marker exists: the stage writes it on its first tick after the ranking
+# card finishes, which a user already in the chat can beat to this run.
+AUDITS_RUNNING_NOTE = (
+    "Workload checks (probes, requests and limits, autoscaling, NetworkPolicy, pod security) come "
+    "from the cost, security, reliability and capacity audits, which run one after another once this "
+    "scan is done. Each posts a summary to the home channel when it finds something new."
+)
+AUDITS_RAN_NOTE = (
+    "Workload checks (probes, requests and limits, autoscaling, NetworkPolicy, pod security) come "
+    "from the first-run audits, which have started: {audits}. Each posts a summary to the home channel "
+    "when it finds something new."
+)
+AUDITS_NONE_RAN_NOTE = (
+    "None of the first-run audits ran, so nothing has checked probes, requests and limits, "
+    "autoscaling, NetworkPolicy or pod security yet."
+)
+AUDITS_NOT_RUN_NOTE = "Not run: {audits}."
+# oobe gives up on an audit it could not start; the audit still runs on its own schedule.
+AUDITS_GAVE_UP_REASON = "it did not start, and runs on its own schedule"
 
 # The delivery job's ``origin`` and the keys the plugin writes into it.
 ORIGIN_KEY = "origin"
@@ -300,7 +350,24 @@ def _findings_endpoint() -> str:
     return (os.environ.get(FINDINGS_ENDPOINT_ENV) or DEFAULT_FINDINGS_ENDPOINT).rstrip("/")
 
 
-def _register_findings(data_dir: Path, in_sandbox: bool) -> set[str]:
+def _no_ranking(data_dir: Path) -> bool | None:
+    """Whether the hand-off filed no prioritization card (``bootstrap_handoff.NO_RANKING``).
+
+    The report is then the hand-off's no-coverage report: no cluster was audited. Read once, for the
+    findings registration and the audits note. ``None`` when the marker cannot be read: the
+    registration then registers nothing, as it did when it read the marker itself and failed.
+    """
+    try:
+        import bootstrap_handoff  # beside this script in the pod
+
+        handed_off = bootstrap_handoff._read_marker(data_dir / bootstrap_handoff.HANDOFF_MARKER)
+        return handed_off.get("task_id") == bootstrap_handoff.NO_RANKING
+    except Exception as e:  # noqa: BLE001 - delivery goes on without registering
+        sys.stderr.write(f"bootstrap_delivery: could not read the hand-off marker: {e}\n")
+        return None
+
+
+def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None) -> set[str]:
     """Register every finding the sweep extracted in the findings queue, as
     ``inventory_findings.py register`` does, from this pod.
 
@@ -313,7 +380,7 @@ def _register_findings(data_dir: Path, in_sandbox: bool) -> set[str]:
     again unchanged.
 
     Nothing is registered when the hand-off filed no prioritization card
-    (``bootstrap_handoff.NO_RANKING``): no cluster was audited, nothing
+    (``no_ranking``, from ``_no_ranking``): no cluster was audited, nothing
     rewrote the items and scores, and any left beside the report are an
     earlier sweep's, whose complete scopes would re-open findings and mark
     current ones absent.
@@ -327,11 +394,12 @@ def _register_findings(data_dir: Path, in_sandbox: bool) -> set[str]:
     """
     suppressed: set[str] = set()
     try:
-        import bootstrap_handoff  # beside this script in the pod
         import inventory_findings  # beside this script in the pod
 
-        handed_off = bootstrap_handoff._read_marker(data_dir / bootstrap_handoff.HANDOFF_MARKER)
-        if handed_off.get("task_id") == bootstrap_handoff.NO_RANKING:
+        if no_ranking is None:
+            sys.stderr.write("bootstrap_delivery: the hand-off marker could not be read; registering nothing\n")
+            return suppressed
+        if no_ranking:
             sys.stderr.write(
                 "bootstrap_delivery: the hand-off filed no prioritization card, so any "
                 f"{ITEMS_NAME} is an earlier sweep's; registering nothing\n"
@@ -511,10 +579,10 @@ def _origin_platform() -> str | None:
 
 def _presented(content: str) -> str:
     """The report as delivered: reshaped when ``KAGE_SLACK_UX`` is on and the
-    job is bound to Slack, verbatim otherwise.
+    job is bound to Slack, as written otherwise.
 
     Both helpers ship beside this script in ``/opt/defaults/scripts``. Any
-    failure to load or reshape delivers the report verbatim, since this runs
+    failure to load or reshape delivers the report as written, since this runs
     after the claim and a lost report is not retried.
     """
     try:
@@ -528,6 +596,58 @@ def _presented(content: str) -> str:
     except Exception as e:
         sys.stderr.write(f"bootstrap_delivery: delivering verbatim: {e}\n")
         return content
+
+
+def _skip_follows_this_sweep(data_dir: Path, state: dict) -> bool:
+    """Whether oobe recorded its skip after the sweep the report comes from was filed.
+
+    A sweep filed after the skip (onboarding repeated with the stage's marker kept) ran on a later
+    build, whose scan leaves the workload checks to the audits whatever the old skip said.
+    """
+    filed = bootstrap_handoff.read_scan_marker(data_dir / oobe.SCAN_FILED_MARKER)
+    try:
+        skipped_at = float(state.get(oobe.STATE_AT))
+    except (TypeError, ValueError):
+        return False
+    return filed is not None and skipped_at >= filed[1]
+
+
+def _audits_note(data_dir: Path, no_coverage: bool) -> str:
+    """The note on the first-run audits the delivery closes with, from oobe's marker.
+
+    Before the marker exists the stage has not decided, and the note is the chain's. ``no_coverage``
+    is a report no cluster's audit reached (``_no_ranking``), which covers nothing.
+    """
+    state = oobe.read_state(data_dir)
+    if state.get(oobe.STATE_SKIPPED):
+        reason = str(state.get(oobe.STATE_REASON) or AUDITS_NO_REASON)
+        if no_coverage:
+            coverage = AUDITS_UNCHECKED_SCHEDULED_NOTE
+        elif reason == LEGACY_NO_REPOSITORY_REASON and _skip_follows_this_sweep(data_dir, state):
+            coverage = AUDITS_COVERED_NOTE
+        else:
+            coverage = AUDITS_NOT_COVERED_NOTE
+        return f"{AUDITS_SKIPPED_NOTE.format(reason=reason)} {coverage}"
+    fired = [a for a in oobe.FIRST_RUN_AUDITS if a in _list(state.get(oobe.STATE_FIRED))]
+    held = state.get(oobe.STATE_HELD) if isinstance(state.get(oobe.STATE_HELD), dict) else {}
+    gave_up = _list(state.get(oobe.STATE_GAVE_UP))
+    not_run = [f"`{a}` ({held[a]})" for a in oobe.FIRST_RUN_AUDITS if a in held]
+    not_run += [f"`{a}` ({AUDITS_GAVE_UP_REASON})" for a in oobe.FIRST_RUN_AUDITS if a in gave_up]
+    if not state.get(oobe.STATE_DONE):
+        note = AUDITS_RUNNING_NOTE
+    elif fired:
+        note = AUDITS_RAN_NOTE.format(audits=", ".join(f"`{a}`" for a in fired))
+    else:
+        note = AUDITS_NONE_RAN_NOTE
+    return f"{note} {AUDITS_NOT_RUN_NOTE.format(audits=', '.join(not_run))}" if not_run else note
+
+
+def _list(value) -> list:
+    return value if isinstance(value, list) else []
+
+
+def _with_note(report: str, note: str) -> str:
+    return report.rstrip("\n") + "\n\n" + note + "\n"
 
 
 def _posted_as_blocks(content: str) -> bool:
@@ -659,7 +779,8 @@ def main(data_dir: Path | None = None) -> int:
 
     # Before the claim, which ends the nudge's hold, so the rows exist when
     # the marks below are sent.
-    suppressed = _register_findings(data_dir, in_sandbox)
+    no_ranking = _no_ranking(data_dir)
+    suppressed = _register_findings(data_dir, in_sandbox, no_ranking)
 
     # The cheap check above is advisory; this is the decision. Nothing may be
     # written to stdout before it succeeds.
@@ -670,9 +791,12 @@ def main(data_dir: Path | None = None) -> int:
     # the shortest window in which to announce these findings as new.
     shown = _mark_shown(data_dir, in_sandbox, suppressed)
 
-    if not _posted_as_blocks(content):
-        sys.stdout.write(_presented(content))
-        sys.stdout.flush()
+    note = _audits_note(data_dir, no_ranking is True)
+    if _posted_as_blocks(content):
+        sys.stdout.write(note + "\n")
+    else:
+        sys.stdout.write(_with_note(_presented(content), note))
+    sys.stdout.flush()
 
     # Cleanup runs only after the report is posted or safely on stdout (already
     # captured by the scheduler), so removing INVENTORY.md here cannot truncate delivery.
