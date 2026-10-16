@@ -59,9 +59,10 @@ a spent budget shows up.
 
 The join has two credential sources and they are additive. `--in-cluster` or `--kubeconfig` gives it
 the one directly reachable cluster; `--profiles-dir` gives it every cluster that has a Cluster
-Agent profile, whichever project it is in, reached as the pod's own Google identity through
-[`internal/clusterprofiles`](../../internal/clusterprofiles/) — one shared token source, not a
-credential per cluster. With neither set the join reaches nothing and every record naming a live
+Agent profile, whichever project it is in, reached through
+[`internal/clusterprofiles`](../../internal/clusterprofiles/) with one credential, not one per
+cluster: in the agent pod, the credential proxy's, through its watcher routes; without a broker
+configured, as on a local run, the pod's own Google identity. With neither set the join reaches nothing and every record naming a live
 object comes out `unreachable`. The subscription carries whatever the install's sinks export, so any
 cluster they cover that neither source reaches still comes out `unreachable`, and two shutdown lines name those
 clusters, split by what became of their records.
@@ -219,8 +220,12 @@ Two flags reach `spec.harness.driftDetector`, `subscription` and `gitopsManagers
 where the process runs. `--in-cluster` and `--profiles-dir` are always on, so a deployed detector
 joins its own cluster and every Cluster Agent profile, whichever project it names, without being asked.
 
-Application Default Credentials need `roles/pubsub.subscriber` on the subscription — inside the
-agent pod, the Workload Identity the `drift-pubsub` module grants it to. Add `roles/pubsub.viewer`
+Inside the agent pod the detector reaches Pub/Sub through the credential proxy (`WATCHER_BROKER_URL`
+and `WATCHER_BROKER_TOKEN_FILE`, set by the operator; the broker relays the four calls on the one
+configured subscription, and fleet reads the same way as the event watcher's). The credential behind
+those calls is then the broker's, which needs `roles/pubsub.subscriber` on the subscription; with
+neither variable set, Application Default Credentials need it — the Workload Identity the
+`drift-pubsub` module grants it to. Add `roles/pubsub.viewer`
 for the startup ack-deadline check described under
 [Three things to know before changing it](#three-things-to-know-before-changing-it): subscriber does
 not carry `subscriptions.get`. The module grants both, so this is a note for a
@@ -233,8 +238,9 @@ The join needs Kubernetes permissions on top of that, and they are not the same 
 groups including CRDs. A resource it cannot read comes out `failed` with the RBAC error on the
 line, not silently unenriched.
 
-`--profiles-dir` needs two more grants, and they attach to the pod's **Google** identity rather
-than to its ServiceAccount, because that is what a profile cluster is reached as. Addressing the
+`--profiles-dir` needs two more grants, and they attach to a **Google** identity rather than to
+the pod's ServiceAccount, because that is what a profile cluster is reached as: the credential
+proxy's, in the agent pod, and the pod's own only without a broker. Addressing the
 cluster at all takes `container.clusters.get` — `roles/container.viewer` is the usual shape — in
 every project a profile names, which is the scope grant that let the reconcile write the profile
 there. Without the grant every profile in that project is skipped at startup with
@@ -246,7 +252,10 @@ clusters' records still come out `unreachable` and are still injected, thin: the
 them, so they are inside the scope and the hold above does not apply, and the thin cards are how the
 missing grant shows up in chat.
 Reading the objects then takes the same cluster-wide `get` as above, bound to that Google identity
-on every cluster in the fleet. A cluster where only the second is missing still starts: its records
+on every cluster in the fleet (through the broker, for the kinds its watcher route reads). A record
+about a Secret comes out `failed` on every profile cluster whatever its RBAC: the broker's watcher
+route never reads a Secret (`kubernetes.watcher.secrets`), so that refusal is the broker's policy,
+and no grant on the cluster lifts it. A cluster where only the second is missing still starts: its records
 come out `failed` with the RBAC error, which is the difference between a cluster that was not
 addressed and one that was and refused.
 
@@ -426,8 +435,9 @@ entry per Cluster Agent profile; `--in-cluster`/`--kubeconfig` contributes the c
 itself can reach. They overlap on every install, because reconcile gives the management cluster a
 profile like any other cluster, and the direct credential is kept: it reaches
 `kubernetes.default.svc` as the pod's Kubernetes service account and never leaves the cluster, where
-a profile authenticates as the pod's Google identity against the control-plane endpoint, which IAM
-without `roles/container.viewer` or a master authorized network can refuse. That profile is declined
+a profile authenticates as a Google identity against the control-plane endpoint (the broker's,
+from the broker's egress, in the agent pod; the pod's without a broker), which IAM without
+`roles/container.viewer` or a master authorized network can refuse. That profile is declined
 during the scan rather than dropped after it, because addressing it is not free: it costs a GKE
 describe for a getter that is discarded, and on an install without
 `container.clusters.get` the describe fails and the profile is reported as skipped — telling an
@@ -446,7 +456,10 @@ skipped and reported with the API's answer like any other.
 
 Profile discovery follows `internal/clusterprofiles`' failure policy, which is the watcher's: a
 `--profiles-dir` that was given and is not there is fatal, because discovery runs once and a restart
-fixes it; an unreadable one degrades to a log line; and a single bad profile is skipped so one
+fixes it, and so is a credential proxy that cannot be reached or answers with an error about itself
+(no credential yet, its hop to Google failed, or it refused this process's own token), for the same
+reason. A Google error it relays for one cluster, a 5xx included, is that cluster's and is skipped; an unreadable one degrades to a
+log line; and a single bad profile is skipped so one
 unparseable `config.yaml` cannot cost the whole fleet. A profile whose dynamic client will not build
 is skipped on the same grounds. Every skip is logged by profile name and counted, and the count is
 reported at startup — a fan-in that silently reached six of seven clusters otherwise looks exactly

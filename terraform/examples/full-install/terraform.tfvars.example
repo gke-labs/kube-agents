@@ -128,6 +128,12 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # Optional GitHub integration and token minter backend (GSA + KMS signing key).
 # enable_github_minter = true
 # github_repo          = "my-github-org/my-repo"
+# On a GitHub Enterprise Server: its hostname, github_repo as owner/name on the
+# instance, and the App created there. The Secret holding a private CA under
+# the key `ca.crt` (install.sh writes it from --gitops-ca-file); restart the
+# minter after the Secret changes.
+# gitops_host           = "github.example.com"
+# github_ca_secret_name = "github-forge-ca"
 
 # Or a GitOps project on GitLab instead (no GitHub App, no minter). The token is
 # never a variable: create Secret gitlab_token_secret_name, key `token`, in the

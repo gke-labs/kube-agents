@@ -751,14 +751,16 @@ def check_thread(session: Session) -> CheckResult:
     if not root:
         return CheckResult(CHECK_THREAD, False, "no thread to reply in: the mention check did not pass in this run and --thread-ts is unset",
                            {"channel": session.channel_id})
-    # inbound() in a2a/gateway/slack.go takes an unmentioned reply only in a thread the
-    # gateway started a task in (isSessionThread), and startTask posts the status line
-    # there. A --thread-ts without one would wait out the settle and blame a steer.
+    # The check judges the follow-up by the gateway's status line, which startTask posts
+    # in a thread it started a task in. The gateway also takes an unmentioned reply under
+    # the bot's own post (an alert; inboundEvent in a2a/gateway/slack.go), but with no
+    # status line there this check can't tell the follow-up's answer from the root's
+    # later posts, so a --thread-ts without one is refused here rather than misjudged.
     if not any(m.get("user") == session.bot_user_id and (session.args.no_status_line or status_state(m.get("text", "")))
                for m in replies_after(session.listed, session.channel_id, root, "0")):
         held = "bot post" if session.args.no_status_line else "gateway status line"
-        return CheckResult(CHECK_THREAD, False, f"thread {root} holds no {held}, so the gateway never started "
-                           "a task in it, and it takes an unmentioned reply only in a thread it started a task in; "
+        return CheckResult(CHECK_THREAD, False, f"thread {root} holds no {held}, so this check has nothing to "
+                           "judge the follow-up's answer by (the gateway may still take the reply); "
                            "run mention in the same run, or pass a --thread-ts the bot answered",
                            {"channel": session.channel_id, "thread_ts": root})
     # Let the task the mention started finish first. Its answer would otherwise

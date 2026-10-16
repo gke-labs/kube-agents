@@ -448,6 +448,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          reaches for it; the content mode it runs in does not.
 #                          Every working copy that *proposes* a change goes
 #                          through `vcs_client`
+#   gitops_preflight.py    the one-line answer a PR-writing skill or SOUL.md is to run
+#                          first: is a GitOps repository registered and readable.
+#                          It reads the registry through gitops_workspace
+#                          and, with --repo, probes it through vcs.py; stdlib only
 #   credential_proxy_client.py  how anything here reaches the broker at all, and
 #                          the only way out of this container that carries a
 #                          credential. Imported by vcs_client, and through it by
@@ -518,6 +522,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/github_token_refresh.py \
      agents/platform/scripts/wif_credentials.py \
      agents/platform/scripts/gitops_workspace.py \
+     agents/platform/scripts/gitops_preflight.py \
      agents/platform/scripts/credential_proxy_client.py \
      agents/platform/scripts/fleet_scope_args.py \
      agents/platform/scripts/vcs_client.py \
