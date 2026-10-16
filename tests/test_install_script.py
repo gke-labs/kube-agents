@@ -4001,6 +4001,33 @@ class AcceptedAbsenceOutlivesTheRunTest(unittest.TestCase):
         self.assertLess(text.index('check_existing_cluster_network_policy_preflight "$project_id"'), first)
         self.assertLess(text.index('ensure_existing_cluster_network_policy "$project_id"'), second)
 
+    def test_install_env_bootstrap_records_the_calendar_mode_advice_key(self):
+        """A fresh install.env carries ENABLE_CALENDAR_MODE_ADVICE: the default
+        when nothing set it, the loaded value when install.env did. The key
+        has no flag and no interview question, so this write is the one place
+        a first install records it for the upgrades that follow."""
+        for exported, expected in (("", "ENABLE_CALENDAR_MODE_ADVICE=false"), ("true", "ENABLE_CALENDAR_MODE_ADVICE=true")):
+            with tempfile.TemporaryDirectory() as tmp:
+                dest = pathlib.Path(tmp) / "install.env"
+                body = (
+                    f'source "{_INSTALLER_COMMON}"\n'
+                    f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                    'PARAM_DRY_RUN="false"\n'
+                    + (f"export ENABLE_CALENDAR_MODE_ADVICE={exported}\n" if exported else "")
+                    + f'bootstrap_install_env_file "{dest}" 0.5.0\n'
+                )
+                empty = pathlib.Path(tmp) / "loaded.env"
+                empty.write_text("")
+                proc = subprocess.run(
+                    ["bash", "-c", body],
+                    capture_output=True,
+                    text=True,
+                    env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty)}),
+                    cwd=str(_REPO_ROOT),
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertIn(expected, dest.read_text(), (exported, dest.read_text()))
+
     def test_install_env_bootstrap_records_the_decision_not_the_flag(self):
         """A fresh install.env carries the key only when enforcement was absent and accepted."""
         for decision, expected in (("absent-accepted", True), ("enforced", False), ("", False)):

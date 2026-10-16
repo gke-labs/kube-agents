@@ -452,6 +452,24 @@ class InstallerCommonTest(unittest.TestCase):
                 self.assertNotIn("enable_drift_pubsub", content)
                 self.assertNotIn("enable_drift_detector", content)
 
+    # ── the calendar-mode advice role: always written, off unless asked ──────
+
+    def test_tfvars_writes_the_calendar_mode_advice_key_on_and_off(self):
+        """ENABLE_CALENDAR_MODE_ADVICE reaches enable_calendar_mode_advice the
+        way enable_gke_backup_plan does: always written, so the key absent from
+        install.env reads false and a later apply deletes the role, and every
+        truthy spelling install.env accepts turns it on.
+        """
+        for value in ("true", "True", "yes", "1", "on"):
+            with self.subTest(value=value):
+                content = self._drift_tfvars(ENABLE_CALENDAR_MODE_ADVICE=value)
+                self.assertIn("enable_calendar_mode_advice = true", content)
+        for value in ("false", "no", "0", "off", ""):
+            with self.subTest(value=repr(value)):
+                content = self._drift_tfvars(ENABLE_CALENDAR_MODE_ADVICE=value)
+                self.assertIn("enable_calendar_mode_advice = false", content)
+                self.assertNotIn("enable_calendar_mode_advice = true", content)
+
     def test_tfvars_writes_both_drift_keys_when_nobody_says_anything(self):
         """Saying nothing provisions the trio, which is what flipping
         DEFAULT_ENABLE_DRIFT_DETECTOR to true means and the one arm that

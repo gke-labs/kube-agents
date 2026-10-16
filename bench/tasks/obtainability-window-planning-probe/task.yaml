@@ -44,7 +44,7 @@ expected_output: >-
   ProvisioningRequest and a Kueue LocalQueue paired to the recommendation.
 infrastructure:
   deployer: noop
-validated: false
+validated: true
 
 # Slug per docs/designs/domains.yaml.
 domain: capacity

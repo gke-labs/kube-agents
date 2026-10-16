@@ -169,3 +169,8 @@ output "scope_lookup_only_hosts" {
   description = "The Shared VPC hosts bound with roles/compute.viewer alone, for the reconcile's lookup of their service projects: every declared host that is neither project_id nor otherwise in scope."
   value       = module.kube_agents_iam.scope_lookup_only_hosts
 }
+
+output "calendar_mode_advice_role" {
+  description = "The calendar-mode advice custom role bound to the agent's service account, or null when enable_calendar_mode_advice is false."
+  value       = module.kube_agents_iam.calendar_mode_advice_role
+}

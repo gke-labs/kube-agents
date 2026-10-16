@@ -150,3 +150,8 @@ output "scope_export_projects" {
   EOT
   value       = sort(tolist(setsubtract(local.scope_listed_projects, toset([var.project_id]))))
 }
+
+output "calendar_mode_advice_role" {
+  description = "Full name of the calendar-mode advice custom role bound to the agent (projects/<project>/roles/kubeAgentsCalendarModeAdvice), or null while calendar_mode_advice_enabled is false."
+  value       = var.calendar_mode_advice_enabled ? google_project_iam_custom_role.calendar_mode_advice[0].id : null
+}
