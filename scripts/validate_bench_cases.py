@@ -156,6 +156,18 @@ CREDENTIAL_SHAPES: dict[str, str] = {
 # enforced for cases that no longer exist, because an in-flight branch
 # registering a case must not red main the day it merges.
 KNOWN_UNREGISTERED = {
+    # The two CUJ 1 cases (#2889), held out for the same infra-lock budget
+    # as the stack cases below: a `stack:` case runs alone on lock-infra
+    # whatever EVAL_TASK_PARALLELISM is, and the main nightly part's serial
+    # chain is already at or past the 480m deadline on cost hints alone.
+    "gitops-drift-deleted-policy-triage": (
+        "#2889: stack case held out of the nightly until the infra-lock "
+        "chain has room"
+    ),
+    "gitops-drift-load-bearing-change-triage": (
+        "#2889: stack case held out of the nightly until the infra-lock "
+        "chain has room"
+    ),
     # Provisions its own cluster, so registering it costs every pull request
     # a second multi-minute provision. Whether it belongs in presubmit or
     # nightly is a tier decision nobody has made; this entry is the record
@@ -179,6 +191,14 @@ KNOWN_UNREGISTERED = {
     # entry goes when an eval lane has a chat platform.
     "chat-relay-posts-report-as-written": (
         "needs a chat platform, which no CI install has; run by hand on a chat install"
+    ),
+    # It grades a GitHub forge declared at a GitHub Enterprise Server host,
+    # which needs the GHES proxy (hack/ghes-proxy) and an install pointed at
+    # it. No eval lane deploys either, so it runs by hand with the recipe in
+    # its header. The entry goes when a lane deploys both.
+    "ghes-pdb-remediation-pr": (
+        "needs the GHES proxy and a GHES-forge install, which no eval lane has; "
+        "run by hand with the recipe in the case header"
     ),
 }
 
@@ -281,18 +301,6 @@ FIXTURE_NOT_READY = {
         "#1873: needs the stalled-controller role applied to every pool "
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
-    ),
-    "observability-trace-latency-brokered": (
-        "#2244: needs the pool host clusters to export traces; until "
-        "2026-10-02, 33 of the 35 had no managed OpenTelemetry collection "
-        "scope, so the operator's telemetry discovery resolved to None, the "
-        "agent ran with OTEL_SDK_DISABLED=true and Cloud Trace in those "
-        "projects was empty, which the case reports as an empty window and "
-        "fails on the report check (a fixture gap, not a red). The scope was "
-        "set by hand that day, and the provisioning script and the verifier's "
-        "gke/host-otel-scope finding now hold it (docs/ci-pool-projects.md "
-        "section 2); the case moves to the nightly once the first leases "
-        "after the repair show traces landing"
     ),
 }
 
