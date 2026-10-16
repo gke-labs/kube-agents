@@ -77,14 +77,42 @@ def test_worker_command_duration_with_minutes(monkeypatch):
     ]
 
 
-def test_worker_log_exceeding_max_bytes_returns_none():
-    # Truncated capture: file size exceeds _MAX_WORKER_LOG_BYTES.
+def test_worker_command_ending_in_duration_word(monkeypatch):
+    log = """__WORKER_LOG__
+  ┊ 💻 $         sleep 30s
+  ┊ 💻 $         kubectl rollout status deploy/x --timeout 5m  12.3s
+"""
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: log)
+    rows = harness._worker_commands(harness._worker_logs(["t_dur"], 5.0))
+    assert rows == [
+        {"task": "t_dur", "command": "sleep 30s", "exit": None},
+        {"task": "t_dur", "command": "kubectl rollout status deploy/x --timeout 5m", "exit": 0},
+    ]
+
+
+def test_worker_log_exceeding_max_bytes_drops_cut_last_line():
+    # Truncated capture: file size exceeds _MAX_WORKER_LOG_BYTES. Intact preceding lines are kept,
+    # and the trailing cut line is dropped.
     large_log = harness._WorkerLog(
-        body="  ┊ 💻 $         echo hi  0.1s [exit 0]\n",
+        body="  ┊ 💻 $         echo first  0.1s [exit 0]\n  ┊ 💻 $         echo partial 12",
         mtime="1758579012",
         size=str(harness._MAX_WORKER_LOG_BYTES + 10),
     )
-    assert harness._worker_commands({"t_large": large_log}) is None
+    rows = harness._worker_commands({"t_large": large_log})
+    assert rows == [{"task": "t_large", "command": "echo first", "exit": 0}]
+
+    # When body bytes exceed _MAX_WORKER_LOG_BYTES without stat size.
+    padded_prefix = "  ┊ 💻 $         echo ok  0.1s [exit 0]\n" + ("# pad\n" * 100000)
+    body = padded_prefix + "  ┊ 💻 $         echo cut"
+    cut_log = harness._WorkerLog(
+        body=body,
+        mtime="1758579012",
+        size="",
+    )
+    rows2 = harness._worker_commands({"t_cut": cut_log})
+    assert rows2 is not None
+    assert any(r["command"] == "echo ok" and r["exit"] == 0 for r in rows2)
+    assert not any(r["command"] == "echo cut" for r in rows2)
 
 
 def test_the_read_returns_text_when_the_output_is_cut_inside_a_glyph(monkeypatch):

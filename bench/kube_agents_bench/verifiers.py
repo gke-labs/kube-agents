@@ -1928,6 +1928,7 @@ _SHELL_FLAG_PREFIX = "-"
 _SHELL_OPTIONS_END = "--"
 _SHELL_EXPANSION_PREFIX = "$"
 _SHELL_COUNT_RE = re.compile(r"^(?:\d+(?:\.\d+)?[smhd]?|infinity)$")
+_COLLAPSED_COMMANDS_RE = re.compile(r"(?:^|\s)\+\s*\d+\s+commands?\b")
 _USAGE_FLAGS = ("-h", "--help")
 
 
@@ -1939,8 +1940,9 @@ class WorkerRun(BaseModel):
     ``pdb,validatingwebhookconfigurations`` is one word, so a pattern over the word reads it
     whole, and a quoted mention of the whole command is one word that is no command), and
     ``succeeded`` (for ``required_runs`` only), whether the command must have exited 0 (a non-zero
-    or unrecorded exit does not count; reflects the overall command line's exit code, so trailing
-    pipes or commands chained with ``;`` or ``||`` may mask an earlier segment's exit)."""
+    or unrecorded exit does not count; trailing operators after the matching segment must be
+    strictly ``&&`` or empty and uncollapsed, so trailing pipes, backgrounding with ``&``,
+    or chains with ``;`` or ``||`` are refused as masked)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2173,34 +2175,48 @@ def _shell_argvs(command: str) -> list[list[str]]:
 def _shell_argvs_with_operators(command: str) -> list[tuple[list[str], list[str]]]:
     """Each segment of a command line as an argv paired with the control operators that follow it."""
     words, spans = _shell_words_and_spans(command)
-    segments: list[tuple[list[str], str]] = []
+    segments: list[tuple[list[str], str | None]] = []
     argv: list[str] = []
-    for word in [*words, _ShellOperator(";")]:
+    for word in words:
         if _is_control_operator(word):
             if argv:
                 segments.append((argv, str(word)))
-            argv = []
+                argv = []
             continue
         argv.append(word)
+    if argv:
+        segments.append((argv, None))
+
     result: list[tuple[list[str], list[str]]] = []
     for i, (seg_argv, _) in enumerate(segments):
-        trailing = [segments[k][1] for k in range(i, len(segments) - 1)]
+        raw_trailing: list[str] = [op for k in range(i, len(segments)) if (op := segments[k][1]) is not None]
+        trailing: list[str] = [op for op in raw_trailing if op not in ("(", ")")]
         result.append((seg_argv, trailing))
+
+    handled_spans: set[str] = set()
     for seg_argv, trailing in list(result):
         index = _command_word_index(seg_argv)
-        if index is None or os.path.basename(seg_argv[index]) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
-            continue
-        for flag_index in range(index + 1, len(seg_argv) - 1):
-            flag = seg_argv[flag_index]
-            if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
-                inner_segments = _shell_argvs_with_operators(seg_argv[flag_index + 1])
-                for inner_argv, inner_trailing in inner_segments:
-                    result.append((inner_argv, trailing + inner_trailing))
-                break
+        if index is not None and os.path.basename(seg_argv[index]) in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
+            for flag_index in range(index + 1, len(seg_argv) - 1):
+                flag = seg_argv[flag_index]
+                if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
+                    inner_segments = _shell_argvs_with_operators(seg_argv[flag_index + 1])
+                    for inner_argv, inner_trailing in inner_segments:
+                        result.append((inner_argv, trailing + inner_trailing))
+                    break
+        for span in spans:
+            if any(span in word for word in seg_argv):
+                handled_spans.add(span)
+                inner = _substitution_commands(span)
+                if inner is not None:
+                    for inner_argv, inner_trailing in _shell_argvs_with_operators(inner):
+                        result.append((inner_argv, trailing + inner_trailing))
+
     for span in spans:
-        inner = _substitution_commands(span)
-        if inner is not None:
-            result.extend(_shell_argvs_with_operators(inner))
+        if span not in handled_spans:
+            inner = _substitution_commands(span)
+            if inner is not None:
+                result.extend(_shell_argvs_with_operators(inner))
     return result
 
 
@@ -2427,7 +2443,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     argv, must run it with those flags after it, a word matching each pattern,
     and no ``-h``/``--help`` (:func:`_argv_runs`). When ``succeeded: true``,
     the command must also have exited 0 (a non-zero or unrecorded exit does
-    not count). ``forbidden_runs``: the same
+    not count; trailing operators after the matching segment must be strictly
+    ``&&`` or empty and uncollapsed, so trailing pipes, backgrounding with ``&``,
+    or chains with ``;`` or ``||`` are refused as masked). ``forbidden_runs``: the same
     shape, and no segment may run it. An argv tells a quoted mention of the
     invocation from a run, where a pattern over the text cannot: a forbidden
     ``kubectl get`` of budgets is not met by ``grep "kubectl get pdb" SKILL.md``
@@ -2639,11 +2657,13 @@ class WorkerCommandsVerifier(BaseVerifier):
 
         unrun_missing: list[WorkerRun] = []
         unrun_failed: list[WorkerRun] = []
+        unrun_masked: list[str] = []
         for run in self.required_runs:
             matched_any = False
+            matched_mask_reason: str | None = None
             succeeded = False
             for c, succ in active_entries:
-                collapsed = bool(re.search(r"\+\s*\d+\s*command\(s\)", c))
+                collapsed = bool(_COLLAPSED_COMMANDS_RE.search(c))
                 for argv, trailing_ops in _shell_argvs_with_operators(c):
                     if _argv_runs(argv, run):
                         matched_any = True
@@ -2654,10 +2674,19 @@ class WorkerCommandsVerifier(BaseVerifier):
                         if succ is True and unmasked:
                             succeeded = True
                             break
+                        if succ is True and not unmasked:
+                            named = " ".join([run.script, *run.flags])
+                            if collapsed:
+                                matched_mask_reason = f"{named} ran in a collapsed chain whose exit is the chain's"
+                            else:
+                                mask_op = next((op for op in trailing_ops if op != "&&"), "operator")
+                                matched_mask_reason = f"{named} ran but its exit is masked by a trailing '{mask_op}'"
                 if succeeded:
                     break
             if not succeeded:
-                if matched_any:
+                if matched_mask_reason is not None:
+                    unrun_masked.append(matched_mask_reason)
+                elif matched_any:
                     unrun_failed.append(run)
                 else:
                     unrun_missing.append(run)
@@ -2668,7 +2697,7 @@ class WorkerCommandsVerifier(BaseVerifier):
         # not; a missing required command, or a clean read, is not when the
         # capture has gaps (the siblings' rule, ``worker_agents`` first).
         partial = self.after_result_pattern is not None and snap.worker_capture_gaps
-        if hits or ran or ((missing or unrun_missing or unrun_failed) and not partial):
+        if hits or ran or ((missing or unrun_missing or unrun_failed or unrun_masked) and not partial):
             parts = []
             if missing:
                 parts.append(
@@ -2681,6 +2710,8 @@ class WorkerCommandsVerifier(BaseVerifier):
             if unrun_failed:
                 named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
                 parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
+            if unrun_masked:
+                parts.append("; ".join(unrun_masked))
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"

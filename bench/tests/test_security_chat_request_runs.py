@@ -40,8 +40,8 @@ def _check(name: str) -> dict:
     return check["check"]
 
 
-def _passes(check: dict, command: str, exit_code: int | None = 0) -> bool:
-    """Grade one worker command with the verifier; True when the check passes."""
+def _verify(check: dict, command: str, exit_code: int | None = 0):
+    """Grade one worker command with the verifier; return the VerifierResult."""
     assert "\n" not in command, command
     transcript.set("ok", [], worker_commands=[{"task": "t_1", "command": command, "exit": exit_code}])
     try:
@@ -49,7 +49,12 @@ def _passes(check: dict, command: str, exit_code: int | None = 0) -> bool:
     finally:
         transcript.clear()
     assert result.status in ("pass", "fail"), result.reason
-    return result.success
+    return result
+
+
+def _passes(check: dict, command: str, exit_code: int | None = 0) -> bool:
+    """Grade one worker command with the verifier; True when the check passes."""
+    return _verify(check, command, exit_code).success
 
 
 def _collector_ran(command: str) -> bool:
@@ -178,10 +183,37 @@ def test_collector_run_with_unrecorded_exit_is_not_credited():
 
 def test_collector_run_masked_by_trailing_pipe_or_operator_is_not_credited():
     cmd = f"python3 {COLLECT} compliance-audit | tee /tmp/o.json"
-    assert not _passes(_check(COLLECTOR_CHECK), cmd, exit_code=0)
+    res = _verify(_check(COLLECTOR_CHECK), cmd, exit_code=0)
+    assert not res.success
+    assert "masked by a trailing '|'" in res.reason
+
     cmd_or = f"python3 {COLLECT} compliance-audit || true"
-    assert not _passes(_check(COLLECTOR_CHECK), cmd_or, exit_code=0)
+    res_or = _verify(_check(COLLECTOR_CHECK), cmd_or, exit_code=0)
+    assert not res_or.success
+    assert "masked by a trailing '||'" in res_or.reason
+
     cmd_semi = f"python3 {COLLECT} compliance-audit ; echo done"
-    assert not _passes(_check(COLLECTOR_CHECK), cmd_semi, exit_code=0)
+    res_semi = _verify(_check(COLLECTOR_CHECK), cmd_semi, exit_code=0)
+    assert not res_semi.success
+    assert "masked by a trailing ';'" in res_semi.reason
+
+    cmd_bg = f"nohup python3 {COLLECT} compliance-audit > /tmp/o.json 2>&1 &"
+    res_bg = _verify(_check(COLLECTOR_CHECK), cmd_bg, exit_code=0)
+    assert not res_bg.success
+    assert "masked by a trailing '&'" in res_bg.reason
+
+    cmd_collapsed = f"python3 {COLLECT} compliance-audit + 1 command"
+    res_col = _verify(_check(COLLECTOR_CHECK), cmd_collapsed, exit_code=0)
+    assert not res_col.success
+    assert "ran in a collapsed chain whose exit is the chain's" in res_col.reason
+
+    cmd_nested = f'bash -c "python3 {COLLECT} compliance-audit | tee /tmp/o.json"'
+    res_nested = _verify(_check(COLLECTOR_CHECK), cmd_nested, exit_code=0)
+    assert not res_nested.success
+    assert "masked by a trailing '|'" in res_nested.reason
+
+    cmd_subshell = f'(cd /x && python3 {COLLECT} compliance-audit) > /tmp/o.json'
+    assert _passes(_check(COLLECTOR_CHECK), cmd_subshell, exit_code=0)
+
     cmd_and = f"python3 {COLLECT} compliance-audit && echo DONE"
     assert _passes(_check(COLLECTOR_CHECK), cmd_and, exit_code=0)
