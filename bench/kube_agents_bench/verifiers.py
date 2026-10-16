@@ -2167,30 +2167,41 @@ def _shell_argvs(command: str) -> list[list[str]]:
     after its ``-c``-style flag, which is read the same way and yields its own argvs; so does
     each command or process substitution and each backtick pair on the line (``OUT=$(python3
     ... --readiness)``, ``cat <(...)``), whose commands the shell runs."""
+    return [argv for argv, _ in _shell_argvs_with_operators(command)]
+
+
+def _shell_argvs_with_operators(command: str) -> list[tuple[list[str], list[str]]]:
+    """Each segment of a command line as an argv paired with the control operators that follow it."""
     words, spans = _shell_words_and_spans(command)
-    argvs: list[list[str]] = []
+    segments: list[tuple[list[str], str]] = []
     argv: list[str] = []
     for word in [*words, _ShellOperator(";")]:
         if _is_control_operator(word):
             if argv:
-                argvs.append(argv)
+                segments.append((argv, str(word)))
             argv = []
             continue
         argv.append(word)
-    for argv in list(argvs):
-        index = _command_word_index(argv)
-        if index is None or os.path.basename(argv[index]) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
+    result: list[tuple[list[str], list[str]]] = []
+    for i, (seg_argv, _) in enumerate(segments):
+        trailing = [segments[k][1] for k in range(i, len(segments) - 1)]
+        result.append((seg_argv, trailing))
+    for seg_argv, trailing in list(result):
+        index = _command_word_index(seg_argv)
+        if index is None or os.path.basename(seg_argv[index]) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
             continue
-        for flag_index in range(index + 1, len(argv) - 1):
-            flag = argv[flag_index]
+        for flag_index in range(index + 1, len(seg_argv) - 1):
+            flag = seg_argv[flag_index]
             if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
-                argvs.extend(_shell_argvs(argv[flag_index + 1]))
+                inner_segments = _shell_argvs_with_operators(seg_argv[flag_index + 1])
+                for inner_argv, inner_trailing in inner_segments:
+                    result.append((inner_argv, trailing + inner_trailing))
                 break
     for span in spans:
         inner = _substitution_commands(span)
         if inner is not None:
-            argvs.extend(_shell_argvs(inner))
-    return argvs
+            result.extend(_shell_argvs_with_operators(inner))
+    return result
 
 
 def _command_word_index(argv: list[str], script: str | None = None) -> int | None:
@@ -2632,10 +2643,15 @@ class WorkerCommandsVerifier(BaseVerifier):
             matched_any = False
             succeeded = False
             for c, succ in active_entries:
-                for argv in _shell_argvs(c):
+                collapsed = bool(re.search(r"\+\s*\d+\s*command\(s\)", c))
+                for argv, trailing_ops in _shell_argvs_with_operators(c):
                     if _argv_runs(argv, run):
                         matched_any = True
-                        if not run.succeeded or succ is True:
+                        if not run.succeeded:
+                            succeeded = True
+                            break
+                        unmasked = not collapsed and all(op == "&&" for op in trailing_ops)
+                        if succ is True and unmasked:
                             succeeded = True
                             break
                 if succeeded:

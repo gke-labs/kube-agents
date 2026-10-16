@@ -64,6 +64,29 @@ def test_worker_command_without_exit_or_duration_records_none_exit(monkeypatch):
     assert rows == [{"task": "t_ab12", "command": "tail -f /var/log/syslog", "exit": None}]
 
 
+def test_worker_command_duration_with_minutes(monkeypatch):
+    log = """__WORKER_LOG__
+  ┊ 💻 $         sleep 75  1m15s [exit 0]
+  ┊ 💻 $         long_run  2m 10.5s
+"""
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: log)
+    rows = harness._worker_commands(harness._worker_logs(["t_ab12"], 5.0))
+    assert rows == [
+        {"task": "t_ab12", "command": "sleep 75", "exit": 0},
+        {"task": "t_ab12", "command": "long_run", "exit": 0},
+    ]
+
+
+def test_worker_log_exceeding_max_bytes_returns_none():
+    # Truncated capture: file size exceeds _MAX_WORKER_LOG_BYTES.
+    large_log = harness._WorkerLog(
+        body="  ┊ 💻 $         echo hi  0.1s [exit 0]\n",
+        mtime="1758579012",
+        size=str(harness._MAX_WORKER_LOG_BYTES + 10),
+    )
+    assert harness._worker_commands({"t_large": large_log}) is None
+
+
 def test_the_read_returns_text_when_the_output_is_cut_inside_a_glyph(monkeypatch):
     # ``head -c`` can cut a transcript between the bytes of one character. The
     # decode must not raise out of _settle ahead of the purge that follows it,

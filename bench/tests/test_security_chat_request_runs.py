@@ -174,3 +174,14 @@ def test_collector_run_exiting_nonzero_is_not_credited():
 def test_collector_run_with_unrecorded_exit_is_not_credited():
     cmd = f"python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json"
     assert not _passes(_check(COLLECTOR_CHECK), cmd, exit_code=None)
+
+
+def test_collector_run_masked_by_trailing_pipe_or_operator_is_not_credited():
+    cmd = f"python3 {COLLECT} compliance-audit | tee /tmp/o.json"
+    assert not _passes(_check(COLLECTOR_CHECK), cmd, exit_code=0)
+    cmd_or = f"python3 {COLLECT} compliance-audit || true"
+    assert not _passes(_check(COLLECTOR_CHECK), cmd_or, exit_code=0)
+    cmd_semi = f"python3 {COLLECT} compliance-audit ; echo done"
+    assert not _passes(_check(COLLECTOR_CHECK), cmd_semi, exit_code=0)
+    cmd_and = f"python3 {COLLECT} compliance-audit && echo DONE"
+    assert _passes(_check(COLLECTOR_CHECK), cmd_and, exit_code=0)

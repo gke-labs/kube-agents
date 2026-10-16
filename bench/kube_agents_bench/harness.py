@@ -294,7 +294,7 @@ _LOG_EXCERPT_CHARS = 200
 # than the text as typed (a chain arrives as its first command plus
 # `` + N command(s)``; the verifier's docstring lists the rest).
 _WORKER_COMMAND_RE = re.compile(
-    r"💻 \$\s+(?P<command>.+?)(?:\s+(?P<duration>\d+(?:\.\d+)?s)(?: \[exit (?P<exit>-?\d+)\])?)?\s*$"
+    r"💻 \$\s+(?P<command>.+?)(?:\s+(?P<duration>(?:\d+m\s*)?\d+(?:\.\d+)?s)(?: \[exit (?P<exit>-?\d+)\])?)?\s*$"
 )
 _MAX_WORKER_LOG_BYTES = 512_000
 # Where a stalled card's transcript is kept. Prow sets ARTIFACTS to the
@@ -947,6 +947,14 @@ def _worker_commands(logs: dict[str, _WorkerLog | None] | None) -> list[dict[str
     commands: list[dict[str, Any]] = []
     for tid, log in logs.items():
         if log is None:
+            return None
+        # A partial capture (file larger than head -c ceiling) must not be graded.
+        try:
+            if int(log.size) > _MAX_WORKER_LOG_BYTES:
+                return None
+        except (ValueError, TypeError):
+            pass
+        if len(log.body.encode("utf-8", errors="replace")) >= _MAX_WORKER_LOG_BYTES:
             return None
         for line in log.body.splitlines():
             match = _WORKER_COMMAND_RE.search(line)
