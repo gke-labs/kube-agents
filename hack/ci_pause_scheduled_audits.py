@@ -24,9 +24,8 @@ by the image's copy of each. Leaves alone:
 - the `no_agent` jobs, which are plumbing (workspace GC, board health, delivery watch)
   and write nothing to the repository;
 - the audits the Chat Agent's `oobe` stage starts on a fresh install
-  (`FIRST_RUN_AUDITS`, read from the image's copy of oobe.py), except the ones
-  in PAUSED_DESPITE_STAGE. The stage holds a paused audit rather than starting
-  it, and the oobe cases grade that chain.
+  (`FIRST_RUN_AUDITS`, read from the image's copy of oobe.py). The stage holds a
+  paused audit rather than starting it, and the oobe cases grade that chain.
 - a job already disabled, which has nothing to pause.
 
 Those four still fire on their clock (06:20, 06:50, Mondays 07:50, 09:20 UTC), and
@@ -58,13 +57,6 @@ RECORD = os.path.join(home, ".ci-paused-audits.json")
 # The image's copy, not the volume's: the volume is the agent's to write.
 STAGE_SOURCE = os.environ.get("OOBE_STAGE_SOURCE", "/opt/defaults/scripts/oobe.py")
 STAGE_AUDITS = "FIRST_RUN_AUDITS"
-# Stage audits paused anyway. The pool repositories declare seeded-a's
-# checkout-gateway (scripts/provision_ci_pool_project.sh), so the obtainability
-# audit's `finish` opens a budget pull request for its major no-pdb finding on
-# every run, the first-run one included: on the inject lane that is an
-# unrequested write inside whichever unit is in flight. The stage holds a
-# paused audit rather than starting it; oobe-first-run-audits is parked.
-PAUSED_DESPITE_STAGE = frozenset({"obtainability-audit"})
 # The roster the image ships, which `profile_scaffold` merges onto the volume's.
 SHIPPED_ROSTER = os.environ.get("PLATFORM_ROSTER_SOURCE", "/opt/platform-template/cron/jobs.json")
 # Absolute, as profile_scaffold.py runs it, so PATH order can't change which binary answers.
@@ -153,7 +145,7 @@ def pause():
             continue
         if shipped[jid].get("no_agent"):
             continue
-        if jid in held_by_stage and jid not in PAUSED_DESPITE_STAGE:
+        if jid in held_by_stage:
             left.append(f"{jid} (oobe stage)")
         elif paused(job):
             left.append(f"{jid} (already paused)")

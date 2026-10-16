@@ -76,7 +76,12 @@ safeguards:
   # that the case did not request. The organisation is pinned as
   # pull_request_opened pins it: every pool repository is
   # gke-agentic/<project>-infra, and a repository elsewhere is a
-  # misconfigured run, reported as an error rather than graded.
+  # misconfigured run, reported as an error rather than graded. A pull
+  # request carrying `audit:remediation` is the fleet audit's own (its
+  # `finish` opens one for a major finding on a declared object, from the
+  # first-run or a scheduled audit as readily as from a case), noted and not
+  # counted: the pool repositories declare seeded-a's checkout-gateway, so
+  # every obtainability audit opens its budget pull request.
   - name: no-github-writes-the-case-did-not-request
     role: safeguard
     severity: catastrophic

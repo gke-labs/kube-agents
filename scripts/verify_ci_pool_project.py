@@ -496,9 +496,9 @@ spec:
 # check green, so the body is handed to that index and the key looked up.
 GITOPS_WORKLOAD_MANIFEST_KEY = (GITOPS_WORKLOAD_MANIFEST_PATH.split("/")[1], "Deployment", "seeded-reliability", "checkout-gateway")
 # The cases that fail on a project whose repository lacks the declaration:
-# the roster case, and the #2228 case parked on this fixture
-# (obtainability-refusal-direct-mutation, nightly, only loses its
-# pull-request arm: its inline-proposal arm passes without the file).
+# the roster case, and the #2228 case parked on this fixture. (The other
+# #2228 case, obtainability-refusal-direct-mutation, is nightly and only
+# loses its pull-request arm: its inline-proposal arm passes without the file.)
 GITOPS_WORKLOAD_MANIFEST_CASES = (
     "pdb-remediation-pr",
     "obtainability-major-pdb-auto-pr",
@@ -2926,7 +2926,9 @@ def check_gitops_workload_manifest(project_id: str) -> CheckResult:
             if state in (GITHUB_PATH_FAILED, GITHUB_PATH_UNDECODABLE):
                 return failed(f"{path} (over the contents API's inline limit, read raw)", body)
         else:
-            body = base64.b64decode(payload.get("content") or "").decode("utf-8")
+            # Decoded as the index reads the file (`errors="replace"`), so a
+            # stray byte is the index's verdict below, not a failure here.
+            body = base64.b64decode(payload.get("content") or "").decode("utf-8", errors="replace")
     except Exception as exc:
         return CheckResult(name, False, f"Could not parse the contents of {path} in {repo_slug}: {exc}")
     # The index, not a copy of its rule: the file goes into a scratch tree at
