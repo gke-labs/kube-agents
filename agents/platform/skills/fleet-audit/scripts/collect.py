@@ -245,7 +245,6 @@ ZONAL_SKEW_THRESHOLD_MIN = 1
 ZONAL_SKEW_MIN_RUNNING = 2
 ZONAL_SKEW_MIN_RUNNING_STARVED = 1
 ZONAL_SKEW_MIN_ZONES = 2
-POD_PHASE_RUNNING = "Running"
 POD_PHASE_PENDING = "Pending"
 # The scheduler's own word for a pod no node has room for: `Insufficient cpu`,
 # `Insufficient memory`, `Insufficient nvidia.com/gpu`. Its first sentence is
@@ -2970,7 +2969,7 @@ def _collect_pod_placements(context: dict, commands: dict, kubeconfig: Path, *, 
         elif truncated:
             what = "was cut at the credential proxy's output cap (rc=0)"
         else:
-            what = f"returned rows that are not the {POD_PLACEMENT_FIELDS} fields the read asks for (rc=0)"
+            what = f"returned no rows, or rows that are not the {POD_PLACEMENT_FIELDS} fields the read asks for (rc=0)"
         context.setdefault("unevaluated", {})[ZONAL_SKEW_SLUG] = (
             f"{UNDETERMINED_PREFIX} `kubectl get pods -A -o jsonpath=...` {what} ({stderr}), "
             "so pod placement could not be read. This check cleared nothing on this cluster."
@@ -2991,14 +2990,18 @@ _IMPACT_ZONAL_SKEW = (
     "{share}% of this workload's placed replicas are in {zone}, so a zonal outage or "
     "stockout there takes that share down at once."
 )
+_IMPACT_ZONAL_SKEW_FALLBACK = (
+    "This workload's placed replicas are concentrated in one zone, so a zonal outage or "
+    "stockout there takes most of it down at once."
+)
 _ZONAL_SKEW_CAUSES = {
     "pinned-with-disks": (
         "pinned to {zone} by its manifest ({pin}), keeping it with its volumeClaimTemplates (StorageClass {classes}, {bound} of {total} claims Bound)",
         " The manifest keeps the pods with their disks; if that class is zonal the fix is a migration, and if it is regional the pin alone is the fix.",
     ),
     "capacity": (
-        "capacity: {count} replica(s) Pending because no node has room ({message})",
-        " The other zone had no room for the rest, which is a capacity shortfall before it is a spreading fault.",
+        "capacity: {count} replica(s) Pending because no node they may use has room ({message})",
+        " No node the pods may use had room for the rest, which is a capacity shortfall before it is a spreading fault.",
     ),
     "pinned": (
         "pinned to {zone} by its manifest ({pin})",
@@ -3125,8 +3128,9 @@ def _zonal_skew_cause(workload: dict, context: dict, pods: list[dict], starved: 
     report; the spreading rules only say what was asked for. A pinned
     StatefulSet with claims is one cause, not two: the pin is how its author
     kept it with its disks, which is also why §3.7 raises nothing on that
-    shape. Capacity outranks the claims because a replica Pending for room has
-    no disk yet.
+    shape. A pin outranks capacity, since a pinned workload is skewed however
+    much room its zone has; capacity outranks the claims, since a replica
+    Pending for room has no disk yet.
     """
     template = workload["template"]
     pin = _manifest_zone_pin(template)
@@ -3139,13 +3143,15 @@ def _zonal_skew_cause(workload: dict, context: dict, pods: list[dict], starved: 
         bound, total = _claims_bound(workload, pods, context)
         phrase, tail = _ZONAL_SKEW_CAUSES["pinned-with-disks"]
         return phrase.format(zone=pin[0], pin=pin[1], classes=classes, bound=bound, total=total), tail
+    if pin:
+        # Before capacity: a pinned workload short of room in its zone is
+        # still pinned, and with unlimited room there it would still be skewed.
+        phrase, tail = _ZONAL_SKEW_CAUSES["pinned"]
+        return phrase.format(zone=pin[0], pin=pin[1]), tail
     if starved:
         phrase, tail = _ZONAL_SKEW_CAUSES["capacity"]
         message = starved[0]["scheduled_message"].split(SCHEDULER_SENTENCE_END)[0].rstrip(".")[:SCHEDULER_MESSAGE_CHARS]
         return phrase.format(count=len(starved), message=message), tail
-    if pin:
-        phrase, tail = _ZONAL_SKEW_CAUSES["pinned"]
-        return phrase.format(zone=pin[0], pin=pin[1]), tail
     if has_claims:
         bound, total = _claims_bound(workload, pods, context)
         phrase, tail = _ZONAL_SKEW_CAUSES["volume"]
@@ -3161,8 +3167,19 @@ def _zonal_skew_cause(workload: dict, context: dict, pods: list[dict], starved: 
     ]
     if preferred:
         rules.append("podAntiAffinity is preferredDuringScheduling")
-    if required:
-        rules.append("podAntiAffinity is requiredDuringScheduling")
+    # A required anti-affinity spreads this workload only when its term selects
+    # this workload's own pods in its own namespace; one against another
+    # application says nothing about where these replicas go relative to each
+    # other.
+    self_required = [
+        entry for entry in required
+        if selector_matches(entry.get("labelSelector") or {}, workload.get("pod_labels") or {})
+        and (not entry.get("namespaces") or workload["ns"] in (entry.get("namespaces") or []))
+    ]
+    if self_required:
+        rules.append("podAntiAffinity is requiredDuringScheduling against its own pods")
+    if len(self_required) < len(required):
+        rules.append("podAntiAffinity is requiredDuringScheduling against other pods")
     if not rules:
         phrase, tail = _ZONAL_SKEW_CAUSES["none"]
         return phrase, tail
@@ -3172,7 +3189,7 @@ def _zonal_skew_cause(workload: dict, context: dict, pods: list[dict], starved: 
         for c in constraints
         if c.get("topologyKey") == _ZONE_KEY and c.get("whenUnsatisfiable", _SPREAD_BINDING) == _SPREAD_BINDING
     ]
-    if any(entry.get("topologyKey") == _ZONE_KEY for entry in required):
+    if any(entry.get("topologyKey") == _ZONE_KEY for entry in self_required):
         allowed.append(ANTI_AFFINITY_MAX_SKEW)
     if not allowed:
         key = "advisory"
@@ -8118,8 +8135,9 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         # is in one zone, because one zonal event then takes the whole workload.
         "major",
         None,
-        # Overridden per hit: the Impact names the zone, the share and the cause.
-        _IMPACT_ZONAL_SKEW,
+        # Every hit carries its own Impact (zone, share, cause); this is the
+        # sentence `CheckSpec` requires and nothing reaches.
+        _IMPACT_ZONAL_SKEW_FALLBACK,
     ),
 )
 

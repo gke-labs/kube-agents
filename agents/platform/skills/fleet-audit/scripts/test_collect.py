@@ -1819,6 +1819,7 @@ class TestZonalSkew(unittest.TestCase):
     def wl(self, replicas=2, kind="Deployment", name="api", tsc=None, affinity=None, vct=False, node_selector=None):
         d = deployment(name, **{"spec.replicas": replicas})
         d["kind"] = kind
+        d["spec"]["template"]["metadata"] = {"labels": {"app": name}}
         if tsc is not None:
             d["spec"]["template"]["spec"]["topologySpreadConstraints"] = tsc
         if affinity is not None:
@@ -1955,7 +1956,7 @@ class TestZonalSkew(unittest.TestCase):
         self.assertEqual(hit["severity"], "critical")
         self.assertIn("replicas=4, 2 placed across 2 zones: us-central1-a=0, us-central1-b=2", hit["excerpt"])
         # The scheduler's first sentence only; the preemption detail after it is noise here.
-        self.assertIn("cause: capacity: 2 replica(s) Pending because no node has room (0/2 nodes are available: 2 Insufficient cpu)", hit["excerpt"])
+        self.assertIn("cause: capacity: 2 replica(s) Pending because no node they may use has room (0/2 nodes are available: 2 Insufficient cpu)", hit["excerpt"])
         self.assertIn("; 2 Pending unplaced", hit["excerpt"])
         self.assertIn("capacity shortfall", hit["impact"])
 
@@ -2006,17 +2007,50 @@ class TestZonalSkew(unittest.TestCase):
         self.assertIn("yet the skew exceeds it", hit["excerpt"])
         self.assertIn("did not hold at placement time", hit["impact"])
 
-    def test_required_zone_anti_affinity_counts_as_a_binding_rule_of_one(self):
-        affinity = {
+    def test_required_zone_anti_affinity_counts_as_a_binding_rule_of_one_only_against_its_own_pods(self):
+        own = {
             "podAntiAffinity": {
                 "requiredDuringSchedulingIgnoredDuringExecution": [
                     {"topologyKey": collect._ZONE_KEY, "labelSelector": {"matchLabels": {"app": "api"}}}
                 ]
             }
         }
-        wl = self.wl(affinity=affinity)
+        wl = self.wl(affinity=own)
         hit = collect.check_zonal_skew(wl, self.ctx(wl, [self.pod("node-a"), self.pod("node-a")]))
-        self.assertIn("cause: a binding zone rule is declared (podAntiAffinity is requiredDuringScheduling)", hit["excerpt"])
+        self.assertIn("cause: a binding zone rule is declared (podAntiAffinity is requiredDuringScheduling against its own pods)", hit["excerpt"])
+        # "Never share a zone with batch-runner" says nothing about where these
+        # replicas go relative to each other; the scheduler honoured it.
+        other = {
+            "podAntiAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": [
+                    {"topologyKey": collect._ZONE_KEY, "labelSelector": {"matchLabels": {"app": "batch-runner"}}}
+                ]
+            }
+        }
+        wl = self.wl(affinity=other)
+        hit = collect.check_zonal_skew(wl, self.ctx(wl, [self.pod("node-a"), self.pod("node-a")]))
+        self.assertIn("cause: no rule binds the zone key (podAntiAffinity is requiredDuringScheduling against other pods)", hit["excerpt"])
+        # The same term scoped to another namespace is also not a self-spread.
+        elsewhere = {
+            "podAntiAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": [
+                    {"topologyKey": collect._ZONE_KEY, "labelSelector": {"matchLabels": {"app": "api"}}, "namespaces": ["other"]}
+                ]
+            }
+        }
+        wl = self.wl(affinity=elsewhere)
+        hit = collect.check_zonal_skew(wl, self.ctx(wl, [self.pod("node-a"), self.pod("node-a")]))
+        self.assertIn("against other pods", hit["excerpt"])
+
+    def test_a_pinned_workload_short_of_room_in_its_zone_is_still_pinned(self):
+        # The scheduler's message for this shape names both the full node and
+        # the affinity miss; the pin is why the other zone was never an option.
+        wl = self.wl(replicas=3, affinity=self.PIN_A)
+        message = "0/2 nodes are available: 1 Insufficient cpu, 1 node(s) didn't match Pod's node affinity/selector."
+        pods = [self.pod("node-a"), self.pod("node-a"), self.pod("", "Pending", message)]
+        hit = collect.check_zonal_skew(wl, self.ctx(wl, pods))
+        self.assertIn("cause: pinned to us-central1-a by its manifest", hit["excerpt"])
+        self.assertIn("; 1 Pending unplaced", hit["excerpt"])
 
     def test_a_partial_skew_is_major_with_the_share_it_puts_at_risk(self):
         wl = self.wl(replicas=4)
