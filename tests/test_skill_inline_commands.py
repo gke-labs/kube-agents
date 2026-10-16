@@ -7,19 +7,23 @@ command whose program is a shell variable (`$G add`) and the refusal is final.
 The image build's deploy/docker/check_skill_commands.py runs the fenced shell
 blocks through that scanner but not inline code, most of which is JSON, report
 templates or fragments the scanner cannot rate. This reads the inline code of
-the same three skill trees for the variable forms the skills used to teach: a
+every shipped skill document, as deploy/docker/skill_documents.py defines it,
+for the variable forms the skills used to teach: a
 variable as the program, a script run by a path that starts with one, or the
 path of git or `submit_suggestion.py` put in a variable.
 """
 
 import re
+import sys
 import unittest
 from pathlib import Path
 
 from markdown_it import MarkdownIt
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SKILL_TREES = ("agents/platform/skills", "agents/cluster/skills", "a2a/persona/platform/skills")
+sys.path.insert(0, str(REPO_ROOT / "deploy" / "docker"))
+
+from skill_documents import SKILL_ROOT_GLOBS, shipped_skill_documents, skill_dirs  # noqa: E402
 
 # A variable run as the program at the start of a span, after a shell join or
 # inside `$(`, and after a shell keyword or a wrapper that runs the next word
@@ -54,12 +58,9 @@ VARIABLE_PATH_PROGRAM_RE = re.compile(
 REFUSED_EXAMPLE_RE = re.compile(r"whose program is a variable \(`[^`]*`\)")
 
 
-def skill_documents(tree):
-    """Each SKILL.md under ``tree`` and its reference pages, which the agent reads at a step."""
-    docs = []
-    for skill in sorted(tree.rglob("SKILL.md")):
-        docs += [skill, *sorted(skill.parent.glob("references/*.md"))]
-    return docs
+def documents(repo):
+    """The skill documents whose inline code this reads, in the repository at ``repo``."""
+    return shipped_skill_documents(repo)
 
 
 def inline_code(text):
@@ -84,19 +85,18 @@ def refused(span):
 
 
 class SkillInlineCommandsTest(unittest.TestCase):
-    def test_each_tree_holds_a_skill(self):
-        for tree in SKILL_TREES:
-            with self.subTest(tree):
+    def test_each_root_holds_a_skill(self):
+        for pattern in SKILL_ROOT_GLOBS:
+            with self.subTest(pattern):
                 self.assertTrue(
-                    any((REPO_ROOT / tree).rglob("SKILL.md")),
-                    f"{tree} holds no SKILL.md, so its inline code would pass unread",
+                    any(skill_dirs(tree) for tree in REPO_ROOT.glob(pattern)),
+                    f"no {pattern} holds a skill, so its inline code would pass unread",
                 )
 
     def test_no_inline_command_runs_a_variable_as_its_program(self):
         found = [
             f"{skill.relative_to(REPO_ROOT)}:{line}: {span}"
-            for tree in SKILL_TREES
-            for skill in skill_documents(REPO_ROOT / tree)
+            for skill in documents(REPO_ROOT)
             for line, span in inline_code(
                 REFUSED_EXAMPLE_RE.sub("", skill.read_text(encoding="utf-8"))
             )
