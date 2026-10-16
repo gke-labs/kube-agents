@@ -7,7 +7,7 @@ sidebar:
 
 The Platform Agent's runtime wiring is declared in [`agents/platform/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/config.yaml). It tells Hermes which MCP servers the agent can reach, which toolsets to expose to which surfaces, and which plugins to load.
 
-The pod's other profiles have their own configs. The Planning Agent's deliberately minimal [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml): a `router` MCP server for specialist discovery, toolsets pinned to `mcp-router` + `kanban` + the `memory` gate on every surface (including the real `google_chat` ingress key), the chat-side plugins (`session_store`, `session_otel_bridge`, `tool_call_audit`, the first-run `bootstrap_onboarding` hook, `legacy_slash_commands`, which unwraps a typed `/hermes <subcommand>` into the real gateway command and disables `/undo` — see its [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/legacy_slash_commands/README.md) — and `agent_roster`, which injects the routable specialists into every turn so delegation needs no `list_agents` roundtrip, see its [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/agent_roster/README.md)), a memory provider for per-user and shared memory — `multiuser_memory` by default, though the install chooses it and the operator writes the choice in (see [`memory`](#memory) below), and no file or cloud tools. Note that on an operator-deployed pod the repository file is not the whole story: the operator renders a config of its own into the `<agent>-config` ConfigMap and the entrypoint merges it into `/opt/data/config.yaml` at startup, so the two files are unioned and the operator wins any key they disagree on. `agents/chat/config.yaml` must be kept in sync with it — a list entry removed from one and left in the other survives the merge — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile). The Platform Agent's own `config.yaml` has no such caveat: it is image-owned and force-synced from the baked template on every start — unless the experimental [`platformFrontDoor`](/kube-agents/operator/platformagent-crd/#platformfrontdoor) flag homes the gateway on this profile, which makes the runtime a writer to that file too and puts it on the same fill-only back-fill the `default` profile's config gets — keys the image adds arrive, keys the live file already holds are left as the agent last wrote them, with one exception: the remote MCP `User-Agent` header, which follows the image (see [`mcp_servers`](#mcp_servers) below). The per-cluster Cluster Agents are stamped from the read-only [`agents/cluster/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/config.yaml) template — see [Cluster Agents](/kube-agents/concepts/cluster-agents/) — and a cluster profile already on the volume is back-filled from it on the same fill-only terms (see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile)). This page annotates the Platform Agent's file; the other two are self-documenting by design.
+The pod's other profiles have their own configs. The Planning Agent's deliberately minimal [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml): a `router` MCP server for specialist discovery, toolsets pinned to `mcp-router` + `kanban` + the `memory` gate on every surface (including the real `google_chat` ingress key), the chat-side plugins (`session_store`, `session_otel_bridge`, `tool_call_audit`, `chat_metrics`, which counts inbound messages for `status.usage`, the first-run `bootstrap_onboarding` hook, `legacy_slash_commands`, which unwraps a typed `/hermes <subcommand>` into the real gateway command and disables `/undo` — see its [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/legacy_slash_commands/README.md) — and `agent_roster`, which injects the routable specialists into every turn so delegation needs no `list_agents` roundtrip, see its [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/agent_roster/README.md)), a memory provider for per-user and shared memory — `multiuser_memory` by default, though the install chooses it and the operator writes the choice in (see [`memory`](#memory) below), and no file or cloud tools. Note that on an operator-deployed pod the repository file is not the whole story: the operator renders a config of its own into the `<agent>-config` ConfigMap and the entrypoint merges it into `/opt/data/config.yaml` at startup, so the two files are unioned and the operator wins any key they disagree on. `agents/chat/config.yaml` must be kept in sync with it — a list entry removed from one and left in the other survives the merge — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile). The Platform Agent's own `config.yaml` has no such caveat: it is image-owned and force-synced from the baked template on every start — unless the experimental [`platformFrontDoor`](/kube-agents/operator/platformagent-crd/#platformfrontdoor) flag homes the gateway on this profile, which makes the runtime a writer to that file too and puts it on the same fill-only back-fill the `default` profile's config gets — keys the image adds arrive, keys the live file already holds are left as the agent last wrote them, with two exceptions that follow the image: the remote MCP `User-Agent` header, and the `plugins.enabled` list, which gains the names the image's list has and the live list lacks ([how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile)) (see [`mcp_servers`](#mcp_servers) below). The per-cluster Cluster Agents are stamped from the read-only [`agents/cluster/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/config.yaml) template — see [Cluster Agents](/kube-agents/concepts/cluster-agents/) — and a cluster profile already on the volume is back-filled from it on the same fill-only terms (see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile)). This page annotates the Platform Agent's file; the other two are self-documenting by design.
 
 ## Shape of the file
 
@@ -98,12 +98,19 @@ toolsets:
 
 agent:
   max_turns: 250
+  disabled_toolsets:
+    - browser
+    - computer_use
+    - image_gen
+    - tts
+    - vision
 
 context_file_max_chars: 100000
 
 tool_loop_guardrails:
   loop_caps:
     max_web_searches: 200
+  permission_refusal_halt_after: 1
 
 memory:
   memory_enabled: false
@@ -114,12 +121,15 @@ memory:
 # The Platform Agent is not the chat ingress (the Chat Agent / `default`
 # profile owns that), so the session_store / session_otel_bridge ingress plugins
 # move to the Chat Agent. Keep otel for observability parity and tool_call_audit
-# to audit this privileged specialist's tool calls.
+# to audit this privileged specialist's tool calls. pr_opened records each pull
+# request this profile's kanban workers open on their card, which is what posts
+# the thread's PR message (plugins/pr_opened/__init__.py).
 plugins:
   enabled:
     - hermes_otel
     - tool_call_audit
     - incident_context
+    - pr_opened
 ```
 
 ## Sections
@@ -150,6 +160,8 @@ Both include the same MCP servers plus their respective Hermes-native tools (`he
 
 Note that the two files' toolset lists are **unioned**, not overridden — the build-time merge combines two lists as `list(dict.fromkeys(a + b))`. Removing an entry from `agents/platform/config.yaml` alone has no effect if the shared defaults still list it.
 
+`agent.disabled_toolsets` then removes `browser`, `computer_use`, `image_gen`, `tts` and `vision` from both surfaces, on the Platform Agent and on every Cluster Agent. Hermes applies it last, so it also narrows the toolsets a kanban worker is spawned with. None of the agents' work uses them, and declaring the full set puts Gemini on Vertex on an intermittent slow path before the first token: in a replay of a captured worker request, the 90th-percentile wait fell from 13.7s (up to 57s) to 2.8s once they were gone.
+
 No MCP server exposes an agent-to-agent call tool; delegation between agents is kanban-only.
 
 ### `toolsets`
@@ -172,6 +184,8 @@ Raised to 200 for this profile only, for the same reason as `max_turns` above: b
 
 The cap was never the whole defect. What made hitting it expensive was the exit taken when it fired: the halt broke out of the agent loop without showing the model the block result, so a worker with 173 successful searches in hand was never told, never got another turn, and exited without closing its card. That path is repaired in [`deploy/docker/patches/kanban_guardrail_exit.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_guardrail_exit.py), whose module docstring carries the analysis. Raising the cap alone would only have moved when the failure happened.
 
+`permission_refusal_halt_after` is a kube-agents addition, read by [`deploy/docker/patches/permission_refusal_stop.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/permission_refusal_stop.py): the number of definitive command-policy refusals in one run before the runtime halts it. The command policy's `kubernetes.read-only` rule refuses a kubectl write with a notice that the change is refused however it is attempted, and the credential proxy's client in the sandbox prints the verb it resolved beside the rule (`policy verb:`), which is what the runtime reads instead of parsing the command's shell text (the text is read only to tell a write chained before a successful read from a read that echoed a refusal); a refused write whose output the call discarded is not seen at all. The stock loop guardrails never see a workaround hunt, because they count identical retries and reset on any success. At the default of 1 the first refusal ends the run through the same kanban-aware exit, so a worker ends its card (blocked, or completed when the card asked for a pull request) with the refusal instead of running to its step budget, and a chat turn replies with the refusal. A higher value makes the refusals below it append guidance to the tool result instead; in live runs the model read that guidance and went on investigating, which is why the default is the first. An API 403 only warns and is never counted, so a fleet audit continues past a project it may not read; so do a `gcp.read-only` refusal and a `kubernetes.read-only` refusal of a read spelling such as `config view`, since both rules are allowlists that refuse an unlisted read with the same notice. There is no unlimited setting.
+
 ### `memory`
 
 `memory_enabled: false` and `user_profile_enabled: false` switch off Hermes' built-in file store (`MEMORY.md` / `USER.md`). They are not what turns memory off here — they gate a different mechanism from the provider below, and leaving them on would hand this profile a writable file store alongside a provider designed to be read-only.
@@ -189,8 +203,9 @@ Hermes plugins enabled:
 - **`hermes_otel`** — OpenTelemetry export. Its trace backend is baked into the image but rewritten at container start to the endpoint the operator resolved; see [Deploy → Telemetry](/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
 - **`tool_call_audit`** — writes per-tool-call records for audit and debug.
 - **`incident_context`** — injects Kubernetes incident context into known chat threads on reply (`pre_gateway_dispatch` hook). The work happens on the Planning Agent, which enables it too: the pod runs a single gateway and it is homed at that profile, so an incident-thread reply is dispatched there and never here. It stands aside for a message that starts with `/`: `legacy_slash_commands` is on the same hook, and prepending the triage report first would move the command off the front of the line where that plugin's anchored pattern can no longer see it.
+- **`pr_opened`** — records each pull or merge request this profile's kanban workers open as a `pr_opened` event on their card (`transform_terminal_output` hook), once the forge confirms the agent's own credential opened it; with `KAGE_SLACK_UX` on, the gateway then posts it as its own message in the card's Slack thread ([ChatOps](/kube-agents/concepts/chatops/)). With [`platformFrontDoor`](/kube-agents/operator/platformagent-crd/#platformfrontdoor) on, the operator's overlay enables it, since the back-fill never adds an entry to a list the live file already holds.
 
-The chat-ingress plugins — `session_store` (durable session state) and `session_otel_bridge` (enriches OTel spans with session context, see [Session metadata](/kube-agents/concepts/observability/#session-metadata-plumbing)) — run on the Planning Agent profile, which owns chat ingress. Their sources live in [`agents/chat/defaults/plugins/`](https://github.com/gke-labs/kube-agents/tree/main/agents/chat/defaults/plugins).
+The chat-ingress plugins — `session_store` (durable session state), `session_otel_bridge` (enriches OTel spans with session context, see [Session metadata](/kube-agents/concepts/observability/#session-metadata-plumbing)) and `chat_metrics` (counts inbound messages for `status.usage`) — run on the Planning Agent profile, which owns chat ingress. Their sources live in [`agents/chat/defaults/plugins/`](https://github.com/gke-labs/kube-agents/tree/main/agents/chat/defaults/plugins).
 
 ## Related files
 

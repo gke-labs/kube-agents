@@ -30,10 +30,11 @@ partial window for it (`collecting`), that evidence feeds both. A case not named
 red a pull request on a graded failure, whatever its record says — and since 2026-09-22 it does
 not run on one either: the eval crew decided that the presubmit runs the blocking roster only
 ([#1023](https://github.com/gke-labs/kube-agents/issues/1023)), so `presubmit-cases.txt` holds
-the roster's twelve cases plus, since 2026-09-29, one documented exception: the held-out seat a
+the roster's thirteen cases plus, since 2026-09-29, one documented exception: the held-out seat a
 coverage tracker puts in the presubmit file without a roster line, one per tracker
-([#2013](https://github.com/gke-labs/kube-agents/issues/2013) for the compliance canary,
-[#2016](https://github.com/gke-labs/kube-agents/issues/2016) for pdb-remediation-pr).
+([#2013](https://github.com/gke-labs/kube-agents/issues/2013) for the compliance canary;
+[#2016](https://github.com/gke-labs/kube-agents/issues/2016)'s seat for pdb-remediation-pr took
+its roster line on 2026-10-14).
 Such a seat runs on every pull request, cannot red one on a graded failure under the default
 `roster` mode below (a switch to `record` mode would let the record admit it), and earns its
 record at presubmit volume; `scripts/test_eval_rosters.py` pins the set (`HELD_OUT_IN_PRESUBMIT`)
@@ -80,8 +81,8 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-Twelve of the fourteen presubmit cases are admitted; the other two, the compliance canary and
-pdb-remediation-pr, are the held-out seats described above (recount the entries of
+Thirteen of the fourteen presubmit cases are admitted; the other one, the compliance canary,
+is the held-out seat described above (recount the entries of
 `hack/eval/presubmit-cases.txt` and
 `blocking-roster.txt` rather than trusting this sentence — an earlier copy of it miscounted
 twice). The bar a case clears to
@@ -132,9 +133,9 @@ with a filed issue naming the exit condition:
   written before the run started; since #2260 the job empties the `*-infra` repository before
   every repetition ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 2). Nightly since
   2026-09-22, and with pdb-remediation-pr's seat withdrawn (below) the remediation domain had
-  no presubmit case, so `remediation` joined `fleet-audits` on the allowlist; pdb-remediation-pr
-  is back in the presubmit held out (seat opened 2026-09-28, below), which changes nothing here until
-  its roster line. Enters when #1189's re-admission bar holds.
+  no presubmit case, so `remediation` joined `fleet-audits` on the allowlist until
+  pdb-remediation-pr's roster line on 2026-10-14 (below) took it off again. Enters when #1189's
+  re-admission bar holds.
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
 [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its
@@ -145,7 +146,10 @@ record. It enters the roster when the lettered-options bar is settled and it has
 record.
 
 **pdb-remediation-pr** ([#1079](https://github.com/gke-labs/kube-agents/pull/1079)), the
-remediation domain's second writer, has never held a presubmit seat either. Its record —
+remediation domain's second writer, is on the roster since 2026-10-14
+([#2016](https://github.com/gke-labs/kube-agents/issues/2016) step 4; the entry under
+"Admitted on the record since the split" below has the record). How it got there, kept for
+the measurements it cites: it held no presubmit seat before 2026-09-28. Its record —
 12/12 on the four graded nights 2026-09-16 to 09-20 (420–1153 s a repetition), after 11/15
 across #1079's five presubmit runs (the misses traced to
 [#1097](https://github.com/gke-labs/kube-agents/issues/1097) and
@@ -174,12 +178,15 @@ to 09-27, 0/3 each) failed on "no pull request URL", the #2011 shape, whose fix
 repetition that linked a 2026-09-17 leftover, `kube-agents-evals-6-infra#38`, the shape the
 sweep closes between leases. Its held-out seat in `presubmit-cases.txt` opened 2026-09-28
 ([#2016](https://github.com/gke-labs/kube-agents/issues/2016) step 2), the second held-out seat:
-it runs on every pull request, cannot red one on rungs 4 or 6, reds one on rungs 1–3 like every
-case, and builds the record step 3 reads at presubmit volume instead of one night at a time.
-The Cases page reads it as held out, undated: it was never on the roster. Enters the roster
-when #2016 step 3 holds: three clean days at ≥ 90 % of graded repetitions under
-`pull_request_opened` with no all-reps collapse, infra classes the harness excludes not
-counted. One miss shape the seat showed before #2260 was graded and counted against the case: a
+it ran on every pull request, could not red one on rungs 4 or 6, redded one on rungs 1–3 like
+every case, and built the record step 3 read at presubmit volume instead of one night at a time.
+The Cases page read it as held out, undated, until the roster line. The bar step 3 set: three
+clean days at ≥ 90 % of graded repetitions under `pull_request_opened` with no all-reps
+collapse, infra classes the harness excludes not counted, read on the Cases page on either
+tier it shows; the eval crew took the roster line on the writers nightlies of 2026-10-12 to
+10-14 with the presubmit at 90.2 % in aggregate, and the dominant remaining miss (the worker
+declining to open a pull request into a repository that holds no manifest for the workload) as
+a known cost rather than a reason to wait. One miss shape the seat showed before #2260 was graded and counted against the case: a
 job's three repetitions shared the leased repository, the sweep closed leftovers between leases
 and not between them, and submit-suggestion derives its branch from the change, so repetitions 2
 and 3 met repetition 1's open pull request. A repetition that pushed its own commit onto that pull
@@ -195,9 +202,8 @@ the job empties the repository before every repetition of a case that requests a
 so the shape no longer arises and a reading in that band is regression.
 `pull_request_opened`'s `accepts_stream_pull_request` is not a
 fourth answer here: it widens only a fleet audit's stream, and this case has no ledger and
-opens submit-suggestion branches. The roster edit (step 4, an eval-crew approval) takes
-`remediation` off the `docs/designs/domains.yaml` allowlist. Until then the domain sits there
-beside fleet-audits.
+opens submit-suggestion branches. The roster edit of 2026-10-14 (step 4) took `remediation` off
+the `docs/designs/domains.yaml` allowlist, where it had sat beside fleet-audits since 2026-09-22.
 
 Every case that is not in the presubmit runs in the nightly, since 2026-09-15 including
 the nine that used to wait commented out in the script (the reasons each cannot take a
@@ -230,6 +236,26 @@ the reds that once argued for un-arming it belonged to the old vocabulary check.
 
 Admitted on the record since the split:
 
+- **pdb-remediation-pr**, 2026-10-14
+  ([#2016](https://github.com/gke-labs/kube-agents/issues/2016) step 4), from the held-out
+  seat it took on 2026-09-28. The three clean days the bar asks for are the writers nightlies
+  of 2026-10-12, 10-13 and 10-14, 3/3 each (16 of 18 over the six nights before that), and the
+  evidence store's newest-20 window stood at 19/21, reported as `would-admit` since 2026-10-13.
+  The presubmit record behind it, since
+  [#2263](https://github.com/gke-labs/kube-agents/pull/2263) landed, which empties the leased
+  repository before each repetition: 1,882 of 2,086 graded repetitions passed (90.2 %); by UTC
+  day, 10-09 298/322, 10-10 69/75, 10-11 12/15 with one all-reps collapse, 10-12 53/60,
+  10-13 245/270, 10-14 101/106 to 14:53Z. Read on the presubmit alone the days do not run three
+  clean in a row, 10-11 and 10-12 being under on 15 and 60 repetitions, and the eval crew's
+  approval of this line is the call that the nightly reading and the aggregate suffice. Named
+  so a reader can reproduce it, the cut: presubmit tier, UTC days, runs started at or after #2263's merge, 2026-10-03 02:32Z, `data.json` generated 2026-10-14 14:53Z, the 13 `MISSING` repetitions of the 2026-10-07 GitHub outage left out, which read 89.6 % with them in. What
+  the remaining misses are: the worker finding checkout-gateway and declining to open a pull
+  request because the `*-infra` repository holds no manifest for it; a 429 on the model; the
+  worker citing an earlier repetition's pull request; two all-reps collapses in the window
+  (PRs #2763, #2874), both the first shape. The terminal exit-255 class
+  ([#2174](https://github.com/gke-labs/kube-agents/issues/2174), fixed by
+  [#2738](https://github.com/gke-labs/kube-agents/pull/2738) on 2026-10-08) is absent from every
+  artifact read after that merge.
 - **capacity-pinned-pool-probe**, 2026-09-22
   ([#1023](https://github.com/gke-labs/kube-agents/issues/1023)). Held out on
   [#1010](https://github.com/gke-labs/kube-agents/issues/1010) (the delegation receipt
@@ -266,7 +292,7 @@ Admitted on the record since the split:
   shape). Its seat took incident-triage off the `docs/designs/domains.yaml` allowlist; the
   same day's decision that the presubmit runs the roster only put `fleet-audits` on it (the
   compliance canary above) and, with pdb-remediation-pr's promotion withdrawn, `remediation`
-  too. Same watch as the case above: a collapse on an unrelated pull request in its first
+  too, until its roster line on 2026-10-14. Same watch as the case above: a collapse on an unrelated pull request in its first
   days, and the demotion lever below.
 
 ## How far the roster's promise reaches
@@ -278,25 +304,26 @@ blocking for every case by design, admitted or not: `grade_case` evaluates them 
 reads admission. Those classes signal a broken case or install, not flake, and the fix is
 on that side rather than on the roster.
 
-Since 2026-09-22 those rungs reach only the cases the presubmit runs: the roster's twelve and,
-since 2026-09-29, the two held-out seats. Those seats put both GitHub-writing paths back on
+Since 2026-09-22 those rungs reach only the cases the presubmit runs: the roster's thirteen and,
+since 2026-09-29, the held-out seat. The seats of 2026-09-29 put both GitHub-writing paths back on
 every pull request — the canary's (the minted token, the cloned `*-infra` workspace, the ledger
 write, the `ledger_issue_contains` verifier) and pdb-remediation-pr's (submit-suggestion opening
 a pull request on the leased `*-infra` repository, the `pull_request_opened` verifier) — so a
 change that breaks either path is seen on the pull request that introduces it again: an
 erroring verifier or an empty record is a rung-1–3 red for every case, admitted or not. A
-graded miss on either seat (no ledger URL or the planted binding skipped; no pull request URL
-in the final answer) is reported as UNSTABLE and "(held out)" and blocks nothing.
+graded miss on the canary's seat (no ledger URL or the planted binding skipped) is reported as
+UNSTABLE and "(held out)" and blocks nothing; since 2026-10-14 pdb-remediation-pr's (no pull
+request URL in the final answer) arms rung 4 like any roster case.
 `rca-remediation-pr` is still nightly-only, so what it alone grades, the RCA delegation chain
 ending in a pull request, is still first seen by the next nightly that finishes grading. The
 eval crew took that trade with the policy; what makes a break on a GitHub-write path block is
-a roster line for one of these seats (#2013 step 4, #2016 step 4), and until one lands a pull
+a roster line for the seat (#2013 step 4; #2016's landed 2026-10-14), and until it lands a pull
 request that touches that path should still say what it ran by hand.
 
 ## The whole-suite rate
 
 Beside the per-case rungs the verdict carries one number for the whole pull request: the pooled
-pass rate of every roster case's scored repetitions — twelve cases × three = 36 units, `infra`
+pass rate of every roster case's scored repetitions — thirteen cases × three = 39 units since 2026-10-14 (36 before), `infra`
 repetitions left out — against `main`'s rate over the same cases from the evidence store (the
 newest seven nightly lines per case, about 249 runs). It is the rule that can see a pull request
 which made several cases a little worse without making any one of them fail three times. The
@@ -447,8 +474,10 @@ GitLab.
 
 The roster above is still the roster, intersected with the lane's list: a roster case in the
 lane arms rung 4 there, and a held-out seat runs and reports without arming it, exactly as on
-the GitHub presubmit. None of the lane's cases is on the roster, so the job cannot red a pull
-request on a graded failure; rungs 1 to 3 red it like every case. GitLab runs on demand
+the GitHub presubmit. Since 2026-10-14 pdb-remediation-pr is on the roster
+([#2016](https://github.com/gke-labs/kube-agents/issues/2016)), so its collapse reds the lane's
+verdict; the lane's other cases are held out and arm nothing; rungs 1 to 3 red it like every
+case. GitLab runs on demand
 (`/test pull-kube-agents-smoke-test-gitlab`) and nightly, not as a blocking presubmit: the agent
 goes through the same forge abstraction on both forges, so the GitHub presubmit already grades
 what a pull request can break in the agent; what GitLab can break on its own is the provider

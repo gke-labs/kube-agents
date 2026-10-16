@@ -210,7 +210,7 @@ var SensitiveEnvVars = map[string]struct{}{
 // source half of this reservation: the audience route, and the creds-Secret
 // route that is cheaper than it.
 //
-// One member so far. `a2a-bus-token` is the projected ServiceAccount token the
+// Two members. The first, `a2a-bus-token`, is the projected ServiceAccount token the
 // platform-agent container presents to the bus under `mode: next`, and it is
 // that container's alone — the auth callout resolves the POD's ServiceAccount,
 // so any other container mounting this token is a second workload wearing the
@@ -218,8 +218,16 @@ var SensitiveEnvVars = map[string]struct{}{
 // union of the two grant sets, which is the retired `worker` credential rebuilt
 // out of a volumeMount. See a2aStripBusTokenMounts and, for the fifth field,
 // a2aStripBusTokenVolumeMounts.
+//
+// The watchers' broker token is the second member, in either mode: it is
+// projected into the gateway's agent-api-auth container alone, and any other
+// container holding it holds the broker's watcher role (every fleet cluster's
+// events and named objects). The controller's watcherTokenSourceNames strips
+// it, and any volume projecting its audience under another name, at render;
+// this is the name half's admission message. The source half is render-only.
 var ReservedVolumeNames = map[string]struct{}{
-	"a2a-bus-token": {},
+	"a2a-bus-token":                  {},
+	"watcher-credential-proxy-token": {},
 }
 
 // BusCredentialRouteKind says which of the two sources a user-authored volume
@@ -678,9 +686,10 @@ type TuningSpec struct {
 	// preemption.
 	//
 	// The number lands in three places that deliberately differ. The gateway's
-	// A2A_MAX_SESSIONS env carries it as a usability control: at the cap a new
-	// delegation is refused with a chat reply naming the numbers, never queued,
-	// never dropped. The namespace ResourceQuota is rendered a fixed headroom
+	// A2A_MAX_SESSIONS env carries it as a usability control: at the cap the
+	// gateway first evicts the longest-idle session pod (its conversation is
+	// told); only with none idle is a new turn refused with a chat reply naming
+	// the numbers, never queued, never dropped. The namespace ResourceQuota is rendered a fixed headroom
 	// ABOVE it as the enforcement control: a compromised or buggy gateway
 	// ignores its own cap and cannot ignore the quota, and keeping the quota
 	// above the cap is what makes users hit the honest refusal rather than an
@@ -722,9 +731,10 @@ type TuningSpec struct {
 	//
 	// Raising it buys concurrent delegations at the per-pod price plus model
 	// concurrency against the shared LiteLLM endpoint; the quota lifts with it.
-	// Lowering it turns busy-hour delegations into refusals sooner - a lower
-	// cap never reaps in-flight sessions, it only blocks new spawns until they
-	// finish. Setting it to 1 serialises delegated SESSION work; kanban worker
+	// Lowering it turns busy-hour delegations into evictions and refusals
+	// sooner - a lower cap never stops a running task: a new spawn at the cap
+	// evicts the session pod idle longest, and is refused only when none is
+	// idle. Setting it to 1 serialises delegated SESSION work; kanban worker
 	// concurrency is MaxInProgress above, a different lane.
 	//
 	// The Maximum exists because the quota render adds its headroom to this
@@ -1501,9 +1511,9 @@ var writeRoles = []string{RepositoryRoleGitOps, RepositoryRoleManaged}
 //
 // A gitlab forge's credentialsRef is required by the API server too, so it
 // holds with the webhook off -- the chart ships it off.
+// +kubebuilder:validation:XValidation:rule="has(self.provider) || !has(self.host) || size(self.host) == 0 || self.host.lowerAscii() in ['github.com', 'www.github.com', 'ssh.github.com']",message="a forge at a host other than github.com names its provider: github for a GitHub Enterprise Server, gitlab for a GitLab instance"
 // +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitlab' || has(self.credentialsRef)",message="a gitlab forge needs credentialsRef.name: the Secret holding its access token under the key token"
-// +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.provider) && self.provider == 'gitlab')",message="caBundleRef is for a gitlab forge: the github provider does not read it yet, and a CA that nothing reads would hide a certificate problem"
-// +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.host) && size(self.host) > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com']))",message="caBundleRef is for a self-managed host: gitlab.com presents a certificate the public CAs sign, and a private CA must never vouch for it"
+// +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.host) && size(self.host) > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com', 'github.com', 'www.github.com', 'ssh.github.com']))",message="caBundleRef is for a self-managed host: gitlab.com and github.com present a certificate the public CAs sign, and a private CA must never vouch for it"
 type ForgeSpec struct {
 	// Name identifies the forge within this PlatformAgent. Repositories refer
 	// to it by this name. The deprecated GitHub alias is the forge "github".
@@ -1518,19 +1528,29 @@ type ForgeSpec struct {
 	// URL's text.
 	//
 	// "github" and "gitlab" are registered; the enum grows with each
-	// agent-side provider. Defaults to "github".
+	// agent-side provider. Omitted, it is "github".
+	//
+	// A forge at a host other than a spelling of github.com must name it, so
+	// a forge written for another instance is never read as a GitHub
+	// Enterprise Server by default.
 	// +kubebuilder:validation:Enum=github;gitlab
-	// +kubebuilder:default=github
 	// +optional
 	Provider string `json:"provider,omitempty"`
 
 	// Host is the forge hostname. Omit it for the provider's default
 	// ("github.com" for GitHub, "gitlab.com" for GitLab). A host the declared
 	// provider does not serve is rejected, and an alternative spelling of one
-	// it does serve resolves to the provider's canonical host. For GitLab it may
-	// also be a self-managed instance's hostname, which every repository on the
-	// forge must then name or leave implied; a host another provider serves is
-	// rejected.
+	// it does serve resolves to the provider's canonical host. It may also be a
+	// self-managed instance's hostname: a GitLab instance, or a GitHub
+	// Enterprise Server instance. Every repository on the forge must then name
+	// that host or leave it implied. A host another provider serves is
+	// rejected, and so is a host under a domain where the provider runs its own
+	// services (for GitHub: github.com, githubusercontent.com, ghe.com and
+	// others).
+	//
+	// An install serves one GitHub host: github.com, or one GitHub Enterprise
+	// Server instance. A second GitHub forge at another host is rejected, and
+	// so is one host declared for two providers.
 	//
 	// The pattern is a DNS name, which every forge's host is; it is here rather
 	// than only in the webhook so the API server still refuses whitespace and
@@ -1583,9 +1603,12 @@ type ForgeSpec struct {
 	// the PEM CA certificates that signed this forge's TLS certificate:
 	// a self-managed instance behind a private CA. The broker trusts these
 	// certificates for this forge's host only, beside the system bundle, in
-	// its API client and in git, so they never vouch for another host. It is
-	// for a gitlab forge at a self-managed host: it is refused when host is
-	// empty or gitlab.com, whose certificate the public CAs sign.
+	// its API client and in git. On a GitHub Enterprise Server forge, the
+	// chart also gives them to the token minter, which trusts them for all of
+	// its outbound calls. It is
+	// for a forge at a self-managed host, GitLab or GitHub Enterprise Server: it
+	// is refused when host is empty, gitlab.com or github.com, whose
+	// certificates the public CAs sign.
 	//
 	// The operator mounts the one key into the credential broker's pod only.
 	// The mount is optional: a missing Secret does not stop the broker, and
@@ -2041,9 +2064,10 @@ type AgentStatus struct {
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
 // update, and ToolExecutionsTotal, EventsIngestedTotal,
-// RemediationsProposedTotal, RemediationsMergedTotal, LastActiveTime,
-// ClustersRegistered and ClustersMonitored from the broker's and the event
-// watcher's metrics
+// RemediationsProposedTotal, RemediationsMergedTotal,
+// ChatMessagesInboundTotal, LastActiveTime, ClustersRegistered and
+// ClustersMonitored from the broker's, the event watcher's and the chat
+// plugin's metrics
 // listeners, which it reads every five minutes on the leader; the agent's own
 // ServiceAccount holds no write verb on this status. SessionsTotal and
 // RemediationsAppliedTotal are declared so that the schema names them, but
@@ -2108,6 +2132,24 @@ type AgentUsageStatus struct {
 	// +optional
 	RemediationsMergedTotal int64 `json:"remediationsMergedTotal,omitempty"`
 
+	// ChatMessagesInboundTotal is the cumulative count of chat messages that
+	// reached the gateway, from every platform it serves: Google Chat, Slack,
+	// Teams and its own API port alike. Counted at the gateway's dispatch
+	// hook, which Hermes runs after dropping its own internal events and
+	// before it checks the sender against the allowlist, so an unlisted
+	// user's message counts and nothing the gateway never hands to the hook
+	// does. Read every five minutes from the chat_metrics plugin's
+	// kubeagents_chat_messages_inbound_total on the platform-agent container
+	// of the gateway pod that runs Hermes (above one replica, the leader
+	// alone), summed across the pods that have led, and, on a next-mode
+	// install, from the A2A gateway's
+	// kubeagents_a2a_gateway_messages_inbound_total as well, since Chat
+	// ingress is that gateway's there; kept monotonic the same way as
+	// ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
+	// brokered command is activity.
+	// +optional
+	ChatMessagesInboundTotal int64 `json:"chatMessagesInboundTotal,omitempty"`
+
 	// ClustersRegistered is the number of clusters the event watcher built a
 	// client for at its last start: the management cluster and the Cluster
 	// Agent profiles the GKE API would describe, the management cluster
@@ -2151,13 +2193,12 @@ type AgentUsageStatus struct {
 	ActiveInterfaces []string `json:"activeInterfaces,omitempty"`
 
 	// LastActiveTime is the time of the last poll in which a counter above
-	// moved: a brokered command ran, a proposal was opened or merged, or an
-	// event was accepted for triage.
-	// Until SessionsTotal has a source, a chat turn that runs no brokered
-	// command does not move it. Scheduled maintenance jobs that run brokered
-	// commands do move it, though -- the Controller Stall Watch cron runs some
-	// every 30 minutes by default -- so it marks agent activity of any origin,
-	// not human or operator use alone. Advances at most once per five minutes.
+	// moved: a brokered command ran, a proposal was opened or merged, a chat
+	// message reached the gateway, or an event was accepted for triage.
+	// Scheduled maintenance jobs that run brokered commands move it too --
+	// the Controller Stall Watch cron runs some every 30 minutes by default
+	// -- so it marks agent activity of any origin, not human or operator use
+	// alone. Advances at most once per five minutes.
 	// +optional
 	LastActiveTime *metav1.Time `json:"lastActiveTime,omitempty"`
 }
@@ -2201,6 +2242,29 @@ func CleanRepoSlug(rawURL string) (string, error) {
 // ResolvedRepository.Resolve.
 func CleanRepoSlugWithOrg(rawURL, org string) (string, error) {
 	ref, err := resolveGitHub(rawURL, org)
+	if err != nil {
+		return "", err
+	}
+	return ref.Path, nil
+}
+
+// GitHubRepoSlugOnHost reads a GitHub repository entry into "owner/repo" on
+// the install's GitHub host: github.com, or a GitHub Enterprise Server host. A
+// bare name is qualified by org. An entry that names another host is refused,
+// never moved onto host. It is what the minter policy sync reads the state
+// ConfigMap's GitHub entries with: the minter mints for the one GitHub host.
+func GitHubRepoSlugOnHost(rawURL, org, host string) (string, error) {
+	if trimmed := strings.TrimSpace(rawURL); trimmed == "" || trimmed == NoRepositorySentinel {
+		return "", fmt.Errorf("empty repository")
+	}
+	provider, err := LookupGitProvider(GitProviderGitHub)
+	if err != nil {
+		return "", err
+	}
+	if provider.Hosts[lowerASCII(strings.TrimSpace(host))] {
+		host = ""
+	}
+	ref, err := provider.Resolve(host, rawURL, org)
 	if err != nil {
 		return "", err
 	}

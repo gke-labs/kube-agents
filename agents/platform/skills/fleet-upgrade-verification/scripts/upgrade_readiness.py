@@ -2,10 +2,12 @@
 """
 upgrade_readiness.py — the rules behind `fleet_upgrade_report.py --readiness`.
 
-Pure functions over data the report script has already read: the PodDisruptionBudgets
-and workloads of one cluster, its `maintenancePolicy`, and its node-pool versions. Nothing
+Pure functions over data the report script has already read: the PodDisruptionBudgets,
+workloads, webhook configurations, Services, EndpointSlices and Namespaces of one cluster, its
+`maintenancePolicy`, and its node-pool versions. Nothing
 here runs a command or touches a clock; the caller passes the instant to evaluate at. The
-three rules are the ones the governance SOPs define in prose:
+first three rules are the ones the governance SOPs define in prose; the fourth has no SOP
+check yet and is stated here:
 
 - a drain-blocking PDB, `obtainability_audit_sop.md` §3.4: `maxUnavailable` 0 or `0%`, or
   `minAvailable` at or above the matched workloads' replica total (an integer, or a
@@ -14,11 +16,35 @@ three rules are the ones the governance SOPs define in prose:
   `security_patch_orchestrator_sop.md` §3.8, and the maintenance window's state at the
   instant, §3.7;
 - node-pool version skew against the target control plane, §3.2: more than two minors, or
-  a different major, blocks the control-plane upgrade until the pool moves.
+  a different major, blocks the control-plane upgrade until the pool moves;
+- a fail-closed admission webhook whose backend the API server cannot reach (no Service,
+  no Service port for the webhook's port, or no ready endpoint behind that port), graded
+  on its rules: one that can match a write a node drain or a node join makes
+  (`UPGRADE_PATH_TARGETS` below is the list, with the package behind each write) breaks
+  the upgrade; so does one whose rules match a bootstrap RBAC write the API server's own
+  start-up reconciles (`CONTROL_PLANE_CLUSTER_WRITES` and, when its `namespaceSelector`
+  admits `kube-system` or `kube-public`, `CONTROL_PLANE_KUBE_SYSTEM_WRITES` below); one that
+  matches none of those is a current
+  outage for what it does match and is reported, not graded. The lists are the rule's
+  reading of the path, not a proof of the upgrade's safety.
+
+After those four, `evaluate_extra_rules` runs every module registered in `EXTRA_RULES`, one
+per entry of docs/designs/upgrade-failure-catalogue.md under `readiness_rules/`, whose
+package docstring is the contract a module meets. The fold stamps each finding with its
+rule; a rule's `blocking` joins the `blocked` verdict, an `unknown` from a rule that can block
+joins `unknown`, its `risks` the member's risks list, which the table and the report print
+under "risks", and its `notes` the note column. A rule that raises, `SystemExit` included, is
+one `unknown` finding, never a crash.
 """
 
+import copy
+import json
 import re
 from datetime import datetime, time, timedelta, timezone
+
+import readiness_rules
+from readiness_rules import audit_log, zonal_control_plane
+from readiness_rules import finding as finding_tiers  # the tier vocabulary; `finding` itself names a loop variable below
 
 # Per-member verdicts. `blocked` when any rule blocks; `unknown` when a rule could not be
 # evaluated (the cluster read failed, or there is no target to grade against) and nothing
@@ -123,6 +149,333 @@ SKEW_NOT_APPLICABLE = "n/a"
 SKEW_AUTOPILOT_REASON = "Autopilot: Google owns the node pools"
 SKEW_NO_TARGET_REASON = "no target to measure against"
 SKEW_MAJOR_DIFFERS = "major version differs from the target"
+# Fail-closed webhooks. admissionregistration.k8s.io/v1 defaults `failurePolicy` to Fail,
+# so an absent field grades as Fail. Only a webhook whose backend is a Service in the
+# cluster is graded: a URL backend is outside what the read can see, so it is counted in
+# the JSON (GKE installs two of its own on every cluster, so a note would say nothing).
+WEBHOOK_CONFIG_KINDS = ("ValidatingWebhookConfiguration", "MutatingWebhookConfiguration")
+SERVICE_KIND = "Service"
+ENDPOINTSLICE_KIND = "EndpointSlice"
+NAMESPACE_KIND = "Namespace"
+SERVICE_NAME_LABEL = "kubernetes.io/service-name"
+FAILURE_POLICY_FAIL = "Fail"
+# The API server resolves a webhook's Service the same way for either routing mode: the
+# Service must exist and carry a port equal to `clientConfig.service.port` (443 when
+# unset); endpoint routing then picks a ready endpoint from the EndpointSlices whose port
+# carries that Service port's name. An endpoint with no `ready` condition counts as ready,
+# as the EndpointSlice API says a consumer must assume.
+DEFAULT_WEBHOOK_PORT = 443
+BACKEND_NO_SERVICE = "Service {service} does not exist"
+BACKEND_NO_PORT = "Service {service} has no port {port}"
+BACKEND_NO_ENDPOINTS = "Service {service} has no ready endpoints on port {port}"
+# What a node upgrade needs admitted, as (API group, version, resource, operation, scope): the
+# writes a node drain and a node join make through the API server, each one refused by a
+# fail-closed webhook whose backend is down, and none of which the drain or the join
+# proceeds without. This tuple is the list's one home: the docstrings, `SKILL.md`, the
+# design notes and the eval case state the rule and point here. Grouped by phase, with the
+# kubernetes package that makes each write; admission reads a PATCH as UPDATE, so UPDATE
+# covers both. A rule that can match any entry puts the webhook in the upgrade's path; a
+# rule that matches none is reported, not graded, because the list is what the rule knows
+# of the path rather than a proof the upgrade is unaffected. Weighed and left off, because
+# the upgrade completes without them: events (`client-go/tools/record` drops a record it
+# cannot write and the caller goes on); Endpoints and EndpointSlices
+# (`pkg/controller/endpointslice` repairs Service routing as pods move, and nothing the
+# drain, the node delete or the join waits on); the CSINode's deletion
+# (`pkg/controller/garbagecollector` removes it after its Node is gone, and an orphan stalls
+# nothing); PersistentVolumeClaims (a replacement pod reuses its bound claim).
+# `objectSelector` and `matchConditions` are not evaluated, and `namespaceSelector` only for
+# the `kube-system` reach (`CONTROL_PLANE_KUBE_SYSTEM_WRITES` below): a webhook they narrow
+# is otherwise reported as able to match, which errs toward naming it. `apiVersions` is
+# evaluated, against the served version on each row (`VERSION_V1` below).
+SCOPE_NAMESPACED = "Namespaced"
+SCOPE_CLUSTER = "Cluster"
+SCOPE_ANY = "*"
+WILDCARD = "*"
+# The version the API server serves each write at, carried on its row: the matcher reads a
+# rule's `apiVersions` as the API server does (`*` or the request's version), so a rule pinned
+# to a version the server no longer serves (`policy/v1beta1`, `certificates.k8s.io/v1beta1`,
+# `storage.k8s.io/v1beta1`) matches nothing. Each rule of a dead off-path webhook is then classed
+# by what the server serves it (`_rule_served_class`), on the resources it names and not on its
+# operations or scope, since the served version is the resource's: live when its `apiVersions`
+# carry `*` or `v1`, so every request the server sends it fails now; pinned when every resource it names is graded and
+# the version is one the server does not serve, so the server sends it nothing (a pair it spells
+# that the server serves at no version, `policy/pods`, is said so, not served at `v1`); unknown when the
+# version is unserved on a resource, group or wildcard off the graded lists, whose served
+# versions this reader does not know. The outage cell says each of the three for the rules it
+# has (`WEBHOOK_PINNED_MATCHES` when every rule is pinned, `WEBHOOK_OFF_PATH_MATCHES` with one
+# clause per class otherwise) and asserts a failure now for the live rules alone. Every write on
+# the list is served at `v1` alone on any GKE version in support; under the default
+# `matchPolicy: Equivalent` a rule naming another served version of the same resource would also
+# match, and no resource here has one.
+VERSION_V1 = "v1"
+GROUP_CORE = ""
+GROUP_POLICY = "policy"
+GROUP_COORDINATION = "coordination.k8s.io"
+GROUP_CERTIFICATES = "certificates.k8s.io"
+GROUP_STORAGE = "storage.k8s.io"
+GROUP_RBAC = "rbac.authorization.k8s.io"
+OP_CREATE = "CREATE"
+OP_UPDATE = "UPDATE"
+OP_DELETE = "DELETE"
+# The drain. The eviction (`pkg/registry/core/pod/storage/eviction.go`), whose handler
+# decrements the budget's status before the pod goes and fails the eviction when it
+# cannot (`pkg/controller/disruption` recomputes it afterwards); the old pod's terminal
+# status and then its deletion, both by the kubelet's status manager (`pkg/kubelet/status`).
+UPGRADE_PATH_DRAIN = (
+    (GROUP_CORE, VERSION_V1, "pods/eviction", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_POLICY, VERSION_V1, "poddisruptionbudgets/status", OP_UPDATE, SCOPE_NAMESPACED),
+    (GROUP_CORE, VERSION_V1, "pods/status", OP_UPDATE, SCOPE_NAMESPACED),
+    (GROUP_CORE, VERSION_V1, "pods", OP_DELETE, SCOPE_NAMESPACED),
+)
+# The replacement pods. Created by their controllers (`pkg/controller/replicaset`, and
+# `pkg/controller/daemon` for the new node's system pods), placed by the scheduler's
+# binding (`pkg/scheduler`), and started only once the kubelet has a token for each
+# projected service-account volume (`pkg/kubelet/token`).
+UPGRADE_PATH_REPLACEMENT_PODS = (
+    (GROUP_CORE, VERSION_V1, "pods", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_CORE, VERSION_V1, "pods/binding", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_CORE, VERSION_V1, "serviceaccounts/token", OP_CREATE, SCOPE_NAMESPACED),
+)
+# The nodes. The new one registers and reports status (`pkg/kubelet/kubelet_node_status.go`;
+# the attach-detach controller writes `volumesAttached` into the same status,
+# `pkg/controller/volume/attachdetach/statusupdater`); its spec is updated by the cordon
+# (`k8s.io/kubectl/pkg/drain`), by the cloud node controller that clears the
+# `uninitialized` taint (`k8s.io/cloud-provider/controllers/node`) and by the lifecycle
+# controller's taints (`pkg/controller/nodelifecycle`); the old one is deleted once its
+# VM is gone (`k8s.io/cloud-provider/controllers/nodelifecycle`). The kubelet's heartbeat
+# lease in kube-node-lease (`pkg/kubelet/nodelease`, through
+# `k8s.io/component-helpers/apimachinery/lease`) is what keeps the node Ready between
+# status reports.
+UPGRADE_PATH_NODES = (
+    (GROUP_CORE, VERSION_V1, "nodes", OP_CREATE, SCOPE_CLUSTER),
+    (GROUP_CORE, VERSION_V1, "nodes", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_CORE, VERSION_V1, "nodes/status", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_CORE, VERSION_V1, "nodes", OP_DELETE, SCOPE_CLUSTER),
+    (GROUP_COORDINATION, VERSION_V1, "leases", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_COORDINATION, VERSION_V1, "leases", OP_UPDATE, SCOPE_NAMESPACED),
+)
+# The new kubelet's identity. It files a certificate signing request to bootstrap its
+# client certificate (`pkg/kubelet/certificate/bootstrap`); the approver writes the
+# `approval` subresource (`pkg/controller/certificates/approver`) and the signer the
+# `status` subresource (`pkg/controller/certificates/signer`). An unsigned request leaves
+# the node without a client certificate.
+UPGRADE_PATH_KUBELET_IDENTITY = (
+    (GROUP_CERTIFICATES, VERSION_V1, "certificatesigningrequests", OP_CREATE, SCOPE_CLUSTER),
+    (GROUP_CERTIFICATES, VERSION_V1, "certificatesigningrequests/approval", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_CERTIFICATES, VERSION_V1, "certificatesigningrequests/status", OP_UPDATE, SCOPE_CLUSTER),
+)
+# A replacement pod's persistent disk. The kubelet creates its CSINode when it starts and
+# holds its Ready condition on the write, then updates it as each CSI driver registers
+# (`pkg/volume/csi/nodeinfomanager`); the external-attacher reads the driver's node id
+# from it. The attach-detach controller creates a VolumeAttachment for the new node and
+# deletes the drained node's (`pkg/controller/volume/attachdetach`, through
+# `pkg/volume/csi/csi_attacher.go`); a ReadWriteOnce disk attaches nowhere else until
+# that delete completes. The external-attacher (`kubernetes-csi/external-attacher`,
+# `pkg/controller/csi_handler.go`) writes its finalizer on the attachment and on the
+# PersistentVolume before it attaches, then `attached: true` into the attachment's status.
+UPGRADE_PATH_STORAGE = (
+    (GROUP_STORAGE, VERSION_V1, "csinodes", OP_CREATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, VERSION_V1, "csinodes", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, VERSION_V1, "volumeattachments", OP_CREATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, VERSION_V1, "volumeattachments", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, VERSION_V1, "volumeattachments/status", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_STORAGE, VERSION_V1, "volumeattachments", OP_DELETE, SCOPE_CLUSTER),
+    (GROUP_CORE, VERSION_V1, "persistentvolumes", OP_UPDATE, SCOPE_CLUSTER),
+)
+UPGRADE_PATH_TARGETS = UPGRADE_PATH_DRAIN + UPGRADE_PATH_REPLACEMENT_PODS + UPGRADE_PATH_NODES + UPGRADE_PATH_KUBELET_IDENTITY + UPGRADE_PATH_STORAGE
+UPGRADE_PATH_LABEL = "{operation} {resource}"
+# The control plane's own writes that a new master cannot start without, which a
+# control-plane upgrade makes on each new master: kube-apiserver's `rbac/bootstrap-roles`
+# post-start hook reconciles the bootstrap ClusterRoles and ClusterRoleBindings, then the
+# Roles and RoleBindings in `kube-system` and `kube-public`
+# (`pkg/registry/rbac/rest/storage_rbac.go`, `EnsureRBACPolicy`: a 30-second poll, then
+# `unable to initialize roles`, which `runPostStartHook` turns into a fatal; the namespaced
+# objects are `bootstrappolicy.NamespaceRoles()` and `NamespaceRoleBindings()` in
+# `plugin/pkg/auth/authorizer/rbac/bootstrappolicy/namespace_policy.go`, six and six in
+# `kube-system` and the `bootstrap-signer` pair in `kube-public`). A fail-closed webhook with
+# a dead backend whose rules match one of these writes refuses that reconcile, so the master
+# crash-loops the way Jetstack's 2019 GKE outage did (`docs/designs/upgrade-readiness-checks.md`),
+# and it is graded `blocked` like a webhook on the node path, with the cell naming the write.
+# The cluster-scoped rows (CONTROL_PLANE_CLUSTER_WRITES) are graded whatever the
+# `namespaceSelector` says: admission matches a cluster-scoped object before it reads the
+# selector. The namespaced rows need the selector to admit `kube-system` or `kube-public`,
+# and the cell names the namespaces admitted.
+# ConfigMaps are not on the list: the `ca-registration` hook that outage deadlocked on left the
+# start-up path in Kubernetes 1.17, and its successor
+# (`pkg/controlplane/controller/clusterauthenticationtrust`) writes from a retrying background
+# queue, so a refused ConfigMap write is an outage, not a stuck master. The leader-election
+# Leases the controller manager and scheduler take in `kube-system` are already on
+# UPGRADE_PATH_NODES (the Lease rows), so a Lease gate blocks on that list. Rows as in
+# UPGRADE_PATH_TARGETS, all served at v1: CONTROL_PLANE_KUBE_SYSTEM_WRITES holds the Namespaced
+# rows and CONTROL_PLANE_CLUSTER_WRITES the Cluster ones. The namespaces are judged on the
+# labels the read returns for them (`bootstrap_namespace_labels`, `namespace_selector_reaches`).
+NAMESPACE_NAME_LABEL = "kubernetes.io/metadata.name"
+KUBE_SYSTEM_NAMESPACE = "kube-system"
+KUBE_PUBLIC_NAMESPACE = "kube-public"
+BOOTSTRAP_POLICY_NAMESPACES = (KUBE_SYSTEM_NAMESPACE, KUBE_PUBLIC_NAMESPACE)
+CONTROL_PLANE_KUBE_SYSTEM_WRITES = (
+    (GROUP_RBAC, VERSION_V1, "roles", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_RBAC, VERSION_V1, "roles", OP_UPDATE, SCOPE_NAMESPACED),
+    (GROUP_RBAC, VERSION_V1, "rolebindings", OP_CREATE, SCOPE_NAMESPACED),
+    (GROUP_RBAC, VERSION_V1, "rolebindings", OP_UPDATE, SCOPE_NAMESPACED),
+)
+CONTROL_PLANE_CLUSTER_WRITES = (
+    (GROUP_RBAC, VERSION_V1, "clusterroles", OP_CREATE, SCOPE_CLUSTER),
+    (GROUP_RBAC, VERSION_V1, "clusterroles", OP_UPDATE, SCOPE_CLUSTER),
+    (GROUP_RBAC, VERSION_V1, "clusterrolebindings", OP_CREATE, SCOPE_CLUSTER),
+    (GROUP_RBAC, VERSION_V1, "clusterrolebindings", OP_UPDATE, SCOPE_CLUSTER),
+)
+# Every row a dead webhook can be graded on, for the served-version question alone: whether a
+# rule's `apiVersions` pins a graded write to a version the server does not serve is the
+# server's fact, not the selector's; the selector decides which rows the webhook is graded
+# blocked on and whether a pinned namespaced write is labelled with the namespaces admitted.
+GRADED_TARGETS = UPGRADE_PATH_TARGETS + CONTROL_PLANE_CLUSTER_WRITES + CONTROL_PLANE_KUBE_SYSTEM_WRITES
+KUBE_SYSTEM_WRITE_LABEL = "{operation} {resource} in {namespaces}"
+BOOTSTRAP_WRITE_LABEL = "{operation} {resource}"
+# A pinned rule whose operations (or scope) reach no graded row is labelled at the resource: the
+# served version is the resource's, not the row's. A group-resource pair such a rule spells that
+# the server does not serve at all (`policy/pods`, a typo the API accepts) is labelled apart, with
+# its group always named, so the cell can say the server serves no such pair rather than that it
+# serves the pair at `v1` alone.
+PINNED_RESOURCE_LABEL = "{resource} in {group}"
+PINNED_CORE_RESOURCE_LABEL = "{resource}"
+UNSERVED_PAIR_LABEL = "{resource} in {group}"
+NAMESPACE_JOIN = ","
+WEBHOOK_NAME_FORMAT = "{config}/{webhook}"
+WEBHOOK_SERVICE_FORMAT = "{namespace}/{name}"
+WEBHOOK_FINDING_FORMAT = "{webhook} ({config_kind}): failurePolicy Fail and {reason}; matches {matches}"
+# The off-path cell: one clause per class of rule the webhook carries (`_rule_served_class`),
+# what fails now (the live rules: every request the server sends them, which claims nothing
+# about whether the server serves an off-list resource at all), what the server sends nothing
+# (the pinned rules) and what the reader cannot place (the unknown rules, at an unserved
+# version on a resource off its lists), so a failure now is asserted for the live rules alone.
+WEBHOOK_OFF_PATH_MATCHES = "none of the operations this rule reads as the upgrade's path (its rules: {rules}); {verdicts}; reported, not graded"
+RULES_LIVE_ALL = "it fails now every request the server sends it"
+RULES_LIVE_SOME = "it fails now every request the server sends it that matches {live}"
+RULES_PINNED_SOME = "{reasons}, so it sends the rule {pinned_rules} nothing"
+# The reasons a pinned rule is sent nothing, one per kind of pair it names, joined when a rule or
+# a webhook carries both: a served pair pinned to an unserved version, and a pair the server does
+# not serve at any version.
+PINNED_SERVED_REASON = "the server serves {pinned} at {served} alone"
+PINNED_UNSERVED_REASON = "the server serves no {unserved}"
+REASON_JOIN = " and "
+RULES_UNKNOWN_ALL = "its requests fail now if the server still serves those versions, which this reader does not know for a resource off its lists"
+RULES_UNKNOWN_SOME = "the requests matched by {unknown} fail now if the server still serves those versions, which this reader does not know for a resource off its lists"
+VERDICT_JOIN = "; "
+# The off-path cell for a webhook whose every rule names graded resources only at a version the
+# server does not serve: the server sends the webhook none of those requests, so nothing fails
+# now, and the cell says so rather than reporting a live outage.
+WEBHOOK_PINNED_MATCHES = "no request the server sends at a served version (its rules: {rules}; {reasons}, so it sends this webhook none of them); it is reported, not graded"
+# The classes `_rule_served_class` returns.
+RULE_LIVE = "live"
+RULE_PINNED = "pinned"
+RULE_UNKNOWN = "unknown"
+# A webhook's rules, rendered for the cell so the operator can judge an outage: operations
+# joined by `/`, resources by `,`, with the API groups named when any is not the core group,
+# and the core group then named `core` beside the others rather than dropped (a rule on
+# `["", "apps"]` gates core resources too, and a cell that says only `in apps` misreads it).
+RULE_FORMAT = "{operations} {resources}"
+RULE_GROUP_FORMAT = "{rule} in {groups}"
+RULE_CORE_GROUP_NAME = "core"
+# A rule's `apiVersions` is rendered only when it pins one (anything but `*` alone): a cell
+# that names a path write at a version the server does not serve then says why it is an outage.
+RULE_VERSIONS_FORMAT = "{rule} at {versions}"
+RULE_OPERATION_JOIN = "/"
+RULE_RESOURCE_JOIN = ","
+RULE_NONE = "no rules"
+
+
+# The per-entry rules (readiness_rules/, one module per entry of the upgrade-failure
+# catalogue; the package docstring is the contract), run after the PDB, maintenance, skew and
+# webhook rules above, in
+# this order, which is the order the table and the JSON list their findings in. One list,
+# grouped by entry number, the entry in the comment.
+EXTRA_RULES = [
+    zonal_control_plane,  # entry 11
+]
+RULE_RESULT_KEYS = readiness_rules.RESULT_KEYS
+# What the fold stamps on a finding: the rule's id and entry on every one, the rule's own
+# rendering (`text`) on a blocker or risk and on an `unknown` entry (the note line), the
+# `reason` an `unknown` entry carries, and whether the rule could have blocked, which is
+# what decides whether its `unknown` moves the verdict.
+RULE_KEY = "rule"
+ENTRY_KEY = "entry"
+TEXT_KEY = "text"
+REASON_KEY = "reason"
+DETAIL_KEY = "detail"
+CAN_BLOCK_KEY = "can_block"
+# The two words the shared helpers write a finding's own grade under (`new_finding` and
+# `finding.py`'s tiers); a blocker the fold demotes to a risk is re-graded under whichever
+# it carries, so the JSON never carries a risk that says it blocks.
+GRADE_KEY = "grade"
+TIER_KEY = "tier"
+RULE_ID_ATTRIBUTE = "RULE_ID"
+ENTRY_ATTRIBUTE = "ENTRY"
+CAN_BLOCK_ATTRIBUTE = "CAN_BLOCK"
+# What names a rule that has no RULE_ID (it is keyed and evaluated under this name) or one
+# whose attributes fail the check below (its unknown entry carries this name).
+MODULE_NAME_ATTRIBUTE = "__name__"
+RULE_PREFIX_FORMAT = "{rule}: {text}"
+RULE_FAILED_REASON = "rule raised {error}; not evaluated"
+# The module's own attributes are read and checked inside the fold's guard, before anything
+# is derived from them: a `RULE_ID` that is not a string cannot key `rules` (a list is
+# unhashable, and the fold would have died on it after every member was read); an `ENTRY`
+# JSON cannot carry would fail the writer from the per-rule record and the unknown entries,
+# which a probe of the result alone does not see; `bool("False")` is True, so `CAN_BLOCK`
+# must be a bool. A module that fails one is not evaluated: one `unknown` under its module
+# name, with no entry and the conservative `can_block`. A read that itself raises (a
+# module-level `__getattr__` on the lazy-import idiom that raises, an `ENTRY` nested past
+# the recursion limit) is the same defect, under the name the fold can still read.
+RULE_ATTRIBUTE_REASON = "{attribute} is {type}, not {expected}; not evaluated"
+RULE_ATTRIBUTES_RAISED_REASON = "reading the module's attributes raised {error}; not evaluated"
+EXPECTED_STRING = "a string"
+EXPECTED_BOOL = "a bool"
+EXPECTED_JSON = "a JSON value"
+# A rule that declares it cannot block and files a blocker anyway: the finding is kept as
+# a risk, and the note says so, so the invariant holds and the defect is visible.
+DEMOTED_BLOCKER_NOTE = "filed a blocker but declares CAN_BLOCK False; reported as a risk"
+# The shapes a rule's result must have for the fold to read it. A result that breaks one is
+# the rule's defect and costs one `unknown`, like a rule that raises: a string under a list
+# key would otherwise be read letter by letter, and a finding that is not a dict or whose
+# `text` is not a string would fail the stamping or the table after every member was read.
+RESULT_NOT_A_DICT = "evaluate returned {type}, not a dict"
+# A key the contract does not name: a misnamed list (`risk`, `findings`) would otherwise
+# read as a clean rule. A key left out is an empty list.
+RESULT_UNKNOWN_KEY = "the result carries {keys}, not among {expected}"
+# An `unknown` entry is a string or a dict whose `reason` or `detail` is a non-empty string;
+# anything else is a shape defect, named rather than rendered as a repr.
+UNKNOWN_WITHOUT_REASON = "an unknown entry carries no reason or detail (keys {keys})"
+UNKNOWN_EMPTY_TEXT = "an unknown entry is an empty string"
+UNKNOWN_ENTRY_NOT_TEXT = "an unknown entry is {type}, not a string or a dict with a reason"
+RESULT_KEY_NOT_A_LIST = "{key} is {type}, not a list"
+FINDING_NOT_A_DICT = "a {kind} finding is {type}, not a dict"
+FINDING_TEXT_NOT_TEXT = "a {kind} finding's text is {type}, not a string"
+NOTE_NOT_TEXT = "a note is {type}, not a string"
+# A blank string passes an "is a string" check and prints as nothing: an unnamed rule in the
+# table and the JSON, a finding with no content in its column, an empty note. Each is named
+# as what it is, like a blank unknown entry.
+FINDING_TEXT_BLANK = "a {kind} finding's text is blank"
+NOTE_BLANK = "a note is blank"
+RULE_ID_BLANK_REASON = "RULE_ID is blank; not evaluated"
+# The findings go to `--output` as they are, so a value JSON cannot carry (a set, a
+# datetime, a tuple-keyed dict, a NaN or infinite float, which `json.dumps` would write as
+# a bare token no JSON parser reads) would fail the writer after every member was read; the
+# fold probes each result, with `allow_nan=False` as the writer does, and makes it the
+# rule's defect instead.
+RESULT_NOT_JSON = "the result is not JSON-serialisable: {error}"
+# The audit-log cache is the one thing the report reads that a rule wrote; a rule that
+# leaves it in a shape `audit_log.summaries` cannot read, or drops or changes a read stored
+# before it, is held to it here, inside the guard, whether it returned or raised, and the
+# cache is put back as it stood before the rule, so neither the report nor a later rule
+# meets the damage and each offender is charged on its own.
+CACHE_DEFECT_REASON = "the rule left the audit-log cache unreadable: {defect}"
+# A second module with a registered rule's id is not run: its findings would be stamped
+# with the other module's id and the per-rule counts would describe one of the two. The
+# registered module keeps the id; the duplicate is one `unknown` counted under it, with the
+# registered module's `can_block`, so `rules[id]` and its entries agree: a duplicate of a
+# rule that cannot block is reported in the note and moves nothing, and the contract test
+# over EXTRA_RULES is what keeps a duplicate registration from merging.
+DUPLICATE_RULE_REASON = "a second module registers RULE_ID {rule}; the duplicate was not evaluated"
 
 
 # ---------------------------------------------------------------------------- PDBs
@@ -142,19 +495,18 @@ def split_items(items: list) -> tuple[list[dict], list[dict]]:
     return pdbs, workloads
 
 
-def selector_matches(selector, labels: dict) -> bool:
-    """policy/v1 semantics: a null selector matches no pod, an empty one every pod."""
-    if selector is None:
-        return False
-    if not isinstance(selector, dict):
-        return False
+def _requirements_hold(selector: dict, labels: dict, *, unevaluable: bool) -> bool:
+    """Whether `labels` satisfy a label selector's `matchLabels` and `matchExpressions`;
+    `unevaluable` is the answer for a requirement this reader cannot evaluate (not a mapping,
+    an operator it does not know). The nil-versus-empty decision is each caller's, because
+    policy/v1 and admission read it differently."""
     labels = labels if isinstance(labels, dict) else {}
     for key, value in (selector.get("matchLabels") or {}).items():
         if labels.get(key) != value:
             return False
     for req in selector.get("matchExpressions") or []:
         if not isinstance(req, dict):
-            return False
+            return unevaluable
         key, op, values = req.get("key"), req.get("operator"), req.get("values") or []
         if op == OP_IN:
             if key not in labels or labels[key] not in values:
@@ -169,8 +521,15 @@ def selector_matches(selector, labels: dict) -> bool:
             if key in labels:
                 return False
         else:
-            return False
+            return unevaluable
     return True
+
+
+def selector_matches(selector, labels: dict) -> bool:
+    """policy/v1 semantics: a null selector matches no pod, an empty one every pod."""
+    if not isinstance(selector, dict):
+        return False
+    return _requirements_hold(selector, labels, unevaluable=False)
 
 
 def _percent(value) -> int | None:
@@ -578,14 +937,693 @@ def evaluate_skew(target, pools: list[dict], autopilot: bool) -> dict:
     }
 
 
+# ---------------------------------------------------------------------- webhooks
+
+
+def split_webhook_items(items: list) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """(webhook configurations, Services, EndpointSlices, Namespaces) from a mixed `items` list."""
+    configs, services, slices, namespaces = [], [], [], []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("kind")
+        if kind in WEBHOOK_CONFIG_KINDS:
+            configs.append(item)
+        elif kind == SERVICE_KIND:
+            services.append(item)
+        elif kind == ENDPOINTSLICE_KIND:
+            slices.append(item)
+        elif kind == NAMESPACE_KIND:
+            namespaces.append(item)
+    return configs, services, slices, namespaces
+
+
+def _named(items: list[dict], namespace: str, name: str) -> dict | None:
+    for item in items:
+        meta = item.get("metadata") or {}
+        if meta.get("namespace") == namespace and meta.get("name") == name:
+            return item
+    return None
+
+
+def backend_problem(service_ref: dict, services: list[dict], slices: list[dict]) -> str | None:
+    """Why the API server cannot reach this webhook's Service, or None when it can.
+
+    The Service must exist and carry a port equal to the webhook's port; the ready count is
+    over the endpoints of the Service's EndpointSlices whose port has that Service port's
+    name (an unnamed single port matches an unnamed slice port)."""
+    namespace, name = service_ref.get("namespace", ""), service_ref.get("name", "")
+    label = WEBHOOK_SERVICE_FORMAT.format(namespace=namespace, name=name)
+    port = service_ref.get("port") or DEFAULT_WEBHOOK_PORT
+    service = _named(services, namespace, name)
+    if service is None:
+        return BACKEND_NO_SERVICE.format(service=label)
+    service_ports = [p for p in (service.get("spec") or {}).get("ports") or [] if isinstance(p, dict) and p.get("port") == port]
+    if not service_ports:
+        return BACKEND_NO_PORT.format(service=label, port=port)
+    port_name = service_ports[0].get("name") or ""
+    ready = 0
+    for slice_ in slices:
+        meta = slice_.get("metadata") or {}
+        if meta.get("namespace") != namespace or (meta.get("labels") or {}).get(SERVICE_NAME_LABEL) != name:
+            continue
+        if not any(isinstance(p, dict) and (p.get("name") or "") == port_name for p in slice_.get("ports") or []):
+            continue
+        for endpoint in slice_.get("endpoints") or []:
+            if isinstance(endpoint, dict) and (endpoint.get("conditions") or {}).get("ready") is not False:
+                ready += 1
+    if not ready:
+        return BACKEND_NO_ENDPOINTS.format(service=label, port=port)
+    return None
+
+
+def _resource_matches(spec: str, target: str) -> bool:
+    """RuleWithOperations `resources` semantics, written as the API server's matcher is
+    (`splitResource`, then two comparisons): the spec's resource is `*` or the target's, and
+    its subresource is `*` or the target's, where no `/` means an empty subresource. So `*`
+    is every resource but no subresource, `*/*` every resource and subresource, `pods/*` pods
+    together with every subresource of pods (a `*` subresource also matches a request that
+    has none, so `leases/*` reaches the lease writes a kubelet heartbeat makes), and `pods/`
+    is `pods`, as the API admits and reads it. Two comparisons leave no spelling to diverge
+    on."""
+    resource, _, sub = target.partition("/")
+    spec_resource, _, spec_sub = spec.partition("/")
+    return spec_resource in (resource, WILDCARD) and spec_sub in (sub, WILDCARD)
+
+
+def _rule_reaches(rule: dict, group: str, version: str | None, resource: str, operation: str, scope: str) -> bool:
+    """Whether one rule matches one write, as the API server's matcher reads it; with
+    `version` None the rule's `apiVersions` is not read."""
+    rule_scope = rule.get("scope") or SCOPE_ANY
+    if rule_scope not in (SCOPE_ANY, scope):
+        return False
+    if not ({WILDCARD, group} & set(rule.get("apiGroups") or [])):
+        return False
+    if version is not None and not ({WILDCARD, version} & set(rule.get("apiVersions") or [])):
+        return False
+    if not ({WILDCARD, operation} & set(rule.get("operations") or [])):
+        return False
+    return any(isinstance(spec, str) and _resource_matches(spec, resource) for spec in rule.get("resources") or [])
+
+
+def _rules(hook: dict) -> list[dict]:
+    return [rule for rule in hook.get("rules") or [] if isinstance(rule, dict)]
+
+
+def _upgrade_path_labels(rules: list[dict], *, read_version: bool) -> list[str]:
+    matched = []
+    for group, version, resource, operation, scope in UPGRADE_PATH_TARGETS:
+        if any(_rule_reaches(rule, group, version if read_version else None, resource, operation, scope) for rule in rules):
+            matched.append(UPGRADE_PATH_LABEL.format(operation=operation, resource=resource))
+    return matched
+
+
+def upgrade_path_matches(hook: dict) -> list[str]:
+    """The operations a node upgrade needs that this webhook's rules can match, as labels."""
+    return _upgrade_path_labels(_rules(hook), read_version=True)
+
+
+def namespace_selector_reaches(hook: dict, labels: dict) -> bool:
+    """Whether the webhook's `namespaceSelector` admits a namespace carrying `labels`, as
+    admission reads it: absent or empty admits every namespace, and a requirement this reader
+    cannot evaluate counts as admitting, which errs toward naming the webhook. The caller
+    passes the namespace's labels as the read returned them (`bootstrap_namespace_labels`), so
+    an exemption an operator added to the namespace (`DoesNotExist` on a label it carries) reads
+    as not admitting and a label it carries reads as admitting, as admission reads both."""
+    selector = hook.get("namespaceSelector")
+    if not isinstance(selector, dict) or not selector:
+        return True
+    return _requirements_hold(selector, labels, unevaluable=True)
+
+
+def bootstrap_namespace_labels(namespaces: list[dict] | None) -> dict[str, dict]:
+    """Each bootstrap-policy namespace's labels, from the Namespace objects the read returned,
+    keyed by name: what the `namespaceSelector` is judged on. A namespace the read did not
+    return is judged on its default `kubernetes.io/metadata.name` label alone, the one label
+    every namespace carries, which is also set here on a read namespace that lacks it."""
+    read: dict[str, dict] = {}
+    for item in namespaces or []:
+        metadata = item.get("metadata") if isinstance(item, dict) else None
+        metadata = metadata if isinstance(metadata, dict) else {}
+        name = metadata.get("name")
+        if name in BOOTSTRAP_POLICY_NAMESPACES:
+            labels = metadata.get("labels")
+            read[name] = {**(labels if isinstance(labels, dict) else {}), NAMESPACE_NAME_LABEL: name}
+    return {name: read.get(name, {NAMESPACE_NAME_LABEL: name}) for name in BOOTSTRAP_POLICY_NAMESPACES}
+
+
+def bootstrap_namespaces_admitted(hook: dict, namespace_labels: dict[str, dict] | None = None) -> list[str]:
+    """The bootstrap-policy namespaces this webhook's `namespaceSelector` admits, judged on
+    `namespace_labels` (`bootstrap_namespace_labels`; the default labels when None), in
+    `BOOTSTRAP_POLICY_NAMESPACES` order; empty when it admits neither."""
+    labels = namespace_labels or bootstrap_namespace_labels(None)
+    return [name for name in BOOTSTRAP_POLICY_NAMESPACES if namespace_selector_reaches(hook, labels[name])]
+
+
+def _kube_system_labels(rules: list[dict], namespaces: list[str], *, read_version: bool) -> list[str]:
+    """The namespaced bootstrap writes `rules` reach, labelled with `namespaces` when the selector
+    admits any, and without a namespace clause when it admits none (a pinned write's label)."""
+    matched = []
+    for group, version, resource, operation, scope in CONTROL_PLANE_KUBE_SYSTEM_WRITES:
+        if any(_rule_reaches(rule, group, version if read_version else None, resource, operation, scope) for rule in rules):
+            matched.append(KUBE_SYSTEM_WRITE_LABEL.format(operation=operation, resource=resource, namespaces=NAMESPACE_JOIN.join(namespaces))
+                           if namespaces else BOOTSTRAP_WRITE_LABEL.format(operation=operation, resource=resource))
+    return matched
+
+
+def _cluster_write_labels(rules: list[dict], *, read_version: bool) -> list[str]:
+    matched = []
+    for group, version, resource, operation, scope in CONTROL_PLANE_CLUSTER_WRITES:
+        if any(_rule_reaches(rule, group, version if read_version else None, resource, operation, scope) for rule in rules):
+            matched.append(UPGRADE_PATH_LABEL.format(operation=operation, resource=resource))
+    return matched
+
+
+def kube_system_write_matches(hook: dict, namespace_labels: dict[str, dict] | None = None) -> list[str]:
+    """The control plane's own bootstrap-policy writes this webhook can match, as labels: the
+    cluster-scoped rows (`CONTROL_PLANE_CLUSTER_WRITES`) whatever its `namespaceSelector` says,
+    and the `kube-system`/`kube-public` rows (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`) when the
+    selector admits either namespace on the labels read for it (`namespace_labels`), each at
+    the served version."""
+    rules = _rules(hook)
+    labels = _cluster_write_labels(rules, read_version=True)
+    admitted = bootstrap_namespaces_admitted(hook, namespace_labels)
+    if admitted:
+        labels += _kube_system_labels(rules, admitted, read_version=True)
+    return labels
+
+
+def _resource_parent(spec: str) -> str:
+    """The resource a spelling names, without its subresource: `pods/exec` and `pods/*` are
+    served under `pods`' group-version, so the served version of the parent is theirs."""
+    return spec.partition("/")[0]
+
+
+def _graded_resources(targets: tuple) -> set[tuple[str, str]]:
+    """(group, resource) for every graded row, the subresource dropped."""
+    return {(group, _resource_parent(resource)) for group, _, resource, _, _ in targets}
+
+
+def _graded_groups(targets: tuple) -> set[str]:
+    return {group for group, _, _, _, _ in targets}
+
+
+def _graded_resource_names(targets: tuple) -> set[str]:
+    return {_resource_parent(resource) for _, _, resource, _, _ in targets}
+
+
+def _pinned_resource_labels(rules: list[dict], targets: tuple) -> tuple[list[str], list[str]]:
+    """What a pinned rule names when no graded row carries its operations or scope, labelled at
+    the resource, since the served version is the resource's and not the row's: (the pairs the
+    server serves, pinned to a version it does not; the pairs it serves at no version). A
+    subresource is labelled by its parent, whose group-version it is served under. A pair the
+    rule spells that is not a graded pair (`policy/pods`, a group and a resource each graded but
+    not together) is one the server does not serve at all, labelled with its group always named,
+    so every pinned rule has a label and the cell says, truly, why the server sends it nothing."""
+    served: list[str] = []
+    unserved: list[str] = []
+    graded_pairs = _graded_resources(targets)
+    for rule in rules:
+        if any(_rule_reaches(rule, group, None, resource, operation, scope) for group, _, resource, operation, scope in targets):
+            continue
+        for group in rule.get("apiGroups") or []:
+            for spec in rule.get("resources") or []:
+                if not isinstance(spec, str):
+                    continue
+                parent = _resource_parent(spec)
+                if (group, parent) in graded_pairs:
+                    template = PINNED_CORE_RESOURCE_LABEL if group == GROUP_CORE else PINNED_RESOURCE_LABEL
+                    label, labels = template.format(resource=parent, group=group), served
+                else:
+                    label, labels = UNSERVED_PAIR_LABEL.format(resource=parent, group=group or RULE_CORE_GROUP_NAME), unserved
+                if label not in labels:
+                    labels.append(label)
+    return served, unserved
+
+
+def _pinned_labels(rules: list[dict], hook: dict, namespace_labels: dict[str, dict] | None = None) -> tuple[list[str], list[str]]:
+    """(the graded writes `rules` name only at a version the server does not serve, labelled; the
+    pairs they spell that the server serves at no version). A namespaced bootstrap write carries
+    the namespaces the selector admits, or no namespace clause when it admits neither, since what
+    the server serves does not depend on the selector; a rule whose operations reach no graded row
+    is labelled at the resource, or as an unserved pair."""
+    served, unserved = _pinned_resource_labels(rules, GRADED_TARGETS)
+    return (_upgrade_path_labels(rules, read_version=False) + _cluster_write_labels(rules, read_version=False)
+            + _kube_system_labels(rules, bootstrap_namespaces_admitted(hook, namespace_labels), read_version=False)
+            + served), unserved
+
+
+def _rule_version_pinned(rule: dict, targets: tuple) -> bool:
+    """Whether the server sends this rule nothing because of its `apiVersions`: every resource
+    it names is a graded one, which the server serves at `VERSION_V1` alone, and the rule names
+    neither `*` nor that version. A spelling is read by the resource it names (`pods/`, `pods/*`
+    and `pods/exec` are `pods`, served under its group-version), and the rule's operations and
+    scope are not read, since what the server serves does not depend on them. The groups and the
+    resources are judged separately rather than as pairs: a rule naming two groups and a resource
+    from each also names the pairs that do not exist (`policy/pods`), which the server sends
+    nothing for either, and every graded resource lives in one graded group (pinned by a test),
+    so a named pair that exists is graded. A wildcard group, a spelling naming every resource
+    (`*`, `*/*`, `*/status`) or a group or resource off the lists, whose served versions this
+    rule does not know, is not pinned. Decided per rule, so a webhook that pairs a pinned rule
+    with a live one is described as failing the live rule's requests, not as sent nothing."""
+    if {WILDCARD, VERSION_V1} & set(rule.get("apiVersions") or []):
+        return False
+    groups = rule.get("apiGroups") or []
+    specs = [spec for spec in rule.get("resources") or [] if isinstance(spec, str)]
+    if not groups or not specs or WILDCARD in groups or any(_resource_parent(spec) == WILDCARD for spec in specs):
+        return False
+    return (all(group in _graded_groups(targets) for group in groups)
+            and all(_resource_parent(spec) in _graded_resource_names(targets) for spec in specs))
+
+
+def _rule_served_class(rule: dict, targets: tuple) -> str:
+    """What the server serves this rule, read from its `apiVersions` against the graded lists.
+    `RULE_LIVE`: it carries `*` or `VERSION_V1`, so a dead backend fails now every request the
+    server sends it; whether the server serves an off-list resource at all (a CRD removed with
+    its controller, `policy/v1 podsecuritypolicies`) is not this reader's to say, and the cell
+    claims no more than that. `RULE_PINNED`: every resource it names is graded and the version is
+    one the server does not serve (`_rule_version_pinned`), so the server sends it nothing.
+    `RULE_UNKNOWN`: an unserved version on a resource, group or wildcard off the lists, whose
+    served versions this reader does not know, so the cell asserts no failure for it. A rule
+    with no `apiVersions` at all, which the API refuses, reads as the first two read it."""
+    versions = set(rule.get("apiVersions") or [])
+    if {WILDCARD, VERSION_V1} & versions:
+        return RULE_LIVE
+    if _rule_version_pinned(rule, targets):
+        return RULE_PINNED
+    return RULE_UNKNOWN if versions else RULE_LIVE
+
+
+def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict], namespaces: list[dict] | None = None) -> dict:
+    """Fail-closed webhooks whose backend is unreachable, split by whether they break an upgrade.
+
+    `blocking`: the webhook's rules can match a write in `UPGRADE_PATH_TARGETS`, one the
+    drain or the node join makes and does not proceed without, so the upgrade cannot
+    complete while its backend is down; or its rules match a bootstrap write a new master's
+    start-up reconciles and fatals without: a ClusterRole or ClusterRoleBinding write whatever
+    the `namespaceSelector` says (`CONTROL_PLANE_CLUSTER_WRITES`), or a Role or RoleBinding
+    write in `kube-system` or `kube-public` when the selector admits that namespace
+    (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`), so the control-plane upgrade cannot complete either.
+    `outage`: the backend is unreachable but the rules match none of those; the member is not graded on it, with
+    what it does match named so the operator can judge it, because the list is what this
+    rule knows of the path, not a proof of safety. Each rule of a finding, blocking or outage, is
+    classed by what the server serves it (`_rule_served_class`): `live_rules` fail their requests now,
+    `pinned_rules` (their writes in `version_pinned`, and in `unserved_pairs` any pair they
+    spell that the server serves at no version) name graded resources only at a version the
+    server does not serve, so it sends them nothing, and `unknown_rules` are at an unserved
+    version on a resource off the graded lists, which this reader cannot place; the cell says
+    each for the rules it has and asserts a failure now for the live rules alone. `namespaces`
+    are the Namespace objects read, whose labels the `namespaceSelector` is judged on for
+    `kube-system` and `kube-public` (`bootstrap_namespace_labels`).
+    Fail-open webhooks are counted
+    (`fail_open`), and so are fail-closed webhooks with a URL backend (`url_backends`),
+    which nothing read here can check, and fail-closed webhooks with no `rules` (`no_rules`),
+    which match no request: the server never calls such a webhook, so a dead backend behind
+    it fails nothing now and blocks nothing (a policy engine's configuration before any policy
+    selects a resource is the usual shape).
+    """
+    result = {"blocking": [], "outage": [], "evaluated": 0, "fail_open": 0, "url_backends": 0, "no_rules": 0}
+    namespace_labels = bootstrap_namespace_labels(namespaces)
+    for config in configs:
+        config_kind = config.get("kind")
+        config_name = (config.get("metadata") or {}).get("name", "")
+        for hook in config.get("webhooks") or []:
+            if not isinstance(hook, dict):
+                continue
+            if hook.get("failurePolicy", FAILURE_POLICY_FAIL) != FAILURE_POLICY_FAIL:
+                result["fail_open"] += 1
+                continue
+            service_ref = (hook.get("clientConfig") or {}).get("service")
+            if not isinstance(service_ref, dict):
+                result["url_backends"] += 1
+                continue
+            if not _rules(hook):
+                result["no_rules"] += 1
+                continue
+            result["evaluated"] += 1
+            reason = backend_problem(service_ref, services, slices)
+            if reason is None:
+                continue
+            matches = upgrade_path_matches(hook) + kube_system_write_matches(hook, namespace_labels)
+            # Every rule is classed by what the server serves it, whichever bucket the finding
+            # lands in: the cell describes a blocking webhook by the path writes it matches and an
+            # outage one by its classes, and the record says of each rule what is true of it.
+            live, pinned, unknown = [], [], []
+            for rule in _rules(hook):
+                served = _rule_served_class(rule, GRADED_TARGETS)
+                (live if served == RULE_LIVE else pinned if served == RULE_PINNED else unknown).append(rule)
+            version_pinned, unserved_pairs = _pinned_labels(pinned, hook, namespace_labels)
+            finding = {
+                "webhook": WEBHOOK_NAME_FORMAT.format(config=config_name, webhook=hook.get("name", "")),
+                "config_kind": config_kind,
+                "config": config_name,
+                "name": hook.get("name", ""),
+                "service": WEBHOOK_SERVICE_FORMAT.format(namespace=service_ref.get("namespace", ""), name=service_ref.get("name", "")),
+                "reason": reason,
+                "upgrade_path": matches,
+                "version_pinned": version_pinned,
+                "unserved_pairs": unserved_pairs,
+                "rules": describe_rules(hook),
+                "pinned_rules": [describe_rule(rule) for rule in pinned],
+                "unknown_rules": [describe_rule(rule) for rule in unknown],
+                "live_rules": [describe_rule(rule) for rule in live],
+            }
+            result["blocking" if matches else "outage"].append(finding)
+    return result
+
+
+def describe_rule(rule: dict) -> str:
+    """One rule as `OP/OP resource,resource[ in group,group][ at version,version]`, so a cell
+    that says the webhook is outside the upgrade's path also says what it does match, and at
+    which versions when the rule pins them."""
+    operations = RULE_OPERATION_JOIN.join(str(o) for o in rule.get("operations") or [])
+    resources = RULE_RESOURCE_JOIN.join(str(r) for r in rule.get("resources") or [])
+    text = RULE_FORMAT.format(operations=operations, resources=resources).strip()
+    groups = [str(g) for g in rule.get("apiGroups") or []]
+    if any(groups):
+        text = RULE_GROUP_FORMAT.format(rule=text, groups=RULE_RESOURCE_JOIN.join(g or RULE_CORE_GROUP_NAME for g in groups))
+    versions = [str(v) for v in rule.get("apiVersions") or []]
+    if versions and versions != [WILDCARD]:
+        text = RULE_VERSIONS_FORMAT.format(rule=text, versions=RULE_RESOURCE_JOIN.join(versions))
+    return text
+
+
+def describe_rules(hook: dict) -> list[str]:
+    """Each of the webhook's rules, as `describe_rule` renders it."""
+    return [describe_rule(rule) for rule in _rules(hook)]
+
+
+def _pinned_reasons(finding: dict) -> str:
+    """Why the server sends the finding's pinned rules nothing, one clause per kind of pair they
+    name: the served pairs pinned to an unserved version (`version_pinned`) and the pairs served
+    at no version (`unserved_pairs`); every pinned rule has a label in one list or the other."""
+    served = finding.get("version_pinned") or []
+    unserved = finding.get("unserved_pairs") or []
+    reasons = []
+    if served:
+        reasons.append(PINNED_SERVED_REASON.format(pinned=LIST_SEPARATOR.join(served), served=VERSION_V1))
+    if unserved:
+        reasons.append(PINNED_UNSERVED_REASON.format(unserved=LIST_SEPARATOR.join(unserved)))
+    return REASON_JOIN.join(reasons)
+
+
+def describe_webhook_finding(finding: dict) -> str:
+    """The cell for one finding: a blocking webhook names the path writes it matches; an outage
+    webhook whose every rule is pinned is told the server sends it nothing; any other outage
+    webhook gets one clause per class of rule it carries, a failure now asserted for the live
+    rules alone."""
+    rules = LIST_SEPARATOR.join(finding.get("rules") or []) or RULE_NONE
+    live = finding.get("live_rules") or []
+    pinned = finding.get("pinned_rules") or []
+    unknown = finding.get("unknown_rules") or []
+    reasons = _pinned_reasons(finding)
+    if finding["upgrade_path"]:
+        matches = LIST_SEPARATOR.join(finding["upgrade_path"])
+    elif pinned and not live and not unknown:
+        matches = WEBHOOK_PINNED_MATCHES.format(rules=rules, reasons=reasons)
+    else:
+        verdicts = []
+        if live:
+            verdicts.append(RULES_LIVE_ALL if not (pinned or unknown) else RULES_LIVE_SOME.format(live=LIST_SEPARATOR.join(live)))
+        if pinned:
+            verdicts.append(RULES_PINNED_SOME.format(reasons=reasons, pinned_rules=LIST_SEPARATOR.join(pinned)))
+        if unknown:
+            verdicts.append(RULES_UNKNOWN_ALL if not (live or pinned) else RULES_UNKNOWN_SOME.format(unknown=LIST_SEPARATOR.join(unknown)))
+        matches = WEBHOOK_OFF_PATH_MATCHES.format(rules=rules, verdicts=VERDICT_JOIN.join(verdicts))
+    return WEBHOOK_FINDING_FORMAT.format(webhook=finding["webhook"], config_kind=finding["config_kind"], reason=finding["reason"], matches=matches)
+
+
+# --------------------------------------------------------------------- extra rules
+
+
+class RuleDefect(TypeError):
+    """A rule's result, or the audit-log cache as the rule left it, does not meet the contract:
+    raised by the fold's own probes (`_rule_result`, `_unknown_entry`) with the defect as its
+    text, and recorded by the fold as that text, not as the rule raising, which it did not."""
+
+
+def _unknown_entry(item, rule_id: str, entry, can_block: bool) -> dict:
+    """One `unknown` entry as the JSON carries it: a dict with `reason` (whole), the rule's
+    id and entry, whether the rule could have blocked, and the `text` the note column prints,
+    the reason on one line of at most NOTE_EXCERPT_CHARS. `item` is a non-empty string or a
+    dict whose `reason` or `detail` is one; anything else raises `RuleDefect`, the shape
+    defect the fold records as the rule's `unknown`."""
+    if isinstance(item, dict):
+        out = dict(item)
+        reason = next((out[key] for key in (REASON_KEY, DETAIL_KEY) if isinstance(out.get(key), str) and out[key].strip()), None)
+        if reason is None:
+            raise RuleDefect(UNKNOWN_WITHOUT_REASON.format(keys=sorted(str(key) for key in out)))
+    elif isinstance(item, str):
+        if not item.strip():  # named as what it is, not as "str, not a string"
+            raise RuleDefect(UNKNOWN_EMPTY_TEXT)
+        out, reason = {}, item
+    else:
+        raise RuleDefect(UNKNOWN_ENTRY_NOT_TEXT.format(type=type(item).__name__))
+    out[REASON_KEY] = reason
+    out[RULE_KEY] = rule_id
+    out[ENTRY_KEY] = entry
+    out[CAN_BLOCK_KEY] = can_block
+    out[TEXT_KEY] = RULE_PREFIX_FORMAT.format(rule=rule_id, text=readiness_rules.one_line(reason, readiness_rules.NOTE_EXCERPT_CHARS))
+    return out
+
+
+def _rule_result(rule, rule_id: str, entry, can_block: bool, cluster: dict, member: dict, read, target, context: dict) -> dict:
+    """One rule's result checked against the contract and in the form the fold emits: every
+    key a list, every blocker and risk a dict copied before it is stamped (so a rule's own
+    objects are never changed or re-attributed) carrying a one-line string `text` (the
+    rule's `describe`, unless the rule set it), its `rule` and `entry`, every note a string
+    prefixed with the rule's id, a blocker from a rule that cannot block kept as a risk with
+    a note, every `unknown` entry in the dict form `_unknown_entry` gives, and the whole, as
+    it will be written, a JSON value; and the audit-log cache, the one thing the report reads
+    that a rule may write, as `audit_log.read` leaves it. Raises `RuleDefect` naming a shape
+    the contract forbids or the cache damage, and lets through whatever the rule raises; the
+    caller records the first as that defect and the second as the rule raising, either as the
+    rule's `unknown`."""
+    snapshot = audit_log.cache_snapshot(context)
+    try:
+        result = rule.evaluate(*_rule_arguments(cluster, member, read, target, context))
+    finally:  # on the raising path too: the raising rule is the one charged, and the next rule reads a sound cache; neither call raises
+        damage = audit_log.cache_damage(context, snapshot)
+        if damage is not None:
+            audit_log.cache_restore(context, snapshot)
+    if damage is not None:
+        raise RuleDefect(CACHE_DEFECT_REASON.format(defect=damage))
+    if result is None:
+        result = {}
+    if not isinstance(result, dict):
+        raise RuleDefect(RESULT_NOT_A_DICT.format(type=type(result).__name__))
+    foreign = sorted(str(key) for key in result if key not in RULE_RESULT_KEYS)
+    if foreign:
+        raise RuleDefect(RESULT_UNKNOWN_KEY.format(keys=foreign, expected=list(RULE_RESULT_KEYS)))
+    out = {}
+    for key in RULE_RESULT_KEYS:
+        value = result.get(key)
+        if value is None:
+            value = []
+        if not isinstance(value, list):
+            raise RuleDefect(RESULT_KEY_NOT_A_LIST.format(key=key, type=type(value).__name__))
+        out[key] = list(value)
+    for kind in ("blocking", "risks"):
+        stamped = []
+        for finding in out[kind]:
+            if not isinstance(finding, dict):
+                raise RuleDefect(FINDING_NOT_A_DICT.format(kind=kind, type=type(finding).__name__))
+            finding = dict(finding)
+            if TEXT_KEY not in finding:
+                finding[TEXT_KEY] = rule.describe(finding)
+            if not isinstance(finding[TEXT_KEY], str):
+                raise RuleDefect(FINDING_TEXT_NOT_TEXT.format(kind=kind, type=type(finding[TEXT_KEY]).__name__))
+            if not finding[TEXT_KEY].strip():
+                raise RuleDefect(FINDING_TEXT_BLANK.format(kind=kind))
+            finding[TEXT_KEY] = readiness_rules.one_line(finding[TEXT_KEY])
+            finding[RULE_KEY] = rule_id
+            finding[ENTRY_KEY] = entry
+            stamped.append(finding)
+        out[kind] = stamped
+    for note in out["notes"]:
+        if not isinstance(note, str):
+            raise RuleDefect(NOTE_NOT_TEXT.format(type=type(note).__name__))
+        if not note.strip():
+            raise RuleDefect(NOTE_BLANK)
+    if not can_block and out["blocking"]:
+        for demoted in out["blocking"]:  # re-graded under whichever word it carries, so the JSON never carries a risk that says it blocks
+            if GRADE_KEY in demoted:
+                demoted[GRADE_KEY] = readiness_rules.GRADE_RISK
+            if TIER_KEY in demoted:
+                demoted[TIER_KEY] = finding_tiers.TIER_RISK
+        out["risks"] = out["blocking"] + out["risks"]
+        out["blocking"] = []
+        out["notes"].append(DEMOTED_BLOCKER_NOTE)
+    out["unknown"] = [_unknown_entry(item, rule_id, entry, can_block) for item in out["unknown"]]
+    out["notes"] = [RULE_PREFIX_FORMAT.format(rule=rule_id, text=readiness_rules.one_line(note)) for note in out["notes"]]
+    try:
+        json.dumps(out, allow_nan=False)
+    except (TypeError, ValueError) as e:
+        raise RuleDefect(RESULT_NOT_JSON.format(error=e)) from e
+    except readiness_rules.NOT_A_RULE_DEFECT:
+        raise
+    except BaseException as e:  # noqa: BLE001 - a value nested past the recursion limit, or one whose encoding raises otherwise, is not JSON either: named as the value's defect, not as the rule raising
+        raise RuleDefect(RESULT_NOT_JSON.format(error=readiness_rules.exception_text(e))) from e
+    return out
+
+
+def _rule_arguments(cluster: dict, member: dict, read, target, context: dict) -> tuple:
+    """What a rule is handed: `cluster`, `member` and `read` as deep copies, `target` as it
+    is (a tuple), and a context whose fleet records (`clusters`, `pools`) are deep copies
+    while the runner, the instant and the cache are shared, the cache through
+    `audit_log.read`, which hands out copies. A rule's writes to its arguments reach no
+    other rule and not the report; the shared cache is the one thing it can damage, and
+    the fold holds it to that."""
+    own = dict(context)
+    for key in (readiness_rules.CONTEXT_CLUSTERS, readiness_rules.CONTEXT_POOLS):
+        if key in own:
+            own[key] = copy.deepcopy(own[key])
+    return copy.deepcopy(cluster), copy.deepcopy(member), copy.deepcopy(read), target, own
+
+
+def _failed_result(reason: str, rule_id: str, entry, can_block: bool) -> dict:
+    """The result of a rule that was not evaluated: one `unknown` entry carrying `reason`,
+    built from the checked attributes and a string, so it needs no probe."""
+    result = {key: [] for key in RULE_RESULT_KEYS}
+    result["unknown"] = [_unknown_entry(reason, rule_id, entry, can_block)]
+    return result
+
+
+def _rule_attributes(rule) -> tuple[str, object, bool, str | None]:
+    """The module's `RULE_ID`, `ENTRY` and `CAN_BLOCK`, read and checked before anything is
+    derived from them: the id a string (returned as a plain `str`), the entry a JSON value,
+    `CAN_BLOCK` a bool. The fourth value is None, or the reason the module is not evaluated;
+    then the id is the module's name, the entry None and `can_block` True, the conservative
+    reading."""
+    name = str(getattr(rule, MODULE_NAME_ATTRIBUTE, rule))
+    rule_id = getattr(rule, RULE_ID_ATTRIBUTE, name)
+    entry = getattr(rule, ENTRY_ATTRIBUTE, None)
+    can_block = getattr(rule, CAN_BLOCK_ATTRIBUTE, True)
+    checks = (
+        (RULE_ID_ATTRIBUTE, rule_id, EXPECTED_STRING, isinstance(rule_id, str)),
+        (CAN_BLOCK_ATTRIBUTE, can_block, EXPECTED_BOOL, isinstance(can_block, bool)),
+        (ENTRY_ATTRIBUTE, entry, EXPECTED_JSON, _is_json(entry)),
+    )
+    for attribute, value, expected, holds in checks:
+        if not holds:
+            return name, None, True, RULE_ATTRIBUTE_REASON.format(attribute=attribute, type=type(value).__name__, expected=expected)
+    if not rule_id.strip():  # a blank id would key `rules` and print as nothing in every cell and note
+        return name, None, True, RULE_ID_BLANK_REASON
+    # A plain `str`, whatever subclass the module declared: the id keys `rules` and formats the
+    # notes after the fold's guard closes, so a subclass whose `__hash__` raises would leave
+    # the fold there. `str()` runs the subclass's `__str__`, inside the guard; one that raises
+    # is the module's defect like any other attribute read.
+    return str(rule_id), entry, can_block, None
+
+
+def _is_json(value) -> bool:
+    try:
+        json.dumps(value, allow_nan=False)
+    except readiness_rules.NOT_A_RULE_DEFECT:
+        raise
+    except BaseException:  # noqa: BLE001 - whatever the value refuses with (a RecursionError past the limit, an `items()` that raises), it is not a JSON value
+        return False
+    return True
+
+
+def _rule_name(rule) -> str:
+    """What names a module whose attribute reads raised: its `__name__`, else `str(rule)`,
+    else its type's name when that raises too. Never raises, so the unknown can be keyed."""
+    try:
+        return str(getattr(rule, MODULE_NAME_ATTRIBUTE, rule))
+    except readiness_rules.NOT_A_RULE_DEFECT:
+        raise
+    except BaseException:  # noqa: BLE001
+        return type(rule).__name__
+
+
+def evaluate_extra_rules(cluster: dict, member: dict, read, target, context: dict, rules: list | None = None) -> dict:
+    """Every registered rule (or `rules`) over one member, folded.
+
+    Returns the four result lists joined across rules in registration order, each blocker
+    and risk stamped with its `rule`, `entry` and `text`, each `unknown` entry a dict with
+    `reason`, `can_block` and the `text` the note column prints, each note prefixed with
+    its rule's id; and `rules`, per rule id, the rule's `entry`, `can_block` and a count per
+    list, so the findings are serialised once and `rules[id]` counts what the lists carry
+    under that id. Each rule is handed its own copies of `cluster`, `member`, `read` and the
+    context's fleet records (`_rule_arguments`), so what it writes to them reaches no other
+    rule and not the report. A rule that raises (`SystemExit` included; `KeyboardInterrupt` and
+    `GeneratorExit` alone pass through), returns a shape the contract forbids, returns a
+    value JSON cannot carry, or damages the audit-log cache is one `unknown` entry naming
+    what it raised, or the shape, value or damage at fault, never a crash: one rule's defect
+    must not hide the others' findings. So is a module whose `RULE_ID` is not
+    a string, whose `ENTRY` is not a JSON value or whose `CAN_BLOCK` is not a bool, under
+    its module name: the three are checked before anything is derived from them, so the
+    fold emits nothing it has not probed or built from checked values. A blocker from a
+    rule whose `CAN_BLOCK` is False is kept as a risk, with a note. A second module
+    carrying a registered id is not evaluated; it is one `unknown` counted under that id
+    with the registered module's `can_block`.
+    """
+    # One plain dict under the cache key for the whole fold: `read`, the snapshot, the probe and
+    # the summary all see it, every rule's shallow copy of the context shares it, and a context
+    # built by hand with no cache key, `None` or a mapping of another class there starts from
+    # an empty one here rather than being tolerated at each access (a reading rule's result
+    # would otherwise land in a dict the fold never sees, read again by the next rule and
+    # missing from the member's summary).
+    if isinstance(context, dict) and type(context.get(readiness_rules.CONTEXT_CACHE)) is not dict:
+        context[readiness_rules.CONTEXT_CACHE] = {}
+    folded = {key: [] for key in RULE_RESULT_KEYS}
+    folded["rules"] = {}
+    for rule in EXTRA_RULES if rules is None else rules:
+        # One guard from the attribute reads to the result: nothing between "next module" and
+        # "record written" leaves the fold. `rule_id` is None inside the guard while the
+        # attribute reads have not returned.
+        rule_id = None
+        try:
+            rule_id, entry, can_block, defect = _rule_attributes(rule)
+            if defect is None and rule_id not in folded["rules"]:
+                result = _rule_result(rule, rule_id, entry, can_block, cluster, member, read, target, context)
+        except readiness_rules.NOT_A_RULE_DEFECT:
+            raise
+        except RuleDefect as e:  # the fold's own probe refused the result, or the cache the rule left: named as that defect, the rule having returned
+            defect = readiness_rules.one_line(str(e), readiness_rules.ERROR_EXCERPT_CHARS)
+        except BaseException as e:  # noqa: BLE001 - a module's defect, in its attributes or its result, SystemExit included, is a reason the verdict is unknown, not a crash
+            error = readiness_rules.exception_text(e)  # never raises, and is capped
+            if rule_id is None:  # the attribute reads raised: named by what can still be read, with no entry and the conservative `can_block`
+                rule_id, entry, can_block, defect = _rule_name(rule), None, True, RULE_ATTRIBUTES_RAISED_REASON.format(error=error)
+            else:
+                defect = RULE_FAILED_REASON.format(error=error)
+        if rule_id in folded["rules"]:  # a second module under a registered id, or a failed one under a name already recorded: not evaluated, one unknown counted under that id
+            registered = folded["rules"][rule_id]
+            duplicate = _unknown_entry(DUPLICATE_RULE_REASON.format(rule=rule_id), rule_id, registered[ENTRY_KEY], registered[CAN_BLOCK_KEY])
+            folded["unknown"].append(duplicate)
+            folded["rules"][rule_id]["unknown"] += 1
+            continue
+        if defect is not None:
+            result = _failed_result(defect, rule_id, entry, can_block)
+        # The record is the checked attributes and counts; the lists are what `_rule_result`
+        # probed or `_failed_result` built from checked values: nothing the fold emits
+        # reaches the writer unprobed.
+        folded["rules"][rule_id] = {ENTRY_KEY: entry, CAN_BLOCK_KEY: can_block, **{key: len(result[key]) for key in RULE_RESULT_KEYS}}
+        for key in RULE_RESULT_KEYS:
+            folded[key].extend(result[key])
+    return folded
+
+
+def _unknown_moves_verdict(item) -> bool:
+    """An `unknown` entry moves the verdict unless its rule declared it cannot block; an
+    entry of another shape counts, the conservative reading."""
+    return bool(item.get(CAN_BLOCK_KEY, True)) if isinstance(item, dict) else True
+
+
 # ------------------------------------------------------------------------- verdict
 
 
-def readiness_status(pdbs: dict | None, maintenance: dict, skew: dict, target_known: bool) -> str:
+def readiness_status(pdbs: dict | None, webhooks: dict | None, maintenance: dict, skew: dict, target_known: bool, rules: dict | None = None) -> str:
     """`blocked` beats `unknown` beats `ready`: a definite blocker is reported whatever else
-    could not be evaluated, and a member is `ready` only when every rule was evaluated."""
-    if (pdbs and pdbs["blocking"]) or maintenance["blocking_exclusions"] or skew["blocking"]:
+    could not be evaluated, and a member is `ready` only when every rule was evaluated.
+    `rules` is `evaluate_extra_rules`' result: its `blocking` blocks, an `unknown` entry from
+    a rule that can block is unknown, an `unknown` from one that cannot is reported and moves
+    nothing, and its `risks` and `notes` never move the verdict."""
+    if (pdbs and pdbs["blocking"]) or (webhooks and webhooks["blocking"]) or maintenance["blocking_exclusions"] or skew["blocking"] or (rules and rules["blocking"]):
         return READINESS_BLOCKED
-    if pdbs is None or not target_known or maintenance["undecided_exclusions"] or skew["unknown"]:
+    if pdbs is None or webhooks is None or not target_known or maintenance["undecided_exclusions"] or skew["unknown"]:
+        return READINESS_UNKNOWN
+    if rules and any(_unknown_moves_verdict(item) for item in rules["unknown"]):
         return READINESS_UNKNOWN
     return READINESS_READY

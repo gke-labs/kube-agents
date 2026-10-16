@@ -40,6 +40,50 @@ type fakeSlackAPI struct {
 	members    []string
 	cursor     string
 	openedIM   string
+	// updatedBlocks and updatedAttachments are each update's blocks and
+	// attachments fields as sent, beside updated.
+	updatedBlocks      []string
+	updatedAttachments []string
+	// reactions records reactions.add and .remove as "+name channel/ts" and
+	// "-name channel/ts"; reactErr, when set, is every reaction call's error.
+	reactions []string
+	reactErr  error
+	// users answers users.info; userInfoCalls counts the calls.
+	users         map[string]*slack.User
+	userInfoCalls int
+	// prompts records setSuggestedPrompts calls.
+	prompts []slack.AssistantThreadsSetSuggestedPromptsParameters
+}
+
+func (f *fakeSlackAPI) AddReaction(name string, item slack.ItemRef) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reactions = append(f.reactions, "+"+name+" "+item.Channel+"/"+item.Timestamp)
+	return f.reactErr
+}
+
+func (f *fakeSlackAPI) RemoveReaction(name string, item slack.ItemRef) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reactions = append(f.reactions, "-"+name+" "+item.Channel+"/"+item.Timestamp)
+	return f.reactErr
+}
+
+func (f *fakeSlackAPI) GetUserInfo(user string, _ ...slack.GetUserInfoOption) (*slack.User, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.userInfoCalls++
+	if u, ok := f.users[user]; ok {
+		return u, nil
+	}
+	return nil, errors.New("user_not_found")
+}
+
+func (f *fakeSlackAPI) SetAssistantThreadsSuggestedPrompts(p slack.AssistantThreadsSetSuggestedPromptsParameters) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.prompts = append(f.prompts, p)
+	return nil
 }
 
 func (f *fakeSlackAPI) AuthTestContext(context.Context) (*slack.AuthTestResponse, error) {
@@ -70,6 +114,11 @@ func (f *fakeSlackAPI) UpdateMessage(channelID, timestamp string, options ...sla
 	f.updated = append(f.updated, struct{ channel, ts, text string }{
 		values.Get("channel"), timestamp, values.Get("text"),
 	})
+	// Blocks and attachments live outside the values UnsafeApplyMsgOptions
+	// returns, so they are read off the wire form a real client sends.
+	sent := sentUpdateForm(channelID, timestamp, options...)
+	f.updatedBlocks = append(f.updatedBlocks, sent.Get("blocks"))
+	f.updatedAttachments = append(f.updatedAttachments, sent.Get("attachments"))
 	return channelID, timestamp, "", nil
 }
 
@@ -1076,6 +1125,44 @@ func TestToMrkdwn(t *testing.T) {
 		"<!channel> deploy done": "&lt;!channel&gt; deploy done",
 		"ping <@U999> now":       "ping &lt;@U999&gt; now",
 		"a & b < c":              "a &amp; b &lt; c",
+	}
+	for in, want := range cases {
+		if got := toMrkdwn(in); got != want {
+			t.Errorf("toMrkdwn(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestToMrkdwnKeepsAnExecutorsSlackLink mirrors
+// TestToGchatTextKeepsAnExecutorsChatLink: <url|text> is Slack's link form
+// too, and escaping turned every one the executor wrote into literal text
+// with a bare URL beside it (#3015 on Chat). A closed one in prose, with an
+// http(s) URL in the markdown destination class and text that names no
+// other host, is kept with its URL and text escaped as the rest of the text
+// is; everything else is escaped as before, Slack's other sequences
+// included.
+func TestToMrkdwnKeepsAnExecutorsSlackLink(t *testing.T) {
+	cases := map[string]string{
+		issue3015Reply:                                              issue3015Reply,
+		"<https://x.example/a?b=1&c=2|R&D>":                         "<https://x.example/a?b=1&amp;c=2|R&amp;D>",
+		"<https://x.example/a|a> and [b](https://x.example/b)":      "<https://x.example/a|a> and <https://x.example/b|b>",
+		"<https://evil.example/login|https://github.com/x>":         "&lt;https://evil.example/login|https://github.com/x&gt;",
+		"<https://evil.example|x](https://good.example) [y>":        "&lt;https://evil.example|x](https://good.example) [y&gt;",
+		"<https://a.example|<https://b.example|c>>":                 "&lt;https://a.example|<https://b.example|c>&gt;",
+		"<https://x.example/a|b|c>":                                 "&lt;https://x.example/a|b|c&gt;",
+		"see <https://evil.example|docs: <https://x.example/p|doc>": "see &lt;https://evil.example|docs: <https://x.example/p|doc>",
+		"<!channel|everyone>":                                       "&lt;!channel|everyone&gt;",
+		"<@U999|bob> and <#C1|chan>":                                "&lt;@U999|bob&gt; and &lt;#C1|chan&gt;",
+		"<mailto:a@x.example|mail>":                                 "&lt;mailto:a@x.example|mail&gt;",
+		"`<https://x.example|doc>`":                                 "`&lt;https://x.example|doc&gt;`",
+		"see ``` <https://x.example|doc>":                           "see ``` &lt;https://x.example|doc&gt;",
+		// The markdown rules read a kept link as the link it is: the bold
+		// a heading becomes wraps it, and a markdown link around it or
+		// inside it is refused rather than nested.
+		"# Opened <https://x.example/p|PR 3>":                "*Opened <https://x.example/p|PR 3>*",
+		"<https://x.example/p|**doc**>":                      "<https://x.example/p|*doc*>",
+		"[t](https://evil.example/<https://good.example|x>)": "[t](https://evil.example/<https://good.example|x>)",
+		"<https://x.example/a|[doc](https://x.example/b)>":   "<https://x.example/a|[doc](https://x.example/b)>",
 	}
 	for in, want := range cases {
 		if got := toMrkdwn(in); got != want {
@@ -2643,6 +2730,21 @@ func TestSlackMappedButDisallowedSenderDropsVisiblyOnce(t *testing.T) {
 	}
 }
 
+// TestSlackVerificationIsToldToTheAdapter: the adapter learns the gateway's
+// word on every sender (VerifiedObserver), so a click from a sender the
+// gateway drops rewrites nothing, and an admitted one's does. A click is a
+// message like any other here: same path, same allowlist.
+func TestSlackVerificationIsToldToTheAdapter(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1"}, false)
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:C1/40.0", Kind: "group", AuthorID: "U2", MessageID: "60.1", Text: "Option A: restart"}
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:C1/40.0", Kind: "group", AuthorID: "U1", MessageID: "60.2", Text: "Option A: restart"}
+	waitFor(t, "both verdicts", func() bool { return len(r.adapter.verifiedCalls()) == 2 })
+	if got, want := r.adapter.verifiedCalls(), []string{"60.1:false", "60.2:true"}; !slices.Equal(got, want) {
+		t.Errorf("verdicts = %v, want %v", got, want)
+	}
+	slackAuthorityOf(t, r)
+}
+
 // TestSlackListedUnmappedSenderIsAttributedByMemberID: the map is an
 // override, not a gate. A listed sender it does not name is admitted and
 // attributed slack:<member id>, with the verifiedBy that says no map was
@@ -2830,4 +2932,95 @@ func teamOf(m *slackevents.MessageEvent) string {
 		return "<nil Message>"
 	}
 	return m.Message.Team
+}
+
+// TestSlackReplyUnderTheBotsOwnPostIsAddressed: a chat.notify post (an alert,
+// a card's report) roots a thread no task started, so it is never a session
+// thread. A reply there with no mention used to drop without a log line
+// (gke-labs/kube-agents#3246). The root's author, which Slack sends on every
+// reply, now decides it, without asking the registry.
+func TestSlackReplyUnderTheBotsOwnPostIsAddressed(t *testing.T) {
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	reg := &countingLookup{}
+	a.sessions = reg.lookup
+
+	reply := slackMsg("channel", "C1", "U1", "why is it OOMing?", "1792100300.000100", "1792100240.299609")
+	got, ok := a.inboundEvent(context.Background(), reply, "UBOT")
+	if !ok || got.Conversation != "slack:C1/1792100240.299609" || got.Text != "why is it OOMing?" {
+		t.Fatalf("reply under the bot's post: delivered=%v conv=%q text=%q", ok, got.Conversation, got.Text)
+	}
+	if len(reg.asked) != 0 {
+		t.Errorf("the registry was asked %v; the root's author is the answer", reg.asked)
+	}
+	if !got.Unaddressed {
+		t.Error("an unmentioned reply under the bot's post is not marked Unaddressed")
+	}
+	mentioned := slackMsg("channel", "C1", "U1", "<@UBOT> why?", "1792100300.000200", "1792100240.299609")
+	if got, ok := a.inboundEvent(context.Background(), mentioned, "UBOT"); !ok || got.Unaddressed {
+		t.Errorf("a mentioned reply there: delivered=%v unaddressed=%v, want delivered and addressed", ok, got.Unaddressed)
+	}
+}
+
+func TestSlackReplyUnderSomeoneElsesPostStillNeedsAMention(t *testing.T) {
+	for _, parent := range []string{"", "UALICE"} {
+		a := newTestSlackAdapter(&fakeSlackAPI{})
+		a.sessions = noSessions
+		reply := slackMsg("channel", "C1", "U1", "do option 2", "5.0", "200.1")
+		if _, ok := a.inboundEvent(context.Background(), reply, parent); ok {
+			t.Errorf("parent %q: an unmentioned reply in a thread the bot did not root must not deliver", parent)
+		}
+	}
+}
+
+func TestSlackParentUserIDFromTheEventsAPIPayload(t *testing.T) {
+	payload := json.RawMessage(`{"token":"x","team_id":"T1","type":"event_callback","event":` +
+		`{"type":"message","channel":"C1","user":"U1","text":"do option 2","ts":"1792100300.000100",` +
+		`"thread_ts":"1792100240.299609","parent_user_id":"UBOT","channel_type":"channel"}}`)
+	if got := slackParentUserID(payload); got != "UBOT" {
+		t.Errorf("parent_user_id = %q, want UBOT", got)
+	}
+	for _, p := range []json.RawMessage{nil, json.RawMessage(`{`), json.RawMessage(`{"event":{"type":"message"}}`)} {
+		if got := slackParentUserID(p); got != "" {
+			t.Errorf("payload %s: parent = %q, want empty", p, got)
+		}
+	}
+}
+
+// TestSlackPumpPassesTheRootAuthorThrough: the pump reads parent_user_id from
+// the envelope's raw payload and hands it to inboundEvent. Without that
+// wiring the reply-under-our-post rule never fires on a real delivery, and
+// the unit tests above would still pass. A reply with no payload behind it
+// stays dropped; a DM after both is the sentinel that the pump got that far.
+func TestSlackPumpPassesTheRootAuthorThrough(t *testing.T) {
+	srv, unblock := stalledSlackStub(t)
+	defer unblock()
+
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	a.sessions = noSessions
+	a.sm = socketmode.New(slack.New("xoxb-stub", slack.OptionAPIURL(srv.URL+"/")))
+
+	withRoot := slackEnvelope("Env-root", slackMsg("channel", "C1", "U1", "why is it OOMing?", "700.1", "650.0"))
+	withRoot.Request.Payload = json.RawMessage(`{"type":"event_callback","event":{"type":"message",` +
+		`"channel":"C1","user":"U1","text":"why is it OOMing?","ts":"700.1","thread_ts":"650.0","parent_user_id":"UBOT"}}`)
+	a.sm.Events <- withRoot
+	a.sm.Events <- slackEnvelope("Env-bare", slackMsg("channel", "C1", "U1", "and now?", "700.2", "660.0"))
+	a.sm.Events <- slackEnvelope("Env-dm", slackMsg("im", "D1", "U1", "sentinel", "700.3", ""))
+
+	delivered := make(chan InboundMessage, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Run(ctx, func(m InboundMessage) { delivered <- m }) }()
+
+	var got []string
+	for len(got) < 2 {
+		select {
+		case m := <-delivered:
+			got = append(got, m.MessageID)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("delivered %v, want the reply under our post and the sentinel", got)
+		}
+	}
+	if got[0] != "700.1" || got[1] != "700.3" {
+		t.Errorf("delivered %v, want [700.1 700.3]: the reply under our post, not the reply with no root author", got)
+	}
 }

@@ -1,0 +1,124 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "Security & RBAC Posture Audit: 2 critical findings",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "type": "divider"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "critical",
+                "type": "text"
+              },
+              {
+                "text": " ",
+                "type": "text"
+              },
+              {
+                "text": "seeded-b and -c admit privileged pods · ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "italic": true
+                },
+                "text": "new",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          },
+          {
+            "elements": [
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "critical",
+                "type": "text"
+              },
+              {
+                "text": " ",
+                "type": "text"
+              },
+              {
+                "text": "default service account is cluster-admin on seeded-c",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "type": "divider"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "5 more (1 major, 4 minor) are in the ledger issue.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "elements": [
+          {
+            "action_id": "kage.choice.0",
+            "style": "primary",
+            "text": {
+              "emoji": true,
+              "text": "Look at the first one",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "Look at the first one"
+          },
+          {
+            "action_id": "kage.link.0",
+            "text": {
+              "emoji": true,
+              "text": "Ledger issue #231 ↗",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "url": "https://github.com/acme/fleet-config/issues/231"
+          }
+        ],
+        "type": "actions"
+      }
+    ],
+    "attachments": []
+  }
+]

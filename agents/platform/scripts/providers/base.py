@@ -148,6 +148,10 @@ class Forge:
     # the transport; nothing here makes a call.
     api_url = ""
     whoami_route: tuple[str, str] | None = None
+    # A GraphQL endpoint on the forge's host that answers `viewer { login }`,
+    # for a forge whose REST current-user route refuses its credential. Empty
+    # means `whoami_route` is the route.
+    whoami_graphql = ""
     # PEM CA certificates this forge's own host is trusted under, beside the
     # system bundle: a self-managed instance whose certificate a private CA
     # signed. Empty for every public forge. The broker reads it for both of

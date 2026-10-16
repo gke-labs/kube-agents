@@ -6339,10 +6339,11 @@ func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
 
 // TestA2AInjectFenceDeniesEveryPod: the fence is what keeps every other pod
 // off the door's port, so a leaked token alone reaches nothing; it has to
-// select the gateway pod and admit nobody to the door. Its one rule admits the
-// managed-Prometheus collector's namespace to the metrics port alone; any
-// other ingress rule appearing here later is a decision someone has to make
-// deliberately.
+// select the gateway pod and admit nobody to the door. The builder's one rule
+// admits the managed-Prometheus collector's namespace to the metrics port
+// alone, and the applied copy adds the operator's (a2aFenceWithOperatorPeer);
+// any other ingress rule appearing here later is a decision someone has to
+// make deliberately.
 func TestA2AInjectFenceDeniesEveryPod(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
 	cl, agent, _, _ := a2aInjectAgentState(t)

@@ -158,6 +158,18 @@ const (
 	eventWatcherMetricsPort     int32 = 9095
 	eventWatcherMetricsPortName       = "event-metrics"
 	eventWatcherMetricsPortEnv        = "EVENT_WATCHER_METRICS_PORT"
+	// chatMetricsPort is where the chat_metrics plugin in the platform-agent
+	// container serves the inbound chat message counter: the CHAT_METRICS_PORT
+	// value the plugin binds, the container port declared beside the API port,
+	// and the port the gateway policy admits the collector and the operator on,
+	// from one constant for the same reason as the watcher's.
+	chatMetricsPort     int32 = 9097
+	chatMetricsPortName       = "chat-metrics"
+	chatMetricsPortEnv        = "CHAT_METRICS_PORT"
+	// platformAgentContainerName is the agent container's name in the gateway
+	// and dashboard pods, the one the poller's Ready gate and the bridge name:
+	// the same word as the app label, under the name for what it is here.
+	platformAgentContainerName = appNamePlatformAgent
 
 	// OperatorNamespaceEnv is the variable both install paths set on the
 	// manager container from the Downward API (the chart's operator
@@ -799,6 +811,8 @@ var DefaultBuiltInPlugins = []string{
 	"tool_call_audit",
 	"incident_context",
 	"bootstrap_onboarding",
+	"pr_opened",
+	"chat_metrics",
 }
 
 // pluginNamePattern mirrors the CEL rule on AgentPlugin.metadata.name. The name becomes
@@ -1211,13 +1225,14 @@ var frontDoorToolsets = []string{
 }
 
 // frontDoorPlugins are the plugins the profile receiving chat ingress has to run, on
-// top of the three agents/platform/config.yaml already enables.
+// top of the ones agents/platform/config.yaml already enables.
 //
 // They are agents/chat/config.yaml's list, less two. legacy_slash_commands unwraps a typed
 // "/hermes sethome" before the gateway dispatcher sees it, and session_store and
 // session_otel_bridge are what make an inbound chat session persist and trace at all —
 // each hooks ingress, so enabling them on a profile no message reaches does nothing, and
 // NOT enabling them on the profile every message reaches loses the behaviour outright.
+// chat_metrics hooks ingress the same way, to count it, so it follows the message too.
 //
 // agent_roster is left off because it exists only to delegate: it injects the
 // routable-specialist roster into every turn, which a front door that does the work
@@ -1233,13 +1248,25 @@ var frontDoorToolsets = []string{
 // own README states the rule ("Do not relocate any part of this flow"), and the CRD page
 // carries the cost as a known limit.
 //
-// hermes_otel, tool_call_audit and incident_context are the three the image's own copy
+// hermes_otel, tool_call_audit and incident_context are ones the image's own copy
 // already enables; the overlay unions lists, so naming them again would be inert rather
 // than wrong, and leaving them out keeps the list to what the flag actually adds.
 var frontDoorPlugins = []string{
 	"session_store",
 	"session_otel_bridge",
 	"legacy_slash_commands",
+	"chat_metrics",
+}
+
+// frontDoorBackfillPlugins are plugins agents/platform/config.yaml enables that an existing
+// front-door volume does not pick up from the image. With the flag on, the platform
+// profile's config.yaml leaves the entrypoint's force-sync and is only back-filled, and the
+// back-fill never extends a list the live file already holds, so a plugin the image
+// enabled after that volume was first written stays off there. The front-door overlay
+// unions these in so the flag cannot hide one. pr_opened records each pull request a
+// worker opens on its card, which is what posts the thread's PR message.
+var frontDoorBackfillPlugins = []string{
+	"pr_opened",
 }
 
 // kanbanDispatchIntervalSeconds and kanbanWakeOnEvents mirror the `kanban` block
@@ -1345,7 +1372,7 @@ func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 
 	return map[string]any{
 		"platform_toolsets": platformToolsets,
-		"plugins":           map[string]any{"enabled": slices.Clone(frontDoorPlugins)},
+		"plugins":           map[string]any{"enabled": slices.Concat(frontDoorPlugins, frontDoorBackfillPlugins)},
 		"kanban":            frontDoorKanban(),
 	}
 }
@@ -1638,6 +1665,9 @@ func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.Confi
 				}
 			} else {
 				managed = append(managed, seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleManaged))...)
+			}
+			if host := resolved.GitHubHost(); host != agentv1alpha1.DefaultGitHubHost {
+				data[gitopsStateGitHubHostKey] = host
 			}
 			for key, entries := range map[string][]agentv1alpha1.ManagedRepoEntry{
 				gitopsStateManagedReposKey: managed,
@@ -2528,9 +2558,24 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		extraVolumes = stripHostPathVolumes(agent.Spec.Deployment.ExtraVolumes)
 		podAnnotations = agent.Spec.Deployment.PodAnnotations
 	}
+	// The watchers' broker token belongs to agent-api-auth alone, in either
+	// mode. Take any user volume that would deliver it -- the reserved name, or
+	// a projection for the watcher audience under another -- out of the CR's
+	// volume lists, and every mount naming one out of the CR's containers,
+	// before the operator's own containers and volumes join the slices. See
+	// watcherTokenSourceNames; buildBaseContainers does the same for
+	// extraVolumeMounts.
+	if agent.Spec.Deployment != nil {
+		watcherSources := watcherTokenSourceNames(agent)
+		initContainers = stripContainerMountsNamed(initContainers, watcherSources)
+		sidecars = stripContainerMountsNamed(sidecars, watcherSources)
+		dropWatcherSource := func(v corev1.Volume) bool { return watcherSources[v.Name] }
+		sidecarVolumes = stripMatching(sidecarVolumes, dropWatcherSource)
+		extraVolumes = stripMatching(extraVolumes, dropWatcherSource)
+	}
 	// The four slices above are still the CR's own, filtered for hostPath and
-	// nothing else: no operator-owned container or volume has joined them yet,
-	// which is what the strip below depends on. Under `next` the pod carries a
+	// the watcher token and nothing else: no operator-owned container or
+	// volume has joined them yet, which is what the strip below depends on. Under `next` the pod carries a
 	// projected bus token that belongs to the platform-agent container alone.
 	// Take the mount away from anything else that names it, before the
 	// operator's own containers join the slices -- see
@@ -3310,6 +3355,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// watcher here, and so does the token the agent presents across the network.
 	volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
 	volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
+	volumes = append(volumes, buildWatcherTokenVolume())
 	if a2aAgentSurface(agent) {
 		volumes = append(volumes, a2aBusTokenVolumeSource())
 	}
@@ -3337,6 +3383,15 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// immutable once created.
 	podLabels := commonLabels(agent)
 	podLabels["app"] = agent.Name + "-gateway"
+	// At one replica the pod is the gateway: no election runs and nothing
+	// would stamp the leader label, so the template carries it, and the one
+	// pod reads as the leader to everything that selects on the label (the
+	// chart's PodMonitoring for the chat listener, the usage poller). Above
+	// one replica the label is leader_elect.py's to stamp and clear, so the
+	// template leaves it off.
+	if replicas <= 1 {
+		podLabels[gatewayLeaderLabel] = gatewayLeaderLabelValue
+	}
 	// No kubeagents.x-k8s.io/has-credential-proxy label. That is what
 	// github-token-minter's NetworkPolicy admits on 8080, and this Pod has no
 	// caller for the minter: the credential runtime is in a Pod of its own and
@@ -4063,6 +4118,9 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			// The watcher's --profiles-dir and its dedup snapshots, both under
 			// CREDENTIAL_PROXY_WORKSPACE_ROOT above.
 			{Name: "platform-agent-data-vol", MountPath: homeDir},
+			// The watchers' broker token. Here and in no other container of this
+			// Pod: the watcher role is what reaches the fleet through the broker.
+			{Name: watcherTokenVolume, MountPath: watcherTokenMountPath, ReadOnly: true},
 		},
 		SecurityContext: securityContext,
 	}
@@ -4093,6 +4151,9 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		// The watcher authenticates to the Session KV server with this; see
 		// start-services.sh --token-env.
 		{Name: "SESSION_KV_API_KEY", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVApiKeySecretRef(agent)}},
+		// The watchers make their Google calls through the broker with this.
+		{Name: watcherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
+		{Name: watcherBrokerTokenFileEnvVar, Value: watcherTokenMountPath + "/token"},
 	}
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
@@ -4254,7 +4315,13 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// either order without chat answering 403 in between.
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CHAT_AUDIENCE", Value: credentialProxyChatAudience},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent)},
+		// The watchers' audience, in both modes: agent-api-auth always runs
+		// them.
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_WATCHER_AUDIENCE", Value: credentialProxyWatcherAudience},
 	)
+	if driftDetectorEnabled(agent) {
+		envVars = append(envVars, corev1.EnvVar{Name: watcherSubscriptionEnvVar, Value: watcherPubsubSubscription(agent)})
+	}
 	if a2aSessionClusterViewEnabled(agent) {
 		// The session pods' audience. Rendered only with the flag, so a
 		// broker on an install without it has no session role to confer
@@ -4441,6 +4508,15 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// One that could set the session callers could unbind the session
 		// ServiceAccount from its audience, or bind another to it.
 		"CREDENTIAL_PROXY_SESSION_CALLERS",
+		// One that could set the watcher audience would decide who holds the
+		// watcher role; one that could set the subscription would point the
+		// watcher relay at any subscription the broker's credential can pull;
+		// and the two on agent-api-auth would point the watchers' token at a
+		// listener of their own.
+		"CREDENTIAL_PROXY_WATCHER_AUDIENCE",
+		watcherSubscriptionEnvVar,
+		watcherBrokerURLEnvVar,
+		watcherBrokerTokenFileEnvVar,
 		"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME",
 		// And the legacy subscription name by name, not only as a managed
 		// name: under next with Chat the render no longer sets it, and a
@@ -4923,6 +4999,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// The source half of the same reservation takes the mounts of any user
 	// volume buildPodTemplateSpec dropped for what it projects or which
 	// Secret it names; see a2aBusCredentialVolumeNames.
+	// The watchers' broker token, on this fifth surface; see
+	// watcherTokenSourceNames. In either mode.
+	extraVolumeMounts = stripVolumeMountsNamed(extraVolumeMounts, watcherTokenSourceNames(agent))
 	if a2aAgentSurface(agent) {
 		extraVolumeMounts = a2aStripBusTokenVolumeMounts(extraVolumeMounts)
 		extraVolumeMounts = stripVolumeMountsNamed(extraVolumeMounts, a2aBusCredentialVolumeNames(agent))
@@ -5024,6 +5103,14 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		Name:  gatewayProfileEnvVar,
 		Value: frontDoorProfile,
 	})
+	// The port the chat_metrics plugin binds, appended after the merge like the
+	// watcher's metrics port on the sidecar and for the same reason: the
+	// container port above and the policy rule name this one, and a CR that
+	// moved the listener would leave both pointing at a port nothing answers on.
+	gatewayEnvVars = append(gatewayEnvVars, corev1.EnvVar{
+		Name:  chatMetricsPortEnv,
+		Value: strconv.Itoa(int(chatMetricsPort)),
+	})
 
 	// Every "appended after the merge" comment above rests on the kubelet collapsing a
 	// repeated env name last-wins. The pod never reaches a kubelet. `Container.Env`
@@ -5042,7 +5129,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 
 	containers := []corev1.Container{
 		{
-			Name:            "platform-agent",
+			Name:            platformAgentContainerName,
 			Image:           image,
 			ImagePullPolicy: pullPolicy,
 			Args:            args,
@@ -5050,6 +5137,12 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				{
 					Name:          "api",
 					ContainerPort: 8642,
+				},
+				// The chat_metrics plugin's /metrics, for the chart's PodMonitoring
+				// and the usage poller (see chatMetricsPort).
+				{
+					Name:          chatMetricsPortName,
+					ContainerPort: chatMetricsPort,
 				},
 			},
 			Env:          gatewayEnvVars,
@@ -6297,6 +6390,22 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// The operator's own pods on the same port, for the poller that reads the
 	// watcher's counters into status.usage (usage_counters_poller.go).
 	if rule, ok := operatorMetricsIngressRule(profile.OperatorNamespace, eventWatcherMetricsPort); ok {
+		ingressRules = append(ingressRules, rule)
+	}
+	// The chat_metrics plugin's listener on the platform-agent container, for
+	// the same two readers: the collector, and the operator's poller that reads
+	// the inbound chat counter into status.usage.
+	ingressRules = append(ingressRules, networkingv1.NetworkPolicyIngressRule{
+		From: []networkingv1.NetworkPolicyPeer{
+			{
+				NamespaceSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
+				},
+			},
+		},
+		Ports: []networkingv1.NetworkPolicyPort{tcpPort(chatMetricsPort)},
+	})
+	if rule, ok := operatorMetricsIngressRule(profile.OperatorNamespace, chatMetricsPort); ok {
 		ingressRules = append(ingressRules, rule)
 	}
 

@@ -42,6 +42,14 @@ mcp_servers:
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
       GOOGLE_CLOUD_PROJECT: "${GOOGLE_CLOUD_PROJECT}"
       GCP_PROJECT_ID: "${GCP_PROJECT_ID}"
+      # The agent's own cluster, which gke_endpoint reads to decide whether a
+      # fleet cluster is reachable over its private endpoint
+      # (docs/designs/private-endpoint-selection.md). Without these three the
+      # server's switch_kube_context never knows its own VPC and leaves that
+      # decision to the credential proxy's splice, one describe later.
+      GKE_PROJECT_ID: "${GKE_PROJECT_ID}"
+      GKE_LOCATION: "${GKE_LOCATION}"
+      GKE_CLUSTER_NAME: "${GKE_CLUSTER_NAME}"
       # Hermes hands a stdio MCP server only a safe baseline (PATH, HOME, …) plus the
       # keys named here (`_build_safe_env` in hermes `tools/mcp_tool.py`), so without
       # this line the `hermes send` behind send_notification has no home channel and
@@ -232,6 +240,22 @@ toolsets:
 # Agents on the default 90, where nothing has ever approached the ceiling.
 agent:
   max_turns: 250
+  # Toolsets this profile's turns never need, kept out of every model call. Gemini
+  # on Vertex intermittently waits tens of seconds to minutes before its first
+  # token when a request declares the full hermes-cli set (36 tools here), and
+  # not when these are dropped: replaying a captured worker request straight to
+  # Vertex, the first token took p90 13.7s and up to 57s with all 36 declared,
+  # and p90 2.8s, max 5.9s, with browser, tts and vision removed. A fleet
+  # question that took 28 minutes answered in about 2.6 once they were gone.
+  # disabled_toolsets is applied last, on every platform key, so it narrows the
+  # hermes-cli bundle above and the toolsets a kanban worker is spawned with
+  # (_resolve_worker_cli_toolsets reads the same resolution).
+  disabled_toolsets:
+    - browser
+    - computer_use
+    - image_gen
+    - tts
+    - vision
 
 # Per-file character cap Hermes puts on a context file (SOUL.md, AGENTS.md) when it
 # builds the system prompt. Unset, the cap is 6% of the model window, and a flat
@@ -268,6 +292,19 @@ context_file_max_chars: 100000
 tool_loop_guardrails:
   loop_caps:
     max_web_searches: 200
+  # Definitive permission refusals (the command policy's kubernetes.read-only
+  # rule refusing a mutating kubectl verb, as the credential-proxy shim's
+  # `policy verb:` line reports it) in one run before the runtime halts it
+  # (deploy/docker/patches/permission_refusal_stop.py).
+  # The policy's notice says the change is refused however it is attempted, so
+  # the first one ends the run with the refusal on the board instead of the
+  # workaround hunt #1943 describes; live runs showed the model reading the
+  # guidance a lower tier appends and going on investigating. A higher value
+  # restores that guidance tier. API 403s are not counted: an audit meets
+  # them on projects it may not read and continues; nor are gcp.read-only
+  # refusals or kubernetes.read-only refusals of a read spelling, since both
+  # allowlists refuse an unlisted read with the same notice.
+  permission_refusal_halt_after: 1
 
 # Shared memory, read-only.
 #
@@ -317,9 +354,12 @@ memory:
 # The Platform Agent is no longer the chat ingress (the Chat Agent / `default`
 # profile owns that), so the session_store / session_otel_bridge ingress plugins
 # move to the Chat Agent. Keep otel for observability parity and tool_call_audit
-# to audit this privileged specialist's tool calls.
+# to audit this privileged specialist's tool calls. pr_opened records each pull
+# request this profile's kanban workers open on their card, which is what posts
+# the thread's PR message (plugins/pr_opened/__init__.py).
 plugins:
   enabled:
     - hermes_otel
     - tool_call_audit
     - incident_context
+    - pr_opened

@@ -259,6 +259,18 @@ class EnumerateProjectClustersTest(unittest.TestCase):
         self.assertIsNotNone(record)
         self.assertIsNone(error)
 
+
+    def test_a_cluster_the_scope_excludes_is_dropped_from_the_listing(self):
+        # #3081: spec.scope.exclude.clusters bounds every fleet read, so an
+        # excluded cluster in a swept project is neither audited nor recorded.
+        fd.declared_scope.set("acme", None, "acme/us-central1/lane-b")
+        self.addCleanup(fd.declared_scope.set, None, None)
+        clusters_json = json.dumps([{"name": "ka-today", "location": "us-central1"}, {"name": "lane-b", "location": "us-central1"}])
+        with mock.patch("sys.stderr"):
+            clusters, _, error = fd.enumerate_project_clusters("acme", run=lambda a: run_of(0, clusters_json))
+        self.assertEqual([c["name"] for c in clusters], ["ka-today"])
+        self.assertIsNone(error)
+
     def test_failed_list_returns_empty_with_no_record_and_says_why(self):
         clusters, record, error = fd.enumerate_project_clusters("acme", run=lambda a: run_of(1, "", "denied"))
         self.assertEqual(clusters, [])
@@ -2699,11 +2711,11 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(fd.discover_fleet("acme-only", run=lambda *a, **k: run_of(1)).projects, ["acme-only"])
 
     def test_main_hands_the_flags_to_the_resolver(self):
-        # The wiring the SOP relies on: the two flags main parses reach the
+        # The wiring the SOP relies on: the three flags main parses reach the
         # holder the resolver reads, before anything else runs.
         with mock.patch.object(fd.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
-            fd.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
-        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+            fd.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied", "--scope-exclude-clusters", "ops-mgmt/us-central1/lane-b"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied", "ops-mgmt/us-central1/lane-b")
 
     def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
         # `--scope-unread` alone (what collector_args carries when no declared

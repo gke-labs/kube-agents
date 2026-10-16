@@ -365,6 +365,13 @@ Deployment passes its readiness probe. The chart never imports it;
 `install.sh --github-pem-path` does, or you import it yourself Ahead-Of-Time —
 see the [Token minter guide](https://gke-labs.github.io/kube-agents/deploy/token-minter/).
 
+When the GitHub forge in `platformAgent.integration.forges` is at a GitHub
+Enterprise Server host, the minter mints there, from the forge declaration
+alone: no `githubMinter.*` value repeats the host or the CA. What the chart
+sets, and the restart a new or rotated CA Secret needs, are in
+[GitHub Enterprise Server](https://gke-labs.github.io/kube-agents/deploy/token-minter/#github-enterprise-server)
+in the token minter guide.
+
 ### Telemetry
 
 `telemetry.otlpEndpoint` (default `""`) is the OTLP/HTTP collector base URL.
@@ -400,25 +407,33 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 
 `platformAgent.podMonitoring` renders a `PodMonitoring` for each of the agent's
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
-event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's
-port 9095, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
+event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_messages_inbound_total` from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
 tool-invocation, request and version-control metrics from its metrics-only port 8766, and the A2A
-gateway pod a `spec.mode: next` install runs, so it scrapes the gateway's task
-terminal and Google Chat pull counters from its metrics-only port 9096 (elsewhere
+gateway pod a `spec.mode: next` install runs, so it scrapes the gateway's inbound-message,
+task terminal and Google Chat pull counters from its metrics-only port 9096 (elsewhere
 that one selects no pod). The operator's policies on all three pods admit the
-collector's namespace, `gke-gmp-system`, on those ports either way, and on the
-first two they admit the operator's own pods as well; the value only decides
+collector's namespace, `gke-gmp-system`, and the operator's own pods on those ports
+either way; the value only decides
 whether a scrape is configured, and the operator's own read of the counters and
 cluster gauges into `status.usage` does not depend on it.
-It is a tri-state: `null`,
-the default, renders them when the cluster serves the `PodMonitoring` API and
-nothing elsewhere, so an install off GKE, or on a GKE cluster with Managed
-Prometheus turned off, upgrades without setting anything; `true` renders them
-regardless and fails at apply time where the CRD is absent, the caveat
-`litellm.podMonitoring` carries; `false` never renders them. `helm template`
-alone has no cluster to ask: pass
-`--api-versions monitoring.googleapis.com/v1/PodMonitoring` to see the default
-render.
+
+Non-GMP clusters scrape these metrics through the corresponding alternative knobs:
+
+- `platformAgent.serviceMonitor` renders Prometheus Operator `ServiceMonitor` objects and headless metrics `Service`s for the three pods (selects `monitoring.coreos.com/v1/ServiceMonitor`).
+- `platformAgent.vmPodScrape` renders VictoriaMetrics Operator `VMPodScrape` objects for the three pods (selects `operator.victoriametrics.com/v1beta1/VMPodScrape`).
+
+Each monitoring knob (`podMonitoring`, `serviceMonitor`, `vmPodScrape`) is an independent tri-state:
+`null`, the default, renders them when the cluster serves the corresponding API and
+nothing elsewhere, so an install off GKE, or on a cluster without Prometheus Operator or
+VictoriaMetrics Operator, upgrades without setting anything; `true` renders them
+regardless and fails at apply time where the CRD is absent; `false` never renders them.
+`helm template` alone has no cluster to ask: pass `--api-versions monitoring.googleapis.com/v1/PodMonitoring`,
+`--api-versions monitoring.coreos.com/v1/ServiceMonitor`, or `--api-versions operator.victoriametrics.com/v1beta1/VMPodScrape`
+to see the default render.
+
+On clusters enforcing NetworkPolicy, scrapes are dropped unless admitted: set `platformAgent.monitoringScraperNamespace: <namespace>` to render admitting NetworkPolicies for ports 9095, 9097, 8766, and 9096, or create an admitting NetworkPolicy manually. The gateway admitting policy includes rules for the agent API (8642/8643 from within the namespace), the GMP collector in `gke-gmp-system` (9095/9097), and operator poller metrics (9095/9097 assuming `operator.enabled: true` in the chart release namespace) alongside the scraper namespace, isolating inbound traffic on the gateway pod to this explicit peer set when operator-managed NetworkPolicies are disabled. Credential proxy (8766) and A2A gateway (9096) guardrails are applied unconditionally and still require an admitting NetworkPolicy. For Prometheus Operator release selectors (e.g. `kube-prometheus-stack` matching `release: <stack-release-name>`), supply labels via `platformAgent.serviceMonitorLabels`, or configure Prometheus with `serviceMonitorSelectorNilUsesHelmValues: false`.
+
+When deploying via GitOps tools like ArgoCD, `helm template` passes the destination cluster's discovered API versions by default when connected to the target cluster. If default detection does not pick up your CRDs or if running disconnected templates, explicitly set `platformAgent.serviceMonitor: true` or `platformAgent.vmPodScrape: true` in your Helm values.
 
 ### Turning telemetry off
 
@@ -487,28 +502,39 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `platformAgent.integration.repositories` the repositories on them (`forge`,
   `repository`, optional `namespace`, and `role`: `gitops` for the one the
   agent publishes to, `managed` for others it may change, `context` for
-  read-only reference). `provider` is `github` (the default) or `gitlab`. `credentialsRef` is
+  read-only reference). `provider` is `github` or `gitlab`. If you omit it, it is `github`. A forge at a host other than github.com must name it. `credentialsRef` is
   ignored for `github` and required for `gitlab`: a Secret holding the access
   token under the key `token`, mounted into the credential broker only. A
   `gitlab` forge's `host` is gitlab.com by default or a self-managed instance,
-  never a GitHub name, and one `gitlab` forge per host. A self-managed
+  never a GitHub name, and one `gitlab` forge per host. A `github` forge's
+  `host` is github.com by default or a GitHub Enterprise Server instance,
+  never a host under a domain where GitHub runs its own services (such as
+  `api.github.com` or `<name>.ghe.com`). An install serves one GitHub host:
+  a second `github` forge at another host, or one host for two providers,
+  fails the render. A self-managed
   instance whose certificate a private CA signed also sets `caBundleRef`
   (`name`, and an optional `key` that defaults to `ca.crt`): a Secret that
-  holds the CA, which the broker trusts for that host only. A Secret, so
+  holds the CA, which the broker trusts for that host only. On a GitHub
+  Enterprise Server forge, the token minter also gets the CA, and it trusts
+  the CA for all of its outbound calls (see the token minter guide). A Secret, so
   changing the CA needs the same rights as changing the token. It is for a
-  `gitlab` forge at a self-managed host, never gitlab.com. With a `gitlab` forge
+  forge at a self-managed host, GitLab or GitHub Enterprise Server, never
+  gitlab.com or github.com. With a `gitlab` forge
   declared beside GitHub, a bare `owner/name` still works for a GitHub
   repository that the install registered by URL. Name a GitLab repository, or
   a GitHub repository that the install did not register, by its URL. Apply `crds/` before upgrading
   to a release that adds a provider, since `helm upgrade` does not update CRDs. A GitHub forge's
-  `host` must be a GitHub spelling (`github.com`, `www.github.com`,
-  `ssh.github.com`), and a repository must name a declared forge.
+  `host` is a spelling of github.com (`github.com`, `www.github.com`,
+  `ssh.github.com`) or a GitHub Enterprise Server hostname, as above, and a
+  repository must name a declared forge.
   `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
   alias for one GitHub forge and its gitops repository — set the lists or the
-  alias, not both. For a GitHub GitOps repository, the alias is still what
+  alias, not both. For a github.com GitOps repository, the alias is still what
   `install.sh` and the `full-install` Terraform composition write. For a
-  GitLab GitOps repository, they write the `forges` and `repositories` lists. One GitHub forge with no
-  `credentialsRef` and at most one repository, the gitops one, with no
+  GitLab or GitHub Enterprise Server GitOps repository, they write the
+  `forges` and `repositories` lists. One GitHub forge with no
+  `credentialsRef`, no `caBundleRef`, no host other than a spelling of
+  github.com, and at most one repository, the gitops one, with no
   namespace of its own, renders as `github`, whichever key set it, because
   `helm upgrade` does not update CRDs — provided the forge declares a
   namespace or the repository, and the repository is one the operator would
@@ -583,6 +609,18 @@ chart's `crds/` before setting the value (`helm upgrade` does not, `upgrade.sh`
 does): against a CRD that predates `spec.deployment.credentialProxy`, the API
 server would prune the value silently while the release record kept it, so the
 chart looks up the installed CRD and fails the upgrade instead.
+
+`platformAgent.deployment.alertDailyLimits` sets the daily alert ceilings. Its keys are
+`critical`, `warning`, `info` and `drift`, and each key that is set becomes an
+`ALERT_DAILY_LIMIT_<KEY>` entry in the CR's `spec.deployment.env`. A key that is not set keeps the
+default in the agent image, and `0` removes the cap. An entry with the same name in
+`platformAgent.deployment.env` wins over the key. A `valueFrom` entry for a key that is set fails
+the render, because the operator forwards only literal values. Each apply that changes the env list
+that the chart renders replaces the full list on the CR, so entries added to the CR by hand are
+lost. Move them to `platformAgent.deployment.env` first. A re-tag to a chart without the value needs
+`upgrade.sh --drop-undeclared-values`. The
+[chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling) gives
+the buckets, the defaults and a sizing method.
 
 #### PlatformAgent annotations
 

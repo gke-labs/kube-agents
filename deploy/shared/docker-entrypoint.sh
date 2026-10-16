@@ -638,6 +638,8 @@ if not isinstance(template, dict) or not isinstance(live, dict):
     raise SystemExit(0)
 
 added = []
+PLUGINS_KEY = "plugins"
+ENABLED_KEY = "enabled"
 
 
 def fill(src, dst, path):
@@ -652,6 +654,20 @@ def fill(src, dst, path):
 
 
 fill(template, live, [])
+
+# plugins.enabled is the one list the image owns: a plugin directory the image
+# ships is inert until the profile's list names it, and the fill above never
+# enters a list, so a volume scaffolded before a plugin existed would carry it
+# into every image and never load it. Add the template's names the live list
+# lacks, after the agent's own, and remove none: a name the agent dropped on
+# purpose comes back, which is the price of a plugin that ships enabled.
+template_enabled = (template.get(PLUGINS_KEY) or {}).get(ENABLED_KEY) if isinstance(template.get(PLUGINS_KEY), dict) else None
+live_plugins = live.get(PLUGINS_KEY)
+if isinstance(template_enabled, list) and isinstance(live_plugins, dict) and isinstance(live_plugins.get(ENABLED_KEY), list):
+    for name in template_enabled:
+        if name not in live_plugins[ENABLED_KEY]:
+            live_plugins[ENABLED_KEY].append(name)
+            added.append(".".join([PLUGINS_KEY, ENABLED_KEY, str(name)]))
 
 if added:
     # Atomic, because a truncated config.yaml is worse than a hollow one: os.replace
@@ -959,7 +975,7 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # do, because cron_jobs_sync.py never prunes: its ledger stops a retired job
 # coming BACK, it never removes one the volume already has.
 #
-# `--cron-retire` deletes the governance ids from this roster outright. They ran
+# `--cron-retire` deletes the listed ids from this roster outright. The governance ids ran
 # here only while the platform profile's store had no ticker; now that
 # `profile-cron-tick` gives it one, they are back on the Platform Agent's own
 # roster where the scheduler can reach their `skills`, `model` and `max_turns`
@@ -974,6 +990,10 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # this image ships it. Retiring it and shipping it on the Platform Agent's roster
 # is the same move, applied late.
 #
+# first-run-quick-value-audit is retired, not moved: `oobe` runs the same first-run audits. A
+# volume that never booted an image shipping it disabled still holds it enabled, and nothing
+# else can reach that copy once the image stops shipping it.
+#
 # It runs BEFORE 2c-bis deliberately, and the two lists must not overlap. The
 # order only decides how fast an accidental overlap bites, not whether it does:
 # retire-last would delete a job the image still ships on every single boot,
@@ -984,7 +1004,8 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # an id belongs on this list only once no roster in this image ships it.
 #
 # This list shrinks to nothing once no live volume can still be carrying the
-# entries; until then removing a name from it silently restores the double-fire.
+# entries; until then removing a name from it silently restores the double-fire, or for
+# first-run-quick-value-audit an enabled copy nothing can reach.
 #
 # `--home` overlays the default profile in place, because that profile IS
 # $TARGET_DIR and has no entry under profiles/ to name. `--cron-jobs` names the
@@ -1000,7 +1021,7 @@ if [ -f "/opt/defaults/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
         --template /opt/defaults \
         --items "cron" \
         --cron-jobs "profile-cron-tick" \
-        --cron-retire "compliance-audit obtainability-audit security-patch-orchestrator fleet-wide-cost-analysis fleet-consistency-drift ai-security-audit stockout-prevention github-issue-resolver" \
+        --cron-retire "compliance-audit obtainability-audit security-patch-orchestrator fleet-wide-cost-analysis fleet-consistency-drift ai-security-audit stockout-prevention github-issue-resolver first-run-quick-value-audit" \
         >/dev/null || echo "WARN: default-profile cron merge failed; jobs added by this image will not run" >&2
 fi
 
@@ -1018,33 +1039,30 @@ fi
 # reading it back off the volume is the one place a partial upgrade can hide. It also frees
 # this step from depending on step 2b having worked.
 #
-# Writing jobs.json without a lock is safe WITHIN THIS POD, on two facts. The scheduler in
-# THIS container is not running yet — everything here is ahead of `exec "$@"`. And no OTHER
-# container in this pod is running this code: step 1.5 hands the shared tree to a single
-# owner, so the dashboard, which has no scheduler and no reason to touch the schedule, stops
-# before it gets here.
+# Writing jobs.json serializes under Hermes' `<cron_dir>/.jobs.lock` advisory lock to
+# coordinate with any concurrent in-pod Hermes cron mutations (`hermes cron pause|resume|add`).
 #
-# Both facts stop at the pod boundary. Step 1.5 elects an owner per pod, not per volume, so
-# at availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
+# At availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
 # rather than a volume each — every replica's gateway is an owner and several of them run
-# this against the same file, with a rolling update overlapping new pods and old. The
-# exposure and why it is not fixable from inside the script are set out in cron_jobs_sync.py's
-# Concurrency section; the short version is that the reconcile wants to run once per volume,
-# which is a topology change rather than a lock. Single-replica installs, the default, are
-# unaffected. Do not restore a bare "there is no second writer" claim here: it was written
-# once, it was wrong, and it read as verified.
+# this against the same file, with a rolling update overlapping new pods and old. While
+# .jobs.lock serializes writers on filesystems supporting advisory locking, eliminating
+# cross-pod scheduler races on shared volumes requires running the reconcile once per volume,
+# which is a topology change. Single-replica installs, the default, are unaffected. Do not
+# restore a bare "there is no second writer" claim here: it was written once, it was wrong,
+# and it read as verified.
 #
 # --assume-retired covers the one case the script's ledger cannot know on its first run: a
 # deployment that finished onboarding before this existed has no record that
 # bootstrap_delivery.py:_retire_jobs retired the two onboarding jobs, so they would look new and
-# be reinstalled. .bootstrap_completed is that record. `oobe` and `first-run-quick-value-audit`
-# are seeded on the same record so an install that onboarded before those jobs existed does not
-# start first-run fleet audits on upgrade.
+# be reinstalled. .bootstrap_completed is that record. `oobe` is seeded on the same record for a
+# different reason: an install that onboarded before the job existed must never get it. oobe.py
+# skips a sweep more than a day old, but one that onboarded recently would start four fleet audits
+# it is not owed.
 CRON_SYNC="/opt/defaults/scripts/cron_jobs_sync.py"
 if [ -f "$CRON_SYNC" ] && [ -f "/opt/defaults/cron/jobs.json" ]; then
     ASSUME_RETIRED=""
     if [ -f "$TARGET_DIR/.bootstrap_completed" ]; then
-        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery,oobe,first-run-quick-value-audit"
+        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery,oobe"
     fi
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
         "$CRON_SYNC" \
@@ -1500,11 +1518,22 @@ fi
 # 2.6's force-sync, not to it.
 CLUSTER_TEMPLATE="/opt/cluster-template"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
+    CLUSTER_PROFILE_SCRIPT="/opt/defaults/scripts/cluster_agent_profile.py"
+    [ -f "$CLUSTER_PROFILE_SCRIPT" ] || CLUSTER_PROFILE_SCRIPT="$TARGET_DIR/scripts/cluster_agent_profile.py"
     for d in "$TARGET_DIR"/profiles/cluster-*; do
         [ -d "$d" ] && [ -f "$d/config.yaml" ] || continue
         for f in SOUL.md AGENTS.md CAPABILITIES.md; do
             [ -f "$CLUSTER_TEMPLATE/$f" ] && cp -f "$CLUSTER_TEMPLATE/$f" "$d/$f" 2>/dev/null || true
         done
+        # The cp -f above replaces each cluster-* profile's SOUL.md with the blank
+        # image template (/opt/cluster-template/SOUL.md) on every gateway restart.
+        # Re-stamp this Cluster Agent's Target Cluster Identity from its preserved
+        # $d/config.yaml via cluster_agent_profile.py so existing cluster-* profiles
+        # keep their identity in SOUL.md.
+        if [ -f "$d/SOUL.md" ] && [ -w "$d/SOUL.md" ] && [ -f "$d/config.yaml" ] && [ -f "$CLUSTER_PROFILE_SCRIPT" ]; then
+            "$INSTALL_DIR/.venv/bin/python3" "$CLUSTER_PROFILE_SCRIPT" stamp-soul --profile-dir "$d" \
+                || echo "WARN: failed to stamp cluster identity into $d/SOUL.md" >&2
+        fi
         sync_profile_skills "$CLUSTER_TEMPLATE" "$d"
         # Targeted self-heal: drop `memory.provider` from cluster configs already
         # on the PVC. The template no longer sets it (per-user memory scopes by
@@ -1742,16 +1771,18 @@ fi
 #     0400/0755 on root-owned files against RunAsUser 10000 besides (the volume's
 #     DefaultMode in platformagent_manifests.go), so it failed the ownership test too.
 #
-# Step 2d has since made that an ordinary writable file on the PVC, which only makes
-# restoring this worse rather than newly safe: the guard would now pass, and the step would
-# rewrite — non-atomically, over a file step 2d has just staged-and-renamed into place — a
-# config it has nothing to add to. Where the guard did pass before (compose, `docker run`)
-# that is exactly what it did, and yaml.safe_dump round-trips the file: it sorted the keys
-# and dropped every comment in a config people read.
+# Step 2d has since made that an ordinary writable file on the PVC, and step 2d's
+# back-fill is now the one writer that appends the template's plugins.enabled names the
+# live list lacks: a plugin the image ships enabled reaches a volume scaffolded before it
+# existed through that step, on the path that works. What this step was faulted for does
+# not hold there: the back-fill stages the file and renames it into place, so a reader
+# sees all of the old file or all of the new one, and it dumps with sort_keys=False, so
+# the keys keep their order. Comments are still dropped, the price every back-fill in
+# step 2d already pays.
 #
-# Do not restore it as a "belt and braces" measure. If a profile ever needs a plugin the
-# image does not ship enabled, the operator overlay in step 2.7 is the mechanism, and it is
-# one that works on the path this ran on.
+# Do not restore this step beside it: two writers of one list, one of them a plain
+# rewrite over the other's rename. A profile that needs a plugin the image does not ship
+# enabled is the operator overlay in step 2.7.
 
 # 4. Point the hermes_otel plugin at the resolved collector and stamp the service name.
 #

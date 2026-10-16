@@ -495,6 +495,29 @@
         "podMonitoring": {
           "type": ["boolean", "null"]
         },
+        "serviceMonitor": {
+          "type": ["boolean", "null"]
+        },
+        "serviceMonitorLabels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "vmPodScrape": {
+          "type": ["boolean", "null"]
+        },
+        "vmPodScrapeLabels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "monitoringScraperNamespace": {
+          "type": "string",
+          "maxLength": 63,
+          "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"
+        },
         "harness": {
           "type": "object",
           "additionalProperties": false,
@@ -635,6 +658,32 @@
               "type": "array",
               "items": {
                 "type": "object"
+              }
+            },
+            "alertDailyLimits": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "critical": {
+                  "type": ["integer", "null"],
+                  "minimum": 0,
+                  "maximum": 2147483647
+                },
+                "warning": {
+                  "type": ["integer", "null"],
+                  "minimum": 0,
+                  "maximum": 2147483647
+                },
+                "info": {
+                  "type": ["integer", "null"],
+                  "minimum": 0,
+                  "maximum": 2147483647
+                },
+                "drift": {
+                  "type": ["integer", "null"],
+                  "minimum": 0,
+                  "maximum": 2147483647
+                }
               }
             },
             "credentialProxy": {

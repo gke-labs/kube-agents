@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/nats-io/nats.go"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 type notifyPost struct{ space, thread, text string }
@@ -528,6 +530,32 @@ type fakeConversations struct {
 	contexts map[string]string
 	err      error
 	posts    []notifyPost
+	// rendersChat, edits and chats: see PostMessage. failEdits fails
+	// every EditMessage as a message that is gone; transientEdits fails the
+	// next N as a rate limit would.
+	rendersChat    bool
+	failEdits      bool
+	transientEdits int
+	// failPosts fails every Post (and so every PostMessage).
+	failPosts bool
+	edits     []notifyPost
+	chats     []*chatmsg.Message
+	// marks records MarkConversation calls as "conversation ask/settle",
+	// then "@update" for a keyed request, with postsAtMark the number of
+	// posts made by then.
+	marks       []string
+	postsAtMark []int
+}
+
+func (f *fakeConversations) MarkConversation(conversation, update string, mark MarkState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	entry := conversation + " " + mark.Ask + "/" + mark.Settle
+	if update != "" {
+		entry += "@" + update
+	}
+	f.marks = append(f.marks, entry)
+	f.postsAtMark = append(f.postsAtMark, len(f.posts))
 }
 
 func (f *fakeConversations) ConversationContext(_ context.Context, key string) (string, error) {
@@ -537,8 +565,43 @@ func (f *fakeConversations) ConversationContext(_ context.Context, key string) (
 func (f *fakeConversations) Post(conversation, text string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failPosts {
+		return "", errors.New("fake post failure")
+	}
 	f.posts = append(f.posts, notifyPost{thread: conversation, text: text})
 	return conversation + "/messages/c" + string(rune('0'+len(f.posts))), nil
+}
+
+// PostMessage and EditMessage lay a chat message out when rendersChat is
+// set (recorded in chats, with the post or edit), and answer ErrTextOnly
+// otherwise, as a backend that renders none does.
+func (f *fakeConversations) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Chat != nil && !f.rendersChat {
+		return "", ErrTextOnly
+	}
+	id, err := f.Post(conversation, m.Text)
+	f.mu.Lock()
+	f.chats = append(f.chats, m.Chat)
+	f.mu.Unlock()
+	return id, err
+}
+
+func (f *fakeConversations) EditMessage(conversation, messageID string, m OutMessage) error {
+	if m.Chat != nil && !f.rendersChat {
+		return ErrTextOnly
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failEdits {
+		return fmt.Errorf("%w: fake", ErrMessageGone)
+	}
+	if f.transientEdits > 0 {
+		f.transientEdits--
+		return errors.New("fake transient failure")
+	}
+	f.edits = append(f.edits, notifyPost{thread: messageID, text: m.Text})
+	f.chats = append(f.chats, m.Chat)
+	return nil
 }
 
 const (
@@ -817,5 +880,3 @@ func TestConversationLookupDoesNotPostWhenStopping(t *testing.T) {
 		t.Fatalf("conv.posts = %v, want 0 posts after Stop", conv.posts)
 	}
 }
-
-
