@@ -52,7 +52,7 @@ class _Upstream(BaseHTTPRequestHandler):
 
 
 FAKE_KUBECTL = r'''"""Answers the two kubectl calls exec_tunnel makes, without a cluster."""
-import json, os, sys
+import json, os, sys, time
 
 args = sys.argv[1:]
 
@@ -91,6 +91,11 @@ if args[0] == "exec":
     if pod == "stale-pod":
         sys.stderr.write("Error from server (NotFound): pods \"stale-pod\" not found\n")
         sys.exit(1)
+    if os.environ.get("FAKE_SILENT"):
+        # An exec that connects and never reports READY: the relay's ready
+        # watchdog has to kill this process, nothing else ends it.
+        time.sleep(60)
+        sys.exit(0)
     # Everything after "--" is the interpreter and its -u -c <program>.
     tail = args[args.index("--") + 1:]
     os.execvp(sys.executable, [sys.executable, "-u", "-c", tail[-1]])
@@ -133,7 +138,7 @@ class ExecTunnelTest(unittest.TestCase):
 
     # Every knob the fake reads, cleared before and after each test so one
     # case cannot leak a mode into the next.
-    FAKE_FLAGS = ("FAKE_STALE", "FAKE_EMPTY", "FAKE_BROKEN", "FAKE_NOTREADY_FIRST")
+    FAKE_FLAGS = ("FAKE_STALE", "FAKE_EMPTY", "FAKE_BROKEN", "FAKE_NOTREADY_FIRST", "FAKE_SILENT")
 
     def setUp(self):
         self._path = os.environ.get("PATH", "")
@@ -255,6 +260,38 @@ class ExecTunnelTest(unittest.TestCase):
         exec_tunnel.reap(proc, timeout=5.0)
         self.assertIsNotNone(proc.poll(), "reap left the child unwaited")
 
+    def _expect_closed_without_answer(self, port, timeout):
+        """Send a request and require the relay to close it with no bytes.
+
+        The client's recv timeout is the test's bound: a relay that neither
+        closes nor answers inside it is the hang under test, reported as a
+        failure that says so rather than a bare TimeoutError.
+        """
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as client:
+            client.sendall(b"GET / HTTP/1.0\r\n\r\n")
+            try:
+                # Clean close or reset both mean "no bytes and not hung", which
+                # is the property under test; which one depends on the platform.
+                self.assertEqual(client.recv(1), b"", "expected the relay to close, not answer")
+            except ConnectionResetError:
+                pass
+            except TimeoutError:
+                self.fail(f"relay neither closed nor answered within {timeout}s")
+
+    def test_ready_timeout_kills_an_exec_that_never_reports_ready(self):
+        # The exec connects and then says nothing, which is the leak the
+        # ready_timeout field exists for: the watchdog has to kill the child on
+        # both attempts and the handler then closes the client. Without the
+        # watchdog the handler blocks on READY for as long as the exec lives.
+        os.environ["FAKE_SILENT"] = "1"
+        ready_timeout = 1.0
+        port = self._tunnel(remote_port=self.upstream_port, ready_timeout=ready_timeout,
+                            stderr=self._temp_sink())
+        started = time.time()
+        self._expect_closed_without_answer(port, timeout=30)
+        self.assertGreaterEqual(time.time() - started, ready_timeout,
+                                "the handler gave up before the watchdog could have fired")
+
     def test_ready_timeout_does_not_hang_on_a_listener_that_never_answers(self):
         # A remote port nothing listens on: the remote half raises before it
         # writes READY, so _spawn must reject rather than block the handler.
@@ -269,19 +306,9 @@ class ExecTunnelTest(unittest.TestCase):
         dead_port = dead.getsockname()[1]
 
         port = self._tunnel(remote_port=dead_port, ready_timeout=5.0, stderr=self._temp_sink())
-        started = time.time()
-        # Two full ready_timeout waits on a slow runner must not outlast the
-        # client's recv; the assertion at the end bounds the test at 30 s.
-        with socket.create_connection(("127.0.0.1", port), timeout=30) as client:
-            client.sendall(b"GET / HTTP/1.0\r\n\r\n")
-            try:
-                # Clean close or reset both mean "no bytes and not hung", which
-                # is the property under test; which one depends on the platform.
-                self.assertEqual(client.recv(1), b"", "expected the relay to close, not answer")
-            except ConnectionResetError:
-                pass
-        self.assertLess(time.time() - started, 30)
-
+        # The refused connect fails each attempt in milliseconds, so the bound
+        # only has to outlast two interpreter start-ups on a slow runner.
+        self._expect_closed_without_answer(port, timeout=30)
 
 if __name__ == "__main__":
     unittest.main()
