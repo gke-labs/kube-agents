@@ -3555,6 +3555,13 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   if [ -n "${dir}" ] && [ -f "${timing}" ]; then
     cp "${timing}" "${dir}/${EVAL_TIMING_FILE}" 2>/dev/null || true
   fi
+  # A gated judged score the judge failed to return is asked for once more
+  # from the saved answer (kube_agents_bench/rejudge.py), before the .dir
+  # state file below hands this record to the grading pass. Best effort: a
+  # re-judge that cannot run leaves the record as devops-bench wrote it.
+  if [ -n "${dir}" ] && [ -f "${dir}/results.json" ]; then
+    (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.rejudge "${dir}/results.json" 2>&1 | _ts_lines >> "${log}") || true
+  fi
   # Written while this unit still holds the task lock, and counted under it:
   # repetitions of one task write their state files serially, so exactly one
   # of them -- the last to finish -- sees the count reach EVAL_REPETITIONS,
