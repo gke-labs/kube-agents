@@ -136,9 +136,10 @@ a skill otherwise, patch it at its current pin ("Make a change").
 
 ## Fix a failing check
 
-| `make skills-check` reports                     | Cause                                        | Fix                                            |
-| ----------------------------------------------- | -------------------------------------------- | ---------------------------------------------- |
-| the committed skill differs from copy + overlay | the skill was edited and no patch records it | `make skills-refresh SKILL=<skill>`            |
-| the committed skill differs from copy + overlay | a patch or `append.md` was edited            | `make skills-generate SKILL=<skill>`           |
-| the copy does not match its lock                | the upstream copy was edited by hand         | revert the copy; change it only through a sync |
-| a patch no longer applies                       | a patch it builds on was deleted or edited   | "Remove a change", step 3                      |
+| `make skills-check` reports                     | Cause                                        | Fix                                                                                       |
+| ----------------------------------------------- | -------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| the committed skill differs from copy + overlay | the skill was edited and no patch records it | `make skills-refresh SKILL=<skill>`                                                       |
+| the committed skill differs from copy + overlay | a patch or `append.md` was edited            | `make skills-generate SKILL=<skill>`                                                      |
+| a skill document is over 40,000 characters      | the generated skill grew past the size limit | move detail to `references/` in the overlay; `scripts/check_skill_size.py` names the file |
+| the copy does not match its lock                | the upstream copy was edited by hand         | revert the copy; change it only through a sync                                            |
+| a patch no longer applies                       | a patch it builds on was deleted or edited   | "Remove a change", step 3                                                                 |

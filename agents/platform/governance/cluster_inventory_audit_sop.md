@@ -38,18 +38,18 @@ other data-cost failure.
 
 ## Step 1: Confirm which cluster you are
 
-Read `USER.md` in your own profile home — the absolute path is in the `Active Hermes profile` line
-of your system prompt, as `<profile home>/USER.md`. It names the project, cluster, and location you
-are pinned to.
+Check the `## Target Cluster Identity` section in your `SOUL.md` (already loaded in your system
+prompt — do not call `read_file` or `search_files` to look up `USER.md`). It names the `project`,
+`cluster`, and `location` you are pinned to.
 
 **Do not derive your cluster from the environment.** `GKE_CLUSTER_NAME`, `GKE_LOCATION`,
 `GKE_PROJECT_ID`, and `GCP_PROJECT_ID` are all set by the pod and name the management cluster the
 harness itself runs on, not yours. An agent that trusts them audits the wrong cluster and reports
 the result as if it were right.
 
-If `USER.md` is missing, incomplete, or does not parse, complete the card with that as the finding
-and audit nothing. Guessing your own identity from a profile name or a cluster list is how a report
-ends up describing somebody else's cluster.
+If the `## Target Cluster Identity` section is missing or incomplete, complete the card with that as
+the finding and audit nothing. Guessing your own identity from a profile name or a cluster list is
+how a report ends up describing somebody else's cluster.
 
 If the audit cannot be done at all for one of the data-cost reasons above, record what failed in
 `gaps`, leave the other fields empty, and complete.
@@ -65,8 +65,8 @@ collection).
 
 Your `KUBECONFIG` is pinned to this cluster, so plain `kubectl` reaches it and nothing else. For
 control-plane settings that `kubectl` cannot see, the GKE MCP tools take a
-`projects/<project>/locations/<location>/clusters/<cluster>` parent — build it from `USER.md`, not
-from the environment.
+`projects/<project>/locations/<location>/clusters/<cluster>` parent — build it from the
+`## Target Cluster Identity` section of `SOUL.md`, not from the environment.
 
 ---
 
