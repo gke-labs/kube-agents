@@ -2047,6 +2047,23 @@ class NoRetryInvitationForAWriteTest(unittest.TestCase):
                         "the refused-retry variant stopped firing; this test would be vacuous")
         self.assertNotIn("--help", decision.message)
 
+    def test_the_help_clause_follows_the_surface_after_a_leading_unknown_flag(self):
+        # With the unknown flag ahead of the surface there are no words before
+        # it; the clause must follow the surface of the retry, which for
+        # `config` has no help escape.
+        for argv, offered in (
+            (["gcloud", "--new-flag", "config", "set", "project", "p"], False),
+            (["gcloud", "--log-http", "config", "set", "project", "p"], False),
+            (["gcloud", "--new-flag", "container", "clusters", "update", "prod"], True),
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertTrue(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD))
+                self.assertEqual(offered, "--help" in decision.message)
+                if offered:
+                    retry = [a for a in argv if not a.startswith("--new")] + ["--help"]
+                    self.assertTrue(evaluate(retry).allowed, f"the offered retry {retry} is refused")
+
     def test_the_unreadable_variant_names_no_positional(self):
         # On a two-word surface the third word is the caller's positional; the
         # variant carries no verb at all, as the flag refusals do not.

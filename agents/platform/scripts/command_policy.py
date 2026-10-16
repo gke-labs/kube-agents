@@ -78,10 +78,12 @@ _ALLOWED = Decision(allowed=True, rule_id="", message="")
 # sanctioned route often exists but differs per flag: `get-credentials` then
 # `--context` is the answer to a refused `--server`, and no fixed sentence
 # could name every such route.
-# The two unreadable-command refusals and the asset-search type refusal carry
-# neither notice, on purpose: re-running with a spelling this module accepts is
-# the legitimate outcome there, and calling that a boundary would stop retries
-# the policy permits.
+# The generic unreadable-command refusal and the asset-search type refusal
+# carry neither notice, on purpose: re-running with a spelling this module
+# accepts is the legitimate outcome there, and calling that a boundary would
+# stop retries the policy permits. The unreadable refusal's refused-retry
+# variant (#2979) carries the action notice, through the read-only refusal it
+# quotes, because there no spelling would be allowed.
 _ACTION_BOUNDARY_NOTICE = (
     "This is a permission boundary, not an error to work around: if this "
     "command would change cluster or cloud state, that change is refused "
@@ -1197,7 +1199,8 @@ def local_render(argv: list[str]) -> bool:
 def _refused_flags(tool: str) -> frozenset[str]:
     """Every flag the policy refuses by name for `tool`, whatever the command."""
     if tool == "kubectl":
-        return frozenset(_IMPERSONATION_FLAGS | _KUBECTL_IDENTITY_FLAGS | _KUBECTL_FILE_WRITE_FLAGS | {"--kuberc"})
+        # --kuberc is already in _KUBECTL_IDENTITY_FLAGS.
+        return frozenset(_IMPERSONATION_FLAGS | _KUBECTL_IDENTITY_FLAGS | _KUBECTL_FILE_WRITE_FLAGS)
     return frozenset(
         _IMPERSONATION_FLAGS | _GCLOUD_IDENTITY_FLAGS | _GCLOUD_FILE_WRITE_FLAGS | {"--flags-file"}
     )
@@ -1316,6 +1319,28 @@ def _flag_refusal(argv: list[str], rule_id: str, reason: str, removal: str, flag
         )
     parts = [reason, removal, _FLAG_BOUNDARY_NOTICE] if removal else [reason, _FLAG_BOUNDARY_NOTICE]
     return Decision(allowed=False, rule_id=rule_id, message=" ".join(parts), offending_flag=flag)
+
+
+def _gcloud_help_escape_for_every_reading(argv: list[str]) -> bool:
+    """Whether `--help` is an allowed retry for every flagless reading of argv.
+
+    The surface comes from the readings, not from the words before the flag:
+    an unknown flag ahead of the surface (`gcloud --new config set …`) leaves
+    no words before it, and the surface that decides the escape follows it. A
+    reading whose surface cannot be read, or names none, offers no escape.
+    """
+    _, index = _gcloud_words_before_unknown_flag(argv)
+    if index >= len(argv):
+        return False
+    readings = [argv[:index] + argv[index + 1:]]
+    if "=" not in argv[index]:
+        readings.append(argv[:index] + argv[index + 2:])
+    for reading in readings:
+        words, _ = _gcloud_words_and_flag(reading)
+        surface = _gcloud_surface(words) if words is not None else None
+        if surface is None or surface in _NO_HELP_ESCAPE_SURFACES:
+            return False
+    return True
 
 
 def _gcloud_unknown_flag_write(argv: list[str]) -> bool | None:
@@ -1485,10 +1510,9 @@ def _evaluate(argv: list[str], readings: bool = True) -> Decision:
             from_readings = _gcloud_unknown_flag_write(argv) if readings else None
             retry_refused = from_readings if from_readings is not None else _gcloud_prefix_write(argv)
         if retry_refused:
-            prefix_words, _ = _gcloud_words_before_unknown_flag(argv)
             help_clause = (
-                "" if _gcloud_surface(prefix_words) in _NO_HELP_ESCAPE_SURFACES
-                else " For its synopsis only, --help with no other flags is allowed."
+                " For its synopsis only, --help with no other flags is allowed."
+                if _gcloud_help_escape_for_every_reading(argv) else ""
             )
             return Decision(
                 allowed=False,
