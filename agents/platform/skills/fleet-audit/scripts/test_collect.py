@@ -76,7 +76,7 @@ def node(name, zone):
 # placement read with. Without them the collector declares the check
 # inapplicable (one zone) and the "every check ran" controls would be false.
 TWO_ZONE_NODES = (node("node-a", "us-central1-a"), node("node-b", "us-central1-b"))
-POD_PLACEMENT_ROWS = "kube-system\tkube-dns-5d-x1\tnode-a\tRunning\t\tReplicaSet\tkube-dns-5d\t\t\n"
+POD_PLACEMENT_ROWS = "0a1b2c3d-0000-4000-8000-000000000001\tkube-system\tkube-dns-5d-x1\tnode-a\tRunning\t\tReplicaSet\tkube-dns-5d\t\t\n"
 
 
 def with_container_resources(dep, resources):
@@ -1804,8 +1804,9 @@ class TestZonalSkew(unittest.TestCase):
         "node-b": {collect._ZONE_KEY: ZONE_B, POOL_KEY: "second-zone-pool"},
     }
     INSUFFICIENT = "0/2 nodes are available: 2 Insufficient cpu. no new claims to deallocate, preemption: 0/2 nodes are available: 2 No preemption victims found for incoming pod."
-    ADVISORY_ZONE = [{"maxSkew": 1, "topologyKey": collect._ZONE_KEY, "whenUnsatisfiable": "ScheduleAnyway"}]
-    BINDING_ZONE = [{"maxSkew": 1, "topologyKey": collect._ZONE_KEY, "whenUnsatisfiable": "DoNotSchedule"}]
+    OWN = {"matchLabels": {"app": "api"}}
+    ADVISORY_ZONE = [{"maxSkew": 1, "topologyKey": collect._ZONE_KEY, "whenUnsatisfiable": "ScheduleAnyway", "labelSelector": OWN}]
+    BINDING_ZONE = [{"maxSkew": 1, "topologyKey": collect._ZONE_KEY, "whenUnsatisfiable": "DoNotSchedule", "labelSelector": OWN}]
     PIN_A = {
         "nodeAffinity": {
             "requiredDuringSchedulingIgnoredDuringExecution": {
@@ -1984,8 +1985,21 @@ class TestZonalSkew(unittest.TestCase):
             hit["excerpt"],
         )
 
+    def test_a_binding_zone_spread_whose_selector_misses_its_own_pods_binds_nothing(self):
+        # A templated or copied constraint selecting `app: api-v1` on pods
+        # labelled `app: api` matches no pod, so the scheduler never had a
+        # skew to enforce; the fix is the selector, cause 6, not a rollout.
+        other = [{"maxSkew": 1, "topologyKey": collect._ZONE_KEY, "whenUnsatisfiable": "DoNotSchedule", "labelSelector": {"matchLabels": {"app": "api-v1"}}}]
+        wl = self.wl(tsc=other)
+        hit = collect.check_zonal_skew(wl, self.ctx(wl, [self.pod("node-a"), self.pod("node-a")]))
+        self.assertIn("cause: no rule binds the zone key (topologySpreadConstraint on topology.kubernetes.io/zone is DoNotSchedule with maxSkew 1 selecting other pods)", hit["excerpt"])
+        unselected = [{"maxSkew": 1, "topologyKey": collect._ZONE_KEY, "whenUnsatisfiable": "DoNotSchedule"}]
+        wl = self.wl(tsc=unselected)
+        hit = collect.check_zonal_skew(wl, self.ctx(wl, [self.pod("node-a"), self.pod("node-a")]))
+        self.assertIn("selecting other pods", hit["excerpt"])
+
     def test_a_binding_hostname_spread_binds_the_wrong_key(self):
-        tsc = [{"maxSkew": 1, "topologyKey": collect._HOSTNAME_KEY, "whenUnsatisfiable": "DoNotSchedule"}]
+        tsc = [{"maxSkew": 1, "topologyKey": collect._HOSTNAME_KEY, "whenUnsatisfiable": "DoNotSchedule", "labelSelector": self.OWN}]
         wl = self.wl(replicas=3, tsc=tsc)
         hit = collect.check_zonal_skew(wl, self.ctx(wl, [self.pod("node-a")] * 3))
         self.assertIn("cause: no rule binds the zone key (topologySpreadConstraint on kubernetes.io/hostname is DoNotSchedule", hit["excerpt"])
@@ -1996,7 +2010,7 @@ class TestZonalSkew(unittest.TestCase):
         self.assertIn("cause: no spreading declared (no-spread's finding on this object)", hit["excerpt"])
 
     def test_a_binding_zone_spread_is_permitted_only_up_to_its_max_skew(self):
-        loose = [{"maxSkew": 3, "topologyKey": collect._ZONE_KEY, "whenUnsatisfiable": "DoNotSchedule"}]
+        loose = [{"maxSkew": 3, "topologyKey": collect._ZONE_KEY, "whenUnsatisfiable": "DoNotSchedule", "labelSelector": self.OWN}]
         wl = self.wl(replicas=3, tsc=loose)
         hit = collect.check_zonal_skew(wl, self.ctx(wl, [self.pod("node-a")] * 3))
         self.assertIn("cause: the declared constraints permit it (", hit["excerpt"])
@@ -2092,11 +2106,12 @@ class TestPodPlacementRead(unittest.TestCase):
     """The placement read's parser, its owner join, the collector's gate, and
     the threshold flag's floor."""
 
-    ROW = "ns1\tapi-7d9f-a\tnode-a\tRunning\t\tReplicaSet\tapi-7d9f\t\t"
-    PENDING = "ns1\tapi-7d9f-x\t\tPending\t\tReplicaSet\tapi-7d9f\tUnschedulable\t0/2 nodes are available: 2 Insufficient cpu."
-    DELETING = "ns1\tapi-7d9f-b\tnode-b\tRunning\t2026-10-16T01:00:00Z\tReplicaSet\tapi-7d9f\t\t"
+    U = "0a1b2c3d-0000-4000-8000-00000000000"
+    ROW = U + "1\tns1\tapi-7d9f-a\tnode-a\tRunning\t\tReplicaSet\tapi-7d9f\t\t"
+    PENDING = U + "2\tns1\tapi-7d9f-x\t\tPending\t\tReplicaSet\tapi-7d9f\tUnschedulable\t0/2 nodes are available: 2 Insufficient cpu."
+    DELETING = U + "3\tns1\tapi-7d9f-b\tnode-b\tRunning\t2026-10-16T01:00:00Z\tReplicaSet\tapi-7d9f\t\t"
 
-    def test_nine_fields_parse_and_the_message_keeps_its_own_text(self):
+    def test_ten_fields_parse_and_the_message_keeps_its_own_text(self):
         rows = collect.parse_pod_placements("\n".join([self.ROW, self.PENDING, self.DELETING]) + "\n")
         self.assertEqual([r["phase"] for r in rows], ["Running", "Pending", "Running"])
         self.assertEqual(rows[1]["scheduled_message"], "0/2 nodes are available: 2 Insufficient cpu.")
@@ -2104,17 +2119,27 @@ class TestPodPlacementRead(unittest.TestCase):
         self.assertEqual(rows[0]["node"], "node-a")
 
     def test_a_short_row_or_empty_output_fails_the_gate(self):
-        self.assertIsNone(collect.parse_pod_placements("ns1\tapi\tnode-a\tRunning\n"))
+        self.assertIsNone(collect.parse_pod_placements(self.U + "1\tns1\tapi\tnode-a\tRunning\n"))
         self.assertIsNone(collect.parse_pod_placements(""))
         self.assertIsNone(collect.parse_pod_placements(json.dumps({"items": []})))
 
+    def test_a_message_written_across_lines_stays_with_its_row(self):
+        # A second scheduler may write a multi-line condition message; the
+        # continuation has no uid, so it joins the row above instead of
+        # failing the whole cluster's read.
+        text = self.PENDING + "\nsecond line of the same message\n" + self.ROW + "\n"
+        rows = collect.parse_pod_placements(text)
+        self.assertEqual([r["name"] for r in rows], ["api-7d9f-x", "api-7d9f-a"])
+        self.assertEqual(rows[0]["scheduled_message"], "0/2 nodes are available: 2 Insufficient cpu.\nsecond line of the same message")
+        self.assertTrue(rows[0]["scheduled_message"].startswith("0/2 nodes"))
+
     def test_pods_join_their_owner_only_when_the_dump_holds_it(self):
         rows = collect.parse_pod_placements(
-            "ns1\tapi-7d9f-a\tnode-a\tRunning\t\tReplicaSet\tapi-7d9f\t\t\n"
-            "ns1\tstore-0\tnode-a\tRunning\t\tStatefulSet\tstore\t\t\n"
-            "ns1\tlone-7d9f-a\tnode-a\tRunning\t\tReplicaSet\tlone-7d9f\t\t\n"
-            "ns1\tbare\tnode-a\tRunning\t\tReplicaSet\tbare\t\t\n"
-            "ns1\tjob-a\tnode-a\tRunning\t\tJob\tjob\t\t\n"
+            self.U + "1\tns1\tapi-7d9f-a\tnode-a\tRunning\t\tReplicaSet\tapi-7d9f\t\t\n"
+            + self.U + "2\tns1\tstore-0\tnode-a\tRunning\t\tStatefulSet\tstore\t\t\n"
+            + self.U + "3\tns1\tlone-7d9f-a\tnode-a\tRunning\t\tReplicaSet\tlone-7d9f\t\t\n"
+            + self.U + "4\tns1\tbare\tnode-a\tRunning\t\tReplicaSet\tbare\t\t\n"
+            + self.U + "5\tns1\tjob-a\tnode-a\tRunning\t\tJob\tjob\t\t\n"
         )
         keys = {("ns1", "Deployment", "api"), ("ns1", "StatefulSet", "store"), ("ns1", "Deployment", "lone-7d9f-a")}
         grouped = collect.placements_by_workload(rows, keys)
@@ -4721,8 +4746,8 @@ class TestCollectCluster(unittest.TestCase):
         # else: §3.25 fires, and its candidate alone carries the marker that
         # makes `finish` keep `draft`'s `zonal-skew on Deployment/api` title.
         rows = POD_PLACEMENT_ROWS + (
-            "default\tapi-7d9f-a\tnode-a\tRunning\t\tReplicaSet\tapi-7d9f\t\t\n"
-            "default\tapi-7d9f-b\tnode-a\tRunning\t\tReplicaSet\tapi-7d9f\t\t\n"
+            "0a1b2c3d-0000-4000-8000-000000000002\tdefault\tapi-7d9f-a\tnode-a\tRunning\t\tReplicaSet\tapi-7d9f\t\t\n"
+            "0a1b2c3d-0000-4000-8000-000000000003\tdefault\tapi-7d9f-b\tnode-a\tRunning\t\tReplicaSet\tapi-7d9f\t\t\n"
         )
         result, _ = self.collect([deployment("api", **{"spec.replicas": 2})], pod_rows=rows)
         by_slug = {c["check"]: c for c in result["candidates"]}
