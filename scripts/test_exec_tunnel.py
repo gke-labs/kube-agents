@@ -256,16 +256,23 @@ class ExecTunnelTest(unittest.TestCase):
         self.assertIsNotNone(proc.poll(), "reap left the child unwaited")
 
     def test_ready_timeout_does_not_hang_on_a_listener_that_never_answers(self):
-        # A remote port nothing is bound to: the remote half raises before it
+        # A remote port nothing listens on: the remote half raises before it
         # writes READY, so _spawn must reject rather than block the handler.
+        # The probe socket stays bound, not listening, for the whole test: a
+        # bound port refuses a connect at once and no other process can take
+        # it. Closing it here would free the port for a test file running
+        # alongside in the sweep, whose listener would accept the remote half,
+        # let READY through, and never answer the GET below.
         dead = socket.socket()
         dead.bind(("127.0.0.1", 0))
+        self.addCleanup(dead.close)
         dead_port = dead.getsockname()[1]
-        dead.close()
 
         port = self._tunnel(remote_port=dead_port, ready_timeout=5.0, stderr=self._temp_sink())
         started = time.time()
-        with socket.create_connection(("127.0.0.1", port), timeout=10) as client:
+        # Two full ready_timeout waits on a slow runner must not outlast the
+        # client's recv; the assertion at the end bounds the test at 30 s.
+        with socket.create_connection(("127.0.0.1", port), timeout=30) as client:
             client.sendall(b"GET / HTTP/1.0\r\n\r\n")
             try:
                 # Clean close or reset both mean "no bytes and not hung", which
