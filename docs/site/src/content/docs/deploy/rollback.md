@@ -86,7 +86,7 @@ The scripts of `0.7.0` and earlier do not take the flag.
 Where `N-1`'s script takes `--allow-breaking-downgrade`, it reads the commits between the tag the
 install runs and `N-1`, and stops when one of them is marked as a breaking change: a `type!:`
 subject or a `BREAKING CHANGE:` footer. It names each such commit. Read what each one changed, then
-add the flag to the operator and harness commands to roll back anyway. The check is in the script
+add the flag to each `upgrade.sh` command, full mode included, to roll back anyway. The check is in the script
 that runs, which in a rollback is `N-1`'s, so a release from before the flag rolls back without it.
 
 `--dry-run` prints the target and the image references the step would apply, from the
@@ -310,8 +310,8 @@ revision.
   written from memory re-renders the `PlatformAgent` with whatever it forgets.
 - **A commit between `N` and `N-1` is marked as a breaking change.** The script names each one, as
   a short SHA and its subject, after `kubectl` has been pointed at the cluster and before the
-  Secret backfills. It reads the history from the checkout when that has both commits, and
-  otherwise from GitHub; when a rollback between two release tags cannot read it, the run also
+  Secret backfills. It reads the history from the checkout when that is a full (not shallow) clone
+  with both commits, and otherwise from GitHub; when a rollback between two release tags cannot read it, the run also
   stops. Read the named commits, then re-run with `--allow-breaking-downgrade`. `--plan` reports
   the same commits as a warning and does not stop.
 - **The memory store cannot be checked and the configuration does not name one.** A rollback runs

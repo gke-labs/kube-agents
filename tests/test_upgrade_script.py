@@ -3805,8 +3805,8 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
 
 
 class DowngradeCheckTest(unittest.TestCase):
-    """check_downgrade: a move to an older tag is refused across a commit marked
-    as a breaking change, naming it, and completes across a clean range."""
+    """check_downgrade: a move that leaves behind a commit marked as a breaking
+    change is refused, naming it, and completes when nothing it leaves is marked."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="downgrade-check-")
@@ -3824,6 +3824,10 @@ class DowngradeCheckTest(unittest.TestCase):
         self._git("tag", "0.3.0")
         self._commit("footer", "fix: rename a value", "Some prose.\n\nBREAKING CHANGE: the value is renamed")
         self._git("tag", "0.4.0")
+        # A GA tag as releases cut it: a stamp commit on a release line off main.
+        self._git("switch", "-q", "-c", "release/0.2", self.sha["clean"])
+        self._commit("stamp", "chore(release): stamp release version 0.2.1")
+        self._git("tag", "0.2.1")
         self._git("switch", "-q", "--orphan", "unrelated")
         self._commit("unrelated", "feat: elsewhere")
         self._git("switch", "-q", "main")
@@ -3864,7 +3868,7 @@ class DowngradeCheckTest(unittest.TestCase):
     def test_a_clean_rollback_continues(self):
         proc, out = self._check("0.1.0", "0.2.0")
         self.assertEqual(proc.returncode, 0, out)
-        self.assertIn("no commit between them is marked as a breaking change", out)
+        self.assertIn("no commit it leaves behind is marked as a breaking change", out)
         self.assertIn("CONTINUED", out)
 
     def test_a_bang_subject_is_refused_and_named(self):
@@ -3883,7 +3887,7 @@ class DowngradeCheckTest(unittest.TestCase):
     def test_every_blocking_commit_in_a_longer_range_is_named(self):
         proc, out = self._check("0.1.0", "0.4.0")
         self.assertEqual(proc.returncode, 1, out)
-        self.assertIn("crosses 2 commit(s)", out)
+        self.assertIn("leaves behind 2 commit(s)", out)
         self.assertIn(self._short("bang"), out)
         self.assertIn(self._short("footer"), out)
         self.assertNotIn("mend a thing", out)
@@ -3898,14 +3902,14 @@ class DowngradeCheckTest(unittest.TestCase):
         proc, out = self._check("0.2.0", "0.3.0", plan=True)
         self.assertEqual(proc.returncode, 0, out)
         self.assertIn(self._short("bang"), out)
-        self.assertIn("A real run refuses this rollback", out)
+        self.assertIn("A real run refuses this move", out)
 
     def test_a_forward_move_and_the_same_tag_say_nothing(self):
         for target, installed in (("0.4.0", "0.1.0"), ("0.3.0", "0.3.0"), ("0.10.0", "0.9.0")):
             with self.subTest(target=target, installed=installed):
                 proc, out = self._check(target, installed)
                 self.assertEqual(proc.returncode, 0, out)
-                self.assertNotIn("Rolling back", out)
+                self.assertNotIn("Moving from", out)
 
     def test_a_commit_sha_older_than_the_installed_one_is_a_rollback(self):
         proc, out = self._check(self.sha["clean"], self.sha["footer"])
@@ -3913,15 +3917,34 @@ class DowngradeCheckTest(unittest.TestCase):
         self.assertIn(self._short("bang"), out)
         self.assertIn(self._short("footer"), out)
 
+    def test_a_commit_build_moved_to_a_ga_tag_on_its_release_line_is_checked(self):
+        # The release line forks from main before the marked commits, so the
+        # tag is not an ancestor of the installed commit, and they are left behind.
+        proc, out = self._check("0.2.1", self.sha["footer"])
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(self._short("bang"), out)
+        self.assertIn(self._short("footer"), out)
+        self.assertNotIn("stamp release version", out)
+
+    def test_a_ga_tag_named_by_its_stamp_commit_is_checked(self):
+        proc, out = self._check(self.sha["stamp"], "0.4.0")
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(self._short("bang"), out)
+
+    def test_a_commit_build_moved_forward_to_a_ga_tag_that_contains_it_says_nothing(self):
+        proc, out = self._check("0.2.1", self.sha["clean"])
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertNotIn("Moving from", out)
+
     def test_a_release_tag_and_its_own_commit_are_the_same_install(self):
         proc, out = self._check("0.3.0", self.sha["bang"])
         self.assertEqual(proc.returncode, 0, out)
-        self.assertNotIn("Rolling back", out)
+        self.assertNotIn("Moving from", out)
 
     def test_an_unrelated_commit_is_not_a_rollback(self):
         proc, out = self._check(self.sha["unrelated"], self.sha["footer"])
         self.assertEqual(proc.returncode, 0, out)
-        self.assertNotIn("Rolling back", out)
+        self.assertNotIn("Moving from", out)
 
     def test_sources_without_history_read_it_from_the_repository_and_clean_up(self):
         proc, out = self._check("0.2.0", "0.3.0", repo_dir=self.no_history)

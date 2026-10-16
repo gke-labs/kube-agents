@@ -344,7 +344,7 @@ Options:
                            between the installed tag and --image-tag is marked
                            as a breaking change. Without it, such a rollback is
                            refused and the refusal names each commit.
-  --help, -h              Show this help message
+  --help, -h               Show this help message
 
 Examples:
   # Perform full atomic upgrade of harness, operator, and skills
@@ -1248,10 +1248,14 @@ breaking_commits_between() {
   done <<<"$log"
 }
 
-# Refuses a move to an older release across a commit marked as a breaking
-# change, naming each one. Returns 0 to let the run continue: the move is not a
-# downgrade, the range is clean, --allow-breaking-downgrade was given, or this
-# is a --plan, which reports the same finding as a warning.
+# Refuses a move that leaves behind a commit marked as a breaking change, naming
+# each one. A move is forward only when the installed commit is an ancestor of
+# the target; any other move between related commits leaves behind what the
+# target lacks. Ancestry alone decides it for commit builds, because a GA tag
+# sits on its release line and is never an ancestor of a main commit. Returns
+# 0 to let the run continue: the move leaves nothing behind, nothing it leaves
+# is marked, --allow-breaking-downgrade was given, or this is a --plan, which
+# reports the same finding as a warning.
 check_downgrade() {
   local repo_dir="$1" target="$2" installed="$3"
   local known_downgrade="false" history_dir="" target_commit="" installed_commit="" blocking="" count="" line=""
@@ -1281,8 +1285,8 @@ check_downgrade() {
   target_commit="$(git -C "$history_dir" rev-parse "${target}^{commit}")"
   installed_commit="$(git -C "$history_dir" rev-parse "${installed}^{commit}")"
   [ "$target_commit" != "$installed_commit" ] || return 0
-  if [ "$known_downgrade" != "true" ] &&
-    ! git -C "$history_dir" merge-base --is-ancestor "$target_commit" "$installed_commit" 2>/dev/null; then
+  if git -C "$history_dir" merge-base --is-ancestor "$installed_commit" "$target_commit" 2>/dev/null ||
+    ! git -C "$history_dir" merge-base "$installed_commit" "$target_commit" >/dev/null 2>&1; then
     return 0
   fi
 
@@ -1291,14 +1295,14 @@ check_downgrade() {
     exit 1
   fi
   if [ -z "$blocking" ]; then
-    print_success "Rolling back from ${installed} to ${target}: no commit between them is marked as a breaking change."
+    print_success "Moving from ${installed} to ${target}: no commit it leaves behind is marked as a breaking change."
     return 0
   fi
   count="$(printf '%s\n' "$blocking" | wc -l | tr -d '[:space:]')"
   if [ "$PARAM_ALLOW_BREAKING_DOWNGRADE" = "true" ] || [ "$PARAM_PLAN" = "true" ]; then
-    print_warning "Rolling back from ${installed} to ${target} crosses ${count} commit(s) marked as a breaking change:"
+    print_warning "Moving from ${installed} to ${target} leaves behind ${count} commit(s) marked as a breaking change:"
   else
-    print_error "Rolling back from ${installed} to ${target} crosses ${count} commit(s) marked as a breaking change:"
+    print_error "Moving from ${installed} to ${target} leaves behind ${count} commit(s) marked as a breaking change:"
   fi
   while IFS= read -r line; do
     echo "      ${line}"
@@ -1308,10 +1312,10 @@ check_downgrade() {
     return 0
   fi
   if [ "$PARAM_PLAN" = "true" ]; then
-    print_info "A real run refuses this rollback unless it is given --allow-breaking-downgrade."
+    print_info "A real run refuses this move unless it is given --allow-breaking-downgrade."
     return 0
   fi
-  print_info "Each can leave state on the cluster that ${target} cannot read. Read them, then re-run with --allow-breaking-downgrade to roll back anyway."
+  print_info "Each can leave state on the cluster that ${target} cannot read. Read them, then re-run with --allow-breaking-downgrade to move anyway."
   exit 1
 }
 

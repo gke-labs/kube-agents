@@ -389,9 +389,10 @@ The run also writes a machine-readable report to `/tmp/kube-agents-upgrade-repor
 ## When an upgrade is refused
 
 Every one of these stops the run before any of the new release is applied. The first four are
-settled before the run touches the cluster at all. The last five need the cluster: they are settled
-after `kubectl` has been pointed at it, and after a real run's pre-flight Secret backfills — a plan
-skips those — but still before any CRD, chart or Terraform change of the new release.
+settled before the run touches the cluster at all. The last six need the cluster: they are settled
+after `kubectl` has been pointed at it, and except for the breaking-change check, after a real run's
+pre-flight Secret backfills — a plan skips those — but still before any CRD, chart or Terraform
+change of the new release.
 
 - **The sources do not match the release.** The checkout's `HEAD` is not the release's commit, the
   tree has uncommitted changes, or an unpacked tree names a release other than the one asked for —
@@ -412,6 +413,12 @@ skips those — but still before any CRD, chart or Terraform change of the new r
   [Recovering `install.env`](#recovering-installenv).
 - **`GITHUB_APP_ID` is not a number.** The token minter needs the GitHub App's numeric ID, the "App
   ID" on the App's General settings page, not its name or slug. `--dry-run` refuses it too.
+- **The move leaves behind a commit marked as a breaking change.** When the installed commit is not
+  an ancestor of the target — a rollback to an older release, or a commit build moved to a release
+  that lacks some of its commits — the run reads the commits the target lacks. It stops before the
+  Secret backfills if any has a `type!:` subject or a `BREAKING CHANGE:` footer, and names each one.
+  Read them, then re-run with `--allow-breaking-downgrade`, in any mode. `--plan` warns instead. See
+  [Rolling back a release](/kube-agents/deploy/rollback/).
 - **No Helm release.** The target namespace has no `kube-agents` release to upgrade.
 - **The memory store cannot be checked and nothing named one.** When the configuration records no
   `MEMORY`, the upgrade asks the cluster whether it runs the Hindsight memory store, so that a store
