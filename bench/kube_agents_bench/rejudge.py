@@ -54,7 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from kube_agents_bench.gate import _judged_metrics
-from kube_agents_bench.scoring import INFRA_FAILURE_MARKER
+from kube_agents_bench.scoring import DELEGATION_CEILING_MARKER, INFRA_FAILURE_MARKER
 
 REJUDGED_KEY = "rejudged"
 JUDGE_ERRORS_KEY = "judge_errors"
@@ -101,9 +101,13 @@ def _default_judge() -> Any:
 
 
 def _describe(exc: BaseException) -> dict[str, str]:
+    # Bounded by what it has seen: the interpreter keeps __context__ acyclic
+    # but never checks an explicit __cause__, so a third-party chain can loop.
     root = exc
-    while root.__cause__ is not None or root.__context__ is not None:
-        root = root.__cause__ or root.__context__
+    seen = {id(exc)}
+    while (nxt := root.__cause__ or root.__context__) is not None and id(nxt) not in seen:
+        seen.add(id(nxt))
+        root = nxt
     return {
         "type": f"{type(exc).__module__}.{type(exc).__qualname__}",
         "root_type": f"{type(root).__module__}.{type(root).__qualname__}",
@@ -113,7 +117,7 @@ def _describe(exc: BaseException) -> dict[str, str]:
 
 def is_infra(record: dict[str, Any]) -> bool:
     error = record.get("error") or record.get("errors")
-    return error is not None and INFRA_FAILURE_MARKER in str(error)
+    return error is not None and any(m in str(error) for m in (INFRA_FAILURE_MARKER, DELEGATION_CEILING_MARKER))
 
 
 def missing_metrics(record: dict[str, Any], metrics: tuple[str, ...]) -> list[str]:

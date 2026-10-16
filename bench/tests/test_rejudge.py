@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 from kube_agents_bench import rejudge
-from kube_agents_bench.scoring import INFRA_FAILURE_MARKER
+from kube_agents_bench.scoring import DELEGATION_CEILING_MARKER, INFRA_FAILURE_MARKER
 
 GATED = ("OutcomeValidity",)
 
@@ -98,10 +98,25 @@ def test_a_second_failure_records_the_exception_and_its_root():
     assert "still missing after a re-judge" in lines[0]
 
 
-def test_an_infrastructure_record_is_left_alone():
-    record = _record(errors=[f"{INFRA_FAILURE_MARKER}: transport exhausted"])
+@pytest.mark.parametrize("marker", [INFRA_FAILURE_MARKER, DELEGATION_CEILING_MARKER])
+def test_a_record_the_scorer_sets_aside_is_left_alone(marker):
+    record = _record(errors=[f"{marker}: set aside"])
     assert rejudge.rejudge_record(record, GATED, _no_judge, {"OutcomeValidity": _scored(1.0)}) == []
     assert "OutcomeValidity" not in record["scores"]
+
+
+def test_a_cause_cycle_still_ends_with_a_description():
+    first, second = RuntimeError("outer"), ValueError("inner")
+    first.__cause__, second.__cause__ = second, first
+
+    def looping(record, judge):
+        raise first
+
+    record = _record()
+    rejudge.rejudge_record(record, GATED, object, {"OutcomeValidity": looping})
+    error = record[rejudge.JUDGE_ERRORS_KEY]["OutcomeValidity"]
+    assert error["type"] == "builtins.RuntimeError"
+    assert error["root_type"] == "builtins.ValueError"
 
 
 def test_a_record_with_no_scores_is_left_alone():
