@@ -56,6 +56,8 @@ BRIDGE_CARRIERS = frozenset({"progress", "terminal"})
 CHAT_ID = "a2a-ctx-1"
 THREAD = "slack:C1/1.2"
 HEADER = "@platform "
+#: What a clipped headline ends with, ``slack_presenter.ELLIPSIS``.
+ELLIPSIS = "…"
 
 
 class _ChatAdapter:
@@ -288,6 +290,23 @@ class SharedCasesTest(unittest.TestCase):
         for case in cases:
             with self.subTest(case=case["name"]):
                 self.assertEqual(_as_case(self.run_case(case), case["expected"]), case["expected"])
+
+
+class QuestionDrawnOnceTest(unittest.TestCase):
+    """A question case's headline is not repeated in its detail, under next or today."""
+
+    def test_every_question_case(self):
+        cases = [c for c in chat_cases.load() if "reason" in c["input"]]
+        self.assertGreater(len(cases), 0)
+        for case in cases:
+            reason = case["input"]["reason"]
+            with self.subTest(case=case["name"]):
+                chat = chat_message.needs_you_message(reason)
+                shown = chat["headline"].removesuffix(ELLIPSIS)
+                self.assertNotIn(shown, chat.get("detail", ""))
+                blocks, _text = chat_message._moments.needs_you(reason)
+                below = [b["elements"][0]["text"] for b in blocks if b["type"] == "context"]
+                self.assertFalse(any(shown in line for line in below), below)
 
 
 class PlanDrawnAlikeTest(unittest.TestCase):

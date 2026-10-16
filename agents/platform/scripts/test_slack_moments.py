@@ -589,11 +589,33 @@ class NeedsYouTest(unittest.TestCase):
         blocks, _ = m.needs_you("Which cluster?\n- seeded-a\n- seeded-b")
         self.assertEqual([b for b in blocks if b["type"] == "context" and b.get("block_id") != p.WAITING_BLOCK_ID], [])
 
-    def test_a_long_first_line_is_repeated_whole_below_the_clipped_headline(self):
+    def test_a_long_first_line_shows_its_question_once(self):
+        question = "Which GitOps repository should I open the pull request against to revert the ConfigMap change?"
+        rest = "The GitOps state ConfigMap currently lists no managed repositories, so I cannot tell which one."
+        blocks, text = m.needs_you(f"{question} {rest}")
+        self.assertEqual(blocks[0]["text"]["text"], f"*{question}*")
+        self.assertEqual(_contexts(blocks), [rest, m.WAITING])
+        self.assertEqual(text.count(question), 1)
+
+    def test_a_long_first_sentence_is_cut_at_a_clause_and_the_rest_opens_the_detail(self):
+        head = "Should I roll back the payments-api deployment in the prod-east cluster to its previous revision"
+        tail = "or leave it running while the on-call engineer reads the crash loop's logs and the recent change history?"
+        blocks, _ = m.needs_you(f"{head}, {tail}")
+        self.assertEqual(blocks[0]["text"]["text"], f"*{head}.*")
+        self.assertEqual(_contexts(blocks)[0], tail[:1].upper() + tail[1:])
+
+    def test_a_long_first_line_with_no_place_to_cut_resumes_below_the_clipped_headline(self):
         first = "why " * 60
         blocks, _ = m.needs_you(first)
-        self.assertLessEqual(len(blocks[0]["text"]["text"]), p.HEADLINE_MAX + 2)
-        self.assertEqual(_contexts(blocks)[0], first.strip())
+        headline, detail = blocks[0]["text"]["text"].strip("*"), _contexts(blocks)[0]
+        self.assertLessEqual(len(headline), p.HEADLINE_MAX)
+        self.assertTrue(headline.endswith(p.ELLIPSIS) and detail.startswith(p.ELLIPSIS))
+        self.assertEqual(headline[: -len(p.ELLIPSIS)] + " " + detail[len(p.ELLIPSIS) :], first.strip())
+
+    def test_a_long_first_line_whose_markup_a_clip_could_split_stays_whole_below(self):
+        first = "**why** " * 40
+        blocks, _ = m.needs_you(first)
+        self.assertEqual(_contexts(blocks)[0].count("why"), first.count("why"))
 
     def test_detail_is_clipped(self):
         blocks, _ = m.needs_you("Question\n" + "y" * (m.DETAIL_MAX * 2))

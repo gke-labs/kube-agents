@@ -16,7 +16,9 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
   …", "`dependabot[bot]` opened …") is not announced as ours.
 * A question the work is waiting on (:func:`needs_you`): the worker's question
   in bold (plain, when bold would cost it a ``*`` or a ``__name__``), the rest
-  of its reason below it, a choice button for each option
+  of its reason below it (of a first line too long for the headline, its first
+  sentence is the headline and the rest opens the detail, so nothing shows
+  twice), a choice button for each option
   the reason ends with, and a "waiting on you" line. A click is the clicker's
   answer in the thread (``gateway/slack_ux_clicks.py``), the same path as
   typing it. The options are buttons only when there are two to five, each
@@ -589,13 +591,40 @@ def _question(reason: str, buttons: bool) -> tuple[str, list[str], list[str]]:
     )
     if not usable:
         start, options = len(lines), []
-    first = lines[0].strip()
-    # A clipped headline keeps its whole line below it too, measured as shown, and so
-    # does one with a link: the headline shows only the label, the line below the url.
-    below = 0 if len(_headline_text(first)) > _presenter.HEADLINE_MAX or _presenter.MD_LINK.search(first) else 1
+    head, overflow = _headline_cut(lines[0].strip())
     # Linked options likewise stay in the detail: their buttons show only the label.
     end = len(lines) if any(_presenter.MD_LINK.search(line) for line in lines[start:]) else start
-    return first, [*before, *lines[below:end]], options
+    # A headline with a link keeps its whole line below it: the headline shows only the
+    # label, the line below the url. So does one :func:`_headline_cut` could not cut.
+    if overflow is None or _presenter.MD_LINK.search(head):
+        return head, [*before, *lines[:end]], options
+    return head, [*before, *([overflow] if overflow else []), *lines[1:end]], options
+
+
+def _headline_cut(line: str) -> tuple[str, str | None]:
+    """``(headline, overflow)`` for a question's first line, so no word of it shows twice.
+
+    A line that fits the headline, measured as shown, is the headline, with no
+    overflow. A longer one gives its first sentence, cut at a clause when that is
+    too long as well (``slack_presenter.split_lead``), and the rest of the line
+    as the overflow, which opens the detail. A sentence with no clause to cut at
+    is clipped at a word, and the overflow resumes after the ellipsis; one whose
+    markup a clip could split is left whole, its overflow None, and the whole
+    line stays below the clipped headline.
+    """
+    if len(_headline_text(line)) <= _presenter.HEADLINE_MAX:
+        return line, ""
+    sentence, body = _presenter.split_lead(line)
+    overflow = "\n".join(body)
+    if sentence and len(_headline_text(sentence)) <= _presenter.HEADLINE_MAX:
+        return sentence, overflow
+    if sentence and _headline_text(sentence) == sentence:
+        title = _presenter._clip(sentence, _presenter.HEADLINE_MAX)
+        shown = title[: -len(_presenter.ELLIPSIS)]
+        if sentence.startswith(shown):
+            resumed = _presenter.ELLIPSIS + sentence[len(shown) :].lstrip()
+            return title, " ".join(part for part in (resumed, overflow) if part)
+    return line, None
 
 
 def _detail(lines: Sequence[str]) -> str:
