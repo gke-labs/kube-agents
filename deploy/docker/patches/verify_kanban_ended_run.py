@@ -212,7 +212,11 @@ try:
           f"now waits on {gate_parent}" in err and "kanban_comment" in err, err)
     check("not with upstream's stale-run reason", "stale run" not in err, err)
     check("the refusal names a dependency block as the exit", 'kanban_block(kind="dependency")' in err, err)
+    # The dispatcher runs the card's worker under its assignee's profile,
+    # which kanban_comment records as the author.
+    os.environ["HERMES_PROFILE"] = "platform"
     saved = json.loads(kt._handle_comment({"task_id": linked, "body": ker.SAVED_RESULT_LEAD + "\nweb-7 is fine: no errors in the last hour"}))
+    os.environ.pop("HERMES_PROFILE", None)
     check("the worker saves its result as a comment", saved.get("ok"), str(saved))
     blocked = json.loads(kt._handle_block({"reason": f"waits on {gate_parent}", "kind": "dependency"}))
     check("the worker's dependency block goes through", blocked.get("ok"), str(blocked))
