@@ -5619,8 +5619,13 @@ run_menu_system() {
             fi
             prompt_read "Allowed Google Chat User Emails (comma-separated, empty allows all users)" \
               allowed_users "$allowed_users" false "$gchat_users_hint"
-            prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
-              google_chat_home_channel "$google_chat_home_channel"
+            if [ "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" = "next" ]; then
+              prompt_read "Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)" \
+                google_chat_home_channel "$google_chat_home_channel"
+            else
+              prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
+                google_chat_home_channel "$google_chat_home_channel"
+            fi
             ;;
           2) slack_enabled="true" ;;
           3) google_chat_enabled="false"; slack_enabled="false" ;;
@@ -5709,6 +5714,9 @@ run_menu_system() {
         export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
         export PARAM_PERMISSION_SET="$permission_set" PARAM_ENABLE_GVISOR="$enable_gvisor"
         export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"
+        # The chat screen's home channel, which the home-channel warning below
+        # reads; save_env_var exports it again when it writes install.env.
+        export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"
         # Before anything is saved: this apply renders PLATFORM_AGENT_MODE
         # from install.env, and if Slack moves to the A2A gateway under next,
         # the settings it cannot use are refused (and again after the
@@ -5925,6 +5933,7 @@ main() {
       exit 1
     fi
     run_menu_system
+    print_next_home_channel_unset_summary
     exit 0
   fi
 
@@ -7694,6 +7703,7 @@ main() {
         print_warning "Provisioning paused by user. Install configuration: $INSTALL_ENV_FILE"
         print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
         write_json_report "PAUSED"
+        print_next_home_channel_unset_summary flags
         exit 0
         ;;
     esac
@@ -7709,6 +7719,7 @@ main() {
     record_flags_into_install_env
     print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
     write_json_report "GENERATE_ONLY_SUCCESS"
+    print_next_home_channel_unset_summary flags
     exit 0
   fi
 

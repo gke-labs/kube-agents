@@ -5855,6 +5855,36 @@ class PlatformAgentModeTest(unittest.TestCase):
         )
 
 
+class NextHomeChannelUnsetWiringTest(unittest.TestCase):
+    """Where install.sh calls the #3320 home-channel warning and its closing
+    summary. The functions are tested in test_installer_common.py; these pin
+    the call sites a review found wrong: the Day-2 menu read the home channel
+    before exporting the one just typed, and two exits skipped the summary."""
+
+    def setUp(self):
+        self.text = _INSTALL_SH.read_text()
+
+    def test_the_menu_exports_its_home_channel_before_warning(self):
+        export = self.text.index('export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"')
+        warn = self.text.index("warn_next_home_channel_unset_from_env\n", export)
+        refuse = self.text.index("refuse_next_slack_gateway_settings_from_env || return 1")
+        self.assertLess(export, refuse)
+        self.assertLess(refuse, warn)
+        self.assertLess(warn - refuse, 200, "the menu's warning moved away from its Slack check")
+
+    def test_every_exit_that_warned_ends_on_the_summary(self):
+        for report in ('write_json_report "DRY_RUN_SUCCESS"', 'write_json_report "PAUSED"',
+                       'write_json_report "GENERATE_ONLY_SUCCESS"'):
+            with self.subTest(exit=report):
+                at = self.text.index(report)
+                tail = self.text[at:self.text.index("exit 0", at)]
+                self.assertIn("print_next_home_channel_unset_summary flags", tail)
+        menu = self.text.index("    run_menu_system\n")
+        self.assertIn("print_next_home_channel_unset_summary", self.text[menu:self.text.index("exit 0", menu)])
+        main_end = self.text.index('\nif [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then')
+        self.assertIn("  print_next_home_channel_unset_summary flags\n}\n", self.text[main_end - 400:main_end + 1])
+
+
 class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
     """#2812 on install.sh. A run whose mode is next (--mode=next, or
     PLATFORM_AGENT_MODE=next in install.env), with Slack on and Chat off,
@@ -11460,7 +11490,7 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
                       "the menu refusal does not name the pool flags it refuses")
         dispatch = self.text.index('if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then')
         refusal = self.text.index("--menu takes no --scope-* flag")
-        run = self.text.index("    run_menu_system\n    exit 0")
+        run = self.text.index("    run_menu_system\n    print_next_home_channel_unset_summary\n    exit 0")
         self.assertLess(dispatch, refusal)
         self.assertLess(refusal, run)
 
