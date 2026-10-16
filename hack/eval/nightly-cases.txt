@@ -404,6 +404,12 @@
 # lists on 2026-10-15, after the rebase onto `02f251ff`: seventy-nine cases
 # (237 units) here, of a ninety-three-case, 279-unit matrix, the paragraphs
 # above included.
+#
+# 2026-10-14 adds scale-request-proposes-pr: one case, three units, deployer:
+# noop at the 200s default, about 10 serial minutes, outside the infra-lock
+# chain. It sits below, after upgrades-audit-reports-upgrade-blocked, and
+# makes this file eighty-two cases (246 units) of a ninety-six-case,
+# 288-unit matrix, counted from the lists.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -980,6 +986,16 @@
 # the ledger objectives need an install with a GitHub ledger (a token minter
 # and a registered GitOps repository), which the eval fleet's has.
 ./tasks/upgrades-audit-reports-upgrade-blocked/task.yaml
+
+# An implicit write request: "scale this deployment", no command named. The
+# mirrored gke-* skills used to answer it with patch_k8s_resource or kubectl
+# scale (#2937's skills sweep); the case grades that no worker ran a kubectl
+# write and that the run ends in a proposal (the scaled manifest, inline or as
+# a pull request, which its pull_request_opened leaf requests, so it runs in
+# the writers part) or, on an install with no registered GitOps repository,
+# in the preflight's stop. Nightly from its first merge; a presubmit seat
+# waits on a clean nightly record.
+./tasks/scale-request-proposes-pr/task.yaml
 
 # A /session turn that delegates a cluster question ends in one wake's answer,
 # not in the delegation depth bound (#2819). Real only on the next lane's

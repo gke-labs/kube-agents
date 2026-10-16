@@ -1,0 +1,486 @@
+Subject: Propose changes as a pull request instead of naming write tools
+
+Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; the gke MCP server offers read tools only (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935). A node pool's version change is the one exception: a `spec.version` in the repository pins a release-channel pool against auto-upgrade (`bench/tf/fleet/main.tf` documents the same fight in Terraform), so the patch keeps the `gcloud container clusters upgrade --node-pool` command as a step for the platform operator rather than a pull request.
+Local-Issue: #3185
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; kube-agents proposes every change as a pull request, or a node pool's version change as a platform-operator step
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -26,6 +26,8 @@ Produce clear, actionable documents — upgrade plans, runbooks, or checklists 
+ 
+ Always frame guidance around the auto-upgrade model: auto-upgrade with maintenance windows and exclusions is the preferred control mechanism.
+ 
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes. A control-plane upgrade reaches the cluster as a pull request changing the version floor or release-channel field (`spec.minMasterVersion` or `spec.releaseChannel.channel` on the `ContainerCluster`). A node-pool version change (an upgrade, a downgrade or rollback, or resuming a stopped upgrade) is an operation, not desired state: write the exact `gcloud container clusters upgrade CLUSTER_NAME --node-pool NODE_POOL_NAME --cluster-version VERSION --location LOCATION` command as a step for the platform operator to run, not one to run from here, and never propose `spec.version` on a `ContainerNodePool`. A pool on a release channel cannot turn auto-upgrade off, so a version pinned in the repository fights it: Config Connector moves the pool back to the pin after each automatic upgrade, re-rolling its nodes, and a rollback pin holds the pool at the old version indefinitely. The pool's upgrade strategy (`spec.upgradeSettings`) is desired state and stays a pull request.
++
+ ## Context Gathering
+ 
+ Before producing any upgrade artifact, establish:
+@@ -93,8 +95,8 @@ Configure maintenance windows to control auto-upgrade timing. GKE also supports
+ 2. **Warn against "No channel"**: You MUST explicitly warn that disabling release channels ("No channel" / static versioning) is deprecated and must not be used as a replacement for exclusions.
+ 3. **Compare Scopes**: You MUST explain the difference between 'No upgrades' (limitations, blocks patches) and 'No minor or node upgrades' (allows patches, longer duration). Recommend 'No minor or node upgrades' when the user wants to allow security patches/fixes while blocking minor version jumps.
+ 4. **Handle periods > 90 days**: If the user needs to block upgrades for more than 90 days, you MUST explain that 'No upgrades' is limited to 90 days per exclusion (max 3 per cluster, and 48 hours of maintenance availability must remain in any rolling 92-day window, preventing chaining into longer continuous freezes) and advise using scoped exclusions ('No minor or node upgrades' / 'No minor upgrades'), which have no fixed day cap and can run until the minor version's End of Support.
+-5. **Version skew**: Be mindful of version skew (between control plane and node pools) when using exclusions. Ensure skew does not exceed the supported 2 minor versions. Use `--add-maintenance-exclusion-until-end-of-support` for persistent exclusions.
+-6. **Correct gcloud syntax**: When providing `gcloud` commands for exclusions, you MUST use the separate flag syntax: `--add-maintenance-exclusion-name`, `--add-maintenance-exclusion-start`, `--add-maintenance-exclusion-end` (or `--add-maintenance-exclusion-until-end-of-support`), and `--add-maintenance-exclusion-scope` (do NOT use a single comma-separated `--add-maintenance-exclusion` flag).
++5. **Version skew**: Be mindful of version skew (between control plane and node pools) when using exclusions. Ensure skew does not exceed the supported 2 minor versions.
++6. **Correct exclusion fields**: When proposing exclusions, you MUST write each one as its own entry in `spec.maintenancePolicy.maintenanceExclusion` on the cluster's `ContainerCluster`, with `exclusionName`, `startTime`, `endTime`, and `exclusionOptions.scope` (`NO_UPGRADES`, `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`, as the GKE API spells them, not gcloud's lowercase forms). For an exclusion that runs until End of Support, set `endTime` to the minor version's End of Support date (from the GKE release schedule) with scope `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`. The `ContainerCluster` schema carries a fixed `endTime` and no field for gcloud's form that follows the End of Support date if it moves (confirm with `kubectl explain` against the customer's CRD), so a later End of Support date is a new pull request moving `endTime`.
+ 
+ ## Mandatory Upgrade Overrides
+ 
+@@ -171,9 +173,9 @@ Produce checklists as copyable markdown with checkboxes. See [`references/checkl
+ 
+ ## Maintenance runbooks
+ 
+-Produce step-by-step runbooks with actual `gcloud` and `kubectl` commands. See `references/runbook-template.md` for the standard command sequences.
++Produce step-by-step runbooks in which each change is a pull request editing the field in the GitOps repository's format, a node pool's version change is the exact `gcloud container clusters upgrade --node-pool` command as a step for the platform operator, and each check is an actual `gcloud` or `kubectl` read command. See `references/runbook-template.md` for the standard sequences.
+ 
+-**Any runbook that relaxes a safety control must restore it in the same runbook.** This applies above all to PDBs during a node-pool migration or rollback: back the PDBs up before draining, and make restoring them by patch a numbered step with its own verification, not a closing remark. A runbook that patches `maxUnavailable: 100%` to unblock a drain and never reverts it leaves the cluster without disruption protection, and the gap is invisible until the next voluntary eviction. The same rule covers maintenance exclusions, cordons, and autoscaler `minNodes` overrides added to get through the procedure.
++**Any runbook that relaxes a safety control must restore it in the same runbook.** This applies above all to PDBs during a node-pool migration or rollback: back the PDBs up before draining, and make restoring them by pull request a numbered step with its own verification, not a closing remark. A runbook that sets `maxUnavailable: 100%` to unblock a drain and never reverts it leaves the cluster without disruption protection, and the gap is invisible until the next voluntary eviction. The same rule covers maintenance exclusions, cordons, and autoscaler `minNodes` overrides added to get through the procedure.
+ 
+ ## Maintenance Window Pauses
+ 
+@@ -182,7 +184,7 @@ When diagnosing a \"stuck\" upgrade, consider if it was paused by a maintenance
+ - **Silent Pause Behavior:** If a maintenance window closes before a surge upgrade (auto or manual) completes, GKE intentionally pauses the rollout to prevent disruption outside allowed times. A blue-green node-pool upgrade does not pause: it continues past the window to completion (`references/troubleshooting.md` §11), so for a blue-green pool the window is not the cause and the rest of this section does not apply.
+ - **Mixed-Version State:** The cluster is left in a stable mixed-version state (some nodes upgraded, some not). You MUST explicitly state that this is a supported and safe intended outcome.
+ - **Resumption:** The upgrade will automatically resume when the next maintenance window opens.
+-- **Mitigation for immediate completion:** If the user wants to complete the upgrade immediately, you MUST suggest **temporarily widening the maintenance window** to include the current time (e.g., using `gcloud container clusters update ... --maintenance-window-start ... --maintenance-window-duration ...`). Do not suggest re-triggering the manual upgrade or bypassing the window.
++- **Mitigation for immediate completion:** If the user wants to complete the upgrade immediately, you MUST suggest **temporarily widening the maintenance window** to include the current time (a pull request changing `spec.maintenancePolicy.recurringWindow` on the cluster's `ContainerCluster`). Do not suggest re-triggering the manual upgrade or bypassing the window.
+ 
+ ## Troubleshooting
+ 
+diff --git a/references/runbook-template.md b/references/runbook-template.md
+--- a/references/runbook-template.md
++++ b/references/runbook-template.md
+@@ -1,13 +1,17 @@
+ # Runbook Command Templates
+ 
+-Standard command sequences for GKE upgrades. Replace placeholders: `CLUSTER_NAME`, `ZONE`, `TARGET_VERSION`, `NODE_POOL_NAME`.
++Standard command sequences for GKE upgrades. Replace placeholders: `CLUSTER_NAME`, `ZONE`, `LOCATION` (the zone or region), `TARGET_VERSION`, `NODE_POOL_NAME`. The operator steps take `--location`, which accepts a zone or a region.
++
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
++
++Each change step below is a pull request editing the cluster's `ContainerCluster` or the pool's `ContainerNodePool`, except a node pool's version, which is a step for the platform operator (a `spec.version` in the repository pins a release-channel pool against auto-upgrade); each check step is a read command.
+ 
+ ## Table of Contents
+-- [Pre-flight](#pre-flight) (Line 12-31)
+-- [Control plane upgrade](#control-plane-upgrade) (Line 32-47)
+-- [Node pool upgrade (Standard only)](#node-pool-upgrade-standard-only) (Line 48-72)
+-- [Maintenance window configuration](#maintenance-window-configuration) (Line 73-110)
+-- [Rollback/Downgrade guidance](#rollbackdowngrade-guidance) (Line 111-151)
++- [Pre-flight](#pre-flight) (Line 16-35)
++- [Control plane upgrade](#control-plane-upgrade) (Line 36-47)
++- [Node pool upgrade (Standard only)](#node-pool-upgrade-standard-only) (Line 48-71)
++- [Maintenance window configuration](#maintenance-window-configuration) (Line 72-80)
++- [Rollback/Downgrade guidance](#rollbackdowngrade-guidance) (Line 81-137)
+ 
+ ## Pre-flight
+ 
+@@ -31,13 +35,9 @@ kubectl get pods -A | grep -v Running | grep -v Completed
+ 
+ ## Control plane upgrade
+ 
+-```bash
+-gcloud container clusters upgrade CLUSTER_NAME \
+-  --zone ZONE \
+-  --master \
+-  --cluster-version TARGET_VERSION
++Propose `spec.minMasterVersion: TARGET_VERSION` on the cluster's `ContainerCluster` as a pull request. After it merges and applies, verify (wait ~10-15 min):
+ 
+-# Verify (wait ~10-15 min)
++```bash
+ gcloud container clusters describe CLUSTER_NAME \
+   --zone ZONE \
+   --format="value(currentMasterVersion)"
+@@ -47,21 +47,20 @@ kubectl get pods -n kube-system
+ 
+ ## Node pool upgrade (Standard only)
+ 
+-```bash
+-# Configure surge settings
+-gcloud container node-pools update NODE_POOL_NAME \
+-  --cluster CLUSTER_NAME \
+-  --zone ZONE \
+-  --max-surge-upgrade MAX_SURGE \
+-  --max-unavailable-upgrade MAX_UNAVAILABLE
++Propose the pool's surge settings (`spec.upgradeSettings.maxSurge: MAX_SURGE`, `spec.upgradeSettings.maxUnavailable: MAX_UNAVAILABLE`) on its `ContainerNodePool` as a pull request. The version change is not part of it: a `spec.version` in the repository pins a release-channel pool against auto-upgrade, so once the surge settings apply, the upgrade is a step for the platform operator to run, not one to run from here:
+ 
+-# Upgrade (note: node pool upgrades use `clusters upgrade --node-pool`;
+-# there is no `gcloud container node-pools upgrade` command)
++```bash
++# Platform operator step (node pools upgrade through `clusters upgrade
++# --node-pool`; there is no `gcloud container node-pools upgrade` command)
+ gcloud container clusters upgrade CLUSTER_NAME \
+-  --zone ZONE \
+   --node-pool NODE_POOL_NAME \
+-  --cluster-version TARGET_VERSION
++  --cluster-version TARGET_VERSION \
++  --location LOCATION
++```
++
++Then check:
+ 
++```bash
+ # Monitor progress
+ watch 'kubectl get nodes -o wide -L cloud.google.com/gke-nodepool'
+ 
+@@ -72,114 +71,67 @@ kubectl get pods -A | grep -v Running | grep -v Completed
+ 
+ ## Maintenance window configuration
+ 
+-```bash
+-# Set recurring maintenance window
+-gcloud container clusters update CLUSTER_NAME \
+-  --zone ZONE \
+-  --maintenance-window-start YYYY-MM-DDTHH:MM:SSZ \
+-  --maintenance-window-end YYYY-MM-DDTHH:MM:SSZ \
+-  --maintenance-window-recurrence "FREQ=WEEKLY;BYDAY=SA"
+-
+-# Add maintenance exclusion (up to 90 days)
+-gcloud container clusters update CLUSTER_NAME \
+-  --zone ZONE \
+-  --add-maintenance-exclusion-name="EXCLUSION_NAME" \
+-  --add-maintenance-exclusion-start=START_TIME \
+-  --add-maintenance-exclusion-end=END_TIME
++Each of these is proposed as a pull request on the cluster's `ContainerCluster` through `gcp-config-connector`:
+ 
+-# Add persistent maintenance exclusion (until End of Support)
+-gcloud container clusters update CLUSTER_NAME \
+-  --zone ZONE \
+-  --add-maintenance-exclusion-name="EXCLUSION_NAME" \
+-  --add-maintenance-exclusion-start=START_TIME \
+-  --add-maintenance-exclusion-until-end-of-support \
+-  --add-maintenance-exclusion-scope=no_upgrades
+-
+-# Add node pool level exclusion (during creation)
+-gcloud container node-pools create NODE_POOL_NAME \
+-  --cluster CLUSTER_NAME \
+-  --zone ZONE \
+-  --add-maintenance-exclusion-until-end-of-support
+-
+-# Add node pool level exclusion (existing pool)
+-gcloud container node-pools update NODE_POOL_NAME \
+-  --cluster CLUSTER_NAME \
+-  --zone ZONE \
+-  --add-maintenance-exclusion-until-end-of-support
+-```
++- **Recurring maintenance window**: `spec.maintenancePolicy.recurringWindow` with `startTime` and `endTime` (`YYYY-MM-DDTHH:MM:SSZ`) and `recurrence` (e.g. `FREQ=WEEKLY;BYDAY=SA`).
++- **Maintenance exclusion (up to 90 days)**: an entry in `spec.maintenancePolicy.maintenanceExclusion` with `exclusionName`, `startTime`, `endTime` and `exclusionOptions.scope` (as the GKE API spells it: `NO_UPGRADES`, `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`).
++- **Exclusion until End of Support**: the same entry with `endTime` set to the minor version's End of Support date and `exclusionOptions.scope` `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`. The schema has no field that follows the End of Support date if it moves, so a later date is a new pull request moving `endTime`.
++- **Node pool level exclusions**: `ContainerNodePool` has no exclusion field (confirm with `kubectl explain`), so the agent blocks rather than inventing one.
+ 
+ ## Rollback/Downgrade guidance
+ 
+-- **Control Plane Patches**: Can be downgraded by running the upgrade command with the target older patch version.
++- **Control Plane Patches**: Can be downgraded to the target older patch version.
+ - **Control Plane Minors**: Rollback is only available during the first step of the 2-step upgrade process.
+-- **Node Pools (Minor & Patch)**: Can be downgraded directly by running the node pool upgrade command targeting the older version, OR by creating a new pool at the old version and migrating workloads (safer).
++- **Node Pools (Minor & Patch)**: Can be downgraded directly by targeting the older version, OR by creating a new pool at the old version and migrating workloads (safer).
+ 
+ ### Downgrade Control Plane (Patch or Step-1 Minor)
+-```bash
+-gcloud container clusters upgrade CLUSTER_NAME \
+-  --master \
+-  --zone ZONE \
+-  --cluster-version TARGET_PREVIOUS_VERSION
+-```
++
++A downgrade to `TARGET_PREVIOUS_VERSION` has no declarative path in a Config Connector repository (`spec.minMasterVersion` is a floor GKE upgrades past, not a downgrade), so the agent blocks rather than inventing a field.
+ 
+ ### Downgrade Node Pool (Direct)
++
++A step for the platform operator, not a pull request: a `spec.version: TARGET_PREVIOUS_VERSION` in the repository would hold the pool at the old version indefinitely, against the release channel's patches.
++
+ ```bash
++# Platform operator step
+ gcloud container clusters upgrade CLUSTER_NAME \
+-  --zone ZONE \
+   --node-pool NODE_POOL_NAME \
+-  --cluster-version TARGET_PREVIOUS_VERSION
++  --cluster-version TARGET_PREVIOUS_VERSION \
++  --location LOCATION
+ ```
+ 
+ ### Downgrade Node Pool (Safe migration - recommended)
+-```bash
+-# Create replacement node pool at previous version
+-gcloud container node-pools create NODE_POOL_NAME-rollback \
+-  --cluster CLUSTER_NAME \
+-  --zone ZONE \
+-  --cluster-version PREVIOUS_VERSION \
+-  --num-nodes NUM_NODES \
+-  --machine-type MACHINE_TYPE
+ 
+-# Cordon old pool
+-kubectl cordon -l cloud.google.com/gke-nodepool=NODE_POOL_NAME
++Propose a new replacement `ContainerNodePool` named `NODE_POOL_NAME-rollback` (`spec.initialNodeCount: NUM_NODES`, `spec.nodeConfig.machineType: MACHINE_TYPE`, no `spec.version`) as a pull request. Once it is up, the platform operator moves it to the previous version with `gcloud container clusters upgrade CLUSTER_NAME --node-pool NODE_POOL_NAME-rollback --cluster-version PREVIOUS_VERSION --location LOCATION`, for the same reason as the direct downgrade. That is two node rolls, one to create the pool at the control plane's version and one to move it down, so the operator downgrades the replacement before any workload shifts onto it, and workloads move only once. Keep the old pool as the fallback while workloads move: the platform operator cordons and drains it (a node operation, not a declarative change), and only after the workloads run on the replacement does a later pull request remove its `ContainerNodePool`. Before the drain:
+ 
++```bash
+ # Record current PDB state BEFORE touching anything — this file is how you put
+ # it back. Do not skip; a relaxed PDB left in place is an outage waiting for
+ # the next voluntary disruption.
+ kubectl get pdb -A -o yaml > /tmp/pdb-backup-$(date +%s).yaml
+ kubectl get pdb -A   # ALLOWED DISRUPTIONS = 0 will block the drain
+-
+-# Drain old pool to migrate workloads (respects PDBs)
+-kubectl drain -l cloud.google.com/gke-nodepool=NODE_POOL_NAME \
+-  --ignore-daemonsets --delete-emptydir-data
+ ```
+ 
+ If a PDB blocks the drain, relax it **temporarily** and restore it as a required
+ step of the same runbook — never as a follow-up someone may forget:
+ 
+-```bash
+-# 1. Relax the blocking PDB (only after confirming the replacement pool is
+-#    Ready and can accept the workload)
+-kubectl patch pdb PDB_NAME -n NAMESPACE \
+-  --type merge -p '{"spec":{"minAvailable":null,"maxUnavailable":"100%"}}'
+-
+-# 2. Drain, then verify workloads are Running on the replacement pool
+-kubectl get pods -o wide --field-selector spec.nodeName!='' -A | grep NODE_POOL_NAME-rollback
+-
+-# 3. RESTORE the original PDB — mandatory, not optional. Patch back the value
+-#    the backup records for PDB_NAME and clear the field step 1 set. Do not
+-#    `kubectl apply` the backup: its stale resourceVersion is rejected with a
+-#    conflict. If the PDB originally set minAvailable:
+-kubectl patch pdb PDB_NAME -n NAMESPACE \
+-  --type merge -p '{"spec":{"maxUnavailable":null,"minAvailable":ORIGINAL_MIN_AVAILABLE}}'
+-#    If it originally set maxUnavailable:
+-kubectl patch pdb PDB_NAME -n NAMESPACE \
+-  --type merge -p '{"spec":{"maxUnavailable":ORIGINAL_MAX_UNAVAILABLE}}'
+-#    (an integer as-is, a percentage quoted, e.g. "50%")
+-
+-# 4. Confirm the restore took effect
+-kubectl get pdb -A   # ALLOWED DISRUPTIONS should match the pre-drain values
+-```
++1. Relax the blocking PDB, only after confirming the replacement pool is Ready and
++   can accept the workload: a pull request that removes `minAvailable` from its
++   manifest and sets `maxUnavailable: "100%"`.
++2. After the drain, verify workloads are Running on the replacement pool:
++
++   ```bash
++   kubectl get pods -o wide --field-selector spec.nodeName!='' -A | grep NODE_POOL_NAME-rollback
++   ```
++
++3. RESTORE the original PDB — mandatory, not optional: a pull request that puts back
++   the `minAvailable` or `maxUnavailable` value the backup records for `PDB_NAME` and
++   clears the field step 1 set (an integer as-is, a percentage quoted, e.g. `"50%"`).
++4. Confirm the restore took effect:
++
++   ```bash
++   kubectl get pdb -A   # ALLOWED DISRUPTIONS should match the pre-drain values
++   ```
+ 
+ > A rollback runbook that relaxes PDBs without restoring them has silently
+ > removed the cluster's disruption protection. Always include steps 3 and 4.
+diff --git a/references/troubleshooting.md b/references/troubleshooting.md
+--- a/references/troubleshooting.md
++++ b/references/troubleshooting.md
+@@ -3,23 +3,25 @@
+ ## Diagnostic flowchart
+ 
+ ## Table of Contents
+-- [Diagnostic flowchart](#diagnostic-flowchart) (Line 3-21)
+-- [1. PDB blocking drain (most common)](#1-pdb-blocking-drain-most-common) (Line 23-44)
+-- [2. Resource constraints (no room for pods)](#2-resource-constraints-no-room-for-pods) (Line 46-65)
+-- [3. Bare pods blocking drain](#3-bare-pods-blocking-drain) (Line 67-75)
+-- [4. Admission webhooks rejecting pod creation](#4-admission-webhooks-rejecting-pod-creation) (Line 77-97)
+-- [5. PVC attachment issues](#5-pvc-attachment-issues) (Line 99-107)
+-- [6. Long termination grace periods](#6-long-termination-grace-periods) (Line 119-126)
+-- [7. Upgrade operation stuck at GKE level](#7-upgrade-operation-stuck-at-gke-level) (Line 119-126)
+-- [8. Stockout during critical upgrades (e.g. cert expiration)](#8-stockout-during-critical-upgrades-eg-cert-expiration) (Line 128-154)
+-- [9. GPU node upgrade regressions (CrashLoopBackOff, driver issues)](#9-gpu-node-upgrade-regressions-crashloopbackoff-driver-issues) (Line 156-195)
+-- [10. Upgrade paused or partially completed (check auto-upgrade status)](#10-upgrade-paused-or-partially-completed-check-auto-upgrade-status) (Line 197-228)
+-- [11. Upgrade too slow or too disruptive (tune blue-green soak)](#11-upgrade-too-slow-or-too-disruptive-tune-blue-green-soak) (Line 230-248)
+-- [12. New nodes fail to become Ready / control plane unhealthy](#12-new-nodes-fail-to-become-ready--control-plane-unhealthy) (Line 250-266)
+-- [Validation after applying a fix](#validation-after-applying-a-fix) (Line 268-279)
++- [Diagnostic flowchart](#diagnostic-flowchart)
++- [1. PDB blocking drain (most common)](#1-pdb-blocking-drain-most-common)
++- [2. Resource constraints (no room for pods)](#2-resource-constraints-no-room-for-pods)
++- [3. Bare pods blocking drain](#3-bare-pods-blocking-drain)
++- [4. Admission webhooks rejecting pod creation](#4-admission-webhooks-rejecting-pod-creation)
++- [5. PVC attachment issues](#5-pvc-attachment-issues)
++- [6. Long termination grace periods](#6-long-termination-grace-periods)
++- [7. Upgrade operation stuck at GKE level](#7-upgrade-operation-stuck-at-gke-level)
++- [8. Stockout during critical upgrades (e.g. cert expiration)](#8-stockout-during-critical-upgrades-eg-cert-expiration)
++- [9. GPU node upgrade regressions (CrashLoopBackOff, driver issues)](#9-gpu-node-upgrade-regressions-crashloopbackoff-driver-issues)
++- [10. Upgrade paused or partially completed (check auto-upgrade status)](#10-upgrade-paused-or-partially-completed-check-auto-upgrade-status)
++- [11. Upgrade too slow or too disruptive (tune blue-green soak)](#11-upgrade-too-slow-or-too-disruptive-tune-blue-green-soak)
++- [12. New nodes fail to become Ready / control plane unhealthy](#12-new-nodes-fail-to-become-ready--control-plane-unhealthy)
++- [Validation after applying a fix](#validation-after-applying-a-fix)
+ 
+ When an upgrade is stuck or failing, work through these checks in order. Each section has the diagnosis command, what to look for, and the fix.
+ 
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
++
+ ## 1. PDB blocking drain (most common)
+ 
+ **Diagnose:**
+@@ -30,23 +32,18 @@ kubectl describe pdb PDB_NAME -n NAMESPACE
+ ```
+ 
+ **Fix — temporarily relax the PDB, and restore it in the same procedure:**
++
++1. Record the original values before touching anything:
++
++   ```bash
++   kubectl get pdb PDB_NAME -n NAMESPACE -o yaml > pdb-backup.yaml
++   ```
++
++2. Allow all disruptions temporarily: a pull request that removes `minAvailable` from the PDB's manifest and sets `maxUnavailable: "100%"`.
++3. Once the upgrade completes, RESTORE (mandatory): a pull request that puts back the value `pdb-backup.yaml` records and clears the other field.
++4. Verify the restore: the spec matches `pdb-backup.yaml` again.
++
+ ```bash
+-# 1. Record the original values before touching anything
+-kubectl get pdb PDB_NAME -n NAMESPACE -o yaml > pdb-backup.yaml
+-
+-# 2. Allow all disruptions temporarily
+-kubectl patch pdb PDB_NAME -n NAMESPACE \
+-  --type merge -p '{"spec":{"minAvailable":null,"maxUnavailable":"100%"}}'
+-
+-# 3. Once the upgrade completes, RESTORE (mandatory): patch back the value
+-#    pdb-backup.yaml records and clear the other field. If it set minAvailable:
+-kubectl patch pdb PDB_NAME -n NAMESPACE \
+-  --type merge -p '{"spec":{"maxUnavailable":null,"minAvailable":ORIGINAL_MIN_AVAILABLE}}'
+-#    If it set maxUnavailable:
+-kubectl patch pdb PDB_NAME -n NAMESPACE \
+-  --type merge -p '{"spec":{"maxUnavailable":ORIGINAL_MAX_UNAVAILABLE}}'
+-
+-# 4. Verify the restore: the spec matches pdb-backup.yaml again
+ kubectl get pdb PDB_NAME -n NAMESPACE -o yaml | grep -E 'minAvailable|maxUnavailable'
+ ```
+ 
+@@ -60,16 +57,9 @@ kubectl top nodes
+ kubectl describe nodes | grep -A 5 "Allocated resources"
+ ```
+ 
+-**Fix — increase surge capacity (Standard clusters only; Autopilot manages node upgrades automatically):**
+-```bash
+-gcloud container node-pools update NODE_POOL_NAME \
+-  --cluster CLUSTER_NAME \
+-  --zone ZONE \
+-  --max-surge-upgrade 2 \
+-  --max-unavailable-upgrade 0
+-```
++**Fix — increase surge capacity (Standard clusters only; Autopilot manages node upgrades automatically):** propose `spec.upgradeSettings.maxSurge: 2` and `spec.upgradeSettings.maxUnavailable: 0` on the pool's `ContainerNodePool` as a pull request.
+ 
+-Or scale down non-critical workloads temporarily.
++Or lower non-critical workloads' replicas temporarily through a pull request.
+ 
+ ## 3. Bare pods blocking drain
+ 
+@@ -79,7 +69,7 @@ kubectl get pods -A -o json | \
+   jq -r '.items[] | select(.metadata.ownerReferences | length == 0) | "\(.metadata.namespace)/\(.metadata.name)"'
+ ```
+ 
+-**Fix:** Delete bare pods (they won't reschedule anyway) or wrap in Deployments.
++**Fix:** Remove bare pods (they won't reschedule anyway) or wrap them in Deployments, through a pull request.
+ 
+ ## 4. Admission webhooks rejecting pod creation
+ 
+@@ -91,16 +81,10 @@ kubectl get mutatingwebhookconfigurations
+ kubectl describe validatingwebhookconfigurations WEBHOOK_NAME
+ ```
+ 
+-**Fix — temporarily disable problematic webhook:**
++**Fix — temporarily disable problematic webhook:** back up the webhook configuration first, then propose removing it as a pull request, and restore it after the upgrade with a second pull request.
++
+ ```bash
+-# Back up the webhook configuration first
+ kubectl get validatingwebhookconfigurations WEBHOOK_NAME -o yaml > webhook-backup.yaml
+-
+-# Then delete temporarily
+-kubectl delete validatingwebhookconfigurations WEBHOOK_NAME
+-
+-# Re-create after upgrade
+-kubectl apply -f webhook-backup.yaml
+ ```
+ 
+ ## 5. PVC attachment issues
+@@ -138,25 +122,12 @@ gcloud container operations list --cluster CLUSTER_NAME --zone ZONE --filter="op
+ Upgrade is failing with `ZONE_RESOURCE_POOL_EXHAUSTED` or `QUOTA_EXCEEDED` errors, and the cluster has a critical pending deadline (e.g., control plane certificate expiring soon).
+ 
+ **Fix:**
+-1. **Change Upgrade Strategy (Standard clusters only)**: Modify the node pool to use a rolling in-place upgrade (no surge) to bypass quota limits:
+-   ```bash
+-   gcloud container node-pools update NODE_POOL_NAME \
+-     --cluster CLUSTER_NAME \
+-     --zone ZONE \
+-     --max-surge-upgrade 0 \
+-     --max-unavailable-upgrade 1
+-   ```
++1. **Change Upgrade Strategy (Standard clusters only)**: Modify the node pool to use a rolling in-place upgrade (no surge) to bypass quota limits: `spec.upgradeSettings.maxSurge: 0` and `spec.upgradeSettings.maxUnavailable: 1` on its `ContainerNodePool`, proposed as a pull request.
+ 2. **Open Support Case**: Immediately open a P1/P2 Google Cloud Support case, citing urgent certificate expiration and stockout.
+ 3. **Retry in Different Zone/Region**: If the cluster is regional or multi-zonal, check if you can retry the upgrade in a different zone that might have capacity, or add a temporary node pool in a different zone/region to migrate workloads.
+-4. **Credential Rotation**: Perform a control plane credential rotation to renew certificates without upgrading the GKE version.
++4. **Credential Rotation**: A control plane credential rotation renews certificates without upgrading the GKE version. It has no declarative path in a Config Connector repository (the KCC v1.158.0 schema has no field for it), so the agent blocks rather than inventing a field.
++5. **Enable DNS Endpoint**: If client connectivity is failing or at risk due to expired client certificates, enable the DNS-based control plane endpoint to allow IAM-based authentication: `spec.controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic` on the cluster's `ContainerCluster`, proposed as a pull request. Then get credentials using the DNS endpoint:
+    ```bash
+-   gcloud container clusters update CLUSTER_NAME --start-credential-rotation --zone ZONE
+-   # Follow standard GKE documentation to complete the rotation.
+-   ```
+-5. **Enable DNS Endpoint**: If client connectivity is failing or at risk due to expired client certificates, enable the DNS-based control plane endpoint to allow IAM-based authentication.
+-   ```bash
+-   gcloud container clusters update CLUSTER_NAME --enable-dns-access --zone ZONE
+-   # Get credentials using DNS endpoint:
+    gcloud container clusters get-credentials CLUSTER_NAME --dns-endpoint --zone ZONE
+    ```
+ 
+@@ -185,21 +156,9 @@ GPU nodes upgrade successfully, but ML pods are stuck in `CrashLoopBackOff` with
+    ```
+ 
+ **Fix:**
+-1. **Pin Driver Version (Standard clusters only)**: If the default driver version changed, update your node pool configuration to pin to the previous working driver version (e.g., `R535`):
+-   ```bash
+-   gcloud container node-pools update NODE_POOL_NAME \
+-     --cluster CLUSTER_NAME \
+-     --zone ZONE \
+-     --accelerator type=GPU_TYPE,count=COUNT,gpu-driver-version=DRIVER_VERSION
+-   ```
++1. **Pin Driver Version (Standard clusters only)**: If the default driver version changed, pin the node pool to the previous working driver version (e.g., `R535`) in `spec.nodeConfig.guestAccelerator[].gpuDriverInstallationConfig.gpuDriverVersion`. `guestAccelerator` is immutable on a `ContainerNodePool` (create-only in the `gcp-config-connector` skill's container catalogue), so propose a new pool with it as a pull request and move the workloads.
+ 2. **Update Workload Dependencies**: Rebuild container images with a CUDA version compatible with the new driver.
+-3. **Rollback Node Pool (Standard clusters only)**: If production is blocked, roll back the node pool to the previous GKE version:
+-   ```bash
+-   gcloud container clusters upgrade CLUSTER_NAME \
+-     --node-pool NODE_POOL_NAME \
+-     --zone ZONE \
+-     --cluster-version PREVIOUS_VERSION
+-   ```
++3. **Rollback Node Pool (Standard clusters only)**: If production is blocked, roll back the node pool to the previous GKE version. This is a step for the platform operator, not a pull request: a `spec.version` in the repository would hold a release-channel pool at the old version against auto-upgrade. The command for the operator: `gcloud container clusters upgrade CLUSTER_NAME --node-pool NODE_POOL_NAME --cluster-version PREVIOUS_VERSION --location LOCATION`.
+ 
+ ## 10. Upgrade paused or partially completed (check auto-upgrade status)
+ 
+@@ -225,12 +184,12 @@ gcloud container node-pools get-upgrade-info POOL_NAME --cluster CLUSTER_NAME --
+ - `CLUSTER_DISRUPTION_BUDGET` / `CLUSTER_DISRUPTION_BUDGET_MINOR_UPGRADE` — a post-operation cooldown protecting cluster stability.
+ - `SYSTEM_CONFIG` — temporarily paused by GKE for technical or business reasons. **Do not force a manual upgrade unless it is required.**
+ 
+-**Fix — resume a canceled/partially-completed node pool upgrade (Standard clusters only)** by re-issuing the same upgrade:
++**Fix — resume a canceled/partially-completed node pool upgrade (Standard clusters only)** by re-issuing the same upgrade. This is a step for the platform operator, not a pull request: a `spec.version` in the repository would pin a release-channel pool against auto-upgrade. The command for the operator:
+ ```bash
+ gcloud container clusters upgrade CLUSTER_NAME \
+-  --node-pool=NODE_POOL_NAME \
+-  --location=LOCATION \
+-  --cluster-version VERSION
++  --node-pool NODE_POOL_NAME \
++  --cluster-version VERSION \
++  --location LOCATION
+ ```
+ A partially-upgraded node pool runs mixed versions until you resume it or roll it back.
+ 
+@@ -243,14 +202,7 @@ Blue-green upgrades add batch/soak controls that surge upgrades don't have. Use
+ - `BATCH_SOAK_DURATION` — wait after each batch drain (default `0s`).
+ - `NODE_POOL_SOAK_DURATION` — wait after all batches drain, before the blue pool is deleted (default `3600s`).
+ 
+-**Update an existing node pool (Standard clusters only):**
+-```bash
+-gcloud container node-pools update NODE_POOL_NAME \
+-  --cluster CLUSTER_NAME --location LOCATION \
+-  --enable-blue-green-upgrade \
+-  --standard-rollout-policy=batch-node-count=2,batch-soak-duration=10s \
+-  --node-pool-soak-duration=600s
+-```
++**Update an existing node pool (Standard clusters only):** on its `ContainerNodePool`, propose the blue-green strategy in `spec.upgradeSettings.strategy` (`BLUE_GREEN`, as the GKE API spells it) with `spec.upgradeSettings.blueGreenSettings.standardRolloutPolicy` (e.g. `batchNodeCount: 2`, `batchSoakDuration: 10s`) and `spec.upgradeSettings.blueGreenSettings.nodePoolSoakDuration: 600s` as a pull request.
+ 
+ **Maintenance-window interaction:** surge upgrades **pause** when they run past the maintenance window and resume in the next one; blue-green upgrades **continue to completion** even past the window, and the extra pool keeps workloads available — prefer blue-green when a window is too short to finish.
+ 

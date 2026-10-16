@@ -13,6 +13,8 @@ metadata:
 
 Guidance on configuring, optimizing, and troubleshooting GKE ComputeClasses.
 
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+
 ## When to Use
 
 -   **Cost optimization:** Spot VMs with on-demand fallback.

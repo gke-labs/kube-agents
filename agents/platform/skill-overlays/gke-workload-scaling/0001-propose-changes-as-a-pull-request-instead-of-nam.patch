@@ -1,0 +1,107 @@
+Subject: Propose changes as a pull request instead of naming write tools
+
+Why: A change to a cluster or Google Cloud resource goes out as a pull request in the GitOps repository's format, never as a direct write; the gke MCP server offers read tools only (#2955) and the broker refuses kubectl and gcloud writes, so instructions naming write tools or write commands point the agent at paths it does not have and away from the pull request (#2935).
+Local-Issue: #3185
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; kube-agents proposes every change as a pull request
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -16,19 +16,24 @@ This skill provides workflows and best practices for scaling applications on
+ Google Kubernetes Engine (GKE). It covers manual scaling, Horizontal Pod
+ Autoscaling (HPA), and Vertical Pod Autoscaling (VPA).
+ 
++> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
++
+ ## Workflows
+ 
+ ### 1. Manual Scaling
+ 
+ Scale a deployment to a fixed number of replicas. Useful for immediate manual
+-intervention or testing.
++intervention or testing. Set `spec.replicas` in the Deployment's manifest and
++propose it as a pull request through `submit-suggestion`:
+ 
+-**Command:**
++```yaml
++spec:
++  replicas: {number}
++```
+ 
+-```bash
+-kubectl scale deployment {deployment_name} --replicas={number} -n {namespace}
++Once it applies, verify the scale event:
+ 
+-# Verify the scale event
++```bash
+ kubectl get deployment {deployment_name} -n {namespace}
+ ```
+ 
+@@ -42,20 +47,13 @@ utilization, or custom metrics.
+ -   Metrics Server must be running (enabled by default on GKE).
+ -   Containers clearly define resource requests/limits.
+ 
+-**Quick Command:**
+-
+-```bash
+-kubectl autoscale deployment {deployment_name} --cpu-percent=50 --min=1 --max=10
+-```
+-
+-**Manifest Approach (Recommended):** Use a YAML manifest for version-controlled
+-configuration. See [assets/hpa-example.yaml](assets/hpa-example.yaml) for a
+-template.
++**Manifest:** Use a YAML manifest for version-controlled configuration,
++proposed as a pull request through `submit-suggestion`. See
++[assets/hpa-example.yaml](assets/hpa-example.yaml) for a template (for example
++target CPU utilization 50%, `minReplicas: 1`, `maxReplicas: 10`). Once it
++applies, verify the HPA is created and fetching metrics:
+ 
+ ```bash
+-kubectl apply -f assets/hpa-example.yaml
+-
+-# Verify HPA is created and fetching metrics
+ kubectl get hpa
+ ```
+ 
+@@ -77,11 +75,9 @@ actual usage. This is critical for right-sizing workloads.
+     -   **Autopilot:** Enabled by default.
+     -   **Standard:** Must be enabled manually.
+ 
+-**Enable VPA on Standard Cluster:**
+-
+-```bash
+-gcloud container clusters update {cluster_name} --enable-vertical-pod-autoscaling --zone {zone}
+-```
++**Enable VPA on Standard Cluster:** `spec.verticalPodAutoscaling.enabled: true` on
++the cluster's `ContainerCluster`, changed as Config Connector YAML through
++`gcp-config-connector`.
+ 
+ **Update Modes:**
+ 
+@@ -95,7 +91,7 @@ gcloud container clusters update {cluster_name} --enable-vertical-pod-autoscalin
+     GKE 1.34+).
+ 
+ **Example:** See [assets/vpa-example.yaml](assets/vpa-example.yaml) for a
+-configuration template.
++configuration template, proposed as a pull request through `submit-suggestion`.
+ 
+ ## Best Practices
+ 
+@@ -118,13 +114,13 @@ configuration template.
+ 
+ ## Rightsizing Workflow
+ 
+-1.  Deploy VPA in `Off` mode for 24+ hours
++1.  Propose VPA in `Off` mode as a pull request and let it run for 24+ hours
+ 2.  Read recommendations: `kubectl describe vpa {deployment_name}-vpa -n
+     {namespace}`
+ 3.  Compare `target` values against current `requests`
+ 4.  Apply with 20% buffer: `new_request = target * 1.2`
+-5.  Use patch format or update deployment manifest to apply new resource
+-    requests
++5.  Update the deployment manifest with the new resource requests and propose
++    it as a pull request
+ 
+ Condition                     | Recommendation                       | Risk
+ ----------------------------- | ------------------------------------ | ------
