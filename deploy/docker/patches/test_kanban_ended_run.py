@@ -501,11 +501,14 @@ class TestSavedResultBanner(unittest.TestCase):
 
     def test_a_long_result_is_clipped_without_severing_a_link(self):
         link = "https://github.com/gke-agentic/infra/pull/276"
-        self.comment(ker.SAVED_RESULT_LEAD + " " + "word " * (ker.SAVED_RESULT_MAX_CHARS // 5) + link)
+        # The padding stops short of the cap, so the cap falls inside the link.
+        padding = "word " * ((ker.SAVED_RESULT_MAX_CHARS - len(link) // 2) // 5)
+        self.comment(ker.SAVED_RESULT_LEAD + " " + padding + link)
         self.event(ker.DEPENDENCY_WAIT_EVENT)
         quoted = " ".join(l for l in ker.saved_result_banner(self.conn, TID) if l.startswith("> "))
         self.assertLessEqual(len(quoted), ker.SAVED_RESULT_MAX_CHARS + 10)
-        self.assertNotIn("https://github.com/gke-agentic/infra/pul", quoted.replace(link, ""))
+        # Either the whole link or none of it: a severed prefix is the defect.
+        self.assertTrue(link in quoted or "https://" not in quoted, quoted[-80:])
 
     def test_a_card_completed_after_the_block_gets_no_banner(self):
         """Reopened after finishing from the saved result: it's spent."""
@@ -513,6 +516,25 @@ class TestSavedResultBanner(unittest.TestCase):
         self.event(ker.DEPENDENCY_WAIT_EVENT)
         self.event("completed", at=160, run=53)
         self.assertEqual(ker.saved_result_banner(self.conn, TID), [])
+
+    def test_a_later_run_that_ended_any_way_spends_it(self):
+        """Run 53 read the banner and blocked, gave up, crashed or timed out:
+        run 54 mustn't be told to complete with run 52's result."""
+        for kind in ("blocked", "gave_up", "crashed", "timed_out"):
+            with self.subTest(kind=kind):
+                self.conn.execute("DELETE FROM task_comments")
+                self.conn.execute("DELETE FROM task_events")
+                self.comment(ker.SAVED_RESULT_LEAD + " web-7 is fine")
+                self.event(ker.DEPENDENCY_WAIT_EVENT)
+                self.event(kind, at=160, run=53)
+                self.assertEqual(ker.saved_result_banner(self.conn, TID), [])
+
+    def test_a_dotted_capital_i_above_the_lead_doesnt_shift_the_slice(self):
+        """U+0130 lowercases to two code points; the slice must stay put."""
+        url = "https://github.com/o/r/pull/12"
+        self.comment("## \u0130stanbul check\n" + ker.SAVED_RESULT_LEAD.split(";")[0] + "\n" + url)
+        self.event(ker.DEPENDENCY_WAIT_EVENT)
+        self.assertIn("> " + url, ker.saved_result_banner(self.conn, TID))
 
     def test_an_archived_parent_isnt_named(self):
         self.conn.execute("INSERT INTO tasks VALUES ('t_wrong', 'platform', NULL, 'archived')")

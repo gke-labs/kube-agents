@@ -276,6 +276,10 @@ def waiting_parent_refusal(task_id: str, conn: Any) -> Optional[str]:
 DEPENDENCY_WAIT_EVENT = "dependency_wait"
 # The most of a saved result the banner quotes.
 SAVED_RESULT_MAX_CHARS = 4000
+# Events that end a run. A saved result is for the run right after the block
+# that saved it; once a later run ends any of these ways, it's spent. (A
+# dependency block records only DEPENDENCY_WAIT_EVENT, never "blocked".)
+RUN_END_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
 # The newest saved result the card's own worker wrote during a run that then
 # blocked on a dependency: the comment's author is the card's assignee (the
 # same check as kanban_children_settled's step lines) and it falls inside that
@@ -293,7 +297,7 @@ _NEWEST_DEPENDENCY_WAIT_SQL = (
     # Spent once a run after it completed the card: a card reopened after
     # finishing from the saved result mustn't be handed it again.
     " AND NOT EXISTS (SELECT 1 FROM task_events d WHERE d.task_id = e.task_id"
-    "   AND d.kind = 'completed' AND d.id > e.id)"
+    f"   AND d.kind IN {RUN_END_KINDS!r} AND d.id > e.id)"
     " ORDER BY e.id DESC LIMIT 1"
 )
 # The card's own worker's comments inside that run, newest first.
@@ -316,6 +320,14 @@ _LEAD_TAIL = "pull request"
 _CURLY = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'})
 
 
+def _fold(text: str) -> str:
+    """Lowercase and straighten quotes without changing the length, so an
+    offset found in the fold is an offset in ``text``. ``str.lower`` alone
+    can grow a string (U+0130 becomes two code points)."""
+    return "".join(c if len(low := c.lower()) != 1 else low
+                   for c in text.translate(_CURLY))
+
+
 def _lead_end(body: str) -> int:
     """Where the saved result starts in ``body``, or -1 when none of its first
     three lines opens with the lead. Tolerant of what a worker does to a line
@@ -324,7 +336,7 @@ def _lead_end(body: str) -> int:
     result starts after the lead's own tail ("pull request", and its colon if
     one follows), or on the next line if the tail isn't on this one. Never at
     the first colon: that may be the result's own, in a URL or a time."""
-    folded = body.translate(_CURLY).lower()
+    folded = _fold(body)
     offset = 0
     for line in folded.split("\n")[:3]:
         head = line.lstrip(" \t\r#>*_`\"'")
