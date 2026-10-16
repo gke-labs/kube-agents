@@ -115,18 +115,18 @@ locals {
         allowedUsers    = var.slack_allowed_users
         homeChannel     = var.slack_home_channel
         homeChannelName = var.slack_home_channel_name
-      },
-      (var.slack_bot_token_secret_name != "" || var.slack_bot_token_secret_key != "") ? {
-        botTokenSecretRef = merge(
-          var.slack_bot_token_secret_name != "" ? { name = var.slack_bot_token_secret_name } : {},
-          var.slack_bot_token_secret_key != "" ? { key = var.slack_bot_token_secret_key } : {}
-        )
-      } : {},
-      (var.slack_app_token_secret_name != "" || var.slack_app_token_secret_key != "") ? {
-        appTokenSecretRef = merge(
-          var.slack_app_token_secret_name != "" ? { name = var.slack_app_token_secret_name } : {},
-          var.slack_app_token_secret_key != "" ? { key = var.slack_app_token_secret_key } : {}
-        )
+        },
+        var.slack_bot_token_secret_name != "" ? {
+          botTokenSecretRef = merge(
+            { name = var.slack_bot_token_secret_name },
+            var.slack_bot_token_secret_key != "" ? { key = var.slack_bot_token_secret_key } : {}
+          )
+        } : {},
+        var.slack_app_token_secret_name != "" ? {
+          appTokenSecretRef = merge(
+            { name = var.slack_app_token_secret_name },
+            var.slack_app_token_secret_key != "" ? { key = var.slack_app_token_secret_key } : {}
+          )
       } : {})
     } : {},
     local.gitops_is_gitlab ? { forges = local.gitlab_forges } : {},
@@ -349,6 +349,16 @@ check "slack_tokens_present" {
       (var.slack_app_token != "" || var.slack_app_token_secret_name != "")
     )
     error_message = "enable_slack is true but slack_bot_token and/or slack_app_token is empty. The agent pod will start and Slack will stay silent until both tokens are set in the credentials Secret (or referenced via slack_bot_token_secret_name / slack_app_token_secret_name)."
+  }
+}
+
+check "slack_secret_keys_require_name" {
+  assert {
+    condition = (
+      (var.slack_bot_token_secret_key == "" || var.slack_bot_token_secret_name != "") &&
+      (var.slack_app_token_secret_key == "" || var.slack_app_token_secret_name != "")
+    )
+    error_message = "slack_bot_token_secret_key and slack_app_token_secret_key require the corresponding slack_bot_token_secret_name or slack_app_token_secret_name to be set."
   }
 }
 

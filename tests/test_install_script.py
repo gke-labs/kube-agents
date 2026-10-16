@@ -7631,21 +7631,22 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
 
     # ── what upgrade.sh renders afterwards ──────────────────────────────────
 
-    def _upgrade_render(self, install_env, extra_env=None):
+    def _upgrade_render(self, install_env, extra_env=None, kubectl_script=None):
         """upgrade.sh's half: load_install_env, then write_tfvars_from_state,
         through test_installer_common's hermetic harness, with a live Secret
         holding both Slack tokens on this install's own kube context."""
         bot_b64 = base64.b64encode(b"xoxb-live").decode()
         app_b64 = base64.b64encode(b"xapp-live").decode()
-        kubectl_stub = (
-            "#!/usr/bin/env bash\n"
-            'case "$*" in\n'
-            '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_BOT_TOKEN}}"*) printf "%s" "{bot_b64}" ;;\n'
-            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_APP_TOKEN}}"*) printf "%s" "{app_b64}" ;;\n'
-            "  *) exit 1 ;;\n"
-            "esac\n"
-        )
+        if kubectl_script is None:
+            kubectl_script = (
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
+                f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_BOT_TOKEN}}"*) printf "%s" "{bot_b64}" ;;\n'
+                f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_APP_TOKEN}}"*) printf "%s" "{app_b64}" ;;\n'
+                "  *) exit 1 ;;\n"
+                "esac\n"
+            )
         dest = install_env.parent / "terraform.tfvars"
         env = {"API_SERVER_KEY": "k", "SLACK_ENABLED": "", "SLACK_BOT_TOKEN": "", "SLACK_APP_TOKEN": "",
                "PERSIST_SECRETS_ON_DISK": ""}
@@ -7653,9 +7654,9 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         proc = _installer_common_tests.InstallerCommonTest._run(
             self,
             f'load_install_env "{install_env}"; write_tfvars_from_state "{dest}"; '
-            'echo "rc=$? TFVAR_BOT=[$TF_VAR_slack_bot_token]"',
+            'echo "rc=$? TFVAR_BOT=[$TF_VAR_slack_bot_token] TFVAR_BOT_SEC=[${TF_VAR_slack_bot_token_secret_name:-}]"',
             env=env,
-            kubectl_script=kubectl_stub,
+            kubectl_script=kubectl_script,
         )
         self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
         return dest.read_text(), proc.stdout
@@ -7708,6 +7709,62 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             self.assertNotIn("slack_bot_token", tfvars)
             self.assertIn("TFVAR_BOT=[xoxb-live]", stdout)
             self.assertNotIn("xoxb-live", path.read_text())
+
+    def test_upgrade_recovers_slack_secret_refs_from_live_cr(self):
+        """When the live PlatformAgent CR references an external Secret for Slack tokens,
+        write_tfvars_from_state recovers them and emits them into terraform.tfvars."""
+        kubectl_stub = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
+            '  *"get platformagents"*"botTokenSecretRef.name"*) printf "custom-bot-secret\tcustom-bot-key\tcustom-app-secret\tcustom-app-key" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, self._COORDINATES + "SLACK_ENABLED=true\n")
+            tfvars, stdout = self._upgrade_render(path, kubectl_script=kubectl_stub)
+            self.assertIn('slack_bot_token_secret_name = "custom-bot-secret"', tfvars)
+            self.assertIn('slack_bot_token_secret_key  = "custom-bot-key"', tfvars)
+            self.assertIn('slack_app_token_secret_name = "custom-app-secret"', tfvars)
+            self.assertIn('slack_app_token_secret_key  = "custom-app-key"', tfvars)
+            self.assertIn("TFVAR_BOT_SEC=[custom-bot-secret]", stdout)
+
+    def test_upgrade_does_not_recover_slack_secret_refs_when_pointing_to_shared_secret(self):
+        """When the live PlatformAgent CR references the default shared Secret, no external
+        Secret ref is emitted into terraform.tfvars."""
+        kubectl_stub = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
+            '  *"get platformagents"*"botTokenSecretRef.name"*) printf "platform-agent-secrets\tSLACK_BOT_TOKEN\tplatform-agent-secrets\tSLACK_APP_TOKEN" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, self._COORDINATES + "SLACK_ENABLED=true\n")
+            tfvars, stdout = self._upgrade_render(path, kubectl_script=kubectl_stub)
+            self.assertNotIn("slack_bot_token_secret_name", tfvars)
+            self.assertNotIn("slack_app_token_secret_name", tfvars)
+            self.assertIn("TFVAR_BOT_SEC=[]", stdout)
+
+    def test_upgrade_explicit_default_secret_ref_does_not_recover_external_cr_ref(self):
+        """An explicit default/platform-agent-secrets setting in install.env overrides
+        live CR recovery back to the shared credentials Secret."""
+        kubectl_stub = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
+            '  *"get platformagents"*"botTokenSecretRef.name"*) printf "custom-bot-secret\tcustom-bot-key\tcustom-app-secret\tcustom-app-key" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, self._COORDINATES + "SLACK_ENABLED=true\nSLACK_BOT_TOKEN_SECRET=default\nSLACK_APP_TOKEN_SECRET=default\n")
+            tfvars, stdout = self._upgrade_render(path, kubectl_script=kubectl_stub)
+            self.assertNotIn("slack_bot_token_secret_name", tfvars)
+            self.assertNotIn("slack_app_token_secret_name", tfvars)
+            self.assertIn("TFVAR_BOT_SEC=[]", stdout)
 
 
 class TfvarsTempFileIsCleanedUpTest(unittest.TestCase):
