@@ -212,6 +212,8 @@ func TestChatChunksContinuationAfterFencedBlock(t *testing.T) {
 	// after the closer fits in one chunk, so the scan window reaches the end of
 	// the text and only the reopen prefix keeps the closer from reading as an
 	// opener (a longer tail is rejected by the span length bound alone).
+	// The link's label names another host so keepChatLinks still defangs it;
+	// a plain label would be kept and the prose assertion below would fail.
 	in := "```\n" + strings.Repeat("log line\n", 400) + "```\n" + strings.Repeat("prose line with **bold** and <https://a.example|https://b.example>\n", 20)
 	chunks := chatChunks(in, discordChunk)
 	if !strings.Contains(chunks[1], "prose line") {

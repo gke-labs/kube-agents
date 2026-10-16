@@ -129,8 +129,9 @@ has nothing unfinished to wait on: no parent that isn't settled, and no child
 that ``kanban_scheduling``'s repair will turn into a parent inside
 ``block_task``. The second test is the repair's own predicate,
 ``find_deadlocked_children``, not "any linked child": an edge it won't flip (a
-successor someone planned before this card started, or a child that still
-waits on another card) leaves the card with nothing to wait on, and it would
+successor someone planned before this card started, a child that still
+waits on another card, or a ``platform`` card queued after a ``platform``
+card, #3164) leaves the card with nothing to wait on, and it would
 re-queue as fast as an unlinked one.
 The refusal is not rationed like the completion gate's, because it can't
 wedge anything: the worker still holds its card and can poll, complete, or

@@ -834,6 +834,12 @@ resource "helm_release" "cert_manager" {
   depends_on = [module.gke_cluster]
 }
 
+# The daily alert ceilings that are set. A null key keeps the default in the
+# agent image, so it is not passed to the chart.
+locals {
+  alert_daily_limits = { for bucket, limit in var.alert_daily_limits : bucket => limit if limit != null }
+}
+
 resource "helm_release" "kube_agents" {
   name             = "kube-agents"
   chart            = "${path.module}/../../../charts/kube-agents"
@@ -971,19 +977,27 @@ resource "helm_release" "kube_agents" {
           }
         } : {}
       )
-      deployment = {
-        image = {
-          tag = var.image_tag
-        }
-        availability = {
-          # The gVisor pool only exists to run the agent sandboxed, so the
-          # pool and the runtimeClass move together. That derivation covers
-          # Standard only: Autopilot has the gvisor RuntimeClass and no pool,
-          # so enable_gvisor_node_pool is false there by force and
-          # agent_runtime_class is what asks for the sandbox.
-          runtimeClassName = var.agent_runtime_class != "" ? var.agent_runtime_class : (var.enable_gvisor_node_pool ? "gvisor" : "")
-        }
-      }
+      deployment = merge(
+        {
+          image = {
+            tag = var.image_tag
+          }
+          availability = {
+            # The gVisor pool only exists to run the agent sandboxed, so the
+            # pool and the runtimeClass move together. That derivation covers
+            # Standard only: Autopilot has the gvisor RuntimeClass and no pool,
+            # so enable_gvisor_node_pool is false there by force and
+            # agent_runtime_class is what asks for the sandbox.
+            runtimeClassName = var.agent_runtime_class != "" ? var.agent_runtime_class : (var.enable_gvisor_node_pool ? "gvisor" : "")
+          }
+        },
+        # Only when a ceiling is set. A default install then keeps the
+        # release values that it had before, and a re-tag to a chart without
+        # the key finds no undeclared value.
+        length(local.alert_daily_limits) > 0 ? {
+          alertDailyLimits = local.alert_daily_limits
+        } : {}
+      )
       security = {
         # With annotations set, the OPERATOR creates and manages the KSA (see
         # the chart README's ServiceAccount-ownership section); this one wires

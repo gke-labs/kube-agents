@@ -1034,21 +1034,17 @@ fi
 # reading it back off the volume is the one place a partial upgrade can hide. It also frees
 # this step from depending on step 2b having worked.
 #
-# Writing jobs.json without a lock is safe WITHIN THIS POD, on two facts. The scheduler in
-# THIS container is not running yet — everything here is ahead of `exec "$@"`. And no OTHER
-# container in this pod is running this code: step 1.5 hands the shared tree to a single
-# owner, so the dashboard, which has no scheduler and no reason to touch the schedule, stops
-# before it gets here.
+# Writing jobs.json serializes under Hermes' `<cron_dir>/.jobs.lock` advisory lock to
+# coordinate with any concurrent in-pod Hermes cron mutations (`hermes cron pause|resume|add`).
 #
-# Both facts stop at the pod boundary. Step 1.5 elects an owner per pod, not per volume, so
-# at availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
+# At availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
 # rather than a volume each — every replica's gateway is an owner and several of them run
-# this against the same file, with a rolling update overlapping new pods and old. The
-# exposure and why it is not fixable from inside the script are set out in cron_jobs_sync.py's
-# Concurrency section; the short version is that the reconcile wants to run once per volume,
-# which is a topology change rather than a lock. Single-replica installs, the default, are
-# unaffected. Do not restore a bare "there is no second writer" claim here: it was written
-# once, it was wrong, and it read as verified.
+# this against the same file, with a rolling update overlapping new pods and old. While
+# .jobs.lock serializes writers on filesystems supporting advisory locking, eliminating
+# cross-pod scheduler races on shared volumes requires running the reconcile once per volume,
+# which is a topology change. Single-replica installs, the default, are unaffected. Do not
+# restore a bare "there is no second writer" claim here: it was written once, it was wrong,
+# and it read as verified.
 #
 # --assume-retired covers the one case the script's ledger cannot know on its first run: a
 # deployment that finished onboarding before this existed has no record that

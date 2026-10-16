@@ -182,8 +182,7 @@ the SOP calls the `fleet_scope` tool (§3.2), probes the collector's lock (§3.6
 names a pending reset makes the run the baseline of §3.6, the collector alone with no `start` or
 `finish`), calls `start`, runs the collector, then `finish` with the collector's manifest (`finish`
 refuses a manifest older than the run); without a repository it runs the collector alone, manifest
-included, and the first-run stage marks this job due without one. That is the "chat-only mode" the first-run design lists as an open question,
-scoped to this one stream. An install that onboarded before the job existed gets its baseline from
+included, and the first-run stage marks this job due without one. An install that onboarded before the job existed gets its baseline from
 the first Sunday tick; the after-upgrade sweep, which on most such installs arrives first, finds no
 full run in the ledger and prints only that (§3.2).
 

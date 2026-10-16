@@ -91,6 +91,7 @@ from kube_agents_bench import (
     github_writes,
     onboarding,
     transcript,
+    worker_trajectory,
 )
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
@@ -953,6 +954,14 @@ def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
     return found
 
 
+def _args_withheld(entry: dict[str, Any]) -> bool:
+    """Whether the pod withheld this call's arguments, so a filter on them cannot decide it."""
+    args = entry.get("args")
+    if isinstance(args, dict) and set(args) == {"raw"}:
+        args = args["raw"]
+    return args == worker_trajectory.WITHHELD
+
+
 @VERIFIERS.register("tool_called")
 class ToolCalledVerifier(BaseVerifier):
     """Count trajectory entries whose tool name is in ``tool_names``.
@@ -1012,6 +1021,15 @@ class ToolCalledVerifier(BaseVerifier):
     matches. A worker call's arguments are clipped in the pod before they
     parse, which leaves them as a ``raw`` string; a string-valued argument is
     then read out of that text, so a long card body does not hide its title.
+
+    ``result``: optional Python regular expression. When set, a call counts
+    only if its recorded result, as a string, matches under ``re.search``: what
+    the tool answered rather than only that it was called, such as Hermes'
+    ``<persisted-output>`` notice for a result too large to return whole. A
+    worker call's result is clipped in the pod, so the pattern must match near
+    the start of it. A call whose result the capture could not read (none
+    recorded, or withheld because the pod's redactor did not load) makes the
+    check ``status="error"``, since a pattern over it would read as no match.
     """
 
     type: Literal["tool_called"]
@@ -1020,6 +1038,7 @@ class ToolCalledVerifier(BaseVerifier):
     scope: Literal["router", "workers", "all"] = "router"
     agent: str | None = None
     arguments: dict[str, str] | None = None
+    result: str | None = None
     # Objectives set this: a call the harness marked status="error" produced
     # no effect (kanban_create that failed filed no card), so counting it
     # would pass a check whose subject never happened. Safeguards leave it
@@ -1072,6 +1091,21 @@ class ToolCalledVerifier(BaseVerifier):
             for name, pattern in self.arguments.items()
         )
 
+    @field_validator("result")
+    @classmethod
+    def _result_pattern_compile(cls, pattern: str | None) -> str | None:
+        if pattern is not None:
+            if not pattern:
+                raise ValueError("result cannot be empty; omit it to match any result")
+            re.compile(pattern)
+        return pattern
+
+    def _result_matches(self, entry: dict[str, Any]) -> bool:
+        if self.result is None:
+            return True
+        value = entry.get("result")
+        return value is not None and re.search(self.result, str(value)) is not None
+
     @model_validator(mode="after")
     def _validate_agent_scope(self) -> ToolCalledVerifier:
         if self.agent is not None and self.scope == "router":
@@ -1121,18 +1155,40 @@ class ToolCalledVerifier(BaseVerifier):
             if not entries:
                 matched_agent = False
         wanted = set(self.tool_names)
-        calls = [
+        named = [
             entry
             for entry in entries
             if (entry.get("name") in wanted or _wrapped_tool_names(entry) & wanted)
             and not (self.require_success and entry.get("status") == "error")
-            and self._arguments_match(entry)
         ]
+        if self.result is not None:
+            # A pod that withholds results withholds arguments too, so the
+            # arguments filter cannot rule out a withheld call; it still rules
+            # out an unread call whose readable arguments name something else.
+            unread = [
+                entry for entry in named
+                if (entry.get("result") is None or entry.get("result") == worker_trajectory.WITHHELD)
+                and (_args_withheld(entry) or self._arguments_match(entry))
+            ]
+            if unread:
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=(
+                        f"{len(unread)} call(s) to {sorted(wanted)} have no readable result "
+                        "(none recorded, or withheld in the pod), so the result pattern "
+                        f"{self.result!r} could not be evaluated"
+                    ),
+                )
+        calls = [entry for entry in named if self._arguments_match(entry) and self._result_matches(entry)]
         count = len(calls)
         ok = count >= self.minimum_calls
         agent_str = f" for agent {self.agent!r}" if self.agent is not None else ""
         if self.arguments is not None:
             agent_str += f" with arguments matching {self.arguments!r}"
+        if self.result is not None:
+            agent_str += f" with a result matching {self.result!r}"
         if self.agent is not None and not matched_agent:
             if snap.worker_capture_gaps:
                 return VerificationResult(
@@ -1646,6 +1702,10 @@ def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
                 break
             i = end
             continue
+        if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE and i + 1 == len(command):
+            # A continuation whose next line the row does not carry: a worker log keeps one row
+            # per displayed line, so `audit_report.py start \` is read as the words before it.
+            break
         if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE and i + 1 < len(command):
             if command[i + 1] == _SHELL_LINE_END:
                 # A line continuation: bash removes the pair before it reads a word, so a

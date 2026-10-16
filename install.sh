@@ -741,7 +741,9 @@ Flags for AI Agents & Automation:
   --scope-exclude-projects=IDS  Project IDs or shell-style globs (*-sandbox) to leave
                                 unmanaged
   --scope-exclude-clusters=TRIPLES
-                                Clusters to leave unmanaged, each as project/location/cluster
+                                Clusters to leave unmanaged and out of fleet answers and
+                                the per-cluster audits, each as
+                                project/location/cluster
   --scoped-sa-pool-enabled[=BOOL]
                                 Arm the scoped service account pool: one reader service
                                 account per project in scope, which the credential broker
@@ -2703,6 +2705,13 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
   write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
+  # The daily alert ceilings, recorded even when empty. An empty key keeps the
+  # image default, and the line shows where to set the ceiling. A value that
+  # was exported only for this run then also applies on the next upgrade.sh.
+  local alert_key
+  for alert_key in $ALERT_DAILY_LIMIT_KEYS; do
+    write_env_var "$tmp" "$alert_key" "${!alert_key:-}"
+  done
   write_secret_env_var "$tmp" GEMINI_API_KEY "${GEMINI_API_KEY:-}"
   write_secret_env_var "$tmp" OPENAI_API_KEY "${OPENAI_API_KEY:-}"
   write_secret_env_var "$tmp" ANTHROPIC_API_KEY "${ANTHROPIC_API_KEY:-}"
@@ -6892,7 +6901,7 @@ main() {
       if [ -n "$github_org" ] || [ -n "$github_app_id" ]; then
         print_info "GitOps interview skipped; keeping the GitOps configuration this install already records."
       else
-        print_info "GitOps repository connection skipped. Scheduled fleet audits still run and report to chat, but write no ledger issue or pull request without one."
+        print_info "GitOps repository connection skipped. Scheduled fleet audits still run, keep their reports on the agent's volume and post to chat when something changed, but write no ledger issue or pull request without one."
       fi
     fi
   else
