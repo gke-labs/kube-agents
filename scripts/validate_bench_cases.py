@@ -240,6 +240,12 @@ FIXTURE_NOT_READY = {
         "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
         "can run it; run it by hand against such an install"
     ),
+    "gitops-drift-no-repository-triage": (
+        "#3313: needs an install with no usable GitOps repository (a PlatformAgent "
+        "whose spec.integration.repositories is empty); every CI eval install "
+        "registers one, so no CI tier can run it; run it by hand against such an "
+        "install"
+    ),
     "fleet-cost-without-forge-keeps-the-report": (
         "#2419: needs an install with no forge (a PlatformAgent with no "
         "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
