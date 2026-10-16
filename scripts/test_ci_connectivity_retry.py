@@ -125,6 +125,10 @@ def run_check(succeed_on: int) -> tuple[subprocess.CompletedProcess, pathlib.Pat
             "NAMESPACE=test-ns",
             "STEP_START=0",
             "dump_prow_artifacts_on_failure() { :; }",
+            # The section's EXIT traps chain to the deploy's exit function and
+            # stop its lease heartbeat (#3129); both are defined in section 2.
+            "stop_deploy_heartbeat() { :; }",
+            "deploy_exit() { dump_prow_artifacts_on_failure; }",
             connectivity_section(),
             'echo "SECTION COMPLETED"',
         ]

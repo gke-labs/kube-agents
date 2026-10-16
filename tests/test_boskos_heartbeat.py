@@ -314,6 +314,38 @@ class BoskosHeartbeatTest(unittest.TestCase):
         self.assertIn("disabled", stdout)
         self.assertEqual(_FakeBoskos.updates, [])
 
+    def test_a_daemons_stop_leaves_another_daemons_capture_file_alone(self):
+        # Steps hand off within seconds and share one log, and a stopped
+        # daemon runs its summary up to one interval later. Its cleanup must
+        # remove only its own capture file: removing the next daemon's mid-curl
+        # makes that beat read as a false 000.
+        other = Path(f"{self.beat_log}.capture")
+        other.write_text("200")
+        proc = self._spawn()
+        self._await_beats(2)
+        self._stop(proc)
+        self.assertTrue(other.exists(), "the stop summary removed a capture file it does not own")
+
+    def test_every_beats_code_lands_in_the_named_file(self):
+        # ci-teardown.sh reads this file before Step 1: a 401 there means the
+        # project is another run's and the cluster steps are skipped, and
+        # only a 200 lets them run (#3129).
+        codes = Path(self.tmp.name) / "beat-codes"
+        proc = self._spawn(BOSKOS_HEARTBEAT_CODES_FILE=str(codes))
+        wait_until(lambda: codes.exists() and len(codes.read_text().split()) >= 3)
+        self._stop(proc)
+        lines = codes.read_text().split()
+        self.assertGreaterEqual(len(lines), 3, lines)
+        self.assertEqual(set(lines), {"200"})
+
+    def test_the_codes_file_says_401_when_the_lease_is_anothers(self):
+        _FakeBoskos.owner = "pull-kube-agents-smoke-test-2110536740778283008"
+        codes = Path(self.tmp.name) / "beat-codes"
+        proc = self._spawn(BOSKOS_HEARTBEAT_CODES_FILE=str(codes))
+        wait_until(lambda: codes.exists() and codes.read_text().strip())
+        self._stop(proc)
+        self.assertEqual(codes.read_text().split()[0], "401")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

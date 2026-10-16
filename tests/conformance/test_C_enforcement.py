@@ -109,6 +109,112 @@ class C1IsolationIsStructural(unittest.TestCase):
         # ServiceAccount the sandbox pod actually names.
         self.assertIn("shellSandboxServiceAccountName(agent)", body)
 
+    _WATCHER_AUDIENCE = "kubeagents-credential-proxy-watcher"
+
+    def test_C1_the_watcher_token_is_mounted_only_in_agent_api_auth(self) -> None:
+        """The watcher role reaches fleet API servers and Pub/Sub through the broker.
+
+        The broker confers the role by audience alone, so the question is where a
+        token for the watcher audience is mounted, under any volume name, in any
+        workload: exactly the gateway's agent-api-auth container. Not the Hermes
+        container beside it, which runs model-chosen tools and holds only the
+        chat token; not the sandbox, where model-authored shell runs; not the
+        broker. Checked on every golden.
+        """
+        for fixture, documents in h.golden_documents().items():
+            mounts = set()
+            gateways = []
+            for workload in h.objects_of_kind(documents, "Deployment") + h.objects_of_kind(documents, "StatefulSet"):
+                name = workload["metadata"]["name"]
+                if workload["kind"] == "Deployment" and name.endswith("-gateway"):
+                    gateways.append(name)
+                spec = workload["spec"]["template"]["spec"]
+                watcher_volumes = {
+                    v["name"]
+                    for v in spec.get("volumes", [])
+                    for source in (v.get("projected") or {}).get("sources", [])
+                    if (source.get("serviceAccountToken") or {}).get("audience") == self._WATCHER_AUDIENCE
+                }
+                for container in h.containers_of(workload):
+                    if any(m["name"] in watcher_volumes for m in container.get("volumeMounts", [])):
+                        mounts.add((name, container["name"]))
+            self.assertEqual(len(gateways), 1, f"{fixture}: expected one gateway Deployment")
+            self.assertEqual(
+                mounts,
+                {(gateways[0], "agent-api-auth")},
+                f"{fixture}: a watcher-audience token is mounted in {sorted(mounts)}",
+            )
+
+    def test_C1_the_watcher_cluster_read_never_relays_a_client_credential(self) -> None:
+        """A GKE clusters.get answer carries masterAuth's client certificate and key
+        on a cluster with issuance on: a credential for that API server, wider
+        than anything the watcher role may do. The broker relays the CA only."""
+        import json
+
+        answer = json.dumps({
+            "name": "c",
+            "masterAuth": {"clusterCaCertificate": "CA", "clientCertificate": "CERT", "clientKey": "KEY",
+                           "username": "admin", "password": "pw"},
+        }).encode()
+        relayed = json.loads(h.watcher_policy.project_cluster(answer))
+        self.assertEqual(relayed["masterAuth"], {"clusterCaCertificate": "CA"})
+
+    def test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads(self) -> None:
+        policy = h.watcher_policy
+        target = "kagents-dev/us-east4/fleet-a/"
+        for method in ("POST", "PUT", "PATCH", "DELETE"):
+            for path in ("api/v1/events", "api/v1/namespaces/default/configmaps/x"):
+                decision = policy.evaluate_k8s(method, target + path, {})
+                self.assertFalse(decision.allowed, f"{method} {path} reaches a fleet API server")
+        for path in (
+            "api/v1/pods",
+            "api/v1/namespaces/default/pods",
+            "api/v1/namespaces/default/pods/x/exec",
+            "api/v1/namespaces/default/serviceaccounts/x/token",
+            "api/v1/namespaces/default/secrets/db",
+            "apis/apps/v1/deployments",
+            # The deprecated watch/<resource> paths the API server still
+            # serves: a watch of anything, Secrets included.
+            "api/v1/watch/secrets",
+            "apis/apps/v1/watch/deployments",
+        ):
+            self.assertFalse(policy.evaluate_k8s("GET", target + path, {}).allowed, f"GET {path} is relayed")
+        self.assertTrue(policy.evaluate_k8s("GET", target + "api/v1/events", {"watch": ["1"]}).allowed)
+
+    def test_C1_the_watcher_pubsub_routes_reach_only_the_configured_subscription(self) -> None:
+        policy = h.watcher_policy
+        configured = "projects/kagents-dev/subscriptions/platform-agent-drift-audit-sub"
+        for other in (
+            "projects/kagents-dev/subscriptions/another-sub",
+            "projects/elsewhere-1/subscriptions/platform-agent-drift-audit-sub",
+        ):
+            decision = policy.evaluate_gcp("POST", policy.PUBSUB_HOST, f"v1/{other}:pull", b"{}", configured)
+            self.assertFalse(decision.allowed, f"the watcher relay pulls {other}")
+        self.assertFalse(
+            policy.evaluate_gcp("POST", policy.PUBSUB_HOST, f"v1/{configured}:pull", b"{}", "").allowed,
+            "with the detector off the relay still reaches Pub/Sub",
+        )
+        self.assertTrue(
+            policy.evaluate_gcp("POST", policy.PUBSUB_HOST, f"v1/{configured}:pull", b'{"maxMessages":1}', configured).allowed
+        )
+
+    def test_C1_only_the_watcher_role_reaches_the_watcher_routes(self) -> None:
+        proxy = h.credential_proxy
+        for prefix in (h.watcher_policy.WATCHER_GCP_PREFIX, h.watcher_policy.WATCHER_K8S_PREFIX):
+            self.assertEqual(proxy.required_roles(prefix + "x"), (proxy.CALLER_ROLE_WATCHER,), prefix)
+
+    def test_C1_the_operator_pins_the_drift_detectors_own_default_subscription(self) -> None:
+        """The broker refuses every subscription but the one the operator names.
+
+        When the CR names none, the operator names the detector's default; the
+        two constants drifting apart would refuse the detector's every pull.
+        """
+        operator = re.search(r'driftDetectorDefaultSubscription = "([^"]+)"', h.text("broker_split_go"))
+        detector = re.search(r'defaultSubscriptionName = "([^"]+)"', h.text("drift_detector_main_go"))
+        self.assertIsNotNone(operator)
+        self.assertIsNotNone(detector)
+        self.assertEqual(operator.group(1), detector.group(1))
+
     def test_C1_the_credential_broker_is_its_own_deployment(self) -> None:
         """Topology, not configuration -- which is the upgrade #913 delivered.
 
