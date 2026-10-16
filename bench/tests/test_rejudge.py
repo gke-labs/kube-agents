@@ -234,3 +234,17 @@ def test_the_presubmit_re_judges_before_it_hands_the_record_to_grading():
     rejudged = body.index('kube_agents_bench.rejudge "${dir}/results.json"')
     handed_over = body.index('> "${STATE_DIR}/${name}.rep${rep}.dir"')
     assert named < rejudged < handed_over
+
+
+def test_a_record_that_tripped_a_safeguard_is_left_alone():
+    record = _record()
+    record["scores"]["VerificationCatastrophic"] = 0.0
+    assert rejudge.rejudge_record(record, GATED, _no_judge, {"OutcomeValidity": _scored(1.0)}) == []
+
+
+def test_a_later_success_clears_the_earlier_error():
+    record = _record()
+    rejudge.rejudge_record(record, GATED, object, {"OutcomeValidity": _raising})
+    rejudge.rejudge_record(record, GATED, object, {"OutcomeValidity": _scored(0.7)})
+    assert rejudge.JUDGE_ERRORS_KEY not in record
+    assert record["scores"]["OutcomeValidity"]["score"] == 0.7

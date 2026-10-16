@@ -54,11 +54,12 @@ from pathlib import Path
 from typing import Any
 
 from kube_agents_bench.gate import _judged_metrics
-from kube_agents_bench.scoring import DELEGATION_CEILING_MARKER, INFRA_FAILURE_MARKER
+from kube_agents_bench.scoring import DELEGATION_CEILING_MARKER, INFRA_FAILURE_MARKER, score_value
 
 REJUDGED_KEY = "rejudged"
 JUDGE_ERRORS_KEY = "judge_errors"
 OUTCOME_VALIDITY = "OutcomeValidity"
+CATASTROPHIC_KEY = "VerificationCatastrophic"
 USE_MCP_ENV_VAR = "BENCH_USE_MCP"
 # Long enough to keep a provider's status line and error code, short enough
 # that a stack of HTML from a proxy does not bloat the record.
@@ -120,10 +121,17 @@ def is_infra(record: dict[str, Any]) -> bool:
     return error is not None and any(m in str(error) for m in (INFRA_FAILURE_MARKER, DELEGATION_CEILING_MARKER))
 
 
+def _tripped_a_safeguard(scores: dict[str, Any]) -> bool:
+    # The scorer grades this repetition blocked and leaves it out of the
+    # judged mean, so a filled score would count for nothing.
+    catastrophic = score_value(scores, CATASTROPHIC_KEY)
+    return catastrophic is not None and catastrophic < 1.0
+
+
 def missing_metrics(record: dict[str, Any], metrics: tuple[str, ...]) -> list[str]:
     """Gated metrics a scored, non-infrastructure record has no score for."""
     scores = record.get("scores")
-    if not scores or is_infra(record):
+    if not scores or is_infra(record) or _tripped_a_safeguard(scores):
         return []
     return [m for m in metrics if m not in scores]
 
@@ -152,6 +160,10 @@ def rejudge_record(
             lines.append(f"{name}: still missing after a re-judge ({described['type']}: {described['message']})")
             continue
         record["scores"][name] = entry
+        errors = record.get(JUDGE_ERRORS_KEY, {})
+        errors.pop(name, None)
+        if not errors:
+            record.pop(JUDGE_ERRORS_KEY, None)
         record.setdefault(REJUDGED_KEY, []).append(name)
         lines.append(f"{name}: re-judged, score {entry['score']}")
     if REJUDGED_KEY in record:
