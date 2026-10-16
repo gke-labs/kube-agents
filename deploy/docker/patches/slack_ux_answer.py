@@ -43,9 +43,9 @@ An answer that declares its next step on a last line of its own (``slack_moments
 ``[next: check seeded-a]``) gets that step as one such button in a thread, the line left
 out of the blocks, after the question when there is one; an answer ``split`` refuses is
 then drawn whole, as upstream's renderer draws it, with the button under it. Options the
-answer offers win over a declared step. Outside a thread, and for an answer that keeps the
-upstream post for any other reason (an actionable report, or one that cannot be drawn
-whole within Slack's 50 blocks), the line stays as written. The folded post
+answer offers win over a declared step. Outside a thread the line follows the question as
+written, and an answer that keeps the upstream post for any other reason (an actionable
+report, or one that cannot be drawn whole within Slack's 50 blocks) keeps it in place. The folded post
 carries what upstream's adds: link-preview settings, ``reply_broadcast``, the
 feedback buttons, the status clear and the reply tracking for the thread. An incident report
 that edits its alert never reaches this send, and a report a reply can act on
@@ -343,13 +343,16 @@ class _AnswerFolder:
         adapter = self._adapter
         mrkdwn_fn = getattr(adapter, "format_message", None)
         in_thread = bool(adapter._resolve_thread_ts(None, metadata))
-        # A declared next step is a button in a thread, with its line left out of the blocks;
-        # outside one a click has no thread to answer in, so the line stays as written.
-        shown_answer, step = _moments.next_step(content) if in_thread else (content, "")
-        step_blocks = choice_blocks([(step, False)]) if step else []
+        # A declared next step is laid out apart from the answer, so the closing question above it
+        # still posts unfolded. In a thread it is a button; outside one a click has no thread to
+        # answer in, so its line follows the question as written.
+        shown_answer, step = _moments.next_step(content)
+        step_line = content.rstrip()[len(shown_answer):].strip() if step else ""
+        step_blocks = choice_blocks([(step, False)]) if step and in_thread else []
+        tail = "" if in_thread else step_line
         parts = split(shown_answer)
         if parts is None:
-            if not step:
+            if not step_blocks:
                 return None
             # The answer as upstream draws it, without the step's line, and the step's button.
             whole_blocks = render_fold(shown_answer, mrkdwn_fn)
@@ -371,6 +374,7 @@ class _AnswerFolder:
             else:
                 rest, question = trailing_question(rest)
                 detail_blocks, action_blocks = [], step_blocks
+            question = "\n\n".join(part for part in (question, tail) if part)
             fold_blocks = render_fold(rest, mrkdwn_fn) if rest else []
             question_blocks = render_fold(question, mrkdwn_fn) if question else []
             if fold_blocks is None or question_blocks is None or detail_blocks is None:

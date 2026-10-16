@@ -1031,7 +1031,8 @@
         "detail": "The fleet has seeded-a, -b and -c. checkout-gateway runs on seeded-a. Check it there?",
         "choices": [
           {
-            "text": "check seeded-a"
+            "text": "check seeded-a",
+            "next": true
           }
         ]
       }
@@ -1043,7 +1044,8 @@
         "headline": "seeded-c is one minor version behind (1.32.9 vs 1.33.4). a and b are current.",
         "choices": [
           {
-            "text": "upgrade plan for seeded-c"
+            "text": "upgrade plan for seeded-c",
+            "next": true
           }
         ]
       }
@@ -1056,7 +1058,8 @@
         "detail": "Both pods have been up for 45h on seeded-a. #oncall may mean payments-api in seeded-debug, which is crashing. Want me to look?",
         "choices": [
           {
-            "text": "look at payments-api"
+            "text": "look at payments-api",
+            "next": true
           }
         ]
       }
@@ -1068,7 +1071,8 @@
         "headline": "seeded-c is behind its channel default.",
         "choices": [
           {
-            "text": "upgrade plan for seeded-c"
+            "text": "upgrade plan for seeded-c",
+            "next": true
           }
         ]
       }
@@ -1104,7 +1108,8 @@
         "headline": "seeded-c is behind.",
         "choices": [
           {
-            "text": "upgrade seeded-c"
+            "text": "upgrade seeded-c",
+            "next": true
           }
         ]
       }
@@ -1174,9 +1179,65 @@
         },
         "choices": [
           {
-            "text": "upgrade plan for seeded-c"
+            "text": "upgrade plan for seeded-c",
+            "next": true
           }
         ]
+      }
+    },
+    {
+      "in": "seeded-c is behind.\r\n[next: check seeded-b]\r\n[next: upgrade plan for seeded-c]\r\n",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is behind.",
+        "detail": "[next: check seeded-b] [next: upgrade plan for seeded-c]"
+      }
+    },
+    {
+      "in": "seeded-c is behind.\r\n\r\n[next: upgrade plan for seeded-c]\r\n",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is behind.",
+        "choices": [
+          {
+            "text": "upgrade plan for seeded-c",
+            "next": true
+          }
+        ]
+      }
+    },
+    {
+      "in": "Five pods match.\n\n[next: **delete pods matching** `app=web-*`]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Five pods match.",
+        "choices": [
+          {
+            "text": "delete pods matching app=web-*",
+            "next": true
+          }
+        ]
+      }
+    },
+    {
+      "in": "Five pods match.\n\n[next: scale app=web-* to 3]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Five pods match.",
+        "choices": [
+          {
+            "text": "scale app=web-* to 3",
+            "next": true
+          }
+        ]
+      }
+    },
+    {
+      "in": "Five pods match.\n\n[next: **]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Five pods match.",
+        "detail": "[next: **]"
       }
     },
     {

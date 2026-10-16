@@ -14,7 +14,8 @@
         "detail": "Both pods have been up for 45h on seeded-a. #oncall may mean payments-api in seeded-debug, which is crashing. Want me to look?",
         "choices": [
           {
-            "text": "look at payments-api"
+            "text": "look at payments-api",
+            "next": true
           }
         ]
       }

@@ -331,11 +331,19 @@ class MarkTest(FlagOn):
             chat = runtime.chat_for(DECLARED_REPLY)
         finally:
             runtime.end(token)
-        self.assertEqual(chat["choices"], [{"text": "check seeded-a"}])
+        self.assertEqual(chat["choices"], [{"text": "check seeded-a", "next": True}])
         self.assertTrue(chat["detail"].endswith("Check it there?"))
         outside = runtime.layout(DECLARED_REPLY, False)
         self.assertIsNone(outside.get("choices"), "no button outside a thread")
         self.assertTrue(outside["detail"].endswith("[next: check seeded-a]"), "so the line stays as written")
+
+    def test_a_declared_step_with_no_room_for_its_button_stays_as_written(self):
+        runtime.note_wake(SUB, {"blocked"}, WAKE)
+        full = lambda content: _render(content) * runtime.MESSAGE_BLOCKS_MAX  # noqa: E731
+        blocks = self.draw(_turn(), content=DECLARED_REPLY, render=full)
+        self.assertEqual(_buttons(blocks), [])
+        self.assertTrue(blocks[0]["text"]["text"].startswith("**I couldn't find seeded-z.**"))
+        self.assertTrue(blocks[0]["text"]["text"].endswith("Check it there?\n\n[next: check seeded-a]"))
 
     def test_outside_a_thread_a_declared_step_stays_as_written(self):
         runtime.note_wake({**SUB, "thread_id": None}, {"blocked"}, WAKE)

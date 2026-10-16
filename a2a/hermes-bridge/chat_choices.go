@@ -59,9 +59,8 @@ const (
 	shownSummary = "%s — %s"
 	// labelTrim is what a label sheds from its end ("Fix it:").
 	labelTrim = ":"
-	// nextStepMarks is NEXT_STEP_MARKS: the emphasis and code marks a
-	// declared step's label sheds.
-	nextStepMarks = "*`"
+	// carriageReturn ends each line of a CRLF answer (CARRIAGE_RETURN).
+	carriageReturn = "\r"
 )
 
 var (
@@ -491,30 +490,25 @@ func answerChoices(rest string) (answerOffer, bool) {
 
 // nextStep is slack_moments.next_step: the one next step an answer declares
 // on its last line, a line of its own reading "[next: <label>]", split off as
-// (the answer above that line, the label). The label sheds its "*" and
-// backticks (nextStepMarks); one that is then empty, longer than a button or
-// holds a link or a mention, or a second "[next: ...]"
+// (the answer above that line, the label). The label is made plain as an
+// option's is (plainLine); one that is then longer than a button, holds no
+// letter or digit, or holds a link or a mention, or a second "[next: ...]"
 // line anywhere, declares none, and the answer is returned as written with
 // an empty label.
 func nextStep(answer string) (string, string) {
 	lines := strings.Split(strings.TrimRightFunc(answer, isPySpace), "\n")
-	m := nextStepLine.FindStringSubmatch(lines[len(lines)-1])
+	m := nextStepLine.FindStringSubmatch(strings.TrimRight(lines[len(lines)-1], carriageReturn))
 	if m == nil {
 		return answer, ""
 	}
 	for _, line := range lines[:len(lines)-1] {
-		if nextStepLine.MatchString(line) {
+		if nextStepLine.MatchString(strings.TrimRight(line, carriageReturn)) {
 			return answer, ""
 		}
 	}
-	shed := strings.Map(func(r rune) rune {
-		if strings.ContainsRune(nextStepMarks, r) {
-			return -1
-		}
-		return r
-	}, m[1])
-	label := strings.Join(strings.FieldsFunc(shed, isPySpace), " ")
-	if label == "" || runeLen(label) > buttonTextMax || nextStepRefused.MatchString(label) {
+	label := strings.Join(strings.FieldsFunc(plainLine(m[1]), isPySpace), " ")
+	if runeLen(label) > buttonTextMax || nextStepRefused.MatchString(label) ||
+		strings.IndexFunc(label, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsNumber(r) }) < 0 {
 		return answer, ""
 	}
 	return strings.TrimRightFunc(strings.Join(lines[:len(lines)-1], "\n"), isPySpace), label

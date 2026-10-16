@@ -469,16 +469,21 @@ def maybe_blocks(content: str, render: Callable[[str], Optional[list]]) -> Optio
     if thread is None:
         return render(content)
     try:
-        shown, step = _next_step(content) if thread else (content, "")
+        shown, step = _next_step(content)
         bolded, offer = present(shown)
         blocks = render(bolded)
         if blocks is None:
             return render(content)
         label = step or (OFFER_LABEL if offer else "")
         if label and thread and len(blocks) < MESSAGE_BLOCKS_MAX:
-            blocks = list(blocks) + _presenter.blocks_answer(
+            return list(blocks) + _presenter.blocks_answer(
                 "", choices=[label], action_id_prefix=ACTION_ID_PREFIX,
             )
+        if step:
+            # No button carries the declared step (outside a thread, or no room): its line as written.
+            step_line = content.rstrip()[len(shown):].strip()
+            drawn = render(f"{bolded}\n\n{step_line}")
+            return drawn if drawn is not None else render(content)
         return blocks
     except Exception:
         logger.warning("slack_ux_failure: drawing the failure reply failed", exc_info=True)

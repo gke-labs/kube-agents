@@ -119,6 +119,10 @@ type Choice struct {
 	Text    string `json:"text"`
 	Reply   string `json:"reply,omitempty"`
 	Primary bool   `json:"primary,omitempty"`
+	// Next marks a finished answer's optional next step: a click still
+	// arrives as the clicker's text, but nothing waits on it, so a renderer
+	// never reads a typed reply as its answer.
+	Next bool `json:"next,omitempty"`
 }
 
 // Link is a button that opens a url.
@@ -182,7 +186,7 @@ var messageShape = &shape{keys: map[string]*shape{
 		"title": leaf, "text": leaf,
 		"table": {keys: map[string]*shape{"columns": leaf, "rows": leaf}},
 	}},
-	"choices": {list: true, keys: map[string]*shape{"text": leaf, "reply": leaf, "primary": leaf}},
+	"choices": {list: true, keys: map[string]*shape{"text": leaf, "reply": leaf, "primary": leaf, "next": leaf}},
 	"links":   {list: true, keys: map[string]*shape{"text": leaf, "url": leaf, "primary": leaf}},
 	"plan": {keys: map[string]*shape{
 		"title": leaf,

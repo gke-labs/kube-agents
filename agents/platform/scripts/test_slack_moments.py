@@ -756,6 +756,13 @@ class NextStepTest(unittest.TestCase):
         self.assertEqual(m.next_step("Up.\n[next: check `seeded-a`]"), ("Up.", "check seeded-a"))
         self.assertEqual(m.next_step("Up.\n[next: **check seeded-a**]"), ("Up.", "check seeded-a"))
         self.assertEqual(m.next_step("Up.\n[next: scale my_app]"), ("Up.", "scale my_app"))
+        # A glob's lone star is the user's words, not markup.
+        self.assertEqual(m.next_step("Up.\n[next: scale app=web-* to 3]"), ("Up.", "scale app=web-* to 3"))
+
+    def test_a_crlf_answer_reads_as_an_lf_one(self):
+        self.assertEqual(m.next_step("Up.\r\n\r\n[next: check seeded-a]\r\n"), ("Up.", "check seeded-a"))
+        two = "Up.\r\n[next: check seeded-b]\r\n[next: check seeded-a]\r\n"
+        self.assertEqual(m.next_step(two), (two, ""))
 
     def test_a_label_at_the_button_cap_is_kept(self):
         label = "x" * p.BUTTON_TEXT_MAX

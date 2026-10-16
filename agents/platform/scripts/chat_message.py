@@ -203,8 +203,12 @@ def _headline(text: Any) -> str:
     return _presenter._clip(_line(_presenter._plain(str(text or ""))), _presenter.HEADLINE_MAX)
 
 
-def _choice(label: str, reply: str = "", primary: bool = False) -> dict | None:
-    """One choice, or None when it cannot be one: empty, too long to reply, or a command word."""
+def _choice(label: str, reply: str = "", primary: bool = False, next_step: bool = False) -> dict | None:
+    """One choice, or None when it cannot be one: empty, too long to reply, or a command word.
+
+    ``next_step`` marks it ``next``: a finished answer's optional follow-up, which a typed
+    reply never answers.
+    """
     text = _presenter._clip(_line(label), _presenter.BUTTON_TEXT_MAX)
     if not text:
         return None
@@ -218,6 +222,8 @@ def _choice(label: str, reply: str = "", primary: bool = False) -> dict | None:
         choice["reply"] = reply
     if primary:
         choice["primary"] = True
+    if next_step:
+        choice["next"] = True
     return choice
 
 
@@ -407,7 +413,7 @@ def answer_message(markdown: str) -> dict | None:
         if all(choices) and len(detail) <= DETAIL_MAX:
             fold = {"title": FOLD_TITLE_DEFAULT, "text": folded} if folded else None
             return message(headline=headline, detail=detail, fold=fold, choices=choices)
-    choice = _choice(step) if step else None
+    choice = _choice(step, next_step=True) if step else None
     choices = [choice] if choice else None
     if len(text) > DETAIL_MAX:
         return message(headline=headline, fold={"title": FOLD_TITLE_DEFAULT, "text": text}, choices=choices)
@@ -571,7 +577,7 @@ def failure_message(reply: str, offer: bool, label: str = "") -> dict | None:
     detail = "\n\n".join(body).strip()
     if not headline or len(detail) > DETAIL_MAX:
         return None
-    choice = _choice(label or OFFER_LABEL) if offer else None
+    choice = _choice(label or OFFER_LABEL, next_step=bool(label)) if offer else None
     return message(headline=headline, detail=detail, choices=[choice] if choice else None)
 
 

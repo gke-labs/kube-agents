@@ -63,7 +63,7 @@ verification_spec:
   # The reply ends on one declared step that names the cluster the card's
   # reason points to: a last line `[next: <label>]`, the label 1-75
   # characters (the button's cap, slack_presenter BUTTON_TEXT_MAX) with no
-  # `<`, `>` or `|` (a Slack link or mention, which a button cannot show).
+  # `[`, `<`, `>` or `|` (a bracket, or a Slack link or mention, which a button cannot show).
   # `*`, `_` and backticks are dropped before matching, as next_step drops
   # `*` and backticks from a label and keeps `_` as typed. Blank lines and trailing spaces
   # after it are allowed, any other text is not: the presenters read only the
@@ -76,7 +76,7 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?![\s\S]*\n[ \t]*\[next:[ \t]*(?=[^\]\n]{1,75}\][ \t]*(?:\n[ \t]*)*\Z)[^\]\n<>|]*\bseeded-a\b[^\]\n<>|]*\][ \t]*(?:\n[ \t]*)*\Z)'
+        - '\A(?![\s\S]*\n[ \t]*\[next:[ \t]*(?=[^\]\n]{1,75}\][ \t]*(?:\n[ \t]*)*\Z)[^\]\[\n<>|]*\bseeded-a\b[^\]\[\n<>|]*\][ \t]*(?:\n[ \t]*)*\Z)'
   # Never more than one: a second declared step anywhere means the reply
   # did not pick the obvious one, and the presenters draw no button for it.
   - name: the-reply-declares-one-step-at-most

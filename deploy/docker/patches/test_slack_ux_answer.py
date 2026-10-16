@@ -521,10 +521,15 @@ class SendTest(unittest.TestCase):
         wrapped = runtime.adapter_for(
             adapter, "slack", SimpleNamespace(kind="completed"), SimpleNamespace(), {"chat_id": CHANNEL}
         )
-        asyncio.run(wrapped.send(CHANNEL, f"{ANSWER}\n\n[next: scale the pool]", metadata={}))
+        question = "Want me to scale the pool to 6 nodes?"
+        asyncio.run(wrapped.send(CHANNEL, f"{ANSWER}\n\n{question}\n\n[next: scale the pool]", metadata={}))
         blocks = adapter.log[0][1]["blocks"]
         self.assertNotIn("actions", [block["type"] for block in blocks])
-        self.assertIn("[next: scale the pool]", json.dumps(blocks))
+        # The question still posts unfolded, and the line follows it as written.
+        _headline, fold, asked, line = blocks
+        self.assertEqual(fold["child_blocks"], _render_blocks(REST, adapter.format_message))
+        self.assertEqual(asked, _render_blocks(question, adapter.format_message)[0])
+        self.assertEqual(line, _render_blocks("[next: scale the pool]", adapter.format_message)[0])
 
     def test_a_top_level_chat_posts_without_a_thread(self):
         adapter = _Adapter()

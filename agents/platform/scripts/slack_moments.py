@@ -300,8 +300,7 @@ NEXT_STEP_LINE = re.compile(r"[ \t]*\[next:[ \t]*([^\]\n]*?)[ \t]*\][ \t]*", re.
 #: What a declared step's label cannot hold: a Slack link or mention, which a button shows as
 #: typed, and the brackets of a second step.
 NEXT_STEP_REFUSED = re.compile(r"[<>|\[\]]")
-#: Emphasis and code marks a label sheds, as an id the report format asks to wrap in backticks.
-NEXT_STEP_MARKS = "*`"
+CARRIAGE_RETURN = "\r"
 
 
 def opened_pr(
@@ -854,17 +853,23 @@ def next_step(text: str) -> tuple[str, str]:
 
     The agent declares it on the answer's last line, a line of its own reading
     ``[next: <label>]``, the words a user would type to ask for it. The label is
-    one line of 1 to ``BUTTON_TEXT_MAX`` characters once its ``*`` and backticks
-    are dropped, with no link or mention; the text returned is the answer above
-    that line. Anything else,
+    one line of 1 to ``BUTTON_TEXT_MAX`` characters once its markup is made plain
+    as an option's label is (``slack_presenter._plain``: paired emphasis and code
+    marks go, a lone ``*`` in a glob stays), holding a letter or digit and no link
+    or mention; the text returned is the answer above that line. Anything else,
     including a second ``[next: ...]`` line anywhere, declares none and leaves
     the text as written.
     """
     lines = (text or "").rstrip().split("\n")
-    match = NEXT_STEP_LINE.fullmatch(lines[-1])
-    if match is None or any(NEXT_STEP_LINE.fullmatch(line) for line in lines[:-1]):
+    # A CRLF answer's lines end in "\r", which no step line may hide behind.
+    match = NEXT_STEP_LINE.fullmatch(lines[-1].rstrip(CARRIAGE_RETURN))
+    if match is None or any(NEXT_STEP_LINE.fullmatch(line.rstrip(CARRIAGE_RETURN)) for line in lines[:-1]):
         return text, ""
-    label = " ".join("".join(c for c in match.group(1) if c not in NEXT_STEP_MARKS).split())
-    if not label or len(label) > _presenter.BUTTON_TEXT_MAX or NEXT_STEP_REFUSED.search(label):
+    label = " ".join(_presenter._plain(match.group(1)).split())
+    if (
+        len(label) > _presenter.BUTTON_TEXT_MAX
+        or NEXT_STEP_REFUSED.search(label)
+        or not any(c.isalnum() for c in label)
+    ):
         return text, ""
     return "\n".join(lines[:-1]).rstrip(), label

@@ -131,13 +131,14 @@ class NextStepTest(unittest.TestCase):
     def test_mock_03(self):
         """The declared step is the one choice, not primary, and its line is not in the detail."""
         chat = cm.answer_message(_case("answer-declares-next-step")["input"]["markdown"])
-        self.assertEqual(chat["choices"], [{"text": "look at payments-api"}])
+        self.assertEqual(chat["choices"], [{"text": "look at payments-api", "next": True}])
         self.assertTrue(chat["detail"].endswith("Want me to look?"))
 
     def test_a_long_rest_folds_and_keeps_the_step(self):
         long = "X" + "x" * cm.DETAIL_MAX
         chat = cm.answer_message(f"Behind. {long}\n\n[next: upgrade plan for seeded-c]")
-        self.assertEqual((chat["fold"]["text"], chat["choices"]), (long, [{"text": "upgrade plan for seeded-c"}]))
+        self.assertEqual((chat["fold"]["text"], chat["choices"]),
+                         (long, [{"text": "upgrade plan for seeded-c", "next": True}]))
 
     def test_options_win_over_a_step(self):
         chat = cm.answer_message("Two ways.\n\n1. **Raise it**\n2. **Roll back**\n\nWhich do you want?\n\n[next: raise it]")
@@ -149,7 +150,7 @@ class NextStepTest(unittest.TestCase):
 
     def test_a_failure_reply_offers_its_step_in_place_of_try_again(self):
         self.assertEqual(cm.failure_message("I couldn't. Check it there?", True, "check seeded-a")["choices"],
-                         [{"text": "check seeded-a"}])
+                         [{"text": "check seeded-a", "next": True}])
         self.assertEqual(cm.failure_message("I couldn't. Retry?", True)["choices"], [{"text": cm.OFFER_LABEL}])
         self.assertNotIn("choices", cm.failure_message("I couldn't. Retry?", False, "check seeded-a"))
 

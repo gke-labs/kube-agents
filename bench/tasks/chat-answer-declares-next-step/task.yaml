@@ -61,7 +61,7 @@ fixtures:
 verification_spec:
   # A delegated result ends on one declared step: a line `[next: <label>]`,
   # the label 1-75 characters (slack_presenter BUTTON_TEXT_MAX) with no `<`,
-  # `>` or `|` (a Slack link or mention), followed only by blank lines up to
+  # `>`, `|` or `[` (a Slack link or mention, or a bracket), followed only by blank lines up to
   # the end of the text or the next delegated result or artifact. The report
   # is normalized first: lowercased, `*`, `_` and backticks dropped, so the 75
   # counts a label without its underscores, which next_step keeps and counts.
@@ -73,7 +73,7 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?![\s\S]*\n[ \t]*\[next:[ \t]*(?=[^\]\n]{1,75}\])[^\]\n<>|]+\][ \t]*(?:\n[ \t]*)*(?:\Z|\n(?:result of delegated task |artifact [^\n]* produced by delegated task )))'
+        - '\A(?![\s\S]*\n[ \t]*\[next:[ \t]*(?=[^\]\n]{1,75}\])[^\]\[\n<>|]+\][ \t]*(?:\n[ \t]*)*(?:\Z|\n(?:result of delegated task |artifact [^\n]* produced by delegated task )))'
   # Never more than one in one answer: two declared steps mean no button.
   - name: no-answer-declares-two-steps
     role: objective

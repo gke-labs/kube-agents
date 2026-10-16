@@ -217,7 +217,7 @@ func answerChat(answer string) (chatmsg.Message, bool) {
 		}
 	}
 	if step != "" && !chattext.IsCommand(step) {
-		msg.Choices = []chatmsg.Choice{{Text: step}}
+		msg.Choices = []chatmsg.Choice{{Text: step, Next: true}}
 	}
 	switch n := runeLen(rest); {
 	case n > chatFoldTextMax:
