@@ -65,9 +65,11 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
   [the IP masquerade agent](https://cloud.google.com/kubernetes-engine/docs/how-to/ip-masquerade-agent).
 - **An HTTPS proxy.** If the cluster reaches GitLab through an HTTPS proxy, set `HTTPS_PROXY`,
   and `NO_PROXY` with the cluster's own addresses (for example `.svc,.cluster.local` and the
-  Kubernetes API address), in the PlatformAgent's `spec.deployment.env`. These variables reach
-  the credential broker container: its GitLab API client and the git commands that it runs use
-  them.
+  Kubernetes API address), in the chart value `platformAgent.deployment.env`. On the Terraform
+  install, set that value through `extra_helm_values`, as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows for `install.sh`. Do not edit the
+  PlatformAgent's `spec.deployment.env` directly, because a chart apply can replace it. These
+  variables reach the credential broker container: its GitLab API client and the git commands that
+  it runs use them.
 - **The installer host.** `install.sh` never connects to GitLab. The machine that runs it needs
   no route to the GitLab host and no trust for its certificate.
 - **The certificate.** On a self-managed instance, the broker must trust the certificate. A

@@ -1041,3 +1041,9 @@
 # memory limit and the skill's created-with-google-skill label. deployer:
 # noop, transcript-only, one delegation round trip.
 ./tasks/alert-config-terraform-promql-probe/task.yaml
+
+# A plain chat request to check the fleet's security posture runs the
+# compliance audit's collector (#2386), and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's rbac-overgrant role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/security-chat-request-runs-collector/task.yaml
