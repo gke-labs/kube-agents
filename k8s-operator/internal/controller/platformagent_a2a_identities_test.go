@@ -121,16 +121,28 @@ func TestPrincipalsAreDistinct(t *testing.T) {
 // a share of every request, and the caller reads the timeout as a denial. The
 // console copied web's `a2a.>` read surface before web gained its deny, and
 // shipped without it.
+//
+// Both shapes of grant count: a wide one that covers the verify subject
+// (`a2a.>`), and an exact one inside it (`a2a.cap.verify.platform`). NATS
+// groups queue subscribers by name across patterns, so either joins.
 func TestOnlyTheVerifierReceivesVerifyRequests(t *testing.T) {
-	const probe = "a2a.cap.verify.probe"
+	const verify, probe = "a2a.cap.verify.*", "a2a.cap.verify.probe"
+	reaches := func(grant string) bool { return subjectMatches(grant, probe) || subjectMatches(verify, grant) }
 	for _, id := range a2aIdentities(identityTestAgent()) {
 		if id.user == a2aVerifierUser {
 			continue
 		}
-		granted := slices.ContainsFunc(id.subscribe, func(p string) bool { return subjectMatches(p, probe) })
-		denied := slices.ContainsFunc(id.denySubscribe, func(p string) bool { return subjectMatches(p, probe) })
-		if granted && !denied {
-			t.Errorf("%s can subscribe %s, so it can join queue group %q; deny a2a.cap.> on its subscribe side", id.user, probe, "cap-verifier")
+		for _, grant := range id.subscribe {
+			if !reaches(grant) {
+				continue
+			}
+			denied := slices.ContainsFunc(id.denySubscribe, func(d string) bool {
+				return subjectMatches(d, probe) || subjectMatches(d, grant)
+			})
+			if !denied {
+				t.Errorf("%s can subscribe %s, which reaches %s, so it can join queue group %q; deny a2a.cap.> on its subscribe side",
+					id.user, grant, verify, "cap-verifier")
+			}
 		}
 	}
 }
@@ -591,7 +603,7 @@ func TestAnOverriddenServiceAccountThatCollidesIsRefused(t *testing.T) {
 // The test is kept because the authoring mistake outlived the hole: a deny
 // nobody reads is still a deny nobody gets.
 //
-// Two of the three denies subtract nothing from their current allow lists and
+// Some of these denies subtract nothing from their current allow lists and
 // say so in their own comments; they are kept as defence against a future
 // widening. That is exactly the situation this test protects -- a deny whose
 // value is entirely prospective is the one most likely to be moved, copied, or
@@ -601,8 +613,8 @@ func TestNoA2AIdentityDeniesWhatItDoesNotFirstAllow(t *testing.T) {
 
 	// Precondition. If the table stops carrying denies -- or this stops
 	// finding them -- every assertion below passes over an empty set and the
-	// guard is gone without a failure. Three is what ships; the check is that
-	// it is not zero, so adding a fourth does not need an edit here.
+	// guard is gone without a failure. The check is that it is not zero, so
+	// adding another does not need an edit here.
 	denies := 0
 	for _, id := range a2aIdentities(agent) {
 		denies += len(id.denyPublish) + len(id.denySubscribe)
