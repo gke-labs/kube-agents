@@ -212,6 +212,42 @@ def test_collector_run_masked_by_trailing_pipe_or_operator_is_not_credited():
     assert not res_nested.success
     assert "masked by a trailing '|'" in res_nested.reason
 
+    cmd_nested_outer = f'bash -c "python3 {COLLECT} compliance-audit" || true'
+    res_no = _verify(_check(COLLECTOR_CHECK), cmd_nested_outer, exit_code=0)
+    assert not res_no.success
+    assert "masked by a trailing '||'" in res_no.reason
+
+    cmd_subshell_pipe = f"(python3 {COLLECT} compliance-audit) | tee /tmp/o.json"
+    res_sp = _verify(_check(COLLECTOR_CHECK), cmd_subshell_pipe, exit_code=0)
+    assert not res_sp.success
+    assert "masked by a trailing '|'" in res_sp.reason
+
+    cmd_subshell_or = f"(python3 {COLLECT} compliance-audit) || true"
+    res_so = _verify(_check(COLLECTOR_CHECK), cmd_subshell_or, exit_code=0)
+    assert not res_so.success
+    assert "masked by a trailing '||'" in res_so.reason
+
+    cmd_subshell_bg = f"(python3 {COLLECT} compliance-audit) &"
+    res_sbg = _verify(_check(COLLECTOR_CHECK), cmd_subshell_bg, exit_code=0)
+    assert not res_sbg.success
+    assert "masked by a trailing '&'" in res_sbg.reason
+
+    cmd_subst_bare = f'echo "$(python3 {COLLECT} compliance-audit)"'
+    res_sb = _verify(_check(COLLECTOR_CHECK), cmd_subst_bare, exit_code=0)
+    assert not res_sb.success
+    assert "inside a command substitution" in res_sb.reason
+
+    cmd_subst_pipe = f'echo "$(python3 {COLLECT} compliance-audit)" | tee /tmp/o.json'
+    res_spi = _verify(_check(COLLECTOR_CHECK), cmd_subst_pipe, exit_code=0)
+    assert not res_spi.success
+    assert "masked by a trailing '|'" in res_spi.reason
+
+    cmd_subst_assign = f'OUT="$(python3 {COLLECT} compliance-audit)"'
+    assert _passes(_check(COLLECTOR_CHECK), cmd_subst_assign, exit_code=0)
+
+    cmd_trailing_semi = f"python3 {COLLECT} compliance-audit > /opt/data/scratch/chat_manifest_compliance-audit.json;"
+    assert _passes(_check(COLLECTOR_CHECK), cmd_trailing_semi, exit_code=0)
+
     cmd_subshell = f'(cd /x && python3 {COLLECT} compliance-audit) > /tmp/o.json'
     assert _passes(_check(COLLECTOR_CHECK), cmd_subshell, exit_code=0)
 

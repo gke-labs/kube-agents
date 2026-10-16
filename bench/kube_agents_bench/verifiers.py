@@ -1950,6 +1950,11 @@ class WorkerRun(BaseModel):
     flags: list[str] = Field(default_factory=list)
     word_patterns: list[str] = Field(default_factory=list)
     succeeded: bool = False
+    """(For ``required_runs`` only) whether the command must have exited 0 (a non-zero or
+    unrecorded exit does not count; on the trajectory path, trailing operators after the matching
+    segment must be strictly ``&&`` or empty and uncollapsed, so trailing pipes, backgrounding with ``&``,
+    or chains with ``;`` or ``||`` are refused as masked; on the card-log path, any collapsed chain
+    ending in ``+ N command(s)`` is refused because the log format hides whether the join was ``&&``, ``;`` or ``||``)."""
 
     @field_validator("word_patterns")
     @classmethod
@@ -2172,25 +2177,51 @@ def _shell_argvs(command: str) -> list[list[str]]:
     return [argv for argv, _ in _shell_argvs_with_operators(command)]
 
 
+def _is_bare_assignment_argv(argv: list[str]) -> bool:
+    """True when argv consists only of assignments and assignment keywords (no external command word)."""
+    has_assignment = False
+    for word in argv:
+        if _is_redirect(word):
+            continue
+        if _SHELL_ASSIGNMENT_RE.match(word):
+            has_assignment = True
+            continue
+        if word in ("export", "typeset", "local", "readonly"):
+            continue
+        return False
+    return has_assignment
+
+
 def _shell_argvs_with_operators(command: str) -> list[tuple[list[str], list[str]]]:
     """Each segment of a command line as an argv paired with the control operators that follow it."""
     words, spans = _shell_words_and_spans(command)
-    segments: list[tuple[list[str], str | None]] = []
-    argv: list[str] = []
-    for word in words:
+    segments: list[tuple[list[str], int]] = []
+    current_argv: list[str] = []
+    last_word_idx = -1
+    for idx, word in enumerate(words):
         if _is_control_operator(word):
-            if argv:
-                segments.append((argv, str(word)))
-                argv = []
+            if current_argv:
+                segments.append((current_argv, last_word_idx))
+                current_argv = []
             continue
-        argv.append(word)
-    if argv:
-        segments.append((argv, None))
+        current_argv.append(word)
+        last_word_idx = idx
+    if current_argv:
+        segments.append((current_argv, last_word_idx))
 
     result: list[tuple[list[str], list[str]]] = []
-    for i, (seg_argv, _) in enumerate(segments):
-        raw_trailing: list[str] = [op for k in range(i, len(segments)) if (op := segments[k][1]) is not None]
-        trailing: list[str] = [op for op in raw_trailing if op not in ("(", ")")]
+    for seg_argv, last_idx in segments:
+        trailing: list[str] = []
+        for k in range(last_idx + 1, len(words)):
+            w = words[k]
+            if _is_control_operator(w) and w not in ("(", ")"):
+                # If ';' or '\n' has no subsequent command words, it terminates without masking.
+                has_subsequent_command = any(
+                    not _is_control_operator(words[j]) for j in range(k + 1, len(words))
+                )
+                if w in (";", _SHELL_LINE_END) and not has_subsequent_command:
+                    continue
+                trailing.append(str(w))
         result.append((seg_argv, trailing))
 
     handled_spans: set[str] = set()
@@ -2209,14 +2240,19 @@ def _shell_argvs_with_operators(command: str) -> list[tuple[list[str], list[str]
                 handled_spans.add(span)
                 inner = _substitution_commands(span)
                 if inner is not None:
+                    is_bare = _is_bare_assignment_argv(seg_argv)
                     for inner_argv, inner_trailing in _shell_argvs_with_operators(inner):
-                        result.append((inner_argv, trailing + inner_trailing))
+                        sub_trailing = trailing + inner_trailing
+                        if not is_bare:
+                            sub_trailing = sub_trailing + ["command substitution"]
+                        result.append((inner_argv, sub_trailing))
 
     for span in spans:
         if span not in handled_spans:
             inner = _substitution_commands(span)
             if inner is not None:
-                result.extend(_shell_argvs_with_operators(inner))
+                for inner_argv, inner_trailing in _shell_argvs_with_operators(inner):
+                    result.append((inner_argv, inner_trailing + ["command substitution"]))
     return result
 
 
@@ -2443,9 +2479,10 @@ class WorkerCommandsVerifier(BaseVerifier):
     argv, must run it with those flags after it, a word matching each pattern,
     and no ``-h``/``--help`` (:func:`_argv_runs`). When ``succeeded: true``,
     the command must also have exited 0 (a non-zero or unrecorded exit does
-    not count; trailing operators after the matching segment must be strictly
+    not count; on the trajectory path, trailing operators after the matching segment must be strictly
     ``&&`` or empty and uncollapsed, so trailing pipes, backgrounding with ``&``,
-    or chains with ``;`` or ``||`` are refused as masked). ``forbidden_runs``: the same
+    or chains with ``;`` or ``||`` are refused as masked; on the card-log path, any collapsed chain
+    ending in ``+ N command(s)`` is refused because the log format hides whether the join was ``&&``, ``;`` or ``||``). ``forbidden_runs``: the same
     shape, and no segment may run it. An argv tells a quoted mention of the
     invocation from a run, where a pattern over the text cannot: a forbidden
     ``kubectl get`` of budgets is not met by ``grep "kubectl get pdb" SKILL.md``
@@ -2680,7 +2717,10 @@ class WorkerCommandsVerifier(BaseVerifier):
                                 matched_mask_reason = f"{named} ran in a collapsed chain whose exit is the chain's"
                             else:
                                 mask_op = next((op for op in trailing_ops if op != "&&"), "operator")
-                                matched_mask_reason = f"{named} ran but its exit is masked by a trailing '{mask_op}'"
+                                if mask_op == "command substitution":
+                                    matched_mask_reason = f"{named} ran inside a command substitution whose exit is discarded"
+                                else:
+                                    matched_mask_reason = f"{named} ran but its exit is masked by a trailing '{mask_op}'"
                 if succeeded:
                     break
             if not succeeded:

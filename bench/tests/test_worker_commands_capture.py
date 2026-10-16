@@ -90,16 +90,19 @@ def test_worker_command_ending_in_duration_word(monkeypatch):
     ]
 
 
-def test_worker_log_exceeding_max_bytes_drops_cut_last_line():
-    # Truncated capture: file size exceeds _MAX_WORKER_LOG_BYTES. Intact preceding lines are kept,
-    # and the trailing cut line is dropped.
+def test_worker_log_exceeding_max_bytes_marks_cut_last_line_exit_none():
+    # Truncated capture: file size exceeds _MAX_WORKER_LOG_BYTES. Preceding lines retain exits,
+    # and the trailing cut line is kept with exit=None so forbidden checks still flag it.
     large_log = harness._WorkerLog(
         body="  ┊ 💻 $         echo first  0.1s [exit 0]\n  ┊ 💻 $         echo partial 12",
         mtime="1758579012",
         size=str(harness._MAX_WORKER_LOG_BYTES + 10),
     )
     rows = harness._worker_commands({"t_large": large_log})
-    assert rows == [{"task": "t_large", "command": "echo first", "exit": 0}]
+    assert rows == [
+        {"task": "t_large", "command": "echo first", "exit": 0},
+        {"task": "t_large", "command": "echo partial 12", "exit": None},
+    ]
 
     # When body bytes exceed _MAX_WORKER_LOG_BYTES without stat size.
     padded_prefix = "  ┊ 💻 $         echo ok  0.1s [exit 0]\n" + ("# pad\n" * 100000)
@@ -112,7 +115,16 @@ def test_worker_log_exceeding_max_bytes_drops_cut_last_line():
     rows2 = harness._worker_commands({"t_cut": cut_log})
     assert rows2 is not None
     assert any(r["command"] == "echo ok" and r["exit"] == 0 for r in rows2)
-    assert not any(r["command"] == "echo cut" for r in rows2)
+    assert rows2[-1] == {"task": "t_cut", "command": "echo cut", "exit": None}
+
+    # A complete log of exactly _MAX_WORKER_LOG_BYTES with stat known retains its last command exit.
+    exact_log = harness._WorkerLog(
+        body="  ┊ 💻 $         echo complete  0.1s [exit 0]",
+        mtime="1758579012",
+        size=str(harness._MAX_WORKER_LOG_BYTES),
+    )
+    rows3 = harness._worker_commands({"t_exact": exact_log})
+    assert rows3 == [{"task": "t_exact", "command": "echo complete", "exit": 0}]
 
 
 def test_the_read_returns_text_when_the_output_is_cut_inside_a_glyph(monkeypatch):
