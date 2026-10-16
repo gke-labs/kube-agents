@@ -1484,6 +1484,12 @@ class Loader(unittest.TestCase):
         )
         self.assertEqual(watch.report_argv(["p1"], readiness=False), ["--project", "p1"])
 
+    def test_the_report_argv_never_carries_the_cluster_exclusion(self) -> None:
+        # #3081: the watch's report still covers the clusters
+        # spec.scope.exclude.clusters excludes (#3026), as the CRD field documents.
+        for readiness in (False, True):
+            self.assertNotIn("--scope-exclude-clusters", watch.report_argv(["ops-mgmt", "payments-prod"], readiness))
+
     def test_the_shipped_set_is_every_skill_module_but_the_tests(self) -> None:
         shipped = watch.shipped_modules()
         for name in (watch.REPORT_MODULE, watch.READINESS_MODULE, "readiness_rules", "readiness_rules.audit_log", "readiness_rules.zonal_control_plane", "readiness_rules.finding", "upgrade_shape_tables"):

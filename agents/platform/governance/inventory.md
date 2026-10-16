@@ -17,6 +17,7 @@ Use native Google Cloud CLI (`gcloud`) and Kubernetes (`kubectl`) read-only comm
 
 1. **Identify GCP Project & Fleet Bounds:**
    - Run `gcloud config get-value project` and `gcloud container clusters list --project=<project-id>` to enumerate every active and stopped GKE cluster in the project.
+   - Drop every cluster the install excludes (`spec.scope.exclude.clusters`) before you go on: the ones your card names, or, on a run that did not come from the onboarding card, the ones the platform_control `fleet_scope` tool lists in `excluded_clusters`. An excluded cluster is outside the scope: it is not in `fleet`, not audited in Step 3, not a gap, and not in the report.
 2. **Inspect Cluster Control Planes & Topologies:**
    - For every running GKE cluster discovered (`e.g., kage-mgmt, platform-agent-host`), inspect its configuration: Kubernetes version, control plane region/zone, node pools (`machine types, node counts, autoscaling boundaries`), network configuration (`VPC-native, Dataplane V2 / eBPF`), and enabled GKE features (`Workload Identity, Managed Prometheus, OpenTelemetry collection`).
 3. **Verify Access & Tenancy Boundaries:**
@@ -43,7 +44,7 @@ reach it, an entry in `gaps` saying so.
 ## Step 3: Audit the clusters the list does not cover
 
 **A cluster with no Cluster Agent has no card, and you audit it here yourself.** Those are the
-clusters Step 1 listed that the list on your card does not name: all of them when the card
+clusters Step 1 kept, after dropping the excluded ones, that the list on your card does not name: all of them when the card
 lists none, and usually none otherwise, because the reconcile gives every listed cluster a profile.
 Take the set from the card's list, not from a roster you look up. Follow Steps 2 to 4 of
 `cluster_inventory_audit_sop.md` for each, and record what you find in that SOP's Step 5 `metadata`
