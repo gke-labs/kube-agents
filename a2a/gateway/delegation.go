@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 // The rules a delegation is refused or ignored under, as the audit line
@@ -454,6 +455,12 @@ func wakeText(state lib.TaskState, childID, ask string, turns []string, result, 
 // wakeCardsPendingNote is added to a completed wake when the delegated child
 // handed off to kanban cards that are still running.
 const wakeCardsPendingNote = "A Cluster Agent card is still running, and its report will post into this conversation."
+
+// cardsPending reports whether a completed task's terminal mark signals that
+// asynchronous kanban cards are still running.
+func cardsPending(state lib.TaskState, terminal chatmsg.Reading) bool {
+	return state == lib.StateCompleted && terminal.Mark != nil && terminal.Mark.Ask != "" && terminal.Mark.Settle == ""
+}
 
 // wakeReplyGuide and wakeReplyGuideFull close every wake's text, chosen by
 // whether the person asking has seen the child's result (wakeNeedsFullAnswer).

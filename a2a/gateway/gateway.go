@@ -1071,6 +1071,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	healed := false
 	var healedSource TerminalSource
 	var healedTask *lib.Task // the terminal the heal found, shape (a) only
+	var healedTerminal chatmsg.Reading
 	switch {
 	case err == nil && task.Final && task.Artifact(lib.ArtifactDelegate) != nil && !rec.delegationHandled(active.TaskID):
 		// A turn that asked to delegate, whose request the relay has not
@@ -1153,7 +1154,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			terminal = g.readChat(rec.Key, active.TaskID, chatmsg.Terminal, task.FinalMessage.Parts)
 		}
 		g.terminalMark(rec, active.TaskID, task.State, terminal)
-		healed, healedSource, healedTask = true, source, task
+		healed, healedSource, healedTask, healedTerminal = true, source, task, terminal
 	case noFirstEventPastGrace(active, isTaskNotFound(err), g.cfg.FirstEventGrace, time.Now()):
 		g.log.Info("healing an active task with no first event inside the grace",
 			"conversation", rec.Key, "taskId", active.TaskID, "addressee", addressee,
@@ -1224,13 +1225,8 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		switch {
 		case child && healedTask != nil:
 			turns, result, reason := healedChildOutcome(healedTask)
-			cardsPending := false
-			if healedTask.FinalMessage != nil && healedTask.State == lib.StateCompleted {
-				terminal := g.readChat(rec.Key, ref.ID, chatmsg.Terminal, healedTask.FinalMessage.Parts)
-				cardsPending = terminal.Mark != nil && terminal.Mark.Ask != "" && terminal.Mark.Settle == ""
-			}
 			// false: the heal's status card above carries no result text.
-			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, cardsPending); !woken {
+			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, cardsPending(healedTask.State, healedTerminal)); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
 			}
 		case child:

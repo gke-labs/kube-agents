@@ -2773,3 +2773,64 @@ func TestAChildEndingWithCardsPendingWakesWithPendingNote(t *testing.T) {
 		t.Fatalf("wake text does not contain pending cards note: %q", wakeContent)
 	}
 }
+
+// TestAHealWithCardsPendingWakesWithPendingNote verifies that when the gateway heals
+// an active task for a completed child whose terminal carries a cards mark, the
+// replayed wake includes wakeCardsPendingNote.
+func TestAHealWithCardsPendingWakesWithPendingNote(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/t-heal-cards-pending"
+	_, _, child := delegated(t, r, spawn, conv, "")
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	cexec := r.execFor(t, child, targetPlatform)
+
+	markPart, err := chatmsg.MarkPart(chatmsg.Mark{Ask: "diagnose"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r2, spawn2 := restartRig(t, r, func() {
+		ctx := context.Background()
+		if err := cexec.PublishArtifact(ctx, lib.Artifact{
+			ArtifactID: "a-r",
+			Name:       lib.ArtifactResult,
+			Parts:      []lib.Part{{Kind: "text", Text: "focusing on memory limits"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		payload, err := json.Marshal(lib.StatusUpdate{
+			TaskID:    child.TaskID,
+			ContextID: child.ContextID,
+			Status: lib.TaskStatus{
+				State: lib.StateCompleted,
+				Message: &lib.Message{
+					Role:      "agent",
+					MessageID: "msg-final-" + child.TaskID,
+					Parts:     []lib.Part{{Kind: "text", Text: "focusing on memory limits"}, markPart},
+				},
+			},
+			Final: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: targetPlatform, AgentType: "test-executor"}, child.TaskID, child.ContextID, child.CorrelationID, payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.bus.Publish(ctx, lib.TaskEventsSubject(targetPlatform, child.TaskID), env); err != nil {
+			t.Fatal(err)
+		}
+		drainRelayDurable(t, r.url)
+	})
+
+	sessionRigTurn(r2, conv, "h-heal", "status")
+	waitFor(t, "the heal's status card", postedContaining(r2, "🔎 task `"+child.TaskID+"` is **completed**"))
+	waitFor(t, "wake spawn", func() bool { return len(spawn2.calls()) == 1 })
+	wakeSession := spawn2.calls()[0].Session
+	wake := r2.awaitTask(t, wakeSession)
+	wakeContent := envText(t, wake)
+	if !strings.Contains(wakeContent, wakeCardsPendingNote) {
+		t.Fatalf("healed wake text does not contain pending cards note: %q", wakeContent)
+	}
+}
