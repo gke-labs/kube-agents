@@ -37,8 +37,9 @@ rung-2 block there -- and the rungs grade what remains (see
 ``_inject_lane_view``). A check that reads the delegated workers or a
 call's result is set aside on every inject record; any other router-scope
 ``tool_called`` only on one from a door that showed no tool-call trace (no
-``a2a.activity`` marker), and it grades in full on one carrying the marker,
-whether or not the persona made a call.
+``a2a.activity`` marker) or whose marker reports a loss, and it grades in
+full on one whose marker reports none, whether or not the persona made a
+call.
 
 HOW THE JUDGE IS AND IS NOT USED. No judged score is ever compared against an
 absolute threshold, and the reason is measured rather than assumed: three
@@ -244,10 +245,11 @@ A2A_STATE_WORKING = "working"
 #: that happened, and a ``none``-wrapped safeguard could pass over one. A
 #: check that reads the delegated workers or a call's result is set aside
 #: on every inject record, marker or not: the trace carries no card ids,
-#: no worker's entries and no results (``cases.py``, ``worker_blind_checks``). The names are
-#: duplicated rather than imported, like the status entry, and so are the
-#: marker's three loss arguments (``inject_transport.ACTIVITY_LOSS_ARGS``);
-#: ``test_scoring.py`` asserts each agrees with the transport's.
+#: no worker's entries and no results (``cases.py``,
+#: ``worker_blind_checks``). The names are duplicated rather than imported,
+#: like the status entry, and so are the marker's three loss arguments
+#: (``inject_transport.ACTIVITY_LOSS_ARGS``); ``test_scoring.py`` asserts
+#: each agrees with the transport's.
 INJECT_TASK_EVENT = "inject.task"
 INJECT_POST_EVENT = "inject.post"
 INJECT_EDIT_EVENT = "inject.edit"
