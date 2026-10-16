@@ -418,6 +418,9 @@
 ./tasks/stockout-pinned-pool/task.yaml
 ./tasks/upgrade-readiness-lagging-cluster/task.yaml
 ./tasks/consistency-drift-outlier/task.yaml
+# Same full-audit shape and cost band as obtainability-planted-pdb; grades the
+# zonal-skew check on slot d's three planted causes (#1356).
+./tasks/obtainability-zonal-skew/task.yaml
 
 # Superseded in the presubmit by reliability-pdb-probe (same planted defect,
 # same question), not by any doubt: 1.0 on #984's live validation.
