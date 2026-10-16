@@ -29,6 +29,7 @@ dependencies = [
 # instead of an inline `python3 -c` heredoc.
 [project.scripts]
 bench-gate = "kube_agents_bench.gate:main"
+bench-score = "kube_agents_bench.score:main"
 
 # The sole registration path. devops-bench scans this group lazily on the first
 # unresolved agent lookup, so `devops-bench --agent-type kubeagents` works with
