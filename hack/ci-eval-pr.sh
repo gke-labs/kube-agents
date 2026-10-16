@@ -1065,7 +1065,8 @@ fi
 # build, then state closed; nothing deleted), and it is called twice: here,
 # once the lease is known and before any unit, for every stream; and in
 # run_one_unit, under the task lock and before devops-bench, for that unit's
-# stream alone -- so repetitions 2 and 3 start as repetition 1 did, and a
+# stream alone (and for each declared stream of a case resets_declared_streams
+# names) -- so repetitions 2 and 3 start as repetition 1 did, and a
 # sibling lane's stream, which has its own label, is never touched. Every
 # repetition then opens a fresh ledger, one closed issue per repetition in a
 # repository that exists to be written to; the agent's leftover pull requests
@@ -1344,7 +1345,8 @@ reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero whe
 # run's, not the ledger's, so the ledger reset above cannot clear it; this
 # does, per unit, from the same place the ledger reset runs (under the task
 # lock and the stream lock, before devops-bench) and just before it, for
-# that unit's stream alone. Not at lease time: the per-unit release covers a
+# that unit's stream alone (or each declared stream, for a case
+# resets_declared_streams names). Not at lease time: the per-unit release covers a
 # note an earlier lease left as well.
 #
 # A unit that ended on its delegation ceiling may have left a worker that is
