@@ -74,6 +74,11 @@ readonly BREAKING_CHANGE_FOOTER_REGEX='^[[:space:]]*BREAKING[ -]CHANGE:[[:space:
 # The downgrade check reads commit messages and ancestry only, so a history it
 # has to fetch carries commits and no trees or file contents.
 readonly DOWNGRADE_HISTORY_FETCH_FILTER="--filter=tree:0"
+readonly DOWNGRADE_HISTORY_DIR_TEMPLATE="kube-agents-history.XXXXXX"
+# Ends each commit record in the downgrade check's `git log`: a byte no commit
+# message carries, so a multi-line body stays one record. Written in git's
+# `%xNN` form for the format and as the byte itself for `read -d`.
+readonly COMMIT_RECORD_SEPARATOR_HEX="1e"
 
 # Default CLI Configuration
 PARAM_UPGRADE_MODE="full"
@@ -1221,7 +1226,7 @@ downgrade_history_dir() {
     DOWNGRADE_HISTORY_SOURCE="$repo_dir"
     return 0
   fi
-  DOWNGRADE_HISTORY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kube-agents-history.XXXXXX")"
+  DOWNGRADE_HISTORY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/${DOWNGRADE_HISTORY_DIR_TEMPLATE}")"
   git clone --quiet --no-checkout "$DOWNGRADE_HISTORY_FETCH_FILTER" "$KUBE_AGENTS_REPO_URL" "$DOWNGRADE_HISTORY_DIR" >/dev/null 2>&1 || return 1
   # A commit no branch or tag reaches (a pull request's build) is fetched by name.
   for ref in "$older" "$newer"; do
@@ -1235,9 +1240,10 @@ downgrade_history_dir() {
 # as a breaking change, judged one commit at a time on the same terms as
 # commit_messages_have_breaking_change: the subject line, then the body.
 breaking_commits_between() {
-  local history_dir="$1" older="$2" newer="$3" log="" record="" header="" body=""
-  log="$(trap - ERR; git -C "$history_dir" log --format='%h %s%n%b%x1e' "${older}..${newer}" 2>/dev/null)" || return 1
-  while IFS= read -r -d $'\x1e' record; do
+  local history_dir="$1" older="$2" newer="$3" log="" record="" header="" body="" separator=""
+  separator="$(printf '%b' "\\x${COMMIT_RECORD_SEPARATOR_HEX}")"
+  log="$(trap - ERR; git -C "$history_dir" log --format="%h %s%n%b%x${COMMIT_RECORD_SEPARATOR_HEX}" "${older}..${newer}" 2>/dev/null)" || return 1
+  while IFS= read -r -d "$separator" record; do
     record="${record#$'\n'}"
     header="${record%%$'\n'*}"
     body="${record#"$header"}"

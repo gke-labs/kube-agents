@@ -296,7 +296,8 @@ checkout_at() {
 # longer declares is a rename the refusal has to surface. The same leg passes
 # the breaking-change bypass. A roll-forward leaves behind only the GA's
 # release-line commits, which carry a breaking change only when one was
-# released by hand there, and then the refusal is worth seeing.
+# released by hand there (calculate_next_version.sh refuses it otherwise);
+# such a line would red the roll-forward until the next minor GA.
 run_upgrade() {
   local dir="$1" tag="$2" mode="$3" drop="${4:-false}" drop_flag="" allow_flag=""
   local log="${DIAGNOSTICS_DIR}/upgrade-${mode}-${tag}.log"

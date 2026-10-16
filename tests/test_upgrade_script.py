@@ -3954,6 +3954,19 @@ class DowngradeCheckTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, out)
         self.assertEqual(list(self.scratch.iterdir()), [], "the commit-only clone is left behind")
 
+    def test_a_shallow_checkout_with_both_refs_reads_the_full_history(self):
+        # Shallow history cuts the merge base, which would make the move read as unrelated.
+        shallow = self.tmp / "shallow"
+        subprocess.run(
+            ["git", "clone", "-q", "--depth", "1", "--no-single-branch", f"file://{self.repo}", str(shallow)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(shallow), "fetch", "-q", "--depth", "1", "origin", "tag", "0.2.0", "tag", "0.3.0"],
+                       check=True, capture_output=True)
+        proc, out = self._check("0.2.0", "0.3.0", repo_dir=shallow)
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(self._short("bang"), out)
+
     def test_a_release_rollback_whose_history_cannot_be_read_is_refused(self):
         proc, out = self._check("0.2.0", "0.3.0", repo_dir=self.no_history, url=str(self.tmp / "missing"))
         self.assertEqual(proc.returncode, 1, out)
