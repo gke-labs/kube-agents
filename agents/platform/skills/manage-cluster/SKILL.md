@@ -27,7 +27,7 @@ This is the explicit, user-driven counterpart to onboarding-time creation (`gke-
      --project "<project>" --cluster "<cluster>" --location "<location>"
    ```
 
-   This scaffolds the Cluster Agent profile home on the data PVC, pins a read-only `KUBECONFIG` to that cluster, stamps its `cluster_identity` into the profile config, and prints the profile name. It is idempotent — re-managing an already-managed cluster is a safe no-op.
+   This scaffolds the Cluster Agent profile home on the data PVC, pins a read-only `KUBECONFIG` to that cluster, stamps its `cluster_identity` into the profile config and `## Target Cluster Identity` into `SOUL.md`, and prints the profile name. It is idempotent — re-managing an already-managed cluster is a safe no-op.
 
 4. **Confirm to the user.** Report that `<cluster>` (`<project>/<location>`) is now managed: it has a Cluster Agent and is delegable (kanban).
 
