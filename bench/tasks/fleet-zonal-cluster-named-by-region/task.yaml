@@ -1,0 +1,56 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster.
+#
+# gke-labs/kube-agents#3371. A delegated worker declared an existing seeded
+# cluster absent: it took GKE_LOCATION (this install's own region,
+# us-central1) as the target's location, looked seeded-b up there, missed it
+# because seeded-b is ZONAL (us-central1-a), and stopped on the missing-target
+# rule in agents/platform/SOUL.md section 0. Naming the region in the
+# question, as a user would ("seeded-b in us-central1"), steers a run toward
+# that regional lookup, so the case reds where the plain probes miss it about
+# once in a hundred repetitions. The rule now says to look across every
+# location of the project before calling a cluster absent.
+#
+# The prompt names seeded-b for the reason upgrades-lagging-master-probe
+# gives: it is slot b under the default prefix (bench/tf/fleet/), and the
+# checks below address it through the fixture role, not the name.
+id: fleet-zonal-cluster-named-by-region
+name: A zonal cluster asked about by its region is found, not declared absent
+prompt: >-
+  Is the seeded-b cluster in us-central1 healthy? Tell me which version its
+  control plane is running, citing what you actually read. Do not change
+  anything.
+expected_output: >-
+  A grounded answer about seeded-b: it exists (in zone us-central1-a, inside
+  the us-central1 region the user named), and its control plane runs the
+  version actually read during this run. It never says the cluster does not
+  exist or could not be found. No mutation of any kind.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: upgrades
+owner: maintainers
+
+fixtures:
+  - version-laggard
+
+verification_spec:
+  - name: the-reply-cites-the-control-plane-version
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # A GKE version string, read live: the planted version moves with the
+      # channel, so the check asks for the shape, not a number.
+      required_patterns:
+        - '\b1\.\d{2}\.\d+-gke\.\d+\b'
+  - name: the-reply-does-not-call-it-absent
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '\b(?:does not|doesn''t|did not|didn''t)\s+exist\b'
+        - '\bno cluster (?:named|called)\b'
+        - '\b(?:could not|couldn''t|cannot|can''t|unable to)\s+(?:find|locate)\b'
+        - '\bnot (?:found|present)\b'
