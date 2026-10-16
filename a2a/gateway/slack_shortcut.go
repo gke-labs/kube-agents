@@ -78,6 +78,7 @@ const (
 	slackRichTextUsergroup     = "usergroup"
 	slackRichTextBroadcast     = "broadcast"
 	slackRichTextEmoji         = "emoji"
+	slackRichTextDate          = "date"
 	slackRichTextUserForm      = "<@%s>"
 	slackRichTextChannelForm   = "<#%s>"
 	slackRichTextUsergroupForm = "<!subteam^%s>"
@@ -180,6 +181,7 @@ type slackShortcutBlock struct {
 	UsergroupID string               `json:"usergroup_id"`
 	Range       string               `json:"range"`
 	Name        string               `json:"name"`
+	Fallback    string               `json:"fallback"`
 	Fields      []slackShortcutBlock `json:"fields"`
 	Elements    []slackShortcutBlock `json:"elements"`
 }
@@ -218,6 +220,10 @@ func (b slackShortcutBlock) words() []string {
 		return []string{fmt.Sprintf(slackRichTextBroadcastForm, b.Range)}
 	case slackRichTextEmoji:
 		return []string{fmt.Sprintf(slackRichTextEmojiForm, b.Name)}
+	case slackRichTextDate:
+		// The date as the member's client formats it is not in the payload;
+		// the fallback the poster gave is.
+		return []string{b.Fallback}
 	case slackRichTextSection, slackRichTextQuote, slackRichTextPre:
 		var line strings.Builder
 		for _, e := range b.Elements {

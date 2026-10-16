@@ -462,10 +462,11 @@ func TestSlackShortcutQuotesRichTextNamesAsTheTextDoes(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"blocks":[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[
 	 {"type":"broadcast","range":"here"},{"type":"text","text":" is "},{"type":"user","user_id":"U2"},
 	 {"type":"text","text":" on "},{"type":"channel","channel_id":"C9"},{"type":"text","text":" with "},
-	 {"type":"usergroup","usergroup_id":"S1"},{"type":"text","text":"? "},{"type":"emoji","name":"fire"}]}]}]}`), &m); err != nil {
+	 {"type":"usergroup","usergroup_id":"S1"},{"type":"text","text":"? "},{"type":"emoji","name":"fire"},
+	 {"type":"text","text":" since "},{"type":"date","timestamp":1792180000,"format":"{date_short}","fallback":"Oct 16"}]}]}]}`), &m); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := slackShortcutQuoted(m), "<!here> is <@U2> on <#C9> with <!subteam^S1>? :fire:"; got != want {
+	if got, want := slackShortcutQuoted(m), "<!here> is <@U2> on <#C9> with <!subteam^S1>? :fire: since Oct 16"; got != want {
 		t.Errorf("quote = %q, want %q", got, want)
 	}
 }
