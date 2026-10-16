@@ -597,6 +597,15 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 - `extraVolumes` — custom volumes for the main container. Both halves of the reservation apply: a reserved name, and a source that would carry the A2A bus credential, are each refused at admission; see [Reconcile behavior](#reconcile-behavior).
 - `extraVolumeMounts` — custom mounts for the main container. A mount has no source, so only the name half applies: an entry naming a reserved volume is refused at admission.
 - `sidecarVolumes` — custom volumes for the sidecar containers. Same reservations as `extraVolumes`.
+- The watchers' broker token is reserved on all five surfaces. The webhook refuses the volume name
+  `watcher-credential-proxy-token` on `sidecars`, `initContainers`, `sidecarVolumes`, `extraVolumes`
+  and `extraVolumeMounts`. Where the webhook did not run, an `extraVolumeMounts` entry naming it
+  degrades the CR with `ForbiddenVolumeMount`, as one naming the broker's own volumes does, and no
+  Pod is rendered. On the other surfaces the controller leaves out of the Pod template any user
+  volume under that name, or projecting a token for the `kubeagents-credential-proxy-watcher`
+  audience under another name, together with every `volumeMount` naming it. The `VolumesDropped`
+  condition names those volumes. The token belongs to the gateway's `agent-api-auth` container
+  alone.
 - A `hostPath` entry on either volume list is refused at admission, and on an install where the
   webhook did not run (the Helm chart ships it off, and one enabled through the chart fails open at
   its default `failurePolicy: Ignore`) the controller leaves it out of the Pod template at render,

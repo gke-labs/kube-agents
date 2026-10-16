@@ -33,9 +33,6 @@ infrastructure:
 
 validated: false
 
-# A greeting needs no tool call.
-tool_calls_optional: true
-
 domain: chat-and-routing
 
 owner: jayantid

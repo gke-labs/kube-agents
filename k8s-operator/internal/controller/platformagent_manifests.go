@@ -2558,9 +2558,24 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		extraVolumes = stripHostPathVolumes(agent.Spec.Deployment.ExtraVolumes)
 		podAnnotations = agent.Spec.Deployment.PodAnnotations
 	}
+	// The watchers' broker token belongs to agent-api-auth alone, in either
+	// mode. Take any user volume that would deliver it -- the reserved name, or
+	// a projection for the watcher audience under another -- out of the CR's
+	// volume lists, and every mount naming one out of the CR's containers,
+	// before the operator's own containers and volumes join the slices. See
+	// watcherTokenSourceNames; buildBaseContainers does the same for
+	// extraVolumeMounts.
+	if agent.Spec.Deployment != nil {
+		watcherSources := watcherTokenSourceNames(agent)
+		initContainers = stripContainerMountsNamed(initContainers, watcherSources)
+		sidecars = stripContainerMountsNamed(sidecars, watcherSources)
+		dropWatcherSource := func(v corev1.Volume) bool { return watcherSources[v.Name] }
+		sidecarVolumes = stripMatching(sidecarVolumes, dropWatcherSource)
+		extraVolumes = stripMatching(extraVolumes, dropWatcherSource)
+	}
 	// The four slices above are still the CR's own, filtered for hostPath and
-	// nothing else: no operator-owned container or volume has joined them yet,
-	// which is what the strip below depends on. Under `next` the pod carries a
+	// the watcher token and nothing else: no operator-owned container or
+	// volume has joined them yet, which is what the strip below depends on. Under `next` the pod carries a
 	// projected bus token that belongs to the platform-agent container alone.
 	// Take the mount away from anything else that names it, before the
 	// operator's own containers join the slices -- see
@@ -3340,6 +3355,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// watcher here, and so does the token the agent presents across the network.
 	volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
 	volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
+	volumes = append(volumes, buildWatcherTokenVolume())
 	if a2aAgentSurface(agent) {
 		volumes = append(volumes, a2aBusTokenVolumeSource())
 	}
@@ -4102,6 +4118,9 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			// The watcher's --profiles-dir and its dedup snapshots, both under
 			// CREDENTIAL_PROXY_WORKSPACE_ROOT above.
 			{Name: "platform-agent-data-vol", MountPath: homeDir},
+			// The watchers' broker token. Here and in no other container of this
+			// Pod: the watcher role is what reaches the fleet through the broker.
+			{Name: watcherTokenVolume, MountPath: watcherTokenMountPath, ReadOnly: true},
 		},
 		SecurityContext: securityContext,
 	}
@@ -4132,6 +4151,9 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		// The watcher authenticates to the Session KV server with this; see
 		// start-services.sh --token-env.
 		{Name: "SESSION_KV_API_KEY", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVApiKeySecretRef(agent)}},
+		// The watchers make their Google calls through the broker with this.
+		{Name: watcherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
+		{Name: watcherBrokerTokenFileEnvVar, Value: watcherTokenMountPath + "/token"},
 	}
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
@@ -4293,7 +4315,13 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// either order without chat answering 403 in between.
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CHAT_AUDIENCE", Value: credentialProxyChatAudience},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent)},
+		// The watchers' audience, in both modes: agent-api-auth always runs
+		// them.
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_WATCHER_AUDIENCE", Value: credentialProxyWatcherAudience},
 	)
+	if driftDetectorEnabled(agent) {
+		envVars = append(envVars, corev1.EnvVar{Name: watcherSubscriptionEnvVar, Value: watcherPubsubSubscription(agent)})
+	}
 	if a2aSessionClusterViewEnabled(agent) {
 		// The session pods' audience. Rendered only with the flag, so a
 		// broker on an install without it has no session role to confer
@@ -4480,6 +4508,15 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// One that could set the session callers could unbind the session
 		// ServiceAccount from its audience, or bind another to it.
 		"CREDENTIAL_PROXY_SESSION_CALLERS",
+		// One that could set the watcher audience would decide who holds the
+		// watcher role; one that could set the subscription would point the
+		// watcher relay at any subscription the broker's credential can pull;
+		// and the two on agent-api-auth would point the watchers' token at a
+		// listener of their own.
+		"CREDENTIAL_PROXY_WATCHER_AUDIENCE",
+		watcherSubscriptionEnvVar,
+		watcherBrokerURLEnvVar,
+		watcherBrokerTokenFileEnvVar,
 		"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME",
 		// And the legacy subscription name by name, not only as a managed
 		// name: under next with Chat the render no longer sets it, and a
@@ -4962,6 +4999,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// The source half of the same reservation takes the mounts of any user
 	// volume buildPodTemplateSpec dropped for what it projects or which
 	// Secret it names; see a2aBusCredentialVolumeNames.
+	// The watchers' broker token, on this fifth surface; see
+	// watcherTokenSourceNames. In either mode.
+	extraVolumeMounts = stripVolumeMountsNamed(extraVolumeMounts, watcherTokenSourceNames(agent))
 	if a2aAgentSurface(agent) {
 		extraVolumeMounts = a2aStripBusTokenVolumeMounts(extraVolumeMounts)
 		extraVolumeMounts = stripVolumeMountsNamed(extraVolumeMounts, a2aBusCredentialVolumeNames(agent))

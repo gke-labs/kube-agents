@@ -240,6 +240,18 @@ const (
 	// directly after a full stop.
 	hostPathDroppedRollingClause = " That template is still rolling out, so Pods from an earlier revision may still be " +
 		"running with these volumes mounted."
+	// watcherAudienceDroppedEntryFormat and watcherAudienceDroppedMessageFormat are
+	// the same condition's report of the other volumes the render strips:
+	// those that would hand a container the watchers' broker token (see
+	// watcherTokenSourceNames). The webhook refuses the reserved name but not a
+	// projection of the watcher audience under another name, so without this a
+	// sidecar would lose a mount its author wrote with nothing in status to say
+	// why.
+	watcherAudienceDroppedEntryFormat   = "%s[%d] %q"
+	watcherAudienceDroppedMessageFormat = "Volumes that would deliver the credential proxy's watcher token are left out " +
+		"of the Pod template the operator renders, along with every volumeMount naming them: %s. That token belongs " +
+		"to the gateway's agent-api-auth container alone; any other container holding it would hold the broker's " +
+		"watcher role on every fleet cluster. Remove the entries from the spec to clear this condition."
 	hostPathDroppedEntrySeparator = ", "
 	// hostPathDroppedEntryBudget bounds the joined entries, and
 	// hostPathDroppedOverflowFormat counts whatever did not fit. Volume names
@@ -4198,19 +4210,47 @@ func (r *PlatformAgentReconciler) gatewayRollIncomplete(ctx context.Context, age
 // hostPath entries the render left out of the Pod template, or "" when the
 // spec carries none and the condition is to be absent.
 func hostPathDroppedMessage(agent *agentv1alpha1.PlatformAgent, oldPods oldPodsPossible) string {
-	dropped := hostPathVolumes(agent)
-	if len(dropped) == 0 {
-		return ""
+	var parts []string
+	if dropped := hostPathVolumes(agent); len(dropped) > 0 {
+		entries := make([]string, 0, len(dropped))
+		for _, d := range dropped {
+			entries = append(entries, fmt.Sprintf(hostPathDroppedEntryFormat, d.field, d.index, d.name, d.path))
+		}
+		rolling := ""
+		if oldPods {
+			rolling = hostPathDroppedRollingClause
+		}
+		parts = append(parts, fmt.Sprintf(hostPathDroppedMessageFormat, hostPathDroppedEntryList(entries), rolling))
 	}
-	entries := make([]string, 0, len(dropped))
-	for _, d := range dropped {
-		entries = append(entries, fmt.Sprintf(hostPathDroppedEntryFormat, d.field, d.index, d.name, d.path))
+	if entries := watcherTokenDroppedEntries(agent); len(entries) > 0 {
+		parts = append(parts, fmt.Sprintf(watcherAudienceDroppedMessageFormat, hostPathDroppedEntryList(entries)))
 	}
-	rolling := ""
-	if oldPods {
-		rolling = hostPathDroppedRollingClause
+	return strings.Join(parts, " ")
+}
+
+// watcherTokenDroppedEntries names, field and index, each user volume the
+// render strips for delivering the watcher token: the set
+// watcherTokenSourceNames builds, read back against the two volume lists.
+func watcherTokenDroppedEntries(agent *agentv1alpha1.PlatformAgent) []string {
+	if agent.Spec.Deployment == nil {
+		return nil
 	}
-	return fmt.Sprintf(hostPathDroppedMessageFormat, hostPathDroppedEntryList(entries), rolling)
+	sources := watcherTokenSourceNames(agent)
+	var entries []string
+	for _, list := range []struct {
+		field   string
+		volumes []corev1.Volume
+	}{
+		{hostPathExtraVolumesField, agent.Spec.Deployment.ExtraVolumes},
+		{hostPathSidecarVolumesField, agent.Spec.Deployment.SidecarVolumes},
+	} {
+		for i, v := range list.volumes {
+			if sources[v.Name] {
+				entries = append(entries, fmt.Sprintf(watcherAudienceDroppedEntryFormat, list.field, i, v.Name))
+			}
+		}
+	}
+	return entries
 }
 
 // hostPathDroppedEntryList joins as many entries as fit in

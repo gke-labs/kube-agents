@@ -145,6 +145,30 @@ class SkillBlocksTest(unittest.TestCase):
             got,
         )
 
+    def test_a_reference_page_is_scanned_with_its_skill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            skill = Path(tmp) / "demo" / "SKILL.md"
+            (skill.parent / "references").mkdir(parents=True)
+            skill.write_text("```bash\nls\n```\n")
+            (skill.parent / "references" / "step.md").write_text("```sh\npwd\n```\n")
+            got = check.skill_blocks("agents/platform/skills", Path(tmp))
+        self.assertEqual(
+            [
+                check.Block("agents/platform/skills/demo/SKILL.md", 2, "ls"),
+                check.Block("agents/platform/skills/demo/references/step.md", 2, "pwd"),
+            ],
+            got,
+        )
+
+    def test_a_skill_md_under_references_is_read_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            skill = Path(tmp) / "demo" / "SKILL.md"
+            (skill.parent / "references").mkdir(parents=True)
+            skill.write_text("")
+            (skill.parent / "references" / "SKILL.md").write_text("```sh\npwd\n```\n")
+            got = check.skill_blocks("agents/platform/skills", Path(tmp))
+        self.assertEqual([check.Block("agents/platform/skills/demo/references/SKILL.md", 2, "pwd")], got)
+
     def test_a_block_is_scanned_whole(self):
         body = "# apply it\nfoo \\\n  --bar\ncat > cm.yaml <<'END-OF-FILE'\ndescription: don't\nEND-OF-FILE\n$G add cm.yaml"
         with tempfile.TemporaryDirectory() as tmp:
@@ -280,6 +304,16 @@ class TriageTest(unittest.TestCase):
         self.assertEqual([], new)
         self.assertEqual([("a/SKILL.md", "gone")], stale)
 
+
+    def test_an_entry_that_may_pass_is_never_stale(self):
+        key = ("a/s/SKILL.md", "pip install x")
+        new, stale = check.triage([], {key: (frozenset({"analysis_incomplete"}), "r")}, ["a"], frozenset({key}))
+        self.assertEqual(([], []), (new, stale))
+
+    def test_only_the_package_lookup_entries_may_pass(self):
+        self.assertEqual(3, len(check.MAY_PASS))
+        for key in check.MAY_PASS:
+            self.assertIn(key[1].split()[0], {"pip", "go", "npm"})
     def run_main(self, known, skill_verdict):
         """Run ``main`` over one skill block the fake scanner rates ``skill_verdict``."""
         probes = {check.PROBE_REFUSED: verdict("block"), check.PROBE_ALLOWED: verdict("allow")}
@@ -308,6 +342,13 @@ class TriageTest(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertIn("('agents/platform/skills/demo/SKILL.md', 'gone')", err)
         self.assertNotIn("agents/cluster/skills", err)
+
+    def test_main_does_not_call_an_allowed_entry_that_may_pass_stale(self):
+        key = ("agents/platform/skills/demo/SKILL.md", "pip install x")
+        with mock.patch.object(check, "MAY_PASS", frozenset({key})):
+            code, _, err = self.run_main({key: (frozenset({"analysis_incomplete"}), "reason")}, verdict("allow"))
+        self.assertEqual(0, code)
+        self.assertEqual("", err)
 
     def test_main_fails_on_a_refused_block_and_reports_it(self):
         code, out, err = self.run_main({}, verdict("block", "r"))
