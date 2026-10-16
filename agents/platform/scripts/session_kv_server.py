@@ -572,6 +572,18 @@ DRIFT_ALERT_EMOJI = "🔀"
 # group on.
 DRIFT_LEDGER_REASON = "OutOfBandChange"
 
+# What a drift card says when the install has no GitOps repository registered.
+# There is no declared state to revert to and nowhere to codify the change, so
+# the card asks for an explanation only: no options, no "To authorize:" line,
+# and so no buttons a reader could click for an action that can only block on
+# NO_REGISTERED_REPO (gke-labs#3313). The registration paths mirror
+# gitops_preflight.REGISTRATION_STEPS.
+DRIFT_NO_GITOPS_LINE = (
+    "No GitOps repository is registered on this install, so there is no declared state to revert this change "
+    "to and nowhere to codify it. Registering one in the PlatformAgent's spec.integration.repositories (or "
+    "re-running the installer with --gitops-repo) gives later drift alerts revert and codify options."
+)
+
 # The `join` value the detector sends when it actually read the live object's
 # `managedFields` (`joinEnriched` in k8s-operator/cmd/drift-detector/join.go).
 # Any other value means ownership is absent because the lookup did not happen,
@@ -2004,28 +2016,8 @@ def _drift_ownership_block(payload: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _drift_task_body(payload: Dict[str, Any]) -> str:
-    """The kanban card body for an out-of-band change to a live object.
-
-    The event path's equivalent is `_triage_task_body`, and its docstring is the
-    canonical explanation of the parts these two share: the `kanban_complete`
-    delivery, the three `##` sections SOUL.md §7 permits, the **Done when**
-    line, and the `To authorize:` bullet that `kanban_notifier.actionable_report`
-    keys on to decide which completions earn an `incidents` row — which is what
-    makes the offer to reply `apply` honourable. Those literals are load-bearing
-    in both bodies for the same reasons; read that docstring before rewording
-    either. This body has its own third reader as well —
-    bench/tasks/gitops-drift-out-of-band-triage/task.yaml's delivery objective
-    keys on the same literals — and bench/tests/test_triage_delivery_contract.py
-    holds this template against both that case and the notifier gate.
-
-    What is not shared is the question. An event says Kubernetes is unhappy and
-    asks for a root cause. This says a person or a tool changed a live object
-    outside git, and asks whether the declared state or the live state is the
-    one that should win. That is a decision the reader makes, not a defect the
-    agent diagnoses, so the report's job is to establish what changed, whether
-    it still stands, and what each answer would cost.
-    """
+def _drift_audit_facts(payload: Dict[str, Any]) -> str:
+    """The audit record a drift card opens with, and whether it was reconciled since."""
     resource_path = _drift_resource_path(payload)
     cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
     principal = _defang_drift_field(payload.get("principal")) or DRIFT_UNKNOWN_FIELD
@@ -2051,8 +2043,6 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         )
 
     return (
-        f"An out-of-band change was made to a live object on GKE cluster '{cluster_name}'. It did not come "
-        f"through git, and the audit log is how we know about it.\n\n"
         f"**What the audit log recorded:**\n"
         f"- **Object:** {resource_path}\n"
         f"- **Cluster / project:** {cluster_name} / {project}\n"
@@ -2063,7 +2053,100 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"- **When:** {timestamp}\n"
         f"- **Audit entry:** `insertId={insert_id}` — search Cloud Logging for this to read the entry itself\n"
         f"{_drift_ownership_block(payload)}\n"
-        f"{reconcile_line}\n\n"
+        f"{reconcile_line}"
+    )
+
+
+def _gitops_repo_registered() -> Optional[bool]:
+    """Whether the install has a usable GitOps repository: True, False, or None when unknown.
+
+    Asks gitops_preflight, the check a PR-writing worker runs first, so the
+    drift card and the worker that would act on it cannot disagree about
+    whether there is a repository. A registry that cannot be read is None,
+    and the card then keeps its options: the worker's own preflight still
+    stops an action that cannot be carried out.
+    """
+    try:
+        import gitops_preflight
+
+        code, _ = gitops_preflight.preflight()
+    except Exception:  # noqa: BLE001 - an unknown answer keeps upstream's card
+        return None
+    if code == gitops_preflight.EXIT_REGISTERED:
+        return True
+    if code == gitops_preflight.EXIT_NO_REGISTERED_REPO:
+        return False
+    return None
+
+
+def _drift_task_body_without_gitops(payload: Dict[str, Any]) -> str:
+    """The drift card for an install with no GitOps repository: explain, offer nothing.
+
+    The same audit facts and the same delivery as :func:`_drift_task_body`,
+    but the report's 'What to do' is :data:`DRIFT_NO_GITOPS_LINE` and nothing
+    else. Without a 'To authorize:' line kanban_notifier.actionable_report
+    files no incidents row, and the Slack presenter draws no option buttons.
+    """
+    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
+    return (
+        f"An out-of-band change was made to a live object on GKE cluster '{cluster_name}', and the audit log "
+        f"recorded it.\n\n"
+        f"{_drift_audit_facts(payload)}\n\n"
+        f"**Read the live object before you conclude anything.** Everything above describes a change as it was "
+        f"made; only the cluster can tell you whether it is still there. You have read access to this cluster — "
+        f"use it.\n\n"
+        f"**{DRIFT_NO_GITOPS_LINE}** So this report explains the change and proposes nothing: no revert, no "
+        f"codify, no other fix, and no call to action.\n\n"
+        f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
+        f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where "
+        f"the alert was raised, and `result` is what gets posted there.\n\n"
+        f"**Done when:** the report says who changed what, what the live object looks like now, whether the change "
+        f"still stands, and what it affects. Nothing else is a condition of finishing.\n\n"
+        f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it.** "
+        f"**Do not judge the change by who made it**, and change nothing in the cluster.\n\n"
+        f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
+        f"these three `##` sections are the only ones:\n\n"
+        f"## What's wrong\n\n"
+        f"<1 sentence: who changed what, and whether it is still live>\n\n"
+        f"## Why\n\n"
+        f"- <What the live object shows now, with the evidence>\n"
+        f"- <What the change affects — availability, cost, security posture — in 1-2 sentences>\n\n"
+        f"## What to do\n\n"
+        f"- {DRIFT_NO_GITOPS_LINE}\n\n"
+        f"Every <...> above is a placeholder: fill each one in. Write the 'What to do' bullet exactly as given."
+    )
+
+
+def _drift_task_body(payload: Dict[str, Any]) -> str:
+    """The kanban card body for an out-of-band change to a live object.
+
+    The event path's equivalent is `_triage_task_body`, and its docstring is the
+    canonical explanation of the parts these two share: the `kanban_complete`
+    delivery, the three `##` sections SOUL.md §7 permits, the **Done when**
+    line, and the `To authorize:` bullet that `kanban_notifier.actionable_report`
+    keys on to decide which completions earn an `incidents` row — which is what
+    makes the offer to reply `apply` honourable. Those literals are load-bearing
+    in both bodies for the same reasons; read that docstring before rewording
+    either. This body has its own third reader as well —
+    bench/tasks/gitops-drift-out-of-band-triage/task.yaml's delivery objective
+    keys on the same literals — and bench/tests/test_triage_delivery_contract.py
+    holds this template against both that case and the notifier gate.
+
+    What is not shared is the question. An event says Kubernetes is unhappy and
+    asks for a root cause. This says a person or a tool changed a live object
+    outside git, and asks whether the declared state or the live state is the
+    one that should win. That is a decision the reader makes, not a defect the
+    agent diagnoses, so the report's job is to establish what changed, whether
+    it still stands, and what each answer would cost.
+    """
+    if _gitops_repo_registered() is False:
+        return _drift_task_body_without_gitops(payload)
+    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
+
+    return (
+        f"An out-of-band change was made to a live object on GKE cluster '{cluster_name}'. It did not come "
+        f"through git, and the audit log is how we know about it.\n\n"
+        f"{_drift_audit_facts(payload)}\n\n"
         f"**Read the live object before you conclude anything.** Everything above describes a change as it was "
         f"made; only the cluster can tell you whether it is still there. You have read access to this cluster — "
         f"use it.\n\n"
