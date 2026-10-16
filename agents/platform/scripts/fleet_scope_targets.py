@@ -14,7 +14,10 @@ project the scope resolved to with the outcome the reconcile read it with. An
 audit sweeps the projects read `ok` or `api-disabled` and the management
 project whatever its row read (the collectors read it themselves), names the
 ones the scope declares but the reconcile could not read, so the run accounts
-for them rather than reading as a full sweep, and lists nothing. An install that declares no scope has drawn
+for them rather than reading as a full sweep, and lists nothing. It also
+hands over the clusters `spec.scope.exclude.clusters` names, which every fleet
+read leaves out (#3081): the scope is otherwise per project, so without them an
+excluded cluster in a swept project is read like any other. An install that declares no scope has drawn
 no boundary; the answer is None there, and the audit keeps the listing it had.
 With no snapshot yet, or one that does not parse, the operator's render answers
 instead: a present block is the management project alone, partial, until the
@@ -26,7 +29,8 @@ the resolved set and the arguments to pass the collectors. The collectors
 themselves cannot read the file: they run in the shell sandbox, whose
 /opt/data is a separate volume at the same path (deploy/sandbox/entrypoint.sh
 says nothing is copied across), so the agent carries the scope from the tool
-to the collector's `--scope-projects` and `--scope-unread`. The reader is
+to the collector's `--scope-projects`, `--scope-unread` and
+`--scope-exclude-clusters`. The reader is
 deliberately independent of cluster_agent_reconcile.py, which writes the
 snapshot and owns its shape: that module's import has side effects.
 """
@@ -96,10 +100,14 @@ class ScopeRenderUnreadable(Exception):
     report, not an install that declares no scope."""
 
 
-# The collectors' two scope flags, which `collector_args` spells with the
+# The collectors' scope flags, which `collector_args` spells with the
 # constants the collectors parse them by, so the two cannot drift apart.
 SCOPE_PROJECTS_FLAG = fleet_scope_args.SCOPE_PROJECTS_FLAG
 SCOPE_UNREAD_FLAG = fleet_scope_args.SCOPE_UNREAD_FLAG
+SCOPE_EXCLUDE_CLUSTERS_FLAG = fleet_scope_args.SCOPE_EXCLUDE_CLUSTERS_FLAG
+# The keys of one spec.scope.exclude.clusters entry, as the operator renders it
+# (ScopeClusterRef) and the reconcile copies it into `declared`.
+CLUSTER_REF_KEYS = ("projectId", "location", "clusterName")
 STATE_IN_SCOPE = "in-scope"
 # Whether the CR carried a spec.scope block this run, which the reconcile records
 # beside `declared`: a present block with every list empty is the host-only
@@ -159,6 +167,10 @@ class ScopeTargets:
     path: str
     # Set when the render answered instead of a snapshot.
     note: str | None = None
+    # The (project, location, cluster) triples spec.scope.exclude.clusters
+    # names: left out of fleet answers and the per-cluster audits, not
+    # a coverage gap.
+    excluded_clusters: tuple[tuple[str, str, str], ...] = ()
 
     def collector_args(self) -> str:
         """The arguments that hand this scope to a collector: `--scope-projects`
@@ -175,7 +187,26 @@ class ScopeTargets:
         unread = self.unread or ((UNRESOLVED_SCOPE_ROW, OUTCOME_UNRESOLVED),) if not self.projects else self.unread
         if unread:
             args.append(f"{SCOPE_UNREAD_FLAG} " + ",".join(f"{project}={outcome}" for project, outcome in unread))
+        if self.excluded_clusters:
+            args.append(f"{SCOPE_EXCLUDE_CLUSTERS_FLAG} " + ",".join(fleet_scope_args.format_cluster_ref(*ref) for ref in self.excluded_clusters))
         return " ".join(args)
+
+
+def _excluded_clusters(block: object) -> tuple[tuple[str, str, str], ...]:
+    """The exclude.clusters entries of a render or a snapshot's `declared`, as
+    sorted triples. An entry missing a part, or with a part the CRD would not
+    admit, is skipped: it could not have come through admission, and spelled
+    into collector_args it would make every collector refuse its arguments."""
+    exclude = block.get("exclude") if isinstance(block, dict) else None
+    entries = exclude.get("clusters") if isinstance(exclude, dict) else None
+    triples = set()
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        parts = tuple(entry.get(key) for key in CLUSTER_REF_KEYS)
+        if all(isinstance(part, str) and fleet_scope_args.SCOPE_CLUSTER_PART.match(part) for part in parts):
+            triples.add(parts)
+    return tuple(sorted(triples))
 
 
 def snapshot_path(agent_home: str | os.PathLike | None = None) -> Path:
@@ -231,6 +262,7 @@ def _from_render(path: Path) -> ScopeTargets | None:
         resolved_at=None,
         path=os.environ.get(SCOPE_FILE_ENV) or str(path),
         note=note,
+        excluded_clusters=_excluded_clusters(render),
     )
 
 
@@ -312,4 +344,5 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
         unread=tuple(unread),
         resolved_at=str(resolved_at) if isinstance(resolved_at, str) else None,
         path=str(path),
+        excluded_clusters=_excluded_clusters(declared),
     )

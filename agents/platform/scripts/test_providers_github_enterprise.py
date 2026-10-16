@@ -57,6 +57,19 @@ FIXTURES = Path(__file__).resolve().parent / "testdata" / "providers" / "github"
 DIFF = "diff --git a/x b/x\n"
 
 
+def setUpModule():
+    # gitops_workspace ignores GITOPS_STATE_PATH where the operator's
+    # /etc/gitops mount exists (in_operator_pod), and this module isolates its
+    # tests with that variable. Point the mount check away from any real one.
+    global _NO_MOUNT
+    _NO_MOUNT = mock.patch.object(gitops_workspace, "GITOPS_STATE_DIR", "/nonexistent/kube-agents-test/etc-gitops")
+    _NO_MOUNT.start()
+
+
+def tearDownModule():
+    _NO_MOUNT.stop()
+
+
 def _openssl(*args: str, cwd: Path) -> None:
     subprocess.run([OPENSSL, *args], cwd=cwd, check=True, capture_output=True)
 

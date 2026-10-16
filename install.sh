@@ -741,7 +741,9 @@ Flags for AI Agents & Automation:
   --scope-exclude-projects=IDS  Project IDs or shell-style globs (*-sandbox) to leave
                                 unmanaged
   --scope-exclude-clusters=TRIPLES
-                                Clusters to leave unmanaged, each as project/location/cluster
+                                Clusters to leave unmanaged and out of fleet answers and
+                                the per-cluster audits, each as
+                                project/location/cluster
   --scoped-sa-pool-enabled[=BOOL]
                                 Arm the scoped service account pool: one reader service
                                 account per project in scope, which the credential broker
@@ -2703,6 +2705,13 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
   write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
+  # The daily alert ceilings, recorded even when empty. An empty key keeps the
+  # image default, and the line shows where to set the ceiling. A value that
+  # was exported only for this run then also applies on the next upgrade.sh.
+  local alert_key
+  for alert_key in $ALERT_DAILY_LIMIT_KEYS; do
+    write_env_var "$tmp" "$alert_key" "${!alert_key:-}"
+  done
   write_secret_env_var "$tmp" GEMINI_API_KEY "${GEMINI_API_KEY:-}"
   write_secret_env_var "$tmp" OPENAI_API_KEY "${OPENAI_API_KEY:-}"
   write_secret_env_var "$tmp" ANTHROPIC_API_KEY "${ANTHROPIC_API_KEY:-}"
@@ -5660,7 +5669,7 @@ run_menu_system() {
       4)
         local p_opt=""
         prompt_menu "Select GCP IAM Permission Set:" \
-          "read-only — auditing and observability, no GCP write capability (Default)" \
+          "read-only — auditing and observability: read roles, no write to infrastructure (Default)" \
           "custom — exactly the roles you list, no built-in bundle" \
           p_opt
         case "$p_opt" in
@@ -6892,7 +6901,7 @@ main() {
       if [ -n "$github_org" ] || [ -n "$github_app_id" ]; then
         print_info "GitOps interview skipped; keeping the GitOps configuration this install already records."
       else
-        print_info "GitOps repository connection skipped. Scheduled fleet audits still run and report to chat, but write no ledger issue or pull request without one."
+        print_info "GitOps repository connection skipped. Scheduled fleet audits still run, keep their reports on the agent's volume and post to chat when something changed, but write no ledger issue or pull request without one."
       fi
     fi
   else
@@ -6996,7 +7005,9 @@ main() {
     # These are GCP IAM role bundles for the agent's GSA, nothing else. Kubernetes
     # RBAC stays read-only in every set, and the GitOps pull-request path works in
     # every set, so neither belongs in these labels. read-only leads because it is
-    # the documented default and the only set that enforces no cloud-plane writes.
+    # the documented default and the only set that keeps writes to infrastructure
+    # out at IAM; what its roles carry beyond reads (the Trace role's console
+    # permissions) is on the canonical page, not restated in the label.
     # See docs/site/src/content/docs/reference/security-and-iam.md.
     # The "(Default)" tag follows the option enter keeps — the seeded one on a
     # re-run — for the reason the gVisor prompt below gives: a static tag on
@@ -7009,7 +7020,7 @@ main() {
       perm_tag_custom=" (Default)"
     fi
     prompt_menu "Select Platform Agent GCP IAM Permission Set:" \
-      "read-only — auditing and observability, no GCP write capability${perm_tag_ro}" \
+      "read-only — auditing and observability: read roles, no write to infrastructure${perm_tag_ro}" \
       "custom — exactly the roles you list, no built-in bundle${perm_tag_custom}" \
       perm_choice
 

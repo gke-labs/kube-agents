@@ -169,8 +169,40 @@ spec:
       cluster has no collector, so this is for the cases it will not decide:
       discovery switched off, a pinned endpoint, or a collector you would rather
       this agent did not export to.
+
+      The daily alert ceilings in deployment.alertDailyLimits come first in the
+      list, as ALERT_DAILY_LIMIT_<KEY>. A key that is not set adds no entry, so
+      a default render has no env. A name that deployment.env also lists is
+      skipped, so the explicit entry wins. The CRD keys env on name, and the
+      API server refuses a duplicate name. A valueFrom entry for a name whose
+      key is set fails the render. The operator forwards only literal values
+      and drops that entry, so the agent would ignore both the entry and the
+      key. The value goes through int64 because Helm reads a number from a
+      values file as float64, and toString writes a large float64 in exponent
+      form, which the daemon cannot read.
     */}}
-    {{- with .Values.platformAgent.deployment.env }}
+    {{- $userEnv := .Values.platformAgent.deployment.env | default list }}
+    {{- $userEnvNames := dict }}
+    {{- $userValueFromNames := dict }}
+    {{- range $userEnv }}
+    {{- $_ := set $userEnvNames (toString .name) true }}
+    {{- if .valueFrom }}
+    {{- $_ := set $userValueFromNames (toString .name) true }}
+    {{- end }}
+    {{- end }}
+    {{- $alertDailyLimits := .Values.platformAgent.deployment.alertDailyLimits | default dict }}
+    {{- $env := list }}
+    {{- range $bucket := list "critical" "warning" "info" "drift" }}
+    {{- $name := printf "ALERT_DAILY_LIMIT_%s" (upper $bucket) }}
+    {{- $limit := index $alertDailyLimits $bucket }}
+    {{- if and (not (kindIs "invalid" $limit)) (hasKey $userValueFromNames $name) }}
+    {{- fail (printf "platformAgent.deployment.alertDailyLimits.%s is set, and platformAgent.deployment.env gives %s through valueFrom. The operator forwards only literal values, so it drops that entry and the agent keeps its default. Remove the valueFrom entry or the key." $bucket $name) }}
+    {{- end }}
+    {{- if and (not (kindIs "invalid" $limit)) (not (hasKey $userEnvNames $name)) }}
+    {{- $env = append $env (dict "name" $name "value" ($limit | int64 | toString)) }}
+    {{- end }}
+    {{- end }}
+    {{- with concat $env $userEnv }}
     env:
       {{- /*
         `value` is quoted rather than passed through toYaml because the CRD types

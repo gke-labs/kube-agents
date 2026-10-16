@@ -195,6 +195,11 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    "scope-excluded-cluster-not-listed": (
+        "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
+        "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
+        "cluster exclusion and the case cannot patch the CR for a run"
+    ),
     "networking-world-open-ingress": (
         "#2682: needs bench/tf/fleet's world_open firewall rule and VM applied to "
         "every pool project (fleet re-apply); no pool project has a rule opening a "
@@ -240,6 +245,11 @@ FIXTURE_NOT_READY = {
         "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
         "can run it; run it by hand against such an install"
     ),
+    "fleet-cost-without-forge-keeps-the-report": (
+        "#2419: needs an install with no forge (a PlatformAgent with no "
+        "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
+        "can run it; run it by hand against such an install"
+    ),
     "networking-audit-second-project": (
         "#1865: needs a second GCP project per pool project that the agent's "
         "service account can read, declared in the install's spec.scope.projects (or an "
@@ -271,6 +281,18 @@ FIXTURE_NOT_READY = {
         "#1873: needs the stalled-controller role applied to every pool "
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
+    ),
+    "observability-trace-latency-brokered": (
+        "#2244: needs the pool host clusters to export traces; until "
+        "2026-10-02, 33 of the 35 had no managed OpenTelemetry collection "
+        "scope, so the operator's telemetry discovery resolved to None, the "
+        "agent ran with OTEL_SDK_DISABLED=true and Cloud Trace in those "
+        "projects was empty, which the case reports as an empty window and "
+        "fails on the report check (a fixture gap, not a red). The scope was "
+        "set by hand that day, and the provisioning script and the verifier's "
+        "gke/host-otel-scope finding now hold it (docs/ci-pool-projects.md "
+        "section 2); the case moves to the nightly once the first leases "
+        "after the repair show traces landing"
     ),
 }
 
@@ -344,6 +366,13 @@ KNOWN_NO_DOMAIN = {
         "and label; it reads no fleet and no domains.yaml row describes "
         "alert authoring"
     ),
+    "observability-trace-latency-brokered": (
+        "the agent's own observability skill: its trace latency helper run to "
+        "completion through the credential broker's relay, graded on the report "
+        "and on the route the worker took (no access token fetched or pasted); "
+        "it reads the install's own traces, not a fleet, and no domains.yaml "
+        "row describes the agent observing itself"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
@@ -385,7 +414,11 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "any_of_phrases",
         "any_of_patterns",
         "forbidden_patterns",
+        "required_patterns",
     ),
+    # The parsed manifest's fields and selector are the assertion; `kind` alone
+    # only names what to look for.
+    "report_manifest": ("fields", "selects", "excludes"),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.

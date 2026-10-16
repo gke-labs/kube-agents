@@ -416,15 +416,24 @@ collector's namespace, `gke-gmp-system`, and the operator's own pods on those po
 either way; the value only decides
 whether a scrape is configured, and the operator's own read of the counters and
 cluster gauges into `status.usage` does not depend on it.
-It is a tri-state: `null`,
-the default, renders them when the cluster serves the `PodMonitoring` API and
-nothing elsewhere, so an install off GKE, or on a GKE cluster with Managed
-Prometheus turned off, upgrades without setting anything; `true` renders them
-regardless and fails at apply time where the CRD is absent, the caveat
-`litellm.podMonitoring` carries; `false` never renders them. `helm template`
-alone has no cluster to ask: pass
-`--api-versions monitoring.googleapis.com/v1/PodMonitoring` to see the default
-render.
+
+Non-GMP clusters scrape these metrics through the corresponding alternative knobs:
+
+- `platformAgent.serviceMonitor` renders Prometheus Operator `ServiceMonitor` objects and headless metrics `Service`s for the three pods (selects `monitoring.coreos.com/v1/ServiceMonitor`).
+- `platformAgent.vmPodScrape` renders VictoriaMetrics Operator `VMPodScrape` objects for the three pods (selects `operator.victoriametrics.com/v1beta1/VMPodScrape`).
+
+Each monitoring knob (`podMonitoring`, `serviceMonitor`, `vmPodScrape`) is an independent tri-state:
+`null`, the default, renders them when the cluster serves the corresponding API and
+nothing elsewhere, so an install off GKE, or on a cluster without Prometheus Operator or
+VictoriaMetrics Operator, upgrades without setting anything; `true` renders them
+regardless and fails at apply time where the CRD is absent; `false` never renders them.
+`helm template` alone has no cluster to ask: pass `--api-versions monitoring.googleapis.com/v1/PodMonitoring`,
+`--api-versions monitoring.coreos.com/v1/ServiceMonitor`, or `--api-versions operator.victoriametrics.com/v1beta1/VMPodScrape`
+to see the default render.
+
+On clusters enforcing NetworkPolicy, scrapes are dropped unless admitted: set `platformAgent.monitoringScraperNamespace: <namespace>` to render admitting NetworkPolicies for ports 9095, 9097, 8766, and 9096, or create an admitting NetworkPolicy manually. The gateway admitting policy includes rules for the agent API (8642/8643 from within the namespace), the GMP collector in `gke-gmp-system` (9095/9097), and operator poller metrics (9095/9097 assuming `operator.enabled: true` in the chart release namespace) alongside the scraper namespace, isolating inbound traffic on the gateway pod to this explicit peer set when operator-managed NetworkPolicies are disabled. Credential proxy (8766) and A2A gateway (9096) guardrails are applied unconditionally and still require an admitting NetworkPolicy. For Prometheus Operator release selectors (e.g. `kube-prometheus-stack` matching `release: <stack-release-name>`), supply labels via `platformAgent.serviceMonitorLabels`, or configure Prometheus with `serviceMonitorSelectorNilUsesHelmValues: false`.
+
+When deploying via GitOps tools like ArgoCD, `helm template` passes the destination cluster's discovered API versions by default when connected to the target cluster. If default detection does not pick up your CRDs or if running disconnected templates, explicitly set `platformAgent.serviceMonitor: true` or `platformAgent.vmPodScrape: true` in your Helm values.
 
 ### Turning telemetry off
 
@@ -600,6 +609,18 @@ chart's `crds/` before setting the value (`helm upgrade` does not, `upgrade.sh`
 does): against a CRD that predates `spec.deployment.credentialProxy`, the API
 server would prune the value silently while the release record kept it, so the
 chart looks up the installed CRD and fails the upgrade instead.
+
+`platformAgent.deployment.alertDailyLimits` sets the daily alert ceilings. Its keys are
+`critical`, `warning`, `info` and `drift`, and each key that is set becomes an
+`ALERT_DAILY_LIMIT_<KEY>` entry in the CR's `spec.deployment.env`. A key that is not set keeps the
+default in the agent image, and `0` removes the cap. An entry with the same name in
+`platformAgent.deployment.env` wins over the key. A `valueFrom` entry for a key that is set fails
+the render, because the operator forwards only literal values. Each apply that changes the env list
+that the chart renders replaces the full list on the CR, so entries added to the CR by hand are
+lost. Move them to `platformAgent.deployment.env` first. A re-tag to a chart without the value needs
+`upgrade.sh --drop-undeclared-values`. The
+[chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling) gives
+the buckets, the defaults and a sizing method.
 
 #### PlatformAgent annotations
 

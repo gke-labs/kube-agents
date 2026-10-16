@@ -77,8 +77,15 @@ def no_session() -> None:
         os.environ.pop(name, None)
 
 
+WORKER_CHILD_ASSIGNEE = "cluster-kube-agents-evals-13-seeded-a-us-central1-a"
+
+
 def tool_create(**args) -> dict:
-    out = json.loads(kt._handle_create({"assignee": "platform", **args}))
+    # Inside a worker the child goes to a Cluster Agent: a platform worker's
+    # card for `platform` that would run alongside it is refused (#3164,
+    # kanban_self_copy).
+    assignee = WORKER_CHILD_ASSIGNEE if os.environ.get("HERMES_KANBAN_TASK") else "platform"
+    out = json.loads(kt._handle_create({"assignee": assignee, **args}))
     if not out.get("ok"):
         raise AssertionError(f"kanban_create failed: {out}")
     return out
