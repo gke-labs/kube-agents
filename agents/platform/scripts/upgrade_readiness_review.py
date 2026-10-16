@@ -112,13 +112,14 @@ SANDBOX_COPY_DIR_CLOSED_MODE = 0o555  # between reviews: no new file, no replace
 
 # The findings queue, as findings_nudge.py reaches it.
 KV_ENDPOINT_ENV = "SESSION_KV_ENDPOINT"
-KV_API_KEY_ENV = "SESSION_KV_API_KEY"
+KV_AUTH_VARIABLE = "SESSION_KV_API_KEY"  # the name of the variable the bearer token is read from
 DEFAULT_KV_ENDPOINT = "http://127.0.0.1:8699"
 KV_FINDINGS_PATH = "/v1/findings"
 KV_TIMEOUT_SECONDS = 30
+KV_ERROR_EXCERPT_CHARS = 300  # of the queue's refusal body, kept in the problem line
 KV_BATCH_LIMIT = findings_queue.MAX_BATCH  # one POST /v1/findings holds this many rows
 
-SOURCE = "audit"
+SOURCE = "upgrade-readiness"  # the review's own writer name in the queue (findings_queue.SOURCES)
 CHECK_PREFIX = "upgrade-"
 CHECK_BUDGET = CHECK_PREFIX + "drain-blocking-budget"
 CHECK_EXCLUSION = CHECK_PREFIX + "maintenance-exclusion"
@@ -138,6 +139,17 @@ OUTAGE_KEY = "outage"
 EXCLUSIONS_KEY = "exclusions"
 POOLS_KEY = "pools"
 READ_ERROR_KEYS = ("read_error", "webhook_read_error")
+# What the grader could not decide: a pool whose version did not parse (or every pool,
+# with no target), an exclusion with an unparsable time or scope, a rule that failed.
+SKEW_UNKNOWN_KEY = "unknown"
+UNDECIDED_EXCLUSIONS_KEY = "undecided_exclusions"
+RULES_UNKNOWN_KEY = "unknown"
+DEFAULT_WEBHOOK_CONFIG_KIND = "webhookconfiguration"
+# The member a finding came from, carried beside the payload (stripped before
+# registration) and written into the summary's rows: cluster names repeat across
+# locations, so project and cluster alone do not name a member.
+MEMBER_FIELD = "_member"
+ROW_MEMBER_KEY = "member"
 SKEW_VERDICT_BLOCKS = "blocks"
 SKEW_VERDICT_CEILING = "at ceiling"
 WORKLOAD_REPLICAS_KEY = "replicas"
@@ -341,12 +353,18 @@ def kv_endpoint() -> str:
 def kv_request(path: str, body: dict) -> dict:
     data = json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    token = (os.environ.get(KV_API_KEY_ENV) or "").strip()
+    token = (os.environ.get(KV_AUTH_VARIABLE) or "").strip()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(f"{kv_endpoint()}{path}", data=data, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=KV_TIMEOUT_SECONDS) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=KV_TIMEOUT_SECONDS) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # The queue says which row or field it refused, or that it is busy, in
+        # the body; str(HTTPError) is the status line alone.
+        body = " ".join(exc.read().decode("utf-8", "replace").split())[:KV_ERROR_EXCERPT_CHARS]
+        raise OSError(f"HTTP {exc.code} {exc.reason}: {body}" if body else f"HTTP {exc.code} {exc.reason}") from None
 
 
 # --- the mapping: report rows to findings ------------------------------------
@@ -416,6 +434,7 @@ def finding(
         },
         # Carried beside the payload for the report; stripped before registration.
         "_entry": entry,
+        MEMBER_FIELD: where,
         "_location": location,
     }
 
@@ -516,6 +535,7 @@ def webhook_findings(member: dict) -> list[dict]:
             if not isinstance(hook, dict):
                 continue
             config = str(hook.get(CONFIG_KEY) or "")
+            config_kind = str(hook.get(CONFIG_KIND_KEY) or DEFAULT_WEBHOOK_CONFIG_KIND).lower()
             name = str(hook.get(NAME_KEY) or hook.get(WEBHOOK_KEY) or "")
             rules = ", ".join(str(r) for r in (hook.get(LIVE_RULES_KEY) or hook.get(RULES_KEY) or []))
             path = ", ".join(str(r) for r in (hook.get(UPGRADE_PATH_KEY) or []))
@@ -527,13 +547,15 @@ def webhook_findings(member: dict) -> list[dict]:
                     check=CHECK_WEBHOOK,
                     entry=ENTRY_WEBHOOK,
                     namespace="",
-                    object_name=f"{config}{WEBHOOK_OBJECT_SEPARATOR}{name}",
+                    # The kind is part of the identity: a Validating and a Mutating
+                    # configuration may share a name and a webhook name.
+                    object_name=WEBHOOK_OBJECT_SEPARATOR.join((config_kind, config, name)),
                     title=f"{ENTRY_WEBHOOK}. {entry_title(ENTRY_WEBHOOK)}: {config}/{name} fails closed with no backend and {what}",
                     detail=f"{hook.get(REASON_KEY) or 'backend unreachable'}; rules: {rules or 'none'}" + (f"; in the upgrade's path: {path}" if path else ""),
                     rubric_values=RUBRIC[kind],
                     action=f"Restore the backend Service {hook.get(SERVICE_KEY) or ''} or set failurePolicy Ignore on {config}/{name}, and keep kube-system out of its namespaceSelector.",
                     rationale=entry_mitigation(ENTRY_WEBHOOK),
-                    verify=f"kubectl get {hook.get(CONFIG_KIND_KEY) or 'validatingwebhookconfiguration'} {config} -o jsonpath='{{.webhooks[*].failurePolicy}}' and kubectl get endpoints -n <ns> <service>",
+                    verify=f"kubectl get {config_kind} {config} -o jsonpath='{{.webhooks[*].failurePolicy}}' and kubectl get endpoints -n <ns> <service>",
                     still_failing_when="failurePolicy is Fail and the backend Service has no ready endpoint.",
                 )
             )
@@ -611,12 +633,23 @@ def member_findings(member: dict) -> list[dict]:
 def member_complete(member: dict, report_errors: list) -> bool:
     """Whether the run read this cluster in full, which is what lets the queue
     lower the confidence of a finding it did not re-report. A member whose own
-    read failed is not complete; neither is one in a location whose
-    ``get-server-config`` failed (an ``errors`` row with the location and no
-    cluster), because the script graded it with no target: no pool verdicts, no
-    exclusion decisions, so their rows are missing rather than cleared."""
+    read failed is not complete; nor one the grader left ``unknown`` or could
+    not decide a part of (a pool whose version did not parse, an exclusion
+    with an unparsable time or scope, a rule that failed to run), since the
+    rows it would have written are missing rather than cleared; nor one in a
+    location whose ``get-server-config`` failed (an ``errors`` row with the
+    location and no cluster), which left it no target to grade against."""
     readiness = member.get(watch.READINESS_KEY) or {}
     if any(readiness.get(key) for key in READ_ERROR_KEYS):
+        return False
+    if readiness.get(watch.STATUS_KEY) == watch.READINESS_UNKNOWN:
+        return False
+    undecided = (
+        (readiness.get(SKEW_KEY) or {}).get(SKEW_UNKNOWN_KEY),
+        (readiness.get(MAINTENANCE_KEY) or {}).get(UNDECIDED_EXCLUSIONS_KEY),
+        readiness.get(RULES_UNKNOWN_KEY),
+    )
+    if any(undecided):
         return False
     errors = [error for error in report_errors if isinstance(error, dict)]
     key = watch.member_key(member)
@@ -680,21 +713,25 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
 # --- registering ------------------------------------------------------------------
 
 
-def register(members: list[dict], errors: list[dict], findings: list[dict]) -> tuple[dict[str, str], list[str], set[tuple[str, str]]]:
-    """Register the findings cluster by cluster, each batch with its scope when
+def register(members: list[dict], errors: list[dict], findings: list[dict]) -> tuple[dict[str, str], list[str], set[str]]:
+    """Register the findings member by member, each batch with its scope when
     the cluster was read in full (a complete cluster with nothing to report
     sends an empty batch with the scope). Returns the outcome per id, the
-    registration errors, and the clusters whose claim of completeness reached
-    the queue, which is what the week's delta may be counted over."""
+    registration errors, and the member keys whose claim of completeness
+    reached the queue, which is what the week's delta may be counted over.
+    Batches are keyed by member (project, location and cluster): a cluster
+    name repeats across locations, and the queue's identity, which carries no
+    location, is the queue's concern, not a reason to merge two members' rows."""
     outcomes: dict[str, str] = {}
     problems: list[str] = []
-    claimed: set[tuple[str, str]] = set()
-    by_cluster: dict[tuple[str, str], list[dict]] = {}
+    claimed: set[str] = set()
+    by_member: dict[str, list[dict]] = {}
     for item in findings:
-        by_cluster.setdefault((item["project"], item["cluster"]), []).append(item)
+        by_member.setdefault(item[MEMBER_FIELD], []).append(item)
     for member in members:
         project, _location, cluster = cluster_fields(member)
-        batch = by_cluster.get((project, cluster), [])
+        key = watch.member_key(member)
+        batch = by_member.get(key, [])
         complete = member_complete(member, errors)
         if not batch and not complete:
             continue
@@ -717,7 +754,7 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
                     outcomes[item_id(item)] = REGISTRATION_FAILED
                 continue
             if claims:
-                claimed.add((project, cluster))
+                claimed.add(key)
             for result in answer.get("results") or []:
                 if isinstance(result, dict) and result.get("id"):
                     outcomes[str(result["id"])] = str(result.get("outcome") or "")
@@ -749,7 +786,7 @@ def summary(
     problems: list[str],
     previous: dict | None,
     report_path: Path,
-    claimed: set[tuple[str, str]] | None = None,
+    claimed: set[str] | None = None,
 ) -> dict:
     keys = [watch.member_key(m) for m in members]
     blocked, ready, unknown, unread = watch.readiness_verdicts({watch.MEMBERS_KEY: members, watch.ERRORS_KEY: errors}, keys)
@@ -769,6 +806,7 @@ def summary(
                 "title": item["title"],
                 "action": item["recommendation"]["action"],
                 "outcome": outcomes.get(fid, ""),
+                ROW_MEMBER_KEY: item[MEMBER_FIELD],
             }
         )
     counts = {severity: sum(1 for r in rows if r["severity"] == severity) for severity in SEVERITY_ORDER}
@@ -776,17 +814,21 @@ def summary(
     # Only a cluster read in full, whose claim of completeness reached the
     # queue, can say that last week's row is gone; one whose read failed, or
     # that was sent in pieces, keeps its rows unjudged, as the queue does.
-    reviewed_pairs = {
-        (str(m.get(watch.MEMBER_ID_KEYS[0]) or ""), str(m.get(watch.MEMBER_ID_KEYS[-1]) or ""))
-        for m in members
-        if member_complete(m, errors)
-    }
+    reviewed_keys = {watch.member_key(m) for m in members if member_complete(m, errors)}
     if claimed is not None:
-        reviewed_pairs &= claimed
+        reviewed_keys &= claimed
+    # A record written before rows carried their member names only project and
+    # cluster; such a row is judged by the pair, as the first review did.
+    reviewed_pairs = {tuple(key.split(watch.MEMBER_KEY_SEPARATOR)[:: len(watch.MEMBER_ID_KEYS) - 1]) for key in reviewed_keys}
     previous_ids = [
         r.get("id")
         for r in (previous or {}).get("findings") or []
-        if r.get("id") and (str(r.get("project") or ""), str(r.get("cluster") or "")) in reviewed_pairs
+        if r.get("id")
+        and (
+            r.get(ROW_MEMBER_KEY) in reviewed_keys
+            if r.get(ROW_MEMBER_KEY)
+            else (str(r.get("project") or ""), str(r.get("cluster") or "")) in reviewed_pairs
+        )
     ]
     return {
         "version": SUMMARY_VERSION,
@@ -837,15 +879,13 @@ def render_report(summary_doc: dict, findings: list[dict], tables: dict[str, str
     ]
     rows_by_cluster: dict[str, list[dict]] = {}
     for row in summary_doc["findings"]:
-        rows_by_cluster.setdefault(watch.MEMBER_KEY_SEPARATOR.join((row["project"], row["cluster"])), []).append(row)
+        rows_by_cluster.setdefault(row[ROW_MEMBER_KEY], []).append(row)
     verdict_of = {}
     for name, key in ((watch.READINESS_BLOCKED, watch.READINESS_BLOCKED), (watch.READINESS_READY, watch.READINESS_READY), (watch.READINESS_UNKNOWN, watch.READINESS_UNKNOWN), ("not read", UNREAD_KEY)):
         for member in clusters[key]:
             verdict_of[member] = name
     for member in clusters[REVIEWED_KEY]:
-        parts = member.split(watch.MEMBER_KEY_SEPARATOR)
-        short = watch.MEMBER_KEY_SEPARATOR.join(parts[::2]) if len(parts) == len(watch.MEMBER_ID_KEYS) else member
-        rows = rows_by_cluster.get(short, [])
+        rows = rows_by_cluster.get(member, [])
         lines.append(
             f"| {member} | {verdict_of.get(member, 'unknown')} | "
             + " | ".join(str(sum(1 for r in rows if r["severity"] == s)) for s in SEVERITY_ORDER)
@@ -914,7 +954,9 @@ def sandbox_copy_program(files: dict[str, str]) -> str:
     the directory closed again. The copy is the terminal login's own file, so
     nothing stops a model turn that ran the readiness report by hand from
     copying its JSON over the brief's Markdown, which one did; read-only modes
-    make that an error the turn sees instead of a record the brief misreads.
+    make that an error the turn sees instead of a record the brief misreads
+    (the login owns the files and could chmod them back; the modes stop the
+    accident, not the intent).
     The contents travel base64-encoded, because a JSON string literal in Python
     source turns a character outside the Basic Multilingual Plane into a
     surrogate pair the file write refuses."""
@@ -943,10 +985,29 @@ def sandbox_copy_program(files: dict[str, str]) -> str:
     )
 
 
+def copy_locally(files: dict[str, str]) -> str | None:
+    """Without an ssh sandbox the agent's terminal runs on this pod, so the copy
+    is a plain write here and nothing is made read-only: the modes exist for a
+    login that is not this job, and the directory may be the record's own."""
+    target = Path(SANDBOX_COPY_DIR)
+    try:
+        if target.resolve() == weekly_home().resolve():
+            return None
+        target.mkdir(parents=True, exist_ok=True)
+        for name, text in files.items():
+            (target / name).write_text(text, encoding="utf-8")
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
 def copy_to_sandbox(report_md: str, summary_doc: dict) -> str | None:
     """Place latest.md and latest.json where the agent reads them; the error
     text on failure, None on success."""
-    program = sandbox_copy_program({LATEST_MD_NAME: report_md, LATEST_JSON_NAME: json.dumps(summary_doc, indent=1, sort_keys=True)})
+    files = {LATEST_MD_NAME: report_md, LATEST_JSON_NAME: json.dumps(summary_doc, indent=1, sort_keys=True)}
+    if not sandbox_exec.sandbox_enabled():
+        return copy_locally(files)
+    program = sandbox_copy_program(files)
     try:
         completed = sandbox_exec.run(
             [watch.PYTHON_EXECUTABLE, watch.PYTHON_ISOLATED_FLAG, watch.STDIN_SCRIPT_ARG],
@@ -1001,7 +1062,7 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
     findings: list[dict] = []
     outcomes: dict[str, str] = {}
     problems: list[str] = []
-    claimed: set[tuple[str, str]] = set()
+    claimed: set[str] = set()
 
     def registered(found: list[dict], read_errors: list[dict]) -> None:
         items = [item for member in found for item in member_findings(member)]

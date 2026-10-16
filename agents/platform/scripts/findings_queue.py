@@ -58,7 +58,7 @@ class FindingNotFound(KeyError):
     would then be reported to the agent as a finding that does not exist."""
 
 
-SOURCES = ("inventory", "event-watcher", "audit")
+SOURCES = ("inventory", "event-watcher", "audit", "upgrade-readiness")
 SEVERITIES = ("critical", "major", "minor")
 REMEDIATION_KINDS = ("manifest", "gcloud", "manual")
 VERIFICATION_KINDS = ("kubectl", "gcloud", "manual")
@@ -784,10 +784,12 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
     An empty batch is a run that found nothing: refused without a complete
     `scope` (there is nothing to do), accepted with one, where the point is
     that every row the claim covers was absent (§5.2). A complete claim
-    reaches the rows its `check_prefix` names, else the rows of the batch's
-    own sources (or `scope.source` for an empty batch); a complete claim that
-    names neither a prefix nor a source and carries no findings is refused,
-    since it would reach every row on the cluster and no caller means that.
+    reaches the rows its `check_prefix` names, whatever wrote them; else the
+    rows of the batch's own sources, or of `scope.source`, which must be a
+    known source and, when the batch is not empty, one the batch wrote; a
+    complete claim that names neither a prefix nor a source and carries no
+    findings is refused, since it would reach every row on the cluster and no
+    caller means that.
     """
     if not isinstance(findings, list):
         raise FindingError("findings must be a list")
@@ -813,8 +815,17 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
         cluster = _text(scope.get("cluster"), "scope.cluster")
         check_prefix = _text(scope.get("check_prefix"), "scope.check_prefix", required=False)
         named = _text(scope.get("source"), "scope.source", required=False)
+        if named and named not in SOURCES:
+            raise FindingError(f"scope.source is {_brief(named)}; must be one of {list(SOURCES)}")
+        if named and sources and named not in sources:
+            raise FindingError("scope.source names a source the batch did not write; a claim reaches only what the run read")
         if named:
             sources = {named}
+        if check_prefix:
+            # The prefix is the claim: the batch's sources narrow nothing further,
+            # so the review's batch on a cluster with findings reaches the same
+            # rows as its empty batch on a clean one.
+            sources = set()
         if not check_prefix and not sources:
             raise FindingError("a complete scope with no findings needs check_prefix or source to say what it covers")
         downgraded = _downgrade_absent(conn, project, cluster, seen, check_prefix, frozenset(sources))

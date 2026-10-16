@@ -135,7 +135,7 @@ Grain is one problem: one check, at one object, on one cluster.
 | column                                       | notes                                                                                                                                                                                                                      |
 | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `id`                                         | identity; primary key. Derived, never written by a model — see below                                                                                                                                                       |
-| `source`                                     | `inventory` \| `event-watcher` \| `audit`                                                                                                                                                                                  |
+| `source`                                     | `inventory` \| `event-watcher` \| `audit` \| `upgrade-readiness`                                                                                                                                                           |
 | `check`                                      | the check slug; the same vocabulary the audit streams use (§10)                                                                                                                                                            |
 | `project`, `cluster`, `namespace`, `object`  | the GCP project qualifies the cluster — a cluster name is only unique within one (a second project's `prod` must not overwrite the first's rows); `namespace` empty for cluster-scoped objects                             |
 | `severity`                                   | `critical` \| `major` \| `minor`. Derived from `rank_score`, not judged separately, with one floor for findings that are failing now (§4.2)                                                                                |
@@ -182,7 +182,7 @@ next sweep re-registers what the user already rejected and it reappears on the l
 ```sql
 CREATE TABLE IF NOT EXISTS findings (
     id               TEXT PRIMARY KEY,
-    source           TEXT NOT NULL,               -- inventory | event-watcher | audit
+    source           TEXT NOT NULL,               -- inventory | event-watcher | audit | upgrade-readiness
     check_slug       TEXT NOT NULL,
     project          TEXT NOT NULL,               -- the GCP project id; qualifies cluster
     cluster          TEXT NOT NULL,
@@ -696,7 +696,7 @@ So absence downgrades confidence rather than deciding anything: on a completed r
 `surfaced` row the run did not re-report has `C` lowered to 0.6 — the rubric's own value for "inferred from
 absence" — which re-ranks it down without asserting anything about it, and the definite answer comes
 from §7.4's verification the next time the row is named in a nudge. Only a run that reports its own scope as
-complete for that cluster may do even this much; a partial run touches nothing. The claim's reach is decided in two steps: the rows whose check starts with `scope.check_prefix` when the scope names one (a run that reads one family of checks); else the rows of the batch's own `source`, or of `scope.source` for an empty batch, so a hand re-run of the inventory sweep lowers no other writer's rows. A complete claim that names neither is refused, so no caller lowers every row on a cluster by accident. With a complete scope an empty batch that names a prefix or a source is accepted, since a sweep that found nothing is exactly the case the rule is for.
+complete for that cluster may do even this much; a partial run touches nothing. The claim's reach is decided in two steps: the rows whose check starts with `scope.check_prefix` when the scope names one (a run that reads one family of checks, whatever source wrote the rows); else the rows of the batch's own `source`, or of `scope.source`, which must be a known source and, for a batch that is not empty, one the batch wrote, so a hand re-run of the inventory sweep lowers no other writer's rows. A complete claim that names neither is refused, so no caller lowers every row on a cluster by accident. The weekly upgrade readiness review writes under a source of its own, `upgrade-readiness`, so a claim made under another writer's source never reaches its rows either. With a complete scope an empty batch that names a prefix or a source is accepted, since a sweep that found nothing is exactly the case the rule is for.
 
 The same run sets `absent_since` on each such row, keeping the first miss, including on a row
 already at 0.6, which is not re-ranked (the register response's `downgraded` counts only the rows

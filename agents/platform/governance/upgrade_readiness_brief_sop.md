@@ -56,14 +56,17 @@ shape; the model chooses the emphasis.
 
 Two `platform_control` tools, because the queue's open backlog and its decided rows are read
 differently; keep from both only the rows whose `check` starts with `upgrade-` (every row the
-review registers carries that prefix; `source` is `audit`). The queue is the authority on
+review registers carries that prefix; `source` is `upgrade-readiness`). The queue is the authority on
 **state**: the summary says what was found, the queue says what the user has decided.
 
 - `get_ranked_findings` returns the open backlog, worst first: **undecided** rows (`state` is
   `queued` or `surfaced`), which still need the user, and `accepted` ones (being worked on).
 - `get_findings` with `state=snoozed`, then with `state=dismissed`, returns the other decided rows:
   snoozed (back on `snoozed_until`) and dismissed (won't fix; the review will keep finding it and
-  the queue will keep it silent). The open backlog never carries them.
+  the queue will keep it silent). The open backlog never carries them. Call it with `limit=1000`
+  and `project=<id>` for each project in the summary's `projects`: the default page is 200 rows
+  across every source, which a mature install exceeds. A page of exactly 1000 rows is cut; say
+  "at least" before that count.
 - A row in the summary with outcome `suppressed` is a dismissed finding seen again. Never name it
   as new.
 
@@ -131,7 +134,7 @@ reply in that thread reaches the agent with the brief attached.
 ## On request
 
 A user may ask in chat for the brief or the report, at any time. The `upgrade-readiness-brief` skill
-(`skills/upgrade-readiness-brief/SKILL.md`) is this section as the agent loads it for a chat request;
+(`/opt/data/profiles/platform/skills/upgrade-readiness-brief/SKILL.md`) is this section as the agent loads it for a chat request;
 its shape is the one in section 3, kept identical by a test.
 
 - **"Show me this week's upgrade readiness report"**, or any ask for the full report → print

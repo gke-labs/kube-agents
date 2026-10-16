@@ -7,7 +7,7 @@ description: Compose the upgrade readiness brief on request — which upgrade re
 
 The Saturday job `upgrade-readiness-weekly-review` grades every cluster and registers each blocker
 and risk on the findings queue; the job `upgrade-readiness-weekly-brief` composes the week's brief
-from both under `governance/upgrade_readiness_brief_sop.md`. This skill is that SOP's "On request"
+from both under `/opt/data/profiles/platform/governance/upgrade_readiness_brief_sop.md`. This skill is that SOP's "On request"
 route: a user asks for the brief, or for what needs their decision, or for this week's report, and
 gets the same shape in chat. Read only. Register nothing, decide nothing, upgrade nothing.
 
@@ -37,7 +37,9 @@ gets the same shape in chat. Read only. Register nothing, decide nothing, upgrad
      A row in state `queued` **or** `surfaced` is **undecided**: nobody has decided on it, whether or
      not the hourly nudge has named it yet. `accepted` is decided (being worked on).
    - `get_findings` with `state=snoozed`, then `state=dismissed`: the other decided rows; the backlog
-     never carries them. Keep the `upgrade-` rows of these too.
+     never carries them. Keep the `upgrade-` rows of these too. Pass `limit=1000` and `project=<id>`
+     for each project in the summary's `projects` (the default page is 200 rows across every
+     source); a page of exactly 1000 rows is cut, so say "at least" before that count.
 3. Compose the brief in exactly this shape, at most twenty-five lines, ids verbatim in backticks:
 
    ```

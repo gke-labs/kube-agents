@@ -142,7 +142,7 @@ class TheMapping(unittest.TestCase):
         blocking = review.webhook_findings(gemma())[0]
         self.assertEqual(severity(outage), "major")
         self.assertEqual(severity(blocking), "critical")
-        self.assertEqual(outage["object"], "seeded-fail-closed-gate/gate.seeded.invalid")
+        self.assertEqual(outage["object"], "validatingwebhookconfiguration/seeded-fail-closed-gate/gate.seeded.invalid")
         self.assertIn("in the upgrade's path", blocking["detail"])
 
     def test_an_exclusion_is_a_minor_posture(self):
@@ -187,6 +187,18 @@ class TheMapping(unittest.TestCase):
         self.assertFalse(review.member_complete(seeded_b(), location_failed))
         self.assertTrue(review.member_complete(seeded_b(), [{"project": PROJECT, "location": "europe-west1", "message": "get-server-config: 503"}]))
         self.assertTrue(review.member_complete(seeded_b(), [{"project": PROJECT, "message": "project unreadable"}]))
+        # What the grader could not decide is not a read in full either: the
+        # rows it would have written are missing, not cleared.
+        self.assertFalse(review.member_complete(member("u", "unknown"), []))
+        pool_unparsed = seeded_b()
+        pool_unparsed["readiness"]["skew"]["unknown"] = ["odd-pool"]
+        self.assertFalse(review.member_complete(pool_unparsed, []))
+        exclusion_undecided = seeded_b()
+        exclusion_undecided["readiness"]["maintenance"]["undecided_exclusions"] = ["freeze"]
+        self.assertFalse(review.member_complete(exclusion_undecided, []))
+        rule_failed = seeded_b()
+        rule_failed["readiness"]["unknown"] = [{"rule": "surge-capacity", "entry": 2, "text": "raised"}]
+        self.assertFalse(review.member_complete(rule_failed, []))
 
     def test_the_rubric_table_covers_the_queue_anchors(self):
         for values in list(review.RUBRIC.values()) + list(review.ENTRY_RISK_RUBRIC.values()) + [review.DEFAULT_RISK_RUBRIC]:
@@ -208,7 +220,7 @@ class Registration(unittest.TestCase):
         with mock.patch.object(review, "kv_request", fake_request):
             outcomes, problems, claimed = review.register(members, [], findings)
         self.assertEqual(problems, [])
-        self.assertEqual(claimed, {(PROJECT, "seeded-b")})
+        self.assertEqual(claimed, {f"{PROJECT}/us-central1-a/seeded-b"})
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][1]["scope"], {"project": PROJECT, "cluster": "seeded-b", "complete": True, "check_prefix": review.CHECK_PREFIX})
         self.assertNotIn("scope", calls[1][1])
@@ -225,7 +237,7 @@ class Registration(unittest.TestCase):
         clean = member("seeded-c")
         with mock.patch.object(review, "kv_request", fake_request):
             outcomes, problems, claimed = review.register([clean], [], [])
-        self.assertEqual((outcomes, problems, claimed), ({}, [], {(PROJECT, "seeded-c")}))
+        self.assertEqual((outcomes, problems, claimed), ({}, [], {f"{PROJECT}/us-central1-a/seeded-c"}))
         self.assertEqual(calls, [{"findings": [], "scope": {"project": PROJECT, "cluster": "seeded-c", "complete": True, "check_prefix": review.CHECK_PREFIX}}])
         partial = member("seeded-c")
         partial["readiness"]["read_error"] = "timed out"
@@ -250,6 +262,37 @@ class Registration(unittest.TestCase):
         self.assertEqual([len(c["findings"]) for c in calls], [review.KV_BATCH_LIMIT, 1])
         self.assertTrue(all("scope" not in c for c in calls))
         self.assertEqual(len(outcomes), review.KV_BATCH_LIMIT + 1)
+
+    def test_same_named_clusters_in_two_locations_are_two_batches(self):
+        calls = []
+
+        def fake_request(path, body):
+            calls.append(body)
+            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]]}
+
+        west = member("prod", "blocked", pdbs={"blocking": [budget(name="west-budget")]})
+        east = member("prod", "blocked", pdbs={"blocking": [budget(name="east-budget")]})
+        east["location"] = "europe-west1"
+        findings = review.member_findings(west) + review.member_findings(east)
+        with mock.patch.object(review, "kv_request", fake_request):
+            outcomes, problems, claimed = review.register([west, east], [], findings)
+        self.assertEqual(problems, [])
+        self.assertEqual(claimed, {f"{PROJECT}/us-central1-a/prod", f"{PROJECT}/europe-west1/prod"})
+        self.assertEqual([[f["object"] for f in c["findings"]] for c in calls], [["west-budget"], ["east-budget"]])
+        self.assertEqual(len(outcomes), 2)
+
+    def test_a_refused_batch_keeps_the_queues_reason(self):
+        import io
+        import urllib.error
+
+        def refuse(req, timeout):
+            raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {}, io.BytesIO(b'{"error": "findings[0]: object is required"}'))
+
+        with mock.patch.object(review.urllib.request, "urlopen", refuse):
+            with self.assertRaises(OSError) as caught:
+                review.kv_request(review.KV_FINDINGS_PATH, {"findings": []})
+        self.assertIn("400", str(caught.exception))
+        self.assertIn("object is required", str(caught.exception))
 
     def test_a_failed_batch_is_reported_and_marks_its_rows(self):
         def failing(path, body):
@@ -341,6 +384,21 @@ class TheRecord(unittest.TestCase):
         self.assertEqual((fake_dir / "latest.md").read_text(encoding="utf-8"), "# second\n")
         self.assertEqual(oct(os.stat(fake_dir).st_mode & 0o777), oct(review.SANDBOX_COPY_DIR_CLOSED_MODE))
         os.chmod(fake_dir, review.SANDBOX_COPY_DIR_OPEN_MODE)  # so the fixture's cleanup can remove it
+
+    def test_without_an_ssh_sandbox_the_copy_is_a_plain_local_write(self):
+        target = Path(self.tmp.name) / "local-copy"
+
+        def never(*args, **kwargs):
+            raise AssertionError("no remote program without an ssh sandbox")
+
+        with mock.patch.object(review.sandbox_exec, "sandbox_enabled", lambda path=None: False), mock.patch.object(review.sandbox_exec, "run", never), mock.patch.object(review, "SANDBOX_COPY_DIR", str(target)):
+            self.assertIsNone(review.copy_to_sandbox("# r\n", {"n": 1}))
+        self.assertEqual((target / review.LATEST_MD_NAME).read_text(encoding="utf-8"), "# r\n")
+        self.assertTrue(os.access(target, os.W_OK))
+        # The record's own directory is never the copy's target.
+        with mock.patch.object(review.sandbox_exec, "sandbox_enabled", lambda path=None: False), mock.patch.object(review.sandbox_exec, "run", never), mock.patch.object(review, "SANDBOX_COPY_DIR", str(review.weekly_home())):
+            self.assertIsNone(review.copy_to_sandbox("# r\n", {"n": 1}))
+        self.assertFalse((review.weekly_home() / review.LATEST_MD_NAME).exists())
 
     def test_the_sop_reads_the_fields_the_summary_writes(self):
         # Step 1 of the brief SOP lists the summary's keys in backticks; a

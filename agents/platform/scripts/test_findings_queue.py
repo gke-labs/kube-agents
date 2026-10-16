@@ -473,6 +473,35 @@ class TestRegistration(QueueTestCase):
         self.assertEqual(fq.get_finding(self.conn, stale_id)["rubric"]["C"], 0.6)
         self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 1.0)
 
+    def test_a_prefixed_claim_reaches_the_family_whatever_wrote_it(self):
+        # The review's ordinary batch: its own rows plus the `upgrade-` prefix.
+        # The claim is the family, so an `upgrade-` row another source wrote and
+        # the review no longer reports loses confidence too, while the inventory
+        # row outside the family keeps it.
+        foreign = sample(source="inventory", check="upgrade-pool-skew", namespace="", object="old-pool")
+        self.register(sample(), foreign)
+        foreign_id = fq.validate_finding(foreign)["id"]
+        inventory_id = fq.validate_finding(sample())["id"]
+        mine = sample(source="upgrade-readiness", check="upgrade-pool-skew", namespace="", object="default-pool")
+
+        result = self.register(mine, scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})
+
+        self.assertEqual(result["downgraded"], 1)
+        self.assertEqual(fq.get_finding(self.conn, foreign_id)["rubric"]["C"], 0.6)
+        self.assertEqual(fq.get_finding(self.conn, inventory_id)["rubric"]["C"], 1.0)
+
+    def test_scope_source_must_be_known_and_one_the_batch_wrote(self):
+        stale = sample(object="Deployment/stale")
+        self.register(stale)
+        stale_id = fq.validate_finding(stale)["id"]
+        with self.assertRaises(fq.FindingError):
+            self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "source": "audits"})
+        # A batch of inventory rows cannot claim the event watcher's rows.
+        with self.assertRaises(fq.FindingError):
+            self.register(sample(), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "source": "event-watcher"})
+        self.assertEqual(fq.get_finding(self.conn, stale_id)["rubric"]["C"], 1.0)
+        self.assertEqual(self.register(sample(), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "source": "inventory"})["downgraded"], 1)
+
     def test_an_empty_batch_needs_a_complete_scope(self):
         with self.assertRaises(fq.FindingError):
             self.register()
