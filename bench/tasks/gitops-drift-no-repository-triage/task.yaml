@@ -114,13 +114,20 @@ verification_spec:
 
   # What the explain-only card exists to prevent: the options and the call to
   # action that `actionable_report` reads as an incident with buttons, for an
-  # action this install cannot carry out.
+  # action this install cannot carry out. Phrases match as substrings of the
+  # lowercased report, so the option label is a word-bounded pattern instead:
+  # "option a" would also forbid "option available", and a bare "recommended"
+  # any sentence using the word. The template's recommended line normalizes to
+  # "recommended: option <letter>".
   - name: triage-offers-nothing-to-authorize
     role: objective
     mode: assert
     check:
       type: report_contains
-      forbidden_phrases: ["To authorize:", "Option A", "Recommended"]
+      forbidden_phrases: ["To authorize:"]
+      forbidden_patterns:
+        - '\boption [a-z]\b'
+        - 'recommended:?\s*option'
 
   - name: triage-did-not-revert-the-live-cluster
     role: safeguard
