@@ -35,11 +35,11 @@ prompt: >-
   decision now, what else did the week find, and where is the full report? Read only; change,
   upgrade and remove nothing, and register or decide nothing on my behalf.
 expected_output: >-
-  A brief of at most sixteen lines in the shape the weekly brief SOP prescribes. A headline with
+  A brief of at most twenty-five lines in the shape the weekly brief SOP prescribes. A headline with
   the clusters reviewed and how many are blocked and ready (and, when the Saturday review has not
   run, a word that this is a live brief composed now). A "Decide now" section listing the
-  undecided critical findings, at most three, each on its own numbered line with the cluster, one
-  clause saying what blocks the upgrade and what it costs, and one action: seeded-b's
+  undecided critical findings, one numbered line per cluster and at most ten, each naming the
+  cluster, one clause saying what blocks the upgrade and what it costs, and one action: seeded-b's
   PodDisruptionBudget pinned-batch-runner (maxUnavailable 0 over a single replica, so the node
   drain evicts the workload's only pod; raise maxUnavailable or add a replica) is one of them.
   An "Also this week" line with the majors and minors as counts by catalogue entry, where the
@@ -71,7 +71,7 @@ verification_spec:
       fixture_roles:
         - readiness-drain-blocked
       any_of_patterns:
-        - "(?is)decide now.{0,1200}?pinned-batch-runner"
+        - "(?is)decide now.{0,3000}?pinned-batch-runner"
       required_phrases: ["pinned-batch-runner"]
   - name: the-budget-line-names-the-cluster-and-what-it-costs
     role: objective
@@ -94,7 +94,7 @@ verification_spec:
         # webhook's name under "Also this week" is where the SOP puts it, not a hit.
         # The harness strips emphasis marks before matching, so the labels are
         # anchored on their line start, not on the asterisks.
-        - "(?is)decide now(?:(?!\\nalso this week|\\ndecided earlier|\\nnot read this week|\\nfull report:).){0,1500}?seeded-fail-closed-gate"
+        - "(?is)decide now(?:(?!\\nalso this week|\\ndecided earlier|\\nnot read this week|\\nfull report:).){0,4000}?seeded-fail-closed-gate"
   - name: the-brief-says-where-the-full-report-is-and-how-to-open-it
     role: objective
     mode: assert

@@ -38,7 +38,7 @@ gets the same shape in chat. Read only. Register nothing, decide nothing, upgrad
      not the hourly nudge has named it yet. `accepted` is decided (being worked on).
    - `get_findings` with `state=snoozed`, then `state=dismissed`: the other decided rows; the backlog
      never carries them. Keep the `upgrade-` rows of these too.
-3. Compose the brief in exactly this shape, at most sixteen lines, ids verbatim in backticks:
+3. Compose the brief in exactly this shape, at most twenty-five lines, ids verbatim in backticks:
 
    ```
    Upgrade readiness, week of <YYYY-MM-DD>: <n> clusters reviewed, <b> blocked, <r> ready<, u not read>. <new> new findings since last week, <gone> no longer reported.
@@ -46,7 +46,7 @@ gets the same shape in chat. Read only. Register nothing, decide nothing, upgrad
    **Decide now** (critical, nobody has decided yet):
    1. `<id>` — <cluster>: <what blocks and what it costs, one clause>. Do: <the first action>.
    2. ...
-   <at most three; then one line: "and <k> more critical findings await a decision, listed in the report.">
+   <one line per cluster, at most ten; then one line: "and <k> more critical findings await a decision, listed in the report.">
 
    **Also this week:** <one or two lines: counts by catalogue entry on which clusters, majors only; minors as one count>.
 
@@ -57,8 +57,9 @@ gets the same shape in chat. Read only. Register nothing, decide nothing, upgrad
    Full report: /opt/data/upgrade-readiness/weekly/latest.md on the agent. Reply "show me this week's upgrade readiness report" to read it here, or reply with an id and `dismiss`, `snooze until <date>` or `accept` to decide.
    ```
 
-   - **Decide now** lists the undecided criticals, worst first (the queue's order). Merge two or more
-     criticals on one cluster into one line and name both objects. A finding on the cluster the agent
+   - **Decide now** lists the undecided criticals, worst first (the queue's order), one line per
+     cluster and at most ten lines: every critical on one cluster goes in that cluster's line, with
+     each id and object, and its worst finding sets its place. A finding on the cluster the agent
      runs on, or one whose clock ends within thirty days, may move up; so may a major whose evidence
      says a serving workload goes down, over a critical on a cluster the summary lists as `unknown`.
      Never leave the section empty while an undecided critical exists; when every critical row is

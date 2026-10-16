@@ -102,7 +102,9 @@ STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 # The copy the agent can read, on the sandbox volume, written by the terminal login.
 SANDBOX_COPY_DIR = "/opt/data/upgrade-readiness/weekly"
 SANDBOX_COPY_TIMEOUT_SECONDS = 60
-SANDBOX_COPY_MODE = 0o644
+SANDBOX_COPY_MODE = 0o444  # the files: the agent reads them, only the review rewrites them
+SANDBOX_COPY_DIR_OPEN_MODE = 0o755  # while the review writes
+SANDBOX_COPY_DIR_CLOSED_MODE = 0o555  # between reviews: no new file, no replacement
 
 # The findings queue, as findings_nudge.py reaches it.
 KV_ENDPOINT_ENV = "SESSION_KV_ENDPOINT"
@@ -872,8 +874,12 @@ def prune(home: Path) -> None:
 
 def sandbox_copy_program(files: dict[str, str]) -> str:
     """The program the terminal login runs to place the copy: the directory
-    made, each file written whole, mode set so the agent can read it. The
-    contents travel base64-encoded, because a JSON string literal in Python
+    made and opened, each file made writable, written whole and set read-only,
+    the directory closed again. The copy is the terminal login's own file, so
+    nothing stops a model turn that ran the readiness report by hand from
+    copying its JSON over the brief's Markdown, which one did; read-only modes
+    make that an error the turn sees instead of a record the brief misreads.
+    The contents travel base64-encoded, because a JSON string literal in Python
     source turns a character outside the Basic Multilingual Plane into a
     surrogate pair the file write refuses."""
     encoded = {name: base64.b64encode(text.encode("utf-8")).decode("ascii") for name, text in files.items()}
@@ -883,12 +889,18 @@ def sandbox_copy_program(files: dict[str, str]) -> str:
             f"DIR = {json.dumps(SANDBOX_COPY_DIR)}",
             f"FILES = {json.dumps(encoded)}",
             f"MODE = {SANDBOX_COPY_MODE}",
+            f"OPEN = {SANDBOX_COPY_DIR_OPEN_MODE}",
+            f"CLOSED = {SANDBOX_COPY_DIR_CLOSED_MODE}",
             "os.makedirs(DIR, exist_ok=True)",
+            "os.chmod(DIR, OPEN)",
             "for name, text in FILES.items():",
             "    path = os.path.join(DIR, name)",
+            "    if os.path.exists(path):",
+            "        os.chmod(path, OPEN)",
             "    with open(path, 'wb') as handle:",
             "        handle.write(base64.b64decode(text))",
             "    os.chmod(path, MODE)",
+            "os.chmod(DIR, CLOSED)",
             "print(len(FILES))",
             "",
         ]

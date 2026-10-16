@@ -65,7 +65,7 @@ review registers carries that prefix; `source` is `audit`). The queue is the aut
 
 ### 3. Compose the brief
 
-Write one message, in this shape and order, at most **16 lines**. Plain sentences; no table; no
+Write one message, in this shape and order, at most **25 lines**. Plain sentences; no table; no
 heading markup beyond the bold labels shown; the ids verbatim as the queue spells them, in
 backticks, because the user replies with them.
 
@@ -75,7 +75,7 @@ Upgrade readiness, week of <YYYY-MM-DD>: <n> clusters reviewed, <b> blocked, <r>
 **Decide now** (critical, nobody has decided yet):
 1. `<id>` — <cluster>: <what blocks and what it costs, one clause>. Do: <the first action>.
 2. ...
-<at most three; then one line: "and <k> more critical findings await a decision, listed in the report.">
+<one line per cluster, at most ten; then one line: "and <k> more critical findings await a decision, listed in the report.">
 
 **Also this week:** <one or two lines: counts by catalogue entry on which clusters, majors only; minors as one count>.
 
@@ -88,11 +88,11 @@ Full report: /opt/data/upgrade-readiness/weekly/latest.md on the agent. Reply "s
 
 Rules for the judgement:
 
-- **Lead with what needs a decision.** The three lines under **Decide now** are the undecided
-  criticals, worst first. The queue's rank order is the default. Depart from it when one of these
-  holds, and only then: two or more criticals on one cluster are one problem (merge them into one
-  line and name both objects); a finding on the cluster the agent runs on outranks the same finding
-  elsewhere; a finding whose clock is short (an exclusion or a target that ends within thirty days)
+- **Lead with what needs a decision.** The lines under **Decide now** are the undecided
+  criticals, worst first, one line per cluster and at most ten lines: every critical on one cluster
+  is one problem, so the cluster's line names each of its ids and objects, and its worst finding
+  sets its place. The queue's rank order is the default. Depart from it when one of these holds,
+  and only then: a finding on the cluster the agent runs on outranks the same finding elsewhere; a finding whose clock is short (an exclusion or a target that ends within thirty days)
   outranks one with no date; a `major` whose evidence says a serving workload goes down outranks a
   `critical` on a cluster the summary lists as `unknown` or whose evidence is inferred.
 - **One clause of why, one action.** "Budget `pinned-batch-runner` refuses eviction of its only
@@ -157,7 +157,7 @@ its shape is the one in section 3, kept identical by a test.
   decides; the queue remembers.
 - **Never run the readiness report from this job.** The on-request route offers it; the scheduled
   brief reads the review.
-- **Never pad the brief.** Sixteen lines is the ceiling, not the target; a quiet week is three lines.
+- **Never pad the brief.** Twenty-five lines is the ceiling, not the target; a quiet week is three lines.
 - **Never name a dismissed finding.**
 - **Never mutate.** No `gcloud ... upgrade`, no `kubectl apply/patch/delete`, nothing through the
   `gke` MCP server that writes.

@@ -320,6 +320,20 @@ class TheRecord(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in fake_dir.iterdir()), ["latest.json", "latest.md"])
         self.assertEqual((fake_dir / "latest.md").read_text(encoding="utf-8"), "# r 🎄 exclusion\n")
         self.assertEqual(oct(os.stat(fake_dir / "latest.md").st_mode & 0o777), oct(review.SANDBOX_COPY_MODE))
+        # Read-only files in a read-only directory: a model turn's `cp` over the
+        # copy fails instead of replacing the review's record.
+        self.assertEqual(review.SANDBOX_COPY_MODE & 0o222, 0)
+        self.assertEqual(oct(os.stat(fake_dir).st_mode & 0o777), oct(review.SANDBOX_COPY_DIR_CLOSED_MODE))
+        with self.assertRaises(PermissionError):
+            (fake_dir / "latest.md").write_text("clobbered")
+        with self.assertRaises(PermissionError):
+            (fake_dir / "fleet_versions.json").write_text("{}")
+        # The next review replaces both files through the same program.
+        second = review.sandbox_copy_program({"latest.md": "# second\n", "latest.json": "{\"n\": 2}"})
+        exec(second.replace(json.dumps(review.SANDBOX_COPY_DIR), json.dumps(str(fake_dir))), {})  # noqa: S102 - the program under test
+        self.assertEqual((fake_dir / "latest.md").read_text(encoding="utf-8"), "# second\n")
+        self.assertEqual(oct(os.stat(fake_dir).st_mode & 0o777), oct(review.SANDBOX_COPY_DIR_CLOSED_MODE))
+        os.chmod(fake_dir, review.SANDBOX_COPY_DIR_OPEN_MODE)  # so the fixture's cleanup can remove it
 
     def test_the_sop_reads_the_fields_the_summary_writes(self):
         # Step 1 of the brief SOP lists the summary's keys in backticks; a

@@ -322,9 +322,9 @@ but cannot tell that two criticals on one cluster are one problem, or that an ex
 week outranks one ending in January. Its SOP (`governance/upgrade_readiness_brief_sop.md`) has it
 read the review's summary, the queue's open backlog (`get_ranked_findings`, the rows whose `check`
 starts with `upgrade-`) and its snoozed and dismissed rows (`get_findings` by state, which the
-backlog never carries), and compose a brief of at most sixteen lines: the week's headline, the
-undecided criticals that need a decision (at most three, with one clause of why and one action
-each), the rest of the week as counts, what was decided earlier, any project the review could not
+backlog never carries), and compose a brief of at most twenty-five lines: the week's headline, the
+undecided criticals that need a decision (one line per cluster, at most ten, with one clause of
+why and one action each), the rest of the week as counts, what was decided earlier, any project the review could not
 read, and where the full report is with the sentence that opens it in chat. It never registers,
 never decides, never runs the report, and is never `[SILENT]`: the brief is owed every week, a
 quiet one in three lines. If the review's summary is missing or older than two days, the brief
