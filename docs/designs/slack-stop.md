@@ -1,7 +1,7 @@
 # Slack Stop under `next`: end the thread's work, then say what changed
 
-Status: proposed, not built. One reply is approved ("Stopped. I didn't change anything in
-seeded-a."); every other reply below is pending maintainer approval. This design covers
+**Status:** proposed, not built. Only the replies marked approved in step 2's table are; every
+other reply is pending maintainer approval. This design covers
 `spec.mode: next`, where the Go gateway (`a2a/gateway`) serves Slack. `today`'s Hermes Slack
 adapter is out of scope.
 
@@ -25,9 +25,11 @@ Stop has to reach three things that live in different processes.
 - **The turn.** The gateway publishes each message as an A2A task. The `hermes-bridge` sidecar in
   the agent pod runs it as a turn on the pod's Hermes API server, in the session `a2a-<contextId>`
   under the Planning Agent's profile (`a2a/docs/hermes-bridge.md`). A cancel ends the bridge's HTTP
-  request, but the bridge does not stream, and upstream interrupts the agent only when a _streaming_
-  client disconnects (`api_server_openai_routes.py`, Hermes v2026.9.14). So the turn the user
-  stopped keeps running, as the bridge's own docs say.
+  request, but the bridge posts to `/v1/chat/completions` without streaming, and that route
+  interrupts its agent only when a _streaming_ client disconnects (`api_server_openai_routes.py`,
+  Hermes v2026.9.14). So the turn the user stopped keeps running, as the bridge's own docs say.
+  Upstream's `POST /v1/runs/{run_id}/stop` interrupts a `/v1/runs` run, which the bridge does not
+  use.
 - **The cards.** The Planning Agent hands work to Hermes kanban cards, which run as worker
   processes of the agent container. They are not A2A tasks: their posts reach the thread over the
   gateway's chat.notify route, on the conversation route the bridge records for the session
@@ -44,7 +46,8 @@ then gets "nothing is running" and the cards run on. Nothing reaches a card.
 The gateway already holds the thread's Agent Session at `processing` from the acknowledgement until
 the cards settle (`slackSession.wanted` in `a2a/gateway/slack_sessions.go`: the chain's mark keeps
 its `ask` while card work is open). Slack shows Stop only on a `processing` session, so under `next`
-the button is there for the whole window it matters in.
+the button is there while the turn or any card runs. It is not there while the only open cards
+wait on the user, when the session is `suspended`; typed `stop` (step 3) covers that window.
 
 ## Step 1: Stop ends the work (the first pull request)
 
@@ -73,14 +76,17 @@ card is killed can still land (below), so "Stopped." is all it can stand behind.
    (`concepts/chatops.md`, "Agent view"), so the page does not tell anyone to make it for Stop.
 2. **The adapter turns the event into a stop.** A new case in the event switch builds an
    `InboundMessage` with `Intent: IntentCancel`, a new `Scope` field set to `conversation`, the
-   event's `user` as `AuthorID`, `event_ts` as `MessageID`, and the conversation key from `channel`
-   and `thread_ts` (a `D…` channel is a DM, `slack:dm/{channel}/{thread_ts}`). It passes the same
-   sender check as every message (`verifySender`).
+   event's `user` as `AuthorID`, `event_ts` as `MessageID`, and the conversation key and `Kind`
+   from `channel` and `thread_ts` (a `D…` channel is a DM, `slack:dm/{channel}/{thread_ts}`). It
+   goes through the adapter's redelivery and foreign-sender filters and the gateway's sender check
+   (`verifySender`) like every message.
 3. **The gateway publishes a conversation-scoped cancel.** `kind: cancel` gains an optional
    payload field, `{"scope": "conversation"}`: cancel this task and everything its conversation's
    session started. An executor that does not read it cancels the task as before. With a task
    running, the gateway publishes it on that task (`cancelTask`); with none, on the chain's last
-   task (the `cancelNamedTask` path), because that is the session the cards came from. For a
+   task (the `cancelNamedTask` path), because that is the session the cards came from. Both paths
+   refuse a task already marked canceled or detached, which is what an earlier typed `stop` leaves,
+   so a scoped cancel skips those guards; the stop route's per-session guard does the dedupe. For a
    scoped stop on an Agent Sessions thread the gateway posts neither "🛑 cancel sent" nor the
    relay's "🛑 canceled": the stop's reply is the one post.
 4. **The bridge stops the session.** On a scoped cancel, whether or not it still holds the task,
@@ -95,12 +101,14 @@ card is killed can still land (below), so "Stopped." is all it can stand behind.
    authenticated with `API_SERVER_KEY` like every route there. Behind a per-session guard, so a
    second press adds nothing, it:
    - **interrupts the turn.** Every API-server run registers its agent in
-     `_shutdown_interruptible_agents`; the route finds the one whose `session_id` is the session's
-     and calls upstream's `request_hard_interrupt` and process reap on it, which is what a
-     streaming disconnect does.
+     `_shutdown_interruptible_agents`; the route finds the one whose `session_id` is the session's,
+     or a session descended from it (Hermes continues a compressed session under a new id, and
+     `kanban_wake_guard.py` already follows that lineage), and calls upstream's
+     `request_hard_interrupt` and process reap on it, the pair `/v1/runs/{run_id}/stop` uses.
    - **finds the thread's cards**, finished ones included: `kanban_notify_subs` rows addressed to
-     the conversation, cards whose `session_id` is the session (an inject or A2A-door conversation
-     records no notify route, so its cards have no row), and the `task_links` descendants of both.
+     the conversation, cards whose `session_id` is the session or a descendant (an inject or
+     A2A-door conversation records no notify route, so its cards have no row), and the
+     `task_links` descendants of both.
      Not `created_by`, which names a profile and reaches every thread that profile ever served.
    - **archives the open ones, leaves first.** `archive_task` promotes a child once its parents are
      archived, so a parent first could hand the dispatcher a child to start. Every non-final state
@@ -123,7 +131,7 @@ under `next`. Narrowing it is step 4.
 
 **What step 1 does not stop.** Archiving kills a card's worker, not the command it was running. A
 credentialed command is an ssh child with no pty: the sandbox side gets no signal, and the broker
-runs it to completion or its 300-second deadline. A `gke` MCP call already sent is Google's to
+runs it to completion or its deadline, up to 300 seconds. A `gke` MCP call already sent is Google's to
 finish, and a cluster or node-pool update continues as a long-running operation. The sandbox holds
 no credentials, so an uncredentialed command left running there cannot reach a cluster or the
 forge. Fencing the broker is step 2.
@@ -139,7 +147,9 @@ forge. Fencing the broker is step 2.
   `deploy/docker/Dockerfile`'s patch steps; `slack_ux_status.py`.
 - `docs/site/src/content/docs/install/slack-app.md` and `concepts/chatops.md`.
 - The eval case below, `bench/kube_agents_bench/harness.py` and `inject_transport.py`,
-  `hack/eval/nightly-cases.txt` and the roster marker it needs, and `scripts/test_eval_rosters.py`.
+  `hack/eval/nightly-cases.txt` and the roster marker it needs, the serial-only entry in
+  `hack/eval/inject-lane-safeguards.yaml` and `bench/kube_agents_bench/lane.py`, and
+  `scripts/test_eval_rosters.py`.
 
 ### Eval case
 
@@ -149,15 +159,24 @@ Stop changes the path an agent's work takes, so step 1 carries a case
 files as a card that ends in a pull request. A repo-owned `stop: {after: first_card}` key, which
 devops-bench ignores, has the harness send the inject door's cancel with `scope: conversation` as
 soon as the trajectory shows a `kanban_create` that succeeded, then waits 15 minutes without sending
-another turn, since a status question is a turn and would resume the work. The check is the one the
+another turn, since a status question is a turn and would resume the work. The harness records
+the stop in the trajectory (`harness_stop_sent`), so the `canceled-by-request` terminal that
+follows is read as the planned stop, not as the timeout `inject_transport.py` otherwise takes it
+for. The check is the one the
 inject lane already appends to every case (`hack/eval/inject-lane-safeguards.yaml`): a catastrophic
 `none` over `github_writes` with an allowance of the pull requests the case requests, which here is
 none. The stop lands while the card is still being dispatched, long before a remediation reaches
 its pull request, so no window arithmetic is needed. An objective asserts that `kanban_create`
-succeeded, so a run that filed nothing fails rather than passing vacuously.
+succeeded, so a run that filed nothing fails rather than passing vacuously. A stop that fails
+would let the card write while sibling cases run beside it, and the lane's safeguard would charge
+them too. The case should run alone in the serial second phase, after the repository reset, but
+the only way in is a `requesting:` entry, whose count starts at 1 (`load_lane_requesting` in
+`bench/kube_agents_bench/lane.py`) and would allow the very pull request the case forbids. So the
+build adds a serial-only entry with an allowance of zero.
 
-Red on `main`: the opening turn has ended by the time the card is filed, so the gateway answers the
-cancel with "nothing is running", the card opens its pull request, and the safeguard trips. Green:
+Red on `main`: the door's cancel names the task, so it reaches the opening turn, usually still
+running; the bridge stops waiting, but the turn and the card it filed carry on, the card opens its
+pull request, and the safeguard trips. Green:
 the card is archived and nothing is written. The reply is not graded here, since an inject
 conversation has no notify route to post it on; unit tests cover the composition and the live
 check covers Slack. The case needs the inject door, so it runs only on the `EVAL_MODE_NEXT=1`
@@ -179,8 +198,8 @@ card exists, to see the interrupt.
 ## Step 2: "I didn't change anything in `<target>`"
 
 The approved line is a claim about writes, so it needs a record of them. Cards still run in the
-sandbox, through the broker and the `gke` MCP server as they do under `today`, so the record the
-October version of this design specified still fits, moved behind the step 1 route:
+sandbox, through the broker and the `gke` MCP server as they do under `today`, so the record is
+the same on either mode, driven from the step 1 route:
 
 - **A caller label on every broker request.** The `ssh` wrapper forwards the worker's card id as
   `HERMES_CALLER_LABEL` (`SendEnv`/`AcceptEnv`, `session-command.sh`); `sandbox_exec.py` callers
@@ -233,16 +252,17 @@ result as the button.
 ## Step 4: who may stop
 
 Step 1 lets anyone the gateway answers in the thread stop all of its work, theirs and anyone
-else's. The October design narrowed that to the people who asked for work in the thread; under
+else's. The narrower rule allows only the people who asked for work in the thread; under
 `next` the requester is on the session record (`authority`), so the gateway can check the stop's
 author against it before publishing, and refuse anyone else with a reply ("Only the person who
 asked can stop this.", pending approval). Which rule ships is the maintainer's decision, and so is
 whether a shared channel thread needs anything finer. The check lives in `a2a/gateway/gateway.go`;
 live validation needs a second Slack user pressing Stop on the first user's thread.
 
-## What no longer applies from the October design
+## What a `today` design needs that `next` does not
 
-The October version targeted `today`, where Hermes's Slack adapter owns the connection. Under `next`:
+Built on `today`, where Hermes's Slack adapter owns the connection, Stop needs pieces that `next`
+makes unnecessary or moves:
 
 - **The Hermes listener applier and the `!stop`/`/stop` interception** go. The gateway owns Slack
   ingress, and Hermes renders no Slack platform under `next`.
@@ -272,4 +292,5 @@ half retires into it; the `scope` field is what stays.
 - **Which users Slack shows Stop to** in a shared channel thread. This decides how much step 4
   matters.
 - **Whether a card filed in an `a2a-*` session carries that `session_id`.** The lookup in step 1
-  assumes it for conversations with no notify route; the build confirms it on a dev install.
+  assumes it for conversations with no notify route, and assumes a compressed continuation can be
+  traced back to it; the build confirms both on a dev install.
