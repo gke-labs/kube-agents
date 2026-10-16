@@ -27,7 +27,10 @@
 # its delivery too, and two in a row can make chat-delivery-watch open an agent:delivery-watch
 # issue on the install. The four audits
 # are real runs: each writes its ledger issue in the install's GitOps repository, and none posts
-# to chat. The runner holds their streams' locks for the unit (`audit_streams` below). It does not
+# to chat. The runner holds their streams' locks for the unit (`audit_streams` below), and closes
+# each stream's open ledger before the unit (hack/ci-eval-pr.sh, resets_declared_streams): an audit
+# with an open ledger and nothing new is silent and posts no summary to lose. Run by hand, close
+# them first, or the verifier reads the silent runs as an error. It does not
 # hold the infra lock (hack/ci-eval-pr.sh, infra_lock_exempt): the stack touches no task cluster
 # and reaches the install through a kubeconfig of its own. The onboarding state lock
 # (unit_state_lock) keeps it apart from the other cases that rewrite the onboarding markers.

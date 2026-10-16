@@ -2818,6 +2818,17 @@ infra_lock_exempt() { # <task-name>
   esac
   return 1
 }
+# A case that grades what its declared audit streams post, not one stream's
+# ledger, so each of those streams starts from a closed ledger, as the graded
+# stream of an audit case does: an audit with an open ledger and nothing new
+# is silent and posts no summary. oobe-late-first-message grades the summaries
+# its four first-run audits fail to deliver.
+resets_declared_streams() { # <task-name>
+  case "$1" in
+    oobe-late-first-message) return 0 ;;
+  esac
+  return 1
+}
 # The agent-install state a case's stack rewrites that another case's stack
 # rewrites too, as a lock name, or nothing. "onboarding" is the onboarding
 # markers (.bootstrap_scan_filed, .bootstrap_handoff_filed) and the Planning
@@ -3322,6 +3333,12 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   if [ -n "${audit_id}" ]; then
     release_inflight_note "${name} rep ${rep}" "${audit_id}"
     reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"
+  fi
+  if resets_declared_streams "${name}"; then
+    for s in ${streams}; do
+      release_inflight_note "${name} rep ${rep}" "${s}"
+      reset_audit_ledgers "${name} rep ${rep}" "${s}"
+    done
   fi
   # The repository this unit's agent writes to, emptied of every agent pull
   # request and every branch but the default and read back, so repetitions
