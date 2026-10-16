@@ -52,7 +52,11 @@
 locals {
   # The read roles a scoped project may carry. tests/test_scope_iam.py holds
   # every entry to the module's default project_roles, so the allowlist cannot
-  # name a role the agent does not hold at home.
+  # name a role the agent does not hold at home, and holds the host-only
+  # roles out: roles/cloudtrace.user is one of those, since Google's Trace
+  # User role carries create, delete and update on Trace-console objects
+  # beside the two trace reads, and the observability helpers that need the
+  # reads look at the host project's own traces (design §6).
   scope_role_allowlist = [
     "roles/container.clusterViewer",
     "roles/container.viewer",

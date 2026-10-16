@@ -140,6 +140,10 @@ MAX_ARGS_CHARS = 2000
 TRUNCATED_GAP = "the read stopped at %d cards; later cards were not read" % MAX_CARDS
 CALL_CAP_GAP = "the read stopped at %d tool calls; later calls were not read" % MAX_CALLS
 CLIP_GAPS = {"cards": TRUNCATED_GAP, "calls": CALL_CAP_GAP}
+# What the in-pod script puts in place of every result and argument when the
+# redactor will not load. Named here too so a verifier can tell a withheld
+# result from a real one; a test holds the two spellings together.
+WITHHELD = "[WITHHELD: redactor unavailable in the pod]"
 
 # Runs inside the agent container under hermes' own interpreter. Plain
 # ``python3`` and ``sqlite3``, plus the redactor loaded from the image: nothing

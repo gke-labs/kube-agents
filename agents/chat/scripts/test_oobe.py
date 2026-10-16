@@ -10,6 +10,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -1094,10 +1095,22 @@ class RosterTest(unittest.TestCase):
         jobs = {job["id"]: job for job in json.loads(roster.read_text(encoding="utf-8"))["jobs"]}
         entrypoint = (Path(__file__).resolve().parents[3] / "deploy" / "shared" / "docker-entrypoint.sh").read_text()
         seeded = next(line for line in entrypoint.splitlines() if line.strip().startswith('ASSUME_RETIRED="bootstrap'))
-        for job_id in ("bootstrap-inventory-scan", "bootstrap-inventory-delivery", "first-run-quick-value-audit"):
+        for job_id in ("bootstrap-inventory-scan", "bootstrap-inventory-delivery"):
             if job_id in jobs:
                 self.assertIs(jobs[job_id].get("enabled"), False, job_id)
                 self.assertIn(job_id, seeded.split('"')[1].split(","), job_id)
+
+    def test_the_retired_first_run_gate_is_deleted_from_volumes(self):
+        # oobe runs the first-run audits. A volume can still hold the gate
+        # enabled, and only the default profile's --cron-retire removes it.
+        roster = Path(__file__).resolve().parent.parent / "defaults" / "cron" / "jobs.json"
+        ids = {job["id"] for job in json.loads(roster.read_text(encoding="utf-8"))["jobs"]}
+        self.assertNotIn("first-run-quick-value-audit", ids)
+        entrypoint = (Path(__file__).resolve().parents[3] / "deploy" / "shared" / "docker-entrypoint.sh").read_text()
+        # The default profile's call is the one that also forces profile-cron-tick.
+        block = re.search(r'--cron-jobs "profile-cron-tick".*?--cron-retire "([^"]*)"', entrypoint, re.S)
+        self.assertIsNotNone(block, "the default profile's --cron-retire call was not found")
+        self.assertIn("first-run-quick-value-audit", block.group(1).split())
 
 
 if __name__ == "__main__":

@@ -156,6 +156,18 @@ CREDENTIAL_SHAPES: dict[str, str] = {
 # enforced for cases that no longer exist, because an in-flight branch
 # registering a case must not red main the day it merges.
 KNOWN_UNREGISTERED = {
+    # The two CUJ 1 cases (#2889), held out for the same infra-lock budget
+    # as the stack cases below: a `stack:` case runs alone on lock-infra
+    # whatever EVAL_TASK_PARALLELISM is, and the main nightly part's serial
+    # chain is already at or past the 480m deadline on cost hints alone.
+    "gitops-drift-deleted-policy-triage": (
+        "#2889: stack case held out of the nightly until the infra-lock "
+        "chain has room"
+    ),
+    "gitops-drift-load-bearing-change-triage": (
+        "#2889: stack case held out of the nightly until the infra-lock "
+        "chain has room"
+    ),
     # Provisions its own cluster, so registering it costs every pull request
     # a second multi-minute provision. Whether it belongs in presubmit or
     # nightly is a tier decision nobody has made; this entry is the record
@@ -180,6 +192,14 @@ KNOWN_UNREGISTERED = {
     "chat-relay-posts-report-as-written": (
         "needs a chat platform, which no CI install has; run by hand on a chat install"
     ),
+    # It grades a GitHub forge declared at a GitHub Enterprise Server host,
+    # which needs the GHES proxy (hack/ghes-proxy) and an install pointed at
+    # it. No eval lane deploys either, so it runs by hand with the recipe in
+    # its header. The entry goes when a lane deploys both.
+    "ghes-pdb-remediation-pr": (
+        "needs the GHES proxy and a GHES-forge install, which no eval lane has; "
+        "run by hand with the recipe in the case header"
+    ),
 }
 
 # Cases whose fixture does not exist at all, waiting on the issue that plants
@@ -195,6 +215,11 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    "scope-excluded-cluster-not-listed": (
+        "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
+        "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
+        "cluster exclusion and the case cannot patch the CR for a run"
+    ),
     "networking-world-open-ingress": (
         "#2682: needs bench/tf/fleet's world_open firewall rule and VM applied to "
         "every pool project (fleet re-apply); no pool project has a rule opening a "
@@ -236,6 +261,11 @@ FIXTURE_NOT_READY = {
         "pattern and the ledger check's forbidden phrase"
     ),
     "fleet-audit-without-forge-keeps-the-report": (
+        "#2419: needs an install with no forge (a PlatformAgent with no "
+        "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
+        "can run it; run it by hand against such an install"
+    ),
+    "fleet-cost-without-forge-keeps-the-report": (
         "#2419: needs an install with no forge (a PlatformAgent with no "
         "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
         "can run it; run it by hand against such an install"
@@ -344,6 +374,13 @@ KNOWN_NO_DOMAIN = {
         "and label; it reads no fleet and no domains.yaml row describes "
         "alert authoring"
     ),
+    "observability-trace-latency-brokered": (
+        "the agent's own observability skill: its trace latency helper run to "
+        "completion through the credential broker's relay, graded on the report "
+        "and on the route the worker took (no access token fetched or pasted); "
+        "it reads the install's own traces, not a fleet, and no domains.yaml "
+        "row describes the agent observing itself"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
@@ -385,7 +422,11 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "any_of_phrases",
         "any_of_patterns",
         "forbidden_patterns",
+        "required_patterns",
     ),
+    # The parsed manifest's fields and selector are the assertion; `kind` alone
+    # only names what to look for.
+    "report_manifest": ("fields", "selects", "excludes"),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.

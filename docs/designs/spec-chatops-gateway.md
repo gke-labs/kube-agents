@@ -1815,12 +1815,15 @@ everything, code included, but a kept link, whose URL and text hold no `<`. The 
 fenced block it cuts and reopens it with a bare fence at the start of the next chunk,
 reading the cut with the same code-span parse the adapters use: every chunk is balanced on
 its fences, so a cut block never leaks its closer into the next chunk, the fences added stay
-within the chunk cap, and the text between them is the original, byte for byte. The
-guarantee covers fenced blocks only: a cut inside a multi-line double-backtick span, or a
-hard cut that lands inside a mid-line fence opener, still leaves the next chunk parsing
-differently from the whole, a display defect tracked as a follow-up. The opener's language tag is not carried onto the
-reopened fence (it is the rest of the opener's line, unbounded), so a continuation chunk
-loses the tag on Discord.
+within the chunk cap, and the text between them is the original, byte for byte. When a cut
+falls inside a code span opening delimiter, or inside a span that can be carried intact into the
+next chunk whose start lies in the second half of the budget, the cut moves back to the span's start,
+preserving the span intact in the next chunk. A fenced block longer than a chunk is split with
+balanced fences as before; a multi-line double-backtick span the rule cannot move (longer than a
+chunk, or beginning before the second half of the budget) is still split with its closer in the next
+chunk, a display defect tracked as a follow-up. The opener's
+language tag is not carried onto the reopened fence (it is the rest of the opener's line, unbounded),
+so a continuation chunk loses the tag on Discord.
 
 **Chat messages (added 10/13).** A task's carriers may hold a `kube-agents.chat/v1` message
 beside their text (spec-a2a-payloads.md, "Chat messages"), and the relay reads it with

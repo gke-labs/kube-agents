@@ -150,5 +150,63 @@ class FleetScopeArgsTest(unittest.TestCase):
         self.assertIn("fleet_scope tool", note)
 
 
+class ExcludeClustersTest(unittest.TestCase):
+    """--scope-exclude-clusters: the clusters spec.scope.exclude.clusters
+    leaves out of every fleet read (#3081)."""
+
+    LISTING = [
+        {"name": "ka-today", "location": "us-central1"},
+        {"name": "lane-b", "location": "us-central1"},
+        # Same name in another location: a different cluster, still read.
+        {"name": "lane-b", "location": "us-east1"},
+        # A zonal cluster an older listing names by `zone` alone.
+        {"name": "lane-c", "zone": "us-central1-a"},
+    ]
+
+    def test_the_flag_parses_to_triples(self):
+        parser = argparse.ArgumentParser()
+        fsa.add_scope_arguments(parser)
+        args = parser.parse_args(["--scope-exclude-clusters", "ops/us-central1/lane-b,ops/us-central1-a/lane-c"])
+        self.assertEqual(fsa.parse_scope_exclude_clusters(args.scope_exclude_clusters),
+                         {("ops", "us-central1", "lane-b"), ("ops", "us-central1-a", "lane-c")})
+        self.assertIsNone(parser.parse_args([]).scope_exclude_clusters)
+        self.assertEqual(fsa.parse_scope_exclude_clusters(None), frozenset())
+
+    def test_a_malformed_entry_is_a_usage_error_not_a_dropped_exclusion(self):
+        # Dropping a malformed entry would read the very cluster it names.
+        for bad in ("ops/lane-b", "ops/us-central1/lane-b/extra", "ops//lane-b", "Ops/us-central1/lane-b"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    fsa.parse_scope_exclude_clusters(bad)
+                parser = argparse.ArgumentParser()
+                fsa.add_scope_arguments(parser)
+                with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                    parser.parse_args(["--scope-exclude-clusters", bad])
+
+    def test_drop_excluded_matches_the_exact_triple(self):
+        scope = fsa.DeclaredScope()
+        scope.set("ops", None, "ops/us-central1/lane-b,ops/us-central1-a/lane-c,other/us-central1/ka-today")
+        with mock.patch("sys.stderr") as err:
+            kept = scope.drop_excluded("ops", list(self.LISTING))
+        self.assertEqual(kept, [{"name": "ka-today", "location": "us-central1"}, {"name": "lane-b", "location": "us-east1"}])
+        logged = "".join(call.args[0] for call in err.write.call_args_list)
+        self.assertIn("ops/us-central1/lane-b", logged)
+        self.assertIn("ops/us-central1-a/lane-c", logged)
+
+    def test_no_exclusion_returns_the_listing_untouched(self):
+        scope = fsa.DeclaredScope()
+        scope.set("ops", None)
+        listing = list(self.LISTING)
+        self.assertIs(scope.drop_excluded("ops", listing), listing)
+
+    def test_the_exclusion_alone_declares_no_scope(self):
+        # The tool passes it beside --scope-projects; alone it narrows a
+        # listing without turning an undeclared install into a declared one.
+        scope = fsa.DeclaredScope()
+        scope.set(None, None, "ops/us-central1/lane-b")
+        self.assertFalse(scope.declared)
+        self.assertEqual(scope.drop_excluded("ops", [{"name": "lane-b", "location": "us-central1"}]), [])
+
+
 if __name__ == "__main__":
     unittest.main()

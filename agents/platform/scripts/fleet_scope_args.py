@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The two flags that carry the install's declared scope into a fleet-audit
+"""The flags that carry the install's declared scope into a fleet-audit
 collector, and their parsing.
 
 The collectors run in the shell sandbox, whose data volume is not the agent
@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 
 SCOPE_PROJECTS_FLAG = "--scope-projects"
 SCOPE_UNREAD_FLAG = "--scope-unread"
@@ -26,6 +27,13 @@ SCOPE_PROJECTS_HELP = (
     "list of project IDs, passed once (a space-separated list only works quoted). Sweep exactly these, listing "
     "nothing; paste the tool's collector_args. Omit on an install that declares no scope, where the collector "
     "enumerates every project the identity can list"
+)
+SCOPE_EXCLUDE_CLUSTERS_FLAG = "--scope-exclude-clusters"
+SCOPE_EXCLUDE_CLUSTERS_HELP = (
+    "project/location/cluster entries from the same tool: the clusters spec.scope.exclude.clusters excludes "
+    "(#3081). A collector that lists clusters drops them before reading anything, not as a coverage gap: the "
+    "operator excluded them on purpose. The networking and GCE audits accept the flag and still count an "
+    "excluded cluster's subnet usage and node VMs"
 )
 SCOPE_UNREAD_HELP = (
     "project=outcome entries from the same tool: declared projects this install could not read, "
@@ -93,14 +101,52 @@ DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR = (
 # A --project with no value, as `--project \"$VAR\"` with the variable unset produces.
 EMPTY_PROJECT_OVERRIDE_ERROR = "the project override was given with no value; pass a project id, or omit the flag to sweep the declared scope"
 SCOPE_ARG_SEPARATORS = r"[,\s]+"
+# One --scope-exclude-clusters entry: project/location/cluster, each part as the
+# CRD admits it (ScopeClusterRef), so an entry can carry no separator of its own.
+SCOPE_CLUSTER_SEPARATOR = "/"
+SCOPE_CLUSTER_PART = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+SCOPE_EXCLUDE_CLUSTERS_MALFORMED_ERROR = "{entry!r} is not project/location/cluster"
+# What a collector logs for the clusters it drops: named, so a reader of the
+# run's log can tell an excluded cluster from one the listing never returned.
+EXCLUDED_CLUSTERS_LOG = "{project}: skipping {count} cluster(s) spec.scope.exclude.clusters excludes: {named}"
 SCOPE_UNREAD_OUTCOME_SEPARATOR = "="
 SCOPE_UNREAD_DEFAULT_OUTCOME = "unknown"
 
 
 def add_scope_arguments(parser: argparse.ArgumentParser) -> None:
-    """The two flags, on every collector alike."""
+    """The scope flags, on every collector alike."""
     parser.add_argument(SCOPE_PROJECTS_FLAG, default=None, help=SCOPE_PROJECTS_HELP)
     parser.add_argument(SCOPE_UNREAD_FLAG, default=None, help=SCOPE_UNREAD_HELP)
+    parser.add_argument(SCOPE_EXCLUDE_CLUSTERS_FLAG, default=None, type=_exclude_clusters_arg, help=SCOPE_EXCLUDE_CLUSTERS_HELP)
+
+
+def _exclude_clusters_arg(value: str) -> str:
+    """argparse's check of --scope-exclude-clusters: a malformed entry is a
+    usage error, never an entry silently dropped, since a dropped exclusion
+    reads the very cluster the operator excluded."""
+    try:
+        parse_scope_exclude_clusters(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
+    return value
+
+
+def format_cluster_ref(project: str, location: str, cluster: str) -> str:
+    """One cluster as --scope-exclude-clusters spells it."""
+    return SCOPE_CLUSTER_SEPARATOR.join((project, location, cluster))
+
+
+def parse_scope_exclude_clusters(value: str | None) -> frozenset[tuple[str, str, str]]:
+    """The (project, location, cluster) triples --scope-exclude-clusters
+    carries; empty when it was not passed. Raises ValueError on an entry that
+    is not three CRD-shaped parts."""
+    triples = set()
+    for entry in (e for e in re.split(SCOPE_ARG_SEPARATORS, value or "") if e):
+        parts = entry.split(SCOPE_CLUSTER_SEPARATOR)
+        if len(parts) != 3 or not all(SCOPE_CLUSTER_PART.match(part) for part in parts):
+            raise ValueError(SCOPE_EXCLUDE_CLUSTERS_MALFORMED_ERROR.format(entry=entry))
+        triples.add((parts[0], parts[1], parts[2]))
+    return frozenset(triples)
 
 
 def parse_scope_projects(value: str | None) -> list[str]:
@@ -159,20 +205,51 @@ class DeclaredScope:
         self.args_missing = False
         self.projects: list[str] | None = None
         self.unread: list[tuple[str, str]] = []
+        self.excluded_clusters: frozenset[tuple[str, str, str]] = frozenset()
+        # What `drop_excluded` dropped, per project, as (name, location): a
+        # collector that judges project-level objects (a disk, a forwarding
+        # rule, an address) against the clusters it read must still know these
+        # exist, or their objects read as orphaned (fleet_waste.py).
+        self.dropped: dict[str, list[tuple[str, str]]] = {}
 
-    def set(self, scope_projects: str | None, scope_unread: str | None) -> None:
+    def set(self, scope_projects: str | None, scope_unread: str | None, scope_exclude_clusters: str | None = None) -> None:
         """Records `--scope-projects` and `--scope-unread`. Either flag passed,
         even blank, is a declared scope; `projects` is then the list, possibly
         empty. Neither flag on a sandbox whose operator says the install
         declares a scope (the root-owned SCOPE_DECLARED_FILE first, else
         SCOPE_DECLARED_ENV) is a declared scope too, with nothing to sweep and
         `args_missing` set, so the run reports rather than lists. `projects`
-        is None only when nothing declares a scope."""
+        is None only when nothing declares a scope. `--scope-exclude-clusters`
+        names clusters to drop and does not by itself declare a scope: the
+        tool passes it beside the other two, never alone."""
         flagged = scope_projects is not None or scope_unread is not None
         self.args_missing = not flagged and sandbox_declares_scope()
         self.declared = flagged or self.args_missing
         self.projects = parse_scope_projects(scope_projects) if self.declared else None
         self.unread = parse_scope_unread(scope_unread)
+        self.excluded_clusters = parse_scope_exclude_clusters(scope_exclude_clusters)
+        self.dropped = {}
+
+    def drop_excluded(self, project: str, clusters: list) -> list:
+        """`clusters`, as `gcloud container clusters list` returns them for
+        `project`, without the ones --scope-exclude-clusters names, matched on
+        the exact (project, location, name) triple as the reconcile matches
+        it. Dropped before the collector reads anything, and logged by name;
+        not a coverage gap, because the operator left them out on purpose."""
+        if not self.excluded_clusters:
+            return clusters
+        kept, dropped = [], []
+        for cluster in clusters:
+            if isinstance(cluster, dict):
+                location = cluster.get("location") or cluster.get("zone") or ""
+                if (project, location, cluster.get("name") or "") in self.excluded_clusters:
+                    dropped.append(format_cluster_ref(project, location, cluster["name"]))
+                    self.dropped.setdefault(project, []).append((cluster["name"], location))
+                    continue
+            kept.append(cluster)
+        if dropped:
+            print(EXCLUDED_CLUSTERS_LOG.format(project=project, count=len(dropped), named=", ".join(dropped)), file=sys.stderr)
+        return kept
 
     def override_error(self, project: str) -> str | None:
         """Why a `--project` override cannot run, or None when it can: on an

@@ -54,6 +54,13 @@ import workspace_paths  # noqa: E402
 # `BaseTestCase` empties the set so the suite's thousand compliance-audit runs
 # need not each carry a manifest; the guard's own tests put this back.
 REAL_COLLECTOR_AUDITS = audit_report.COLLECTOR_AUDITS
+SKILL_ROOT = Path(__file__).resolve().parents[1]
+
+
+def skill_text() -> str:
+    """The whole skill as a worker can read it: the core and every reference file."""
+    parts = [SKILL_ROOT / "SKILL.md", *sorted((SKILL_ROOT / "references").glob("*.md"))]
+    return "\n".join(part.read_text(encoding="utf-8") for part in parts)
 
 
 @dataclass
@@ -4995,6 +5002,7 @@ class TestStart(HarnessTestCase):
         self.assertNotIn("\n", out)
         payload = json.loads(out)
         contract = payload.pop("checks_contract", "")
+        steps = payload.pop("next_steps", [])
         self.assertEqual(
             payload,
             {
@@ -5035,6 +5043,7 @@ class TestStart(HarnessTestCase):
         # Autopilot fleet came from.
         self.assertIn("checks_not_applicable", contract)
         self.assertIn("reason", contract)
+        self.assertEqual(steps, audit_report.next_steps(AUDIT, payload["findings_path"]))
 
     def test_a_second_start_is_refused_while_the_stream_is_in_flight(self):
         """One stream, one run at a time, whoever started it (#1876).
@@ -5398,6 +5407,32 @@ class TestStart(HarnessTestCase):
                 )
                 self.assertEqual(audit_report.sop_path(audit_id), payload["sop"])
                 self.assertTrue(Path(payload["sop"]).is_absolute())
+
+    def test_start_names_the_next_steps_and_the_files_they_need(self):
+        """The core SKILL.md is short; `start` points at the detail for each step.
+
+        Every full path a step names under the skill's tree must be a file the
+        image ships, so each is mapped back to this checkout and checked.
+        """
+        self.patch_attr("COLLECTOR_AUDITS", REAL_COLLECTOR_AUDITS)
+        skill_root = Path(__file__).resolve().parents[1]
+        prefix = audit_report.skill_path() + "/"
+        for audit_id in audit_report.AUDITS:
+            with self.subTest(audit=audit_id):
+                self.out = ""
+                self.harness.replies = {"issue-list": {"issues": []}}
+                self.assertEqual(self.run_main(["start", "--audit", audit_id]), 0)
+                payload = json.loads(self.out)
+                steps = payload["next_steps"]
+                self.assertIn(payload["sop"], steps[0])
+                self.assertIn(payload["findings_path"], steps[1])
+                self.assertIn(f"draft --audit {audit_id} --manifest-file", steps[1])
+                self.assertIn(f"finish --audit {audit_id} --findings-file", steps[2])
+                self.assertIn(f"--manifest-file {audit_report.manifest_path_for(audit_id)}", steps[2])
+                named = re.findall(re.escape(prefix) + r"[\w./-]*\w", " ".join(steps))
+                self.assertGreaterEqual(len(named), 3)
+                for path in named:
+                    self.assertTrue((skill_root / path[len(prefix):]).is_file(), path)
 
     def test_start_hands_over_the_context_repositories(self):
         """The declared-intent step searches what `start` names, and nothing else.
@@ -16366,7 +16401,7 @@ class TestDispatchAndHandover(unittest.TestCase):
         what the refusal means, the one carve-out and its bound, and what the
         note spans.
         """
-        text = self.read("skills/fleet-audit/SKILL.md")
+        text = skill_text()
         section = text.split("## Running a stream on demand", 1)[1].split("\n## ", 1)[0]
         # #1887's two forms are still the frame.
         self.assertIn("Run the audit directly", section)
@@ -16400,6 +16435,24 @@ class TestDispatchAndHandover(unittest.TestCase):
         # `BROKER UNAVAILABLE` apart from a rejected document: neither has a
         # file to fix.
         self.assertIn("Two exit 2s are not a document to fix", text)
+
+    def test_the_core_carries_what_a_worker_needs_before_any_reference(self):
+        """`skill_view` returns SKILL.md alone; these must not slide into a reference."""
+        core = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        script = "/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py"
+        for needed in (
+            f"{script} start --audit",
+            f"{script} finish --audit",
+            f"{script} draft --audit",
+            "`finish`, once your `start` succeeded, `mode: none` included",
+            "`kanban_block`",
+            "never `kanban_complete` a card as done",
+            "Do not open anything under\n`scripts/`",
+            "`START REFUSED`",
+            "`BROKER UNAVAILABLE`",
+        ):
+            with self.subTest(needed=needed):
+                self.assertIn(needed, core)
 
     def test_the_worker_protocol_requires_the_url_in_the_summary(self):
         section = self.read("SOUL.md").split("## 1.")[0]
@@ -25056,8 +25109,7 @@ class TestDetectContentMode(BaseTestCase):
             audit_report.detect_content_mode()
         self.assertNotIsInstance(raised.exception, audit_report.StartRefused)
         self.assertIn("the broker at", str(raised.exception))
-        skill = Path(__file__).resolve().parents[1] / "SKILL.md"
-        text = skill.read_text(encoding="utf-8")
+        text = skill_text()
         on_demand = text.split("## Running a stream on demand", 1)[1].split("\n## ", 1)[0]
         exit_codes = " ".join(
             text.split("Two exit 2s are not a document to fix", 1)[1].split("\n### ", 1)[0].split()
@@ -25762,7 +25814,7 @@ class TestSopPath(unittest.TestCase):
         documents = sorted((platform / "governance").glob("*_sop.md")) + [
             platform / "skills" / name / "SKILL.md"
             for name in ("fleet-audit", "gce-compute-fleet-audit", "gcp-networking-fabric-audit")
-        ]
+        ] + sorted((platform / "skills" / "fleet-audit" / "references").glob("*.md"))
         for document in documents:
             with self.subTest(document=document.name):
                 self.assertEqual(

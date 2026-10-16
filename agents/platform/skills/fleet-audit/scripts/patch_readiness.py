@@ -161,7 +161,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 
-# The scope this collector was handed, set by main from the two flags.
+# The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
 
 # `--project` skips discovery, so a scoped run names no other project. Without
@@ -1978,6 +1978,7 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
         # nobody enumerated. Recorded as `gate-failed`, the loss is a target the
         # document has to account for, and §6 turns that into a coverage gap.
         return [_gate_failed_project(project, f"clusters list rc={result.rc}: {_stderr_excerpt(result)}")]
+    parsed = declared_scope.drop_excluded(project, parsed)
     # rc 0 and a warning that some zones did not answer: the clusters that came
     # back are collected, and the project also gets its `gate-failed` row, the
     # only thing that stops the missing ones reading as absent.
@@ -2232,7 +2233,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", help="single project to audit (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else run §1's project discovery")
     fleet_scope_args.add_scope_arguments(parser)
     args = parser.parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     manifest = collect_fleet(args.project)
     print(json.dumps(manifest, indent=2))
     if manifest.get("error"):

@@ -23,6 +23,28 @@ import slack_ux_clicks as clicks
 import slack_ux_moments as runtime
 import verify_slack_ux_moments as verifier
 
+try:
+    import gitops_workspace
+except ImportError:  # the runtime falls back without it too
+    gitops_workspace = None
+
+
+def setUpModule():
+    # gitops_workspace ignores GITOPS_STATE_PATH where the operator's
+    # /etc/gitops mount exists (in_operator_pod), and this module isolates its
+    # tests with that variable. Point the mount check away from any real one.
+    global _NO_MOUNT
+    if gitops_workspace is None:
+        _NO_MOUNT = mock.patch.dict({})
+        _NO_MOUNT.start()
+        return
+    _NO_MOUNT = mock.patch.object(gitops_workspace, "GITOPS_STATE_DIR", "/nonexistent/kube-agents-test/etc-gitops")
+    _NO_MOUNT.start()
+
+
+def tearDownModule():
+    _NO_MOUNT.stop()
+
 PR = "https://github.com/acme/fleet-config/pull/412"
 SUB = {
     "task_id": "t_e0c1",
