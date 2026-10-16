@@ -416,7 +416,7 @@ func capAsk(text string) string {
 // and then ended otherwise wakes with those answers, then its reason under
 // wakeEndMarker. With none the body is the result or the reason alone, as
 // before.
-func wakeText(state lib.TaskState, childID, ask string, turns []string, result, reason string, fullAnswer bool) string {
+func wakeText(state lib.TaskState, childID, ask string, turns []string, result, reason string, fullAnswer, cardsPending bool) string {
 	outcome, completed, body := "completed", true, result
 	switch state {
 	case lib.StateFailed, lib.StateCanceled: // a canceled the gateway did not publish
@@ -436,6 +436,9 @@ func wakeText(state lib.TaskState, childID, ask string, turns []string, result, 
 	} else {
 		text = fmt.Sprintf("The task you delegated to %s (task %s) %s.", targetPlatform, childID, outcome)
 	}
+	if cardsPending {
+		text += "\n" + wakeCardsPendingNote
+	}
 	if earlier != "" {
 		// wakeAnswers trimmed each answer; last opens with its separator.
 		text += "\n" + fenceWakeBody(earlier, body)
@@ -447,6 +450,10 @@ func wakeText(state lib.TaskState, childID, ask string, turns []string, result, 
 	}
 	return text + "\n" + wakeReplyGuide
 }
+
+// wakeCardsPendingNote is added to a completed wake when the delegated child
+// handed off to kanban cards that are still running.
+const wakeCardsPendingNote = "A Cluster Agent card is still running, and its report will post into this conversation."
 
 // wakeReplyGuide and wakeReplyGuideFull close every wake's text, chosen by
 // whether the person asking has seen the child's result (wakeNeedsFullAnswer).
@@ -465,8 +472,8 @@ const (
 )
 
 // wakeReplyGuideMax is the longer of the two guides, which the result
-// body's budget reserves room for.
-var wakeReplyGuideMax = max(len(wakeReplyGuide), len(wakeReplyGuideFull))
+// body's budget reserves room for, plus room for the cards-pending note.
+var wakeReplyGuideMax = max(len(wakeReplyGuide), len(wakeReplyGuideFull)) + len("\n") + len(wakeCardsPendingNote)
 
 // wakeFollowUpMarker opens each follow-up's answer in a wake body that
 // carries a child's turns, numbered from the first follow-up.
@@ -696,7 +703,7 @@ func (g *Gateway) flushNotices(conversation string, rs *relayState) {
 // It reports whether the wake reached the bus, and when it did not, why, in
 // a phrase for the chain root's terminal reason (observeChildEnd). A stop
 // the requester asked for reports false and no reason.
-func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child TaskRef, state lib.TaskState, turns []string, result, reason string, resultPosted bool) (bool, string) {
+func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child TaskRef, state lib.TaskState, turns []string, result, reason string, resultPosted, cardsPending bool) (bool, string) {
 	log := g.log.With("child", child.ID, "conversation", rec.Key, "state", string(state))
 	// The gateway published a cancel for the child: the human said stop,
 	// and whatever the executor answered with, waking the session would act
@@ -730,7 +737,7 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 
 	// The delegating turn's request, carried down a longer chain: the
 	// human's question, not an intermediate wake's gateway-authored text.
-	text := wakeText(state, child.ID, parent.Request, turns, result, reason, wakeNeedsFullAnswer(&parent, resultPosted))
+	text := wakeText(state, child.ID, parent.Request, turns, result, reason, wakeNeedsFullAnswer(&parent, resultPosted), cardsPending)
 
 	if rec.Profile == "" {
 		rec.Profile = sessionProfile

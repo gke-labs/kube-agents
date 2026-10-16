@@ -1689,30 +1689,28 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 }
 
 func (b *Bridge) publishTerminal(ctx context.Context, run *taskRun, state lib.TaskState, msg string) error {
-	if msg == "" {
-		if part, ok := cardsMark(run, state); ok {
-			return b.publishStatusParts(ctx, run, state, true, []lib.Part{part})
-		}
-		return run.exec.PublishStatus(ctx, state, true)
+	var parts []lib.Part
+	if msg != "" {
+		parts = append(parts, lib.Part{Kind: "text", Text: msg})
 	}
-	return b.publishStatusMessage(ctx, run, state, true, msg)
+	if part, ok := cardsMark(run, state); ok {
+		parts = append(parts, part)
+	}
+	if len(parts) > 0 {
+		return b.publishStatusParts(ctx, run, state, true, parts)
+	}
+	return run.exec.PublishStatus(ctx, state, true)
 }
 
 // cardsMark is the terminal's mark-only chat message for a completed turn
 // that filed kanban cards: the ask stays marked, so the terminal's no-mark
 // default does not take it off at the acknowledgement, and the cards'
 // notifies settle it (spec-a2a-payloads, "Card work after the task ends").
-// The one carrier with no text fallback. Only where something settles it:
-// the kanban notifier's Slack plan (deploy/docker/patches/slack_ux_status.py)
-// carries the cards' mark, for a Slack conversation with KAGE_SLACK_UX on,
-// which the bridge reads from the agent environment it inherits, and only
-// when the task's route was recorded, without which no card post reaches the
-// conversation. Anywhere else the terminal keeps the default and takes the
-// ask off.
+// It also signals to the gateway that the turn handed work off to cards.
+// A turn that filed cards with its route recorded always emits it.
 func cardsMark(run *taskRun, state lib.TaskState) (lib.Part, bool) {
 	a := run.act.Load()
-	if state != lib.StateCompleted || a == nil || !a.cardsFiled.Load() || !run.routeRecorded.Load() ||
-		!cardsSettleTheAsk(run.origin) {
+	if state != lib.StateCompleted || a == nil || !a.cardsFiled.Load() || !run.routeRecorded.Load() {
 		return lib.Part{}, false
 	}
 	part, err := chatmsg.MarkPart(chatmsg.Mark{Ask: run.askKind()})

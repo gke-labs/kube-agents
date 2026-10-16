@@ -1224,8 +1224,13 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		switch {
 		case child && healedTask != nil:
 			turns, result, reason := healedChildOutcome(healedTask)
+			cardsPending := false
+			if healedTask.FinalMessage != nil && healedTask.State == lib.StateCompleted {
+				terminal := g.readChat(rec.Key, ref.ID, chatmsg.Terminal, healedTask.FinalMessage.Parts)
+				cardsPending = terminal.Mark != nil && terminal.Mark.Ask != "" && terminal.Mark.Settle == ""
+			}
 			// false: the heal's status card above carries no result text.
-			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false); !woken {
+			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, cardsPending); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
 			}
 		case child:
