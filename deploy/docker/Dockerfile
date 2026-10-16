@@ -2125,6 +2125,15 @@ COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 # left. See the
 # module docstring for what a failure here means.
 #
+# verify_card_stop.py rides along too, for the same layer budget, and runs here
+# rather than beside verify_kanban_event_routing.py in the agent-base stage
+# because it imports session_kv_server.py, which reaches the image only with
+# the COPY of /opt/defaults/scripts above. It drives the card stop route
+# (POST /v1/sessions/{id}/cards/stop, #3263) against Hermes' real archive_task
+# and recompute_ready on a board built with create_task and claim_task, and a
+# real worker process started as the dispatcher starts one; see its module
+# docstring.
+#
 # check_skill_commands.py rides along the same way. It runs every shell block
 # in the SKILL.md files and references/*.md pages of the image's three skill
 # trees through Hermes' Tirith scan, which is why the Cluster Agent template is
@@ -2134,6 +2143,7 @@ COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
 COPY agents/platform/config.yaml \
      deploy/docker/merge_configs.py \
      deploy/docker/patches/verify_slack_relay_registry_contract.py \
+     deploy/docker/patches/verify_card_stop.py \
      deploy/docker/check_skill_commands.py \
      /tmp/platform-config/
 RUN /opt/hermes/.venv/bin/python3 /tmp/platform-config/merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml && \
@@ -2147,6 +2157,7 @@ assert caps.max_web_searches == 200, 'per-card web_search budget lost: %r' % cap
 assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.max_subagents; \
 assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
+    cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_card_stop.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/platform-config/check_skill_commands.py \
         agents/platform/skills=/opt/platform-template/skills \
         agents/cluster/skills=/opt/cluster-template/skills \
