@@ -184,6 +184,7 @@ ADDED_AFTER_THE_MOVE = [
     "not-found-target-stops-as-failure",  # a missing target stops its card on a hard wall, mock 06
     "alert-config-terraform-promql-probe",  # the gke-alert-configuration skill sync
     "security-chat-request-runs-collector",  # a plain security-posture request runs the compliance collector, #2386
+    "compute-class-canary-active-migration-pdb-probe",  # the gke-compute-classes skill sync
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
