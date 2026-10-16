@@ -7,11 +7,14 @@
 # (`agents/platform/governance/upgrade_readiness_brief_sop.md`, "On request"): a user asks what
 # needs their decision, and the agent answers in the brief's form — a headline, a "Decide now"
 # section whose lines name the undecided critical findings with one clause of why and one action
-# each, the rest of the week as counts, and the sentence that opens the full report in chat. On an
-# install where the Saturday review has run, the brief reads the review's summary and the queue;
-# on one where it has not (every CI install), the route runs the readiness report live and
-# composes from it, saying so in the headline. Both answers carry the same objects, because the
-# fixtures are the same.
+# each, the rest of the week as counts, and the sentence that opens the full report in chat. The
+# route depends on the install: where the Saturday review has run, the brief reads the review's
+# summary and the queue; where it has not and the queue holds no upgrade- rows, the route runs the
+# readiness report live and composes from it, with the live headline and the live closing line. A
+# CI install is fresh per lease, so the nightly takes the live route six nights of seven and may
+# take the recorded one on a Saturday night; the pull request's recorded greens took the recorded
+# route on a development install whose review had run that day. Both answers carry the same
+# objects, because the fixtures are the same, and the checks accept either closing line.
 #
 # Planted defect required: the seeded fleet's slot-b cluster carries the drain-blocking
 # PodDisruptionBudget pinned-batch-runner in seeded-upgrade at maxUnavailable: 0 over a

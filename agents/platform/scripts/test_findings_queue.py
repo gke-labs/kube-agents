@@ -511,6 +511,13 @@ class TestRegistration(QueueTestCase):
         # Folded like the stored check: a capitalised prefix reaches the row.
         result = self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "Upgrade-"})
         self.assertEqual(result["downgraded"], 1)
+        # A check that is only its family's name (stored without the separator) belongs to the family.
+        bare = sample(source="upgrade-readiness", check="upgrade-", namespace="", object="bare-pool")
+        self.register(bare)
+        bare_id = fq.validate_finding(bare)["id"]
+        self.assertEqual(fq.get_finding(self.conn, bare_id)["check"], "upgrade")
+        self.assertEqual(self.register(bare, scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})["results"][0]["outcome"], "updated")
+        self.assertEqual(self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})["downgraded"], 1)
 
     def test_a_check_is_stored_lower_case_so_the_prefix_reaches_it(self):
         odd = sample(source="upgrade-readiness", check="Upgrade_Pool Skew", namespace="", object="old-pool")

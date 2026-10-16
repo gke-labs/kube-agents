@@ -349,6 +349,16 @@ class Registration(unittest.TestCase):
         self.assertEqual(set(outcomes.values()), {"created"})
         self.assertEqual(len(outcomes), 1)
 
+    def test_an_exclusion_named_without_a_letter_or_digit_registers_under_a_digest(self):
+        odd = seeded_b()
+        odd["readiness"]["maintenance"]["exclusions"].append({"name": "冻结", "scope": "NO_MINOR_UPGRADES", "end_time": "2027-01-05T00:00:00Z", "blocks": True, "detail": "a freeze named in CJK"})
+        found = [f for f in review.exclusion_findings(odd) if "冻结" in f["title"]]
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0]["object"].startswith("exclusion-"))
+        fq.validate_finding(review.payload(found[0]))  # the queue accepts it
+        again = [f for f in review.exclusion_findings(odd) if "冻结" in f["title"]][0]
+        self.assertEqual(found[0]["object"], again["object"])  # stable across runs
+
     def test_an_object_past_the_queues_cap_keys_the_same_id_on_both_sides(self):
         long_name = "a" * (fq.MAX_LABEL_CHARS + 40)
         found = review.budget_findings(member("c", "blocked", pdbs={"blocking": [budget(name=long_name)]}))[0]
@@ -409,14 +419,21 @@ class Registration(unittest.TestCase):
             return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]]}
 
         odd = seeded_b()
-        odd["readiness"]["maintenance"]["exclusions"].append({"name": "!!!", "scope": "NO_MINOR_UPGRADES", "end_time": "2027-01-05T00:00:00Z", "blocks": True, "detail": "punctuation for a name"})
+        odd["readiness"]["maintenance"]["exclusions"].append({"name": "freeze", "scope": "NO_MINOR_UPGRADES", "end_time": "2027-01-05T00:00:00Z", "blocks": True, "detail": "a second exclusion"})
         findings = review.member_findings(odd)
-        with mock.patch.object(review, "kv_request", fake_request):
+        real = fq.validate_finding
+
+        def strict(raw):
+            if raw.get("object") == "freeze":
+                raise fq.FindingError("refused for the test")
+            return real(raw)
+
+        with mock.patch.object(review, "kv_request", fake_request), mock.patch.object(review.findings_queue, "validate_finding", strict):
             outcomes, problems, claimed = review.register([odd], [], findings)
         self.assertEqual(len(problems), 1)
-        self.assertIn("!!!", problems[0])
+        self.assertIn("freeze", problems[0])
         self.assertEqual(len(calls), 1)
-        self.assertNotIn("!!!", [f["object"] for f in calls[0]["findings"]])
+        self.assertNotIn("freeze", [f["object"] for f in calls[0]["findings"]])
         self.assertIn("scope", calls[0])
         self.assertEqual(claimed, {f"{PROJECT}/us-central1-a/seeded-b"})
         self.assertEqual(sum(1 for v in outcomes.values() if v == review.REGISTRATION_FAILED), 1)
@@ -617,8 +634,16 @@ class TheRecord(unittest.TestCase):
             self.assertIn(key, named, f"the SOP does not tell the brief about `{key}`")
 
     def test_projects_last_week_could_not_read_go_first(self):
-        self.assertEqual(review.ordered_names(["a", "b", "c"], {"project_failures": {"c": "timed out"}}), ["c", "a", "b"])
+        # Only a failure the order can repair moves a project up: the budget
+        # ran out before it, or cut its run short. A run that timed out on its
+        # own, or was refused, keeps its place.
+        cut = review.CUT_SHORT_DETAIL.format(seconds=300)
+        self.assertEqual(review.ordered_names(["a", "b", "c"], {"project_failures": {"c": cut}}), ["c", "a", "b"])
+        self.assertEqual(review.ordered_names(["a", "b", "c"], {"project_failures": {"c": review.BUDGET_EXHAUSTED_DETAIL}}), ["c", "a", "b"])
+        self.assertEqual(review.ordered_names(["a", "b", "c"], {"project_failures": {"c": "the sandbox run timed out after 1500s"}}), ["a", "b", "c"])
         self.assertEqual(review.ordered_names(["a", "b"], None), ["a", "b"])
+        # A spelling by number runs after the ids in its group.
+        self.assertEqual(review.ordered_names(["123456789012", "acme-prod"], None), ["acme-prod", "123456789012"])
 
 
 class TheTick(unittest.TestCase):
@@ -740,21 +765,23 @@ class TheTick(unittest.TestCase):
         def run_report(names, readiness, *, scope, outside_stands, timeout=None):
             calls.append(names[0])
             if names[0] == OTHER_PROJECT:
-                raise RuntimeError("the sandbox run timed out after 1500s")
+                raise watch.SandboxTimedOut(f"the sandbox run timed out after {int(timeout)}s")
             return self.envelope
 
         # `projects()` sorts, which would put acme-dev first on its own; the
         # names are handed unsorted so the second run's order is `ordered_names`'s.
-        with mock.patch.object(watch, "projects", return_value=[PROJECT, OTHER_PROJECT]), mock.patch.object(watch, "run_report", side_effect=run_report):
+        # The budget is short of two full runs, so the second project's run is
+        # one the review's own budget cut short: the failure the order repairs.
+        with mock.patch.object(watch, "projects", return_value=[PROJECT, OTHER_PROJECT]), mock.patch.object(review, "TOTAL_BUDGET_SECONDS", 900), mock.patch.object(watch, "run_report", side_effect=run_report):
             code, out = self.run_main()
         self.assertEqual(code, 0)
         self.assertEqual(calls, [PROJECT, OTHER_PROJECT])
-        self.assertIn("1 project(s) not read this week: acme-dev: the sandbox run timed out", out)
+        self.assertIn(f"1 project(s) not read this week: acme-dev: {review.CUT_SHORT_PREFIX}", out)
         self.assertEqual(len(self.registered), 2)
         latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
-        self.assertEqual(latest["project_failures"], {OTHER_PROJECT: "the sandbox run timed out after 1500s"})
-        # Next run, the project that failed goes first.
-        with mock.patch.object(watch, "projects", return_value=[PROJECT, OTHER_PROJECT]), mock.patch.object(watch, "run_report", side_effect=run_report):
+        self.assertTrue(latest["project_failures"][OTHER_PROJECT].startswith(review.CUT_SHORT_PREFIX))
+        # Next run, the project the budget cut short goes first.
+        with mock.patch.object(watch, "projects", return_value=[PROJECT, OTHER_PROJECT]), mock.patch.object(review, "TOTAL_BUDGET_SECONDS", 900), mock.patch.object(watch, "run_report", side_effect=run_report):
             calls.clear()
             self.run_main()
         self.assertEqual(calls, [OTHER_PROJECT, PROJECT])
@@ -807,6 +834,10 @@ class TheTick(unittest.TestCase):
         latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
         self.assertEqual(len(latest["clusters"]["reviewed"]), 2)
         self.assertEqual(len(latest["findings"]), len(review.member_findings(seeded_b())))
+        self.assertEqual(latest["projects"], [PROJECT])  # the id the rows carry, not the number
+        report = (review.weekly_home() / review.LATEST_MD_NAME).read_text()
+        self.assertEqual(report.count("### acme-prod"), 1)
+        self.assertNotIn(f"### {numbered}", report)
 
     def test_a_numbered_project_the_report_resolved_whose_listing_failed_is_not_read(self):
         numbered = "123456789012"

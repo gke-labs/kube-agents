@@ -63,6 +63,13 @@ SOURCES = ("inventory", "event-watcher", "audit", "upgrade-readiness")
 # nothing shorter or longer: what a complete claim may name with `scope.check_prefix`.
 CHECK_FAMILY_SEPARATOR = "-"
 CHECK_FAMILY_RE = re.compile(rf"^[a-z0-9]+{re.escape(CHECK_FAMILY_SEPARATOR)}$")
+
+
+def in_check_family(check: str, family: str) -> bool:
+    """Whether a stored check belongs to a family: it starts with the family,
+    or it is the family's name alone (the stored fold strips a trailing
+    separator, so `upgrade-` with nothing after it is stored as `upgrade`)."""
+    return check.startswith(family) or check == family[: -len(CHECK_FAMILY_SEPARATOR)]
 SEVERITIES = ("critical", "major", "minor")
 REMEDIATION_KINDS = ("manifest", "gcloud", "manual")
 VERIFICATION_KINDS = ("kubectl", "gcloud", "manual")
@@ -760,7 +767,7 @@ def _downgrade_absent(
     for finding_id, raw, check_slug, row_source in rows:
         if finding_id in seen:
             continue
-        if check_prefix and not str(check_slug or "").startswith(check_prefix):
+        if check_prefix and not in_check_family(str(check_slug or ""), check_prefix):
             continue
         if sources and str(row_source or "") not in sources:
             continue
@@ -830,7 +837,7 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
         check_prefix = _text(raw_prefix, "scope.check_prefix", required=False).lower()
         if check_prefix and not CHECK_FAMILY_RE.fullmatch(check_prefix):
             raise FindingError(f"scope.check_prefix is {_brief(check_prefix)}; a check family is one segment and its separator, as 'upgrade-' is")
-        if check_prefix and checks and not all(check.startswith(check_prefix) for check in checks):
+        if check_prefix and checks and not all(in_check_family(check, check_prefix) for check in checks):
             raise FindingError("scope.check_prefix names a family the batch did not write; a claim reaches only what the run read")
         named = _text(scope.get("source"), "scope.source", required=False)
         if named and named not in SOURCES:

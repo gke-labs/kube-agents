@@ -59,8 +59,9 @@ read some projects and not others prints one line naming the projects it did
 not read, since the brief's counts cannot show them; a run whose findings the
 queue refused, or whose sandbox copy failed, prints one line for each, since
 both leave the week where the brief cannot act on it; a run that fails prints
-one line saying so, once per distinct failure, and exits 0; the exit is 1 only
-when the record could not be written. ``--dry-run`` runs the
+one line saying so, once per distinct failure, and the next clean run prints
+the recovery line; the exit is 0 throughout, and 1 only when the record could
+not be written. ``--dry-run`` runs the
 reports and prints the summary without registering or writing anything.
 
 ``UPGRADE_READINESS_PROJECTS``, ``UPGRADE_READINESS_WATCH_HOME``,
@@ -71,6 +72,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import http.client
 import json
 import os
@@ -323,8 +325,15 @@ REPORT_TITLE = "Weekly upgrade readiness review"
 SUMMARY_VERSION = 1
 NO_PROJECTS_DETAIL = "no project to review: set UPGRADE_READINESS_PROJECTS or declare a scope"
 BUDGET_EXHAUSTED_DETAIL = "the run's time budget ran out before this project"
-CUT_SHORT_DETAIL = "readiness run cut short by the review's time budget after {seconds}s; it goes first next week"
+CUT_SHORT_PREFIX = "readiness run cut short by the review's time budget"
+CUT_SHORT_DETAIL = CUT_SHORT_PREFIX + " after {seconds}s; it goes first next week"
+# A budget failure is one the order can repair; a run that failed on its own
+# (its full timeout, a refusal, a listing failure) rotates to the back instead.
+BUDGET_FAILURE_PREFIXES = (CUT_SHORT_PREFIX,)
 LISTING_FAILED_DETAIL = "the project's cluster listing failed"
+EXCLUSION_SURROGATE_OBJECT = "exclusion-{digest}"  # an exclusion name with no ASCII letter or digit
+EXCLUSION_DIGEST_CHARS = 8
+LOADER_NOISE_PREFIX = "Wrote /tmp/"  # the loader's own line about a directory it has removed
 MAX_PROBLEMS_IN_LINE = 3  # of the queue's refusals quoted in the chat line; the record has them all
 MAX_NAMES_IN_LINE = 6  # projects named in the partial line
 OVERFLOW_NOTE = "and {count} more in the record"
@@ -516,13 +525,17 @@ def exclusion_findings(member: dict) -> list[dict]:
             continue
         name = str(exclusion.get(NAME_KEY) or "")
         end_time = exclusion.get(END_TIME_KEY)
+        # The name is the free-form key of the cluster's maintenanceExclusions
+        # map; one with no ASCII letter or digit derives no usable queue id, so
+        # the object is a digest of it and the title keeps the name.
+        object_name = name if re.search(r"[A-Za-z0-9]", name) else EXCLUSION_SURROGATE_OBJECT.format(digest=hashlib.sha256(name.encode("utf-8")).hexdigest()[:EXCLUSION_DIGEST_CHARS])
         out.append(
             finding(
                 member=member,
                 check=CHECK_EXCLUSION,
                 entry=ENTRY_EXCLUSION,
                 namespace="",
-                object_name=name,
+                object_name=object_name,
                 title=f"{ENTRY_EXCLUSION}. {entry_title(ENTRY_EXCLUSION)}: exclusion {name} ({exclusion.get(SCOPE_KEY)}) holds the automatic upgrade until {end_time}",
                 detail=str(exclusion.get(DETAIL_KEY) or ""),
                 rubric_values=RUBRIC["exclusion"],
@@ -746,18 +759,31 @@ def payload(item: dict) -> dict:
 
 
 def ordered_names(names: list[str], previous: dict | None) -> list[str]:
-    """The projects last week could not read go first, so a budget that ran
-    out does not run out on the same tail twice."""
-    failed = set(((previous or {}).get("project_failures") or {}).keys())
-    return [n for n in names if n in failed] + [n for n in names if n not in failed]
+    """The projects last week's budget cut short or never started go first,
+    so a budget that ran out does not run out on the same tail twice; a
+    project that failed on its own (its full timeout, a refusal, a listing
+    failure) keeps its place, so it does not take the budget off the top
+    every week. Within each group a spelling by number runs after the ids,
+    so a project the roster spells both ways is read under its id and the
+    number's run is the one skipped."""
+    failures = (previous or {}).get("project_failures") or {}
+    budget = {p for p, detail in failures.items() if str(detail) == BUDGET_EXHAUSTED_DETAIL or str(detail).startswith(BUDGET_FAILURE_PREFIXES)}
+
+    def group(selected: list[str]) -> list[str]:
+        return [n for n in selected if not watch.is_project_number(n)] + [n for n in selected if watch.is_project_number(n)]
+
+    return group([n for n in names if n in budget]) + group([n for n in names if n not in budget])
 
 
-def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], list[dict], dict[str, str], dict[str, str]]:
+def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], list[dict], dict[str, str], dict[str, str], set[str]]:
     """One readiness run per project inside the total budget. Returns the
-    members, the report errors, the report script's tables per project, and
-    the projects that failed with why. `on_project(members, errors)` runs as
-    each project returns, which is where registration happens, so a run the
-    hour cuts short keeps what it registered."""
+    members, the report errors, the report script's tables per project, the
+    projects that failed with why, and the ids the report resolved and read.
+    `on_project(members, errors)` runs as each project returns, which is where
+    registration happens, so a run the hour cuts short keeps what it
+    registered. A run whose resolved id was already read (the roster spelled
+    one project by number and by id) is dropped whole: no table, no errors,
+    no failure, nothing registered."""
     members: list[dict] = []
     errors: list[dict] = []
     tables: dict[str, str] = {}
@@ -784,6 +810,12 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
         report = envelope.get(watch.ENVELOPE_REPORT_KEY) or {}
         found = [m for m in report.get(watch.MEMBERS_KEY) or [] if isinstance(m, dict)]
         read_errors = [e for e in report.get(watch.ERRORS_KEY) or [] if isinstance(e, dict)]
+        resolved = {str(p) for p in report.get(watch.REPORT_PROJECTS_KEY) or [project]}
+        if resolved & read_ids:
+            # The roster spelled one project twice, by number and by id: the
+            # report resolved both to the same id, and its clusters are already
+            # read and registered under the first run. The second leaves nothing.
+            continue
         errors.extend(read_errors)
         tables[project] = str(envelope.get(watch.ENVELOPE_TABLES_KEY) or "")
         unlisted = watch.unlisted_projects(read_errors)
@@ -799,17 +831,11 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
                 LISTING_FAILED_DETAIL,
             )
             continue
-        resolved = {str(p) for p in report.get(watch.REPORT_PROJECTS_KEY) or [project]}
-        if resolved & read_ids:
-            # The roster spelled one project twice, by number and by id: the
-            # report resolved both to the same id, and its clusters are already
-            # read and registered under the first run. The second is not.
-            continue
         read_ids |= resolved
         members.extend(found)
         if on_project is not None:
             on_project(found, read_errors)
-    return members, errors, tables, failures
+    return members, errors, tables, failures, read_ids
 
 
 # --- registering ------------------------------------------------------------------
@@ -912,6 +938,7 @@ def summary(
     previous: dict | None,
     report_path: Path,
     claimed: set[str] | None = None,
+    read_ids: set[str] | None = None,
 ) -> dict:
     keys = [watch.member_key(m) for m in members]
     blocked, ready, unknown, unread = watch.readiness_verdicts({watch.MEMBERS_KEY: members, watch.ERRORS_KEY: errors}, keys)
@@ -961,7 +988,9 @@ def summary(
         "job": JOB_ID,
         "stamp": stamp,
         "generated_at": iso(now),
-        "projects": names,
+        # The ids the report resolved and read (what the queue's rows carry),
+        # then the spellings that failed, for the brief's paging and its line.
+        "projects": sorted(read_ids) + [p for p in names if p in failures] if read_ids is not None else names,
         "clusters": {
             REVIEWED_KEY: keys,
             watch.READINESS_BLOCKED: blocked,
@@ -1044,7 +1073,8 @@ def render_report(summary_doc: dict, findings: list[dict], tables: dict[str, str
         lines += ["## Read errors", ""] + [f"- {json.dumps(e, sort_keys=True)}" for e in errors] + [""]
     lines += ["## Report script output", ""]
     for project, text in tables.items():
-        lines += [f"### {project}", "", text.rstrip(), ""]
+        table = "\n".join(line for line in text.splitlines() if not line.startswith(LOADER_NOISE_PREFIX))
+        lines += [f"### {project}", "", table.rstrip(), ""]
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1229,7 +1259,7 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
         problems.extend(bad)
         claimed.update(done)
 
-    members, errors, tables, failures = run_projects(ordered_names(names, previous), scope, on_project=registered)
+    members, errors, tables, failures, read_ids = run_projects(ordered_names(names, previous), scope, on_project=registered)
     if failures and len(failures) == len(set(names)):
         raise RuntimeError(shown([f"{p}: {d}" for p, d in failures.items()], MAX_NAMES_IN_LINE, OVERFLOW_NOTE_PLAIN))
     report_path = home / stamp / REPORT_MD_NAME
@@ -1237,13 +1267,14 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
         stamp=stamp, now=now, names=names, members=members, errors=errors, failures=failures,
         findings=findings, outcomes=outcomes, problems=problems, previous=previous, report_path=report_path,
         claimed=None if dry_run else claimed,
+        read_ids=read_ids,
     )
     report_md = render_report(summary_doc, findings, tables, errors)
     if dry_run:
         lines = [DRY_RUN_HEADER, json.dumps({k: v for k, v in summary_doc.items() if k != "findings"}, indent=1, sort_keys=True)]
         lines += [f"- {r['severity']}: {r['id']}: {r['title']}" for r in summary_doc["findings"]]
         return lines, 0
-    report_json = {"generated_at": iso(now), "projects": names, watch.MEMBERS_KEY: members, watch.ERRORS_KEY: errors, "project_failures": failures}
+    report_json = {"generated_at": iso(now), "projects": summary_doc["projects"], watch.MEMBERS_KEY: members, watch.ERRORS_KEY: errors, "project_failures": failures}
     findings_json = {"generated_at": iso(now), "findings": [payload(item) for item in findings], "outcomes": outcomes, "errors": problems}
     try:
         write_record(home, stamp, report_md, report_json, findings_json, summary_doc)
