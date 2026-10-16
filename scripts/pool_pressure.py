@@ -1136,15 +1136,15 @@ def collect_waits(
         if not entries:
             return Source(error=f"the build index at {GCS_BUILD_INDEX} is empty")
         # A vanished pointer is a build the sweep never saw: named with the
-        # unreadable builds when its ID falls in the window (with the same
-        # slack as below; a replay of a past day does not report today's)
-        # and on a day the sweep finished, left out of the numbers, and not
-        # counted against the newest-builds share below, which judges the
-        # reader, not Prow.
+        # unreadable builds when its ID falls in the window, left out of the
+        # numbers, and not counted against the newest-builds share below,
+        # which judges the reader, not Prow. Slack on the high side only (a
+        # replay of a past day does not report today's); the ID encodes the
+        # end of the wait, so one below window_start was created below it.
         vanished_in_window = [
             gone
             for gone in vanished
-            if window_start - SNOWFLAKE_SLACK
+            if window_start
             <= snowflake_time(int(gone["build_id"]))
             <= window_end + SNOWFLAKE_SLACK
         ]

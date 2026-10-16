@@ -913,14 +913,13 @@ class SweepDeadline(unittest.TestCase):
         """The report says the days the deadline cut are missing, not empty;
         a pointer that vanished on one of them is not listed beside the
         builds from the days that were read."""
-        # The second is on the day that was read; the third is on that day
-        # too by the clock but on no day with a landed build (today's first
-        # build, still running): kept, because it is inside the window the
-        # sweep covered, which is the bound, not the days that had reads.
-        # The first two are on the cut day, the second inside the hours the
-        # window slack would admit; the ID encodes the end of the wait, so a
-        # build below the measured start was created below it too, and the
-        # slack does not apply on this side.
+        # Four pointers. The first two are on the cut day (08-26), the second
+        # within the six hours a window slack would admit: both dropped,
+        # because the ID encodes the end of the wait, so a build below the
+        # measured start was created below it too, and no slack applies on
+        # that side. The last two are on the day that was read (08-27), the
+        # fourth after that day's last landed build: both kept, because the
+        # window the sweep covered is the bound, not the builds it read.
         def at(moment):
             return str(int(moment.timestamp() * 1000 - pp.SNOWFLAKE_EPOCH_MS)
                        << pp.SNOWFLAKE_TIMESTAMP_SHIFT)
