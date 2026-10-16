@@ -192,6 +192,8 @@ def run_env(hermes_home: Path | str | None = None, extra: dict[str, str] | None 
 
 def link_shared_profile_resources(home: Path, hermes_home: Path) -> None:
     """Share identical binaries and cache directories across profiles (#3325)."""
+    home = Path(home)
+    hermes_home = Path(hermes_home)
     tirith_bin = home / "bin" / "tirith"
     if not tirith_bin.exists() and not tirith_bin.is_symlink():
         candidates = []
