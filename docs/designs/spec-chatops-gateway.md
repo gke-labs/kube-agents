@@ -1614,7 +1614,9 @@ and its reply says to send it in the question's thread instead; the adapter mark
 a message top-level (`InboundMessage.TopLevel`, set only for a top-level DM), and the
 gateway keys the reply on that mark, not on the conversation's task history, so a
 `stop` in a thread with nothing running (a question refused at the session cap, say)
-gets the plain "nothing is running". A top-level status question matches the exact
+gets the plain "nothing is running" reply, which also says that a task card the
+front desk filed keeps working and posts there, since `stop` cannot reach a card
+(gke-labs#3263). A top-level status question matches the exact
 status phrases only; one shaped like a question ("how is the deploy doing") is an ask.
 A bare `/session` asks for the next message in its thread.
 
