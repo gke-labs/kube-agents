@@ -1545,6 +1545,14 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # itself was installed by its own stage.
 # See the module docstring in deploy/docker/patches/kanban_children_settled.py.
 #
+# kanban_audit_ledger: kanban_complete refuses — once, never wedging — to close
+# a card whose worker ran `audit_report.py start` and got no `finish` result
+# line after it, and the retry closes marked "Not published" (#2856). A
+# published run's ledger URL is appended when the result does not name it. It
+# reads the worker's own session in state.db, because the audit's files live in
+# the sandbox pod. Same anchor as kanban_children_settled, so it also runs
+# AFTER apply_kanban_result_required.py; the two stack in either order.
+#
 # kanban_wake_guard: a wake turn in a gateway conversation can't file a card.
 # When a card finishes, Hermes runs a synthetic turn in the session that filed
 # it (the wake self-post in gateway/wake.py), with every tool. On the next lane
@@ -1638,6 +1646,9 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_children_settled.py \
      deploy/docker/patches/apply_kanban_children_settled.py \
      deploy/docker/patches/verify_kanban_children_settled.py \
+     deploy/docker/patches/kanban_audit_ledger.py \
+     deploy/docker/patches/apply_kanban_audit_ledger.py \
+     deploy/docker/patches/verify_kanban_audit_ledger.py \
      deploy/docker/patches/kanban_wake_guard.py \
      deploy/docker/patches/apply_kanban_wake_guard.py \
      deploy/docker/patches/verify_kanban_wake_guard.py \
@@ -1709,6 +1720,10 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF 'tid, _kanban_children_connect, result' /opt/hermes/tools/kanban_tools.py && \
     grep -qF '_steps_err = _require_steps_settled(' /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_children_settled import" /opt/hermes/tools/kanban_tools.py && \
+    cp /tmp/latency-patches/kanban_audit_ledger.py /opt/hermes/tools/kanban_audit_ledger.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_audit_ledger.py /opt/hermes && \
+    grep -qF '_audit_err, result = _require_audit_ledger(' /opt/hermes/tools/kanban_tools.py && \
+    grep -q "from tools.kanban_audit_ledger import" /opt/hermes/tools/kanban_tools.py && \
     cp /tmp/latency-patches/kanban_wake_guard.py /opt/hermes/tools/kanban_wake_guard.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_wake_guard.py /opt/hermes && \
     grep -qF '_kanban_refuse_create_on_wake()' /opt/hermes/tools/kanban_tools.py && \
@@ -1753,6 +1768,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_chat_notify.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_event_routing.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_audit_ledger.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_guard.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_ended_run.py && \
