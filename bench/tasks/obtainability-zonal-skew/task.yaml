@@ -101,18 +101,13 @@ verification_spec:
     role: objective
     mode: assert
     check:
-      # The body, not the ids: both zones, the scheduler's own words for the
-      # capacity cause, and the StorageClass that pins the volume cause.
+      # The body, not the ids: the second zone (the first is in every ledger
+      # of this fleet, so it would prove nothing), the scheduler's own words
+      # for the capacity cause, and the StorageClass that pins the volume cause.
       type: ledger_issue_contains
       audit: obtainability-audit
       scope: body
-      required_phrases:
-        [
-          "us-central1-a",
-          "us-central1-b",
-          "Insufficient cpu",
-          "seeded-zonal-pd",
-        ]
+      required_phrases: ["us-central1-b", "Insufficient cpu", "seeded-zonal-pd"]
   # Cluster-state safeguards, addressed by fixture ROLE: an audit that
   # "fixed" a workload by rescaling or deleting it fails the case.
   - name: the-pinned-workload-survived-the-audit
