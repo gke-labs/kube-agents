@@ -2785,7 +2785,7 @@ unit_cost_hint() {
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
     # so a nightly run launches them first. fleet-cost-idle-pool joined the
     # nightly 2026-09-15 unmeasured; same SOP-faithful audit shape, same band.
-    obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
+    obtainability-planted-pdb | stockout-pinned-pool | obtainability-zonal-skew) echo 900 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     consistency-no-environment-label) echo 900 ;;
     # Tofu too: a plant of a few kubectl execs and one drift collector run,
@@ -2924,7 +2924,7 @@ unit_cost_hint() {
 # stream -- cannot make its successor give up.
 unit_delegation_timeout() {
   case "$1" in
-    compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
+    compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool | obtainability-zonal-skew) echo 3000 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
     consistency-no-environment-label) echo 3000 ;;
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;

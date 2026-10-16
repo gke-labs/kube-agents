@@ -196,6 +196,7 @@ ADDED_AFTER_THE_MOVE = [
     "provisioning-cluster-request-never-creates",  # a cluster request ends in a PR or a stop, #2937
     "provisioning-kcc-cluster-without-crds-stops",  # the KCC skill's no-CRDs stop, #2937
     "cluster-setting-request-proposes-pr",  # the gke-platform-security skill's pull request path, #2937
+    "obtainability-zonal-skew",  # the obtainability audit's zonal-skew check on slot d's three causes, #1356
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.

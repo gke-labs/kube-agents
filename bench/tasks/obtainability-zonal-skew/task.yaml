@@ -36,8 +36,8 @@ prompt: >-
 expected_output: >-
   The closing response carries the ledger URL in full and, where it
   summarises, counts zonal-skew among the findings on the multi-zonal seeded
-  cluster. The ledger issue itself, which the deterministic checks above
-  read, carries a zonal-skew finding for each of the three workloads in
+  cluster. The ledger issue itself, which the deterministic checks in
+  verification_spec read, carries a zonal-skew finding for each of the three workloads in
   seeded-topology, each naming the zone that holds every running replica,
   the cause (a node affinity pin, zonal PersistentVolumeClaims on
   seeded-zonal-pd, or replicas Pending on Insufficient cpu) and the share of
@@ -61,33 +61,39 @@ fixtures:
   - zonal-skew-capacity
 
 verification_spec:
-  # One objective per planted cause, each on the ledger's finding ids: the
-  # check slug and the object the finding names. On a main without the check
-  # all three are absent, which is the red this case exists to show.
+  # One objective per planted cause, on the finding's rendered heading
+  # (`#### zonal-skew on <Kind>/<name>`, composed by audit_report.py's
+  # `_finding_identity_lines`). Not on finding ids: the id check tests each
+  # phrase on its own, so `zonal-skew` plus `zone-pinned-api` would pass on a
+  # rigid-scheduling finding for that object beside any zonal-skew finding at
+  # all, and a long id is shortened (`capacity-starved-work-dc658d` on the dev
+  # install), so a composite id cannot be matched either. The heading binds
+  # check and object in one string. On a main without the check all three are
+  # absent, which is the red this case exists to show.
   - name: the-pinned-workload-is-a-zonal-skew-finding
     role: objective
     mode: assert
     check:
       type: ledger_issue_contains
       audit: obtainability-audit
-      scope: finding_ids
-      required_phrases: ["zonal-skew", "zone-pinned-api"]
+      scope: body
+      required_phrases: ["zonal-skew on Deployment/zone-pinned-api"]
   - name: the-disk-bound-workload-is-a-zonal-skew-finding
     role: objective
     mode: assert
     check:
       type: ledger_issue_contains
       audit: obtainability-audit
-      scope: finding_ids
-      required_phrases: ["zonal-skew", "zone-bound-store"]
+      scope: body
+      required_phrases: ["zonal-skew on StatefulSet/zone-bound-store"]
   - name: the-capacity-starved-workload-is-a-zonal-skew-finding
     role: objective
     mode: assert
     check:
       type: ledger_issue_contains
       audit: obtainability-audit
-      scope: finding_ids
-      required_phrases: ["zonal-skew", "capacity-starved-worker"]
+      scope: body
+      required_phrases: ["zonal-skew on Deployment/capacity-starved-worker"]
   - name: the-ledger-names-the-zones-and-the-causes
     role: objective
     mode: assert
