@@ -86,7 +86,7 @@ Upgrade readiness, week of <YYYY-MM-DD>: <n> clusters reviewed, <b> blocked, <r>
 
 **Also this week:** <one or two lines: counts by catalogue entry on which clusters, majors only; minors as one count>.
 
-**Decided earlier:** <a> accepted, <s> snoozed, <d> dismissed; nothing changes there<, or "none yet">.
+**Decided earlier:** <a> accepted, <s> snoozed, <d> dismissed; nothing changes there.
 
 <when project_failures is not empty: "**Not read this week:** <project>: <reason>; last week's findings there stand.">
 
@@ -112,6 +112,7 @@ has a decision.` and the brief is shorter.
 - **Majors and minors stay out of Decide now.** They go in **Also this week** as counts by
   catalogue entry (the row's `entry` and the first part of its `title`), so the user sees the shape
   of the week without a list. The queue names them at its own pace.
+- **Nothing decided yet** → the line is `**Decided earlier:** none yet.`
 - **Dismissed is silent.** A `suppressed` row is never counted as new and never named; it was the
   user's decision.
 - **A project the review could not read is said, once, in its own line.** The headline's counts

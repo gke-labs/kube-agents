@@ -52,7 +52,7 @@ gets the same shape in chat. Read only. Register nothing, decide nothing, upgrad
 
    **Also this week:** <one or two lines: counts by catalogue entry on which clusters, majors only; minors as one count>.
 
-   **Decided earlier:** <a> accepted, <s> snoozed, <d> dismissed; nothing changes there<, or "none yet">.
+   **Decided earlier:** <a> accepted, <s> snoozed, <d> dismissed; nothing changes there.
 
    <when project_failures is not empty: "**Not read this week:** <project>: <reason>; last week's findings there stand.">
 
@@ -71,7 +71,7 @@ finding has a decision.` When nothing was found at all, the brief is the headlin
    - One clause of why ("budget `pinned-batch-runner` refuses eviction of its only pod, so the drain
      kills it"), one action (the row's `action`, shortened to the verb and the object).
    - Majors and minors go under **Also this week** as counts by catalogue entry; a `suppressed` row is
-     never named.
+     never named. With nothing decided yet, the line is `**Decided earlier:** none yet.`
    - When `registration_errors` is not empty, or a row's `outcome` is `failed`, the headline says
      how many findings are in the report but not on the queue, and a critical among them goes under
      **Decide now** by its object with "not on the queue" after it: there is no id to reply with.
