@@ -42,10 +42,10 @@ REPORT = "Security & RBAC Posture Audit: 0 new, 3 resolved; 2 findings (0 critic
 NOTES = "silent_ok is false (resolved: 3).\nLet's format the final response!## Security & RBAC Posture Audit"
 
 
-def gateway(posted, ended=True, response="report", delivery_error=None, threads=1):
+def gateway(posted, ended=True, response="report", outcome="delivered", threads=1):
     state = {"job_id": "compliance-audit", "fired_at": FIRED.isoformat()}
     if ended:
-        state.update(last_run_at=(FIRED + timedelta(minutes=20)).isoformat(), last_delivery_error=delivery_error)
+        state.update(last_run_at=(FIRED + timedelta(minutes=20)).isoformat(), delivery_outcome=outcome)
     return {"state": state, "posted": posted, "threads": threads, "response": response}
 
 
@@ -99,9 +99,18 @@ def test_a_run_that_has_not_ended_is_an_error():
 
 
 def test_a_failed_delivery_fails_with_its_error():
-    status, reason = acr.verdict(gateway([], delivery_error="chat relay answered HTTP 502"), record([REPORT]))
+    status, reason = acr.verdict(gateway([], outcome="failed: chat relay answered HTTP 502"), record([REPORT]))
     assert status == "fail"
     assert "HTTP 502" in reason
+
+
+def test_an_oversized_record_fails_naming_the_size():
+    big = acr.SANDBOX_READ + "x" * (acr.MAX_REPORT_BYTES + 1)
+    read, rec = acr.read_chat_report(lambda c, t: big, "compliance-audit", 1)
+    assert read
+    status, reason = acr.verdict(gateway([REPORT]), rec)
+    assert status == "fail"
+    assert "over" in reason and str(acr.MAX_REPORT_BYTES) in reason
 
 
 def test_no_thread_is_an_error():
@@ -151,3 +160,71 @@ def test_the_check_is_registered_and_the_task_names_it():
     assert entry_points["devops_bench.verifiers"]["audit_chat_report_posted"].endswith(":AuditChatReportPostedVerifier")
     task = yaml.safe_load(TASK.read_text())
     assert task["verification_spec"][0]["check"]["type"] == "audit_chat_report_posted"
+
+
+def _arm():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "audit_chat_report_arm", REPO / "bench" / "tf" / "prebuilt" / "audit-chat-report" / "arm.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _home(tmp_path, rows):
+    cron = tmp_path / "profiles" / "platform" / "cron"
+    cron.mkdir(parents=True)
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "compliance-audit"}]}))
+    with sqlite3.connect(cron / "executions.db") as conn:
+        conn.execute(
+            "CREATE TABLE executions (job_id TEXT, status TEXT, claimed_at TEXT, finished_at TEXT, delivery_outcome TEXT)"
+        )
+        conn.executemany("INSERT INTO executions VALUES ('compliance-audit', ?, ?, ?, ?)", rows)
+    return str(tmp_path)
+
+
+def test_wait_reads_only_a_run_claimed_after_the_mark(tmp_path):
+    arm = _arm()
+    before = (FIRED - timedelta(minutes=5)).isoformat()
+    after = (FIRED + timedelta(minutes=1)).isoformat()
+    done = (FIRED + timedelta(minutes=20)).isoformat()
+    home = _home(tmp_path, [
+        ("completed", before, (FIRED + timedelta(seconds=30)).isoformat(), "delivered"),
+        ("completed", after, done, "delivered"),
+    ])
+    Path(home, arm.STATE_NAME).write_text(json.dumps({"job_id": "compliance-audit", "fired_at": FIRED.isoformat()}))
+    arm.wait(home, "compliance-audit", 1)
+    state = json.loads(Path(home, arm.STATE_NAME).read_text())
+    assert state["last_run_at"] == done
+    assert state["delivery_outcome"] == "delivered"
+
+
+def test_wait_does_not_take_an_earlier_runs_end(tmp_path):
+    arm = _arm()
+    home = _home(tmp_path, [
+        ("completed", (FIRED - timedelta(minutes=5)).isoformat(), (FIRED + timedelta(seconds=30)).isoformat(), "delivered"),
+    ])
+    Path(home, arm.STATE_NAME).write_text(json.dumps({"job_id": "compliance-audit", "fired_at": FIRED.isoformat()}))
+    arm.POLL_S = 0
+    try:
+        arm.wait(home, "compliance-audit", 0)
+    except SystemExit as exc:
+        assert "did not finish" in str(exc)
+    else:
+        raise AssertionError("wait accepted a run claimed before the mark")
+
+
+def test_idle_waits_out_a_running_run(tmp_path):
+    arm = _arm()
+    home = _home(tmp_path, [("running", FIRED.isoformat(), None, None)])
+    arm.POLL_S = 0
+    try:
+        arm.idle(home, "compliance-audit", 0)
+    except SystemExit as exc:
+        assert "still claimed or running" in str(exc)
+    else:
+        raise AssertionError("idle returned while a run was going")
+    idle_home = _home(tmp_path / "idle", [("completed", FIRED.isoformat(), FIRED.isoformat(), "delivered")])
+    arm.idle(idle_home, "compliance-audit", 0)

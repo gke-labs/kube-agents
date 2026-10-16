@@ -70,7 +70,7 @@ variable "audit_job" {
 
 variable "own_wait" {
   type        = number
-  description = "Seconds to wait for a run already in flight on the stream to end"
+  description = "Seconds to wait for a run of the job already claimed or running to finish"
   default     = 3600
 }
 

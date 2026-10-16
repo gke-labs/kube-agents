@@ -3034,7 +3034,8 @@ def render_chat_report(audit_id: str, payload: dict, data: dict, delta_known: bo
     Slack headline reads the line above a link-only last line
     (`slack_audit_report._ledger_line`). With no trusted memory of the previous
     run (`delta_known` false) the line's `new` and `resolved` are withheld
-    zeros, so it says the change is unknown instead of counting them.
+    zeros, so it says the change is unknown instead of counting them; a HELD
+    run prints no counts and keeps its own line.
     """
     findings = list(data.get("findings") or [])
     clusters = len((data.get("scope") or {}).get("clusters") or [])
@@ -3042,12 +3043,7 @@ def render_chat_report(audit_id: str, payload: dict, data: dict, delta_known: bo
     status = payload.get("status")
     resolved = int(payload.get("resolved") or 0)
     unaccounted = list(payload.get(UNACCOUNTED_KEY) or [])
-    if not delta_known:
-        head = (
-            f"{name}: {findings_phrase(len(findings))} ({severity_counts(findings)['critical']} critical) "
-            f"across {clusters} cluster(s); the change since the last run is unknown."
-        )
-    elif status == "CLEAN":
+    if status == "CLEAN" and delta_known:
         head = f"{name}: clean, 0 findings, {resolved} resolved across {clusters} cluster(s)."
     elif status == "HELD" and unaccounted:
         head = (
@@ -3060,6 +3056,11 @@ def render_chat_report(audit_id: str, payload: dict, data: dict, delta_known: bo
         head = (
             f"{name}: 0 findings across {clusters} cluster(s), but the ledger stays open: "
             f"its comments could not be read, so a /remediate there may be unanswered."
+        )
+    elif not delta_known:
+        head = (
+            f"{name}: {findings_phrase(len(findings))} ({severity_counts(findings)['critical']} critical) "
+            f"across {clusters} cluster(s); the change since the last run is unknown."
         )
     else:
         head = (

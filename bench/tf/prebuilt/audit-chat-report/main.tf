@@ -30,8 +30,9 @@
 # the `oobe` job's first-run audits stage does, and waits for the run to end. The
 # profile's cron tick claims the mark and the scheduler delivers the run through
 # the job's `deliver` leg, so the report takes the path every scheduled report
-# takes. An audit run already in flight on the stream is waited out first, up to
-# `own_wait`, because its end would otherwise read as this run's.
+# takes. A run of the job already claimed or running is waited out first, up to
+# `own_wait`, and only a run claimed after the mark is read as the fired one
+# (both from the scheduler's own `cron/executions.db`).
 #
 # On an install with a chat platform the report is posted to the home channel,
 # and the audit writes its ledger issue in the install's GitOps repository.
@@ -54,12 +55,9 @@ locals {
   python    = "/opt/hermes/.venv/bin/python3"
   arm_b64   = base64encode(file("${path.module}/arm.py"))
   store_b64 = base64encode(file("${path.module}/store.sh"))
-  # audit_report.py: REPORTS_DIR and the in-flight note under SCRATCH_DIR.
+  # audit_report.py: REPORTS_DIR.
   store    = "/opt/data/fleet-audit/reports/${var.audit_job}"
-  inflight = "/opt/data/scratch/inflight_${var.audit_job}.json"
-  # audit_report.py: INFLIGHT_TTL_SECONDS; an older note holds nothing.
-  inflight_ttl = 7200
-  pod_wait     = 5
+  pod_wait = 5
 }
 
 resource "null_resource" "audit_chat_report" {
@@ -123,9 +121,6 @@ resource "null_resource" "audit_chat_report" {
             -c "${var.agent_container}" --pod-running-timeout=${local.pod_wait}s -- \
             ${local.python} - "$@"
       }
-      sandbox() {
-        kubectl exec -n "${var.agent_namespace}" "${var.sandbox_pod}" -c "${var.sandbox_container}" -- sh -c "$1"
-      }
       store() {
         printf '%s' '${local.store_b64}' | base64 -d | \
           kubectl exec -i -n "${var.agent_namespace}" "${var.sandbox_pod}" -c "${var.sandbox_container}" -- \
@@ -134,15 +129,7 @@ resource "null_resource" "audit_chat_report" {
 
       arm clean "${local.home}"
 
-      deadline=$(( $(date +%s) + ${var.own_wait} ))
-      while sandbox 'f=${local.inflight}; [ -f "$f" ] && [ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt ${local.inflight_ttl} ]'; do
-        if [ "$(date +%s)" -ge "$deadline" ]; then
-          echo "ERROR: a ${var.audit_job} run is still in flight after ${var.own_wait}s." >&2
-          exit 1
-        fi
-        echo "A ${var.audit_job} run is in flight; waiting for it to end."
-        sleep 30
-      done
+      arm idle "${local.home}" "${var.audit_job}" "${var.own_wait}"
 
       moved=1
       store move

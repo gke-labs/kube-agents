@@ -55,10 +55,14 @@ CHAT_REPORT = "/opt/data/scratch/chat_report_{audit}.json"
 # session_kv_server.py: CHAT_REPORT_PARTS_SEPARATOR.
 PARTS_SEPARATOR = "\n\n"
 SILENT_MARKER = "[SILENT]"
+# The scheduler's `delivery_outcome` for a run whose report reached its leg.
+DELIVERED = "delivered"
 GATEWAY_READ = "__AUDIT_CHAT_GATEWAY__"
 SANDBOX_READ = "__AUDIT_CHAT_SANDBOX__"
 SANDBOX_ABSENT = "__AUDIT_CHAT_ABSENT__"
 MAX_REPORT_BYTES = 1 << 20
+# What read_chat_report returns for a record past MAX_REPORT_BYTES.
+OVERSIZE_KEY = "__oversize__"
 EXCERPT_CHARS = 240
 
 # Prints the state file, the rows the job's threads stored since the fire, and
@@ -114,8 +118,9 @@ def gateway_command() -> str:
 
 def sandbox_command(audit: str) -> str:
     path = shlex.quote(CHAT_REPORT.format(audit=audit))
+    # One byte past the cap, so a record over it is told from one at it.
     return (
-        f"if [ -f {path} ]; then printf '%s' {SANDBOX_READ}; head -c {MAX_REPORT_BYTES} {path}; "
+        f"if [ -f {path} ]; then printf '%s' {SANDBOX_READ}; head -c {MAX_REPORT_BYTES + 1} {path}; "
         f"else printf '%s' {SANDBOX_ABSENT}; fi"
     )
 
@@ -140,8 +145,11 @@ def read_chat_report(shell: Callable[[str, float], str], audit: str, timeout: fl
     marker = reply.find(SANDBOX_READ)
     if marker < 0:
         return False, None
+    body = reply[marker + len(SANDBOX_READ) :]
+    if len(body.encode("utf-8")) > MAX_REPORT_BYTES:
+        return True, {OVERSIZE_KEY: True}
     try:
-        record = json.loads(reply[marker + len(SANDBOX_READ) :])
+        record = json.loads(body)
     except json.JSONDecodeError:
         return True, None
     return True, record if isinstance(record, dict) else None
@@ -160,11 +168,14 @@ def verdict(gateway: dict[str, Any], record: dict[str, Any] | None) -> tuple[Ver
         return "error", "the run was silent, so nothing reached a channel to grade"
     posted = gateway.get("posted") or []
     if not posted:
-        if state.get("last_delivery_error"):
-            return "fail", f"the run's report was not delivered: {state['last_delivery_error'][:EXCERPT_CHARS]}"
+        outcome = state.get("delivery_outcome")
+        if outcome and outcome != DELIVERED:
+            return "fail", f"the run's report was not delivered: {str(outcome)[:EXCERPT_CHARS]}"
         if not gateway.get("threads"):
             return "error", "the relay registered no thread for the job, so what the channel got cannot be read back"
         return "fail", "the relay stored no post for the run in the job's thread"
+    if (record or {}).get(OVERSIZE_KEY):
+        return "fail", f"the run's chat report record is over {MAX_REPORT_BYTES} bytes"
     fired = datetime.fromisoformat(state["fired_at"]).timestamp()
     parts = (record or {}).get("parts")
     try:

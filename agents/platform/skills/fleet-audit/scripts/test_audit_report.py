@@ -25888,6 +25888,14 @@ class TestChatReport(HarnessTestCase):
         self.assertIn("the change since the last run is unknown", head)
         self.assertNotIn("0 new", head)
 
+    def test_a_held_run_with_no_memory_still_says_the_ledger_stays_open(self):
+        payload = {"status": "HELD", "issue_url": "https://github.com/acme/fleet/issues/7",
+                   "new": 0, "resolved": 0, audit_report.UNACCOUNTED_KEY: []}
+        head = audit_report.render_chat_report(
+            AUDIT, payload, make_doc(findings=[]), delta_known=False
+        ).splitlines()[0]
+        self.assertIn("its comments could not be read", head)
+
     def test_a_held_run_with_unreadable_comments_says_so(self):
         payload = {"status": "HELD", "issue_url": "https://github.com/acme/fleet/issues/7",
                    "new": 0, "resolved": 0, audit_report.UNACCOUNTED_KEY: []}

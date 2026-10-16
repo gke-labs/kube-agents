@@ -14,21 +14,27 @@
 
 """Fire one scheduled fleet-audit run on the install and wait for its delivery.
 
-Runs in the agent container, streamed in by main.tf. Three commands:
+Runs in the agent container, streamed in by main.tf. Four commands:
 
+  idle <home> <job> <seconds>  wait until no run of <job> is claimed or running, so a run
+                               already going is not read as the fired one
   fire <home> <python> <job>   mark <job> due with Hermes' own ``cron.jobs.trigger_job``
                                and record when, in STATE_FILE
-  wait <home> <job> <seconds>  wait until the job's runtime record shows a run that ended
-                               after the mark, and record its delivery error
+  wait <home> <job> <seconds>  wait until a run claimed after the mark has finished, and
+                               record when and how its delivery went
   clean <home>                 remove STATE_FILE
 
-The run is a real scheduled run: the profile's cron tick claims the mark and the
-scheduler delivers the final message through the job's ``deliver`` leg, the
-chat relay.
+Runs are read from the profile's ``cron/executions.db``, where the scheduler
+records each run with its claim time, its end, and its delivery outcome. A run
+finishes after its delivery, so a finished row means the report was handed to
+the relay. The run is a real scheduled run: the profile's cron tick claims the
+mark and the scheduler delivers the final message through the job's
+``deliver`` leg, the chat relay.
 """
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -37,6 +43,9 @@ from datetime import datetime, timezone
 STATE_NAME = ".bench-audit-chat-report.json"
 PROFILE_HOME = ("profiles", "platform")
 ROSTER = ("cron", "jobs.json")
+EXECUTIONS = ("cron", "executions.db")
+ACTIVE = ("claimed", "running")
+SQLITE_BUSY_TIMEOUT_S = 10
 TRIGGER_SCRIPT = "import sys\nfrom cron.jobs import trigger_job\nsys.exit(0 if trigger_job(sys.argv[1]) else 3)\n"
 TRIGGER_TIMEOUT_S = 60
 POLL_S = 20
@@ -54,6 +63,32 @@ def _job(home, job_id):
         if isinstance(job, dict) and job.get("id") == job_id:
             return job
     raise SystemExit(f"{job_id} is not in the Platform Agent's cron roster")
+
+
+def _executions(home, job_id):
+    """The job's runs as dicts, newest claim first."""
+    path = os.path.join(home, *PROFILE_HOME, *EXECUTIONS)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT_S)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT status, claimed_at, finished_at, delivery_outcome FROM executions "
+            "WHERE job_id = ? ORDER BY claimed_at DESC",
+            (job_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def idle(home, job_id, seconds):
+    _job(home, job_id)
+    deadline = time.monotonic() + float(seconds)
+    while any(run["status"] in ACTIVE for run in _executions(home, job_id)):
+        if time.monotonic() > deadline:
+            raise SystemExit(f"a {job_id} run is still claimed or running after {seconds}s")
+        print(f"a {job_id} run is going; waiting for it to finish")
+        time.sleep(POLL_S)
 
 
 def _write(home, state):
@@ -81,15 +116,22 @@ def wait(home, job_id, seconds):
     fired = datetime.fromisoformat(state["fired_at"])
     deadline = time.monotonic() + float(seconds)
     while True:
-        job = _job(home, job_id)
-        ended = job.get("last_run_at")
-        if ended and datetime.fromisoformat(ended) > fired:
-            state.update(last_run_at=ended, last_delivery_error=job.get("last_delivery_error"))
+        ours = [
+            run for run in _executions(home, job_id)
+            if run["claimed_at"] and datetime.fromisoformat(run["claimed_at"]) > fired
+        ]
+        if ours and ours[-1]["finished_at"]:
+            run = ours[-1]
+            state.update(
+                last_run_at=run["finished_at"],
+                status=run["status"],
+                delivery_outcome=run["delivery_outcome"],
+            )
             _write(home, state)
-            print(f"{job_id} ended at {ended}: {job.get('last_status')}")
+            print(f"{job_id} finished at {run['finished_at']}: {run['status']}, {run['delivery_outcome']}")
             return
         if time.monotonic() > deadline:
-            raise SystemExit(f"{job_id} did not end a run within {seconds}s of {state['fired_at']}")
+            raise SystemExit(f"{job_id} did not finish a run within {seconds}s of {state['fired_at']}")
         time.sleep(POLL_S)
 
 
@@ -102,7 +144,9 @@ def clean(home):
 
 if __name__ == "__main__":
     command, home = sys.argv[1], sys.argv[2]
-    if command == "fire":
+    if command == "idle":
+        idle(home, sys.argv[3], sys.argv[4])
+    elif command == "fire":
         fire(home, sys.argv[3], sys.argv[4])
     elif command == "wait":
         wait(home, sys.argv[3], sys.argv[4])

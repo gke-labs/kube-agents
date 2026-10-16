@@ -124,10 +124,12 @@ targets the bold line drops.
 
 `_failed_audit_line` posts the first sentence of a report's "What's wrong" section
 (`slack_audit_report.failed_line`, or `failed_chat` under `spec.mode: next`) for a report
-that ends with no ledger link, and only for a job that runs the fleet-audit skill. Such a
-job's report is what its `finish` rendered or a notice that it did not finish
+that ends with no ledger link, and only for a job that runs the fleet-audit skill. For a
+job the image ships, the report is what its `finish` rendered or a notice that it did
+not finish
 ([A fleet-audit report comes from `finish`](#a-fleet-audit-report-comes-from-finish-not-the-final-message)),
-and neither has that section, so the line is never posted.
+and neither has that section, so the line is not posted for it. A fleet-audit job
+created at runtime still posts its final message, and the line still applies to it.
 
 Every other report (Google Chat, one that does not end with
 a managed-repository issue link and is not such a failed run, a job the scheduler already delivered to Slack
