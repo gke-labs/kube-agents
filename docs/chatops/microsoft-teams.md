@@ -6,20 +6,24 @@ This guide walks through configuring and deploying the **Microsoft Teams ChatOps
 
 ## Overview
 
-The Microsoft Teams integration allows cluster operators, SREs, and developers to interact with PlatformAgents directly from Microsoft Teams channels, group chats, or direct messages.
+The Microsoft Teams integration connects PlatformAgents to Microsoft Teams through the credential broker (`TeamsRelay` in `agents/platform/scripts/credential_proxy.py`) and the gateway runtime relay patch (`agents/platform/scripts/teams_relay_patch.py`).
 
-### Architecture Highlights
+What ships today is the outbound half: the gateway can post messages and Adaptive Cards into a Teams conversation through the broker. Messages from Teams to the agent are not delivered yet. The broker admits only the agent's own ServiceAccounts on `/v1/chat/teams/*`, and no shipped component receives Bot Framework's HTTPS deliveries or validates its token, so there is nothing for Microsoft to call. Until that receiver exists, a Teams user cannot talk to the agent.
 
-- **Deterministic Gateway & Credential Isolation**: The agent harness runs in an isolated container without ambient Microsoft credentials. The `credential-proxy` sidecar handles Microsoft Entra ID token acquisition, OAuth lifecycle caching, and webhook activity queues.
-- **Single-Tenant Enterprise Lock-Down**: Optional verification of `TEAMS_TENANT_ID` ensures incoming activities are strictly rejected if they originate from outside your organization's Microsoft Entra ID tenant.
-- **User Authorization**: Granular allowlisting via `allowedUsers` (supporting Entra ID Object IDs and UserPrincipalName emails) or tenant-wide access via `allowAllUsers: true`.
-- **Microsoft Adaptive Cards v1.5**: Rich interactive card responses with action buttons (e.g. `/remediate`, `/audit`, status checks) and automatic fallback to Markdown for standard text.
+### Architecture & Security Boundaries
+
+- **Credential Isolation**: The `platform-agent` container runs without Microsoft Entra client secrets. The `credential-proxy` broker holds `TEAMS_APP_ID` and `TEAMS_APP_PASSWORD`, acquires and caches Microsoft Entra OAuth2 tokens (`https://api.botframework.com/.default`), and exposes `/v1/chat/teams/*` to the gateway only: the broker checks both the token's audience and the caller's ServiceAccount against its allowed-callers list, which the operator renders and the CR cannot widen.
+- **Outbound Egress & Method Guards**: `/v1/chat/teams/api` forwards `POST` to `v3/conversations/<id>/activities` (send) and `v3/conversations/<id>/activities/<activityId>` (reply) only, never `activities/history`, and only to `smba.trafficmanager.net`, `botframework.com` and its subdomains over HTTPS, with redirects refused. The bot token never reaches another `*.trafficmanager.net` or tenant-owned host.
+- **Inbound delivery (not shipped)**: `POST /v1/chat/teams/events` queues an activity for the gateway, but only a caller on the broker's allowed-callers list can reach it, and the operator renders no public `Ingress` or `LoadBalancer` for the broker. No shipped component validates the Bot Framework JWT or forwards Microsoft's deliveries to this route. Registering a messaging endpoint therefore has nothing to point at yet.
+- **Single-Tenant Lock-Down**: When `TEAMS_TENANT_ID` (`spec.integration.teams.tenantId`) is configured, both the credential broker (`POST /v1/chat/teams/events`, returning `403 Forbidden`) and the gateway adapter (`_process_activity`) verify that `channelData.tenant.id` (falling back to `conversation.tenantId`) matches the configured tenant ID.
+- **User Authorization (`TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`)**: The operator wires `spec.integration.teams.allowedUsers` to `TEAMS_ALLOWED_USERS` and `spec.integration.teams.allowAllUsers` to `TEAMS_ALLOW_ALL_USERS`. Authorization matches `from.aadObjectId` (Entra ID Object ID), `from.userPrincipalName` / `from.email` (when supplied by the forwarder or activity), or `from.id` (Teams `29:…` channel account ID). Display names (`from.name`) are never matched for authorization.
+- **Microsoft Adaptive Cards v1.5**: Outbound messages format Markdown headers, lists, and fenced code blocks into Adaptive Card v1.5 attachments when `adaptiveCards: true` (default), or plain text when `adaptiveCards: false`.
 
 ---
 
 ## Step 1: Register Microsoft Entra ID App & Azure Bot
 
-1. Navigate to the [Azure Portal](https://portal.azure.com/) -> **Azure Active Directory (Entra ID)** -> **App registrations**.
+1. Navigate to the [Azure Portal](https://portal.azure.com/) -> **Microsoft Entra ID** -> **App registrations**.
 2. Click **New registration**:
    - **Name**: `kube-agents-kage` (or your preferred agent name).
    - **Supported account types**: Select _Accounts in this organizational directory only (Single tenant)_ or _Multitenant_.
@@ -29,7 +33,7 @@ The Microsoft Teams integration allows cluster operators, SREs, and developers t
    - Bot handle: `kube-agents-bot`
    - App Type: _Single Tenant_ or _MultiTenant_
    - Microsoft App ID: Use the client ID created above.
-   - **Messaging endpoint**: `https://<YOUR_INGRESS_DOMAIN>/api/v1/teams/events`
+   - **Messaging endpoint**: Leave empty. Inbound delivery is not shipped (see Architecture above); set it once a receiver exists.
 6. In the Azure Bot blade, navigate to **Channels** and add **Microsoft Teams**.
 
 ---
@@ -42,14 +46,15 @@ Store the bot credentials in the PlatformAgent credentials secret:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: platform-agent-credentials
-  namespace: kube-agents-system
+  name: platform-agent-secrets
+  namespace: kubeagents-system
 type: Opaque
 stringData:
   TEAMS_APP_ID: "00000000-0000-0000-0000-000000000000"
   TEAMS_APP_PASSWORD: "your-azure-app-client-secret"
-  TEAMS_TENANT_ID: "11111111-1111-1111-1111-111111111111" # Optional single-tenant lock-down
 ```
+
+The tenant lock-down is `spec.integration.teams.tenantId` on the PlatformAgent (below), not a Secret key.
 
 ---
 
@@ -60,18 +65,16 @@ stringData:
 ```yaml
 platformAgent:
   credentials:
-    secretName: platform-agent-credentials
+    secretName: platform-agent-secrets
   integration:
     teams:
       enabled: true
       tenantId: "11111111-1111-1111-1111-111111111111"
       allowedUsers:
+        - "22222222-2222-2222-2222-222222222222" # Entra ID Object ID (from.aadObjectId)
         - "alice@example.com"
-        - "bob@example.com"
-        - "22222222-2222-2222-2222-222222222222"
       allowAllUsers: false
       homeChannel: "19:abc123conversationid@thread.v2"
-      serviceUrl: "https://smba.trafficmanager.net/teams/"
       adaptiveCards: true
 ```
 
@@ -82,25 +85,24 @@ apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: PlatformAgent
 metadata:
   name: platform-agent
-  namespace: kube-agents-system
+  namespace: kubeagents-system
 spec:
   credentialsSecretRef:
-    name: platform-agent-credentials
+    name: platform-agent-secrets
   integration:
     teams:
       enabled: true
       appIdSecretRef:
-        name: platform-agent-credentials
+        name: platform-agent-secrets
         key: TEAMS_APP_ID
       appPasswordSecretRef:
-        name: platform-agent-credentials
+        name: platform-agent-secrets
         key: TEAMS_APP_PASSWORD
       tenantId: "11111111-1111-1111-1111-111111111111"
       allowedUsers:
-        - "admin@example.com"
+        - "22222222-2222-2222-2222-222222222222"
       allowAllUsers: false
       homeChannel: "19:teamchannelid@thread.v2"
-      serviceUrl: "https://smba.trafficmanager.net/teams/"
       adaptiveCards: true
 ```
 
@@ -119,11 +121,6 @@ spec:
 
 ---
 
-## Interactive ChatOps Commands
+## Talking to the agent
 
-Once installed, you can interact with the agent:
-
-- `@Kage /audit fleet` — Trigger a fleet-wide cgroup and GCE/GKE configuration audit.
-- `@Kage /remediate <finding-id>` — Review and execute automated remediation workflows with Interactive Adaptive Cards.
-- `@Kage status` — Check agent health, cluster connectivity, and queue state.
-- `@Kage help` — List available toolsets and ChatOps capabilities.
+Once inbound delivery ships and the app is installed, you mention the bot and ask in plain language, as on Google Chat and Slack; there is no command syntax.
