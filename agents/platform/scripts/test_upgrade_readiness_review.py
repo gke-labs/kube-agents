@@ -327,6 +327,27 @@ class Registration(unittest.TestCase):
             _outcomes, _problems, claimed = review.register([west], [], review.member_findings(west))
         self.assertEqual(claimed, {f"{PROJECT}/us-central1-a/prod"})
 
+    def test_twins_whose_objects_coincide_share_one_finding(self):
+        calls = []
+
+        def fake_request(path, body):
+            calls.append(body)
+            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]]}
+
+        west = member("prod", "blocked", pdbs={"blocking": [budget(name="pinned")]})
+        east = member("prod", "blocked", pdbs={"blocking": [budget(name="pinned")]})
+        east["location"] = "europe-west1"
+        findings = review.fold_shared_ids(review.member_findings(west) + review.member_findings(east))
+        self.assertEqual(len(findings), 1)
+        self.assertIn("also on acme-prod/europe-west1/prod", findings[0]["detail"])
+        with mock.patch.object(review, "kv_request", fake_request):
+            outcomes, problems, claimed = review.register([west, east], [], review.member_findings(west) + review.member_findings(east))
+        self.assertEqual(problems, [])
+        self.assertEqual(claimed, set())
+        self.assertEqual(len(calls), 1)  # one POST carries the one finding; the other twin has nothing left to send and no claim
+        self.assertEqual(set(outcomes.values()), {"created"})
+        self.assertEqual(len(outcomes), 1)
+
     def test_a_row_the_queue_would_refuse_fails_alone(self):
         calls = []
 
@@ -449,12 +470,15 @@ class TheRecord(unittest.TestCase):
         doc, findings = self.summary_for([seeded_b()])
         home = review.weekly_home()
         for stamp in [f"2026100{i}T060000Z" for i in range(1, 10)]:
-            review.write_record(home, stamp, "# r\n", {"members": []}, {"findings": []}, doc)
+            review.write_record(home, stamp, f"# r {stamp}\n", {"members": []}, {"findings": []}, {**doc, "stamp": stamp})
         runs = sorted(p.name for p in home.iterdir() if p.is_dir())
         self.assertEqual(len(runs), review.KEEP_RUNS)
         self.assertEqual(runs[-1], "20261009T060000Z")
-        self.assertEqual(json.loads((home / review.LATEST_JSON_NAME).read_text())["stamp"], doc["stamp"])
-        self.assertEqual(review.load_previous(home)["stamp"], doc["stamp"])
+        # The latest files are the newest run's, replaced whole, with no temporary left.
+        self.assertEqual(json.loads((home / review.LATEST_JSON_NAME).read_text())["stamp"], "20261009T060000Z")
+        self.assertEqual((home / review.LATEST_MD_NAME).read_text(), "# r 20261009T060000Z\n")
+        self.assertEqual(review.load_previous(home)["stamp"], "20261009T060000Z")
+        self.assertEqual([p.name for p in home.iterdir() if p.name.endswith(review.TMP_SUFFIX)], [])
 
     def test_the_sandbox_copy_program_writes_both_files_readable(self):
         program = review.sandbox_copy_program({"latest.md": "# r 🎄 exclusion\n", "latest.json": "{}"})
@@ -488,9 +512,13 @@ class TheRecord(unittest.TestCase):
             exec(broken, {})  # noqa: S102 - the program under test
         self.assertEqual((fake_dir / "latest.md").read_text(encoding="utf-8"), "# second\n")
         self.assertEqual(oct(os.stat(fake_dir).st_mode & 0o777), oct(review.SANDBOX_COPY_DIR_CLOSED_MODE))
-        os.chmod(fake_dir, review.SANDBOX_COPY_DIR_OPEN_MODE)
-        for stray in fake_dir.glob("*" + review.TMP_SUFFIX):
-            stray.unlink()
+        self.assertTrue(any(p.name.endswith(review.TMP_SUFFIX) for p in fake_dir.iterdir()))
+        # The next run replaces the strays itself: nobody has to clean up by hand.
+        fourth = review.sandbox_copy_program({"latest.md": "# fourth\n", "latest.json": "{}"}).replace(json.dumps(review.SANDBOX_COPY_DIR), json.dumps(str(fake_dir)))
+        exec(fourth, {})  # noqa: S102 - the program under test
+        self.assertEqual((fake_dir / "latest.md").read_text(encoding="utf-8"), "# fourth\n")
+        self.assertEqual(sorted(p.name for p in fake_dir.iterdir()), ["latest.json", "latest.md"])
+        os.chmod(fake_dir, review.SANDBOX_COPY_DIR_OPEN_MODE)  # so the fixture's cleanup can remove it
         os.chmod(fake_dir, review.SANDBOX_COPY_DIR_OPEN_MODE)  # so the fixture's cleanup can remove it
 
     def test_without_an_ssh_sandbox_the_copy_is_a_plain_local_write(self):

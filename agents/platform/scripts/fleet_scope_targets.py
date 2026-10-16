@@ -157,8 +157,8 @@ RENDER_PRESENT_KEY = "present"
 # sweep is then that project, until the next tick writes the resolved set. One
 # name: it is what the platform_control env block forwards to the fleet_scope
 # tool (agents/platform/config.yaml), and what the gateway pod's own
-# environment carries for the upgrade-readiness-watch job, the other
-# production reader.
+# environment carries for the upgrade-readiness-watch and
+# upgrade-readiness-weekly-review jobs, the other production readers.
 MANAGEMENT_PROJECT_ENVS = ("GCP_PROJECT_ID",)
 
 # The keys under `declared` whose presence means the install drew a boundary,

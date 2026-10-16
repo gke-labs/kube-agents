@@ -322,6 +322,7 @@ BUDGET_EXHAUSTED_DETAIL = "the run's time budget ran out before this project"
 CUT_SHORT_DETAIL = "readiness run cut short by the review's time budget after {seconds}s; it goes first next week"
 LISTING_FAILED_DETAIL = "the project's cluster listing failed"
 DUPLICATE_DETAIL_SEPARATOR = " | also: "  # two rows of one member that derive one queue id
+SHARED_DETAIL_SEPARATOR = " | also on {member}: "  # two same-named clusters whose objects coincide
 TMP_SUFFIX = watch.LEDGER_TMP_SUFFIX  # a file is written beside its name and renamed over it
 FAILED_LINE = "{prefix}: failed: {detail}"
 RECOVERED_LINE = "{prefix}: runs again after a failure"
@@ -655,7 +656,16 @@ def member_findings(member: dict) -> list[dict]:
     are one finding whose detail carries both texts and whose rubric is the
     higher, since the queue would hold one row and answer the second as an
     update of the first."""
-    items = budget_findings(member) + exclusion_findings(member) + skew_findings(member) + webhook_findings(member) + rule_findings(member)
+    return fold_shared_ids(budget_findings(member) + exclusion_findings(member) + skew_findings(member) + webhook_findings(member) + rule_findings(member))
+
+
+def fold_shared_ids(items: list[dict]) -> list[dict]:
+    """One finding per queue id across the items handed in. Within a member,
+    two rows that derive one id are one finding whose detail carries both
+    texts; across members, two same-named clusters in one project whose
+    objects coincide (regional twins deployed alike) derive one id too, since
+    the queue's identity carries no location, and the one finding's detail
+    names the other member. The rubric is the higher of the two."""
     by_id: dict[str, dict] = {}
     for item in items:
         fid = item_id(item)
@@ -663,7 +673,10 @@ def member_findings(member: dict) -> list[dict]:
         if first is None:
             by_id[fid] = item
             continue
-        first["detail"] = clip(first["detail"] + DUPLICATE_DETAIL_SEPARATOR + item["detail"])
+        if item[MEMBER_FIELD] != first[MEMBER_FIELD]:
+            first["detail"] = clip(first["detail"] + SHARED_DETAIL_SEPARATOR.format(member=item[MEMBER_FIELD]) + item["detail"])
+        else:
+            first["detail"] = clip(first["detail"] + DUPLICATE_DETAIL_SEPARATOR + item["detail"])
         if rank_of(item) > rank_of(first):
             first["rubric"] = item["rubric"]
     return list(by_id.values())
@@ -788,7 +801,7 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
     problems: list[str] = []
     claimed: set[str] = set()
     by_member: dict[str, list[dict]] = {}
-    for item in findings:
+    for item in fold_shared_ids(findings):
         by_member.setdefault(item[MEMBER_FIELD], []).append(item)
     pairs = [cluster_fields(m)[:: len(watch.MEMBER_ID_KEYS) - 1] for m in members]
     twins = {pair for pair in pairs if pairs.count(pair) > 1}
@@ -1054,10 +1067,13 @@ def sandbox_copy_program(files: dict[str, str]) -> str:
             # beside last week's summary, or a half-written file; the directory
             # is closed again whatever happened.
             "    for name, text in FILES.items():",
-            "        with open(os.path.join(DIR, name + TMP), 'wb') as handle:",
+            "        tmp = os.path.join(DIR, name + TMP)",
+            "        if os.path.exists(tmp):",  # a run that failed between the write and the rename
+            "            os.remove(tmp)",
+            "        with open(tmp, 'wb') as handle:",
             "            handle.write(base64.b64decode(text))",
-            "        os.chmod(os.path.join(DIR, name + TMP), MODE)",
             "    for name in FILES:",
+            "        os.chmod(os.path.join(DIR, name + TMP), MODE)",
             "        os.replace(os.path.join(DIR, name + TMP), os.path.join(DIR, name))",
             "finally:",
             "    os.chmod(DIR, CLOSED)",
@@ -1077,7 +1093,9 @@ def copy_locally(files: dict[str, str]) -> str | None:
             return None
         target.mkdir(parents=True, exist_ok=True)
         for name, text in files.items():
-            (target / name).write_text(text, encoding="utf-8")
+            (target / (name + TMP_SUFFIX)).write_text(text, encoding="utf-8")
+        for name in files:
+            os.replace(target / (name + TMP_SUFFIX), target / name)
     except OSError as exc:
         return str(exc)
     return None
@@ -1152,7 +1170,7 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
     claimed: set[str] = set()
 
     def registered(found: list[dict], read_errors: list[dict]) -> None:
-        items = [item for member in found for item in member_findings(member)]
+        items = fold_shared_ids([item for member in found for item in member_findings(member)])
         findings.extend(items)
         if dry_run:
             return

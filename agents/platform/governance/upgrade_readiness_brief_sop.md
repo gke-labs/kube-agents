@@ -18,8 +18,9 @@ chat carries one of its lines: the failure line, the partial line, or the line t
 did not land. Step 1 says what each means; nothing else sequences the two.
 
 **Why a model turn.** The review job can rank by rubric; it cannot tell that two criticals on one
-cluster are one problem, that a major on the cluster the agent itself runs on outranks a critical on
-a scratch cluster, or that an exclusion ending next week matters more than one ending in January.
+cluster are one problem, that a critical on the cluster the agent itself runs on outranks the same
+one on a scratch cluster, or that a critical whose clock ends next week matters more than one with
+no date.
 That is the judgement this turn makes, inside the rules below. The rules bound the length and the
 shape; the model chooses the emphasis.
 
@@ -102,10 +103,12 @@ Rules for the judgement:
 - **Lead with what needs a decision.** The lines under **Decide now** are the undecided
   criticals, worst first, one line per cluster and at most ten lines: every critical on one cluster
   is one problem, so the cluster's line names each of its ids and objects, and its worst finding
-  sets its place. The queue's rank order is the default. Depart from it when one of these holds,
-  and only then: a finding on the cluster the agent runs on outranks the same finding elsewhere; a finding whose clock is short (an exclusion or a target that ends within thirty days)
-  outranks one with no date; a `major` whose evidence says a serving workload goes down outranks a
-  `critical` on a cluster the summary lists as `unknown` or whose evidence is inferred.
+  sets its place. The queue's rank order is the default. Depart from it, among the criticals and
+  only among them, when one of these holds: a critical on the cluster the agent runs on outranks
+  the same one elsewhere; a critical whose clock is short (a target or a date within thirty days)
+  outranks one with no date; a critical whose evidence says a serving workload goes down outranks
+  one on a cluster the summary lists as `unknown` or whose evidence is inferred. No major or minor
+  moves up: they have their own line below.
 - **One clause of why, one action.** "Budget `pinned-batch-runner` refuses eviction of its only
   pod, so the drain kills it" is the clause; the action is the row's `action`, shortened to the
   verb and the object. Never paste the row's full text.

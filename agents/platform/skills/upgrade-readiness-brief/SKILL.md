@@ -63,9 +63,10 @@ gets the same shape in chat. Read only. Register nothing, decide nothing, upgrad
 
    - **Decide now** lists the undecided criticals, worst first (the queue's order), one line per
      cluster and at most ten lines: every critical on one cluster goes in that cluster's line, with
-     each id and object, and its worst finding sets its place. A finding on the cluster the agent
-     runs on, or one whose clock ends within thirty days, may move up; so may a major whose evidence
-     says a serving workload goes down, over a critical on a cluster the summary lists as `unknown`.
+     each id and object, and its worst finding sets its place. Among the criticals, and only among
+     them, one on the cluster the agent runs on, one whose clock ends within thirty days, or one
+     whose evidence says a serving workload goes down moves up over one on a cluster the summary
+     lists as `unknown`; no major or minor moves up.
      Never leave the section empty while an undecided critical exists; when every critical row is
      `accepted`, `snoozed` or `dismissed`, the section reads `**Decide now:** nothing; every critical
 finding has a decision.` When nothing was found at all, the brief is the headline and the

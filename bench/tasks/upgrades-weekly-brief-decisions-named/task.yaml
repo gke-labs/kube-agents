@@ -72,8 +72,10 @@ verification_spec:
         - readiness-drain-blocked
       any_of_patterns:
         # Bounded to the Decide-now block the same way the webhook check below
-        # is, so a budget named only under "Also this week" is not a pass.
-        - "(?is)decide now(?:(?!\\nalso this week|\\ndecided earlier|\\nnot read this week|\\nfull report:).){0,3000}?pinned-batch-runner"
+        # is, so a budget named only under "Also this week" is not a pass. The
+        # block's end is the next label, not a character count: ten lines of
+        # three ids each run past any count a short brief would suggest.
+        - "(?is)decide now(?:(?!\\nalso this week|\\ndecided earlier|\\nnot read this week|\\nfull report:).)*?pinned-batch-runner"
       required_phrases: ["pinned-batch-runner"]
   - name: the-budget-line-names-the-cluster-and-what-it-costs
     role: objective
@@ -83,14 +85,16 @@ verification_spec:
       fixture_roles:
         - readiness-drain-blocked
       any_of_patterns:
-        # One line: the cluster, the budget and its cost must sit on the same
-        # Decide-now line, so the gaps never cross a line break; the cost word
-        # must come before the action ("Do:"), so an action phrased with evict
-        # or drain is not taken for the cost clause; and the id's own
-        # "drain-blocking" does not count as one either.
-        - "(?i){cluster:b}[^\\n]{0,400}?pinned-batch-runner(?:(?!\\bdo:)[^\\n]){0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)"
-        - "(?i)pinned-batch-runner[^\\n]{0,400}?{cluster:b}(?:(?!\\bdo:)[^\\n]){0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)"
-        - "(?i){cluster:b}(?:(?!\\bdo:)[^\\n]){0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)[^\\n]{0,400}?pinned-batch-runner"
+        # One line, one clause: the cluster, the budget and its cost must sit
+        # on the same Decide-now line and the cost word inside the first
+        # sentence after them (the SOP's "<what blocks and what it costs, one
+        # clause>." ends at a full stop, and the action follows it), so an
+        # action phrased with evict or drain is not taken for the cost clause
+        # however it is introduced; the id's own "drain-blocking" does not
+        # count as one either.
+        - "(?i){cluster:b}[^\\n]{0,400}?pinned-batch-runner[^\\n.]{0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)"
+        - "(?i)pinned-batch-runner[^\\n]{0,400}?{cluster:b}[^\\n.]{0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)"
+        - "(?i){cluster:b}[^\\n.]{0,400}?(evict\\w*|drains?\\b(?!-blocking)|only pod|single replica|one replica|singleton)[^\\n]{0,400}?pinned-batch-runner"
   - name: the-webhook-outage-is-not-a-decision
     role: objective
     mode: assert
@@ -103,7 +107,7 @@ verification_spec:
         # The harness strips emphasis marks before matching and, with
         # fold_decoration, a bullet, heading or indent in front of a label, so
         # the labels are anchored on their line start.
-        - "(?is)decide now(?:(?!\\nalso this week|\\ndecided earlier|\\nnot read this week|\\nfull report:).){0,4000}?seeded-fail-closed-gate"
+        - "(?is)decide now(?:(?!\\nalso this week|\\ndecided earlier|\\nnot read this week|\\nfull report:).)*?seeded-fail-closed-gate"
   - name: the-brief-says-where-the-full-report-is-and-how-to-open-it
     role: objective
     mode: assert
