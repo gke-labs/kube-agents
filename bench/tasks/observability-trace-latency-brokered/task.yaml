@@ -1,4 +1,5 @@
-# Registered in hack/eval/nightly-cases.txt from 2026-10-16. It merged parked
+# Registered in hack/eval/nightly-cases.txt; nightly from the merge that
+# un-parked it. It merged parked
 # (a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py) while the
 # pool host clusters exported no traces; the collection scope was set on
 # every one on 2026-10-02 and the provisioning script and the verifier hold

@@ -1061,7 +1061,8 @@
 # shape and on the worker's route (no token fetched or pasted). Reads the
 # install's own traces; parked in FIXTURE_NOT_READY from its merge until the
 # pool host clusters exported traces (scope set 2026-10-02, held by the
-# provisioning script and the verifier since). Nightly from 2026-10-16.
+# provisioning script and the verifier since). Nightly from the merge
+# that un-parked it.
 # deployer: noop, read-only, no fixture: three units at the 200s default,
 # ~10 serial minutes, off the infra lock, main nightly part.
 ./tasks/observability-trace-latency-brokered/task.yaml
