@@ -107,21 +107,25 @@ neither reads nor writes the rollout record, so the record above is untouched by
 
 ### Reading `get-server-config` by hand
 
-Prefer the script, even for one cluster: `--cluster <location>/<name>` answers "is this control
-plane current for its channel?" and measures it against the right field. If you do read
-`gcloud container get-server-config` yourself, each entry of `channels[]` carries three versions,
-and only one of them is the channel's current version:
+Prefer the script, even for one cluster: the command above with `--cluster <location>/<name>`
+added (and the `collector_args`, as always) answers "is this control plane current for its
+channel?" against the right field. Read the control-plane column for that question: a member's
+status also folds in its node pools. If you do read `gcloud container get-server-config`
+yourself, read it at the cluster's location (`--location`, `--project`). Each entry of
+`channels[]` carries up to three versions, and only one of them is the channel's current version:
 
 - `defaultVersion` is the version the channel offers now, what a new cluster on it gets. A cluster
   is behind its channel when its `currentMasterVersion` is below this, and the lag in minors is
   measured against it.
-- `upgradeTargetVersion` is the version GKE's automatic upgrades currently move clusters on the
-  channel to, and it can trail `defaultVersion` by a minor: on 2026-10-16 REGULAR's target was
-  `1.35.8-gke.1439001` while its default was `1.36.4-gke.1391002`. It is not the channel's current
-  version, so a cluster at or above it can still be a minor behind `defaultVersion`.
-- `validVersions` is everything the channel will accept. A version on it is offered, not current.
+- `upgradeTargetVersion`, where present, is the version GKE's automatic upgrades currently move
+  clusters on the channel to, and it can trail `defaultVersion` by a minor: on 2026-10-16 REGULAR's
+  was `1.35.8-gke.1439001` while its default was `1.36.4-gke.1391002`. It is not the channel's
+  current version, so a cluster at or above it can still be a minor behind `defaultVersion`.
+- `validVersions` is what the channel currently offers. A running version absent from it can still
+  be served (GKE keeps patching a version a channel has promoted past), so its absence does not
+  mean unsupported.
 
-So "on the channel's upgrade target" and "current" are different answers. Report the cluster's
+So "at the automatic-upgrade version" and "current" are different answers. Report the cluster's
 version, the channel's `defaultVersion`, and the gap in minors between them.
 
 ## Read the table
