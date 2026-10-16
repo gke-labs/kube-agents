@@ -60,6 +60,7 @@ import os
 import re
 import shlex
 import subprocess
+import textwrap
 import time
 import urllib.error
 import urllib.parse
@@ -119,6 +120,7 @@ __all__ = [
     "ReplayCardVerifier",
     "ReplyIsSilentVerifier",
     "ReportContainsVerifier",
+    "ReportManifestVerifier",
     "SandboxTreeMatchesImageVerifier",
     "ToolCalledVerifier",
     "WorkerCommandsVerifier",
@@ -129,6 +131,27 @@ _NO_TRANSCRIPT_REASON = (
     "agent execution (kube_agents_bench.transcript is empty), so this check "
     "could not be evaluated"
 )
+# A fence line read by ``report_manifest``, after any blockquote prefix: an
+# optional indent (a block inside a list item), a run of three or more
+# backticks or tildes, and the info string. CommonMark closes a block on a run
+# of the same character at least as long, with no info string.
+_FENCE_LINE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
+# The ``> `` prefix of a line inside a blockquote, nested quotes included.
+_BLOCKQUOTE_PREFIX = re.compile(r"^[ \t]*(?:>[ \t]?)+")
+# The marker of a list item whose first line opens a fence (``- ```yaml``).
+_LIST_MARKER_PREFIX = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+")
+# A shell heredoc opener (``kubectl apply -f - <<'EOF'``): its body is the
+# manifest when an answer shows the command rather than the bare YAML.
+_HEREDOC_OPENER = re.compile(r"<<-?[ \t]*['\"]?([\w.-]+)['\"]?")
+# The kind suffix of a list whose ``items`` are the documents it wraps:
+# ``List`` and the typed lists (``PodList``, ``PodDisruptionBudgetList``).
+_LIST_KIND_SUFFIX = "List"
+# The Kubernetes label-selector operators ``report_manifest`` evaluates.
+_SELECTOR_IN = "In"
+_SELECTOR_NOT_IN = "NotIn"
+_SELECTOR_EXISTS = "Exists"
+_SELECTOR_DOES_NOT_EXIST = "DoesNotExist"
+_PATH_SEPARATOR = "."
 _UNREACHED_SLOT_REASON = (
     "a seeded cluster this check's patterns require a line about was not reached before the run, "
     "so a missing line about it is the environment's gap, not the agent's miss"
@@ -712,6 +735,289 @@ class ReportContainsVerifier(BaseVerifier):
             success=True,
             elapsed_time=time.monotonic() - start,
             reason="report contains " + ", ".join(satisfied),
+        )
+
+
+class ManifestField(BaseModel):
+    """One field a ``report_manifest`` document must carry or leave out.
+
+    With ``equals``, the value at ``path`` (dot-separated keys, so a key that
+    itself contains a dot, such as a label name, cannot be addressed) is one of the
+    entries; with ``absent_or``, the path is absent or its value is one of
+    them, and an empty list means it must be absent. Each entry is a YAML
+    scalar compared by type as well as value, the way the API server reads
+    it: ``"0"`` is the integer 0 and matches ``maxUnavailable: 0``, not the
+    quoted ``maxUnavailable: "0"`` an ``IntOrString`` field refuses; write
+    ``'"0"'`` to accept the string.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    path: str
+    equals: list[str] | None = Field(default=None, min_length=1)
+    absent_or: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _one_form(self) -> "ManifestField":
+        if (self.equals is None) == (self.absent_or is None):
+            raise ValueError("a manifest field needs exactly one of equals or absent_or")
+        return self
+
+    def holds(self, document: dict[str, Any]) -> bool:
+        value = _at_path(document, self.path)
+        if value is None:
+            return self.equals is None
+        accepted = [yaml.safe_load(entry) for entry in (self.equals or self.absent_or or [])]
+        return any(type(value) is type(entry) and value == entry for entry in accepted)
+
+
+def _fenced_bodies(text: str) -> list[str]:
+    """The body of every fenced code block in ``text``, nested blocks too.
+
+    A line walker rather than a regex, so a bare fence closes only the block
+    that is open, a longer fence holds shorter ones, CRLF line ends and a
+    blockquote prefix are stripped, a fence may open on a list item's first
+    line, and a block left open runs to the end of
+    the text, as CommonMark has it. Each body is scanned again, so a relayed
+    answer that wraps the worker's ``yaml`` block in a fence of its own still
+    has the inner block read.
+    """
+    bodies: list[str] = []
+    pending = [text]
+    while pending:
+        found = _top_level_fenced_bodies(pending.pop())
+        bodies += found
+        pending += found
+    return bodies
+
+
+def _top_level_fenced_bodies(text: str) -> list[str]:
+    """The fenced code blocks of ``text`` itself, not those nested in them."""
+    bodies: list[str] = []
+    fence = ""
+    quoted = False
+    lines: list[str] = []
+    for line in text.split("\n"):
+        line = line.rstrip("\r")
+        unquoted = _BLOCKQUOTE_PREFIX.sub("", line, count=1)
+        if not fence:
+            match = _FENCE_LINE.match(_LIST_MARKER_PREFIX.sub("", unquoted, count=1))
+            if match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
+                fence, quoted, lines = match.group(1), unquoted != line, []
+            continue
+        content = unquoted if quoted else line
+        match = _FENCE_LINE.match(content)
+        if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence) and not match.group(2).strip():
+            bodies.append("\n".join(lines))
+            fence = ""
+            continue
+        lines.append(content)
+    if fence:
+        bodies.append("\n".join(lines))
+    return bodies
+
+
+def _heredoc_bodies(body: str) -> list[str]:
+    """The text of every heredoc in a shell block, up to its terminator line."""
+    lines = body.split("\n")
+    found = []
+    for index, line in enumerate(lines):
+        match = _HEREDOC_OPENER.search(line)
+        if not match:
+            continue
+        rest = lines[index + 1 :]
+        end = next((i for i, text in enumerate(rest) if text.strip() == match.group(1)), len(rest))
+        found.append("\n".join(rest[:end]))
+    return found
+
+
+def _loaded_documents(body: str) -> list[Any]:
+    """The documents of ``body`` that load before any YAML error.
+
+    A block that is prose or shell yields nothing. A manifest followed, after
+    ``---``, by a line YAML refuses keeps the documents before it; one
+    followed by such a line with no ``---`` between is lost with it, since
+    the error falls inside the manifest's own document. JSON that YAML
+    refuses (tab indentation) is read as JSON.
+    """
+    documents = []
+    try:
+        for document in yaml.safe_load_all(body):
+            documents.append(document)
+    except (yaml.YAMLError, ValueError, RecursionError):
+        # PyYAML builds an impossible timestamp (2026-02-30) with datetime,
+        # whose ValueError is outside the YAMLError hierarchy; its composer
+        # recurses once per nesting level, so deeply nested input raises
+        # RecursionError instead.
+        try:
+            return [json.loads(body)]
+        except (ValueError, RecursionError):
+            pass
+    return documents
+
+
+def _flattened(document: Any) -> list[dict[str, Any]]:
+    """A mapping as itself; a sequence, or a list kind's ``items``, as the
+    mappings it holds. A work list rather than recursion, and each container
+    is visited once, so deep nesting and a YAML alias cycle (``&a [*a]``)
+    both end."""
+    found: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    pending = [document]
+    while pending:
+        node = pending.pop()
+        if id(node) in seen:
+            continue
+        if isinstance(node, list):
+            seen.add(id(node))
+            pending += reversed(node)
+        elif isinstance(node, dict):
+            seen.add(id(node))
+            found.append(node)
+            kind, items = node.get("kind"), node.get("items")
+            if isinstance(kind, str) and kind.endswith(_LIST_KIND_SUFFIX) and isinstance(items, list):
+                pending.append(items)
+    return found
+
+
+def _manifest_documents(raw: str) -> list[dict[str, Any]]:
+    """Every mapping document in the report's fenced code blocks, including
+    the heredocs of shell blocks and the items of a list. JSON is YAML."""
+    documents = []
+    for block in _fenced_bodies(raw):
+        body = textwrap.dedent(block)
+        for source in [body, *_heredoc_bodies(body)]:
+            for document in _loaded_documents(textwrap.dedent(source)):
+                documents.extend(_flattened(document))
+    return documents
+
+
+def _at_path(document: dict[str, Any], path: str) -> Any:
+    node: Any = document
+    for key in path.split(_PATH_SEPARATOR):
+        if not isinstance(node, dict) or key not in node:
+            return None
+        node = node[key]
+    return node
+
+
+def _selects(selector: Any, labels: dict[str, str]) -> bool:
+    """Whether a Kubernetes label selector selects a pod with ``labels``.
+
+    A missing selector selects nothing (``policy/v1``); an empty one selects
+    everything. A malformed selector selects nothing, so it can never stand in
+    for a correct one.
+    """
+    if not isinstance(selector, dict):
+        return False
+    match_labels = selector.get("matchLabels") or {}
+    expressions = selector.get("matchExpressions") or []
+    if not isinstance(match_labels, dict) or not isinstance(expressions, list):
+        return False
+    if any(labels.get(str(key)) != str(value) for key, value in match_labels.items()):
+        return False
+    for expression in expressions:
+        if not isinstance(expression, dict):
+            return False
+        key = expression.get("key")
+        operator = expression.get("operator")
+        values = expression.get("values") or []
+        # What the API server refuses at admission selects nothing here: a
+        # missing key, In/NotIn without values, Exists/DoesNotExist with them.
+        if not isinstance(key, str) or not key or not isinstance(values, list):
+            return False
+        if (operator in (_SELECTOR_IN, _SELECTOR_NOT_IN)) != bool(values):
+            return False
+        values = [str(v) for v in values]
+        present = key in labels
+        if operator == _SELECTOR_IN:
+            held = present and labels[key] in values
+        elif operator == _SELECTOR_NOT_IN:
+            held = not present or labels[key] not in values
+        elif operator == _SELECTOR_EXISTS:
+            held = present
+        elif operator == _SELECTOR_DOES_NOT_EXIST:
+            held = not present
+        else:
+            return False
+        if not held:
+            return False
+    return True
+
+
+@VERIFIERS.register("report_manifest")
+class ReportManifestVerifier(BaseVerifier):
+    """Whether the answer carries one manifest that does what the case asks.
+
+    ``report_contains`` reads text, so a regex standing in for a manifest can
+    take a token from prose, a comment, a second document or another list
+    entry. This check parses instead: every fenced code block in the answer is
+    loaded as YAML (JSON is YAML), and the check passes when a single document
+    has ``kind``, meets every one of ``fields`` and, when given, a label selector at
+    ``selector_path`` that selects every label set in ``selects`` and none in
+    ``excludes``. The selector is evaluated the way Kubernetes evaluates it
+    (``matchLabels`` and ``matchExpressions`` with ``In``, ``NotIn``,
+    ``Exists`` and ``DoesNotExist``), so any spelling of the same selector is
+    the same answer. A manifest outside a fenced block is not read; inside
+    one it is read from a bare document, a sequence or ``kind: List``, or a
+    shell heredoc.
+
+    ``scope`` is ``report_contains``'s: ``final`` (the default) is what the
+    user receives, ``full`` the accumulated output.
+    """
+
+    type: Literal["report_manifest"]
+    kind: str
+    fields: list[ManifestField] = Field(default_factory=list)
+    selector_path: str = "spec.selector"
+    selects: list[dict[str, str]] = Field(default_factory=list)
+    excludes: list[dict[str, str]] = Field(default_factory=list)
+    scope: Literal["final", "full"] = "final"
+
+    @model_validator(mode="after")
+    def _asserts_something(self) -> "ReportManifestVerifier":
+        if not (self.fields or self.selects or self.excludes):
+            raise ValueError("report_manifest needs fields, selects or excludes; kind alone asserts only a word")
+        return self
+
+    def _matches(self, document: dict[str, Any]) -> bool:
+        if document.get("kind") != self.kind:
+            return False
+        if not all(field.holds(document) for field in self.fields):
+            return False
+        if self.selects or self.excludes:
+            selector = _at_path(document, self.selector_path)
+            if not all(_selects(selector, labels) for labels in self.selects):
+                return False
+            if any(_selects(selector, labels) for labels in self.excludes):
+                return False
+        return True
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_TRANSCRIPT_REASON,
+            )
+        raw = snap.final_message if self.scope == "final" else snap.output
+        documents = _manifest_documents(raw)
+        same_kind = [d for d in documents if d.get("kind") == self.kind]
+        if any(self._matches(d) for d in same_kind):
+            return VerificationResult(
+                success=True,
+                elapsed_time=time.monotonic() - start,
+                reason=f"a {self.kind} manifest in the answer meets every condition",
+            )
+        return VerificationResult(
+            success=False,
+            elapsed_time=time.monotonic() - start,
+            reason=(
+                f"no {self.kind} manifest in the answer meets every condition: "
+                f"{len(documents)} manifest document(s) parsed, {len(same_kind)} of kind {self.kind}"
+            ),
         )
 
 
@@ -3460,10 +3766,8 @@ def _is_kubernetes_list(node: Any) -> bool:
     """Whether a mapping node is a ``kind: List`` with a sequence of ``items``."""
     keys = {k.value: v for k, v in node.value if isinstance(k, yaml.ScalarNode)}
     kind, items = keys.get("kind"), keys.get("items")
-    # `List` and the typed lists (`PodList`, `ConfigMapList`) kubectl reads
-    # the same way.
     return (
-        isinstance(kind, yaml.ScalarNode) and kind.value.endswith("List")
+        isinstance(kind, yaml.ScalarNode) and kind.value.endswith(_LIST_KIND_SUFFIX)
         and isinstance(items, yaml.SequenceNode)
     )
 

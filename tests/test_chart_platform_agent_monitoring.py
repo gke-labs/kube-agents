@@ -49,7 +49,13 @@ _GOLDEN_AGENT = "platformagent"
 _GMP_API = "monitoring.googleapis.com/v1/PodMonitoring"
 # What a cluster with GKE Managed Prometheus tells helm it serves.
 _ON_GKE = ["--api-versions", _GMP_API]
+_PROMETHEUS_OPERATOR_API = "monitoring.coreos.com/v1/ServiceMonitor"
+_ON_PROMETHEUS = ["--api-versions", _PROMETHEUS_OPERATOR_API]
+_VICTORIAMETRICS_API = "operator.victoriametrics.com/v1beta1/VMPodScrape"
+_ON_VICTORIAMETRICS = ["--api-versions", _VICTORIAMETRICS_API]
 _GATE = '{{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentPodMonitoring" .) }}'
+_SERVICE_MONITOR_GATE = '{{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentServiceMonitor" .) }}'
+_VM_POD_SCRAPE_GATE = '{{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentVMPodScrape" .) }}'
 
 # One row per scraped pod: the PodMonitoring name suffix, the Deployment and
 # container the golden declares the port on, the port's name there, and the
@@ -59,6 +65,7 @@ _GATE = '{{- if and .Values.platformAgent.enabled (include "kube-agents.platform
 _SCRAPES = (
     {
         "suffix": "-gateway-monitoring",
+        "sm_suffix": "-gateway-metrics",
         "deployment": "platformagent-gateway",
         "container": "agent-api-auth",
         "port_name": "event-metrics",
@@ -72,6 +79,7 @@ _SCRAPES = (
         # operator puts the label on the template, so the key is read from the
         # golden like the others.
         "suffix": "-gateway-chat-monitoring",
+        "sm_suffix": "-gw-chat-metrics",
         "deployment": "platformagent-gateway",
         "container": "platform-agent",
         "port_name": "chat-metrics",
@@ -79,6 +87,7 @@ _SCRAPES = (
     },
     {
         "suffix": "-credential-proxy-monitoring",
+        "sm_suffix": "-cred-metrics",
         "deployment": "platformagent-credential-proxy",
         "container": "envoy-credential-proxy",
         "port_name": "cred-metrics",
@@ -88,6 +97,7 @@ _SCRAPES = (
     # the module docstring).
     {
         "suffix": "-a2a-gateway-monitoring",
+        "sm_suffix": "-a2a-metrics",
         "fixture": _A2A_FIXTURE,
         "agent_name": "test-agent",
         "deployment": "test-agent-a2a-gateway",
@@ -157,11 +167,13 @@ class MonitoringShapeTest(unittest.TestCase):
     def test_the_value_defaults_to_null_and_the_schema_admits_the_tri_state(self):
         values = yaml.safe_load((_CHART / "values.yaml").read_text())
         self.assertIsNone(values["platformAgent"]["podMonitoring"])
+        self.assertIsNone(values["platformAgent"]["serviceMonitor"])
+        self.assertIsNone(values["platformAgent"]["vmPodScrape"])
         schema = json.loads((_CHART / "values.schema.json").read_text())
-        self.assertEqual(
-            schema["properties"]["platformAgent"]["properties"]["podMonitoring"],
-            {"type": ["boolean", "null"]},
-        )
+        props = schema["properties"]["platformAgent"]["properties"]
+        self.assertEqual(props["podMonitoring"], {"type": ["boolean", "null"]})
+        self.assertEqual(props["serviceMonitor"], {"type": ["boolean", "null"]})
+        self.assertEqual(props["vmPodScrape"], {"type": ["boolean", "null"]})
 
     def test_the_ports_are_the_ones_the_operator_declares(self):
         # Numbers rather than port names, because the gateway's listener is on
@@ -188,9 +200,15 @@ class MonitoringShapeTest(unittest.TestCase):
 
     def test_the_gate_asks_the_helper_and_the_helper_asks_the_cluster(self):
         self.assertIn(_GATE, self.template)
+        self.assertIn(_SERVICE_MONITOR_GATE, self.template)
+        self.assertIn(_VM_POD_SCRAPE_GATE, self.template)
         helpers = _HELPERS.read_text()
         self.assertIn('{{- define "kube-agents.platformAgentPodMonitoring" -}}', helpers)
         self.assertIn(f'.Capabilities.APIVersions.Has "{_GMP_API}"', helpers)
+        self.assertIn('{{- define "kube-agents.platformAgentServiceMonitor" -}}', helpers)
+        self.assertIn(f'.Capabilities.APIVersions.Has "{_PROMETHEUS_OPERATOR_API}"', helpers)
+        self.assertIn('{{- define "kube-agents.platformAgentVMPodScrape" -}}', helpers)
+        self.assertIn(f'.Capabilities.APIVersions.Has "{_VICTORIAMETRICS_API}"', helpers)
 
     def test_kind_up_leaves_the_default_to_the_cluster(self):
         # kind serves no PodMonitoring API, so the null default renders nothing
@@ -257,6 +275,352 @@ class MonitoringRenderTest(unittest.TestCase):
 
     def test_no_agent_renders_nothing(self):
         self.assertEqual(self._monitorings(*_ON_GKE, "--set", "platformAgent.enabled=false"), {})
+
+    def _service_monitors(self, *extra):
+        proc = subprocess.run(
+            ["helm", "template", "test-release", str(_CHART), *_REQUIRED, *extra],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        suffixes = tuple(scrape["sm_suffix"] for scrape in _SCRAPES)
+        return {
+            document["metadata"]["name"]: document
+            for document in yaml.safe_load_all(proc.stdout)
+            if isinstance(document, dict)
+            and document.get("kind") == "ServiceMonitor"
+            and document["metadata"]["name"].endswith(suffixes)
+        }
+
+    def _headless_services(self, *extra):
+        proc = subprocess.run(
+            ["helm", "template", "test-release", str(_CHART), *_REQUIRED, *extra],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        suffixes = tuple(scrape["sm_suffix"] for scrape in _SCRAPES)
+        return {
+            document["metadata"]["name"]: document
+            for document in yaml.safe_load_all(proc.stdout)
+            if isinstance(document, dict)
+            and document.get("kind") == "Service"
+            and document["metadata"]["name"].endswith(suffixes)
+        }
+
+    def _vm_pod_scrapes(self, *extra):
+        proc = subprocess.run(
+            ["helm", "template", "test-release", str(_CHART), *_REQUIRED, *extra],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        suffixes = tuple(scrape["sm_suffix"] for scrape in _SCRAPES)
+        return {
+            document["metadata"]["name"]: document
+            for document in yaml.safe_load_all(proc.stdout)
+            if isinstance(document, dict)
+            and document.get("kind") == "VMPodScrape"
+            and document["metadata"]["name"].endswith(suffixes)
+        }
+
+    def test_service_monitor_default_follows_the_cluster(self):
+        self.assertEqual(self._service_monitors(), {})
+        self.assertEqual(self._headless_services(), {})
+        rendered = self._service_monitors(*_ON_PROMETHEUS)
+        services = self._headless_services(*_ON_PROMETHEUS)
+        self.assertEqual(sorted(rendered), sorted(_AGENT + s["sm_suffix"] for s in _SCRAPES))
+        self.assertEqual(sorted(services), sorted(_AGENT + s["sm_suffix"] for s in _SCRAPES))
+        for scrape in _SCRAPES:
+            with self.subTest(scrape=scrape["sm_suffix"]):
+                sm = rendered[_AGENT + scrape["sm_suffix"]]
+                svc = services[_AGENT + scrape["sm_suffix"]]
+                self.assertEqual(svc["spec"]["clusterIP"], "None")
+                self.assertEqual(svc["spec"]["selector"], _selector(scrape, _AGENT))
+                self.assertEqual(
+                    svc["spec"]["ports"],
+                    [{
+                        "name": scrape["port_name"],
+                        "port": _scrape_port(scrape),
+                        "targetPort": _scrape_port(scrape),
+                    }],
+                )
+                svc_metrics_label = f"{_AGENT}{scrape['sm_suffix']}"
+                self.assertEqual(svc["metadata"]["labels"]["app"], svc_metrics_label)
+                self.assertEqual(sm["spec"]["selector"], {"matchLabels": {"app": svc_metrics_label}})
+                self.assertEqual(
+                    sm["spec"]["endpoints"],
+                    [{
+                        "port": scrape["port_name"],
+                        "path": "/metrics",
+                        "interval": "30s",
+                    }],
+                )
+
+    def test_service_monitor_true_renders_them_without_asking_the_cluster(self):
+        rendered = self._service_monitors("--set", "platformAgent.serviceMonitor=true")
+        self.assertEqual(sorted(rendered), sorted(_AGENT + s["sm_suffix"] for s in _SCRAPES))
+        services = self._headless_services("--set", "platformAgent.serviceMonitor=true")
+        self.assertEqual(sorted(services), sorted(_AGENT + s["sm_suffix"] for s in _SCRAPES))
+
+    def test_service_monitor_false_renders_nothing_even_where_the_api_is_served(self):
+        self.assertEqual(self._service_monitors(*_ON_PROMETHEUS, "--set", "platformAgent.serviceMonitor=false"), {})
+        self.assertEqual(self._headless_services(*_ON_PROMETHEUS, "--set", "platformAgent.serviceMonitor=false"), {})
+
+    def test_service_monitor_no_agent_renders_nothing(self):
+        self.assertEqual(self._service_monitors(*_ON_PROMETHEUS, "--set", "platformAgent.enabled=false"), {})
+        self.assertEqual(self._headless_services(*_ON_PROMETHEUS, "--set", "platformAgent.enabled=false"), {})
+
+    def test_vm_pod_scrape_default_follows_the_cluster(self):
+        self.assertEqual(self._vm_pod_scrapes(), {})
+        rendered = self._vm_pod_scrapes(*_ON_VICTORIAMETRICS)
+        self.assertEqual(sorted(rendered), sorted(_AGENT + s["sm_suffix"] for s in _SCRAPES))
+        for scrape in _SCRAPES:
+            with self.subTest(scrape=scrape["sm_suffix"]):
+                vmp = rendered[_AGENT + scrape["sm_suffix"]]
+                self.assertEqual(vmp["spec"]["selector"], {"matchLabels": _selector(scrape, _AGENT)})
+                self.assertEqual(
+                    vmp["spec"]["podMetricsEndpoints"],
+                    [{
+                        "port": scrape["port_name"],
+                        "path": "/metrics",
+                        "interval": "30s",
+                    }],
+                )
+
+    def test_vm_pod_scrape_true_renders_them_without_asking_the_cluster(self):
+        rendered = self._vm_pod_scrapes("--set", "platformAgent.vmPodScrape=true")
+        self.assertEqual(sorted(rendered), sorted(_AGENT + s["sm_suffix"] for s in _SCRAPES))
+
+    def test_vm_pod_scrape_false_renders_nothing_even_where_the_api_is_served(self):
+        self.assertEqual(self._vm_pod_scrapes(*_ON_VICTORIAMETRICS, "--set", "platformAgent.vmPodScrape=false"), {})
+
+    def test_vm_pod_scrape_no_agent_renders_nothing(self):
+        self.assertEqual(self._vm_pod_scrapes(*_ON_VICTORIAMETRICS, "--set", "platformAgent.enabled=false"), {})
+
+    def test_service_monitor_and_vmpodscrape_labels(self):
+        sm_rendered = self._service_monitors(
+            *_ON_PROMETHEUS,
+            "--set", "platformAgent.serviceMonitorLabels.release=kube-prometheus-stack",
+            "--set", "platformAgent.serviceMonitorLabels.custom=test-label",
+        )
+        for sm in sm_rendered.values():
+            self.assertEqual(sm["metadata"]["labels"]["release"], "kube-prometheus-stack")
+            self.assertEqual(sm["metadata"]["labels"]["custom"], "test-label")
+
+        vm_rendered = self._vm_pod_scrapes(
+            *_ON_VICTORIAMETRICS,
+            "--set", "platformAgent.vmPodScrapeLabels.release=victoria-metrics",
+        )
+        for vm in vm_rendered.values():
+            self.assertEqual(vm["metadata"]["labels"]["release"], "victoria-metrics")
+
+    def test_monitoring_scraper_namespace_renders_network_policy(self):
+        proc = subprocess.run(
+            [
+                "helm", "template", "test-release", str(_CHART),
+                *_REQUIRED, *_ON_PROMETHEUS,
+                "--set", "platformAgent.monitoringScraperNamespace=monitoring",
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        netpols = {
+            doc["metadata"]["name"]: doc
+            for doc in yaml.safe_load_all(proc.stdout)
+            if isinstance(doc, dict) and doc.get("kind") == "NetworkPolicy" and "mon-netpol" in doc["metadata"]["name"]
+        }
+        self.assertIn(f"{_AGENT}-gw-mon-netpol", netpols)
+        self.assertIn(f"{_AGENT}-cred-mon-netpol", netpols)
+        self.assertIn(f"{_AGENT}-a2a-mon-netpol", netpols)
+
+        gw_np = netpols[f"{_AGENT}-gw-mon-netpol"]
+        self.assertEqual(gw_np["spec"]["podSelector"]["matchLabels"]["app"], f"{_AGENT}-gateway")
+        self.assertEqual(len(gw_np["spec"]["ingress"]), 4)
+        self.assertEqual(
+            gw_np["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "monitoring",
+        )
+        ports = [p["port"] for p in gw_np["spec"]["ingress"][0]["ports"]]
+        self.assertIn(9095, ports)
+        self.assertIn(9097, ports)
+
+        # Ingress rule 1: same-namespace agent API (8642/8643)
+        self.assertEqual(gw_np["spec"]["ingress"][1]["from"][0]["podSelector"], {})
+        ports_api = [p["port"] for p in gw_np["spec"]["ingress"][1]["ports"]]
+        self.assertIn(8642, ports_api)
+        self.assertIn(8643, ports_api)
+
+        # Ingress rule 2: operator poller on 9095/9097
+        self.assertEqual(
+            gw_np["spec"]["ingress"][2]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "default",
+        )
+        self.assertEqual(
+            gw_np["spec"]["ingress"][2]["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
+            "kube-agents-operator",
+        )
+        ports_op = [p["port"] for p in gw_np["spec"]["ingress"][2]["ports"]]
+        self.assertIn(9095, ports_op)
+        self.assertIn(9097, ports_op)
+
+        # Ingress rule 3: GMP collector on 9095/9097
+        self.assertEqual(
+            gw_np["spec"]["ingress"][3]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "gke-gmp-system",
+        )
+        ports_gmp = [p["port"] for p in gw_np["spec"]["ingress"][3]["ports"]]
+        self.assertIn(9095, ports_gmp)
+        self.assertIn(9097, ports_gmp)
+
+        cp_np = netpols[f"{_AGENT}-cred-mon-netpol"]
+        self.assertEqual(cp_np["spec"]["podSelector"]["matchLabels"]["app"], f"{_AGENT}-credential-proxy")
+        self.assertEqual(
+            cp_np["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "monitoring",
+        )
+        self.assertEqual(cp_np["spec"]["ingress"][0]["ports"][0]["port"], 8766)
+
+        a2a_np = netpols[f"{_AGENT}-a2a-mon-netpol"]
+        self.assertEqual(a2a_np["spec"]["podSelector"]["matchLabels"]["app"], f"{_AGENT}-a2a-gateway")
+        self.assertEqual(
+            a2a_np["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "monitoring",
+        )
+        self.assertEqual(a2a_np["spec"]["ingress"][0]["ports"][0]["port"], 9096)
+
+    def test_monitoring_scraper_namespace_unset_renders_no_network_policy(self):
+        proc = subprocess.run(
+            [
+                "helm", "template", "test-release", str(_CHART),
+                *_REQUIRED, *_ON_PROMETHEUS,
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        netpols = [
+            doc["metadata"]["name"]
+            for doc in yaml.safe_load_all(proc.stdout)
+            if isinstance(doc, dict) and doc.get("kind") == "NetworkPolicy" and "mon-netpol" in doc.get("metadata", {}).get("name", "")
+        ]
+        self.assertEqual(netpols, [])
+
+    def test_monitoring_scraper_namespace_renders_even_when_scrape_crds_disabled(self):
+        proc = subprocess.run(
+            [
+                "helm", "template", "test-release", str(_CHART),
+                *_REQUIRED,
+                "--set", "platformAgent.monitoringScraperNamespace=monitoring",
+                "--set", "platformAgent.serviceMonitor=false",
+                "--set", "platformAgent.vmPodScrape=false",
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        netpols = {
+            doc["metadata"]["name"]: doc
+            for doc in yaml.safe_load_all(proc.stdout)
+            if isinstance(doc, dict) and doc.get("kind") == "NetworkPolicy" and "mon-netpol" in doc.get("metadata", {}).get("name", "")
+        }
+        self.assertEqual(len(netpols), 3)
+
+    def test_monitoring_scraper_namespace_quoted_properly_for_yaml_non_strings(self):
+        for ns in ["123", "on", "yes", "true"]:
+            with self.subTest(ns=ns):
+                proc = subprocess.run(
+                    [
+                        "helm", "template", "test-release", str(_CHART),
+                        *_REQUIRED,
+                        "--set-string", f"platformAgent.monitoringScraperNamespace={ns}",
+                    ],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                netpols = [
+                    doc for doc in yaml.safe_load_all(proc.stdout)
+                    if isinstance(doc, dict) and doc.get("kind") == "NetworkPolicy" and "mon-netpol" in doc.get("metadata", {}).get("name", "")
+                ]
+                self.assertEqual(len(netpols), 3)
+                for np in netpols:
+                    val = np["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"]
+                    self.assertIsInstance(val, str)
+                    self.assertEqual(val, ns)
+
+    def test_gateway_netpol_renders_superset_rules_even_when_operator_network_policy_disabled(self):
+        proc = subprocess.run(
+            [
+                "helm", "template", "test-release", str(_CHART),
+                *_REQUIRED,
+                "--set", "platformAgent.monitoringScraperNamespace=monitoring",
+                "--set", "platformAgent.networkPolicy.enabled=false",
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        netpols = {
+            doc["metadata"]["name"]: doc
+            for doc in yaml.safe_load_all(proc.stdout)
+            if isinstance(doc, dict) and doc.get("kind") == "NetworkPolicy" and "mon-netpol" in doc.get("metadata", {}).get("name", "")
+        }
+        # Gateway policy renders as a superset including agent API, operator metrics, and GMP collector ingress rules
+        self.assertIn(f"{_AGENT}-gw-mon-netpol", netpols)
+        self.assertIn(f"{_AGENT}-cred-mon-netpol", netpols)
+        self.assertIn(f"{_AGENT}-a2a-mon-netpol", netpols)
+        gw_np = netpols[f"{_AGENT}-gw-mon-netpol"]
+        self.assertEqual(len(gw_np["spec"]["ingress"]), 4)
+
+    def test_monitoring_scraper_namespace_pattern_validation(self):
+        # Valid DNS-1123 labels succeed
+        for ns in ["monitoring", "openshift-user-workload-monitoring", "vm", "123", "on", "yes", "true"]:
+            with self.subTest(ns=ns, valid=True):
+                proc = subprocess.run(
+                    [
+                        "helm", "template", "test-release", str(_CHART),
+                        *_REQUIRED,
+                        "--set-string", f"platformAgent.monitoringScraperNamespace={ns}",
+                    ],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        # Invalid namespace strings fail values schema validation
+        for ns in ["Monitoring", "monitoring.svc", "monitoring_ns", "has space", "-starts-hyphen", "ends-hyphen-"]:
+            with self.subTest(ns=ns, valid=False):
+                proc = subprocess.run(
+                    [
+                        "helm", "template", "test-release", str(_CHART),
+                        *_REQUIRED,
+                        "--set-string", f"platformAgent.monitoringScraperNamespace={ns}",
+                    ],
+                    capture_output=True, text=True,
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("/platformAgent/monitoringScraperNamespace", proc.stderr)
+
+    def test_max_supported_agent_name_length_succeeds_under_service_monitor(self):
+        # 46 chars is the operator's longest 63-character slot bound (63 - len("-credential-proxy")).
+        # With shortened suffixes (<= 16 chars), no resource name or label value overflows 63 chars.
+        max_name = "a" * 46
+        proc = subprocess.run(
+            [
+                "helm", "template", "test-release", str(_CHART),
+                *_REQUIRED, *_ON_PROMETHEUS,
+                "--set", f"platformAgent.name={max_name}",
+                "--set", "platformAgent.monitoringScraperNamespace=monitoring",
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for doc in yaml.safe_load_all(proc.stdout):
+            if not isinstance(doc, dict):
+                continue
+            name = doc.get("metadata", {}).get("name", "")
+            self.assertLessEqual(
+                len(name), 63,
+                f"resource {doc.get('kind')}/{name} exceeds 63 characters ({len(name)})",
+            )
+            for k, v in doc.get("metadata", {}).get("labels", {}).items():
+                self.assertLessEqual(
+                    len(v), 63,
+                    f"label {k}={v} on {doc.get('kind')}/{name} exceeds 63 characters ({len(v)})",
+                )
 
 
 if __name__ == "__main__":
