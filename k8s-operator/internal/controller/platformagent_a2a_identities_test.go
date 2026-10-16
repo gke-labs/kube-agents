@@ -115,6 +115,26 @@ func TestPrincipalsAreDistinct(t *testing.T) {
 	}
 }
 
+// Only the verifier may receive verify requests. A NATS subscriber may join
+// any queue group on a subject it can subscribe to, so a principal whose grant
+// covers `a2a.cap.verify.*` without a deny can join `cap-verifier` and swallow
+// a share of every request, and the caller reads the timeout as a denial. The
+// console copied web's `a2a.>` read surface before web gained its deny, and
+// shipped without it.
+func TestOnlyTheVerifierReceivesVerifyRequests(t *testing.T) {
+	const probe = "a2a.cap.verify.probe"
+	for _, id := range a2aIdentities(identityTestAgent()) {
+		if id.user == a2aVerifierUser {
+			continue
+		}
+		granted := slices.ContainsFunc(id.subscribe, func(p string) bool { return subjectMatches(p, probe) })
+		denied := slices.ContainsFunc(id.denySubscribe, func(p string) bool { return subjectMatches(p, probe) })
+		if granted && !denied {
+			t.Errorf("%s can subscribe %s, so it can join queue group %q; deny a2a.cap.> on its subscribe side", id.user, probe, "cap-verifier")
+		}
+	}
+}
+
 // Each auth mode owes different fields, and a principal carrying the wrong set
 // renders into the wrong place: a callout principal with no ServiceAccount
 // cannot be resolved, and a static one with no creds key renders a password of
