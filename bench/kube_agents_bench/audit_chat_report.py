@@ -57,6 +57,9 @@ PARTS_SEPARATOR = "\n\n"
 SILENT_MARKER = "[SILENT]"
 # The scheduler's `delivery_outcome` for a run whose report reached its leg.
 DELIVERED = "delivered"
+# Its `delivery_outcome` for a run the scheduler treated as silent, whatever
+# else the final message held.
+SUPPRESSED = "suppressed"
 GATEWAY_READ = "__AUDIT_CHAT_GATEWAY__"
 SANDBOX_READ = "__AUDIT_CHAT_SANDBOX__"
 SANDBOX_ABSENT = "__AUDIT_CHAT_ABSENT__"
@@ -164,7 +167,7 @@ def verdict(gateway: dict[str, Any], record: dict[str, Any] | None) -> tuple[Ver
     state = gateway["state"]
     if not state.get("last_run_at"):
         return "error", f"the fired {state.get('job_id')} run has not ended, so nothing was delivered to grade"
-    if _is_silent(gateway.get("response")):
+    if _is_silent(gateway.get("response")) or state.get("delivery_outcome") == SUPPRESSED:
         return "error", "the run was silent, so nothing reached a channel to grade"
     posted = gateway.get("posted") or []
     if not posted:

@@ -93,6 +93,13 @@ def test_a_silent_run_is_an_error():
     assert status == "error"
 
 
+def test_a_run_the_scheduler_suppressed_is_an_error():
+    status, _ = acr.verdict(
+        gateway([], response="I have executed the stream.\n\n[SILENT]\n", outcome="suppressed"), record([])
+    )
+    assert status == "error"
+
+
 def test_a_run_that_has_not_ended_is_an_error():
     status, _ = acr.verdict(gateway([], ended=False), None)
     assert status == "error"
