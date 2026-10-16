@@ -374,6 +374,24 @@ variable "model_max_tokens" {
   }
 }
 
+variable "alert_daily_limits" {
+  description = "Daily alert ceilings for the Platform Agent, one per bucket: critical, warning, info and drift. The chart renders each key that is set as ALERT_DAILY_LIMIT_<KEY> in the PlatformAgent's spec.deployment.env. A key that is not set keeps the default in the agent image, and 0 removes the cap for that bucket. Each apply that changes the env list that the chart renders replaces the full env list on the CR, and entries added to the CR by hand are lost; set those through platformAgent.deployment.env in extra_helm_values. Buckets, defaults and a sizing method: the site's chatops page, \"Daily alert ceiling\"."
+  # A map, not an object type: Terraform drops an unknown attribute of an
+  # object without an error, so a misspelt key would set nothing.
+  type    = map(number)
+  default = {}
+
+  validation {
+    condition     = alltrue([for bucket in keys(var.alert_daily_limits) : contains(["critical", "warning", "info", "drift"], bucket)])
+    error_message = "Each alert_daily_limits key must be critical, warning, info or drift."
+  }
+
+  validation {
+    condition     = alltrue([for limit in values(var.alert_daily_limits) : limit >= 0 && limit <= 2147483647 && floor(limit) == limit if limit != null])
+    error_message = "Each alert_daily_limits value must be a whole number of alerts, from 0 to 2147483647."
+  }
+}
+
 variable "litellm_redaction" {
   description = "Redaction of every request body the LiteLLM gateway forwards to a provider: the chart's litellm.redaction values, rendered only while enabled is true, so an install that leaves it off keeps the gateway config it had. ip_action is pseudonym, mask or off for IPv4 and IPv6 literals; allow_cidrs lists the networks the model must still see; each rule has a name, exactly one of pattern (a Python regular expression) or literal, and an action of mask (the chart's default when unset) or pseudonym. A litellm.redaction key set in extra_helm_values still wins. What is and is not redacted: the site's inference-gateway page, \"Redaction at the gateway\"."
   type = object({

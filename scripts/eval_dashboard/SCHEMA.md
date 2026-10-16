@@ -697,7 +697,7 @@ America/Toronto ("ET"), formatted in the browser with
 | `grid.html`    | **The Grid**: one row per case (blocking cases by domain, then the held-out ones, folded away when they passed everything in the window), one column per presubmit run in a window of 6 h, 24 h, 36 h or 7 days (header: PR # and ET start; a green run that recorded no cases gets no column); cells passed / failed all reps / failed some / quota-infra / died before the cases / still running (`pending_builds`); merges to main and incident starts and ends marked between the columns; a cell opens that run's detail for the case.                                                                                                     |
 | `cases.html`   | **The Cases page** ("How reliable is each test?"): one row per case by domain — its last `STRIP_RUNS` presubmit outcomes, pass rate over reps at 7 and 30 days for the presubmit and the nightly apart (`—` when a tier has no graded run), its roster status (blocking / held out / demoted with its date / nightly only / not in any matrix), its last failure with the grader's reason, its presubmit timing, and its issues from `case-notes.yaml`.                                                                                                                                                                                         |
 | `nightly.html` | **The Nightly report**: last night's run of the nightly tier (or the night `#build=` names) — its wall clock and whether it ran to the end, the counts (passed all reps / partial / failed / infra), what is newly failing against the night before and what passes again, every case by domain with its state, reps, timing medians and p90s, the grader's reason and a transcript link, a turn-1 latency tile, the timing night over night (the night's turn-1 p50 and p95, and each case `#cases=` names), and the other nights on record. The Brief's "Last night's run" block and the 9 AM Chat digest link here. `nightly.py` derives it. |
-| `trend.html`   | **The Trend page** ("Scores over time on main"): the store's nightly records per case and domain — pass rate by night with the trailing admission window and the bar, judged quality by night with the spread the store supports (a case: the range of its nightly means over seven nights at one key; a domain: the range across its cases), a marker on each night the version key changed, a table under each chart, a banner when the store was not read. `#cases=`, `#domain=`, `#since=` (incident). `trend.py`, from `store.json`.                                                                                                       |
+| `trend.html`   | **The Trend page** ("Scores over time on main"): the store's nightly records per case and domain — pass rate by night with the trailing admission window and the bar, judged quality by night with the spread the store supports (a case: the range of its nightly means over seven nights at one key; a domain: the range across its cases), a marker on each night the version key changed, a table under each chart, a banner when the store was not read. Under each card and for all cases: turn 1 p50/p95, agent p50/p90 by night, advisory. `#cases=`, `#domain=`, `#since=` (incident). `trend.py`, from `store.json` and `data.json`.  |
 
 The pages render in the browser from `brief.json` (below),
 which `render.py` inlines into each page as
@@ -964,7 +964,8 @@ published beside `brief.json` as **`trend.json`**, which the Trend page
 polls. It is `trend.py`'s block from `store.json` (below), the evidence
 store's read: `{source, read_at, error, window_days, lead_days, max_objects,
 truncated{case: n}, partial, warnings[], records, metrics[], default_metric,
-spread_nights, bar{rate, min_runs}, keys{}, nights[], cases{}, domains{}}`.
+spread_nights, bar{rate, min_runs}, keys{}, nights[], cases{}, domains{},
+latency{}}`.
 Without a `--store` every field is empty or `null` and the page says the
 store was not read; `error` set means the last read failed or was not
 attempted and the rest is the read before it. The page draws the
@@ -1002,6 +1003,31 @@ points[], key_changes[]}` with `points[]` the cases pooled per night
 high, cases}}}` (`mean` weighted by `n`, `low`/`high` the range of the
 cases' means). Only nightly records exist in the store (a pull request's
 run never writes it), so nothing here is a presubmit's.
+
+`latency{}` is the one part of the block not read from the store, which
+carries no timing: it is from `data.json`'s nightly runs inside the same
+drawn window (empty without a `--store`, like the rest), each night filed
+as `nightly.filed_nights` files it, from its own main and writers parts
+only (a case both parts recorded counts as the main part recorded it; a
+main re-run night does not borrow its date's writers part, so writers reps
+count once). The page draws a scope's points under its card, and `all[]`
+above the domain cards on the all-domains view, each row with its own
+latency table. `{target_s, pct{turn1, agent}, nights[], all[], domains{domain:
+points[]}, cases{case: points[]}}`: `target_s` is the advisory chat-turn
+target (p95, nothing gates on it) and `pct` each series' slow percentile
+(`turn1` 95, the target's `TURN1_TARGET_PCT`; `agent` 90, `SLOW_PCT`), as
+`nightly.py` has them; `nights[]` is `{id, at, build}`
+oldest first, `id` the same `build:<main part's build>` as the store's
+`nights[].id`, `at` that night's `at` when the store holds it, else the
+newest finish (or start) of its parts. Each scope (`all[]` every case,
+`domains{}` a domain's cases, `cases{}` one case) has one point per night
+it recorded a repetition, oldest first: `{night, at, n_turn1, turn1_p50_s,
+turn1_p95_s, n_agent, agent_p50_s, agent_p90_s}`, the nearest-rank p50 and
+`pct` percentile of `turn1_s` and `agent_s` over the scope's reps
+whose `result` is not `infra`, and `n_*` how many such reps carry each. A
+night the scope ran with no timed rep that counts (none timed, or every
+timed rep `infra`) has `n_*` 0 and `null` percentiles, which the page draws
+as a gap.
 
 ### `store.json` (written by `store.py`, read by `render.py --store`)
 

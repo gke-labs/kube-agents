@@ -68,7 +68,9 @@ go higher.
 
 `Info` events do arrive — nothing on the path from the kubelet to `inject_message` filters on `Event.Type`, and `BackOff` is on the watcher's default reason list emitted as `type: Normal` for image-pull back-off — but none of them ever bills this bucket, because the [severity gate](#severity-gate) drops every `Info` event before the claim. The `Info` row is kept regardless: deleting it would turn the entry into a `.get(severity, 0)` miss, and `_claim_alert_quota` treats that miss exactly as it treats a limit of `0` — allowed through, uncapped. Narrowing that gate afterwards would therefore send an unbounded `Info` stream to chat rather than restore a ceiling. Setting a limit to `0` turns that severity's cap off entirely, by the same branch.
 
-All four are tunable on the `PlatformAgent` CR without rebuilding the image. They reach the container because they are on the sandbox env allowlist in `safeSandboxEnvOverrides` (`k8s-operator/internal/controller/platformagent_manifests.go`) — `spec.deployment.env` is filtered, so an arbitrary variable set there is dropped, and a ceiling left off that allowlist is an override that renders, validates and silently does nothing:
+All four are tunable without rebuilding the image. Set them at install time: the `ALERT_DAILY_LIMIT_*` keys in `install.env`, the chart value `platformAgent.deployment.alertDailyLimits`, or the Terraform variable `alert_daily_limits`. Each route renders the keys that are set into the CR's `spec.deployment.env`. The [site's chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling) gives the routes and a sizing method. They reach the container because they are on the sandbox env allowlist in `safeSandboxEnvOverrides` (`k8s-operator/internal/controller/platformagent_manifests.go`) — `spec.deployment.env` is filtered, so an arbitrary variable set there is dropped, and a ceiling left off that allowlist is an override that renders, validates and silently does nothing.
+
+An entry on the CR itself also works:
 
 ```yaml
 spec:
@@ -79,6 +81,8 @@ spec:
       - name: ALERT_DAILY_LIMIT_WARNING
         value: "0" # uncapped
 ```
+
+On an install that the installer, the chart or Terraform manages, do not edit the CR. Each apply that changes the env list that the chart renders replaces the full list on the CR, and entries added by hand are lost. The [site's chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling) tells when this occurs. Use the install-time route for a ceiling, and `platformAgent.deployment.env` for another name.
 
 Behaviour worth knowing before relying on it:
 

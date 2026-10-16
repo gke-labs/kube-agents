@@ -33,6 +33,18 @@ WHAT "SCORE" MEANS is written once, in ``docs/designs/eval-scorer.md``
   is drawn as one marked point with its ``n``); for a domain, the
   ``n``-weighted mean across its cases with the range of their means.
 
+LATENCY IS ADVISORY, AND NOT FROM THE STORE. The store's records carry no
+timing, so the latency row under each card reads ``data.json``'s nightly
+runs, each night filed as ``nightly.filed_nights`` files it, with its own
+parts only (a main re-run night does not borrow its date's writers part,
+so writers reps count once): per night and scope (a case, a domain's cases,
+every case), the p50 and the slow percentile (``LATENCY_SLOW_PCT``: the
+opening chat turn's p95, ``nightly.TURN1_TARGET_PCT``, which its target is
+defined on; the agent run's ``nightly.SLOW_PCT``) over the scope's reps
+that are not ``infra`` (``nightly.rep_seconds``), with how many reps carry
+each. A night the scope ran without timing is a point without values, which
+the page draws as a gap.
+
 ONLY NIGHTLY RECORDS. The store holds what ran on ``main``: only the nightly
 appends to it (a pull request's run is graded against it and never writes),
 so a trend read from the store is the nightly's by construction; the
@@ -78,6 +90,12 @@ DEFAULT_METRIC = "OutcomeValidity"
 DAY_MS = 24 * 3600 * 1000
 KEY_COMPONENTS = ("setup_id", "scoring_version", "judge_model", "fleet", "verifiers")
 DOMAIN_UNKNOWN = nightly.DOMAIN_UNKNOWN
+# The latency row's two series and its percentiles: the median, and a slow
+# percentile per series. The opening turn's is the p95 its target is defined
+# on; the agent run's is the slow-run percentile the Nightly page shows.
+LATENCY_SERIES = {"turn1": nightly.REP_TURN1_S, "agent": nightly.REP_AGENT_S}
+LATENCY_SLOW_PCT = {"turn1": nightly.TURN1_TARGET_PCT, "agent": nightly.SLOW_PCT}
+MEDIAN_PCT = 50
 UTC = datetime.timezone.utc
 
 
@@ -399,6 +417,72 @@ def domain_key_changes(cases: dict[str, dict]) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
+# latency: the nightly runs in data.json, joined per night
+
+
+def latency_point(night: str, at: str, seconds: dict[str, list[float]]) -> dict:
+    """One scope's night: per series (``LATENCY_SERIES``) its reps' count
+    and percentiles, ``None`` when no rep carries it."""
+    point = {"night": night, "at": at}
+    for name, values in seconds.items():
+        point[f"n_{name}"] = len(values)
+        point[f"{name}_p50_s"] = nightly.percentile(values, MEDIAN_PCT)
+        point[f"{name}_p{LATENCY_SLOW_PCT[name]}_s"] = nightly.percentile(values, LATENCY_SLOW_PCT[name])
+    return point
+
+
+def latency_document(data: dict, store_nights: list[dict], in_window) -> dict:
+    """The ``latency`` block of the trend document: ``nights[]`` (``{id, at,
+    build}``, oldest first) and, per scope, one point per night the scope
+    recorded a rep (``latency_point``). A night is the Nightly page's
+    (``nightly.filed_nights``, its parts only; a case both parts recorded
+    counts as the main part recorded it) under the id the store's records
+    of it carry (``night_id``), dated by the store's night when it holds
+    one, so the row's points sit under the bars above them, else by its
+    parts' newest finish (or start). ``in_window`` is the page's window."""
+    domain_of = nightly.domains(data)
+    store_at = {n["id"]: n["at"] for n in store_nights}
+    nights: list[dict] = []
+    scopes: dict[str, dict[str, list[dict]]] = {"all": {"": []}, "domains": {}, "cases": {}}
+    for night, _filed in nightly.filed_nights(nightly.sorted_nightly_runs(data)):
+        parts = nightly.night_parts(night)
+        build = parts[0].get("build_id")
+        if not isinstance(build, str) or not build:
+            continue
+        stamps = [nightly.parse_iso(run.get("finished")) or nightly.parse_iso(run.get("started")) for run in parts]
+        stamps = [s for s in stamps if s]
+        nid = night_id({"build": build})
+        at = store_at.get(nid) or (max(stamps).isoformat() if stamps else None)
+        if at is None or not in_window(at_ms({"at": at})):
+            continue
+        pooled: dict[tuple[str, str], dict[str, list[float]]] = {}
+        seen: set[str] = set()
+        for run in parts:
+            for task in run.get("tasks") or []:
+                if not isinstance(task, dict) or not isinstance(task.get("name"), str) or task["name"] in seen or not nightly.task_reps(task):
+                    continue
+                seen.add(task["name"])
+                for scope in (("all", ""), ("domains", domain_of.get(task["name"], DOMAIN_UNKNOWN)), ("cases", task["name"])):
+                    acc = pooled.setdefault(scope, {name: [] for name in LATENCY_SERIES})
+                    for name, key in LATENCY_SERIES.items():
+                        acc[name] += nightly.rep_seconds(task.get("reps"), key)
+        if not pooled:
+            continue
+        nights.append({"id": nid, "at": at, "build": build})
+        for (kind, name), seconds in pooled.items():
+            scopes[kind].setdefault(name, []).append(latency_point(nid, at, seconds))
+    by_at = lambda points: sorted(points, key=at_ms)
+    return {
+        "target_s": nightly.TURN1_P95_TARGET_S,
+        "pct": LATENCY_SLOW_PCT,
+        "nights": by_at(nights),
+        "all": by_at(scopes["all"][""]),
+        "domains": {name: by_at(points) for name, points in sorted(scopes["domains"].items())},
+        "cases": {name: by_at(points) for name, points in sorted(scopes["cases"].items())},
+    }
+
+
+# --------------------------------------------------------------------------
 # the document
 
 
@@ -450,7 +534,9 @@ def trend_document(store: dict | None, data: dict) -> dict:
     says the store was not read this tick). Records in the read's lead-in
     (older than the drawn window) feed the trailing windows and spreads of
     the first drawn nights and appear nowhere else: not as points, nights,
-    key changes or in ``records``."""
+    key changes or in ``records``. ``latency`` is from ``data``'s nightly
+    runs over the same window (``latency_document``), and empty like the
+    rest without a store: the page draws it only under the store's cards."""
     every = usable_records(store)
     drawn_since_ms, window_days, lead_days = read_span(store)
     older_paths = older_by_case(store)
@@ -489,6 +575,7 @@ def trend_document(store: dict | None, data: dict) -> dict:
         members = {name: doc for name, doc in cases.items() if doc["domain"] == domain}
         domains[domain] = {"cases": sorted(members), "points": domain_points(members), "key_changes": domain_key_changes(members)}
     metric_list = sorted(metrics, key=lambda m: (m != DEFAULT_METRIC, m))
+    nights = night_documents(records, data)
     return {
         "source": store.get("source") if store and isinstance(store.get("source"), str) else None,
         "read_at": store.get("read_at") if store and nightly.parse_iso(store.get("read_at")) is not None else None,
@@ -505,7 +592,8 @@ def trend_document(store: dict | None, data: dict) -> dict:
         "spread_nights": SPREAD_NIGHTS,
         "bar": {"rate": ADMISSION_RATE, "min_runs": ADMISSION_MIN_RUNS},
         "keys": keys,
-        "nights": night_documents(records, data),
+        "nights": nights,
         "cases": cases,
         "domains": domains,
+        "latency": latency_document(data if store else {}, nights, in_window),
     }

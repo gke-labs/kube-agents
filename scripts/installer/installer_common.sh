@@ -327,6 +327,15 @@ readonly HINDSIGHT_MEMORY_PROVIDER="kube_agents_memory"
 readonly HINDSIGHT_STATEFULSET="hindsight-postgresql"
 readonly HINDSIGHT_API_DEPLOYMENT="hindsight-api"
 
+# The daily alert ceilings in install.env. write_tfvars_from_state writes each
+# key that is set into alert_daily_limits, with the part after the prefix in
+# lower case as the bucket name. install.sh records all of them in a new
+# install.env. uninstall.sh blanks all of them by name and not with a loop
+# over this list, because it can source an older copy of this file that does
+# not define the list. tests/test_uninstall_script.py compares the two lists.
+readonly ALERT_DAILY_LIMIT_PREFIX="ALERT_DAILY_LIMIT_"
+readonly ALERT_DAILY_LIMIT_KEYS="ALERT_DAILY_LIMIT_CRITICAL ALERT_DAILY_LIMIT_WARNING ALERT_DAILY_LIMIT_INFO ALERT_DAILY_LIMIT_DRIFT"
+
 # Memory mode (the input spelling, recorded in install.env as MEMORY) → the
 # provider name everything downstream reads. The inverse of install.sh's
 # memory_mode_from_provider, and needed here because install.env records the
@@ -3964,6 +3973,21 @@ write_tfvars_from_state() {
     print_error "MODEL_MAX_TOKENS='${model_max_tokens}' is not a whole number of tokens. Set a non-negative integer, or leave it empty, in install.env."
     return 1
   fi
+  # The daily alert ceilings, checked for the MODEL_MAX_TOKENS reason. An
+  # empty key is not written, so the agent image keeps its default for that
+  # bucket. No install.defaults.env entry exists for these keys, because
+  # session_kv_server.py is the one home of the defaults.
+  local alert_daily_limits="" alert_key alert_value alert_bucket
+  for alert_key in $ALERT_DAILY_LIMIT_KEYS; do
+    alert_value="${!alert_key:-}"
+    [ -n "$alert_value" ] || continue
+    if ! is_non_negative_integer "$alert_value"; then
+      print_error "${alert_key}='${alert_value}' is not a whole number of alerts. Set a non-negative integer, or leave it empty for the default, in install.env."
+      return 1
+    fi
+    alert_bucket="$(printf '%s' "${alert_key#"$ALERT_DAILY_LIMIT_PREFIX"}" | tr '[:upper:]' '[:lower:]')"
+    alert_daily_limits="${alert_daily_limits}  ${alert_bucket} = ${alert_value}"$'\n'
+  done
   # A triple the block cannot render, or a container ID that is not a bare
   # number, stops the run here, with the file untouched, rather than at
   # terraform with a message naming neither the key nor the entry.
@@ -4063,6 +4087,16 @@ write_tfvars_from_state() {
     echo "vertex_project_id  = $(hcl_str "${VERTEX_PROJECT_ID:-}")"
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"
+    echo ""
+    echo "# The daily alert ceilings (ALERT_DAILY_LIMIT_* in install.env), only the"
+    echo "# keys that are set. A bucket that is not here keeps the image default."
+    if [ -n "$alert_daily_limits" ]; then
+      echo "alert_daily_limits = {"
+      printf '%s' "$alert_daily_limits"
+      echo "}"
+    else
+      echo "alert_daily_limits = {}"
+    fi
     echo ""
     echo "# The PlatformAgent's spec.mode (PLATFORM_AGENT_MODE in install.env). The"
     echo "# composition passes the chart nothing for \"today\", so its CR carries no mode."

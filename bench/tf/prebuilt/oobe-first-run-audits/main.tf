@@ -41,8 +41,8 @@
 # The teardown, and the exit trap on a failed apply, run disarm.py: the markers
 # go back as they were and the `oobe` job comes out if this stack put it there.
 # The audits the stage started are left to finish. Each writes its ledger issue in
-# the install's GitOps repository (with none, its report in the report store) and
-# posts its summary where it always does.
+# the install's GitOps repository (with none, its report in the report store) and,
+# when it changed something, posts its summary where it always does.
 
 terraform {
   required_version = ">= 1.5.0"
