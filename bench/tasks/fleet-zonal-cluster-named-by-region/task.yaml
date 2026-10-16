@@ -16,6 +16,12 @@
 # forbidden patterns name it too, so they match a claim that seeded-b is
 # absent and not a lookup narrated along the way ("the regional lookup
 # returned not found, so I listed every location").
+#
+# What it does not guard: which cluster the version came from. The version
+# check asks only for the shape, so a worker that read this install's host
+# cluster (also in us-central1) through a context-less kubectl and reported
+# that version would pass. No verifier binds a cited version to slot b's live
+# control plane today.
 id: fleet-zonal-cluster-named-by-region
 name: A zonal cluster asked about by its region is found, not declared absent
 prompt: >-
