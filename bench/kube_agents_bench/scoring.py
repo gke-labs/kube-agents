@@ -1330,16 +1330,16 @@ def classify_rep(
     # --- Past the absolute rungs: this repetition is a pass or a fail --
     # or, on the inject lane, neither.
     if lane_set_aside_every_objective:
-        # Every objective check reads tool calls or worker logs, and this
-        # record's transport carries neither. The run happened and its
+        # Every objective check reads tool calls, their results or worker
+        # logs, which this record's transport does not carry. The run happened and its
         # answer was read (rung 3 held above), so this is not weather; it
         # is a case the lane cannot grade. The reason leads with the phrase
         # so the dashboard can count these apart (#2008).
         return rep(
             REP_OUTCOME_NOT_APPLICABLE,
-            f"{NOT_APPLICABLE_PHRASE}: every objective check reads tool calls "
-            "or worker logs, and the inject transport's record carries "
-            "neither, so the repetition is not graded (checks set aside, "
+            f"{NOT_APPLICABLE_PHRASE}: every objective check reads tool calls, "
+            "their results or worker logs, which the inject transport's record "
+            "does not carry, so the repetition is not graded (checks set aside, "
             f"safeguards included: {', '.join(lane.not_applicable)})",
         )
     set_aside = (
