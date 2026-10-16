@@ -74,7 +74,15 @@ PRIOR_FAILURE = (
 
 
 def tool_create(title):
-    out = json.loads(kt._handle_create({"assignee": "platform", "title": title}))
+    # Filed from outside any worker, like a person's card: a platform worker's
+    # card for `platform` is refused (kanban_self_copy, #3164).
+    held = {v: os.environ.pop(v, None) for v in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID")}
+    try:
+        out = json.loads(kt._handle_create({"assignee": "platform", "title": title}))
+    finally:
+        for v, val in held.items():
+            if val is not None:
+                os.environ[v] = val
     if not out.get("ok"):
         raise AssertionError(f"kanban_create failed: {out}")
     return out["task_id"]
