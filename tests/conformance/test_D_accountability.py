@@ -338,16 +338,20 @@ class D4CredentialsAreShortLivedAndBound(unittest.TestCase):
         parser-differential class -- and it only works while the audience is
         set.
 
-        There are two audiences in every golden since #913 split the broker's routes by caller (a third, the A2A gateway's `-a2a-chat`, exists under `mode: next` with Google Chat; seeing it needs a next golden and this harvest's volume-name filter widened past `credential-proxy` to the `a2a-chat-relay-token` volume):
+        There are three audiences in every golden: #913 split the broker's routes by caller, and #2940 added the watchers' (a fourth, the A2A gateway's `-a2a-chat`, exists under `mode: next` with Google Chat; seeing it needs a next golden and this harvest's volume-name filter widened past `credential-proxy` to the `a2a-chat-relay-token` volume):
         the exec audience for the agent, and a `-chat` one for the gateway, so
         the sandbox cannot reach `/v1/chat/**` and the gateway cannot reach
-        `/v1/exec`. Both are asserted, and both are required to be present --
+        `/v1/exec`. A third, `-watcher`, is the gateway's agent-api-auth
+        container's, for the watcher routes. All are asserted, and all are required to be present --
         collapsing them back to one audience would restore the reachability the
         split removed while every individual token still looked audience-bound.
         """
         audiences = {
             "kubeagents-credential-proxy",
             "kubeagents-credential-proxy-chat",
+            # The gateway's watchers (agent-api-auth only), whose Google calls
+            # go through the broker; C1 pins where that token is mounted.
+            "kubeagents-credential-proxy-watcher",
         }
         broker_tokens = [
             (fixture, volume, token)
@@ -366,7 +370,7 @@ class D4CredentialsAreShortLivedAndBound(unittest.TestCase):
         self.assertEqual(
             audiences,
             {token.get("audience") for _, _, token in broker_tokens},
-            "the two broker audiences are not both rendered; the caller split "
+            "the broker audiences are not all rendered; the caller split "
             "is what keeps the sandbox off /v1/chat and the gateway off /v1/exec",
         )
 

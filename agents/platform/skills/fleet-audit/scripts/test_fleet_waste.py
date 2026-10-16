@@ -4943,6 +4943,47 @@ class CollectProjectComputeTest(unittest.TestCase):
         self.assertIn("--filter=-users:*", disks)
         self.assertNotIn("--filter", disks)
 
+    def test_an_excluded_cluster_s_disk_is_skipped_beside_a_read_cluster_s(self):
+        # #3081, the mixed project: lane-b is excluded (known, never read) and
+        # ka-today was read. lane-b's detached disk is skipped, not judged
+        # against ka-today's PersistentVolumes; ka-today's is judged.
+        def disk(name, owner):
+            return {"name": name, "sizeGb": "10", "type": "pd-standard", "creationTimestamp": "2026-01-01T00:00:00Z",
+                    "zone": "us-central1-a", "users": [], "labels": {fw.GKE_CLUSTER_LABEL: owner}}
+
+        def run(argv, **kwargs):
+            if argv[2] == "disks":
+                return run_of(0, json.dumps([disk("gke-lane-b-pvc-1", "lane-b"), disk("gke-ka-today-pvc-1", "ka-today")]))
+            return self.run_with()(argv, **kwargs)
+
+        target = fw.collect_project_compute("acme", False, self.FACTS, run=run, now=NOW, known_clusters={"ka-today", "lane-b"},
+                                            unread_clusters=frozenset({"lane-b"}), clusters_read=1, excluded=["lane-b"])
+        disks = [c["object"] for c in target["candidates"] if c["check"] == "unattached-disk"]
+        self.assertEqual(disks, ["Disk/us-central1-a:gke-ka-today-pvc-1"])
+        self.assertIn("could belong to a cluster this run did not read (lane-b)", target["limitations"])
+        self.assertIn("lane-b in this project are excluded", target["limitations"])
+        self.assertIn("the clusters the install excludes were not read", target["limitations"])
+
+    def test_only_excluded_unread_is_decided_on_name_and_location(self):
+        excluded = [("lane-b", "us-central1")]
+        known = {("lane-b", "us-central1"), ("ka-today", "us-central1")}
+        self.assertTrue(fw._only_excluded_unread(known, {("ka-today", "us-central1")}, excluded))
+        # A same-named lane-b in us-east1 that was not read is not an exclusion.
+        known_twin = known | {("lane-b", "us-east1")}
+        self.assertFalse(fw._only_excluded_unread(known_twin, {("ka-today", "us-central1")}, excluded))
+        self.assertFalse(fw._only_excluded_unread(known, {("ka-today", "us-central1")}, []))
+
+    def test_a_same_named_cluster_that_failed_is_not_read_as_an_exclusion(self):
+        # lane-b in us-central1 is excluded; another lane-b in us-east1 was not
+        # read. By name the unread set is {lane-b}, which the exclusion covers;
+        # by (name, location) it is not, and the caller says so.
+        target = fw.collect_project_compute("acme", False, self.FACTS, run=self.run_with(), now=NOW, known_clusters={"lane-b"},
+                                            unread_clusters=frozenset({"lane-b"}), clusters_read=0, excluded=["lane-b"],
+                                            only_excluded_unread=False)
+        self.assertIn("none of its clusters (lane-b) could be read", target["limitations"])
+        self.assertIn("could not be read", target["limitations"])
+        self.assertNotIn("the clusters the install excludes were not read", target["limitations"])
+
     def test_a_failed_read_names_the_command_and_what_it_said(self):
         target = fw.collect_project_compute(
             "acme", True, self.FACTS, run=self.run_with(fail={"addresses": "PERMISSION_DENIED: compute.addresses.list"}), now=NOW
@@ -5743,6 +5784,19 @@ class SoleNodePoolNotApplicableTest(unittest.TestCase):
     CLUSTER = {"name": "sole-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
     POOL = {"name": "default-pool", "config": {"machineType": "e2-standard-4"}}
 
+
+    def test_a_cluster_the_scope_excludes_is_dropped_from_the_listing(self):
+        # #3081: spec.scope.exclude.clusters bounds every fleet read, so an
+        # excluded cluster in a swept project is neither audited nor recorded.
+        fw.declared_scope.set("acme", None, "acme/us-central1/lane-b")
+        self.addCleanup(fw.declared_scope.set, None, None)
+        listing = [{"name": "ka-today", "location": "us-central1", "status": "RUNNING"},
+                   {"name": "lane-b", "location": "us-central1", "status": "RUNNING"}]
+        with patch("sys.stderr"):
+            running, not_running = fw.enumerate_clusters("acme", run=lambda argv, **kwargs: run_of(0, json.dumps(listing)))
+        self.assertEqual([c["name"] for c in running], ["ka-today"])
+        self.assertEqual(not_running, [])
+
     def collect(self, pools):
         def run(argv, **kwargs):
             if "get-credentials" in argv:
@@ -6075,6 +6129,43 @@ class GetTargetProjectsTest(unittest.TestCase):
             {("project/proj-a", "collected"), ("project/proj-b", "collected")},
         )
 
+
+    def test_an_excluded_cluster_s_objects_are_not_reported_as_abandoned(self):
+        # #3081: the excluded cluster is dropped unread, but it still owns the
+        # project's disks, forwarding rules and addresses. Its detached disk
+        # must not read as "provisioned for a cluster this project no longer
+        # runs", and the checks that need every cluster's Services are
+        # withheld, not judged clean or flagged.
+        fw.declared_scope.set("proj-a", None, "proj-a/us-central1/lane-b")
+        self.addCleanup(fw.declared_scope.set, None, None)
+        disk = {"name": "gke-lane-b-pvc-1", "sizeGb": "10", "type": "pd-balanced", "creationTimestamp": "2026-01-01T00:00:00Z",
+                "zone": "us-central1-b", "users": [], "lastDetachTimestamp": "2026-07-22T00:00:00Z",
+                "labels": {"goog-k8s-cluster-name": "lane-b"}}
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return run_of(0, json.dumps([{"name": "lane-b", "location": "us-central1", "status": "RUNNING"}]))
+            if argv[:3] == ["gcloud", "compute", "disks"]:
+                return run_of(0, json.dumps([disk]))
+            if argv[:2] in (["gcloud", "compute"], ["gcloud", "artifacts"]):
+                return run_of(0, "[]")
+            raise AssertionError(argv)
+
+        with patch("sys.stderr"):
+            manifest = fw.collect_fleet(None, run=run, session=FakeSession(**NO_USAGE), now=NOW)
+        entries = {c["name"]: c for c in manifest["clusters"]}
+        self.assertNotIn("proj-a/us-central1/lane-b", entries)
+        project = entries["project/proj-a"]
+        self.assertEqual([c for c in project.get("candidates", []) if c["check"] in ("unattached-disk", "orphan-lb", "idle-address")], [])
+        unevaluated = {c["check"]: c["reason"] for c in project.get("checks_unevaluated", [])}
+        self.assertIn("excluded by spec.scope.exclude.clusters", unevaluated["orphan-lb"])
+        self.assertIn("excluded by spec.scope.exclude.clusters", unevaluated["idle-address"])
+        self.assertIn("lane-b in this project are excluded", project["limitations"])
+        self.assertIn("the clusters the install excludes were not read", project["limitations"])
+        self.assertNotIn("the reason each one failed", project["limitations"])
+        self.assertIn("its clusters (lane-b) are all excluded by spec.scope.exclude.clusters and were not read", project["limitations"])
+        self.assertNotIn("could be read", project["limitations"])
+        self.assertEqual(unevaluated["unattached-disk"], "this project's clusters are all excluded by spec.scope.exclude.clusters")
     def test_project_list_failure_falls_back_to_the_base_project(self):
         def run(argv, **kwargs):
             if argv[:2] == ["gcloud", "config"] and "get-value" in argv:
@@ -8034,11 +8125,11 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertFalse(fw._only_a_scope_note({"name": fw.UNENUMERATED_PROJECTS_TARGET, "error": "`gcloud projects list` rc=1: boom"}, None))
 
     def test_main_hands_the_flags_to_the_resolver(self):
-        # The wiring the SOP relies on: the two flags main parses reach the
+        # The wiring the SOP relies on: the three flags main parses reach the
         # holder the resolver reads, before anything else runs.
         with patch.object(fw.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
-            fw.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
-        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+            fw.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied", "--scope-exclude-clusters", "ops-mgmt/us-central1/lane-b"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied", "ops-mgmt/us-central1/lane-b")
 
     def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
         # `--scope-unread` alone (what collector_args carries when no declared

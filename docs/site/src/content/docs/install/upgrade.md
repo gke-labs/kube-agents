@@ -8,12 +8,9 @@ Terraform composition and the same Helm chart at a newer revision, re-rendering 
 the configuration it already has. A release copy of the script carries the version it upgrades to,
 so the ordinary upgrade names no version at all.
 
-An install whose GitHub forge is a GitHub Enterprise Server does not use `upgrade.sh`: it
-regenerates `terraform.tfvars` from `install.env`, which has no keys for the instance, and it can
-run from a checkout or a temporary copy of the engine that does not hold `ghes.auto.tfvars`. Move
-the checkout to the new release (change a pinned `image_tag` in `terraform.tfvars` to it), apply
-`charts/kube-agents/crds/`, and run `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply` in
-`terraform/examples/full-install`, with the forge kept in `ghes.auto.tfvars`: see
+An install whose GitHub forge is a GitHub Enterprise Server uses `upgrade.sh` too: it renders the
+forge from `GITOPS_FORGE=github`, `GITOPS_HOST` and `GITOPS_CA_SECRET` in `install.env`. An install
+made with the Terraform + Helm method is upgraded with that method: see
 [GitHub Enterprise Server in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#upgrade-switch-and-teardown).
 
 This site describes `main`, not a release. It changes each time a docs change merges to `main`. For
@@ -130,6 +127,7 @@ Each path is a `jq` path on `values.json`.
 | `GITHUB_APP_ID`                                  | `.githubMinter.appId`                                                                 |                                                                                                                                                                                                                                                                               |
 | `KMS_KEYRING`, `KMS_KEY`                         | `.githubMinter.kms.keyring`, `.githubMinter.kms.key`                                  |                                                                                                                                                                                                                                                                               |
 | GitLab keys                                      | `.platformAgent.integration.forges[0]`, `.platformAgent.integration.repositories[0]`  | If the forge's `provider` is `gitlab`, set `GITOPS_FORGE=gitlab`. Copy the forge's `host` to `GITOPS_HOST`, `credentialsRef.name` to `GITLAB_TOKEN_SECRET` and `caBundleRef.name` to `GITOPS_CA_SECRET`, and the repository's `repository` to `GITOPS_REPO`.                  |
+| GitHub Enterprise Server keys                    | `.platformAgent.integration.forges[0]`, `.platformAgent.integration.repositories[0]`  | If the forge's `provider` is `github` and it has a `host`, set `GITOPS_FORGE=github`. Copy the forge's `host` to `GITOPS_HOST`, `caBundleRef.name` to `GITOPS_CA_SECRET` and `namespace` to `GITOPS_ORG`, and the repository's `repository` to `GITOPS_REPO`.                 |
 | `ENABLE_GVISOR`                                  | `.platformAgent.deployment.availability.runtimeClassName`                             | `gvisor` means `true`. Always write the key: the upgrade's default is `false`, not the installer's `true`.                                                                                                                                                                    |
 | `MEMORY`                                         | `.platformAgent.harness.memory.provider`                                              | `kube_agents_memory` is `hindsight`, `multiuser_memory` is `file` and `none` is `off`.                                                                                                                                                                                        |
 | `USER_PROFILE_ENABLED`                           | `.platformAgent.harness.memory.userProfileEnabled`                                    |                                                                                                                                                                                                                                                                               |
@@ -175,6 +173,7 @@ rebuilt file has more cases:
 - Without the GitHub App keys, a full upgrade stops while the token minter runs, and prints the
   lines to set. See [When an upgrade is refused](#when-an-upgrade-is-refused).
 - Without the GitLab keys, the `PlatformAgent` loses its GitLab repository.
+- Without the GitHub Enterprise Server keys, the `PlatformAgent` names its repository on github.com, and the agent loses its repositories on the instance.
 - Without `MODEL_PROVIDER=vertex_ai`, the upgrade deletes the LiteLLM service account and its
   Vertex AI grant.
 - Without a drift or stockout `TF_VAR_` name that the install changed, the upgrade replaces that

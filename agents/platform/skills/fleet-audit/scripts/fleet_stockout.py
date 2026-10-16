@@ -257,7 +257,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 
-# The scope this collector was handed, set by main from the two flags.
+# The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
 
 SCOPED_RUN_NOTE = (
@@ -813,6 +813,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
     # the project as holding no cluster.
     if not isinstance(clusters, list) or not all(isinstance(c, dict) for c in clusters):
         raise RuntimeError("cluster enumeration returned JSON that is not a list of clusters")
+    clusters = declared_scope.drop_excluded(project, clusters)
     running = [
         {
             "name": c["name"],
@@ -2663,7 +2664,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", help="audit only this project (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else every project the credential can see")
     fleet_scope_args.add_scope_arguments(parser)
     args = parser.parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     manifest = collect_fleet(args.project)
     print(json.dumps(manifest, indent=2))
     return 1 if manifest.get("error") else 0

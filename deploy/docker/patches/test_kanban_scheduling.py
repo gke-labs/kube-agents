@@ -155,7 +155,8 @@ def upstream_fingerprint(error_text):
 DEPENDENCY_SCHEMA = """
 CREATE TABLE tasks (
     id TEXT PRIMARY KEY,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    assignee TEXT
 );
 CREATE TABLE task_links (
     parent_id TEXT NOT NULL,
@@ -382,6 +383,19 @@ class RepairTest(unittest.TestCase):
             log=planned("P", "OLDER") + [("P", "claimed"), ("NEWER", "created")],
         )
         self.assertEqual(find_deadlocked_children(conn, "P"), ["NEWER"])
+
+    def test_a_platform_follow_up_of_a_platform_card_is_never_released(self):
+        """Inverting it would start a second Platform Agent worker alongside
+        the first (#3164); a Cluster Agent child of the same card still is."""
+        conn = board(
+            {"P": "running", "FOLLOW": "todo", "CLUSTER": "todo"},
+            [("P", "FOLLOW"), ("P", "CLUSTER")],
+            log=fanned_out("P", "FOLLOW", "CLUSTER"),
+        )
+        conn.execute("UPDATE tasks SET assignee = 'platform' WHERE id IN ('P', 'FOLLOW')")
+        conn.execute("UPDATE tasks SET assignee = 'cluster-x' WHERE id = 'CLUSTER'")
+        self.assertEqual(repair_inverted_dependencies(conn, "P"), ["CLUSTER"])
+        self.assertFalse(claimable(conn, "FOLLOW"))
 
     def test_a_second_repair_finds_nothing_to_do(self):
         """The first pass turned the edge around, so the second finds no successor."""

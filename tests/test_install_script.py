@@ -4993,6 +4993,59 @@ class ModelMaxTokensPersistsThroughInstallEnvTest(unittest.TestCase):
         self.assertLess(exported, bootstrap)
 
 
+class AlertDailyLimitsRecordedInInstallEnvTest(unittest.TestCase):
+    """A first install records all four ALERT_DAILY_LIMIT_* keys, empty included.
+
+    No flag sets them, so the file is the only route. An empty line shows the
+    operator where to set a ceiling, and a key exported only for the first run
+    then also applies on every later upgrade.sh.
+    """
+
+    _KEYS = (
+        "ALERT_DAILY_LIMIT_CRITICAL",
+        "ALERT_DAILY_LIMIT_WARNING",
+        "ALERT_DAILY_LIMIT_INFO",
+        "ALERT_DAILY_LIMIT_DRIFT",
+    )
+
+    def _bootstrap(self, exported):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "new.install.env"
+            loaded = pathlib.Path(tmp) / "loaded.install.env"
+            loaded.write_text("")
+            loaded.chmod(0o600)
+            env = get_isolated_test_env(overrides={
+                "KUBE_AGENTS_INSTALL_ENV": str(loaded),
+                "PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "us-central1",
+            })
+            # A developer's own exported value must not stand in for the test's.
+            for key in self._KEYS:
+                env.pop(key, None)
+            env.update(exported)
+            proc = subprocess.run(
+                ["bash", "-c",
+                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                 'source scripts/installer/installer_common.sh\n'
+                 'resolve_shared_defaults\n'
+                 'PARAM_DRY_RUN=false; PARAM_MEMORY=file\n'
+                 f'bootstrap_install_env_file "{dest}" some-tag >/dev/null'],
+                capture_output=True, text=True, env=env, cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            return dest.read_text()
+
+    def test_the_first_install_records_all_four_keys_empty(self):
+        text = self._bootstrap({})
+        for key in self._KEYS:
+            with self.subTest(key=key):
+                self.assertRegex(text, re.compile(rf"^{key}=''$", re.MULTILINE))
+
+    def test_an_exported_key_is_recorded_with_its_value(self):
+        text = self._bootstrap({"ALERT_DAILY_LIMIT_DRIFT": "20"})
+        self.assertRegex(text, re.compile(r"^ALERT_DAILY_LIMIT_DRIFT=20$", re.MULTILINE))
+        self.assertRegex(text, re.compile(r"^ALERT_DAILY_LIMIT_WARNING=''$", re.MULTILINE))
+
+
 class LitellmRedactionPersistsThroughInstallEnvTest(unittest.TestCase):
     """The same walk for the LITELLM_REDACTION_* keys: the first run records
     what main() exported, the next run's parameter block and environment read

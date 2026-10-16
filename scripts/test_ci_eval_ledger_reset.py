@@ -630,10 +630,10 @@ class CallSiteTest(unittest.TestCase):
         self.assertLess(wait, unit.index('lock_acquire "${STATE_DIR}/lock-infra"'))
         # A failed acquisition gives back the streams already held.
         self.assertIn('release_streams "${held}"', unit)
-        # Released on the state-lock and infra-lock paths and after the run
-        # here, and on the mint-failure, repository-reset and kubeconfig-copy
-        # paths through skip_unit, which all hand it the streams.
-        self.assertEqual(unit.count('release_streams "${streams}"'), 3)
+        # Released on the gone-gateway, state-lock and infra-lock paths and
+        # after the run here, and on the mint-failure, repository-reset and
+        # kubeconfig-copy paths through skip_unit, which all hand it the streams.
+        self.assertEqual(unit.count('release_streams "${streams}"'), 4)
         self.assertEqual(unit.count('skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}"'), 3)
         self.assertIn('release_streams "${streams}"', lifted("skip_unit"))
         # Before the infra lock: a stack-bearing unit waiting on its stream
