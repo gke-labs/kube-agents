@@ -1041,3 +1041,10 @@
 # memory limit and the skill's created-with-google-skill label. deployer:
 # noop, transcript-only, one delegation round trip.
 ./tasks/alert-config-terraform-promql-probe/task.yaml
+
+# The front door's reply to a blocked card declares the one next step on a
+# last line of its own, `[next: <label>]`, which Slack draws as a button
+# (agents/chat/SOUL.md §2, step 5). deployer: noop; the blocked card is
+# planted per run (bench/kube_agents_bench/card_wake.py), so one front-door
+# turn and no worker: filing or unblocking a card fails its catastrophic fence.
+./tasks/chat-failure-reply-declares-next-step/task.yaml
