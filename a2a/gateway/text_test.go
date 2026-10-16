@@ -216,11 +216,11 @@ func TestChatChunksContinuationAfterFencedBlock(t *testing.T) {
 	// a plain label would be kept and the prose assertion below would fail.
 	in := "```\n" + strings.Repeat("log line\n", 400) + "```\n" + strings.Repeat("prose line with **bold** and <https://a.example|https://b.example>\n", 20)
 	chunks := chatChunks(in, discordChunk)
-	if !strings.Contains(chunks[1], "prose line") {
-		t.Errorf("chunk 1 cut was dragged back before prose: len=%d suffix=%q", len(chunks[1]), chunks[1][max(0, len(chunks[1])-30):])
-	}
 	if len(chunks) < 3 {
 		t.Fatalf("got %d chunks, want >= 3", len(chunks))
+	}
+	if !strings.Contains(chunks[1], "prose line") {
+		t.Errorf("chunk 2 cut was dragged back before prose: len=%d suffix=%q", len(chunks[1]), chunks[1][max(0, len(chunks[1])-30):])
 	}
 	for i, c := range chunks {
 		if len(c) > discordChunk {
