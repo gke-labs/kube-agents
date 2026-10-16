@@ -82,6 +82,9 @@ TRANSPORT_BLIND_CHECK_TYPES = TRACE_GRADABLE_CHECK_TYPES | WORKER_BLIND_CHECK_TY
 # (``verifiers.ToolCalledVerifier``: ``router`` is the default).
 _TOOL_CALLED_SCOPE_KEY = "scope"
 _TOOL_CALLED_ROUTER_SCOPE = "router"
+# ``tool_called``'s result-pattern key. The door's trace records no results,
+# so a leaf that sets it cannot be graded from the trace in any scope.
+_TOOL_CALLED_RESULT_KEY = "result"
 # The compound type that negates its children ("none of these tools was
 # called"), which is how a safeguard against a forbidden call is written.
 _NEGATED_COMPOUND_TYPE = "none"
@@ -145,9 +148,9 @@ class CaseSpec:
 
     trace_blind_checks: frozenset[str] = frozenset()
     """The entries in ``transport_blind_checks`` whose every leaf is a
-    ``tool_called`` in the ``router`` scope: blind only on an inject record
-    whose door showed no tool-call trace (no ``a2a.activity`` marker), and
-    graded in full on one that did."""
+    ``tool_called`` in the ``router`` scope with no ``result`` pattern:
+    blind only on an inject record whose door showed no tool-call trace (no
+    ``a2a.activity`` marker), and graded in full on one that did."""
 
     negated_trace_blind_checks: frozenset[str] = frozenset()
     """The entries in ``trace_blind_checks`` whose every leaf sits under an
@@ -162,14 +165,16 @@ class CaseSpec:
     worker_blind_checks: frozenset[str] = frozenset()
     """The entries in ``transport_blind_checks`` with any leaf that reads the
     delegated workers -- ``worker_commands``, ``worker_agents``, or a
-    ``tool_called`` in the ``workers`` or ``all`` scope. Blind on every
-    inject record, trace or none: the trace carries no results, so no card
-    id can be read from it. The delegation wait reads the workers from the
-    pod when the turn ran under the bridge's api executor; the set-aside
-    stays until the scorer grades them on a record that carries them. A
-    compound mixing such a leaf with a router-scope ``tool_called`` lands
-    here, not in ``trace_blind_checks``: its worker leaf would still error
-    with the trace shown, and grading the compound would block on it."""
+    ``tool_called`` in the ``workers`` or ``all`` scope -- or any
+    ``tool_called`` with a ``result`` pattern. Blind on every inject record,
+    trace or none: the trace carries no results, so no card id can be read
+    from it and no result pattern can match. The delegation wait reads the
+    workers from the pod when the turn ran under the bridge's api executor;
+    the set-aside stays until the scorer grades them on a record that
+    carries them. A compound mixing such a leaf with a router-scope
+    ``tool_called`` lands here, not in ``trace_blind_checks``: its worker
+    leaf would still error with the trace shown, and grading the compound
+    would block on it."""
 
     tool_calls_optional: bool = False
     """``tool_calls_optional:``, for a case a correct agent can answer without
@@ -194,14 +199,17 @@ def _leaves(node: Any) -> list[dict[str, Any]]:
 
 
 def _reads_the_workers(leaf: dict[str, Any]) -> bool:
-    """Whether a transport-blind leaf reads the delegated workers rather than
-    the delegating turn's own calls: a worker type, or a ``tool_called``
-    outside the ``router`` scope."""
+    """Whether a transport-blind leaf is blind on every inject record: a
+    worker type, a ``tool_called`` outside the ``router`` scope, or a
+    ``tool_called`` with a ``result`` pattern, which the trace cannot serve."""
     kind = str(leaf.get("type") or "")
     if kind in WORKER_BLIND_CHECK_TYPES:
         return True
-    scope = leaf.get(_TOOL_CALLED_SCOPE_KEY)
-    return kind in TRACE_GRADABLE_CHECK_TYPES and scope not in (None, _TOOL_CALLED_ROUTER_SCOPE)
+    if kind not in TRACE_GRADABLE_CHECK_TYPES:
+        return False
+    if leaf.get(_TOOL_CALLED_RESULT_KEY) is not None:
+        return True
+    return leaf.get(_TOOL_CALLED_SCOPE_KEY) not in (None, _TOOL_CALLED_ROUTER_SCOPE)
 
 
 def _negates_every_leaf(node: Any, *, negations: int = 0) -> bool:

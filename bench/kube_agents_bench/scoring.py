@@ -944,9 +944,10 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     ``tool_called`` (:attr:`CaseSpec.trace_blind_checks`) is set aside only
     on an inject record whose door showed no trace (:func:`_inject_blind`),
     and grades in full on one carrying the activity marker; a check that
-    reads the delegated workers (:attr:`CaseSpec.worker_blind_checks`) is
-    set aside on every inject record (:func:`_inject_record`), marker or
-    not, since the trace carries no card ids and no worker's entries. One
+    reads the delegated workers or a call's result
+    (:attr:`CaseSpec.worker_blind_checks`) is set aside on every inject
+    record (:func:`_inject_record`), marker or not, since the trace carries
+    no card ids, no worker's entries and no results. One
     exception inside the first family: a ``none``-wrapped check
     (:attr:`CaseSpec.negated_trace_blind_checks`) that FAILED on a record
     whose door showed the trace stays graded even when the marker reports a
