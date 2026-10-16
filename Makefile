@@ -733,8 +733,9 @@ skills-refresh: ## Record edits to a mirrored skill as a patch (SKILL=name [MSG=
 skills-generate: ## Rebuild a mirrored skill from its upstream copy and overlay (SKILL=name).
 	@$(SKILL_OVERLAY) generate $(SKILL)
 
-skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, offline.
+skills-check: ## Verify every mirrored skill equals its upstream copy plus overlay, and every shipped skill document fits skill_view.
 	@$(SKILL_OVERLAY) check
+	@python3 scripts/check_skill_size.py
 
 skills-status: ## List mirrored skills google/skills has moved past, and upstream skills not mirrored.
 	@$(SKILL_OVERLAY) status

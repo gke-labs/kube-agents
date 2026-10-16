@@ -290,18 +290,6 @@ FIXTURE_NOT_READY = {
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
     ),
-    "observability-trace-latency-brokered": (
-        "#2244: needs the pool host clusters to export traces; until "
-        "2026-10-02, 33 of the 35 had no managed OpenTelemetry collection "
-        "scope, so the operator's telemetry discovery resolved to None, the "
-        "agent ran with OTEL_SDK_DISABLED=true and Cloud Trace in those "
-        "projects was empty, which the case reports as an empty window and "
-        "fails on the report check (a fixture gap, not a red). The scope was "
-        "set by hand that day, and the provisioning script and the verifier's "
-        "gke/host-otel-scope finding now hold it (docs/ci-pool-projects.md "
-        "section 2); the case moves to the nightly once the first leases "
-        "after the repair show traces landing"
-    ),
 }
 
 # Cases that claim no domain because no row in domains.yaml describes them.
