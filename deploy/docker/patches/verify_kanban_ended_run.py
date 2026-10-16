@@ -236,7 +236,7 @@ try:
     check("once the parent is done the card is ready again", status(linked) == "ready", status(linked))
     context = K.build_worker_context(conn, linked)
     check("the re-run's worker context opens with the saved result",
-          context.startswith("## Saved result from a previous run") and ker.banner_text([gate_parent]) in context
+          context.startswith(ker.SAVED_RESULT_HEADING) and ker.banner_text([gate_parent]) in context
           and "> web-7 is fine: no errors in the last hour" in context, context[:400])
     plain = K.build_worker_context(conn, own)
     check("a card with no saved result reads as before", "Saved result from a previous run" not in plain, plain[:200])

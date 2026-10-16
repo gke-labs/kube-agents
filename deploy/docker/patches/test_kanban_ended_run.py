@@ -363,12 +363,14 @@ class TestSavedResultBanner(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
         self.conn.executescript(
-            "CREATE TABLE tasks (id TEXT, assignee TEXT);"
+            "CREATE TABLE tasks (id TEXT, assignee TEXT, completed_at INTEGER);"
             "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, started_at INTEGER);"
             "CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT, created_at INTEGER);"
             "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, created_at INTEGER);"
             "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);")
-        self.conn.execute("INSERT INTO tasks VALUES (?, 'platform')", (TID,))
+        self.conn.execute("INSERT INTO tasks VALUES (?, 'platform', NULL)", (TID,))
+        # The parent linked mid-run, finished after the block.
+        self.conn.execute("INSERT INTO tasks VALUES ('t_rotate', 'platform', 150)")
         self.conn.execute("INSERT INTO task_links VALUES ('t_rotate', ?)", (TID,))
         self.conn.execute("INSERT INTO task_runs VALUES (52, ?, 90)", (TID,))
 
@@ -386,11 +388,42 @@ class TestSavedResultBanner(unittest.TestCase):
         lines = ker.saved_result_banner(self.conn, TID)
         banner = ker.banner_text(["t_rotate"])
         self.assertIn(banner, lines)
-        self.assertIn("before t_rotate was added as a prerequisite", banner)
+        self.assertIn("before it was made to wait on t_rotate", banner)
         self.assertIn("don't open another", banner)
         self.assertNotIn("Don't redo the work", banner)
         self.assertIn("> web-7 logs: no errors", lines)
         self.assertIn("> PR #12 opened", lines)
+
+    def test_a_near_compliant_lead_still_counts(self):
+        """Quoted as shown, emphasised, after a heading, curly apostrophe."""
+        lead = ker.SAVED_RESULT_LEAD
+        for body in ('"' + lead + '" web-7 is fine',
+                     "**" + lead.replace("'", "\u2019") + "**\nweb-7 is fine",
+                     "## Saved\n" + lead + "\nweb-7 is fine"):
+            with self.subTest(body=body[:24]):
+                self.conn.execute("DELETE FROM task_comments")
+                self.conn.execute("DELETE FROM task_events")
+                self.comment(body)
+                self.event(ker.DEPENDENCY_WAIT_EVENT)
+                self.assertIn("> web-7 is fine", ker.saved_result_banner(self.conn, TID))
+
+    def test_only_the_newest_dependency_block_counts(self):
+        """Run 52 saved a result; run 60 blocked again without one. Run 61
+        mustn't be handed run 52's stale result."""
+        self.comment(ker.SAVED_RESULT_LEAD + " old result")
+        self.event(ker.DEPENDENCY_WAIT_EVENT)
+        self.conn.execute("INSERT INTO task_runs VALUES (60, ?, 200)", (TID,))
+        self.event(ker.DEPENDENCY_WAIT_EVENT, at=210, run=60)
+        self.assertEqual(ker.saved_result_banner(self.conn, TID), [])
+
+    def test_a_parent_done_before_the_block_isnt_named(self):
+        self.conn.execute("INSERT INTO tasks VALUES ('t_audit', 'platform', 50)")
+        self.conn.execute("INSERT INTO task_links VALUES ('t_audit', ?)", (TID,))
+        self.comment(ker.SAVED_RESULT_LEAD + " web-7 is fine")
+        self.event(ker.DEPENDENCY_WAIT_EVENT)
+        banner = ker.saved_result_banner(self.conn, TID)[1]
+        self.assertIn("t_rotate", banner)
+        self.assertNotIn("t_audit", banner)
 
     def test_a_saved_result_from_anyone_but_the_assignee_is_ignored(self):
         """An operator, another card's worker or a chat-relayed comment can't
