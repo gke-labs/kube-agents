@@ -100,6 +100,7 @@ import functools
 import json
 import logging
 import os
+import re
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -208,6 +209,12 @@ SAVED_RESULT_LEAD = (
 )
 
 
+#: What a worker closes a quoted or bolded lead with, left at the head of the
+#: result: one closing mark followed by whitespace. Nothing else is stripped, so
+#: a bullet, an opening fence or the result's own last characters survive.
+_LEAD_CLOSE = re.compile(r'^\s*(?:\*\*|["\'`\u201d\u2019])(?=\s|$)')
+
+
 def waiting_parent_text(task_id: str, parent_id: str) -> str:
     """The terminal answer for a current run whose card gained a parent."""
     return (
@@ -216,8 +223,9 @@ def waiting_parent_text(task_id: str, parent_id: str) -> str:
         f"finishes. Save your result with kanban_comment, opening it with "
         f"\"{SAVED_RESULT_LEAD}\", then call kanban_block(kind=\"dependency\") and "
         f"end your turn: the card goes back to the queue and runs again once "
-        f"{parent_id} is done, and that run reads your comment. Don't retry "
-        f"kanban_complete."
+        f"{parent_id} is done, and that run reads your comment. Retry "
+        f"kanban_complete only if kanban_block answers that the card has no "
+        f"unfinished parent: {parent_id} finished or was unlinked meanwhile."
     )
 
 
@@ -392,7 +400,7 @@ def saved_result_banner(conn: Any, task_id: str) -> list[str]:
         end = _lead_end(body)
         if end >= 0:
             # Keep the run's own characters: the fold was only for matching.
-            result = body[end:].strip().strip('"*`').strip()
+            result = _LEAD_CLOSE.sub("", body[end:], count=1).strip()
             break
     if not result:
         return []

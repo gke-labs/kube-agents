@@ -319,6 +319,14 @@ class TestWaitingParentRefusal(unittest.TestCase):
         self.assertNotIn("Don't call kanban_complete or kanban_block", text)
         self.assertIn(ker.SAVED_RESULT_LEAD, text)
 
+    def test_the_answer_allows_the_retry_the_unlatched_design_needs(self):
+        """If the parent finishes or is unlinked before the block, the block
+        tells the worker to complete; this answer mustn't forbid that."""
+        self.link()
+        text = ker.waiting_parent_refusal(TID, self.conn)
+        self.assertNotIn("Don't retry", text)
+        self.assertIn("Retry kanban_complete only if kanban_block answers", text)
+
     def test_the_answer_is_not_latched(self):
         """The parent can go away; a retried completion should then succeed,
         and the worker's own block must still reach the board."""
@@ -406,6 +414,22 @@ class TestSavedResultBanner(unittest.TestCase):
                 self.comment(body)
                 self.event(ker.DEPENDENCY_WAIT_EVENT)
                 self.assertIn("> web-7 is fine", ker.saved_result_banner(self.conn, TID))
+
+    def test_the_results_own_marks_are_kept(self):
+        """Only the lead's closing mark is shed: a bullet, a closing fence and
+        a trailing backtick belong to the result."""
+        lead = ker.SAVED_RESULT_LEAD
+        for body, want in (
+                (lead + "\n* checked web-7\n* checked web-8", "> * checked web-7"),
+                (lead + "\n```yaml\nstatus: Ready\n```", "> ```"),
+                (lead + " ran `kubectl get pods -n web`", "`kubectl get pods -n web`")):
+            with self.subTest(want=want):
+                self.conn.execute("DELETE FROM task_comments")
+                self.conn.execute("DELETE FROM task_events")
+                self.comment(body)
+                self.event(ker.DEPENDENCY_WAIT_EVENT)
+                banner = ker.saved_result_banner(self.conn, TID)
+                self.assertTrue(any(line.rstrip() == want or line.endswith(want) for line in banner), banner)
 
     def test_a_card_with_no_assignee_gets_no_banner(self):
         """No assignee means no author to trust, even for an empty author."""
