@@ -277,15 +277,16 @@ list, add the entry to that list, because Helm replaces a list as a whole. See
 `next` is an unsupported development stack. To move a running install between `today` and
 `next`, set `PLATFORM_AGENT_MODE` in `install.env` and run a full upgrade (the default mode) or
 `install.sh`. The operator and harness modes re-apply the values the release recorded, so they do
-not switch. Preview the run with `--plan` first; a run that switches says so before it applies.
+not switch. Preview a full upgrade with `upgrade.sh --plan` first; a run that switches says so
+before it applies.
 
 - **Slack.** With Slack on and Google Chat off, `next` hands Slack to the A2A gateway. Before the
   switch, check the three Slack settings the run refuses (see
   [When an upgrade is refused](#when-an-upgrade-is-refused)). After it, edit the Slack app as
   [Moving an existing app to `next`](/kube-agents/install/slack-app/#moving-an-existing-app-to-next)
   describes.
-- **Switching back** to `today` is the same `install.env` edit the other way, and the app's slash
-  commands go back on.
+- **Switching back** to `today` is the same `install.env` edit the other way. Put the Slack app's
+  slash commands back too, as that section says.
 
 What a switch changes inside the install is in the design document,
 [`docs/designs/spec-mode-switch.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-mode-switch.md).
@@ -329,7 +330,7 @@ to run.
   commit, or a release the script does not itself carry. It is not part of upgrading to a published
   release. Mutable refs such as `latest`, `main` and `HEAD` are rejected, so the scripts and the
   container images always name the same revision.
-  A commit that is not a release carries the chart's unstamped placeholder version, `0.1.0`, so
+  A commit on `main` carries the chart's unstamped placeholder version, `0.1.0`, so
   `helm history` and the plan show the chart moving from your release to `kube-agents-0.1.0`.
   That is the placeholder, not a downgrade: only the release pipeline stamps the version.
 - `--keep-image-tag` upgrades everything except the images, leaving them on the tag the install

@@ -99,19 +99,19 @@ wait_for_a_bit() {
   local msg=$2
   local spinner=( "⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏" )
   echo -ne "  ${C_YELLOW}${msg} (${seconds}s)...  "
-  [ -t 1 ] && { tput civis 2>/dev/null || true; }
+  if [ -t 1 ]; then tput civis 2>/dev/null || true; fi
   for (( i=0; i<seconds*10; i++ )); do
     local idx=$(( i % 10 ))
     echo -ne "\b${spinner[$idx]}"
     sleep 0.1
   done
   echo -ne "\b ${C_RESET}\n"
-  [ -t 1 ] && { tput cnorm 2>/dev/null || true; }
+  if [ -t 1 ]; then tput cnorm 2>/dev/null || true; fi
 }
 
 # Only on a terminal: written into a pipe or a log, the cursor escape is the
 # stray "[?12l[?25h" a script that printed nothing else leaves behind.
-cleanup() { [ -t 1 ] && { tput cnorm 2>/dev/null || true; }; return 0; }
+cleanup() { if [ -t 1 ]; then tput cnorm 2>/dev/null || true; fi; }
 trap cleanup EXIT
 
 # ─── Universal Argument Parsing ──────────────────────────────────────────────
