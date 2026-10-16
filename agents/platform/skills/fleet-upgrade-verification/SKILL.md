@@ -1,6 +1,6 @@
 ---
 name: fleet-upgrade-verification
-description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, fail-closed admission webhooks in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public) with an unreachable backend, maintenance exclusions and windows, node-pool version skew, and what the per-entry rules of the upgrade-failure catalogue find, each a blocker or a risk that does not block (a zonal control plane is one). Scans the linked GitOps repositories' manifests for apiVersions the target removes, with each hit's replacement. Read-only against GCP, the clusters and Git, from gcloud container, kubectl get and repository reads, plus the audit log through gcloud logging read when a registered rule reads it, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
+description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors, and answers whether one cluster is current for its channel (--cluster); run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, fail-closed admission webhooks in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public) with an unreachable backend, maintenance exclusions and windows, node-pool version skew, and what the per-entry rules of the upgrade-failure catalogue find, each a blocker or a risk that does not block (a zonal control plane is one). Scans the linked GitOps repositories' manifests for apiVersions the target removes, with each hit's replacement. Read-only against GCP, the clusters and Git, from gcloud container, kubectl get and repository reads, plus the audit log through gcloud logging read when a registered rule reads it, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
 ---
 
 # Fleet upgrade verification
@@ -9,7 +9,8 @@ Answer "against version X, which clusters lag, by how much, and is it the contro
 pool" with a table read from the fleet, not from memory, and "which manifests in our GitOps
 repositories declare an API that version X removes" with a scan read from Git. Use it when a user
 asks whether an upgrade has reached every cluster, which members are behind a target, how far the
-fleet is from a release-channel default, or whether the repositories are ready for a target
+fleet is from a release-channel default, whether one cluster's control plane is current for its
+channel (`--cluster <location>/<name>`), or whether the repositories are ready for a target
 version. Run the version report again during a rollout and it also says, per member, what changed
 since the previous run and which members have stopped moving (see "Track a rollout across runs").
 With `--readiness` it also says, per member, what would stop the upgrade: a PodDisruptionBudget
@@ -102,6 +103,29 @@ such as a quota project, is one. The weekly upgrade audit's collector also runs 
 `--readiness --cluster <location>/<name>`, once per behind cluster: that run writes
 `upgrade-readiness_<project>_<location>_<name>.json` under `/opt/data/scratch/`, and a `--cluster` run
 neither reads nor writes the rollout record, so the record above is untouched by it.
+
+### Reading `get-server-config` by hand
+
+Prefer the script, even for one cluster: the command above with `--cluster <location>/<name>`
+added (and the `collector_args`, as always) answers "is this control plane current for its
+channel?" against the right field. Read the control-plane column for that question: a member's
+status also folds in its node pools. If you do read `gcloud container get-server-config`
+yourself, read it at the cluster's location (`--location`, `--project`). Each entry of
+`channels[]` carries up to three versions, and only one of them is the channel's current version:
+
+- `defaultVersion` is the version the channel offers now, what a new cluster on it gets. A cluster
+  is behind its channel when its `currentMasterVersion` is below this, and the lag in minors is
+  measured against it.
+- `upgradeTargetVersion`, where present, is the version GKE's automatic upgrades currently move
+  clusters on the channel to, and it can trail `defaultVersion` by a minor: on 2026-10-16 REGULAR's
+  was `1.35.8-gke.1439001` while its default was `1.36.4-gke.1391002`. It is not the channel's
+  current version, so a cluster at or above it can still be a minor behind `defaultVersion`.
+- `validVersions` is what the channel currently offers. A running version absent from it can still
+  be served (GKE keeps patching a version a channel has promoted past), so its absence does not
+  mean unsupported.
+
+So "at the automatic-upgrade version" and "current" are different answers. Report the cluster's
+version, the channel's `defaultVersion`, and the gap in minors between them.
 
 ## Read the table
 
