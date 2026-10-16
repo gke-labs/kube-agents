@@ -77,6 +77,22 @@ locals {
   )]
   gitlab_repositories = [{ forge = "gitlab", repository = var.gitlab_repo, role = "gitops" }]
 
+  # A GitHub Enterprise Server GitOps repository: the github forge at
+  # gitops_host, declared through the same lists, because the deprecated
+  # github alias has no host and always means github.com. The organization is
+  # the forge's namespace and the repository is named on it; caBundleRef names
+  # the Secret with the instance's private CA, which the credential broker and
+  # the chart's token minter both read. The chart points the minter at
+  # https://<host>/api/v3 from this declaration. github = null removes the
+  # alias from the release values. A github.com install (gitops_host empty)
+  # renders the alias, as before.
+  gitops_is_ghes = !local.gitops_is_gitlab && var.gitops_host != ""
+  ghes_forges = [merge(
+    { name = "github", provider = "github", host = var.gitops_host, namespace = local.github_org },
+    var.github_ca_secret_name != "" ? { caBundleRef = { name = var.github_ca_secret_name } } : {}
+  )]
+  ghes_repositories = [{ forge = "github", repository = local.github_repo_name, role = "gitops" }]
+
   # The CR's spec.integration, as one local so the tests can read it.
   platform_agent_integration = merge(
     var.enable_google_chat ? {
@@ -99,7 +115,10 @@ locals {
     } : {},
     local.gitops_is_gitlab ? { forges = local.gitlab_forges } : {},
     local.gitops_is_gitlab ? { repositories = local.gitlab_repositories } : {},
-    (!local.gitops_is_gitlab && (local.github_org != "" || var.github_repo != "")) ? {
+    local.gitops_is_ghes ? { forges = local.ghes_forges } : {},
+    local.gitops_is_ghes ? { repositories = local.ghes_repositories } : {},
+    local.gitops_is_ghes ? { github = null } : {},
+    (!local.gitops_is_gitlab && !local.gitops_is_ghes && (local.github_org != "" || var.github_repo != "")) ? {
       github = merge(
         local.github_org != "" ? { org = local.github_org } : {},
         var.github_repo != "" ? { gitRepo = var.github_repo } : {}
@@ -1124,10 +1143,36 @@ resource "helm_release" "kube_agents" {
     }
 
     # The reverse: GitLab inputs under the default forge would be dropped,
-    # applying a CR with no GitOps repository and no error.
+    # applying a CR with no GitOps repository and no error. gitops_host is
+    # the github forge's too: a GitHub Enterprise Server host.
     precondition {
-      condition     = local.gitops_is_gitlab || (var.gitlab_repo == "" && var.gitops_host == "" && var.gitlab_ca_secret_name == "")
-      error_message = "gitlab_repo, gitops_host and gitlab_ca_secret_name apply only with gitops_forge = \"gitlab\"; set it, or leave them unset."
+      condition     = local.gitops_is_gitlab || (var.gitlab_repo == "" && var.gitlab_ca_secret_name == "")
+      error_message = "gitlab_repo and gitlab_ca_secret_name apply only with gitops_forge = \"gitlab\"; set it, or leave them unset."
+    }
+
+    # A GitHub Enterprise Server's CA belongs to the github forge at a host:
+    # github.com presents a certificate the public CAs sign, and a private CA
+    # must never vouch for it.
+    precondition {
+      condition     = var.github_ca_secret_name == "" || local.gitops_is_ghes
+      error_message = "github_ca_secret_name is for a GitHub Enterprise Server: set gitops_host to its hostname, with gitops_forge = \"github\". github.com uses the public CAs."
+    }
+
+    # The github forge at gitops_host is a GitHub Enterprise Server. A host
+    # where GitHub runs its own services is refused, as the operator refuses
+    # it; github.com is the default and needs no host; and a GitLab host is
+    # not GitHub's.
+    precondition {
+      condition     = !local.gitops_is_ghes || !can(regex("(^|\\.)(github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com)$", var.gitops_host))
+      error_message = "gitops_host with gitops_forge = \"github\" is a GitHub Enterprise Server hostname. Leave it empty for github.com; a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like) or gitlab.com is not one."
+    }
+
+    # On a GitHub Enterprise Server, github_repo is required, as owner/name
+    # on the instance: the forge is declared with the owner as its namespace,
+    # and the composition reads a URL on github.com only.
+    precondition {
+      condition     = !local.gitops_is_ghes || can(regex("^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]+$", var.github_repo))
+      error_message = "With gitops_host set, github_repo is required, as owner/name on the GitHub Enterprise Server, not a URL."
     }
 
     # A private CA is for a self-managed GitLab only: gitlab.com presents a

@@ -50,10 +50,7 @@ Take the set from the card's list, not from a roster you look up. Follow Steps 2
 shape: Step 2 is the control-plane topology, and Steps 3 and 4 are the workload list, startup
 probe, read-only root filesystem, added capabilities, namespace quota, addons, observability and
 hardening checks the Cluster Agents run. Checks the first-run audits own (liveness and readiness probes, requests and
-limits, HPA, NetworkPolicy and pod security among them) are not part of this scan, unless your card
-tells you to follow that SOP's "Without a GitOps repository" section: it does when the install has
-no GitOps repository, so those audits do not run after the scan. Then follow it for each cluster you audit here, as
-the Cluster Agents do for theirs.
+limits, HPA, NetworkPolicy and pod security among them) are not part of this scan.
 
 **Pin `kubectl` to each cluster before you run a single command against it.** That SOP is written
 for a Cluster Agent whose `KUBECONFIG` already points at one cluster; yours does not. Bare

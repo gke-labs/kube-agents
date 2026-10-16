@@ -110,15 +110,19 @@ func TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly(t *testing.T) {
 
 	gateway := operatorPeerRules(buildNetworkPolicy(agent, nil, profile, false, "", false))
 	broker := operatorPeerRules(credentialProxyNetworkPolicyWithOperatorPeer(agent, policyTestOperatorNamespace))
-	if len(gateway) != 2 || len(broker) != 1 {
-		t.Fatalf("operator peer rules: gateway on ports %v, broker on ports %v; want the gateway's two listeners and the broker's one", gateway, broker)
+	a2aFence := operatorPeerRules(a2aGatewayFencePolicyWithOperatorPeer(agent, policyTestOperatorNamespace))
+	a2aDoor := operatorPeerRules(a2aDoorNetworkPolicyWithOperatorPeer(agent, policyTestOperatorNamespace))
+	if len(gateway) != 2 || len(broker) != 1 || len(a2aFence) != 1 || len(a2aDoor) != 1 {
+		t.Fatalf("operator peer rules: gateway on ports %v, broker on ports %v, A2A fence %v, A2A door %v; want the gateway's two listeners and one each elsewhere", gateway, broker, a2aFence, a2aDoor)
 	}
 	for name, want := range map[string]struct {
 		got   map[int32]networkingv1.NetworkPolicyPeer
 		ports []int32
 	}{
-		"gateway": {gateway, []int32{eventWatcherMetricsPort, chatMetricsPort}},
-		"broker":  {broker, []int32{credentialProxyMetricsPort}},
+		"gateway":   {gateway, []int32{eventWatcherMetricsPort, chatMetricsPort}},
+		"broker":    {broker, []int32{credentialProxyMetricsPort}},
+		"a2a fence": {a2aFence, []int32{a2aGatewayMetricsPort}},
+		"a2a door":  {a2aDoor, []int32{a2aGatewayMetricsPort}},
 	} {
 		for _, port := range want.ports {
 			peer, ok := want.got[port]
@@ -140,7 +144,11 @@ func TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly(t *testing.T) {
 	// slips past.
 	gatewayBaseline := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 	brokerBaseline := buildCredentialProxyNetworkPolicy(agent)
+	a2aBaseline := buildA2AGatewayFencePolicy(agent)
 	for _, ns := range []string{"", policyTestMalformedNamespace, policyTestNonDNS1123Namespace} {
+		if fence := a2aGatewayFencePolicyWithOperatorPeer(agent, ns); !equality.Semantic.DeepEqual(fence.Spec.Ingress, a2aBaseline.Spec.Ingress) {
+			t.Errorf("the A2A fence's ingress changes under namespace %q, want no operator rule:\n got %+v\nwant %+v", ns, fence.Spec.Ingress, a2aBaseline.Spec.Ingress)
+		}
 		gwProfile := defaultTestNetpolProfile()
 		gwProfile.OperatorNamespace = ns
 		if gw := buildNetworkPolicy(agent, nil, gwProfile, false, "", false); !equality.Semantic.DeepEqual(gw.Spec.Ingress, gatewayBaseline.Spec.Ingress) {

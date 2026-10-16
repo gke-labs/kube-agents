@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -60,7 +61,8 @@ type Config struct {
 	// session pod that lost its name.
 	ProfileExecutor bool
 
-	// TaskID names the one task this process exists for.
+	// TaskID names the task this process was started for: the only one,
+	// unless SessionReuse is set, and then the first.
 	TaskID string
 	// Profile is the persona the pod boots (PROFILE env); rides from.profile.
 	Profile string
@@ -70,10 +72,19 @@ type Config struct {
 	Session string
 
 	// Primer is the conversation so far, from the file the spawner mounts
-	// (lib.EnvPrimerFile). Every turn is a fresh pod, so without it a
-	// follow-up starts with no idea what came before. Empty is a
+	// (lib.EnvPrimerFile). A pod is spawned cold for a conversation's first
+	// turn, after a reap, and whenever the gateway could not reuse the live
+	// one, so without it that turn starts with no idea what came before.
+	// Only the pod's first harness run reads it: later turns in the same pod
+	// resume the harness session, which already holds it. Empty is a
 	// conversation with nothing before this turn.
 	Primer string
+
+	// SessionReuse keeps the process up after its first task: it takes each
+	// later turn of its conversation from its own `…in` subjects, resuming
+	// the same harness session, until SIGTERM (lib.EnvSessionReuse). Session
+	// pods only; a profile pod is refused it (validate).
+	SessionReuse bool
 
 	// OriginSeq is the TASKS stream sequence of the submission this process
 	// exists to execute, from the spawner's own PubAck (lib.EnvOriginSeq).
@@ -93,8 +104,19 @@ type Config struct {
 	// HarnessCommand is the full argv of the harness. Tests point it at a
 	// stub; the pod default is the native binary with the stream-json flags.
 	HarnessCommand []string
+	// HarnessCommandNoDelegate is the argv for a task whose delegate tool
+	// is off (delegateOffForTask). Nil means HarnessCommand, which is right
+	// for a stub and for a pod whose tool is off for every task anyway.
+	HarnessCommandNoDelegate []string
 	// HarnessEnv is the complete environment for the harness subprocess.
 	HarnessEnv []string
+	// HarnessUserSettings is the harness's user settings file
+	// ($CLAUDE_CONFIG_DIR/settings.json). The image ships none, and under
+	// SessionReuse every turn removes it before the harness starts: the
+	// config dir outlives a turn whose model had Write, and a settings file
+	// left there (hooks, env, a helper command) would run in the next turn's
+	// harness. Empty skips the removal.
+	HarnessUserSettings string
 
 	// Namespace is the pod's own namespace (POD_NAMESPACE), used only to
 	// default Scope the same way the gateway defaults its ceiling.
@@ -175,6 +197,11 @@ func (c Config) consumerStem() string {
 // outside: a wrong inbox prefix means every JetStream call and every request
 // waits out its timeout with no error anywhere.
 func (c Config) validate() error {
+	// A profile pod's addressee is its profile, shared by every pod of it:
+	// a watcher there would take tasks meant for its siblings.
+	if c.SessionReuse && (c.ProfileExecutor || c.Session == "") {
+		return fmt.Errorf("%s is set on a pod with no session of its own; only a session pod serves more than one task", lib.EnvSessionReuse)
+	}
 	if c.BusTokenFile == "" {
 		return nil
 	}
@@ -310,6 +337,7 @@ type adapter struct {
 	cfg  Config
 	log  *slog.Logger
 	c    *lib.Client
+	nc   *nats.Conn
 	js   jetstream.JetStream
 	from lib.Party
 	exec *lib.TaskExecution
@@ -322,26 +350,63 @@ type adapter struct {
 	finalized bool
 	finalErr  error
 	appended  map[string]bool // artifact name -> first chunk already out
+
+	// harnessSession is the session id the harness reported at init, which
+	// the next task in a reused pod resumes (Config.SessionReuse).
+	harnessSession string
 }
 
-// Run executes the adapter's whole lifecycle for one task and returns the
-// terminal state it published. Context cancellation is the eviction path:
-// SIGTERM from the kubelet lands here, and the contract is flush, publish
-// terminal failed reason worker-evicted, exit 143 (spec-subagent-profiles.md
+// Run executes the adapter's whole lifecycle and returns the terminal state of
+// the last task it ran. Context cancellation is the eviction path: SIGTERM
+// from the kubelet lands here, and the contract is flush, publish terminal
+// failed reason worker-evicted, exit 143 (spec-subagent-profiles.md
 // "Evicted"). The one exception is a turn that has delegated: its deliverable
 // was decided at the delegate call, so it completes with it, exit 0.
+//
+// One task per process unless Config.SessionReuse is set. With it, the
+// process stays up after the first task and takes each later turn of its
+// conversation from its own subjects (runSessionLoop); a SIGTERM that lands
+// between tasks publishes nothing and returns a zero Result.
 func Run(ctx context.Context, cfg Config) (Result, error) {
 	cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
 		return Result{}, err
 	}
-	log := cfg.Logger
-	a := &adapter{cfg: cfg, log: log, appended: map[string]bool{}}
-	a.from = lib.Party{Session: cfg.Addressee(), AgentType: "claude-code", Profile: cfg.Profile}
+	b, closeBus, err := dialBus(ctx, cfg)
+	if err != nil {
+		return Result{}, err
+	}
+	defer closeBus()
 
-	// Two connections, the bridge's split: the lib client owns validated
-	// publishes and replay-fold; the raw JetStream handle owns the ordered
-	// consumers the lib doesn't expose (origin fetch, live in-subject).
+	// The pod exists because the message is already durable, so the fetch
+	// cannot miss (spec ordering rule) - but consumer setup can race pod
+	// start, so poll briefly rather than trusting one shot.
+	a := newTaskAdapter(cfg, b)
+	origin, originSeq, err := a.fetchOrigin(ctx)
+	if err != nil {
+		return Result{}, fmt.Errorf("fetch task %s: %w", cfg.TaskID, err)
+	}
+	out := a.execute(ctx, origin, originSeq, turnPlan{primer: cfg.Primer})
+	if !cfg.SessionReuse {
+		return out.res, out.err
+	}
+	return runSessionLoop(ctx, cfg, b, origin.TaskID, originSeq, out)
+}
+
+// busConns is the pod's bus: opened once, shared by every task the process
+// runs. Two connections, the bridge's split: the lib client owns validated
+// publishes and replay-fold; the raw JetStream handle owns the named
+// consumers the lib doesn't expose (origin fetch, live in-subject, the
+// session's task watcher).
+type busConns struct {
+	c  *lib.Client
+	nc *nats.Conn
+	js jetstream.JetStream
+}
+
+// dialBus opens the pod's two bus connections with its credential.
+func dialBus(ctx context.Context, cfg Config) (*busConns, func(), error) {
+	log := cfg.Logger
 	natsOpts := []nats.Option{
 		nats.Name("worker-adapter-" + cfg.Addressee()),
 		// Permission violations are asynchronous, and under the callout that
@@ -375,7 +440,7 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		// profile pod (ProfileExecutor) has no session to check it against.
 		tokenOpts, err := lib.KSATokenNATSOptions(cfg.BusTokenFile, cfg.PodName)
 		if err != nil {
-			return Result{}, err
+			return nil, nil, err
 		}
 		natsOpts = append(natsOpts, tokenOpts...)
 	case cfg.NATSUser != "":
@@ -388,28 +453,72 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 	c, err := lib.Connect(ctx, cfg.NATSURL, lib.WithLogger(log), lib.WithNATSOptions(natsOpts...))
 	if err != nil {
-		return Result{}, fmt.Errorf("connect (lib): %w", err)
+		return nil, nil, fmt.Errorf("connect (lib): %w", err)
 	}
-	defer c.Close()
-	a.c = c
-
 	nc, err := nats.Connect(cfg.NATSURL, natsOpts...)
 	if err != nil {
-		return Result{}, fmt.Errorf("connect (raw): %w", err)
+		c.Close()
+		return nil, nil, fmt.Errorf("connect (raw): %w", err)
 	}
-	defer nc.Close()
 	js, err := jetstream.New(nc)
 	if err != nil {
-		return Result{}, fmt.Errorf("jetstream: %w", err)
+		nc.Close()
+		c.Close()
+		return nil, nil, fmt.Errorf("jetstream: %w", err)
 	}
-	a.js = js
+	return &busConns{c: c, nc: nc, js: js}, func() {
+		nc.Close()
+		c.Close()
+	}, nil
+}
 
-	// The pod exists because the message is already durable, so the fetch
-	// cannot miss (spec ordering rule) - but consumer setup can race pod
-	// start, so poll briefly rather than trusting one shot.
-	origin, originSeq, err := a.fetchOrigin(ctx)
-	if err != nil {
-		return Result{}, fmt.Errorf("fetch task %s: %w", cfg.TaskID, err)
+// newTaskAdapter is one task's run state over the pod's bus. cfg.TaskID names
+// the task.
+func newTaskAdapter(cfg Config, b *busConns) *adapter {
+	return &adapter{
+		cfg:      cfg,
+		log:      cfg.Logger,
+		c:        b.c,
+		nc:       b.nc,
+		js:       b.js,
+		from:     lib.Party{Session: cfg.Addressee(), AgentType: "claude-code", Profile: cfg.Profile},
+		appended: map[string]bool{},
+	}
+}
+
+// turnPlan is what one task's run is handed besides its submission: the
+// primer, which only the conversation's first harness run reads, and the
+// harness session to resume, which every later run in the same pod continues.
+type turnPlan struct {
+	primer string
+	resume string
+}
+
+// turnOutcome is one task's run, as the session loop needs it: the terminal
+// for main's exit code, and what the harness said about its own session.
+type turnOutcome struct {
+	res Result
+	err error
+	// launched is true once a harness process started for this task.
+	launched bool
+	// harnessSession is the session id the harness reported at init, or ""
+	// when it reported none (it never started, or died before saying).
+	harnessSession string
+	// task is the task this outcome is for, set by the session loop.
+	task string
+	// podBroken is a turn refused after working and before its harness ran,
+	// for a reason in the pod's own state (the per-turn socket, the user
+	// settings file, the listener, the harness binary). The next turn here
+	// would be refused the same way, so a reused pod ends instead.
+	podBroken bool
+}
+
+// execute runs one task from its submission to its terminal state.
+func (a *adapter) execute(ctx context.Context, origin *lib.Envelope, originSeq uint64, plan turnPlan) turnOutcome {
+	cfg, log := a.cfg, a.log
+	done := func(res Result, err error) turnOutcome { return turnOutcome{res: res, err: err} }
+	broken := func(res Result, err error) turnOutcome {
+		return turnOutcome{res: res, err: err, podBroken: true}
 	}
 
 	// Respawn safety: a task already terminal on the stream is not ours to
@@ -418,11 +527,11 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	skipSubmitted := false
 	switch prior, err := a.priorEvents(ctx); {
 	case err != nil:
-		return Result{}, fmt.Errorf("terminal check for %s: %w", cfg.TaskID, err)
+		return done(Result{}, fmt.Errorf("terminal check for %s: %w", cfg.TaskID, err))
 	case prior != nil && prior.Final:
 		log.Warn("task already terminal on the stream; refusing to re-run",
 			"task", cfg.TaskID, "state", prior.State)
-		return Result{}, nil
+		return done(Result{}, nil)
 	case prior != nil:
 		// Events exist but no terminal: a predecessor incarnation died
 		// mid-task and the supervisor has not swept it yet. Publishing a
@@ -432,16 +541,16 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		skipSubmitted = true
 	}
 
-	exec, err := c.NewTaskExecution(origin, a.from, cfg.Addressee())
+	exec, err := a.c.NewTaskExecution(origin, a.from, cfg.Addressee())
 	if err != nil {
-		return Result{}, fmt.Errorf("task execution: %w", err)
+		return done(Result{}, fmt.Errorf("task execution: %w", err))
 	}
 	a.exec = exec
 	a.taskID, a.contextID, a.correlationID = origin.TaskID, origin.ContextID, origin.CorrelationID
 
 	if !skipSubmitted {
 		if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
-			return Result{}, fmt.Errorf("publish submitted: %w", err)
+			return done(Result{}, fmt.Errorf("publish submitted: %w", err))
 		}
 	}
 
@@ -449,7 +558,7 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	// for this task has to permit this executor to execute it, at this
 	// executor's own scope, and the verifier is the only thing that can say
 	// so. Refused is terminal rejected, before any model spend.
-	if reason := a.capabilityRefusal(ctx, nc, origin); reason != "" {
+	if reason := a.capabilityRefusal(ctx, a.nc, origin); reason != "" {
 		// A SIGTERM that lands inside the verify window is an eviction, not
 		// a refusal. Check wraps this same ctx and turns its cancellation
 		// into "the verifier could not be reached", so without this branch
@@ -461,10 +570,10 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 			state := lib.StateFailed
 			err := a.finalize(state, "reason: worker-evicted - infrastructure delivered SIGTERM "+
 				"while the capability was being verified", "")
-			return Result{State: state, Evicted: true}, err
+			return done(Result{State: state, Evicted: true}, err)
 		}
 		state := lib.StateRejected
-		return Result{State: state}, a.finalize(state, reason, "")
+		return done(Result{State: state}, a.finalize(state, reason, ""))
 	}
 
 	// The deliverable prompt is the message's text parts. A submission with
@@ -474,9 +583,9 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	if prompt == "" {
 		state := lib.StateRejected
 		err := a.finalize(state, "reason: no-text-parts - the submission message carries nothing to execute", "")
-		return Result{State: state}, err
+		return done(Result{State: state}, err)
 	}
-	prompt = withPrimer(a.cfg.Primer, prompt)
+	prompt = withPrimer(plan.primer, prompt)
 
 	// The live in-subject consumer opens positioned just after the
 	// submission (the dual-reader rule: everything after the submission -
@@ -488,33 +597,82 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	if err != nil {
 		state := lib.StateFailed
 		ferr := a.finalize(state, "reason: bus-subscribe-failed - "+err.Error(), "")
-		return Result{State: state}, ferr
+		return done(Result{State: state}, ferr)
 	}
 	defer stopIn()
 
 	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
-		return Result{State: lib.StateFailed}, fmt.Errorf("publish working: %w", err)
+		return done(Result{State: lib.StateFailed}, fmt.Errorf("publish working: %w", err))
+	}
+
+	// The delegate tool is decided per task: off on a wake, whatever the
+	// pod was started with (delegateOffForTask). A task with the tool off
+	// gets neither the listener nor the harness flags, the same shape as a
+	// pod started with A2A_DELEGATE_TOOL=off.
+	delegate := cfg.DelegateSocket != "" && !delegateOffForTask(origin)
+	argv := cfg.HarnessCommand
+	socket := cfg.DelegateSocket
+	if !delegate {
+		socket = ""
+		if cfg.HarnessCommandNoDelegate != nil {
+			argv = cfg.HarnessCommandNoDelegate
+		}
+	}
+	argv = withResume(argv, plan.resume)
+	env := cfg.HarnessEnv
+	if delegate && cfg.SessionReuse {
+		// A reused pod runs every turn of its conversation, and two turns
+		// can have different requesters. Each turn's listener gets a path of
+		// its own, and only that turn's harness is told it
+		// (taskDelegateSocket), so nothing kept from an earlier turn dials
+		// the current one at a path it already knows.
+		socket, err = taskDelegateSocket(cfg.DelegateSocket)
+		if err != nil {
+			state := lib.StateFailed
+			ferr := a.finalize(state, "reason: delegate-socket-failed - "+err.Error(), "")
+			return broken(Result{State: state}, ferr)
+		}
+		var rewrote bool
+		argv, env, rewrote = withDelegateSocket(argv, env, socket)
+		if !rewrote && slices.Contains(argv, MCPConfigFlag) {
+			// The harness is configured for MCP but not by the shape the pod
+			// builds, so its delegate server may still name the configured
+			// path, where nothing listens in a reused pod.
+			log.Warn("the harness's --mcp-config has no delegate server entry to point at this turn's socket; the delegate tool may not reach it",
+				"socket", socket)
+		}
+	}
+
+	if cfg.SessionReuse {
+		if err := removeUserSettings(cfg.HarnessUserSettings); err != nil {
+			state := lib.StateFailed
+			ferr := a.finalize(state, "reason: harness-settings-failed - "+err.Error(), "")
+			return broken(Result{State: state}, ferr)
+		}
 	}
 
 	// The listener is up before the harness starts, so the tool can never
-	// race it. Under an A2A_HARNESS_CMD override the harness may never be
-	// told about the tool; the socket then simply goes unused.
-	delegateCh, stopDelegate, err := startDelegateListener(cfg.DelegateSocket, log)
+	// race it, and down when this task returns, so an ask from this task's
+	// harness can never be answered by the next task's turn. Under an
+	// A2A_HARNESS_CMD override the harness may never be told about the
+	// tool; the socket then simply goes unused.
+	delegateCh, stopDelegate, err := startDelegateListener(socket, log)
 	if err != nil {
 		state := lib.StateFailed
 		ferr := a.finalize(state, "reason: delegate-socket-failed - "+err.Error(), "")
-		return Result{State: state}, ferr
+		return broken(Result{State: state}, ferr)
 	}
 	defer stopDelegate()
 
-	proc, err := startHarness(cfg.HarnessCommand, cfg.HarnessEnv, prompt, cfg.KillGrace, log)
+	proc, err := startHarness(argv, env, prompt, cfg.KillGrace, log)
 	if err != nil {
 		state := lib.StateFailed
 		ferr := a.finalize(state, "reason: spawn-failed - "+err.Error(), "")
-		return Result{State: state}, ferr
+		return broken(Result{State: state}, ferr)
 	}
 
-	return a.supervise(ctx, proc, steerCh, cancelCh, delegateCh)
+	res, err := a.supervise(ctx, proc, steerCh, cancelCh, delegateCh)
+	return turnOutcome{res: res, err: err, launched: true, harnessSession: a.harnessSession}
 }
 
 // supervise is the main loop: harness stdout events out, steering in, cancel
@@ -543,6 +701,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		err := proc.cmd.Wait()
 		took := time.Since(reapStart)
 		proc.reaped()
+		proc.killLeftovers()
 		waitDone <- reapOutcome{err, took}
 	}()
 
@@ -578,6 +737,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			case "system":
 				if ev.Subtype == "init" {
 					log.Info("harness session started", "harnessSession", ev.SessionID)
+					a.harnessSession = ev.SessionID
 				}
 			case "assistant":
 				a.publishAssistant(ctx, ev)
@@ -698,9 +858,10 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			proc.kill(0)
 			// A turn that delegated has its deliverable already: the
 			// one-line result. The SIGTERM is not a failure of it, and is
-			// expected: a child that ends fast wakes the session, and the
-			// wake's fresh incarnation retires this pod while the harness
-			// is still inside KillGrace.
+			// expected: a child that ends fast wakes the session, and a
+			// wake the gateway could not route to this pod starts a fresh
+			// incarnation that retires it while the harness is still
+			// inside KillGrace.
 			if delegated {
 				return a.completeWith(resultText)
 			}
@@ -1004,8 +1165,25 @@ func (a *adapter) finalize(state lib.TaskState, reason, evidence string) error {
 // FilterSubjects (plural) instead would move the filter into the request body,
 // where no subject permission can see it. That is not a style choice; it is
 // the difference between a scoped consumer and an unscoped one.
+//
+// A reused session pod (Config.SessionReuse) creates each name once per task,
+// each time with that task's filter and start, and a consumer's deliver
+// policy and start cannot be updated in place: the previous task's consumer
+// is deleted first. Not finding it, the usual case once its inactivity
+// threshold has reaped it, is not an error.
 func (a *adapter) sessionConsumer(ctx context.Context, role, filter string, cfg jetstream.ConsumerConfig) (jetstream.Consumer, error) {
-	cfg.Name = lib.SessionConsumerName(a.cfg.consumerStem(), role)
+	name := lib.SessionConsumerName(a.cfg.consumerStem(), role)
+	if a.cfg.SessionReuse {
+		_ = a.js.DeleteConsumer(ctx, lib.TasksStream, name)
+	}
+	return a.js.CreateOrUpdateConsumer(ctx, lib.TasksStream, sessionConsumerConfig(name, filter, cfg))
+}
+
+// sessionConsumerConfig completes a session consumer's config: the exact name
+// and the single filter the grant pins (sessionConsumer says why both), and
+// the settings every one of them shares.
+func sessionConsumerConfig(name, filter string, cfg jetstream.ConsumerConfig) jetstream.ConsumerConfig {
+	cfg.Name = name
 	cfg.FilterSubject = filter
 	cfg.FilterSubjects = nil
 	// Ack-none: the adapter reads a durable stream it does not own and its
@@ -1016,7 +1194,7 @@ func (a *adapter) sessionConsumer(ctx context.Context, role, filter string, cfg 
 	cfg.InactiveThreshold = consumerInactiveThreshold
 	cfg.MemoryStorage = true
 	cfg.Replicas = 1
-	return a.js.CreateOrUpdateConsumer(ctx, lib.TasksStream, cfg)
+	return cfg
 }
 
 // priorEvents answers the respawn question — has this task already run? — by

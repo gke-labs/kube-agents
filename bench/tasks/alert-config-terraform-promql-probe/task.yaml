@@ -1,0 +1,59 @@
+# Skill-guidance probe for gke-alert-configuration: a Terraform alerting
+# policy for a GKE workload. The skill mandates a
+# `google_monitoring_alert_policy` with `condition_prometheus_query_language`
+# (PromQL through Managed Service for Prometheus, never MQL), the
+# `created-with-google-skill` user label, and memory saturation measured
+# against the cAdvisor limit `container_spec_memory_limit_bytes` rather than
+# the kube-state-metrics `kube_pod_container_resource_limits`. Memory, not
+# CrashLoopBackOff: the skill body's crash-loop query is a kube-state-metrics
+# series, which its own guardrail says to stop and ask about first (the
+# footer adds a native one, but a run may still take the body's).
+#
+# Planted defect required: none. deployer: noop, no fixture.
+#
+# No scope: workers answer_query safeguard: knowledge lookup is not what this
+# case grades, and that check errors (fails closed) on a run whose trajectory
+# carries no tagged worker entry, which happened in 4 of this case's 11 runs.
+#
+# Isolation class: read-only fixture.
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: alert-config-terraform-promql-probe
+name: GKE memory alert in Terraform uses PromQL, the cAdvisor limit and the skill label
+
+owner: GinnyJI
+
+prompt: >-
+  Write a Terraform alerting policy that pages me when any container in the
+  namespace checkout on my GKE cluster prod-1 stays above 90% of its memory
+  limit for more than 5 minutes. Give me the HCL only; do not apply anything.
+expected_output: >-
+  A google_monitoring_alert_policy using condition_prometheus_query_language
+  with a PromQL query dividing container_memory_working_set_bytes by
+  container_spec_memory_limit_bytes for namespace checkout on cluster prod-1,
+  over 0.9 for 5 minutes, carrying the created-with-google-skill user label,
+  with a note that the containers need memory limits set.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: the-policy-uses-promql-and-the-skill-label
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases:
+        [
+          "condition_prometheus_query_language",
+          "created-with-google-skill",
+          "container_spec_memory_limit_bytes",
+        ]
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # Same delegation-boundary safeguard as knowledge-grounding-sources-probe.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]

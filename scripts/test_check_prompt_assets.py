@@ -885,6 +885,52 @@ class CheckoutPathTests(unittest.TestCase):
         )
         self.assertEqual([], self._findings())
 
+    def test_the_profile_home_spelling_of_a_file_it_ships_passes(self):
+        self.fixture.write("agents/platform/skills/thing/scripts/run.py", "")
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Run `/opt/data/profiles/platform/skills/thing/scripts/run.py` first.\n",
+        )
+        self.assertEqual([], self._findings())
+
+    def test_the_profile_home_spelling_of_a_missing_file_is_reported(self):
+        """Named in full for a kanban worker, it is still a file the image ships."""
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Run `/opt/data/profiles/platform/skills/thing/scripts/gone.py` first.\n",
+        )
+        self.assertEqual(len(self._findings()), 1)
+
+    def test_a_template_under_the_profile_home_is_not_reported(self):
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Read `/opt/data/profiles/platform/governance/<stream>_sop.md` first.\n",
+        )
+        self.assertEqual([], self._findings())
+
+    def test_the_profile_home_spelling_of_a_checkout_only_file_is_reported(self):
+        self.fixture.write("agents/platform/docs/glossary.md", "# glossary\n")
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Read `/opt/data/profiles/platform/docs/glossary.md` first.\n",
+        )
+        self.assertEqual(len(self._findings()), 1)
+
+    def test_a_misspelt_full_path_under_a_checkout_only_directory_is_reported(self):
+        self.fixture.write("agents/platform/docs/glossary.md", "# glossary\n")
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Read `/opt/data/profiles/platform/docs/glosary.md` first.\n",
+        )
+        self.assertEqual(len(self._findings()), 1)
+
+    def test_runtime_state_under_the_profile_home_is_not_reported(self):
+        self.fixture.write(
+            "agents/platform/governance/sop.md",
+            "Read `/opt/data/profiles/platform/SETTINGS.md` first.\n",
+        )
+        self.assertEqual([], self._findings())
+
     def test_the_finding_names_the_spelling_that_would_work(self):
         """The author checked that the file exists; saying only "does not
         resolve" reads as the checker being wrong. Hand them the rewrite."""
