@@ -472,7 +472,7 @@ When a base node pool is labeled `cloud.google.com/compute-class=<name>` without
 - **Do NOT flag:** standard exclusions; DaemonSets; single-zone clusters; a workload below the placed floor above (one replica has no distribution; `single-replica` owns it); a skew below the threshold with nothing Pending for want of room. Terminating pods (a `deletionTimestamp`) and pods on a node the dump does not know are not counted.
 - **Severity:** `critical` when every placed replica is in one zone — one zonal event takes the whole workload — otherwise `major`.
 - **Impact:** the collector writes it onto the finding and marks it authoritative: the share of placed replicas in the busiest zone (the blast radius of losing that zone), then the cause's own clause. State it as given.
-- **Title:** keep the one `draft` wrote, `zonal-skew on <Kind>/<name>`; it is the heading readers and tooling key on.
+- **Title:** `zonal-skew on <Kind>/<name>`, as `draft` wrote it; the collector marks it and `finish` restores it over any rewrite, because it is the heading readers and tooling key on.
 - **Remediation:** by cause, as above. **Never close this by lowering the replica count**, and never propose `DoNotSchedule` on a cluster the excerpt shows has no room in the other zone — that converts a skewed workload into a Pending one.
 
 **Dropped deliberately.** Right-sizing from VPA recommendations, "HPA pegged at max", CPU-throttling ratios, and OOMKill history all require Prometheus/GMP, VPA, or an event history this audit is forbidden from or cannot sample reliably at a fixed daily time. Node-pool surge and maintenance-window settings are real reliability risks but belong to the upgrade/security-patch audit, not here.

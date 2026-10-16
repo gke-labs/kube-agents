@@ -18222,6 +18222,66 @@ class TestAdoptCollectorEvidence(unittest.TestCase):
         self.assertEqual(finding["evidence"]["command"], self.COMMAND)
 
 
+class TestAdoptCollectorTitle(unittest.TestCase):
+    """A collector candidate marked `title_authoritative` publishes under the
+    title `draft` wrote, `<check> on <Kind>/<name>` -- see
+    `audit_report.adopt_collector_title`. Every other title is the model's,
+    which is the narrowness this class defends alongside `TestAdoptArmImpact`.
+    """
+
+    def candidate(self, **overrides):
+        cand = {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Namespace/no-network-policy",
+            "severity": "major",
+            "excerpt": "zero NetworkPolicies",
+            "impact": "model may rewrite this",
+            "title_authoritative": True,
+        }
+        cand.update(overrides)
+        return cand
+
+    def manifest(self, candidates, name="prod-us-east"):
+        return {"clusters": [{"name": name, "outcome": "collected", "candidates": candidates}]}
+
+    def test_the_drafted_title_replaces_a_rewrite(self):
+        finding = make_finding(title="Replicas of no-network-policy concentrated in one zone")
+        adopted = audit_report.adopt_collector_title([finding], self.manifest([self.candidate()]))
+        self.assertEqual(adopted, ["no-network-policy"])
+        self.assertEqual(finding["title"], "netpol-missing on Namespace/no-network-policy")
+
+    def test_an_unmarked_candidate_leaves_the_models_title_alone(self):
+        cand = self.candidate()
+        del cand["title_authoritative"]
+        finding = make_finding(title="the model's better title")
+        self.assertEqual(audit_report.adopt_collector_title([finding], self.manifest([cand])), [])
+        self.assertEqual(finding["title"], "the model's better title")
+
+    def test_a_title_already_in_the_drafted_form_is_not_reported_as_changed(self):
+        finding = make_finding(title="netpol-missing on Namespace/no-network-policy")
+        self.assertEqual(audit_report.adopt_collector_title([finding], self.manifest([self.candidate()])), [])
+
+    def test_nothing_but_the_title_is_taken_from_the_candidate(self):
+        finding = make_finding(title="rewritten", impact="model impact", excerpt="model excerpt")
+        audit_report.adopt_collector_title([finding], self.manifest([self.candidate()]))
+        self.assertEqual(finding["impact"], "model impact")
+        self.assertEqual(finding["evidence"]["excerpt"], "model excerpt")
+
+    def test_a_candidate_missing_its_check_or_object_adopts_nothing(self):
+        for field in ("check", "object"):
+            finding = make_finding(title="rewritten")
+            self.assertEqual(
+                audit_report.adopt_collector_title([finding], self.manifest([self.candidate(**{field: ""})])),
+                [],
+            )
+            self.assertEqual(finding["title"], "rewritten")
+
+    def test_draft_and_the_restoration_agree_on_the_form(self):
+        self.assertEqual(audit_report.collector_title("zonal-skew", "Deployment/api"), "zonal-skew on Deployment/api")
+
+
 class TestAdoptArmImpact(unittest.TestCase):
     """A multi-arm check's `impact` reports *which arm fired*, so the collector
     authors it — see `audit_report.adopt_arm_impact`. Everywhere else the

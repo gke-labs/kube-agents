@@ -5632,6 +5632,40 @@ def adopt_collector_evidence(findings: list[dict], manifest: dict | None) -> lis
     return adopted
 
 
+def collector_title(check: str, obj: str) -> str:
+    """The title `draft` gives every collector candidate: `<check> on <Kind>/<name>`."""
+    return f"{check} on {obj}"
+
+
+def adopt_collector_title(findings: list[dict], manifest: dict | None) -> list[str]:
+    """Restore the drafted title for a candidate the collector marked
+    `title_authoritative`. Returns the ids changed.
+
+    As narrow as `adopt_arm_impact`, for the same reason: a title is prose and
+    the model's is usually the better one. The exception is a check whose
+    heading something downstream keys on -- a reader looking for `zonal-skew on
+    Deployment/x`, or an eval case grading it -- where a retitle, carried
+    forward by `carry_unchanged_findings` on every later run, would hide the
+    finding under new words. The collector marks those; nothing else is touched.
+    """
+    marked: dict[str, str] = {}
+    for entry, candidate in _candidates(manifest):
+        if not candidate.get("title_authoritative"):
+            continue
+        check = str(candidate.get("check") or "").strip()
+        obj = str(candidate.get("object") or "").strip()
+        if check and obj:
+            marked[_candidate_identity(entry, candidate)] = collector_title(check, obj)
+
+    adopted = []
+    for finding in findings:
+        title = marked.get(derive_finding_id(finding))
+        if title and finding.get("title") != title:
+            finding["title"] = title
+            adopted.append(str(finding.get("id") or ""))
+    return adopted
+
+
 def adopt_arm_impact(findings: list[dict], manifest: dict | None) -> list[str]:
     """Take the collector's `impact` for a candidate that marked it arm-specific.
 
@@ -15376,7 +15410,7 @@ def draft_findings(manifest: dict, audit_id: str) -> dict:
                     "id": f"{check}.{name}.{candidate.get('namespace') or '_'}.{obj}",
                     "check": check,
                     "severity": str(candidate.get("severity") or ""),
-                    "title": f"{check} on {obj}",
+                    "title": collector_title(check, obj),
                     "cluster": str(candidate.get("cluster") or name),
                     "namespace": str(candidate.get("namespace") or ""),
                     "object": obj,
@@ -16533,6 +16567,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             f"{fid}: impact taken from the collector, which knows which arm "
             "of the check fired."
         )
+    # Same placement, same reason: a title the collector marks is the heading
+    # readers and tooling key on, so a rewrite, carried or fresh, is undone.
+    for fid in adopt_collector_title(data["findings"], manifest):
+        log(f"{fid}: title restored to the collector's `<check> on <object>` form.")
     # After the adoptions and the carry, and ahead of the dry-run split so the
     # preview and the real run publish the same command. `validate_findings`
     # already ran this repair, but the DNS arm is read off `evidence.excerpt`,

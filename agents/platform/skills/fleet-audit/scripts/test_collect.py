@@ -4416,7 +4416,7 @@ class TestDumpStateGate(unittest.TestCase):
 class TestCollectCluster(unittest.TestCase):
     CLUSTER = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
 
-    def collect(self, dump_items, cred_rc=0, dump_rc=0, checks=None, cluster=None):
+    def collect(self, dump_items, cred_rc=0, dump_rc=0, checks=None, cluster=None, pod_rows=POD_PLACEMENT_ROWS):
         calls = []
 
         def run(argv, **kwargs):
@@ -4424,7 +4424,7 @@ class TestCollectCluster(unittest.TestCase):
             if "get-credentials" in argv:
                 return Run(argv, cred_rc, "", "" if cred_rc == 0 else "denied", 0.1)
             if "pods" in argv:
-                return Run(argv, dump_rc, POD_PLACEMENT_ROWS, "", 0.1)
+                return Run(argv, dump_rc, pod_rows, "", 0.1)
             if argv[:2] == ["kubectl", "get"]:
                 return Run(argv, dump_rc, json.dumps(dump_of(*dump_items, *TWO_ZONE_NODES)), "", 0.2)
             return Run(argv, 0, "", "", 0.01)
@@ -4715,6 +4715,21 @@ class TestCollectCluster(unittest.TestCase):
                 )
                 self.assertNotIn("pod_selector", found)
                 self.assertIn(f"{other['kind']}/{other['metadata']['name']}", found["pod_selector_withheld"])
+
+    def test_a_zonal_skew_candidate_marks_its_title_as_the_collectors(self):
+        # Two replicas of `api` placed on the first zone's node and nothing
+        # else: §3.25 fires, and its candidate alone carries the marker that
+        # makes `finish` keep `draft`'s `zonal-skew on Deployment/api` title.
+        rows = POD_PLACEMENT_ROWS + (
+            "default\tapi-7d9f-a\tnode-a\tRunning\t\tReplicaSet\tapi-7d9f\t\t\n"
+            "default\tapi-7d9f-b\tnode-a\tRunning\t\tReplicaSet\tapi-7d9f\t\t\n"
+        )
+        result, _ = self.collect([deployment("api", **{"spec.replicas": 2})], pod_rows=rows)
+        by_slug = {c["check"]: c for c in result["candidates"]}
+        self.assertIn("zonal-skew", by_slug)
+        self.assertIs(by_slug["zonal-skew"]["title_authoritative"], True)
+        self.assertIs(by_slug["zonal-skew"]["impact_authoritative"], True)
+        self.assertNotIn("title_authoritative", by_slug["no-pdb"])
 
     def test_the_collection_command_is_the_same_across_every_check(self):
         result, _ = self.collect([deployment("api")])
