@@ -1641,6 +1641,8 @@ _ALL_FINDINGS_RE = re.compile(
 # (`FINDING_MARKER_RE`'s shape) and inline code outside HTML comments.
 _HEADING_ID_RE = re.compile(r"^####[ \t].*?<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M)
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+# The notice audit_report's `_render_findings` writes when it omits findings.
+_OMITTED_NOTICE_RE = re.compile(r"\d+ further finding\(s\) are omitted from this description")
 # Mirrors audit_report's `HELD_IDS_RE`: the held ids its held span records.
 _HELD_IDS_RE = re.compile(r"<!--[ \t]*audit-held-ids:[ \t]*(\[.*?\])[ \t]*-->", re.S)
 _CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
@@ -3608,6 +3610,11 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             # findings leave; this check grades the findings the run filed.
             held = {fid for match in _HELD_IDS_RE.findall(body) for fid in _json_str_list(match)}
             unnamed = [fid for fid in filed[0] if fid not in named and fid not in held]
+            # Past its cap the complete-id block is left out and `filed` is the
+            # delta block, which lacks the omitted ids; the renderer's omission
+            # notice still says they exist.
+            if filed[1] == "audit-findings" and _OMITTED_NOTICE_RE.search(_HTML_COMMENT_RE.sub("", body)):
+                unnamed.append("(omitted findings with no complete-id block to name them)")
 
         missing = [p for p in self.required_phrases if p.lower() not in text]
         present = [p for p in self.forbidden_phrases if p.lower() in text]

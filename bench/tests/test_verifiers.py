@@ -3788,6 +3788,19 @@ def test_every_finding_named_does_not_grade_a_collector_held_id(token, github):
     assert _ledger_check(every_finding_named=True).verify(5.0).status == "pass"
 
 
+def test_every_finding_named_fails_on_an_omission_notice_without_a_complete_block(token, github):
+    _stash_report()
+    body = _ledger_body(
+        findings=f"#### debug-binding <!-- finding:{_NAMED_SHOWN} -->\n\n"
+        "_3 further finding(s) are omitted from this description to stay inside GitHub's body limit._\n",
+        finding_ids=[_NAMED_SHOWN],
+    )
+    github.routes[_api()] = (200, _issue(body))
+    res = _ledger_check(every_finding_named=True).verify(5.0)
+    assert res.status == "fail"
+    assert "omitted" in res.reason
+
+
 def test_every_finding_named_fails_without_a_delta_block(token, github):
     _stash_report()
     github.routes[_api()] = (200, _issue(_ledger_body(finding_ids=None)))
