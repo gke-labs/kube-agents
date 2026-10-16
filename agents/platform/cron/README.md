@@ -192,13 +192,17 @@ platform_control `fleet_scope` tool hands the SOPs (`--scope-projects`,
 outside it with the reason, which the table carries as that project's failure;
 an install that declares none keeps the bare flag, and a scope render the pod
 cannot read fails the tick with the reason. That read is `gcloud` cluster metadata
-for the version table and, on a report day, one `get-credentials` and two
-`kubectl get` per cluster for the readiness grade, one of
-`pdb,deploy,statefulset -A` and one of
-`validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces -A`;
-the budget names those objects, and a fail-closed webhook with no reachable
-backend names its configuration and its Service, in the saved report, which is
-tenant-written text, so the entry declares `risk: high` as `stall-watch` does. A project
+for the version table and, on a report day, the readiness report's read set,
+the same as a run on request: one `get-credentials` and six `kubectl get`s
+per cluster (budgets, Deployments and StatefulSets; webhook configurations
+with their Services, EndpointSlices and Namespaces; DaemonSets, CronJobs,
+claims, NetworkPolicies and Namespaces; every pod; the nodes through a
+jsonpath projection; StorageClasses and PersistentVolumes), plus
+`gcloud logging read` over the Admin Activity log when a registered rule reads
+it; the saved report names those objects, pods and nodes among them, and a
+fail-closed webhook with no reachable backend names its configuration and its
+Service, which is tenant-written text, so the entry declares `risk: high` as
+`stall-watch` does. A project
 spelled by its number is keyed by the id `gcloud projects describe` resolves,
 learned on its first table run. A number the credential cannot resolve is
 never a key, so its clusters earn no report until it resolves: when nothing
@@ -213,11 +217,12 @@ without it is a custom grant) or the project id in place of the number
 (`spec.harness.projectId` has to be the id; `UPGRADE_READINESS_PROJECTS` for a
 hand run).
 
-It runs the skill the way `stall-watch` runs `stall_report.py`: the two scripts
-are read from the agent image's `/opt/platform-template/skills/` copy and
-handed to `python3 -I -` in the sandbox on stdin, behind a loader that
-registers `upgrade_readiness`, and the agent image's `fleet_scope_args` so the
-script formats a refusal with the constants the job parses it by, before
+It runs the skill the way `stall-watch` runs `stall_report.py`: every module
+under the skill's `scripts/` except its tests, with the data files beside them,
+is read from the agent image's `/opt/platform-template/skills/` copy and handed
+to `python3 -I -` in the sandbox on stdin, behind a loader (a meta-path finder
+serving the shipped set, the agent image's `fleet_scope_args` among them so the
+script formats a refusal with the constants the job parses it by) before
 running `fleet_upgrade_report.main`. The
 loader gives the report a private `tempfile.mkdtemp` directory for its JSON
 output and rollout record, so nothing the model can write to is on the path
@@ -263,9 +268,9 @@ chat line says "none graded" and the version is tried again tomorrow), and the
 weekly comparison carries ten minutes of slack so the tick's own drift cannot
 push a refresh to day eight. A partial table, an ungraded version or a failed
 tick is announced once, not daily: the ledger keeps what was announced (the
-kinds of read error for a partial table; each project and how it went
-ungraded for a version, never the error text, which an outage rewords from
-one run to the next), a
+kinds of read error for a partial table, and for a refusal the project and
+its cause; each project and how it went ungraded for a version, never the
+error text, which an outage rewords from one run to the next), a
 failed tick (which writes nothing to the ledger but its record of the projects
 the hops refused as outside the declared scope, kept at whichever step the tick
 failed, so the next tick files them under the same cause) keeps its line in
@@ -440,12 +445,15 @@ the message a week after the upgrade that brings it.
 
 Every other tick prints nothing and relays nothing, so once the message has
 landed the job costs one silent subprocess a day, like `github-repo-watcher`'s idle
-ticks. Two environment variables, set per install through the CR's
-`spec.deployment.env` and passed to the agent container by the operator's
-allowlist, are the whole configuration surface: `FEEDBACK_PROMPT_ENABLED`
+ticks. Two environment variables, set per install through the chart value
+`platformAgent.deployment.env` (on an `install.sh` install, a
+`TF_VAR_extra_helm_values` line in `install.env`; on a hand-driven Terraform
+apply, `extra_helm_values` in `terraform.tfvars`) and passed to the agent container by the
+operator's allowlist, are the whole configuration surface: `FEEDBACK_PROMPT_ENABLED`
 (default `true`; `false` neither arms nor claims, so an install that turns it
 on later still gets exactly one) and `FEEDBACK_PROMPT_DELAY` (default `7d`;
-`<n>d`, `<n>h` or `<n>m`). A delay that does not parse is a failed run, exit 1
+`<n>d`, `<n>h` or `<n>m`). A hand edit of the CR's `spec.deployment.env` can
+be lost at the next chart apply. A delay that does not parse is a failed run, exit 1
 with the reason on stderr, which the scheduler reports in chat like any other
 script failure until the value is fixed; it does not fall back, because the
 scheduler keeps a zero-exit script's stderr nowhere and a silent fallback

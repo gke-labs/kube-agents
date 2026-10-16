@@ -49,8 +49,10 @@ nothing:
   ``manifests/vendor/x.yaml`` out of the report without an allowlist anyone has
   to maintain;
 * ``/opt/data/**`` is runtime state that exists only in a live pod, and is
-  skipped. So is any reference holding a shell variable or an obvious
-  placeholder;
+  skipped, except the platform profile home ``/opt/data/profiles/platform/``,
+  which skills and SOPs name in full for a kanban worker and which is resolved
+  against what that home is given (``PROFILE_HOME_ITEMS``). Any reference
+  holding a shell variable or an obvious placeholder is skipped too;
 * nothing resolves against the repository root. A checkout is not mounted into
   any agent, so ``agents/platform/skills/x/y.md`` -- which names a real file
   here, and survives every review a human gives it -- is a finding: that tree
@@ -166,6 +168,12 @@ PROFILE_HOME_ITEMS: dict[str, frozenset[str]] = {
         {"SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills"}
     ),
 }
+
+# The platform profile's home in a running pod, and a file in the platform
+# tree (relative to REPO, which the tests repoint) that selects that home's
+# item list in `_resolves_in_home`.
+PLATFORM_PROFILE_HOME = "/opt/data/profiles/platform/"
+PLATFORM_HOME_ANCHOR = "agents/platform/SOUL.md"
 
 # The profile templates the entrypoint scaffolds from. Unlike /opt/defaults
 # these are plain directory copies, so the mapping is one line each.
@@ -330,11 +338,21 @@ def _is_placeholder(ref: str) -> bool:
     absent from a checkout. The rest are references written as templates --
     `$HERMES_HOME/...`, `memory/YYYY-MM-DD.md`, `<cluster>/kustomization.yaml`.
     """
-    if ref.startswith("/opt/data/"):
-        return True
     if any(ch in ref for ch in "$<>{}*?"):
         return True
     if "..." in ref or "YYYY" in ref:
+        return True
+    if ref.startswith(PLATFORM_PROFILE_HOME):
+        # The items the image gives that home are checked, and so is a path the
+        # checkout has under agents/platform but does not ship (docs/); anything
+        # else under it (SETTINGS.md, memories/) is runtime state, as the rest of
+        # /opt/data is.
+        rest = ref[len(PLATFORM_PROFILE_HOME) :]
+        head = rest.split("/", 1)[0]
+        if head in PROFILE_HOME_ITEMS["platform"]:
+            return False
+        return not (REPO / PLATFORM_HOME_ANCHOR).parent.joinpath(head).exists()
+    if ref.startswith("/opt/data/"):
         return True
     # Absolute paths that are neither image layout nor repository content:
     # /var/run/docker.sock, /run/containerd/containerd.sock, /etc/...
@@ -475,6 +493,10 @@ def _looks_like_reference(ref: str, roots: list[Path]) -> bool:
 
 
 def _resolves(ref: str, path: Path, roots: list[Path]) -> bool:
+    if ref.startswith(PLATFORM_PROFILE_HOME):
+        # Named in full for a kanban worker, which starts in its card's
+        # workspace; judged against what the platform home is given.
+        return _resolves_in_home(ref[len(PLATFORM_PROFILE_HOME) :], REPO / PLATFORM_HOME_ANCHOR)
     if ref.startswith("/opt/defaults/"):
         return _resolve_opt(ref[len("/opt/defaults/") :]) is not None
     for prefix, source in OPT_TEMPLATES:
@@ -490,9 +512,7 @@ def _resolves(ref: str, path: Path, roots: list[Path]) -> bool:
         # the profile home for a persona or an SOP and the bundle for a skill --
         # not the directory the sentence happens to be written in. A skill's
         # reference page says `./assets/x.sh` for an asset one level up from
-        # itself, and the fleet-audit SKILL.md says
-        # `./skills/fleet-audit/scripts/audit_report.py` for its own script.
-        # Both are right, and both are wrong if `./` is read literally.
+        # itself: right, and wrong if `./` is read literally.
         bare = ref[2:]
         if (path.parent / bare).exists():
             return True

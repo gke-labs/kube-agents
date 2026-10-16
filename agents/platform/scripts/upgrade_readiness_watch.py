@@ -68,14 +68,14 @@ project the sandbox cannot finish leaves only its own clusters ungraded.
 Where it runs, and how. The agent container carries no ``gcloud`` or
 ``kubectl``; both live in the shell sandbox behind the credential proxy, and
 the sandbox login never executes a file under the agent-owned ``/opt/data``
-(``deploy/sandbox/Dockerfile``). So the skill's two scripts are read here, from
-the agent image's copy under ``/opt/platform-template``, and handed to
-``python3 -I -`` on the command's stdin wrapped in a small loader that
-registers ``upgrade_readiness``, and this image's ``fleet_scope_args`` (the
-collectors' scope flags and refusals, so the report script formats a
-refusal with the constants this job parses it by), as modules before running
-``fleet_upgrade_report.main``: the same route ``stall_watch.py`` takes with
-``stall_report.py``. ``-I`` keeps the sandbox's working directory off the
+(``deploy/sandbox/Dockerfile``). So every module under the skill's ``scripts/``
+except its tests, with the data files beside them, is read here from the agent
+image's copy under ``/opt/platform-template`` and handed to ``python3 -I -`` on
+the command's stdin behind a loader, a meta-path finder that serves the shipped
+set with this image's ``fleet_scope_args`` beside it (the collectors' scope flags
+and refusals, so the report script formats a refusal with the constants this job
+parses it by), before running ``fleet_upgrade_report.main``: the route ``stall_watch.py``
+takes with ``stall_report.py``, widened to a package. ``-I`` keeps the sandbox's working directory off the
 module path. The loader gives the report script a private temporary directory
 of its own (``tempfile.mkdtemp``, owned by the sandbox login and readable by
 nobody else) for its JSON output and its rollout record, reads the output
@@ -206,6 +206,18 @@ READINESS_MODULE = "upgrade_readiness"
 # whatever copy the sandbox image carries.
 SCOPE_ARGS_MODULE = "fleet_scope_args"
 PYTHON_SOURCE_SUFFIX = ".py"
+# What the loader ships into the sandbox: every module under the skill's scripts directory
+# except its tests, behind a meta-path finder, so the report's imports (the readiness
+# module, the readiness_rules package, the shape tables, and whatever a later rule adds)
+# resolve from the shipped set alone. The sandbox has the files on disk but on no import
+# path, and a stdin program under -I has no script directory to find them from.
+SKILL_TEST_PREFIX = "test_"
+PACKAGE_INIT = "__init__"
+PYCACHE_DIR = "__pycache__"
+MODULE_SEPARATOR = "."
+# The skill's data files ship beside its modules (the removal table the shape tables read
+# through `pkgutil.get_data`); the tests' fixtures do not.
+SKILL_DATA_SKIPPED_DIRS = (PYCACHE_DIR, "testdata")
 
 # How the report runs in the sandbox.
 PYTHON_EXECUTABLE = "python3"
@@ -321,8 +333,16 @@ REMEDY_OUTSIDE_UNRESOLVED = (
     "named here again with its remedy; a lookup that keeps failing needs the install's read access on that folder, "
     "organisation or selector"
 )
-REMEDY_ID = INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run)"
+REMEDY_ID = INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run), or grant the agent's identity resourcemanager.projects.get on it so the reconcile resolves the number"
 REMEDY_SANDBOX_RESTART = "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again"
+# The unresolved note for a declaration the reconcile did resolve in part: a
+# container or selector lookup did not finish on its last run, so the set it
+# wrote is short, as against ``fleet_scope_args.UNRESOLVED_SCOPE_NOTE``, which
+# says no resolved set was written at all and is quoted only then.
+PARTLY_UNRESOLVED_SCOPE_NOTE = (
+    "the install's declared scope is resolved in part (a container or selector lookup did not finish on the reconcile's last run, "
+    "so its resolved set is short)"
+)
 # The reconcile's listing of the project did not finish on its last run (a
 # timeout, a network or quota error, a gcloud failure it did not classify, or
 # a carried tick): not an access failure, so no grant is asked for. Posted
@@ -344,6 +364,10 @@ UNREAD_REMEDIES = {
 # and what the announcements key it on, so a cause that changes (a project
 # declared and then found unread, a scope that resolves, an exclude entry
 # added or dropped) is news.
+# The failure marker's key for a tick every project of which was refused: the refused
+# projects and their causes, as the partial line keys a refusal, never the line's text,
+# which names the resolved set and so moves with the scope's membership.
+FAILURE_KEY_REFUSED = "refused"
 REFUSAL_OUTSIDE = "outside the resolved scope"
 REFUSAL_OUTSIDE_UNRESOLVED = "outside a scope not yet resolved"
 REFUSAL_EXCLUDED = "excluded by spec.scope.exclude"
@@ -454,8 +478,8 @@ TABLE_ERRORS_KEY = "table_errors"
 # since a container just gained carries no members when its lookup fails.
 # Saved even when the tick fails (``keep_standing``), at whichever step after
 # a hop filed it, since a failed tick writes nothing else of the ledger: the
-# failure line is keyed on the refusal's text, and the hold is what keeps that
-# text the same.
+# failure line is keyed on the refused projects and their causes
+# (``refused_tick_signature``), and the hold is what keeps that key the same.
 STANDING_OUTSIDE_KEY = "standing_outside"
 # The report script keys members and read errors by the project id it resolved,
 # so a project the roster spells as a number must be keyed the same way in the
@@ -579,11 +603,21 @@ class ReportRefused(RuntimeError):
     for its cause, composed once (``refusal_detail``) so the partial line,
     the ungraded line and the tick's failure line all say the same thing and
     none relays the remedy the script wrote for an agent; ``cause`` is what
-    the announcements key it on, so a changed remedy is a new line."""
+    the announcements key it on, so a changed remedy is a new line.
+    ``signature`` is set where one refusal stands for a whole tick
+    (``versions_by_project``): the refused projects and their causes, the key
+    the tick's failure line is announced under instead of its text."""
 
     def __init__(self, detail: str, cause: str) -> None:
         super().__init__(detail)
         self.cause = cause
+        self.signature: str | None = None
+
+
+def refused_tick_signature(failed: dict) -> str:
+    """The failure marker's key for a tick whose every run was refused: the
+    refused projects and their causes, sorted, under ``FAILURE_KEY_REFUSED``."""
+    return json.dumps([FAILURE_KEY_REFUSED, sorted([project, exc.cause] for project, exc in failed.items() if isinstance(exc, ReportRefused))])
 
 
 class SandboxTimedOut(RuntimeError):
@@ -711,37 +745,99 @@ def scope_args_path() -> Path:
     return Path(__file__).resolve().parent / (SCOPE_ARGS_MODULE + PYTHON_SOURCE_SUFFIX)
 
 
-def loader_source(argv: list[str]) -> str:
-    """The program ``python3 -I -`` runs in the sandbox: both skill scripts and
-    this image's ``fleet_scope_args`` as string literals, the readiness and
-    scope-args modules registered first so the report's ``import
-    upgrade_readiness`` and ``import fleet_scope_args`` resolve to them, then
-    ``main`` with ``argv`` plus an output path and a rollout record inside a
-    private temporary directory, its tables captured, the directory removed,
-    and one JSON envelope printed after a sentinel line."""
+def _stamped(path: Path, scripts: Path, root: str | None) -> str:
+    """The path a shipped file is known by in the sandbox: where it was read from on the
+    agent side, or the same path under ``root`` when a caller re-roots the set (the tests
+    do, to a directory that does not exist, so a read can only come from the shipped set)."""
+    return str(path) if root is None else str(Path(root) / path.relative_to(scripts))
+
+
+def shipped_modules(root: str | None = None) -> dict[str, tuple[str, str, bool]]:
+    """Every module the loader ships, by import name: its source, the path it is known by
+    (the module's ``__file__`` in the sandbox, so the report's own path-relative lookups
+    are unchanged) and whether it is a package. Every ``.py`` under the skill's scripts
+    directory except the tests, so a module a later rule adds ships without a change here,
+    and an import the set does not satisfy fails the loader tests rather than the job;
+    plus this image's ``fleet_scope_args``, which the report imports."""
     scripts = skill_scripts_dir()
-    readiness_path = scripts / (READINESS_MODULE + PYTHON_SOURCE_SUFFIX)
-    report_path = scripts / (REPORT_MODULE + PYTHON_SOURCE_SUFFIX)
+    shipped: dict[str, tuple[str, str, bool]] = {}
+    for path in sorted(scripts.rglob("*" + PYTHON_SOURCE_SUFFIX)):
+        relative = path.relative_to(scripts)
+        if PYCACHE_DIR in relative.parts or relative.name.startswith(SKILL_TEST_PREFIX):
+            continue
+        parts = list(relative.with_suffix("").parts)
+        is_package = parts[-1] == PACKAGE_INIT
+        if is_package:
+            parts = parts[:-1]
+        shipped[MODULE_SEPARATOR.join(parts)] = (path.read_text(encoding="utf-8"), _stamped(path, scripts, root), is_package)
+    # This image's copy of the collectors' scope module, beside this script rather than
+    # under the skill: the report imports it, and shipping the copy this job parses
+    # refusals by keeps the sandbox image's copy out of the format.
     scope_args = scope_args_path()
+    shipped[SCOPE_ARGS_MODULE] = (scope_args.read_text(encoding="utf-8"), str(scope_args) if root is None else str(Path(root) / scope_args.name), False)
+    return shipped
+
+
+def shipped_data(root: str | None = None) -> dict[str, str]:
+    """Every data file the loader ships, by the path it is known by (beside its module, so
+    ``pkgutil.get_data(module, name)`` finds it through the finder): every file under the
+    skill's scripts directory that is not a module, a test or a test fixture. Today that is
+    the removal table the shape tables and the GitOps scan share."""
+    scripts = skill_scripts_dir()
+    data: dict[str, str] = {}
+    for path in sorted(scripts.rglob("*")):
+        relative = path.relative_to(scripts)
+        if not path.is_file() or path.suffix == PYTHON_SOURCE_SUFFIX or relative.name.startswith(SKILL_TEST_PREFIX):
+            continue
+        if any(part in SKILL_DATA_SKIPPED_DIRS for part in relative.parts):
+            continue
+        data[_stamped(path, scripts, root)] = path.read_text(encoding="utf-8")
+    return data
+
+
+def loader_preamble(root: str | None = None) -> str:
+    """The first part of the sandbox program: the shipped modules and data files as
+    literals behind a meta-path finder, so ``import fleet_upgrade_report`` and every import
+    under it resolve from them, in whatever order the imports ask, each module's
+    ``__file__`` the path it is known by, and a module's ``pkgutil.get_data`` reads the
+    shipped file beside it (the finder is the module's loader, and serves the data)."""
     return "\n".join(
         [
-            "import contextlib, io, json, os, shutil, sys, tempfile, types",
-            f"READINESS_SRC = {json.dumps(readiness_path.read_text(encoding='utf-8'))}",
-            f"SCOPE_ARGS_SRC = {json.dumps(scope_args.read_text(encoding='utf-8'))}",
-            f"REPORT_SRC = {json.dumps(report_path.read_text(encoding='utf-8'))}",
+            "import contextlib, importlib, importlib.abc, importlib.util, io, json, os, shutil, sys, tempfile",
+            f"SOURCES = {shipped_modules(root)!r}",
+            f"DATA = {shipped_data(root)!r}",
+            "class Shipped(importlib.abc.MetaPathFinder, importlib.abc.Loader):",
+            "    def find_spec(self, name, path=None, target=None):",
+            "        entry = SOURCES.get(name)",
+            "        return None if entry is None else importlib.util.spec_from_loader(name, self, origin=entry[1], is_package=entry[2])",
+            "    def create_module(self, spec):",
+            "        return None",
+            "    def exec_module(self, module):",
+            "        source, file, _ = SOURCES[module.__name__]",
+            "        module.__file__ = file",
+            "        exec(compile(source, file, 'exec'), module.__dict__)",
+            "    def get_data(self, path):",
+            "        if path in DATA:",
+            "            return DATA[path].encode('utf-8')",
+            "        with open(path, 'rb') as handle:",
+            "            return handle.read()",
+            "sys.meta_path.insert(0, Shipped())",
+            "",
+        ]
+    )
+
+
+def loader_source(argv: list[str]) -> str:
+    """The program ``python3 -I -`` runs in the sandbox: the skill's modules behind a
+    finder (``loader_preamble``), the report imported through it, then ``main`` with
+    ``argv`` plus an output path and a rollout record inside a private temporary
+    directory, its tables captured, the directory removed, and one JSON envelope printed
+    after a sentinel line."""
+    return loader_preamble() + "\n".join(
+        [
             f"ARGV = {json.dumps(argv)}",
             f"SENTINEL = {json.dumps(ENVELOPE_SENTINEL)}",
-            f"readiness = types.ModuleType({json.dumps(READINESS_MODULE)})",
-            f"readiness.__file__ = {json.dumps(str(readiness_path))}",
-            "exec(compile(READINESS_SRC, readiness.__file__, 'exec'), readiness.__dict__)",
-            f"sys.modules[{json.dumps(READINESS_MODULE)}] = readiness",
-            f"scope_args = types.ModuleType({json.dumps(SCOPE_ARGS_MODULE)})",
-            f"scope_args.__file__ = {json.dumps(str(scope_args))}",
-            "exec(compile(SCOPE_ARGS_SRC, scope_args.__file__, 'exec'), scope_args.__dict__)",
-            f"sys.modules[{json.dumps(SCOPE_ARGS_MODULE)}] = scope_args",
-            f"report = types.ModuleType({json.dumps(REPORT_MODULE)})",
-            f"report.__file__ = {json.dumps(str(report_path))}",
-            "exec(compile(REPORT_SRC, report.__file__, 'exec'), report.__dict__)",
+            f"report = importlib.import_module({json.dumps(REPORT_MODULE)})",
             f"private = tempfile.mkdtemp(prefix={json.dumps(SANDBOX_TMP_PREFIX)})",
             f"output = os.path.join(private, {json.dumps(SANDBOX_OUTPUT_NAME)})",
             f"state = os.path.join(private, {json.dumps(SANDBOX_STATE_DIR_NAME)})",
@@ -876,7 +972,9 @@ def unresolved_note(scope: fleet_scope_targets.ScopeTargets | None) -> str | Non
     if scope.note:
         return scope.note
     if any(project == fleet_scope_args.UNRESOLVED_SCOPE_ROW for project, _ in scope.unread):
-        return fleet_scope_args.UNRESOLVED_SCOPE_NOTE
+        # The collectors' note says no resolved set was written; true only while the
+        # declaration resolved nothing, else the set is there and short.
+        return PARTLY_UNRESOLVED_SCOPE_NOTE if scope.projects else fleet_scope_args.UNRESOLVED_SCOPE_NOTE
     return None
 
 
@@ -1493,7 +1591,10 @@ def versions_by_project(
             # a sandbox failure or a timeout on another is what stopped the
             # read this tick, so it is the one named, and a refusal only when
             # every run was refused.
-            raise next((exc for exc in failed.values() if not isinstance(exc, ReportRefused)), next(iter(failed.values())))
+            chosen = next((exc for exc in failed.values() if not isinstance(exc, ReportRefused)), next(iter(failed.values())))
+            if isinstance(chosen, ReportRefused):
+                chosen.signature = refused_tick_signature(failed)
+            raise chosen
         if unresolved:
             raise ProjectUnresolved(
                 UNRESOLVED_TICK_DETAIL.format(reasons=REASONS_SEPARATOR.join(PARTIAL_REASON.format(project=p, message=d) for p, d in unresolved.items()))
@@ -1672,7 +1773,8 @@ def keep_standing(path: Path, standing: dict[str, list[str]], loaded: dict[str, 
     that failed, at whichever step: a table that read nothing, a hop whose
     sandbox call raised, a report that could not be written. Such a tick
     writes nothing else to the ledger (``main`` announces its failure through
-    the marker, keyed on the failure's text, or prints the write failure), but
+    the marker, keyed on the failure's text or, for a refused tick, on its
+    refusals, or prints the write failure), but
     the refusals and reads its hops filed are the scope's verdicts on those
     projects, and the hold the next tick reads lives in the record: a roster
     of nothing but outside projects would otherwise see its failure line
@@ -1970,18 +2072,20 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
     return lines
 
 
-def announce_failure_once(detail: str) -> bool:
-    """A failure that persists is posted once per distinct detail and the next
-    clean tick posts a recovery line. The marker lives beside the ledger, to
-    which a failed tick writes nothing but the standing-outside record; a
-    marker that cannot be read or written leaves the line posted every time,
-    since nothing can remember it."""
+def announce_failure_once(detail: str, key: str | None = None) -> bool:
+    """A failure that persists is posted once per distinct key, the detail
+    itself unless the caller hands one (a refused tick's, so the resolved set
+    the detail names can change membership without re-posting a standing
+    refusal), and the next clean tick posts a recovery line. The marker lives
+    beside the ledger, to which a failed tick writes nothing but the
+    standing-outside record; a marker that cannot be read or written leaves
+    the line posted every time, since nothing can remember it."""
     try:
         marker = watch_home() / FAILURE_MARKER_FILE_NAME
-        if marker.exists() and marker.read_text(encoding="utf-8") == detail:
+        if marker.exists() and marker.read_text(encoding="utf-8") == (key or detail):
             return False
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(detail, encoding="utf-8")
+        marker.write_text(key or detail, encoding="utf-8")
     except (OSError, RuntimeError):
         pass
     return True
@@ -2000,7 +2104,8 @@ def main(argv: list[str] | None = None) -> int:
         detail = f"{type(exc).__name__}: {exc}"
         # A dry run changes nothing, the marker included, and is never silenced
         # by it: the operator running one is looking at the failure.
-        if args.dry_run or announce_failure_once(detail):
+        key = exc.signature if isinstance(exc, ReportRefused) else None
+        if args.dry_run or announce_failure_once(detail, key):
             print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_TICK, detail=detail))
         return 0
     for line in lines:

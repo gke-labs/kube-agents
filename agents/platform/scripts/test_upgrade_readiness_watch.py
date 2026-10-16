@@ -129,13 +129,19 @@ class FakeSandbox:
         if any(p in (self.timeout_projects if wanted else self.table_timeout_projects) for p in asked):
             raise subprocess.TimeoutExpired(argv, timeout)
         if any(p in self.refused_projects for p in asked):
-            # The script's usage exit, no report, the reason on stderr, as the real one answers an override outside the handed scope.
+            # The script's usage exit, no report, the reason on stderr, decided as the real
+            # reporter decides it from the handed argv (`DeclaredScope.override_error`): a
+            # project in `--scope-projects` is read, one in `--scope-unread` is refused as
+            # unread, any other as outside. A test that names a project the argv lists as
+            # refused stages a tick the reporter cannot produce, and fails here.
             flags = {report_argv[i]: report_argv[i + 1] for i, flag in enumerate(report_argv) if flag in (fleet_scope_targets.SCOPE_PROJECTS_FLAG, fleet_scope_targets.SCOPE_UNREAD_FLAG)}
+            listed = [p for p in flags.get(fleet_scope_targets.SCOPE_PROJECTS_FLAG, "").split(",") if p]
             unread = dict(fleet_scope_args.parse_scope_unread(flags.get(fleet_scope_targets.SCOPE_UNREAD_FLAG)))
+            assert asked[0] not in listed, f"FakeSandbox: {asked[0]} is in refused_projects but the handed argv lists it in {fleet_scope_targets.SCOPE_PROJECTS_FLAG}; the reporter would read it"
             if asked[0] in unread:
                 reason = fleet_scope_args.DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR.format(project=asked[0], outcome=unread[asked[0]])
             else:
-                reason = fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project=asked[0], projects=flags.get(fleet_scope_targets.SCOPE_PROJECTS_FLAG, "").replace(",", ", ") or "none readable")
+                reason = fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project=asked[0], projects=", ".join(listed) or "none readable")
             body = {"exit": 2, "tables": "", "report": None}
             return subprocess.CompletedProcess(argv, 0, stdout=f"{watch.ENVELOPE_SENTINEL}\n{json.dumps(body)}\n", stderr=f"(declared scope: fleet_scope): {reason}\n")
         body = self.readiness if wanted else self.versions
@@ -497,6 +503,19 @@ class Retired(Base):
             code, out = self.run_tick(FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")])))
         self.assertIn("1 ready;", out)
         self.assertNotIn(TARGET, self.ledger()["announced"].get("ungraded", {}))
+
+    def test_a_failed_audit_log_read_leaves_the_member_graded(self) -> None:
+        """The report lists a failed audit-log read under ``readiness.audit_log_failures``,
+        apart from ``errors``, so the watch's reading of a cluster-keyed error as a kubectl
+        read that failed never sees it: the member keeps its verdict."""
+        graded = member("a", "lagging", readiness=watch.READINESS_READY)
+        report = {
+            watch.MEMBERS_KEY: [graded],
+            watch.ERRORS_KEY: [],
+            watch.READINESS_KEY: {"audit_log_failures": [{"project": "p1", "location": "us-central1-a", "cluster": "a", "read": "removed", "message": "timed out"}]},
+        }
+        blocked, ready, unknown, unread = watch.readiness_verdicts(report, [watch.member_key(graded)])
+        self.assertEqual((blocked, ready, unknown, unread), ([], [watch.member_key(graded)], [], []))
 
     def test_a_server_config_failure_leaves_the_location_s_unknown_members_unread(self) -> None:
         readiness = envelope(
@@ -1614,6 +1633,26 @@ class DeclaredScope(Base):
         self.assertEqual(self.ledger()["standing_outside"], {"p2": []})
         self.assertEqual((self.ledger()["last_tick"], self.ledger()["targets"], self.ledger()["table_runs"]), (None, {}, {}))
 
+    def test_an_all_refused_ticks_failure_line_is_keyed_on_the_refusal_not_its_text(self) -> None:
+        """The failure line names the resolved set, which moves with the scope's
+        membership; the marker is keyed on what the partial line keys a refusal on,
+        the refused projects and their causes, so a project joining the scope beside a
+        standing refusal re-posts nothing, and a changed cause is a new line."""
+        self.declare_scope(["p1"])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p2"}):
+            code, first = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
+            self.assertEqual(code, 0)
+            self.assertIn("does not list p2; it lists p1;", first)
+            self.assertEqual(json.loads(self.marker().read_text()), [watch.FAILURE_KEY_REFUSED, [["p2", watch.REFUSAL_OUTSIDE]]])
+            self.declare_scope(["p1", "p3"])
+            code, second = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
+            self.assertEqual((code, second), (0, ""), "the same refusal with a longer resolved set is not a new line")
+            self.declare_scope(["p1"], unread=["p2"])
+            code, third = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
+            self.assertEqual(code, 0)
+            self.assertIn("lists p2 but the install could not read it", third)
+            self.assertEqual(json.loads(self.marker().read_text()), [watch.FAILURE_KEY_REFUSED, [["p2", watch.REFUSAL_UNREAD.format(outcome="denied")]]])
+
     def test_an_all_refused_tick_keeps_the_standing_record_so_its_failure_line_holds_across_a_failed_lookup(self) -> None:
         """A folder-scoped install whose roster holds nothing but p2, in no
         part of the declaration: every run is refused, the tick fails in the
@@ -1743,7 +1782,7 @@ class DeclaredScope(Base):
             watch.refusal_detail(label + fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number="123456789012"), resolved),
             (
                 "refused by the report script: the report script could not resolve project number 123456789012 to an id; "
-                "the remedy is on the install, not this job: spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run)",
+                "the remedy is on the install, not this job: spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run), or grant the agent's identity resourcemanager.projects.get on it so the reconcile resolves the number",
                 "project number unresolved",
             ),
         )
@@ -1786,7 +1825,7 @@ class DeclaredScope(Base):
             watch.refusal_detail(label + outside.format(project="p2", projects="p1"), carried),
             (
                 "refused by the report script: the install's declared scope does not list p2; it lists p1; "
-                + watch.REMEDY_OUTSIDE_UNRESOLVED.format(note=fleet_scope_args.UNRESOLVED_SCOPE_NOTE),
+                + watch.REMEDY_OUTSIDE_UNRESOLVED.format(note=watch.PARTLY_UNRESOLVED_SCOPE_NOTE),
                 "outside a scope not yet resolved",
             ),
         )
@@ -2289,7 +2328,8 @@ class Loader(unittest.TestCase):
     def test_the_loader_registers_the_readiness_module_and_calls_main_in_a_private_directory(self) -> None:
         source = watch.loader_source(["--project", "p1"])
         compile(source, "loader", "exec")
-        self.assertIn('sys.modules["upgrade_readiness"]', source)
+        self.assertIn("sys.meta_path.insert(0, Shipped())", source)
+        self.assertIn('importlib.import_module("fleet_upgrade_report")', source)
         self.assertIn("report.main(ARGV + ", source)
         self.assertIn("tempfile.mkdtemp(", source)
         self.assertIn("shutil.rmtree(private", source)
@@ -2297,13 +2337,28 @@ class Loader(unittest.TestCase):
         self.assertNotIn("/tmp/upgrade-readiness", source)
 
     def test_the_loader_hands_the_sandbox_this_image_s_fleet_scope_args(self) -> None:
-        """The report script formats a refusal with the constants this job
-        parses it by, whatever copy the sandbox image carries."""
-        source = watch.loader_source(["--project", "p1"])
-        self.assertIn('sys.modules["fleet_scope_args"]', source)
-        self.assertIn(json.dumps(str(watch.scope_args_path())), source)
+        """The report script formats a refusal with the constants this job parses it by,
+        whatever copy the sandbox image carries: this image's ``fleet_scope_args`` is in
+        the shipped set, known by its path here (or under a caller's root), and the finder
+        serves it ahead of any copy on the sandbox's path."""
         self.assertEqual(watch.scope_args_path(), Path(watch.__file__).resolve().parent / "fleet_scope_args.py")
-        self.assertLess(source.index('sys.modules["fleet_scope_args"]'), source.index("exec(compile(REPORT_SRC"))
+        source, file, is_package = watch.shipped_modules()[watch.SCOPE_ARGS_MODULE]
+        self.assertEqual((source, file, is_package), (watch.scope_args_path().read_text(encoding="utf-8"), str(watch.scope_args_path()), False))
+        self.assertEqual(watch.shipped_modules(root="/absent")[watch.SCOPE_ARGS_MODULE][1], "/absent/fleet_scope_args.py")
+        self.assertIn(repr(watch.SCOPE_ARGS_MODULE) + ":", watch.loader_source(["--project", "p1"]))
+        program = watch.loader_preamble() + "\n".join(
+            [
+                f"scope_args = importlib.import_module({json.dumps(watch.SCOPE_ARGS_MODULE)})",
+                "print(json.dumps([scope_args.__file__, scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR]))",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as scratch:
+            decoy = Path(scratch) / "fleet_scope_args.py"
+            decoy.write_text("DECLARED_SCOPE_ARGS_MISSING_ERROR = 'the sandbox image copy'\n", encoding="utf-8")
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": scratch, "TMPDIR": scratch, "PYTHONPATH": scratch}
+            completed = subprocess.run([sys.executable, "-", "-c", "pass"], input=program, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout.strip().splitlines()[-1]), [str(watch.scope_args_path()), fleet_scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR])
 
     def test_the_report_argv_carries_the_projects_and_the_sandbox_side_kubeconfig_dir(self) -> None:
         self.assertEqual(
@@ -2330,6 +2385,63 @@ class Loader(unittest.TestCase):
     @staticmethod
     def envelope_of(completed: subprocess.CompletedProcess) -> dict:
         return json.loads(completed.stdout.rsplit(watch.ENVELOPE_SENTINEL, 1)[1])
+
+    def test_the_shipped_set_is_every_skill_module_but_the_tests(self) -> None:
+        shipped = watch.shipped_modules()
+        for name in (watch.REPORT_MODULE, watch.READINESS_MODULE, "readiness_rules", "readiness_rules.audit_log", "readiness_rules.zonal_control_plane", "readiness_rules.finding", "upgrade_shape_tables"):
+            self.assertIn(name, shipped)
+        self.assertEqual([name for name in shipped if name.rsplit(".", 1)[-1].startswith(watch.SKILL_TEST_PREFIX)], [])
+        self.assertTrue(shipped["readiness_rules"][2])
+        self.assertFalse(shipped[watch.REPORT_MODULE][2])
+        self.assertTrue(all(Path(entry[1]).is_file() for entry in shipped.values()))
+        # The data files beside the modules ship too (the removal table), the test fixtures do not.
+        data = watch.shipped_data()
+        self.assertEqual(sorted(Path(path).name for path in data), ["removed_apis.json"])
+        self.assertTrue(all(Path(path).is_file() for path in data))
+        self.assertEqual(sorted(Path(path).name for path in watch.shipped_data(root="/elsewhere")), ["removed_apis.json"])
+        self.assertTrue(all(path.startswith("/elsewhere/") for path in watch.shipped_data(root="/elsewhere")))
+
+    def test_a_replacement_is_read_from_the_shipped_set_alone(self) -> None:
+        """The shape tables read the removal table through their module's loader. With the
+        set re-rooted to a directory that does not exist, as the sandbox's view of the
+        agent-side paths is, the replacement still comes from the shipped data; without
+        the data, the read fails loudly rather than as an empty table."""
+        with tempfile.TemporaryDirectory() as scratch:
+            absent = os.path.join(scratch, "absent")
+            program = watch.loader_preamble(root=absent) + "\n".join(
+                [
+                    "tables = importlib.import_module('upgrade_shape_tables')",
+                    "print(tables.replacement_for('extensions/v1beta1 networkpolicies'))",
+                ]
+            )
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": scratch, "TMPDIR": scratch}
+            completed = subprocess.run([sys.executable, "-I", "-"], input=program, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip().splitlines()[-1], "networking.k8s.io/v1")
+            without_data = program.replace("DATA = {", "DATA = {}  # ", 1)
+            self.assertNotEqual(without_data, program)
+            completed = subprocess.run([sys.executable, "-I", "-"], input=without_data, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("removed_apis.json could not be read beside upgrade_shape_tables", completed.stderr)
+
+    def test_the_report_imports_from_the_shipped_set_alone(self) -> None:
+        """The finder alone, in an empty directory under ``-I``: every import the report
+        makes resolves from the shipped modules (or the shared scripts directory the report
+        appends itself), so a module a later change imports without shipping fails here,
+        not in the daily job."""
+        program = watch.loader_preamble() + "\n".join(
+            [
+                f"report = importlib.import_module({json.dumps(watch.REPORT_MODULE)})",
+                "print(json.dumps(sorted(name for name in sys.modules if name in SOURCES)))",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as scratch:
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": scratch, "TMPDIR": scratch}
+            completed = subprocess.run([sys.executable, "-I", "-"], input=program, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        loaded = json.loads(completed.stdout.strip().splitlines()[-1])
+        for name in (watch.REPORT_MODULE, watch.READINESS_MODULE, "readiness_rules", "readiness_rules.audit_log", "readiness_rules.zonal_control_plane", "upgrade_shape_tables"):
+            self.assertIn(name, loaded)
 
     def test_the_loader_runs_the_checkout_copy_of_the_report_script(self) -> None:
         """End to end against the real scripts, with gcloud answering no

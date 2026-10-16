@@ -613,8 +613,8 @@ platformAgent:
   # broker serves its own on the metrics-only cred-metrics port (8766), and
   # the A2A gateway a spec.mode next install runs, which serves its counters on
   # the metrics-only a2a-metrics port (9096). The operator's policies admit the
-  # collector's namespace, gke-gmp-system, on those ports whatever this is set
-  # to, and on all but the A2A gateway's the operator's own pods as well; this decides
+  # collector's namespace, gke-gmp-system, and the operator's own pods on those
+  # ports whatever this is set to; this decides
   # only whether a scrape is configured, and the operator's own read of the
   # counters into status.usage does not depend on it.
   # A tri-state: null (the default) renders them when the cluster serves
@@ -776,6 +776,25 @@ platformAgent:
     # Prefer telemetry.otlpEndpoint when you do have a collector; this is the
     # off switch, not the way to point at one.
     env: []
+    # The daily alert ceilings, one per bucket: critical, warning, info and
+    # drift. Each key that you set becomes ALERT_DAILY_LIMIT_<KEY> in
+    # spec.deployment.env. A key that you do not set keeps the default in the
+    # agent image. 0 removes the cap for that bucket. The counter is
+    # fleet-wide and resets at 00:00 UTC.
+    #
+    #   alertDailyLimits:
+    #     warning: 15
+    #     drift: 30
+    #
+    # An entry with the same name in env above wins over the key here. A
+    # valueFrom entry for a key that is set fails the render, because the
+    # operator forwards only literal values.
+    #
+    # Each apply that changes the env list that the chart renders replaces
+    # the full env list on the CR. Entries that you added to the CR by hand
+    # are then lost. Move them to env above first. The site's chatops page, "Daily alert ceiling", gives the
+    # buckets and a sizing method.
+    alertDailyLimits: {}
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
     # merges over the operator's defaults (500m CPU and 1Gi requests; 1 CPU,

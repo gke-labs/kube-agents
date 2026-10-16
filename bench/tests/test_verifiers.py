@@ -792,6 +792,67 @@ def test_worker_commands_empty_stash_is_error():
 def test_worker_commands_rejects_a_pattern_that_does_not_compile():
     with pytest.raises(Exception):
         WorkerCommandsVerifier(type="worker_commands", required_patterns=["("])
+    with pytest.raises(Exception):
+        WorkerCommandsVerifier(type="worker_commands", exempt_patterns=["("])
+
+
+def test_worker_commands_exempt_command_is_not_read_by_the_forbidden_list():
+    # A worker that greps the skill for the word the case forbids has run
+    # nothing that fetches or sends; the exemption removes the whole grep
+    # here, since its pattern spans the line, and the reason says so, while
+    # the same word in a command that is not a plain grep is still a hit.
+    _stash_commands(["grep -rn print-access-token /opt/defaults/skills", "python3 helper.py"])
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        forbidden_patterns=["print-access-token"],
+        exempt_patterns=[r"^\s*grep\s[^;&|`$()\n]*$"],
+    )
+    res = v.verify(5.0)
+    assert res.status == "pass" and res.success, res.reason
+    assert "1 worker command(s) (1 exempted)" in res.reason
+
+    _stash_commands(["grep -c x /dev/null; gcloud auth print-access-token", "python3 helper.py"])
+    res = v.verify(5.0)
+    assert res.status == "fail"
+    assert "print-access-token" in res.reason
+
+
+def test_worker_commands_exemption_removes_its_match_and_grades_the_rest():
+    # An exemption takes out the text it matched and nothing else: a case
+    # that exempts a grep through its pattern argument leaves the operands
+    # on the line, so a fetch rendered onto the same line behind the grep is
+    # read, and the reason shows what was graded, while the honest grep's
+    # path is left over and matches nothing.
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        forbidden_patterns=["print-access-token"],
+        exempt_patterns=[r"^\s*grep\s+(?:-\S+\s+)*\S+"],
+    )
+    _stash_commands(["grep -n x /etc/hosts gcloud auth print-access-token", "python3 helper.py"])
+    res = v.verify(5.0)
+    assert res.status == "fail" and not res.success
+    assert "'print-access-token' matched 'grep -n x /etc/hosts gcloud auth print-access-token'" in res.reason
+    assert "exempt part removed: '/etc/hosts gcloud auth print-access-token'" in res.reason
+
+    _stash_commands(["grep -rn print-access-token /opt/defaults/skills", "python3 helper.py"])
+    res = v.verify(5.0)
+    assert res.status == "pass" and res.success, res.reason
+    assert "1 worker command(s) (1 exempted)" in res.reason
+
+
+def test_worker_commands_exempt_command_does_not_satisfy_a_required_pattern():
+    # A command an exemption touched is out of the required list whatever
+    # it left on the line: a grep for the helper's name is not the helper
+    # being run.
+    _stash_commands(["grep -rn helper.py /opt/defaults/skills"])
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        required_patterns=[r"helper\.py"],
+        exempt_patterns=[r"^\s*grep\s[^;&|`$()\n]*$"],
+    )
+    res = v.verify(5.0)
+    assert res.status == "fail" and not res.success
+    assert "across 0 command(s) (1 exempted)" in res.reason
 
 
 def test_worker_commands_is_registered_under_its_type():
@@ -2724,6 +2785,63 @@ def test_a_pass_with_no_any_of_does_not_claim_an_any_of_clause():
     res = v.verify(5.0)
     assert res.status == "pass"
     assert "alternative phrasing" not in res.reason
+
+
+TRACE_ID_PATTERN = r"\b[0-9a-f]{32}\b"
+SHARE_PATTERN = r"\d+(\.\d+)?\s*%"
+# A report whose helper exited 1, written with the prompt's own vocabulary:
+# every substring the trace case once required is in it, and no trace id.
+FAILURE_REPORT_IN_THE_PROMPTS_WORDS = (
+    "I could not obtain any trace ID, duration or slowest-span % share "
+    "because the analyzer failed."
+)
+BREAKDOWN_REPORT = (
+    "| **Trace ID** | total | slowest span |\n"
+    "| `0384e171d360c91c96df3124562dcc59` | `2.590s` | `api.model-default` `2.590s` (`100.0%`) |"
+)
+
+
+def test_a_required_pattern_demands_the_shape_and_names_it_when_absent():
+    # The substring checks this replaces (`trace id`, `%`) are the prompt's
+    # words, so a report of failure carries them; a 32-hex id it cannot.
+    v = ReportContainsVerifier(
+        type="report_contains", required_patterns=[TRACE_ID_PATTERN, SHARE_PATTERN]
+    )
+    transcript.set(BREAKDOWN_REPORT, [])
+    res = v.verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "all 2 required pattern(s)" in res.reason
+    transcript.set(FAILURE_REPORT_IN_THE_PROMPTS_WORDS, [])
+    res = v.verify(5.0)
+    assert res.status == "fail"
+    # The reason lists the absent patterns as Python reprs.
+    assert "required patterns absent from the report" in res.reason
+    assert repr(TRACE_ID_PATTERN) in res.reason
+
+
+def test_a_required_pattern_runs_on_the_lowercased_emphasis_free_text():
+    # Same normalization as the phrases: bold and code markers are dropped and
+    # the text is lowercased before the regex runs, so a pattern spells the
+    # label in lower case and no Markdown around the value can hide it.
+    v = ReportContainsVerifier(
+        type="report_contains", required_patterns=[r"trace id: [0-9a-f]{32}"]
+    )
+    transcript.set("**Trace ID:** `0384e171d360c91c96df3124562dcc59`", [])
+    assert v.verify(5.0).status == "pass"
+    transcript.set("**Trace ID:** unavailable", [])
+    assert v.verify(5.0).status == "fail"
+
+
+def test_a_required_pattern_that_does_not_compile_is_refused_at_construction():
+    # The same refusal forbidden_patterns has: re.compile raises at load.
+    with pytest.raises(Exception):
+        ReportContainsVerifier(type="report_contains", required_patterns=["("])
+
+
+def test_a_pass_with_no_required_pattern_does_not_claim_a_pattern_clause():
+    v = ReportContainsVerifier(type="report_contains", required_phrases=["HPA"])
+    transcript.set("the HPA hit max replicas", [])
+    assert "required pattern" not in v.verify(5.0).reason
 
 
 def test_scope_final_ignores_a_quoted_phrase_in_the_accumulated_output():
@@ -8051,6 +8169,11 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     # a backslash-newline pair is a continuation, gone before the words are read
     assert _shell_argvs("python3 \\\n  f.py \\\n--readiness") == [["python3", "f.py", "--readiness"]]
     assert _shell_argvs("cd /x && \\\n  python3 f.py --readiness") == [["cd", "/x"], ["python3", "f.py", "--readiness"]]
+    # a worker-log row ends at a continuation whose next line it does not carry: the words before it are read
+    assert _shell_argvs("./skills/fleet-audit/scripts/audit_report.py start \\") == [["./skills/fleet-audit/scripts/audit_report.py", "start"]]
+    assert _argv_runs(_shell_argvs("python3 /x/audit_report.py finish --audit a \\")[0],
+                      WorkerRun(script="audit_report.py", word_patterns=["^finish$"]))
+    assert _shell_argvs("echo 'a \\'") == [["echo", "a \\"]]
     # a `#` inside quotes, escaped, or inside a word is part of the word
     assert _shell_argvs("python3 f.py --readiness --output '#1.json'") == [["python3", "f.py", "--readiness", "--output", "#1.json"]]
     assert _shell_argvs('python3 f.py --output "#1.json" --readiness') == [["python3", "f.py", "--output", "#1.json", "--readiness"]]
@@ -8125,3 +8248,98 @@ def test_worker_commands_required_run_names_what_did_not_run():
     v = WorkerCommandsVerifier(type="worker_commands", required_runs=_WEBHOOK_RUNS)
     res = v.verify(5.0)
     assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason
+
+
+
+
+# The readiness case for the same catalogue entry grades the readiness report's
+# own output: a fifth declared-line slot quotes the cell the report prints for
+# the finding. That cell carries a `;`, which keeps `_VALUE_WRAP` from removing
+# a quote or angle bracket the agent kept around it, so the case's patterns
+# admit one opener before the text; these tests hold the case to that, through
+# the shipped entry and the real fold, for every wrap an agent is likely to keep.
+_READINESS_CASE = TASKS / "upgrades-readiness-zonal-control-plane" / "task.yaml"
+_READINESS_SPEC = yaml.safe_load(_READINESS_CASE.read_text(encoding="utf-8"))
+_READINESS_CELL = (
+    "zonal-control-plane: control plane is zonal (us-central1-a): the API is unavailable for minutes while GKE replaces its one replica, "
+    "so schedule the control-plane upgrade in a maintenance window and have API clients retry with backoff; "
+    "running pods are unaffected, and only a regional cluster, a recreate, keeps the API available"
+)
+# The same cell as `report.json` carries it (`readiness.risks[].text`): the column's rule prefix is the table's.
+_READINESS_CELL_BARE = _READINESS_CELL.removeprefix("zonal-control-plane: ")
+_READINESS_SLOT_OBJECTIVES = (
+    "every-seeded-cluster-has-a-declared-line",
+    "the-declared-lines-say-the-control-plane-is-zonal",
+    "the-declared-lines-name-the-reports-rule",
+    "the-declared-lines-grade-the-finding-a-risk",
+    "the-declared-lines-quote-the-reports-cell",
+)
+
+
+def _readiness_case_check(objective: str) -> dict:
+    for entry in _READINESS_SPEC["verification_spec"]:
+        if entry["name"] == objective:
+            return entry["check"]
+    raise AssertionError(f"{objective} not in {_READINESS_CASE}")
+
+
+def _readiness_case_grades(objective: str, text: str) -> bool:
+    v = parse_node(_readiness_case_check(objective))
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="readiness-fleet-") as root:
+        _write_fleet_dir(Path(root), list(_READINESS_SPEC["fixtures"]), None)
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0).status == "pass"
+
+
+def _readiness_line(cluster: str, cell: str = _READINESS_CELL, rule="zonal-control-plane", grade="risk") -> str:
+    return f"{cluster}: kind Cluster; control plane: zonal; readiness rule: {rule}; graded as: {grade}; cell: {cell}"
+
+
+@pytest.mark.parametrize("objective", _READINESS_SLOT_OBJECTIVES)
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        "{cell}",
+        '"{cell}"',
+        "'{cell}'",
+        "“{cell}”",
+        "<{cell}>",
+        "`{cell}`",
+    ],
+)
+def test_readiness_case_accepts_the_cell_however_the_agent_wrapped_it(objective, wrap):
+    text = "\n".join(_readiness_line(c, wrap.format(cell=_READINESS_CELL)) for c in _SLOTS)
+    assert _readiness_case_grades(objective, text)
+
+
+@pytest.mark.parametrize("objective", _READINESS_SLOT_OBJECTIVES)
+@pytest.mark.parametrize("wrap", ["{cell}", '"{cell}"'])
+def test_readiness_case_accepts_the_cell_as_the_json_carries_it(objective, wrap):
+    # An agent that reads `report.json` copies the cell without the column's rule prefix;
+    # the rule slot names the rule, so the cell proves the report ran either way.
+    text = "\n".join(_readiness_line(c, wrap.format(cell=_READINESS_CELL_BARE)) for c in _SLOTS)
+    assert _readiness_case_grades(objective, text)
+
+
+@pytest.mark.parametrize(
+    "objective,text",
+    [
+        # A report whose rule is missing prints no cell: `none`, or another rule's text.
+        ("the-declared-lines-quote-the-reports-cell", "\n".join(_readiness_line(c, "none") for c in _SLOTS)),
+        ("the-declared-lines-quote-the-reports-cell", "\n".join(_readiness_line(c, "zonal-control-plane: something else") for c in _SLOTS)),
+        ("the-declared-lines-quote-the-reports-cell", "\n".join(_readiness_line(c, '"zonal-control-plane: something else"') for c in _SLOTS)),
+        ("the-declared-lines-quote-the-reports-cell", "\n".join(_readiness_line(c, "control plane is zonal (us-central1-a): something else") for c in _SLOTS)),
+        # The grade slot names its subject; a wrapped cell does not make `blocker` a risk.
+        ("the-declared-lines-grade-the-finding-a-risk", "\n".join(_readiness_line(c, f'"{_READINESS_CELL}"', grade="blocker") for c in _SLOTS)),
+        # A line without the cell slot is the earlier frame and fails the slots that need it.
+        ("the-declared-lines-grade-the-finding-a-risk", "\n".join(_readiness_line(c).rsplit("; cell:", 1)[0] for c in _SLOTS)),
+        ("the-declared-lines-quote-the-reports-cell", "\n".join(_readiness_line(c).rsplit("; cell:", 1)[0] for c in _SLOTS)),
+        # Three complete lines and one that stops at a wrong grade without the cell slot: the
+        # frame every cluster must satisfy refuses it, so the grade and cell objectives, whose
+        # forbidden patterns need the slot to fire, cannot be passed around on that line.
+        ("every-seeded-cluster-has-a-declared-line", "\n".join(_readiness_line(c) if c != _SLOTS[1] else _readiness_line(c, grade="blocker").rsplit("; cell:", 1)[0] for c in _SLOTS)),
+    ],
+)
+def test_readiness_case_refuses_a_missing_or_foreign_cell(objective, text):
+    assert not _readiness_case_grades(objective, text)

@@ -77,6 +77,13 @@ type InboundMessage struct {
 	// settles on the answer, and the ask keeps ⏸️. False on every backend
 	// but Slack.
 	Answer bool
+	// Unaddressed marks a message the sender did not address to the bot,
+	// delivered only because of where it was typed: today an unmentioned
+	// Slack reply under one of the bot's own posts (an alert, or another
+	// post it roots in the home channel), which is often people talking to each other. An unverified
+	// sender's such message is dropped without the public refusal notice,
+	// since they asked the bot nothing. False on every other path.
+	Unaddressed bool
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running

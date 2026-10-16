@@ -81,7 +81,9 @@ unset _gke_dns_endpoint_helper
 # Request timeout for kubectl probes against live clusters in the installer.
 readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
 # The GitHub token minter's Deployment, and the Secret its App ID is read from
-# (refuse_apply_dropping_live_gitops, live_github_app_id).
+# (refuse_apply_dropping_live_gitops, live_github_app_id). install.sh also
+# restarts the Deployment after it writes a GitHub Enterprise Server's CA
+# Secret, because the minter reads its CA when it starts.
 readonly GITHUB_MINTER_DEPLOYMENT="github-token-minter"
 readonly GITHUB_APP_CREDENTIALS_SECRET="github-app-credentials"
 
@@ -186,6 +188,10 @@ readonly TF_KUBE_AGENTS_RELEASE_NAME="kube_agents"
 readonly TF_PUBSUB_SUBSCRIPTION_TYPE="google_pubsub_subscription"
 readonly TF_CHAT_EVENTS_SUBSCRIPTION_NAME="chat_events"
 readonly TF_RESOURCE_MODE_MANAGED="managed"
+# The drift-pubsub module's sink in a source project, as the state records
+# it, for the sink preflight's read of which projects already have one.
+readonly TF_LOGGING_SINK_TYPE="google_logging_project_sink"
+readonly TF_SOURCE_SINK_NAME="source_drift_audit"
 # The Helm status of a release whose last operation failed, the one of a first
 # install still in flight or interrupted, and the statuses `helm history`
 # gives a revision that served at some point.
@@ -222,6 +228,15 @@ readonly SCOPE_FOLDER_SET_IAM_PERMISSION="resourcemanager.folders.setIamPolicy"
 readonly SCOPE_ORGANIZATION_SET_IAM_PERMISSION="resourcemanager.organizations.setIamPolicy"
 readonly SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION="cloudasset.assets.searchAllResources"
 readonly SCOPE_CONTAINER_ASSET_SEARCH_ROLE="roles/cloudasset.viewer"
+# What check_scope_export_sink_access verifies before an apply that creates
+# a drift audit-log sink in each project the scope lists: the permission the
+# applying identity needs there, and the role that carries it.
+readonly SCOPE_SINK_CREATE_PERMISSION="logging.sinks.create"
+readonly SCOPE_SINK_CREATE_ROLE="roles/logging.configWriter"
+# And, for a sink the state already holds, what the plan's read of it needs
+# and the role that carries that alone.
+readonly SCOPE_SINK_GET_PERMISSION="logging.sinks.get"
+readonly SCOPE_SINK_READ_ROLE="roles/logging.viewer"
 readonly SCOPE_SERVICE_USAGE_CONSTRAINTS="gcp.restrictServiceUsage serviceuser.services"
 readonly RESOURCE_MANAGER_API_URL="https://cloudresourcemanager.googleapis.com/v3"
 readonly SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS=20
@@ -245,6 +260,16 @@ readonly SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN="SERVICE_DISABLED|has not b
 # may well be held, so it is not a permission answer either, and the remedy
 # is the token's scope, not a grant.
 readonly SCOPE_PROBE_TOKEN_SCOPE_PATTERN="insufficient authentication scopes|ACCESS_TOKEN_SCOPE_INSUFFICIENT"
+# The undecided reasons a probe prints that hold for every resource it could
+# be asked about, not the one it was: the request never completed (one
+# endpoint answers every probe), the token lacks the scope, the API is off in
+# the credentials' quota project, the token rejected outright. A caller with
+# many probes to make stops at the first of these rather than repeat it once
+# per resource.
+readonly SCOPE_PROBE_TRANSPORT_FAILURE_REASON="the request to Resource Manager did not complete"
+readonly SCOPE_PROBE_UNAUTHENTICATED_REASON="Resource Manager rejected the token (HTTP 401): it has expired or been revoked, so mint a fresh one"
+readonly SCOPE_PROBE_TOKEN_SCOPE_REASON="the token lacks the cloud-platform scope; mint it with that scope, as gcloud does"
+readonly SCOPE_PROBE_API_OFF_REASON="Resource Manager answered 403 for its API being off in the credentials' quota project, which the apply enables before it binds"
 # The APIs the plan-time resolution of a selector reads
 # (terraform/modules/kube-agents-scope-resolver), per selector kind, billed to
 # the management project, which the resolver sends as the quota project: a
@@ -301,6 +326,15 @@ readonly TF_STATE_RC_UNREADABLE=2
 readonly HINDSIGHT_MEMORY_PROVIDER="kube_agents_memory"
 readonly HINDSIGHT_STATEFULSET="hindsight-postgresql"
 readonly HINDSIGHT_API_DEPLOYMENT="hindsight-api"
+
+# The daily alert ceilings in install.env. write_tfvars_from_state writes each
+# key that is set into alert_daily_limits, with the part after the prefix in
+# lower case as the bucket name. install.sh records all of them in a new
+# install.env. uninstall.sh blanks all of them by name and not with a loop
+# over this list, because it can source an older copy of this file that does
+# not define the list. tests/test_uninstall_script.py compares the two lists.
+readonly ALERT_DAILY_LIMIT_PREFIX="ALERT_DAILY_LIMIT_"
+readonly ALERT_DAILY_LIMIT_KEYS="ALERT_DAILY_LIMIT_CRITICAL ALERT_DAILY_LIMIT_WARNING ALERT_DAILY_LIMIT_INFO ALERT_DAILY_LIMIT_DRIFT"
 
 # Memory mode (the input spelling, recorded in install.env as MEMORY) → the
 # provider name everything downstream reads. The inverse of install.sh's
@@ -1052,7 +1086,9 @@ load_install_env() {
   unset PLATFORM_AGENT_MODE
   # The GitOps forge keys too: an inherited GITOPS_FORGE=gitlab would render a
   # GitLab forge, and drop the GitHub alias and minter, for one run of an
-  # install the file records as GitHub. --gitops-forge is the per-run way in.
+  # install the file records as GitHub, and an inherited GITOPS_HOST would
+  # move a GitHub install to a GitHub Enterprise Server. --gitops-forge and
+  # --gitops-host are the per-run way in.
   unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
@@ -1285,23 +1321,34 @@ derive_chat_sub_name() {
 # Classifies a GitHub account name against the public API, echoing exactly one
 # of: organization | user | missing | unknown.
 #
+# With HOST, a GitHub Enterprise Server hostname, it asks that instance's REST
+# API (https://HOST/api/v3) and not api.github.com, and with CA_FILE it trusts
+# that PEM CA for the call. The request carries no credential, on either host,
+# and does not follow a redirect. An instance in private mode answers 401 to an
+# anonymous request, which reads as "unknown".
+#
 # "unknown" is the catch-all for every inconclusive answer — curl absent, the
 # network down, rate limiting, an unexpected payload — so a caller can tell
 # "GitHub says no" apart from "we could not ask". Never exits and never prints,
 # so it is safe to call from an interactive prompt loop; callers decide whether
 # an answer is fatal. install.sh uses it to validate before provisioning starts.
 github_account_type() {
-  local name="${1:-}"
+  local name="${1:-}" host="${2:-}" ca_file="${3:-}"
   if [ -z "$name" ] || ! command -v curl &>/dev/null; then
     echo "unknown"
     return 0
   fi
+  local api="https://api.github.com"
+  [ -n "$host" ] && api="https://${host}/api/v3"
+  local ca_args=()
+  [ -n "$host" ] && [ -n "$ca_file" ] && ca_args=(--cacert "$ca_file")
 
   # Status is appended on its own line so a transport failure (curl non-zero)
   # stays distinguishable from an HTTP error (curl zero, status in the body).
   local response status body
-  if ! response=$(trap - ERR; curl -sS --max-time 10 -H "Accept: application/vnd.github+json" \
-      -w '\n%{http_code}' "https://api.github.com/users/${name}" 2>/dev/null); then
+  if ! response=$(trap - ERR; curl -sS --max-time 10 --proto '=https' ${ca_args[@]+"${ca_args[@]}"} \
+      -H "Accept: application/vnd.github+json" \
+      -w '\n%{http_code}' "${api}/users/${name}" 2>/dev/null); then
     echo "unknown"
     return 0
   fi
@@ -1336,9 +1383,14 @@ github_account_type() {
 # This exits, so it is the wrong entry point for anything that can still
 # re-prompt: install.sh calls github_account_type directly and settles the value
 # before provisioning starts. An inconclusive lookup is never fatal — an
-# unreachable api.github.com must not block a provision that is otherwise fine.
+# unreachable api.github.com (or instance) must not block a provision that is
+# otherwise fine. HOST and CA_FILE are the GitHub Enterprise Server's, as for
+# github_account_type: the organization is looked up on the install's GitHub
+# host, never on github.com for an instance.
 check_github_org_is_organization() {
-  local org="${1:-}"
+  local org="${1:-}" host="${2:-}" ca_file="${3:-}"
+  local where="GitHub"
+  [ -n "$host" ] && where="$host"
   [ -z "$org" ] && return 0
   # A GitLab install has no token minter, so no GitHub account to check.
   [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "gitlab" ] && return 0
@@ -1348,10 +1400,10 @@ check_github_org_is_organization() {
     return 0
   fi
 
-  case "$(github_account_type "$org")" in
+  case "$(github_account_type "$org" "$host" "$ca_file")" in
     organization) return 0 ;;
     user)
-      print_error "GITOPS_ORG='${org}' is a GitHub user account, not an organization."
+      print_error "GITOPS_ORG='${org}' is a user account on ${where}, not an organization."
       print_error "The GitHub Token Minter looks installations up at /orgs/${org}/installation,"
       print_error "which does not exist for personal accounts, so every token request would"
       print_error "fail with a 404 after deployment."
@@ -1362,18 +1414,16 @@ check_github_org_is_organization() {
       exit 1
       ;;
     missing)
-      print_error "GITOPS_ORG='${org}' does not exist on GitHub."
+      print_error "GITOPS_ORG='${org}' does not exist on ${where}."
       print_error "Check the spelling. The Token Minter resolves installations at"
       print_error "/orgs/${org}/installation, so a name that does not exist fails every"
       print_error "token request after deployment."
       print_error "Edit GITOPS_ORG in install.env, or re-run with"
       print_error "SKIP_GITHUB_ORG_CHECK=true to bypass this check."
-      print_error "(GitHub Enterprise Server is not supported: this check, and the Minter,"
-      print_error "both talk to api.github.com.)"
       exit 1
       ;;
     *)
-      print_warning "Could not determine whether '${org}' is an organization; continuing."
+      print_warning "Could not determine whether '${org}' is an organization on ${where}; continuing."
       return 0
       ;;
   esac
@@ -2139,6 +2189,196 @@ scope_pool_lists_containers() {
   [[ "${SCOPE_FOLDERS:-}${SCOPE_ORGANIZATIONS:-}" == *[![:space:],]* ]]
 }
 
+# The projects beyond the host the apply creates a drift audit-log sink in,
+# one per line, sorted, once each, as the composition lists them at plan time
+# from the same keys (terraform/examples/full-install/main.tf,
+# drift_pubsub_source_projects): SCOPE_PROJECTS less PROJECT_ID, less a
+# project an exact SCOPE_EXCLUDE_PROJECTS entry names or a glob there matches
+# (the reconcile's fnmatch, whose * ? [seq] and [!seq] a bash case pattern
+# shares), less TF_VAR_drift_pubsub_source_exclude_projects. Nothing while the
+# drift ingress is off: ENABLE_DRIFT_DETECTOR, or, with that off,
+# TF_VAR_enable_drift_pubsub on its own, the two ways write_tfvars_from_state
+# lets it reach the apply. A Shared VPC host's or Metrics Scope's members are
+# resolved in the plan and are not here. Each list is read through
+# csv_list_items, the grammar the tfvars carry.
+scope_export_projects() {
+  is_truthy "${ENABLE_DRIFT_DETECTOR:-$DEFAULT_ENABLE_DRIFT_DETECTOR}" || is_truthy "${TF_VAR_enable_drift_pubsub:-}" || return 0
+  local project pattern excluded kept=() exclude_patterns=() lever_projects=()
+  while IFS= read -r pattern; do exclude_patterns+=("$pattern"); done < <(csv_list_items "${SCOPE_EXCLUDE_PROJECTS:-}")
+  while IFS= read -r pattern; do lever_projects+=("$pattern"); done < <(csv_list_items "${TF_VAR_drift_pubsub_source_exclude_projects:-}")
+  while IFS= read -r project; do
+    [ "$project" != "${PROJECT_ID:-}" ] || continue
+    excluded=false
+    for pattern in ${exclude_patterns[@]+"${exclude_patterns[@]}"}; do
+      # The entry is the pattern: an exact ID matches itself. A case pattern
+      # is never pathname-expanded, so no set -f is needed around it.
+      # shellcheck disable=SC2254
+      case "$project" in $pattern) excluded=true; break ;; esac
+    done
+    $excluded && continue
+    for pattern in ${lever_projects[@]+"${lever_projects[@]}"}; do
+      [ "$project" != "$pattern" ] || { excluded=true; break; }
+    done
+    $excluded && continue
+    kept+=("$project")
+  done < <(csv_list_items "${SCOPE_PROJECTS:-}")
+  [ "${#kept[@]}" -gt 0 ] || return 0
+  printf '%s\n' "${kept[@]}" | sort -u
+}
+
+# Preflight for the drift audit-log sinks the apply creates in the scope's
+# other projects (the drift-pubsub module's source_projects), before the apply
+# that would create them. For each project scope_export_projects lists, this
+# asks Resource Manager whether the identity Terraform applies with holds
+# logging.sinks.create there, through the same probe and the same credentials
+# check_scope_container_access uses for a container's setIamPolicy, and
+# refuses the apply with every project that lacks it named: a sink that
+# cannot be created fails the apply at that project, after the host's
+# resources and the other projects' sinks have changed (the module's README,
+# "Exporting the scope's other projects"). A project the identity is denied
+# in whose sink this install's Terraform state already holds
+# (tf_state_has_source_sink, read once and only on a denial) is warned
+# about, not refused, when the identity can read it (logging.sinks.get,
+# asked second): an apply that leaves the sink as it is refreshes it with
+# that read and goes ahead, which is how an install made by an owner is
+# upgraded by a narrower Day-2 identity; one that changes the sink (its
+# filter, which a release can move), recreates or removes it would fail
+# there, since the roles that lack create lack update and delete too. The
+# warning says so per route: under "warn" the plan that follows shows which
+# this apply is; on an applying route the run goes ahead without a further
+# prompt, and the way to see first is to stop and run upgrade.sh --plan. An
+# identity that cannot read the sink either, or cannot see the project, is
+# refused, since the plan's read of the sink fails. A state that cannot be
+# read, or holds no such sink, or holds it tainted or deposed (the next
+# apply replaces or deletes it), refuses as for a first apply. The
+# project's number read and its Logging service agent's mint are left to
+# the apply, as the container preflight leaves serviceusage.services.enable.
+# A probe that cannot decide warns and lets the apply speak; one whose
+# answer holds for every project (the request did not complete, the token
+# lacks the scope or was rejected, the API is off in the quota project)
+# stops the probing, since each further request would repeat it, or wait
+# the full timeout to, and the projects not asked are named in one warning.
+# An install that lists no such
+# project returns silently and asks nothing. $1 "warn" turns the refusal into
+# a warning, on the routes the container preflight warns on.
+# Caller defines print_error / print_info / print_warning.
+check_scope_export_sink_access() {
+  local mode="${1:-$SCOPE_CHECK_MODE_REFUSE}"
+  local projects entry token="" failures=() undecided=() unasked=() existing=() stop=false rc identity properties reason had_noglob=false
+  local state="" state_read=false
+  projects="$(scope_export_projects)"
+  [ -n "$projects" ] || return 0
+  identity="$(_scope_terraform_identity_label)"
+  if ! command -v curl >/dev/null 2>&1; then
+    undecided+=("whether ${identity} can create a Log Router sink in the scope's projects (curl is not installed)")
+  elif properties="$(_scope_gcloud_auth_properties_in_the_way)" && [ -n "$properties" ]; then
+    undecided+=("whether ${identity} can create a Log Router sink in the scope's projects (gcloud's active configuration sets ${properties}, which its token mint honours and Terraform does not; run: gcloud config unset <property>, or set GOOGLE_IMPERSONATE_SERVICE_ACCOUNT to apply as that account)")
+  elif ! token="$(_scope_terraform_access_token)" || [ -z "$token" ]; then
+    undecided+=("whether ${identity} can create a Log Router sink in the scope's projects ($(_scope_terraform_token_remedy))")
+  else
+    # Each probe is called in a `||` list: a denied answer is an answer, not
+    # an error, under the front doors' ERR trap. Globbing off around the
+    # unquoted split, as the container preflight has it: an entry carrying a
+    # glob character would otherwise be replaced by the files it matches.
+    case "$-" in *f*) had_noglob=true ;; esac
+    set -f
+    for entry in $projects; do
+      if $stop; then
+        unasked+=("$entry")
+        continue
+      fi
+      rc=0
+      reason="$(_scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_CREATE_PERMISSION" "$token")" || rc=$?
+      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+        # The state is read on the first denial alone: a run with every
+        # project granted never reads it.
+        if ! $state_read; then
+          state="$(tf_state_read)" || state=""
+          state_read=true
+        fi
+        if tf_state_has_source_sink "$state" "$entry"; then
+          # The sink is there to be left alone only if this identity can read
+          # it: the plan refreshes it, and a 403 or 404 above may mean the
+          # project itself is not visible.
+          rc=0
+          reason="$(_scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_GET_PERMISSION" "$token")" || rc=$?
+          if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+            failures+=("${identity} cannot read this install's drift audit-log sink in project '${entry}' (${SCOPE_SINK_GET_PERMISSION}), or the project is not visible to it, and cannot create one (${SCOPE_SINK_CREATE_PERMISSION}); the plan reads the sink and would fail there, or the apply would at that project's read, after the host's resources and the other projects' sinks have changed. Ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity, or ${SCOPE_SINK_READ_ROLE} there for an apply that leaves the sink as it is.")
+          else
+            [ "$rc" -eq "$SCOPE_PROBE_GRANTED" ] || undecided+=("whether ${identity} can read this install's drift audit-log sink in project '${entry}'${reason:+ ($reason)}")
+            if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+              existing+=("${identity} cannot create a Log Router sink in project '${entry}' (${SCOPE_SINK_CREATE_PERMISSION}), and this install's drift audit-log sink there is already in its Terraform state: an apply that leaves the sink as it is goes ahead, and one that changes it, which a release that moves the sink filter does, recreates it or removes it would fail there, after the host's resources and the other projects' sinks have changed. The plan below shows which this apply is; ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity before one that changes it.")
+            else
+              existing+=("${identity} cannot create a Log Router sink in project '${entry}' (${SCOPE_SINK_CREATE_PERMISSION}), and this install's drift audit-log sink there is already in its Terraform state: an apply that leaves the sink as it is goes ahead, and one that changes it, which a release that moves the sink filter does, recreates it or removes it would fail there, after the host's resources and the other projects' sinks have changed. This run applies without a further prompt; to see which this apply is first, stop it and run upgrade.sh --plan, and ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity before one that changes it.")
+            fi
+          fi
+        else
+          failures+=("${identity} cannot create a Log Router sink in project '${entry}' (${SCOPE_SINK_CREATE_PERMISSION}), or the project is not visible to it; an apply that creates the project's drift audit-log sink would fail there, after the host's resources and the other projects' sinks have changed. Ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity. A project that is to have no sink is added to TF_VAR_drift_pubsub_source_exclude_projects in install.env (it stays in the scope) or dropped from SCOPE_PROJECTS; removing a sink it already has needs the same role.")
+        fi
+      elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
+        undecided+=("whether ${identity} can create a Log Router sink in project '${entry}'${reason:+ ($reason)}")
+        case "$reason" in
+          "$SCOPE_PROBE_TRANSPORT_FAILURE_REASON" | "$SCOPE_PROBE_UNAUTHENTICATED_REASON" | "$SCOPE_PROBE_TOKEN_SCOPE_REASON" | "$SCOPE_PROBE_API_OFF_REASON") stop=true ;;
+        esac
+      fi
+    done
+    $had_noglob || set +f
+    if [ "${#unasked[@]}" -gt 0 ]; then
+      undecided+=("whether ${identity} can create a Log Router sink in ${unasked[*]} (not asked: the answer above holds for every project)")
+    fi
+  fi
+  for entry in ${undecided[@]+"${undecided[@]}"}; do
+    print_warning "The scope export preflight could not decide ${entry}; the apply will report it if it fails."
+  done
+  for entry in ${existing[@]+"${existing[@]}"}; do
+    print_warning "An apply that changes an existing sink would fail: ${entry}"
+  done
+  [ "${#failures[@]}" -eq 0 ] && return 0
+  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+    for entry in "${failures[@]}"; do print_warning "An applying run would be refused: ${entry}"; done
+    return 0
+  fi
+  for entry in "${failures[@]}"; do print_error "Refusing to apply: ${entry}"; done
+  print_info "Nothing was changed. Fix what is named above, or edit SCOPE_PROJECTS, SCOPE_EXCLUDE_PROJECTS or TF_VAR_drift_pubsub_source_exclude_projects in install.env, and re-run."
+  return 1
+}
+
+# True when the Terraform state text in $1 holds this install's drift
+# audit-log sink for the source project $2: a managed
+# google_logging_project_sink named source_drift_audit (the drift-pubsub
+# module's resource for a project in source_projects) with an instance keyed
+# by that project, neither tainted nor deposed: the next apply replaces a
+# tainted instance and deletes a deposed one, so neither is a sink an apply
+# can leave as it is. Parsed, not grepped, for the reasons
+# tf_state_has_cluster gives: an entry with no instance manages nothing, and
+# the host's own sink (drift_audit) is not a source sink. An empty or
+# unparseable state, and a state that holds no such instance, read as false,
+# which the caller treats as a sink still to be created.
+tf_state_has_source_sink() {
+  local state="${1:-}" project="${2:-}"
+  [ -n "$state" ] && [ -n "$project" ] || return 1
+  (trap - ERR; printf '%s' "$state" | python3 -c '
+import json, sys
+project, mode, sink_type, sink_name = sys.argv[1:5]
+try:
+    doc = json.load(sys.stdin) or {}
+except Exception:
+    sys.exit(1)
+for resource in (doc.get("resources") or []) if isinstance(doc, dict) else []:
+    if not isinstance(resource, dict):
+        continue
+    if resource.get("mode") != mode or resource.get("type") != sink_type or resource.get("name") != sink_name:
+        continue
+    for instance in resource.get("instances") or []:
+        if not isinstance(instance, dict) or instance.get("index_key") != project:
+            continue
+        if instance.get("status") == "tainted" or instance.get("deposed"):
+            continue
+        sys.exit(0)
+sys.exit(1)
+' "$project" "$TF_RESOURCE_MODE_MANAGED" "$TF_LOGGING_SINK_TYPE" "$TF_SOURCE_SINK_NAME" 2>/dev/null)
+}
+
 # Prints, space-separated, the APIs the plan reads for the selectors the
 # environment declares (SCOPE_METRICS_SCOPE_APIS for SCOPE_METRICS_SCOPES,
 # SCOPE_SHARED_VPC_HOST_APIS for SCOPE_SHARED_VPC_HOSTS, SCOPE_ASSET_API for
@@ -2456,11 +2696,13 @@ sys.exit(not_denied)
 }
 
 # Asks Resource Manager whether the token's identity holds one permission on a
-# container, through testIamPermissions, which never mutates and answers for
-# the caller alone. $1 folders/<id> or organizations/<id>; $2 the permission;
-# $3 the access token. Returns SCOPE_PROBE_GRANTED, _DENIED (a 200 without the
-# permission, a 404, or a 403 that is a permission answer: a container the
-# caller cannot see cannot be bound) or _UNDECIDED (transport failure, a 403
+# resource, through testIamPermissions, which never mutates and answers for
+# the caller alone. $1 folders/<id>, organizations/<id> or projects/<id>; $2
+# the permission (any the resource carries, not only an IAM one: the sink
+# preflight asks a project for logging.sinks.create); $3 the access token.
+# Returns SCOPE_PROBE_GRANTED, _DENIED (a 200 without the permission, a 404,
+# or a 403 that is a permission answer: a resource the caller cannot see
+# cannot be bound or written to) or _UNDECIDED (transport failure, a 403
 # for the API being off in the quota project or for a token minted without
 # the cloud-platform scope, any other status, an unreadable body), printing
 # for an undecided answer the reason, which the caller's warning carries so
@@ -2470,11 +2712,14 @@ _scope_container_can_set_iam() {
   # The bearer token goes to curl on its stdin (-H @-), never argv, where any
   # local user could read it from the process table for the request's
   # duration, and never a file, which an interrupted run would leave behind.
-  if ! response="$(trap - ERR; printf 'Authorization: Bearer %s\n' "$token" | curl -sS --max-time "$SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS" -X POST \
+  # -g: curl's own URL globbing off, so a resource name carrying [ or { (a
+  # mistyped project ID) is sent as is and answered, rather than refused by
+  # curl before any request, which would read as the endpoint being down.
+  if ! response="$(trap - ERR; printf 'Authorization: Bearer %s\n' "$token" | curl -sSg --max-time "$SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS" -X POST \
     -H @- -H "Content-Type: application/json" \
     -d "{\"permissions\":[\"${permission}\"]}" \
     -w $'\n%{http_code}' "${RESOURCE_MANAGER_API_URL}/${resource}:testIamPermissions" 2>/dev/null)"; then
-    printf 'the request to Resource Manager did not complete'
+    printf '%s' "$SCOPE_PROBE_TRANSPORT_FAILURE_REASON"
     return "$SCOPE_PROBE_UNDECIDED"
   fi
   status="${response##*$'\n'}"
@@ -2500,15 +2745,21 @@ sys.exit(granted if sys.argv[1] in held else denied)
       # and the Resource Manager API being off in the credential's quota
       # project (the apply enables that API before it binds).
       if printf '%s' "$body" | grep -qE "$SCOPE_PROBE_TOKEN_SCOPE_PATTERN"; then
-        printf 'the token lacks the cloud-platform scope; mint it with that scope, as gcloud does'
+        printf '%s' "$SCOPE_PROBE_TOKEN_SCOPE_REASON"
         return "$SCOPE_PROBE_UNDECIDED"
       fi
       if printf '%s' "$body" | grep -qE "$SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN"; then
-        printf 'Resource Manager answered 403 for its API being off in the credentials'"'"' quota project, which the apply enables before it binds'
+        printf '%s' "$SCOPE_PROBE_API_OFF_REASON"
         return "$SCOPE_PROBE_UNDECIDED"
       fi
       return "$SCOPE_PROBE_DENIED" ;;
     404) return "$SCOPE_PROBE_DENIED" ;;
+    401)
+      # Not a permission answer either: a raw GOOGLE_OAUTH_ACCESS_TOKEN that
+      # has expired reaches here unminted, and the answer is the same for
+      # every resource.
+      printf '%s' "$SCOPE_PROBE_UNAUTHENTICATED_REASON"
+      return "$SCOPE_PROBE_UNDECIDED" ;;
     *)
       printf 'Resource Manager answered HTTP %s' "$status"
       return "$SCOPE_PROBE_UNDECIDED" ;;
@@ -3722,6 +3973,21 @@ write_tfvars_from_state() {
     print_error "MODEL_MAX_TOKENS='${model_max_tokens}' is not a whole number of tokens. Set a non-negative integer, or leave it empty, in install.env."
     return 1
   fi
+  # The daily alert ceilings, checked for the MODEL_MAX_TOKENS reason. An
+  # empty key is not written, so the agent image keeps its default for that
+  # bucket. No install.defaults.env entry exists for these keys, because
+  # session_kv_server.py is the one home of the defaults.
+  local alert_daily_limits="" alert_key alert_value alert_bucket
+  for alert_key in $ALERT_DAILY_LIMIT_KEYS; do
+    alert_value="${!alert_key:-}"
+    [ -n "$alert_value" ] || continue
+    if ! is_non_negative_integer "$alert_value"; then
+      print_error "${alert_key}='${alert_value}' is not a whole number of alerts. Set a non-negative integer, or leave it empty for the default, in install.env."
+      return 1
+    fi
+    alert_bucket="$(printf '%s' "${alert_key#"$ALERT_DAILY_LIMIT_PREFIX"}" | tr '[:upper:]' '[:lower:]')"
+    alert_daily_limits="${alert_daily_limits}  ${alert_bucket} = ${alert_value}"$'\n'
+  done
   # A triple the block cannot render, or a container ID that is not a bare
   # number, stops the run here, with the file untouched, rather than at
   # terraform with a message naming neither the key nor the entry.
@@ -3821,6 +4087,16 @@ write_tfvars_from_state() {
     echo "vertex_project_id  = $(hcl_str "${VERTEX_PROJECT_ID:-}")"
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"
+    echo ""
+    echo "# The daily alert ceilings (ALERT_DAILY_LIMIT_* in install.env), only the"
+    echo "# keys that are set. A bucket that is not here keeps the image default."
+    if [ -n "$alert_daily_limits" ]; then
+      echo "alert_daily_limits = {"
+      printf '%s' "$alert_daily_limits"
+      echo "}"
+    else
+      echo "alert_daily_limits = {}"
+    fi
     echo ""
     echo "# The PlatformAgent's spec.mode (PLATFORM_AGENT_MODE in install.env). The"
     echo "# composition passes the chart nothing for \"today\", so its CR carries no mode."
@@ -3925,6 +4201,15 @@ write_tfvars_from_state() {
       fi
     elif [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ]; then
       echo "github_repo = $(hcl_str "${GITOPS_ORG}/${GITOPS_REPO}")"
+      # A GitHub Enterprise Server: the composition declares the github forge
+      # at this host, with the CA Secret, in place of the github.com alias.
+      # Only then, so a github.com install renders the lines it always has.
+      if [ -n "${GITOPS_HOST:-}" ]; then
+        echo "gitops_host = $(hcl_str "${GITOPS_HOST}")"
+        if [ -n "${GITOPS_CA_SECRET:-}" ]; then
+          echo "github_ca_secret_name = $(hcl_str "${GITOPS_CA_SECRET}")"
+        fi
+      fi
     fi
     echo "enable_github_minter = ${enable_github_minter}"
     echo "github_app_id        = $(hcl_str "${GITHUB_APP_ID:-}")"

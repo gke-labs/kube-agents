@@ -1521,7 +1521,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # recorded children are neither settled nor gated on it, telling the worker to
 # wait and synthesize instead. kanban_block also refuses kind="dependency" on a
 # card with nothing unfinished to wait on, which upstream re-queues to a fresh
-# worker that can't see the first one's work (#2704's duplicate PR). Must run
+# worker that can't see the first one's work (#2704's duplicate PR). And
+# kanban_complete refuses, every time, a card whose declared `step <key>:` lines
+# (in its body or comments) are not all `done` (#2935, #2939). Must run
 # AFTER apply_kanban_result_required.py
 # (earlier stage): its completion anchor is text that patch introduced,
 # deliberately, because the site it needs only exists in the patched tree. The
@@ -1557,6 +1559,19 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # above, whose lines it does not share. The _WAKE_KINDS grep repeats the one in
 # the kanban-progress stage: a queued notice must never cost an LLM turn.
 # See the module docstring in deploy/docker/patches/kanban_priority.py.
+#
+# kanban_ended_run: a block from outside a card's run stops the run's worker,
+# and a worker whose run is over is told so (#2947). Upstream's block_task ends
+# the run but leaves the process running (archive_task stops it), and a refused
+# kanban_complete reports the card's last_failure_error, an earlier run's text
+# telling the worker to verify and complete again. On the rehearsal an operator
+# blocked a card mid-run and its worker retried for 41 minutes. block_task is
+# wrapped so a block with no expected_run_id on a running card stops its
+# host-local worker the way archive does and comments on the card;
+# kanban_complete and kanban_block answer an ended run with one latched,
+# terminal refusal before any gate runs. Runs after children_settled, whose
+# gates sit below the _worker_guard line this inserts after.
+# See the module docstring in deploy/docker/patches/kanban_ended_run.py.
 #
 # credential-redaction: a kanban worker that pasted a GCP access token into a
 # curl left it in plaintext on the PVC (#603). Upstream already redacts
@@ -1610,6 +1625,9 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/verify_kanban_chat_notify.py \
      deploy/docker/patches/apply_kanban_priority.py \
      deploy/docker/patches/verify_kanban_priority.py \
+     deploy/docker/patches/kanban_ended_run.py \
+     deploy/docker/patches/apply_kanban_ended_run.py \
+     deploy/docker/patches/verify_kanban_ended_run.py \
      deploy/docker/patches/kanban_result_required.py \
      deploy/docker/patches/credential_redaction.py \
      deploy/docker/patches/apply_credential_redaction.py \
@@ -1665,6 +1683,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_children_settled.py /opt/hermes && \
     grep -qF '_kanban_record_worker_child(conn, new_tid)' /opt/hermes/tools/kanban_tools.py && \
     grep -qF 'tid, _kanban_children_connect, result' /opt/hermes/tools/kanban_tools.py && \
+    grep -qF '_steps_err = _require_steps_settled(' /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_children_settled import" /opt/hermes/tools/kanban_tools.py && \
     cp /tmp/latency-patches/kanban_wake_guard.py /opt/hermes/tools/kanban_wake_guard.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_wake_guard.py /opt/hermes && \
@@ -1682,6 +1701,11 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF '+ ("heartbeat", "pr_opened") + ("queued",)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF '_EVENT_FORMATTERS["queued"] = _kanban_format_queued' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q '^_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    cp /tmp/latency-patches/kanban_ended_run.py /opt/hermes/tools/kanban_ended_run.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_ended_run.py /opt/hermes && \
+    test "$(grep -c '_kanban_refuse_ended_run(tid, _kanban_ended_run_connect)' /opt/hermes/tools/kanban_tools.py)" = "2" && \
+    test "$(grep -c '_kanban_ended_run_refusal(tid, conn) or' /opt/hermes/tools/kanban_tools.py)" = "2" && \
+    grep -qF 'block_task = _kanban_stop_worker_on_external_block(' /opt/hermes/hermes_cli/kanban_db.py && \
     install -m 0644 /tmp/latency-patches/credential_redaction.py /opt/hermes/agent/credential_redaction.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_credential_redaction.py /opt/hermes && \
     test "$(grep -c '_kube_agents_register_patterns()' /opt/hermes/agent/redact.py)" = "1" && \
@@ -1704,6 +1728,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_guard.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_ended_run.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_credential_redaction.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_skill_manage_image_owned.py && \
     rm -rf /tmp/latency-patches
@@ -2073,9 +2098,9 @@ COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 # module docstring for what a failure here means.
 #
 # check_skill_commands.py rides along the same way. It runs every shell block
-# in the SKILL.md files of the image's three skill trees through Hermes' Tirith
-# scan, which is why the Cluster Agent template is copied above this block
-# rather than below it.
+# in the SKILL.md files and references/*.md pages of the image's three skill
+# trees through Hermes' Tirith scan, which is why the Cluster Agent template is
+# copied above this block rather than below it.
 # It downloads the Tirith release it pins; see its module docstring.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
 COPY agents/platform/config.yaml \

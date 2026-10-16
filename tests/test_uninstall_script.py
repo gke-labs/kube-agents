@@ -1155,6 +1155,20 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         pool_at = text.find('export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""')
         self.assertNotEqual(pool_at, -1, "uninstall.sh must blank the SCOPED_SA_POOL_* keys")
         self.assertLess(pool_at, call_at)
+        # And the daily alert ceilings: the generator refuses a value that is
+        # not a whole number, and a teardown must not stop on it. The names
+        # come from the generator's own list, so a key added there and not
+        # here fails this test.
+        keys_match = re.search(
+            r'^readonly ALERT_DAILY_LIMIT_KEYS="([^"]+)"$',
+            _INSTALLER_COMMON.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(keys_match, "installer_common.sh must define ALERT_DAILY_LIMIT_KEYS")
+        alert_export = "export " + " ".join(f'{key}=""' for key in keys_match.group(1).split())
+        alert_at = text.find(alert_export)
+        self.assertNotEqual(alert_at, -1, f"uninstall.sh must blank every ALERT_DAILY_LIMIT_* key: {alert_export}")
+        self.assertLess(alert_at, call_at)
 
 
 class UninstallSummaryDisclosureTest(unittest.TestCase):

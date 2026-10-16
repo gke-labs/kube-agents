@@ -3738,6 +3738,22 @@ func TestReconcileGitopsStateGitHubHost(t *testing.T) {
 		t.Errorf("a refused declaration wrote events: %v", got)
 	}
 	agent.Spec.Integration.Forges[0].CABundleRef = nil
+	// A refusal the schema admits, with a later GitHub forge at github.com:
+	// the first forge still holds the host, so the key stays.
+	agent.Spec.Integration.Forges[0].Namespace = "acme.ops"
+	agent.Spec.Integration.Forges = append(agent.Spec.Integration.Forges,
+		agentv1alpha1.ForgeSpec{Name: "upstream", Namespace: "kubernetes"})
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if host, _ := read(); host != "ghe.example.com" {
+		t.Errorf("github_host = %q with a refused first forge and a github.com forge after it, expected ghe.example.com", host)
+	}
+	if got := events(); len(got) != 0 {
+		t.Errorf("a refused first forge wrote events: %v", got)
+	}
+	agent.Spec.Integration.Forges = agent.Spec.Integration.Forges[:1]
+	agent.Spec.Integration.Forges[0].Namespace = "acme"
 	declare("")
 	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
 		t.Fatal(err)

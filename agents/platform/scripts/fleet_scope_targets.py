@@ -178,9 +178,10 @@ class ScopeTargets:
     # a glob against ids), with the explicit projects the reconcile dropped on
     # one by number (`excludedProjects`): what `declared_scope_targets` skips
     # on the way into `unread`. Never in the sweep and never in the collector
-    # flags; carried so a reader that meets a project with no row can tell one
-    # the operator left out from one the declaration never named, as the
-    # upgrade-readiness watch does for a roster project the report refused.
+    # flags; carried so a reader that meets a project with no row can say
+    # whether an exclude entry matches its id (`excludes`), as the
+    # upgrade-readiness watch does for a roster project the report refused;
+    # whether that entry is why the row is missing only the reconcile knows.
     excluded: tuple[str, ...] = ()
     # The folders, organisations and selectors the declaration names, as the
     # reconcile keys their lookups (`folders/<id>`, `organizations/<id>`,

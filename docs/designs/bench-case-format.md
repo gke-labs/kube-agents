@@ -207,17 +207,19 @@ fixture role, named by `fixture_role:` rather than by cluster.
 Ten read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
-`report_contains` (phrases in the agent's answer; its `forbidden_patterns` and
+`report_contains` (phrases in the agent's answer; its `forbidden_patterns`, `required_patterns` and
 `any_of_patterns` are regular expressions searched against a line-preserving text, with each
 line's decoration folded when the check sets `fold_decoration: true` (indentation, bullets,
 numbers, headings, quotes, links, a trailing stop or an affirming mark; a mark that hedges or
 negates the last word stays, so it reads as a wrong value), so a pattern anchored at both ends
 spells a declared line once and should keep `\n` out of its gaps (a literal space does not cross a
 line break; a phrase that may wrap says `\s+`), for what no substring can
-express: a banned word whose negated uses are legitimate, a phrase that must start at a word
+express: a banned word whose negated uses are legitimate, a value only the work produces, such
+as a 32-hex trace id, where the words around it are the prompt's own and a report of failure
+would echo them (`required_patterns` must each match), a phrase that must start at a word
 boundary (`any_of_patterns` are the regex alternatives to `any_of_phrases`, one pool: at least one
 of either must match), and a required claim whose subject and verb an adverb or a tense can
-separate; `{cluster:<slot>}` in either list stands for the
+separate; `{cluster:<slot>}` in any of the three lists stands for the
 cluster the runner recorded for that slot, bare or as the last `-` or `/`-joined component of a longer id (a
 kubeconfig context's `_` joins only under `fold_decoration: true`, which makes it a `-`; without the fold the
 underscore is deleted as emphasis and the id has no boundary before the name) and
@@ -245,7 +247,12 @@ passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
 case it runs), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
-purges it, or with `required_runs` a script by its basename and the flags that must
+purges it; each of its `exempt_patterns` removes the text it matches from a
+command before the forbidden list reads it, and nothing else, and takes a
+command it touched out of the required list, for a command that can fetch and
+send nothing but carries a forbidden word as its argument, such as a plain
+`grep` exempted through its pattern argument so that whatever else shares the
+line is still graded; or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
 it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
@@ -267,8 +274,7 @@ completed cluster cards has a block line) or `ranking_card_filed` (the newest un
 `bootstrap-inventory-prioritize` filed at or after the sweep carries the hand-off's own body and is
 not `blocked`, `triage`, `failed` or `cancelled`) or `raw_report_no_first_run_audit_checks` (the
 same parse, and no block line carries a check from the roster of one of the four audits the `oobe`
-stage runs after the scan; an error on an install the gate recorded as having no GitOps repository,
-where the scan runs those checks on purpose).
+stage runs after the scan).
 
 `bootstrap_findings` reads the shell sandbox of the install under test:
 `INVENTORY.items.json`, which the onboarding prioritization stage's `inventory_findings.py
@@ -319,7 +325,13 @@ required phrase that was never reported and false-fails a forbidden one that onl
 in quoted material. `worker_commands` reads the route a worker took through its terminal
 commands, not its MCP tool calls, and only for cards the run delegated — a router that
 answered without delegating leaves it nothing to read, which is `status: "error"`, not a
-pass. `worker_agents` reads only which profile made the workers' tagged entries, and the
+pass. What it reads is the one-line rendering hermes writes to the card log, not the command
+as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||` arrives as its first
+command plus ` + N command(s)`, and a redirection is dropped, so a pattern never sees a command
+chained behind another, and the quotes stay, so a listed word the command splits with an empty
+quote inside it is one word to the shell and none to the pattern; the command as typed is on the
+trajectory, tagged with the worker's profile, and reading it from there, split into words, is the
+verifier change that closes both gaps. `worker_agents` reads only which profile made the workers' tagged entries, and the
 judged metrics receive those entries as the execution trace.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,
@@ -468,7 +480,9 @@ case that declares no `fixtures:` at all, a missing, empty or inline `verificati
 a check that carries no assertion and so can only pass, a missing `owner:` or one written
 as a mention or as something other than a login, an `expected_fail:` or `tool_calls_optional:`
 that is not a bare YAML boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
-does not have, and a case that is registered nowhere. It
+does not have, a case that is registered nowhere, and a file that writes one key twice in
+the same mapping, which PyYAML would load with the last value and devops-bench's loader
+refuses (a key that overrides one merged in with `<<:` is not a repeat). It
 also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`
 mode, a positive weight — which devops-bench enforces too, at spec-load time, after the
 lease.
@@ -525,6 +539,10 @@ classes of mistake get through it and fail at spec-load, after a cluster lease i
   (`devops_bench/tasks/loader.py:41`), which is YAML 1.2 and parses it into the string
   `"yes"` — the exact value the strict-mode note above warns fails validation. By the time
   the validator sees the field, the trap has already been parsed away.
+
+A fourth divergence is caught: PyYAML's `safe_load` keeps the last of two equal keys
+silently, where `YAML(typ="safe")` raises `DuplicateKeyError`, so the validator loads with
+a `SafeLoader` subclass that refuses a key written twice in one mapping.
 
 The gap is deliberate rather than pending. `make bench-case-check` depends on PyYAML alone,
 so it runs in a checkout with no `bench/` virtualenv and no harness install, which is what
