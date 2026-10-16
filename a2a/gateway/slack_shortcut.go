@@ -65,6 +65,13 @@ const (
 	slackShortcutPostedBy = "Posted by %s:"
 	// slackShortcutNameMax clips that name, in code points.
 	slackShortcutNameMax = 40
+	// The rich_text element types whose words run together on one line, and
+	// the leaves inside them that carry words.
+	slackRichTextSection = "rich_text_section"
+	slackRichTextQuote   = "rich_text_quote"
+	slackRichTextPre     = "rich_text_preformatted"
+	slackRichTextLeaf    = "text"
+	slackRichTextLink    = "link"
 	// slackShortcutQuotePrefix opens every quoted line.
 	slackShortcutQuotePrefix = "> "
 	// slackShortcutAttached names a file the message carried.
@@ -86,9 +93,9 @@ const (
 	// slackGroupDMNamePrefix begins the name Slack gives a group DM.
 	slackGroupDMNamePrefix = "mpdm-"
 
-	// slackShortcutCredit names the clicker on the bot's first post in the
-	// thread, so the channel sees who asked: a small line above the post,
-	// the clicker by their Slack name, never a mention.
+	// slackShortcutCredit names the clicker in the thread as the shortcut's
+	// task starts, so the channel sees who asked: a small line just above the
+	// bot's first reply, the clicker by their Slack name, never a mention.
 	slackShortcutCredit = "%s asked me to look at this"
 )
 
@@ -141,6 +148,61 @@ type slackShortcutMessage struct {
 	Files []struct {
 		Name string `json:"name"`
 	} `json:"files"`
+	// Blocks is the message's Block Kit layout, where an app posting with
+	// blocks (and every message typed in Slack's composer, as rich_text)
+	// carries what the member sees; its text is then only the fallback.
+	Blocks []slackShortcutBlock `json:"blocks"`
+}
+
+// slackShortcutBlock is the part of a block, or of an element inside one,
+// that carries words: its own text (a string for a rich_text leaf, an
+// object for a section, header or context element), a section's fields,
+// and the elements nested under it (context and rich_text children).
+type slackShortcutBlock struct {
+	Type     string               `json:"type"`
+	Text     json.RawMessage      `json:"text"`
+	URL      string               `json:"url"`
+	Fields   []slackShortcutBlock `json:"fields"`
+	Elements []slackShortcutBlock `json:"elements"`
+}
+
+// words is the block's text as the member reads it: one line per section,
+// header, field and context element, and each rich_text paragraph's leaves
+// run together, a link by its label or else its URL.
+func (b slackShortcutBlock) words() []string {
+	var own string
+	if len(b.Text) > 0 {
+		var obj struct {
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(b.Text, &own) != nil && json.Unmarshal(b.Text, &obj) == nil {
+			own = obj.Text
+		}
+	}
+	switch b.Type {
+	case slackBlockActionsT:
+		// Buttons and menus: what the member can do, not what the message says.
+		return nil
+	case slackRichTextLeaf, slackRichTextLink:
+		if own == "" {
+			own = b.URL
+		}
+		return []string{own}
+	case slackRichTextSection, slackRichTextQuote, slackRichTextPre:
+		var line strings.Builder
+		for _, e := range b.Elements {
+			line.WriteString(strings.Join(e.words(), ""))
+		}
+		return []string{line.String()}
+	}
+	out := []string{own}
+	for _, f := range b.Fields {
+		out = append(out, f.words()...)
+	}
+	for _, e := range b.Elements {
+		out = append(out, e.words()...)
+	}
+	return out
 }
 
 // slackIsShortcut reports an interactive payload that is a message shortcut.
@@ -323,7 +385,16 @@ func slackShortcutQuoted(m slackShortcutMessage) string {
 			parts = append(parts, t)
 		}
 	}
-	add(m.Text)
+	// The blocks are what the member sees; the text beside them is the
+	// fallback, which an app is free to make a placeholder.
+	for _, b := range m.Blocks {
+		for _, w := range b.words() {
+			add(w)
+		}
+	}
+	if len(parts) == 0 {
+		add(m.Text)
+	}
 	for _, a := range m.Attachments {
 		before := len(parts)
 		add(a.Pretext)
@@ -363,149 +434,51 @@ func slackShortcutQuote(text string) string {
 	return strings.Join(lines, "\n")
 }
 
-// creditLocked holds line for the bot's next post in conversation, for the
-// task taskID (the chain root TaskStarted named). Caller holds s.mu.
-func (s *SlackAdapter) creditLocked(conversation, line, taskID string) {
+// creditLocked holds line until the shortcut's own task starts in
+// conversation (creditShortcut). Caller holds s.mu.
+func (s *SlackAdapter) creditLocked(conversation, line string) {
 	ux := s.uxLocked()
-	remember(&ux.creditsOrder, conversation, func(k string) {
-		delete(ux.credits, k)
-		delete(ux.creditTasks, k)
-	})
+	remember(&ux.creditsOrder, conversation, func(k string) { delete(ux.credits, k) })
 	ux.credits[conversation] = line
-	ux.creditTasks[conversation] = taskID
 }
 
-// uncreditLocked forgets conversation's credit line, waiting or held for a
-// post. Caller holds s.mu.
+// uncreditLocked forgets conversation's waiting credit line. Caller holds
+// s.mu.
 func (s *SlackAdapter) uncreditLocked(conversation string) {
 	ux := s.uxLocked()
-	delete(ux.awaiting, conversation)
-	forget(&ux.awaitingOrder, conversation)
 	delete(ux.credits, conversation)
-	delete(ux.creditTasks, conversation)
 	forget(&ux.creditsOrder, conversation)
 }
 
-// awaitCreditLocked holds line until the shortcut's own task starts in
-// conversation (startCredit). Caller holds s.mu. It is held for the task
-// rather than for the next post because the turn is verified before it is
-// routed: a task already running in the thread would otherwise post its own
-// progress under the line, and a turn that starts nothing would leave it for
-// whoever asks there next.
-func (s *SlackAdapter) awaitCreditLocked(conversation, line string) {
-	ux := s.uxLocked()
-	remember(&ux.awaitingOrder, conversation, func(k string) { delete(ux.awaiting, k) })
-	ux.awaiting[conversation] = line
-}
-
-// startCredit moves a waiting credit to the conversation's next post, as the
-// shortcut's task starts (TaskStarted).
-func (s *SlackAdapter) startCredit(conversation, taskID string) {
+// creditShortcut posts the waiting credit line, if conversation has one, as
+// its own message in the thread: a context block naming who asked. It runs
+// as the shortcut's task starts (TaskStarted), so nothing of the task's has
+// posted yet, and Slack shows the task's first reply under it as one block
+// from the bot. It is the task's start, not a post, that takes the line: a
+// turn routed as a steer starts nothing, and any other verified turn clears
+// a line still waiting (InboundVerified), so it never names someone over a
+// reply that is not to their ask.
+func (s *SlackAdapter) creditShortcut(conversation string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	ux := s.uxLocked()
-	line, ok := ux.awaiting[conversation]
+	line, ok := s.uxLocked().credits[conversation]
+	if ok {
+		s.uncreditLocked(conversation)
+	}
+	s.mu.Unlock()
 	if !ok {
 		return
 	}
-	delete(ux.awaiting, conversation)
-	forget(&ux.awaitingOrder, conversation)
-	s.creditLocked(conversation, line, taskID)
-}
-
-// takeCredit hands over the credit line waiting for conversation's next
-// post, and the task it is for, and forgets them: it goes on one message
-// only.
-func (s *SlackAdapter) takeCredit(conversation string) (line, taskID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ux := s.uxLocked()
-	line, ok := ux.credits[conversation]
-	if !ok {
-		return "", ""
+	channel, thread, ok := slackChannelThread(conversation)
+	if !ok || thread == "" {
+		return
 	}
-	taskID = ux.creditTasks[conversation]
-	delete(ux.credits, conversation)
-	delete(ux.creditTasks, conversation)
-	forget(&ux.creditsOrder, conversation)
-	return line, taskID
-}
-
-// dropCredit forgets a credit line no post took once the task it was for has
-// ended (TaskTerminal), so it cannot land on a later, unrelated post. A
-// terminal for any other task, one that predates the shortcut, leaves it.
-func (s *SlackAdapter) dropCredit(conversation, taskID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ux := s.uxLocked()
-	if _, ok := ux.credits[conversation]; ok && ux.creditTasks[conversation] == taskID {
-		delete(ux.credits, conversation)
-		delete(ux.creditTasks, conversation)
-		forget(&ux.creditsOrder, conversation)
+	set, err := slackRawBlocks([]map[string]any{{"type": slackContextBlock, "elements": []any{
+		map[string]any{"type": slackPlainText, "text": line, "emoji": true}}}})
+	if err == nil {
+		_, _, err = s.api.PostMessage(channel, slack.MsgOptionText(slackEscaper.Replace(line), false),
+			slack.MsgOptionBlocks(set...), slack.MsgOptionTS(thread))
 	}
-}
-
-// noteCredited records that the message at channel/ts carries line, so an
-// edit of it keeps the line.
-func (s *SlackAdapter) noteCredited(channel, ts, line string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ux := s.uxLocked()
-	key := channel + "/" + ts
-	remember(&ux.creditedOrder, key, func(k string) { delete(ux.credited, k) })
-	ux.credited[key] = line
-}
-
-// creditedLine is the credit line the message at channel/ts carries, or "".
-func (s *SlackAdapter) creditedLine(channel, ts string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.uxLocked().credited[channel+"/"+ts]
-}
-
-// slackCreditNote is the credit line as the context block above a post.
-func slackCreditNote(line string) map[string]any {
-	return map[string]any{"type": slackContextBlock, "elements": []any{
-		map[string]any{"type": slackPlainText, "text": line, "emoji": true}}}
-}
-
-// slackCreditedOptions is slackMessageOptions with the credit line above the
-// message: a context block before the chat message's layout, or before the
-// text laid out as a section when there is no chat message (text past a
-// section's cap posts as text alone, without the line).
-func slackCreditedOptions(m OutMessage, line string) ([]slack.MsgOption, error) {
-	text := toMrkdwn(m.Text)
-	if m.Chat == nil {
-		if utf8.RuneCountInString(text) > slackChatSectionMax {
-			return slackMessageOptions(m)
-		}
-		set, err := slackRawBlocks([]map[string]any{slackCreditNote(line),
-			{"type": slackSectionBlock, "text": map[string]any{"type": slackMrkdwnText, "text": text}}})
-		if err != nil {
-			return nil, err
-		}
-		return []slack.MsgOption{slack.MsgOptionText(text, false), slack.MsgOptionBlocks(set...),
-			slack.MsgOptionAttachments([]slack.Attachment{}...)}, nil
-	}
-	layout, err := slackCreditedLayout(m, text, line)
 	if err != nil {
-		return nil, err
+		s.log.Warn("slack: posting a shortcut's credit line failed", "channel", channel, "err", err)
 	}
-	return slackChatOptions(layout, text)
-}
-
-// slackCreditedLayout is a chat message's layout with the credit line's
-// block first, refused as slackMessageOptions refuses it.
-func slackCreditedLayout(m OutMessage, text, line string) (slackChatLayout, error) {
-	if utf8.RuneCountInString(text) > slackChatTextMax {
-		return slackChatLayout{}, fmt.Errorf("%w: %w", ErrLayoutRefused, errSlackChatTooLarge)
-	}
-	layout, err := renderSlackChat(m.Chat, text)
-	if err != nil {
-		return slackChatLayout{}, fmt.Errorf("%w: %w", ErrLayoutRefused, err)
-	}
-	if line != "" {
-		layout.Blocks = append([]map[string]any{slackCreditNote(line)}, layout.Blocks...)
-	}
-	return layout, nil
 }

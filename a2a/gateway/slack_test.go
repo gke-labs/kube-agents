@@ -36,10 +36,13 @@ type fakeSlackAPI struct {
 	// postValues is every chat.postMessage's full form, for the fields
 	// posted does not name.
 	postValues []url.Values
-	updated    []struct{ channel, ts, text string }
-	members    []string
-	cursor     string
-	openedIM   string
+	// postOptions is every chat.postMessage's options as given, for the
+	// blocks (sentUpdateForm reads them off the wire).
+	postOptions [][]slack.MsgOption
+	updated     []struct{ channel, ts, text string }
+	members     []string
+	cursor      string
+	openedIM    string
 	// updatedBlocks and updatedAttachments are each update's blocks and
 	// attachments fields as sent, beside updated.
 	updatedBlocks      []string
@@ -125,6 +128,7 @@ func (f *fakeSlackAPI) PostMessage(channelID string, options ...slack.MsgOption)
 		values.Get("channel"), values.Get("thread_ts"), values.Get("text"),
 	})
 	f.postValues = append(f.postValues, values)
+	f.postOptions = append(f.postOptions, options)
 	return channelID, "999.001", nil
 }
 

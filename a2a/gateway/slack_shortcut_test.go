@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -273,7 +272,9 @@ func TestSlackShortcutVerifiedTitlesTheThreadAfterTheMessage(t *testing.T) {
 	}
 }
 
-func TestSlackShortcutVerifiedCreditsTheClickerOnce(t *testing.T) {
+// The credit line posts as the shortcut's own task starts, once, in the
+// thread, as a context block naming the clicker.
+func TestSlackShortcutCreditPostsWhenItsTaskStarts(t *testing.T) {
 	api := &fakeSlackAPI{users: map[string]*slack.User{"U1": {Profile: slack.UserProfile{DisplayName: "jayanti"}}}}
 	a, _ := newShortcutAdapter(api)
 	turns := runShortcut(a, shortcutPayload(t, "C1", "oncall", "203.0", alertMessage()))
@@ -281,60 +282,40 @@ func TestSlackShortcutVerifiedCreditsTheClickerOnce(t *testing.T) {
 		t.Fatalf("turns = %+v", turns)
 	}
 	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, true)
-	if got, _ := a.takeCredit(turns[0].Conversation); got != "" {
-		t.Errorf("a post before the shortcut's own task starts (a running task's progress) took the credit: %q", got)
+	if len(api.posted) != 0 {
+		t.Fatalf("posted before the task started: %+v", api.posted)
 	}
 	a.TaskStarted(turns[0].Conversation, "task-1")
-	if got, _ := a.takeCredit(turns[0].Conversation); got != "jayanti asked me to look at this" {
-		t.Errorf("credit = %q, want the clicker's name in the mock's words", got)
+	a.TaskStarted(turns[0].Conversation, "task-2")
+	if len(api.posted) != 1 || api.posted[0].channel != "C1" || api.posted[0].thread != "100.5" ||
+		api.posted[0].text != "jayanti asked me to look at this" {
+		t.Fatalf("posted = %+v, want the credit line once in the thread under 100.5", api.posted)
 	}
-	if got, _ := a.takeCredit(turns[0].Conversation); got != "" {
-		t.Errorf("a credit goes on one post only; second take = %q", got)
+	if sent := sentUpdateForm("C1", "1.0", api.postOptions[0]...).Get("blocks"); !strings.Contains(sent, `"context"`) {
+		t.Errorf("the credit line is not a context block: %s", sent)
 	}
 }
 
-// A verified shortcut whose turn starts no task (a steer into a running one,
-// a failed mint) leaves no credit for the next member's ask in the thread.
-func TestSlackShortcutCreditDoesNotPassToALaterAsk(t *testing.T) {
-	a, _ := newShortcutAdapter(&fakeSlackAPI{})
+// A shortcut whose turn starts no task (a steer into a running one, a failed
+// mint) credits nothing, and the next verified turn clears its line, so a
+// later member's task never posts under the clicker's name. A refused
+// clicker is credited nowhere.
+func TestSlackShortcutCreditGoesToNoOtherTurn(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newShortcutAdapter(api)
 	turns := runShortcut(a, shortcutPayload(t, "C1", "oncall", "203.5", alertMessage()))
 	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, true)
 	typed := InboundMessage{Conversation: turns[0].Conversation, AuthorID: "U3", MessageID: "300.0", Text: "and staging?"}
 	a.notePending(typed)
 	a.InboundVerified(typed.Conversation, typed.MessageID, true)
 	a.TaskStarted(turns[0].Conversation, "task-2")
-	if got, _ := a.takeCredit(turns[0].Conversation); got != "" {
-		t.Errorf("a later member's ask was credited to the clicker: %q", got)
-	}
-}
-
-// With Agent Sessions there is no placeholder, so the credit waits across the
-// lock for the task's first post. A member's reply in that window is a steer
-// whose ack the gateway posts: it must not carry the clicker's line.
-func TestSlackShortcutCreditDoesNotGoOnASteerAck(t *testing.T) {
-	a, _ := newShortcutAdapter(&fakeSlackAPI{})
-	turns := runShortcut(a, shortcutPayload(t, "C1", "oncall", "203.8", alertMessage()))
-	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, true)
-	a.TaskStarted(turns[0].Conversation, "task-1")
-	typed := InboundMessage{Conversation: turns[0].Conversation, AuthorID: "U3", MessageID: "301.0", Text: "check staging too"}
-	a.notePending(typed)
-	a.InboundVerified(typed.Conversation, typed.MessageID, true)
-	if got, _ := a.takeCredit(turns[0].Conversation); got != "" {
-		t.Errorf("the steer's ack would carry the clicker's line: %q", got)
-	}
-}
-
-// The terminal of a task that predates the shortcut (the heal, or the relay
-// finishing it under the lock) leaves the shortcut's line for its own task.
-func TestSlackShortcutCreditSurvivesAnEarlierTasksTerminal(t *testing.T) {
-	a, _ := newShortcutAdapter(&fakeSlackAPI{})
-	turns := runShortcut(a, shortcutPayload(t, "C1", "oncall", "203.9", alertMessage()))
-	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, true)
-	a.TaskTerminal(turns[0].Conversation, "task-old", lib.StateCompleted, "", "")
-	a.TaskStarted(turns[0].Conversation, "task-new")
-	a.TaskTerminal(turns[0].Conversation, "task-old", lib.StateCompleted, "", "")
-	if got, task := a.takeCredit(turns[0].Conversation); got == "" || task != "task-new" {
-		t.Errorf("credit = %q for %q, want the line for task-new", got, task)
+	refused := runShortcut(a, shortcutPayload(t, "C1", "oncall", "203.6", map[string]any{
+		"type": "message", "user": "U2", "ts": "107.0", "text": "is it down?",
+	}))
+	a.InboundVerified(refused[0].Conversation, refused[0].MessageID, false)
+	a.TaskStarted(refused[0].Conversation, "task-3")
+	if len(api.posted) != 0 {
+		t.Errorf("a credit line went on another turn's task: %+v", api.posted)
 	}
 }
 
@@ -366,75 +347,6 @@ func TestSlackShortcutInAGroupDMNamesNoChannel(t *testing.T) {
 	turns := runShortcut(a, shortcutPayload(t, "G7", "mpdm-alex--sam--kage-1", "203.7", alertMessage()))
 	if len(turns) != 1 || !strings.Contains(turns[0].Text, "posted in this conversation:") {
 		t.Errorf("a group DM is named as a channel: %+v", turns)
-	}
-}
-
-// An answered question that was the credited first post keeps both lines
-// when it is edited again without its choices.
-func TestSlackAnsweredEditKeepsTheCreditLine(t *testing.T) {
-	opts, err := slackAnsweredOptions(OutMessage{Text: "Want me to open a PR?"}, "✓ jayanti: yes", "jayanti asked me to look at this")
-	if err != nil {
-		t.Fatal(err)
-	}
-	form := sentUpdateForm("C1", "1.0", opts...)
-	blocks := decodeBlocks(t, form.Get("blocks"))
-	if len(blocks) != 3 || blocks[0]["type"] != "context" || blocks[2]["type"] != "context" ||
-		!strings.Contains(form.Get("blocks"), "jayanti asked me to look at this") || !strings.Contains(form.Get("blocks"), "✓ jayanti: yes") {
-		t.Errorf("blocks = %s, want the credit line, the text, then the answered line", form.Get("blocks"))
-	}
-}
-
-func TestSlackShortcutRefusedOrEndedLeavesNoCredit(t *testing.T) {
-	a, _ := newShortcutAdapter(&fakeSlackAPI{})
-	turns := runShortcut(a, shortcutPayload(t, "C1", "oncall", "203.1", alertMessage()))
-	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, false)
-	if got, _ := a.takeCredit(turns[0].Conversation); got != "" {
-		t.Errorf("a refused clicker is credited: %q", got)
-	}
-	turns = runShortcut(a, shortcutPayload(t, "C1", "oncall", "203.2", alertMessage()))
-	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, true)
-	a.TaskStarted(turns[0].Conversation, "task-1")
-	a.TaskTerminal(turns[0].Conversation, "task-1", lib.StateFailed, "", "")
-	if got, _ := a.takeCredit(turns[0].Conversation); got != "" {
-		t.Errorf("a credit outlived its work and could land on a later post: %q", got)
-	}
-}
-
-// The credit line goes above the first post, as a context block, and stays
-// through an edit of that message; the next post carries none.
-func TestSlackCreditLineIsAboveTheFirstPostAndSurvivesItsEdit(t *testing.T) {
-	a, stub := startSlackStubAdapter(t)
-	a.mu.Lock()
-	a.creditLocked("slack:C1/100.5", "jayanti asked me to look at this", "task-1")
-	a.mu.Unlock()
-	ts, err := a.Post("slack:C1/100.5", "checking payments-api in seeded-debug.")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := a.Post("slack:C1/100.5", "second"); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.Edit("slack:C1/100.5", ts, "checking payments-api in seeded-debug. (edited)"); err != nil {
-		t.Fatal(err)
-	}
-	stub.mu.Lock()
-	forms := append([]url.Values(nil), stub.forms...)
-	stub.mu.Unlock()
-	if len(forms) != 3 {
-		t.Fatalf("calls = %d, want two posts and an edit", len(forms))
-	}
-	for i, want := range []bool{true, false, true} {
-		blocks := forms[i].Get("blocks")
-		has := strings.Contains(blocks, `"context"`) && strings.Contains(blocks, "jayanti asked me to look at this")
-		if has != want {
-			t.Errorf("call %d carries the credit line = %v, want %v: %s", i, has, want, blocks)
-		}
-	}
-	if first := decodeBlocks(t, forms[0].Get("blocks")); len(first) != 2 || first[0]["type"] != "context" || first[1]["type"] != "section" {
-		t.Errorf("first post's blocks = %v, want the credit line, then the text", first)
-	}
-	if forms[0].Get("thread_ts") != "100.5" {
-		t.Errorf("first post thread = %q", forms[0].Get("thread_ts"))
 	}
 }
 
@@ -487,6 +399,40 @@ func TestSlackShortcutAskIsTheEvalCasesPrompt(t *testing.T) {
 	}
 	if task.Prompt != turns[0].Text {
 		t.Errorf("%s's prompt is not the ask the adapter writes.\ngot:\n%s\nwant:\n%s", shortcutEvalCase, task.Prompt, turns[0].Text)
+	}
+}
+
+// An app posting with Block Kit carries the alert in its blocks and a
+// placeholder in its text: the quote is the blocks, without the buttons.
+func TestSlackShortcutQuotesBlockKitAndNotItsFallback(t *testing.T) {
+	var m slackShortcutMessage
+	if err := json.Unmarshal([]byte(`{"text":"New alert","blocks":[
+	 {"type":"header","text":{"type":"plain_text","text":"payments-api crashlooping"}},
+	 {"type":"section","text":{"type":"mrkdwn","text":"*seeded-debug* restarted 6 times"},
+	  "fields":[{"type":"mrkdwn","text":"*Severity:* critical"}]},
+	 {"type":"context","elements":[{"type":"mrkdwn","text":"Triggered 14:04"}]},
+	 {"type":"actions","elements":[{"type":"button","text":{"type":"plain_text","text":"Acknowledge"}}]}]}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	got := slackShortcutQuoted(m)
+	want := "payments-api crashlooping\n*seeded-debug* restarted 6 times\n*Severity:* critical\nTriggered 14:04"
+	if got != want {
+		t.Errorf("quote = %q, want %q", got, want)
+	}
+}
+
+// A message typed in Slack carries its words twice, as text and as
+// rich_text: quoted once, a link by its label or URL.
+func TestSlackShortcutQuotesRichTextOnce(t *testing.T) {
+	var m slackShortcutMessage
+	if err := json.Unmarshal([]byte(`{"text":"is payments down? <https://status.example|status>","blocks":[
+	 {"type":"rich_text","elements":[{"type":"rich_text_section","elements":[
+	  {"type":"text","text":"is payments down? "},{"type":"link","url":"https://status.example","text":"status"}]},
+	  {"type":"rich_text_section","elements":[{"type":"link","url":"https://dash.example"}]}]}]}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := slackShortcutQuoted(m); got != "is payments down? status\nhttps://dash.example" {
+		t.Errorf("quote = %q", got)
 	}
 }
 

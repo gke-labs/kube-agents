@@ -135,17 +135,10 @@ type slackUX struct {
 	// questions is each conversation's open question, the latest posted.
 	questions      map[string]slackQuestion
 	questionsOrder []string
-	// awaiting is each conversation's verified shortcut credit line until the
-	// shortcut's own task starts there; credits is the line from then until
-	// the bot's next post there; credited is the line a post took, by
-	// channel/ts, so an edit of that message keeps it (slack_shortcut.go).
-	awaiting      map[string]string
-	awaitingOrder []string
-	credits       map[string]string
-	creditTasks   map[string]string
-	creditsOrder  []string
-	credited      map[string]string
-	creditedOrder []string
+	// credits is each conversation's verified shortcut credit line until the
+	// shortcut's own task starts there (slack_shortcut.go).
+	credits      map[string]string
+	creditsOrder []string
 }
 
 // uxLocked is s.ux, made on first use. Caller holds s.mu.
@@ -153,8 +146,7 @@ func (s *SlackAdapter) uxLocked() *slackUX {
 	if s.ux == nil {
 		s.ux = &slackUX{pending: map[string]slackPending{}, claims: map[string]bool{},
 			answered: map[string]bool{}, lines: map[string]string{}, questions: map[string]slackQuestion{},
-			awaiting: map[string]string{}, credits: map[string]string{}, creditTasks: map[string]string{},
-			credited: map[string]string{}}
+			credits: map[string]string{}}
 	}
 	return s.ux
 }
@@ -223,9 +215,7 @@ func (s *SlackAdapter) trackQuestion(conversation, ts string, m OutMessage) {
 		return
 	}
 	text := toMrkdwn(m.Text)
-	// With the credit line the message carries, so an answer's rewrite
-	// keeps it.
-	layout, err := slackCreditedLayout(m, text, s.creditedLine(channel, ts))
+	layout, err := renderSlackChat(m.Chat, text)
 	if err != nil {
 		return
 	}
@@ -251,9 +241,8 @@ func (s *SlackAdapter) trackQuestion(conversation, ts string, m OutMessage) {
 // question already answered: the same layout with the answered line added
 // where slackAnsweredLayout would put it, or, for text alone, the text as a
 // section with the line under it (text past a section's cap posts as text
-// alone, without the line). A credit line, when the message carries one,
-// stays above it all (slackCreditedOptions).
-func slackAnsweredOptions(m OutMessage, line, credit string) ([]slack.MsgOption, error) {
+// alone, without the line).
+func slackAnsweredOptions(m OutMessage, line string) ([]slack.MsgOption, error) {
 	text := toMrkdwn(m.Text)
 	note := map[string]any{"type": slackContextBlock, "elements": []any{
 		map[string]any{"type": slackPlainText, "text": line, "emoji": true}}}
@@ -261,12 +250,8 @@ func slackAnsweredOptions(m OutMessage, line, credit string) ([]slack.MsgOption,
 		if utf8.RuneCountInString(text) > slackChatSectionMax {
 			return slackMessageOptions(m)
 		}
-		blocks := []map[string]any{
-			{"type": slackSectionBlock, "text": map[string]any{"type": slackMrkdwnText, "text": text}}, note}
-		if credit != "" {
-			blocks = append([]map[string]any{slackCreditNote(credit)}, blocks...)
-		}
-		set, err := slackRawBlocks(blocks)
+		set, err := slackRawBlocks([]map[string]any{
+			{"type": slackSectionBlock, "text": map[string]any{"type": slackMrkdwnText, "text": text}}, note})
 		if err != nil {
 			return nil, err
 		}
@@ -275,9 +260,12 @@ func slackAnsweredOptions(m OutMessage, line, credit string) ([]slack.MsgOption,
 	}
 	// Refusals wrapped as slackMessageOptions wraps them, so a caller tells
 	// a refused layout from a failed call (ErrLayoutRefused).
-	layout, err := slackCreditedLayout(m, text, credit)
+	if utf8.RuneCountInString(text) > slackChatTextMax {
+		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, errSlackChatTooLarge)
+	}
+	layout, err := renderSlackChat(m.Chat, text)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, err)
 	}
 	if n := len(layout.Attachments); n > 0 {
 		last := layout.Attachments[n-1]
@@ -413,21 +401,19 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 		s.mu.Unlock()
 		return
 	}
-	if !p.shortcut {
-		// Another member's turn in the conversation, or the clicker's own:
-		// a shortcut's credit line, waiting for its task or for that task's
-		// first post, would otherwise go on this turn's reply (a steer's
-		// ack). Better none than one naming someone for an ask they did not
-		// make.
+	if verified {
+		// Any verified turn in the conversation: a shortcut's credit line
+		// still waiting for its task is not about the task this turn may
+		// start. A shortcut arms its own below.
 		s.uncreditLocked(conversation)
 	}
 	if p.shortcut {
 		// A shortcut answers no question: it is an ask about a message, so
 		// it titles the thread after that message and credits the clicker
-		// on the bot's next post there, and a clicker the gateway refused is
-		// told so where only they can see it.
+		// when its task starts, and a clicker the gateway refused is told so
+		// where only they can see it.
 		if verified {
-			s.awaitCreditLocked(conversation, fmt.Sprintf(slackShortcutCredit, p.clicker))
+			s.creditLocked(conversation, fmt.Sprintf(slackShortcutCredit, p.clicker))
 			s.mu.Unlock()
 			s.noteAsk(conversation, p.text)
 			return
