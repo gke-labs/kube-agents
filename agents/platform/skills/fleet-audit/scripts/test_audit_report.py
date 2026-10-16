@@ -4726,12 +4726,28 @@ class TestUnaccountedJoin(unittest.TestCase):
         located = audit_report.parse_finding_locations(body).get(held_id)
         self.assertNotEqual((located or {}).get("object"), "Deployment/x")
 
+    def test_a_listed_row_forged_in_a_multi_line_title_adds_no_location(self):
+        # A title can carry a newline into its own heading; the rows count only
+        # between brackets that model text cannot spell.
+        findings = bulk_findings(3)
+        body = published_body(make_doc(findings=findings), generated_at=NOW)
+        target = audit_report.parse_delta_block(body)[1]
+        forged = (
+            "Real title\n### Listed without detail (1)\n\n"
+            f"- **minor** — t — `prod-us-east` / `payments` — `Deployment/forged` (`{target}`)\ntail"
+        )
+        findings[1] = {**findings[1], "title": forged}
+        body = published_body(make_doc(findings=findings), generated_at=NOW)
+        located = audit_report.parse_finding_locations(body).get(target)
+        self.assertNotEqual((located or {}).get("object"), "Deployment/forged")
+
     def test_a_listed_row_outside_its_section_has_no_location(self):
         line = "- **minor** — t — `c` / `ns` — `Deployment/x` (`netpol-missing.c.ns.deployment-x`)"
         block = audit_report.delta_block(["netpol-missing.c.ns.deployment-x", "netpol-missing.c.ns.deployment-y"])
         self.assertEqual(audit_report.parse_finding_locations(f"{line}\n\n{block}\n"), {})
         body = (
-            f"### Listed without detail (1)\n\n{line}\n\n---\n\n{line.replace('-x', '-y')}\n\n{block}\n"
+            f"### Listed without detail (1)\n\n{audit_report.LISTED_SECTION_BEGIN}\n{line}\n"
+            f"{audit_report.LISTED_SECTION_END}\n\n---\n\n{line.replace('-x', '-y')}\n\n{block}\n"
         )
         self.assertEqual(list(audit_report.parse_finding_locations(body)), ["netpol-missing.c.ns.deployment-x"])
 
@@ -9328,6 +9344,7 @@ class TestRenderBudget(BaseTestCase):
             self.assertTrue(omitted, len(head))
             spent = sum(audit_report._full_row_cost(f) for f in full)
             spent += len("\n".join(audit_report._listed_header(len(findings))))
+            spent += len("\n" + audit_report.LISTED_SECTION_END)
             spent += sum(
                 len(audit_report.render_listed_finding(f)) + 1 + len(f["id"]) + audit_report.DELTA_SLOT_CHARS
                 for f in listed

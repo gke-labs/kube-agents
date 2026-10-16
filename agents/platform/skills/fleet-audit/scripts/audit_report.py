@@ -1017,11 +1017,12 @@ LEDGER_STAMP_FORMAT = "%Y-%m-%d %H:%M UTC"
 # `issue_title` makes. `refresh_coverage_ledger` rewrites only a ledger with
 # such a title, so it never rewrites a body that lists findings.
 COVERAGE_TITLE_RE = re.compile(r" — coverage incomplete \(\d+ gaps?, 0 findings\)$")
-# The one-line rows `_render_listed` writes under `LISTED_HEADING_RE`, read back
-# by `parse_finding_locations` with the full blocks. Only lines inside the last
-# such section count, up to `LISTED_SECTION_END_RE`.
-LISTED_HEADING_RE = re.compile(r"^### Listed without detail \(\d+\)[ \t]*$", re.M)
-LISTED_SECTION_END_RE = re.compile(r"^(?:#|---|<!--)", re.M)
+# The renderer's own brackets around the one-line rows `_render_listed`
+# writes, which `parse_finding_locations` reads back with the full blocks.
+# Comments, like the held span's: `publishable_text` escapes `<!--` in every
+# model-written field, so no title or excerpt can spell one.
+LISTED_SECTION_BEGIN = "<!-- audit-listed:begin -->"
+LISTED_SECTION_END = "<!-- audit-listed:end -->"
 LISTED_LINE_RE = re.compile(
     r"^- \*\*[a-z]+\*\* — (.*) — `([^`\n]*)`(?: / `([^`\n]*)`| / _cluster-scoped_)"
     r" — `([^`\n]*)` \(`([^`\n]+)`\)(?: — [^`\n]*)?[ \t]*$",
@@ -9602,26 +9603,31 @@ def _listed_header(count: int) -> list[str]:
         "recommendations are kept in full in this run's stored report; ask the "
         "agent for that report to read them._",
         "",
+        LISTED_SECTION_BEGIN,
     ]
 
 
 def _listed_locations(body: str) -> dict[str, dict[str, str]]:
     """{finding id: {title, cluster, namespace, object}} for the listed rows of a body.
 
-    The last heading, not the first: the section is written after every full
-    block, and a heading earlier in the body sits in a finding's model-written
-    evidence.
+    Read only between the renderer's brackets, each alone on its line, and
+    only when the body holds exactly one of each in order: any other shape is
+    not one this renderer writes, and it carries nothing.
     """
-    headings = list(LISTED_HEADING_RE.finditer(body))
-    if not headings:
+    begins: list[int] = []
+    ends: list[int] = []
+    offset = 0
+    for line in body.split("\n"):
+        stripped = line.strip()
+        if stripped == LISTED_SECTION_BEGIN:
+            begins.append(offset + len(line))
+        elif stripped == LISTED_SECTION_END:
+            ends.append(offset)
+        offset += len(line) + 1
+    if len(begins) != 1 or len(ends) != 1 or ends[0] < begins[0]:
         return {}
-    heading = headings[-1]
-    section = body[heading.end() :]
-    end = LISTED_SECTION_END_RE.search(section)
     out: dict[str, dict[str, str]] = {}
-    for title, cluster, namespace, obj, fid in LISTED_LINE_RE.findall(
-        section[: end.start()] if end else section
-    ):
+    for title, cluster, namespace, obj, fid in LISTED_LINE_RE.findall(body[begins[0] : ends[0]]):
         out[fid] = {
             "title": title.strip(),
             "cluster": cluster,
@@ -9645,7 +9651,7 @@ def _render_listed(
             pr_url=(pr_urls or {}).get(str(finding.get("id", ""))),
         )
         for finding in sort_findings(listed)
-    ]
+    ] + [LISTED_SECTION_END]
 
 
 def split_findings_for_body(
@@ -9684,7 +9690,7 @@ def split_findings_for_body(
         for finding in order
     ]
     # Charged once, at its widest, when the first finding is listed.
-    header = len("\n".join(_listed_header(len(order))))
+    header = len("\n".join(_listed_header(len(order)))) + len("\n" + LISTED_SECTION_END)
     full_rows: list[dict] = []
     listed: list[dict] = []
     omitted: list[dict] = []

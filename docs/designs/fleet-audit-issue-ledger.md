@@ -729,7 +729,8 @@ headroom for the trailing marker and for anything a later section appends.
   as many as fit, then a count. A listed line is a
   bullet, never a `####` heading, so the readers that recover a finding's detail from its heading
   (`FINDING_MARKER_RE`, the Slack card) do not take it for one. Its id rides the delta marker like a
-  full row's, and `parse_finding_locations` reads its row with the full blocks: the ledger names it,
+  full row's, and `parse_finding_locations` reads its row with the full blocks, only between
+  the renderer's `audit-listed:begin`/`end` comments, which model text cannot spell: the ledger names it,
   so the delta, the collector hold, the clean close and the `carried` list `start` prints all treat
   it as on the ledger. A listed finding that gains a full block when others resolve is not new, and
   one that stops reproducing is resolved.
