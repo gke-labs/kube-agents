@@ -180,6 +180,14 @@ KNOWN_UNREGISTERED = {
     "chat-relay-posts-report-as-written": (
         "needs a chat platform, which no CI install has; run by hand on a chat install"
     ),
+    # It grades a GitHub forge declared at a GitHub Enterprise Server host,
+    # which needs the GHES proxy (hack/ghes-proxy) and an install pointed at
+    # it. No eval lane deploys either, so it runs by hand with the recipe in
+    # its header. The entry goes when a lane deploys both.
+    "ghes-pdb-remediation-pr": (
+        "needs the GHES proxy and a GHES-forge install, which no eval lane has; "
+        "run by hand with the recipe in the case header"
+    ),
 }
 
 # Cases whose fixture does not exist at all, waiting on the issue that plants
