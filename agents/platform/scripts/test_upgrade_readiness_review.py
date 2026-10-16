@@ -200,6 +200,36 @@ class TheMapping(unittest.TestCase):
         rule_failed["readiness"]["unknown"] = [{"rule": "surge-capacity", "entry": 2, "text": "raised"}]
         self.assertFalse(review.member_complete(rule_failed, []))
 
+    def test_the_entry_titles_are_the_catalogue_headings(self):
+        import re
+
+        catalogue = Path(__file__).resolve().parents[3] / "docs" / "designs" / "upgrade-failure-catalogue.md"
+        headings = {int(n): title.strip() for n, title in re.findall(r"^### (\d+)\. (.+)$", catalogue.read_text(encoding="utf-8"), re.M)}
+        self.assertEqual(headings, review.ENTRY_TITLES)
+        self.assertEqual(set(review.ENTRY_MITIGATIONS), set(headings))
+
+    def test_the_prose_rubric_in_the_sop_and_the_readme_matches_the_script(self):
+        # The SOP's live brief and the README grade by the same sentence; the
+        # script's table is what the Saturday review applies.
+        by_kind = {kind: review.severity_of({"rubric": review.rubric(v)}) for kind, v in review.RUBRIC.items()}
+        self.assertEqual(
+            by_kind,
+            {"budget-singleton": "critical", "skew-blocks": "critical", "webhook-blocking": "critical", "rule-blocking": "critical", "budget": "major", "skew-ceiling": "major", "webhook-outage": "major", "exclusion": "minor"},
+        )
+        readme = Path(__file__).resolve().parents[1] / "cron" / "README.md"
+        for document in (SOP, readme):
+            text = " ".join(document.read_text(encoding="utf-8").split())
+            critical, rest = text.split("are critical", 1)
+            major, rest = rest.split("are major", 1)
+            minor = rest.split("minor", 1)[0]
+            self.assertIn("single replica", critical[-240:], document.name)
+            self.assertIn("past the skew ceiling", critical[-240:], document.name)
+            self.assertIn("upgrade's path", critical[-240:], document.name)
+            self.assertIn("several replicas", major[-240:], document.name)
+            self.assertIn("at the ceiling", major[-240:], document.name)
+            self.assertIn("matches today", major[-240:], document.name)
+            self.assertIn("covering exclusion", minor[-80:], document.name)
+
     def test_the_rubric_table_covers_the_queue_anchors(self):
         for values in list(review.RUBRIC.values()) + list(review.ENTRY_RISK_RUBRIC.values()) + [review.DEFAULT_RISK_RUBRIC]:
             fq.validate_rubric(review.rubric(values))
@@ -263,23 +293,83 @@ class Registration(unittest.TestCase):
         self.assertTrue(all("scope" not in c for c in calls))
         self.assertEqual(len(outcomes), review.KV_BATCH_LIMIT + 1)
 
-    def test_same_named_clusters_in_two_locations_are_two_batches(self):
+    def test_same_named_clusters_in_two_locations_are_two_batches_and_no_claim(self):
+        # Through the real queue: the queue keys rows and claims by project and
+        # cluster, so a claim from either twin would lower the other's rows the
+        # moment after they were written. Two batches go; no claim does.
+        import sqlite3
+
+        conn = sqlite3.connect(":memory:")
+        fq.init_findings_schema(conn)
+        self.addCleanup(conn.close)
+        calls = []
+
+        def through_the_queue(path, body):
+            calls.append(body)
+            return fq.register_findings(conn, body["findings"], body.get("scope"))
+
+        west = member("prod", "blocked", pdbs={"blocking": [budget(name="west-budget")]})
+        east = member("prod", "blocked", pdbs={"blocking": [budget(name="east-budget")]})
+        east["location"] = "europe-west1"
+        findings = review.member_findings(west) + review.member_findings(east)
+        with mock.patch.object(review, "kv_request", through_the_queue):
+            outcomes, problems, claimed = review.register([west, east], [], findings)
+        self.assertEqual(problems, [])
+        self.assertEqual(claimed, set())
+        self.assertEqual([[f["object"] for f in c["findings"]] for c in calls], [["west-budget"], ["east-budget"]])
+        self.assertTrue(all("scope" not in c for c in calls))
+        self.assertEqual(set(outcomes.values()), {"created"})
+        for row in fq.ranked_findings(conn):
+            self.assertIsNone(row["absent_since"], row["id"])
+            self.assertEqual(row["rubric"]["C"], 1.0, row["id"])
+        # A lone cluster of that name still claims.
+        with mock.patch.object(review, "kv_request", through_the_queue):
+            _outcomes, _problems, claimed = review.register([west], [], review.member_findings(west))
+        self.assertEqual(claimed, {f"{PROJECT}/us-central1-a/prod"})
+
+    def test_a_row_the_queue_would_refuse_fails_alone(self):
         calls = []
 
         def fake_request(path, body):
             calls.append(body)
             return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]]}
 
-        west = member("prod", "blocked", pdbs={"blocking": [budget(name="west-budget")]})
-        east = member("prod", "blocked", pdbs={"blocking": [budget(name="east-budget")]})
-        east["location"] = "europe-west1"
-        findings = review.member_findings(west) + review.member_findings(east)
+        odd = seeded_b()
+        odd["readiness"]["maintenance"]["exclusions"].append({"name": "!!!", "scope": "NO_MINOR_UPGRADES", "end_time": "2027-01-05T00:00:00Z", "blocks": True, "detail": "punctuation for a name"})
+        findings = review.member_findings(odd)
         with mock.patch.object(review, "kv_request", fake_request):
-            outcomes, problems, claimed = review.register([west, east], [], findings)
-        self.assertEqual(problems, [])
-        self.assertEqual(claimed, {f"{PROJECT}/us-central1-a/prod", f"{PROJECT}/europe-west1/prod"})
-        self.assertEqual([[f["object"] for f in c["findings"]] for c in calls], [["west-budget"], ["east-budget"]])
-        self.assertEqual(len(outcomes), 2)
+            outcomes, problems, claimed = review.register([odd], [], findings)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("!!!", problems[0])
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("!!!", [f["object"] for f in calls[0]["findings"]])
+        self.assertIn("scope", calls[0])
+        self.assertEqual(claimed, {f"{PROJECT}/us-central1-a/seeded-b"})
+        self.assertEqual(sum(1 for v in outcomes.values() if v == review.REGISTRATION_FAILED), 1)
+        self.assertEqual(sum(1 for v in outcomes.values() if v == "created"), len(findings) - 1)
+
+    def test_an_answer_cut_short_is_this_batchs_failure(self):
+        import http.client
+
+        def cut_short(req, timeout):
+            raise http.client.IncompleteRead(b"{")
+
+        with mock.patch.object(review.urllib.request, "urlopen", cut_short):
+            with self.assertRaises(OSError) as caught:
+                review.kv_request(review.KV_FINDINGS_PATH, {"findings": []})
+        self.assertIn("IncompleteRead", str(caught.exception))
+
+    def test_a_budget_over_a_scaled_to_zero_and_a_running_workload_is_not_a_singleton(self):
+        pair = budget(replicas=3)
+        pair["workloads"].append({"kind": "Deployment", "namespace": "seeded-upgrade", "name": "idle", "replicas": 0})
+        found = review.budget_findings(member("c", "blocked", pdbs={"blocking": [pair]}))[0]
+        self.assertEqual(severity(found), "major")
+        none_running = budget(replicas=0)
+        self.assertEqual(severity(review.budget_findings(member("c", "blocked", pdbs={"blocking": [none_running]}))[0]), "critical")
+
+    def test_a_boolean_entry_is_no_entry(self):
+        self.assertEqual(review.rule_entry({"rule": "odd", "entry": True}, {}), ("odd", None))
+        self.assertEqual(review.rule_entry({"rule": "odd", "entry": 12}, {}), ("odd", 12))
 
     def test_a_refused_batch_keeps_the_queues_reason(self):
         import io
@@ -374,10 +464,11 @@ class TheRecord(unittest.TestCase):
         # copy fails instead of replacing the review's record.
         self.assertEqual(review.SANDBOX_COPY_MODE & 0o222, 0)
         self.assertEqual(oct(os.stat(fake_dir).st_mode & 0o777), oct(review.SANDBOX_COPY_DIR_CLOSED_MODE))
-        with self.assertRaises(PermissionError):
-            (fake_dir / "latest.md").write_text("clobbered")
-        with self.assertRaises(PermissionError):
-            (fake_dir / "fleet_versions.json").write_text("{}")
+        if os.geteuid() != 0:  # root ignores the mode bits these two assertions rely on
+            with self.assertRaises(PermissionError):
+                (fake_dir / "latest.md").write_text("clobbered")
+            with self.assertRaises(PermissionError):
+                (fake_dir / "fleet_versions.json").write_text("{}")
         # The next review replaces both files through the same program.
         second = review.sandbox_copy_program({"latest.md": "# second\n", "latest.json": "{\"n\": 2}"})
         exec(second.replace(json.dumps(review.SANDBOX_COPY_DIR), json.dumps(str(fake_dir))), {})  # noqa: S102 - the program under test
@@ -493,6 +584,25 @@ class TheTick(unittest.TestCase):
             self.assertEqual(out, "")
         code, out = self.run_main()
         self.assertEqual(out.strip(), review.RECOVERED_LINE.format(prefix=review.LOG_PREFIX))
+
+    def test_a_failure_that_differs_only_in_its_numbers_is_the_same_failure(self):
+        with mock.patch.object(watch, "run_report", side_effect=RuntimeError("the sandbox run timed out after 1187s")):
+            code, out = self.run_main()
+            self.assertIn("failed:", out)
+        with mock.patch.object(watch, "run_report", side_effect=RuntimeError("the sandbox run timed out after 1203s")):
+            code, out = self.run_main()
+            self.assertEqual(out, "")
+        self.assertEqual(review.failure_signature("a: after 1187s; b: after 12s"), "a: after #s; b: after #s")
+
+    def test_findings_the_queue_refused_are_said_in_chat_not_on_stderr(self):
+        with mock.patch.object(review, "kv_request", side_effect=OSError("HTTP 503 Service Unavailable: the findings queue is busy")):
+            code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("did not reach the findings queue", out)
+        self.assertIn("503", out)
+        latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
+        self.assertTrue(latest["registration_errors"])
+        self.assertTrue(all(r["outcome"] == review.REGISTRATION_FAILED for r in latest["findings"]))
 
     def test_a_project_not_read_is_one_line_and_the_rest_is_registered(self):
         calls = []

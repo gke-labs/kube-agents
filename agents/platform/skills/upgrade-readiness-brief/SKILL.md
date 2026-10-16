@@ -72,6 +72,9 @@ finding has a decision.` When nothing was found at all, the brief is the headlin
      kills it"), one action (the row's `action`, shortened to the verb and the object).
    - Majors and minors go under **Also this week** as counts by catalogue entry; a `suppressed` row is
      never named.
+   - When `registration_errors` is not empty, or a row's `outcome` is `failed`, the headline says
+     how many findings are in the report but not on the queue, and a critical among them goes under
+     **Decide now** by its object with "not on the queue" after it: there is no id to reply with.
    - Every id and every count comes from the summary or the queue; invent nothing, name no CVE,
      recommend no version.
 

@@ -490,6 +490,14 @@ class TestRegistration(QueueTestCase):
         self.assertEqual(fq.get_finding(self.conn, foreign_id)["rubric"]["C"], 0.6)
         self.assertEqual(fq.get_finding(self.conn, inventory_id)["rubric"]["C"], 1.0)
 
+    def test_a_check_is_stored_lower_case_so_the_prefix_reaches_it(self):
+        odd = sample(source="upgrade-readiness", check="Upgrade-Pool-Skew", namespace="", object="old-pool")
+        self.register(odd)
+        odd_id = fq.validate_finding(odd)["id"]
+        self.assertEqual(fq.get_finding(self.conn, odd_id)["check"], "upgrade-pool-skew")
+        result = self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})
+        self.assertEqual(result["downgraded"], 1)
+
     def test_scope_source_must_be_known_and_one_the_batch_wrote(self):
         stale = sample(object="Deployment/stale")
         self.register(stale)

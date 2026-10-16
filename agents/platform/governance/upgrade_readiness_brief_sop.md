@@ -117,6 +117,10 @@ has a decision.` and the brief is shorter.
 - **A project the review could not read is said, once, in its own line.** The headline's counts
   cover the clusters that were read; `project_failures` names the rest with the review's reason.
   Without the line a reader takes "6 clusters reviewed" for the fleet.
+- **Findings that did not reach the queue are said.** When `registration_errors` is not empty, or a
+  row's `outcome` is `failed`, the headline says how many findings are in the report but not on the
+  queue, and a critical among them goes under **Decide now** by its object (it has no id to reply
+  with), with "not on the queue" after it: a user who dismisses it in chat has nothing to dismiss.
 - **Never invent.** Every id comes from the summary or the queue; every count comes from the
   summary. If the queue and the summary disagree on a row's state, the queue wins and you say
   nothing about the disagreement in the brief.

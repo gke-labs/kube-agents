@@ -313,8 +313,10 @@ nothing. The script writes the technical report under `upgrade-readiness/weekly/
 watch's ledger, keeps the newest eight runs, and places a copy of `latest.md` and `latest.json` in
 the sandbox at `/opt/data/upgrade-readiness/weekly/` so the agent can read it when asked. It prints
 nothing on success: the brief speaks for the week and the queue for each finding. A project it could
-not read is one line naming it; a failure is one line, once per distinct failure, with the recovery
-line on the next clean run. The entry declares `risk: high` as the watch does: the budget, pool, exclusion and webhook names it reads are tenant-written, and they reach the queue, the report and the sandbox copy.
+not read is one line naming it; a batch the findings queue refused, or a sandbox copy that failed,
+is one line each, since both leave the week's findings where the brief cannot act on them; a
+failure of the run is one line, once per distinct failure (numbers aside), with the recovery line
+on the next clean run. The entry declares `risk: high` as the watch does: the budget, pool, exclusion and webhook names it reads are tenant-written, and they reach the queue, the report and the sandbox copy.
 
 `upgrade-readiness-weekly-brief` (`0 7 * * 6`, an hour after the review starts and past its
 budget) is the model turn, and the reason the pair is not one job: the review can rank by rubric

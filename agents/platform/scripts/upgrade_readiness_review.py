@@ -69,8 +69,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import http.client
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -320,6 +322,13 @@ BUDGET_EXHAUSTED_DETAIL = "the run's time budget ran out before this project"
 FAILED_LINE = "{prefix}: failed: {detail}"
 RECOVERED_LINE = "{prefix}: runs again after a failure"
 PARTIAL_LINE = "{prefix}: {count} project(s) not read this week: {detail}; their clusters keep last week's findings and are not counted"
+REGISTRATION_FAILED_LINE = "{prefix}: {count} finding batch(es) did not reach the findings queue: {detail}; those findings are in the report, not on the queue, and the brief says so"
+COPY_FAILED_LINE = "{prefix}: the sandbox copy failed: {detail}; the brief reads the previous copy until the next review"
+# A failure is announced once per distinct cause: the marker keeps the failure's text
+# with every number replaced, so a timeout that reads 1187s one week and 1203s the
+# next is the same failure.
+FAILURE_DIGITS = re.compile(r"\d+")
+FAILURE_DIGIT_MARK = "#"
 PARTIAL_DETAIL_SEPARATOR = "; "
 DRY_RUN_HEADER = "dry run: nothing registered, nothing written"
 
@@ -365,6 +374,10 @@ def kv_request(path: str, body: dict) -> dict:
         # the body; str(HTTPError) is the status line alone.
         body = " ".join(exc.read().decode("utf-8", "replace").split())[:KV_ERROR_EXCERPT_CHARS]
         raise OSError(f"HTTP {exc.code} {exc.reason}: {body}" if body else f"HTTP {exc.code} {exc.reason}") from None
+    except http.client.HTTPException as exc:
+        # A response cut short or malformed is a transport failure of this
+        # batch, as the nudge treats it, not the end of the run.
+        raise OSError(f"the queue's answer was cut short: {exc.__class__.__name__}: {exc}") from None
 
 
 # --- the mapping: report rows to findings ------------------------------------
@@ -446,7 +459,11 @@ def budget_findings(member: dict) -> list[dict]:
         if not isinstance(budget, dict):
             continue
         workloads = [w for w in (budget.get(WORKLOADS_KEY) or []) if isinstance(w, dict)]
-        singleton = any((w.get(WORKLOAD_REPLICAS_KEY) or 0) <= 1 for w in workloads) or not workloads
+        # A workload scaled to zero has no pod the drain can evict; the budget
+        # is a singleton's when a running workload has one replica, or when
+        # the report names no workload at all.
+        running = [w for w in workloads if (w.get(WORKLOAD_REPLICAS_KEY) or 0) > 0]
+        singleton = any((w.get(WORKLOAD_REPLICAS_KEY) or 0) <= 1 for w in running) or not running
         owners = ", ".join(f"{w.get(KIND_KEY)} {w.get(NAMESPACE_KEY)}/{w.get(NAME_KEY)} ({w.get(WORKLOAD_REPLICAS_KEY)} replicas)" for w in workloads)
         name = str(budget.get(NAME_KEY) or budget.get(PDB_KEY) or "")
         namespace = str(budget.get(NAMESPACE_KEY) or "")
@@ -570,6 +587,8 @@ def rule_entry(item: dict, rules: dict) -> tuple[str, int | None]:
     entry = item.get(ENTRY_KEY)
     if entry is None and rule and isinstance(rules, dict) and isinstance(rules.get(rule), dict):
         entry = rules[rule].get(ENTRY_KEY)
+    if isinstance(entry, bool):  # a rule's ENTRY is a number; True would be entry 1
+        entry = None
     try:
         entry = int(entry) if entry is not None else None
     except (TypeError, ValueError):
@@ -720,19 +739,33 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
     registration errors, and the member keys whose claim of completeness
     reached the queue, which is what the week's delta may be counted over.
     Batches are keyed by member (project, location and cluster): a cluster
-    name repeats across locations, and the queue's identity, which carries no
-    location, is the queue's concern, not a reason to merge two members' rows."""
+    name repeats across locations. The queue keys rows and claims by project
+    and cluster alone, so two members of one name in one project send their
+    batches and no claim: one twin's claim would lower the other's rows, and
+    a row left at full confidence is the lesser error. Each row is validated
+    here before it is sent, so one the queue would refuse fails alone instead
+    of its whole batch."""
     outcomes: dict[str, str] = {}
     problems: list[str] = []
     claimed: set[str] = set()
     by_member: dict[str, list[dict]] = {}
     for item in findings:
         by_member.setdefault(item[MEMBER_FIELD], []).append(item)
+    pairs = [cluster_fields(m)[:: len(watch.MEMBER_ID_KEYS) - 1] for m in members]
+    twins = {pair for pair in pairs if pairs.count(pair) > 1}
     for member in members:
         project, _location, cluster = cluster_fields(member)
         key = watch.member_key(member)
-        batch = by_member.get(key, [])
-        complete = member_complete(member, errors)
+        batch = []
+        for item in by_member.get(key, []):
+            try:
+                findings_queue.validate_finding(payload(item))
+            except findings_queue.FindingError as exc:
+                problems.append(f"{project}/{cluster}: {item['check']} {item['namespace'] + '/' if item['namespace'] else ''}{item['object']}: {exc}")
+                outcomes[item_id(item)] = REGISTRATION_FAILED
+                continue
+            batch.append(item)
+        complete = member_complete(member, errors) and (project, cluster) not in twins
         if not batch and not complete:
             continue
         # A complete read of a cluster with nothing to report is sent too: it is
@@ -905,7 +938,7 @@ def render_report(summary_doc: dict, findings: list[dict], tables: dict[str, str
             f"### [{row['severity']}] {row['title']}",
             "",
             f"- Id: `{row['id']}` ({row['outcome'] or 'not registered'})",
-            f"- Where: {row['project']}/{row['cluster']}" + (f", namespace {row['namespace']}" if row["namespace"] else "") + f", {row['object']}",
+            f"- Where: {row[ROW_MEMBER_KEY]}" + (f", namespace {row['namespace']}" if row["namespace"] else "") + f", {row['object']}",
             f"- Evidence: {item.get('detail') or '-'}",
             f"- Do: {row['action']}",
             f"- Verify: {(item.get('verification') or {}).get('command') or '-'}",
@@ -1026,13 +1059,18 @@ def copy_to_sandbox(report_md: str, summary_doc: dict) -> str | None:
 # --- the tick ---------------------------------------------------------------------
 
 
+def failure_signature(detail: str) -> str:
+    return FAILURE_DIGITS.sub(FAILURE_DIGIT_MARK, detail)
+
+
 def announce_failure_once(detail: str) -> bool:
     try:
         marker = failure_marker()
-        if marker.exists() and marker.read_text(encoding="utf-8") == detail:
+        signature = failure_signature(detail)
+        if marker.exists() and marker.read_text(encoding="utf-8") == signature:
             return False
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(detail, encoding="utf-8")
+        marker.write_text(signature, encoding="utf-8")
     except OSError:
         pass
     return True
@@ -1095,13 +1133,16 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
     except OSError as exc:
         return [FAILED_LINE.format(prefix=LOG_PREFIX, detail=f"could not write the record under {home}: {exc}")], 1
     copy_error = copy_to_sandbox(report_md, summary_doc)
-    if copy_error:
-        sys.stderr.write(f"{LOG_PREFIX}: the sandbox copy failed: {copy_error}\n")
-    if problems:
-        sys.stderr.write(f"{LOG_PREFIX}: {len(problems)} cluster batch(es) failed to register: {'; '.join(problems)}\n")
     lines = []
     if clear_failure_marker():
         lines.append(RECOVERED_LINE.format(prefix=LOG_PREFIX))
+    # Said in chat, not on stderr, which the scheduler keeps nowhere for a
+    # zero-exit script: findings off the queue and a copy the brief cannot read
+    # are the week's failures even when the record was written.
+    if problems:
+        lines.append(REGISTRATION_FAILED_LINE.format(prefix=LOG_PREFIX, count=len(problems), detail=PARTIAL_DETAIL_SEPARATOR.join(problems)))
+    if copy_error:
+        lines.append(COPY_FAILED_LINE.format(prefix=LOG_PREFIX, detail=copy_error))
     if failures:
         detail = PARTIAL_DETAIL_SEPARATOR.join(f"{p}: {d}" for p, d in failures.items())
         lines.append(PARTIAL_LINE.format(prefix=LOG_PREFIX, count=len(failures), detail=detail))

@@ -535,7 +535,10 @@ def validate_finding(raw: Any) -> dict:
     if source not in SOURCES:
         raise FindingError(f"source is {_brief(source)}; must be one of {list(SOURCES)}")
 
-    check = _text(raw.get("check") if raw.get("check") is not None else raw.get("check_slug"), "check")
+    # Lower-cased as the derived id is, so a claim's `check_prefix` and a
+    # reader's "starts with `upgrade-`" reach a row however its writer spelled
+    # the check.
+    check = _text(raw.get("check") if raw.get("check") is not None else raw.get("check_slug"), "check").lower()
     # Required, not defaulted: cluster names are only unique within a project,
     # so a finding that omits its project is one key collision away from
     # silently overwriting another cluster's row (and keeping its state).
