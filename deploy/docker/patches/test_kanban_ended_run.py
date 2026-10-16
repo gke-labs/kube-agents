@@ -407,6 +407,13 @@ class TestSavedResultBanner(unittest.TestCase):
                 self.event(ker.DEPENDENCY_WAIT_EVENT)
                 self.assertIn("> web-7 is fine", ker.saved_result_banner(self.conn, TID))
 
+    def test_a_card_with_no_assignee_gets_no_banner(self):
+        """No assignee means no author to trust, even for an empty author."""
+        self.conn.execute("UPDATE tasks SET assignee = NULL WHERE id = ?", (TID,))
+        self.comment(ker.SAVED_RESULT_LEAD + " x", author="")
+        self.event(ker.DEPENDENCY_WAIT_EVENT)
+        self.assertEqual(ker.saved_result_banner(self.conn, TID), [])
+
     def test_only_the_newest_dependency_block_counts(self):
         """Run 52 saved a result; run 60 blocked again without one. Run 61
         mustn't be handed run 52's stale result."""

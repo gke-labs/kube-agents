@@ -359,7 +359,10 @@ def saved_result_banner(conn: Any, task_id: str) -> list[str]:
         if block is None:
             return []
         blocked_at, run_started, assignee = block
-        comments = conn.execute(_RUN_COMMENTS_SQL, (task_id, assignee or "", run_started, blocked_at)).fetchall()
+        if not (assignee or "").strip():
+            # No assignee, no author to trust: fail closed.
+            return []
+        comments = conn.execute(_RUN_COMMENTS_SQL, (task_id, assignee, run_started, blocked_at)).fetchall()
         parents = [r[0] for r in conn.execute(_WAITED_ON_SQL, (task_id, blocked_at))]
     except Exception as exc:
         logger.warning("kanban_ended_run: could not read %s's saved result: %s", task_id, exc)
