@@ -351,6 +351,14 @@ one at all — so a dry-run write by a person would currently be reported as dri
 step on it is establishing what the payload looks like rather than writing a rule for a shape
 nobody has seen.
 
+**Coordination objects are not drift.** Tools such as `scripts/live_test_lease.py`
+([`docs/designs/live-test-lease.md`](../../../docs/designs/live-test-lease.md)) create and update the
+`live-test-lease` ConfigMap in `kubeagents-system` under a contributor's own credential during live
+testing. Even though the principal is human and the call mutates cluster state, the object is an
+ephemeral developer mutex and not part of the cluster's declared GitOps state. `isCoordinationResource`
+drops writes to the `live-test-lease` ConfigMap, counting them as `non_declarative` so they are not
+flagged as out-of-band drift or offered for reversion.
+
 **A failed call is not drift.** The audit log records attempts: writes rejected by RBAC, refused by
 admission, or aborted after losing an optimistic-concurrency race. A 24-hour query for failed
 mutating calls on one project returned its full 5000-row limit — a floor, not a total — with 4793 of
