@@ -823,6 +823,13 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # edit_message; the steer and auth failure replies are replaced where they
 # are built, so no exception text reaches Slack). See
 # deploy/docker/patches/slack_boilerplate.py.
+# Slack thread context, whatever the flag: a thread root the bot posted itself is
+# labelled "[thread parent, posted by you earlier]" instead of reading as a
+# person's message, and every context block says it is conversation, not observed
+# cluster state. Without it a sample report the bot once posted read as real, and
+# a "fix the first one" under it filed a fix for a workload that never existed
+# (#3080). verify_slack_thread_provenance.py runs the shipped methods over that
+# thread. See deploy/docker/patches/apply_slack_thread_provenance.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \
@@ -860,6 +867,8 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/patchlib.py \
      deploy/docker/patches/apply_slack_agent_view.py \
      deploy/docker/patches/verify_slack_agent_view.py \
+     deploy/docker/patches/apply_slack_thread_provenance.py \
+     deploy/docker/patches/verify_slack_thread_provenance.py \
      /tmp/message-surface/
 RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis.py /opt/hermes && \
     grep -q "_CODE_SENTINEL_RE" /opt/hermes/plugins/platforms/slack/block_kit.py && \
@@ -894,6 +903,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     install -m 0644 /tmp/message-surface/slack_boilerplate.py /opt/hermes/gateway/slack_boilerplate.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_boilerplate.py /opt/hermes && \
     grep -qF "_kage_slack_boilerplate.cron_delivery_text" /opt/hermes/cron/scheduler_delivery.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_thread_provenance.py /opt/hermes && \
+    grep -qF "kube-agents patch: thread-context provenance" /opt/hermes/plugins/platforms/slack/adapter.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_agent_view.py /opt/hermes && \
     grep -qF "def _kage_slack_ux_on(" /opt/hermes/hermes_cli/slack_cli.py && \
@@ -911,6 +922,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_failure.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_kanban_progress_lines.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_boilerplate.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_thread_provenance.py /opt/hermes && \
     rm -rf /tmp/message-surface
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
