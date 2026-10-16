@@ -457,9 +457,10 @@ gateway's doors cap a text at 65,536 runes, the server's own cap on a message
 (`MAX_NORMALIZED_TEXT_LENGTH`, 65,536 characters), and the bus's 1 MiB message limit keeps the
 request far under the server's 10 MB body limit. Each earlier turn's answer is published as a
 `turn` artifact as soon as the next turn is about to run; the last turn's answer is the `result`,
-then the one terminal. At each turn boundary the bridge asks the verifier once per distinct
-capability among the queued follow-ups, not once per follow-up, so a verifier that does not answer
-holds the previous turn's answer back for one timeout. A turn's answer the bridge holds between
+then the one terminal. At each turn boundary the bridge checks each distinct capability among the
+queued follow-ups once, not once per follow-up, so a verifier it cannot reach holds the previous
+turn's answer back for one reach window per capability (`DefaultReachWindow` in
+`a2a/capability/service.go`): the check keeps asking for that long before it refuses. A turn's answer the bridge holds between
 turns, while the next follow-up's capability is checked, is not lost to a shutdown: the worker ends
 the task with it as the `result`, and the queue is refused `task-ended`. Nor is it lost when its
 `turn` artifact fails to publish (the task completes with it as the `result`), or when a cancel,

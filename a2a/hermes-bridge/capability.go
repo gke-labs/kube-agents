@@ -55,7 +55,21 @@ func (b *Bridge) capabilityRefusal(ctx context.Context, env *lib.Envelope) strin
 	if err != nil {
 		return "reason: capability-refused - this executor has no verify subject of its own"
 	}
+	// The client rides out a verifier it cannot reach for its reach
+	// window (capability.DefaultReachWindow) before refusing, and says so
+	// here when that wait is what let the check through.
+	client.Log = b.cfg.Logger.With("task", env.TaskID)
 	if err := client.Check(ctx, ref, capability.VerbTaskExecute, b.cfg.Scope); err != nil {
+		// A check ended by its caller (a cancel of the task, or the bridge
+		// shutting down) never heard from the verifier either way, and
+		// Check reports that as unreachable. Logged as what happened, so a
+		// cancelled task doesn't read as a verifier outage; the caller
+		// decides the terminal (capabilityPermits).
+		if ctx.Err() != nil {
+			b.cfg.Logger.Info("capability check stopped before the verifier answered",
+				"task", env.TaskID, "verb", capability.VerbTaskExecute, "cause", context.Cause(ctx))
+			return "reason: capability-refused - " + capability.Reason(err)
+		}
 		// capability.Reason carries the rule the verifier named, which
 		// never quotes anything the caller supplied.
 		b.cfg.Logger.Warn("capability refused this task",
