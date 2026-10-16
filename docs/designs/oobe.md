@@ -261,8 +261,8 @@ times. It rides with the audits stage, whose eval case covers both.
   it end; nothing holds a finding back to meet a target.
 - **Reaching an install with no home channel.** Audit summaries go to the home channel only. An
   audit that finishes before anyone opens the chat posts nothing, and nothing posts it later; the
-  onboarding report, sent on the first message, names every audit the stage started and that
-  finished whose summary failed to deliver, with its ledger issue when its final message links one
+  onboarding report, sent on the first message, names every audit the stage started or adopted and
+  that finished whose summary failed to deliver, with its ledger issue when its final message links one
   (`bootstrap_delivery._undelivered_audits`). A held, given-up or skipped audit's scheduled run is
   not named yet ([#3283](https://github.com/gke-labs/kube-agents/issues/3283)). Posting the report there at T+0 when one is set is a
   separate change.
@@ -281,7 +281,7 @@ times. It rides with the audits stage, whose eval case covers both.
 
 Eval case `oobe-late-first-message` (nightly, `bench/tf/prebuilt/oobe-late-first-message`) covers a
 first message that arrives after the four audits end: its stack takes the home channel away, and the
-`oobe_late_report` verifier checks that the report names each audit the stage started whose summary
+`oobe_late_report` verifier checks that the report names each audit the stage started or adopted whose summary
 failed to deliver.
 
 Eval case `oobe-first-run-audits` (domain `fleet-audits`; nightly, in `hack/eval/nightly-cases.txt`,

@@ -7,7 +7,7 @@ first message is then the first thing that user reads.
 
 The case's stack (``bench/tf/prebuilt/oobe-late-first-message``) clears the home channel, lets the
 four audits run, then opens the chat. This passes when the delivered report links the ledger issue
-of every audit the stage started whose summary failed and named one in its final message, and names
+of every audit the stage started or adopted whose summary failed and named one in its final message, and names
 every other such audit as not posted. It needs at least one failed summary: without one the stack did not take the
 home channel away, and the case tested nothing.
 
@@ -24,8 +24,6 @@ from kube_agents_bench.oobe import AUDITS_MARKER, FIRST_RUN_AUDITS, STATE_FILE, 
 from kube_agents_bench.verifiers import _OnboardingPollVerifier
 from kube_agents_bench.worker_trajectory import DATA_ROOT, FALLBACK_PYTHON, HERMES_PYTHON
 
-# The report names only audits the stage started (`fired` in AUDITS_MARKER), so only those are
-# graded; held, given-up and skipped audits are #3283.
 # bench/tf/prebuilt/oobe-late-first-message/late.py: STATE, with the time the chat was opened.
 LATE_STATE_FILE = f"{DATA_ROOT}/.bench-oobe-late.json"
 PLATFORM_EXECUTIONS_DB = f"{DATA_ROOT}/profiles/platform/cron/executions.db"
@@ -148,6 +146,8 @@ def grade(read: dict[str, Any]) -> tuple[VerificationStatus, str]:
     if not read.get("applied_at") or not read.get("opened_at"):
         return "error", "the stack did not arm the stage and open the chat (no applied_at or opened_at in its state files)"
     runs = read["runs"]
+    # The report names only audits the stage started or adopted (`fired` in AUDITS_MARKER), so only
+    # those are graded; held, given-up and skipped audits are #3283.
     fired = set(read.get("fired") or [])
     if not fired:
         return "error", "the oobe stage's marker records no audit it started (missing, unreadable, or a skip), so nothing could be graded"
@@ -179,8 +179,8 @@ def grade(read: dict[str, Any]) -> tuple[VerificationStatus, str]:
 @VERIFIERS.register("oobe_late_report")
 class OobeLateReportVerifier(_OnboardingPollVerifier):
     """Passes once the report delivered on the first message links the ledger issue of every
-    first-run audit the stage started whose summary failed to deliver, and names as not posted any
-    such audit whose final message had no link. At least one summary must have failed; none is ``status="error"``,
+    first-run audit the stage started or adopted whose summary failed to deliver, and names as not
+    posted any such audit whose final message had no link. At least one summary must have failed; none is ``status="error"``,
     as is an unreadable agent pod or state file.
     """
 

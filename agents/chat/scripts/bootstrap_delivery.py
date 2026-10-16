@@ -45,8 +45,8 @@ report twice; see ``_posted_as_blocks``.
 
 Every delivery closes with a short note on the first-run audits, read off the ``oobe`` stage's
 marker by ``_audits_note``: the report's scan leaves the workload checks to those audits, and a
-short report would otherwise read as a healthy fleet. An audit the stage started whose summary failed
-to deliver, as every one that finished before anyone opened the chat does for want of a home
+short report would otherwise read as a healthy fleet. An audit the stage started or adopted whose summary
+failed to deliver, as every one that finished before anyone opened the chat does for want of a home
 channel, is named with its ledger link (``_undelivered_audits``). The text path appends it to the report; the
 card paths print it on their own, since the card leaves closing lines out.
 
