@@ -34,16 +34,20 @@ from typing import Any
 
 import pytest
 
-#: The variables that select and configure a GitLab forge. Every check
+#: The variables that select and configure a forge: GitLab, a GitHub
+#: Enterprise Server host, another GitHub API root, a private CA. Every check
 #: reads them from the process environment, so a developer's shell that
 #: exports them (as a GitLab dev install is told to) would turn the GitHub
-#: tests' answers into GitLab's. Cleared before every test; a GitLab test's
-#: own fixture sets back what it needs.
+#: tests' answers into another forge's. Cleared before every test; a forge
+#: test's own fixture sets back what it needs.
 FORGE_ENV_VARS = (
     "BENCH_FORGE",
     "BENCH_GITLAB_HOST",
     "BENCH_GITLAB_TOKEN",
     "BENCH_GITLAB_AGENT_LOGIN",
+    "BENCH_GITHUB_HOST",
+    "BENCH_GITHUB_API_ROOT",
+    "BENCH_FORGE_CA_FILE",
 )
 
 
