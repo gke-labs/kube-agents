@@ -10,14 +10,15 @@ description: >-
   acquire read-only, validates every field with kubectl explain against the
   customer's CRDs, and never applies. Don't use for Kubernetes workload
   manifests (use gke-manifest-generation), imperative cluster creation (use
-  gke-cluster-creation), or Terraform HCL.
+  gke-cluster-creation), or Terraform HCL (use gcp-terraform).
 ---
 
 # Config Connector (KCC) Authoring
 
-A Google Cloud change leaves this agent only one way: as a Config Connector
-manifest in the GitOps repository, reviewed by a human and applied by the
-customer's reconciler. This skill writes that manifest. It reads the cluster
+On a repository that keeps its Google Cloud resources as Config Connector
+YAML, a change leaves this agent as a manifest in the GitOps repository,
+reviewed by a human and applied by the customer's reconciler (a repository
+that keeps them as Terraform gets the `gcp-terraform` skill instead). This skill writes that manifest. It reads the cluster
 and the cloud project to decide what to write, validates the result against
 the CRDs the customer actually runs, and opens the pull request through
 **submit-suggestion**. Nothing here mutates a cluster or a project, and the
@@ -42,7 +43,7 @@ command policy refuses the verbs that would.
 - **Creating a cluster imperatively** with the `gke` MCP tools or `gcloud`:
   the `gke-cluster-creation` skill.
 - **A repository whose `provisioning/` holds Terraform HCL** rather than KCC
-  YAML: say so and stop. This skill authors KRM only.
+  YAML: the `gcp-terraform` skill. This skill authors KRM only.
 - **Kinds outside the families catalogued in `references/`.** Other Config
   Connector kinds follow the same annotations and workflow, but their
   immutable fields are not catalogued here; validate every field with

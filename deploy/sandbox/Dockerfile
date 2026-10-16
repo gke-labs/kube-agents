@@ -79,6 +79,33 @@ RUN ARCH=$(dpkg --print-architecture) && \
     mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
     rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH}
 
+# OpenTofu, for one command: `tofu fmt -check -diff`, the gcp-terraform skill's
+# syntax check on the HCL it writes before a pull request. It is the only check
+# that needs no provider plugins, state or credentials: `init`, `validate`,
+# `plan`, `apply` and `import` all need plugins from a registry this pod cannot
+# reach where its NetworkPolicy is enforced (DNS and the credential proxy out,
+# nothing else) and a cloud credential it never holds, so they fail here, and
+# the skill never runs them (agents/platform/scripts/test_command_policy.py). Like
+# helm, tofu is not one of the tools the command policy governs, because there
+# is nothing here for it to reach. OpenTofu rather than Terraform for its MPL
+# licence. Pinned and checked against the release's SHA256SUMS, per
+# architecture.
+ARG OPENTOFU_VERSION=1.13.1
+ARG OPENTOFU_SHA256_AMD64=378ada19d4bc70c43732004e8159be771b23b9a5afdf059e5f8a2b3fa2c70a69
+ARG OPENTOFU_SHA256_ARM64=9c1ef375aa1852db0b2888aa921b640c71f8140d4682aa4fec99378a64fa7dc3
+RUN ARCH=$(dpkg --print-architecture) && \
+    case "${ARCH}" in \
+      amd64) TOFU_SHA256="${OPENTOFU_SHA256_AMD64}" ;; \
+      arm64) TOFU_SHA256="${OPENTOFU_SHA256_ARM64}" ;; \
+      *) echo "no OpenTofu checksum pinned for ${ARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -sSLf --retry 5 --retry-all-errors -o /tmp/tofu.tar.gz \
+      "https://github.com/opentofu/opentofu/releases/download/v${OPENTOFU_VERSION}/tofu_${OPENTOFU_VERSION}_linux_${ARCH}.tar.gz" && \
+    echo "${TOFU_SHA256}  /tmp/tofu.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/tofu.tar.gz --no-same-owner -C /usr/local/bin tofu && \
+    rm -f /tmp/tofu.tar.gz && \
+    tofu version
+
 # In the agent container `python3` resolves through PATH into the Hermes venv,
 # so a shell command there gets these for free; here python3 is the bare base
 # image. No skill script imports a third-party module today — the ones that do
