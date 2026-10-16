@@ -1013,7 +1013,7 @@ LISTED_HEADING_RE = re.compile(r"^### Listed without detail \(\d+\)[ \t]*$", re.
 LISTED_SECTION_END_RE = re.compile(r"^(?:#|---|<!--)", re.M)
 LISTED_LINE_RE = re.compile(
     r"^- \*\*[a-z]+\*\* — (.*) — `([^`\n]*)`(?: / `([^`\n]*)`| / _cluster-scoped_)"
-    r" — `([^`\n]*)` \(`([^`\n]+)`\)[ \t]*$",
+    r" — `([^`\n]*)` \(`([^`\n]+)`\)(?: — [^`\n]*)?[ \t]*$",
     re.M,
 )
 # How a finding's heading line starts (`_finding_identity_lines`); the marker
@@ -9523,21 +9523,30 @@ def _full_row_cost(
     return len("\n".join(rendered)) + 2 + len(fid) + DELTA_SLOT_CHARS
 
 
-def render_listed_finding(finding: dict) -> str:
+def render_listed_finding(
+    finding: dict, *, state: str | None = None, pr_url: str | None = None
+) -> str:
     """One line naming a finding the body has no room to show in full.
 
     A bullet, never a `FINDING_HEADING`: the readers that recover a finding's
     detail from its heading (`FINDING_MARKER_RE`, the Slack card) must not
     take a listed one for a finding whose detail is on the ledger.
+
+    A state other than open, and its pull request, follow the id: the state
+    index covers full rows only, so a listed row is the one place a reader
+    finds them.
     """
     fid = str(finding.get("id", ""))
+    suffix = ""
+    if state and state != STATE_OPEN:
+        suffix = f" — {STATE_LABELS.get(state, state)}" + (f" — {pr_url}" if pr_url else "")
     namespace = _ident(str(finding.get("namespace", "")))
     where = f"`{_ident(str(finding.get('cluster', '')))}`"
     where += f" / `{namespace}`" if namespace else " / _cluster-scoped_"
     return (
         f"- **{_cell(str(finding.get('severity', '')))}** — "
         f"{_cell(str(finding.get('title', '')))} — {where} — "
-        f"`{_ident(str(finding.get('object', '')))}` (`{fid}`)"
+        f"`{_ident(str(finding.get('object', '')))}` (`{fid}`){suffix}"
     )
 
 
@@ -9580,11 +9589,20 @@ def _listed_locations(body: str) -> dict[str, dict[str, str]]:
     return out
 
 
-def _render_listed(listed: list[dict]) -> list[str]:
+def _render_listed(
+    listed: list[dict],
+    states: dict[str, str] | None = None,
+    pr_urls: dict[str, str] | None = None,
+) -> list[str]:
     if not listed:
         return []
     return _listed_header(len(listed)) + [
-        render_listed_finding(finding) for finding in sort_findings(listed)
+        render_listed_finding(
+            finding,
+            state=(states or {}).get(str(finding.get("id", ""))),
+            pr_url=(pr_urls or {}).get(str(finding.get("id", ""))),
+        )
+        for finding in sort_findings(listed)
     ]
 
 
@@ -9611,7 +9629,16 @@ def split_findings_for_body(
     # + 1 for the newline joining each line to the one before it, and the
     # id's slot in the hidden delta block.
     line_costs = [
-        len(render_listed_finding(finding)) + 1 + len(str(finding.get("id", ""))) + DELTA_SLOT_CHARS
+        len(
+            render_listed_finding(
+                finding,
+                state=(render_args.get("states") or {}).get(str(finding.get("id", ""))),
+                pr_url=(render_args.get("pr_urls") or {}).get(str(finding.get("id", ""))),
+            )
+        )
+        + 1
+        + len(str(finding.get("id", "")))
+        + DELTA_SLOT_CHARS
         for finding in order
     ]
     # Charged once, at its widest, when the first finding is listed.
@@ -10038,7 +10065,7 @@ def _render_findings(
                 unlinked_paths=unlinked_paths,
             )
 
-    out += _render_listed(listed)
+    out += _render_listed(listed, states, pr_urls)
     if omitted:
         out += [
             "",

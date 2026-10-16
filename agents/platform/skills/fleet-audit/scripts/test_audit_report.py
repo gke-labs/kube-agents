@@ -9267,6 +9267,21 @@ class TestRenderBudget(BaseTestCase):
             self.assertNotIn(finding["id"], listed)
         self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
 
+    def test_a_listed_finding_keeps_its_state_and_pull_request(self):
+        # The state index shows full rows only, so a listed row carries both.
+        findings = bulk_findings(250)
+        states = {f["id"]: audit_report.STATE_PR_OPEN for f in findings}
+        pr_urls = {f["id"]: f"https://github.com/acme/fleet/pull/{i}" for i, f in enumerate(findings)}
+        rendered = audit_report.render_issue_body(
+            make_doc(findings=findings), generated_at=NOW, states=states, pr_urls=pr_urls
+        )
+        self.assertTrue(rendered.listed)
+        sample = rendered.listed[0]["id"]
+        line = next(l for l in rendered.body.splitlines() if l.startswith("- **") and f"(`{sample}`)" in l)
+        self.assertTrue(line.endswith(f"— fix proposed — {pr_urls[sample]}"), line)
+        self.assertIn(sample, audit_report.parse_finding_locations(rendered.body))
+        self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
     def test_no_name_that_fits_is_omitted(self):
         # Whatever leads the body, the first omitted finding's line must not
         # fit in what the split left: a header charged twice would leave room.
