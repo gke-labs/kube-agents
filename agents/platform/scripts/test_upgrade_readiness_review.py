@@ -108,7 +108,7 @@ def with_rules() -> dict:
         "seeded-a",
         "ready",
         rules={"surge-capacity": {"entry": 2, "can_block": True, "blocking": 1, "risks": 0}, "removed-node-label": {"entry": 12, "can_block": False, "blocking": 0, "risks": 1}},
-        rule_blocking=[{"pool": "no-surge-pool", "strategy": "SURGE", "max_surge": 0, "text": "pool no-surge-pool (maxSurge 0, maxUnavailable 1; 1 node) has no room for its displaced pods"}],
+        rule_blocking=[{"rule": "surge-capacity", "entry": 2, "pool": "no-surge-pool", "strategy": "SURGE", "max_surge": 0, "text": "pool no-surge-pool (maxSurge 0, maxUnavailable 1; 1 node) has no room for its displaced pods"}],
         risks=[
             {"rule": "removed-node-label", "entry": 12, "grade": "risk", "kind": "Deployment", "namespace": "seeded-shapes", "name": "arch-pinned-worker", "object": "seeded-shapes/arch-pinned-worker", "text": "selects on beta.kubernetes.io/arch=amd64"},
             {"rule": "zonal-control-plane", "entry": 11, "text": "control plane is zonal (us-central1-a)"},
@@ -180,6 +180,13 @@ class TheMapping(unittest.TestCase):
         failed["readiness"]["read_error"] = "connection refused"
         self.assertFalse(review.member_complete(failed, []))
         self.assertFalse(review.member_complete(seeded_b(), [{"project": PROJECT, "location": "us-central1-a", "cluster": "seeded-b", "error": "x"}]))
+        # A location whose get-server-config failed left its members no target:
+        # no pool verdicts and no exclusion decisions, so the cluster was not
+        # read in full even though no row names it (the watch counts it unread).
+        location_failed = [{"project": PROJECT, "location": "us-central1-a", "message": "get-server-config: 503"}]
+        self.assertFalse(review.member_complete(seeded_b(), location_failed))
+        self.assertTrue(review.member_complete(seeded_b(), [{"project": PROJECT, "location": "europe-west1", "message": "get-server-config: 503"}]))
+        self.assertTrue(review.member_complete(seeded_b(), [{"project": PROJECT, "message": "project unreadable"}]))
 
     def test_the_rubric_table_covers_the_queue_anchors(self):
         for values in list(review.RUBRIC.values()) + list(review.ENTRY_RISK_RUBRIC.values()) + [review.DEFAULT_RISK_RUBRIC]:

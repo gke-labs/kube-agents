@@ -71,7 +71,9 @@ verification_spec:
       fixture_roles:
         - readiness-drain-blocked
       any_of_patterns:
-        - "(?is)decide now.{0,3000}?pinned-batch-runner"
+        # Bounded to the Decide-now block the same way the webhook check below
+        # is, so a budget named only under "Also this week" is not a pass.
+        - "(?is)decide now(?:(?!\\nalso this week|\\ndecided earlier|\\nnot read this week|\\nfull report:).){0,3000}?pinned-batch-runner"
       required_phrases: ["pinned-batch-runner"]
   - name: the-budget-line-names-the-cluster-and-what-it-costs
     role: objective

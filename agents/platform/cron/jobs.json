@@ -278,7 +278,7 @@
         "expr": "0 7 * * 6",
         "display": "0 7 * * 6"
       },
-      "prompt": "Write this week's upgrade readiness brief. Read the SOP at 'governance/upgrade_readiness_brief_sop.md' in your profile home \u2014 all 163 lines of it, before you write anything. Its composing rules are section 3, lines 66-118, so a read that stops early writes a brief in the wrong shape. The review job has already graded every cluster and registered its findings on the findings queue; your turn reads the review's summary and the queue and composes the one message a person reads: what needs their decision now, what else the week found, and where the full report is. Follow the shape and the ceiling in section 3 exactly. Never [SILENT]: the brief is owed every week. This turn is read-only: register nothing, decide nothing, upgrade nothing.",
+      "prompt": "Write this week's upgrade readiness brief. Read the SOP at 'governance/upgrade_readiness_brief_sop.md' in your profile home \u2014 all 167 lines of it, before you write anything. Its composing rules are section 3, lines 70-122, so a read that stops early writes a brief in the wrong shape. The review job has already graded every cluster and registered its findings on the findings queue; your turn reads the review's summary and the queue and composes the one message a person reads: what needs their decision now, what else the week found, and where the full report is. Follow the shape and the ceiling in section 3 exactly. Never [SILENT]: the brief is owed every week. This turn is read-only: register nothing, decide nothing, upgrade nothing.",
       "skills": [],
       "risk": "low",
       "enabled": true,

@@ -82,6 +82,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sandbox_exec  # noqa: E402
+import findings_queue  # noqa: E402
 import upgrade_readiness_watch as watch  # noqa: E402
 
 JOB_ID = "upgrade-readiness-weekly-review"
@@ -90,6 +91,9 @@ LOG_PREFIX = "upgrade readiness weekly review"
 
 # Where the record lives, under the watch's home (`<agent home>/upgrade-readiness/`).
 WEEKLY_DIR_NAME = "weekly"
+# The summary's cluster buckets beside the watch's three verdicts.
+REVIEWED_KEY = "reviewed"
+UNREAD_KEY = "unread"
 REPORT_MD_NAME = "report.md"
 REPORT_JSON_NAME = "report.json"
 FINDINGS_JSON_NAME = "findings.json"
@@ -112,7 +116,7 @@ KV_API_KEY_ENV = "SESSION_KV_API_KEY"
 DEFAULT_KV_ENDPOINT = "http://127.0.0.1:8699"
 KV_FINDINGS_PATH = "/v1/findings"
 KV_TIMEOUT_SECONDS = 30
-KV_BATCH_LIMIT = 500
+KV_BATCH_LIMIT = findings_queue.MAX_BATCH  # one POST /v1/findings holds this many rows
 
 SOURCE = "audit"
 CHECK_PREFIX = "upgrade-"
@@ -137,6 +141,32 @@ READ_ERROR_KEYS = ("read_error", "webhook_read_error")
 SKEW_VERDICT_BLOCKS = "blocks"
 SKEW_VERDICT_CEILING = "at ceiling"
 WORKLOAD_REPLICAS_KEY = "replicas"
+WORKLOADS_KEY = "workloads"
+NAME_KEY = "name"
+PDB_KEY = "pdb"
+NAMESPACE_KEY = "namespace"
+KIND_KEY = "kind"
+FIELD_KEY = "field"
+DISRUPTIONS_ALLOWED_KEY = "disruptions_allowed"
+BLOCKS_KEY = "blocks"
+SCOPE_KEY = "scope"
+END_TIME_KEY = "end_time"
+DETAIL_KEY = "detail"
+VERDICT_KEY = "verdict"
+VERSION_KEY = "version"
+CONFIG_KEY = "config"
+CONFIG_KIND_KEY = "config_kind"
+WEBHOOK_KEY = "webhook"
+LIVE_RULES_KEY = "live_rules"
+UPGRADE_PATH_KEY = "upgrade_path"
+REASON_KEY = "reason"
+SERVICE_KEY = "service"
+RULE_KEY = "rule"
+ENTRY_KEY = "entry"
+OBJECT_KEY = "object"
+POOL_KEY = "pool"
+TEXT_KEY = "text"
+SUMMARY_KEY = "summary"
 
 # The per-run budget: the watch's readiness timeout per project, the watch's
 # whole-tick budget for the run (Hermes kills a no_agent script at an hour, as
@@ -362,7 +392,7 @@ def finding(
     still_failing_when: str,
 ) -> dict:
     project, location, cluster = cluster_fields(member)
-    where = f"{project}/{location}/{cluster}"
+    where = watch.MEMBER_KEY_SEPARATOR.join((project, location, cluster))
     return {
         "source": SOURCE,
         "check": check,
@@ -396,11 +426,12 @@ def budget_findings(member: dict) -> list[dict]:
     for budget in pdbs.get(BLOCKING_KEY) or []:
         if not isinstance(budget, dict):
             continue
-        workloads = [w for w in (budget.get("workloads") or []) if isinstance(w, dict)]
+        workloads = [w for w in (budget.get(WORKLOADS_KEY) or []) if isinstance(w, dict)]
         singleton = any((w.get(WORKLOAD_REPLICAS_KEY) or 0) <= 1 for w in workloads) or not workloads
-        owners = ", ".join(f"{w.get('kind')} {w.get('namespace')}/{w.get('name')} ({w.get(WORKLOAD_REPLICAS_KEY)} replicas)" for w in workloads)
-        name = str(budget.get("name") or budget.get("pdb") or "")
-        namespace = str(budget.get("namespace") or "")
+        owners = ", ".join(f"{w.get(KIND_KEY)} {w.get(NAMESPACE_KEY)}/{w.get(NAME_KEY)} ({w.get(WORKLOAD_REPLICAS_KEY)} replicas)" for w in workloads)
+        name = str(budget.get(NAME_KEY) or budget.get(PDB_KEY) or "")
+        namespace = str(budget.get(NAMESPACE_KEY) or "")
+        field = budget.get(FIELD_KEY)
         out.append(
             finding(
                 member=member,
@@ -408,8 +439,8 @@ def budget_findings(member: dict) -> list[dict]:
                 entry=ENTRY_BUDGET,
                 namespace=namespace,
                 object_name=name,
-                title=f"{ENTRY_BUDGET}. {entry_title(ENTRY_BUDGET)}: {namespace}/{name} ({budget.get('field')}) holds the node drain",
-                detail=f"PodDisruptionBudget {namespace}/{name} ({budget.get('field')}, disruptionsAllowed {budget.get('disruptions_allowed')}) covers {owners or 'no running workload'}; a surge upgrade holds each node's drain for up to an hour and then evicts the pod anyway.",
+                title=f"{ENTRY_BUDGET}. {entry_title(ENTRY_BUDGET)}: {namespace}/{name} ({field}) holds the node drain",
+                detail=f"PodDisruptionBudget {namespace}/{name} ({field}, disruptionsAllowed {budget.get(DISRUPTIONS_ALLOWED_KEY)}) covers {owners or 'no running workload'}; a surge upgrade holds each node's drain for up to an hour and then evicts the pod anyway.",
                 rubric_values=RUBRIC["budget-singleton" if singleton else "budget"],
                 action=f"Raise maxUnavailable to 1 (or lower minAvailable) on PodDisruptionBudget {namespace}/{name}, and run two replicas of {owners or 'the workload'} so the budget can be honoured.",
                 rationale=entry_mitigation(ENTRY_BUDGET),
@@ -424,9 +455,10 @@ def exclusion_findings(member: dict) -> list[dict]:
     out = []
     maintenance = (member.get(watch.READINESS_KEY) or {}).get(MAINTENANCE_KEY) or {}
     for exclusion in maintenance.get(EXCLUSIONS_KEY) or []:
-        if not isinstance(exclusion, dict) or not exclusion.get("blocks"):
+        if not isinstance(exclusion, dict) or not exclusion.get(BLOCKS_KEY):
             continue
-        name = str(exclusion.get("name") or "")
+        name = str(exclusion.get(NAME_KEY) or "")
+        end_time = exclusion.get(END_TIME_KEY)
         out.append(
             finding(
                 member=member,
@@ -434,10 +466,10 @@ def exclusion_findings(member: dict) -> list[dict]:
                 entry=ENTRY_EXCLUSION,
                 namespace="",
                 object_name=name,
-                title=f"{ENTRY_EXCLUSION}. {entry_title(ENTRY_EXCLUSION)}: exclusion {name} ({exclusion.get('scope')}) holds the automatic upgrade until {exclusion.get('end_time')}",
-                detail=str(exclusion.get("detail") or ""),
+                title=f"{ENTRY_EXCLUSION}. {entry_title(ENTRY_EXCLUSION)}: exclusion {name} ({exclusion.get(SCOPE_KEY)}) holds the automatic upgrade until {end_time}",
+                detail=str(exclusion.get(DETAIL_KEY) or ""),
                 rubric_values=RUBRIC["exclusion"],
-                action=f"Decide whether exclusion {name} should end on {exclusion.get('end_time')}: keep it for a planned freeze, shorten it when the lag is unintended; a manual upgrade is not held by it.",
+                action=f"Decide whether exclusion {name} should end on {end_time}: keep it for a planned freeze, shorten it when the lag is unintended; a manual upgrade is not held by it.",
                 rationale=entry_mitigation(ENTRY_EXCLUSION),
                 verify="gcloud container clusters describe <cluster> --location <location> --format='json(maintenancePolicy.window.maintenanceExclusions)'",
                 still_failing_when="the exclusion is in effect with a scope that covers the upgrade the cluster is due.",
@@ -452,10 +484,10 @@ def skew_findings(member: dict) -> list[dict]:
     for pool in skew.get(POOLS_KEY) or []:
         if not isinstance(pool, dict):
             continue
-        verdict = str(pool.get("verdict") or "")
+        verdict = str(pool.get(VERDICT_KEY) or "")
         if verdict not in (SKEW_VERDICT_BLOCKS, SKEW_VERDICT_CEILING):
             continue
-        name = str(pool.get("name") or "")
+        name = str(pool.get(NAME_KEY) or "")
         blocks = verdict == SKEW_VERDICT_BLOCKS
         out.append(
             finding(
@@ -464,8 +496,8 @@ def skew_findings(member: dict) -> list[dict]:
                 entry=ENTRY_SKEW,
                 namespace="",
                 object_name=name,
-                title=f"{ENTRY_SKEW}. {entry_title(ENTRY_SKEW)}: pool {name} at {pool.get('version')} {'blocks' if blocks else 'is at the ceiling for'} the control-plane upgrade",
-                detail=str(pool.get("detail") or ""),
+                title=f"{ENTRY_SKEW}. {entry_title(ENTRY_SKEW)}: pool {name} at {pool.get(VERSION_KEY)} {'blocks' if blocks else 'is at the ceiling for'} the control-plane upgrade",
+                detail=str(pool.get(DETAIL_KEY) or ""),
                 rubric_values=RUBRIC["skew-blocks" if blocks else "skew-ceiling"],
                 action=f"Upgrade node pool {name} to the control plane's version before the control-plane move; GKE refuses a control plane more than two minors ahead of a pool.",
                 rationale=entry_mitigation(ENTRY_SKEW),
@@ -483,10 +515,10 @@ def webhook_findings(member: dict) -> list[dict]:
         for hook in webhooks.get(key) or []:
             if not isinstance(hook, dict):
                 continue
-            config = str(hook.get("config") or "")
-            name = str(hook.get("name") or hook.get("webhook") or "")
-            rules = ", ".join(str(r) for r in (hook.get("live_rules") or hook.get("rules") or []))
-            path = ", ".join(str(r) for r in (hook.get("upgrade_path") or []))
+            config = str(hook.get(CONFIG_KEY) or "")
+            name = str(hook.get(NAME_KEY) or hook.get(WEBHOOK_KEY) or "")
+            rules = ", ".join(str(r) for r in (hook.get(LIVE_RULES_KEY) or hook.get(RULES_KEY) or []))
+            path = ", ".join(str(r) for r in (hook.get(UPGRADE_PATH_KEY) or []))
             blocking = kind == "webhook-blocking"
             what = "refuses writes the upgrade makes" if blocking else "refuses what it matches today"
             out.append(
@@ -497,11 +529,11 @@ def webhook_findings(member: dict) -> list[dict]:
                     namespace="",
                     object_name=f"{config}{WEBHOOK_OBJECT_SEPARATOR}{name}",
                     title=f"{ENTRY_WEBHOOK}. {entry_title(ENTRY_WEBHOOK)}: {config}/{name} fails closed with no backend and {what}",
-                    detail=f"{hook.get('reason') or 'backend unreachable'}; rules: {rules or 'none'}" + (f"; in the upgrade's path: {path}" if path else ""),
+                    detail=f"{hook.get(REASON_KEY) or 'backend unreachable'}; rules: {rules or 'none'}" + (f"; in the upgrade's path: {path}" if path else ""),
                     rubric_values=RUBRIC[kind],
-                    action=f"Restore the backend Service {hook.get('service') or ''} or set failurePolicy Ignore on {config}/{name}, and keep kube-system out of its namespaceSelector.",
+                    action=f"Restore the backend Service {hook.get(SERVICE_KEY) or ''} or set failurePolicy Ignore on {config}/{name}, and keep kube-system out of its namespaceSelector.",
                     rationale=entry_mitigation(ENTRY_WEBHOOK),
-                    verify=f"kubectl get {hook.get('config_kind') or 'validatingwebhookconfiguration'} {config} -o jsonpath='{{.webhooks[*].failurePolicy}}' and kubectl get endpoints -n <ns> <service>",
+                    verify=f"kubectl get {hook.get(CONFIG_KIND_KEY) or 'validatingwebhookconfiguration'} {config} -o jsonpath='{{.webhooks[*].failurePolicy}}' and kubectl get endpoints -n <ns> <service>",
                     still_failing_when="failurePolicy is Fail and the backend Service has no ready endpoint.",
                 )
             )
@@ -509,17 +541,13 @@ def webhook_findings(member: dict) -> list[dict]:
 
 
 def rule_entry(item: dict, rules: dict) -> tuple[str, int | None]:
-    """The rule a blocker or risk belongs to and its catalogue entry, from the
-    item itself or, for a blocker that names neither, from the one rule that
-    reports a blocker."""
-    rule = str(item.get("rule") or "")
-    entry = item.get("entry")
-    if not rule and isinstance(rules, dict):
-        blockers = [name for name, value in rules.items() if isinstance(value, dict) and value.get(BLOCKING_KEY)]
-        if len(blockers) == 1:
-            rule = blockers[0]
-    if entry is None and rule and isinstance(rules.get(rule), dict):
-        entry = rules[rule].get("entry")
+    """The rule a blocker or risk belongs to and its catalogue entry. The report
+    stamps both on every row; the entry falls back to the rule's own entry in
+    the ``rules`` table, and a row that names no rule is skipped."""
+    rule = str(item.get(RULE_KEY) or "")
+    entry = item.get(ENTRY_KEY)
+    if entry is None and rule and isinstance(rules, dict) and isinstance(rules.get(rule), dict):
+        entry = rules[rule].get(ENTRY_KEY)
     try:
         entry = int(entry) if entry is not None else None
     except (TypeError, ValueError):
@@ -530,15 +558,15 @@ def rule_entry(item: dict, rules: dict) -> tuple[str, int | None]:
 def rule_object(item: dict) -> tuple[str, str]:
     """The namespace and object a rule's row names: the workload for a workload
     row, the pool for a pool row, the cluster for a cluster-wide one."""
-    if item.get("object") and item.get("kind"):
-        return str(item.get("namespace") or ""), f"{item['kind']}/{item.get('name') or str(item['object']).split('/')[-1]}"
-    if item.get("pool"):
-        return "", str(item["pool"])
-    if item.get("object"):
-        parts = str(item["object"]).split("/")
+    if item.get(OBJECT_KEY) and item.get(KIND_KEY):
+        return str(item.get(NAMESPACE_KEY) or ""), f"{item[KIND_KEY]}/{item.get(NAME_KEY) or str(item[OBJECT_KEY]).split('/')[-1]}"
+    if item.get(POOL_KEY):
+        return "", str(item[POOL_KEY])
+    if item.get(OBJECT_KEY):
+        parts = str(item[OBJECT_KEY]).split("/")
         return (parts[0], "/".join(parts[1:])) if len(parts) > 1 else ("", parts[0])
-    if item.get("name"):
-        return str(item.get("namespace") or ""), f"{item.get('kind') or 'Object'}/{item['name']}"
+    if item.get(NAME_KEY):
+        return str(item.get(NAMESPACE_KEY) or ""), f"{item.get(KIND_KEY) or 'Object'}/{item[NAME_KEY]}"
     return "", CLUSTER_OBJECT
 
 
@@ -554,7 +582,7 @@ def rule_findings(member: dict) -> list[dict]:
             if not rule:
                 continue
             namespace, object_name = rule_object(item)
-            text = str(item.get("text") or item.get("summary") or item.get("detail") or "")
+            text = str(item.get(TEXT_KEY) or item.get(SUMMARY_KEY) or item.get(DETAIL_KEY) or "")
             values = RUBRIC["rule-blocking"] if blocking else ENTRY_RISK_RUBRIC.get(entry or 0, DEFAULT_RISK_RUBRIC)
             lead = "blocks the upgrade" if blocking else "is at risk in the upgrade"
             out.append(
@@ -582,12 +610,23 @@ def member_findings(member: dict) -> list[dict]:
 
 def member_complete(member: dict, report_errors: list) -> bool:
     """Whether the run read this cluster in full, which is what lets the queue
-    lower the confidence of a finding it did not re-report."""
+    lower the confidence of a finding it did not re-report. A member whose own
+    read failed is not complete; neither is one in a location whose
+    ``get-server-config`` failed (an ``errors`` row with the location and no
+    cluster), because the script graded it with no target: no pool verdicts, no
+    exclusion decisions, so their rows are missing rather than cleared."""
     readiness = member.get(watch.READINESS_KEY) or {}
     if any(readiness.get(key) for key in READ_ERROR_KEYS):
         return False
+    errors = [error for error in report_errors if isinstance(error, dict)]
     key = watch.member_key(member)
-    return not any(watch.member_key(error) == key for error in report_errors if isinstance(error, dict))
+    if any(watch.member_key(error) == key for error in errors):
+        return False
+    location_keys = watch.MEMBER_ID_KEYS[:-1]
+    cluster_key = watch.MEMBER_ID_KEYS[-1]
+    location = tuple(member.get(k) for k in location_keys)
+    failed_locations = {tuple(error.get(k) for k in location_keys) for error in errors if error.get(location_keys[-1]) and not error.get(cluster_key)}
+    return location not in failed_locations
 
 
 def payload(item: dict) -> dict:
@@ -686,14 +725,10 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
 
 
 def item_id(item: dict) -> str:
-    import findings_queue  # the id rule, so the report names rows the queue holds
-
     return findings_queue.derive_finding_id(item["check"], item["project"], item["cluster"], item["namespace"], item["object"])
 
 
 def severity_of(item: dict) -> str:
-    import findings_queue
-
     r = findings_queue.validate_rubric(item["rubric"])
     return findings_queue.severity_for(findings_queue.rank_score(r), r)
 
@@ -760,11 +795,11 @@ def summary(
         "generated_at": iso(now),
         "projects": names,
         "clusters": {
-            "reviewed": keys,
-            "blocked": blocked,
-            "ready": ready,
-            "unknown": unknown,
-            "unread": unread,
+            REVIEWED_KEY: keys,
+            watch.READINESS_BLOCKED: blocked,
+            watch.READINESS_READY: ready,
+            watch.READINESS_UNKNOWN: unknown,
+            UNREAD_KEY: unread,
         },
         "project_failures": failures,
         "counts": counts,
@@ -802,13 +837,14 @@ def render_report(summary_doc: dict, findings: list[dict], tables: dict[str, str
     ]
     rows_by_cluster: dict[str, list[dict]] = {}
     for row in summary_doc["findings"]:
-        rows_by_cluster.setdefault(f"{row['project']}/{row['cluster']}", []).append(row)
+        rows_by_cluster.setdefault(watch.MEMBER_KEY_SEPARATOR.join((row["project"], row["cluster"])), []).append(row)
     verdict_of = {}
-    for name, key in (("blocked", "blocked"), ("ready", "ready"), ("unknown", "unknown"), ("not read", "unread")):
+    for name, key in ((watch.READINESS_BLOCKED, watch.READINESS_BLOCKED), (watch.READINESS_READY, watch.READINESS_READY), (watch.READINESS_UNKNOWN, watch.READINESS_UNKNOWN), ("not read", UNREAD_KEY)):
         for member in clusters[key]:
             verdict_of[member] = name
-    for member in clusters["reviewed"]:
-        short = "/".join(member.split("/")[::2]) if member.count("/") == 2 else member
+    for member in clusters[REVIEWED_KEY]:
+        parts = member.split(watch.MEMBER_KEY_SEPARATOR)
+        short = watch.MEMBER_KEY_SEPARATOR.join(parts[::2]) if len(parts) == len(watch.MEMBER_ID_KEYS) else member
         rows = rows_by_cluster.get(short, [])
         lines.append(
             f"| {member} | {verdict_of.get(member, 'unknown')} | "

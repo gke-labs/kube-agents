@@ -1,17 +1,21 @@
 # SOP: Weekly Upgrade Readiness Brief
 
-**Cron id:** `upgrade-readiness-weekly-brief` — `0 7 * * 6` (Saturdays, 07:00 UTC), an hour after
-`upgrade-readiness-weekly-review` starts. The review grades every cluster in scope and registers what
-it finds on the findings queue inside a 45-minute budget, so by 07:00 its summary is on disk, its
-failure line is in chat, or (a run the hour cut short before its record) neither, which step 1
-treats as a review that did not finish; nothing else sequences the two.
-
 **Purpose:** one message a person reads in a minute, saying what this week's upgrade readiness
 review found, which findings need their decision now, and where the full report is. The review job
 did the reading and the registering; the findings queue carries every finding to a decision and
 reminds on its own schedule. This brief is the weekly judgement over both: what matters most this
 week, said once, in plain words. It changes nothing: it registers no finding, decides nothing on the
 user's behalf, and upgrades nothing.
+
+**Data sources:** the review's copy in the sandbox, `/opt/data/upgrade-readiness/weekly/latest.json`
+and `latest.md`, and the findings queue through `get_ranked_findings` and `get_findings`. Nothing
+else is read, and nothing is run.
+
+**Cron id:** `upgrade-readiness-weekly-brief` — `0 7 * * 6` (Saturdays, 07:00 UTC), an hour after
+`upgrade-readiness-weekly-review` starts. The review grades every cluster in scope and registers what
+it finds on the findings queue inside a 45-minute budget, so by 07:00 its summary is on disk, its
+failure line is in chat, or (a run the hour cut short before its record) neither, which step 1
+treats as a review that did not finish; nothing else sequences the two.
 
 **Why a model turn.** The review job can rank by rubric; it cannot tell that two criticals on one
 cluster are one problem, that a major on the cluster the agent itself runs on outranks a critical on
