@@ -654,9 +654,10 @@ func (d *driftFilter) tally(ctx context.Context, record AuditRecord) {
 		return
 	}
 
-	// Last, because it is the narrowest test and the only one that has to run
-	// on the human path alone. Everything above drops ~98% of the stream, so a
-	// map lookup here is paid for by almost nothing.
+	// Non-declarative filters (subresources and coordination objects) run last,
+	// because they are the narrowest tests and only run on the human path.
+	// Everything above drops ~98% of the stream, so these lookups are paid for
+	// by almost nothing.
 	if nonDeclarativeSubresources[record.Resource.Subresource] {
 		d.counts.NonDeclarative++
 		if d.logDropped {
