@@ -561,6 +561,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 		return fmt.Errorf("subscribe: %w", err)
 	}
 	b.cfg.Logger.Info("hermes bridge consuming", "profile", b.cfg.Profile, "executor", b.cfg.Executor)
+	if board := b.serveBoard(); board != nil {
+		defer board.Stop()
+	}
 	if b.cfg.Executor == ExecutorAPI && b.activityLn != nil && b.cfg.ActivitySecret == "" {
 		// The door is open but nothing can be attributed through it: the
 		// pod's hook signs with a secret this bridge was not given.

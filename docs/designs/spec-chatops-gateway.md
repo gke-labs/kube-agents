@@ -1909,6 +1909,22 @@ key reaches that ask while a newer chain runs. A `mark` with no key goes to the 
 once nothing runs, and is dropped, logged and counted (`notify_marks_dropped_total`) while a
 chain runs.
 
+**The Home tab.** A member opening the app's Home tab (`app_home_opened`, tab `home`) is answered
+with `views.publish`: a dashboard of five panels, with no model in the loop (`slack_home.go`). Fleet,
+Running, Recent pull requests and Last audit are one board snapshot, read over the board route: the
+gateway publishes an empty request on `chat.board` with its reply under `chat.board.reply.gateway.`,
+and the Hermes bridge answers with session-kv's `GET /v1/board` (`agents/platform/scripts/board_snapshot.py`):
+every Cluster Agent profile's cluster with the findings queue's open findings for it, the running
+kanban cards, the newest `pr_opened` events, and the newest finished fleet-audit run from the report
+store. Waiting on you is the adapter's own record: the open question of each conversation whose
+latest verified asker is the viewer, so it is per member and the rest is the install's, and it holds
+only questions posted since the gateway started. One snapshot serves every open for 30 seconds. A
+member who opened the tab in the last ten minutes is published to again, ten seconds after a burst
+of changes: a card's plan moving or a mark changing reads the board again, a question asked or
+answered only recomputes who is waiting. Admission is the inbound allowlist (`slackPrincipal`) and
+the member's `users.info` team being the bot's; anyone else gets one line and no read of the board.
+A board that cannot be read draws Fleet with a line saying so, never an empty fleet.
+
 ## The console adapter (added 9/23)
 
 The web console's chat door. Not a chat product's ingress: the browser is a bus client
