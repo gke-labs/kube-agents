@@ -4,15 +4,18 @@
 # cluster absent: it took GKE_LOCATION (this install's own region,
 # us-central1) as the target's location, looked seeded-b up there, missed it
 # because seeded-b is ZONAL (us-central1-a), and stopped on the missing-target
-# rule in agents/platform/SOUL.md section 0. Naming the region in the
-# question, as a user would ("seeded-b in us-central1"), steers a run toward
-# that regional lookup, so the case reds where the plain probes miss it about
-# once in a hundred repetitions. The rule now says to look across every
-# location of the project before calling a cluster absent.
+# rule in agents/platform/SOUL.md section 0. That was rare (two runs in
+# #3002's next-mode smoke build), and this case was not seen red: on
+# ka-fleet-dev-1 the platform routed the question to seeded-b's own cluster
+# agent, whose context is pinned to the right zone. It is a regression guard
+# for the user's phrasing, naming the region of a zonal cluster. The rule now
+# says to look across every location before calling a cluster absent.
 #
 # The prompt names seeded-b for the reason upgrades-lagging-master-probe
-# gives: it is slot b under the default prefix (bench/tf/fleet/), and the
-# checks below address it through the fixture role, not the name.
+# gives: it is slot b under the default prefix (bench/tf/fleet/). The
+# forbidden patterns name it too, so they match a claim that seeded-b is
+# absent and not a lookup narrated along the way ("the regional lookup
+# returned not found, so I listed every location").
 id: fleet-zonal-cluster-named-by-region
 name: A zonal cluster asked about by its region is found, not declared absent
 prompt: >-
@@ -50,7 +53,6 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\b(?:does not|doesn''t|did not|didn''t)\s+exist\b'
-        - '\bno cluster (?:named|called)\b'
-        - '\b(?:could not|couldn''t|cannot|can''t|unable to)\s+(?:find|locate)\b'
-        - '\bnot (?:found|present)\b'
+        - '\bseeded-b\b[^.;]{0,40}\b(?:does not|doesn''t|did not|didn''t)\s+exist\b'
+        - '\bno (?:gke )?clusters? (?:named|called)\s+seeded-b\b'
+        - '\b(?:could not|couldn''t|cannot|can''t|unable to)\s+(?:find|locate)\s+(?:the\s+)?(?:gke\s+)?(?:cluster\s+)?seeded-b\b'
