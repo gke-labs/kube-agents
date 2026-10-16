@@ -128,11 +128,11 @@ class AnswerTest(unittest.TestCase):
 
 
 class NextStepTest(unittest.TestCase):
-    def test_mock_03(self):
+    def test_mock_07(self):
         """The declared step is the one choice, not primary, and its line is not in the detail."""
         chat = cm.answer_message(_case("answer-declares-next-step")["input"]["markdown"])
-        self.assertEqual(chat["choices"], [{"text": "look at payments-api", "next": True}])
-        self.assertTrue(chat["detail"].endswith("Want me to look?"))
+        self.assertEqual(chat["choices"], [{"text": "upgrade plan for seeded-c", "next": True}])
+        self.assertTrue(chat["detail"].endswith("are current."))
 
     def test_a_long_rest_folds_and_keeps_the_step(self):
         long = "X" + "x" * cm.DETAIL_MAX

@@ -356,13 +356,14 @@ class AdapterForTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "0"}):
             self.assertIs(self.wrap(adapter), adapter)
 
-    def test_an_adapter_not_rendering_rich_blocks_is_kept(self):
+    def test_an_adapter_not_rendering_rich_blocks_folds_nothing_but_drops_the_step_line(self):
         for extra in ({}, {"rich_blocks": True, "markdown_blocks": True}):
             adapter = _Adapter(extra=extra)
             with self.subTest(extra):
-                self.assertIs(self.wrap(adapter), adapter)
-        bare = SimpleNamespace(send=None)
-        self.assertIs(self.wrap(bare), bare)
+                wrapped = self.wrap(adapter)
+                self.assertFalse(wrapped._fold)
+                asyncio.run(wrapped.send(CHANNEL, f"{ANSWER}\n\n[next: scale the pool]", metadata=METADATA))
+                self.assertEqual(adapter.log, [("send", CHANNEL, ANSWER, METADATA)])
 
 
 class SendTest(unittest.TestCase):
@@ -482,7 +483,7 @@ class SendTest(unittest.TestCase):
         adapter = _Adapter()
         self.send(adapter, answer)
         post = adapter.log[0][1]
-        self.assertEqual(post["text"], f"mrkdwn({answer})", "the text Slack keeps is the answer as written")
+        self.assertEqual(post["text"], f"mrkdwn({ANSWER}\n\n{question})", "no step line in the text Slack keeps")
         _headline, fold, after, actions = post["blocks"]
         self.assertEqual(fold["child_blocks"], _render_blocks(REST, adapter.format_message))
         self.assertEqual(after, _render_blocks(question, adapter.format_message)[0])
@@ -507,10 +508,11 @@ class SendTest(unittest.TestCase):
         refused = "[next: " + "scale " * 13 + "the pool]"
         adapter = _Adapter()
         self.send(adapter, f"{ANSWER}\n\n{question}\n\n{refused}")
-        _headline, fold, asked, line = adapter.log[0][1]["blocks"]
+        post = adapter.log[0][1]
+        _headline, fold, asked = post["blocks"]
         self.assertEqual(fold["child_blocks"], _render_blocks(REST, adapter.format_message))
         self.assertEqual(asked, _render_blocks(question, adapter.format_message)[0])
-        self.assertEqual(line, _render_blocks(refused, adapter.format_message)[0])
+        self.assertNotIn("[next:", json.dumps(post))
 
     def test_an_answer_drawn_whole_keeps_a_divider(self):
         # A top-level post may hold any block the plugin renders; only a fold limits the types.
@@ -527,7 +529,7 @@ class SendTest(unittest.TestCase):
         adapter = _Adapter()
         with self.assertLogs(runtime.logger):
             self.send(adapter, answer)
-        self.assertEqual(adapter.log, [("send", CHANNEL, answer, METADATA)])
+        self.assertEqual(adapter.log, [("send", CHANNEL, answer.rsplit("\n\n", 1)[0], METADATA)])
 
     def test_options_win_over_a_declared_step(self):
         answer = f"{HEADLINE} Two ways.\n\n1. **Scale it**\n2. **Shed load**\n\nWhich do you want?\n\n[next: scale it]"
@@ -545,11 +547,11 @@ class SendTest(unittest.TestCase):
         asyncio.run(wrapped.send(CHANNEL, f"{ANSWER}\n\n{question}\n\n[next: scale the pool]", metadata={}))
         blocks = adapter.log[0][1]["blocks"]
         self.assertNotIn("actions", [block["type"] for block in blocks])
-        # The question still posts unfolded, and the line follows it as written.
-        _headline, fold, asked, line = blocks
+        # The question still posts unfolded, and nothing takes the step's place.
+        _headline, fold, asked = blocks
         self.assertEqual(fold["child_blocks"], _render_blocks(REST, adapter.format_message))
         self.assertEqual(asked, _render_blocks(question, adapter.format_message)[0])
-        self.assertEqual(line, _render_blocks("[next: scale the pool]", adapter.format_message)[0])
+        self.assertNotIn("[next:", json.dumps(adapter.log[0][1]))
 
     def test_a_top_level_chat_posts_without_a_thread(self):
         adapter = _Adapter()
@@ -559,6 +561,13 @@ class SendTest(unittest.TestCase):
         asyncio.run(wrapped.send(CHANNEL, ANSWER, metadata={}))
         self.assertNotIn("thread_ts", adapter.log[0][1])
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_postMessage"])
+
+    def test_an_actionable_report_posts_upstream_without_the_step_line(self):
+        report = "Checkout is slow.\n\n**Option A:** scale it\n**Option B:** shed load\n\n[next: apply option A]"
+        adapter = _Adapter()
+        with mock.patch.object(kanban_notifier, "actionable_report", return_value=True), self.assertLogs(runtime.logger):
+            self.send(adapter, report)
+        self.assertEqual(adapter.log, [("send", CHANNEL, report.rsplit("\n\n", 1)[0], METADATA)])
 
     def test_a_refused_answer_takes_the_upstream_send(self):
         adapter = _Adapter()

@@ -765,6 +765,19 @@ class NextStepTest(unittest.TestCase):
         self.assertEqual(m.step_line(long), ("Up.", long.split("\n")[-1]))
         self.assertEqual(m.step_line("Up. Want me to?"), ("Up. Want me to?", ""))
 
+    def test_visible_text_takes_every_step_shaped_line_off_the_end(self):
+        too_long = "Up.\n\n[next: " + "x" * (p.BUTTON_TEXT_MAX + 5) + "]"
+        for text, want in (
+            ("Up.\n\n[next: check seeded-a]", "Up."),
+            ("Up.\n[next: a]\n[next: b]\n", "Up."),
+            (too_long, "Up."),
+            ("Up. [next: inline]", "Up. [next: inline]"),
+            ("Up.", "Up."),
+            ("[next: check]", ""),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(m.visible_text(text), want)
+
     def test_a_crlf_answer_reads_as_an_lf_one(self):
         self.assertEqual(m.next_step("Up.\r\n\r\n[next: check seeded-a]\r\n"), ("Up.", "check seeded-a"))
         two = "Up.\r\n[next: check seeded-b]\r\n[next: check seeded-a]\r\n"

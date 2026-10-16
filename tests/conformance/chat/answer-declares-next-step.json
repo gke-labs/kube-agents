@@ -1,20 +1,20 @@
 {
   "name": "answer-declares-next-step",
-  "source": "agents/platform/scripts/test_chat_message.py::NextStepTest.test_mock_03",
-  "notes": "Mock 03: an answer whose last line declares its next step, [next: look at payments-api], offers that step as its one choice, and the line is not shown.",
+  "source": "agents/platform/scripts/test_chat_message.py::NextStepTest.test_mock_07",
+  "notes": "Mock 07: an answer whose last line declares its next step, [next: upgrade plan for seeded-c], offers that step as its one choice, and the line is not shown. (Mock 03's offer has no button.)",
   "input": {
-    "markdown": "**Good news: it's not restarting.** Both pods have been up for 45h on seeded-a. #oncall may mean payments-api in seeded-debug, which is crashing. Want me to look?\n\n[next: look at payments-api]"
+    "markdown": "**seeded-c is one minor version behind.** It runs 1.32.9 and stable is 1.33.4; seeded-a and seeded-b are current.\n\n[next: upgrade plan for seeded-c]"
   },
   "expected": [
     {
       "carrier": "result",
       "chat": {
         "schema": "kube-agents.chat/v1",
-        "headline": "Good news: it's not restarting.",
-        "detail": "Both pods have been up for 45h on seeded-a. #oncall may mean payments-api in seeded-debug, which is crashing. Want me to look?",
+        "headline": "seeded-c is one minor version behind.",
+        "detail": "It runs 1.32.9 and stable is 1.33.4; seeded-a and seeded-b are current.",
         "choices": [
           {
-            "text": "look at payments-api",
+            "text": "upgrade plan for seeded-c",
             "next": true
           }
         ]

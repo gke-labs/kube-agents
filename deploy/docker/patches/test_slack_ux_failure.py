@@ -320,6 +320,27 @@ class MarkTest(FlagOn):
         (button,) = _buttons(self.draw(_turn(), content=reply))
         self.assertEqual(button["value"], "check seeded-a")
 
+    def test_visible_takes_the_line_off_every_chat_final_and_holds_the_step(self):
+        for platform in ("slack", "google_chat", "discord"):
+            with self.subTest(platform):
+                self.assertEqual(runtime.visible(_event(platform=platform), DECLARED_REPLY), REPLY)
+        # A program reads the API server's answer: the eval sees what the agent wrote.
+        self.assertEqual(runtime.visible(_event(platform="api_server"), DECLARED_REPLY), DECLARED_REPLY)
+
+    def test_a_reply_whose_line_visible_took_off_still_draws_the_held_step(self):
+        runtime.note_wake(SUB, {"blocked"}, WAKE)
+        event = _turn()
+        token = runtime.begin(event)
+        try:
+            posted = runtime.visible(event, DECLARED_REPLY)
+            blocks = runtime.maybe_blocks(posted, _render)
+        finally:
+            runtime.end(token)
+        (button,) = _buttons(blocks)
+        self.assertEqual(button["value"], "check seeded-a")
+        self.assertNotIn("[next:", blocks[0]["text"]["text"])
+        self.assertEqual(runtime._held.get(), "", "end drops the held step")
+
     def test_an_unmarked_reply_keeps_its_declared_line(self):
         # Only a failure wake's reply is drawn here; any other is upstream's, line and all.
         self.assertEqual(self.draw(_event(), content=DECLARED_REPLY), _render(DECLARED_REPLY))
@@ -335,21 +356,21 @@ class MarkTest(FlagOn):
         self.assertTrue(chat["detail"].endswith("Check it there?"))
         outside = runtime.layout(DECLARED_REPLY, False)
         self.assertIsNone(outside.get("choices"), "no button outside a thread")
-        self.assertTrue(outside["detail"].endswith("[next: check seeded-a]"), "so the line stays as written")
+        self.assertTrue(outside["detail"].endswith("Check it there?"), "and its line is no text either")
 
-    def test_a_declared_step_with_no_room_for_its_button_stays_as_written(self):
+    def test_a_declared_step_with_no_room_for_its_button_is_not_shown_as_text(self):
         runtime.note_wake(SUB, {"blocked"}, WAKE)
         full = lambda content: _render(content) * runtime.MESSAGE_BLOCKS_MAX  # noqa: E731
         blocks = self.draw(_turn(), content=DECLARED_REPLY, render=full)
         self.assertEqual(_buttons(blocks), [])
         self.assertTrue(blocks[0]["text"]["text"].startswith("**I couldn't find seeded-z.**"))
-        self.assertTrue(blocks[0]["text"]["text"].endswith("Check it there?\n\n[next: check seeded-a]"))
+        self.assertTrue(blocks[0]["text"]["text"].endswith("Check it there?"))
 
     def test_outside_a_thread_a_declared_step_stays_as_written(self):
         runtime.note_wake({**SUB, "thread_id": None}, {"blocked"}, WAKE)
         blocks = self.draw(_turn(thread_id=None), content=DECLARED_REPLY)
         self.assertEqual(_buttons(blocks), [])
-        self.assertTrue(blocks[0]["text"]["text"].endswith("[next: check seeded-a]"))
+        self.assertTrue(blocks[0]["text"]["text"].endswith("Check it there?"), "nothing takes the step's place")
 
     def test_a_reply_needs_its_turn_to_have_claimed_the_mark(self):
         runtime.note_wake(SUB, {"gave_up"}, WAKE)
@@ -583,7 +604,8 @@ class ApplyTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root)
         files = {
             applier.NOTIFIER: "class N:\n    def build_wake_text(self):\n" + applier.WAKE_ANCHOR,
-            applier.BASE: "class B:\n    async def send_final_ledgered(self, event):\n"
+            applier.BASE: "class B:\n    async def send_final_ledgered(self, event, text_content, metadata, *, reply_to):\n"
+            + "        delivery_adapter = self\n"
             + applier.FINAL_ANCHOR
             + "        return result\n\n"
             + "    async def _process_message_background(self, event, session_key):\n"

@@ -858,6 +858,22 @@ def step_line(text: str) -> tuple[str, str]:
     return "\n".join(lines[:-1]).rstrip(), lines[-1].strip()
 
 
+def visible_text(text: str) -> str:
+    """``text`` as a person sees it: every step-shaped line at its end taken off.
+
+    The ``[next: ...]`` line is plumbing between the agent and the presenters,
+    which draw it as a button where one can render; no surface shows it as
+    text, a refused or second one included. Returns the text as written when it
+    ends on no such line.
+    """
+    shown, line = step_line(text)
+    if not line:
+        return text
+    while line:
+        shown, line = step_line(shown)
+    return shown
+
+
 def next_step(text: str) -> tuple[str, str]:
     """``(text, label)``: the one next step an answer declares, split off, or ``(text, "")``.
 

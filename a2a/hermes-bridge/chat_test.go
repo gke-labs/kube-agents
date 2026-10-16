@@ -450,3 +450,21 @@ func TestSplitAnswerStaysLinear(t *testing.T) {
 		plainLine(line)
 	}
 }
+
+// visibleText takes off every step-shaped line at an answer's end, refused or
+// not: the line is plumbing no surface shows as text.
+func TestVisibleText(t *testing.T) {
+	for in, want := range map[string]string{
+		"Up.\n\n[next: check seeded-a]":                  "Up.",
+		"Up.\n[next: a]\n[next: b]\n":                    "Up.",
+		"Up.\r\n\r\n[next: check seeded-a]\r\n":          "Up.",
+		"Up.\n\n[next: " + strings.Repeat("x", 80) + "]": "Up.",
+		"Up. [next: inline]":                             "Up. [next: inline]",
+		"Up.":                                            "Up.",
+		"[next: check]":                                  "",
+	} {
+		if got := visibleText(in); got != want {
+			t.Errorf("visibleText(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

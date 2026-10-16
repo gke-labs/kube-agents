@@ -43,10 +43,11 @@ An answer that declares its next step on a last line of its own (``slack_moments
 ``[next: check seeded-a]``) gets that step as one such button in a thread, the line left
 out of the blocks, after the question when there is one; an answer ``split`` refuses is
 then drawn whole, as upstream's renderer draws it, with the button under it. Options the
-answer offers win over a declared step. Outside a thread, and for a step-shaped line the
-parser refuses, the line follows the question as written, and an answer that keeps the
-upstream post for any other reason (an actionable report, or one that cannot be drawn whole
-within Slack's 50 blocks) keeps it in place. The folded post
+answer offers win over a declared step. The line itself is plumbing and is never posted as
+text: outside a thread, for a step-shaped line the parser refuses, and on the upstream post an
+answer keeps for any other reason (an actionable report, one that cannot be drawn whole within
+Slack's 50 blocks, an adapter not rendering rich blocks), it is taken off and nothing takes its
+place. The folded post
 carries what upstream's adds: link-preview settings, ``reply_broadcast``, the
 feedback buttons, the status clear and the reply tracking for the thread. An incident report
 that edits its alert never reaches this send, and a report a reply can act on
@@ -323,22 +324,26 @@ def _renders_rich_blocks(adapter: Any) -> bool:
 class _AnswerFolder:
     """The notifier's adapter, with ``send`` posting the answer folded."""
 
-    def __init__(self, adapter: Any, chat_id: str):
+    def __init__(self, adapter: Any, chat_id: str, fold: bool = True):
         self._adapter = adapter
         self._chat_id = chat_id
+        self._fold = fold
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._adapter, name)
 
     async def send(self, chat_id: Any, content: Any, metadata: Any = None, **kwargs: Any) -> Any:
         if str(chat_id) == self._chat_id and isinstance(content, str) and not kwargs:
-            try:
-                posted = await self._post(content.strip(), metadata)
-            except Exception as exc:  # noqa: BLE001 — the upstream post still delivers it
-                logger.warning("slack_ux_answer: could not post the answer folded, posting it whole: %s", exc)
-                posted = None
+            posted = None
+            if self._fold:
+                try:
+                    posted = await self._post(content.strip(), metadata)
+                except Exception as exc:  # noqa: BLE001 — the upstream post still delivers it
+                    logger.warning("slack_ux_answer: could not post the answer folded, posting it whole: %s", exc)
             if posted is not None:
                 return posted
+            # Whatever posts it, the declared step's line is plumbing no one reads as text.
+            content = _moments.visible_text(content) or content
         return await self._adapter.send(chat_id, content, metadata=metadata, **kwargs)
 
     async def _post(self, content: str, metadata: Any) -> Any:
@@ -352,16 +357,12 @@ class _AnswerFolder:
         adapter = self._adapter
         mrkdwn_fn = getattr(adapter, "format_message", None)
         in_thread = bool(adapter._resolve_thread_ts(None, metadata))
-        # A declared next step is laid out apart from the answer, so the closing question above it
-        # still posts unfolded. In a thread it is a button; outside one a click has no thread to
-        # answer in, so its line follows the question as written.
-        shown_answer, step = _moments.next_step(content)
-        if not step:
-            # A step-shaped line the parser refuses is set aside all the same, and shown as written.
-            shown_answer, _line = _moments.step_line(content)
-        step_line = content.rstrip()[len(shown_answer):].strip()
+        # The declared next step is a button in a thread, where a click answers. Its line, and any
+        # step-shaped line the parser refuses, is never shown as text: it is taken off before the
+        # closing question is found, so the question still posts unfolded.
+        _shown, step = _moments.next_step(content)
+        shown_answer = _moments.visible_text(content)
         step_blocks = choice_blocks([(step, False)]) if step and in_thread else []
-        tail = "" if step_blocks else step_line
         parts = split(shown_answer)
         if parts is None:
             if not step_blocks:
@@ -386,7 +387,6 @@ class _AnswerFolder:
             else:
                 rest, question = trailing_question(rest)
                 detail_blocks, action_blocks = [], step_blocks
-            question = "\n\n".join(part for part in (question, tail) if part)
             fold_blocks = render_fold(rest, mrkdwn_fn) if rest else []
             question_blocks = render_fold(question, mrkdwn_fn) if question else []
             if fold_blocks is None or question_blocks is None or detail_blocks is None:
@@ -409,7 +409,7 @@ class _AnswerFolder:
                 kwargs[REPLY_BROADCAST] = True
         response = await adapter._client_for(channel, metadata).chat_postMessage(
             channel=channel,
-            text=mrkdwn_fn(content) if callable(mrkdwn_fn) else content,
+            text=mrkdwn_fn(shown_answer) if callable(mrkdwn_fn) else shown_answer,
             blocks=adapter._append_feedback_block(layout),
             **kwargs,
         )
@@ -443,9 +443,10 @@ def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) ->
         if getattr(event, "kind", None) != COMPLETED or not isinstance(sub, dict):
             return adapter
         chat_id = str(sub.get("chat_id") or "").strip()
-        if not chat_id or not _renders_rich_blocks(adapter):
+        if not chat_id:
             return adapter
-        return _AnswerFolder(adapter, chat_id)
+        # An adapter not rendering rich blocks gets no fold, only the step line taken off.
+        return _AnswerFolder(adapter, chat_id, fold=_renders_rich_blocks(adapter))
     except Exception as exc:  # noqa: BLE001 — never fail a delivery on presentation
         logger.warning("slack_ux_answer: not folding the answer: %s", exc)
         return adapter

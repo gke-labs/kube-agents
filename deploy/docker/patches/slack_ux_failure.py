@@ -27,7 +27,8 @@ should it use?"), a request ("Could you share the namespace?") or an either/or
 stays text, since it needs a word, not a click. A reply that declares its next step on a
 last line of its own (``slack_moments.next_step``: ``[next: check seeded-a]``) gets that
 step as the button instead, whatever its question says, and the line is left out of the
-blocks; outside a thread the line stays as written. A click is the clicker answering in the thread with the button's text
+blocks. The line itself is plumbing and is never posted as text, on any chat platform
+(:func:`visible`, in the final's send); outside a thread nothing takes its place. A click is the clicker answering in the thread with the button's text
 (``gateway/slack_ux_clicks.py``), so the Planning Agent reads it as the user
 saying yes. The words are the agent's; only how they are drawn changes. The
 ``text`` Slack keeps for notifications and for a later read of the thread is
@@ -150,6 +151,12 @@ _marks: "OrderedDict[tuple[str, str], tuple[float, datetime, str]]" = OrderedDic
 #: Marks a queued wake carried to its follow-up's reply, ``(chat_id, thread_id) ->
 #: (mark time, when carried)``: taken under any event that arrived before the carry.
 _carried: "OrderedDict[tuple[str, str], tuple[float, datetime]]" = OrderedDict()
+
+#: The step the final being sent declared, held while its line is kept off the posted text.
+_held: contextvars.ContextVar[str] = contextvars.ContextVar("kage_declared_step", default="")
+#: Platforms whose finals are no chat post: the API server's reader is a program (the eval
+#: among them), which gets the agent's text as written, and the local CLI.
+NOT_CHAT_PLATFORMS = frozenset({"api_server", "local"})
 
 #: The marked thread's id ("" outside a thread) for the length of one marked final's send.
 _marked: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("kage_failure_reply", default=None)
@@ -304,9 +311,30 @@ def _noted_by(event: Any, moment: datetime) -> bool:
 
 
 def end(token: Optional[contextvars.Token]) -> None:
-    """Undo :func:`begin`."""
+    """Undo :func:`begin`, and drop any step :func:`visible` held."""
+    _held.set("")
     if token is not None:
         _marked.reset(token)
+
+
+def visible(event: Any, text: Any) -> Any:
+    """The final ``text`` as a chat platform posts it: without a declared step's line.
+
+    The ``[next: ...]`` line is plumbing, so no chat surface shows it, on any
+    platform and with the flag on or off. The step it declares is held for
+    :func:`maybe_blocks`, which draws it as the reply's button in a thread. A
+    program's platform (:data:`NOT_CHAT_PLATFORMS`) gets the text as written.
+    """
+    try:
+        source = getattr(event, "source", None)
+        platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+        if not isinstance(text, str) or _moments is None or str(platform or "").lower() in NOT_CHAT_PLATFORMS:
+            return text
+        _held.set(_moments.next_step(text)[1])
+        return _moments.visible_text(text) or text
+    except Exception:
+        logger.warning("slack_ux_failure: taking the step line off the final failed", exc_info=True)
+        return text
 
 
 def present(content: str) -> tuple[str, str]:
@@ -439,9 +467,11 @@ def _next_step(content: str) -> tuple[str, str]:
 
 def layout(content: str, in_thread: bool) -> Optional[dict]:
     """A failure reply as a ``kube-agents.chat/v1`` message: :func:`present`'s offer, or the
-    declared next step in its place, as its button, only ``in_thread``; outside a thread a
-    declared step's line stays in the reply as written."""
-    content, step = _next_step(content) if in_thread else (content, "")
+    declared next step in its place, as its button, only ``in_thread``. The step's line is
+    never part of the layout, in a thread or out of one."""
+    content, step = _next_step(content)
+    step = step if in_thread else ""
+    content = _moments.visible_text(content) or content if _moments is not None else content
     _bolded, offer = present(content)
     return _chat.failure_message(content, bool((step or offer) and in_thread), step)
 
@@ -469,21 +499,20 @@ def maybe_blocks(content: str, render: Callable[[str], Optional[list]]) -> Optio
     if thread is None:
         return render(content)
     try:
+        # visible() has usually taken the step's line off already and held the step.
         shown, step = _next_step(content)
+        step = step or _held.get()
+        shown = _moments.visible_text(shown) or shown if _moments is not None else shown
         bolded, offer = present(shown)
         blocks = render(bolded)
         if blocks is None:
-            return render(content)
+            return render(shown)
         label = step or (OFFER_LABEL if offer else "")
         if label and thread and len(blocks) < MESSAGE_BLOCKS_MAX:
             return list(blocks) + _presenter.blocks_answer(
                 "", choices=[label], action_id_prefix=ACTION_ID_PREFIX,
             )
-        if step:
-            # No button carries the declared step (outside a thread, or no room): its line as written.
-            step_line = content.rstrip()[len(shown):].strip()
-            drawn = render(f"{bolded}\n\n{step_line}")
-            return drawn if drawn is not None else render(content)
+        # No button can carry the step (outside a thread, or no room): nothing takes its place.
         return blocks
     except Exception:
         logger.warning("slack_ux_failure: drawing the failure reply failed", exc_info=True)

@@ -488,6 +488,20 @@ func answerChoices(rest string) (answerOffer, bool) {
 	return offer, true
 }
 
+// visibleText is slack_moments.visible_text: answer with every step-shaped
+// line at its end taken off, since the "[next: ...]" line is plumbing no
+// surface shows as text; the answer as written when it ends on none.
+func visibleText(answer string) string {
+	shown := answer
+	for {
+		lines := strings.Split(strings.TrimRightFunc(shown, isPySpace), "\n")
+		if !nextStepLine.MatchString(strings.TrimRight(lines[len(lines)-1], carriageReturn)) {
+			return shown
+		}
+		shown = strings.TrimRightFunc(strings.Join(lines[:len(lines)-1], "\n"), isPySpace)
+	}
+}
+
 // nextStep is slack_moments.next_step: the one next step an answer declares
 // on its last line, a line of its own reading "[next: <label>]", split off as
 // (the answer above that line, the label). The label is made plain as an
