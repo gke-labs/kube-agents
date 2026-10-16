@@ -587,7 +587,7 @@ func TestDriftFilterDropsCoordinationResources(t *testing.T) {
 				Version:   "v1",
 				Namespace: "kubeagents-system",
 				Resource:  "leases",
-				Name:      "kube-agents-operator-leader-election",
+				Name:      "c5a0294c.kubeagents.x-k8s.io",
 			},
 		},
 		// Coordination lease in another namespace (e.g. kube-system): must also reach detector.
