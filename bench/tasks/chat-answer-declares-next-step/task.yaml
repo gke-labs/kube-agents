@@ -63,7 +63,8 @@ verification_spec:
   # the label 1-75 characters (slack_presenter BUTTON_TEXT_MAX) with no `<`,
   # `>` or `|` (a Slack link or mention), followed only by blank lines up to
   # the end of the text or the next delegated result or artifact. The report
-  # is normalized first: lowercased, `*`, `_` and backticks dropped.
+  # is normalized first: lowercased, `*`, `_` and backticks dropped, so the 75
+  # counts a label without its underscores, which next_step keeps and counts.
   - name: an-answer-ends-on-a-declared-next-step
     role: objective
     # assert, not the converge default: the transcript is immutable once the
