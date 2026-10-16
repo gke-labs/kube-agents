@@ -312,7 +312,7 @@ the three `B1-slack-*` mutations, all KILLED when they were added on 2026-10-06,
 `A3-agent-answers-its-own-notify` (KILLED) and
 `A3-bridge-sends-a-notify` (NOISY: it also trips the served-config precondition) when
 they were added on 2026-10-07, and `A3-session-sends-a-notify` (KILLED) on 2026-10-08, and
-`A3-agent-answers-the-board` and `A3-session-asks-the-board` (VERDICTS) on 2026-10-16, and
+`A3-agent-answers-the-board` and `A3-session-asks-the-board`, both KILLED when they were added on 2026-10-16, and
 `C4-skills-unchecked`, `C4-skills-check-silenced`, `C4-skills-check-skips-lock` and
 `C4-skills-make-noop`, all KILLED when they were added on 2026-10-07, and
 `C4-skills-check-blank-line-escape` and `C4-skills-check-comment-escape`, both KILLED when they were added on 2026-10-13, and
