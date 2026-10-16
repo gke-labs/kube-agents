@@ -696,7 +696,7 @@ So absence downgrades confidence rather than deciding anything: on a completed r
 `surfaced` row the run did not re-report has `C` lowered to 0.6 — the rubric's own value for "inferred from
 absence" — which re-ranks it down without asserting anything about it, and the definite answer comes
 from §7.4's verification the next time the row is named in a nudge. Only a run that reports its own scope as
-complete for that cluster may do even this much; a partial run touches nothing. A run that reads one family of checks narrows the claim with `scope.check_prefix`, so it reaches only rows whose check starts with that prefix; with a complete scope an empty batch is accepted, since a sweep that found nothing is exactly the case the rule is for.
+complete for that cluster may do even this much; a partial run touches nothing. The claim's reach is decided in three steps: the rows whose check starts with `scope.check_prefix` when the scope names one (a run that reads one family of checks); else the rows of the batch's own `source`, or of `scope.source` for an empty batch, so a hand re-run of the inventory sweep lowers no other writer's rows; else every undecided row on the cluster. With a complete scope an empty batch is accepted, since a sweep that found nothing is exactly the case the rule is for.
 
 The same run sets `absent_since` on each such row, keeping the first miss, including on a row
 already at 0.6, which is not re-ranked (the register response's `downgraded` counts only the rows
@@ -997,8 +997,8 @@ install only a person's decision (dismiss, snooze or accept) releases a pending 
 built. The onboarding sweep runs once, so for its rows no recurring complete sweep lowers a fixed
 row's `C` unless someone re-runs the sweep by hand; the weekly upgrade readiness review is such a
 sweep for its own `upgrade-` rows, so a shown row of that family that a Saturday no longer reports
-is not pending and is not reminded from that Saturday on, and comes back at full confidence the
-Saturday it is found again.
+is not pending and is not reminded from that Saturday on, and comes back at the confidence the
+review registers it with the Saturday it is found again.
 
 ### 7.3 What a dry run showed, and why there is no selection
 

@@ -303,8 +303,9 @@ found behind, two cron jobs on the Platform Agent's roster run the whole report 
   sandbox. `upgrade-readiness-weekly-brief` follows it with the week's brief in chat. A user who
   asks for "this week's upgrade readiness report" gets that copy printed; one who asks for the brief,
   or for what needs their decision, gets the brief's shape composed from the copy and the findings
-  queue (`governance/upgrade_readiness_brief_sop.md`, "On request"), never this skill's table or a
-  summary of it: the brief leads with **Decide now** and the undecided critical findings' queue ids.
+  queue by the `upgrade-readiness-brief` skill (the SOP's "On request" route as the agent loads
+  it), never this skill's table or a summary of it: the brief leads with **Decide now** and the
+  undecided critical findings' queue ids.
 
 ## Scan the GitOps manifests
 

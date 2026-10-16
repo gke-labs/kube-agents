@@ -1,6 +1,6 @@
 ---
 name: upgrade-readiness-brief
-description: Compose the upgrade readiness brief on request — which upgrade readiness findings need the user's decision now, what else the week found, and where the full report is — from the Saturday review's record and the findings queue, in the brief's fixed shape. Never the readiness table, never a summary of the report, never "nothing needs a decision" while a critical row is queued.
+description: Compose the upgrade readiness brief on request — which upgrade readiness findings need the user's decision now, what else the week found, and where the full report is — from the Saturday review's record and the findings queue, in the brief's fixed shape. Never the readiness table, never a summary of the report, never "nothing needs a decision" while a critical row is queued or surfaced.
 ---
 
 # upgrade-readiness-brief — The Week's Decisions, On Request
@@ -19,12 +19,17 @@ gets the same shape in chat. Read only. Register nothing, decide nothing, upgrad
      `severity`, `check`, `entry`, `project`, `cluster`, `namespace`, `object`, `title`, `action`,
      `outcome`), `new_ids`, `suppressed_ids`, `no_longer_reported_ids`, `project_failures`.
    - `cat /opt/data/upgrade-readiness/weekly/latest.md` when a line needs more than the row says.
-   - If the asked-for thing is **the report**, print `latest.md` as it is and stop.
+   - If the asked-for thing is **the report**, print `latest.md` as it is and stop; when the file is
+     missing, say the weekly review has not run yet and offer the on-request readiness report
+     (`fleet-upgrade-verification`, `--readiness`) instead of composing anything.
+   - If `generated_at` is older than 48 hours, compose from the summary anyway and say its date and
+     age in the headline: a stale brief with its date beats none.
    - If the file is missing, compose a **live brief**: run the `fleet-upgrade-verification` skill
      with `--readiness` once over every project in scope, treat its blockers and risks as the
      findings (a budget over one replica, a pool past the skew ceiling and a webhook in the upgrade's
      path are critical; a budget over several replicas, a webhook refusing only what it matches
-     today and a pool at the ceiling are major; a covering exclusion is minor), name objects where the
+     today and a pool at the ceiling are major; a covering exclusion is minor; a readiness rule's
+     risk takes the severity the review's rubric gives its catalogue entry), name objects where the
      queue would give ids, and say "live brief, composed now; the weekly review has not run" in the
      headline.
 2. Read the queue, with the `platform_control` tools:
@@ -54,9 +59,12 @@ gets the same shape in chat. Read only. Register nothing, decide nothing, upgrad
 
    - **Decide now** lists the undecided criticals, worst first (the queue's order). Merge two or more
      criticals on one cluster into one line and name both objects. A finding on the cluster the agent
-     runs on, or one whose clock ends within thirty days, may move up. Never leave the section empty
-     while an undecided critical exists; "nothing" is allowed only when every critical row is
-     `accepted`, `snoozed` or `dismissed`.
+     runs on, or one whose clock ends within thirty days, may move up; so may a major whose evidence
+     says a serving workload goes down, over a critical on a cluster the summary lists as `unknown`.
+     Never leave the section empty while an undecided critical exists; when every critical row is
+     `accepted`, `snoozed` or `dismissed`, the section reads `**Decide now:** nothing; every critical
+finding has a decision.` When nothing was found at all, the brief is the headline and the
+     report line, two lines.
    - One clause of why ("budget `pinned-batch-runner` refuses eviction of its only pod, so the drain
      kills it"), one action (the row's `action`, shortened to the verb and the object).
    - Majors and minors go under **Also this week** as counts by catalogue entry; a `suppressed` row is

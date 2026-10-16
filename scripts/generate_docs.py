@@ -141,6 +141,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
     ],
     "Reliability": [
         "fleet-upgrade-verification",
+        "upgrade-readiness-brief",
         "gke-reliability",
         "gke-upgrades",
     ],
