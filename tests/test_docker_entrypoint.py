@@ -150,6 +150,28 @@ class SharedStateGateTest(unittest.TestCase):
             npm_cache = home / ".npm-cache"
             self.assertTrue(npm_cache.is_dir(), "the setup must create .npm-cache/ (#3325)")
 
+    def test_the_setup_tolerates_uncreatable_npm_cache_dir(self):
+        """Step 4.5: if $TARGET_DIR/.npm-cache cannot be created (e.g. occupied by a file or ENOSPC),
+        the entrypoint emits a warning and continues rather than exiting under set -e (#3325)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp) / "data"
+            home.mkdir(parents=True)
+            # Pre-create .npm-cache as a regular file so mkdir -p fails
+            (home / ".npm-cache").write_text("not a directory")
+            proc = subprocess.run(
+                ["sh", str(_ENTRYPOINT), "echo", "hermes", "gateway", "run"],
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "PLATFORM_AGENT_HOME": str(home),
+                    "AGENT_SHARED_STATE_WAIT_SECS": "0",
+                },
+                timeout=60,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("could not create", proc.stderr)
+
     def test_entrypoint_exports_npm_config_cache(self):
         """Line 28: the entrypoint exports NPM_CONFIG_CACHE derived from TARGET_DIR (#3325)."""
         with tempfile.TemporaryDirectory() as tmp:

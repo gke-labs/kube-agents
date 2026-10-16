@@ -1894,7 +1894,7 @@ fi
 # created it too tight; guarded because an already-correct dir owned by the
 # peer uid may refuse the chmod, and that is fine.
 mkdir -p "$TARGET_DIR/scratch"
-mkdir -p "$TARGET_DIR/.npm-cache"
+mkdir -p "$TARGET_DIR/.npm-cache" 2>/dev/null || echo "WARN: could not create $TARGET_DIR/.npm-cache; profiles fall back to their own npm caches" >&2
 chmod 0775 "$TARGET_DIR/scratch" 2>/dev/null || true
 
 # 4.5 Say so loudly when the remote MCP servers cannot start. Every profile's
