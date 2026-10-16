@@ -18,8 +18,10 @@ A skill is a directory holding ``SKILL.md``, at any depth under a skill tree,
 so a skill filed under a category directory counts. Its documents are every
 Markdown file in that directory except under its ``scripts/``: an agent can
 open any of them with ``skill_view``. A ``SKILL.md`` inside another skill, such
-as ``references/SKILL.md``, is a document of that skill rather than a skill,
-except under its ``scripts/``, where it is a skill of its own.
+as ``references/SKILL.md``, is a document of that skill rather than a skill.
+Hermes does not list one under a skill's support directories (``scripts/``
+among them) as a skill either; ``skill_view`` opens it only as a file of the
+skill that holds it.
 
 ``scripts/check_skill_size.py``, ``tests/test_skill_inline_commands.py`` and
 ``deploy/docker/check_skill_commands.py`` all read skills through this module,
@@ -51,12 +53,7 @@ SCRIPTS_DIR = "scripts"
 def skill_dirs(tree: Path) -> list[Path]:
     """Every skill directory under ``tree``."""
     found = sorted(skill_md.parent for skill_md in tree.rglob(SKILL_FILE))
-    return [d for d in found if not any(_holds(other, d) for other in found)]
-
-
-def _holds(skill: Path, path: Path) -> bool:
-    """Whether ``path`` lies in ``skill`` outside its ``scripts/``."""
-    return skill in path.parents and SCRIPTS_DIR not in path.relative_to(skill).parts
+    return [d for d in found if not any(other in d.parents for other in found)]
 
 
 def skill_documents(tree: Path) -> list[Path]:
@@ -66,7 +63,7 @@ def skill_documents(tree: Path) -> list[Path]:
         path
         for skill in skills
         for path in skill.rglob(f"*{DOCUMENT_SUFFIX}")
-        if path.is_file() and _holds(skill, path)
+        if path.is_file() and SCRIPTS_DIR not in path.relative_to(skill).parts
     )
 
 

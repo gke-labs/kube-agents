@@ -57,15 +57,11 @@ class SkillDocumentsTest(unittest.TestCase):
         skill = self.write("agents/platform/skills/category/s/SKILL.md")
         self.assertEqual([skill], skill_documents(self.repo / "agents/platform/skills"))
 
-    def test_a_skill_under_scripts_is_a_skill_of_its_own(self):
-        tree = self.repo / "agents/platform/skills"
-        documents = [
-            self.write("agents/platform/skills/s/SKILL.md"),
-            self.write("agents/platform/skills/s/scripts/x/SKILL.md"),
-            self.write("agents/platform/skills/s/scripts/x/references/step.md"),
-        ]
-        self.write("agents/platform/skills/s/scripts/x/scripts/README.md")
-        self.assertEqual(sorted(documents), skill_documents(tree))
+    def test_a_skill_md_under_scripts_is_neither_a_skill_nor_a_document(self):
+        skill = self.write("agents/platform/skills/s/SKILL.md")
+        self.write("agents/platform/skills/s/scripts/x/SKILL.md")
+        self.write("agents/platform/skills/s/scripts/x/references/step.md")
+        self.assertEqual([skill], skill_documents(self.repo / "agents/platform/skills"))
 
     def test_every_shipped_root_is_read_and_others_are_not(self):
         shipped = [

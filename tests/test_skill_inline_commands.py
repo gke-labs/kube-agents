@@ -23,7 +23,7 @@ from markdown_it import MarkdownIt
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "deploy" / "docker"))
 
-from skill_documents import shipped_skill_documents, shipped_trees, skill_dirs  # noqa: E402
+from skill_documents import SKILL_ROOT_GLOBS, shipped_skill_documents, shipped_trees, skill_dirs  # noqa: E402
 
 # The trees the agent image ships, which deploy/docker/Dockerfile copies.
 IMAGE_SKILL_TREES = ("agents/platform/skills", "agents/cluster/skills", "a2a/persona/platform/skills")
@@ -92,6 +92,9 @@ class SkillInlineCommandsTest(unittest.TestCase):
         for tree in IMAGE_SKILL_TREES:
             with self.subTest(tree):
                 self.assertIn(REPO_ROOT / tree, shipped_trees(REPO_ROOT))
+        for pattern in SKILL_ROOT_GLOBS:
+            with self.subTest(pattern):
+                self.assertTrue(any(REPO_ROOT.glob(pattern)), f"{pattern} matches no skill tree")
         for tree in shipped_trees(REPO_ROOT):
             with self.subTest(tree):
                 self.assertTrue(
