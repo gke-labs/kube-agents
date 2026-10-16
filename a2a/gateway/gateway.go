@@ -478,7 +478,9 @@ func New(o Options) (*Gateway, error) {
 	// The Home tab: the allowlist an inbound message is admitted by, and the
 	// agent pod's board read over the bus (slack_home.go, board.go).
 	if sink, ok := o.Adapter.(HomeSink); ok {
-		sink.SetHome(func(member string) bool { return g.slackRosterPrincipal(member) != "" }, busBoardReader(o.Client))
+		sink.SetHome(func(member string) (bool, bool) {
+			return g.slackRosterPrincipal(member) != "", g.slackAllowAll && !g.slackAllowed[member]
+		}, busBoardReader(o.Client))
 	}
 	g.events = newKeyedQueue(g.relayBatch)
 	if o.Spawner != nil {

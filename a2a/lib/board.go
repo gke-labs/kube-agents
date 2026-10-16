@@ -22,9 +22,11 @@ const (
 type Board struct {
 	// GeneratedAt is when the sender read it.
 	GeneratedAt time.Time `json:"generated_at"`
-	// Clusters is every cluster the agent manages (a Cluster Agent profile
-	// each), with its open findings.
-	Clusters []BoardCluster `json:"clusters"`
+	// Clusters is the clusters the agent manages (a Cluster Agent profile
+	// each), with their open findings, worst first and capped by the sender;
+	// ClusterCount is how many there are in all.
+	Clusters     []BoardCluster `json:"clusters"`
+	ClusterCount int            `json:"cluster_count"`
 	// Running is the kanban cards in flight.
 	Running []BoardCard `json:"running"`
 	// PRs is the pull requests cards opened (their pr_opened events).
@@ -42,7 +44,7 @@ type BoardCluster struct {
 	// Findings counts the cluster's open findings.
 	Findings int `json:"findings"`
 	// Severity and Top are the highest-ranked open finding's severity
-	// (critical, high, medium, low) and title; empty with no findings.
+	// (the findings queue's critical, major or minor) and title; empty with no findings.
 	Severity string `json:"severity,omitempty"`
 	Top      string `json:"top,omitempty"`
 }

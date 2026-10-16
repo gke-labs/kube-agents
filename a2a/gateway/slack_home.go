@@ -25,8 +25,8 @@ import (
 const (
 	slackHomeTab = "home"
 
-	// slackHomeBoardFresh is how long one snapshot serves every open: a
-	// burst of members opening the tab costs one board read.
+	// slackHomeBoardFresh is how long one snapshot serves every open: once a
+	// read has landed, a burst of members opening the tab costs no more.
 	slackHomeBoardFresh = 30 * time.Second
 	// slackHomeBoardTimeout bounds one board read, the request and the
 	// bridge's SQLite reads behind it.
@@ -78,7 +78,7 @@ const (
 	slackPermalinkThread = "?thread_ts=%s&cid=%s"
 
 	slackHomeClusterCount = "%d cluster%s"
-	slackHomeMoreClusters = "%d more clusters"
+	slackHomeMoreClusters = "%d more cluster%s"
 	slackHomeBoardUnread  = "Could not read the board at %s."
 	slackHomeMoreFindings = " · %d more finding%s"
 	slackHomeNoFindings   = "no open findings"
@@ -88,6 +88,10 @@ const (
 	slackHomeAsked        = "asked "
 	slackHomeStarted      = "started "
 	slackHomeOpened       = "opened "
+	// slackHomePRLink is a pull request as mrkdwn: its URL, number and title.
+	slackHomePRLink = "<%s|#%d %s>"
+	// slackHomeHTTPS is the scheme prRepo reads a forge URL under.
+	slackHomeHTTPS = "https://"
 
 	// findingCritical is the findings queue's top severity.
 	findingCritical = "critical"
@@ -96,9 +100,11 @@ const (
 // BoardReader reads the agent pod's board snapshot.
 type BoardReader func(ctx context.Context) (*lib.Board, error)
 
-// HomeAdmits answers whether the gateway would answer a Slack member: the
-// same allowlist an inbound message is admitted by.
-type HomeAdmits func(member string) bool
+// HomeAdmits answers whether the gateway would answer a Slack member, by the
+// same allowlist an inbound message is admitted by, and whether that answer
+// rests on allow-all rather than on the member being listed: only then does
+// the member's workspace still need checking.
+type HomeAdmits func(member string) (admitted, byAllowAll bool)
 
 // HomeSink is the optional extension an Adapter implements to draw a home
 // view: the gateway hands it the admission rule and the board reader. Wired
@@ -175,15 +181,23 @@ func (s *SlackAdapter) publishHome(member string, note bool) {
 	}
 }
 
-// homeAdmitted is the allowlist, and the member's workspace being the bot's:
-// under allow-all the list admits anyone who can open the app, and a Slack
-// Connect member of another organisation is not anyone.
+// homeAdmitted is the allowlist, and under allow-all the member's workspace
+// being the bot's: allow-all admits anyone who can open the app, and a Slack
+// Connect member of another organisation is not anyone. A listed member is
+// the install's own word and needs no users.info (nor users:read).
 func (s *SlackAdapter) homeAdmitted(member string) bool {
 	s.home.mu.Lock()
 	admits := s.home.admits
 	s.home.mu.Unlock()
-	if admits == nil || !admits(member) {
+	if admits == nil {
 		return false
+	}
+	admitted, byAllowAll := admits(member)
+	if !admitted {
+		return false
+	}
+	if !byAllowAll {
+		return true
 	}
 	user, err := s.api.GetUserInfo(member)
 	if err != nil {
@@ -348,14 +362,17 @@ func (s *SlackAdapter) homeBlocks(b *lib.Board, waiting []homeQuestion, now time
 	if b.Error != "" {
 		note(fmt.Sprintf(slackHomeBoardUnread, slackDate(now, slackDateTime)))
 	} else {
-		note(fmt.Sprintf(slackHomeClusterCount, len(b.Clusters), plural(len(b.Clusters))),
+		total := max(b.ClusterCount, len(b.Clusters))
+		note(fmt.Sprintf(slackHomeClusterCount, total, plural(total)),
 			slackHomeUpdated+slackDate(b.GeneratedAt, slackDateTime))
 		for i, c := range b.Clusters {
 			if i == slackHomeClustersMax {
-				note(fmt.Sprintf(slackHomeMoreClusters, len(b.Clusters)-i))
 				break
 			}
 			section(clusterLine(c), nil)
+		}
+		if shown := min(len(b.Clusters), slackHomeClustersMax); total > shown {
+			note(fmt.Sprintf(slackHomeMoreClusters, total-shown, plural(total-shown)))
 		}
 	}
 
@@ -392,7 +409,7 @@ func (s *SlackAdapter) homeBlocks(b *lib.Board, waiting []homeQuestion, now time
 			if i == slackHomePRsMax {
 				break
 			}
-			section(fmt.Sprintf("<%s|#%d %s>", p.URL, p.Number, slackEscaper.Replace(p.Title)), nil)
+			section(fmt.Sprintf(slackHomePRLink, p.URL, p.Number, slackEscaper.Replace(p.Title)), nil)
 			var parts []string
 			if repo := prRepo(p.URL); repo != "" {
 				parts = append(parts, repo)
@@ -477,7 +494,7 @@ func (s *SlackAdapter) permalink(q slackQuestion) string {
 // (https://github.com/owner/name/pull/41); empty when the URL is not that
 // shape.
 func prRepo(url string) string {
-	rest, ok := strings.CutPrefix(url, "https://")
+	rest, ok := strings.CutPrefix(url, slackHomeHTTPS)
 	if !ok {
 		return ""
 	}

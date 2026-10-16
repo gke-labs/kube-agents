@@ -24,7 +24,7 @@ func homeBoardFixture() *lib.Board {
 		GeneratedAt: homeNow,
 		Clusters: []lib.BoardCluster{
 			{Name: "seeded-a", Findings: 7, Severity: "critical", Top: "payments-api crashlooping (OOM) in seeded-debug"},
-			{Name: "seeded-b", Findings: 5, Severity: "high", Top: "control plane one minor behind REGULAR"},
+			{Name: "seeded-b", Findings: 5, Severity: "major", Top: "control plane one minor behind REGULAR"},
 			{Name: "seeded-c", Findings: 0},
 		},
 		Running: []lib.BoardCard{{Title: "Diagnose the payments-api crashloop", Cluster: "seeded-a", StartedAt: homeNow}},
@@ -45,7 +45,8 @@ func homeAdapter(t *testing.T, board *lib.Board, boardErr error) (*SlackAdapter,
 	a.workspaceURL = "https://acme.slack.com/"
 	var mu sync.Mutex
 	reads := 0
-	a.SetHome(func(m string) bool { return m == "U1" || m == "UX" }, func(context.Context) (*lib.Board, error) {
+	// U1 is listed; UX is admitted by allow-all only, so its workspace counts.
+	a.SetHome(func(m string) (bool, bool) { return m == "U1" || m == "UX", m == "UX" }, func(context.Context) (*lib.Board, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		reads++
@@ -129,7 +130,7 @@ func TestSlackHomeDrawsTheDashboardForAnAllowedMember(t *testing.T) {
 // asked in is not on their tab.
 func TestSlackHomeWaitingIsPerViewer(t *testing.T) {
 	a, api, _ := homeAdapter(t, homeBoardFixture(), nil)
-	a.SetHome(func(string) bool { return true }, func(context.Context) (*lib.Board, error) { return homeBoardFixture(), nil })
+	a.SetHome(func(string) (bool, bool) { return true, false }, func(context.Context) (*lib.Board, error) { return homeBoardFixture(), nil })
 	a.noteAsker("slack:C1/40.0", "U2")
 	a.trackQuestion("slack:C1/40.0", "50.0", OutMessage{Text: "q", Chat: &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Theirs?",
 		Choices: []chatmsg.Choice{{Text: "a"}}}})
@@ -154,6 +155,35 @@ func TestSlackHomeShowsNoFleetToAMemberTheGatewayWouldNotAnswer(t *testing.T) {
 				t.Errorf("board read %d times for a member who sees none of it", *reads)
 			}
 		})
+	}
+}
+
+// A listed member needs no users.info, so an app without users:read still
+// draws their dashboard; allow-all is what needs the workspace check.
+func TestSlackHomeAListedMemberNeedsNoUserLookup(t *testing.T) {
+	a, api, _ := homeAdapter(t, homeBoardFixture(), nil)
+	api.users = nil
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	if got := viewText(t, api.views[0].view); !strings.Contains(got, "header: Fleet") {
+		t.Errorf("listed member denied without users.info:\n%s", got)
+	}
+	if api.userInfoCalls != 0 {
+		t.Errorf("users.info called %d times for a listed member", api.userInfoCalls)
+	}
+}
+
+// Past the cap, the count is the whole fleet and a line says how many more.
+func TestSlackHomeCountsTheWholeFleetPastTheCap(t *testing.T) {
+	b := homeBoardFixture()
+	b.ClusterCount = 40
+	for len(b.Clusters) < slackHomeClustersMax+2 {
+		b.Clusters = append(b.Clusters, lib.BoardCluster{Name: "extra"})
+	}
+	a, api, _ := homeAdapter(t, b, nil)
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	got := viewText(t, api.views[0].view)
+	if !strings.Contains(got, "context: 40 clusters ·") || !strings.Contains(got, "context: 25 more clusters") {
+		t.Errorf("view:\n%s", got)
 	}
 }
 

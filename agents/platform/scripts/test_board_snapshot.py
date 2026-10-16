@@ -80,11 +80,22 @@ class BoardSnapshotTest(unittest.TestCase):
                 finding("seeded-a", "checkout-gateway has no PDB", "major"),
             ],
         )
-        got = self.snap()["clusters"]
+        board = self.snap()
+        got = board["clusters"]
+        self.assertEqual(board["cluster_count"], 3)
         self.assertEqual([c["name"] for c in got], ["seeded-a", "seeded-b", "seeded-c"])
         self.assertEqual(got[0], {"name": "seeded-a", "findings": 2, "severity": "critical", "top": "payments-api crashlooping"})
         self.assertEqual(got[1]["findings"], 1)
         self.assertEqual(got[2], {"name": "seeded-c", "findings": 0})
+
+    def test_the_count_is_the_whole_fleet_past_the_listed_cap(self):
+        for i in range(board_snapshot.CLUSTERS_MAX + 5):
+            home = self.profiles / f"ca-extra-{i}"
+            home.mkdir()
+            (home / "config.yaml").write_text(f"cluster_identity:\n  project: p\n  cluster: extra-{i:02d}\n  location: l\n")
+        board = self.snap()
+        self.assertEqual(len(board["clusters"]), board_snapshot.CLUSTERS_MAX)
+        self.assertEqual(board["cluster_count"], board_snapshot.CLUSTERS_MAX + 7)
 
     def test_a_closed_finding_is_not_open(self):
         findings_queue.register_findings(self.session, [finding("seeded-a", "gone", "critical")])

@@ -211,8 +211,15 @@ do.
 The bridge connects as the static `bridge` user, whose grants are written for this
 program and nothing else: subscribe `a2a.tasks.platform.*.in`, publish
 `a2a.tasks.platform.*.events`, `$KV.runtime-state.>` both ways for the in-flight
-registry below, and `_INBOX.bridge.>`. Nothing wider - a bridge that can publish
+registry below, `_INBOX.bridge.>`, and the board route's two subjects below. Nothing wider - a bridge that can publish
 submissions is a bridge that can impersonate the gateway.
+
+The board route is the Slack Home tab's read of this pod: the bridge subscribes `chat.board`
+and answers each request with session-kv's `GET /v1/board`, published on the request's reply
+subject under `chat.board.reply.gateway.`, the one namespace it may publish there; a request
+replying anywhere else is dropped. It is bound only when the bridge has session-kv's URL and
+key (`BRIDGE_ROUTE_URL`, `SESSION_KV_API_KEY`), and reads nothing else
+([spec-nats-deployment.md](../../docs/designs/spec-nats-deployment.md), "The board route").
 
 Two of those grants are the capability check's: publish `a2a.cap.verify.platform` and
 subscribe `a2a.cap.reply.platform.>`. Both are single subjects rather than wildcards,

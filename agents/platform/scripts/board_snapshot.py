@@ -61,7 +61,7 @@ def _iso(epoch: float | None) -> str | None:
     return datetime.fromtimestamp(float(epoch), timezone.utc).isoformat()
 
 
-def cluster_identities(profiles_dir: Optional[Path] = None) -> dict[str, str]:
+def cluster_identities(profiles_dir: Path | None = None) -> dict[str, str]:
     """Profile name -> cluster name, for every profile stamped with a ``cluster_identity``."""
     import yaml  # lazy, like cluster_agent_profile's reader
 
@@ -103,7 +103,7 @@ def clusters(findings: list[dict], roster: list[str]) -> list[dict]:
     for name in sorted(set(roster) - set(rows)):
         rows[name] = {"name": name, "findings": 0}
         order.append(name)
-    return [rows[name] for name in order[:CLUSTERS_MAX]]
+    return [rows[name] for name in order]
 
 
 def running(kanban: sqlite3.Connection, identities: dict[str, str]) -> list[dict]:
@@ -195,7 +195,7 @@ def snapshot(
     session_db: sqlite3.Connection,
     kanban: sqlite3.Connection | None,
     now: datetime,
-    profiles_dir: Optional[Path] = None,
+    profiles_dir: Path | None = None,
     audit: Callable[[], dict | None] | None = None,
 ) -> dict:
     """The whole board. ``kanban`` is None before the board's first card, which is an empty board."""
@@ -204,9 +204,11 @@ def snapshot(
     except sqlite3.Error as exc:
         raise BoardError(f"the findings queue could not be read: {exc}") from None
     identities = cluster_identities(profiles_dir)
+    fleet = clusters(findings, sorted(set(identities.values())))
     board: dict[str, Any] = {
         "generated_at": now.astimezone(timezone.utc).isoformat(),
-        "clusters": clusters(findings, sorted(set(identities.values()))),
+        "clusters": fleet[:CLUSTERS_MAX],
+        "cluster_count": len(fleet),
         "running": [],
         "prs": [],
     }
