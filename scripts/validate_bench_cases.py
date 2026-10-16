@@ -272,6 +272,14 @@ FIXTURE_NOT_READY = {
         "each pool project's *-infra repository, so 3.3's fix is a manifest "
         "rather than manual"
     ),
+    "obtainability-pdb-kustomize-overlay": (
+        "#2686: needs checkout-gateway declared in a Kustomize root under "
+        "clusters/seeded-a/seeded-reliability/ in each pool project's *-infra "
+        "repository (the two files are in the case's header), so a new "
+        "PodDisruptionBudget there renders only if the kustomization lists it; "
+        "the fixture cannot share a repository with "
+        "obtainability-major-pdb-auto-pr's (#2228)"
+    ),
     "obtainability-untargeted-compute-class-manifest": (
         "#2540: needs a ComputeClass cluster without default ComputeClass and with "
         "an untargeted workload (untargeted-worker) in each pool project, so 3.24's "
