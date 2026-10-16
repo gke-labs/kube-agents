@@ -60,6 +60,11 @@ verification_spec:
     check:
       type: report_contains
       required_phrases: ["checkout-gateway", "seeded-a"]
+      # The count only a live read of seeded-a produces, so an answer that
+      # names seeded-a as unchecked doesn't pass on the cluster name alone.
+      any_of_phrases: ["2 replicas", "replica count of 2"]
+      forbidden_patterns:
+        - 'seeded-a[^\n]*(unchecked|not (been )?checked|did not finish)'
   - name: the-seeded-b-card-completed
     role: objective
     mode: assert
