@@ -809,6 +809,8 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// card rather than clearing silently — the same deterministic template
 	// the status ask uses. In the relay-lag case this duplicates the
 	// rolling-line edit that follows; redundant beats swallowed.
+	// MarkTerminalObserved on the record dedupes the relay's observeTaskTerminal
+	// call so metrics are not double-counted.
 	//
 	// The other stale shape has no terminal to find: a task with NO events
 	// at all (TasksGet answers TaskNotFound) because its executor never
@@ -1144,6 +1146,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// root's end comes from the wake below or, with no wake, from
 		// observeChildEnd.
 		g.observeEnded(rec, active.TaskID, task.State, source, finalMessageText(task))
+		rec.MarkTerminalObserved(active.TaskID)
 		// The terminal's mark, or the default, as relayTerminal draws it.
 		var terminal chatmsg.Reading
 		if task.FinalMessage != nil {
@@ -1193,7 +1196,8 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// terminal the heal found finds no route and is dropped, so it
 		// neither posts nor wakes. A never-started child's late events are
 		// dropped the same way. A human turn keeps its index, so its late
-		// result still posts.
+		// result still posts; MarkTerminalObserved on the record prevents
+		// double-counting in metrics when the relay arrives.
 		ref, known := rec.TaskRefFor(active.TaskID)
 		child := known && ref.Role == taskRoleChild
 		if child {
@@ -1848,9 +1852,13 @@ func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 // observeTaskTerminal is also where the task-terminal counter counts
 // (metrics.go), whatever the adapter: it is the funnel every terminal path
 // ends in, once per path -- relayTerminal, the heal (stale terminal or never
-// started) and the publish that never reached the bus -- so the failures the
-// gateway itself declares are counted beside the executor's, and a terminal
-// is counted as often as an adapter is told of it.
+// started), observeChildEnd, and the publish that never reached the bus -- so
+// the failures the gateway itself declares are counted beside the executor's,
+// and a terminal is counted as often as an adapter is told of it.
+// A delegation chain is counted once under its root: observedAs keeps both
+// the turn that delegated and its child from reaching observeTaskTerminal
+// separately, and a session turn that asked to delegate but started no child
+// is counted as failed (handOffEnd) even when the executor reported completed.
 func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	g.metrics.taskTerminal(state, source)
 	if observer, ok := g.adapter.(TaskObserver); ok {
