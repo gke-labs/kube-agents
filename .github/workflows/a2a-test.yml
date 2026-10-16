@@ -139,9 +139,23 @@ jobs:
       # than about our client library - so the test that covers the one product
       # client authenticating through the callout needs the real binary. A Go
       # install, no container.
+      #
+      # Retried like the Makefile's go-install-tool: a `go install` is a fetch
+      # from the module proxy and the checksum database, and one stream error
+      # from sum.golang.org failed the operator's job the same way (#3029).
+      # Four attempts with a doubling delay, the schedule the Makefile uses.
       - name: Install the nats CLI
         if: steps.filter.outputs.a2a == 'true'
-        run: go install github.com/nats-io/natscli/nats@v0.4.0
+        run: |
+          attempts=4; delay=5; attempt=1
+          until go install github.com/nats-io/natscli/nats@v0.4.0; do
+            if [ "$attempt" -ge "$attempts" ]; then
+              echo "::error::go install of the nats CLI failed after $attempts attempts"
+              exit 1
+            fi
+            echo "go install of the nats CLI: attempt $attempt of $attempts failed; retrying in ${delay}s"
+            sleep "$delay"; attempt=$((attempt + 1)); delay=$((delay * 2))
+          done
 
       - name: Run Tests
         if: steps.filter.outputs.a2a == 'true'

@@ -1416,7 +1416,7 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 				next = agentv1alpha1.DefaultGitHubHost
 			}
 			r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonGitHubHostChanged, fmt.Sprintf(
-				"the install's GitHub host changed from %s to %s; the first GitHub forge declared that can be served decides it, and repositories registered on %s are no longer served",
+				"the install's GitHub host changed from %s to %s; the first GitHub forge declared decides it, and repositories registered on %s are no longer served",
 				previous, next, previous))
 			if found.Data == nil {
 				found.Data = map[string]string{}

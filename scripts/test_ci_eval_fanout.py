@@ -300,6 +300,10 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
             # task lock, and the unwinding its skip paths share.
             lifted("finished_rep_count"),
             lifted("skip_unit"),
+            # What the unit does when the install is gone (#3129): the code
+            # wait_platform_runs returns for it and the marker that latches it.
+            lifted_constant("EVAL_GATEWAY_GONE_RC"),
+            lifted_constant("EVAL_INSTALL_GONE_MARKER"),
             lifted("run_one_unit"),
             self.UNIT_STUBS,
             extra,
@@ -342,6 +346,52 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
         self.assertNotIn("FINISH_CASE", result.stdout)
         self.assertIn("case-x rep 2 gave up on its task lock", result.stderr)
         self.assertNotIn("case-x.rep2.end", result.stdout)
+
+    def test_a_gateway_that_is_gone_records_every_repetition_as_infrastructure_and_never_launches(self):
+        """#3129: when wait_platform_runs reports the gateway Deployment gone,
+        the unit records its repetition as infrastructure instead of running
+        the bench against a missing install, and latches the state for the
+        run, so later units, streams or none, skip the exec and record the
+        same way; the last one grades the case."""
+        gone = "\n".join(
+            [
+                lifted_constant("EVAL_INFRA_FAILURE_MARKER"),
+                lifted_constant("EVAL_NOT_RUN_DIR"),
+                lifted_constant("EVAL_NOT_RUN_STATUS"),
+                lifted("record_unit_not_run"),
+                'wait_platform_runs() { echo "WAIT ${rep}"; return "${EVAL_GATEWAY_GONE_RC}"; }',
+            ]
+        )
+        result = self.run_reps(gone)
+        out = result.stdout + result.stderr
+        self.assertEqual(result.stdout.count("WAIT"), 1, out)
+        self.assertEqual(result.stderr.count("recorded as infrastructure"), 3, out)
+        self.assertNotIn("ran 1 task(s)", result.stdout, "the bench must not launch against a missing install")
+        self.assertIn("FINISH_CASE case-x after rep 3", result.stdout, out)
+        self.assertIn("install-gone", result.stdout, out)
+
+    def test_a_gone_gateway_leaves_a_state_lock_another_unit_holds(self):
+        """The gone-gateway exit comes before this unit takes its state lock,
+        so it must not release that lock: another unit sharing it may hold it
+        at that moment, and skip_unit's release would take it from under it."""
+        gone = "\n".join(
+            [
+                lifted_constant("EVAL_INFRA_FAILURE_MARKER"),
+                lifted_constant("EVAL_NOT_RUN_DIR"),
+                lifted_constant("EVAL_NOT_RUN_STATUS"),
+                lifted("record_unit_not_run"),
+                lifted("release_state_lock"),
+                'unit_state_lock() { echo shared-state; }',
+                'state_lock_deadline() { echo 1; }',
+                'mkdir "${STATE_DIR}/lock-state-shared-state"',
+                'wait_platform_runs() { return "${EVAL_GATEWAY_GONE_RC}"; }',
+            ]
+        )
+        after = '[ -d "${STATE_DIR}/lock-state-shared-state" ] && echo "STATE LOCK KEPT" || echo "STATE LOCK RELEASED"'
+        result = self.run_reps(gone, after)
+        out = result.stdout + result.stderr
+        self.assertEqual(result.stderr.count("recorded as infrastructure"), 3, out)
+        self.assertIn("STATE LOCK KEPT", result.stdout, out)
 
     def test_every_repetition_gets_its_own_tunnels(self):
         """The harness owns one port-forward per process and its atexit
@@ -426,7 +476,9 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
         released = unit.rindex('lock_release "${STATE_DIR}/lock-task-${name}"')
         self.assertLess(written, counted)
         self.assertLess(counted, released)
-        self.assertLess(released, unit.index('finish_case "${task}" "${name}"'))
+        # The last finish_case: the main path's (the gone-gateway exit grades
+        # earlier, under the same rule).
+        self.assertLess(released, unit.rindex('finish_case "${task}" "${name}"'))
         # A repetition the launcher could not start writes its record and is
         # counted the same way, under the lock, before it lets go.
         skip = lifted("skip_unit")
@@ -636,6 +688,8 @@ class StateLockTest(unittest.TestCase):
         body = "\n".join(
             [
                 lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+                lifted_constant("EVAL_GATEWAY_GONE_RC"),
+                lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
@@ -677,6 +731,8 @@ class StateLockTest(unittest.TestCase):
         body = "\n".join(
             [
                 lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+                lifted_constant("EVAL_GATEWAY_GONE_RC"),
+                lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
@@ -723,6 +779,8 @@ class StateLockTest(unittest.TestCase):
         body_for = lambda exempt: "\n".join(  # noqa: E731
             [
                 lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+                lifted_constant("EVAL_GATEWAY_GONE_RC"),
+                lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),

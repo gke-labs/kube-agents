@@ -9,7 +9,10 @@ builds: two jobs on #1562 went red four minutes apart on a 504 from GitHub's
 release-asset CDN. Nothing about that failure is visible in a normal run, and
 nothing about the fix is either -- dropping `--retry` from a curl line, or the
 `sleep` from the retry loop, fails no build and reports green until the next bad
-minute, by which time the connection to this change is lost.
+minute, by which time the connection to this change is lost. The `go install`
+of the tools themselves is the same kind of fetch and failed the same way once
+(#3029): `GoInstallRetryTest` runs that macro against a stub `go`, and
+`NatsCliInstallRetryTest` runs a2a-test.yml's nats CLI step the same way.
 
 So the loop is *run*, not read: `RetryLoopBehaviourTest` points the recipe at a
 stub `setup-envtest` and counts invocations, which is what catches a backoff
@@ -179,6 +182,70 @@ GUARD_MESSAGE = "holds no kube-apiserver"
 ENVTEST_VERSION_VAR = "ENVTEST_K8S_VERSION"
 ENVTEST_VERSION_DECLARATION = re.compile(r"^%s \?= (.+)$" % ENVTEST_VERSION_VAR, re.MULTILINE)
 
+#: The two retry tunables as k8s-operator/Makefile declares them. The nats CLI
+#: step in a2a-test.yml copies their values, so the test that runs that step
+#: reads the schedule from here rather than from a second copy of its own.
+RETRY_ATTEMPTS_VAR = "ENVTEST_DOWNLOAD_ATTEMPTS"
+RETRY_DELAY_VAR = "ENVTEST_RETRY_DELAY_SECONDS"
+RETRY_TUNABLE_DECLARATION = r"^%s \?= (\d+)$"
+
+#: Values `test -ge` accepts and `sleep` refuses: a trailing space and a signed
+#: zero. The guard must stop on them before the first attempt.
+BAD_DELAYS = ("5 ", "-0")
+
+#: A delay the digits check passes that bash arithmetic reads as octal: `08`
+#: is an error to `$(( ))` and `010` is 8. The guard reads the value as
+#: decimal, so this schedule follows, not an abandoned loop.
+LEADING_ZERO_DELAY = "08"
+LEADING_ZERO_SCHEDULE = ["8", "16"]
+
+#: A `sleep` that records the delay it was handed instead of waiting.
+SLEEP_RECORDER_STUB = '#!/bin/sh\necho "$1" >> "%s"\n'
+
+
+#: What the `go` stub below writes to stderr on a failed install: the shape of
+#: the checksum-database error that failed the operator's job (#3029).
+GO_INSTALL_ERROR = "verifying module: reading https://sum.golang.org/tile: stream error"
+
+#: Stands in for the Go toolchain under go-install-tool. `go install` appends
+#: a line to a calls file and fails until that file holds more lines than the
+#: failure count the test asked for; on success it drops the named binary into
+#: GOBIN, which is what the recipe then moves and links. Any other verb
+#: answers nothing and succeeds, as the Makefile's parse-time `go env` needs.
+GO_INSTALL_STUB = """#!/bin/sh
+case "$1" in
+  install)
+    echo call >> "%(calls)s"
+    if [ "$(wc -l < "%(calls)s")" -le %(failures)d ]; then
+      echo "%(error)s" >&2
+      exit 1
+    fi
+    : > "$GOBIN/%(binary)s"
+    chmod +x "$GOBIN/%(binary)s"
+    ;;
+esac
+exit 0
+"""
+
+#: More failures than any test lets the macro attempt, for the exhausted case.
+NEVER_SUCCEEDS = 1000
+
+#: The three targets that install through go-install-tool, each with the
+#: variable that names its binary, so a case can read each one's recipe.
+GO_INSTALL_TARGETS = (("envtest", "ENVTEST"), ("controller-gen", "CONTROLLER_GEN"), ("kustomize", "KUSTOMIZE"))
+
+#: The step in a2a-test.yml that installs the nats CLI with a bare `go install`,
+#: found by name so a renumbering of the steps does not move the test.
+NATS_CLI_STEP = "Install the nats CLI"
+NATS_CLI_WORKFLOW = "a2a-test.yml"
+
+#: Stands in for `sleep` under the workflow step: records the delay it was
+#: asked for and returns at once, so the backoff is observed, not waited for.
+SLEEP_STUB = """#!/bin/sh
+echo "$1" >> "%s"
+"""
+
+
 
 def _joined_commands(text):
     """(joined text, [(offset, line number)]) per backslash-continued line.
@@ -282,6 +349,12 @@ def _make(args, cwd=OPERATOR_DIR, env=None, extra_env=None):
     return run_make(list(args), timeout=MAKE_TIMEOUT_SECONDS, cwd=cwd, extra_env=extra_env)
 
 
+def _executable(path, script):
+    """Write `script` to `path` and mark it executable for everyone."""
+    path.write_text(script)
+    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
 def _make_ok(args, **kwargs):
     result = _make(args, **kwargs)
     if result.returncode != 0:
@@ -301,6 +374,18 @@ def _recipe(target):
     deliberately not memoised, since they run the recipe for its side effects.
     """
     return _make_ok(["-n", target])
+
+
+def _declared_retry_schedule():
+    """(attempts, delay) as k8s-operator/Makefile declares the two retry tunables."""
+    text = OPERATOR_MAKEFILE.read_text()
+    values = []
+    for name in (RETRY_ATTEMPTS_VAR, RETRY_DELAY_VAR):
+        declared = re.search(RETRY_TUNABLE_DECLARATION % name, text, re.MULTILINE)
+        if not declared:
+            raise AssertionError("k8s-operator/Makefile must declare %s as a whole number" % name)
+        values.append(int(declared.group(1)))
+    return tuple(values)
 
 
 def _declared_version():
@@ -393,21 +478,17 @@ class RetryLoopBehaviourTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _executable(self, path, script):
-        path.write_text(script)
-        path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-
     def _write_stub(self, script):
-        self._executable(self.versioned, script)
+        _executable(self.versioned, script)
         self.stub.unlink(missing_ok=True)
         self.stub.symlink_to(self.versioned)
 
     def _write_go_stub(self):
         """Put a fake `go` ahead of the real one and return the PATH to use."""
-        self._executable(self.tmp / "go", GO_STUB)
+        _executable(self.tmp / "go", GO_STUB)
         return "%s%s%s" % (self.tmp, os.pathsep, os.environ["PATH"])
 
-    def _run(self, attempts=STUB_ATTEMPTS, delay=0):
+    def _run(self, attempts=STUB_ATTEMPTS, delay=0, extra_env=None):
         return _make(
             ["-s", "envtest-path"],
             env={
@@ -416,6 +497,7 @@ class RetryLoopBehaviourTest(unittest.TestCase):
                 "ENVTEST_DOWNLOAD_ATTEMPTS": attempts,
                 "ENVTEST_RETRY_DELAY_SECONDS": delay,
             },
+            extra_env=extra_env,
         )
 
     def _call_count(self):
@@ -496,6 +578,40 @@ class RetryLoopBehaviourTest(unittest.TestCase):
         self.assertEqual(
             self._call_count(), 0, "it must refuse before fetching, not after an attempt"
         )
+
+    def test_a_padded_or_signed_delay_is_refused_before_the_first_fetch(self):
+        # `test -ge` takes "5 " and "-0"; `sleep` does not, and under `-e` the
+        # refused sleep would end the recipe after the first failed attempt.
+        for delay in BAD_DELAYS:
+            with self.subTest(delay=delay):
+                self._write_stub('#!/bin/sh\necho call >> "%s"\nexit 1\n' % self.calls)
+                self.calls.write_text("")
+                result = self._run(delay=delay)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self._call_count(), 0, "the guard runs before the first fetch")
+                self.assertIn("digits only", result.stderr)
+
+    def test_a_leading_zero_delay_is_read_as_decimal(self):
+        # `08` passes the digits check and `sleep`; the doubling arithmetic
+        # would read it as a bad octal literal and end the recipe after the
+        # first sleep. The guard reads it as decimal, so the loop runs its
+        # schedule: 8, then 16, and the third attempt succeeds.
+        self._write_stub(
+            "#!/bin/sh\n"
+            'echo call >> "%s"\n'
+            'if [ "$(wc -l < "%s")" -lt 3 ]; then\n'
+            "  exit 1\n"
+            "fi\n"
+            "echo /the/assets/path\n" % (self.calls, self.calls),
+        )
+        sleeps = self.tmp / "sleeps"
+        sleeps.write_text("")
+        _executable(self.tmp / "sleep", SLEEP_RECORDER_STUB % sleeps)
+        result = self._run(attempts=3, delay=LEADING_ZERO_DELAY,
+                           extra_env={"PATH": "%s%s%s" % (self.tmp, os.pathsep, os.environ["PATH"])})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._call_count(), 3, "the loop must survive its first doubling")
+        self.assertEqual(sleeps.read_text().split(), LEADING_ZERO_SCHEDULE)
 
     def test_the_test_target_stops_when_the_assets_do_not_resolve(self):
         """`make test` must fail, not skip, when the fetch yields no binaries.
@@ -917,6 +1033,187 @@ class ShippedDownloadsRetryTest(unittest.TestCase):
             "%s are, so either a download needs rewriting to fetch to a file first or "
             "the separator scan is reading a shape wrong" % (exempt,),
         )
+
+
+class GoInstallRetryTest(unittest.TestCase):
+    """go-install-tool retries `go install`, the fetch #1603 left unretried (#3029).
+
+    The operator's Run Tests job failed 92 seconds in, before any test ran,
+    when the checksum database answered one tile read with an HTTP/2 stream
+    error while `go install` verified a dependency of setup-envtest. The
+    envtest binary download beside it had the retry; this fetch did not. As
+    with RetryLoopBehaviourTest, the recipe is run against a stub and the
+    calls counted, because a retry loop deleted from the macro fails no build.
+    """
+
+    STUB_VERSION = "test-stub"
+    BINARY = "setup-envtest-stub"
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="go-install-retry-")).resolve()
+        self.localbin = self.tmp / "bin"
+        self.localbin.mkdir()
+        self.calls = self.tmp / "calls"
+        self.calls.write_text("")
+        self.toolchain = self.tmp / "toolchain"
+        self.toolchain.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_go(self, failures):
+        _executable(self.toolchain / "go", GO_INSTALL_STUB % {"calls": self.calls, "failures": failures, "error": GO_INSTALL_ERROR, "binary": self.BINARY})
+
+    def _run(self, attempts=STUB_ATTEMPTS, delay=0):
+        return _make(
+            ["-s", "envtest"],
+            env={
+                "ENVTEST": str(self.localbin / self.BINARY),
+                "ENVTEST_VERSION": self.STUB_VERSION,
+                "LOCALBIN": str(self.localbin),
+                "ENVTEST_DOWNLOAD_ATTEMPTS": attempts,
+                "ENVTEST_RETRY_DELAY_SECONDS": delay,
+            },
+            extra_env={"PATH": "%s%s%s" % (self.toolchain, os.pathsep, os.environ["PATH"])},
+        )
+
+    def _call_count(self):
+        return len(self.calls.read_text().splitlines())
+
+    def _installed(self):
+        link = self.localbin / self.BINARY
+        return link.is_symlink() and os.readlink(link) == str(self.localbin / ("%s-%s" % (self.BINARY, self.STUB_VERSION)))
+
+    def test_a_failing_install_is_attempted_the_configured_number_of_times(self):
+        self._write_go(NEVER_SUCCEEDS)
+        result = self._run()
+        self.assertEqual(self._call_count(), STUB_ATTEMPTS, "the recipe should have retried up to the ceiling, stderr was:\n%s" % result.stderr)
+        self.assertNotEqual(result.returncode, 0, "exhausting the attempts must fail the target")
+        self.assertFalse(self._installed(), "nothing must be linked after a failed install")
+
+    def test_it_stops_at_the_first_success_and_links_the_binary(self):
+        self._write_go(2)
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._call_count(), 3, "it should stop at the first success")
+        self.assertTrue(self._installed(), "the versioned binary and its link should be in place")
+        self.assertEqual(result.stdout, "", "the retry notices must stay off stdout; got %r" % result.stdout)
+
+    def test_a_first_try_success_installs_once(self):
+        self._write_go(0)
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._call_count(), 1)
+        self.assertTrue(self._installed())
+
+    def test_an_empty_ceiling_fails_before_the_first_install(self):
+        self._write_go(0)
+        result = self._run(attempts="")
+        self.assertNotEqual(result.returncode, 0, "an empty ceiling must be refused, not read as infinite")
+        self.assertEqual(self._call_count(), 0, "the guard runs before the first install")
+        self.assertIn("ENVTEST_DOWNLOAD_ATTEMPTS", result.stderr)
+
+    def test_it_waits_between_attempts(self):
+        """The backoff, which asserting on recipe text cannot see: with the
+        `sleep` line gone the attempts fire back to back and a stream error
+        that lasts a second defeats all four."""
+        self._write_go(1)
+        started = time.monotonic()
+        result = self._run(attempts=2, delay=1)
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._call_count(), 2)
+        self.assertGreaterEqual(elapsed, 1.0, "two attempts with a 1s delay should take at least a second")
+
+    def test_a_padded_or_signed_delay_is_refused_before_the_first_install(self):
+        for delay in BAD_DELAYS:
+            with self.subTest(delay=delay):
+                self._write_go(1)
+                self.calls.write_text("")
+                result = self._run(delay=delay)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self._call_count(), 0, "the guard runs before the first install")
+                self.assertIn("digits only", result.stderr)
+
+    def test_a_leading_zero_delay_is_read_as_decimal(self):
+        # As for the envtest loop: `08` must give the 8 s, 16 s schedule, not
+        # a bad octal literal that ends the recipe after the first sleep.
+        self._write_go(2)
+        sleeps = self.tmp / "sleeps"
+        sleeps.write_text("")
+        _executable(self.toolchain / "sleep", SLEEP_RECORDER_STUB % sleeps)
+        result = self._run(attempts=3, delay=LEADING_ZERO_DELAY)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._call_count(), 3, "the loop must survive its first doubling")
+        self.assertTrue(self._installed())
+        self.assertEqual(sleeps.read_text().split(), LEADING_ZERO_SCHEDULE)
+
+    def test_every_installer_goes_through_the_retry(self):
+        # Three targets share the macro; a retry added to one copy of the
+        # recipe and not the macro would leave the other two as they were.
+        for target, variable in GO_INSTALL_TARGETS:
+            with self.subTest(target=target):
+                recipe = _make(["-n", target], env={variable: str(self.tmp / target)}).stdout
+                self.assertRegex(recipe, r"while ! GOBIN=.* go install", "%s does not install through the retrying macro" % target)
+                self.assertIn("retrying in", recipe, "%s has the loop but not its notice" % target)
+
+
+class NatsCliInstallRetryTest(unittest.TestCase):
+    """a2a-test.yml's nats CLI step retries its `go install` on the Makefile's schedule.
+
+    The step is a `run:` block, which no Makefile macro covers and
+    `DOWNLOAD_SOURCES` does not read, so its loop is run here: the block is
+    lifted out of the workflow and executed under the shell GitHub gives it,
+    with a stub `go` that fails a set number of installs and a stub `sleep`
+    that records the delay instead of waiting.
+    """
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="nats-cli-retry-")).resolve()
+        self.calls = self.tmp / "calls"
+        self.calls.write_text("")
+        self.sleeps = self.tmp / "sleeps"
+        self.sleeps.write_text("")
+        self.toolchain = self.tmp / "toolchain"
+        self.toolchain.mkdir()
+        step = next(
+            step for step in _steps(_load_workflow(NATS_CLI_WORKFLOW)) if step.get("name") == NATS_CLI_STEP
+        )
+        self.script = self.tmp / "step.sh"
+        self.script.write_text(step["run"])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, failures):
+        _executable(self.toolchain / "go", GO_INSTALL_STUB % {"calls": self.calls, "failures": failures, "error": GO_INSTALL_ERROR, "binary": "nats"})
+        _executable(self.toolchain / "sleep", SLEEP_STUB % self.sleeps)
+        env = dict(os.environ, PATH="%s%s%s" % (self.toolchain, os.pathsep, os.environ["PATH"]), GOBIN=str(self.tmp))
+        return subprocess.run(["bash", "-e", str(self.script)], capture_output=True, text=True, env=env, timeout=MAKE_TIMEOUT_SECONDS)
+
+    def _calls(self):
+        return len(self.calls.read_text().splitlines())
+
+    def _delays(self):
+        return [int(line) for line in self.sleeps.read_text().split()]
+
+    def test_a_failing_install_stops_at_the_makefile_ceiling_with_its_doubling_delay(self):
+        # The schedule is read from k8s-operator/Makefile, not from a copy
+        # here: a change to either tunable there reads red until the step
+        # follows it.
+        attempts, delay = _declared_retry_schedule()
+        result = self._run(NEVER_SUCCEEDS)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._calls(), attempts, result.stdout + result.stderr)
+        self.assertEqual(self._delays(), [delay * 2**i for i in range(attempts - 1)], "the step's delays should follow the Makefile's")
+        self.assertIn("::error::", result.stdout)
+
+    def test_it_stops_at_the_first_success(self):
+        _, delay = _declared_retry_schedule()
+        result = self._run(2)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self._calls(), 3)
+        self.assertEqual(self._delays(), [delay, delay * 2])
 
 
 if __name__ == "__main__":
