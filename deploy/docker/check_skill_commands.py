@@ -38,7 +38,8 @@ program output as often as commands. ``tests/test_skill_inline_commands.py``
 checks inline code for the forms the skills used to teach: a variable as the
 program, a script path starting with a variable, and a program's path put in
 a variable. The Dockerfile names the agent image's three trees; a plugin's
-skills ship in its own image and are not read.
+skills ship in its own image and this scan does not read them, though the
+inline-code test does.
 A tree with no shell block fails the check, and so do two trees where one path
 is, or holds, the other: an empty copy, or a path repeated from another tree in
 the Dockerfile, would otherwise pass a tree with nothing read.

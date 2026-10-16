@@ -33,7 +33,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 # The image build copies skill_documents.py beside check_skill_commands.py, so it
 # lives in deploy/docker rather than here.
-sys.path.insert(0, str(REPO / "deploy" / "docker"))
+SKILL_DOCUMENTS_DIR = REPO / "deploy" / "docker"
+sys.path.insert(0, str(SKILL_DOCUMENTS_DIR))
 
 from skill_documents import shipped_skill_documents  # noqa: E402
 

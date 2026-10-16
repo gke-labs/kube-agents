@@ -23,7 +23,10 @@ from markdown_it import MarkdownIt
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "deploy" / "docker"))
 
-from skill_documents import SKILL_ROOT_GLOBS, shipped_skill_documents, skill_dirs  # noqa: E402
+from skill_documents import shipped_skill_documents, shipped_trees, skill_dirs  # noqa: E402
+
+# The trees the agent image ships, which deploy/docker/Dockerfile copies.
+IMAGE_SKILL_TREES = ("agents/platform/skills", "agents/cluster/skills", "a2a/persona/platform/skills")
 
 # A variable run as the program at the start of a span, after a shell join or
 # inside `$(`, and after a shell keyword or a wrapper that runs the next word
@@ -85,12 +88,15 @@ def refused(span):
 
 
 class SkillInlineCommandsTest(unittest.TestCase):
-    def test_each_root_holds_a_skill(self):
-        for pattern in SKILL_ROOT_GLOBS:
-            with self.subTest(pattern):
+    def test_each_tree_holds_a_skill(self):
+        for tree in IMAGE_SKILL_TREES:
+            with self.subTest(tree):
+                self.assertIn(REPO_ROOT / tree, shipped_trees(REPO_ROOT))
+        for tree in shipped_trees(REPO_ROOT):
+            with self.subTest(tree):
                 self.assertTrue(
-                    any(skill_dirs(tree) for tree in REPO_ROOT.glob(pattern)),
-                    f"no {pattern} holds a skill, so its inline code would pass unread",
+                    skill_dirs(tree),
+                    f"{tree} holds no skill, so its inline code would pass unread",
                 )
 
     def test_no_inline_command_runs_a_variable_as_its_program(self):
