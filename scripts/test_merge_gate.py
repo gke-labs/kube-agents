@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for merge_gate.py -- the merge queue's gate checks.
+"""Tests for merge_gate.py -- the merge queue's gate checks and the enqueue sweep.
 
 Run: cd scripts && python3 -m unittest test_merge_gate
 
@@ -11,9 +11,11 @@ skip list is checked against the paths Prow skips, and the queue branch is
 parsed from the shape GitHub names it.
 """
 
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
@@ -27,11 +29,15 @@ BASE_SHA = "b" * 40
 APPROVED = {"lgtm", "approved", "size/M"}
 
 
-def pull(labels=APPROVED, statuses=None, base="main"):
+def pull(labels=APPROVED, statuses=None, draft=False, auto_merge=False, queue_entry=None, base="main"):
     return {
+        "id": "PR_1",
         "number": 7,
         "sha": SHA,
         "base": base,
+        "draft": draft,
+        "auto_merge": auto_merge,
+        "queue_entry": queue_entry,
         "labels": set(labels),
         "statuses": statuses or {},
     }
@@ -48,11 +54,13 @@ def no_files():
 class FakeAPI:
     """Just enough of `GitHubAPI` for the functions that call it."""
 
-    def __init__(self, raw_pull=None, statuses=(), files=()):
+    def __init__(self, raw_pull=None, statuses=(), files=(), nodes=()):
         self.repo = REPO
         self.raw_pull = raw_pull
         self.statuses = list(statuses)
         self.files = list(files)
+        self.nodes = list(nodes)
+        self.mutations = []
         self.posts = []
 
     def get(self, path, tolerate=()):
@@ -67,6 +75,12 @@ class FakeAPI:
 
     def post(self, path, payload=None, tolerate=()):
         self.posts.append((path, payload))
+
+    def graphql(self, query, variables):
+        if query.startswith("mutation"):
+            self.mutations.append((query.split("(", 2)[1].split("{")[-1].strip(), variables["id"]))
+            return {}
+        return {"repository": {"pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": self.nodes}}}
 
 
 class LabelsTest(unittest.TestCase):
@@ -217,6 +231,143 @@ class GroupTest(unittest.TestCase):
         for ref in ("refs/heads/main", "refs/heads/gh-readonly-queue/main/pr-42", ""):
             with self.subTest(ref=ref):
                 self.assertFalse(gate.cmd_group(FakeAPI(raw_pull=self.RAW), ref, gate.LABELS_GATE)[0])
+
+
+class EnqueueTest(unittest.TestCase):
+    def test_approved_and_not_queued_is_enabled(self):
+        self.assertEqual(gate.enqueue_action(pull()), gate.ENABLE)
+
+    def test_already_queued_is_left_alone(self):
+        self.assertIsNone(gate.enqueue_action(pull(auto_merge=True)))
+        self.assertIsNone(gate.enqueue_action(pull(queue_entry="MQE_1")))
+
+    def test_a_hold_or_a_lost_label_comes_out(self):
+        self.assertEqual(gate.enqueue_action(pull(APPROVED | {"do-not-merge/hold"}, auto_merge=True)), gate.DISABLE)
+        self.assertEqual(gate.enqueue_action(pull({"approved"}, queue_entry="MQE_1")), gate.DISABLE)
+
+    def test_a_draft_is_never_enabled(self):
+        self.assertIsNone(gate.enqueue_action(pull(draft=True)))
+
+    def test_unapproved_and_not_queued_is_nothing(self):
+        self.assertIsNone(gate.enqueue_action(pull({"lgtm"})))
+
+    def test_removed_from_the_queue_since_the_last_push_stays_out(self):
+        removed = pull() | {"removed_since_push": True}
+        self.assertEqual(gate.enqueue_action(removed), gate.LEFT_OUT)
+
+
+class RemovalTest(unittest.TestCase):
+    """The last removal against the head's first check suite, which is when the head was pushed."""
+
+    def test_a_removal_after_the_last_push_counts(self):
+        self.assertTrue(gate.removed_since_push(node(1, APPROVED, timeline=[removal()])))
+
+    def test_a_push_after_the_removal_clears_it(self):
+        """The commit may be dated before the removal; the check suite is dated by the push."""
+        late_push = node(1, APPROVED, timeline=[removal(at="2026-10-13T11:00:00Z")], pushed="2026-10-13T11:20:00Z")
+        self.assertFalse(gate.removed_since_push(late_push))
+
+    def test_a_removal_caused_by_the_push_itself_does_not_count(self):
+        """A push to a queued pull request removes it within seconds of the push."""
+        pushed_while_queued = node(1, APPROVED, timeline=[removal(at="2026-10-13T10:00:30Z")])
+        self.assertFalse(gate.removed_since_push(pushed_while_queued))
+
+    def test_a_head_with_no_check_suite_counts_as_pushed_after(self):
+        self.assertFalse(gate.removed_since_push(node(1, APPROVED, timeline=[removal()], pushed=None)))
+
+    def test_the_sweeps_own_dequeue_does_not_count(self):
+        self.assertFalse(gate.removed_since_push(node(1, APPROVED, timeline=[removal(gate.SWEEP_ACTOR)])))
+
+    def test_no_timeline_item_is_no_removal(self):
+        self.assertFalse(gate.removed_since_push(node(1, APPROVED)))
+
+    def test_the_apps_own_dequeue_does_not_count_with_or_without_the_bot_suffix(self):
+        self.assertFalse(gate.removed_since_push(node(1, APPROVED, timeline=[removal("merge-bot")]), "merge-bot"))
+        self.assertFalse(gate.removed_since_push(node(1, APPROVED, timeline=[removal("merge-bot[bot]")]), "merge-bot"))
+        self.assertTrue(gate.removed_since_push(node(1, APPROVED, timeline=[removal(gate.SWEEP_ACTOR)]), "merge-bot"))
+
+
+def status_node(context, state, description=""):
+    return {"__typename": "StatusContext", "context": context, "state": state, "description": description}
+
+
+PUSHED = "2026-10-13T10:00:00Z"
+
+
+def removal(actor="octocat", at="2026-10-13T11:00:00Z"):
+    return {"createdAt": at, "actor": {"login": actor}}
+
+
+def node(number, labels, auto_merge=False, queue_entry=None, contexts=(), timeline=(), pushed=PUSHED):
+    return {
+        "id": f"PR_{number}",
+        "number": number,
+        "isDraft": False,
+        "headRefOid": SHA,
+        "labels": {"nodes": [{"name": name} for name in labels]},
+        "autoMergeRequest": {"enabledAt": "t"} if auto_merge else None,
+        "mergeQueueEntry": {"id": queue_entry} if queue_entry else None,
+        "timelineItems": {"nodes": list(timeline)},
+        "commits": {"nodes": [{"commit": {
+            "checkSuites": {"nodes": [{"createdAt": pushed}] if pushed else []},
+            "statusCheckRollup": {"contexts": {"nodes": list(contexts)}},
+        }}]},
+    }
+
+
+class RollupTest(unittest.TestCase):
+    def test_statuses_read_in_rest_form_and_check_runs_are_skipped(self):
+        check_run = {"__typename": "CheckRun", "name": "cla/google", "status": "COMPLETED", "conclusion": "SUCCESS"}
+        statuses = gate.rollup_statuses([status_node(gate.SMOKE_CONTEXT, "SUCCESS", "Job succeeded."), check_run])
+        self.assertEqual(statuses, {gate.SMOKE_CONTEXT: ("success", "Job succeeded.")})
+
+
+class SweepTest(unittest.TestCase):
+    def test_enables_dequeues_and_refreshes_only_the_approved(self):
+        api = FakeAPI(
+            nodes=[
+                node(1, APPROVED, contexts=[status_node(gate.SMOKE_CONTEXT, "SUCCESS")]),
+                node(2, {"lgtm", "do-not-merge/hold"}, auto_merge=True, queue_entry="MQE_2"),
+                node(3, {"lgtm"}),
+            ]
+        )
+        lines, failures = gate.sweep(api)
+        self.assertEqual(failures, 0)
+        self.assertIn(("enablePullRequestAutoMerge", "PR_1"), api.mutations)
+        self.assertIn(("dequeuePullRequest", "PR_2"), api.mutations)
+        self.assertIn(("disablePullRequestAutoMerge", "PR_2"), api.mutations)
+        self.assertEqual(len(api.mutations), 3)
+        self.assertEqual({path for path, _ in api.posts}, {f"/repos/{REPO}/statuses/{SHA}"})
+        self.assertEqual(len(api.posts), 2, "only #1 is approved, so only #1's statuses are refreshed")
+
+    def test_a_status_already_posted_reads_as_unchanged(self):
+        """GraphQL says SUCCESS; a gate already green must not be posted again."""
+        posted = status_node(gate.LABELS_GATE, "SUCCESS", gate.labels_verdict(APPROVED)[1])
+        api = FakeAPI(nodes=[node(1, APPROVED, auto_merge=True, contexts=[posted])])
+        gate.sweep(api)
+        self.assertNotIn(gate.LABELS_GATE, [payload["context"] for _, payload in api.posts])
+
+    def test_the_calls_that_enqueue_go_through_the_enqueue_token(self):
+        api, enqueuer = FakeAPI(nodes=[node(1, APPROVED)]), FakeAPI()
+        gate.sweep(api, enqueuer=enqueuer)
+        self.assertEqual((api.mutations, enqueuer.mutations), ([], [("enablePullRequestAutoMerge", "PR_1")]))
+
+    def test_a_write_sweep_needs_the_enqueue_token_and_a_dry_run_does_not(self):
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "t"}, clear=True), mock.patch.object(gate, "sweep", return_value=([], 0)):
+            self.assertEqual(gate.main(["--repo", REPO, "sweep"]), 2)
+            self.assertEqual(gate.main(["--repo", REPO, "--dry-run", "sweep", "--base", gate.DRY_RUN_BASE]), 0)
+
+    def test_a_pull_request_the_queue_removed_is_not_enabled_again(self):
+        api = FakeAPI(nodes=[node(1, APPROVED, timeline=[removal()])])
+        lines, failures = gate.sweep(api)
+        self.assertEqual((failures, api.mutations), (0, []))
+        self.assertTrue(any("left out" in line for line in lines))
+
+    def test_a_dry_run_changes_nothing(self):
+        api = FakeAPI(nodes=[node(1, APPROVED)])
+        lines, _ = gate.sweep(api, dry_run=True)
+        self.assertEqual((api.mutations, api.posts), ([], []))
+        self.assertTrue(any("would turn auto-merge on" in line for line in lines))
 
 
 if __name__ == "__main__":

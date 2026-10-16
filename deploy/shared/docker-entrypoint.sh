@@ -1034,21 +1034,17 @@ fi
 # reading it back off the volume is the one place a partial upgrade can hide. It also frees
 # this step from depending on step 2b having worked.
 #
-# Writing jobs.json without a lock is safe WITHIN THIS POD, on two facts. The scheduler in
-# THIS container is not running yet — everything here is ahead of `exec "$@"`. And no OTHER
-# container in this pod is running this code: step 1.5 hands the shared tree to a single
-# owner, so the dashboard, which has no scheduler and no reason to touch the schedule, stops
-# before it gets here.
+# Writing jobs.json serializes under Hermes' `<cron_dir>/.jobs.lock` advisory lock to
+# coordinate with any concurrent in-pod Hermes cron mutations (`hermes cron pause|resume|add`).
 #
-# Both facts stop at the pod boundary. Step 1.5 elects an owner per pod, not per volume, so
-# at availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
+# At availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
 # rather than a volume each — every replica's gateway is an owner and several of them run
-# this against the same file, with a rolling update overlapping new pods and old. The
-# exposure and why it is not fixable from inside the script are set out in cron_jobs_sync.py's
-# Concurrency section; the short version is that the reconcile wants to run once per volume,
-# which is a topology change rather than a lock. Single-replica installs, the default, are
-# unaffected. Do not restore a bare "there is no second writer" claim here: it was written
-# once, it was wrong, and it read as verified.
+# this against the same file, with a rolling update overlapping new pods and old. While
+# .jobs.lock serializes writers on filesystems supporting advisory locking, eliminating
+# cross-pod scheduler races on shared volumes requires running the reconcile once per volume,
+# which is a topology change. Single-replica installs, the default, are unaffected. Do not
+# restore a bare "there is no second writer" claim here: it was written once, it was wrong,
+# and it read as verified.
 #
 # --assume-retired covers the one case the script's ledger cannot know on its first run: a
 # deployment that finished onboarding before this existed has no record that
@@ -1518,11 +1514,22 @@ fi
 # 2.6's force-sync, not to it.
 CLUSTER_TEMPLATE="/opt/cluster-template"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
+    CLUSTER_PROFILE_SCRIPT="/opt/defaults/scripts/cluster_agent_profile.py"
+    [ -f "$CLUSTER_PROFILE_SCRIPT" ] || CLUSTER_PROFILE_SCRIPT="$TARGET_DIR/scripts/cluster_agent_profile.py"
     for d in "$TARGET_DIR"/profiles/cluster-*; do
         [ -d "$d" ] && [ -f "$d/config.yaml" ] || continue
         for f in SOUL.md AGENTS.md CAPABILITIES.md; do
             [ -f "$CLUSTER_TEMPLATE/$f" ] && cp -f "$CLUSTER_TEMPLATE/$f" "$d/$f" 2>/dev/null || true
         done
+        # The cp -f above replaces each cluster-* profile's SOUL.md with the blank
+        # image template (/opt/cluster-template/SOUL.md) on every gateway restart.
+        # Re-stamp this Cluster Agent's Target Cluster Identity from its preserved
+        # $d/config.yaml via cluster_agent_profile.py so existing cluster-* profiles
+        # keep their identity in SOUL.md.
+        if [ -f "$d/SOUL.md" ] && [ -w "$d/SOUL.md" ] && [ -f "$d/config.yaml" ] && [ -f "$CLUSTER_PROFILE_SCRIPT" ]; then
+            "$INSTALL_DIR/.venv/bin/python3" "$CLUSTER_PROFILE_SCRIPT" stamp-soul --profile-dir "$d" \
+                || echo "WARN: failed to stamp cluster identity into $d/SOUL.md" >&2
+        fi
         sync_profile_skills "$CLUSTER_TEMPLATE" "$d"
         # Targeted self-heal: drop `memory.provider` from cluster configs already
         # on the PVC. The template no longer sets it (per-user memory scopes by

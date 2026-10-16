@@ -908,7 +908,14 @@ def scope_flags(scope: fleet_scope_targets.ScopeTargets | None) -> list[str]:
     stdin, beside both scripts' sources."""
     if scope is None:
         return []
-    return list(scope.collector_argv())
+    argv = list(scope.collector_argv())
+    # No --scope-exclude-clusters, on purpose: the watch's report covers the
+    # clusters spec.scope.exclude.clusters excludes, one of the reads the CRD
+    # field names as still covering them (#3081, #3026).
+    if fleet_scope_targets.SCOPE_EXCLUDE_CLUSTERS_FLAG in argv:
+        at = argv.index(fleet_scope_targets.SCOPE_EXCLUDE_CLUSTERS_FLAG)
+        del argv[at : at + 2]
+    return argv
 
 
 def report_argv(names: list[str], readiness: bool, scope: fleet_scope_targets.ScopeTargets | None) -> list[str]:

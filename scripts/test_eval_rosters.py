@@ -184,6 +184,7 @@ ADDED_AFTER_THE_MOVE = [
     "not-found-target-stops-as-failure",  # a missing target stops its card on a hard wall, mock 06
     "alert-config-terraform-promql-probe",  # the gke-alert-configuration skill sync
     "security-chat-request-runs-collector",  # a plain security-posture request runs the compliance collector, #2386
+    "compute-class-canary-active-migration-pdb-probe",  # the gke-compute-classes skill sync
     "upgrades-weekly-brief-decisions-named",  # the Saturday brief's on-request route
 ]
 # Taken back out of the nightly file after registering there, each with a

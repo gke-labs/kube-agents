@@ -2386,6 +2386,18 @@ class Loader(unittest.TestCase):
     def envelope_of(completed: subprocess.CompletedProcess) -> dict:
         return json.loads(completed.stdout.rsplit(watch.ENVELOPE_SENTINEL, 1)[1])
 
+    def test_the_report_argv_never_carries_the_cluster_exclusion(self) -> None:
+        # #3081: the watch's report still covers the clusters
+        # spec.scope.exclude.clusters excludes (#3026), as the CRD field documents.
+        excluding = fleet_scope_targets.ScopeTargets(projects=("ops-mgmt", "payments-prod"), unread=(), resolved_at=None, path="render", excluded_clusters=(("payments-prod", "europe-west1", "edge"),))
+        self.assertIn(fleet_scope_targets.SCOPE_EXCLUDE_CLUSTERS_FLAG, excluding.collector_argv())
+        for readiness in (False, True):
+            for scope in (None, excluding):
+                argv = watch.report_argv(["ops-mgmt", "payments-prod"], readiness, scope)
+                self.assertNotIn("--scope-exclude-clusters", argv)
+                self.assertNotIn("payments-prod/europe-west1/edge", " ".join(argv))
+            self.assertIn(fleet_scope_targets.SCOPE_PROJECTS_FLAG, watch.report_argv(["ops-mgmt"], readiness, excluding))
+
     def test_the_shipped_set_is_every_skill_module_but_the_tests(self) -> None:
         shipped = watch.shipped_modules()
         for name in (watch.REPORT_MODULE, watch.READINESS_MODULE, "readiness_rules", "readiness_rules.audit_log", "readiness_rules.zonal_control_plane", "readiness_rules.finding", "upgrade_shape_tables"):

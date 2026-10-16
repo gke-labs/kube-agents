@@ -112,6 +112,12 @@ SOURCES: dict[str, Source] = {
         "agents/platform/skills/fleet-audit/scripts/audit_report.py",
         ("def _ident(", "def _cell(", "def trim_command(", "def trim_excerpt("),
     ),
+    # B2 imports this module and drives `enqueue_action` over the label space,
+    # and greps it for the one allowed auto-merge call.
+    "merge_gate": Source(
+        "scripts/merge_gate.py",
+        ("def enqueue_action(", "enablePullRequestAutoMerge", "HOLD_LABELS"),
+    ),
     "credential_proxy": Source(
         "agents/platform/scripts/credential_proxy.py",
         (

@@ -14,7 +14,10 @@ project the scope resolved to with the outcome the reconcile read it with. An
 audit sweeps the projects read `ok` or `api-disabled` and the management
 project whatever its row read (the collectors read it themselves), names the
 ones the scope declares but the reconcile could not read, so the run accounts
-for them rather than reading as a full sweep, and lists nothing. An install that declares no scope has drawn
+for them rather than reading as a full sweep, and lists nothing. It also
+hands over the clusters `spec.scope.exclude.clusters` names, which every fleet
+read leaves out (#3081): the scope is otherwise per project, so without them an
+excluded cluster in a swept project is read like any other. An install that declares no scope has drawn
 no boundary; the answer is None there, and the audit keeps the listing it had.
 With no snapshot yet, or one that does not parse, the operator's render answers
 instead: a present block is the management project alone, partial, until the
@@ -29,7 +32,8 @@ script on the same pod that hands the readiness report script
 themselves cannot read the file: they run in the shell sandbox, whose
 /opt/data is a separate volume at the same path (deploy/sandbox/entrypoint.sh
 says nothing is copied across), so the agent carries the scope from the tool
-to the collector's `--scope-projects` and `--scope-unread`. The reader is
+to the collector's `--scope-projects`, `--scope-unread` and
+`--scope-exclude-clusters`. The reader is
 deliberately independent of cluster_agent_reconcile.py, which writes the
 snapshot and owns its shape: that module's import has side effects.
 """
@@ -106,10 +110,14 @@ class ScopeRenderUnreadable(Exception):
     report, not an install that declares no scope."""
 
 
-# The collectors' two scope flags, which `collector_args` spells with the
+# The collectors' scope flags, which `collector_args` spells with the
 # constants the collectors parse them by, so the two cannot drift apart.
 SCOPE_PROJECTS_FLAG = fleet_scope_args.SCOPE_PROJECTS_FLAG
 SCOPE_UNREAD_FLAG = fleet_scope_args.SCOPE_UNREAD_FLAG
+SCOPE_EXCLUDE_CLUSTERS_FLAG = fleet_scope_args.SCOPE_EXCLUDE_CLUSTERS_FLAG
+# The keys of one spec.scope.exclude.clusters entry, as the operator renders it
+# (ScopeClusterRef) and the reconcile copies it into `declared`.
+CLUSTER_REF_KEYS = ("projectId", "location", "clusterName")
 STATE_IN_SCOPE = "in-scope"
 # The row's state for a project the declaration no longer names, whose profiles
 # the reconcile keeps until its next clean run prunes them.
@@ -200,6 +208,10 @@ class ScopeTargets:
     # declaration never named, as the upgrade-readiness watch does for a roster
     # project the report refused.
     retiring: tuple[str, ...] = ()
+    # The (project, location, cluster) triples spec.scope.exclude.clusters
+    # names: left out of fleet answers and the per-cluster audits, not
+    # a coverage gap.
+    excluded_clusters: tuple[tuple[str, str, str], ...] = ()
 
     def excludes(self, project: str) -> bool:
         """Whether an exclude entry matches the project's id: the match the
@@ -215,8 +227,9 @@ class ScopeTargets:
         list (each flag and its value one token each) for a caller that builds
         the collector's argv itself, as the upgrade-readiness watch does:
         `--scope-projects` with the sweep, and `--scope-unread` naming each
-        declared project the install could not read, as `project=outcome`.
-        With nothing readable the unread flag goes alone, so a collector handed
+        declared project the install could not read, as `project=outcome`,
+        and `--scope-exclude-clusters` with the clusters the declaration
+        excludes, when it names any. With nothing readable the unread flag goes alone, so a collector handed
         it still knows a scope was declared and reports that rather than
         listing. Never empty: a declared scope with no row at all hands the
         collector the fixed unresolved row, so it reports "nothing readable"
@@ -227,12 +240,31 @@ class ScopeTargets:
         unread = self.unread or ((UNRESOLVED_SCOPE_ROW, OUTCOME_UNRESOLVED),) if not self.projects else self.unread
         if unread:
             argv += [SCOPE_UNREAD_FLAG, ",".join(f"{project}={outcome}" for project, outcome in unread)]
+        if self.excluded_clusters:
+            argv += [SCOPE_EXCLUDE_CLUSTERS_FLAG, ",".join(fleet_scope_args.format_cluster_ref(*ref) for ref in self.excluded_clusters)]
         return tuple(argv)
 
     def collector_args(self) -> str:
         """`collector_argv` as the one line the `fleet_scope` tool hands the
         agent to paste after a collector command."""
         return " ".join(self.collector_argv())
+
+
+def _excluded_clusters(block: object) -> tuple[tuple[str, str, str], ...]:
+    """The exclude.clusters entries of a render or a snapshot's `declared`, as
+    sorted triples. An entry missing a part, or with a part the CRD would not
+    admit, is skipped: it could not have come through admission, and spelled
+    into collector_args it would make every collector refuse its arguments."""
+    exclude = block.get("exclude") if isinstance(block, dict) else None
+    entries = exclude.get("clusters") if isinstance(exclude, dict) else None
+    triples = set()
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        parts = tuple(entry.get(key) for key in CLUSTER_REF_KEYS)
+        if all(isinstance(part, str) and fleet_scope_args.SCOPE_CLUSTER_PART.match(part) for part in parts):
+            triples.add(parts)
+    return tuple(sorted(triples))
 
 
 def snapshot_path(agent_home: str | os.PathLike | None = None) -> Path:
@@ -301,6 +333,7 @@ def _from_render(path: Path) -> ScopeTargets | None:
         note=note,
         excluded=tuple(exclude_patterns),
         declared_containers=_declared_containers(render),
+        excluded_clusters=_excluded_clusters(render),
     )
 
 
@@ -389,4 +422,5 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
         excluded=(*exclude_patterns, *(p for p in sorted(dropped) if p not in exclude_patterns)),
         declared_containers=_declared_containers(declared),
         retiring=tuple(retiring),
+        excluded_clusters=_excluded_clusters(declared),
     )

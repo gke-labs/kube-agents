@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
 // The rules a delegation is refused or ignored under, as the audit line
@@ -416,7 +417,7 @@ func capAsk(text string) string {
 // and then ended otherwise wakes with those answers, then its reason under
 // wakeEndMarker. With none the body is the result or the reason alone, as
 // before.
-func wakeText(state lib.TaskState, childID, ask string, turns []string, result, reason string, fullAnswer bool) string {
+func wakeText(state lib.TaskState, childID, ask string, turns []string, result, reason string, fullAnswer, cardsPending bool) string {
 	outcome, completed, body := "completed", true, result
 	switch state {
 	case lib.StateFailed, lib.StateCanceled: // a canceled the gateway did not publish
@@ -436,16 +437,31 @@ func wakeText(state lib.TaskState, childID, ask string, turns []string, result, 
 	} else {
 		text = fmt.Sprintf("The task you delegated to %s (task %s) %s.", targetPlatform, childID, outcome)
 	}
+	extraReserve := 0
+	if cardsPending {
+		text += "\n" + wakeCardsPendingNote
+		extraReserve = len("\n") + len(wakeCardsPendingNote)
+	}
 	if earlier != "" {
 		// wakeAnswers trimmed each answer; last opens with its separator.
-		text += "\n" + fenceWakeBody(earlier, body)
+		text += "\n" + fenceWakeBody(earlier, body, extraReserve)
 	} else if body = strings.TrimSpace(body); body != "" {
-		text += "\n" + fenceWakeBody("", body)
+		text += "\n" + fenceWakeBody("", body, extraReserve)
 	}
 	if fullAnswer {
 		return text + "\n" + wakeReplyGuideFull
 	}
 	return text + "\n" + wakeReplyGuide
+}
+
+// wakeCardsPendingNote is added to a completed wake when the delegated child
+// handed work to kanban cards whose report posts to the conversation.
+const wakeCardsPendingNote = "The delegated turn handed work to a Cluster Agent card. That card's report posts into this conversation on its own; if it is not above yet, it is still to come."
+
+// cardsPending reports whether a completed task's terminal mark signals that
+// asynchronous kanban cards are still running.
+func cardsPending(state lib.TaskState, terminal chatmsg.Reading) bool {
+	return state == lib.StateCompleted && terminal.Mark != nil && terminal.Mark.Ask != "" && terminal.Mark.Settle == ""
 }
 
 // wakeReplyGuide and wakeReplyGuideFull close every wake's text, chosen by
@@ -528,8 +544,8 @@ func wakeAnswers(turns []string, outcome string, completed bool, body string) (e
 // body is earlier then last. Over the cap, earlier is cut first, so the
 // newest answer arrives whole when it fits the cap alone; when it does not,
 // the joined body is cut from its end as a lone result is. Either cut is
-// marked.
-func fenceWakeBody(earlier, last string) string {
+// marked. When cards are pending, extraReserve reserves room for the note.
+func fenceWakeBody(earlier, last string, extraReserve int) string {
 	earlier = breakBacktickRuns(earlier, wakeFenceMax-1)
 	last = breakBacktickRuns(last, wakeFenceMax-1)
 	body := earlier + last
@@ -537,7 +553,7 @@ func fenceWakeBody(earlier, last string) string {
 	// label \n fence \n body \n fence, then \n and the closing guide
 	// (wakeReplyGuide or wakeReplyGuideFull), which wakeText appends after
 	// this block.
-	budget := lib.DelegateTextCap - len(wakeResultLabel) - 2*len(fence) - 3 - 1 - wakeReplyGuideMax
+	budget := lib.DelegateTextCap - len(wakeResultLabel) - 2*len(fence) - 3 - 1 - wakeReplyGuideMax - extraReserve
 	if len(body) > budget {
 		if keep := budget - len(last) - len("…") - len(wakeTruncatedNote); earlier != "" && keep >= 0 {
 			body = truncateRunes(earlier, keep) + wakeTruncatedNote + last
@@ -696,7 +712,7 @@ func (g *Gateway) flushNotices(conversation string, rs *relayState) {
 // It reports whether the wake reached the bus, and when it did not, why, in
 // a phrase for the chain root's terminal reason (observeChildEnd). A stop
 // the requester asked for reports false and no reason.
-func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child TaskRef, state lib.TaskState, turns []string, result, reason string, resultPosted bool) (bool, string) {
+func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child TaskRef, state lib.TaskState, turns []string, result, reason string, resultPosted, cardsPending bool) (bool, string) {
 	log := g.log.With("child", child.ID, "conversation", rec.Key, "state", string(state))
 	// The gateway published a cancel for the child: the human said stop,
 	// and whatever the executor answered with, waking the session would act
@@ -730,7 +746,7 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 
 	// The delegating turn's request, carried down a longer chain: the
 	// human's question, not an intermediate wake's gateway-authored text.
-	text := wakeText(state, child.ID, parent.Request, turns, result, reason, wakeNeedsFullAnswer(&parent, resultPosted))
+	text := wakeText(state, child.ID, parent.Request, turns, result, reason, wakeNeedsFullAnswer(&parent, resultPosted), cardsPending)
 
 	if rec.Profile == "" {
 		rec.Profile = sessionProfile

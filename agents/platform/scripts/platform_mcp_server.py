@@ -438,8 +438,9 @@ def fleet_scope() -> str:
     Reads the reconcile's snapshot (fleet_scope.json at the data volume's
     root). Returns JSON:
       {"declared": true, "resolved_at": "...", "projects": [...],
-       "unread": [{"project": ..., "outcome": ...}], "collector_args": "...",
-       "source": "<the snapshot's path>"}
+       "unread": [{"project": ..., "outcome": ...}],
+       "excluded_clusters": [{"project": ..., "location": ..., "cluster": ...}],
+       "collector_args": "...", "source": "<the snapshot's path>"}
     `projects` is the sweep: every project the scope resolved to that this
     install could read (its Kubernetes Engine API off included; the collectors
     count such a project empty), plus the management project whatever the
@@ -449,8 +450,12 @@ def fleet_scope() -> str:
     One entry, `declared-scope=unresolved`, is not a project: it rides when
     the reconcile has not resolved the declaration (before its first tick, or
     on a tick that could not read the render while a folder, organisation or
-    selector is declared), and the collectors render it as its own sentence. `collector_args` is the string to append to
-    a collector command verbatim (`--scope-projects ... --scope-unread ...`);
+    selector is declared), and the collectors render it as its own sentence.
+    `excluded_clusters` names each cluster spec.scope.exclude.clusters leaves
+    out: leave it out of fleet answers and audits, so do not list, describe, audit or report
+    on it, even though its project is in `projects`. `collector_args` is the string to append to
+    a collector command verbatim (`--scope-projects ... --scope-unread ...
+    --scope-exclude-clusters ...`);
     when nothing is readable it carries `--scope-unread` alone, and the
     collector then reports that and sweeps nothing. When no snapshot answers
     that a boundary is in force (before the reconcile's first tick, or when
@@ -473,13 +478,15 @@ def fleet_scope() -> str:
     except Exception as e:  # noqa: BLE001 - a tool answers, it does not raise
         return f"ERROR: Could not read the scope snapshot: {e}"
     if targets is None:
-        return json.dumps({"declared": False, "projects": [], "unread": [], "collector_args": "",
+        return json.dumps({"declared": False, "projects": [], "unread": [], "excluded_clusters": [], "collector_args": "",
                            "note": "no declared scope: the collectors enumerate every project the identity can list"}, indent=2)
     return json.dumps({
         "declared": True,
         "resolved_at": targets.resolved_at,
         "projects": list(targets.projects),
         "unread": [{"project": project, "outcome": outcome} for project, outcome in targets.unread],
+        "excluded_clusters": [{"project": project, "location": location, "cluster": cluster}
+                              for project, location, cluster in targets.excluded_clusters],
         "collector_args": targets.collector_args(),
         **({"note": targets.note} if targets.note else {}),
         "source": targets.path,

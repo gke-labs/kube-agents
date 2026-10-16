@@ -38,7 +38,7 @@ RECEIPT = (
 # own table is deliberately absent: the module creates it on first write, and
 # a board that predates the patch must read as "no children" (fail-open).
 BOARD_SCHEMA = """
-CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT, current_run_id INTEGER);
+CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT, current_run_id INTEGER, assignee TEXT);
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id TEXT NOT NULL,
     child_id  TEXT NOT NULL,
