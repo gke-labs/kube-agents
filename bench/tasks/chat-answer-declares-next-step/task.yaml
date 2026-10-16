@@ -1,7 +1,7 @@
 # Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
 # presubmit seat is a later pull request that cites this case's nightly record.
 #
-# Domain: chat and routing. Mocks 03 and 07: a card's answer that has one
+# Domain: chat and routing. Mock 07: a card's answer that has one
 # obvious next step ends by declaring it on a last line of its own,
 # `[next: <label>]`, which Slack draws as one button that sends the label as
 # the user's reply (slack_moments.next_step; the bridge's nextStep;
