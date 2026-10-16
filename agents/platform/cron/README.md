@@ -268,9 +268,9 @@ chat line says "none graded" and the version is tried again tomorrow), and the
 weekly comparison carries ten minutes of slack so the tick's own drift cannot
 push a refresh to day eight. A partial table, an ungraded version or a failed
 tick is announced once, not daily: the ledger keeps what was announced (the
-kinds of read error for a partial table; each project and how it went
-ungraded for a version, never the error text, which an outage rewords from
-one run to the next), a
+kinds of read error for a partial table, and for a refusal the project and
+its cause; each project and how it went ungraded for a version, never the
+error text, which an outage rewords from one run to the next), a
 failed tick (which writes nothing to the ledger but its record of the projects
 the hops refused as outside the declared scope, kept at whichever step the tick
 failed, so the next tick files them under the same cause) keeps its line in
