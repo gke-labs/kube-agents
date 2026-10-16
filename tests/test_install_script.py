@@ -7810,8 +7810,8 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             self.assertNotIn("slack_app_token_secret_key", tfvars)
 
     def test_slack_secret_refs_on_cr_rejects_delimiter_injection(self):
-        """A '|' or newline inside a Slack Secret ref field on the CR fails validation and emits nothing."""
-        for bad_key in ["a|b", "SLACK_BOT_TOKEN\n", "my-key\r", "bad key"]:
+        """A '|', newline, '.', '..', or invalid character in a Slack Secret ref field fails validation and emits nothing."""
+        for bad_key in ["a|b", "SLACK_BOT_TOKEN\n", "my-key\r", "bad key", ".", "..", "..ca"]:
             script = (
                 f'cr_json=\'{{"items": [{{"spec": {{"integration": {{"slack": {{\n'
                 f'  "botTokenSecretRef": {{"name": "my-secret", "key": {json.dumps(bad_key)}}},\n'
@@ -7828,11 +7828,17 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             self.assertEqual(proc.stdout, "", f"Expected empty output for bad_key={bad_key!r}, got: {proc.stdout!r}")
 
     def test_slack_secret_ref_validation_and_sentinel_handling(self):
-        """slack_secret_ref_is_external and write_tfvars_from_state reject mis-cased sentinels and invalid names (#3275)."""
+        """slack_secret_ref_is_external and write_tfvars_from_state reject mis-cased sentinels, invalid names, and invalid keys (#3275)."""
         script = (
             'validate_k8s_secret_name "Default" && echo "Default valid" || echo "Default invalid"\n'
             'validate_k8s_secret_name "Platform-Agent-Secrets" && echo "PAS valid" || echo "PAS invalid"\n'
             'validate_k8s_secret_name "valid-secret-name" && echo "valid-secret-name valid" || echo "valid-secret-name invalid"\n'
+            'validate_k8s_secret_key "." && echo ". valid" || echo ". invalid"\n'
+            'validate_k8s_secret_key ".." && echo ".. valid" || echo ".. invalid"\n'
+            'validate_k8s_secret_key "..ca" && echo "..ca valid" || echo "..ca invalid"\n'
+            'validate_k8s_secret_key "bad key" && echo "bad key valid" || echo "bad key invalid"\n'
+            'validate_k8s_secret_key "a|b" && echo "a|b valid" || echo "a|b invalid"\n'
+            'validate_k8s_secret_key "valid.key-name_123" && echo "valid.key valid" || echo "valid.key invalid"\n'
             'slack_secret_ref_is_external "Default" && echo "ext Default" || echo "not ext Default"\n'
             'slack_secret_ref_is_external "default" && echo "ext default" || echo "not ext default"\n'
             'slack_secret_ref_is_external "platform-agent-secrets" && echo "ext pas" || echo "not ext pas"\n'
@@ -7847,6 +7853,12 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         self.assertIn("Default invalid", proc.stdout)
         self.assertIn("PAS invalid", proc.stdout)
         self.assertIn("valid-secret-name valid", proc.stdout)
+        self.assertIn(". invalid", proc.stdout)
+        self.assertIn(".. invalid", proc.stdout)
+        self.assertIn("..ca invalid", proc.stdout)
+        self.assertIn("bad key invalid", proc.stdout)
+        self.assertIn("a|b invalid", proc.stdout)
+        self.assertIn("valid.key valid", proc.stdout)
         self.assertIn("not ext Default", proc.stdout)
         self.assertIn("not ext default", proc.stdout)
         self.assertIn("not ext pas", proc.stdout)
@@ -7863,6 +7875,61 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             )
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("SLACK_BOT_TOKEN_SECRET is set to 'Default'", proc.stderr)
+
+    def test_write_tfvars_from_state_refuses_invalid_slack_secret_key(self):
+        """write_tfvars_from_state rejects keys matching '.', starting with '..', or with whitespace in SLACK_BOT_TOKEN_KEY (#3275)."""
+        for bad_key in ["bad key", "..", ".", "..token"]:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = self._file(
+                    tmp,
+                    self._COORDINATES
+                    + f'API_SERVER_KEY=test-key\nSLACK_ENABLED=true\nSLACK_BOT_TOKEN_SECRET=my-slack-secret\nSLACK_BOT_TOKEN_KEY="{bad_key}"\n',
+                )
+                dest = path.parent / "terraform.tfvars"
+                proc = _installer_common_tests.InstallerCommonTest._run(
+                    self,
+                    f'load_install_env "{path}"; write_tfvars_from_state "{dest}"',
+                    env={"API_SERVER_KEY": "test-key"},
+                )
+                self.assertNotEqual(proc.returncode, 0, f"Expected non-zero exit for key={bad_key!r}")
+                self.assertIn(f"SLACK_BOT_TOKEN_KEY is set to '{bad_key}'", proc.stderr)
+                self.assertIn("is not a valid Kubernetes Secret data key", proc.stderr)
+
+    def test_write_tfvars_from_state_permits_stale_slack_refs_when_slack_disabled(self):
+        """write_tfvars_from_state does not reject invalid or stale Slack Secret refs when SLACK_ENABLED is false (#3275)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(
+                tmp,
+                self._COORDINATES
+                + 'API_SERVER_KEY=test-key\nSLACK_ENABLED=false\nSLACK_BOT_TOKEN_SECRET=Default\nSLACK_BOT_TOKEN_KEY="bad key"\n',
+            )
+            dest = path.parent / "terraform.tfvars"
+            proc = _installer_common_tests.InstallerCommonTest._run(
+                self,
+                f'load_install_env "{path}"; write_tfvars_from_state "{dest}"',
+                env={"API_SERVER_KEY": "test-key"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_write_tfvars_from_state_blanks_token_when_secret_name_is_external(self):
+        """When an external Secret ref is set, inline tokens are blanked in tfvars and TF_VAR exports to prevent conflict warnings (#3275)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(
+                tmp,
+                self._COORDINATES
+                + "API_SERVER_KEY=test-key\nSLACK_ENABLED=true\nPERSIST_SECRETS_ON_DISK=true\nSLACK_BOT_TOKEN=xoxb-stale\nSLACK_BOT_TOKEN_SECRET=my-slack-secret\n",
+            )
+            dest = path.parent / "terraform.tfvars"
+            proc = _installer_common_tests.InstallerCommonTest._run(
+                self,
+                f'load_install_env "{path}"; write_tfvars_from_state "{dest}"; echo "EXPORTED_TF_VAR_BOT=[${{TF_VAR_slack_bot_token:-}}]"',
+                env={"API_SERVER_KEY": "test-key"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            tfvars = dest.read_text(encoding="utf-8")
+            self.assertIn('slack_bot_token_secret_name = "my-slack-secret"', tfvars)
+            self.assertIn('slack_bot_token         = ""', tfvars)
+            self.assertIn("EXPORTED_TF_VAR_BOT=[]", proc.stdout)
 
     def test_bootstrap_install_env_file_records_slack_secret_refs(self):
         """A first install records SLACK_BOT_TOKEN_SECRET and SLACK_APP_TOKEN_SECRET into install.env (#3275)."""

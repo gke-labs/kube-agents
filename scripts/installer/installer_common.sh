@@ -671,11 +671,14 @@ validate_k8s_secret_name() {
   [[ "$name" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]
 }
 
-# True when $1 is empty or a valid Kubernetes Secret data key (max 253 chars).
+# True when $1 is empty or a valid Kubernetes Secret data key (max 253 chars,
+# matching ^[-._a-zA-Z0-9]+$, and not "." or starting with "..").
 validate_k8s_secret_key() {
   local key="${1:-}"
   [ -z "$key" ] && return 0
   [ "${#key}" -gt 253 ] && return 1
+  [ "$key" = "." ] && return 1
+  [[ "$key" == ..* ]] && return 1
   [[ "$key" =~ ^[-._a-zA-Z0-9]+$ ]]
 }
 
@@ -699,7 +702,12 @@ def valid_name(s: str) -> bool:
     return not s or (len(s) <= 253 and bool(DNS_1123_SUBDOMAIN_RE.fullmatch(s)))
 
 def valid_key(s: str) -> bool:
-    return not s or (len(s) <= 253 and bool(SECRET_KEY_RE.fullmatch(s)))
+    return not s or (
+        len(s) <= 253
+        and s != "."
+        and not s.startswith("..")
+        and bool(SECRET_KEY_RE.fullmatch(s))
+    )
 
 items = (json.load(sys.stdin) or {}).get("items") or []
 if items:
@@ -3765,6 +3773,12 @@ write_tfvars_from_state() {
     [ "$(kubectl config current-context 2>/dev/null || true)" = "$expected_ctx" ]; then
     for secret_key in API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT; do
       [ -z "${!secret_key:-}" ] || continue
+      if [ "$secret_key" = "SLACK_BOT_TOKEN" ] && slack_secret_ref_is_external "${SLACK_BOT_TOKEN_SECRET:-}"; then
+        continue
+      fi
+      if [ "$secret_key" = "SLACK_APP_TOKEN" ] && slack_secret_ref_is_external "${SLACK_APP_TOKEN_SECRET:-}"; then
+        continue
+      fi
       # Every stage exits 0 on its own (|| true inside the substitution):
       # install.sh runs an inherited ERR trap (set -E), and a failing kubectl
       # here — no cluster yet, stale context — must be a silent no-op, not a
@@ -3816,24 +3830,26 @@ write_tfvars_from_state() {
     fi
   fi
 
-  for var_name in SLACK_BOT_TOKEN_SECRET SLACK_APP_TOKEN_SECRET; do
-    local sec_val="${!var_name:-}"
-    if [ -n "$sec_val" ] && [ "$sec_val" != "default" ] && [ "$sec_val" != "${PLATFORM_AGENT_SECRET}" ]; then
-      if ! validate_k8s_secret_name "$sec_val"; then
-        print_error "${var_name} is set to '${sec_val}', which is not a valid Kubernetes Secret name and not a sentinel ('default' or '${PLATFORM_AGENT_SECRET}'). Secret names must be valid DNS-1123 subdomains (lowercase alphanumeric, '-', '.', max 253 characters)."
-        return 1
+  if is_truthy "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"; then
+    for var_name in SLACK_BOT_TOKEN_SECRET SLACK_APP_TOKEN_SECRET; do
+      local sec_val="${!var_name:-}"
+      if [ -n "$sec_val" ] && [ "$sec_val" != "default" ] && [ "$sec_val" != "${PLATFORM_AGENT_SECRET}" ]; then
+        if ! validate_k8s_secret_name "$sec_val"; then
+          print_error "${var_name} is set to '${sec_val}', which is not a valid Kubernetes Secret name and not a sentinel ('default' or '${PLATFORM_AGENT_SECRET}'). Secret names must be valid DNS-1123 subdomains (lowercase alphanumeric, '-', '.', max 253 characters)."
+          return 1
+        fi
       fi
-    fi
-  done
-  for var_name in SLACK_BOT_TOKEN_KEY SLACK_APP_TOKEN_KEY; do
-    local key_val="${!var_name:-}"
-    if [ -n "$key_val" ]; then
-      if ! validate_k8s_secret_key "$key_val"; then
-        print_error "${var_name} is set to '${key_val}', which is not a valid Kubernetes Secret data key. Secret keys must match '^[-._a-zA-Z0-9]+$' (max 253 characters)."
-        return 1
+    done
+    for var_name in SLACK_BOT_TOKEN_KEY SLACK_APP_TOKEN_KEY; do
+      local key_val="${!var_name:-}"
+      if [ -n "$key_val" ]; then
+        if ! validate_k8s_secret_key "$key_val"; then
+          print_error "${var_name} is set to '${key_val}', which is not a valid Kubernetes Secret data key. Secret keys must match '^[-._a-zA-Z0-9]+$', must not be '.', and must not start with '..' (max 253 characters)."
+          return 1
+        fi
       fi
-    fi
-  done
+    done
+  fi
 
   local slack_bot_sec="${SLACK_BOT_TOKEN_SECRET:-}"
   local slack_bot_key="${SLACK_BOT_TOKEN_KEY:-}"
@@ -3847,6 +3863,15 @@ write_tfvars_from_state() {
   if ! slack_secret_ref_is_external "$slack_app_sec"; then
     slack_app_sec=""
     slack_app_key=""
+  fi
+
+  local slack_bot_tok="${SLACK_BOT_TOKEN:-}"
+  local slack_app_tok="${SLACK_APP_TOKEN:-}"
+  if [ -n "$slack_bot_sec" ]; then
+    slack_bot_tok=""
+  fi
+  if [ -n "$slack_app_sec" ]; then
+    slack_app_tok=""
   fi
 
   # MEMORY is the one key whose absence from install.env costs DATA rather than
@@ -4299,8 +4324,8 @@ write_tfvars_from_state() {
     echo ""
     echo "enable_slack            = $(hcl_bool "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}")"
     if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
-      echo "slack_bot_token         = $(hcl_str "${SLACK_BOT_TOKEN:-}")"
-      echo "slack_app_token         = $(hcl_str "${SLACK_APP_TOKEN:-}")"
+      echo "slack_bot_token         = $(hcl_str "$slack_bot_tok")"
+      echo "slack_app_token         = $(hcl_str "$slack_app_tok")"
     fi
     if [ -n "$slack_bot_sec" ]; then
       echo "slack_bot_token_secret_name = $(hcl_str "$slack_bot_sec")"
@@ -4408,8 +4433,8 @@ write_tfvars_from_state() {
   export TF_VAR_gemini_api_key="${GEMINI_API_KEY:-}"
   export TF_VAR_openai_api_key="${OPENAI_API_KEY:-}"
   export TF_VAR_anthropic_api_key="${ANTHROPIC_API_KEY:-}"
-  export TF_VAR_slack_bot_token="${SLACK_BOT_TOKEN:-}"
-  export TF_VAR_slack_app_token="${SLACK_APP_TOKEN:-}"
+  export TF_VAR_slack_bot_token="$slack_bot_tok"
+  export TF_VAR_slack_app_token="$slack_app_tok"
   export TF_VAR_slack_bot_token_secret_name="$slack_bot_sec"
   export TF_VAR_slack_bot_token_secret_key="$slack_bot_key"
   export TF_VAR_slack_app_token_secret_name="$slack_app_sec"

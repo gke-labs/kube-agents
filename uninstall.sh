@@ -930,6 +930,10 @@ main() {
   # named here, because an older installer_common.sh has no
   # ALERT_DAILY_LIMIT_KEYS list.
   export ALERT_DAILY_LIMIT_CRITICAL="" ALERT_DAILY_LIMIT_WARNING="" ALERT_DAILY_LIMIT_INFO="" ALERT_DAILY_LIMIT_DRIFT=""
+  # The Slack Secret refs, likewise: the generator refuses a name that is not
+  # DNS-1123 or a key that is not a Secret data key, and the CR that reads
+  # them goes with the release.
+  export SLACK_BOT_TOKEN_SECRET="" SLACK_BOT_TOKEN_KEY="" SLACK_APP_TOKEN_SECRET="" SLACK_APP_TOKEN_KEY=""
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"
