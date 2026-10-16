@@ -201,10 +201,14 @@ func askIsQuestion(text string) bool {
 // text: no headline (one opening on a code fence) or a rest past the fold's
 // cap. An answer that declares its next step (nextStep) is laid out without
 // that line and offers the step as its one choice, unless it offers options,
-// which win; a step the gateway would act on as a command is dropped with
-// its line.
+// which win; a step the gateway would act on as a command is no choice, and
+// its line stays in the text as written.
 func answerChat(answer string) (chatmsg.Message, bool) {
+	written := answer
 	answer, step := nextStep(answer)
+	if step != "" && chattext.IsCommand(step) {
+		answer, step = written, ""
+	}
 	headline, body := splitAnswer(answer)
 	if headline == "" {
 		return chatmsg.Message{}, false
@@ -216,7 +220,7 @@ func answerChat(answer string) (chatmsg.Message, bool) {
 			return offered, true
 		}
 	}
-	if step != "" && !chattext.IsCommand(step) {
+	if step != "" {
 		msg.Choices = []chatmsg.Choice{{Text: step, Next: true}}
 	}
 	switch n := runeLen(rest); {

@@ -144,9 +144,9 @@ class NextStepTest(unittest.TestCase):
         chat = cm.answer_message("Two ways.\n\n1. **Raise it**\n2. **Roll back**\n\nWhich do you want?\n\n[next: raise it]")
         self.assertEqual(chat["choices"], [{"text": "Raise it"}, {"text": "Roll back"}])
 
-    def test_a_command_word_step_is_dropped_with_its_line(self):
+    def test_a_command_word_step_is_no_button_and_keeps_its_line(self):
         self.assertEqual(cm.answer_message("Running.\n\n[next: stop]"),
-                         {"schema": cm.SCHEMA, "headline": "Running."})
+                         {"schema": cm.SCHEMA, "headline": "Running.", "detail": "[next: stop]"})
 
     def test_a_failure_reply_offers_its_step_in_place_of_try_again(self):
         self.assertEqual(cm.failure_message("I couldn't. Check it there?", True, "check seeded-a")["choices"],

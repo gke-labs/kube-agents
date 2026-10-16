@@ -1142,14 +1142,16 @@
       "in": "The upgrade is running.\n\n[next: stop]",
       "chat": {
         "schema": "kube-agents.chat/v1",
-        "headline": "The upgrade is running."
+        "headline": "The upgrade is running.",
+        "detail": "[next: stop]"
       }
     },
     {
       "in": "The upgrade is running.\n\n[next: what's happening?]",
       "chat": {
         "schema": "kube-agents.chat/v1",
-        "headline": "The upgrade is running."
+        "headline": "The upgrade is running.",
+        "detail": "[next: what's happening?]"
       }
     },
     {

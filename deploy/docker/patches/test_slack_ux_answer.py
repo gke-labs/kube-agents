@@ -502,6 +502,26 @@ class SendTest(unittest.TestCase):
         self.assertEqual(whole, _render_blocks("Checkout is healthy.", adapter.format_message)[0])
         self.assertEqual(actions["elements"][0]["value"], "check checkout on seeded-b")
 
+    def test_a_refused_step_keeps_the_question_unfolded_and_its_line_after_it(self):
+        question = "Want me to scale the pool to 6 nodes?"
+        refused = "[next: " + "scale " * 13 + "the pool]"
+        adapter = _Adapter()
+        self.send(adapter, f"{ANSWER}\n\n{question}\n\n{refused}")
+        _headline, fold, asked, line = adapter.log[0][1]["blocks"]
+        self.assertEqual(fold["child_blocks"], _render_blocks(REST, adapter.format_message))
+        self.assertEqual(asked, _render_blocks(question, adapter.format_message)[0])
+        self.assertEqual(line, _render_blocks(refused, adapter.format_message)[0])
+
+    def test_an_answer_drawn_whole_keeps_a_divider(self):
+        # A top-level post may hold any block the plugin renders; only a fold limits the types.
+        answer = "## Summary\n\nAll good in seeded-b.\n\n---\n\nOne pod restarted.\n\n[next: check seeded-a]"
+        adapter = _Adapter()
+        with self.assertLogs(runtime.logger):
+            self.send(adapter, answer)
+        blocks = adapter.log[0][1]["blocks"]
+        self.assertIn({"type": "divider"}, blocks)
+        self.assertEqual(blocks[-1]["elements"][0]["value"], "check seeded-a")
+
     def test_an_answer_drawn_whole_at_the_block_cap_keeps_the_upstream_post(self):
         answer = "\n\n".join(f"- item {i}" for i in range(runtime.MESSAGE_BLOCKS_MAX)) + "\n\n[next: check it]"
         adapter = _Adapter()

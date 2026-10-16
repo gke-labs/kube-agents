@@ -43,9 +43,10 @@ An answer that declares its next step on a last line of its own (``slack_moments
 ``[next: check seeded-a]``) gets that step as one such button in a thread, the line left
 out of the blocks, after the question when there is one; an answer ``split`` refuses is
 then drawn whole, as upstream's renderer draws it, with the button under it. Options the
-answer offers win over a declared step. Outside a thread the line follows the question as
-written, and an answer that keeps the upstream post for any other reason (an actionable
-report, or one that cannot be drawn whole within Slack's 50 blocks) keeps it in place. The folded post
+answer offers win over a declared step. Outside a thread, and for a step-shaped line the
+parser refuses, the line follows the question as written, and an answer that keeps the
+upstream post for any other reason (an actionable report, or one that cannot be drawn whole
+within Slack's 50 blocks) keeps it in place. The folded post
 carries what upstream's adds: link-preview settings, ``reply_broadcast``, the
 feedback buttons, the status clear and the reply tracking for the thread. An incident report
 that edits its alert never reaches this send, and a report a reply can act on
@@ -264,6 +265,14 @@ def render_fold(rest: str, mrkdwn_fn: Any = None) -> list[dict] | None:
     return blocks
 
 
+def render_whole(markdown: str, mrkdwn_fn: Any = None) -> list[dict] | None:
+    """``markdown`` as the blocks the adapter's own send would post at the top level, or None for
+    none; unlike :func:`render_fold`, any block type the plugin renders (a divider) is kept."""
+    block_kit = _load_block_kit()
+    blocks = block_kit.sanitize_blocks(block_kit.render_blocks(markdown, mrkdwn_fn=mrkdwn_fn))
+    return blocks or _refuse("the Slack plugin rendered no blocks")
+
+
 def choice_blocks(options: list[tuple[str, bool]]) -> list[dict]:
     """``slack_moments.answer_choices``'s options as choice buttons, the primary one drawn as Slack's
     primary; each button's value is its label, so a click answers with what the button says."""
@@ -347,15 +356,18 @@ class _AnswerFolder:
         # still posts unfolded. In a thread it is a button; outside one a click has no thread to
         # answer in, so its line follows the question as written.
         shown_answer, step = _moments.next_step(content)
-        step_line = content.rstrip()[len(shown_answer):].strip() if step else ""
+        if not step:
+            # A step-shaped line the parser refuses is set aside all the same, and shown as written.
+            shown_answer, _line = _moments.step_line(content)
+        step_line = content.rstrip()[len(shown_answer):].strip()
         step_blocks = choice_blocks([(step, False)]) if step and in_thread else []
-        tail = "" if in_thread else step_line
+        tail = "" if step_blocks else step_line
         parts = split(shown_answer)
         if parts is None:
             if not step_blocks:
                 return None
             # The answer as upstream draws it, without the step's line, and the step's button.
-            whole_blocks = render_fold(shown_answer, mrkdwn_fn)
+            whole_blocks = render_whole(shown_answer, mrkdwn_fn)
             if whole_blocks is None or len(whole_blocks) >= MESSAGE_BLOCKS_MAX:
                 return None
             layout = [*whole_blocks, *step_blocks]

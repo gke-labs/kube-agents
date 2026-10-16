@@ -396,9 +396,13 @@ def answer_message(markdown: str) -> dict | None:
     An answer that declares its next step (``slack_moments.next_step``) is laid
     out without that line, and the step is its one choice, unless the answer
     offers options, which win. A step the gateway would read as a command is
-    dropped with its line.
+    no choice, and its line stays in the text as written.
     """
+    written = markdown
     markdown, step = _moments.next_step(markdown)
+    if step and _choice(step, next_step=True) is None:
+        # A step the gateway would act on as a command is no button, and its line stays as written.
+        markdown, step = written, ""
     headline, body = _presenter.split_answer(markdown)
     if not headline:
         return None

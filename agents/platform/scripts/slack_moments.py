@@ -848,6 +848,16 @@ def answer_choices(rest: str, buttons: bool = True) -> tuple[str, str, str, list
     ]
 
 
+def step_line(text: str) -> tuple[str, str]:
+    """``(text above, line)`` when the last line is shaped as a declared step, whether or not
+    :func:`next_step` accepts its label; ``(text, "")`` otherwise. A layout that reads the closing
+    question from the last line sets the line aside first, so a refused step cannot hide it."""
+    lines = (text or "").rstrip().split("\n")
+    if not NEXT_STEP_LINE.fullmatch(lines[-1].rstrip(CARRIAGE_RETURN)):
+        return text, ""
+    return "\n".join(lines[:-1]).rstrip(), lines[-1].strip()
+
+
 def next_step(text: str) -> tuple[str, str]:
     """``(text, label)``: the one next step an answer declares, split off, or ``(text, "")``.
 

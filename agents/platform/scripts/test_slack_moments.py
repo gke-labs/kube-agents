@@ -759,6 +759,12 @@ class NextStepTest(unittest.TestCase):
         # A glob's lone star is the user's words, not markup.
         self.assertEqual(m.next_step("Up.\n[next: scale app=web-* to 3]"), ("Up.", "scale app=web-* to 3"))
 
+    def test_a_refused_step_is_still_set_aside_by_its_shape(self):
+        long = "Up.\n\n[next: " + "x" * (p.BUTTON_TEXT_MAX + 1) + "]"
+        self.assertEqual(m.next_step(long), (long, ""))
+        self.assertEqual(m.step_line(long), ("Up.", long.split("\n")[-1]))
+        self.assertEqual(m.step_line("Up. Want me to?"), ("Up. Want me to?", ""))
+
     def test_a_crlf_answer_reads_as_an_lf_one(self):
         self.assertEqual(m.next_step("Up.\r\n\r\n[next: check seeded-a]\r\n"), ("Up.", "check seeded-a"))
         two = "Up.\r\n[next: check seeded-b]\r\n[next: check seeded-a]\r\n"
