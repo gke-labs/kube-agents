@@ -333,8 +333,16 @@ REMEDY_OUTSIDE_UNRESOLVED = (
     "named here again with its remedy; a lookup that keeps failing needs the install's read access on that folder, "
     "organisation or selector"
 )
-REMEDY_ID = INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run)"
+REMEDY_ID = INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run), or grant the agent's identity resourcemanager.projects.get on it so the reconcile resolves the number"
 REMEDY_SANDBOX_RESTART = "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again"
+# The unresolved note for a declaration the reconcile did resolve in part: a
+# container or selector lookup did not finish on its last run, so the set it
+# wrote is short, as against ``fleet_scope_args.UNRESOLVED_SCOPE_NOTE``, which
+# says no resolved set was written at all and is quoted only then.
+PARTLY_UNRESOLVED_SCOPE_NOTE = (
+    "the install's declared scope is resolved in part (a container or selector lookup did not finish on the reconcile's last run, "
+    "so its resolved set is short)"
+)
 # The reconcile's listing of the project did not finish on its last run (a
 # timeout, a network or quota error, a gcloud failure it did not classify, or
 # a carried tick): not an access failure, so no grant is asked for. Posted
@@ -470,8 +478,8 @@ TABLE_ERRORS_KEY = "table_errors"
 # since a container just gained carries no members when its lookup fails.
 # Saved even when the tick fails (``keep_standing``), at whichever step after
 # a hop filed it, since a failed tick writes nothing else of the ledger: the
-# failure line is keyed on the refusal's text, and the hold is what keeps that
-# text the same.
+# failure line is keyed on the refused projects and their causes
+# (``refused_tick_signature``), and the hold is what keeps that key the same.
 STANDING_OUTSIDE_KEY = "standing_outside"
 # The report script keys members and read errors by the project id it resolved,
 # so a project the roster spells as a number must be keyed the same way in the
@@ -964,7 +972,9 @@ def unresolved_note(scope: fleet_scope_targets.ScopeTargets | None) -> str | Non
     if scope.note:
         return scope.note
     if any(project == fleet_scope_args.UNRESOLVED_SCOPE_ROW for project, _ in scope.unread):
-        return fleet_scope_args.UNRESOLVED_SCOPE_NOTE
+        # The collectors' note says no resolved set was written; true only while the
+        # declaration resolved nothing, else the set is there and short.
+        return PARTLY_UNRESOLVED_SCOPE_NOTE if scope.projects else fleet_scope_args.UNRESOLVED_SCOPE_NOTE
     return None
 
 
@@ -1763,7 +1773,8 @@ def keep_standing(path: Path, standing: dict[str, list[str]], loaded: dict[str, 
     that failed, at whichever step: a table that read nothing, a hop whose
     sandbox call raised, a report that could not be written. Such a tick
     writes nothing else to the ledger (``main`` announces its failure through
-    the marker, keyed on the failure's text, or prints the write failure), but
+    the marker, keyed on the failure's text or, for a refused tick, on its
+    refusals, or prints the write failure), but
     the refusals and reads its hops filed are the scope's verdicts on those
     projects, and the hold the next tick reads lives in the record: a roster
     of nothing but outside projects would otherwise see its failure line

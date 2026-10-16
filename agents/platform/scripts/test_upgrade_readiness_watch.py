@@ -129,13 +129,19 @@ class FakeSandbox:
         if any(p in (self.timeout_projects if wanted else self.table_timeout_projects) for p in asked):
             raise subprocess.TimeoutExpired(argv, timeout)
         if any(p in self.refused_projects for p in asked):
-            # The script's usage exit, no report, the reason on stderr, as the real one answers an override outside the handed scope.
+            # The script's usage exit, no report, the reason on stderr, decided as the real
+            # reporter decides it from the handed argv (`DeclaredScope.override_error`): a
+            # project in `--scope-projects` is read, one in `--scope-unread` is refused as
+            # unread, any other as outside. A test that names a project the argv lists as
+            # refused stages a tick the reporter cannot produce, and fails here.
             flags = {report_argv[i]: report_argv[i + 1] for i, flag in enumerate(report_argv) if flag in (fleet_scope_targets.SCOPE_PROJECTS_FLAG, fleet_scope_targets.SCOPE_UNREAD_FLAG)}
+            listed = [p for p in flags.get(fleet_scope_targets.SCOPE_PROJECTS_FLAG, "").split(",") if p]
             unread = dict(fleet_scope_args.parse_scope_unread(flags.get(fleet_scope_targets.SCOPE_UNREAD_FLAG)))
+            assert asked[0] not in listed, f"FakeSandbox: {asked[0]} is in refused_projects but the handed argv lists it in {fleet_scope_targets.SCOPE_PROJECTS_FLAG}; the reporter would read it"
             if asked[0] in unread:
                 reason = fleet_scope_args.DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR.format(project=asked[0], outcome=unread[asked[0]])
             else:
-                reason = fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project=asked[0], projects=flags.get(fleet_scope_targets.SCOPE_PROJECTS_FLAG, "").replace(",", ", ") or "none readable")
+                reason = fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project=asked[0], projects=", ".join(listed) or "none readable")
             body = {"exit": 2, "tables": "", "report": None}
             return subprocess.CompletedProcess(argv, 0, stdout=f"{watch.ENVELOPE_SENTINEL}\n{json.dumps(body)}\n", stderr=f"(declared scope: fleet_scope): {reason}\n")
         body = self.readiness if wanted else self.versions
@@ -1641,7 +1647,7 @@ class DeclaredScope(Base):
             self.declare_scope(["p1", "p3"])
             code, second = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
             self.assertEqual((code, second), (0, ""), "the same refusal with a longer resolved set is not a new line")
-            self.declare_scope(["p1", "p2"], unread=["p2"])
+            self.declare_scope(["p1"], unread=["p2"])
             code, third = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
             self.assertEqual(code, 0)
             self.assertIn("lists p2 but the install could not read it", third)
@@ -1776,7 +1782,7 @@ class DeclaredScope(Base):
             watch.refusal_detail(label + fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number="123456789012"), resolved),
             (
                 "refused by the report script: the report script could not resolve project number 123456789012 to an id; "
-                "the remedy is on the install, not this job: spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run)",
+                "the remedy is on the install, not this job: spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run), or grant the agent's identity resourcemanager.projects.get on it so the reconcile resolves the number",
                 "project number unresolved",
             ),
         )
@@ -1819,7 +1825,7 @@ class DeclaredScope(Base):
             watch.refusal_detail(label + outside.format(project="p2", projects="p1"), carried),
             (
                 "refused by the report script: the install's declared scope does not list p2; it lists p1; "
-                + watch.REMEDY_OUTSIDE_UNRESOLVED.format(note=fleet_scope_args.UNRESOLVED_SCOPE_NOTE),
+                + watch.REMEDY_OUTSIDE_UNRESOLVED.format(note=watch.PARTLY_UNRESOLVED_SCOPE_NOTE),
                 "outside a scope not yet resolved",
             ),
         )
