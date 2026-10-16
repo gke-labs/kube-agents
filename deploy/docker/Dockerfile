@@ -2025,11 +2025,7 @@ ARG TIRITH_VERSION
 # result rather than the syscall.
 #
 # The same layer checks that the pinned tirith is what PATH resolves, so Hermes
-# never installs a per-profile copy, and points npm's cache at one directory on
-# the data volume. Each profile's HOME is its own, so without the global setting
-# every profile that ran an npx tool kept its own ~100 MiB cache (gke-labs#3325).
-# The setting is read back under a HOME of no profile's, which is how a profile
-# without an .npmrc of its own resolves it.
+# never installs a per-profile copy (gke-labs#3325).
 RUN set -eu; \
     for d in /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools; do \
         find "$d" -type d -exec chmod 755 {} + ; \
@@ -2037,9 +2033,7 @@ RUN set -eu; \
     done; \
     chown -R root:root /opt/hermes/plugins; \
     [ "$(command -v tirith)" = /usr/local/bin/tirith ]; \
-    tirith --version | grep -qx "tirith ${TIRITH_VERSION#v}"; \
-    printf 'cache=/opt/data/.cache/npm\n' >> "$(npm config get globalconfig)"; \
-    [ "$(HOME=/nonexistent npm config get cache)" = /opt/data/.cache/npm ]
+    tirith --version | grep -qx "tirith ${TIRITH_VERSION#v}"
 
 # --- Chat Agent (the `default` profile) ---
 # Chat ingress plugins/hooks (session_store, session_otel_bridge, tool_call_audit,
