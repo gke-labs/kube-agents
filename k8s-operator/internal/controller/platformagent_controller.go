@@ -3604,7 +3604,7 @@ func setBusProvisionedCondition(agent *agentv1alpha1.PlatformAgent, want bool, j
 	}
 }
 
-// syncA2AConditions keeps the two render-derived conditions true of this
+// syncA2AConditions keeps the render-derived conditions true of this
 // pass on the paths that rendered the stack and then park Degraded
 // (A2AProvisionFailed, ShellSandboxKeysMissing), where updateStatusDegraded
 // is handed the CR and the refusal and nothing else. Without it a dark
@@ -3626,13 +3626,19 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	}
 	want := wantBusProvisioned(agent, a2a)
 	verifierNotReady, verifierKnown := r.a2aVerifierNotReady(ctx, agent)
+	// The home-channel advisory rides here too: a rendered stack parked
+	// Degraded still runs a gateway that drops proactive posts, and a bare
+	// helm install parks on ShellSandboxKeysMissing indefinitely (#3320).
+	homeMsg := homeChannelUnsetMessage(agent)
 	if a2aGatewayConditionCurrent(agent, dark) && busProvisionedConditionCurrent(agent, want) &&
-		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) {
+		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
+		homeChannelUnsetConditionCurrent(agent, homeMsg) {
 		return nil
 	}
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
 		wantLive := wantBusProvisioned(live, a2a)
-		return a2aGatewayConditionCurrent(live, dark) && busProvisionedConditionCurrent(live, wantLive)
+		return a2aGatewayConditionCurrent(live, dark) && busProvisionedConditionCurrent(live, wantLive) &&
+			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live))
 	}) {
 		return nil
 	}
@@ -3640,6 +3646,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setA2AGatewayCondition(agent, dark, now)
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
+	setHomeChannelUnsetCondition(agent, homeMsg, now)
 	return r.Status().Update(ctx, agent)
 }
 

@@ -172,3 +172,39 @@ func TestPlatformAgentReconciler_Reconcile_HomeChannelUnsetCondition(t *testing.
 		t.Errorf("%s survived setting homeChannel: %+v", homeChannelUnsetConditionType, cond)
 	}
 }
+
+// TestPlatformAgentReconciler_Reconcile_HomeChannelUnsetOnADegradedPark: a
+// bare helm install parks on ShellSandboxKeysMissing indefinitely with the
+// next stack rendered, its gateway dropping proactive posts all the while,
+// so the condition has to reach the CR on that park too (syncA2AConditions).
+func TestPlatformAgentReconciler_Reconcile_HomeChannelUnsetOnADegradedPark(t *testing.T) {
+	scheme := setupScheme()
+	agent := slackTestAgent("next", true)
+	agent.Name = "test-agent-home-parked"
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster",
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent). // no shell sandbox keys Secret: the pass parks Degraded
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	for i := 1; i <= 2; i++ {
+		_, _ = r.Reconcile(ctx, req) // a park may return an error; the status is what is checked
+	}
+	got := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status.Phase != "Degraded" {
+		t.Fatalf("the fixture no longer parks Degraded (phase %q, conditions %+v); this test needs a Degraded park", got.Status.Phase, got.Status.Conditions)
+	}
+	if cond := meta.FindStatusCondition(got.Status.Conditions, homeChannelUnsetConditionType); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("expected %s True on a Degraded park with the stack rendered, got %+v (conditions %+v)",
+			homeChannelUnsetConditionType, cond, got.Status.Conditions)
+	}
+}

@@ -5872,6 +5872,13 @@ class NextHomeChannelUnsetWiringTest(unittest.TestCase):
         self.assertLess(refuse, warn)
         self.assertLess(warn - refuse, 200, "the menu's warning moved away from its Slack check")
 
+    def test_the_apply_path_warns_right_after_its_slack_check(self):
+        # The route --dry-run and a non-interactive apply take (#3320).
+        refuse = self.text.index("  elif ! refuse_next_slack_gateway_settings_from_env flags; then")
+        warn = self.text.index("  warn_next_home_channel_unset_from_env flags\n", refuse)
+        self.assertLess(warn - refuse, 600, "the apply path's warning moved away from its Slack check")
+        self.assertLess(warn, self.text.index('print_success "Terraform input saved to: $tfvars_file"', refuse))
+
     def test_every_exit_that_warned_ends_on_the_summary(self):
         for report in ('write_json_report "DRY_RUN_SUCCESS"', 'write_json_report "PAUSED"',
                        'write_json_report "GENERATE_ONLY_SUCCESS"'):
@@ -6142,6 +6149,25 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         # A home channel given at once is not questioned.
         proc = self._interview("--mode=next", "", lead + ["C0123ABCD", "#ops"])
         self.assertNotIn("Continue without a home channel", proc.stdout + proc.stderr)
+
+    def test_the_google_chat_home_channel_under_next_is_confirmed_too(self):
+        # #3320 on Chat, which holds the gateway whenever it is enabled under
+        # next. Allowlist, topic, subscription, then the home channel.
+        lead = ["", "", ""]
+        proc = self._interview("--mode=next", "", lead + ["", "n", "spaces/AAA"], choice="1")
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=6", proc.stdout, out)
+        self.assertIn("PROMPT: Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)", out)
+        self.assertIn("GOOGLE_CHAT_HOME_CHANNEL is empty", out)
+        self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+        proc = self._interview("--mode=next", "", lead + ["", "y"], choice="1")
+        self.assertIn("went on ASKED=5", proc.stdout, proc.stdout + proc.stderr)
+        # Under today the prompt stays optional and nothing is confirmed.
+        proc = self._interview("", "", lead + [""], choice="1")
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=4", proc.stdout, out)
+        self.assertIn("Google Chat Home Channel / Space ID (optional", out)
+        self.assertNotIn("Continue without a home channel", out)
 
     def test_the_interview_keeps_the_today_prompts_where_slack_stays_on_the_today_path(self):
         answers = ["xoxb-a,xoxb-b", "xapp-1", "alice@example.com", "D0DM", "#ops"]
