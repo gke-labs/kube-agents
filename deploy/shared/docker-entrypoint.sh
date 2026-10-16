@@ -21,6 +21,9 @@ umask 0002
 # come up; every other non-zero exit there is still fatal. Change both together.
 readonly SANDBOX_MIRROR_RETRY_RC=2
 readonly OTEL_FLAG_DISABLED="--disabled"
+# The pinned tirith the image puts on PATH (deploy/docker/Dockerfile, a2a-tools).
+# Step 4.4 removes the per-home copies Hermes downloaded before it was there.
+readonly IMAGE_TIRITH=/usr/local/bin/tirith
 
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
@@ -1852,6 +1855,20 @@ fi
 # before starting anything long-lived, so a peer container is not blocked behind
 # this one for the life of the pod. Closing the fd releases it too, but do both
 # explicitly — the fd is inherited across the `exec` in step 6 otherwise.
+# 4.4 Reclaim the tirith copies Hermes downloaded into each home before the
+# image carried one on PATH. Hermes' tools/tirith_security looks on PATH first,
+# so with the image's copy there a home's bin/tirith is never used again, and it
+# was 38 MiB per scaffolded profile: 6.5 GiB of a 10 GiB data volume at 209
+# clusters (gke-labs#3325). Only regular files are removed, and only when PATH
+# really resolves the image's copy, so an image without it keeps what it has.
+if [ "$(command -v tirith 2>/dev/null)" = "$IMAGE_TIRITH" ]; then
+    for stale_tirith in "$TARGET_DIR/bin/tirith" "$TARGET_DIR"/profiles/*/bin/tirith; do
+        if [ -f "$stale_tirith" ] && [ ! -L "$stale_tirith" ]; then
+            rm -f "$stale_tirith"
+        fi
+    done
+fi
+
 if [ -n "$BOOTSTRAP_LOCK_FD" ]; then
     flock -u 9 2>/dev/null || true
     exec 9>&-
