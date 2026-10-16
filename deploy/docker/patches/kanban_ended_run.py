@@ -77,7 +77,9 @@ What this changes
    ``_parents_satisfied``. The worker is told the card now waits on that
    parent, to save its result with ``kanban_comment`` and block on the
    dependency, so the card runs again once the parent is done (#3252). Not
-   latched: the parent can go away. The ``kanban_link`` guard planned in
+   latched: the parent can go away. When the card runs again, its worker
+   context opens with that saved result and an instruction to complete with
+   it (:func:`saved_result_banner`), so the re-run doesn't redo the work. The ``kanban_link`` guard planned in
    #3248 would refuse such a link from an agent; this also covers one from
    the CLI or the dashboard.
 
@@ -257,6 +259,59 @@ def waiting_parent_refusal(task_id: str, conn: Any) -> Optional[str]:
         run_id, task_id, row[2],
     )
     return waiting_parent_text(task_id, row[2])
+
+
+# The event a dependency block records (kanban_db._route_block).
+DEPENDENCY_WAIT_EVENT = "dependency_wait"
+# The most of a saved result the banner quotes.
+SAVED_RESULT_MAX_CHARS = 4000
+SAVED_RESULT_BANNER = (
+    "A previous run of this card already did the work and saved its result "
+    "below before the card went back to the queue. Verify it and complete "
+    "with it. Don't redo the work, and don't open another pull request."
+)
+
+
+def saved_result_banner(conn: Any, task_id: str) -> list[str]:
+    """Lines for the top of the worker context when the card's newest
+    saved-result comment came from a run that then blocked on a dependency:
+    the banner, then the result quoted. Otherwise none.
+
+    A comment in the context's comment list was not enough: on next-dev-3 the
+    re-run read it and followed the card's body instead, redoing the work
+    (#3252). Narrow on purpose: only a comment opening with
+    :data:`SAVED_RESULT_LEAD` that a dependency block followed, so a card with
+    ordinary comments reads as before.
+    """
+    try:
+        row = conn.execute(
+            "SELECT c.body, c.created_at FROM task_comments c "
+            "WHERE c.task_id = ? AND substr(c.body, 1, ?) = ? ORDER BY c.id DESC LIMIT 1",
+            (task_id, len(SAVED_RESULT_LEAD), SAVED_RESULT_LEAD),
+        ).fetchone()
+        if row is None:
+            return []
+        blocked = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? AND created_at >= ? LIMIT 1",
+            (task_id, DEPENDENCY_WAIT_EVENT, row[1]),
+        ).fetchone()
+    except Exception as exc:
+        logger.warning("kanban_ended_run: could not read %s's saved result: %s", task_id, exc)
+        return []
+    if blocked is None:
+        return []
+    result = str(row[0])[len(SAVED_RESULT_LEAD):].strip()
+    if not result:
+        return []
+    if len(result) > SAVED_RESULT_MAX_CHARS:
+        result = result[:SAVED_RESULT_MAX_CHARS] + "… [truncated]"
+    return [
+        "## Saved result from a previous run",
+        SAVED_RESULT_BANNER,
+        "",
+        *("> " + line for line in result.splitlines()),
+        "",
+    ]
 
 
 def refuse_ended_run(task_id: str, connect: Callable[[], Any]) -> Optional[str]:

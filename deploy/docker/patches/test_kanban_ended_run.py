@@ -356,6 +356,59 @@ class TestWaitingParentRefusal(unittest.TestCase):
         self.assertIsNone(ker.waiting_parent_refusal(TID, self.conn))
 
 
+class TestSavedResultBanner(unittest.TestCase):
+    """#3252: a re-claimed card whose previous run saved its result and
+    blocked on a dependency reads that result first."""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.executescript(
+            "CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT, created_at INTEGER);"
+            "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, created_at INTEGER);")
+
+    def comment(self, body, at=100):
+        self.conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, 'platform', ?, ?)",
+                          (TID, body, at))
+
+    def event(self, kind, at=101):
+        self.conn.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES (?, ?, ?)", (TID, kind, at))
+
+    def test_a_saved_result_followed_by_a_dependency_block_leads_the_context(self):
+        self.comment(ker.SAVED_RESULT_LEAD + "\nweb-7 logs: no errors\nPR #12 opened")
+        self.event(ker.DEPENDENCY_WAIT_EVENT)
+        lines = ker.saved_result_banner(self.conn, TID)
+        self.assertIn(ker.SAVED_RESULT_BANNER, lines)
+        self.assertIn("> web-7 logs: no errors", lines)
+        self.assertIn("> PR #12 opened", lines)
+
+    def test_ordinary_comments_add_nothing(self):
+        self.comment("please also check web-8")
+        self.event(ker.DEPENDENCY_WAIT_EVENT)
+        self.assertEqual(ker.saved_result_banner(self.conn, TID), [])
+
+    def test_a_saved_result_with_no_dependency_block_after_it_adds_nothing(self):
+        self.event(ker.DEPENDENCY_WAIT_EVENT, at=50)
+        self.comment(ker.SAVED_RESULT_LEAD + " web-7 is fine", at=100)
+        self.event("blocked", at=101)
+        self.assertEqual(ker.saved_result_banner(self.conn, TID), [])
+
+    def test_an_empty_saved_result_adds_nothing(self):
+        self.comment(ker.SAVED_RESULT_LEAD)
+        self.event(ker.DEPENDENCY_WAIT_EVENT)
+        self.assertEqual(ker.saved_result_banner(self.conn, TID), [])
+
+    def test_a_long_result_is_capped(self):
+        self.comment(ker.SAVED_RESULT_LEAD + " " + "x" * (ker.SAVED_RESULT_MAX_CHARS + 50))
+        self.event(ker.DEPENDENCY_WAIT_EVENT)
+        quoted = [l for l in ker.saved_result_banner(self.conn, TID) if l.startswith("> ")]
+        self.assertTrue(quoted[-1].endswith("[truncated]"))
+
+    def test_an_unreadable_board_fails_open(self):
+        self.conn.execute("DROP TABLE task_events")
+        self.comment(ker.SAVED_RESULT_LEAD + " x")
+        self.assertEqual(ker.saved_result_banner(self.conn, TID), [])
+
+
 class TestTheApplier(unittest.TestCase):
     TOOLS = (
         "def _handle_complete(args, **kw):\n"
@@ -383,7 +436,13 @@ class TestTheApplier(unittest.TestCase):
         self.tools = self.root / applier.TOOLS_RELATIVE
         self.db.parent.mkdir(parents=True)
         self.tools.parent.mkdir(parents=True)
-        self.db.write_text("def block_task(conn, task_id, **kw):\n    return True\n")
+        self.db.write_text(
+            "def block_task(conn, task_id, **kw):\n    return True\n\n"
+            "def build_worker_context(conn, task_id):\n"
+            "    task = None\n"
+            "    lines: list[str] = []\n"
+            "    _ctx_header(lines, task)\n"
+            "    return lines\n")
         self.tools.write_text(self.TOOLS)
 
     def test_the_gates_come_first_and_the_stale_reason_is_gone(self):
@@ -402,6 +461,7 @@ class TestTheApplier(unittest.TestCase):
         self.assertEqual(out.count('_check(ok, "" if ok else ('), 2)
         db = self.db.read_text()
         ast.parse(db)
+        self.assertLess(db.index("lines.extend(_kanban_saved_result_banner(conn, task_id))"), db.index("_ctx_header(lines, task)"))
         self.assertIn("block_task = _kanban_stop_worker_on_external_block(", db)
 
     def test_a_second_run_refuses(self):

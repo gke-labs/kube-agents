@@ -24,7 +24,8 @@ patched ``block_task`` and tool handlers, with real worker processes:
 - a parent linked onto a running card mid-run gets the card's
   ``kanban_complete`` a plain answer that it now waits on that parent, not
   upstream's "stale run"; the worker's dependency block then goes through,
-  and the card is ready again once the parent is done (#3252).
+  the card is ready again once the parent is done, and its worker context
+  then opens with the result the first run saved (#3252).
 
 Before the patch the blocked card's worker keeps running, and its
 ``kanban_complete`` is told "If the prior run already did the work, verify it
@@ -211,6 +212,8 @@ try:
           f"now waits on {gate_parent}" in err and "kanban_comment" in err, err)
     check("not with upstream's stale-run reason", "stale run" not in err, err)
     check("the refusal names a dependency block as the exit", 'kanban_block(kind="dependency")' in err, err)
+    saved = json.loads(kt._handle_comment({"task_id": linked, "body": ker.SAVED_RESULT_LEAD + "\nweb-7 is fine: no errors in the last hour"}))
+    check("the worker saves its result as a comment", saved.get("ok"), str(saved))
     blocked = json.loads(kt._handle_block({"reason": f"waits on {gate_parent}", "kind": "dependency"}))
     check("the worker's dependency block goes through", blocked.get("ok"), str(blocked))
     check("and the card waits in todo, not counted as a failure", status(linked) == "todo", status(linked))
@@ -219,6 +222,12 @@ try:
     conn.commit()
     K.recompute_ready(conn)
     check("once the parent is done the card is ready again", status(linked) == "ready", status(linked))
+    context = K.build_worker_context(conn, linked)
+    check("the re-run's worker context opens with the saved result",
+          context.startswith("## Saved result from a previous run") and ker.SAVED_RESULT_BANNER in context
+          and "> web-7 is fine: no errors in the last hour" in context, context[:400])
+    plain = K.build_worker_context(conn, own)
+    check("a card with no saved result reads as before", "Saved result from a previous run" not in plain, plain[:200])
     ker._LATCHED = None
 
     print("the stopped run's handoffs:")
