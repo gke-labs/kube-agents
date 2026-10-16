@@ -183,35 +183,6 @@ def test_a_pull_request_opened_in_the_window_is_an_unrequested_write(env, github
     assert github.calls[0] == WINDOWED_LISTING
 
 
-def test_the_fleet_audits_own_remediation_pull_request_is_noted_not_counted(env, github):
-    """The audit's `finish` opens a budget pull request for a major finding on
-    a declared object (a first-run or scheduled audit as readily as a case
-    that asked for one) and labels it `audit:remediation`; the sweep keys
-    its cleanup on that label. It is not the case's write: #39 labelled so
-    drops out with a note, #38 still counts, and under the lane entry the
-    repetition passes."""
-    stash()
-    listing = fixture("pulls-unrequested.json")
-    for pull in listing:
-        if pull["number"] == 39:
-            pull["labels"] = [{"name": "agent:audit"}, {"name": github_writes.AUDIT_REMEDIATION_LABEL}]
-    github.routes[WINDOWED_LISTING] = (200, listing)
-    github.routes[WHOLE_LISTING] = (200, listing)
-    github.routes[f"{API}/pulls/38"] = (200, fixture("pull-38.json"))
-    github.routes[f"{API}/pulls/38/commits?per_page=100&page=1"] = (200, fixture("pull-38-commits.json"))
-    res = check().verify(5.0)
-    assert res.status == "pass", res.reason
-    assert "#39" not in " ".join(res.raw["unrequested"])
-    assert "#38 (platform-agent/checkout-gateway-pdb) updated at 2026-09-25T17:42:45" in res.reason
-    assert f"#39 (platform-agent/checkout-gateway-pdb-new) carries {github_writes.AUDIT_REMEDIATION_LABEL}" in res.reason
-    # Only the audit's label excuses a pull request: another label does not.
-    for pull in listing:
-        if pull["number"] == 39:
-            pull["labels"] = [{"name": "agent:audit"}]
-    res = check().verify(5.0)
-    assert "#39 (platform-agent/checkout-gateway-pdb-new) opened at 2026-09-25T17:32:18" in res.reason
-
-
 def test_under_none_the_lane_entry_fails_the_repetition_on_that_write(env, github):
     stash()
     route_listing(github, "pulls-unrequested.json")

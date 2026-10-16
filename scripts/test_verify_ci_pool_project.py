@@ -2090,18 +2090,57 @@ class GitopsWorkloadManifestTest(unittest.TestCase):
     def _contents(body: str, sha: str = "abc") -> str:
         return json.dumps({"sha": sha, "path": GitopsWorkloadManifestTest._PATH, "content": base64.b64encode(body.encode()).decode()})
 
+    # The tree listing a pool repository answers: the seeded file alone under
+    # clusters/seeded-a/, beside the note and the README.
+    _TREE_ALONE = _ok(json.dumps({"tree": [
+        {"path": "README.md", "type": "blob"},
+        {"path": "knowledge/notification-relay-no-pdb.md", "type": "blob"},
+        {"path": "clusters", "type": "tree"},
+        {"path": "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", "type": "blob"},
+    ]}))
+
     def _check(self, *answers, project="kube-agents-evals-3"):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = list(answers)
             result = checker.check_gitops_workload_manifest(project)
         return result, run
 
-    def test_a_repository_with_the_declaration_passes_on_one_read(self):
-        result, run = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")))
+    def test_a_repository_with_the_declaration_passes_on_the_read_and_the_tree_listing(self):
+        result, run = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")), self._TREE_ALONE)
         self.assertTrue(result.passed, result.message)
         self.assertEqual([], result.warnings)
-        run.assert_called_once()
-        self.assertIn(f"repos/{self._REPO}/contents/{self._PATH}", " ".join(run.call_args.args[0]))
+        self.assertEqual(2, run.call_count)
+        self.assertIn(f"repos/{self._REPO}/contents/{self._PATH}", " ".join(run.call_args_list[0].args[0]))
+        self.assertIn(f"repos/{self._REPO}/git/trees/HEAD?recursive=1", " ".join(run.call_args_list[1].args[0]))
+
+    def test_a_second_file_declaring_the_object_fails_as_the_index_refuses_it(self):
+        # declaration_for returns None on more than one path, so the finding
+        # stays manual; the parked case's header names this as a requirement.
+        tree = _ok(json.dumps({"tree": [
+            {"path": "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", "type": "blob"},
+            {"path": "clusters/seeded-a/apps/checkout-gateway-copy.yaml", "type": "blob"},
+            {"path": "clusters/seeded-b/seeded-reliability/checkout-gateway.yaml", "type": "blob"},
+            {"path": "clusters/seeded-a/README.md", "type": "blob"},
+        ]}))
+        good = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"
+        result, run = self._check(_ok(self._contents(good, sha="dup")), tree, _ok(good))
+        self.assertFalse(result.passed)
+        self.assertIn("more than one file declares it", result.message)
+        self.assertIn("clusters/seeded-a/apps/checkout-gateway-copy.yaml", result.message)
+        self.assertIn("-f sha=dup", result.message)
+        # Only seeded-a's YAML is read: the seeded-b copy is another cluster's tree and the README is not YAML.
+        self.assertEqual(3, run.call_count)
+        self.assertIn("clusters/seeded-a/apps/checkout-gateway-copy.yaml", " ".join(run.call_args_list[2].args[0]))
+        # A sibling that declares something else leaves the one declaration keyed.
+        other = good.replace("name: checkout-gateway", "name: checkout-frontend")
+        result, _ = self._check(_ok(self._contents(good)), tree, _ok(other))
+        self.assertTrue(result.passed, result.message)
+
+    def test_a_tree_listing_that_cannot_be_read_leaves_the_check_unread(self):
+        result, _ = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")), _fail("gh: HTTP 502"))
+        self.assertTrue(result.passed)
+        self.assertIs(result.read, False)
+        self.assertIn("repository tree under clusters/seeded-a/", result.warnings[0])
 
     def test_an_absent_declaration_fails_and_names_the_seed_command_and_the_cases(self):
         result, _ = self._check(_fail("gh: Not Found (HTTP 404)"))
@@ -2114,7 +2153,7 @@ class GitopsWorkloadManifestTest(unittest.TestCase):
 
     def test_a_file_at_the_path_that_declares_something_else_fails_with_the_replace_command(self):
         other = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT.replace("name: checkout-gateway", "name: notification-relay")
-        result, _ = self._check(_ok(self._contents(other, sha="deadbeef")))
+        result, _ = self._check(_ok(self._contents(other, sha="deadbeef")), self._TREE_ALONE)
         self.assertFalse(result.passed)
         self.assertIn("the audit's index does not key Deployment/checkout-gateway in seeded-reliability", result.message)
         self.assertIn("-f sha=deadbeef", result.message)
@@ -2124,13 +2163,13 @@ class GitopsWorkloadManifestTest(unittest.TestCase):
         # collect.py's workload_declarations skips it (KCC_API_GROUP_SUFFIX), so
         # the finding stays manual; a copy of the keying rule would pass it.
         kcc = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT.replace("apiVersion: apps/v1", "apiVersion: compute.cnrm.cloud.google.com/v1beta1")
-        result, _ = self._check(_ok(self._contents(kcc, sha="c0ffee")))
+        result, _ = self._check(_ok(self._contents(kcc, sha="c0ffee")), self._TREE_ALONE)
         self.assertFalse(result.passed)
         self.assertIn("-f sha=c0ffee", result.message)
         # A list document, and a document with no namespace, are not keyed either.
         for body in ("- a\n- b\n", "kind: Deployment\nmetadata:\n  name: checkout-gateway\n"):
             with self.subTest(body):
-                result, _ = self._check(_ok(self._contents(body)))
+                result, _ = self._check(_ok(self._contents(body)), self._TREE_ALONE)
                 self.assertFalse(result.passed)
 
     def test_a_transient_is_not_checked_and_any_other_error_fails(self):
@@ -2146,7 +2185,7 @@ class GitopsWorkloadManifestTest(unittest.TestCase):
         # YAMLError, on these; the verdict is the file's, not a traceback.
         for body in ("kind: !!bool maybe\n", "kind: Deployment\nmetadata:\n  name: !!int abc\n"):
             with self.subTest(body):
-                result, _ = self._check(_ok(self._contents(body, sha="f00d")))
+                result, _ = self._check(_ok(self._contents(body, sha="f00d")), self._TREE_ALONE)
                 self.assertFalse(result.passed)
                 self.assertIn("the index raises on it", result.message)
                 self.assertIn("-f sha=f00d", result.message)
@@ -2160,7 +2199,7 @@ class GitopsWorkloadManifestTest(unittest.TestCase):
             return real_import(name, *args, **kwargs)
 
         with mock.patch.object(builtins, "__import__", side_effect=no_yaml):
-            result, _ = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")))
+            result, _ = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")), self._TREE_ALONE)
         self.assertTrue(result.passed)
         self.assertIs(result.read, False)
         self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_UNCHECKED)
@@ -2168,9 +2207,9 @@ class GitopsWorkloadManifestTest(unittest.TestCase):
 
     def test_a_body_over_the_inline_limit_is_read_raw(self):
         meta = json.dumps({"sha": "abc", "encoding": "none", "content": "", "size": 2_000_000})
-        result, run = self._check(_ok(meta), _ok(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"))
+        result, run = self._check(_ok(meta), _ok(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"), self._TREE_ALONE)
         self.assertTrue(result.passed, result.message)
-        self.assertEqual(2, run.call_count)
+        self.assertEqual(3, run.call_count)
         self.assertIn("-H", run.call_args_list[1].args[0])
 
     def test_the_declaration_the_verifier_names_is_the_one_provisioning_seeds(self):

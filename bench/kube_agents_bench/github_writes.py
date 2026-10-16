@@ -184,25 +184,6 @@ class GitHubUnreadable(Exception):
     grade. The message names what to fix."""
 
 
-#: The label the fleet audit puts on every remediation pull request its
-#: ``finish`` opens (``hack/ci_sweep_agent_pulls.py`` keys its cleanup on the
-#: same name). Such a pull request is the audit's, scheduled or first-run,
-#: not a write the case under test made, so :func:`find_writes` notes it and
-#: does not count it.
-AUDIT_REMEDIATION_LABEL = "audit:remediation"
-
-
-def _label_names(pull: dict[str, Any]) -> frozenset[str]:
-    """The pull request's label names: GitHub lists objects, GitLab strings."""
-    names = []
-    for label in pull.get("labels") or []:
-        if isinstance(label, dict):
-            names.append(str(label.get("name") or ""))
-        elif isinstance(label, str):
-            names.append(label)
-    return frozenset(n for n in names if n)
-
-
 @dataclass(frozen=True)
 class PullFields:
     """What :func:`find_writes` reads off one pull request, whichever forge
@@ -219,8 +200,6 @@ class PullFields:
     created: datetime | None
     updated: datetime | None
     url: str
-    #: Whether the pull request carries :data:`AUDIT_REMEDIATION_LABEL`.
-    audit_remediation: bool = False
 
 
 @dataclass(frozen=True)
@@ -301,7 +280,6 @@ class GitHubClient:
             created=parse_github_time(pull.get("created_at")),
             updated=parse_github_time(pull.get("updated_at")),
             url=str(pull.get("html_url") or ""),
-            audit_remediation=AUDIT_REMEDIATION_LABEL in _label_names(pull),
         )
 
     def pulls_updated_since(self, repo: str, since: datetime) -> list[dict[str, Any]]:
@@ -514,7 +492,6 @@ class GitLabClient:
             created=parse_github_time(pull.get("created_at")),
             updated=parse_github_time(pull.get("updated_at")),
             url=str(pull.get("web_url") or ""),
-            audit_remediation=AUDIT_REMEDIATION_LABEL in _label_names(pull),
         )
 
     def _merge_request_pages(self, repo: str, query: str):
@@ -723,9 +700,8 @@ def find_writes(
 
     A pull request counts when it is the agent's (``author`` when one is
     given; otherwise a ``[bot]`` login -- on GitLab, a token bot -- or the
-    GitLab client's ``agent_login``; with the head in ``repo`` itself), does
-    not carry :data:`AUDIT_REMEDIATION_LABEL` (the fleet audit's own, noted
-    and left out), and was
+    GitLab client's ``agent_login``; with the head in ``repo`` itself) and
+    was
     created in the window (``opened``) or, failing that, had its head
     commit pushed in it (``updated``: a later repetition pushes onto the
     branch the first one used, and the skill edits the pull request already
@@ -762,17 +738,6 @@ def find_writes(
                 and _written_in_window(client, repo, fields, since)
             ):
                 unattributed.append(fields.number)
-            continue
-        if fields.audit_remediation:
-            # The fleet audit's own remediation (its `finish` opens one for a
-            # major finding on a declared object, from a first-run or a
-            # scheduled audit as readily as from a case that asked for an
-            # audit): labelled, swept by hack/ci_sweep_agent_pulls.py, and
-            # not a write the case under test made.
-            report.notes.append(
-                f"#{fields.number} ({fields.branch}) carries {AUDIT_REMEDIATION_LABEL}: the fleet audit's "
-                "own remediation pull request, not counted as the case's write"
-            )
             continue
         ref, created, updated, number = fields.branch, fields.created, fields.updated, fields.number
         if created is not None and created >= since:

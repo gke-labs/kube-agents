@@ -233,23 +233,6 @@ def test_a_merge_request_and_an_orphan_branch_in_the_window_are_writes(env, gitl
     assert {tok for _, tok in gitlab.calls} == {"glpat-fake"}
 
 
-def test_the_fleet_audits_own_merge_request_is_noted_not_counted(env, gitlab):
-    """GitLab lists labels as plain strings; !3 carrying `audit:remediation`
-    is the fleet audit's remediation, noted and left out, while the orphan
-    branch is still a write."""
-    route_recorded(gitlab)
-    listing = fixture("mrs-updated-desc.json")
-    for mr in listing:
-        if mr["iid"] == 3:
-            mr["labels"] = ["agent:audit", github_writes.AUDIT_REMEDIATION_LABEL]
-    gitlab.routes[WINDOWED_LISTING] = (200, listing)
-    stash()
-    result = check().verify(30)
-    assert result.status != "error", result.reason
-    assert {(w["kind"], w["branch"]) for w in result.raw["writes"]} == {("branch", "platform-agent/writes-orphan")}
-    assert f"#3 (platform-agent/writes-mr) carries {github_writes.AUDIT_REMEDIATION_LABEL}" in result.reason
-
-
 def test_merge_requests_only_closed_in_the_window_are_not_writes(env, gitlab):
     # !1 and !2 were created before the window and closed inside it; their
     # head commits predate it, so they are noted, not counted.

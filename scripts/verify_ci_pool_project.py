@@ -495,6 +495,14 @@ spec:
 # another object leaves the finding manual and the cases red with a presence
 # check green, so the body is handed to that index and the key looked up.
 GITOPS_WORKLOAD_MANIFEST_KEY = (GITOPS_WORKLOAD_MANIFEST_PATH.split("/")[1], "Deployment", "seeded-reliability", "checkout-gateway")
+# The index refuses an object two files declare (`declaration_for` returns
+# None on more than one path), so every YAML under the seeded cluster's tree is
+# handed to it with the seeded file, read from the repository's tree listing.
+# A pool repository holds a handful of files; the cap keeps a repository nobody
+# sized from turning the check into a crawl, and is reported when it bites.
+GITOPS_WORKLOAD_MANIFEST_TREE = "/".join(GITOPS_WORKLOAD_MANIFEST_PATH.split("/")[:2])
+GITOPS_WORKLOAD_MANIFEST_SIBLING_CAP = 25
+GITOPS_YAML_SUFFIXES = (".yaml", ".yml")
 # The cases that fail on a project whose repository lacks the declaration:
 # the roster case, and the #2228 case parked on this fixture. (The other
 # #2228 case, obtainability-refusal-direct-mutation, is nightly and only
@@ -2932,10 +2940,17 @@ def check_gitops_workload_manifest(project_id: str) -> CheckResult:
     except Exception as exc:
         return CheckResult(name, False, f"Could not parse the contents of {path} in {repo_slug}: {exc}")
     # The index, not a copy of its rule: the file goes into a scratch tree at
-    # its own path and collect.py's workload_declarations says whether it keys
-    # the Deployment there (dict documents, the Config Connector skip, one
-    # file per object). A collector that cannot load here is a machine fault,
-    # unread as the note check's parser is; a raise on the file is the file's.
+    # its own path, beside every other YAML the repository holds under the
+    # seeded cluster's tree, and collect.py's workload_declarations says
+    # whether it keys the Deployment there once (dict documents, the Config
+    # Connector skip, and the one-file-per-object rule declaration_for
+    # enforces). A collector that cannot load here is a machine fault, unread
+    # as the note check's parser is; a raise on the file is the file's.
+    state, siblings = _gitops_cluster_tree_yaml(repo_slug, path)
+    if state == GITHUB_PATH_UNREAD:
+        return unread(f"the repository tree under {GITOPS_WORKLOAD_MANIFEST_TREE}/", siblings)
+    if state != GITHUB_PATH_PRESENT:
+        return failed(f"the repository tree under {GITOPS_WORKLOAD_MANIFEST_TREE}/", siblings)
     try:
         collect = _load_collect()
     except Exception as exc:
@@ -2947,7 +2962,7 @@ def check_gitops_workload_manifest(project_id: str) -> CheckResult:
             read=False,
         )
     try:
-        problem = _workload_manifest_problem(body, collect)
+        problem = _workload_manifest_problem(body, collect, siblings)
     except OSError as exc:
         return CheckResult(name, True, "Not checked", warnings=[Unread(f"Not checked: {path} (no writable temporary directory to hand it to the audit's index): {type(exc).__name__}: {exc}")], read=False)
     if problem:
@@ -2982,19 +2997,58 @@ def _load_collect():
     return module
 
 
-def _workload_manifest_problem(body: str, collect) -> str:
-    """Why the audit's index would not key GITOPS_WORKLOAD_MANIFEST_KEY from `body` at its path, or "" when it does.
+def _gitops_cluster_tree_yaml(repo_slug: str, seeded_path: str) -> tuple[str, dict[str, str] | str]:
+    """(GITHUB_PATH_*, {path: body} for every other YAML under the seeded cluster's tree, or the reason).
 
-    Raises OSError when the scratch tree cannot be written. A raise from the
-    index itself (PyYAML's safe constructors raise KeyError, AttributeError or
-    ValueError on a tagged scalar, outside the YAMLError the index catches) is
-    the file's verdict, not a traceback.
+    One listing of the repository's tree, then one raw read per sibling. A
+    sibling that cannot be read makes the whole answer unread or failed as
+    that read was: the index's one-file rule cannot be judged without it.
+    """
+    rc, out, err = run_cmd(["gh", "api", f"repos/{repo_slug}/git/trees/HEAD?recursive=1"])
+    if rc != 0:
+        reason = _unread_reason(err or "")
+        if reason is not None or _GH_TRANSPORT_LINE.search(err or ""):
+            return GITHUB_PATH_UNREAD, reason or (err or "").strip()
+        return GITHUB_PATH_FAILED, (err or "").strip()
+    try:
+        entries = _load_json(out).get("tree") or []
+    except Exception as exc:
+        return GITHUB_PATH_FAILED, f"could not parse the tree listing: {exc}"
+    prefix = GITOPS_WORKLOAD_MANIFEST_TREE + "/"
+    wanted = sorted(
+        str(e.get("path"))
+        for e in entries
+        if isinstance(e, dict) and e.get("type") == "blob" and str(e.get("path") or "").startswith(prefix)
+        and str(e.get("path") or "").endswith(GITOPS_YAML_SUFFIXES) and e.get("path") != seeded_path
+    )
+    if len(wanted) > GITOPS_WORKLOAD_MANIFEST_SIBLING_CAP:
+        return GITHUB_PATH_UNREAD, f"{len(wanted)} YAML files under {prefix}, over the {GITOPS_WORKLOAD_MANIFEST_SIBLING_CAP} this check reads"
+    siblings: dict[str, str] = {}
+    for sibling in wanted:
+        state, text = _gitops_path_state(repo_slug, sibling, raw=True)
+        if state != GITHUB_PATH_PRESENT:
+            return (GITHUB_PATH_UNREAD if state == GITHUB_PATH_UNREAD else GITHUB_PATH_FAILED), f"{sibling}: {text or state}"
+        siblings[sibling] = text
+    return GITHUB_PATH_PRESENT, siblings
+
+
+def _workload_manifest_problem(body: str, collect, siblings: dict[str, str] | None = None) -> str:
+    """Why the audit's index would not key GITOPS_WORKLOAD_MANIFEST_KEY from `body` at its path, once, or "" when it does.
+
+    `siblings` are the repository's other YAML files under the seeded
+    cluster's tree, written beside the body so the index's one-file-per-object
+    rule is judged as the audit judges it. Raises OSError when the scratch
+    tree cannot be written. A raise from the index itself (PyYAML's safe
+    constructors raise KeyError, AttributeError or ValueError on a tagged
+    scalar, outside the YAMLError the index catches) is the file's verdict,
+    not a traceback.
     """
     with tempfile.TemporaryDirectory() as scratch:
         tree = Path(scratch)
-        target = tree / GITOPS_WORKLOAD_MANIFEST_PATH
-        target.parent.mkdir(parents=True)
-        target.write_text(body, encoding="utf-8")
+        for rel, text in {GITOPS_WORKLOAD_MANIFEST_PATH: body, **(siblings or {})}.items():
+            target = tree / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 index = collect.workload_declarations(tree)
@@ -3003,6 +3057,8 @@ def _workload_manifest_problem(body: str, collect) -> str:
     paths = index.get(GITOPS_WORKLOAD_MANIFEST_KEY)
     if not paths:
         return "no document in it is keyed as " + "/".join(GITOPS_WORKLOAD_MANIFEST_KEY)
+    if len(paths) > 1:
+        return "more than one file declares it (" + ", ".join(sorted(paths)) + "), which the index refuses to resolve"
     return ""
 
 
