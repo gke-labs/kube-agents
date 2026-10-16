@@ -177,9 +177,52 @@ def run_env(hermes_home: Path | str | None = None, extra: dict[str, str] | None 
     env = {**os.environ, "HOME": "/tmp"}
     if hermes_home is not None:
         env["HERMES_HOME"] = str(hermes_home)
+        if "NPM_CONFIG_CACHE" not in env:
+            env["NPM_CONFIG_CACHE"] = str(Path(hermes_home) / ".npm-cache")
+    if "TIRITH_BIN" not in env:
+        if Path("/usr/local/bin/tirith").is_file():
+            env["TIRITH_BIN"] = "/usr/local/bin/tirith"
+        elif hermes_home is not None and (Path(hermes_home) / "bin" / "tirith").is_file():
+            env["TIRITH_BIN"] = str(Path(hermes_home) / "bin" / "tirith")
     if extra:
         env.update(extra)
     return env
+
+
+def link_shared_profile_resources(home: Path, hermes_home: Path) -> None:
+    """Share identical binaries and cache directories across profiles (#3325)."""
+    tirith_bin = home / "bin" / "tirith"
+    if not tirith_bin.exists() and not tirith_bin.is_symlink():
+        candidates = []
+        if env_tirith := os.environ.get("TIRITH_BIN"):
+            candidates.append(Path(env_tirith))
+        candidates.extend([
+            Path("/usr/local/bin/tirith"),
+            Path(hermes_home) / "bin" / "tirith",
+            Path("/opt/data/bin/tirith"),
+        ])
+        for target in candidates:
+            if target.is_file() and os.access(target, os.X_OK):
+                try:
+                    tirith_bin.parent.mkdir(parents=True, exist_ok=True)
+                    tirith_bin.symlink_to(target)
+                    break
+                except OSError:
+                    break
+
+    shared_cache_dir = (
+        Path(os.environ["NPM_CONFIG_CACHE"])
+        if os.environ.get("NPM_CONFIG_CACHE")
+        else Path(hermes_home) / ".npm-cache"
+    )
+    for profile_npm in (home / "home" / ".npm", home / ".npm"):
+        if not profile_npm.exists() and not profile_npm.is_symlink():
+            try:
+                shared_cache_dir.mkdir(parents=True, exist_ok=True)
+                profile_npm.parent.mkdir(parents=True, exist_ok=True)
+                profile_npm.symlink_to(shared_cache_dir)
+            except OSError:
+                pass
 
 
 def ensure_profile(name: str, description: str, hermes_home: Path) -> Path:
@@ -217,6 +260,7 @@ def ensure_profile(name: str, description: str, hermes_home: Path) -> Path:
             raise SystemExit(f"ERROR: could not execute 'hermes' to create profile {name}: {e}")
     if not home.is_dir():
         raise SystemExit(f"ERROR: expected profile home not found after create: {home}")
+    link_shared_profile_resources(home, hermes_home)
     return home
 
 
@@ -533,6 +577,11 @@ def main() -> None:
         "--backfill-cron",
         help="Backfill default risk tier onto a cron/jobs.json file directly without overlaying.",
     )
+    group.add_argument(
+        "--link-shared",
+        action="store_true",
+        help="Link shared Tirith binary and npm cache into all profiles under $HERMES_HOME/profiles.",
+    )
     ap.add_argument("--template", default="", help="Baked template dir to overlay onto the profile home.")
     ap.add_argument("--description", default="", help="Profile description (surfaced in discovery).")
     ap.add_argument("--plugins", default="", help="Optional shared plugins dir to overlay for observability.")
@@ -564,6 +613,15 @@ def main() -> None:
         if not target.is_file():
             raise SystemExit(f"ERROR: --backfill-cron target not found: {target}")
         backfill_cron_file(target)
+        return
+
+    if args.link_shared:
+        hermes_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+        base = profiles_base(hermes_home)
+        if base.is_dir():
+            for prof in base.iterdir():
+                if prof.is_dir():
+                    link_shared_profile_resources(prof, hermes_home)
         return
 
     if not args.template:

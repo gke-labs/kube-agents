@@ -663,6 +663,51 @@ class CreateProfileTest(unittest.TestCase):
         self.create()
         self.assertEqual(self.config(), first)
 
+    def test_links_shared_tirith_and_npm_cache(self):
+        """Profile links identical binaries (Tirith) and npm cache from shared root (#3325)."""
+        shared_tirith = self.home_root / "bin" / "tirith"
+        shared_tirith.parent.mkdir(parents=True, exist_ok=True)
+        shared_tirith.write_text("#!/bin/sh\nexit 0\n")
+        shared_tirith.chmod(0o755)
+
+        self.create()
+
+        tirith_link = self.profile / "bin" / "tirith"
+        self.assertTrue(tirith_link.is_symlink(), "profile bin/tirith must be a symlink")
+        self.assertEqual(tirith_link.resolve(), shared_tirith.resolve())
+
+        npm_link = self.profile / "home" / ".npm"
+        self.assertTrue(npm_link.is_symlink(), "profile home/.npm must be a symlink")
+        self.assertEqual(npm_link.resolve(), (self.home_root / ".npm-cache").resolve())
+
+    def test_link_shared_resources_tolerates_missing_tirith(self):
+        """Scaffold succeeds and links npm cache even when Tirith binary is not yet present."""
+        self.create()
+
+        tirith_link = self.profile / "bin" / "tirith"
+        self.assertFalse(tirith_link.exists(), "no tirith symlink if shared binary is missing")
+
+        npm_link = self.profile / "home" / ".npm"
+        self.assertTrue(npm_link.is_symlink(), "profile home/.npm must still be linked")
+        self.assertEqual(npm_link.resolve(), (self.home_root / ".npm-cache").resolve())
+
+    def test_link_shared_resources_does_not_clobber_existing_file(self):
+        """Existing profile files are preserved rather than overwritten by symlinks."""
+        prof_dir = self.home_root / "profiles" / self.name
+        prof_bin = prof_dir / "bin" / "tirith"
+        prof_bin.parent.mkdir(parents=True, exist_ok=True)
+        prof_bin.write_text("existing custom tirith")
+
+        shared_tirith = self.home_root / "bin" / "tirith"
+        shared_tirith.parent.mkdir(parents=True, exist_ok=True)
+        shared_tirith.write_text("shared tirith")
+        shared_tirith.chmod(0o755)
+
+        self.create()
+
+        self.assertFalse(prof_bin.is_symlink(), "existing file must not be replaced with a symlink")
+        self.assertEqual(prof_bin.read_text(), "existing custom tirith")
+
     def test_every_user_md_field_is_readable_by_preflight(self):
         """USER.md's shape is a contract with cluster_preflight.sh's user_md_field().
 

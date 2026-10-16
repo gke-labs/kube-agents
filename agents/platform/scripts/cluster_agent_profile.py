@@ -32,6 +32,7 @@ from profile_scaffold import (
     backfill_cron_file,
     ensure_profile,
     is_scaffolded,
+    link_shared_profile_resources,
     overlay_template,
     profiles_base,
 )
@@ -478,6 +479,11 @@ def _probe_connectivity(name: str, kubeconfig: Path, decision: EndpointDecision 
     return False
 
 
+def _link_shared_profile_resources(home: Path) -> None:
+    """Share identical binaries and cache directories across profiles (#3325)."""
+    link_shared_profile_resources(home, HERMES_HOME)
+
+
 def create_profile(project: str, cluster: str, location: str) -> str:
     """Scaffold (idempotently) a Cluster Agent profile for a GKE cluster; return its name.
 
@@ -494,6 +500,9 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # 1. Register the profile with Hermes (idempotent) via the shared scaffold helper.
     description = f"Read-only Cluster Agent for GKE cluster {cluster} ({project}/{location})."
     home = ensure_profile(name, description, HERMES_HOME)
+
+    # 1a. Share identical binaries and caches across profiles (#3325).
+    _link_shared_profile_resources(home)
 
     # 2. Overlay the Cluster Agent persona, scoped config, and skills (+ shared plugins).
     overlay_template(home, TEMPLATE_DIR, SHARED_PLUGINS_DIR, items=OVERLAY_ITEMS)

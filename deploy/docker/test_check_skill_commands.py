@@ -444,6 +444,38 @@ class InstallTirithTest(unittest.TestCase):
         with self.assertRaises(check.ScannerUnavailable):
             self.install(_archive({"README": b"x"}))
 
+    def test_main_install_tirith_copies_verified_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "usr" / "local" / "bin" / "tirith"
+            fake_bin = Path(tmp) / "fake-tirith"
+            fake_bin.write_bytes(b"ELF-TIRITH")
+            fake_bin.chmod(0o755)
+
+            probes = {check.PROBE_REFUSED: verdict("block"), check.PROBE_ALLOWED: verdict("allow")}
+            scanner = types.ModuleType("tools.tirith_security")
+            setattr(scanner, "check_command_security", lambda text: probes.get(text, verdict("allow")))
+            modules = {"tools": types.ModuleType("tools"), "tools.tirith_security": scanner}
+
+            skill = Path(tmp) / "demo" / "SKILL.md"
+            skill.parent.mkdir(parents=True, exist_ok=True)
+            skill.write_text("```bash\npwd\n```\n")
+
+            with mock.patch.dict(sys.modules, modules), \
+                    mock.patch.dict(check.os.environ), \
+                    mock.patch.object(check, "KNOWN_FINDINGS", {}), \
+                    mock.patch("sys.stdout", new=io.StringIO()), \
+                    mock.patch("sys.stderr", new=io.StringIO()):
+                code = check.main([
+                    f"agents/platform/skills={tmp}",
+                    "--tirith-bin", str(fake_bin),
+                    "--install-tirith", str(dest),
+                ])
+
+            self.assertEqual(0, code)
+            self.assertTrue(dest.is_file(), "binary must be copied to --install-tirith destination")
+            self.assertEqual(dest.read_bytes(), b"ELF-TIRITH")
+            self.assertEqual(dest.stat().st_mode & 0o777, 0o755)
+
 
 if __name__ == "__main__":
     unittest.main()

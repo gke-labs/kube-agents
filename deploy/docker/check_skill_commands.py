@@ -77,6 +77,7 @@ import io
 import os
 import platform
 import re
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -509,6 +510,11 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help=f"a Tirith binary to use instead of downloading {TIRITH_VERSION}",
     )
+    parser.add_argument(
+        "--install-tirith",
+        type=Path,
+        help="copy the verified Tirith binary to this path after checking",
+    )
     args = parser.parse_args(argv)
     overlapping = [
         (first, second)
@@ -569,6 +575,10 @@ def main(argv: list[str] | None = None) -> int:
             check_scanner(check_command_security)
             findings = scan_blocks(blocks, check_command_security)
             check_scanner(check_command_security)
+            if args.install_tirith:
+                args.install_tirith.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(binary, args.install_tirith)
+                args.install_tirith.chmod(TIRITH_BINARY_MODE)
         except ScannerUnavailable as exc:
             print(f"SKILL COMMAND CHECK COULD NOT RUN: {exc}", file=sys.stderr)
             return 1

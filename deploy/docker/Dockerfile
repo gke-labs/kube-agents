@@ -2148,6 +2148,7 @@ assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.ma
 assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/platform-config/check_skill_commands.py \
+        --install-tirith /usr/local/bin/tirith \
         agents/platform/skills=/opt/platform-template/skills \
         agents/cluster/skills=/opt/cluster-template/skills \
         a2a/persona/platform/skills=/opt/a2a-template/skills && \
@@ -2470,6 +2471,7 @@ USER 10000:10000
 # names the exact image.
 ARG KUBE_AGENTS_VERSION
 ENV KUBE_AGENTS_VERSION=${KUBE_AGENTS_VERSION}
+ENV NPM_CONFIG_CACHE=/opt/data/.npm-cache
 
 # --- CREDENTIAL PROXY TOOLING ---
 # Everything the sidecar needs that is not agent source: the credential-aware

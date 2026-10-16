@@ -25,6 +25,7 @@ readonly OTEL_FLAG_DISABLED="--disabled"
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
 export INSTALL_DIR="/opt/hermes"
+export NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-$TARGET_DIR/.npm-cache}"
 
 # The WAL-to-DELETE conversion (deploy/shared/sqlite_journal_migrate.py). Named here
 # because two places use it: the owner runs it at step 1.7 and a non-owner waits on
@@ -1265,6 +1266,12 @@ if [ -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -d "$PLATFORM_TEMPLA
         >/dev/null || echo "WARN: platform profile force-sync failed; continuing" >&2
 fi
 
+# 2.6c Link shared binaries and caches for existing profiles (#3325).
+if [ -d "$TARGET_DIR/profiles" ] && [ -f "$SCAFFOLD" ]; then
+    HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+        "$SCAFFOLD" --link-shared || echo "WARN: link-shared profile resources failed; continuing" >&2
+fi
+
 # 2.6a Re-sync each specialist profile's skills from the image on every start.
 # Same reasoning as 2.6, applied to the directory that carries the agent's
 # executable procedures. The scaffold in 2.5 (and cluster_agent_profile.py for
@@ -1885,6 +1892,7 @@ fi
 # created it too tight; guarded because an already-correct dir owned by the
 # peer uid may refuse the chmod, and that is fine.
 mkdir -p "$TARGET_DIR/scratch"
+mkdir -p "$TARGET_DIR/.npm-cache"
 chmod 0775 "$TARGET_DIR/scratch" 2>/dev/null || true
 
 # 4.5 Say so loudly when the remote MCP servers cannot start. Every profile's

@@ -10,10 +10,11 @@ agent shipped a CAPABILITIES.md describing machinery that was not there. The
 directory cases below are that regression, not a formality.
 """
 
-import io
 import fcntl
-import shutil
+import io
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -645,6 +646,59 @@ class BackfillCronStoreTest(unittest.TestCase):
             ps.backfill_cron_file(cron_file)
 
         self.assertTrue(lock_held, ".jobs.lock was NOT held exclusively during backfill_cron_file")
+
+    def test_link_shared_profile_resources_links_tirith_and_npm(self):
+        """link_shared_profile_resources links shared Tirith binary and npm cache (#3325)."""
+        hermes_home = self.root / "hermes_home"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        shared_tirith = hermes_home / "bin" / "tirith"
+        shared_tirith.parent.mkdir(parents=True, exist_ok=True)
+        shared_tirith.write_text("#!/bin/sh\nexit 0\n")
+        shared_tirith.chmod(0o755)
+
+        home = hermes_home / "profiles" / "test-cluster"
+        home.mkdir(parents=True, exist_ok=True)
+
+        ps.link_shared_profile_resources(home, hermes_home)
+
+        tirith_link = home / "bin" / "tirith"
+        self.assertTrue(tirith_link.is_symlink())
+        self.assertEqual(tirith_link.resolve(), shared_tirith.resolve())
+
+        npm_link = home / "home" / ".npm"
+        self.assertTrue(npm_link.is_symlink())
+        self.assertEqual(npm_link.resolve(), (hermes_home / ".npm-cache").resolve())
+
+        # Also verifies home/.npm is linked
+        direct_npm = home / ".npm"
+        self.assertTrue(direct_npm.is_symlink())
+        self.assertEqual(direct_npm.resolve(), (hermes_home / ".npm-cache").resolve())
+
+    def test_main_link_shared_links_all_profiles(self):
+        """main with --link-shared links every profile under profiles_base (#3325)."""
+        hermes_home = self.root / "hermes_home_cli"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        shared_tirith = hermes_home / "bin" / "tirith"
+        shared_tirith.parent.mkdir(parents=True, exist_ok=True)
+        shared_tirith.write_text("#!/bin/sh\nexit 0\n")
+        shared_tirith.chmod(0o755)
+
+        for name in ("platform", "cluster-a", "cluster-b"):
+            p = hermes_home / "profiles" / name
+            p.mkdir(parents=True, exist_ok=True)
+
+        with unittest.mock.patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            with unittest.mock.patch.object(sys, "argv", ["profile_scaffold.py", "--link-shared"]):
+                ps.main()
+
+        for name in ("platform", "cluster-a", "cluster-b"):
+            p = hermes_home / "profiles" / name
+            tirith_link = p / "bin" / "tirith"
+            self.assertTrue(tirith_link.is_symlink(), f"{name} bin/tirith must be symlink")
+            self.assertEqual(tirith_link.resolve(), shared_tirith.resolve())
+            npm_link = p / "home" / ".npm"
+            self.assertTrue(npm_link.is_symlink(), f"{name} home/.npm must be symlink")
+            self.assertEqual(npm_link.resolve(), (hermes_home / ".npm-cache").resolve())
 
 
 if __name__ == "__main__":
