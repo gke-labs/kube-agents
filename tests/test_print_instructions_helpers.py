@@ -75,7 +75,7 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
 
     _NEXT_HOME = "C0123ABCD"
 
-    def _run(self, install_env):
+    def _run(self, install_env, applied=None):
         with tempfile.TemporaryDirectory() as tmp:
             env_file = pathlib.Path(tmp) / "install.env"
             env_file.write_text(install_env)
@@ -88,6 +88,7 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
                 "VARS_FILE": str(pathlib.Path(tmp) / "vars.sh"),
                 "KUBE_AGENTS_INSTALL_ENV": str(env_file),
                 "REGISTRY_PREFIX": "ghcr.io/gke-labs/kube-agents",
+                **(applied or {}),
             }
             proc = subprocess.run(
                 ["bash", str(_REPO_ROOT / "scripts" / "installer" / "print_instructions_slack.sh"), "--dry-run"],
@@ -146,12 +147,32 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
             with self.subTest(home=home):
                 self._assert_today(self._run(self._env(mode="today", home=home)))
 
-    def test_install_sh_hands_the_printer_the_install_env_it_read(self):
-        # Without it the printer reads the checkout's install.env, which is not
-        # the run's when install.env came from the working directory.
+    def test_install_sh_hands_the_printer_its_install_env_and_applied_values(self):
+        # Without them the printer reads the checkout's install.env, which is
+        # not the run's when install.env came from the working directory, and
+        # misses an interview answer the run applied but did not record.
         source = (_REPO_ROOT / "install.sh").read_text()
         call = source.index('bash "${repo_dir}/scripts/installer/print_instructions_slack.sh"')
-        self.assertIn('KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE"', source[source.rindex("\n\n", 0, call):call])
+        head = source[source.rindex("\n\n", 0, call):call]
+        for handoff in ('KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE"',
+                        'SLACK_STEPS_PLATFORM_AGENT_MODE="$platform_agent_mode"',
+                        'SLACK_STEPS_GOOGLE_CHAT_ENABLED="${google_chat_enabled:-false}"',
+                        'SLACK_STEPS_HOME_CHANNEL="$slack_home_channel"'):
+            with self.subTest(handoff=handoff):
+                self.assertIn(handoff, head)
+
+    def test_the_values_install_sh_applied_win_over_install_env(self):
+        # An interactive run applies its chat-menu and home-channel answers
+        # without writing them to install.env.
+        file_says_both = self._env(mode="next", gchat=True)
+        applied_slack_only = {"SLACK_STEPS_PLATFORM_AGENT_MODE": "next",
+                              "SLACK_STEPS_GOOGLE_CHAT_ENABLED": "false",
+                              "SLACK_STEPS_HOME_CHANNEL": self._NEXT_HOME}
+        out = self._run(file_says_both, applied_slack_only)
+        self._assert_next(out)
+        self.assertIn(f"Invite the app to the home channel {self._NEXT_HOME}", out)
+        applied_both = {**applied_slack_only, "SLACK_STEPS_GOOGLE_CHAT_ENABLED": "true"}
+        self._assert_today(self._run(self._env(mode="next"), applied_both))
 
     def test_an_install_env_without_a_mode_is_today(self):
         # Such a file predates the key. Reading it as the install default would

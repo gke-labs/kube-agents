@@ -41,6 +41,14 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 
 load_state
 
+# install.sh passes what its run applied, which load_state's install.env would
+# otherwise override. A standalone run passes none and reads the file.
+if [ -n "${SLACK_STEPS_PLATFORM_AGENT_MODE+set}" ]; then
+  PLATFORM_AGENT_MODE="$SLACK_STEPS_PLATFORM_AGENT_MODE"
+  GOOGLE_CHAT_ENABLED="${SLACK_STEPS_GOOGLE_CHAT_ENABLED:-}"
+  SLACK_HOME_CHANNEL="${SLACK_STEPS_HOME_CHANNEL:-}"
+fi
+
 # Slack on the A2A gateway: no slash commands, no pairing, and a home channel
 # that only SLACK_HOME_CHANNEL sets.
 print_a2a_gateway_steps() {
