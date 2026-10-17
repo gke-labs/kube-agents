@@ -156,6 +156,7 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
         head = source[source.rindex("\n\n", 0, call):call]
         for handoff in ('KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE"',
                         'SLACK_STEPS_PLATFORM_AGENT_MODE="$platform_agent_mode"',
+                        'SLACK_STEPS_SLACK_ENABLED="$slack_enabled"',
                         'SLACK_STEPS_GOOGLE_CHAT_ENABLED="${google_chat_enabled:-false}"',
                         'SLACK_STEPS_HOME_CHANNEL="$slack_home_channel"'):
             with self.subTest(handoff=handoff):
@@ -166,6 +167,7 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
         # without writing them to install.env.
         file_says_both = self._env(mode="next", gchat=True)
         applied_slack_only = {"SLACK_STEPS_PLATFORM_AGENT_MODE": "next",
+                              "SLACK_STEPS_SLACK_ENABLED": "true",
                               "SLACK_STEPS_GOOGLE_CHAT_ENABLED": "false",
                               "SLACK_STEPS_HOME_CHANNEL": self._NEXT_HOME}
         out = self._run(file_says_both, applied_slack_only)
@@ -173,6 +175,9 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
         self.assertIn(f"Invite the app to the home channel {self._NEXT_HOME}", out)
         applied_both = {**applied_slack_only, "SLACK_STEPS_GOOGLE_CHAT_ENABLED": "true"}
         self._assert_today(self._run(self._env(mode="next"), applied_both))
+        # Slack added on a re-run over a file that records it off.
+        file_says_no_slack = self._env(mode="next").replace("SLACK_ENABLED=true", "SLACK_ENABLED=false")
+        self._assert_next(self._run(file_says_no_slack, applied_slack_only))
 
     def test_a_standalone_run_ignores_what_the_shell_exports(self):
         # install.sh's bootstrap drops an inherited PLATFORM_AGENT_MODE too.
@@ -183,8 +188,15 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
     def test_the_home_channel_is_trimmed_not_rewritten(self):
         out = self._run(self._env(mode="next", home=f'"  {self._NEXT_HOME} "'))
         self.assertIn(f"Invite the app to the home channel {self._NEXT_HOME},", out)
-        out = self._run(self._env(mode="next", home='"C012 C013"'))
-        self.assertIn("Invite the app to the home channel C012 C013,", out)
+
+    def test_a_home_channel_that_is_not_an_id_is_named_not_invited(self):
+        # The gateway turns home posts off for such a value (slack-app.md).
+        for home in ('"C012 C013"', "'#gke-alerts'"):
+            with self.subTest(home=home):
+                out = self._run(self._env(mode="next", home=home))
+                self.assertIn("which is not a channel ID", out)
+                self.assertIn("Set SLACK_HOME_CHANNEL in install.env", out)
+                self.assertNotIn("Invite the app to the home channel", out)
 
     def test_an_install_env_without_a_mode_is_today(self):
         # Such a file predates the key. Reading it as the install default would

@@ -51,6 +51,7 @@ load_state
 # otherwise override. A standalone run passes none and reads the file.
 if [ -n "${SLACK_STEPS_PLATFORM_AGENT_MODE+set}" ]; then
   PLATFORM_AGENT_MODE="$SLACK_STEPS_PLATFORM_AGENT_MODE"
+  SLACK_ENABLED="${SLACK_STEPS_SLACK_ENABLED:-}"
   GOOGLE_CHAT_ENABLED="${SLACK_STEPS_GOOGLE_CHAT_ENABLED:-}"
   SLACK_HOME_CHANNEL="${SLACK_STEPS_HOME_CHANNEL:-}"
 fi
@@ -59,9 +60,10 @@ fi
 # that only SLACK_HOME_CHANNEL sets.
 print_a2a_gateway_steps() {
   local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
-  local home="${SLACK_HOME_CHANNEL:-}"
+  local home="${SLACK_HOME_CHANNEL:-}" not_an_id
   home="${home#"${home%%[![:space:]]*}"}"
   home="${home%"${home##*[![:space:]]}"}"
+  not_an_id="$(slack_home_channel_not_an_id "$home")"
   echo -e "[ ] 1. Check the Slack app against the spec.mode next manifest:"
   echo -e "       ${SLACK_NEXT_APP_DOC}"
   echo -e "       Socket Mode on, the scopes and message events it lists, and ${C_YELLOW}no slash commands${C_RESET}:"
@@ -79,6 +81,9 @@ print_a2a_gateway_steps() {
     echo -e "[ ] 4. No home channel is configured, so the agent posts no alerts or scheduled reports to Slack."
     echo -e "       Set ${C_WHITE}SLACK_HOME_CHANNEL${C_RESET} in install.env to a channel ID (C... or G...) and re-run the installer."
     echo -e "       A chat message or ${C_WHITE}/sethome${C_RESET} does not set it under next: ${SLACK_NEXT_HOME_CHANNEL_DOC}"
+  elif [ -n "$not_an_id" ]; then
+    echo -e "[ ] 4. SLACK_HOME_CHANNEL is '${not_an_id}', which is not a channel ID, so the gateway posts no alerts or scheduled reports to Slack."
+    echo -e "       Set ${C_WHITE}SLACK_HOME_CHANNEL${C_RESET} in install.env to a channel ID (C... or G...) and re-run the installer: ${SLACK_NEXT_HOME_CHANNEL_DOC}"
   else
     echo -e "[ ] 4. Invite the app to the home channel ${C_WHITE}${home}${C_RESET}, or Slack refuses its alerts and scheduled reports there:"
     echo -e "       ${C_WHITE}/invite @<app display name>${C_RESET} in that channel."

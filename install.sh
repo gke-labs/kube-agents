@@ -8059,6 +8059,7 @@ main() {
     # record makes differ from the file.
     IMAGE_TAG="$image_tag" KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE" \
       SLACK_STEPS_PLATFORM_AGENT_MODE="$platform_agent_mode" \
+      SLACK_STEPS_SLACK_ENABLED="$slack_enabled" \
       SLACK_STEPS_GOOGLE_CHAT_ENABLED="${google_chat_enabled:-false}" \
       SLACK_STEPS_HOME_CHANNEL="$slack_home_channel" \
       bash "${repo_dir}/scripts/installer/print_instructions_slack.sh" || true
