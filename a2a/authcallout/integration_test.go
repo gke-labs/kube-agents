@@ -43,7 +43,9 @@ const (
 	strangerSA   = "system:serviceaccount:kubeagents-system:some-other-workload"
 	strangerTok  = "token-for-a-serviceaccount-that-is-not-in-the-map-at-all-padded"
 
-	agentSA = "system:serviceaccount:kubeagents-system:agent"
+	// The platform agent container's principal: the gateway Pod's own
+	// ServiceAccount, as the operator renders it (gatewayServiceAccountName).
+	agentSA = "system:serviceaccount:kubeagents-system:agent-gateway-agent"
 )
 
 // twoIdentityMap grants the two principals deliberately disjoint subjects, so
@@ -62,7 +64,7 @@ const twoIdentityMap = `{
       }
     },
     {
-      "serviceAccount": "system:serviceaccount:kubeagents-system:agent",
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-gateway-agent",
       "user": "agent",
       "account": "APP",
       "grants": {
