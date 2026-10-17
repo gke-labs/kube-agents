@@ -57,12 +57,13 @@ const (
 	// thing enforcing the ceiling. A soft limit makes GC more aggressive as
 	// the heap approaches it; it does not cap live heap.
 	memoryLimitFraction = 0.5
-	// defaultGatewayWait is two of the agent container's startup probe
-	// budgets (agentAPIProbe(10, 90) in platformagent_manifests.go, 905s).
-	// A boot that overruns one budget is restarted, and the restarted
-	// entrypoint redoes its profile steps before the gateway binds, so a
-	// single budget would give up on exactly the slowest boots.
-	defaultGatewayWait = 30 * time.Minute
+	// defaultGatewayWait outlasts two of the agent container's startup probe
+	// budgets (agentAPIProbe(10, 90) in platformagent_manifests.go, 905s)
+	// plus the kill grace period and restart backoff between them. A boot
+	// that overruns one budget is restarted, and the restarted entrypoint
+	// redoes its profile steps before the gateway binds, so a single budget
+	// would give up on exactly the slowest boots.
+	defaultGatewayWait = 35 * time.Minute
 )
 
 // flags holds the CLI-based configurations parsed once during startup.

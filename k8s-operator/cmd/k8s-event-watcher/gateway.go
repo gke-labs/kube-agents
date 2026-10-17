@@ -59,6 +59,7 @@ func waitForGateway(ctx context.Context, gatewayURL string, limit, interval time
 	for {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, gatewayURL+gatewayProbePath, nil)
 		if err != nil {
+			// validate() rejects such a URL; this guards callers that skip it.
 			log.Printf("k8s-event-watcher: ALERT gateway URL %q is not usable (%v); watching events without waiting", gatewayURL, err)
 			return false
 		}

@@ -173,7 +173,7 @@ func TestValidate_GatewayFlags(t *testing.T) {
 		t.Errorf("trailing slash: got %v; want a --gateway-url error", err)
 	}
 
-	for _, bad := range []string{"localhost:8642", "127.0.0.1:8642", "ftp://127.0.0.1:8642", "http://"} {
+	for _, bad := range []string{"localhost:8642", "127.0.0.1:8642", "ftp://127.0.0.1:8642", "http:8642"} {
 		f = base()
 		f.gatewayURL = bad
 		if err := f.validate(); err == nil || !strings.Contains(err.Error(), "--gateway-url") {
@@ -190,8 +190,8 @@ func TestParseFlags_GatewayDefaults(t *testing.T) {
 	if f.gatewayURL != "" {
 		t.Errorf("--gateway-url default = %q; want empty (no wait)", f.gatewayURL)
 	}
-	if f.gatewayWait != 30*time.Minute {
-		t.Errorf("--gateway-wait default = %s; want 30m", f.gatewayWait)
+	if f.gatewayWait != 35*time.Minute {
+		t.Errorf("--gateway-wait default = %s; want 35m", f.gatewayWait)
 	}
 }
 
