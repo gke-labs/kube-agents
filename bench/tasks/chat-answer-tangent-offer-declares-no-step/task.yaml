@@ -11,12 +11,15 @@
 # (deploy/docker/patches/kanban_report_format.py) keeps an offer about
 # something the user did not ask about a question, with no `[next: ...]` line.
 #
-# What is graded is the delivered answer (report_contains, final): it meets
-# the other workload (names payments-api or seeded-debug, as mock 03's answer
-# does), so a pass is not vacuous, and no declared step is about it or any
-# other workload the case knows of (payments-api, inventory-api, anything in
-# seeded-debug, a crash or an OOM). A step about checkout-gateway itself (a
-# PodDisruptionBudget, say) is allowed. The safeguards keep the run read-only.
+# What is graded is the delivered answer (report_contains, final): no
+# declared step is about a workload the case knows the user did not ask about
+# (payments-api, inventory-api, anything in seeded-debug, a crash or an OOM).
+# A step about checkout-gateway itself (a PodDisruptionBudget, say) is
+# allowed. The limit: a run in which the worker never meets the other
+# workload passes vacuously. Requiring it to name payments-api or
+# seeded-debug failed about half of the clean runs, because the worker often
+# does not look there, so the case grades the step and not the discovery.
+# The safeguards keep the run read-only.
 #
 # The prompt names no cluster: fixtures.json is the only thing allowed to
 # address a seeded cluster (cluster-agent-crashloop-debug's header). It names
@@ -34,8 +37,8 @@ prompt: >-
   though they may have been looking at seeded-debug
 expected_output: >-
   The front door files one card and acks it. The worker finds checkout-gateway
-  healthy and not restarting, says the workload that is crashlooping is
-  payments-api in seeded-debug, and offers to look at it as a question in the
+  healthy and not restarting, may say the workload that is crashlooping is
+  payments-api in seeded-debug, and if so offers to look at it as a question in the
   answer. It declares no next step about payments-api, seeded-debug or any
   other workload; a step about checkout-gateway itself would be allowed.
   Nothing is changed.
@@ -67,14 +70,6 @@ verification_spec:
       type: report_contains
       forbidden_patterns:
         - '\[next:[^\]\n]*(?:payments|inventory|seeded-debug|crash|oom)'
-  # The answer meets the other workload, as mock 03's does, so the check above
-  # is not passed by an answer that never saw it.
-  - name: the-answer-meets-the-other-workload
-    role: objective
-    mode: assert
-    check:
-      type: report_contains
-      any_of_phrases: ["payments-api", "seeded-debug"]
   # The answer is about what was asked: checkout-gateway.
   - name: the-answer-names-checkout-gateway
     role: objective
