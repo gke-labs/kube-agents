@@ -430,9 +430,10 @@ type ExperimentalSpec struct {
 	// at the Chat Agent, which delegates through the router and the kanban board.
 	//
 	// The trade is the Chat Agent's whole reason for existing: its lockdown (a
-	// router with three toolsets) is what keeps an inbound message from reaching
-	// the full Platform Agent tool surface before a card and a worker turn have
-	// framed it. With this on, an inbound message reaches that surface directly.
+	// router, the board, memory, and one read-only terminal that opens only after
+	// a turn's triage) is what keeps an inbound message from reaching the Platform
+	// Agent's write surface before a card and a worker turn have framed it. With
+	// this on, an inbound message reaches that surface directly.
 	//
 	// One gateway means one profile, so this is not additive: while it is on, the
 	// Chat Agent persona sees no chat at all.

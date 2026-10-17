@@ -640,6 +640,49 @@ Mutation(
         "and not byte-equal to the canonical spelling",
     ),
     Mutation(
+        "B1-front-door-file-toolset-undenied",
+        "agents/chat/config.yaml",
+        ("    - file # read_file / write_file / patch / search_files\n", ""),
+        "test_B1_front_door_write_capable_toolsets_stay_denied",
+        "give the front door read_file so it can open the glossary -- and with "
+        "it write_file and patch on the data volume, the write surface the "
+        "assistant route was built not to have",
+    ),
+    Mutation(
+        "B1-front-door-slack-key-dropped",
+        "agents/chat/config.yaml",
+        ("  slack:\n    - mcp-router\n    - kanban\n    - memory\n    - terminal\n    - triage\n", ""),
+        "test_B1_front_door_every_ingress_key_lists_the_same_read_only_surface",
+        "delete the slack key as redundant with the others -- an absent key "
+        "falls back to Hermes' hermes-slack bundle, bounded only by the denylist",
+    ),
+    Mutation(
+        "B1-front-door-gate-plugin-disabled",
+        "agents/chat/config.yaml",
+        ("    - assistant_route\n", ""),
+        "test_B1_front_door_gate_is_enabled_and_its_tool_is_never_deferred",
+        "switch the plugin off to debug a turn, leaving terminal in every "
+        "toolset list with nothing hiding it or refusing it before triage",
+    ),
+    Mutation(
+        "B1-front-door-tool-search-back-on",
+        "agents/chat/config.yaml",
+        ('    enabled: "off"\n', '    enabled: "auto"\n'),
+        "test_B1_front_door_gate_is_enabled_and_its_tool_is_never_deferred",
+        "restore Hermes' default tool search -- the plugin's triage tool is "
+        "then deferred behind a catalog stub, and the forced first call names a "
+        "tool the model cannot see",
+    ),
+    Mutation(
+        "B1-front-door-second-mcp-server",
+        "agents/chat/config.yaml",
+        ("mcp_servers:\n  router:\n",
+         'mcp_servers:\n  gke:\n    url: "https://container.googleapis.com/mcp"\n  router:\n'),
+        "test_B1_front_door_router_is_the_only_mcp_server",
+        "hand the front door the hosted GKE server on the gateway's own "
+        "credential, the shape of the incident the lockdown answers",
+    ),
+    Mutation(
         # The platform overlay's copy of the allowlist is redundant with the
         # shared defaults' one once the two are merged, and Hermes lets
         # `include` win over `exclude`. Pinned as deliberate: a suite that went

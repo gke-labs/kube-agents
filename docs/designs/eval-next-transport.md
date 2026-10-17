@@ -356,8 +356,9 @@ scope reads the workers' tagged entries, which the trace does not carry, and sta
 the worker checks, as does a `tool_called` with a `result` pattern, since the trace records no results
 ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
 cannot show"). A case whose premise
-needs the front door — `agent-kanban-smoke`, which grades
-the chat profile's `kanban_create` — is a different matter:
+needs the front door — `chat-voice-ack-names-target`, which grades
+the chat profile's `kanban_create` (as `agent-kanban-smoke` did until it was parked on 2026-10-15,
+when the front door's assistant route took over the fleet list) — is a different matter:
 `hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the reason below, and the
 api lane's roster is untouched. The lane runs the bridge's shipped default executor, `api`, the
 one a customer install runs: `hack/ci-deploy.sh` leaves the operator's `A2A_BRIDGE_EXECUTOR`
@@ -381,7 +382,7 @@ graded failure with no
 issue URL in the report, not as an error.
 
 **The executor is the Hermes persona through the bridge sidecar (decided 2026-09-17).** The
-session worker carries only the tool-less `chat` profile; running the platform persona as a
+session worker carries only the session persona, with the cluster view's read-only `kubectl` and `gcloud` and a `delegate` tool; running the platform persona as a
 session pod waits on the profile and dispatcher work, which has no date, and the A2A owner set
 none for the bridge's retirement: it goes when profiles land and the retirement ordering is
 written. Stage 1 builds against the bridge
@@ -450,8 +451,9 @@ the lane then ran).** Under `cli` the inject door's task reaches the platform pe
 with the `platform_toolsets.cli` bundle: `terminal`, `read_file`, `patch`, `process_manage`,
 `execute_code`, `delegate_task` and every MCP tool the install carries. That is a different agent
 from the one today's evals reach. The api transport posts to the API server, which runs the
-default profile, the Planning Agent: its model-facing tools are the kanban set, it delegates fleet
-work to the platform persona over a card, and it relays the worker's report. Same prompt, two
+default profile, the Planning Agent: its model-facing tools are the kanban set and a read-only
+terminal that opens only after its triage call finds no specialist is needed, so it answers a direct
+lookup itself, delegates fleet work to the platform persona over a card, and relays the worker's report. Same prompt, two
 agents reading it: `obtainability-remediation-proposal` is 12 of 12 on the first, where the
 Planning Agent inlines a manifest, and was 0 of 3 on the second, where the persona followed its own
 rule and opened a pull request (the rule has since been scoped, in `agents/platform/SOUL.md` §3: a

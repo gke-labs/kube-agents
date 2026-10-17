@@ -119,8 +119,7 @@ verification_spec:
       type: report_contains
       required_phrases: ["seeded-a", "payments-api"]
       any_of_phrases: ["restart", "crashloop", "oomkilled"]
-  # The front door holds no infrastructure tools and never works a card
-  # itself. No require_success: an attempted worker-verb call is the
+  # The front door never works a card itself. No require_success: an attempted worker-verb call is the
   # violation, successful or not.
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard

@@ -9,8 +9,9 @@ files one audit card per Cluster Agent and writes their findings to
 no Cluster Agent, and a second card ranks it all into the short report the user
 receives. The audits are LLM work AND privileged work, and the
 profile this cron runs on can do neither: the Chat Agent's toolsets are
-deliberately stripped to ``mcp-router`` + ``kanban`` (no terminal, no gcloud,
-no kubectl), so it cannot run the sweep itself even as an LLM job.
+``mcp-router`` + ``kanban`` + a terminal that opens only after a model turn's
+``triage`` call, and this job is ``no_agent`` -- no model turn, so no ``triage``
+and no terminal -- so it cannot run the sweep itself.
 
 Nor can the job simply move to ``platform``. Every marker that makes onboarding
 once-only — ``.bootstrap_scan_filed`` below, ``.bootstrap_greeted`` and

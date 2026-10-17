@@ -168,6 +168,7 @@ identifier appears, add its source here.
 | Identifier | Source of truth |
 | --- | --- |
 | Kubernetes service-account names | `scripts/installer/common.sh` |
+| The front door's gated tools, the forced-triage switch, and the turn prefixes it never forces (`GATED_TOOLS`, `FORCE_TOOL_CHOICE_ENV`, `UNFORCED_MESSAGE_PREFIXES`) | `agents/chat/defaults/plugins/assistant_route/plugin.py` |
 | Seeded-fleet reconcile report keys and outcomes, fixture-state role states, the delete/replace allowlist | `hack/fleet_reconcile.py` (`OUTCOMES`, `write_report`), `scripts/eval_dashboard/fixture_state.py` (`ROLE_STATES`), `bench/tf/fleet/reconcile-allow.json` |
 | GCP service-account names an install creates, release namespace, GKE CMEK key ring and key | `install.defaults.env` |
 | Defaults an install gets for saying nothing (region, cluster, permission set, registry prefix) | `install.defaults.env` |

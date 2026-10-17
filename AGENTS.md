@@ -7,7 +7,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`): agent c
 ## Repository Layout
 
 - `agents/`: Source of truth for agent blueprints (personas and skills).
-  - `chat/`: The Planning Agent front door: the `default` Hermes profile that receives chat ingress, plans the work, and delegates each piece to a specialist.
+  - `chat/`: The Planning Agent front door: the `default` Hermes profile that receives chat ingress, triages it, answers read-only lookups itself, and delegates the rest to a specialist.
   - `platform/`: Configuration for the Platform Agent, scaffolded at pod startup into the `platform` profile.
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, runtime-debugging skills), which the Platform Agent scaffolds into per-cluster Hermes profiles at runtime; not deployed directly.
   - `contributor/`: The contributor-agent protocol: the claim/PR/review/escalation loop for external bots (e.g. Kyber, Codebot Robot) coordinating over GitHub alone. Not a runtime blueprint; not shipped.

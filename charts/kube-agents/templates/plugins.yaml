@@ -28,7 +28,8 @@ spec:
     platform_toolsets:
       pubsub:
         # Delegation set every working platform key carries (cli, api_server,
-        # google_chat). Without mcp-router the gateway cannot hand an alert to a
+        # google_chat, slack; the front door's own lists add terminal and triage
+        # for its assistant route). Without mcp-router the gateway cannot hand an alert to a
         # specialist profile, and kanban is the second gate the dispatcher checks.
         #
         # `mcp-<name>` maps to `mcp_servers.<name>`. Upstream's startup check

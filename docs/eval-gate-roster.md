@@ -30,7 +30,7 @@ partial window for it (`collecting`), that evidence feeds both. A case not named
 red a pull request on a graded failure, whatever its record says — and since 2026-09-22 it does
 not run on one either: the eval crew decided that the presubmit runs the blocking roster only
 ([#1023](https://github.com/gke-labs/kube-agents/issues/1023)), so `presubmit-cases.txt` holds
-the roster's thirteen cases plus, since 2026-09-29, one documented exception: the held-out seat a
+the roster's eleven cases plus, since 2026-09-29, one documented exception: the held-out seat a
 coverage tracker puts in the presubmit file without a roster line, one per tracker
 ([#2013](https://github.com/gke-labs/kube-agents/issues/2013) for the compliance canary;
 [#2016](https://github.com/gke-labs/kube-agents/issues/2016)'s seat for pdb-remediation-pr took
@@ -81,7 +81,7 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-Thirteen of the fourteen presubmit cases are admitted; the other one, the compliance canary,
+Eleven of the twelve presubmit cases are admitted; the other one, the compliance canary,
 is the held-out seat described above (recount the entries of
 `hack/eval/presubmit-cases.txt` and
 `blocking-roster.txt` rather than trusting this sentence — an earlier copy of it miscounted
@@ -241,7 +241,11 @@ fails on a correct agent today, and the nightly record is what will show a fix l
 
 One re-admission on record: **agent-kanban-smoke** earned its seat back after the
 2026-08-27 redesign (a real SRE question graded on `kanban_create` plus cluster names);
-the reds that once argued for un-arming it belonged to the old vocabulary check.
+the reds that once argued for un-arming it belonged to the old vocabulary check. It left again
+on 2026-10-15 (#3202), not as a flake demotion but as a parked premise: the front door's
+assistant route now answers the fleet list itself with no card, so the case is off the presubmit
+file and the roster with a `KNOWN_UNREGISTERED` entry, and `chat-assistant-route-lists-clusters`
+grades the route that replaced it in the nightly.
 
 Admitted on the record since the split:
 
@@ -313,7 +317,7 @@ blocking for every case by design, admitted or not: `grade_case` evaluates them 
 reads admission. Those classes signal a broken case or install, not flake, and the fix is
 on that side rather than on the roster.
 
-Since 2026-09-22 those rungs reach only the cases the presubmit runs: the roster's thirteen and,
+Since 2026-09-22 those rungs reach only the cases the presubmit runs: the roster's eleven and,
 since 2026-09-29, the held-out seat. The seats of 2026-09-29 put both GitHub-writing paths back on
 every pull request — the canary's (the minted token, the cloned `*-infra` workspace, the ledger
 write, the `ledger_issue_contains` verifier) and pdb-remediation-pr's (submit-suggestion opening
@@ -332,7 +336,7 @@ request that touches that path should still say what it ran by hand.
 ## The whole-suite rate
 
 Beside the per-case rungs the verdict carries one number for the whole pull request: the pooled
-pass rate of every roster case's scored repetitions — thirteen cases × three = 39 units since 2026-10-14 (36 before), `infra`
+pass rate of every roster case's scored repetitions — eleven cases × three = 33 units since 2026-10-16 (39 from 2026-10-14, 36 before), `infra`
 repetitions left out — against `main`'s rate over the same cases from the evidence store (the
 newest seven nightly lines per case, about 249 runs). It is the rule that can see a pull request
 which made several cases a little worse without making any one of them fail three times. The
@@ -422,7 +426,8 @@ rebuilt, but the worker half stays until `scoring.py` takes those entries out of
 `worker_blind_checks` for a record that carries the workers.
 
 A premise the transport removes is the lane's exclusion list,
-`hack/eval/inject-lane-exclusions.txt`. `agent-kanban-smoke`'s objective is the default profile
+`hack/eval/inject-lane-exclusions.txt`. `chat-voice-ack-names-target`'s objective (and, until it
+was parked on 2026-10-15, `agent-kanban-smoke`'s) is the default profile
 filing a `kanban_create` and the specialist's answer coming back to the thread. Under the bridge's
 default `api` executor the default profile answers the door's task and can file the card, but the
 card's completion never reaches the A2A thread. The lane's delegation wait reads the card's

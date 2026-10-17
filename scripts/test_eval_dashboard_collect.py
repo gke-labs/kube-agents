@@ -1373,7 +1373,11 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # 2026-10-14 (#2016), which covered remediation again.
         # upgrades-lagging-master-probe, upgrades' only roster case, was
         # demoted to the nightly on 2026-10-16 (#3269), uncovering upgrades.
-        self.assertEqual(cov["uncovered"], ["fleet-audits", "upgrades"])
+        # 2026-10-15 (#3202): agent-kanban-smoke, chat-and-routing's one roster
+        # case, was parked when the front door's assistant route took its
+        # premise; chat-assistant-route-lists-clusters is the domain's nightly
+        # case, and a roster seat is a later pull request on its record.
+        self.assertEqual(cov["uncovered"], ["chat-and-routing", "fleet-audits", "upgrades"])
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
     def test_active_tasks_are_the_presubmit_file_entries(self):

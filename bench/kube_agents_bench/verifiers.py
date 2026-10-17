@@ -1101,9 +1101,15 @@ def _sentences(text: str) -> list[str]:
     return [s.strip() for s in _SENTENCE_BREAK.split(_unabbreviate(joined)) if s.strip()]
 
 
+# What answer_first graded, as its reason names it: a delivered card result
+# ("result N"), or the reply itself when none was delivered.
+_ANSWER_FIRST_DELIVERED = "result"
+_ANSWER_FIRST_REPLY = "reply"
+
+
 @VERIFIERS.register("answer_first")
 class AnswerFirstVerifier(BaseVerifier):
-    """Whether each delivered card result opens on its answer and stops.
+    """Whether each delivered card result, or the reply itself, opens on its answer and stops.
 
     The shape a chat answer owes the person who asked: one bold sentence that
     answers the ask, a sentence or two of the evidence that settles it, an
@@ -1124,8 +1130,11 @@ class AnswerFirstVerifier(BaseVerifier):
     ``report_contains`` phrases, so ``memory`` finds ``MemoryPressure``), so an
     ask the front door split across two cards can be answered in two leads.
 
-    A run that delivered no result fails rather than erroring: the transcript
-    was read, and an answer that never arrived does not have the shape.
+    When the final message carries no delivered card result, the reply itself
+    is the one result: the front door's assistant route answers in its own
+    turn and files no card, and the shape it owes is the same. A run whose
+    final message is empty fails rather than erroring: the transcript was
+    read, and an answer that never arrived does not have the shape.
     """
 
     type: Literal["answer_first"]
@@ -1197,18 +1206,23 @@ class AnswerFirstVerifier(BaseVerifier):
                 reason=_NO_TRANSCRIPT_REASON,
             )
         results = _delivered_results(snap.final_message)
+        kind = _ANSWER_FIRST_DELIVERED
         if not results:
-            return VerificationResult(
-                success=False,
-                elapsed_time=time.monotonic() - start,
-                reason="no delegated card result was delivered, so there is no answer to read",
-            )
+            reply = snap.final_message.strip()
+            if not reply:
+                return VerificationResult(
+                    success=False,
+                    elapsed_time=time.monotonic() - start,
+                    reason="no delegated card result was delivered and the reply is empty, so there is no answer to read",
+                )
+            results, kind = [reply], _ANSWER_FIRST_REPLY
         failures, leads = [], []
         for i, result in enumerate(results):
             defects, lead_text = self._defects(result)
             leads.append(lead_text)
             if defects:
-                failures.append(f"result {i + 1}: " + "; ".join(defects))
+                label = f"{kind} {i + 1}" if kind == _ANSWER_FIRST_DELIVERED else kind
+                failures.append(f"{label}: " + "; ".join(defects))
         missing = [t for t in self.lead_terms if not any(_normalize(t) in lead for lead in leads)]
         if missing:
             failures.append(f"no bold lead mentions {missing}")
@@ -1218,11 +1232,12 @@ class AnswerFirstVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=" | ".join(failures),
             )
-        return VerificationResult(
-            success=True,
-            elapsed_time=time.monotonic() - start,
-            reason=f"{len(results)} delivered result(s) open on a bold one-sentence answer and stop",
+        reason = (
+            f"{len(results)} delivered result(s) open on a bold one-sentence answer and stop"
+            if kind == _ANSWER_FIRST_DELIVERED
+            else "the reply opens on a bold one-sentence answer and stops"
         )
+        return VerificationResult(success=True, elapsed_time=time.monotonic() - start, reason=reason)
 
 
 # Hermes' MCP dispatch wrapper: a worker's trajectory entry named this carries

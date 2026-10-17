@@ -200,6 +200,17 @@ KNOWN_UNREGISTERED = {
         "needs the GHES proxy and a GHES-forge install, which no eval lane has; "
         "run by hand with the recipe in the case header"
     ),
+    # Parked 2026-10-15 (#3202): it graded a kanban card for the fleet list,
+    # and the front door's assistant route now answers that question itself
+    # with a read-only terminal command and no card
+    # (chat-assistant-route-lists-clusters is the nightly case for it). The
+    # file stays because the bench harness's own tests read it as a fixture
+    # (bench/tests/conftest.py). The entry goes if the case is rewritten for
+    # a question that still needs a specialist and registered again.
+    "agent-kanban-smoke": (
+        "#3202: premise removed by the front door's assistant route; kept as the bench "
+        "harness's test fixture"
+    ),
 }
 
 # Cases whose fixture does not exist at all, waiting on the issue that plants

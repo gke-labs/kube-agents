@@ -480,15 +480,17 @@ Three things change while it is on:
   dispatcher/worker handoff survives — so cards in flight are unaffected by the flip.
 - The entrypoint stops force-syncing `profiles/platform/config.yaml` from the image and back-fills
   it instead, on the same terms as the `default` profile's own file (except the remote MCP server
-  entries and the `plugins.enabled` list, which follow the image), so `/sethome` and `monitoring.install_id` survive a restart — see
+  entries, the `plugins.enabled` list, the `platform_toolsets` lists and the denylist entries those
+  lists grant against, which follow the image), so `/sethome` and `monitoring.install_id` survive a restart — see
   [How config reaches each profile](#how-config-reaches-each-profile).
 
 Setting the field back to `false` reverses all three. The overlay records what it applied, so the
 keys are unapplied rather than left behind, and the force-sync resumes.
 
 **What it costs.** The Planning Agent's lockdown is its whole reason for existing: a front door
-with three toolsets, so an inbound message cannot reach the full Platform Agent tool surface before a
-card and a worker turn have framed it. With this on, an inbound message reaches that surface
+with routing, kanban, memory and one read-only terminal that opens only after a turn's triage, so an
+inbound message cannot reach the Platform Agent's write surface before a card and a worker turn have
+framed it. With this on, an inbound message reaches that surface
 directly. The lockdown is deliberately **not** copied onto the platform profile — copying it would
 leave the Platform Agent unable to do the work the flag exists to let it do.
 
@@ -1114,8 +1116,8 @@ overlays. The reverse order would silently erase every overlay on each restart. 
 profile's `config.yaml` is the exception to the force-sync: it is the agent's own file, and a
 force-sync is exactly what would throw the runtime's edits away. It is instead seeded from the image
 on a fresh volume, and thereafter only back-filled — keys the image declares and the live file has
-lost are restored, keys it already holds are left alone, and the `plugins.enabled` list gains the
-names the image's list has and it lacks (below). Its overlay is merged after that
+lost are restored, keys it already holds are left alone, and the three image-owned lists follow
+the image (below). Its overlay is merged after that
 back-fill, so the operator's settings are not undone by it.
 
 The platform profile's `config.yaml` becomes a second exception under
@@ -1123,7 +1125,7 @@ The platform profile's `config.yaml` becomes a second exception under
 that file is now the one `/sethome` and the monitoring policy write to. It leaves the force-sync
 list and is back-filled from the image template instead, on exactly the terms `default` gets — keys
 the template declares and the live file has lost are restored, keys it already holds are left
-alone. Its overlay merges after that back-fill as it always did. Everything else the image owns in
+alone except the image-owned lists below. Its overlay merges after that back-fill as it always did. Everything else the image owns in
 that profile — the persona files, `cron/`, `skills/`, `governance/`, `hindsight/` — still
 force-syncs either way.
 
@@ -1132,7 +1134,8 @@ stamp the cluster reconciler matches the profile to its cluster by, and an overw
 it. It is back-filled from the cluster template instead, on the same fill-only terms — keys the
 template declares and the live file has lost are restored at the next start, and `cluster_identity`
 and every value the file already holds are left alone, except the retired `memory.provider` key,
-which the entrypoint drops. The persona files and `skills/` beside it still force-sync.
+which the entrypoint drops, and the image-owned lists below. The persona files and `skills/` beside
+it still force-sync.
 
 The remote MCP server entries inside both of these files do follow the image (see
 [the config reference](/kube-agents/reference/config/)). The back-fill recurses only through
@@ -1143,7 +1146,7 @@ server the template routes through the credential proxy's MCP relay (`gke` and
 `developer_knowledge`), the whole `args` list and the `MCP_REMOTE_BEARER_FILE` entry in its `env`
 become the template's, so a hand edit to either is reverted at the next start; for any other remote
 server the image ships, only the `User-Agent` header value is set. Nothing else in the file is
-changed.
+changed by that repair.
 
 The `plugins.enabled` list follows the image for the same reason: it is a list, so the back-fill
 never enters it. In the `default`, `platform` and every cluster profile it gains the names the
@@ -1151,6 +1154,15 @@ image template's list has and the live list lacks, appended after the agent's ow
 removed, so a name the agent dropped on purpose comes back, which is the price of a plugin that
 ships enabled. Without it a volume scaffolded before a plugin existed would carry the plugin into
 every image and never load it.
+
+The tool surface follows the image the same way, in two lists. Each `platform_toolsets.<key>`
+gains the names the template's list has and the live list lacks, appended after the agent's own
+(the front door's `terminal` and `triage`, on a volume scaffolded before them). And
+`agent.disabled_toolsets` loses exactly the names the image has stopped denying, today one, the
+front door's `terminal`, while the template lists it in one of those `platform_toolsets` lists
+and no longer denies it, because the denylist runs last and would cancel the grant. That is the
+one removal the back-fill makes. Nothing else leaves the denylist: a denial of any other name,
+the template's or one an operator added by hand, stays.
 
 **Merge semantics.** These differ between the two mechanisms, which is the easiest thing to get
 wrong here. In a startup **overlay** — every profile including `default` — maps merge recursively,

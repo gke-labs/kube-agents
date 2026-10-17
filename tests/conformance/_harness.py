@@ -676,6 +676,12 @@ SOURCES: dict[str, Source] = {
         ".github/workflows/autopush-deploy.yml",
         ("workflow_run", "head_branch"),
     ),
+    # The chat front door's own config: the one read-only surface it holds and
+    # the denylist that keeps everything else off it (B1, the front-door declaration half).
+    "chat_config": Source(
+        "agents/chat/config.yaml",
+        ("platform_toolsets:", "disabled_toolsets:", "assistant_route"),
+    ),
     # --- the published site ----------------------------------------------
     # The page AGENTS.md names as the home of what the agent may and may not
     # do. D2 requires it to be among the pages site_pages() finds, which is

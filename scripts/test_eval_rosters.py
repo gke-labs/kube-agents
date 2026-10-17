@@ -163,7 +163,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-voice-failure-leads-with-fact",  # the front door's reply to a blocked card
     "upgrades-zonal-control-plane-outage-warned",  # upgrade-failure catalogue entry 11, the first scenario case
     "oobe-first-run-audits",  # the oobe job's first-run audits stage
-    "chat-voice-answer-first",  # a delegated answer opens on its verdict
+    "chat-voice-answer-first",  # a quick health question is answered first, in one bold sentence (assistant route since #3202)
     "observability-watcher-scrape-state",  # the event watcher's scrape state, #2141
     "platform-security-secrets-encryption-currentstate-probe",  # the gke-basics/security skills sync
     "chat-fanout-fleet-restarts-rows",  # a fleet question fanned out one titled card per cluster
@@ -186,10 +186,16 @@ ADDED_AFTER_THE_MOVE = [
     "security-chat-request-runs-collector",  # a plain security-posture request runs the compliance collector, #2386
     "compute-class-canary-active-migration-pdb-probe",  # the gke-compute-classes skill sync
     "observability-trace-latency-brokered",  # the trace latency helper through the broker, unparked 2026-10-16 (#2244)
+    "chat-assistant-route-lists-clusters",  # the front door's assistant route: the fleet list with no card, #3202
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
 PARKED_AFTER_THE_MOVE: list[str] = []
+# Taken off the presubmit file and the blocking roster without a nightly line,
+# each with a KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py.
+PARKED_FROM_PRESUBMIT = [
+    "agent-kanban-smoke",  # 2026-10-15 (#3202): its premise, a card for the fleet list, is now the front door's own read
+]
 
 # Admitted after the split, each by a pull request that cited the record
 # (docs/eval-gate-roster.md, "Admitted on the record since the split"), as
@@ -239,7 +245,7 @@ HELD_OUT_TO_NIGHTLY = [
 # blocking-roster.txt. roster <= presubmit holds; presubmit == roster holds
 # less exactly this list.
 HELD_OUT_IN_PRESUBMIT = [
-    ("compliance-rbac-overgrant", "agent-kanban-smoke"),  # #2013 step 2, seated 2026-09-29; the roster line is step 4
+    ("compliance-rbac-overgrant", "incident-triage-oom-event-probe"),  # #2013 step 2, seated 2026-09-29; the roster line is step 4
 ]
 
 
@@ -310,8 +316,9 @@ class ParserTest(unittest.TestCase):
 class SplitLostNothingTest(unittest.TestCase):
     def test_the_presubmit_file_is_the_tasks_array_at_the_split_plus_the_promoted_less_the_held_out(self):
         expected = [
-            c for c in with_insertions(PRESUBMIT_AT_SPLIT, PROMOTED_AFTER_THE_SPLIT)
-            if c not in HELD_OUT_TO_NIGHTLY and c not in DEMOTED
+            c
+            for c in with_insertions(PRESUBMIT_AT_SPLIT, PROMOTED_AFTER_THE_SPLIT)
+            if c not in HELD_OUT_TO_NIGHTLY and c not in DEMOTED and c not in PARKED_FROM_PRESUBMIT
         ]
         self.assertEqual(eval_rosters.presubmit_cases(), with_insertions(expected, HELD_OUT_IN_PRESUBMIT))
 
@@ -345,7 +352,11 @@ class SplitLostNothingTest(unittest.TestCase):
     def test_the_blocking_roster_is_bootstrap_admitted_at_the_split_plus_the_admitted(self):
         self.assertEqual(
             eval_rosters.blocking_roster(),
-            [c for c in with_insertions(ROSTER_AT_SPLIT, ADMITTED_AFTER_THE_SPLIT) if c not in DEMOTED],
+            [
+                c
+                for c in with_insertions(ROSTER_AT_SPLIT, ADMITTED_AFTER_THE_SPLIT)
+                if c not in DEMOTED and c not in PARKED_FROM_PRESUBMIT
+            ],
         )
 
     def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases_less_the_promoted_plus_the_held_out(self):
@@ -400,7 +411,6 @@ class SplitLostNothingTest(unittest.TestCase):
 # file edits this set in the same pull request, for the reason the sets above
 # are pinned.
 INJECT_LANE_EXCLUDED = [
-    "agent-kanban-smoke",  # #2039: grades kanban_create by the front door and the specialist's answer folded back, which the door's thread never gets
     "chat-voice-retry-says-it-is-retried",  # #2039: grades the front door's reply to a crashed card's wake; a card-wake replay runs on the api transport only
     "chat-voice-final-attempt-is-not-retried",  # the same for a card's last-attempt wake
     "chat-voice-failure-leads-with-fact",  # #2039: grades the front door's reply to a blocked card's wake; same reason
@@ -410,10 +420,11 @@ INJECT_LANE_EXCLUDED = [
     "chat-voice-ack-names-target",  # #2039: grades the front door's delegation ack with the specialist's answer after it, which the door's thread never gets
     "chat-reset-history-names-the-command",  # #2039: grades the front door's answer to a reset request; excluded under cli, not yet graded on api
     "chat-routing-board-read",  # the same for the front door reading the board instead of filing a card
-    "chat-routing-fleet-question",  # the same as the ack: the answer is the specialist's, which the door's thread never gets
+    "chat-routing-fleet-question",  # #3202: the front door's own triage and terminal read, not yet graded on this lane
+    "chat-assistant-route-lists-clusters",  # the same for the front door listing the clusters itself
     "first-install-hello-running",  # #2039: grades the chat profile's onboarding greeting; excluded under cli, not yet graded on api
     "first-install-hello-done",  # the same once the first-look scan has finished
-    "chat-voice-answer-first",  # #2039: grades the card result the front door delivers; the inject door files no card
+    "chat-voice-answer-first",  # #3202: the front door's own triage, terminal read and verdict-first reply, not yet graded on this lane
     "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
     "chat-question-asked-to-choose-pauses",  # #2039: grades the worker's needs_input block under the door's one card; same door
 ]
@@ -421,14 +432,14 @@ INJECT_LANE_EXCLUDED = [
 # front door (bench/kube_agents_bench/card_wake.py); the harness errors such
 # a run on any transport but api.
 FRONT_DOOR_WAKE_DIRECTIVES = ("[bench:card-failure-wake]", "[bench:slack-question-wake]")
-# Check types that read what only the chat front door's card round trip
-# delivers; on the inject lane there is no card, so the check fails rather
-# than being set aside (bench/README.md, the transport table).
+# Check types that read the chat front door's reply: the card results it
+# delivered, or the reply itself when no card was filed. The inject door's
+# reply has not been graded by one, so a case carrying it is held off the lane
+# until a run grades it (bench/README.md, the transport table).
 FRONT_DOOR_DELIVERY_CHECK_TYPES = frozenset({"answer_first"})
 # Each exclusion's api-lane tier, pinned beside it: an entry is not a
 # demotion, so a case that leaves its tier's file while still excluded reds.
 INJECT_LANE_EXCLUDED_TIER = {
-    "agent-kanban-smoke": "presubmit",
     "chat-voice-retry-says-it-is-retried": "nightly",
     "chat-voice-final-attempt-is-not-retried": "nightly",
     "chat-voice-failure-leads-with-fact": "nightly",
@@ -439,6 +450,7 @@ INJECT_LANE_EXCLUDED_TIER = {
     "chat-reset-history-names-the-command": "nightly",
     "chat-routing-board-read": "nightly",
     "chat-routing-fleet-question": "nightly",
+    "chat-assistant-route-lists-clusters": "nightly",
     "first-install-hello-running": "nightly",
     "first-install-hello-done": "nightly",
     "chat-voice-answer-first": "nightly",
@@ -577,8 +589,8 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                     self.assertIn(case, excluded, f"{case} replays a wake but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
 
     def test_every_registered_front_door_delivery_case_is_excluded(self):
-        # answer_first fails on the inject lane rather than being set aside,
-        # so an unlisted case carrying one reds there every repetition.
+        # answer_first is graded, not set aside, on the inject lane, and no run
+        # there has graded it yet, so an unlisted case carrying one is a bet.
         import yaml
 
         def check_types(node):
@@ -596,7 +608,7 @@ class InjectLaneExclusionsTest(unittest.TestCase):
             doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
             if FRONT_DOOR_DELIVERY_CHECK_TYPES & set(check_types(doc.get("verification_spec"))):
                 with self.subTest(case=case):
-                    self.assertIn(case, excluded, f"{case} reads a delivered card result but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
+                    self.assertIn(case, excluded, f"{case} grades the front door's reply but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
 
     def test_an_exclusion_is_not_a_demotion(self):
         # The api lane's roster is untouched by an entry here: an excluded

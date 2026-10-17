@@ -235,7 +235,7 @@ entry for every slot it means; its `fixture_roles` names the seeded-fleet
 roles whose clusters the patterns require a line about, each resolved to its slot's own
 credential (`clusters/<slot>.kubeconfig`, written for every seeded cluster the runner reached,
 before any role on it is confirmed), and a slot the runner did not reach returns
-`status: "error"`, the cluster being absent from the project rather than missed by the agent), `report_manifest` (the fenced code blocks in the same text, parsed as YAML: one document of `kind` carries every `fields` value and a label selector that selects every `selects` set and no `excludes` set), `answer_first` (each delivered card result, raw:
+`status: "error"`, the cluster being absent from the project rather than missed by the agent), `report_manifest` (the fenced code blocks in the same text, parsed as YAML: one document of `kind` carries every `fields` value and a label selector that selects every `selects` set and no `excludes` set), `answer_first` (each delivered card result, or the reply itself when no card was filed, raw:
 it opens on one bold sentence, has no heading, stays
 under its character and sentence caps, and no later sentence matches a
 `recap_patterns` regex; each of the case's `lead_terms` appears in at least one result's

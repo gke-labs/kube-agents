@@ -1341,7 +1341,7 @@ func frontDoorKanban() map[string]any {
 // contract asks callers not to do.
 //
 // What it deliberately does NOT carry is the Chat Agent's lockdown —
-// `agent.disabled_toolsets`, the three-toolset `platform_toolsets`, `toolsets: [kanban]`
+// `agent.disabled_toolsets`, the five-toolset `platform_toolsets`, `toolsets: [kanban]`
 // as a ceiling. That lockdown is the Chat Agent's contract, and copying it here would
 // leave the Platform Agent unable to do the work the flag exists to let it do
 // directly. The trade is stated on the CRD field.
@@ -4747,16 +4747,23 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// mergeCredentialProxyEnv instead — a denylist, so an unreserved name
 		// passes through without being named anywhere. An entry here would copy
 		// the variable into a container that never reads it.
-		"EOD_EXCLUDE_NAMESPACES":      {},
-		"FEEDBACK_PROMPT_DELAY":       {},
-		"FEEDBACK_PROMPT_ENABLED":     {},
-		"KAGE_SLACK_UX":               {},
-		envHermesOtelEnabled:          {},
-		"OTEL_EXPORTER_OTLP_ENDPOINT": {},
-		"OTEL_EXPORTER_OTLP_PROTOCOL": {},
-		"OTEL_RESOURCE_ATTRIBUTES":    {},
-		"OTEL_SDK_DISABLED":           {},
-		"OTEL_SERVICE_NAME":           {},
+		"EOD_EXCLUDE_NAMESPACES":  {},
+		"FEEDBACK_PROMPT_DELAY":   {},
+		"FEEDBACK_PROMPT_ENABLED": {},
+		"KAGE_SLACK_UX":           {},
+		// The front door's two route switches (agents/chat/defaults/plugins/assistant_route):
+		// the first closes the assistant route, the second only stops forcing `triage` as
+		// a turn's first call. Each selects between code paths already in the image, is
+		// compared against a fixed set of off-values, and names no path, URL, credential
+		// or image; any other value is the default.
+		"KUBE_AGENTS_ASSISTANT_ROUTE":          {},
+		"KUBE_AGENTS_TRIAGE_FORCE_TOOL_CHOICE": {},
+		envHermesOtelEnabled:                   {},
+		"OTEL_EXPORTER_OTLP_ENDPOINT":          {},
+		"OTEL_EXPORTER_OTLP_PROTOCOL":          {},
+		"OTEL_RESOURCE_ATTRIBUTES":             {},
+		"OTEL_SDK_DISABLED":                    {},
+		"OTEL_SERVICE_NAME":                    {},
 
 		// The findings queue's pacing limits (`findings_queue.pacing_limits`,
 		// read by the `no_agent` scripts `findings_nudge.py` and
@@ -5242,9 +5249,8 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				// dashboard read a config the gateway never read, and narrowing
 				// renderConfigYAML to the pinned subtrees silently narrowed this
 				// container's entire config to them: no plugins.enabled, no kanban, no
-				// toolsets, and no agent.disabled_toolsets — the denylist that
-				// agents/chat/config.yaml calls the authoritative guarantee that the
-				// front door has no runtime tools of its own.
+				// toolsets, and no agent.disabled_toolsets — the denylist that keeps
+				// the front door's file, skill and code-execution toolsets off.
 				//
 				// The presence guarantee moved to where it can be conditional: the
 				// non-owner branch at step 1.5 of deploy/shared/docker-entrypoint.sh waits

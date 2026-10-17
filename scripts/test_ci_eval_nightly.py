@@ -214,8 +214,8 @@ class RefusalTest(unittest.TestCase):
         self.assert_refused(result, "presubmit-cases.txt", "no-such-case", "names no case under bench/tasks/")
 
     def test_a_nightly_entry_that_is_also_presubmit_stops_the_job(self):
-        result = self.scratch(lambda d: (d / "nightly-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n"))
-        self.assert_refused(result, "agent-kanban-smoke", "would run it twice")
+        result = self.scratch(lambda d: (d / "nightly-cases.txt").write_text("./tasks/reliability-pdb-probe/task.yaml\n"))
+        self.assert_refused(result, "reliability-pdb-probe", "would run it twice")
 
     def test_a_roster_name_outside_the_presubmit_stops_the_job(self):
         result = self.scratch(lambda d: (d / "blocking-roster.txt").write_text("obtainability-planted-pdb\n"))
@@ -269,10 +269,10 @@ class GitLabLaneTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
-            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/pdb-remediation-pr/task.yaml\n")
+            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/pdb-remediation-pr/task.yaml\n./tasks/reliability-pdb-probe/task.yaml\n")
             result = load_matrix({"EVAL_FORGE": "gitlab"}, hack_dir=hack)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(lines_tagged(result, "ROSTER"), ["pdb-remediation-pr,agent-kanban-smoke"], "the roster intersected with the lane, in roster order")
+        self.assertEqual(lines_tagged(result, "ROSTER"), ["reliability-pdb-probe,pdb-remediation-pr"], "the roster intersected with the lane, in roster order")
         self.assertNotIn("rung 4 is disarmed", result.stdout)
 
     def test_the_inject_guard_still_fires_on_the_lane(self):
@@ -282,9 +282,11 @@ class GitLabLaneTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
-            # agent-kanban-smoke is the lane's only roster case and is
-            # inject-excluded; vcs-spent-branch-reuse is held out.
-            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/vcs-spent-branch-reuse/task.yaml\n")
+            # No roster case is inject-excluded today, so the lane is built
+            # here: reliability-pdb-probe is its only roster case and the
+            # scratch exclusion list names it; vcs-spent-branch-reuse is held out.
+            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/reliability-pdb-probe/task.yaml\n./tasks/vcs-spent-branch-reuse/task.yaml\n")
+            (hack / "eval" / "inject-lane-exclusions.txt").write_text("# #2039: a scratch exclusion for the test\nreliability-pdb-probe\n")
             result = load_matrix_through_the_lane_step({"EVAL_FORGE": "gitlab", "AGENT_TRANSPORT": "inject"}, hack_dir=hack)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("every blocking-roster case in eval/gitlab-cases.txt is excluded on the inject lane", result.stderr)
@@ -531,11 +533,23 @@ class InjectLaneExclusionTest(unittest.TestCase):
         # never grades would trip bench-gate's misspelled-roster banner on
         # every run of the lane.
         excluded_names = set(eval_rosters.inject_lane_exclusions())
-        self.assertTrue(excluded_names & set(eval_rosters.blocking_roster()), "the pinned exclusion is a roster case, so the export must differ from the file")
         self.assertEqual(
             lines_tagged(result, "ROSTER"),
             [",".join(c for c in eval_rosters.blocking_roster() if c not in excluded_names)],
         )
+
+    def test_an_excluded_roster_case_leaves_the_export(self):
+        # No roster case is excluded today (agent-kanban-smoke was the one,
+        # until it was parked), so the property is held on a scratch copy:
+        # excluding a roster case drops it from the export, not from the file.
+        roster = eval_rosters.blocking_roster()
+        result = self.scratch(
+            lambda d: (d / "inject-lane-exclusions.txt").write_text(f"# #1: a scratch exclusion\n{roster[0]}\n"),
+            {"AGENT_TRANSPORT": "inject"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"AGENT_TRANSPORT=inject: {roster[0]} leaves the matrix", result.stdout)
+        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(roster[1:])])
 
     def test_the_api_lane_exports_the_whole_roster(self):
         result = load_matrix_through_the_lane_step({"AGENT_TRANSPORT": "api"})

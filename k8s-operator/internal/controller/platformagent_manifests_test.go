@@ -1261,6 +1261,24 @@ func TestSafeSandboxEnvOverridesPassesHermesOtelEnabled(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesTheFrontDoorRouteSwitches(t *testing.T) {
+	// The assistant_route plugin's two switches are documented as spec.deployment.env
+	// settings (concepts/chatops.md, "Two routes"). Off the allowlist the documented
+	// recipe renders, validates, and silently does nothing, and the only way to close
+	// the route would be a new image.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "KUBE_AGENTS_ASSISTANT_ROUTE", Value: "off"},
+		{Name: "KUBE_AGENTS_TRIAGE_FORCE_TOOL_CHOICE", Value: "0"},
+	})
+	values := map[string]string{}
+	for _, e := range got {
+		values[e.Name] = e.Value
+	}
+	if values["KUBE_AGENTS_ASSISTANT_ROUTE"] != "off" || values["KUBE_AGENTS_TRIAGE_FORCE_TOOL_CHOICE"] != "0" {
+		t.Fatalf("expected both front-door route switches to survive the allowlist, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	// The session server reads its daily alert ceilings from the environment,
 	// so an operator has to be able to tune or disable them on the CR. Without
@@ -6635,7 +6653,10 @@ func TestFrontDoorPluginsMatchChatConfig(t *testing.T) {
 	// bootstrap_onboarding: its markers and its delivery job both resolve from the home
 	// the flag moves away from, so enabling it here greets an onboarded install and
 	// promises a report the dead `default` roster can never deliver.
-	excluded := []string{"agent_roster", "bootstrap_onboarding"}
+	// assistant_route: the default profile's per-turn gate on its sandbox terminal.
+	// The platform front door already holds the platform's full tool surface, so
+	// the gate has nothing to unlock there.
+	excluded := []string{"agent_roster", "bootstrap_onboarding", "assistant_route"}
 
 	onPlatform := read("platform")
 	want := []string{}

@@ -1,13 +1,13 @@
 ---
 title: ChatOps
-description: Google Chat and Slack are the primary interfaces to the harness. Both terminate at the Planning Agent front door, which delegates to the Platform Agent.
+description: Google Chat and Slack are the primary interfaces to the harness. Both terminate at the Planning Agent front door, which answers read-only lookups itself and delegates the rest to the Platform Agent.
 sidebar:
   order: 3
 ---
 
 Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The channels shipping today are **Google Chat** (the reference channel; enable with the installer's `--enable-google-chat`) and **Slack** (enable it in the installer's chat menu, or with `--enable-slack`). Both are opt-in and default to disabled.
 
-Both channels terminate at the **Planning Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress. It knows which specialists exist because the roster is injected into every turn by the `agent_roster` plugin (its `router` MCP tool `list_agents` re-reads the same list on demand), and files the work as a card on the shared **kanban board** (`kanban_create`), assigned to the specialist that can execute it. Results come back on their own: the gateway posts each completed card's answer into the thread verbatim, and the Planning Agent handles the hand-off and anything that blocks or fails. The [Platform Agent](/kube-agents/concepts/platform-agent/) does the actual infrastructure work as a delegated kanban worker, and per-cluster [Cluster Agents](/kube-agents/concepts/cluster-agents/) handle single-cluster runtime debugging; neither receives chat directly. A user still sees a single conversational agent regardless of channel — the delegation is visible only as progress updates in the thread. The design of record for this coordination model is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
+Both channels terminate at the **Planning Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress. It knows which specialists exist because the roster is injected into every turn by the `agent_roster` plugin (its `router` MCP tool `list_agents` re-reads the same list on demand), and either answers a read-only lookup itself ([two routes](#two-routes), below) or files the work as a card on the shared **kanban board** (`kanban_create`), assigned to the specialist that can execute it. Results come back on their own: the gateway posts each completed card's answer into the thread verbatim, and the Planning Agent handles the hand-off and anything that blocks or fails. The [Platform Agent](/kube-agents/concepts/platform-agent/) does the actual infrastructure work as a delegated kanban worker, and per-cluster [Cluster Agents](/kube-agents/concepts/cluster-agents/) handle single-cluster runtime debugging; neither receives chat directly. A user still sees a single conversational agent regardless of channel — the delegation is visible only as progress updates in the thread. The design of record for this coordination model is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
 
 Under the unsupported `spec.mode: next` toggle, Google Chat terminates at the A2A gateway instead: the same Chat app, topic and subscription, pulled through the credential broker by the gateway rather than by the Planning Agent, with the same `allowedUsers` list deciding who is answered. The Planning Agent's Google Chat platform is off on such an install, so proactive alerts and scheduled reports reach the [home channel](#home-channel) through the gateway instead, which posts them there as new threads or as replies in those threads; a reply a person types in one of those threads starts a new conversation rather than continuing the investigation that raised the alert. The reports of the cards a triage files reach the alert's thread the same way, and so do the answers of the cards the agent files for a question you asked it in chat: they post in the thread or DM you asked in, whether or not a home channel is configured (a home channel that is set but is not a space name turns this off too). Either way there are two differences from the Planning Agent's own delivery: each progress note posts as a message of its own, because the gateway can post but not edit, and a file the card produced is not attached. The design of record is [`docs/designs/spec-chatops-gateway.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-chatops-gateway.md).
 
@@ -48,6 +48,24 @@ Under `spec.mode: next` only the resource field counts. The operator hands it to
 A card that also produced a file gets the file's contents pasted into the thread rather than attached: Chat's `media.upload` refuses app authentication, so an install reaching Chat through the credential proxy can never produce a native attachment. Text deliverables under a size ceiling are posted as message text, split across messages where they have to be; anything else — a PDF, an image, an oversize file — gets a notice naming the path the agent wrote it to instead. Which formats and what ceiling are in [`agents/platform/scripts/google_chat_relay_patch.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/google_chat_relay_patch.py).
 
 The agent has to declare the file for any of that to happen. Its terminal and file tools run in a separate sandbox pod, so a file it writes is on a volume the gateway cannot read; only paths the card names in its `artifacts` list get copied across to the gateway for delivery, and only for as long as the delivery takes. Four ceilings apply to that copy — 8 MiB per file, 16 files per card, 16 MiB across the card, and a two-minute deadline for the lot — and a file that exceeds one is skipped with a warning in the gateway log while the rest of the card still delivers. Paths under the sandbox's credential and system directories are refused outright. [`agents/platform/scripts/sandbox_artifact_patch.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/sandbox_artifact_patch.py) holds the limits and the denied prefixes.
+
+### Two routes
+
+Step 3 has a shorter branch, on Slack as on Google Chat. The Planning Agent opens every user turn
+(not a wake from the board, a scheduled run, or a status poll) with a `triage` call that decides
+whether a specialist is needed and states a one-sentence plan. When the request is a direct
+translation into a few read-only commands (which clusters exist, which namespaces a named cluster
+has, whether a pod is Running, the last log lines of a workload), it is the assistant route: the
+Planning Agent's own terminal in the shell sandbox opens for that turn, it runs the commands, and
+its reply is the answer, with no card and no worker. The terminal's `kubectl` and `gcloud` go
+through the credential proxy, which refuses every verb that writes; the sandbox also carries the
+Platform Agent's version-control client, which the persona keeps off this route. Everything that
+needs investigation, knowledge, a change, or more than a few commands is the delegation route
+above. On Google Chat the "Kage is thinking…" card shows the plan while the commands run, or
+"delegated the task, this may take a while" once triage picks a specialist, and the final reply
+replaces it. Two settings in `spec.deployment.env` reach the route: `KUBE_AGENTS_ASSISTANT_ROUTE=off`
+closes it, so every request delegates as before, and `KUBE_AGENTS_TRIAGE_FORCE_TOOL_CHOICE=0` only
+turns the forced first call off; the persona rule and the gate still hold.
 
 ### Session metadata
 
@@ -194,7 +212,7 @@ If a task is already running on the `platform` route when you send `/session`, t
 
 ## How a chat question is answered under `next`
 
-Under the unsupported `spec.mode: next` toggle, a message from Google Chat, or from Slack when Google Chat is not also enabled, reaches the A2A gateway rather than a listener in the agent pod. The Planning Agent still answers it, and still hands cluster work to a specialist as a kanban card. What differs from the default `today` mode is how the message reaches the Planning Agent, over the message bus, and how the card's answer gets back to the thread, through the gateway. Setting up the Slack app for the gateway is covered in [Slack app setup](/kube-agents/install/slack-app/).
+Under the unsupported `spec.mode: next` toggle, a message from Google Chat, or from Slack when Google Chat is not also enabled, reaches the A2A gateway rather than a listener in the agent pod. The Planning Agent still answers it, still answers a read-only lookup itself, and still hands the rest of the cluster work to a specialist as a kanban card. What differs from the default `today` mode is how the message reaches the Planning Agent, over the message bus, and how the card's answer gets back to the thread, through the gateway. Setting up the Slack app for the gateway is covered in [Slack app setup](/kube-agents/install/slack-app/).
 
 The commands below assume the default resource names (`platform-agent`) and the `kubeagents-system` namespace. The gateway logs one JSON object per line.
 
@@ -212,7 +230,7 @@ The commands below assume the default resource names (`platform-agent`) and the 
 
    The startup line should carry `"executor":"api"`. Its `"profile":"platform"` is the bus address the bridge takes tasks from, not the Hermes profile that runs the turn. With `"executor":"cli"` (the operator setting `A2A_BRIDGE_EXECUTOR=cli`, or a bridge with no API server key), each message runs as a one-off `hermes -p platform` command instead: the Platform Agent answers it directly, with no Planning Agent and no memory of the thread, and a card it files does not report back to the thread.
 
-3. **The Planning Agent files a card and acknowledges.** It routes the request the way it does under `today`: to the Cluster Agent for a named cluster's live runtime state when one is on the roster, otherwise to `platform`. It files a kanban card for that specialist, then replies with one short line naming what is being checked, such as `checking prod-east.` The gateway posts that line as a message (and, on Google Chat, the status line becomes `✅ completed`). The turn has ended; the work has not. The gateway logs the end of the turn:
+3. **The Planning Agent triages, then files a card and acknowledges.** A read-only lookup it answers itself ([two routes](#two-routes)); anything else it routes the way it does under `today`: to the Cluster Agent for a named cluster's live runtime state when one is on the roster, otherwise to `platform`. It files a kanban card for that specialist, then replies with one short line naming what is being checked, such as `checking prod-east.` The gateway posts that line as a message (and, on Google Chat, the status line becomes `✅ completed`). The turn has ended; the work has not. The gateway logs the end of the turn:
 
    ```bash
    kubectl logs deployment/platform-agent-a2a-gateway -n kubeagents-system -c gateway | grep '"msg":"task terminal"'

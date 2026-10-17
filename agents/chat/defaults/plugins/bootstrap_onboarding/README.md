@@ -5,7 +5,7 @@ This document describes the first-time onboarding and GKE environment-discovery 
 **The flow lives on the `default` (Chat Agent) profile.** That placement is forced by two constraints introduced with the profile split:
 
 - Every marker onboarding coordinates on (the agent-pod rows in §2) lives in the Chat Agent's home, and a job on another profile would gate itself on a different directory.
-- The Chat Agent's toolsets are stripped to `mcp-router` + `kanban` (no terminal, gcloud, or kubectl), so it cannot perform the sweep itself.
+- The Chat Agent's toolsets are `mcp-router` + `kanban` + `memory`, plus a terminal its `assistant_route` plugin opens only for a turn whose `triage` call found no specialist is needed; the sweep runs as a `no_agent` job with no model turn at all, so nothing there can perform it.
 
 A third constraint used to be the decisive one: only the `default` profile's cron ticked at all, so a job on `platform` stayed `enabled: true` with `last_run: None` forever. That is fixed — `profile_cron_tick.py` ticks every named profile's store — but the two above still hold.
 

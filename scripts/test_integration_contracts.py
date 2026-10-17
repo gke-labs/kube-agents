@@ -128,8 +128,18 @@ class SpecToolRegistryTest(unittest.TestCase):
     # evidence of them. Evidence of each is the agent text that tells the agent
     # to use it, backticked or called
     # (test_the_core_allowlist_still_has_evidence_in_the_agent_text).
-    HERMES_CORE_TOOLS = {"skill_view"}
-    CORE_TOOL_EVIDENCE = ("agents/platform/skills/github-issue-resolver/SKILL.md",)
+    HERMES_CORE_TOOLS = {"skill_view", "terminal"}
+    CORE_TOOL_EVIDENCE = (
+        "agents/platform/skills/github-issue-resolver/SKILL.md",
+        "agents/chat/defaults/plugins/assistant_route/guide.md",
+    )
+
+    # Tools this repository's own Hermes plugins register in-process
+    # (`ctx.register_tool(name=...)` under agents/*/defaults/plugins/*/plugin.py),
+    # called by their bare name in the trajectory like any native tool. Derived
+    # from the registrations rather than written down (_registered_plugin_tools).
+    PLUGIN_SOURCES = "*/defaults/plugins/*/plugin.py"
+    REGISTER_TOOL_NAME = re.compile(r"register_tool\(\s*name=(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))")
 
     # Tools behind a remote MCP proxy (`/opt/mcp-remote/dist/proxy.js <url>`),
     # as (server alias, tool): nothing in this repository can enumerate them,
@@ -271,6 +281,38 @@ class SpecToolRegistryTest(unittest.TestCase):
                 names.add(f"mcp__{alias}__{tool}")
         return names
 
+    def _registered_plugin_tools(self):
+        """Bare names of the tools the repository's plugins register in-process.
+
+        A `name=` given as an identifier is resolved against a string constant
+        of that name at the plugin's module level, the form the plugins use
+        (`TOOL_NAME = "triage"`); a name that resolves to nothing is skipped, so
+        a refactor that hides the name fails the spec that relies on it rather
+        than passing it quietly.
+        """
+        names = set()
+        for path in (REPO_ROOT / "agents").glob(self.PLUGIN_SOURCES):
+            source = path.read_text(errors="replace")
+            for literal_dq, literal_sq, identifier in self.REGISTER_TOOL_NAME.findall(source):
+                literal = literal_dq or literal_sq
+                if not literal and identifier:
+                    constant = re.search(
+                        rf"^{identifier}\s*=\s*(?:\"([^\"]+)\"|'([^']+)')\s*$", source, re.MULTILINE
+                    )
+                    literal = (constant.group(1) or constant.group(2)) if constant else ""
+                if literal:
+                    names.add(literal)
+        return names
+
+    def test_the_plugin_tool_join_still_resolves(self):
+        """The front door's `triage` is the one plugin tool a spec names today;
+        an empty join would reject it rather than accept it, which is the
+        loud failure, but a join that silently covers fewer plugins is what
+        this pins."""
+        registered = self._registered_plugin_tools()
+        self.assertIn("triage", registered)
+        self.assertNotIn("TOOL_NAME", registered)
+
     def test_the_alias_to_server_join_still_resolves(self):
         """The join above is the whole check; an empty one passes everything.
 
@@ -320,6 +362,7 @@ class SpecToolRegistryTest(unittest.TestCase):
         registry = (
             self._registered_mcp_tools()
             | self._remote_mcp_tools()
+            | self._registered_plugin_tools()
             | self.HERMES_BUILTIN_TOOLS
             | self.HERMES_CORE_TOOLS
             | self.SESSION_HARNESS_TOOLS
