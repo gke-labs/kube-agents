@@ -8335,6 +8335,27 @@ def test_worker_commands_required_run_names_what_did_not_run():
     assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason
 
 
+def test_worker_commands_required_run_succeeded_reports_trajectory_command_count():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo other"}, "result": "other", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "kubectl get nodes"}, "result": "node-1", "status": "completed", "at": 2.0},
+    ]
+    # Card log has 1 command carrying the collector, while trajectory has 2 completed non-matching calls.
+    # Evaluated across trajectory calls (2), not card log rows (1).
+    transcript.set(
+        "ok",
+        traj,
+        worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
+    )
+    res = v.verify(5.0)
+    assert res.status == "fail"
+    assert "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason
+
+
 def test_worker_commands_required_run_succeeded_flag():
     from kube_agents_bench.verifiers import WorkerRun
 
@@ -8418,6 +8439,27 @@ def test_worker_commands_required_run_succeeded_flag():
     # Forbidden runs cannot set succeeded=True.
     with pytest.raises(ValueError, match="forbidden_runs cannot set succeeded: true"):
         WorkerCommandsVerifier(type="worker_commands", forbidden_runs=[run])
+
+
+def test_worker_commands_succeeded_worker_typed_nothing_grades_as_zero_commands():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+    mcp = {
+        "agent": "worker",
+        "name": "mcp__gke__get_k8s_resource",
+        "task": "t_1",
+        "args": {"name": "test"},
+        "result": "{}",
+        "status": "completed",
+        "at": 10.0,
+    }
+    # Tagged MCP calls beside an empty card log: reads 0 commands, fails conclusively rather than erroring.
+    transcript.set("ok", [mcp], worker_commands=[])
+    res = v.verify(5.0)
+    assert res.status == "fail"
+    assert "no worker command ran fleet_upgrade_report.py --readiness across 0 command(s)" in res.reason
 
 
 def test_worker_commands_required_run_succeeded_with_after_result_pattern():

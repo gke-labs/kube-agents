@@ -88,8 +88,8 @@ verification_spec:
   # scripts/eval_dashboard/collect.py do not count. The basename must be
   # collect.py, so test_collect.py does not count. A -h or --help call,
   # python3 -c, cat of the script, and an echo or grep that quotes the
-  # command are not runs. The check requires succeeded: true (terminal call exit 0),
-  # graded from the worker trajectory. bench/tests/test_security_chat_request_runs.py
+  # The check requires succeeded: true (terminal call exit 0, graded from
+  # the worker trajectory per WorkerRun.succeeded). bench/tests/test_security_chat_request_runs.py
   # pins the samples.
   - name: the-compliance-collector-ran
     role: objective

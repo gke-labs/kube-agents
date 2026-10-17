@@ -1955,11 +1955,12 @@ class WorkerRun(BaseModel):
     ``pdb,validatingwebhookconfigurations`` is one word, so a pattern over the word reads it
     whole, and a quoted mention of the whole command is one word that is no command), and
     ``succeeded`` (for ``required_runs`` only), whether the command must have exited 0 (graded from
-    the worker trajectory's terminal call exit status; a non-zero or unrecorded exit does not count,
-    and any command the worker joins after the script on the same shell line via `|`, `;`, `||` or
-    substitution decides the exit status the call is graded on, so the dictated form is a bare command
-    or redirection; a required run with ``succeeded: true`` and no worker trajectory to read is not
-    credited)."""
+    the worker trajectory's terminal call exit status; a non-zero or unrecorded exit does not count;
+    the call's exit is the whole shell line's, so anything joined on the line before (``||``, ``!``)
+    or after (``|``, ``;``, ``||``, substitution) the script decides it -- a guard that succeeds
+    skips the script and exits 0 -- and the dictated form is a bare command or redirection with
+    nothing else on the line; a required run with ``succeeded: true`` and no worker trajectory to read
+    is not credited)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2498,11 +2499,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     the argv names the file or the shell and not what was written to it, which
     no reading of the argv recovers -- a case names a run this way where the
     persona dictates one typed command, and a worker that runs it through a
-    file is not credited; and ``succeeded: true`` on a required run checks the
-    terminal call's overall exit status from the worker trajectory, so any command
-    the worker joins after the script on the same shell line decides the exit code
-    the run is graded on (e.g. a trailing `| tee`, `; echo done`, or `|| true`
-    shields an error), while the dictated form is a bare command or redirection.
+    file is not credited; and ``succeeded: true`` on a required run checks the terminal call's
+    overall exit status from the worker trajectory (see ``WorkerRun.succeeded``
+    for the single-command rule: anything joined before or after the script on
+    the same line decides the exit status), while the dictated form is a bare
+    command or redirection.
     Under ``after_result_pattern``: a refused command
     whose output the call discarded prints nothing into its result; a result is
     clipped in the pod at ``worker_trajectory.MAX_RESULT_CHARS``; a read whose
