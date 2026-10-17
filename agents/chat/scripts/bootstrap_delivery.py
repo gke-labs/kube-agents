@@ -774,7 +774,8 @@ def _ledger_url(data_dir: Path, audit: str, claimed_at: float, finished_at: floa
         return None
     response = text.rpartition(RESPONSE_HEADING)[2]
     candidates = [m.group(0) for m in LEDGER_URL_RE.finditer(response) if _managed_issue(m.group(0))]
-    named = [url for url in candidates if any(url in line and LEDGER_WORD in line.lower() for line in response.splitlines())]
+    ledger_lines = [line for line in response.splitlines() if LEDGER_WORD in line.lower()]
+    named = [url for url in candidates if any(url in LEDGER_URL_RE.findall(line) for line in ledger_lines)]
     return (named or candidates or [None])[0]
 
 

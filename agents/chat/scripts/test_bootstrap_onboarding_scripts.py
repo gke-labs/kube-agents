@@ -1882,6 +1882,15 @@ class FirstRunAuditsTest(unittest.TestCase):
                            oobe.STATE_DONE: True})
         self.assertIn("`compliance-audit` (findings: https://github.com/o/r/issues/3)", note)
 
+    def test_an_earlier_issue_whose_number_prefixes_the_ledger_s_is_not_the_ledger(self):
+        now = time.time()
+        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
+        self._document("compliance-audit", "Related: https://github.com/o/r/issues/1\n"
+                       "- **Ledger Issue:** https://github.com/o/r/issues/12", now - 500)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
+                           oobe.STATE_DONE: True})
+        self.assertIn("`compliance-audit` (findings: https://github.com/o/r/issues/12)", note)
+
     def test_a_link_outside_the_managed_repositories_is_not_the_ledger(self):
         now = time.time()
         self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)

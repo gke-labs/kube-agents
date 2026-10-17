@@ -15,6 +15,7 @@ Its own module, registered through the ``devops_bench.verifiers`` entry-point gr
 """
 
 import json
+import re
 import shlex
 from typing import Any, Callable, Literal
 
@@ -35,6 +36,8 @@ REPORT_TITLE = "Onboarding report (oobe-late-first-message eval)"
 # bootstrap_delivery.py: AUDITS_UNDELIVERED_NOTE, the words that say a summary was never posted.
 NOT_POSTED = "summaries were not posted"
 DELIVERY_FAILED = "failed"
+# An issue link in the report, matched whole so issue 1 is not counted inside issue 12.
+LEDGER_LINK_RE = re.compile(r"https://[^\s()<>\[\]]+/issues/\d+")
 LATE_READ = "__OOBE_LATE_READ__"
 
 # Prints the open time, each audit's last completed run since the arm with its delivery outcome
@@ -165,7 +168,8 @@ def grade(read: dict[str, Any]) -> tuple[VerificationStatus, str]:
     unnamed = [a for a in failed if f"`{a}`" not in after]
     if unnamed:
         return "fail", f"the report sent on the first message leaves out audits whose summaries were never posted: it does not name {', '.join(unnamed)} as not posted"
-    linked = [a for a in failed if runs[a].get("ledger") and runs[a]["ledger"] in after]
+    links = set(LEDGER_LINK_RE.findall(after))
+    linked = [a for a in failed if runs[a].get("ledger") in links]
     return "pass", (
         f"the report sent on the first message carries the {len(failed)} summaries that never reached the chat"
         f" ({len(linked)} with their ledger link)"

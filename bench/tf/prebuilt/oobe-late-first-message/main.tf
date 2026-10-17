@@ -72,12 +72,14 @@ locals {
     for f in INVENTORY.*; do [ -e "$f" ] || continue; mv -f "$f" "$2/" || exit 1; done
     touch "$3"
   SH
-  # The case's files go only when the marker says every original was set aside first.
+  # The case's files go only when the marker says every original was set aside first, and the
+  # marker goes with them, before the first original comes back: a put-back that stops part-way
+  # must not remove a restored original on the next attempt.
   put_back = <<-SH
     cd "$1" 2>/dev/null && [ -d "$2" ] || exit 0
-    if [ -e "$3" ]; then rm -f INVENTORY.*; fi
+    if [ -e "$3" ]; then rm -f INVENTORY.* && rm -f "$3" || exit 1; fi
     for f in "$2"/INVENTORY.*; do [ -e "$f" ] || continue; mv -f "$f" . || exit 1; done
-    rmdir "$2" && rm -f "$3"
+    rmdir "$2"
   SH
   # As in oobe-first-run-audits: the install's own onboarding must be over before the arm.
   own_wait = 3600
