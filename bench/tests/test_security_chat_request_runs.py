@@ -181,12 +181,27 @@ def test_collector_run_exiting_nonzero_is_not_credited():
     assert "ran but exited non-zero (or its exit was not recorded)" in res.reason
 
 
-def test_collector_run_with_no_trajectory_is_not_credited():
+def test_collector_run_called_unrecorded_is_not_credited():
+    cmd = f"python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json"
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": cmd}, "result": None, "status": "called", "at": 1.0}
+    ]
+    transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": cmd}])
+    try:
+        res = WorkerCommandsVerifier(**_check(COLLECTOR_CHECK)).verify(5.0)
+        assert not res.success
+        assert "ran but exited non-zero (or its exit was not recorded)" in res.reason
+    finally:
+        transcript.clear()
+
+
+def test_collector_run_with_no_trajectory_is_error():
     cmd = f"python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json"
     transcript.set("ok", [], worker_commands=[{"task": "t_1", "command": cmd}])
     try:
         res = WorkerCommandsVerifier(**_check(COLLECTOR_CHECK)).verify(5.0)
         assert not res.success
-        assert "no worker command ran collect.py across 1 command(s)" in res.reason
+        assert res.status == "error"
+        assert "no delegated worker's terminal or execute_code calls are readable in the trajectory" in res.reason
     finally:
         transcript.clear()

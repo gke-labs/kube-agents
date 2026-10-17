@@ -8356,10 +8356,28 @@ def test_worker_commands_required_run_succeeded_flag():
     res = v.verify(5.0)
     assert res.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res.reason
 
-    # Card log only (no worker trajectory) fails under succeeded: true.
+    # Trajectory entry with status="called" (unrecorded exit) fails.
+    traj_called = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": None, "status": "called", "at": 1.0}
+    ]
+    transcript.set("ok", traj_called, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_called = v.verify(5.0)
+    assert res_called.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res_called.reason
+
+    # Card log only (no worker trajectory) yields status="error" under succeeded: true.
     transcript.set("ok", [], worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
     res_notraj = v.verify(5.0)
-    assert res_notraj.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 1 command(s)" in res_notraj.reason
+    assert res_notraj.status == "error" and "no delegated worker's terminal or execute_code calls are readable in the trajectory" in res_notraj.reason
+
+    # Capture with gaps under succeeded: true yields status="error".
+    transcript.set(
+        "ok",
+        traj_ok,
+        worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
+        worker_capture_gaps=["card_1 unread session store"],
+    )
+    res_gap = v.verify(5.0)
+    assert res_gap.status == "error" and "the worker-trajectory capture was partial (card_1 unread session store)" in res_gap.reason
 
     # Without succeeded=True (default False), card log alone is credited.
     run_any = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"])
@@ -8394,6 +8412,14 @@ def test_worker_commands_required_run_succeeded_with_after_result_pattern():
     transcript.set("ok", traj_error)
     res = v.verify(5.0)
     assert res.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res.reason
+
+    # Required run completes before the opener pattern matches (runs read every command).
+    traj_before_opener = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": "done", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj_before_opener)
+    assert v.verify(5.0).status == "pass"
 
 
 
