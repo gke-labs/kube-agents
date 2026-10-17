@@ -4746,6 +4746,30 @@ class TestDriftInject(unittest.TestCase):
             ["## What's wrong", "## Why", "## What to do"],
         )
 
+    def test_the_card_sends_the_agent_to_a_skill_the_cluster_profile_ships(self):
+        """The named skill has to exist, and to exist for a Cluster Agent.
+
+        The body is copied verbatim onto a card the Cluster Agent works, and
+        `cluster_agent_profile.OVERLAY_ITEMS` scaffolds `agents/cluster/skills`
+        into that profile -- so a name here that no directory there matches
+        sends the agent to load something it does not have. Renaming the
+        bundle without rewording the card, or the reverse, is the failure:
+        neither side is read by the other at runtime, and nothing else in the
+        tree pins them together. A platform-only bundle of the same name would
+        not help, which is why the path is the cluster tree and not a glob.
+        """
+        card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("`gke-load-bearing-change`", card)
+        bundle = (
+            Path(__file__).resolve().parents[3]
+            / "agents"
+            / "cluster"
+            / "skills"
+            / "gke-load-bearing-change"
+            / "SKILL.md"
+        )
+        self.assertTrue(bundle.is_file(), f"{bundle} is named by the drift card and does not exist")
+
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
     def test_drift_has_its_own_ceiling(self, trigger):
         """Capped, and capped on its own budget."""

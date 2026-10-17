@@ -1575,9 +1575,11 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     shape behind an ``a2a.activity`` marker that says the door carried the
     trace at all (``inject_transport.EVENT_ENTRY_ACTIVITY``; a door that
     cannot show it writes neither, and the scorer sets router-scope
-    ``tool_called`` checks aside only then). Tokens stay null -- the gateway reports no usage --
-    and ``metadata`` says so rather than inventing a number. ``identity`` is
-    the run, case and repetition the key and message id were built from,
+    ``tool_called`` checks with no ``result`` pattern aside then, or when
+    the marker reports a loss).
+    Tokens stay null -- the gateway reports no usage -- and ``metadata``
+    says so rather than inventing a number. ``identity`` is the run, case
+    and repetition the key and message id were built from,
     stored beside the task id so the record joins to the gateway's ingress
     log.
     """
