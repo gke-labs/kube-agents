@@ -1118,3 +1118,8 @@
 # its own on the host cluster, so it too serializes on the infra lock. Priced
 # at that case's 1450s hint until it has a record.
 ./tasks/ai-security-chat-request-runs-collector/task.yaml
+
+# Front door model identity inquiry (#3295): states backing model and provider
+# rather than leaking internal router alias names ("model-default", "hermes-agent")
+# or placeholder "custom" strings, and files no kanban card.
+./tasks/chat-model-identity-truth/task.yaml
