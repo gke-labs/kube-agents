@@ -231,6 +231,21 @@ const (
 	driftDetectorSubscriptionEnv   = "DRIFT_DETECTOR_SUBSCRIPTION"
 	driftDetectorGitopsManagersEnv = "DRIFT_DETECTOR_GITOPS_MANAGERS"
 
+	// incidentTriageOpenPullRequestEnv tells session_kv_server.py to file the
+	// pull-request card beside the triage card. Set on the platform agent
+	// container only when spec.harness.incidentTriage.openPullRequest is true,
+	// so an install that never set the field renders the same pod. The CRD
+	// field is the only way to set it: safeSandboxEnvOverrides does not
+	// allowlist it, so a spec.deployment.env entry of the same name is dropped,
+	// and session_kv_server.py skips the key when it loads the PVC .env.
+	incidentTriageOpenPullRequestEnv = "INCIDENT_TRIAGE_OPEN_PULL_REQUEST"
+	// incidentTriageWorkloadDedupEnv tells session_kv_server.py how long after
+	// a workload's last admitted event a further event for that workload is
+	// folded into the same incident. Set on the platform agent container only
+	// when spec.harness.incidentTriage.workloadDedupSeconds is above zero, and
+	// only by the field, for the same reasons as the entry above.
+	incidentTriageWorkloadDedupEnv = "INCIDENT_WORKLOAD_DEDUP_SECONDS"
+
 	// driftDetectorProjectNumberDigits is the character set a GCP project number
 	// is made of, and the whole of the test for one: a project ID must start with
 	// a lowercase letter, so a value that is nothing but digits cannot be an ID.
@@ -2725,6 +2740,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	)
 
 	envVars = append(envVars, otelTelemetryEnvVars("platform", agent.Name, agent.Namespace, opts.otlpEndpoint, opts.otlpDisabled)...)
+	if incidentTriageOpensPullRequest(agent) {
+		envVars = append(envVars, corev1.EnvVar{Name: incidentTriageOpenPullRequestEnv, Value: strconv.FormatBool(true)})
+	}
+	if seconds := incidentTriageWorkloadDedupSeconds(agent); seconds > 0 {
+		envVars = append(envVars, corev1.EnvVar{Name: incidentTriageWorkloadDedupEnv, Value: strconv.Itoa(int(seconds))})
+	}
 	if agent.Spec.Deployment != nil {
 		envVars = mergeEnvVars(envVars, safeSandboxEnvOverrides(agent.Spec.Deployment.Env))
 	}
@@ -2975,7 +2996,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// operator renders them only under next, after this merge.
 		kept := extEnvs[:0]
 		for _, e := range extEnvs {
-			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar {
+			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar &&
+				e.Name != incidentTriageOpenPullRequestEnv && e.Name != incidentTriageWorkloadDedupEnv {
 				kept = append(kept, e)
 			}
 		}
@@ -3876,6 +3898,26 @@ func isProjectNumber(project string) bool {
 	return project != "" && strings.TrimLeft(project, driftDetectorProjectNumberDigits) == ""
 }
 
+// incidentTriageOpensPullRequest reports spec.harness.incidentTriage.openPullRequest,
+// with an absent block, an absent field and false all meaning no.
+func incidentTriageOpensPullRequest(agent *agentv1alpha1.PlatformAgent) bool {
+	harness := agent.Spec.Harness
+	if harness == nil || harness.IncidentTriage == nil || harness.IncidentTriage.OpenPullRequest == nil {
+		return false
+	}
+	return *harness.IncidentTriage.OpenPullRequest
+}
+
+// incidentTriageWorkloadDedupSeconds reports spec.harness.incidentTriage.workloadDedupSeconds,
+// with an absent block, an absent field and zero all meaning off.
+func incidentTriageWorkloadDedupSeconds(agent *agentv1alpha1.PlatformAgent) int32 {
+	harness := agent.Spec.Harness
+	if harness == nil || harness.IncidentTriage == nil || harness.IncidentTriage.WorkloadDedupSeconds == nil {
+		return 0
+	}
+	return *harness.IncidentTriage.WorkloadDedupSeconds
+}
+
 // driftDetectorSubscription and driftDetectorGitopsManagers read their fields
 // without a nil check at every call site. Both are empty by default and the
 // detector treats empty as "use my own default" and "claim no reconciliation"
@@ -4154,6 +4196,12 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		// The watchers make their Google calls through the broker with this.
 		{Name: watcherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
 		{Name: watcherBrokerTokenFileEnvVar, Value: watcherTokenMountPath + "/token"},
+	}
+	if incidentTriageOpensPullRequest(agent) {
+		envVars = append(envVars, corev1.EnvVar{Name: incidentTriageOpenPullRequestEnv, Value: strconv.FormatBool(true)})
+	}
+	if seconds := incidentTriageWorkloadDedupSeconds(agent); seconds > 0 {
+		envVars = append(envVars, corev1.EnvVar{Name: incidentTriageWorkloadDedupEnv, Value: strconv.Itoa(int(seconds))})
 	}
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
@@ -4602,6 +4650,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		driftDetectorClusterNameEnv,
 		driftDetectorSubscriptionEnv,
 		driftDetectorGitopsManagersEnv,
+		incidentTriageOpenPullRequestEnv,
+		incidentTriageWorkloadDedupEnv,
 		// Not every DRIFT_DETECTOR_* name belongs on this list, and the six
 		// above are not here for being drift variables. They are here because
 		// buildAgentAPIAuthSidecar appends each one after this merge, so an

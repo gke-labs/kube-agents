@@ -80,6 +80,11 @@ type metrics struct {
 	// here is healthy — these are alerts that would otherwise have been
 	// swallowed by the family's Info member. See ReopenIfPolicyFiltered.
 	eventsPolicyReopened *prometheus.CounterVec
+	// eventsWorkloadFolded counts Warning events the daemon folded into an
+	// active incident for the same workload within workloadDedupSeconds.
+	// Kept distinct from eventsPolicyFiltered so routine Info churn and
+	// folded Warning replicas are reported separately.
+	eventsWorkloadFolded *prometheus.CounterVec
 	injectErrors         *prometheus.CounterVec
 	sessionCreates       *prometheus.CounterVec
 	activeIncidents      *prometheus.GaugeVec
@@ -146,6 +151,10 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_events_policy_reopened_total",
 			Help: "Total events that escaped deduplication because the entry holding their key was left behind by a policy-filtered event of the same canonical family. Each one is an alert that would otherwise have been silenced by an informational sibling.",
 		}, []string{"cluster", "project", "location", "reason", "namespace"}),
+		eventsWorkloadFolded: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_events_workload_folded_total",
+			Help: "Total Warning events the daemon accepted and folded into an earlier admitted anchor event for the same workload within workloadDedupSeconds. The dedup entry stays closed and unflagged.",
+		}, []string{"cluster", "project", "location", "reason", "namespace"}),
 		injectErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_inject_errors_total",
 			Help: "Total inject (or session-create) attempts that returned a non-2xx response or transport error.",
@@ -194,6 +203,7 @@ func newMetrics() *metrics {
 		m.eventsQuotaSuppress,
 		m.eventsPolicyFiltered,
 		m.eventsPolicyReopened,
+		m.eventsWorkloadFolded,
 		m.injectErrors,
 		m.sessionCreates,
 		m.activeIncidents,

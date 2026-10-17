@@ -155,6 +155,15 @@ const injectStatusSuppressed = "suppressed"
 // install and a pod is not all-old or all-new.
 const injectStatusFiltered = "filtered"
 
+// injectStatusFolded is the daemon's word for "accepted, and folded into an
+// active workload incident" — another pod of the same controller already
+// anchored a triage session within INCIDENT_WORKLOAD_DEDUP_SECONDS. The
+// watcher's per-pod dedup entry stays closed (unlike injectStatusSuppressed)
+// and is NOT marked policy-filtered (unlike injectStatusFiltered, which would
+// let a subsequent Warning on the same pod reopen the entry and re-inject on
+// every kubelet resync).
+const injectStatusFolded = "folded"
+
 // injectFeaturesHeader lists the response behaviours this watcher understands,
 // so the daemon can answer an older one the way that older one expects.
 //

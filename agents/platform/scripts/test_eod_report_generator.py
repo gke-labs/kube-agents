@@ -520,6 +520,57 @@ class TestEODWatcherRecap(unittest.TestCase):
         self.assertEqual(summary["cap_dropped_workloads"], 2)
         self.assertIn("*2 alerts from 2 workloads withheld", report)
 
+    def test_workload_window_folded_duplicates_are_not_counted_as_ceiling_drops(self):
+        """A duplicate folded into a live incident was not withheld by the daily ceiling."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "session_kv.db")
+            conn = sqlite3.connect(path)
+            with conn:
+                conn.execute(
+                    """
+                    CREATE TABLE intercepted_events (
+                        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                        cluster        TEXT NOT NULL DEFAULT '',
+                        namespace      TEXT NOT NULL DEFAULT '',
+                        workload       TEXT NOT NULL DEFAULT '',
+                        object_uid     TEXT NOT NULL DEFAULT '',
+                        object_kind    TEXT NOT NULL DEFAULT '',
+                        reason         TEXT NOT NULL DEFAULT '',
+                        message        TEXT NOT NULL DEFAULT '',
+                        severity       TEXT NOT NULL DEFAULT '',
+                        occurrences    INTEGER NOT NULL DEFAULT 1,
+                        notified       INTEGER NOT NULL DEFAULT 0,
+                        delivery_error TEXT NOT NULL DEFAULT '',
+                        duplicate_of   INTEGER NOT NULL DEFAULT 0,
+                        created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO intercepted_events "
+                    "(id, cluster, namespace, workload, object_uid, object_kind, reason, message, severity, occurrences, notified, duplicate_of) "
+                    "VALUES (42, 'test-cluster', 'prod-api', 'payment-api', 'pod-0', 'Pod', 'OOMKilled', 'oom', 'Critical', 1, 1, 0)"
+                )
+                for i in range(1, 4):
+                    conn.execute(
+                        "INSERT INTO intercepted_events "
+                        "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, occurrences, notified, duplicate_of) "
+                        "VALUES ('test-cluster', 'prod-api', 'payment-api', ?, 'Pod', 'OOMKilled', 'oom', 'Critical', 1, 0, 42)",
+                        (f"pod-{i}",),
+                    )
+            conn.close()
+            rows = load_intercepted_events(path, window_hours=24)
+
+        summary = filter_and_aggregate_events(rows)
+        report = generate_markdown_report(summary, cluster_name="test-cluster")
+
+        self.assertEqual(summary["alerts_posted"], 1)
+        self.assertEqual(summary["total_occurrences"], 1)
+        self.assertEqual(summary["unique_incidents"], 1)
+        self.assertEqual(summary["cap_dropped"], 0)
+        self.assertEqual(summary["cap_dropped_alerts"], 0)
+        self.assertNotIn("withheld by the daily ceiling", report)
+
     def test_a_clean_day_is_not_told_about_alerts_it_did_not_lose(self):
         """The control. Without it the assertion above passes on a fixed string."""
         summary = filter_and_aggregate_events([event(), listed()])
@@ -899,6 +950,89 @@ class TestLedgerLoading(unittest.TestCase):
         self.assertEqual(
             load_intercepted_events(path, window_hours=24)[0]["cluster"], "cluster-b"
         )
+
+    def test_the_duplicate_of_column_is_read_when_present(self):
+        """A folded row stored in SQLite with duplicate_of > 0 is read and not counted as cap-dropped."""
+        path = self._db(
+            [("prod", "api", "OOMKilled", 0, 2)],
+            table_sql="""
+            CREATE TABLE intercepted_events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster     TEXT NOT NULL DEFAULT 'cluster-a',
+                namespace   TEXT NOT NULL DEFAULT '',
+                workload    TEXT NOT NULL DEFAULT '',
+                object_uid  TEXT NOT NULL DEFAULT '',
+                object_kind TEXT NOT NULL DEFAULT '',
+                reason      TEXT NOT NULL DEFAULT '',
+                message     TEXT NOT NULL DEFAULT '',
+                severity    TEXT NOT NULL DEFAULT '',
+                occurrences INTEGER NOT NULL DEFAULT 1,
+                notified    INTEGER NOT NULL DEFAULT 0,
+                delivery_error TEXT NOT NULL DEFAULT '',
+                duplicate_of INTEGER NOT NULL DEFAULT 42,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+        )
+        rows = load_intercepted_events(path, window_hours=24)
+        self.assertEqual(rows[0]["duplicate_of"], 42)
+        agg = filter_and_aggregate_events(rows)
+        self.assertEqual(agg["cap_dropped"], 0)
+        self.assertEqual(agg["unique_incidents"], 0)
+
+    def test_aborted_sentinel_duplicate_of_is_not_counted_as_ceiling_drop(self):
+        """A row with duplicate_of = -1 (TRIAGE_ABORTED_SENTINEL) and notified = 0 is not cap-dropped."""
+        aborted_path = self._db(
+            [("prod", "api", "OOMKilled", 0, 1)],
+            table_sql="""
+            CREATE TABLE intercepted_events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster     TEXT NOT NULL DEFAULT 'cluster-a',
+                namespace   TEXT NOT NULL DEFAULT '',
+                workload    TEXT NOT NULL DEFAULT '',
+                object_uid  TEXT NOT NULL DEFAULT '',
+                object_kind TEXT NOT NULL DEFAULT '',
+                reason      TEXT NOT NULL DEFAULT '',
+                message     TEXT NOT NULL DEFAULT '',
+                severity    TEXT NOT NULL DEFAULT '',
+                occurrences INTEGER NOT NULL DEFAULT 1,
+                notified    INTEGER NOT NULL DEFAULT 0,
+                delivery_error TEXT NOT NULL DEFAULT '',
+                duplicate_of INTEGER NOT NULL DEFAULT -1,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+        )
+        aborted_rows = load_intercepted_events(aborted_path, window_hours=24)
+        self.assertEqual(aborted_rows[0]["duplicate_of"], -1)
+        aborted_agg = filter_and_aggregate_events(aborted_rows)
+        self.assertEqual(aborted_agg["cap_dropped"], 0)
+        self.assertEqual(aborted_agg["unique_incidents"], 0)
+
+        # An aborted anchor that had posted an alert (notified = 1 or headless 2)
+        # and had no sibling to promote counts under delivery_failed rather than
+        # alerts_posted or dispatched_headless.
+        unpromoted_agg = filter_and_aggregate_events(
+            [
+                {
+                    "cluster": "cluster-a",
+                    "namespace": "prod",
+                    "workload": "api",
+                    "object_uid": "uid-api",
+                    "object_kind": "Deployment",
+                    "reason": "OOMKilled",
+                    "message": "msg",
+                    "severity": "Critical",
+                    "occurrences": 1,
+                    "notified": 2,
+                    "delivery_error": "",
+                    "duplicate_of": -1,
+                }
+            ]
+        )
+        self.assertEqual(unpromoted_agg["delivery_failed"], 1)
+        self.assertEqual(unpromoted_agg["dispatched_headless"], 0)
+        self.assertEqual(unpromoted_agg["alerts_posted"], 0)
 
     def test_a_table_without_the_cluster_column_is_a_read_failure(self):
         """A pre-release shape the writer cannot use, not an older one to tolerate.
