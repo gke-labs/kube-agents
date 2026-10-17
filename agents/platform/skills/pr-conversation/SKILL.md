@@ -24,12 +24,11 @@ posting, and recording that a request has been handled — belongs to
 `"$HERMES_HOME"/skills/pr-conversation/scripts/pr_conversation.py`. Your role is
 reasoning: understanding what was asked and producing the answer or the change.
 
-Every command below spells that path out in full. Most skills here are written
-`./skills/…`, which works because a cron turn starts in the profile directory —
-but a card dispatch starts you in the task's kanban workspace
-(`…/kanban/workspaces/<task-id>`), where the relative form is
-`No such file or directory`. `$HERMES_HOME` is the profile directory in both
-contexts, so it is the form that works from either.
+Every command below spells that path out in full. A relative `./skills/…` path
+works only from the profile directory, where a cron turn starts; a card dispatch
+starts you in the task's kanban workspace (`…/kanban/workspaces/<task-id>`), where
+the relative form is `No such file or directory`. `$HERMES_HOME` is the profile
+directory in both contexts, so it is the form that works from either.
 
 ## Vocabulary
 

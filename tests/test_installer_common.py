@@ -2426,6 +2426,112 @@ class InstallerCommonTest(unittest.TestCase):
             # The TF_VAR_* channel carries them instead.
             self.assertIn("tfvar=k1", proc.stdout)
 
+    # ── openai_compatible ────────────────────────────────────────────────────
+
+    _OPENAI_COMPATIBLE_ENV = {
+        "API_SERVER_KEY": "k",
+        "MODEL_PROVIDER": "openai_compatible",
+        "MODEL_DEFAULT_NAME": "some-org/some-model",
+        "OPENAI_COMPATIBLE_API_BASE": "http://10.8.0.12:8000/v1",
+        "OPENAI_COMPATIBLE_TARGET_PORT": "",
+        "OPENAI_COMPATIBLE_EGRESS_CIDRS": "10.8.0.0/24, 10.9.0.0/24",
+        "OPENAI_COMPATIBLE_CA_SECRET_NAME": "llm-ca",
+        "OPENAI_COMPATIBLE_API_KEY": "oc-key",
+    }
+
+    def test_tfvars_carries_the_openai_compatible_lines_for_that_provider(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$? tfvar=$TF_VAR_openai_compatible_api_key"',
+                env=self._OPENAI_COMPATIBLE_ENV,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('model_provider     = "openai_compatible"', content)
+            self.assertIn('openai_compatible_api_base       = "http://10.8.0.12:8000/v1"', content)
+            # Empty is the variable's "unset", 0, not a bare word HCL refuses.
+            self.assertIn("openai_compatible_target_port    = 0\n", content)
+            self.assertIn('openai_compatible_egress_cidrs   = ["10.8.0.0/24", "10.9.0.0/24"]', content)
+            self.assertIn('openai_compatible_ca_secret_name = "llm-ca"', content)
+            self.assertIn('openai_compatible_api_key = "oc-key"', content)
+            self.assertIn("tfvar=oc-key", proc.stdout)
+
+    def test_tfvars_writes_a_service_target_port_as_a_number(self):
+        env = dict(self._OPENAI_COMPATIBLE_ENV,
+                   OPENAI_COMPATIBLE_API_BASE="http://llm.models.svc.cluster.local/v1",
+                   OPENAI_COMPATIBLE_TARGET_PORT="8000", OPENAI_COMPATIBLE_EGRESS_CIDRS="")
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn("openai_compatible_target_port    = 8000\n", content)
+            self.assertIn("openai_compatible_egress_cidrs   = []", content)
+
+    def test_tfvars_leaves_the_openai_compatible_lines_out_for_any_other_provider(self):
+        # Every other install's file stays byte for byte what it was (the
+        # gitlab_forge goldens hold that), even with the keys in the environment.
+        env = dict(self._OPENAI_COMPATIBLE_ENV, MODEL_PROVIDER="gemini", MODEL_DEFAULT_NAME="")
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertNotIn("openai_compatible", dest.read_text())
+
+    def test_tfvars_keeps_the_openai_compatible_key_off_disk_when_persist_secrets_off(self):
+        env = dict(self._OPENAI_COMPATIBLE_ENV, PERSIST_SECRETS_ON_DISK="false")
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$? tfvar=$TF_VAR_openai_compatible_api_key"',
+                env=env,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertNotIn("oc-key", content)
+            self.assertNotIn("openai_compatible_api_key", content)
+            self.assertIn('openai_compatible_api_base       = "http://10.8.0.12:8000/v1"', content)
+            self.assertIn("tfvar=oc-key", proc.stdout)
+
+    def test_tfvars_generation_refuses_an_openai_compatible_install_the_chart_cannot_render(self):
+        # upgrade.sh regenerates from install.env without install.sh's
+        # interview, so the generator holds the same line.
+        for overrides, message in (
+            ({"MODEL_DEFAULT_NAME": ""}, "has no default model"),
+            ({"OPENAI_COMPATIBLE_API_BASE": ""}, "needs the server's base URL"),
+            ({"OPENAI_COMPATIBLE_EGRESS_CIDRS": ""}, "set --openai-compatible-egress-cidrs"),
+            ({"OPENAI_COMPATIBLE_TARGET_PORT": "http"}, "is not a port"),
+        ):
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env=dict(self._OPENAI_COMPATIBLE_ENV, **overrides),
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn(message, proc.stderr + proc.stdout)
+                self.assertFalse(dest.exists())
+
+    def test_tfvars_generation_recovers_the_openai_compatible_key_from_live_secret(self):
+        # PERSIST_SECRETS_ON_DISK=false on an earlier run left install.env
+        # without the key; an adoption re-install must not drop it.
+        recovered_b64 = "cmVjb3ZlcmVkLWtleQ=="  # base64("recovered-key")
+        kubectl_stub = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
+            f'  *"get secret platform-agent-secrets"*"{{.data.OPENAI_COMPATIBLE_API_KEY}}"*) printf "%s" "{recovered_b64}" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        env = dict(self._OPENAI_COMPATIBLE_ENV, OPENAI_COMPATIBLE_API_KEY="")
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env, kubectl_script=kubectl_stub)
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn('openai_compatible_api_key = "recovered-key"', dest.read_text())
+
     def test_google_chat_home_channel_written_to_tfvars(self):
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"

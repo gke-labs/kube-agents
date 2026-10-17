@@ -148,10 +148,11 @@ transport carries the task's lifecycle envelope as its trajectory (`inject.task`
 calls without their results, so it names no card. The delegation wait reads the cards from the
 pod instead, by the Hermes session the bridge's `api` executor ran the turn in, so such a record
 can carry the delegated workers' tagged entries and token counts. The scorer still treats
-`worker_commands`, `worker_agents` and a `tool_called` in the `workers` or `all` scope as blind on
+`worker_commands`, `worker_agents`, a `tool_called` in the `workers` or `all` scope, and a
+`tool_called` with a `result` pattern (the trace records no results) as blind on
 every such record, a policy that stays until `scoring.py` grades them on records that carry the
-workers ([#2619](https://github.com/gke-labs/kube-agents/issues/2619)); a router-scope `tool_called` is blind only when the
-door showed no trace: the first matrix run through the door (#2007, 2026-09-25) collapsed
+workers ([#2619](https://github.com/gke-labs/kube-agents/issues/2619)); any other router-scope `tool_called` is blind only when the
+door showed no trace or a trace that lost calls: the first matrix run through the door (#2007, 2026-09-25) collapsed
 `agent-kanban-smoke` 0 of 3 with a correct answer in every repetition. `classify_rep()` therefore
 re-reads such a record before the rungs. The condition is the record's, not the environment's: the
 trajectory carries the transport's task marker (`_inject_record()` in `scoring.py`), and for the
@@ -175,8 +176,8 @@ least one such is **not graded on transport** (the `Rung` member and the build-l
 record is not re-read, and without the marker it is a crashed scoring pass on any transport; a record on the api
 transport never carries the marker, and `test_scoring.py` grades every captured api record, under
 every mutation the suite uses, identically with the rule present and removed; and an inject record
-whose `a2a.activity` marker reports no loss grades its router-scope `tool_called` checks in full,
-with or without a call behind the marker. The transport writes that marker whenever the door's
+whose `a2a.activity` marker reports no loss grades in full its router-scope `tool_called` checks
+that set no `result` pattern, with or without a call behind the marker. The transport writes that marker whenever the door's
 probe carried the task's tool-call trace at all (the relay never posts `activity` artifacts to a
 conversation, so the probe is where the harness reads them), so that half of the rule retires on
 the door's capability to show calls rather than on a call having happened: a `tool_called` check

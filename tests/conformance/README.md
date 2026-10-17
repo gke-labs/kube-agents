@@ -83,7 +83,7 @@ reads with an anchor string that `test_harness_selfcheck.py` verifies. Rename
 a symbol and the self-check goes red before anything gets a chance to pass
 quietly.
 
-Three sets of inputs are not registered. The group-B workflow tests glob
+Four sets of inputs are not registered. The group-B workflow tests glob
 `.github/workflows/*.y*ml` (both extensions, so a `.yaml` workflow cannot
 slip past an allowlist) rather than naming each file, because the assertion
 is about the set and a registry would have to be edited every time a workflow
@@ -110,6 +110,10 @@ The third is the mirrored `gke-*` skills, which C4 globs under
 `agents/platform/skills/` to require an `upstream.lock` beside each one. The
 test asserts the glob is non-empty, and `gke-basics`'s lock is registered and
 required to be in the set, so the self-check names the tree when it moves.
+
+The fourth is `scripts/`, which B2 globs for merge calls a workflow scan cannot
+see. The test requires the one allowed call to be found, so an empty or moved
+set goes red, and `scripts/merge_gate.py`, which holds that call, is registered.
 
 ## Invariant → test → bucket → historical attack
 
@@ -175,7 +179,10 @@ currently fails.
 | B1  | the operator's relay URL is the route the policy guards                                   | 1        | `test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route`                                | the route renamed on one side, leaving every `gke` call failing with no policy refusal to read                                                                                                                                                           |
 | B2  | no workflow approves or merges a pull request                                             | 1        | `test_B2_no_workflow_approves_or_merges_a_pull_request`                                             | a model verdict causing a merge                                                                                                                                                                                                                          |
 | B2  | `pull-requests: write` has exactly six holders                                            | 1        | `test_B2_no_workflow_grants_a_bot_the_ability_to_approve`                                           | —                                                                                                                                                                                                                                                        |
-| B2  | a certified predicate in a human-only path                                                | **3**    | —                                                                                                   | no such mechanism exists. Auto-merge over a certified predicate is a D2 tier that was never built.                                                                                                                                                       |
+| B2  | no script merges, bar the label-gated enqueue sweep                                       | 1        | `test_B2_no_script_merges_except_the_enqueue_sweep`                                                 | a merge call moved into a script the workflow scan cannot read                                                                                                                                                                                           |
+| B2  | the enqueue sweep assents only on `lgtm` + `approved`                                     | 1        | `test_B2_the_enqueue_sweep_assents_only_on_both_human_labels`                                       | a held or half-approved pull request enqueued                                                                                                                                                                                                            |
+| B2  | App-token write grants are pinned                                                         | 1        | `test_B2_app_token_write_grants_are_pinned`                                                         | a workflow minting Pull requests or Contents write that no `permissions:` block shows                                                                                                                                                                    |
+| B2  | a certified predicate in a human-only path                                                | **3**    | —                                                                                                   | no such mechanism exists. Auto-merge over a certified predicate is a D2 tier that was never built; the enqueue sweep acts on human labels, not on one.                                                                                                   |
 | B3  | substrate paths enumerated as code                                                        | 1 **KV** | `test_B3_the_substrate_paths_are_enumerated_as_code`                                                | `failurePolicy: Fail` → `Ignore`, commit message "unblock apply during upgrade window"                                                                                                                                                                   |
 | B3  | the agent cannot reach admission or RBAC through kubectl                                  | 1        | `test_B3_the_agent_cannot_reach_the_admission_policy_through_kubectl`                               | — (the API half; the artifact half is the KV above)                                                                                                                                                                                                      |
 | B4  | every `workflow_run` deploy gates on repo, conclusion and branch                          | 1        | `test_B4_every_workflow_run_deploy_gates_on_repository_and_branch`                                  | a fork's completed run reaching a job that mints a deploy credential                                                                                                                                                                                     |
@@ -306,7 +313,10 @@ the three `B1-slack-*` mutations, all KILLED when they were added on 2026-10-06,
 they were added on 2026-10-07, and `A3-session-sends-a-notify` (KILLED) on 2026-10-08, and
 `C4-skills-unchecked`, `C4-skills-check-silenced`, `C4-skills-check-skips-lock` and
 `C4-skills-make-noop`, all KILLED when they were added on 2026-10-07, and
-`C4-skills-check-blank-line-escape` and `C4-skills-check-comment-escape`, both KILLED when they were added on 2026-10-13;
+`C4-skills-check-blank-line-escape` and `C4-skills-check-comment-escape`, both KILLED when they were added on 2026-10-13, and
+`B2-script-merge`, `B2-enqueue-predicate-ignores-holds`,
+`B2-app-token-grants-pull-requests` and `B2-app-token-scopes-dropped`, all KILLED
+when they were added on 2026-10-13 and 2026-10-14;
 re-run the harness rather than trusting these numbers, which is the sentence this
 paragraph exists to make cheap.
 Note that the summary line the harness prints accounts for 113 of the 115: a

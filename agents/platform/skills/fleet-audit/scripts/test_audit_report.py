@@ -54,6 +54,13 @@ import workspace_paths  # noqa: E402
 # `BaseTestCase` empties the set so the suite's thousand compliance-audit runs
 # need not each carry a manifest; the guard's own tests put this back.
 REAL_COLLECTOR_AUDITS = audit_report.COLLECTOR_AUDITS
+SKILL_ROOT = Path(__file__).resolve().parents[1]
+
+
+def skill_text() -> str:
+    """The whole skill as a worker can read it: the core and every reference file."""
+    parts = [SKILL_ROOT / "SKILL.md", *sorted((SKILL_ROOT / "references").glob("*.md"))]
+    return "\n".join(part.read_text(encoding="utf-8") for part in parts)
 
 
 @dataclass
@@ -4995,6 +5002,7 @@ class TestStart(HarnessTestCase):
         self.assertNotIn("\n", out)
         payload = json.loads(out)
         contract = payload.pop("checks_contract", "")
+        steps = payload.pop("next_steps", [])
         self.assertEqual(
             payload,
             {
@@ -5035,6 +5043,7 @@ class TestStart(HarnessTestCase):
         # Autopilot fleet came from.
         self.assertIn("checks_not_applicable", contract)
         self.assertIn("reason", contract)
+        self.assertEqual(steps, audit_report.next_steps(AUDIT, payload["findings_path"]))
 
     def test_a_second_start_is_refused_while_the_stream_is_in_flight(self):
         """One stream, one run at a time, whoever started it (#1876).
@@ -5398,6 +5407,32 @@ class TestStart(HarnessTestCase):
                 )
                 self.assertEqual(audit_report.sop_path(audit_id), payload["sop"])
                 self.assertTrue(Path(payload["sop"]).is_absolute())
+
+    def test_start_names_the_next_steps_and_the_files_they_need(self):
+        """The core SKILL.md is short; `start` points at the detail for each step.
+
+        Every full path a step names under the skill's tree must be a file the
+        image ships, so each is mapped back to this checkout and checked.
+        """
+        self.patch_attr("COLLECTOR_AUDITS", REAL_COLLECTOR_AUDITS)
+        skill_root = Path(__file__).resolve().parents[1]
+        prefix = audit_report.skill_path() + "/"
+        for audit_id in audit_report.AUDITS:
+            with self.subTest(audit=audit_id):
+                self.out = ""
+                self.harness.replies = {"issue-list": {"issues": []}}
+                self.assertEqual(self.run_main(["start", "--audit", audit_id]), 0)
+                payload = json.loads(self.out)
+                steps = payload["next_steps"]
+                self.assertIn(payload["sop"], steps[0])
+                self.assertIn(payload["findings_path"], steps[1])
+                self.assertIn(f"draft --audit {audit_id} --manifest-file", steps[1])
+                self.assertIn(f"finish --audit {audit_id} --findings-file", steps[2])
+                self.assertIn(f"--manifest-file {audit_report.manifest_path_for(audit_id)}", steps[2])
+                named = re.findall(re.escape(prefix) + r"[\w./-]*\w", " ".join(steps))
+                self.assertGreaterEqual(len(named), 3)
+                for path in named:
+                    self.assertTrue((skill_root / path[len(prefix):]).is_file(), path)
 
     def test_start_hands_over_the_context_repositories(self):
         """The declared-intent step searches what `start` names, and nothing else.
@@ -16366,7 +16401,7 @@ class TestDispatchAndHandover(unittest.TestCase):
         what the refusal means, the one carve-out and its bound, and what the
         note spans.
         """
-        text = self.read("skills/fleet-audit/SKILL.md")
+        text = skill_text()
         section = text.split("## Running a stream on demand", 1)[1].split("\n## ", 1)[0]
         # #1887's two forms are still the frame.
         self.assertIn("Run the audit directly", section)
@@ -16400,6 +16435,24 @@ class TestDispatchAndHandover(unittest.TestCase):
         # `BROKER UNAVAILABLE` apart from a rejected document: neither has a
         # file to fix.
         self.assertIn("Two exit 2s are not a document to fix", text)
+
+    def test_the_core_carries_what_a_worker_needs_before_any_reference(self):
+        """`skill_view` returns SKILL.md alone; these must not slide into a reference."""
+        core = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        script = "/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py"
+        for needed in (
+            f"{script} start --audit",
+            f"{script} finish --audit",
+            f"{script} draft --audit",
+            "`finish`, once your `start` succeeded, `mode: none` included",
+            "`kanban_block`",
+            "never `kanban_complete` a card as done",
+            "Do not open anything under\n`scripts/`",
+            "`START REFUSED`",
+            "`BROKER UNAVAILABLE`",
+        ):
+            with self.subTest(needed=needed):
+                self.assertIn(needed, core)
 
     def test_the_worker_protocol_requires_the_url_in_the_summary(self):
         section = self.read("SOUL.md").split("## 1.")[0]
@@ -25056,8 +25109,7 @@ class TestDetectContentMode(BaseTestCase):
             audit_report.detect_content_mode()
         self.assertNotIsInstance(raised.exception, audit_report.StartRefused)
         self.assertIn("the broker at", str(raised.exception))
-        skill = Path(__file__).resolve().parents[1] / "SKILL.md"
-        text = skill.read_text(encoding="utf-8")
+        text = skill_text()
         on_demand = text.split("## Running a stream on demand", 1)[1].split("\n## ", 1)[0]
         exit_codes = " ".join(
             text.split("Two exit 2s are not a document to fix", 1)[1].split("\n### ", 1)[0].split()
@@ -25751,22 +25803,88 @@ class TestSopPath(unittest.TestCase):
             )
 
     # A skill file (script, SKILL.md, reference page) or an SOP named relative to
-    # the profile home, with or without a leading `./` or `../`.
-    RELATIVE = re.compile(r"(?<![\w/.-])(?:\.\.?/)*(?:skills/[\w-]+/|governance/[\w-]+\.md\b)")
+    # the profile home, with or without a leading `./` or `../`, or a script named
+    # relative to the skill's own folder with `./` or `../`.
+    RELATIVE = re.compile(
+        r"(?<![\w/.-])(?:(?:\.\.?/)*(?:skills/[\w-]+/|governance/[\w-]+\.md\b)|\.\.?/scripts/)"
+    )
+    # A bare `scripts/...` is relative to the skill folder too, but prose uses the
+    # same spelling to name a file ("the script is `scripts/vcs.py`"). So a bare
+    # path counts only where a shell runs it: in a fenced block, as the first word
+    # of a command or after a wrapper or interpreter; in inline code, only after a
+    # wrapper or interpreter, because a span that is just a path names a file.
+    # Only shell fences are read: a fence labelled sh, bash, shell, zsh or console,
+    # or one with no label. A YAML or text fence lists paths, it does not run them.
+    FENCE = re.compile(
+        r"^[ \t]*(```|~~~)[ \t]*([\w+-]*)[^\n]*\n(.*?)^[ \t]*\1[ \t]*$", re.MULTILINE | re.DOTALL
+    )
+    SHELL_FENCES = {"", "sh", "bash", "shell", "zsh", "console"}
+    INLINE_CODE = re.compile(r"`([^`\n]+)`")
+    COMMAND_BREAK = re.compile(r"&&|\|\||[;|]|\$\(|`")
+    ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+    INTERPRETER = re.compile(r"^(?:python(?:3(?:\.\d+)?)?|bash|sh)$")
+    WRAPPERS = {"exec", "env", "nohup", "time", "command"}
 
-    def test_audit_documents_name_skill_files_and_sops_by_full_path(self):
-        """A kanban worker starts in its card's workspace, where `./skills/...`
-        and `governance/...` name nothing; the SOPs and the audit skills must
-        not send it there."""
+    @classmethod
+    def runs_bare_script(cls, segment, first_word_counts):
+        words = segment.split()
+        wrapped = False
+        while words:
+            word = words[0]
+            if cls.ASSIGNMENT.match(word) or word.startswith("-"):
+                words.pop(0)
+            elif word in cls.WRAPPERS or cls.INTERPRETER.match(word):
+                words.pop(0)
+                wrapped = True
+            elif word == "timeout":
+                words[:2] = []
+                wrapped = True
+            else:
+                break
+        return bool(words) and words[0].startswith("scripts/") and (wrapped or first_word_counts)
+
+    @classmethod
+    def bare_script_commands(cls, text):
+        found = []
+        for block in cls.FENCE.finditer(text):
+            if block.group(2).lower() not in cls.SHELL_FENCES:
+                continue
+            # A line that ends in a backslash continues on the next one.
+            for line in re.sub(r"\\\n", " ", block.group(3)).splitlines():
+                if line.lstrip().startswith("#"):
+                    continue
+                found += [
+                    segment.strip()
+                    for segment in cls.COMMAND_BREAK.split(line)
+                    if cls.runs_bare_script(segment, first_word_counts=True)
+                ]
+        for span in cls.INLINE_CODE.finditer(cls.FENCE.sub("", text)):
+            found += [
+                segment.strip()
+                for segment in cls.COMMAND_BREAK.split(span.group(1))
+                if cls.runs_bare_script(segment, first_word_counts=False)
+            ]
+        return found
+
+    @classmethod
+    def relative_references(cls, text):
+        return cls.RELATIVE.findall(text) + cls.bare_script_commands(text)
+
+    def test_skills_and_sops_name_skill_files_and_sops_by_full_path(self):
+        """A kanban worker starts in its card's workspace, where `./skills/...`,
+        `scripts/...` and `governance/...` name nothing; no SOP and no platform
+        skill may send it there. A mirrored skill's text comes from its overlay's
+        `append.md` or patches, so the generated SKILL.md covers those too."""
         platform = Path(__file__).resolve().parents[3]
-        documents = sorted((platform / "governance").glob("*_sop.md")) + [
-            platform / "skills" / name / "SKILL.md"
-            for name in ("fleet-audit", "gce-compute-fleet-audit", "gcp-networking-fabric-audit")
-        ]
+        documents = (
+            sorted((platform / "governance").glob("*_sop.md"))
+            + sorted((platform / "skills").glob("*/SKILL.md"))
+            + sorted((platform / "skills" / "fleet-audit" / "references").glob("*.md"))
+        )
         for document in documents:
-            with self.subTest(document=document.name):
+            with self.subTest(document=str(document.relative_to(platform))):
                 self.assertEqual(
-                    [], self.RELATIVE.findall(document.read_text(encoding="utf-8"))
+                    [], self.relative_references(document.read_text(encoding="utf-8"))
                 )
 
     def test_the_relative_form_is_caught_in_every_spelling(self):
@@ -25777,16 +25895,39 @@ class TestSopPath(unittest.TestCase):
             "(../skills/fleet-audit/reference.md)",
             "`skills/gke-compute-classes/references/ccc.md`",
             "`governance/compliance_audit_sop.md`",
+            "python3 ./scripts/get_chat_users.py",
+            "Run `python3 scripts/get_chat_users.py --hours 2` for the window.",
+            "```bash\nscripts/audit_cluster.sh <cluster-name> <region> <project-id>\n```",
+            "```bash\npython3 scripts/get_chat_users.py\n```",
+            "```bash\npython3 -u scripts/x.py\n```",
+            "```bash\npython3.12 scripts/x.py\n```",
+            "```bash\ntimeout 600 scripts/collect.py\n```",
+            "```bash\ncd /opt/data/scratch && scripts/audit_cluster.sh a b c\n```",
+            "```bash\nexec scripts/x.sh\n```",
+            "```bash\nH=$(scripts/x.py open)\n```",
+            "```bash\nFOO=1 scripts/x.sh\n```",
+            "```\nscripts/x.sh\n```",
+            "```console\nscripts/x.sh --help\n```",
+            "```bash\nexport V=1 \\\n  && scripts/x.sh\n```",
         ):
             with self.subTest(relative=relative):
-                self.assertRegex(relative, self.RELATIVE)
+                self.assertTrue(self.relative_references(relative), relative)
         for full in (
             "/opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py",
             '"$HERMES_HOME"/skills/fleet-audit/scripts/collect.py',
             "/opt/data/profiles/platform/governance/compliance_audit_sop.md",
+            "The script is `scripts/vcs.py`.",
+            "The engine is\nscripts/vcs.py, which speaks to a broker.",
+            "  scripts/collect.py\n  scripts/fleet_drift.py",
+            "```bash\npython3 $V annotate scripts/rotate-keys.sh\n```",
+            "```bash\n# run scripts/x.py from the profile home\n```",
+            "```yaml\nsteps:\n  - scripts/x.sh\n```",
+            "```text\nfleet-audit/\n  scripts/\n  scripts/collect.py\n```",
+            "```bash\npython3 $V annotate \\\n  scripts/rotate-keys.sh\n```",
+            "```bash\npython3 /opt/data/profiles/platform/skills/x/scripts/y.py\n```",
         ):
             with self.subTest(full=full):
-                self.assertNotRegex(full, self.RELATIVE)
+                self.assertEqual([], self.relative_references(full), full)
 
     def test_a_rejection_points_at_the_sop_by_full_path(self):
         self.assertIn(audit_report.sop_path(AUDIT), audit_report._sop_pointer(AUDIT))

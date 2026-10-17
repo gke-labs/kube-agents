@@ -198,7 +198,9 @@
 # (147 units) here, of a sixty-three-case, 189-unit matrix with the presubmit
 # file's fourteen. The parallelism arithmetic above does not price
 # this case: every case with a `stack:` holds the infra lock for its whole run,
-# so those cases run one at a time whatever EVAL_TASK_PARALLELISM is. With this
+# so those cases run one at a time whatever EVAL_TASK_PARALLELISM is (since
+# 2026-10-15 an infra_lock_exempt case, hack/ci-eval-pr.sh, takes no infra lock
+# and is not one of them). With this
 # case the nightly carries eleven of them, ~433 serial minutes at their
 # unit_cost_hint figures and three repetitions (~378 without it), against the
 # 480m deadline. Whether that fits is the eval crew's call, on the first nights'
@@ -666,6 +668,14 @@
 # shape, unmeasured: priced with the 900s band in unit_cost_hint.
 ./tasks/fleet-cost-idle-pool/task.yaml
 
+# #3269: upgrades-lagging-master-probe demoted 2026-10-16. The fixture is
+# healthy (seeded-b one minor behind REGULAR's defaultVersion on every pool),
+# but the agent compares seeded-b against the channel's upgradeTargetVersion,
+# the newest patch of its own minor, and reports no lag, so it fails 0/3 on
+# unrelated pull requests. Back on the roster once an agent-side fix has the
+# comparison use the channel default and the case shows greens (#3269).
+./tasks/upgrades-lagging-master-probe/task.yaml
+
 # Blocker: #1254, for all four fleet-upgrade-verification cases (#1343
 # Phases 1-4: #1365, #1410, #1411, #1412). #1254 is the open issue on
 # upgrades-lagging-master-probe: a delegated run's acknowledgement graded as
@@ -1047,3 +1057,20 @@
 # publishing. deployer: noop; reads the seeded fleet's rbac-overgrant role.
 # Nightly rather than presubmit for the collector's full sweep.
 ./tasks/security-chat-request-runs-collector/task.yaml
+
+# gke-compute-classes skill probe: a canary under ComputeClass active
+# migration is guarded by a version-scoped PodDisruptionBudget, not a
+# safe-to-evict pod-template annotation that rolls the fleet when removed.
+# deployer: noop, transcript-only.
+./tasks/compute-class-canary-active-migration-pdb-probe/task.yaml
+
+# kube-agents-observability skill's trace latency helper, run to completion
+# through the credential broker's relay and graded on the report's breakdown
+# shape and on the worker's route (no token fetched or pasted). Reads the
+# install's own traces; parked in FIXTURE_NOT_READY from its merge until the
+# pool host clusters exported traces (scope set 2026-10-02, held by the
+# provisioning script and the verifier since). Nightly from the merge
+# that un-parked it.
+# deployer: noop, read-only, no fixture: three units at the 200s default,
+# ~10 serial minutes, off the infra lock, main nightly part.
+./tasks/observability-trace-latency-brokered/task.yaml
