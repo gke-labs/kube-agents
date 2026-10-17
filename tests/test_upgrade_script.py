@@ -3741,7 +3741,7 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, out)
                 self.assertIn("APPLIED crds\nAPPLIED terraform", proc.stdout, out)
                 self.assertNotIn("look like emails", out)
-                self.assertNotIn("SLACK_HOME_CHANNEL is", out)
+                self.assertNotIn("which is not a Slack channel id", out)
                 self.assertNotIn("SLACK_BOT_TOKEN holds", out)
 
     _PLAN_START = 'if [ "$PARAM_PLAN" = "true" ]; then\n    print_step "4. Planning (read-only)"\n'
@@ -3791,6 +3791,39 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
                            "SLACK_ALLOWED_USERS": "alice@example.com"})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("would be refused", proc.stdout + proc.stderr)
+
+    # ── #3320: no home channel for the gateway's chat backend ──
+
+    _NO_HOME = {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD"}
+
+    def test_a_plan_warns_of_no_home_channel_and_ends_on_it(self):
+        proc = self._plan(self._NO_HOME)
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("SLACK_HOME_CHANNEL is empty", out)
+        self.assertLess(out.index("SLACK_HOME_CHANNEL is empty"), out.index("PLANNED"))
+        tail = [l for l in proc.stdout.splitlines() if l.strip()][-2:]
+        self.assertIn("No home channel: proactive posts are dropped.", tail[0], proc.stdout)
+        self.assertIn("Set SLACK_HOME_CHANNEL", tail[1], proc.stdout)
+        quiet = self._plan({**self._NO_HOME, "SLACK_HOME_CHANNEL": "C0123ABCD"})
+        self.assertEqual(quiet.returncode, 0, quiet.stdout + quiet.stderr)
+        self.assertNotIn("SLACK_HOME_CHANNEL is empty", quiet.stdout + quiet.stderr)
+        self.assertNotIn("No home channel", quiet.stdout + quiet.stderr)
+
+    def test_the_full_arm_warns_of_no_home_channel_and_still_applies(self):
+        proc = self._run(self._NO_HOME)
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("SLACK_HOME_CHANNEL is empty", out)
+        self.assertIn("APPLIED terraform", proc.stdout)
+        self.assertLess(out.index("SLACK_HOME_CHANNEL is empty"), out.index("APPLIED terraform"))
+
+    def test_the_upgrade_ends_on_the_home_channel_summary(self):
+        # The closing summary sits after the run's last step, where a
+        # non-interactive log ends.
+        source = _UPGRADE_SH.read_text()
+        done = source.index('  print_step "🎉 Upgrade Complete!"\n')
+        self.assertIn("    print_next_home_channel_unset_summary\n", source[done:source.index("\n}\n", done)])
 
     def test_the_refusal_sits_beside_the_dropped_next_refusal_before_the_gate(self):
         arm = self._arm()
