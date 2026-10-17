@@ -661,7 +661,8 @@ Flags for AI Agents & Automation:
                                 stack. Recorded in install.env as PLATFORM_AGENT_MODE when
                                 the file sets none; one that sets it differently refuses
                                 the flag, so change that key instead
-                                (a mode switch: docs/designs/spec-mode-switch.md)
+                                (a mode switch: the upgrade guide's
+                                "Switching spec.mode" section)
                                 (default: DEFAULT_PLATFORM_AGENT_MODE, currently today)
   --agent-namespace=NAMESPACE   Kubernetes namespace the release installs into
                                 (default: DEFAULT_NAMESPACE, currently kubeagents-system).
