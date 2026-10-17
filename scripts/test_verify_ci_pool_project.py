@@ -2127,7 +2127,9 @@ class GitopsWorkloadManifestTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertIn("more than one file declares it", result.message)
         self.assertIn("clusters/seeded-a/apps/checkout-gateway-copy.yaml", result.message)
-        self.assertIn("-f sha=dup", result.message)
+        # The seed is right and a PUT over it repairs nothing: the remedy names the other file.
+        self.assertNotIn("-f sha=dup", result.message)
+        self.assertIn("Remove every declaration but clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", result.message)
         # Only seeded-a's YAML is read: the seeded-b copy is another cluster's tree and the README is not YAML.
         self.assertEqual(3, run.call_count)
         self.assertIn("clusters/seeded-a/apps/checkout-gateway-copy.yaml", " ".join(run.call_args_list[2].args[0]))
@@ -2135,6 +2137,29 @@ class GitopsWorkloadManifestTest(unittest.TestCase):
         other = good.replace("name: checkout-gateway", "name: checkout-frontend")
         result, _ = self._check(_ok(self._contents(good)), tree, _ok(other))
         self.assertTrue(result.passed, result.message)
+
+    def test_a_truncated_tree_listing_leaves_the_check_unread(self):
+        truncated = _ok(json.dumps({"tree": [], "truncated": True}))
+        result, _ = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")), truncated)
+        self.assertTrue(result.passed)
+        self.assertIs(result.read, False)
+        self.assertIn("truncated", result.warnings[0])
+
+    def test_a_sibling_gone_since_the_listing_is_skipped_and_an_undecodable_one_is_unread(self):
+        tree = _ok(json.dumps({"tree": [
+            {"path": "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", "type": "blob"},
+            {"path": "clusters/seeded-a/apps/old.yaml", "type": "blob"},
+        ]}))
+        good = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"
+        result, _ = self._check(_ok(self._contents(good)), tree, _fail("gh: Not Found (HTTP 404)"))
+        self.assertTrue(result.passed, result.message)
+        self.assertEqual([], result.warnings)
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(good)), tree, UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")]
+            result = checker.check_gitops_workload_manifest("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertIs(result.read, False)
+        self.assertIn("clusters/seeded-a/apps/old.yaml", result.warnings[0])
 
     def test_a_tree_listing_that_cannot_be_read_leaves_the_check_unread(self):
         result, _ = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")), _fail("gh: HTTP 502"))

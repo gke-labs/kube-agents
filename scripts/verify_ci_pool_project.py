@@ -503,6 +503,9 @@ GITOPS_WORKLOAD_MANIFEST_KEY = (GITOPS_WORKLOAD_MANIFEST_PATH.split("/")[1], "De
 GITOPS_WORKLOAD_MANIFEST_TREE = "/".join(GITOPS_WORKLOAD_MANIFEST_PATH.split("/")[:2])
 GITOPS_WORKLOAD_MANIFEST_SIBLING_CAP = 25
 GITOPS_YAML_SUFFIXES = (".yaml", ".yml")
+# How _workload_manifest_problem names a duplicate declaration; the check
+# reads it to print the remedy for the siblings rather than for the seed.
+DUPLICATE_DECLARATION_PREFIX = "more than one file declares it ("
 # The cases that fail on a project whose repository lacks the declaration:
 # the roster case, and the #2228 case parked on this fixture. (The other
 # #2228 case, obtainability-refusal-direct-mutation, is nightly and only
@@ -2946,11 +2949,6 @@ def check_gitops_workload_manifest(project_id: str) -> CheckResult:
     # Connector skip, and the one-file-per-object rule declaration_for
     # enforces). A collector that cannot load here is a machine fault, unread
     # as the note check's parser is; a raise on the file is the file's.
-    state, siblings = _gitops_cluster_tree_yaml(repo_slug, path)
-    if state == GITHUB_PATH_UNREAD:
-        return unread(f"the repository tree under {GITOPS_WORKLOAD_MANIFEST_TREE}/", siblings)
-    if state != GITHUB_PATH_PRESENT:
-        return failed(f"the repository tree under {GITOPS_WORKLOAD_MANIFEST_TREE}/", siblings)
     try:
         collect = _load_collect()
     except Exception as exc:
@@ -2961,10 +2959,26 @@ def check_gitops_workload_manifest(project_id: str) -> CheckResult:
             warnings=[Unread(f"Not checked: could not load the audit's collector to index {path}: {type(exc).__name__}: {exc}")],
             read=False,
         )
+    state, siblings = _gitops_cluster_tree_yaml(repo_slug, path)
+    if state == GITHUB_PATH_UNREAD:
+        return unread(f"the repository tree under {GITOPS_WORKLOAD_MANIFEST_TREE}/", siblings)
+    if state != GITHUB_PATH_PRESENT:
+        return failed(f"the repository tree under {GITOPS_WORKLOAD_MANIFEST_TREE}/", siblings)
     try:
         problem = _workload_manifest_problem(body, collect, siblings)
     except OSError as exc:
         return CheckResult(name, True, "Not checked", warnings=[Unread(f"Not checked: {path} (no writable temporary directory to hand it to the audit's index): {type(exc).__name__}: {exc}")], read=False)
+    if problem.startswith(DUPLICATE_DECLARATION_PREFIX):
+        # The seeded file is right; another file under the tree declares the
+        # same object, and the index resolves neither. Replacing the seed
+        # changes nothing: the other file has to go.
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} declares Deployment/checkout-gateway in seeded-reliability more than once under "
+            f"{GITOPS_WORKLOAD_MANIFEST_TREE}/ ({problem}), so the audit's index resolves none of them and {cases} fail on this "
+            f"project. Remove every declaration but {path}.",
+        )
     if problem:
         return CheckResult(
             name,
@@ -3011,9 +3025,14 @@ def _gitops_cluster_tree_yaml(repo_slug: str, seeded_path: str) -> tuple[str, di
             return GITHUB_PATH_UNREAD, reason or (err or "").strip()
         return GITHUB_PATH_FAILED, (err or "").strip()
     try:
-        entries = _load_json(out).get("tree") or []
+        listing = _load_json(out)
+        entries = listing.get("tree") or []
     except Exception as exc:
         return GITHUB_PATH_FAILED, f"could not parse the tree listing: {exc}"
+    if listing.get("truncated"):
+        # The API cut the listing; the entries under the tree may be the
+        # ones missing, so the one-file rule cannot be judged from it.
+        return GITHUB_PATH_UNREAD, "the tree listing is truncated by the API, so the one-file rule cannot be judged"
     prefix = GITOPS_WORKLOAD_MANIFEST_TREE + "/"
     wanted = sorted(
         str(e.get("path"))
@@ -3026,6 +3045,13 @@ def _gitops_cluster_tree_yaml(repo_slug: str, seeded_path: str) -> tuple[str, di
     siblings: dict[str, str] = {}
     for sibling in wanted:
         state, text = _gitops_path_state(repo_slug, sibling, raw=True)
+        if state == GITHUB_PATH_ABSENT:
+            # Gone between the listing and the read: the index would not see it either.
+            continue
+        if state == GITHUB_PATH_UNDECODABLE:
+            # The index reads it with replacement characters and keys what
+            # parses; this reader cannot, so the rule is unjudged, not failed.
+            return GITHUB_PATH_UNREAD, f"{sibling}: {text}"
         if state != GITHUB_PATH_PRESENT:
             return (GITHUB_PATH_UNREAD if state == GITHUB_PATH_UNREAD else GITHUB_PATH_FAILED), f"{sibling}: {text or state}"
         siblings[sibling] = text
@@ -3058,7 +3084,7 @@ def _workload_manifest_problem(body: str, collect, siblings: dict[str, str] | No
     if not paths:
         return "no document in it is keyed as " + "/".join(GITOPS_WORKLOAD_MANIFEST_KEY)
     if len(paths) > 1:
-        return "more than one file declares it (" + ", ".join(sorted(paths)) + "), which the index refuses to resolve"
+        return DUPLICATE_DECLARATION_PREFIX + ", ".join(sorted(paths)) + ")"
     return ""
 
 
