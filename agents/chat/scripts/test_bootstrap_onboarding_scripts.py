@@ -409,14 +409,28 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertFalse((self.d / COMPLETED).exists())
         self.assertEqual(self._attempts()["attempts"], 1)
 
-    def test_an_exit_1_with_no_gateway_answer_posted_nothing(self):
-        # The bus or the login refused it before the gateway saw it.
-        self._answer(1, "", "a2a: notify: the bus refused it, so nothing was posted")
+    def test_a_bus_refusal_before_the_gateway_posted_nothing(self):
+        self._answer(1, "", "a2a: notify: the bus refused it, so nothing was posted: permissions violation")
         self._run()
         self.assertFalse((self.d / COMPLETED).exists())
         self.assertTrue((self.d / INVENTORY).exists())
         self.assertEqual(self._attempts()["attempts"], 1)
         self.assertIn("bus refused", self._attempts()["last_reason"])
+
+    def test_a_failure_without_a_gateway_answer_keeps_the_claim(self):
+        # A connection dropped after the publish: the gateway may have posted it.
+        for returncode, stderr in ((1, "a2a: notify: flush: nats: connection closed"),
+                                   (chat_notify.NOTIFY_OUTCOME_UNKNOWN, "a2a: notify: no answer from the gateway")):
+            with self.subTest(returncode=returncode):
+                (self.d / COMPLETED).unlink(missing_ok=True)
+                (self.d / DELIVERED).replace(self.d / INVENTORY) if (self.d / DELIVERED).exists() else None
+                self.calls.clear()
+                self._answer(returncode, "", stderr)
+                self._run()
+                self.assertEqual(len(self.calls), 1)
+                self.assertTrue((self.d / COMPLETED).exists())
+                self.assertEqual(self._attempts()["attempts"], 0)
+                self.assertIn("may have landed", self._attempts()["last_reason"])
 
     def test_findings_are_marked_shown_only_after_the_post(self):
         order = []

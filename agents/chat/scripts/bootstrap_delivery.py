@@ -37,13 +37,15 @@ With the flag on, a Slack origin and the credential proxy's Slack relay in the
 environment, the report goes out as Block Kit instead (a headline with the
 total, the top two rows, the rest folded, and "Fix the first one" and "See all N"
 buttons), posted here through ``slack_blocks_post`` because the scheduler's delivery
-takes text only. Under ``spec.mode: next`` with a home channel the same card goes through the A2A
-gateway as a chat message instead (``_posted_through_gateway``).
+takes text only. Under ``spec.mode: next``, on an install whose job was linked to a chat before the
+switch, the same card goes through the A2A gateway as a chat message instead
+(``_posted_through_gateway``).
 
 Under ``spec.mode: next`` the plugin may instead have recorded the conversation the user first
 wrote in (``CONVERSATION_FILE``, with ``CONVERSATION_ALIGNED_MARKER`` as the human-present marker).
-Then the run never prints the report, since the scheduler cannot reach a gateway conversation: it
-checks before the claim that ``a2a notify`` can reach the gateway from this child, posts the report
+That record wins over a job origin. The run then never prints the report, since the scheduler
+cannot reach a gateway conversation: it checks before the claim that this child's env carries the
+bus address, a bus identity and the gateway's platform, posts the report
 and the audits note with ``a2a notify --conversation``, marks the findings shown only once the post
 landed, and releases the claim when nothing posted, to try again after a wait, up to
 ``CONVERSATION_MAX_ATTEMPTS`` (``CONVERSATION_ATTEMPTS_FILE`` records why). So on that path a claim
@@ -251,11 +253,13 @@ CONVERSATION_MAX_ATTEMPTS = len(CONVERSATION_RETRY_WAITS_SECONDS) + 1
 # The card's update key, so a post retried after one that may have landed edits it rather than
 # adding one. Text goes without a key: the gateway cuts a keyed text post to one message.
 CONVERSATION_REPORT_UPDATE = "onboarding-report"
-# How the gateway answers a post that failed after reaching the chat (a2a/gateway/notify.go). Any
-# other exit 1 posted nothing, as `a2a notify`'s usage says: a gateway refusal, or the bus or the
-# login refusing the request before the gateway saw it.
+# How the gateway answers a post that failed after reaching the chat (a2a/gateway/notify.go); its
+# other answers with no message id are refusals, which posted nothing.
 NOTIFY_POST_FAILED_PREFIX = "post failed:"
-NOTIFY_EXIT_NOTHING_POSTED = 1
+# The words `a2a notify` uses for a bus refusal before the gateway saw the request
+# (a2a/cmd/a2a/notify.go). Any other failure without a gateway answer, a dropped connection after
+# the publish say, may have posted, so it keeps the claim.
+NOTIFY_NOTHING_SENT_PHRASES = ("so nothing was posted", "so nothing was sent")
 # A conversation post's outcome.
 POSTED = "posted"
 NOT_POSTED = "not posted"
@@ -891,8 +895,8 @@ def _gateway_error(stdout: str) -> str:
 def _notify_conversation(conversation: dict, text: str, chat: dict | None = None, update: str = "") -> tuple[str, str]:
     """Post ``text`` (or ``chat``, with ``text`` its fallback) into the conversation.
 
-    Returns ``POSTED``, ``NOT_POSTED`` (an exit 1 other than the gateway's
-    ``post failed:``, or a route that was not there through the retries) or
+    Returns ``POSTED``, ``NOT_POSTED`` (a gateway refusal, a bus refusal before
+    the gateway saw it, or a route that was not there through the retries) or
     ``MAYBE_POSTED`` (anything that may have reached the chat), and a reason
     for the last two.
     """
@@ -932,10 +936,13 @@ def _notify_conversation(conversation: dict, text: str, chat: dict | None = None
             with contextlib.suppress(OSError):
                 os.unlink(path)
     error = _gateway_error(res.stdout)
-    detail = error or (res.stderr or "").strip()
-    if res.returncode == NOTIFY_EXIT_NOTHING_POSTED and not error.startswith(NOTIFY_POST_FAILED_PREFIX):
-        return NOT_POSTED, f"a2a notify posted nothing: {detail}"
-    return MAYBE_POSTED, f"a2a notify exited {res.returncode}; the post may have landed: {detail}"
+    stderr = (res.stderr or "").strip()
+    if not chat_notify.outcome_unknown(res.returncode) and (
+        (error and not error.startswith(NOTIFY_POST_FAILED_PREFIX))
+        or (not error and any(phrase in stderr for phrase in NOTIFY_NOTHING_SENT_PHRASES))
+    ):
+        return NOT_POSTED, f"a2a notify posted nothing: {error or stderr}"
+    return MAYBE_POSTED, f"a2a notify exited {res.returncode}; the post may have landed: {error or stderr}"
 
 
 def _post_to_conversation(conversation: dict, content: str, note: str) -> tuple[str, str]:
