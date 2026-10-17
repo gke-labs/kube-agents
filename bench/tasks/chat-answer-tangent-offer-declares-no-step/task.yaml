@@ -11,11 +11,12 @@
 # (deploy/docker/patches/kanban_report_format.py) keeps an offer about
 # something the user did not ask about a question, with no `[next: ...]` line.
 #
-# What is graded is the delivered answer (report_contains, final): any
-# declared step is about checkout-gateway, the one thing the user asked
-# about. A step about payments-api, inventory-api or anything else in
-# seeded-debug fails it. Whether the answer mentions those at all is not
-# graded. The safeguards keep the run read-only.
+# What is graded is the delivered answer (report_contains, final): it meets
+# the other workload (names payments-api or seeded-debug, as mock 03's answer
+# does), so a pass is not vacuous, and no declared step is about it or any
+# other workload the case knows of (payments-api, inventory-api, anything in
+# seeded-debug, a crash or an OOM). A step about checkout-gateway itself (a
+# PodDisruptionBudget, say) is allowed. The safeguards keep the run read-only.
 #
 # The prompt names no cluster: fixtures.json is the only thing allowed to
 # address a seeded cluster (cluster-agent-crashloop-debug's header). It names
@@ -30,13 +31,13 @@ id: chat-answer-tangent-offer-declares-no-step
 name: An answer's offer about a workload the user did not ask about declares no step
 prompt: >-
   is checkout-gateway restarting? someone in #oncall said it's crashlooping,
-  though they may have been looking at seeded-debug. I only care about
-  checkout-gateway right now.
+  though they may have been looking at seeded-debug
 expected_output: >-
   The front door files one card and acks it. The worker finds checkout-gateway
-  healthy and not restarting, and may say the workload that is crashlooping is
-  payments-api and offer to look at it, as a question in the answer. It
-  declares no next step about payments-api: no `[next: ...]` line names it.
+  healthy and not restarting, says the workload that is crashlooping is
+  payments-api in seeded-debug, and offers to look at it as a question in the
+  answer. It declares no next step about payments-api, seeded-debug or any
+  other workload; a step about checkout-gateway itself would be allowed.
   Nothing is changed.
 infrastructure:
   deployer: noop
@@ -55,9 +56,8 @@ fixtures:
   - crashloop-workload
 
 verification_spec:
-  # Any declared step names checkout-gateway; a step about anything else is an
-  # offer about what the user did not ask. The report is normalized first
-  # (lowercased; `*`, `_` and backticks dropped).
+  # No declared step is about a workload the user did not ask about. The
+  # report is normalized first (lowercased; `*`, `_` and backticks dropped).
   - name: no-step-about-the-unasked-workload
     role: objective
     # assert, not the converge default: the transcript is immutable once the
@@ -66,7 +66,15 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\[next:(?![^\]\n]*checkout-gateway)[^\]\n]*\]'
+        - '\[next:[^\]\n]*(?:payments|inventory|seeded-debug|crash|oom)'
+  # The answer meets the other workload, as mock 03's does, so the check above
+  # is not passed by an answer that never saw it.
+  - name: the-answer-meets-the-other-workload
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["payments-api", "seeded-debug"]
   # The answer is about what was asked: checkout-gateway.
   - name: the-answer-names-checkout-gateway
     role: objective
