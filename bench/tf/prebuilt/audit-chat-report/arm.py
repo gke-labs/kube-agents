@@ -73,7 +73,7 @@ def _executions(home, job_id):
     try:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT status, claimed_at, finished_at, delivery_outcome FROM executions "
+            "SELECT status, claimed_at, started_at, finished_at, delivery_outcome FROM executions "
             "WHERE job_id = ? ORDER BY claimed_at DESC",
             (job_id,),
         ).fetchall()
@@ -123,10 +123,12 @@ def wait(home, job_id, seconds):
     fired = datetime.fromisoformat(state["fired_at"])
     deadline = time.monotonic() + float(seconds)
     while True:
-        # A `skipped` row is an occurrence the scheduler dropped, not a run.
+        # An occurrence the scheduler dropped is not a run: a `skipped` row, or
+        # a row closed without ever starting (a lost fire claim ends `failed`
+        # with no `started_at`).
         ours = [
             run for run in _executions(home, job_id)
-            if run["status"] != SKIPPED
+            if run["status"] != SKIPPED and run["started_at"]
             and run["claimed_at"] and datetime.fromisoformat(run["claimed_at"]) > fired
         ]
         if ours and ours[-1]["finished_at"]:

@@ -194,9 +194,13 @@ def _home(tmp_path, rows):
     (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "compliance-audit"}]}))
     with sqlite3.connect(cron / "executions.db") as conn:
         conn.execute(
-            "CREATE TABLE executions (job_id TEXT, status TEXT, claimed_at TEXT, finished_at TEXT, delivery_outcome TEXT)"
+            "CREATE TABLE executions (job_id TEXT, status TEXT, claimed_at TEXT, started_at TEXT, finished_at TEXT, delivery_outcome TEXT)"
         )
-        conn.executemany("INSERT INTO executions VALUES ('compliance-audit', ?, ?, ?, ?)", rows)
+        conn.executemany(
+            "INSERT INTO executions VALUES ('compliance-audit', ?, ?, ?, ?, ?)",
+            [(status, claimed, None if status == "skipped" or (status == "failed" and outcome == "never-started") else claimed, finished, outcome)
+             for status, claimed, finished, outcome in rows],
+        )
     return str(tmp_path)
 
 
@@ -258,6 +262,21 @@ def test_wait_ignores_a_skipped_occurrence(tmp_path):
         assert "did not finish" in str(exc)
     else:
         raise AssertionError("wait took a skipped row as the fired run")
+
+
+def test_wait_ignores_an_occurrence_that_never_started(tmp_path):
+    arm = _arm()
+    home = _home(tmp_path, [
+        ("failed", (FIRED + timedelta(seconds=5)).isoformat(), (FIRED + timedelta(seconds=6)).isoformat(), "never-started"),
+    ])
+    Path(home, arm.STATE_NAME).write_text(json.dumps({"job_id": "compliance-audit", "fired_at": FIRED.isoformat()}))
+    arm.POLL_S = 0
+    try:
+        arm.wait(home, "compliance-audit", 0)
+    except SystemExit as exc:
+        assert "did not finish" in str(exc)
+    else:
+        raise AssertionError("wait took a never-started row as the fired run")
 
 
 def test_fire_refuses_a_disabled_job(tmp_path):
