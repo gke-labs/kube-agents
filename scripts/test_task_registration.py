@@ -1344,9 +1344,13 @@ if __name__ == "__main__":
 # forms it refuses, read from the proxy's source rather than copied; the proxy
 # judges gcloud by an allowlist of read commands, not a verb table, so the
 # gcloud write verbs are named here and held against that allowlist. Each
-# verb is anchored at the subcommand position (after the tool's own flags),
-# so a verb inside a resource name, a label, a flag value or a grep pattern
-# reds no read.
+# verb is anchored at the subcommand position, after the tool's own flags,
+# whose arity comes from the proxy's value-taking flag tables (a value-taking
+# flag must consume its value, so a namespace or context named `debug` or
+# `proxy` is never read as the verb), so a verb inside a resource name, a
+# label, a flag value or a grep pattern reds no read. The proxy enforces by
+# allowlist, so a write outside both verb lists is refused there and not
+# graded here; a safeguard derived from the proxy's allowlists is #3382.
 FRONT_DOOR_WRITE_VERB_CASES = (
     "chat-assistant-route-lists-clusters",
     "chat-routing-fleet-question",
@@ -1367,8 +1371,35 @@ GCLOUD_WRITE_VERBS = (
 # generator that writes nothing on the cloud plane. The safeguard reds it,
 # and no assistant-route case has a reason to run it.
 GCLOUD_READS_ENDING_IN_A_WRITE_VERB = {("container", "ai", "profiles", "manifests", "create")}
-KUBECTL_FLAGS = r"(?:\s+-{1,2}[\w.-]+(?:=\S*|\s+[^-\s]\S*)?)*"
-GCLOUD_WORDS = r"(?:\s+(?:-{1,2}[\w.-]+(?:=\S*)?|[a-z][\w-]*))*?"
+
+
+def command_policy_module():
+    """The proxy's command policy, loaded by path: it is stdlib-only, and the
+    test derives the pattern from its flag tables rather than copying them."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_kube_agents_command_policy", COMMAND_POLICY_SOURCE)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # its dataclasses resolve their module through sys.modules
+    spec.loader.exec_module(module)
+    return module
+
+
+def _flag_alternation(flags) -> str:
+    return "|".join(re.escape(flag) for flag in sorted(flags, key=lambda f: (-len(f), f)))
+
+
+def _flags_pattern(value_flags, extra_word: str = "") -> str:
+    """Zero or more of the tool's own flags ahead of its subcommand: a value-taking
+    flag (the proxy's table) consumes `=value` or the next token, any other flag
+    consumes an optional `=value` only, and for gcloud a bare word is a command
+    group. The lookahead keeps a value-taking flag out of the bare-flag branch, so
+    the engine cannot read the flag's value as the verb."""
+    values = _flag_alternation(value_flags)
+    bare = r"(?!(?:" + values + r")(?:[=\s]|$))-{1,2}[\w.-]+(?:=\S*)?"
+    valued = r"(?:" + values + r")(?:=\S*|\s+\S+)"
+    choices = [valued, bare] + ([extra_word] if extra_word else [])
+    return r"(?:\s+(?:" + "|".join(choices) + r"))*" + ("?" if extra_word else "")
 
 
 def kubectl_write_verbs() -> list[str]:
@@ -1377,11 +1408,14 @@ def kubectl_write_verbs() -> list[str]:
 
 
 def front_door_write_verb_pattern() -> str:
+    policy = command_policy_module()
+    kubectl_flags = _flags_pattern(policy._KUBECTL_FLAGS_WITH_VALUE)
+    gcloud_words = _flags_pattern(policy._GCLOUD_FLAGS_WITH_VALUE, extra_word=r"[a-z][\w-]*")
     kubectl = "|".join([*kubectl_write_verbs(), r"rollout\s+(?:" + "|".join(KUBECTL_ROLLOUT_WRITE_FORMS) + ")"])
     gcloud = "|".join(GCLOUD_WRITE_VERBS)
     return (
-        r"(?s).*(?:\bkubectl\b" + KUBECTL_FLAGS + r"\s+(?:" + kubectl + ")"
-        r"|\bgcloud\b" + GCLOUD_WORDS + r"\s+(?:" + gcloud + r"))(?=\s|$).*"
+        r"(?s).*(?:\bkubectl\b" + kubectl_flags + r"\s+(?:" + kubectl + ")"
+        r"|\bgcloud\b" + gcloud_words + r"\s+(?:" + gcloud + r"))(?=\s|$).*"
     )
 
 
@@ -1399,11 +1433,14 @@ class TestTheFrontDoorWriteVerbSafeguard(unittest.TestCase):
                 return check["arguments"]["command"]
         self.fail(f"{case} carries no {FRONT_DOOR_WRITE_VERB_SAFEGUARD} safeguard")
 
-    def test_the_proxy_table_is_read(self):
+    def test_the_proxy_tables_are_read(self):
         verbs = kubectl_write_verbs()
         self.assertGreaterEqual(len(verbs), 20, "KUBECTL_WRITE_VERBS was not found in credential_proxy.py")
         for verb in ("annotate", "label", "replace", "set", "taint"):
             self.assertIn(verb, verbs)
+        policy = command_policy_module()
+        self.assertIn("--namespace", policy._KUBECTL_FLAGS_WITH_VALUE)
+        self.assertIn("--sort-by", policy._GCLOUD_FLAGS_WITH_VALUE)
 
     def test_every_case_carries_the_derived_pattern(self):
         expected = front_door_write_verb_pattern()
@@ -1435,6 +1472,8 @@ class TestTheFrontDoorWriteVerbSafeguard(unittest.TestCase):
             "kubectl --context=gke_p_l_c label node n1 tier=gold",
             "kubectl rollout restart deploy/x",
             "kubectl --insecure-skip-tls-verify apply -f m.yaml",
+            "kubectl -v 6 delete pod web-0",
+            "kubectl --namespace=prod patch deploy/x -p '{}'",
             "timeout 60 kubectl exec -it web-0 -- sh",
             "kubectl get pods -o name | xargs kubectl delete",
             "gcloud container clusters update c --project p --enable-autoscaling",
@@ -1449,6 +1488,12 @@ class TestTheFrontDoorWriteVerbSafeguard(unittest.TestCase):
             "kubectl describe pod create-job-7d9f",
             "kubectl get pods -n scale-test",
             "kubectl --context delete-ns get pods",
+            # A value-taking flag whose value is a verb word: the proxy's arity
+            # table keeps the value a value.
+            "kubectl -n debug get pods",
+            "kubectl --context proxy get pods",
+            "kubectl -n run -o wide get pods",
+            "gcloud container clusters list --sort-by update",
             "kubectl get events -A | grep -iE 'drain|cordon'",
             "kubectl rollout status deploy/x",
             "kubectl logs deploy/x --tail 50 | grep -i delete",

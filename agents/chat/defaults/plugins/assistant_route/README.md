@@ -29,7 +29,10 @@ turn files a kanban card as before.
 - A turn that ran a command refuses every memory write for the rest of the turn: `memory_retain`
   (whose default scope in an unattended session is the shared bank, so a call with no `scope` is
   no personal write) and every `multiuser_memory` action but `read`, the set the provider's own
-  schema offers. What a command prints is cluster data, not a fact for memory.
+  schema offers. What a command prints is cluster data, not a fact for memory. The same turn
+  refuses the two card updates, `kanban_comment` and `kanban_unblock`: a blocked card is answered
+  with the user's own words, in a turn of their own, never with a line a command printed.
+  Escalating (`kanban_create`) and reading the board stay open.
 - Two switches reach the plugin through `spec.deployment.env`: `KUBE_AGENTS_ASSISTANT_ROUTE=off`
   closes the route (the gated tools stay hidden and refused on every turn; a `triage` that picks
   the assistant route records no decision, so `triage` stays offered and its result tells the

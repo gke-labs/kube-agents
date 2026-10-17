@@ -34,9 +34,11 @@ ADAPTER_SYMBOLS = (
 GATEWAY_SYMBOLS = ("_gateway_runner_ref", "self._gateway_loop")
 REGISTRY_SYMBOLS = ("def get_tool_names_for_toolset(",)
 WAKE_PREFIX = "[kanban] Task "
-# The wake text lives in the locale file; the plugin keeps the same prefix in
-# UNFORCED_MESSAGE_PREFIXES.
-WAKE_PATTERN = re.compile(r"\[kanban\] Task \{task_id\}")
+# The wake text lives in the locale file (gateway.kanban.wake.message); the
+# plugin keeps the same prefix in UNFORCED_MESSAGE_PREFIXES and tests the
+# message's START, so the pin requires a `message:` value that opens with it,
+# not the substring anywhere in the file.
+WAKE_PATTERN = re.compile(r"^\s*message:\s*[\"']\[kanban\] Task \{task_id\}", re.MULTILINE)
 
 
 def _require(path: pathlib.Path, needles: tuple[str, ...]) -> list[str]:
