@@ -1,0 +1,42 @@
+Subject: Route Helm charts to gitops-helm-chart instead of helm
+
+Why: the agent's shell holds no cluster credential and reaches no chart repository, so a helm install or upgrade it is told to run fails, and the next move observed was asking the broker for an access token to hand to helm. A chart change here goes into the GitOps repository as a pull request through gitops-helm-chart, a skill this repository has and upstream does not, so the helm lines and the table's Helm mentions are replaced with that route.
+Local-Issue: #2938
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; gitops-helm-chart is this repository's skill and the read-only shell is this repository's design
+
+diff --git a/references/cli-reference.md b/references/cli-reference.md
+--- a/references/cli-reference.md
++++ b/references/cli-reference.md
+@@ -47,14 +47,13 @@ Default preference order:
+ :                   : components, IAM/SA setup,  :                             :
+ :                   : Cloud Logging queries.     :                             :
+ | **`kubectl`**     | Neither MCP nor `gcloud`   | `kubectl top pods`,         |
+-:                   : covers the operation, or   : `kubectl scale deployment`, :
+-:                   : user explicitly prefers    : `helm install`              :
++:                   : covers the operation, or   : `kubectl scale deployment`  :
++:                   : user explicitly prefers    :                             :
+ :                   : kubectl. Required for\:    :                             :
+ :                   : `kubectl top`, `kubectl    :                             :
+ :                   : scale`, `kubectl exec`,    :                             :
+ :                   : `kubectl port-forward`,    :                             :
+-:                   : Helm, custom CRDs not in   :                             :
+-:                   : MCP.                       :                             :
++:                   : custom CRDs not in MCP.    :                             :
+ 
+ ### User preference override
+ 
+@@ -278,10 +277,11 @@ kubectl port-forward svc/<SERVICE> <LOCAL_PORT>:<REMOTE_PORT> -n <NAMESPACE>
+ kubectl cp <NAMESPACE>/<POD>:<PATH> <LOCAL_PATH>
+ kubectl run debug --rm -it --image=busybox -- /bin/sh
+ kubectl drain <NODE_NAME> --ignore-daemonsets --delete-emptydir-data
+-helm install <RELEASE> <CHART> -n <NAMESPACE>
+-helm upgrade <RELEASE> <CHART> -n <NAMESPACE>
+ ```
+ 
++Helm charts are never installed or upgraded with `helm`: declare the chart in
++the GitOps repository with the `gitops-helm-chart` skill.
++
+ ## `parent` / `name` Format Quick Reference
+ 
+ ```

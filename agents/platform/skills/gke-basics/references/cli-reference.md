@@ -47,14 +47,13 @@ Default preference order:
 :                   : components, IAM/SA setup,  :                             :
 :                   : Cloud Logging queries.     :                             :
 | **`kubectl`**     | Neither MCP nor `gcloud`   | `kubectl top pods`,         |
-:                   : covers the operation, or   : `kubectl scale deployment`, :
-:                   : user explicitly prefers    : `helm install`              :
+:                   : covers the operation, or   : `kubectl scale deployment`  :
+:                   : user explicitly prefers    :                             :
 :                   : kubectl. Required for\:    :                             :
 :                   : `kubectl top`, `kubectl    :                             :
 :                   : scale`, `kubectl exec`,    :                             :
 :                   : `kubectl port-forward`,    :                             :
-:                   : Helm, custom CRDs not in   :                             :
-:                   : MCP.                       :                             :
+:                   : custom CRDs not in MCP.    :                             :
 
 ### User preference override
 
@@ -278,9 +277,10 @@ kubectl port-forward svc/<SERVICE> <LOCAL_PORT>:<REMOTE_PORT> -n <NAMESPACE>
 kubectl cp <NAMESPACE>/<POD>:<PATH> <LOCAL_PATH>
 kubectl run debug --rm -it --image=busybox -- /bin/sh
 kubectl drain <NODE_NAME> --ignore-daemonsets --delete-emptydir-data
-helm install <RELEASE> <CHART> -n <NAMESPACE>
-helm upgrade <RELEASE> <CHART> -n <NAMESPACE>
 ```
+
+Helm charts are never installed or upgraded with `helm`: declare the chart in
+the GitOps repository with the `gitops-helm-chart` skill.
 
 ## `parent` / `name` Format Quick Reference
 
