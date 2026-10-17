@@ -1942,22 +1942,19 @@ _SHELL_FLAG_PREFIX = "-"
 _SHELL_OPTIONS_END = "--"
 _SHELL_EXPANSION_PREFIX = "$"
 _SHELL_COUNT_RE = re.compile(r"^(?:\d+(?:\.\d+)?[smhd]?|infinity)$")
-_COLLAPSED_COMMANDS_RE = re.compile(r"(?:^|\s)\+\s*\d+\s+commands?\b")
 _USAGE_FLAGS = ("-h", "--help")
-_COMMAND_SUBSTITUTION = "command substitution"
 
 
 class WorkerRun(BaseModel):
     """One program run a case requires of a worker, or forbids: a script by its basename (or its
     module stem under ``-m``), the flags that have to follow it on the same shell segment as exact
-    words, ``word_patterns``, regular expressions each of which some later word of the segment
+    words, and ``word_patterns``, regular expressions each of which some later word of the segment
     must match on its own (``^(?:get|describe)$`` for a verb; a resource list such as
     ``pdb,validatingwebhookconfigurations`` is one word, so a pattern over the word reads it
     whole, and a quoted mention of the whole command is one word that is no command), and
     ``succeeded`` (for ``required_runs`` only), whether the command must have exited 0 (a non-zero
-    or unrecorded exit does not count; trailing operators after the matching segment must be
-    strictly ``&&`` or empty and uncollapsed, so trailing pipes, backgrounding with ``&``,
-    or chains with ``;`` or ``||`` are refused as masked)."""
+    or unrecorded exit does not count; graded from the worker trajectory only, and a run with
+    ``succeeded: true`` and no worker trajectory to read is not credited)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1965,13 +1962,6 @@ class WorkerRun(BaseModel):
     flags: list[str] = Field(default_factory=list)
     word_patterns: list[str] = Field(default_factory=list)
     succeeded: bool = False
-    """(For ``required_runs`` only) whether the command must have exited 0 (a non-zero or
-    unrecorded exit does not count; on the trajectory path, neither preceding ``||`` in the
-    same list nor leading ``!`` may stand ahead of the matching segment, and trailing operators
-    after the matching segment must be strictly ``&&`` or empty and uncollapsed, so trailing pipes,
-    backgrounding with ``&``, or chains with ``;`` or ``||`` are refused as masked; on the card-log
-    path, any collapsed chain ending in ``+ N command(s)`` is refused because the log format hides
-    whether the join was ``&&``, ``;`` or ``||``)."""
 
     @field_validator("word_patterns")
     @classmethod
@@ -2191,141 +2181,30 @@ def _shell_argvs(command: str) -> list[list[str]]:
     after its ``-c``-style flag, which is read the same way and yields its own argvs; so does
     each command or process substitution and each backtick pair on the line (``OUT=$(python3
     ... --readiness)``, ``cat <(...)``), whose commands the shell runs."""
-    return [argv for argv, _ in _shell_argvs_with_operators(command)]
-
-
-def _is_bare_assignment_argv(argv: list[str]) -> bool:
-    """True when argv consists only of a single bare assignment (no external command word or declaration keywords)."""
-    # `export`, `local`, `readonly` and `typeset` return their own status (0), not the
-    # substitution's (shellcheck SC2155), so they are command words that mask it here.
-    count = 0
-    for word in argv:
-        if _is_redirect(word):
-            continue
-        if _SHELL_ASSIGNMENT_RE.match(word):
-            count += 1
-            continue
-        return False
-    return count == 1
-
-
-def _is_terminator(w: str, k: int, words: list[str]) -> bool:
-    if w not in (";", _SHELL_LINE_END):
-        return False
-    # Check if there are no subsequent command words, or the immediately next closing delimiter is '}' or ')'
-    for j in range(k + 1, len(words)):
-        wj = words[j]
-        if wj == _SHELL_LINE_END:
-            continue
-        if wj in ("}", ")"):
-            return True
-        return False
-    return True
-
-
-def _shell_argvs_with_operators(
-    command: str, outer_spans: set[str] | None = None
-) -> list[tuple[list[str], list[str]]]:
-    """Each segment of a command line as an argv paired with the control operators that follow it."""
     words, spans = _shell_words_and_spans(command)
-    all_outer_spans = set(spans) if outer_spans is None else (outer_spans | set(spans))
-    segments: list[tuple[list[str], int, int]] = []
-    current_argv: list[str] = []
-    first_word_idx = -1
-    last_word_idx = -1
-    for idx, word in enumerate(words):
+    argvs: list[list[str]] = []
+    argv: list[str] = []
+    for word in [*words, _ShellOperator(";")]:
         if _is_control_operator(word):
-            if current_argv:
-                segments.append((current_argv, first_word_idx, last_word_idx))
-                current_argv = []
-                first_word_idx = -1
+            if argv:
+                argvs.append(argv)
+            argv = []
             continue
-        if not current_argv:
-            first_word_idx = idx
-        current_argv.append(word)
-        last_word_idx = idx
-    if current_argv:
-        segments.append((current_argv, first_word_idx, last_word_idx))
-
-    result: list[tuple[list[str], list[str]]] = []
-    for seg_argv, first_idx, last_idx in segments:
-        ops: list[str] = []
-        # Preceding operators: check if preceding || or ! stands in the segment's enclosing list.
-        for k in range(first_idx - 1, -1, -1):
-            w = words[k]
-            if not isinstance(w, _ShellOperator):
-                continue
-            if w == _SHELL_LINE_END and k > 0 and _is_control_operator(words[k - 1]) and words[k - 1] != ")":
-                continue
-            if w in (";", _SHELL_LINE_END, "&", ")"):
+        argv.append(word)
+    for argv in list(argvs):
+        index = _command_word_index(argv)
+        if index is None or os.path.basename(argv[index]) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
+            continue
+        for flag_index in range(index + 1, len(argv) - 1):
+            flag = argv[flag_index]
+            if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
+                argvs.extend(_shell_argvs(argv[flag_index + 1]))
                 break
-            if w == "(":
-                continue
-            if w == "||":
-                ops.append("preceding ||")
-                break
-        has_bang = bool(seg_argv and seg_argv[0] == "!")
-        if not has_bang:
-            for k in range(first_idx - 1, -1, -1):
-                w = words[k]
-                if w in ("(", _SHELL_LINE_END):
-                    continue
-                if w == "!":
-                    has_bang = True
-                break
-        if has_bang:
-            ops.append("!")
-
-        for k in range(last_idx + 1, len(words)):
-            w = words[k]
-            if _is_control_operator(w) and w not in ("(", ")"):
-                # A newline directly following a control operator (e.g. '&& \n') is continuation whitespace.
-                if w == _SHELL_LINE_END and k > 0 and _is_control_operator(words[k - 1]) and words[k - 1] != ")":
-                    continue
-                # If ';' or '\n' has no subsequent command words or closes a brace group, it terminates without masking.
-                if _is_terminator(w, k, words):
-                    continue
-                ops.append(str(w))
-        result.append((seg_argv, ops))
-
-    handled_spans: set[str] = set()
-    for seg_argv, trailing in list(result):
-        index = _command_word_index(seg_argv)
-        if index is not None and os.path.basename(seg_argv[index]) in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
-            for flag_index in range(index + 1, len(seg_argv) - 1):
-                flag = seg_argv[flag_index]
-                if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
-                    inner_segments = _shell_argvs_with_operators(
-                        seg_argv[flag_index + 1], outer_spans=all_outer_spans
-                    )
-                    for inner_argv, inner_trailing in inner_segments:
-                        result.append((inner_argv, trailing + inner_trailing))
-                    break
-        for span in spans:
-            if any(span in word for word in seg_argv):
-                handled_spans.add(span)
-                inner = _substitution_commands(span)
-                if inner is not None:
-                    is_bare = _is_bare_assignment_argv(seg_argv) and (
-                        outer_spans is None or span not in outer_spans
-                    )
-                    for inner_argv, inner_trailing in _shell_argvs_with_operators(
-                        inner, outer_spans=all_outer_spans
-                    ):
-                        sub_trailing = trailing + inner_trailing
-                        if not is_bare:
-                            sub_trailing = sub_trailing + [_COMMAND_SUBSTITUTION]
-                        result.append((inner_argv, sub_trailing))
-
     for span in spans:
-        if span not in handled_spans:
-            inner = _substitution_commands(span)
-            if inner is not None:
-                for inner_argv, inner_trailing in _shell_argvs_with_operators(
-                    inner, outer_spans=all_outer_spans
-                ):
-                    result.append((inner_argv, inner_trailing + [_COMMAND_SUBSTITUTION]))
-    return result
+        inner = _substitution_commands(span)
+        if inner is not None:
+            argvs.extend(_shell_argvs(inner))
+    return argvs
 
 
 def _command_word_index(argv: list[str], script: str | None = None) -> int | None:
@@ -2413,8 +2292,8 @@ def _words_after_carry(words: list[str], run: WorkerRun) -> bool:
     return all(flag in words for flag in run.flags) and all(any(re.search(pattern, word) for word in words) for pattern in run.word_patterns)
 
 
-def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str, str, bool | None]]:
-    """``(card, at, command, result, succ)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
+def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str, str, bool]]:
+    """``(card, at, command, result, failed)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
 
     ``card`` is the entry's ``task`` tag (its ``session`` when a card is not
     recorded): the worker the call belongs to. The workers' entries reach
@@ -2426,11 +2305,11 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
     turn issued together share it. An argument object clipped in the pod
     arrives as ``{"raw": text}`` and the command is read out of the text, as
     ``tool_called`` reads its arguments, and one clipped inside the command
-    itself keeps the head that survived, which carries the verb. A result that is not text reads as empty; ``succ`` is True if the call completed
-    (``status == "completed"``), False if it errored (``status == "error"``), or None if
-    unrecorded (``status == "called"``).
+    itself keeps the head that survived, which carries the verb. A result
+    that is not text reads as empty; ``failed`` is the pod's verdict on the
+    unclipped result (``status == "error"``), so it survives the clip.
     """
-    calls: list[tuple[str, float | None, str, str, bool | None]] = []
+    calls: list[tuple[str, float | None, str, str, bool]] = []
     for entry in trajectory:
         if not isinstance(entry, dict) or not entry.get("agent") or entry.get("name") not in _CODE_TOOLS:
             continue
@@ -2457,17 +2336,13 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
             continue
         at = entry.get("at")
         result = entry.get("result")
-        status = entry.get("status")
-        succ: bool | None = (
-            True if status == "completed" else False if (status == "error" or entry.get("failed")) else None
-        )
         calls.append(
             (
                 str(entry.get("task") or entry.get("session") or ""),
                 float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None,
                 command,
                 result if isinstance(result, str) else "",
-                succ,
+                entry.get("status") == "error",
             )
         )
     calls.sort(key=lambda call: float("-inf") if call[1] is None else call[1])
@@ -2552,12 +2427,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     argv, must run it with those flags after it, a word matching each pattern,
     and no ``-h``/``--help`` (:func:`_argv_runs`). When ``succeeded: true``,
     the command must also have exited 0 (a non-zero or unrecorded exit does
-    not count; on the trajectory path, neither preceding ``||`` in the same
-    list nor leading ``!`` may stand ahead of the matching segment, and trailing operators
-    after the matching segment must be strictly ``&&`` or empty and uncollapsed, so trailing pipes,
-    backgrounding with ``&``, or chains with ``;`` or ``||`` are refused as masked; on the card-log path, any collapsed chain
-    ending in ``+ N command(s)`` is refused because the log format hides whether the join was ``&&``, ``;`` or ``||``). ``forbidden_runs``: the same
-    shape, and no segment may run it. An argv tells a quoted mention of the
+    not count; graded from the worker trajectory only, and a required run with
+    ``succeeded: true`` and no worker trajectory to read is not credited).
+    ``forbidden_runs``: the same shape, and no segment may run it. An argv tells a quoted mention of the
     invocation from a run, where a pattern over the text cannot: a forbidden
     ``kubectl get`` of budgets is not met by ``grep "kubectl get pdb" SKILL.md``
     or an echoed sentence, where ``forbidden_patterns`` over the text would be.
@@ -2684,6 +2556,7 @@ class WorkerCommandsVerifier(BaseVerifier):
             )
         window = ""
         result_hits: list[tuple[str, str]] = []
+        all_later_calls: list[tuple[str, float | None, str, str, bool]] = []
         if self.after_result_pattern is None:
             if snap.worker_commands is None:
                 return VerificationResult(
@@ -2694,13 +2567,6 @@ class WorkerCommandsVerifier(BaseVerifier):
                 )
             typed = [row.get("command", "") for row in snap.worker_commands]
             windowed = typed
-            command_entries = [
-                (
-                    row.get("command", ""),
-                    True if row.get("exit") == 0 else False if isinstance(row.get("exit"), int) else None,
-                )
-                for row in snap.worker_commands
-            ]
         else:
             calls = _worker_terminal_calls(snap.trajectory)
             if not calls:
@@ -2717,10 +2583,6 @@ class WorkerCommandsVerifier(BaseVerifier):
                         reason=_NO_WORKER_TERMINAL_CALLS_REASON,
                     )
             typed = [command for _, _, command, _, _ in calls]
-            command_entries = [
-                (command, succ)
-                for _, _, command, _, succ in calls
-            ]
             untimed = [command for _, at, command, _, _ in calls if at is None]
             if untimed:
                 shown = "; ".join(repr(c[:_SHOWN_COMMAND_CHARS]) for c in untimed[:_MAX_NAMED_COMMANDS])
@@ -2733,6 +2595,7 @@ class WorkerCommandsVerifier(BaseVerifier):
             lineage = _card_lineages(snap.worker_card_parents or {}, [c for c, _, _, _, _ in calls])
             windowed = []
             opened: list[str] = []
+            all_later_calls: list[tuple[str, float | None, str, str, bool]] = []
             for root in dict.fromkeys(lineage[c] for c, _, _, _, _ in calls):
                 mine = [call for call in calls if lineage[call[0]] == root]
                 opener = next((i for i, (_, _, _, result, _) in enumerate(mine) if re.search(self.after_result_pattern, result)), None)
@@ -2740,6 +2603,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                     continue
                 opened_at = mine[opener][1]
                 later = [call for call in mine[opener + 1 :] if call[1] > opened_at]
+                all_later_calls.extend(later)
                 windowed.extend(command for _, _, command, _, _ in later)
                 for _, _, command, result, _ in later:
                     result_hits.extend((p, command) for p in self.forbidden_result_patterns if re.search(p, result))
@@ -2759,64 +2623,52 @@ class WorkerCommandsVerifier(BaseVerifier):
         # exemption touched is out of the required list. The forbidden list
         # reads the windowed commands (every command without a window).
         commands = [c for c in typed if self._without_exempt_text(c) == c]
-        active_entries = [(c, succ) for c, succ in command_entries if self._without_exempt_text(c) == c]
         exempted = f" ({len(typed) - len(commands)} exempted)" if len(commands) < len(typed) else ""
         graded = [(c, self._without_exempt_text(c)) for c in windowed]
         missing = [p for p in self.required_patterns if not any(re.search(p, c) for c in commands)]
         hits = [(p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)]
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
+        argvs = [argv for c in commands for argv in _shell_argvs(c)]
+        typed_argvs = [argv for c in typed for argv in _shell_argvs(c)]
+
+        if self.after_result_pattern is not None:
+            traj_eligible = [(call[2], not call[4]) for call in all_later_calls if self._without_exempt_text(call[2]) == call[2]]
+        else:
+            traj_calls = _worker_terminal_calls(snap.trajectory) if snap.trajectory else []
+            traj_eligible = [(cmd, not failed) for _, _, cmd, _, failed in traj_calls if self._without_exempt_text(cmd) == cmd]
 
         unrun_missing: list[WorkerRun] = []
         unrun_failed: list[WorkerRun] = []
-        unrun_masked: list[str] = []
         for run in self.required_runs:
-            matched_any = False
-            matched_mask_reason: str | None = None
-            succeeded = False
-            for c, succ in active_entries:
-                collapsed = bool(_COLLAPSED_COMMANDS_RE.search(c))
-                for argv, trailing_ops in _shell_argvs_with_operators(c):
-                    if _argv_runs(argv, run):
-                        matched_any = True
-                        if not run.succeeded:
-                            succeeded = True
-                            break
-                        unmasked = not collapsed and all(op == "&&" for op in trailing_ops)
-                        if succ is True and unmasked:
-                            succeeded = True
-                            break
-                        if succ is True and not unmasked:
-                            named = " ".join([run.script, *run.flags])
-                            if collapsed:
-                                matched_mask_reason = f"{named} ran in a collapsed chain whose exit is the chain's"
-                            else:
-                                mask_op = next((op for op in trailing_ops if op != "&&"), "operator")
-                                if mask_op == _COMMAND_SUBSTITUTION:
-                                    matched_mask_reason = f"{named} ran inside a command substitution whose exit is discarded"
-                                elif mask_op == "!":
-                                    matched_mask_reason = f"{named} ran but its exit is inverted by '!'"
-                                elif mask_op == "preceding ||":
-                                    matched_mask_reason = f"{named} ran in an '||' chain whose exit may not be the command's"
-                                else:
-                                    mask_op_display = "\\n" if mask_op == _SHELL_LINE_END else mask_op
-                                    matched_mask_reason = f"{named} ran but its exit is masked by a trailing '{mask_op_display}'"
-                if succeeded:
-                    break
-            if not succeeded:
-                if matched_mask_reason is not None:
-                    unrun_masked.append(matched_mask_reason)
-                elif matched_any:
-                    unrun_failed.append(run)
-                else:
+            if not run.succeeded:
+                if not any(_argv_runs(argv, run) for argv in argvs):
                     unrun_missing.append(run)
+            else:
+                # Grade succeeded: true from worker trajectory only.
+                # A required run with succeeded: true and no trajectory to read is not credited.
+                matched_any = False
+                succeeded = False
+                for cmd_text, call_succeeded in traj_eligible:
+                    for argv in _shell_argvs(cmd_text):
+                        if _argv_runs(argv, run):
+                            matched_any = True
+                            if call_succeeded:
+                                succeeded = True
+                                break
+                    if succeeded:
+                        break
+                if not succeeded:
+                    if matched_any:
+                        unrun_failed.append(run)
+                    else:
+                        unrun_missing.append(run)
 
-        typed_argvs = [argv for c in typed for argv in _shell_argvs(c)]
         ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
         # A forbidden command that was read is conclusive whatever else was
         # not; a missing required command, or a clean read, is not when the
         # capture has gaps (the siblings' rule, ``worker_agents`` first).
         partial = self.after_result_pattern is not None and snap.worker_capture_gaps
-        if hits or ran or ((missing or unrun_missing or unrun_failed or unrun_masked) and not partial):
+        if hits or ran or ((missing or unrun_missing or unrun_failed) and not partial):
             parts = []
             if missing:
                 parts.append(
@@ -2829,8 +2681,6 @@ class WorkerCommandsVerifier(BaseVerifier):
             if unrun_failed:
                 named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
                 parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
-            if unrun_masked:
-                parts.append("; ".join(unrun_masked))
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"

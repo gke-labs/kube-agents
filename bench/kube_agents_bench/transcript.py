@@ -97,12 +97,12 @@ class TranscriptSnapshot:
     # a phrase check against it passes on progress chatter; checks default to
     # this field instead.
     final_message: str = ""
-    # Every terminal command the delegated workers ran, as ``{"task", "command", "exit"}``
+    # Every terminal command the delegated workers ran, as ``{"task", "command"}``
     # rows parsed from each card's worker log before the harness purged it.
     # ``None`` means the harness captured nothing -- no card was delegated, or
     # the run ended before settlement -- which ``worker_commands`` reports as
     # ``status="error"``; an empty list means workers ran and typed nothing.
-    worker_commands: list[dict[str, Any]] | None = None
+    worker_commands: list[dict[str, str]] | None = None
     # What the worker-trajectory read could not reach (``worker_trajectory.
     # gaps``): a store it could not open for a profile a run was dispatched
     # to, a dispatched card with no session, a fan-out clipped at the card cap. ``None`` when the read did not run;
@@ -125,7 +125,7 @@ def set(  # noqa: A001 - deliberate, matches get/clear
     prompt: str = "",
     final_message: str = "",
     started_at: float = 0.0,
-    worker_commands: list[dict[str, Any]] | None = None,
+    worker_commands: list[dict[str, str]] | None = None,
     worker_capture_gaps: list[str] | None = None,
     worker_card_parents: dict[str, str] | None = None,
 ) -> None:

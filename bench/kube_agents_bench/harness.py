@@ -288,13 +288,12 @@ _ARCHIVED_PREFIX = "Archived "
 _LOG_EXCERPT_CHARS = 200
 # One terminal command per line in a card's worker log, as hermes renders it:
 # ``  ┊ 💻 $         <command>  0.6s [exit 1]``. The timing and exit suffixes
-# are parsed to record the command and its exit code (0 for a timed command with
-# no exit suffix, N for ``[exit N]``, None when unrecorded); the rendering is kept
-# verbatim otherwise, and it is hermes's one-line summary of the command rather
-# than the text as typed (a chain arrives as its first command plus
-# `` + N command(s)``; the verifier's docstring lists the rest).
+# are stripped; the rendering is kept verbatim otherwise, and it is hermes's
+# one-line summary of the command rather than the text as typed (a chain
+# arrives as its first command plus `` + N command(s)``; the verifier's
+# docstring lists the rest).
 _WORKER_COMMAND_RE = re.compile(
-    r"💻 \$\s+(?P<command>.+?)(?:\s{2,}(?P<duration>(?:\d+m\s?)?\d+(?:\.\d+)?s)(?:\s+\[exit\s+(?P<exit>-?\d+)\])?)?\s*$"
+    r"💻 \$\s+(?P<command>.+?)(?:\s+\d+(?:\.\d+)?s(?: \[exit \d+\])?)?\s*$"
 )
 _MAX_WORKER_LOG_BYTES = 512_000
 # Where a stalled card's transcript is kept. Prow sets ARTIFACTS to the
@@ -928,7 +927,7 @@ def _worker_logs(task_ids: list[str], timeout: float) -> dict[str, _WorkerLog | 
     return logs
 
 
-def _worker_commands(logs: dict[str, _WorkerLog | None] | None) -> list[dict[str, Any]] | None:
+def _worker_commands(logs: dict[str, _WorkerLog | None] | None) -> list[dict[str, str]] | None:
     """Every terminal command the delegated workers ran, from their card logs.
 
     The worker is a separate hermes session; its log records each terminal
@@ -944,37 +943,14 @@ def _worker_commands(logs: dict[str, _WorkerLog | None] | None) -> list[dict[str
     """
     if logs is None:
         return None
-    commands: list[dict[str, Any]] = []
+    commands: list[dict[str, str]] = []
     for tid, log in logs.items():
         if log is None:
             return None
-        # A partial capture (file larger than head -c ceiling) marks the cut trailing line's exit as None.
-        is_truncated = False
-        try:
-            is_truncated = int(log.size) > _MAX_WORKER_LOG_BYTES
-        except (ValueError, TypeError):
-            # No stat: the only evidence of a cut is a body at the ceiling.
-            is_truncated = len(log.body.encode("utf-8", errors="replace")) >= _MAX_WORKER_LOG_BYTES
-
-        lines = log.body.splitlines()
-        for idx, line in enumerate(lines):
+        for line in log.body.splitlines():
             match = _WORKER_COMMAND_RE.search(line)
             if match:
-                if is_truncated and idx == len(lines) - 1 and not log.body.endswith("\n"):
-                    exit_code = None
-                else:
-                    exit_str = match.group("exit")
-                    if exit_str is not None:
-                        exit_code = int(exit_str)
-                    elif match.group("duration") is not None:
-                        exit_code = 0
-                    else:
-                        exit_code = None
-                commands.append({
-                    "task": tid,
-                    "command": match.group("command").strip(),
-                    "exit": exit_code,
-                })
+                commands.append({"task": tid, "command": match.group("command").strip()})
     return commands
 
 
