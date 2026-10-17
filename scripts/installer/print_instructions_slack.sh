@@ -48,11 +48,11 @@ print_a2a_gateway_steps() {
   local home="${SLACK_HOME_CHANNEL:-}"
   home="${home//[[:space:]]/}"
   echo -e "[ ] 1. Check the Slack app against the spec.mode next manifest:"
-  echo -e "       ${C_UNDERLINE}${SLACK_NEXT_APP_DOC}${C_RESET}"
+  echo -e "       ${SLACK_NEXT_APP_DOC}"
   echo -e "       Socket Mode on, the scopes and message events it lists, and ${C_YELLOW}no slash commands${C_RESET}:"
   echo -e "       the A2A gateway does not acknowledge them, so Slack shows the member a timeout error."
   echo -e "       An app made for today: delete its ${C_WHITE}features.slash_commands${C_RESET} block instead of pasting the new manifest over it:"
-  echo -e "       ${C_UNDERLINE}${SLACK_NEXT_MOVE_APP_DOC}${C_RESET}"
+  echo -e "       ${SLACK_NEXT_MOVE_APP_DOC}"
   echo -e ""
   echo -e "[ ] 2. Check that the gateway connected to Slack (it can take a minute after the install):"
   echo -e "       ${C_WHITE}kubectl logs deploy/${PLATFORM_AGENT_A2A_GATEWAY_DEPLOYMENT} -c ${PLATFORM_AGENT_A2A_GATEWAY_CONTAINER} -n ${ns} | grep 'slack connected'${C_RESET}"
@@ -63,7 +63,7 @@ print_a2a_gateway_steps() {
   if [ -z "$home" ]; then
     echo -e "[ ] 4. No home channel is configured, so the agent posts no alerts or scheduled reports to Slack."
     echo -e "       Set ${C_WHITE}SLACK_HOME_CHANNEL${C_RESET} in install.env to a channel ID (C... or G...) and re-run the installer."
-    echo -e "       A chat message or ${C_WHITE}/sethome${C_RESET} does not set it under next: ${C_UNDERLINE}${SLACK_NEXT_HOME_CHANNEL_DOC}${C_RESET}"
+    echo -e "       A chat message or ${C_WHITE}/sethome${C_RESET} does not set it under next: ${SLACK_NEXT_HOME_CHANNEL_DOC}"
   else
     echo -e "[ ] 4. Invite the app to the home channel ${C_WHITE}${home}${C_RESET}, or Slack refuses its alerts and scheduled reports there:"
     echo -e "       ${C_WHITE}/invite @<app display name>${C_RESET} in that channel."

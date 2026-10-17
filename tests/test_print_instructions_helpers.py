@@ -146,6 +146,13 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
             with self.subTest(home=home):
                 self._assert_today(self._run(self._env(mode="today", home=home)))
 
+    def test_install_sh_hands_the_printer_the_install_env_it_read(self):
+        # Without it the printer reads the checkout's install.env, which is not
+        # the run's when install.env came from the working directory.
+        source = (_REPO_ROOT / "install.sh").read_text()
+        call = source.index('bash "${repo_dir}/scripts/installer/print_instructions_slack.sh"')
+        self.assertIn('KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE"', source[source.rindex("\n\n", 0, call):call])
+
     def test_an_install_env_without_a_mode_is_today(self):
         # Such a file predates the key. Reading it as the install default would
         # turn every old install into next once that default changes.
