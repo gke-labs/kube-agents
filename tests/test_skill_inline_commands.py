@@ -61,11 +61,6 @@ VARIABLE_PATH_PROGRAM_RE = re.compile(
 REFUSED_EXAMPLE_RE = re.compile(r"whose program is a variable \(`[^`]*`\)")
 
 
-def documents(repo):
-    """The skill documents whose inline code this reads, in the repository at ``repo``."""
-    return shipped_skill_documents(repo)
-
-
 def inline_code(text):
     for token in MarkdownIt("commonmark").parse(text):
         if token.type == "inline":
@@ -78,6 +73,18 @@ def inline_code(text):
                     end = token.content.index(child.markup, start + len(child.markup))
                     end += len(child.markup)
                     yield token.map[0] + 1 + token.content.count("\n", 0, start), child.content
+
+
+def refused_spans(repo):
+    """``(document, line, span)`` for each refused inline span in the shipped skills at ``repo``."""
+    return [
+        (document, line, span)
+        for document in shipped_skill_documents(repo)
+        for line, span in inline_code(
+            REFUSED_EXAMPLE_RE.sub("", document.read_text(encoding="utf-8"))
+        )
+        if refused(span)
+    ]
 
 
 def refused(span):
@@ -104,12 +111,8 @@ class SkillInlineCommandsTest(unittest.TestCase):
 
     def test_no_inline_command_runs_a_variable_as_its_program(self):
         found = [
-            f"{skill.relative_to(REPO_ROOT)}:{line}: {span}"
-            for skill in documents(REPO_ROOT)
-            for line, span in inline_code(
-                REFUSED_EXAMPLE_RE.sub("", skill.read_text(encoding="utf-8"))
-            )
-            if refused(span)
+            f"{document.relative_to(REPO_ROOT)}:{line}: {span}"
+            for document, line, span in refused_spans(REPO_ROOT)
         ]
         self.assertEqual([], found)
 

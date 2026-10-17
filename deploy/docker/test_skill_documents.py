@@ -1,4 +1,4 @@
-"""Tests that every check reading skill text reads the same skill documents.
+"""Tests that the skill size and command checks read the same skill documents.
 
 Run: python3 -m unittest discover -s deploy/docker -p 'test_skill_documents.py'
 """
@@ -23,7 +23,8 @@ _spec = importlib.util.spec_from_file_location(
 inline_commands = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(inline_commands)
 
-SHELL_BLOCK = "```bash\nls\n```\n"
+# A shell block for the Tirith check and a refused inline span for the inline test.
+SKILL_TEXT = "```bash\nls\n```\n\nRun `$G add x`.\n"
 
 
 class SkillDocumentsTest(unittest.TestCase):
@@ -37,7 +38,7 @@ class SkillDocumentsTest(unittest.TestCase):
     def write(self, rel):
         path = self.repo / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(SHELL_BLOCK, encoding="utf-8")
+        path.write_text(SKILL_TEXT, encoding="utf-8")
         return path
 
     def test_a_skill_holds_every_markdown_file_but_its_scripts(self):
@@ -88,7 +89,7 @@ class SkillDocumentsTest(unittest.TestCase):
         tirith = [Path(block.path) for block in check_skill_commands.skill_blocks(str(tree), tree)]
         self.assertEqual(skill_documents(tree), tirith)
         self.assertEqual(expected, [doc for doc, _ in check_skill_size.oversized(self.repo, limit=0)])
-        self.assertEqual(expected, inline_commands.documents(self.repo))
+        self.assertEqual(expected, [doc for doc, _, _ in inline_commands.refused_spans(self.repo)])
 
 
 if __name__ == "__main__":
