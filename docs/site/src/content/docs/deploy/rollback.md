@@ -83,6 +83,14 @@ commands. Without it, their script stops before any of `N-1` is applied when the
 value `N-1`'s chart does not declare, and names each one; with it, the script drops and names them.
 The scripts of `0.7.0` and earlier do not take the flag.
 
+Where `N-1`'s script takes `--allow-breaking-downgrade`, it reads the commits between the tag the
+install runs and `N-1`, and stops when one of them is marked as a breaking change: a `type!:`
+subject or a `BREAKING CHANGE:` footer. Each mode reads the tag of what it moves: the operator mode
+the operator's, the harness mode the agent's, and the full mode both. It names each such commit. Read what each one changed, then
+add the flag to the operator and harness commands, or to a full-mode run, to roll back anyway. The
+check is in the script that runs, which in a rollback is `N-1`'s, so a release from before the flag
+rolls back without it.
+
 `--dry-run` prints the target and the image references the step would apply, from the
 configuration alone, and contacts nothing. It refuses a checkout at the wrong commit, as the real
 run does, and only warns about uncommitted changes, which the real run refuses.
@@ -288,7 +296,7 @@ that set `NAMESPACE` in `install.env` uses that one. `platform-agent` is the cha
 
 ## When a rollback is refused
 
-The first two refusals happen before anything on the cluster moves, and the third before any of
+The first three refusals happen before anything on the cluster moves, and the fourth before any of
 `N-1` is applied. The last two land in the operator step after `N-1`'s CRDs are applied, except
 that from the first release after `0.7.0` the script makes the schema check itself, before the CRD
 apply. Helm checks before it renders or applies anything, so the release itself keeps its last
@@ -302,6 +310,12 @@ revision.
   `$HOME/kube-agents` — or `KUBE_AGENTS_INSTALL_ENV` names a file that is not there, which is
   reported by that path rather than searched past. Supply the install's own file; a fresh one
   written from memory re-renders the `PlatformAgent` with whatever it forgets.
+- **A commit between `N` and `N-1` is marked as a breaking change.** The script names each one, as
+  a short SHA and its subject, after `kubectl` has been pointed at the cluster and before the
+  Secret backfills. It reads the history from the checkout when that is a full (not shallow) clone
+  with both commits, and otherwise from GitHub; when a rollback between two release tags cannot
+  read it, the run also stops. Read the named commits, then re-run with
+  `--allow-breaking-downgrade`. `--plan` reports the same commits as a warning and does not stop.
 - **The memory store cannot be checked and the configuration does not name one.** A rollback runs
   `upgrade.sh`, and its `terraform.tfvars` is regenerated in every mode, so an `install.env` with
   no `MEMORY` line makes the run ask the cluster whether it is running Hindsight rather than
