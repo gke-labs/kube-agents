@@ -1075,6 +1075,13 @@
 # ~10 serial minutes, off the infra lock, main nightly part.
 ./tasks/observability-trace-latency-brokered/task.yaml
 
+# A plain chat request for a cost analysis runs the waste audit's collector
+# (#2386): the Platform Agent routes a domain request to its stream's
+# collector even when the request names no SOP, and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's idle-nodepool role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/cost-chat-request-runs-collector/task.yaml
+
 # The front door's reply to a blocked card declares the one next step on a
 # last line of its own, `[next: <label>]`, which Slack draws as a button
 # (agents/chat/SOUL.md §2, step 5). deployer: noop; the blocked card is

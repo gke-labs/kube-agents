@@ -186,6 +186,7 @@ ADDED_AFTER_THE_MOVE = [
     "security-chat-request-runs-collector",  # a plain security-posture request runs the compliance collector, #2386
     "compute-class-canary-active-migration-pdb-probe",  # the gke-compute-classes skill sync
     "observability-trace-latency-brokered",  # the trace latency helper through the broker, unparked 2026-10-16 (#2244)
+    "cost-chat-request-runs-collector",  # a plain cost request runs the waste collector, #2386
     "chat-failure-reply-declares-next-step",  # a blocked card's reply declares the one next step, mock 06
     "chat-answer-declares-next-step",  # a card's answer declares its one obvious next step, mock 07
     "chat-answer-tangent-offer-declares-no-step",  # an offer about an unasked workload declares no step, mock 03
