@@ -1074,3 +1074,10 @@
 # deployer: noop, read-only, no fixture: three units at the 200s default,
 # ~10 serial minutes, off the infra lock, main nightly part.
 ./tasks/observability-trace-latency-brokered/task.yaml
+
+# A plain chat request for a cost analysis runs the waste audit's collector
+# (#2386): the Platform Agent routes a domain request to its stream's
+# collector even when the request names no SOP, and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's idle-nodepool role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/cost-chat-request-runs-collector/task.yaml

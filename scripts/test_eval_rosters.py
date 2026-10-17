@@ -186,6 +186,7 @@ ADDED_AFTER_THE_MOVE = [
     "security-chat-request-runs-collector",  # a plain security-posture request runs the compliance collector, #2386
     "compute-class-canary-active-migration-pdb-probe",  # the gke-compute-classes skill sync
     "observability-trace-latency-brokered",  # the trace latency helper through the broker, unparked 2026-10-16 (#2244)
+    "cost-chat-request-runs-collector",  # a plain cost request runs the waste collector, #2386
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
