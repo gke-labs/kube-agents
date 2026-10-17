@@ -404,18 +404,19 @@ nothing in the two roster files changes, and every case not named in the lane's 
 (below) runs and can red the job exactly as on the api lane. Two things differ, and they are
 kept apart on purpose.
 
-A check the transport blinds is the scorer's business. The door's trace carries no card ids
-and no worker's entries. The delegation wait now reads the cards and the workers from the pod
+A check the transport blinds is the scorer's business. The door's trace carries no card ids,
+no worker's entries and no results. The delegation wait now reads the cards and the workers from the pod
 when the turn ran under the bridge's `api` executor, but the scorer still treats
-`worker_commands`, `worker_agents` and a `tool_called` in the `workers` or `all` scope as blind on
+`worker_commands`, `worker_agents`, a `tool_called` in the `workers` or `all` scope, and a
+`tool_called` with a `result` pattern as blind on
 every inject record, and a door that shows no tool-call trace leaves a `tool_called` in its
 default `router` scope nothing to read; `bench-gate` sets
 those entries aside as not applicable on that transport and grades the rest, and a case whose
 only objectives are of that kind is reported `NOT_GRADED_ON_TRANSPORT` rather than collapsed —
 evaluated, outside the pass rate, never weather
 ([`docs/designs/eval-scorer.md`](designs/eval-scorer.md), "The inject lane sets aside what its
-transport cannot show"). No roster edit is involved. The router-scope `tool_called` half of the
-rule retires on a record whose door showed the whole trace (the transport's `a2a.activity` marker,
+transport cannot show"). No roster edit is involved. The half of the rule for a router-scope
+`tool_called` without a `result` pattern retires on a record whose door showed the whole trace (the transport's `a2a.activity` marker,
 reporting no loss), whether or not the run made a call. The delegation wait for this path is
 rebuilt, but the worker half stays until `scoring.py` takes those entries out of
 `worker_blind_checks` for a record that carries the workers.

@@ -242,9 +242,10 @@ litellm:
   # the managed collector exists; the NetworkPolicy already allows the egress.
   otel: false
   # model-default routes to <modelProvider>/<modelDefaultName>. Providers:
-  # gemini, anthropic, openai, vertex_ai. The provider's API key must exist in
-  # the credentials Secret — except vertex_ai, which authenticates with
-  # Workload Identity instead.
+  # gemini, anthropic, openai, vertex_ai, openai_compatible. The provider's API
+  # key must exist in the credentials Secret — except vertex_ai, which
+  # authenticates with Workload Identity instead, and openai_compatible, whose
+  # key (OPENAI_COMPATIBLE_API_KEY) is optional; see openaiCompatible below.
   modelProvider: gemini
   # Empty selects the per-provider default (mirrors common.sh).
   # A Claude model (anthropic, or vertex_ai with a claude-* name) gets
@@ -278,6 +279,40 @@ litellm:
     # region here for either reason.
     projectId: ""
     location: ""
+  # modelProvider: openai_compatible only: any server speaking the OpenAI
+  # chat-completions API (vLLM, TGI, an internal gateway), self-hosted or
+  # private. Nothing here has a default, and modelDefaultName is required too:
+  # it is the model name the server serves. The gateway reaches the server
+  # through LiteLLM's hosted_vllm handler and sends the optional
+  # OPENAI_COMPATIBLE_API_KEY from the credentials Secret as the bearer token;
+  # it never sends the gemini, anthropic or openai keys to this server. Set
+  # maxTokens above for a small-context server. The egress rule is derived
+  # from apiBase: the chart adds it to the static litellm-policy and stamps it
+  # on the PlatformAgent as kubeagents.x-k8s.io/litellm-upstream-egress for the
+  # operator's copy.
+  openaiCompatible:
+    # The server's OpenAI-compatible base URL, including /v1. Required.
+    apiBase: ""
+    # The server pod's port. Required when apiBase names an in-cluster Service
+    # (<svc>, <svc>.<ns>.svc, <svc>.<ns>.svc.cluster.local; a two-label host
+    # such as openrouter.ai is a hostname, not <svc>.<ns>): NetworkPolicy
+    # matches after Service translation, so the Service port is not enough.
+    targetPort: null
+    # Private destinations the gateway may reach the server at, when apiBase is
+    # not an in-cluster Service (an internal load balancer, an on-prem address).
+    # Each a CIDR no broader than /12 (IPv4) or /48 (IPv6); refused if it
+    # overlaps link-local or metadata addresses. Ignored for an in-cluster
+    # Service. A public endpoint on port 443 needs none: the gateway's existing
+    # 443 rule already reaches public addresses. Any other host outside the
+    # cluster (a private or IPv6 address, or a hostname on another port) needs
+    # them, because a NetworkPolicy cannot name a DNS name.
+    egressCIDRs: []
+    # Optional Secret holding a CA bundle (PEM) that signs the server's TLS
+    # certificate. Trusted for this endpoint only; every other upstream keeps
+    # the public roots.
+    caBundleSecretRef:
+      name: ""
+      key: "ca.crt"
   # Keep in step with the kustomize base
   # (k8s-operator/config/integrations/litellm/base/deployment.yaml), which is
   # the dev copy of this gateway.
@@ -595,11 +630,14 @@ platformAgent:
   mode: null
   # Annotations to add to the PlatformAgent custom resource metadata. The
   # operator reads its kubeagents.x-k8s.io/* keys from here (chart README,
-  # "PlatformAgent annotations"). Two of them the chart also derives from
+  # "PlatformAgent annotations"). Three of them the chart also derives from
   # values: litellm.networkPolicy=false stamps
-  # kubeagents.x-k8s.io/enable-litellm-network-policy: "false", and
+  # kubeagents.x-k8s.io/enable-litellm-network-policy: "false",
   # telemetry.collectorNamespace stamps
-  # kubeagents.x-k8s.io/otlp-collector-namespace. When the chart stamps a key,
+  # kubeagents.x-k8s.io/otlp-collector-namespace, and
+  # litellm.modelProvider=openai_compatible stamps
+  # kubeagents.x-k8s.io/litellm-upstream-egress from litellm.openaiCompatible
+  # (unless the endpoint is public on port 443). When the chart stamps a key,
   # an entry here that disagrees with it fails the render; otherwise the entry
   # passes through, except that with litellm.otel=true an otlp-collector-namespace
   # entry that is not a namespace name (a lowercase RFC 1123 label) fails the

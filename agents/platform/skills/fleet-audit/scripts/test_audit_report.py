@@ -25803,22 +25803,88 @@ class TestSopPath(unittest.TestCase):
             )
 
     # A skill file (script, SKILL.md, reference page) or an SOP named relative to
-    # the profile home, with or without a leading `./` or `../`.
-    RELATIVE = re.compile(r"(?<![\w/.-])(?:\.\.?/)*(?:skills/[\w-]+/|governance/[\w-]+\.md\b)")
+    # the profile home, with or without a leading `./` or `../`, or a script named
+    # relative to the skill's own folder with `./` or `../`.
+    RELATIVE = re.compile(
+        r"(?<![\w/.-])(?:(?:\.\.?/)*(?:skills/[\w-]+/|governance/[\w-]+\.md\b)|\.\.?/scripts/)"
+    )
+    # A bare `scripts/...` is relative to the skill folder too, but prose uses the
+    # same spelling to name a file ("the script is `scripts/vcs.py`"). So a bare
+    # path counts only where a shell runs it: in a fenced block, as the first word
+    # of a command or after a wrapper or interpreter; in inline code, only after a
+    # wrapper or interpreter, because a span that is just a path names a file.
+    # Only shell fences are read: a fence labelled sh, bash, shell, zsh or console,
+    # or one with no label. A YAML or text fence lists paths, it does not run them.
+    FENCE = re.compile(
+        r"^[ \t]*(```|~~~)[ \t]*([\w+-]*)[^\n]*\n(.*?)^[ \t]*\1[ \t]*$", re.MULTILINE | re.DOTALL
+    )
+    SHELL_FENCES = {"", "sh", "bash", "shell", "zsh", "console"}
+    INLINE_CODE = re.compile(r"`([^`\n]+)`")
+    COMMAND_BREAK = re.compile(r"&&|\|\||[;|]|\$\(|`")
+    ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+    INTERPRETER = re.compile(r"^(?:python(?:3(?:\.\d+)?)?|bash|sh)$")
+    WRAPPERS = {"exec", "env", "nohup", "time", "command"}
 
-    def test_audit_documents_name_skill_files_and_sops_by_full_path(self):
-        """A kanban worker starts in its card's workspace, where `./skills/...`
-        and `governance/...` name nothing; the SOPs and the audit skills must
-        not send it there."""
+    @classmethod
+    def runs_bare_script(cls, segment, first_word_counts):
+        words = segment.split()
+        wrapped = False
+        while words:
+            word = words[0]
+            if cls.ASSIGNMENT.match(word) or word.startswith("-"):
+                words.pop(0)
+            elif word in cls.WRAPPERS or cls.INTERPRETER.match(word):
+                words.pop(0)
+                wrapped = True
+            elif word == "timeout":
+                words[:2] = []
+                wrapped = True
+            else:
+                break
+        return bool(words) and words[0].startswith("scripts/") and (wrapped or first_word_counts)
+
+    @classmethod
+    def bare_script_commands(cls, text):
+        found = []
+        for block in cls.FENCE.finditer(text):
+            if block.group(2).lower() not in cls.SHELL_FENCES:
+                continue
+            # A line that ends in a backslash continues on the next one.
+            for line in re.sub(r"\\\n", " ", block.group(3)).splitlines():
+                if line.lstrip().startswith("#"):
+                    continue
+                found += [
+                    segment.strip()
+                    for segment in cls.COMMAND_BREAK.split(line)
+                    if cls.runs_bare_script(segment, first_word_counts=True)
+                ]
+        for span in cls.INLINE_CODE.finditer(cls.FENCE.sub("", text)):
+            found += [
+                segment.strip()
+                for segment in cls.COMMAND_BREAK.split(span.group(1))
+                if cls.runs_bare_script(segment, first_word_counts=False)
+            ]
+        return found
+
+    @classmethod
+    def relative_references(cls, text):
+        return cls.RELATIVE.findall(text) + cls.bare_script_commands(text)
+
+    def test_skills_and_sops_name_skill_files_and_sops_by_full_path(self):
+        """A kanban worker starts in its card's workspace, where `./skills/...`,
+        `scripts/...` and `governance/...` name nothing; no SOP and no platform
+        skill may send it there. A mirrored skill's text comes from its overlay's
+        `append.md` or patches, so the generated SKILL.md covers those too."""
         platform = Path(__file__).resolve().parents[3]
-        documents = sorted((platform / "governance").glob("*_sop.md")) + [
-            platform / "skills" / name / "SKILL.md"
-            for name in ("fleet-audit", "gce-compute-fleet-audit", "gcp-networking-fabric-audit")
-        ] + sorted((platform / "skills" / "fleet-audit" / "references").glob("*.md"))
+        documents = (
+            sorted((platform / "governance").glob("*_sop.md"))
+            + sorted((platform / "skills").glob("*/SKILL.md"))
+            + sorted((platform / "skills" / "fleet-audit" / "references").glob("*.md"))
+        )
         for document in documents:
-            with self.subTest(document=document.name):
+            with self.subTest(document=str(document.relative_to(platform))):
                 self.assertEqual(
-                    [], self.RELATIVE.findall(document.read_text(encoding="utf-8"))
+                    [], self.relative_references(document.read_text(encoding="utf-8"))
                 )
 
     def test_the_relative_form_is_caught_in_every_spelling(self):
@@ -25829,16 +25895,39 @@ class TestSopPath(unittest.TestCase):
             "(../skills/fleet-audit/reference.md)",
             "`skills/gke-compute-classes/references/ccc.md`",
             "`governance/compliance_audit_sop.md`",
+            "python3 ./scripts/get_chat_users.py",
+            "Run `python3 scripts/get_chat_users.py --hours 2` for the window.",
+            "```bash\nscripts/audit_cluster.sh <cluster-name> <region> <project-id>\n```",
+            "```bash\npython3 scripts/get_chat_users.py\n```",
+            "```bash\npython3 -u scripts/x.py\n```",
+            "```bash\npython3.12 scripts/x.py\n```",
+            "```bash\ntimeout 600 scripts/collect.py\n```",
+            "```bash\ncd /opt/data/scratch && scripts/audit_cluster.sh a b c\n```",
+            "```bash\nexec scripts/x.sh\n```",
+            "```bash\nH=$(scripts/x.py open)\n```",
+            "```bash\nFOO=1 scripts/x.sh\n```",
+            "```\nscripts/x.sh\n```",
+            "```console\nscripts/x.sh --help\n```",
+            "```bash\nexport V=1 \\\n  && scripts/x.sh\n```",
         ):
             with self.subTest(relative=relative):
-                self.assertRegex(relative, self.RELATIVE)
+                self.assertTrue(self.relative_references(relative), relative)
         for full in (
             "/opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py",
             '"$HERMES_HOME"/skills/fleet-audit/scripts/collect.py',
             "/opt/data/profiles/platform/governance/compliance_audit_sop.md",
+            "The script is `scripts/vcs.py`.",
+            "The engine is\nscripts/vcs.py, which speaks to a broker.",
+            "  scripts/collect.py\n  scripts/fleet_drift.py",
+            "```bash\npython3 $V annotate scripts/rotate-keys.sh\n```",
+            "```bash\n# run scripts/x.py from the profile home\n```",
+            "```yaml\nsteps:\n  - scripts/x.sh\n```",
+            "```text\nfleet-audit/\n  scripts/\n  scripts/collect.py\n```",
+            "```bash\npython3 $V annotate \\\n  scripts/rotate-keys.sh\n```",
+            "```bash\npython3 /opt/data/profiles/platform/skills/x/scripts/y.py\n```",
         ):
             with self.subTest(full=full):
-                self.assertNotRegex(full, self.RELATIVE)
+                self.assertEqual([], self.relative_references(full), full)
 
     def test_a_rejection_points_at_the_sop_by_full_path(self):
         self.assertIn(audit_report.sop_path(AUDIT), audit_report._sop_pointer(AUDIT))

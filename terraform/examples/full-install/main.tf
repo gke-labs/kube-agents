@@ -58,6 +58,10 @@ locals {
   vertex_location = var.vertex_location != "" ? var.vertex_location : "global"
   litellm_ksa     = "kubeagents-litellm"
 
+  use_openai_compatible = var.model_provider == "openai_compatible"
+  # The key the CA bundle Secret holds the PEM under, as for the GitLab CA.
+  openai_compatible_ca_key = "ca.crt"
+
   # The minter chart values need the GitOps repository split into owner and
   # name. Accepts the same forms integration.github.gitRepo takes: owner/repo,
   # or a github.com URL. Anything else leaves both parts empty, which the
@@ -185,6 +189,9 @@ locals {
       ANTHROPIC_API_KEY       = var.anthropic_api_key
       GEMINI_API_KEY          = var.gemini_api_key
       OPENAI_API_KEY          = var.openai_api_key
+      # Read by the gateway for openai_compatible only, and sent to that
+      # server alone.
+      OPENAI_COMPATIBLE_API_KEY = var.openai_compatible_api_key
     } : key => value if value != ""
   }
 
@@ -916,6 +923,20 @@ resource "helm_release" "kube_agents" {
           location  = local.vertex_location
         }
       } : {},
+      # Only for this provider, so every other install renders the values it
+      # did before. A target port of 0 is the variable's "unset", which the
+      # chart spells null.
+      local.use_openai_compatible ? {
+        openaiCompatible = {
+          apiBase     = var.openai_compatible_api_base
+          targetPort  = var.openai_compatible_target_port == 0 ? null : var.openai_compatible_target_port
+          egressCIDRs = var.openai_compatible_egress_cidrs
+          caBundleSecretRef = {
+            name = var.openai_compatible_ca_secret_name
+            key  = local.openai_compatible_ca_key
+          }
+        }
+      } : {},
       # Only while on, so an install that never turns redaction on renders the
       # gateway ConfigMap, and its checksum, exactly as before. Unset rule keys
       # are dropped: yamlencode writes them as null, which the chart refuses.
@@ -1148,6 +1169,19 @@ resource "helm_release" "kube_agents" {
   ]
 
   lifecycle {
+    # The chart refuses to render openai_compatible without these, and a
+    # render failure inside helm_release arrives after the cluster and IAM
+    # have been built; a precondition fails the plan instead. The egress rules
+    # (a target port for a Service, CIDRs otherwise) are the chart's to judge.
+    precondition {
+      condition     = !local.use_openai_compatible || var.model_default_name != ""
+      error_message = "model_provider = \"openai_compatible\" requires model_default_name, the model the server serves; the provider has no default."
+    }
+    precondition {
+      condition     = !local.use_openai_compatible || var.openai_compatible_api_base != ""
+      error_message = "model_provider = \"openai_compatible\" requires openai_compatible_api_base, the server's base URL including /v1."
+    }
+
     precondition {
       condition     = !var.enable_github_minter || (local.github_org != "" && local.github_repo_name != "")
       error_message = "enable_github_minter requires github_repo in owner/repo (or github.com URL) form — the minty rule ConfigMap is scoped to that repository."

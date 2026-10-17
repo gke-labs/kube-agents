@@ -61,7 +61,7 @@ When running the official release installer (`<RELEASE_VERSION>/install.sh`) or 
 - **Install Sources**: Puts the Terraform configuration and chart on disk (this checkout, or a clone at the requested revision) and verifies they match the image ref _before_ the interview starts. A clone an earlier one-liner left at `$HOME/kube-agents` is moved to the requested release when it is clean (detached at the tag; a branch it was on stays where it was, and untracked files such as `install.env` are kept), and left alone when it has uncommitted changes, where verification then stops the run.
 - **GKE Cluster Setup**: Provisions an Autopilot or Standard cluster (`--gke-cluster-mode`, Autopilot by default) or connects to an existing one. Autopilot is regional, so a zonal `--gcp-region` with no explicit `--gke-cluster-mode` builds Standard instead of failing; asking for `--gke-cluster-mode=autopilot` at a zone is still an error.
 - **Chat Integrations**: Configures Google Chat and/or Slack when selected.
-- **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials, or selects Vertex AI (no key — Workload Identity).
+- **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials, selects Vertex AI (no key — Workload Identity), or points the gateway at an OpenAI-compatible server you run (model name, base URL, the egress it needs, and an optional key).
 - **Long-Term Memory**: Asks whether the agents should remember anything between conversations, and if so which store (`--memory=file|hindsight|off`, default `file`). The default is **on**, and it is the store this repository shipped before the searchable one existed, so an upgrade that says nothing about memory keeps what it already has: per-user Markdown inside the pod (`multiuser_memory`), no extra services, suited to **small or personal** deployments — but the whole store is loaded into the model's context every turn, so it stops scaling past a few pages. Pick `hindsight` for **enterprise** deployments — ranked recall that stays affordable as the store grows, at the cost of an API server and a Postgres database in the cluster; it selects the `kube_agents_memory` provider. Pick `off` to retain nothing and run no database. The measurements behind that split, and how to change it later, are in [`docs/designs/memory.md`](docs/designs/memory.md).
 - **Automated Engine Execution**: Generates `terraform/examples/full-install/terraform.tfvars` from the loaded configuration, records that configuration in `install.env` when a first install has none, and launches `lifecycle.sh apply` — a single `terraform apply` that provisions every GCP resource and installs the Helm chart, with the Terraform state kept in a versioned GCS bucket (`<project>-kube-agents-tfstate`).
 
@@ -302,7 +302,7 @@ An agent given that prompt, or reading this file on its own, follows these steps
    `<RELEASE_VERSION>` below.
 2. Read the operator's environment and confirm the target with them before going further —
    project, cluster, its location (the zone, not the region, for a zonal cluster, exactly as
-   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic` or `openai`),
+   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic`, `openai` or `openai_compatible`),
    where the model credential comes from, and, if the operator wants GitOps pull requests, the
    forge that holds the GitOps repository (GitHub or GitLab) and its path:
 
@@ -330,7 +330,13 @@ An agent given that prompt, or reading this file on its own, follows these steps
    starting, so the key stays out of the command line and the agent's transcript; `vertex_ai` needs
    no key, and `gemini` can instead read one from the Secret Manager secret
    `DEFAULT_GEMINI_API_KEY_SECRET_NAME` names in `install.defaults.env`. Without a key, the
-   installer only warns, and the agent it installs cannot call a model. For a GitOps repository on
+   installer only warns, and the agent it installs cannot call a model. `openai_compatible` has no
+   defaults: confirm the model name the server serves (`--model-default-name`), its base URL
+   (`--openai-compatible-api-base`), and either the server pod's port for an in-cluster Service
+   (`--openai-compatible-target-port`) or the CIDRs of a private address
+   (`--openai-compatible-egress-cidrs`), and add those flags to the dry run; its key is optional and
+   goes in `OPENAI_COMPATIBLE_API_KEY`. [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#openai-compatible-endpoints-self-hosted-or-private)
+   has every setting. For a GitOps repository on
    GitLab, do not ask the operator to paste the GitLab token. The two safe ways are in
    [GitOps Repository on GitLab](#gitops-repository-on-gitlab).
 
@@ -372,7 +378,7 @@ The Kubernetes Agentic Harness manages Kubernetes operations via an autonomous *
 
 - **Agent Configuration (`agents/platform`)**: Contains the system prompt and persona identity (`SOUL.md`), workspace instructions (`AGENTS.md`), runtime configuration (`config.yaml`), operational playbooks (`governance/`) that the scheduled governance jobs point at, their schedules (`cron/jobs.json`), and reusable skills (`skills/`).
 - **Kubernetes Operator (`k8s-operator`)**: A Kubebuilder-powered Go operator that manages Custom Resource Definitions (`PlatformAgent`) and reconciles cluster lifecycle state.
-- **Integrations**: Supports LiteLLM Gateway for LLM provider routing (Gemini, Vertex AI, OpenAI, Anthropic) and enterprise messaging bridges (Google Chat, Slack).
+- **Integrations**: Supports LiteLLM Gateway for LLM provider routing (Gemini, Vertex AI, OpenAI, Anthropic, or an OpenAI-compatible server you run) and enterprise messaging bridges (Google Chat, Slack).
 
 ---
 
@@ -519,7 +525,8 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   yourself, `--mode` adds `PLATFORM_AGENT_MODE` to it when it sets none, and is refused when it
   sets a different one. Terraform takes `platform_agent_mode`,
   the chart `platformAgent.mode`. To switch a running install, edit `PLATFORM_AGENT_MODE` in
-  `install.env` and re-run `install.sh` or a full `upgrade.sh`;
+  `install.env` and re-run `install.sh` or a full `upgrade.sh` (the upgrade guide's
+  [Switching `spec.mode`](docs/site/src/content/docs/install/upgrade.md#switching-specmode));
   [`scripts/installer/README.md`](scripts/installer/README.md) has the rules for the key. Before
   switching an install whose Slack is on and Google Chat off to `next` (the A2A gateway then
   takes Slack), check three Slack keys: `SLACK_ALLOWED_USERS` holds member IDs such as
@@ -630,11 +637,12 @@ If you enabled Google Chat or Slack during the install, perform the following re
 
 1. **Verify Slack App Settings**:
    - Ensure **Socket Mode** is enabled in your Slack App console.
-   - Verify that your Bot Token (`SLACK_BOT_TOKEN`) holds every bot scope in the manifest `hermes slack manifest` emits (step 4 below). At the Hermes tag in [`tags.env`](tags.env) that list is `app_mentions:read`, `assistant:write`, `channels:history`, `channels:read`, `chat:write`, `commands`, `files:read`, `files:write`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `mpim:history`, `mpim:read`, `reactions:read`, `reactions:write`, `users:read`. Regenerate it from the command rather than editing this line: `reactions:write` is added by [`deploy/docker/patches/apply_slack_reactions_scope.py`](deploy/docker/patches/apply_slack_reactions_scope.py) rather than by Hermes, and `--no-assistant` drops `assistant:write`. If the app does not exist yet, create it from that manifest (**Create New App → From a manifest**) instead of ticking scopes by hand; the command reads nothing from Slack, so it runs on an install where Slack is not configured.
+   - Verify that your Bot Token (`SLACK_BOT_TOKEN`) holds every bot scope in the manifest `hermes slack manifest` emits (step 4 below). At the Hermes tag in [`tags.env`](tags.env) that list is `app_mentions:read`, `assistant:write`, `channels:history`, `channels:read`, `chat:write`, `commands`, `files:read`, `files:write`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `mpim:history`, `mpim:read`, `reactions:read`, `reactions:write`, `users:read`. Regenerate it from the command rather than editing this line: `reactions:write` is added by [`deploy/docker/patches/apply_slack_reactions_scope.py`](deploy/docker/patches/apply_slack_reactions_scope.py) rather than by Hermes, and `--no-assistant` drops `assistant:write`. If the app does not exist yet, create it from that manifest (**Create New App → From a manifest**) instead of ticking scopes by hand; the command reads nothing from Slack, so it runs on an install where Slack is not configured. The manifest names the app and its bot user "Hermes" (`display_information.name` and `features.bot_user.display_name`) and sets its description: generate it with `--name <your app name>` and `--description <text>`, or the paste renames the app.
    - The `*:history` scopes are the ones a hand-built app most often lacks. `im:read` grants the conversation metadata; the text of a DM arrives on `message.im`, which needs `im:history`, and `groups:history` and `mpim:history` do the same for private and group channels. A bot without them connects normally and is never sent the message; the only symptom is a DM that goes unanswered.
    - `files:write` is the one that is easy to miss, because omitting it looks like nothing is wrong. A card whose answer is text is delivered normally; a card that produces a **file** has its upload rejected with `missing_scope`, which the artifact delivery path catches and logs as a warning. The user is told the task completed and never sees the artifact. Add the scope and reinstall the app.
    - `reactions:write` fails more quietly still. The agent adds a reaction for the kind of ask when it picks the work up, ⏸️ while work waits on you, and ❌ on failure (with `KAGE_SLACK_UX=false` it puts 👀 on a message when it picks the work up and adds ✅ or ❌ beside it when the turn ends); without the scope Slack rejects each of those with `missing_scope`, the adapter logs it at debug and carries on, and the answer still arrives. The only symptom is that no reaction ever appears. Add the scope and reinstall.
 2. **Test Bot Connection**:
+   - Nothing connects as the app until the install has applied its tokens, so before then the bot does not answer. That is expected, not a broken app.
    - Invite the bot to a channel or send a direct message: `"Hi Platform Agent"`.
    - If you left `SLACK_HOME_CHANNEL` empty and this is the install's first chat message on either platform, it makes its channel or DM the home channel, where scheduled audits post (step 5).
 3. **Approve Pairing Code (Optional / First-time setup)**:
@@ -647,7 +655,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
      ```bash
      kubectl exec deploy/platform-agent-gateway -n kubeagents-system -- hermes slack manifest
      ```
-   - Paste the JSON into the Slack App Console (**Features → App Manifest → Edit**), save, and reinstall when Slack prompts. That manifest replaces the whole app definition — to keep an app you have already configured, add `--slashes-only` and merge the printed array into the existing `features.slash_commands`.
+   - Paste the JSON into the Slack App Console (**Features → App Manifest → Edit**), save, and reinstall when Slack prompts. That manifest replaces the whole app definition, its "Hermes" name included — to keep an app you have already configured, add `--slashes-only` and merge the printed array into the existing `features.slash_commands`.
    - This adds Slack's autocomplete, not the behaviour: a typed `/hermes <subcommand>` works either way, because the Planning Agent's `legacy_slash_commands` plugin unwraps it before the gateway resolves the command.
 5. **Set or Move the Home Channel (if you left `SLACK_HOME_CHANNEL` empty)**:
    - If step 2's message was the install's first chat message, it set the home channel to the channel or DM it came from. If Google Chat received the first message instead, Slack has none, and scheduled audits have nowhere to post on Slack. Either way, run `/sethome` (or `/hermes sethome`) from the Slack channel you want. It takes effect immediately and persists across restarts.
@@ -1151,6 +1159,8 @@ export MODEL_DEFAULT_NAME=gemini-3.5-flash
 # For MODEL_PROVIDER=vertex_ai also export PROJECT_ID, LITELLM_KSA_NAME,
 # LITELLM_GSA_NAME, VERTEX_PROJECT_ID, and VERTEX_LOCATION — the vertex overlay
 # renders the gateway's Workload Identity ServiceAccount from them.
+# MODEL_PROVIDER=openai_compatible is not available here; install through
+# install.sh, the Terraform example or the Helm chart for it.
 make deploy-litellm
 
 # Deploy GitHub Integration (requires pre-provisioned Cloud KMS key and pre-created credentials secret)
