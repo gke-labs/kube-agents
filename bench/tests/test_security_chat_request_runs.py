@@ -40,16 +40,24 @@ def _check(name: str) -> dict:
     return check["check"]
 
 
-def _passes(check: dict, command: str) -> bool:
-    """Grade one worker command with the verifier; True when the check passes."""
+def _verify(check: dict, command: str, status: str = "completed"):
+    """Grade one worker command with the verifier; return the VerificationResult."""
     assert "\n" not in command, command
-    transcript.set("ok", [], worker_commands=[{"task": "t_1", "command": command}])
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": command}, "result": "done", "status": status, "at": 1.0}
+    ]
+    transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": command}])
     try:
         result = WorkerCommandsVerifier(**check).verify(5.0)
     finally:
         transcript.clear()
     assert result.status in ("pass", "fail"), result.reason
-    return result.success
+    return result
+
+
+def _passes(check: dict, command: str, status: str = "completed") -> bool:
+    """Grade one worker command with the verifier; True when the check passes."""
+    return _verify(check, command, status).success
 
 
 def _collector_ran(command: str) -> bool:
@@ -164,3 +172,66 @@ def test_ledger_mention_help_or_draft_is_not_flagged(command):
 )
 def test_no_ledger_objective_fails_a_form_one_run(command, passes):
     assert _passes(_check("no-ledger-run-was-opened"), command) is passes
+
+
+def test_collector_run_exiting_nonzero_is_not_credited():
+    cmd = f"python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json"
+    res = _verify(_check(COLLECTOR_CHECK), cmd, status="error")
+    assert not res.success
+    assert "ran but exited non-zero (or its exit was not recorded)" in res.reason
+
+
+def test_collector_run_called_unrecorded_is_not_credited():
+    cmd = f"python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json"
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": cmd}, "result": None, "status": "called", "at": 1.0}
+    ]
+    transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": cmd}])
+    try:
+        res = WorkerCommandsVerifier(**_check(COLLECTOR_CHECK)).verify(5.0)
+        assert not res.success
+        assert "ran but exited non-zero (or its exit was not recorded)" in res.reason
+    finally:
+        transcript.clear()
+
+
+def test_collector_run_with_no_trajectory_is_error():
+    cmd = f"python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json"
+    transcript.set("ok", [], worker_commands=[{"task": "t_1", "command": cmd}])
+    try:
+        res = WorkerCommandsVerifier(**_check(COLLECTOR_CHECK)).verify(5.0)
+        assert not res.success
+        assert res.status == "error"
+        assert "no delegated worker's terminal or execute_code calls are readable in the trajectory" in res.reason
+    finally:
+        transcript.clear()
+
+
+def test_collector_run_with_gaps_passes_when_completed():
+    cmd = f"python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json"
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": cmd}, "result": "done", "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": cmd}], worker_capture_gaps=["card_2 unread session store"])
+    try:
+        res = WorkerCommandsVerifier(**_check(COLLECTOR_CHECK)).verify(5.0)
+        assert res.success
+        assert res.status == "pass"
+    finally:
+        transcript.clear()
+
+
+def test_collector_run_with_gaps_errors_when_uncredited():
+    cmd = f"python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json"
+    traj_other = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "kubectl get nodes"}, "result": "nodes", "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj_other, worker_commands=[{"task": "t_1", "command": cmd}], worker_capture_gaps=["card_2 unread session store"])
+    try:
+        res = WorkerCommandsVerifier(**_check(COLLECTOR_CHECK)).verify(5.0)
+        assert not res.success
+        assert res.status == "error"
+        assert "the worker-trajectory capture was partial (card_2 unread session store)" in res.reason
+        assert "collect.py" in res.reason
+    finally:
+        transcript.clear()

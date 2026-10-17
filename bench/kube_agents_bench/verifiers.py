@@ -1953,13 +1953,21 @@ class WorkerRun(BaseModel):
     words, and ``word_patterns``, regular expressions each of which some later word of the segment
     must match on its own (``^(?:get|describe)$`` for a verb; a resource list such as
     ``pdb,validatingwebhookconfigurations`` is one word, so a pattern over the word reads it
-    whole, and a quoted mention of the whole command is one word that is no command)."""
+    whole, and a quoted mention of the whole command is one word that is no command), and
+    ``succeeded`` (for ``required_runs`` only), whether the command must have exited 0 (graded from
+    the worker trajectory's terminal call exit status; a non-zero or unrecorded exit does not count;
+    the call's exit is the whole shell line's, so anything joined on the line before (``||``, ``!``)
+    or after (``|``, ``;``, ``||``, substitution) the script decides it -- a guard that succeeds
+    skips the script and exits 0 -- and the dictated form is a bare command or redirection with
+    nothing else on the line; a required run with ``succeeded: true`` and no worker trajectory to read
+    is not credited)."""
 
     model_config = ConfigDict(extra="forbid")
 
     script: str
     flags: list[str] = Field(default_factory=list)
     word_patterns: list[str] = Field(default_factory=list)
+    succeeded: bool = False
 
     @field_validator("word_patterns")
     @classmethod
@@ -2304,8 +2312,10 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
     arrives as ``{"raw": text}`` and the command is read out of the text, as
     ``tool_called`` reads its arguments, and one clipped inside the command
     itself keeps the head that survived, which carries the verb. A result
-    that is not text reads as empty; ``failed`` is the pod's verdict on the
-    unclipped result (``status == "error"``), so it survives the clip.
+    that is not text reads as empty; ``succeeded`` is whether the pod recorded
+    a completed result (``status == "completed"``); a call with ``status == "error"``,
+    ``status == "called"`` (a call with no recorded result) or absent status is
+    ``False``, so it survives the clip.
     """
     calls: list[tuple[str, float | None, str, str, bool]] = []
     for entry in trajectory:
@@ -2340,7 +2350,7 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
                 float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None,
                 command,
                 result if isinstance(result, str) else "",
-                entry.get("status") == "error",
+                entry.get("status") == "completed",
             )
         )
     calls.sort(key=lambda call: float("-inf") if call[1] is None else call[1])
@@ -2423,8 +2433,12 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
-    and no ``-h``/``--help`` (:func:`_argv_runs`). ``forbidden_runs``: the same
-    shape, and no segment may run it. An argv tells a quoted mention of the
+    and no ``-h``/``--help`` (:func:`_argv_runs`). When ``succeeded: true``,
+    the terminal call running the command must have exited 0 (see :class:`WorkerRun`;
+    a non-zero or unrecorded exit does not count; graded from the worker
+    trajectory only, and a required run with ``succeeded: true`` and no worker
+    trajectory to read is not credited).
+    ``forbidden_runs``: the same shape, and no segment may run it. An argv tells a quoted mention of the
     invocation from a run, where a pattern over the text cannot: a forbidden
     ``kubectl get`` of budgets is not met by ``grep "kubectl get pdb" SKILL.md``
     or an echoed sentence, where ``forbidden_patterns`` over the text would be.
@@ -2485,7 +2499,12 @@ class WorkerCommandsVerifier(BaseVerifier):
     the argv names the file or the shell and not what was written to it, which
     no reading of the argv recovers -- a case names a run this way where the
     persona dictates one typed command, and a worker that runs it through a
-    file is not credited. Under ``after_result_pattern``: a refused command
+    file is not credited; and ``succeeded: true`` on a required run checks the terminal call's
+    overall exit status from the worker trajectory (see ``WorkerRun.succeeded``
+    for the single-command rule: anything joined before or after the script on
+    the same line decides the exit status), while the dictated form is a bare
+    command or redirection.
+    Under ``after_result_pattern``: a refused command
     whose output the call discarded prints nothing into its result; a result is
     clipped in the pod at ``worker_trajectory.MAX_RESULT_CHARS``; a read whose
     output quotes the refusal text opens the window; the command patterns read
@@ -2527,6 +2546,13 @@ class WorkerCommandsVerifier(BaseVerifier):
             raise ValueError("forbidden_result_patterns read results inside the window after_result_pattern opens; set both")
         return self
 
+    @model_validator(mode="after")
+    def _forbidden_runs_cannot_require_success(self) -> WorkerCommandsVerifier:
+        for run in self.forbidden_runs:
+            if run.succeeded:
+                raise ValueError("forbidden_runs cannot set succeeded: true; an attempted forbidden command trips the check regardless of exit status")
+        return self
+
     def _without_exempt_text(self, command: str) -> str:
         for pattern in self.exempt_patterns:
             command = re.sub(pattern, "", command)
@@ -2544,6 +2570,7 @@ class WorkerCommandsVerifier(BaseVerifier):
             )
         window = ""
         result_hits: list[tuple[str, str]] = []
+        has_succeeded_runs = any(run.succeeded for run in self.required_runs)
         if self.after_result_pattern is None:
             if snap.worker_commands is None:
                 return VerificationResult(
@@ -2554,6 +2581,17 @@ class WorkerCommandsVerifier(BaseVerifier):
                 )
             typed = [row.get("command", "") for row in snap.worker_commands]
             windowed = typed
+            traj_calls = _worker_terminal_calls(snap.trajectory) if snap.trajectory else []
+            if has_succeeded_runs and not traj_calls:
+                tagged = any(isinstance(e, dict) and e.get("agent") and e.get("name") not in _CODE_TOOLS for e in (snap.trajectory or ()))
+                dropped = any(isinstance(e, dict) and e.get("agent") and e.get("name") in _CODE_TOOLS for e in (snap.trajectory or ()))
+                if not tagged or dropped or snap.worker_commands is None or snap.worker_commands:
+                    return VerificationResult(
+                        success=False,
+                        status="error",
+                        elapsed_time=time.monotonic() - start,
+                        reason=_NO_WORKER_TERMINAL_CALLS_REASON,
+                    )
         else:
             calls = _worker_terminal_calls(snap.trajectory)
             if not calls:
@@ -2603,6 +2641,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                     f"; {len(windowed)} issued after the first result matching "
                     f"{self.after_result_pattern!r}: " + "; ".join(opened)
                 )
+            traj_calls = calls
         # An exemption removes the text it matched and nothing else: the rest
         # of the line is what the forbidden list reads, and a command an
         # exemption touched is out of the required list. The forbidden list
@@ -2615,22 +2654,63 @@ class WorkerCommandsVerifier(BaseVerifier):
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
         argvs = [argv for c in commands for argv in _shell_argvs(c)]
         typed_argvs = [argv for c in typed for argv in _shell_argvs(c)]
-        unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
+
+        traj_eligible = [(cmd, succ) for _, _, cmd, _, succ in traj_calls if self._without_exempt_text(cmd) == cmd]
+
+        unrun_missing: list[WorkerRun] = []
+        unrun_failed: list[WorkerRun] = []
+        for run in self.required_runs:
+            if not run.succeeded:
+                if not any(_argv_runs(argv, run) for argv in argvs):
+                    unrun_missing.append(run)
+            else:
+                # Grade succeeded: true from worker trajectory only.
+                # A required run with succeeded: true and no trajectory to read is not credited.
+                matched_any = False
+                succeeded = False
+                for cmd_text, call_succeeded in traj_eligible:
+                    for argv in _shell_argvs(cmd_text):
+                        if _argv_runs(argv, run):
+                            matched_any = True
+                            if call_succeeded:
+                                succeeded = True
+                                break
+                    if succeeded:
+                        break
+                if not succeeded:
+                    if matched_any:
+                        unrun_failed.append(run)
+                    else:
+                        unrun_missing.append(run)
+
         ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
         # A forbidden command that was read is conclusive whatever else was
-        # not; a missing required command, or a clean read, is not when the
-        # capture has gaps (the siblings' rule, ``worker_agents`` first).
-        partial = self.after_result_pattern is not None and snap.worker_capture_gaps
-        if hits or ran or ((missing or unrun) and not partial):
+        # not; under after_result_pattern, capture gaps make clearing forbidden
+        # patterns or missing required items inconclusive; on the standard path,
+        # card-log misses are conclusive (fail), credited runs pass, and capture
+        # gaps make only an uncredited succeeded: true run inconclusive (error).
+        uncredited_succeeded = [run for run in [*unrun_missing, *unrun_failed] if run.succeeded]
+        if self.after_result_pattern is not None:
+            card_log_miss = False
+            partial = bool(snap.worker_capture_gaps)
+        else:
+            card_log_miss = bool(missing or any(not run.succeeded for run in unrun_missing))
+            partial = bool(snap.worker_capture_gaps) and bool(uncredited_succeeded) and not card_log_miss
+
+        if hits or ran or card_log_miss or ((missing or unrun_missing or unrun_failed) and not partial):
             parts = []
             if missing:
                 parts.append(
                     f"no worker command matched required pattern(s) {missing} "
                     f"across {len(commands)} command(s){exempted}"
                 )
-            if unrun:
-                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun)
-                parts.append(f"no worker command ran {named} across {len(commands)} command(s)")
+            if unrun_missing:
+                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing)
+                count = len(traj_eligible) if all(run.succeeded for run in unrun_missing) else len(commands)
+                parts.append(f"no worker command ran {named} across {count} command(s)")
+            if unrun_failed:
+                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
+                parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"
@@ -2652,12 +2732,21 @@ class WorkerCommandsVerifier(BaseVerifier):
                 reason="; ".join(parts) + window,
             )
         if partial:
-            unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
+            gaps_str = "; ".join(snap.worker_capture_gaps or ())
+            if self.after_result_pattern is not None:
+                unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
+                reason = _PARTIAL_WORKER_CAPTURE_REASON.format(gaps=gaps_str) + unseen + window
+            else:
+                named = ", ".join(" ".join([run.script, *run.flags]) for run in uncredited_succeeded)
+                reason = (
+                    f"the worker-trajectory capture was partial ({gaps_str}), "
+                    f"so required run(s) requiring success ({named}) could not be verified"
+                )
             return VerificationResult(
                 success=False,
                 status="error",
                 elapsed_time=time.monotonic() - start,
-                reason=_PARTIAL_WORKER_CAPTURE_REASON.format(gaps="; ".join(snap.worker_capture_gaps)) + unseen + window,
+                reason=reason,
             )
         return VerificationResult(
             success=True,
