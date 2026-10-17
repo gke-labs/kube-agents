@@ -37,8 +37,8 @@ With the flag on, a Slack origin and the credential proxy's Slack relay in the
 environment, the report goes out as Block Kit instead (a headline with the
 total, the top two rows, the rest folded, and "Fix the first one" and "See all N"
 buttons), posted here through ``slack_blocks_post`` because the scheduler's delivery
-takes text only. Under ``spec.mode: next``, on an install whose job was linked to a chat before the
-switch, the same card goes through the A2A gateway as a chat message instead
+takes text only. Under ``spec.mode: next``, on an install whose job was linked to a Slack chat before
+the switch and that has a Slack home channel, the same card goes through the A2A gateway as a chat message instead
 (``_posted_through_gateway``).
 
 Under ``spec.mode: next`` the plugin may instead have recorded the conversation the user first
@@ -895,8 +895,9 @@ def _gateway_error(stdout: str) -> str:
 def _notify_conversation(conversation: dict, text: str, chat: dict | None = None, update: str = "") -> tuple[str, str]:
     """Post ``text`` (or ``chat``, with ``text`` its fallback) into the conversation.
 
-    Returns ``POSTED``, ``NOT_POSTED`` (a gateway refusal, a bus refusal before
-    the gateway saw it, or a route that was not there through the retries) or
+    Returns ``POSTED``, ``NOT_POSTED`` (``a2a notify`` could not start, a gateway
+    refusal, a bus refusal before the gateway saw it, or a route that was not
+    there through the retries) or
     ``MAYBE_POSTED`` (anything that may have reached the chat), and a reason
     for the last two.
     """
