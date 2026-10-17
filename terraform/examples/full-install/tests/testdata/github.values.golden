@@ -83,3 +83,5 @@
       "sink": "gke-stockout-alerts-sink"
       "subscription": "gke-stockout-alerts-sub"
       "topic": "gke-stockout-alerts-topic"
+"webConsole":
+  "enabled": false

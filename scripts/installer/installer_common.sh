@@ -175,6 +175,13 @@ readonly HELM_ROLLBACK_TIMEOUT_DEFAULT="2m"
 # install configuration and do not belong in install.defaults.env; they are
 # named here so that no front door spells one differently from the others.
 readonly KUBE_AGENTS_HELM_RELEASE="kube-agents"
+# The web console's Service (charts/kube-agents/templates/web-console.yaml
+# names it <release>-web-console) and the port it listens on, which the chart
+# fixes at 8080.
+# shellcheck disable=SC2034  # read by install.sh
+readonly WEB_CONSOLE_SERVICE="${KUBE_AGENTS_HELM_RELEASE}-web-console"
+# shellcheck disable=SC2034  # read by install.sh
+readonly WEB_CONSOLE_PORT="8080"
 # shellcheck disable=SC2034  # read by install.sh and upgrade.sh
 readonly KUBE_AGENTS_OPERATOR_DEPLOYMENT="kube-agents-controller-manager"
 readonly PLATFORM_AGENT_DEPLOYMENT="platform-agent-gateway"
@@ -4384,6 +4391,19 @@ write_tfvars_from_state() {
     print_error "PLATFORM_AGENT_MODE='${platform_agent_mode}' is not one of today, next. Fix it in install.env."
     return 1
   fi
+  # Refused here for upgrade.sh and the Day-2 menu, which regenerate from
+  # install.env without install.sh's preflight. install.sh (which passes
+  # KUBE_AGENTS_GENERATE_API_SERVER_KEY=true) defers this check to
+  # check_existing_cluster_network_policy_preflight so a cluster that has
+  # since enabled Dataplane V2 or Calico reaches note_stale_network_policy_acceptance
+  # instead of failing before the live cluster is probed.
+  if ! is_truthy "${KUBE_AGENTS_GENERATE_API_SERVER_KEY:-false}" && \
+     is_truthy "${ACCEPT_NO_NETWORK_POLICY:-false}" && \
+     is_truthy "${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}"; then
+    print_error "WEB_CONSOLE_ENABLED=true cannot be combined with ACCEPT_NO_NETWORK_POLICY=true."
+    print_info "The web console holds the Platform Agent's API key with no login of its own, and its NetworkPolicy is what keeps other pods in the cluster from reaching it. Enable NetworkPolicy enforcement on the cluster (and remove any stale ACCEPT_NO_NETWORK_POLICY=true from install.env if the cluster already enforces it), or set WEB_CONSOLE_ENABLED=false in install.env."
+    return 1
+  fi
 
   local old_umask
   old_umask="$(umask)"
@@ -4585,6 +4605,7 @@ write_tfvars_from_state() {
     echo "# The CRD defaults dashboardEnabled to true; the installer has always"
     echo "# defaulted it to false and asks. Memory settings mirror --memory."
     echo "hermes_dashboard_enabled = $(hcl_bool "${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}")"
+    echo "web_console_enabled      = $(hcl_bool "${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}")"
     echo "memory_enabled           = $(hcl_bool "${MEMORY_ENABLED:-$DEFAULT_MEMORY_ENABLED}")"
     echo "memory_provider          = $(hcl_str "$memory_provider")"
     echo "user_profile_enabled     = $(hcl_bool "${USER_PROFILE_ENABLED:-$DEFAULT_USER_PROFILE_ENABLED}")"
