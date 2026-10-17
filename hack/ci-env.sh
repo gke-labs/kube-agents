@@ -267,7 +267,7 @@ collect_bench_results() {
 # failure dumper below calls this rather than taking its own, shorter tail, so
 # the failure path never overwrites the every-run capture with less.
 # Once per process, like collect_agent_pod_diagnostics: ci-eval-pr.sh takes it
-# before the next lane's rollback round trip replaces the pod, and the EXIT
+# before a next-mode run's rollback round trip replaces the pod, and the EXIT
 # trap's call after that must not overwrite the eval's log with the new pod's.
 # Read with a default, so the function alone, without this assignment, still
 # runs under `set -u` (the test suites lift it that way).
