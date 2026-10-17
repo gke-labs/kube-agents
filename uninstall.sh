@@ -938,6 +938,7 @@ main() {
   if [ "${MODEL_PROVIDER:-}" = "openai_compatible" ]; then
     export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""
   fi
+  export WEB_CONSOLE_ENABLED="false"
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

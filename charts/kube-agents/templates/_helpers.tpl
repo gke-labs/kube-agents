@@ -710,6 +710,26 @@ Takes a dict of field name to value.
 {{- end }}
 
 {{/*
+The model LiteLLM serves as model-default: litellm.modelDefaultName, or the
+provider's default when that is empty. litellm.yaml renders it into the gateway
+config and web-console.yaml shows it in the console banner, so the two cannot
+name different models. Fails on a provider the table does not know.
+
+Takes the root context.
+*/}}
+{{- define "kube-agents.litellmModel" -}}
+{{- $provider := .Values.litellm.modelProvider }}
+{{- /* Per-provider default model names mirror install.defaults.env (DEFAULT_MODEL_*);
+       a chart cannot source that file, and tests/test_installer_common.py pins the two equal. */}}
+{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" }}
+{{- /* openai_compatible has no default model, so it is allowed beside the table rather than in it. */}}
+{{- if and (not (hasKey $defaultModels $provider)) (ne $provider "openai_compatible") }}
+{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai, openai_compatible — a typo here would otherwise fail only at runtime" $provider) }}
+{{- end }}
+{{- .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
+{{- end }}
+
+{{/*
 The LiteLLM gateway config, mirroring
 k8s-operator/config/integrations/litellm/base/config.yaml and its provider
 overlays.
@@ -1910,6 +1930,10 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- end -}}
 {{- if .Values.githubMinter.enabled -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.githubMinter "pods" (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- if .Values.webConsole.enabled -}}
+  {{- /* templates/web-console.yaml renders exactly one replica; see the note there. */ -}}
+  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.webConsole "pods" 1 "surges" true) -}}
 {{- end -}}
 {{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled -}}
   {{- /* Pre-delete hook Job in templates/platform-agent-cr-cleanup.yaml: runs at helm uninstall
