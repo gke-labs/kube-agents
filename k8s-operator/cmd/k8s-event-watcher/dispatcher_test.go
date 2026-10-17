@@ -1598,3 +1598,124 @@ func TestDispatcherScaleUpMarkFromAnotherReporterRecordsNoVerdict(t *testing.T) 
 		t.Fatalf("FailedScheduling after cluster-autoscaler's decline: injects = %d; want 2", *injectCount)
 	}
 }
+
+// TestDispatcherKeepsDedupClosedOnWorkloadFoldedDuplicate verifies that when
+// the daemon returns {"status":"folded","duplicate_of":"42"}, the watcher keeps
+// the per-pod dedup entry closed without marking it PolicyFiltered, so a
+// subsequent Warning on the same pod is deduplicated locally instead of
+// triggering ReopenIfPolicyFiltered and re-injecting on every kubelet resync.
+func TestDispatcherKeepsDedupClosedOnWorkloadFoldedDuplicate(t *testing.T) {
+	injectCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sessions" {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: "session-folded"})
+			return
+		}
+		injectCount++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"folded","duplicate_of":"42"}`))
+	}))
+	defer server.Close()
+
+	inj, err := newInjector(injectorConfig{
+		daemonURL:   server.URL,
+		bearerToken: "mock-token",
+		httpClient:  server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("failed to build injector: %v", err)
+	}
+	dedup, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatalf("failed to build cache: %v", err)
+	}
+	m := newMetrics()
+	disp := &dispatcher{
+		filter:      newFilter(newFilterConfig(nil, nil, nil, filterThresholds{})),
+		dedup:       dedup,
+		pullClasses: newPullClassMemo(0, 0),
+		injector:    inj,
+		metrics:     m,
+		mode:        "per-incident",
+	}
+
+	now := time.Now()
+	ev1 := TriageEvent{
+		Key: EventKey{UID: "pod-folded-1", Reason: "BackOff"}, Type: "Warning",
+		Cluster: "test-cluster", Namespace: "prod", Name: "api-7d9f8c6b5-k4m2p",
+		Message: "Back-off restarting failed container app", LastSeen: now, Count: 3,
+	}
+	disp.Dispatch(context.Background(), ev1)
+	if injectCount != 1 {
+		t.Fatalf("first folded sighting injects = %d, want 1", injectCount)
+	}
+
+	// Subsequent Warning sightings on the same pod must be deduplicated locally
+	// (no ReopenIfPolicyFiltered, no extra POST /sessions or POST /inject).
+	ev2 := ev1
+	ev2.LastSeen = now.Add(30 * time.Second)
+	ev2.Count = 4
+	disp.Dispatch(context.Background(), ev2)
+	if injectCount != 1 {
+		t.Errorf("second Warning sighting on folded pod triggered another inject (injectCount=%d, want 1)", injectCount)
+	}
+	if got := testutil.ToFloat64(m.eventsPolicyFiltered.WithLabelValues("test-cluster", "", "", "BackOff", "prod")); got != 0 {
+		t.Errorf("events_policy_filtered_total = %v, want 0 for folded workload duplicate", got)
+	}
+	if got := testutil.ToFloat64(m.eventsWorkloadFolded.WithLabelValues("test-cluster", "", "", "BackOff", "prod")); got != 1 {
+		t.Errorf("events_workload_folded_total = %v, want 1 for folded workload duplicate", got)
+	}
+}
+
+func TestDispatcherResolvesControllerRefOnAdmittedEventOnly(t *testing.T) {
+	disp, _, injectCount, injected := newCountingDispatcher(t, filterThresholds{})
+	lookupCalls := 0
+	disp.resolveControllerRef = func(_ context.Context, namespace, kind, name string) string {
+		lookupCalls++
+		if namespace == "prod" && kind == "Pod" && name == "billing-6c8b7f5d4-x9m2q" {
+			return "Deployment/billing"
+		}
+		return ""
+	}
+	ctx := context.Background()
+	now := time.Now()
+
+	// A Normal event rejected by the filter must not trigger a Pod GET.
+	normalEv := TriageEvent{
+		Key: EventKey{UID: "pod-normal", Reason: "Pulled"}, Type: "Normal",
+		Cluster: "test-cluster", Namespace: "prod", KindOfObject: "Pod", Name: "billing-6c8b7f5d4-x9m2q",
+		Message: "Successfully pulled image", LastSeen: now, Count: 1,
+	}
+	disp.Dispatch(ctx, normalEv)
+	if lookupCalls != 0 {
+		t.Fatalf("filtered event triggered %d controllerRef lookups; want 0", lookupCalls)
+	}
+
+	// An admitted Warning event resolves ControllerRef and stamps it onto Context.ControllerRef.
+	warnEv := TriageEvent{
+		Key: EventKey{UID: "pod-warn", Reason: "BackOff"}, Type: "Warning",
+		Cluster: "test-cluster", Namespace: "prod", KindOfObject: "Pod", Name: "billing-6c8b7f5d4-x9m2q",
+		Message: "Back-off restarting failed container app", LastSeen: now, Count: 3,
+	}
+	disp.Dispatch(ctx, warnEv)
+	if *injectCount != 1 {
+		t.Fatalf("admitted Warning injects = %d; want 1", *injectCount)
+	}
+	if lookupCalls != 1 {
+		t.Fatalf("admitted Warning triggered %d controllerRef lookups; want 1", lookupCalls)
+	}
+	if got := (*injected)[0].Context.ControllerRef; got != "Deployment/billing" {
+		t.Errorf("injected Context.ControllerRef = %q; want %q", got, "Deployment/billing")
+	}
+
+	// A deduplicated repeat of the same pod must not trigger another Pod GET.
+	warnEv.LastSeen = now.Add(30 * time.Second)
+	warnEv.Count = 4
+	disp.Dispatch(ctx, warnEv)
+	if lookupCalls != 1 {
+		t.Errorf("deduplicated repeat triggered %d controllerRef lookups; want 1", lookupCalls)
+	}
+}
+
+

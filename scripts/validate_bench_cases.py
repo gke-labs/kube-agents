@@ -317,6 +317,13 @@ FIXTURE_NOT_READY = {
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
     ),
+    "autoops-warning-event-triage-open-pr": (
+        "#2513: needs an install with spec.harness.incidentTriage.openPullRequest: true, "
+        "each pool project's *-infra GitOps repository to carry both a manifest for "
+        "eval-open-pr-workload and a terraform/ directory, and per-repetition session KV "
+        "ledger reset or workload suffixing so consecutive units do not fold into unit 1's "
+        "pull request"
+    ),
 }
 
 # Cases that claim no domain because no row in domains.yaml describes them.
