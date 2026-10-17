@@ -63,7 +63,7 @@ func waitForGateway(ctx context.Context, gatewayURL string, limit, interval time
 			return false
 		}
 		if resp, err := client.Do(req); err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			log.Printf("k8s-event-watcher: agent gateway at %s answered; watching events", gatewayURL)
 			return true
 		}
