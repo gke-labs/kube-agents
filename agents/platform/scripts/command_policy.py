@@ -1259,10 +1259,16 @@ def _gcloud_prefix_write(argv: list[str]) -> bool:
 
     When no entry in GCLOUD_READ_COMMANDS agrees with them (neither a prefix
     of them nor extending them), no flag or word after them can make the
-    command a read: it is refused whatever follows.
+    command a read, with one exception: a help flag anywhere after them can
+    make it a synopsis request the help escape allows (`clusters upgrade c
+    --node-pool=p --image-type=t --help`). Whether that help flag stands as a
+    flag or as another flag's value cannot be read past the unknown flag, so
+    any help token keeps the answer open, and the retry is invited.
     """
-    words, _ = _gcloud_words_before_unknown_flag(argv)
+    words, index = _gcloud_words_before_unknown_flag(argv)
     if not words:
+        return False
+    if any(token.partition("=")[0] in _GCLOUD_HELP_FLAGS for token in argv[index:]):
         return False
     return not any(
         tuple(words[:min(len(command), len(words))]) == command[:min(len(command), len(words))]
@@ -1539,11 +1545,10 @@ def _evaluate(argv: list[str], readings: bool = True) -> Decision:
                 # and `--maintenance-window-start` reach this branch. Saying
                 # "global flag" sent readers looking for a gcloud release note
                 # that does not exist, and an agent repeating the advice into a
-                # report tells a customer something untrue. Both examples are
-                # flags on `container clusters update`, which this gate refuses
-                # as a write regardless, so the retry below is what resolves the
-                # ambiguity: if the command still fails without the flag, the
-                # flag was never the reason.
+                # report tells a customer something untrue. A flag on a command
+                # whose every flagless retry is refused takes the variant above
+                # instead (#2979); this branch is what is left, where a retry
+                # without the flag may be allowed.
                 message=(
                     "gcloud used a flag whose arity is unknown to this module, so the "
                     "command path cannot be read. Re-run without the flag: if the "

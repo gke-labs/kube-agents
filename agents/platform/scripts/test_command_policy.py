@@ -2064,6 +2064,16 @@ class NoRetryInvitationForAWriteTest(unittest.TestCase):
                     retry = [a for a in argv if not a.startswith("--new")] + ["--help"]
                     self.assertTrue(evaluate(retry).allowed, f"the offered retry {retry} is refused")
 
+    def test_a_help_flag_after_a_second_unknown_flag_keeps_the_retry(self):
+        # The SOP's own shape: confirm a remediation flag with --help. The
+        # reading drops one unknown flag and stops at the next, so only the
+        # prefix check judges it, and --help can still make it a synopsis.
+        argv = ["gcloud", "container", "clusters", "upgrade", "c", "--node-pool=pool", "--image-type=t", "--help"]
+        decision = evaluate(argv)
+        self.assertFalse(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD))
+        self.assertIn("Re-run without the flag", decision.message)
+        self.assertTrue(evaluate(["gcloud", "container", "clusters", "upgrade", "c", "--help"]).allowed)
+
     def test_the_unreadable_variant_names_no_positional(self):
         # On a two-word surface the third word is the caller's positional; the
         # variant carries no verb at all, as the flag refusals do not.
@@ -2123,34 +2133,34 @@ class NoRetryInvitationForAWriteTest(unittest.TestCase):
     WRITE_FLAG_REFUSALS = (
         (["kubectl", "delete", "pod", "web-0", "--as", "system:admin"],
          "identity.caller-supplied-impersonation",
-         "Impersonation is set by the credential proxy, not by the caller.", ("delete", "pod")),
+         "Impersonation is set by the credential proxy, not by the caller."),
         (["kubectl", "--kuberc", "/workspace/kr.yaml", "delete", "pod", "web-0"],
          "kubernetes.kuberc-forbidden",
          "--kuberc reads options from a file under the agent's control, including impersonation "
          "defaults that never appear in the command line. We cannot read that file without a race "
-         "condition, so we refuse it outright.", ("delete", "pod")),
+         "condition, so we refuse it outright."),
         (["kubectl", "delete", "pod", "web-0", "--token", "t"],
          "kubernetes.identity-change-forbidden",
-         "Identity and API server address belong to the broker.", ("delete", "pod")),
+         "Identity and API server address belong to the broker."),
         (["kubectl", "delete", "pod", "web-0", "--profile-output", "/workspace/x"],
          "kubernetes.file-write-forbidden",
          "--profile, --profile-output, --cache-dir and --output-directory write to a path of the "
-         "caller's choosing inside the credential sidecar.", ("delete", "pod")),
+         "caller's choosing inside the credential sidecar."),
         (["gcloud", "--flags-file", "/workspace/f.yaml", "container", "clusters", "update", "prod"],
          "gcp.flags-file-forbidden",
          "--flags-file reads from a file under the agent's control. We cannot read that file without "
-         "a race condition, so we refuse it outright.", ("container", "clusters", "update")),
+         "a race condition, so we refuse it outright."),
         (["gcloud", "container", "clusters", "update", "prod", "--account", "x@example.com"],
          "gcp.identity-change-forbidden",
-         "Identity belongs to the broker.", ("container", "clusters", "update")),
+         "Identity belongs to the broker."),
         (["gcloud", "container", "clusters", "update", "prod", "--log-http-log-file", "/workspace/l"],
          "gcp.file-write-forbidden",
          "--output-path and --log-http-log-file write a file inside the credential proxy's own "
-         "container, not the agent workspace.", ("container", "clusters", "update")),
+         "container, not the agent workspace."),
     )
 
     def test_a_flag_refusal_on_a_write_states_the_write_and_invites_nothing(self):
-        for argv, rule_id, reason, verb in self.WRITE_FLAG_REFUSALS:
+        for argv, rule_id, reason in self.WRITE_FLAG_REFUSALS:
             with self.subTest(argv=argv):
                 decision = evaluate(argv)
                 self.assertFalse(decision.allowed)
