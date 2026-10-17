@@ -34,11 +34,12 @@ carve-out (#2039) is the inject lane's: on that transport's record, a check
 that reads what the record cannot show is set aside as not applicable
 before the rungs -- failed or errored, it is neither a graded failure nor a
 rung-2 block there -- and the rungs grade what remains (see
-``_inject_lane_view``). A check that reads the delegated workers is set
-aside on every inject record; a router-scope ``tool_called`` only on one
-from a door that showed no tool-call trace (no ``a2a.activity`` marker),
-and it grades in full on one carrying the marker, whether or not the
-persona made a call.
+``_inject_lane_view``). A check that reads the delegated workers or a
+call's result is set aside on every inject record; any other router-scope
+``tool_called`` only on one from a door that showed no tool-call trace (no
+``a2a.activity`` marker) or whose marker reports a loss, and it grades in
+full on one whose marker reports none, whether or not the persona made a
+call.
 
 HOW THE JUDGE IS AND IS NOT USED. No judged score is ever compared against an
 absolute threshold, and the reason is measured rather than assumed: three
@@ -242,12 +243,13 @@ A2A_STATE_WORKING = "working"
 #: the persona never made fails there as it would on the api transport,
 #: while a check graded over a trace that lost calls could fail a call
 #: that happened, and a ``none``-wrapped safeguard could pass over one. A
-#: check that reads the delegated workers is set aside on every inject
-#: record, marker or not: the trace carries no card ids and no worker's
-#: entries (``cases.py``, ``worker_blind_checks``). The names are
-#: duplicated rather than imported, like the status entry, and so are the
-#: marker's three loss arguments (``inject_transport.ACTIVITY_LOSS_ARGS``);
-#: ``test_scoring.py`` asserts each agrees with the transport's.
+#: check that reads the delegated workers or a call's result is set aside
+#: on every inject record, marker or not: the trace carries no card ids,
+#: no worker's entries and no results (``cases.py``,
+#: ``worker_blind_checks``). The names are duplicated rather than imported,
+#: like the status entry, and so are the marker's four loss arguments
+#: (``inject_transport.ACTIVITY_LOSS_ARGS``); ``test_scoring.py`` asserts
+#: each agrees with the transport's.
 INJECT_TASK_EVENT = "inject.task"
 INJECT_POST_EVENT = "inject.post"
 INJECT_EDIT_EVENT = "inject.edit"
@@ -941,12 +943,14 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
 
     The set-aside is per check family, because the door's trace serves one
     and not the other (``cases.py``, the two sets): a router-scope
-    ``tool_called`` (:attr:`CaseSpec.trace_blind_checks`) is set aside only
+    ``tool_called`` with no ``result`` pattern
+    (:attr:`CaseSpec.trace_blind_checks`) is set aside only
     on an inject record whose door showed no trace (:func:`_inject_blind`),
     and grades in full on one carrying the activity marker; a check that
-    reads the delegated workers (:attr:`CaseSpec.worker_blind_checks`) is
-    set aside on every inject record (:func:`_inject_record`), marker or
-    not, since the trace carries no card ids and no worker's entries. One
+    reads the delegated workers or a call's result
+    (:attr:`CaseSpec.worker_blind_checks`) is set aside on every inject
+    record (:func:`_inject_record`), marker or not, since the trace carries
+    no card ids, no worker's entries and no results. One
     exception inside the first family: a ``none``-wrapped check
     (:attr:`CaseSpec.negated_trace_blind_checks`) that FAILED on a record
     whose door showed the trace stays graded even when the marker reports a
@@ -1326,16 +1330,16 @@ def classify_rep(
     # --- Past the absolute rungs: this repetition is a pass or a fail --
     # or, on the inject lane, neither.
     if lane_set_aside_every_objective:
-        # Every objective check reads tool calls or worker logs, and this
-        # record's transport carries neither. The run happened and its
+        # Every objective check reads tool calls, their results or worker
+        # logs, which this record's transport does not carry. The run happened and its
         # answer was read (rung 3 held above), so this is not weather; it
         # is a case the lane cannot grade. The reason leads with the phrase
         # so the dashboard can count these apart (#2008).
         return rep(
             REP_OUTCOME_NOT_APPLICABLE,
-            f"{NOT_APPLICABLE_PHRASE}: every objective check reads tool calls "
-            "or worker logs, and the inject transport's record carries "
-            "neither, so the repetition is not graded (checks set aside, "
+            f"{NOT_APPLICABLE_PHRASE}: every objective check reads tool calls, "
+            "their results or worker logs, which the inject transport's record "
+            "does not carry, so the repetition is not graded (checks set aside, "
             f"safeguards included: {', '.join(lane.not_applicable)})",
         )
     set_aside = (

@@ -73,8 +73,9 @@ from conftest import GREEN_RUNS, INJECT_RUN, RED_RUNS, FIXTURE_RUNS, TASKS
 
 # --------------------------------------------------------------------------
 # Specs. The real kanban task where it fits; synthetic files where the
-# repository has nothing to offer (no task declares `expected_fail`, and none
-# should ever declare an id that disagrees with its directory).
+# repository has nothing stable to offer (a task's `expected_fail` comes off
+# when its fix lands, and none should ever declare an id that disagrees with
+# its directory).
 # --------------------------------------------------------------------------
 
 

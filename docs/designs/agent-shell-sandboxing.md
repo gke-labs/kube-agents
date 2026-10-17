@@ -2376,8 +2376,8 @@ the script deleted. An operator back-fills a card with no subscription with the 
 `hermes kanban notify-subscribe`, run in the agent pod.
 
 **Executing `hermes`.** Exactly one capability is invoked from sandbox-side prose:
-`hermes cron run <job-id>`, at `agents/platform/AGENTS.md:32` and
-`agents/platform/skills/fleet-audit/SKILL.md:53`. Both spell it
+`hermes cron run <job-id>`, at `agents/platform/AGENTS.md` and
+`agents/platform/skills/fleet-audit/references/on-demand.md`. Both spell it
 `/opt/hermes/.venv/bin/hermes`, which is absent from the sandbox twice over. The other
 matches across `agents/` are either prose mentioning the binary or agent-side processes
 that stay put; `agentplugins/gke-stockout-investigator/scenarios/lib/common.sh:617`

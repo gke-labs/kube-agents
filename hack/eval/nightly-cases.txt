@@ -668,6 +668,14 @@
 # shape, unmeasured: priced with the 900s band in unit_cost_hint.
 ./tasks/fleet-cost-idle-pool/task.yaml
 
+# #3269: upgrades-lagging-master-probe demoted 2026-10-16. The fixture is
+# healthy (seeded-b one minor behind REGULAR's defaultVersion on every pool),
+# but the agent compares seeded-b against the channel's upgradeTargetVersion,
+# the newest patch of its own minor, and reports no lag, so it fails 0/3 on
+# unrelated pull requests. Back on the roster once an agent-side fix has the
+# comparison use the channel default and the case shows greens (#3269).
+./tasks/upgrades-lagging-master-probe/task.yaml
+
 # Blocker: #1254, for all four fleet-upgrade-verification cases (#1343
 # Phases 1-4: #1365, #1410, #1411, #1412). #1254 is the open issue on
 # upgrades-lagging-master-probe: a delegated run's acknowledgement graded as
@@ -1056,7 +1064,63 @@
 # deployer: noop, transcript-only.
 ./tasks/compute-class-canary-active-migration-pdb-probe/task.yaml
 
-# A Cluster Agent runs its gke-workload-security audit script from the card's
-# workspace: graded on a Cluster Agent doing the work, audit_cluster.sh being run,
-# and no result showing the script missing.
+# kube-agents-observability skill's trace latency helper, run to completion
+# through the credential broker's relay and graded on the report's breakdown
+# shape and on the worker's route (no token fetched or pasted). Reads the
+# install's own traces; parked in FIXTURE_NOT_READY from its merge until the
+# pool host clusters exported traces (scope set 2026-10-02, held by the
+# provisioning script and the verifier since). Nightly from the merge
+# that un-parked it.
+# deployer: noop, read-only, no fixture: three units at the 200s default,
+# ~10 serial minutes, off the infra lock, main nightly part.
+./tasks/observability-trace-latency-brokered/task.yaml
+
+# A plain chat request for a cost analysis runs the waste audit's collector
+# (#2386): the Platform Agent routes a domain request to its stream's
+# collector even when the request names no SOP, and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's idle-nodepool role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/cost-chat-request-runs-collector/task.yaml
+
+# A plain chat request about workload reliability across the fleet runs the
+# reliability audit's collector (#2386), and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's no-pdb-workload role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/reliability-chat-request-runs-collector/task.yaml
+
+# A plain chat request for the fleet's stockout and capacity risks runs the
+# stockout-prevention audit's collector (#2386), and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's hpa-saturated role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/stockout-chat-request-runs-collector/task.yaml
+
+# A plain chat request about upgrade and patch readiness runs the patch
+# audit's collector (#2386), and answers in chat without publishing.
+# deployer: noop; reads seeded-a's shipped no-notifications posture (no
+# fixtures role). Nightly rather than presubmit for the collector's full sweep.
+./tasks/upgrade-chat-request-runs-collector/task.yaml
+
+# A plain chat request for the clusters that differ from their peers runs the
+# drift audit's collector (#2386), and answers in chat without publishing.
+# deployer: noop; reads the seeded fleet's drift-outlier role (slot c).
+# Nightly rather than presubmit: consistency-authorized-networks-probe holds
+# the domain's presubmit seat. Red on main: no SOUL.md row routes the question
+# to fleet_drift.py. Marked expected_fail: true, so the nightly records it as
+# EXPECTED_FAIL and also records whether the outlier and facet reply checks
+# pass on seeded-c. The follow-up that adds the drift row removes the marker.
+./tasks/drift-chat-request-runs-collector/task.yaml
+
+# A plain chat request about the security of the fleet's AI and
+# model-serving workloads runs the AI security audit's collector (#2386), and
+# answers in chat without publishing. The chat form of
+# ai-security-planted-model-audit above: a tofu stack
+# (prebuilt/ai-model-defects) that plants its own workload in a namespace of
+# its own on the host cluster, so it too serializes on the infra lock. Priced
+# at that case's 1450s hint until it has a record.
+./tasks/ai-security-chat-request-runs-collector/task.yaml
+
+# A Cluster Agent runs its gke-workload-security audit script from the path
+# the skill names: graded on a Cluster Agent doing the work, running
+# audit_cluster.sh against seeded-a, never searching for the script, and no
+# result showing it missing.
 ./tasks/cluster-agent-security-audit-script/task.yaml
