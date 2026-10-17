@@ -668,6 +668,14 @@
 # shape, unmeasured: priced with the 900s band in unit_cost_hint.
 ./tasks/fleet-cost-idle-pool/task.yaml
 
+# #3269: upgrades-lagging-master-probe demoted 2026-10-16. The fixture is
+# healthy (seeded-b one minor behind REGULAR's defaultVersion on every pool),
+# but the agent compares seeded-b against the channel's upgradeTargetVersion,
+# the newest patch of its own minor, and reports no lag, so it fails 0/3 on
+# unrelated pull requests. Back on the roster once an agent-side fix has the
+# comparison use the channel default and the case shows greens (#3269).
+./tasks/upgrades-lagging-master-probe/task.yaml
+
 # Blocker: #1254, for all four fleet-upgrade-verification cases (#1343
 # Phases 1-4: #1365, #1410, #1411, #1412). #1254 is the open issue on
 # upgrades-lagging-master-probe: a delegated run's acknowledgement graded as

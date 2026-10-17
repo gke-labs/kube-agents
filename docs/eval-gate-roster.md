@@ -136,6 +136,15 @@ with a filed issue naming the exit condition:
   no presubmit case, so `remediation` joined `fleet-audits` on the allowlist until
   pdb-remediation-pr's roster line on 2026-10-14 (below) took it off again. Enters when #1189's
   re-admission bar holds.
+- **upgrades-lagging-master-probe** —
+  [#3269](https://github.com/gke-labs/kube-agents/issues/3269): demoted 2026-10-16 after
+  rung-4 collapses on unrelated pull requests the same day (#2997, #2959, #3282, #3271 and
+  more failed it 0/3; it was UNSTABLE on several others). Not the diff, and not the fixture:
+  the fixture scan read seeded-b one minor behind REGULAR's `defaultVersion` on every pool,
+  but the agent compares it against the channel's `upgradeTargetVersion` (the newest patch of
+  the cluster's own minor) and reports no lag. Its removal leaves `upgrades` with no presubmit
+  case, so the domain is on the `domains.yaml` allowlist until it returns. Enters again when an
+  agent-side fix has the comparison use the channel default and the case shows greens (#3269).
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
 [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its
@@ -395,18 +404,19 @@ nothing in the two roster files changes, and every case not named in the lane's 
 (below) runs and can red the job exactly as on the api lane. Two things differ, and they are
 kept apart on purpose.
 
-A check the transport blinds is the scorer's business. The door's trace carries no card ids
-and no worker's entries. The delegation wait now reads the cards and the workers from the pod
+A check the transport blinds is the scorer's business. The door's trace carries no card ids,
+no worker's entries and no results. The delegation wait now reads the cards and the workers from the pod
 when the turn ran under the bridge's `api` executor, but the scorer still treats
-`worker_commands`, `worker_agents` and a `tool_called` in the `workers` or `all` scope as blind on
+`worker_commands`, `worker_agents`, a `tool_called` in the `workers` or `all` scope, and a
+`tool_called` with a `result` pattern as blind on
 every inject record, and a door that shows no tool-call trace leaves a `tool_called` in its
 default `router` scope nothing to read; `bench-gate` sets
 those entries aside as not applicable on that transport and grades the rest, and a case whose
 only objectives are of that kind is reported `NOT_GRADED_ON_TRANSPORT` rather than collapsed —
 evaluated, outside the pass rate, never weather
 ([`docs/designs/eval-scorer.md`](designs/eval-scorer.md), "The inject lane sets aside what its
-transport cannot show"). No roster edit is involved. The router-scope `tool_called` half of the
-rule retires on a record whose door showed the whole trace (the transport's `a2a.activity` marker,
+transport cannot show"). No roster edit is involved. The half of the rule for a router-scope
+`tool_called` without a `result` pattern retires on a record whose door showed the whole trace (the transport's `a2a.activity` marker,
 reporting no loss), whether or not the run made a call. The delegation wait for this path is
 rebuilt, but the worker half stays until `scoring.py` takes those entries out of
 `worker_blind_checks` for a record that carries the workers.
