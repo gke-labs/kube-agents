@@ -487,7 +487,7 @@ describes.
 An install with no chat route gets no send at all: when the managed scope turns
 every platform off and nothing routes one through the gateway — a `next` install
 whose only chat platform is held by the gateway with no home channel, or an
-install with no chat — the relay answers 502 without posting. The detail names the gateway's
+install with neither Google Chat nor Slack — the relay answers 502 without posting. The detail names the gateway's
 platform from `A2A_NOTIFY_CONVERSATIONS` and the CR field that sets its home
 channel (`composed but not delivered to slack (no home channel: set
 spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`), or says that no route
