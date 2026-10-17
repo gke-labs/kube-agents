@@ -545,6 +545,14 @@ class SendTest(unittest.TestCase):
             self.send(adapter, answer)
         self.assertEqual(adapter.log, [("send", CHANNEL, answer.rsplit("\n\n", 1)[0], METADATA)])
 
+    def test_options_win_over_a_declared_step_on_an_answer_drawn_whole(self):
+        # split refuses a heading opener; the answer still asks to choose, so no step button is drawn.
+        answer = "## Two ways\n\n1. **Scale it**\n2. **Shed load**\n\nWhich do you want?\n\n[next: scale it]"
+        adapter = _Adapter()
+        with self.assertLogs(runtime.logger):
+            self.send(adapter, answer)
+        self.assertEqual(adapter.log, [("send", CHANNEL, answer.rsplit("\n\n", 1)[0], METADATA)])
+
     def test_options_win_over_a_declared_step(self):
         answer = f"{HEADLINE} Two ways.\n\n1. **Scale it**\n2. **Shed load**\n\nWhich do you want?\n\n[next: scale it]"
         adapter = _Adapter()

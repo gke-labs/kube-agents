@@ -387,7 +387,8 @@ class _AnswerFolder:
         if layout is None:
             # split or the fold refused (a divider cannot fold): with a declared step and no options,
             # the answer as upstream draws it, without the step's line, and the step's button.
-            if not step_blocks or offered is not None:
+            # Options the answer asks the user to choose from win here too, as on the fold path.
+            if not step_blocks or offered is not None or _moments.answer_choices(shown_answer) is not None:
                 return None
             whole_blocks = render_whole(shown_answer, mrkdwn_fn)
             if whole_blocks is None or len(whole_blocks) >= MESSAGE_BLOCKS_MAX:
