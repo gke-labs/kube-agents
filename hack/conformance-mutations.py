@@ -604,7 +604,7 @@ Mutation(
     ),
     Mutation(
         "C1-gateway-metadata-dns-rule-widened-to-a-range",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-egress-allowlist.yaml",
         ("        - port: 53\n          protocol: TCP\n      to:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: kube-dns\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: node-local-dns\n        - ipBlock:\n            cidr: 169.254.20.10/32\n        - ipBlock:\n            cidr: 169.254.169.254/32\n        - ipBlock:\n            cidr: 10.96.0.10/32\n    - ports:\n        - port: 80\n",
          "        - port: 53\n          endPort: 988\n          protocol: TCP\n      to:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: kube-dns\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: node-local-dns\n        - ipBlock:\n            cidr: 169.254.20.10/32\n        - ipBlock:\n            cidr: 169.254.169.254/32\n        - ipBlock:\n            cidr: 10.96.0.10/32\n    - ports:\n        - port: 80\n"),
         "test_C1_the_rendered_egress_policy_reaches_no_metadata_address",
