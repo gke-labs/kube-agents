@@ -3936,6 +3936,17 @@ class DowngradeCheckTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, out)
         self.assertNotIn("Moving from", out)
 
+    def test_a_record_separator_byte_in_a_message_does_not_split_the_commit(self):
+        self._git("switch", "-q", "-c", "odd", self.sha["footer"])
+        self._commit("odd_bang", "docs: odd body", "line\x1e\nx feat!: not a subject")
+        self._commit("odd_footer", "fix: odd footer", "line\x1e\nBREAKING CHANGE: still a footer")
+        self._git("switch", "-q", "main")
+        proc, out = self._check(self.sha["footer"], self.sha["odd_footer"])
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn("leaves behind 1 commit(s)", out)
+        self.assertIn(f"{self._short('odd_footer')} fix: odd footer", out)
+        self.assertNotIn("not a subject", out)
+
     def test_a_release_tag_and_its_own_commit_are_the_same_install(self):
         proc, out = self._check("0.3.0", self.sha["bang"])
         self.assertEqual(proc.returncode, 0, out)
@@ -3985,7 +3996,7 @@ class DowngradeCheckTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, out)
         self.assertIn("Could not read the tag the install runs, so the downgrade check is skipped", out)
 
-    def _check_mode(self, mode, target, agent, operator, repo_dir=None, extra=""):
+    def _check_mode(self, mode, target, agent, operator, repo_dir=None, extra="", agent_ref=None, operator_ref=None):
         """check_downgrade_for_mode against a stub kubectl that serves each Deployment's image."""
         bin_dir = self.tmp / "bin"
         bin_dir.mkdir(exist_ok=True)
@@ -3993,8 +4004,8 @@ class DowngradeCheckTest(unittest.TestCase):
         kubectl.write_text(
             "#!/usr/bin/env bash\n"
             'case "$3" in\n'
-            f'  platform-agent-gateway) echo "ghcr.io/x/platform-agent:{agent}" ;;\n'
-            f'  kube-agents-controller-manager) echo "ghcr.io/x/k8s-operator:{operator}" ;;\n'
+            f'  platform-agent-gateway) echo "ghcr.io/x/platform-agent{agent_ref or ":" + agent}" ;;\n'
+            f'  kube-agents-controller-manager) echo "ghcr.io/x/k8s-operator{operator_ref or ":" + operator}" ;;\n'
             "  *) exit 1 ;;\n"
             "esac\n"
         )
@@ -4034,6 +4045,15 @@ class DowngradeCheckTest(unittest.TestCase):
         proc, out = self._check_mode("full", "0.1.0", agent="0.2.0", operator="0.2.0")
         self.assertEqual(proc.returncode, 0, out)
         self.assertEqual(out.count("no commit it leaves behind"), 1, out)
+
+    def test_a_digest_pinned_image_is_checked_by_its_tag(self):
+        digest = "@sha256:" + "a" * 64
+        proc, out = self._check_mode("harness", "0.2.0", agent="", operator="", agent_ref=":0.3.0" + digest)
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(self._short("bang"), out)
+        proc, out = self._check_mode("harness", "0.2.0", agent="", operator="", agent_ref=digest)
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("Could not read the tag deployment/platform-agent-gateway runs", out)
 
     def test_full_mode_without_local_history_clones_once_and_cleans_up(self):
         proc, out = self._check_mode(

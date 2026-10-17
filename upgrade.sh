@@ -75,10 +75,7 @@ readonly BREAKING_CHANGE_FOOTER_REGEX='^[[:space:]]*BREAKING[ -]CHANGE:[[:space:
 # has to fetch carries commits and no trees or file contents.
 readonly DOWNGRADE_HISTORY_FETCH_FILTER="--filter=tree:0"
 readonly DOWNGRADE_HISTORY_DIR_TEMPLATE="kube-agents-history.XXXXXX"
-# Ends each commit record in the downgrade check's `git log`: a byte no commit
-# message carries, so a multi-line body stays one record. Written in git's
-# `%xNN` form for the format and as the byte itself for `read -d`.
-readonly COMMIT_RECORD_SEPARATOR_HEX="1e"
+readonly DOWNGRADE_LOG_FILE_TEMPLATE="kube-agents-commits.XXXXXX"
 # Where the downgrade check reads the installed tags: the agent and operator
 # containers. The Deployment names default to installer_common.sh's, which the
 # check cannot rely on, since it reads them before or without that file.
@@ -1250,11 +1247,16 @@ downgrade_history_dir() {
 # Prints "<short sha> <subject>" for each commit in older..newer that is marked
 # as a breaking change, judged one commit at a time on the same terms as
 # commit_messages_have_breaking_change: the subject line, then the body.
+# NUL-separated (`-z`), the one byte git keeps out of a commit message. Read
+# through a file, because command substitution drops NUL bytes.
 breaking_commits_between() {
-  local history_dir="$1" older="$2" newer="$3" log="" record="" header="" body="" separator=""
-  separator="$(printf '%b' "\\x${COMMIT_RECORD_SEPARATOR_HEX}")"
-  log="$(trap - ERR; git -C "$history_dir" log --format="%h %s%n%b%x${COMMIT_RECORD_SEPARATOR_HEX}" "${older}..${newer}" 2>/dev/null)" || return 1
-  while IFS= read -r -d "$separator" record; do
+  local history_dir="$1" older="$2" newer="$3" log_file="" record="" header="" body=""
+  log_file="$(mktemp "${TMPDIR:-/tmp}/${DOWNGRADE_LOG_FILE_TEMPLATE}")" || return 1
+  if ! git -C "$history_dir" log -z --format='%h %s%n%b' "${older}..${newer}" >"$log_file" 2>/dev/null; then
+    rm -f -- "$log_file"
+    return 1
+  fi
+  while IFS= read -r -d '' record; do
     record="${record#$'\n'}"
     header="${record%%$'\n'*}"
     body="${record#"$header"}"
@@ -1262,7 +1264,8 @@ breaking_commits_between() {
       { [ -n "$body" ] && grep -qE "$BREAKING_CHANGE_FOOTER_REGEX" <<<"$body"; }; then
       printf '%s\n' "$header"
     fi
-  done <<<"$log"
+  done <"$log_file"
+  rm -f -- "$log_file"
 }
 
 # Prints the tag a Deployment's named container runs, or nothing when it cannot
@@ -1271,6 +1274,8 @@ deployment_image_tag() {
   local namespace="$1" deployment="$2" container="$3" image=""
   image="$(trap - ERR; kubectl get deployment "$deployment" -n "$namespace" \
     -o jsonpath="{.spec.template.spec.containers[?(@.name==\"${container}\")].image}" 2>/dev/null)" || return 0
+  # A digest pin (`repo:tag@sha256:...`) keeps its tag before the `@`.
+  image="${image%%@*}"
   case "${image##*:}" in
     "$image"|*/*) return 0 ;;
   esac

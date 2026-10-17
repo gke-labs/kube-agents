@@ -391,6 +391,21 @@ class ReconcileWorkflowTest(unittest.TestCase):
         step = next(s for s in self.job["steps"] if s.get("id") == "reconcile")
         self.assertEqual(step["env"]["ALLOW_BREAKING_DOWNGRADE"], "${{ inputs.allow_breaking_downgrade }}")
 
+    def test_every_deploy_dispatch_can_pass_the_bypass(self):
+        """The deploy workflows' own image_tag dispatch is where a refused rollback is retried."""
+        for name in ("autopush-deploy.yml", "autopush-next-deploy.yml", "staging-deploy.yml"):
+            with self.subTest(workflow=name):
+                doc = _doc(_WORKFLOWS / name)
+                triggers = doc.get("on") or doc.get(True)
+                spec = triggers["workflow_dispatch"]["inputs"]["allow_breaking_downgrade"]
+                self.assertEqual(spec["type"], "boolean")
+                self.assertIs(spec["default"], False)
+                callers = [job for job in doc["jobs"].values()
+                           if str(job.get("uses", "")).startswith("./.github/workflows/reconcile-environment.yml")]
+                self.assertEqual(len(callers), 1)
+                self.assertEqual(callers[0]["with"]["allow_breaking_downgrade"],
+                                 "${{ inputs.allow_breaking_downgrade == true }}")
+
     def test_it_can_read_the_actions_api(self):
         """The in-flight redeploy check is a `gh run list`."""
         self.assertEqual(self.job["permissions"].get("actions"), "read")
