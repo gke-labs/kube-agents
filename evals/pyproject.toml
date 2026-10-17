@@ -19,5 +19,5 @@ description = "Inspect AI evaluation suite for kube-agents conforming to eval-ru
 requires-python = ">=3.11, <3.14"
 dependencies = [
     "google-genai>=2.31.0",
-    "inspect-ai==0.3.281",
+    "inspect-ai>=0.3.278",
 ]
