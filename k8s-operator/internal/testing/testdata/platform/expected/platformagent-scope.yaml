@@ -1725,6 +1725,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: kubeagents-platform-agent
+      terminationGracePeriodSeconds: 60
       volumes:
         - name: platform-agent-data-vol
           persistentVolumeClaim:
