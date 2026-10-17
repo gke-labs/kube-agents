@@ -43,29 +43,31 @@ only renders its kubeconfig bootstrap (the `gcloud container clusters get-creden
 the agent a usable kubectl context) when it has the complete triple; with one missing, every
 `kubectl` the agent runs resolves to `localhost:8080` instead of a cluster.
 
-| Field                                          | Type   | Purpose                                                                                                                                                                                                                           |
-| ---------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `clusterName`                                  | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.                                                                                                                                              |
-| `location`                                     | string | Cloud region (e.g. `us-central1-a`).                                                                                                                                                                                              |
-| `projectId`                                    | string | GCP Project ID of the cluster. Required.                                                                                                                                                                                          |
-| `hermes.dashboardEnabled`                      | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                                                                                                                                                             |
-| `hermes.pluginsDebug`                          | bool   | Enable plugin-level debug logging. Default `false`.                                                                                                                                                                               |
-| `hermes.agentHome`                             | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                                                                                                                                                          |
-| `hermes.apiServerSecretRef.name` + `key`       | string | `Secret` holding `API_SERVER_EXTERNAL_KEY`, the credential outside callers present to the gateway pod's `agent-api-auth` sidecar. Not `API_SERVER_KEY` — see [How config reaches each profile](#how-config-reaches-each-profile). |
-| `hermes.sessionKVApiKeySecretRef.name` + `key` | string | `Secret` holding the bearer token for the pod-local Session KV server (`SESSION_KV_API_KEY`). Optional; absent, the server rejects every request with `503`.                                                                      |
-| `hermes.sessionKVSaltSecretRef.name` + `key`   | string | `Secret` holding the HMAC salt used to pseudonymise chat identities (`SESSION_KV_SALT`). Optional; absent, the agent generates a per-pod salt and warns.                                                                          |
-| `memory.memoryEnabled`                         | bool   | Toggle framework memory persistence. Default `false`.                                                                                                                                                                             |
-| `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`; `none` for none. See below.                                                                                                                                           |
-| `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                                                                                                |
-| `eventWatcher.enabled`                         | bool   | Start the `k8s-event-watcher`. Default `true`; `false` is the emergency stop for an event storm (see below).                                                                                                                      |
-| `driftDetector.enabled`                        | bool   | Start the `drift-detector`. Default `false`, because it needs a Pub/Sub subscription a hand-written CR or a Helm-only install does not create; `install.sh` creates one and sets this to `true` unless told otherwise. See below. |
-| `driftDetector.subscription`                   | string | Pub/Sub subscription the detector pulls audit records from. Unset takes the detector's own default, which is the name the Terraform module creates.                                                                               |
-| `driftDetector.gitopsManagers`                 | string | Comma-separated `managedFields` field managers belonging to your GitOps controller, matched exactly — `argocd-controller`, `flux`. Unset means no card is ever annotated as possibly already reconciled.                          |
-| `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                                             |
-| `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                                  |
-| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `6`.                                                                                                                                                        |
-| `tuning.maxSessions`                           | int    | Install-wide cap on concurrent A2A session pods (1–10000). Unset = operator default `10`. Inert under `mode: today`; a separate lane from `maxInProgress`. A stream too small for it makes the provision Job refuse.              |
-| `experimental.platformFrontDoor`               | bool   | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                                                                                                  |
+| Field                                          | Type   | Purpose                                                                                                                                                                                                                                                         |
+| ---------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `clusterName`                                  | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.                                                                                                                                                                            |
+| `location`                                     | string | Cloud region (e.g. `us-central1-a`).                                                                                                                                                                                                                            |
+| `projectId`                                    | string | GCP Project ID of the cluster. Required.                                                                                                                                                                                                                        |
+| `hermes.dashboardEnabled`                      | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                                                                                                                                                                                           |
+| `hermes.pluginsDebug`                          | bool   | Enable plugin-level debug logging. Default `false`.                                                                                                                                                                                                             |
+| `hermes.agentHome`                             | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                                                                                                                                                                                        |
+| `hermes.apiServerSecretRef.name` + `key`       | string | `Secret` holding `API_SERVER_EXTERNAL_KEY`, the credential outside callers present to the gateway pod's `agent-api-auth` sidecar. Not `API_SERVER_KEY` — see [How config reaches each profile](#how-config-reaches-each-profile).                               |
+| `hermes.sessionKVApiKeySecretRef.name` + `key` | string | `Secret` holding the bearer token for the pod-local Session KV server (`SESSION_KV_API_KEY`). Optional; absent, the server rejects every request with `503`.                                                                                                    |
+| `hermes.sessionKVSaltSecretRef.name` + `key`   | string | `Secret` holding the HMAC salt used to pseudonymise chat identities (`SESSION_KV_SALT`). Optional; absent, the agent generates a per-pod salt and warns.                                                                                                        |
+| `memory.memoryEnabled`                         | bool   | Toggle framework memory persistence. Default `false`.                                                                                                                                                                                                           |
+| `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`; `none` for none. See below.                                                                                                                                                                         |
+| `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                                                                                                                              |
+| `eventWatcher.enabled`                         | bool   | Start the `k8s-event-watcher`. Default `true`; `false` is the emergency stop for an event storm (see below).                                                                                                                                                    |
+| `driftDetector.enabled`                        | bool   | Start the `drift-detector`. Default `false`, because it needs a Pub/Sub subscription a hand-written CR or a Helm-only install does not create; `install.sh` creates one and sets this to `true` unless told otherwise. See below.                               |
+| `driftDetector.subscription`                   | string | Pub/Sub subscription the detector pulls audit records from. Unset takes the detector's own default, which is the name the Terraform module creates.                                                                                                             |
+| `driftDetector.gitopsManagers`                 | string | Comma-separated `managedFields` field managers belonging to your GitOps controller, matched exactly — `argocd-controller`, `flux`. Unset means no card is ever annotated as possibly already reconciled.                                                        |
+| `incidentTriage.openPullRequest`               | bool   | Open the triage report's recommended fix as a pull request without waiting for a human `apply` reply. Default `false`. See below.                                                                                                                               |
+| `incidentTriage.workloadDedupSeconds`          | int    | Fold further Warning events for the same workload into its last admitted anchor event for a fixed window of this many seconds. Default `0` (one incident per object UID when `openPullRequest` is `false`; `300`s when `openPullRequest` is `true`). See below. |
+| `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                                                                           |
+| `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                                                                |
+| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `6`.                                                                                                                                                                                      |
+| `tuning.maxSessions`                           | int    | Install-wide cap on concurrent A2A session pods (1–10000). Unset = operator default `10`. Inert under `mode: today`; a separate lane from `maxInProgress`. A stream too small for it makes the provision Job refuse.                                            |
+| `experimental.platformFrontDoor`               | bool   | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                                                                                                                                |
 
 `dashboardEnabled` publishes port `9119` on the agent Service, but nothing answers there: `hermes
 dashboard` binds `127.0.0.1`, so a request arriving over the pod network gets connection refused.
@@ -266,6 +268,69 @@ ownership is still read and reported, and you get the same cards without the ann
 Nothing else about the detector is exposed here. Which principals count as human, and which calls
 are dropped as failed or non-declarative, are compiled into the binary; what reaches it at all is
 set by the Terraform module's log sinks, not by the CR.
+
+### `spec.harness.incidentTriage`
+
+By default, a triage report from the `k8s-event-watcher` proposes GitOps fixes and stops. A human
+replies `apply` (or `apply Option B`), and the Platform Agent opens that fix as a pull request.
+`openPullRequest: true` removes the wait for the reply. The Planning Agent files a second card
+beside the triage card. That card is assigned to the Platform Agent and parented on the triage card,
+so the dispatcher holds it in `todo` until the diagnosis card settles (`done` or `archived`); if the
+diagnosis card ends `blocked`, the pull-request card stays held in `todo` (surfaced by
+`kanban_board_health` under the blocked parent) until the parent is unblocked and completed or
+archived. Once the report is complete, the second card opens the option the report marked
+Recommended, or the single proposed fix, through `submit-suggestion`.
+
+```yaml
+spec:
+  harness:
+    incidentTriage:
+      openPullRequest: true
+```
+
+A human still reviews and merges the pull request, and nothing is written to the live cluster. The
+branch is `platform-agent/incident-<cluster>-<namespace>-<workload>-<digest>`, keyed to the workload, so a
+repeat on that workload is folded into its open pull request's incident rather than opening another, and a
+`Critical` escalation revises it. The event
+watcher's own window lapses on a fault nobody has fixed yet (`FailedScheduling` repeats on a five-minute
+back-off), and each lapse would be a new incident. So before it starts a session, Session KV asks the
+forge whether the workload's branch has a pull request that is open, or merged or closed in the last
+ten minutes, the time a merged fix takes to sync and roll out. If one does, the event is written to the
+ledger as a duplicate of the workload's last admitted event (provided a `Warning` anchor does not
+silence a `Critical` escalation), answered to the watcher as folded (`status: folded`), and starts no
+session; each folded event refreshes the seven-day anchor window so long-lived open pull requests keep
+folding. The lookup is bounded at five seconds across managed repositories; a slow or failed forge
+admits the event as before. After that grace period, the next incident opens a new pull request. The
+second card's result, the pull request URL, is posted to the same chat thread as the report.
+
+The setting has limits. Drift reports from `drift-detector` are not covered; they still wait for a
+reply. On Slack with `KAGE_SLACK_UX` enabled, `slack_ux_incident` omits the primary `apply` button
+for the recommended or single fix that is already being opened, leaving buttons only for alternative
+options; a manual `apply Option B` reply in chat routes through `incident_context` on its own
+`submit-suggestion` branch. Changing the field rolls the gateway pod, because it reaches the agent
+as the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` environment variable. The operator sets that variable
+only when the field is `true`, so an install that never sets it keeps the pod it had. The Helm value
+is `platformAgent.harness.incidentTriage.openPullRequest`.
+
+`workloadDedupSeconds` bounds how many incidents one failing workload opens over a fixed time
+window. The `k8s-event-watcher` deduplicates on the involved object's UID, so a Deployment whose two
+replicas fail the same way, or whose rollout replaces one failing pod with another, offers one event
+per pod. Each becomes a triage session, and with `openPullRequest` a pull request for the same fix.
+With the window set, a further event for the same cluster, namespace, object kind, and workload
+(resolved from the pod's `OwnerReferences` via `context.controller_ref` when available, and falling
+back to pod-name suffix stripping otherwise) within that many seconds of the workload's last
+admitted event is written to the event ledger as a duplicate of that row (`duplicate_of`), answered
+to the watcher as folded (`status: folded`), and starts no session — regardless of whether the
+anchor's triage session is still running or has already closed. Only an admitted event anchors the
+window, whether or not its chat post went through (an event the daily ceiling refused does not
+silence the next), and a `Warning` anchor never silences a `Critical` escalation. Pick a window
+longer than the gap between sibling pods' first events (seconds) and shorter than the time a second,
+unrelated incident on the same workload could follow a fix. Default `0` keeps one incident per
+object UID when `openPullRequest` is off; when `openPullRequest` is `true` and `workloadDedupSeconds`
+is unset or `0`, the session server defaults the window to `300` seconds so concurrent sibling
+replica bursts do not file duplicate pull-request cards for the same workload branch. It reaches the
+agent as `INCIDENT_WORKLOAD_DEDUP_SECONDS`, set only when the field is above zero. The Helm value is
+`platformAgent.harness.incidentTriage.workloadDedupSeconds`.
 
 ### `spec.harness.tuning`
 

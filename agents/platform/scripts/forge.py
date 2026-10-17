@@ -453,7 +453,14 @@ def _host_of(repo: str) -> str:
         return ""
 
 
-def call(verb: str, payload: dict, repo: str, *, retry_transient: bool = False) -> dict:
+def call(
+    verb: str,
+    payload: dict,
+    repo: str,
+    *,
+    retry_transient: bool = False,
+    timeout: float | None = None,
+) -> dict:
     """One version-control verb against one repository, wherever this is running.
 
     Every forge call in this module and its consumers goes through here, so
@@ -496,7 +503,7 @@ def call(verb: str, payload: dict, repo: str, *, retry_transient: bool = False) 
         try:
             with _as_forge_error(repo):
                 if sandbox_exec.sandbox_enabled():
-                    return _forward(verb, payload, repo)
+                    return _forward(verb, payload, repo, timeout=timeout)
                 return vcs_client.forge(verb, dict(payload), repository=repo)
         except ForgeError as error:
             if attempt == attempts or error.reason not in TRANSIENT_CODES:
@@ -507,7 +514,13 @@ def call(verb: str, payload: dict, repo: str, *, retry_transient: bool = False) 
     raise AssertionError("unreachable")  # pragma: no cover -- the loop returns or raises
 
 
-def _forward(verb: str, payload: dict, repo: str) -> dict:
+def _forward(
+    verb: str,
+    payload: dict,
+    repo: str,
+    *,
+    timeout: float | None = None,
+) -> dict:
     """Ask a copy of this file inside the sandbox, and read its answer back.
 
     The payload travels as JSON on fd 0 rather than as arguments. A comment body
@@ -524,10 +537,11 @@ def _forward(verb: str, payload: dict, repo: str) -> dict:
     The forwarded process cannot forward again. `sandbox_enabled()` reads the
     agent pod's managed Hermes config, and the sandbox image does not carry it.
     """
+    effective_timeout = FORWARD_TIMEOUT_S if timeout is None else max(0.1, float(timeout))
     try:
         completed = sandbox_exec.run(
             ["python3", SANDBOX_FORGE, "call", verb, "--repository", repo],
-            timeout=FORWARD_TIMEOUT_S,
+            timeout=effective_timeout,
             stdin=json.dumps(payload),
         )
     except sandbox_exec.SandboxUnavailable as unreachable:
@@ -539,7 +553,7 @@ def _forward(verb: str, payload: dict, repo: str) -> dict:
         ) from unreachable
     except subprocess.TimeoutExpired as expired:
         raise vcs_client.VcsError(
-            f"{verb} on {repo} did not answer within {FORWARD_TIMEOUT_S}s",
+            f"{verb} on {repo} did not answer within {effective_timeout:g}s",
             code=REASON_SANDBOX_UNREACHABLE,
         ) from expired
     if completed.returncode != 0:
