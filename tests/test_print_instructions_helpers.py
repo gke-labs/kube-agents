@@ -65,5 +65,92 @@ class ChatInstructionHelpersTest(unittest.TestCase):
                 self.assertEqual(proc.stdout, "", repr(proc.stdout))
 
 
+class SlackStepsFollowTheModeTest(unittest.TestCase):
+    """The Slack checklist follows the path the install's Slack is on (#3386).
+
+    Under next without Google Chat the A2A gateway holds Slack: it does not
+    acknowledge slash commands, ignores /sethome, and takes its home channel
+    only from SLACK_HOME_CHANNEL. Everywhere else the Hermes listener does.
+    """
+
+    _NEXT_HOME = "C0123ABCD"
+
+    def _run(self, install_env):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text(install_env)
+            # Only what a clean shell has: an inherited PLATFORM_AGENT_MODE or
+            # SLACK_HOME_CHANNEL would decide a case the file leaves unset.
+            env = {
+                "PATH": os.environ["PATH"],
+                "HOME": tmp,
+                "TERM": "dumb",
+                "VARS_FILE": str(pathlib.Path(tmp) / "vars.sh"),
+                "KUBE_AGENTS_INSTALL_ENV": str(env_file),
+                "REGISTRY_PREFIX": "ghcr.io/gke-labs/kube-agents",
+            }
+            proc = subprocess.run(
+                ["bash", str(_REPO_ROOT / "scripts" / "installer" / "print_instructions_slack.sh"), "--dry-run"],
+                capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL, timeout=60,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # install.sh runs the script under `|| true`, so a failure inside it
+        # shows up only as a missing checklist.
+        self.assertIn("[Slack Integration Instructions]", proc.stdout, proc.stderr)
+        return proc.stdout
+
+    @staticmethod
+    def _env(mode=None, gchat=False, home=""):
+        lines = ["SLACK_ENABLED=true", f"GOOGLE_CHAT_ENABLED={'true' if gchat else 'false'}",
+                 f"SLACK_HOME_CHANNEL={home}"]
+        if mode is not None:
+            lines.append(f"PLATFORM_AGENT_MODE={mode}")
+        return "\n".join(lines) + "\n"
+
+    def _assert_today(self, out):
+        self.assertIn("hermes slack manifest", out)
+        self.assertIn("hermes pairing approve slack", out)
+        self.assertNotIn("platform-agent-a2a-gateway", out)
+
+    def _assert_next(self, out):
+        self.assertIn("#for-specmode-next-the-a2a-gateway", out)
+        self.assertIn("#moving-an-existing-app-to-next", out)
+        self.assertIn("kubectl logs deploy/platform-agent-a2a-gateway -c gateway -n kubeagents-system", out)
+        self.assertNotIn("hermes slack manifest", out)
+        self.assertNotIn("pairing", out)
+        self.assertNotIn("/hermes sethome", out)
+
+    def test_next_without_google_chat_prints_the_gateway_steps(self):
+        for home in ("", self._NEXT_HOME):
+            with self.subTest(home=home):
+                self._assert_next(self._run(self._env(mode="next", home=home)))
+
+    def test_next_with_no_home_channel_names_install_env_not_the_flag(self):
+        # install.sh refuses --slack-home-channel when install.env assigns the
+        # key, and every installer-written install.env assigns it, empty or not.
+        out = self._run(self._env(mode="next"))
+        self.assertIn("Set SLACK_HOME_CHANNEL in install.env", out)
+        self.assertNotIn("--slack-home-channel", out)
+        self.assertNotIn("Invite the app to the home channel", out)
+
+    def test_next_with_a_home_channel_says_to_invite_the_app_there(self):
+        out = self._run(self._env(mode="next", home=self._NEXT_HOME))
+        self.assertIn(f"Invite the app to the home channel {self._NEXT_HOME}", out)
+        self.assertNotIn("No home channel is configured", out)
+
+    def test_next_with_google_chat_keeps_slack_on_the_today_steps(self):
+        self._assert_today(self._run(self._env(mode="next", gchat=True)))
+
+    def test_today_prints_the_listener_steps(self):
+        for home in ("", self._NEXT_HOME):
+            with self.subTest(home=home):
+                self._assert_today(self._run(self._env(mode="today", home=home)))
+
+    def test_an_install_env_without_a_mode_is_today(self):
+        # Such a file predates the key. Reading it as the install default would
+        # turn every old install into next once that default changes.
+        self._assert_today(self._run(self._env(mode=None)))
+
+
 if __name__ == "__main__":
     unittest.main()

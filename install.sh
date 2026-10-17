@@ -8054,7 +8054,9 @@ main() {
   fi
   if [ "${slack_enabled:-false}" = "true" ]; then
     echo ""
-    IMAGE_TAG="$image_tag" bash "${repo_dir}/scripts/installer/print_instructions_slack.sh" || true
+    # The install.env this run read, which need not be the checkout's.
+    IMAGE_TAG="$image_tag" KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE" \
+      bash "${repo_dir}/scripts/installer/print_instructions_slack.sh" || true
   fi
   # Repeated here, where the two printers above give their instructions. Arm 4
   # prints it as well, for the runs that never reach the end of main().
