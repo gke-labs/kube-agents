@@ -2,7 +2,7 @@
 # a pull request and ci-kube-agents-eval-nightly-gitlab runs once a night
 # (kube-agents#2394, #2832). hack/ci-eval-pr.sh reads this file in place of
 # the catalogue whenever EVAL_FORGE=gitlab, on either tier: nothing else
-# grades the forge, so the twelve other presubmit cases and the nightly-only
+# grades the forge, so the presubmit cases and the other nightly-only
 # cases run on GitHub only. The nightly never appends to the evidence store.
 #
 # One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts
@@ -22,9 +22,11 @@
 # WHAT CAN RED THE LANE. The blocking roster still applies, intersected with
 # this list: a roster case here arms rung 4 on the lane; a held-out case here
 # runs and reports without arming it, as it does on the GitHub presubmit.
-# Rungs 1-3 red the lane like every case. Since 2026-10-14 pdb-remediation-pr
-# is on the roster (#2016), so its collapse reds the lane's verdict; the other
-# two cases below are held out and report without arming it.
+# Rungs 1-3 red the lane like every case. pdb-remediation-pr was on the
+# roster from 2026-10-14 (#2016) until its demotion to the nightly on
+# 2026-10-17 (#3120), so today no case below is on the roster: all three are
+# held out, rung 4 is disarmed on the lane (the script says so in the log),
+# and the case returns to arming it with its roster line.
 # The job runs on demand (`/test pull-kube-agents-smoke-test-gitlab`) and
 # nightly, never as a blocking presubmit: the agent goes through the same
 # forge abstraction on both forges, so the GitHub presubmit grades what a
@@ -61,5 +63,7 @@
 # before it is described (pull_request_opened).
 ./tasks/vcs-review-feedback-read-back/task.yaml
 # The remediation path: the fix lands as a merge request on the project's
-# GitLab repository, never on the cluster (pull_request_opened).
+# GitLab repository, never on the cluster (pull_request_opened). Registered
+# in nightly-cases.txt since its demotion (#3120); the lane picks from either
+# file.
 ./tasks/pdb-remediation-pr/task.yaml

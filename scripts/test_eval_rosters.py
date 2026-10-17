@@ -13,7 +13,8 @@ so is the 2026-09-22 decision that the presubmit runs the blocking roster
 only (HELD_OUT_TO_NIGHTLY: the seven held-out cases that left the presubmit
 file for the nightly one that day) and the held-out seats a coverage tracker
 puts back in the presubmit file without a roster line (HELD_OUT_IN_PRESUBMIT,
-the documented exception: #2013; #2016's seat took its roster line 2026-10-14) -- and the nightly file holds the
+the documented exception: #2013; #2016's seat took its roster line 2026-10-14) and the
+cases demoted since (DEMOTED_AFTER_THE_SPLIT) -- and the nightly file holds the
 script's nightly array plus the nine cases the TASKS array held commented
 out, which the same decision moved into the nightly (#1546, #1564), plus
 whatever landed there since (ADDED_AFTER_THE_SPLIT, ADDED_AFTER_THE_MOVED_BLOCK),
@@ -86,7 +87,7 @@ NIGHTLY_AT_SPLIT = [
     "knowledge-grounding-sources-probe",
     "cluster-agent-stalled-controller-healthy-silence",
     "chat-routing-board-read",
-    "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); seated held out 2026-09-28, promoted 2026-10-14 (#2016)
+    "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); seated held out 2026-09-28, promoted 2026-10-14 (#2016), demoted 2026-10-17 (#3120)
 ]
 # The nine cases TASKS held commented out at the split, moved into the
 # nightly by the same decision. The two commented-out cases NOT here had no
@@ -255,6 +256,7 @@ HELD_OUT_IN_PRESUBMIT = [
 # follows). Restoring a case deletes its entry here.
 DEMOTED_AFTER_THE_SPLIT = [
     ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),  # 2026-10-16, #3269 (agent reads upgradeTargetVersion)
+    ("pdb-remediation-pr", "upgrades-lagging-master-probe"),  # 2026-10-17, #3120 (worker declines a pull request into an -infra repo with no manifest; #3145)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
 
@@ -383,6 +385,8 @@ class SplitLostNothingTest(unittest.TestCase):
 
     def test_a_promoted_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
         for case, _ in PROMOTED_AFTER_THE_SPLIT:
+            if case in DEMOTED:
+                continue  # demoted since its promotion; test_a_demoted_case_is_in_the_nightly_only holds it
             with self.subTest(case=case):
                 self.assertIn(case, eval_rosters.presubmit_cases())
                 self.assertIn(case, eval_rosters.blocking_roster())
