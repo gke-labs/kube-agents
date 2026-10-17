@@ -934,6 +934,14 @@ main() {
   # DNS-1123 or a key that is not a Secret data key, and the CR that reads
   # them goes with the release.
   export SLACK_BOT_TOKEN_SECRET="" SLACK_BOT_TOKEN_KEY="" SLACK_APP_TOKEN_SECRET="" SLACK_APP_TOKEN_KEY=""
+  # The openai_compatible endpoint, likewise: the generator refuses a missing
+  # model or URL and a malformed port, CIDR or CA name. With those blanked the
+  # provider has no endpoint, so it is reset to the default, which the destroy
+  # renders no differently: the release and the gateway go either way.
+  export OPENAI_COMPATIBLE_API_BASE="" OPENAI_COMPATIBLE_TARGET_PORT="" OPENAI_COMPATIBLE_EGRESS_CIDRS="" OPENAI_COMPATIBLE_CA_SECRET_NAME=""
+  if [ "${MODEL_PROVIDER:-}" = "openai_compatible" ]; then
+    export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""
+  fi
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

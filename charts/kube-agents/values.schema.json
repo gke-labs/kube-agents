@@ -177,6 +177,38 @@
             }
           }
         },
+        "openaiCompatible": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "apiBase": {
+              "type": "string"
+            },
+            "targetPort": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "egressCIDRs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "caBundleSecretRef": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
         "image": {
           "type": "object",
           "additionalProperties": false,
