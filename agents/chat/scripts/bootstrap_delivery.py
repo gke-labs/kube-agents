@@ -213,6 +213,42 @@ AUDITS_NONE_RAN_NOTE = (
 AUDITS_NOT_RUN_NOTE = "Not run: {audits}."
 # oobe gives up on an audit it could not start; the audit still runs on its own schedule.
 AUDITS_GAVE_UP_REASON = "it did not start, and runs on its own schedule"
+# The sentence of the two notes above that names the home channel, and what replaces it where the
+# gateway has none to post to (no A2A_NOTIFY_PLATFORM on the conversation path).
+AUDITS_HOME_SENTENCE = "Each posts a summary to the home channel when it finds something new."
+AUDITS_NO_HOME_SENTENCE = (
+    "Each one's summary goes to the home channel, and this install has none yet, so those summaries "
+    "are not posted to chat."
+)
+
+# Under spec.mode next the plugin records the conversation the report goes to (its
+# CONVERSATION_FILE) and touches CONVERSATION_ALIGNED_MARKER in place of .user_aligned. Either one
+# present puts the run on the conversation path, which never prints the report: the scheduler
+# cannot post to a gateway conversation.
+CONVERSATION_FILE = "onboarding_conversation.json"
+CONVERSATION_ALIGNED_MARKER = ".user_aligned_conversation"
+CONVERSATION_KEYS = ("platform", "conversation", "context_id")
+# This stage's record of the conversation path: the posts that released the claim, and why the
+# report is not out yet. Stderr from a run that exits 0 is dropped, so this is where that shows.
+CONVERSATION_ATTEMPTS_FILE = ".bootstrap_conversation_attempts.json"
+ATTEMPTS_COUNT = "attempts"
+ATTEMPTS_REASON = "last_reason"
+ATTEMPTS_AT = "last_at"
+# The waits before the second and each later post after one that posted nothing; past the last,
+# the report waits. Spread over hours, because the gateway's "not a live conversation" also covers
+# a session record it could not read in time.
+CONVERSATION_RETRY_WAITS_SECONDS = (5 * 60, 30 * 60, 2 * 60 * 60, 6 * 60 * 60)
+CONVERSATION_MAX_ATTEMPTS = len(CONVERSATION_RETRY_WAITS_SECONDS) + 1
+# The card's update key, so a post retried after one that may have landed edits it rather than
+# adding one. Text goes without a key: the gateway cuts a keyed text post to one message.
+CONVERSATION_REPORT_UPDATE = "onboarding-report"
+# How the gateway answers a post that failed after reaching the chat (a2a/gateway/notify.go); any
+# other answer it gives with no message id posted nothing.
+NOTIFY_POST_FAILED_PREFIX = "post failed:"
+# A conversation post's outcome.
+POSTED = "posted"
+NOT_POSTED = "not posted"
+MAYBE_POSTED = "maybe posted"
 
 # The delivery job's ``origin`` and the keys the plugin writes into it.
 ORIGIN_KEY = "origin"
@@ -228,10 +264,97 @@ def _data_dir() -> Path:
 def _awaiting_delivery(data_dir: Path) -> bool:
     """True when a human is present; main() has already returned on a delivered report.
 
-    The marker lives on this pod, so this costs one stat; it runs before the
+    The markers live on this pod, so this costs a stat or two; it runs before the
     report read, which may cross into the sandbox.
     """
-    return (data_dir / ".user_aligned").exists()
+    return (data_dir / ".user_aligned").exists() or (data_dir / CONVERSATION_ALIGNED_MARKER).exists()
+
+
+def _bound_conversation(data_dir: Path) -> dict | None:
+    """The conversation the plugin bound the report to, or None when the run is on the origin path.
+
+    A conversation file or marker that is there but unusable is a dict with empty values, which
+    ``_conversation_ready`` refuses: it must never fall back to printing the report.
+    """
+    path = data_dir / CONVERSATION_FILE
+    if not path.exists() and not (data_dir / CONVERSATION_ALIGNED_MARKER).exists():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        record = {}
+    if not isinstance(record, dict):
+        record = {}
+    return {key: str(record.get(key) or "").strip() for key in CONVERSATION_KEYS}
+
+
+def _read_attempts(data_dir: Path) -> dict:
+    try:
+        record = json.loads((data_dir / CONVERSATION_ATTEMPTS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def _attempt_count(record: dict) -> int:
+    count = record.get(ATTEMPTS_COUNT)
+    return count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 0
+
+
+def _record_attempt(data_dir: Path, reason: str, counted: bool) -> None:
+    """Record why the report is not out; ``counted`` adds one post that released the claim."""
+    sys.stderr.write(f"bootstrap_delivery: {reason}\n")
+    record = _read_attempts(data_dir)
+    count = _attempt_count(record) + (1 if counted else 0)
+    if not counted and record.get(ATTEMPTS_REASON) == reason:
+        return  # the same block as the last tick's: no write each minute
+    record.update({ATTEMPTS_COUNT: count, ATTEMPTS_REASON: reason, ATTEMPTS_AT: time.time()})
+    target = data_dir / CONVERSATION_ATTEMPTS_FILE
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(target)
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not record the attempt: {e}\n")
+
+
+def _conversation_ready(data_dir: Path, conversation: dict) -> bool:
+    """Whether this run may claim the report for the conversation path.
+
+    Checked before the claim, in this process, because the cron child's env is
+    scrubbed apart from the gateway's: a child that cannot run ``a2a notify``
+    claims nothing. Past ``CONVERSATION_MAX_ATTEMPTS`` posts that posted
+    nothing, and inside the wait after each, it is False too.
+    """
+    import chat_notify  # beside this script in the pod
+
+    platform = conversation["platform"]
+    if not all(conversation.values()):
+        reason = f"{CONVERSATION_FILE} is missing or incomplete; the report waits"
+    elif chat_notify.conversations_platform() != platform:
+        reason = (
+            f"the gateway does not serve {platform} conversations to this run "
+            f"({chat_notify.NOTIFY_CONVERSATIONS_ENV}={chat_notify.conversations_platform()!r}); the report waits"
+        )
+    else:
+        reason = chat_notify.bus_unreachable_reason()
+        if reason:
+            reason = f"a2a notify cannot reach the bus from this run: {reason}; the report waits"
+    if reason:
+        _record_attempt(data_dir, reason, counted=False)
+        return False
+    record = _read_attempts(data_dir)
+    count = _attempt_count(record)
+    if count >= CONVERSATION_MAX_ATTEMPTS:
+        return False
+    if count:
+        try:
+            last = float(record.get(ATTEMPTS_AT))
+        except (TypeError, ValueError):
+            last = 0.0
+        if time.time() - last < CONVERSATION_RETRY_WAITS_SECONDS[count - 1]:
+            return False
+    return True
 
 
 def _completed_at(data_dir: Path) -> float | None:
@@ -577,9 +700,9 @@ def _origin_platform() -> str | None:
     return _origin().get(PLATFORM_KEY)
 
 
-def _presented(content: str) -> str:
+def _presented(content: str, platform: str | None = None) -> str:
     """The report as delivered: reshaped when ``KAGE_SLACK_UX`` is on and the
-    job is bound to Slack, as written otherwise.
+    job is bound to Slack (or ``platform`` is), as written otherwise.
 
     Both helpers ship beside this script in ``/opt/defaults/scripts``. Any
     failure to load or reshape delivers the report as written, since this runs
@@ -588,7 +711,7 @@ def _presented(content: str) -> str:
     try:
         import slack_presenter
 
-        if not slack_presenter.enabled() or _origin_platform() != PRESENTED_PLATFORM:
+        if not slack_presenter.enabled() or (platform or _origin_platform()) != PRESENTED_PLATFORM:
             return content
         import inventory_presenter
 
@@ -612,7 +735,13 @@ def _skip_follows_this_sweep(data_dir: Path, state: dict) -> bool:
     return filed is not None and skipped_at >= filed[1]
 
 
-def _audits_note(data_dir: Path, no_coverage: bool) -> str:
+def _audits_note(data_dir: Path, no_coverage: bool, home: bool = True) -> str:
+    """The note on the first-run audits, saying where their summaries go only when ``home``."""
+    note = _audits_state_note(data_dir, no_coverage)
+    return note if home else note.replace(AUDITS_HOME_SENTENCE, AUDITS_NO_HOME_SENTENCE)
+
+
+def _audits_state_note(data_dir: Path, no_coverage: bool) -> str:
     """The note on the first-run audits the delivery closes with, from oobe's marker.
 
     Before the marker exists the stage has not decided, and the note is the chain's. ``no_coverage``
@@ -735,6 +864,123 @@ def _posted_through_gateway(content: str, channel: str, thread: str) -> bool:
     return True
 
 
+def _gateway_error(stdout: str) -> str:
+    """The gateway's error from ``a2a notify``'s answer when it posted nothing, else ""."""
+    for line in reversed((stdout or "").strip().splitlines()):
+        try:
+            answer = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(answer, dict) and answer.get("error") and not answer.get("message_id"):
+            return str(answer["error"])
+        return ""
+    return ""
+
+
+def _notify_conversation(conversation: dict, text: str, chat: dict | None = None, update: str = "") -> tuple[str, str]:
+    """Post ``text`` (or ``chat``, with ``text`` its fallback) into the conversation.
+
+    Returns ``POSTED``, ``NOT_POSTED`` (the gateway refused it, or its route was
+    not there through the retries) or ``MAYBE_POSTED`` (anything that may have
+    reached the chat), and a reason for the last two.
+    """
+    import chat_notify  # beside this script in the pod
+
+    path = ""
+    try:
+        if chat is not None:
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+                json.dump(chat, handle)
+                path = handle.name
+        argv = chat_notify.conversation_command(
+            conversation["platform"], conversation["conversation"], conversation["context_id"], text,
+            path, update, chat_notify.NOTIFY_WAIT_SECONDS,
+        )
+        for delay in (*chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS, None):
+            try:
+                res = subprocess.run(
+                    argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                    timeout=chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS, check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return MAYBE_POSTED, "a2a notify did not finish in time; the post may have landed"
+            except OSError as e:
+                return NOT_POSTED, f"could not run a2a notify: {e}"
+            if res.returncode == 0:
+                return POSTED, ""
+            if not chat_notify.route_unavailable(res.returncode):
+                break
+            if delay is None:
+                return NOT_POSTED, f"the gateway's notify route was not there: {(res.stderr or '').strip()}"
+            time.sleep(delay)
+    except OSError as e:
+        return NOT_POSTED, f"could not write the report card: {e}"
+    finally:
+        if path:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+    error = _gateway_error(res.stdout)
+    if error and not error.startswith(NOTIFY_POST_FAILED_PREFIX):
+        return NOT_POSTED, f"the gateway refused the report: {error}"
+    return MAYBE_POSTED, f"a2a notify exited {res.returncode}: {(res.stderr or '').strip() or error}"
+
+
+def _post_to_conversation(conversation: dict, content: str, note: str) -> tuple[str, str]:
+    """Post the report and the audits note: the card then the note, or one text message.
+
+    The card goes only when ``KAGE_SLACK_UX`` is on, the conversation is Slack's
+    and the report parses. A note that fails after the card posted is logged:
+    the report is out.
+    """
+    platform = conversation["platform"]
+    card = None
+    try:
+        import slack_presenter
+
+        if platform == PRESENTED_PLATFORM and slack_presenter.enabled():
+            import inventory_presenter
+
+            card = inventory_presenter.chat(content)
+    except Exception as e:
+        sys.stderr.write(f"bootstrap_delivery: posting the report as text: {e}\n")
+    if card is None:
+        return _notify_conversation(conversation, _with_note(_presented(content, platform), note))
+    chat, text = card
+    outcome, reason = _notify_conversation(conversation, text, chat, CONVERSATION_REPORT_UPDATE)
+    if outcome == POSTED:
+        note_outcome, note_reason = _notify_conversation(conversation, note)
+        if note_outcome != POSTED:
+            sys.stderr.write(f"bootstrap_delivery: the report posted but its audits note did not: {note_reason}\n")
+    return outcome, reason
+
+
+def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dict, content: str,
+                             no_ranking: bool | None, suppressed: set[str]) -> None:
+    """After the claim: post into the conversation, and release the claim only if nothing posted.
+
+    The findings are marked shown only once the report is out, so a released
+    claim leaves none counted against the day's limit.
+    """
+    import chat_notify  # beside this script in the pod
+
+    note = _audits_note(data_dir, no_ranking is True, home=bool(chat_notify.routed_platform()))
+    outcome, reason = _post_to_conversation(conversation, content, note)
+    if outcome == NOT_POSTED:
+        # Recorded first, so the released claim is retried only after the wait.
+        _record_attempt(data_dir, reason, counted=True)
+        try:
+            (data_dir / ".bootstrap_completed").unlink()
+        except OSError as e:
+            sys.stderr.write(f"bootstrap_delivery: could not release the claim: {e}\n")
+        return
+    shown = False
+    if outcome == POSTED:
+        shown = _mark_shown(data_dir, in_sandbox, suppressed)
+    else:
+        _record_attempt(data_dir, reason, counted=False)
+    _cleanup(data_dir, in_sandbox, shown)
+
+
 def main(data_dir: Path | None = None) -> int:
     if data_dir is None:
         data_dir = _data_dir()
@@ -747,6 +993,9 @@ def main(data_dir: Path | None = None) -> int:
 
     if not _awaiting_delivery(data_dir):
         return 0  # silent run — nobody to deliver to yet
+    conversation = _bound_conversation(data_dir)
+    if conversation is not None and not _conversation_ready(data_dir, conversation):
+        return 0
 
     try:
         in_sandbox = sandbox_exec.sandbox_enabled()
@@ -786,6 +1035,10 @@ def main(data_dir: Path | None = None) -> int:
     # written to stdout before it succeeds.
     if not _claim_delivery(data_dir):
         return 0  # another run is delivering this report — stay silent
+
+    if conversation is not None:
+        _deliver_to_conversation(data_dir, in_sandbox, conversation, content, no_ranking, suppressed)
+        return 0
 
     # Right after the claim, which ends the nudge's hold, so a nudge run has
     # the shortest window in which to announce these findings as new.

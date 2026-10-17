@@ -11,6 +11,8 @@ the greeting context it returns.
 
 import enum
 import json
+import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -29,6 +31,16 @@ EVAL_STACK_DIR = "bench/tf/prebuilt/first-install-hello/"
 # A report name the eval seam accepts with from_report.
 BENCH_REPORT = "INVENTORY.bench-done.md"
 REPO_SANDBOX_EXEC = Path(__file__).resolve().parents[4] / "platform" / "scripts" / "sandbox_exec.py"
+# The repository copy of the module the image ships at plugin.CHAT_NOTIFY_PATH.
+REPO_CHAT_NOTIFY = Path(__file__).resolve().parents[4] / "platform" / "scripts" / "chat_notify.py"
+# A session the hermes-bridge opened for a Slack thread, and the route it recorded for it.
+BRIDGE_SESSION = "a2a-ctx-21f41a7dc20859301d2307b8"
+SLACK_ROUTE = {
+    "platform": "slack",
+    "conversation": "slack:C0HOME/1792185148.859139",
+    "context_id": "ctx-21f41a7dc20859301d2307b8",
+    "ask": "question",
+}
 
 
 # Hermes' Platform also has non-durable members, so a turn past a regressed
@@ -684,6 +696,155 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertIn("SCAN IN PROGRESS", result["context"])
         self.assertEqual(self.update_job.call_count, len(plugin.DELIVERY_JOB_IDS))
         self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
+
+
+class ConversationPrimingTest(unittest.TestCase):
+    """Under spec.mode next: an API-server first turn the hermes-bridge relayed from a chat."""
+
+    # The same workspace and framework doubles, without running PreLlmCallTest's tests again.
+    tearDown = PreLlmCallTest.tearDown
+    _call = PreLlmCallTest._call
+    _arm_home_channel = PreLlmCallTest._arm_home_channel
+
+    def setUp(self):
+        PreLlmCallTest.setUp(self)
+        self.db = self.data_dir / "session_kv.db"
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("CREATE TABLE session_metadata (session_id TEXT PRIMARY KEY, metadata TEXT)")
+        self._route(BRIDGE_SESSION, SLACK_ROUTE)
+        env = mock.patch.dict(
+            "os.environ", {"SESSION_KV_DB_PATH": str(self.db), "A2A_NOTIFY_CONVERSATIONS": "slack"}
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        patcher = mock.patch.object(plugin, "CHAT_NOTIFY_PATH", REPO_CHAT_NOTIFY)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _route(self, session_id, route):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO session_metadata VALUES (?, ?)",
+                (session_id, json.dumps({"conversation_route": route})),
+            )
+
+    def _bridge_call(self, **overrides):
+        return self._call(**{"platform": "api_server", "session_id": BRIDGE_SESSION, **overrides})
+
+    def _assert_unprimed(self):
+        for name in (plugin.CONVERSATION_FILE, plugin.CONVERSATION_ALIGNED_MARKER, plugin.GREETED_MARKER,
+                     ".user_aligned", plugin.PRIMING_MARKER):
+            self.assertFalse((self.data_dir / name).exists(), name)
+        self.trigger_job.assert_not_called()
+
+    def test_a_bridged_slack_turn_records_the_conversation_and_greets(self):
+        persist, save_env_value = self._arm_home_channel()
+        result = self._bridge_call()
+        self.assertIn("SCAN IN PROGRESS", result["context"])
+        self.assertNotIn(plugin.HOME_CHANNEL_INSTRUCTION, result["context"])
+        record = json.loads((self.data_dir / plugin.CONVERSATION_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(
+            {k: record[k] for k in ("platform", "conversation", "context_id")},
+            {k: SLACK_ROUTE[k] for k in ("platform", "conversation", "context_id")},
+        )
+        self.assertIsInstance(record["bound_at"], float)
+        self.assertTrue((self.data_dir / plugin.CONVERSATION_ALIGNED_MARKER).exists())
+        self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
+        self.assertFalse((self.data_dir / plugin.PRIMING_MARKER).exists())
+        self.trigger_job.assert_called_once_with("oobe")
+        # The scheduler cannot post to a gateway conversation: no job is pointed anywhere, the
+        # origin path's marker stays absent, and no Hermes home channel is written.
+        self.update_job.assert_not_called()
+        self.assertFalse((self.data_dir / ".user_aligned").exists())
+        persist.assert_not_called()
+        save_env_value.assert_not_called()
+
+    def test_a_ready_report_gives_the_completed_greeting(self):
+        (self.data_dir / "INVENTORY.md").write_text("# report\n", encoding="utf-8")
+        self.assertIn("SCAN COMPLETED", self._bridge_call()["context"])
+
+    def test_a_google_chat_route_primes_when_the_gateway_serves_it(self):
+        self._route(BRIDGE_SESSION, {**SLACK_ROUTE, "platform": "google_chat",
+                                     "conversation": "gchat:spaces/S/threads/T"})
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": "google_chat"}):
+            self.assertIsNotNone(self._bridge_call())
+        record = json.loads((self.data_dir / plugin.CONVERSATION_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(record["conversation"], "gchat:spaces/S/threads/T")
+
+    def test_an_api_server_turn_with_no_route_is_ignored(self):
+        # The bench, curl, and the inject and A2A doors: no chat conversation behind the session.
+        self.assertIsNone(self._bridge_call(session_id="a2a-ctx-inject-only"))
+        self.assertIsNone(self._bridge_call(session_id="20260720_120000_abcd1234"))
+        self._assert_unprimed()
+
+    def test_a_route_with_no_context_is_ignored(self):
+        self._route(BRIDGE_SESSION, {**SLACK_ROUTE, "context_id": ""})
+        self.assertIsNone(self._bridge_call())
+        self._assert_unprimed()
+
+    def test_a_route_to_a_platform_without_durable_delivery_is_ignored(self):
+        self._route(BRIDGE_SESSION, {**SLACK_ROUTE, "platform": "discord", "conversation": "discord:g/c"})
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": "discord"}):
+            self.assertIsNone(self._bridge_call())
+        self._assert_unprimed()
+
+    def test_a_gateway_that_does_not_serve_the_platform_leaves_onboarding_unprimed(self):
+        for served in ("", "google_chat"):
+            with self.subTest(served=served), mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": served}):
+                self.assertIsNone(self._bridge_call())
+                self._assert_unprimed()
+
+    def test_an_unreadable_session_store_leaves_onboarding_unprimed(self):
+        self.db.write_text("not a database", encoding="utf-8")
+        self.assertIsNone(self._bridge_call())
+        self._assert_unprimed()
+
+    def test_a_live_priming_holds_off_a_second_first_turn(self):
+        (self.data_dir / plugin.PRIMING_MARKER).touch()
+        self.assertIsNone(self._bridge_call())
+        self.assertFalse((self.data_dir / plugin.CONVERSATION_FILE).exists())
+        self.assertTrue((self.data_dir / plugin.PRIMING_MARKER).exists())
+
+    def test_a_stale_priming_is_taken_over(self):
+        marker = self.data_dir / plugin.PRIMING_MARKER
+        marker.touch()
+        old = time.time() - plugin.PRIMING_STALE_SECONDS - 1
+        os.utime(marker, (old, old))
+        self.assertIsNotNone(self._bridge_call())
+        self.assertTrue((self.data_dir / plugin.CONVERSATION_FILE).exists())
+        self.assertFalse(marker.exists())
+
+    def test_the_next_first_turn_after_priming_is_ignored(self):
+        self._bridge_call()
+        self._route("a2a-ctx-second", {**SLACK_ROUTE, "conversation": "slack:D0DM/1.1", "context_id": "ctx-second"})
+        self.assertIsNone(self._bridge_call(session_id="a2a-ctx-second"))
+        record = json.loads((self.data_dir / plugin.CONVERSATION_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(record["conversation"], SLACK_ROUTE["conversation"])
+        self.trigger_job.assert_called_once()
+
+    def test_a_sweep_from_before_this_path_is_not_primed(self):
+        marker = self.data_dir / plugin.SCAN_FILED_MARKER
+        marker.write_text("task_id=t_1\nfiled_at=1\n", encoding="utf-8")
+        old = time.time() - plugin.SCAN_MAX_AGE_SECONDS - 1
+        os.utime(marker, (old, old))
+        self.assertIsNone(self._bridge_call())
+        self._assert_unprimed()
+
+    def test_a_recent_sweep_is_primed(self):
+        (self.data_dir / plugin.SCAN_FILED_MARKER).write_text("task_id=t_1\n", encoding="utf-8")
+        self.assertIsNotNone(self._bridge_call())
+
+    def test_a_failed_conversation_write_leaves_onboarding_unprimed(self):
+        (self.data_dir / plugin.CONVERSATION_FILE).mkdir()
+        self.assertIsNone(self._bridge_call())
+        for name in (plugin.CONVERSATION_ALIGNED_MARKER, plugin.GREETED_MARKER, plugin.PRIMING_MARKER):
+            self.assertFalse((self.data_dir / name).exists(), name)
+        self.trigger_job.assert_not_called()
+
+    def test_already_greeted_is_ignored(self):
+        (self.data_dir / plugin.GREETED_MARKER).touch()
+        self.assertIsNone(self._bridge_call())
+        self.assertFalse((self.data_dir / plugin.CONVERSATION_FILE).exists())
 
 
 if __name__ == "__main__":
