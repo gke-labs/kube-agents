@@ -123,8 +123,9 @@ stands in for the trajectory, and the token, latency and status signals still ap
 a bare YAML boolean, and devops-bench ignores it.
 
 `audit_streams` is for a case whose stack starts real audit runs without grading their
-ledger: a list of the Platform Agent job ids it starts
-(`audit_streams: [compliance-audit, stockout-prevention]`). The runner holds each one's stream
+ledger, or whose agent runs a stream's collector outside a ledger run and so shares that
+stream's scratch state (`upgrade-chat-request-runs-collector`): a list of the Platform Agent
+job ids (`audit_streams: [compliance-audit, stockout-prevention]`). The runner holds each one's stream
 lock for the whole unit, beside the stream a `ledger_issue_contains` check names
 (`hack/ci-eval-pr.sh`, `task_streams`, reading the key with the YAML parser the lint uses), and
 releases them when devops-bench returns. A run that outlasts the unit is covered by the next
