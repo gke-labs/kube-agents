@@ -56,11 +56,10 @@ const (
 	// thing enforcing the ceiling. A soft limit makes GC more aggressive as
 	// the heap approaches it; it does not cap live heap.
 	memoryLimitFraction = 0.5
-	// defaultGatewayWait covers the agent container's startup probe budget
-	// (agentAPIProbe(10, 90) in platformagent_manifests.go, 15 minutes) plus
-	// the time before that container starts: this sidecar starts first, and
-	// the agent image is pulled after it.
-	defaultGatewayWait = 20 * time.Minute
+	// defaultGatewayWait matches the agent container's startup probe budget
+	// (agentAPIProbe(10, 90) in platformagent_manifests.go): past it the
+	// kubelet gives up on that start of the gateway.
+	defaultGatewayWait = 15 * time.Minute
 )
 
 // flags holds the CLI-based configurations parsed once during startup.
@@ -860,16 +859,25 @@ func realMain(argv []string) error {
 		}
 	}()
 
+	clusters, err := buildWatchSet(ctx, f, m)
+	if err != nil {
+		return err
+	}
+
+	// After buildWatchSet, so a watch set that cannot be built still exits
+	// at once and counts as a failed start to the entrypoint's supervisor;
+	// before any dedup cache, so nothing is restored or snapshotted while
+	// the process may yet be a standby. cluster_up is published at 0 first,
+	// so the wait reads as "registered, not yet watching" rather than as no
+	// watcher at all.
 	if f.gatewayURL != "" && !f.dryRun {
+		for _, tc := range clusters {
+			m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
+		}
 		waitForGateway(ctx, f.gatewayURL, f.gatewayWait, gatewayProbeInterval)
 		if ctx.Err() != nil {
 			return nil
 		}
-	}
-
-	clusters, err := buildWatchSet(ctx, f, m)
-	if err != nil {
-		return err
 	}
 	if f.dryRun {
 		log.Printf("k8s-event-watcher: running in --dry-run mode; watching %d cluster(s) without calling the daemon", len(clusters))

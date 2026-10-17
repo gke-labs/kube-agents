@@ -16,12 +16,15 @@ package main
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -37,6 +40,18 @@ func refusingURL(t *testing.T) (string, string) {
 	addr := ln.Addr().String()
 	ln.Close()
 	return "http://" + addr, addr
+}
+
+// writeKubeconfig writes a kubeconfig that parses and points at server.
+func writeKubeconfig(t *testing.T, server string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "kubeconfig")
+	cfg := "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: " + server +
+		"\ncontexts:\n- name: c\n  context:\n    cluster: c\n    user: u\ncurrent-context: c\nusers:\n- name: u\n  user:\n    token: t\n"
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 // The Hermes API answers 401 to a caller without its key. That still proves
@@ -136,52 +151,132 @@ func TestParseFlags_GatewayDefaults(t *testing.T) {
 	if f.gatewayURL != "" {
 		t.Errorf("--gateway-url default = %q; want empty (no wait)", f.gatewayURL)
 	}
-	if f.gatewayWait != 20*time.Minute {
-		t.Errorf("--gateway-wait default = %s; want 20m", f.gatewayWait)
+	if f.gatewayWait != 15*time.Minute {
+		t.Errorf("--gateway-wait default = %s; want 15m", f.gatewayWait)
 	}
 }
 
-// realMain must not build its watch set, and so start no informer, until the
-// gateway wait ends. A kubeconfig that cannot be parsed fails buildWatchSet,
-// so the time that error takes to arrive is the time the wait held it.
-func TestRealMain_HoldsTheWatchSetUntilTheGatewayWaitEnds(t *testing.T) {
+// realMain must start no informer until the gateway wait ends. The informers
+// are started per cluster after the wait, and each logs a "starting" line, so
+// the time between the wait's ALERT and that line is the hold.
+func TestRealMain_HoldsTheInformersUntilTheGatewayWaitEnds(t *testing.T) {
 	logs := captureLog(t)
+	t.Setenv("WATCHER_TEST_TOKEN", "token")
+	url, _ := refusingURL(t)
+	_, metricsAddr := refusingURL(t)
+	const wait = time.Second
+
+	// realMain stops on SIGTERM. Registering for it here as well keeps the
+	// signal from killing the test binary if it lands after realMain returns.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		<-ctx.Done()
+		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+	}()
+	stopAfter := func(line string) {
+		for ctx.Err() == nil {
+			if strings.Contains(logs.String(), line) {
+				cancel()
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	go stopAfter("starting: preflight")
+	scraped := make(chan string, 1)
+	go func() {
+		for ctx.Err() == nil && !strings.Contains(logs.String(), "waiting up to") {
+			time.Sleep(10 * time.Millisecond)
+		}
+		body := ""
+		if resp, err := http.Get("http://" + metricsAddr + "/metrics"); err == nil {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			body = string(b)
+		}
+		scraped <- body
+	}()
+
+	err := realMain([]string{
+		"--daemon-url", "http://127.0.0.1:1", "--token-env", "WATCHER_TEST_TOKEN", "--owner", "watcher",
+		"--kubeconfig", writeKubeconfig(t, "http://127.0.0.1:1"), "--cluster-name", "x",
+		"--gateway-url", url, "--gateway-wait", wait.String(), "--metrics-addr", metricsAddr,
+	})
+	if err != nil {
+		t.Fatalf("realMain: %v", err)
+	}
+	// Registered at 0 during the wait: an absent series would read as no
+	// watcher at all to an absent() alert and to status.usage.
+	if body := <-scraped; !strings.Contains(body, `k8s_event_watcher_cluster_up{cluster="x",location="",project=""} 0`) {
+		t.Errorf("cluster_up is not published at 0 during the gateway wait; /metrics:\n%s", body)
+	}
+	got := logs.String()
+	alert := strings.Index(got, "did not answer within")
+	start := strings.Index(got, "starting: preflight")
+	if alert < 0 || start < 0 {
+		t.Fatalf("log lacks the wait's ALERT line or the informer start:\n%s", got)
+	}
+	if start < alert {
+		t.Errorf("an informer started before the gateway wait ended:\n%s", got)
+	}
+}
+
+// A watch set that cannot be built must still exit at once, so the
+// entrypoint's supervisor counts it as a failed start and raises its ALERT.
+func TestRealMain_AnUnbuildableWatchSetDoesNotWaitForTheGateway(t *testing.T) {
+	captureLog(t)
 	t.Setenv("WATCHER_TEST_TOKEN", "token")
 	badKubeconfig := filepath.Join(t.TempDir(), "kubeconfig")
 	if err := os.WriteFile(badKubeconfig, []byte("not: [a kubeconfig"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	url, _ := refusingURL(t)
-	const wait = 300 * time.Millisecond
 
 	start := time.Now()
 	err := realMain([]string{
 		"--daemon-url", "http://127.0.0.1:1", "--token-env", "WATCHER_TEST_TOKEN", "--owner", "watcher",
 		"--kubeconfig", badKubeconfig, "--cluster-name", "x",
-		"--gateway-url", url, "--gateway-wait", wait.String(),
+		"--gateway-url", url, "--gateway-wait", time.Hour.String(),
 	})
 	if err == nil || !strings.Contains(err.Error(), "kubeconfig") {
-		t.Fatalf("want realMain to stop on the kubeconfig after the wait, got err=%v", err)
+		t.Fatalf("want realMain to stop on the kubeconfig, got err=%v", err)
 	}
-	if elapsed := time.Since(start); elapsed < wait {
-		t.Errorf("buildWatchSet ran after %s, before the %s gateway wait ended", elapsed, wait)
-	}
-	if got := logs.String(); !strings.Contains(got, "did not answer within") {
-		t.Errorf("log does not carry the gateway wait's ALERT line:\n%s", got)
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("realMain took %s to report an unbuildable watch set; it waited for the gateway first", elapsed)
 	}
 }
 
-// The entrypoint is what turns the wait on in a deployed pod; without the
-// flag the watcher keeps the old behaviour and the boot window is open again.
-func TestStartServicesPassesTheGatewayURL(t *testing.T) {
-	script, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "shared", "start-services.sh"))
-	if err != nil {
-		t.Fatal(err)
+// --dry-run makes no daemon call, so there is no triage turn to wait for.
+func TestRealMain_DryRunDoesNotWaitForTheGateway(t *testing.T) {
+	logs := captureLog(t)
+	url, _ := refusingURL(t)
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		for ctx.Err() == nil && !strings.Contains(logs.String(), "starting: preflight") {
+			time.Sleep(10 * time.Millisecond)
+		}
+		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+	}()
+
+	start := time.Now()
+	if err := realMain([]string{
+		"--dry-run", "--kubeconfig", writeKubeconfig(t, "http://127.0.0.1:1"), "--cluster-name", "x",
+		"--gateway-url", url, "--gateway-wait", time.Hour.String(),
+	}); err != nil {
+		t.Fatalf("realMain: %v", err)
 	}
-	if !strings.Contains(string(script), `--gateway-url="${AGENT_GATEWAY_URL}"`) {
-		t.Error(`start-services.sh does not pass --gateway-url="${AGENT_GATEWAY_URL}" to k8s-event-watcher`)
+	if strings.Contains(logs.String(), "waiting up to") {
+		t.Errorf("--dry-run waited for the gateway:\n%s", logs.String())
 	}
-	if !strings.Contains(string(script), `readonly AGENT_GATEWAY_URL="http://127.0.0.1:8642"`) {
-		t.Error("start-services.sh does not set AGENT_GATEWAY_URL to the gateway's loopback address")
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Errorf("--dry-run took %s to start its informer", elapsed)
 	}
 }

@@ -68,9 +68,9 @@ func waitForGateway(ctx context.Context, gatewayURL string, limit, interval time
 			return true
 		}
 		if time.Now().After(deadline) {
-			// A leader-election standby runs no gateway, so it always lands
-			// here; the line says so rather than leaving it to read as a fault.
-			log.Printf("k8s-event-watcher: ALERT the agent gateway at %s did not answer within %s; watching events anyway, and triage for events offered before it answers will not start (expected on a leader-election standby, which runs no gateway)", gatewayURL, limit)
+			// This sidecar cannot tell a leader-election standby, which runs
+			// no gateway, from a gateway that failed, so the line names both.
+			log.Printf("k8s-event-watcher: ALERT the agent gateway at %s did not answer within %s; watching events anyway, and triage for events offered before it answers will not start. On a leader-election standby, which runs no gateway, this line is printed on every start; otherwise the agent container did not start", gatewayURL, limit)
 			return false
 		}
 		if time.Since(lastLog) >= gatewayWaitLogEvery {
