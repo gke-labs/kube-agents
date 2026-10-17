@@ -150,8 +150,9 @@ var SensitiveEnvVars = map[string]struct{}{
 	// posts going to a platform that is not there.
 	"A2A_NOTIFY_PLATFORM": {},
 	// A2A_NOTIFY_CONVERSATIONS arms the kanban notifier's report back to the
-	// gateway conversation a card was filed in, on the same route. The
-	// operator renders it exactly when the gateway arms the route.
+	// gateway conversation a card was filed in, on the same route, and names
+	// the platform in the cron relay's refusal when no home channel is set.
+	// The operator renders it exactly when the gateway arms the route.
 	"A2A_NOTIFY_CONVERSATIONS": {},
 	"NATS_URL":                 {},
 	"NATS_USER":                {},

@@ -58,6 +58,7 @@ except Exception:  # pragma: no cover
     _stub.MCPServer = _MCPServer
     sys.modules["mcp.server"] = _stub
 
+import chat_notify
 import session_kv_server
 from session_kv_server import clean_workload_name, clean_reason_label, clean_event_message, get_severity_details
 
@@ -3245,6 +3246,132 @@ class TestRelayReachesEveryEnabledPlatform(unittest.TestCase):
         os.environ.pop("SLACK_HOME_CHANNEL")
         _, sender = self._post(self._threads())
         self.assertEqual([call.args[0] for call in sender.call_args_list], ["google_chat"])
+
+
+class TestRelayWithNoChatRoute(unittest.TestCase):
+    """An install with no chat route sends nothing and says why (#3385).
+
+    The case that found it: `spec.mode: next`, the gateway holding Slack, no
+    home channel. The managed scope turns both Hermes platforms off and
+    `A2A_NOTIFY_PLATFORM` is absent, so the platform walk resolves nothing and
+    the fallback used to post the report to Google Chat.
+    """
+
+    SLACK_REFUSAL = (
+        "composed but not delivered to slack "
+        "(no home channel: set spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)"
+    )
+    BOTH_OFF = "platforms:\n  google_chat:\n    enabled: false\n  slack:\n    enabled: false\n"
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(os.environ.pop, "SESSION_KV_API_KEY", None)
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in PLATFORM_SIGNAL_KEYS + (
+            chat_notify.NOTIFY_PLATFORM_ENV, chat_notify.NOTIFY_CONVERSATIONS_ENV,
+        ):
+            os.environ.pop(key, None)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.managed = os.path.join(tmp.name, "config.yaml")
+        with open(self.managed, "w") as handle:
+            handle.write(self.BOTH_OFF)
+        for attribute, path in (
+            ("MANAGED_CONFIG_PATH", self.managed),
+            ("CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"),
+        ):
+            patcher = patch.object(session_kv_server, attribute, path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+
+    def _post(self):
+        """POST a report with every outbound step recorded rather than run."""
+        outbound = {
+            name: patch.object(session_kv_server, name, return_value=None)
+            for name in (
+                "_send_to_chat",
+                "_post_audit_blocks",
+                "_post_failed_audit_via_gateway",
+                "_slack_audit_headline",
+                "_failed_audit_line",
+            )
+        }
+        mocks = {name: patcher.start() for name, patcher in outbound.items()}
+        try:
+            response = self.client.post(
+                "/v1/cron-reports",
+                json={"job_id": "fleet-wide-cost-analysis", "profile": "platform", "report": "finding"},
+            )
+        finally:
+            for patcher in outbound.values():
+                patcher.stop()
+        return response, mocks
+
+    def test_slack_with_no_home_channel_sends_nothing_and_names_the_field(self):
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "slack"
+        response, mocks = self._post()
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["detail"], f"chat relay failed: {self.SLACK_REFUSAL}")
+        for name, mock in mocks.items():
+            mock.assert_not_called()
+
+    def test_google_chat_with_no_home_channel_names_its_own_field(self):
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "google_chat"
+        response, mocks = self._post()
+        self.assertEqual(response.status_code, 502)
+        self.assertIn(
+            "composed but not delivered to google_chat (no home channel: set "
+            "spec.integration.googleChat.homeChannel / GOOGLE_CHAT_HOME_CHANNEL)",
+            response.json()["detail"],
+        )
+        mocks["_send_to_chat"].assert_not_called()
+
+    def test_no_gateway_backend_gets_the_neutral_refusal(self):
+        """No chat at all and a malformed home channel both leave the variable
+        unset, and the text must be true for either, so it names no platform."""
+        response, mocks = self._post()
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.json()["detail"], f"chat relay failed: {session_kv_server.NO_CHAT_ROUTE_ERROR}")
+        mocks["_send_to_chat"].assert_not_called()
+
+    def test_a_backend_with_no_known_setting_gets_the_neutral_refusal(self):
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "discord"
+        response, _ = self._post()
+        self.assertEqual(
+            response.json()["detail"], f"chat relay failed: {session_kv_server.NO_CHAT_ROUTE_ERROR}")
+
+    def test_the_ledger_reads_the_platform_from_the_refusal(self):
+        """`chat_delivery_watch` names the missed platform in its issue from this
+        wording; any other shows a dash."""
+        import chat_delivery_watch
+
+        self.assertEqual(chat_delivery_watch.platforms_from(self.SLACK_REFUSAL), ["slack"])
+        self.assertEqual(chat_delivery_watch.platforms_from(session_kv_server.NO_CHAT_ROUTE_ERROR), [])
+
+    def test_a_routed_platform_is_not_refused(self):
+        """The control: with a home channel the operator renders
+        `A2A_NOTIFY_PLATFORM`, the walk resolves Slack, and the relay sends."""
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "slack"
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "slack"
+        _, mocks = self._post()
+        self.assertEqual(
+            [call.args[0] for call in mocks["_send_to_chat"].call_args_list], ["slack"])
+
+    def test_an_install_no_source_describes_keeps_the_fallback(self):
+        """No file says anything, so nothing is explicitly off: the relay still
+        tries DEFAULT_CHAT_PLATFORM, as it did before the guard."""
+        os.remove(self.managed)
+        _, mocks = self._post()
+        self.assertEqual(
+            [call.args[0] for call in mocks["_send_to_chat"].call_args_list],
+            [session_kv_server.DEFAULT_CHAT_PLATFORM],
+        )
 
 
 class TestTheFanOutSkipsWhatTheSchedulerAlreadySent(unittest.TestCase):

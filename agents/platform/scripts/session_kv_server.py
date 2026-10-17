@@ -1117,6 +1117,17 @@ _CHAT_ENV_SIGNALS: Dict[str, tuple[str, ...]] = {
 # worse off than it was and no send is addressed to the empty string.
 DEFAULT_CHAT_PLATFORM = "google_chat"
 
+# Where each platform's home channel is set, named in the relay's refusal when
+# the gateway holds that platform's backend with no home channel: the CR field,
+# then the install.env key the installer turns into it.
+HOME_CHANNEL_SETTINGS: Dict[str, str] = {
+    "google_chat": "spec.integration.googleChat.homeChannel / GOOGLE_CHAT_HOME_CHANNEL",
+    "slack": "spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL",
+}
+# The refusal when no platform can be named: no chat at all, a malformed home
+# channel the gateway refuses, or a backend this file has no route for.
+NO_CHAT_ROUTE_ERROR = "no Google Chat or Slack route to post to; check the chat integration and homeChannel"
+
 
 def _mapping(value: object) -> dict:
     """`value` if it is a mapping, else an empty one.
@@ -1320,6 +1331,23 @@ def _chat_platforms_disabled() -> bool:
     """
     resolved, explicit = _resolve_chat_platforms()
     return not resolved and bool(explicit) and not any(explicit.values())
+
+
+def _no_chat_route_error() -> str:
+    """Why a report was not sent on an install with no chat route.
+
+    It reaches `last_delivery_error` through the relay adapter and the 502, and
+    from there the dashboard, `hermes cron list`, the cronjob tool's reply in
+    chat and the `chat_delivery_watch` ledger issue. The gateway names its
+    backend whether or not a home channel is set, so with one named the cause is
+    the missing home channel; without one this cannot tell no chat from a
+    misconfigured one, so it guesses at neither.
+    """
+    platform = chat_notify.gateway_platform()
+    setting = HOME_CHANNEL_SETTINGS.get(platform)
+    if setting:
+        return f"composed but not delivered to {platform} (no home channel: set {setting})"
+    return NO_CHAT_ROUTE_ERROR
 
 
 def get_active_platform(platforms: Optional[list[str]] = None) -> str:
@@ -3239,6 +3267,13 @@ def relay_cron_report(
     `also_delivered_to` are not in it: the scheduler is posting there itself, so
     they are skipped rather than missed.
 
+    An install with no chat route gets no send at all, where the fallback to
+    DEFAULT_CHAT_PLATFORM would post to a platform it may not have (#3385): a
+    `next` install whose gateway holds Slack with no home channel. The error
+    names the platform and the setting that arms it, in the wording
+    `chat_delivery_watch` reads the platform from; see
+    :func:`_no_chat_route_error`.
+
     No agent turn runs over the report. One did, to have the Chat Agent present
     it, and the turn replaced reports with replies about them ("noted.", a line
     about a kanban card it had filed) that were then posted and recorded as
@@ -3246,6 +3281,11 @@ def relay_cron_report(
     in its thread: that comes from the incident row stored below, which
     `incident_context` replays, not from a session the turn left behind.
     """
+    if _chat_platforms_disabled():
+        error = _no_chat_route_error()
+        logger.error(f"Relay for {profile}/{job_id}: report not sent: {error}")
+        return error, []
+
     posts_deadline = time.monotonic() + CRON_RELAY_POSTS_BUDGET_S
     blocks_deadline = posts_deadline - AUDIT_TEXT_SEND_RESERVE_S
     # Floored at the full set, so a wrong sibling list cannot silence the report:
