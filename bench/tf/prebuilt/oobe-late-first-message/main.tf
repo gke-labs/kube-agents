@@ -59,6 +59,8 @@ locals {
   late_b64   = base64encode(file("${path.module}/late.py"))
   report_b64 = base64encode(file("${path.module}/report.txt"))
   report     = "INVENTORY.md"
+  # oobe-first-run-audits/arm.py prints this when the image ships no oobe job.
+  no_job = "ships no oobe job"
   # Every INVENTORY.* file on the sandbox is set aside here for the run: a report a real onboarding
   # left waiting would be delivered in place of the stand-in, the delivered report would be
   # overwritten, and the items and scores a sweep left would be registered again in the findings
@@ -191,7 +193,12 @@ resource "null_resource" "oobe_late" {
       arming=1
       sandbox '${local.set_aside}' sh "${local.home}" "${local.inventory_aside}" "${local.sandbox_marker}"
       late clear
-      printf '%s' '${local.arm_b64}' | base64 -d | agent_py "${local.home}" "${local.hermes}" "$(date -u +%Y%m%d%H%M%S)"
+      armed="$(printf '%s' '${local.arm_b64}' | base64 -d | agent_py "${local.home}" "${local.hermes}" "$(date -u +%Y%m%d%H%M%S)")"
+      printf '%s\n' "$armed"
+      if [[ "$armed" == *"${local.no_job}"* ]]; then
+        echo "ERROR: this image ships no oobe job, so nothing starts the first-run audits." >&2
+        exit 1
+      fi
 
       # ---- 4. Wait for every audit to end ----------------------------------
       elapsed=0

@@ -1891,6 +1891,16 @@ class FirstRunAuditsTest(unittest.TestCase):
                            oobe.STATE_DONE: True})
         self.assertIn("`compliance-audit` (findings: https://github.com/o/r/issues/12)", note)
 
+    def test_a_mark_that_is_not_a_number_reads_as_no_mark(self):
+        now = time.time()
+        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
+        for mark in ("1790000000", None, [1]):
+            with self.subTest(mark=mark):
+                note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": mark},
+                                   oobe.STATE_DONE: True})
+                self.assertIn("which have run: `compliance-audit`.", note)
+                self.assertIn("were not posted to the chat: `compliance-audit`", note)
+
     def test_a_link_outside_the_managed_repositories_is_not_the_ledger(self):
         now = time.time()
         self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)

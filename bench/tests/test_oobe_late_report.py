@@ -294,7 +294,7 @@ platforms:
       chat_id: spaces/AAA
       name: DM
 """
-ENV = "GEMINI_API_KEY=x\nGOOGLE_CHAT_HOME_CHANNEL=spaces/AAA\nGOOGLE_CHAT_HOME_CHANNEL_THREAD_ID=\n"
+ENV = "GEMINI_API_KEY=x\nGOOGLE_CHAT_HOME_CHANNEL=spaces/AAA\nGOOGLE_CHAT_HOME_CHANNEL_THREAD_ID=\nexport SLACK_HOME_CHANNEL=C1\n"
 
 
 # A stand-in for Hermes' cron.jobs: the store is a JSON file beside the stub.

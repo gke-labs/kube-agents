@@ -69,6 +69,8 @@ SKIPPED = "skipped"
 # (bootstrap_onboarding plugin: HOME_CHANNEL_ENV_FORMAT and HOME_THREAD_ENV_SUFFIX).
 HOME_CHANNEL_VARS = ("GOOGLE_CHAT_HOME_CHANNEL", "SLACK_HOME_CHANNEL")
 THREAD_SUFFIX = "_THREAD_ID"
+# deploy/shared/terminal_env_pin.py: EXPORT_PREFIX, the form agent.secret_scope.load_env_file accepts.
+EXPORT_PREFIX = "export "
 HOME_CHANNEL_KEY = "home_channel"
 OOBE_JOB = "oobe"
 LOCAL_DELIVERY = "local"
@@ -129,9 +131,15 @@ def without_home_channel(text):
     return yaml.safe_dump(cfg, sort_keys=False) if changed else text
 
 
+def env_key(line):
+    """The name a dotenv line assigns, with the optional `export ` prefix a loader accepts removed."""
+    key = line.split("=", 1)[0].strip()
+    return key[len(EXPORT_PREFIX):].strip() if key.startswith(EXPORT_PREFIX) else key
+
+
 def without_home_vars(text):
     names = {v for base in HOME_CHANNEL_VARS for v in (base, base + THREAD_SUFFIX)}
-    kept = [line for line in text.splitlines(keepends=True) if line.split("=", 1)[0].strip() not in names]
+    kept = [line for line in text.splitlines(keepends=True) if env_key(line) not in names]
     return "".join(kept)
 
 

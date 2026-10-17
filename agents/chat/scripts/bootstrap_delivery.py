@@ -673,7 +673,10 @@ def _audits_note(data_dir: Path, no_coverage: bool) -> str:
     not_run += [f"`{a}` ({AUDITS_GAVE_UP_REASON})" for a in oobe.FIRST_RUN_AUDITS if a in gave_up]
     runs = _completed_runs(data_dir, fired)
     marks = state.get(oobe.STATE_MARKS) if isinstance(state.get(oobe.STATE_MARKS), dict) else {}
-    finished = [a for a in fired if any(claimed >= marks.get(a, 0) for claimed, _, _ in runs.get(a, ()))]
+    # A mark that is not a number reads as no mark: this runs after the claim, and a raise here
+    # would lose the report.
+    since = {a: m if isinstance(m, (int, float)) else 0 for a, m in marks.items()}
+    finished = [a for a in fired if any(claimed >= since.get(a, 0) for claimed, _, _ in runs.get(a, ()))]
     if not state.get(oobe.STATE_DONE):
         note = AUDITS_RUNNING_NOTE
     elif fired and finished == fired:
