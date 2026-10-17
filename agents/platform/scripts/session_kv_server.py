@@ -1119,7 +1119,7 @@ DEFAULT_CHAT_PLATFORM = "google_chat"
 
 # Where each platform's home channel is set, named in the relay's refusal when
 # the gateway holds that platform's backend with no home channel: the CR field,
-# then the variable an install without the operator exports.
+# then the install.env key the installer turns into it.
 HOME_CHANNEL_SETTINGS: Dict[str, str] = {
     "google_chat": "spec.integration.googleChat.homeChannel / GOOGLE_CHAT_HOME_CHANNEL",
     "slack": "spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL",

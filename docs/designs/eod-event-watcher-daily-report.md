@@ -56,7 +56,10 @@ chat relay partial: the report did not reach slack. Delivered — do not re-run 
 
 The home channel is set either by the
 CR — `spec.integration.googleChat.homeChannel`, which the operator renders into the pod as
-`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Every entry
+`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Under
+`spec.mode: next` `/sethome` does not reach the gateway, so the CR field is the only way, and with
+none the relay sends nothing: the error names the platform and the field, as in
+`composed but not delivered to slack (no home channel: set spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`. Every entry
 on the roster shipping `deliver: "chat"` takes this route; nothing about it is specific to
 `no_agent`. It matters here because the recap is the only place a filtered event is ever reported,
 so an install without a home channel loses those events entirely rather than seeing them late.
