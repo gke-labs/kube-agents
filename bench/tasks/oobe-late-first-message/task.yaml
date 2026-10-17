@@ -20,7 +20,8 @@
 #
 # Isolation class: writes to the install under test. It replaces config.yaml and .env without the
 # home channel for the run and puts both back byte for byte, with `.user_aligned`,
-# `.bootstrap_completed`, the oobe markers and the sandbox's own INVENTORY.* files, which it sets
+# `.bootstrap_completed`, the oobe markers, the `oobe` job and the two disabled onboarding
+# entries the delivery retires five minutes after its claim, and the sandbox's own INVENTORY.* files, which it sets
 # aside for the run (a waiting report, the delivered one, and a sweep's items and scores). A change
 # another writer makes to config.yaml or .env during the run is lost at the restore. It refuses an
 # install whose CR sets a homeChannel, and one whose oobe job is bound to a chat. While the home

@@ -214,6 +214,11 @@ def test_a_later_silent_run_does_not_stand_in_for_a_failed_one(install: Install)
     result = _verify()
     assert result.status == "fail"
     assert "does not name compliance-audit" in result.reason
+    # The failed run's link is read from its own document, not the later silent run's.
+    install.deliver(_note(oobe_late.FIRST_RUN_AUDITS), at=install.opened + timedelta(minutes=2))
+    result = _verify()
+    assert result.status == "pass", result.reason
+    assert "(4 with their ledger link)" in result.reason
 
 
 def test_an_audit_the_stage_did_not_start_is_not_graded(install: Install) -> None:
@@ -292,11 +297,29 @@ platforms:
 ENV = "GEMINI_API_KEY=x\nGOOGLE_CHAT_HOME_CHANNEL=spaces/AAA\nGOOGLE_CHAT_HOME_CHANNEL_THREAD_ID=\n"
 
 
+# A stand-in for Hermes' cron.jobs: the store is a JSON file beside the stub.
+CRON_STUB = """
+import contextlib, json, os
+STORE = os.path.join(os.path.dirname(__file__), "store.json")
+def load_jobs():
+    return json.load(open(STORE)) if os.path.exists(STORE) else []
+def save_jobs(jobs):
+    json.dump(jobs, open(STORE, "w"))
+@contextlib.contextmanager
+def _jobs_lock():
+    yield
+def compute_next_run(schedule):
+    return "next"
+"""
+
+
 def _late(home: Path, *args: str, jobs: list | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
     stub = home.parent / "stub"
     (stub / "cron").mkdir(parents=True, exist_ok=True)
     (stub / "cron" / "__init__.py").write_text("")
-    (stub / "cron" / "jobs.py").write_text(f"def load_jobs():\n    return {jobs or []!r}\n")
+    (stub / "cron" / "jobs.py").write_text(CRON_STUB)
+    if jobs is not None:
+        (stub / "cron" / "store.json").write_text(json.dumps(jobs))
     clean = {k: v for k, v in os.environ.items() if not k.endswith("_HOME_CHANNEL")}
     return subprocess.run(
         [sys.executable, "-", str(home), *args], input=LATE.read_text(), capture_output=True, text=True,
@@ -329,6 +352,24 @@ def test_clear_takes_the_home_channel_away_and_restore_puts_it_back_byte_for_byt
     assert (home / ".env").read_text() == ENV
     assert (home / ".bootstrap_completed").read_text() == "1760000000\n"
     assert not (home / ".bench-oobe-late.json").exists()
+
+
+def test_restore_puts_back_the_jobs_the_retire_step_removed(home: Path) -> None:
+    jobs = [
+        {"id": "oobe", "deliver": "local", "schedule": "* * * * *"},
+        {"id": "bootstrap-inventory-scan", "schedule": "* * * * *", "fire_claim": "x"},
+        {"id": "bootstrap-inventory-delivery", "schedule": "* * * * *"},
+        {"id": "profile-cron-tick", "schedule": "* * * * *"},
+    ]
+    assert _late(home, "clear", jobs=jobs).returncode == 0
+    store = home.parent / "stub" / "cron" / "store.json"
+    # The delivery's retire step removed oobe and the two disabled entries.
+    store.write_text(json.dumps([{"id": "profile-cron-tick", "schedule": "* * * * *"}]))
+    assert _late(home, "restore").returncode == 0
+    back = {j["id"]: j for j in json.loads(store.read_text())}
+    assert set(back) == {"profile-cron-tick", "oobe", "bootstrap-inventory-scan", "bootstrap-inventory-delivery"}
+    assert "fire_claim" not in back["bootstrap-inventory-scan"]
+    assert back["oobe"]["next_run_at"] == "next"
 
 
 def test_clear_refuses_a_home_channel_in_the_container_environment(home: Path) -> None:

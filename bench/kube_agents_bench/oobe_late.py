@@ -50,6 +50,7 @@ arm_state, late_state, marker, db, out_dir, oobe_dir, title, sentinel, audits = 
     sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9:])
 SQLITE_BUSY_TIMEOUT = 10
 SILENT = ("suppressed", None)
+OUTPUT_SLACK_SECONDS = 300
 HEADING = "## Response"
 LEDGER = re.compile(r"https://[^\s()<>\[\]]+/issues/\d+")
 LEDGER_WORD = "ledger"
@@ -58,12 +59,13 @@ out = {"applied_at": None, "opened_at": None, "fired": [], "runs": {}, "report":
 def ts(value):
     return datetime.fromisoformat(value).timestamp()
 
-def newest(directory, since):
+def newest(directory, since, until=None):
     try:
         docs = [os.path.join(directory, n) for n in os.listdir(directory) if n.endswith(".md")]
     except OSError:
         return []
-    return sorted((p for p in docs if os.path.getmtime(p) >= since), key=os.path.getmtime, reverse=True)
+    kept = (p for p in docs if os.path.getmtime(p) >= since and (until is None or os.path.getmtime(p) <= until))
+    return sorted(kept, key=os.path.getmtime, reverse=True)
 
 def response(path):
     with open(path, encoding="utf-8", errors="replace") as fh:
@@ -94,7 +96,9 @@ if out["applied_at"] and not out["error"] and os.path.exists(db):
                 if ts(claimed) >= armed and outcome not in SILENT:
                     last = {"claimed_at": claimed, "finished_at": finished, "delivery_outcome": outcome, "ledger": None}
             if last is not None:
-                docs = newest(os.path.join(out_dir, audit), ts(last["claimed_at"]))
+                # The run's own document, as bootstrap_delivery._ledger_url reads it.
+                end = ts(last["finished_at"] or last["claimed_at"]) + OUTPUT_SLACK_SECONDS
+                docs = newest(os.path.join(out_dir, audit), ts(last["claimed_at"]), end)
                 if docs:
                     text = response(docs[0])
                     named = [l for l in text.splitlines() if LEDGER_WORD in l.lower() and LEDGER.search(l)]

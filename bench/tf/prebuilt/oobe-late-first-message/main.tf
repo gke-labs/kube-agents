@@ -15,8 +15,8 @@
 # The scenario driver for bench/tasks/oobe-late-first-message: an install nobody has spoken to
 # runs its first-run audits, and the first chat message arrives only after they have ended.
 #
-# 1. The sandbox's own INVENTORY.* files are set aside (`set_aside`). late.py `clear` records, then
-#    takes away, the home channel (`config.yaml` and `.env`) and the
+# 1. The sandbox's own INVENTORY.* files are set aside (`set_aside`, script step 3). late.py `clear`
+#    records, then takes away, the home channel (`config.yaml` and `.env`) and the
 #    delivery markers (`.user_aligned`, `.bootstrap_completed`), so each audit's summary finds
 #    no home channel, as on a fresh install nobody has opened the chat on.
 # 2. oobe-first-run-audits/arm.py (shared, not copied) arms the `oobe` stage the way that case
@@ -32,9 +32,10 @@
 # The `oobe` job delivers to `local` here (late.py refuses one bound to a chat), so the report goes
 # to the default profile's cron/output/oobe/ only, where the verifier reads it.
 #
-# The teardown, and the exit trap on a failed apply, put everything back: the `oobe` stage through
-# oobe-first-run-audits/disarm.py, the home channel and the markers byte for byte through late.py
-# `restore`, and the sandbox's own INVENTORY.* files from where step 3 set them aside. The
+# The teardown, and the exit trap on a failed apply, put everything back: the home channel, the
+# markers and the cron jobs the delivery retires through late.py `restore` (first, so no tick can
+# retire a job again), the `oobe` stage through oobe-first-run-audits/disarm.py, and the sandbox's
+# own INVENTORY.* files from where the arm (`set_aside`) put them. The
 # audits are left to finish, as in oobe-first-run-audits.
 
 terraform {
@@ -164,9 +165,11 @@ resource "null_resource" "oobe_late" {
       sandbox() {
         kubectl exec -i -n "${var.agent_namespace}" "$sandbox_pod" -c "${var.sandbox_container}" -- sh -c "$@"
       }
+      # late restore first: once its claim marker is gone, no oobe tick can retire the job the
+      # disarm puts back.
       teardown() {
-        printf '%s' '${local.disarm_b64}' | base64 -d | agent_py "${local.home}" "${local.hermes}"
         late restore
+        printf '%s' '${local.disarm_b64}' | base64 -d | agent_py "${local.home}" "${local.hermes}"
         sandbox '${local.put_back}' sh "${local.home}" "${local.inventory_aside}" "${local.sandbox_marker}"
       }
 
@@ -243,10 +246,10 @@ resource "null_resource" "oobe_late" {
         kubectl exec -i -n "${self.triggers.namespace}" "deployment/${self.triggers.deployment}" \
           -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- ${self.triggers.python} - "$@"
       }
-      printf '%s' '${self.triggers.disarm_b64}' | base64 -d | agent_py "${self.triggers.home}" "${self.triggers.hermes}" \
-        || echo "WARNING: could not disarm the oobe stage; the next run of this case does it first." >&2
       printf '%s' '${self.triggers.late_b64}' | base64 -d | agent_py "${self.triggers.home}" restore \
         || echo "WARNING: could not restore the home channel; the next run of this case does it first." >&2
+      printf '%s' '${self.triggers.disarm_b64}' | base64 -d | agent_py "${self.triggers.home}" "${self.triggers.hermes}" \
+        || echo "WARNING: could not disarm the oobe stage; the next run of this case does it first." >&2
       for pod in $(kubectl get pods -n "${self.triggers.namespace}" -l "${self.triggers.sandbox_selector}" -o name); do
         kubectl exec -i -n "${self.triggers.namespace}" "$pod" -c "${self.triggers.sandbox_container}" -- \
           sh -c '${self.triggers.put_back}' sh "${self.triggers.home}" "${self.triggers.inventory_aside}" "${self.triggers.sandbox_marker}" \

@@ -241,7 +241,7 @@ DELIVERY_FAILED = "failed"
 CRON_OUTPUT_DIR = "output"
 CRON_OUTPUT_SUFFIX = ".md"
 RESPONSE_HEADING = "## Response"
-# A document is the run's when it was saved no earlier than this before the run's finish time.
+# A document is the run's when it was saved between the run's claim and this long after its finish.
 OUTPUT_SLACK_SECONDS = 300
 # The ledger issue a fleet audit links in its summary (fleet-audit skill, `finish`). The summary is
 # the model's prose and can cite other issues, so a link on a line that names the ledger wins.

@@ -28,7 +28,9 @@ Usage: python3 - <home> <command> < late.py
   ``pending``.
 - ``open``: touch ``.user_aligned``, as the onboarding plugin does on a person's first message,
   and record when.
-- ``restore``: put back what ``clear`` recorded, byte for byte.
+- ``restore``: put back what ``clear`` recorded, byte for byte, and any of ``RETIRED_JOBS`` it
+  recorded that the delivery's retire step has since removed. Run it before the stage's disarm:
+  with the claim marker gone no tick can retire a job again.
 
 The state file is written before anything changes, so ``restore`` undoes a ``clear`` that
 stopped part-way.
@@ -70,6 +72,11 @@ THREAD_SUFFIX = "_THREAD_ID"
 HOME_CHANNEL_KEY = "home_channel"
 OOBE_JOB = "oobe"
 LOCAL_DELIVERY = "local"
+# The jobs the delivery's retire step removes five minutes after the claim this case lets land
+# (bootstrap_delivery._retire_jobs): `oobe` and the two disabled entries it takes with it.
+RETIRED_JOBS = (OOBE_JOB, "bootstrap-inventory-scan", "bootstrap-inventory-delivery")
+# Scheduler bookkeeping a put-back record must not carry over.
+RUN_STATE_KEYS = ("fire_claim", "pending_slot")
 SQLITE_BUSY_TIMEOUT = 10
 
 
@@ -136,7 +143,8 @@ def clear():
         sys.exit(f"the container environment sets {', '.join(named)} (the CR's homeChannel); this case needs an install without one")
     from cron.jobs import load_jobs
 
-    job = next((j for j in load_jobs() if j.get("id") == OOBE_JOB), None)
+    jobs = load_jobs()
+    job = next((j for j in jobs if j.get("id") == OOBE_JOB), None)
     if job is not None and job.get("deliver", LOCAL_DELIVERY) != LOCAL_DELIVERY:
         sys.exit(f"the {OOBE_JOB} job delivers to {job.get('deliver')!r}; the report this case plants would be posted there")
     state = {
@@ -146,6 +154,7 @@ def clear():
         "aligned": read(ALIGNED),
         "completed": read(COMPLETED),
         "opened_at": None,
+        "jobs": [j for j in jobs if j.get("id") in RETIRED_JOBS],
     }
     save_state(state)
     if state["config"] is not None:
@@ -221,6 +230,21 @@ def restore():
     put_back(ENV_FILE, state.get("env"))
     put_back(ALIGNED, state.get("aligned"))
     put_back(COMPLETED, state.get("completed"))
+    saved = state.get("jobs") or []
+    if saved:
+        from cron.jobs import _jobs_lock, compute_next_run, load_jobs, save_jobs
+
+        with _jobs_lock():
+            jobs = load_jobs()
+            have = {j.get("id") for j in jobs}
+            back = []
+            for job in saved:
+                if job.get("id") not in have:
+                    job = {k: v for k, v in job.items() if k not in RUN_STATE_KEYS}
+                    job["next_run_at"] = compute_next_run(job["schedule"])
+                    back.append(job)
+            if back:
+                save_jobs(jobs + back)
     os.remove(STATE)
     print("restored the home channel and the delivery markers")
 
