@@ -71,14 +71,14 @@ verification_spec:
         # The path the skill names, so a copy found some other way does not count.
         - '/opt/data/scripts/audit_cluster\.sh[''"]?\s+[''"]?seeded-a\b'
       forbidden_patterns:
-        - '\b(?:find|locate)\b[^\n]*audit_cluster'
+        - '\b(?:find|locate|which)\b[^\n]*audit_cluster'
       forbidden_result_patterns:
-        - 'audit_cluster\.sh: (?:[Nn]o such file or directory|(?:command )?not found|[Pp]ermission denied)'
+        - 'audit_cluster\.sh[''"]?: (?:[Nn]o such file or directory|(?:command )?not found|[Pp]ermission denied)'
   - name: report-carries-the-script-results
     role: objective
     mode: assert
     check:
       type: report_contains
       required_phrases: ["Workload Identity", "Shielded Nodes"]
-      # Bounded: a substring would also take "password", "failed" or "warning".
-      any_of_patterns: ['(?i)\b(?:pass|fail|warn)\b']
+      # Word-bounded so "password" does not count; the result words do.
+      any_of_patterns: ['(?i)\b(?:pass(?:ed)?|fail(?:ed)?|warn(?:ing)?)\b']
