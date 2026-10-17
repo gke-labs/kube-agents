@@ -56,10 +56,11 @@ const (
 	// thing enforcing the ceiling. A soft limit makes GC more aggressive as
 	// the heap approaches it; it does not cap live heap.
 	memoryLimitFraction = 0.5
-	// defaultGatewayWait matches the agent container's startup probe budget
-	// (agentAPIProbe(10, 90) in platformagent_manifests.go): past it the
-	// kubelet restarts that container, and the start being waited on is gone.
-	defaultGatewayWait = 15 * time.Minute
+	// defaultGatewayWait covers the agent container's startup probe budget
+	// (agentAPIProbe(10, 90) in platformagent_manifests.go, 15 minutes) plus
+	// the time before that container starts: this sidecar starts first, and
+	// the agent image is pulled after it.
+	defaultGatewayWait = 20 * time.Minute
 )
 
 // flags holds the CLI-based configurations parsed once during startup.

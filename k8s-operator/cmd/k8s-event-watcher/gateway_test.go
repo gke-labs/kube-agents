@@ -19,6 +19,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -134,7 +136,52 @@ func TestParseFlags_GatewayDefaults(t *testing.T) {
 	if f.gatewayURL != "" {
 		t.Errorf("--gateway-url default = %q; want empty (no wait)", f.gatewayURL)
 	}
-	if f.gatewayWait != 15*time.Minute {
-		t.Errorf("--gateway-wait default = %s; want 15m", f.gatewayWait)
+	if f.gatewayWait != 20*time.Minute {
+		t.Errorf("--gateway-wait default = %s; want 20m", f.gatewayWait)
+	}
+}
+
+// realMain must not build its watch set, and so start no informer, until the
+// gateway wait ends. A kubeconfig that cannot be parsed fails buildWatchSet,
+// so the time that error takes to arrive is the time the wait held it.
+func TestRealMain_HoldsTheWatchSetUntilTheGatewayWaitEnds(t *testing.T) {
+	logs := captureLog(t)
+	t.Setenv("WATCHER_TEST_TOKEN", "token")
+	badKubeconfig := filepath.Join(t.TempDir(), "kubeconfig")
+	if err := os.WriteFile(badKubeconfig, []byte("not: [a kubeconfig"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	url, _ := refusingURL(t)
+	const wait = 300 * time.Millisecond
+
+	start := time.Now()
+	err := realMain([]string{
+		"--daemon-url", "http://127.0.0.1:1", "--token-env", "WATCHER_TEST_TOKEN", "--owner", "watcher",
+		"--kubeconfig", badKubeconfig, "--cluster-name", "x",
+		"--gateway-url", url, "--gateway-wait", wait.String(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "kubeconfig") {
+		t.Fatalf("want realMain to stop on the kubeconfig after the wait, got err=%v", err)
+	}
+	if elapsed := time.Since(start); elapsed < wait {
+		t.Errorf("buildWatchSet ran after %s, before the %s gateway wait ended", elapsed, wait)
+	}
+	if got := logs.String(); !strings.Contains(got, "did not answer within") {
+		t.Errorf("log does not carry the gateway wait's ALERT line:\n%s", got)
+	}
+}
+
+// The entrypoint is what turns the wait on in a deployed pod; without the
+// flag the watcher keeps the old behaviour and the boot window is open again.
+func TestStartServicesPassesTheGatewayURL(t *testing.T) {
+	script, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "shared", "start-services.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(script), `--gateway-url="${AGENT_GATEWAY_URL}"`) {
+		t.Error(`start-services.sh does not pass --gateway-url="${AGENT_GATEWAY_URL}" to k8s-event-watcher`)
+	}
+	if !strings.Contains(string(script), `readonly AGENT_GATEWAY_URL="http://127.0.0.1:8642"`) {
+		t.Error("start-services.sh does not set AGENT_GATEWAY_URL to the gateway's loopback address")
 	}
 }
