@@ -490,6 +490,14 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          skill trees are not staged in this image (see
 #                          deploy/sandbox/entrypoint.sh: everything agents/cluster
 #                          names is under /opt/data/scripts)
+#   audit_storage.py       single-pass storage collector (PVCs, PVs, StorageClasses,
+#                          VolumeAttachments) for Cluster Agent domain audits (#3285)
+#   audit_networking.py    single-pass ingress, Gateway API, and LoadBalancer collector
+#                          for Cluster Agent domain audits (#3285)
+#   audit_certificates.py  single-pass cert-manager CRD, Certificate, Issuer, and native
+#                          kubernetes.io/tls secret collector (#3285)
+#   audit_network_policies.py  single-pass NetworkPolicy and namespace isolation
+#                          collector for Cluster Agent domain audits (#3285)
 #   inventory_findings.py  the onboarding ranking card's bridge from
 #                          INVENTORY.raw.md to the findings queue
 #                          (governance/inventory_prioritize_sop.md). `extract`
@@ -531,6 +539,10 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/gke_endpoint.py \
      agents/platform/scripts/cluster_preflight.sh \
      agents/platform/scripts/stall_report.py \
+     agents/platform/scripts/audit_storage.py \
+     agents/platform/scripts/audit_networking.py \
+     agents/platform/scripts/audit_certificates.py \
+     agents/platform/scripts/audit_network_policies.py \
      agents/platform/scripts/inventory_findings.py \
      agents/platform/scripts/findings_queue.py \
      /opt/defaults/scripts/
