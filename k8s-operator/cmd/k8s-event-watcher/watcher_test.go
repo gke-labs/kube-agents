@@ -29,8 +29,10 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1546,5 +1548,142 @@ func TestObserveWatch_ForwardsInOrderAndReleasesOnStop(t *testing.T) {
 	}
 	if !fw.IsStopped() {
 		t.Error("Stop did not stop the upstream watch")
+	}
+}
+
+func TestResolveControllerRef(t *testing.T) {
+	isController := true
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "billing-6c8b7f5d4",
+			Namespace: "prod",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       "billing",
+				Controller: &isController,
+			}},
+		},
+	}
+	deployPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "billing-6c8b7f5d4-x9m2q",
+			Namespace: "prod",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       "billing-6c8b7f5d4",
+				Controller: &isController,
+			}},
+		},
+	}
+	jobPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "billing-zwv24",
+			Namespace: "prod",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "batch/v1",
+				Kind:       "Job",
+				Name:       "billing",
+				Controller: &isController,
+			}},
+		},
+	}
+	standalonePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "billing-zwv24",
+			Namespace: "default",
+		},
+	}
+	mirrorPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kube-proxy-gke-prod-pool-1a2b3c4d-xyz1",
+			Namespace: "kube-system",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1",
+				Kind:       "Node",
+				Name:       "gke-prod-pool-1a2b3c4d-xyz1",
+				Controller: &isController,
+			}},
+		},
+	}
+	missingRSPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "billing-7f9d8c6b5-bbbbb",
+			Namespace: "prod",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       "billing-7f9d8c6b5",
+				Controller: &isController,
+			}},
+		},
+	}
+	cronJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "nightly-backup-28473920",
+			Namespace: "prod",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "batch/v1",
+				Kind:       "CronJob",
+				Name:       "nightly-backup",
+				Controller: &isController,
+			}},
+		},
+	}
+	cronJobPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "nightly-backup-28473920-x7k2m",
+			Namespace: "prod",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "batch/v1",
+				Kind:       "Job",
+				Name:       "nightly-backup-28473920",
+				Controller: &isController,
+			}},
+		},
+	}
+	rolloutPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "payments-rollout-6c8b7f5d4-x9m2q",
+			Namespace: "prod",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "argoproj.io/v1alpha1",
+				Kind:       "Rollout",
+				Name:       "payments-rollout",
+				Controller: &isController,
+			}},
+		},
+	}
+
+	client := fake.NewClientset(rs, deployPod, jobPod, standalonePod, mirrorPod, missingRSPod, cronJob, cronJobPod, rolloutPod)
+	ctx := context.Background()
+
+	if got := resolveControllerRef(ctx, client, "prod", "Pod", "billing-6c8b7f5d4-x9m2q"); got != "Deployment/billing" {
+		t.Errorf("Deployment-owned pod ControllerRef = %q; want %q", got, "Deployment/billing")
+	}
+	if got := resolveControllerRef(ctx, client, "prod", "Pod", "billing-zwv24"); got != "Job/billing" {
+		t.Errorf("Job-owned pod ControllerRef = %q; want %q", got, "Job/billing")
+	}
+	if got := resolveControllerRef(ctx, client, "prod", "Pod", "nightly-backup-28473920-x7k2m"); got != "CronJob/nightly-backup" {
+		t.Errorf("CronJob-owned pod ControllerRef = %q; want %q", got, "CronJob/nightly-backup")
+	}
+	if got := resolveControllerRef(ctx, client, "prod", "Pod", "payments-rollout-6c8b7f5d4-x9m2q"); got != "Rollout/payments-rollout" {
+		t.Errorf("custom-controller pod ControllerRef = %q; want %q", got, "Rollout/payments-rollout")
+	}
+	if got := resolveControllerRef(ctx, client, "default", "Pod", "billing-zwv24"); got != "Pod/billing-zwv24" {
+		t.Errorf("standalone pod ControllerRef = %q; want %q", got, "Pod/billing-zwv24")
+	}
+	if got := resolveControllerRef(ctx, client, "kube-system", "Pod", "kube-proxy-gke-prod-pool-1a2b3c4d-xyz1"); got != "Pod/kube-proxy-gke-prod-pool-1a2b3c4d-xyz1" {
+		t.Errorf("mirror pod ControllerRef = %q; want %q", got, "Pod/kube-proxy-gke-prod-pool-1a2b3c4d-xyz1")
+	}
+	if got := resolveControllerRef(ctx, client, "prod", "Pod", "billing-7f9d8c6b5-bbbbb"); got != "" {
+		t.Errorf("missing-RS pod ControllerRef = %q; want empty string", got)
+	}
+	if got := resolveControllerRef(ctx, client, "prod", "Pod", "already-deleted-pod"); got != "" {
+		t.Errorf("missing pod ControllerRef = %q; want empty string", got)
+	}
+	if got := resolveControllerRef(ctx, client, "prod", "Node", "node-1"); got != "" {
+		t.Errorf("non-Pod ControllerRef = %q; want empty string", got)
 	}
 }

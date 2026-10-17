@@ -18,6 +18,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -192,13 +195,17 @@ type watcher struct {
 
 // newWatcher constructs a watcher. There is no resync period: a resync
 // re-fires every object a store holds, and this watcher holds none.
-func newWatcher(client kubernetes.Interface, dispatcher eventDispatcher, cluster targetCluster) *watcher {
-	return &watcher{
+func newWatcher(client kubernetes.Interface, disp eventDispatcher, cluster targetCluster) *watcher {
+	w := &watcher{
 		client:        client,
-		dispatcher:    dispatcher,
+		dispatcher:    disp,
 		cluster:       cluster,
 		forbiddenHold: forbiddenRetryInterval,
 	}
+	if d, ok := disp.(*dispatcher); ok && d.resolveControllerRef == nil && controllerRefResolutionEnabled() {
+		d.resolveControllerRef = w.resolveControllerRef
+	}
+	return w
 }
 
 // Run asks whether this identity may list and watch Events on the cluster,
@@ -828,11 +835,10 @@ func toTriageEvent(ev *corev1.Event, cluster targetCluster) TriageEvent {
 	// InvolvedObject.UID is what we key dedup on.
 	uid := string(ev.InvolvedObject.UID)
 
-	// ControllerRef: for a Pod, the parent ReplicaSet /
-	// Deployment / StatefulSet is on OwnerReferences. Populating
-	// this requires an additional Pod GET which we don't have
-	// in-hand here. Left empty; the recipe includes RBAC for
-	// pod GET so the agent can enrich via MCP if needed.
+	// ControllerRef is left empty during the raw Event conversion so the
+	// reflector does not issue a Pod GET for every Normal or deduplicated
+	// sighting on the cluster; the dispatcher resolves it via
+	// resolveControllerRef once an event passes filtering and deduplication.
 	controllerRef := ""
 
 	return TriageEvent{
@@ -909,4 +915,109 @@ func labelsFromMeta(m metav1.ObjectMeta) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+const controllerRefLookupTimeout = 2 * time.Second
+
+// controllerRefResolutionEnabled reports whether the session daemon will use
+// Context.ControllerRef (workload dedup window > 0 or incident triage PR opt-in
+// enabled). On default installs where both are off, skipping the live Pod/RS
+// GETs avoids extra kube-apiserver lookups on the event delivery goroutine.
+func controllerRefResolutionEnabled() bool {
+	if raw := strings.TrimSpace(os.Getenv("INCIDENT_WORKLOAD_DEDUP_SECONDS")); raw != "" {
+		if sec, err := strconv.Atoi(raw); err == nil && sec > 0 {
+			return true
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("INCIDENT_TRIAGE_OPEN_PULL_REQUEST"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// isWorkloadOwnerKind reports whether kind is a built-in Kubernetes workload
+// controller kind.
+func isWorkloadOwnerKind(kind string) bool {
+	switch kind {
+	case "Deployment", "ReplicaSet", "StatefulSet", "DaemonSet", "Job", "CronJob":
+		return true
+	default:
+		return false
+	}
+}
+
+func controllerOwnerReference(refs []metav1.OwnerReference, childName string) (metav1.OwnerReference, bool) {
+	for _, ref := range refs {
+		if ref.Controller != nil && *ref.Controller && ref.Kind != "" && ref.Name != "" && ref.Kind != "Node" {
+			if isWorkloadOwnerKind(ref.Kind) || childName == "" || childName == ref.Name || strings.HasPrefix(childName, ref.Name+"-") {
+				return ref, true
+			}
+			return metav1.OwnerReference{}, false
+		}
+	}
+	for _, ref := range refs {
+		if ref.Kind != "" && ref.Name != "" && isWorkloadOwnerKind(ref.Kind) {
+			if childName == "" || childName == ref.Name || strings.HasPrefix(childName, ref.Name+"-") {
+				return ref, true
+			}
+		}
+	}
+	return metav1.OwnerReference{}, false
+}
+
+// resolveControllerRef looks up the live Pod for a Pod event and returns its
+// top-level workload owner in "Kind/Name" form (walking ReplicaSet ->
+// Deployment or Job -> CronJob one hop so sibling pods across a rollout or
+// schedule share one workload identity). A standalone Pod with no workload
+// OwnerReferences (or a kubelet mirror pod owned by a Node) returns
+// "Pod/<name>" so the daemon does not guess an owner by stripping suffixes
+// from the pod name. Any lookup failure returns "" (logging non-NotFound
+// errors) so the daemon falls back to its name heuristic.
+func resolveControllerRef(ctx context.Context, client kubernetes.Interface, namespace, kind, name string) string {
+	if client == nil || !strings.EqualFold(kind, "Pod") || namespace == "" || name == "" {
+		return ""
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, controllerRefLookupTimeout)
+	defer cancel()
+
+	pod, err := client.CoreV1().Pods(namespace).Get(lookupCtx, name, metav1.GetOptions{})
+	if err != nil || pod == nil {
+		if err != nil && !apierrors.IsNotFound(err) {
+			log.Printf("WARN: controller_ref Pod lookup failed for %s/%s (falling back to pod name heuristic): %v", namespace, name, err)
+		}
+		return ""
+	}
+	owner, ok := controllerOwnerReference(pod.OwnerReferences, pod.Name)
+	if !ok {
+		return "Pod/" + pod.Name
+	}
+	if owner.Kind == "ReplicaSet" {
+		rs, err := client.AppsV1().ReplicaSets(namespace).Get(lookupCtx, owner.Name, metav1.GetOptions{})
+		if err != nil || rs == nil {
+			if err != nil && !apierrors.IsNotFound(err) {
+				log.Printf("WARN: controller_ref ReplicaSet lookup failed for %s/%s (falling back to pod name heuristic): %v", namespace, owner.Name, err)
+			}
+			return ""
+		}
+		if parent, ok := controllerOwnerReference(rs.OwnerReferences, rs.Name); ok {
+			return parent.Kind + "/" + parent.Name
+		}
+	}
+	if owner.Kind == "Job" {
+		job, err := client.BatchV1().Jobs(namespace).Get(lookupCtx, owner.Name, metav1.GetOptions{})
+		if err == nil && job != nil {
+			if parent, ok := controllerOwnerReference(job.OwnerReferences, job.Name); ok {
+				return parent.Kind + "/" + parent.Name
+			}
+		}
+	}
+	return owner.Kind + "/" + owner.Name
+}
+
+func (w *watcher) resolveControllerRef(ctx context.Context, namespace, kind, name string) string {
+	if w == nil {
+		return ""
+	}
+	return resolveControllerRef(ctx, w.client, namespace, kind, name)
 }

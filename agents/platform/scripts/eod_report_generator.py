@@ -237,6 +237,7 @@ def load_intercepted_events(
                 # checked, and the recap keeps working against a ledger written
                 # by an older session server mid-rollout.
                 delivery_col = "delivery_error" if "delivery_error" in columns else "''"
+                duplicate_col = "duplicate_of" if "duplicate_of" in columns else "0"
                 # `intercepted_events` has had a second writer since the drift
                 # detector landed: session_kv_server.py records every
                 # out-of-band-change inject in it too, under
@@ -256,7 +257,7 @@ def load_intercepted_events(
                 # reads these rows next.
                 cursor.execute(
                     "SELECT cluster, namespace, workload, object_uid, object_kind, reason, message, "
-                    f"severity, occurrences, notified, created_at, {delivery_col} "
+                    f"severity, occurrences, notified, created_at, {delivery_col}, {duplicate_col} "
                     "FROM intercepted_events "
                     "WHERE created_at >= datetime('now', ?) "
                     "AND reason NOT IN (?, ?) "
@@ -294,6 +295,7 @@ def load_intercepted_events(
                 "notified": 2 if r[9] == 2 else bool(r[9]),
                 "created_at": r[10],
                 "delivery_error": r[11] or "",
+                "duplicate_of": int(r[12] or 0),
             }
             for r in rows
         ]
@@ -401,6 +403,20 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     for event in events:
         ns = event.get("namespace", "")
         reason = event.get("reason", "Unknown")
+        cluster = event.get("cluster", "") or ""
+        if cluster:
+            clusters_seen.add(cluster)
+
+        # Folded into an earlier live incident for the same workload (inside
+        # `INCIDENT_WORKLOAD_DEDUP_SECONDS` or while the workload's pull request
+        # is in review), or an aborted row (`duplicate_of = -1`) that was never
+        # delivered (`notified = 0` and no `delivery_error`). Skipping these
+        # here keeps them out of `cap_dropped`, `total_occurrences`, and
+        # `workload_map` (where a `notified = 0` key would otherwise split
+        # one multi-replica incident into two `unique_incidents` groups).
+        dup = int(event.get("duplicate_of") or 0)
+        if dup > 0 or (dup < 0 and not event.get("notified") and not (event.get("delivery_error") or "").strip()):
+            continue
 
         # A flag, not a `continue`. `EOD_EXCLUDE_NAMESPACES` is a noise filter on the
         # breakdown and the headline counts; the `cap_dropped` and `delivery_failed`
@@ -418,8 +434,9 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             total_occurrences += count
 
-        # `notified = 0` covers three unrelated outcomes and they must not be
-        # reported as one: the severity gate held the event back as
+        # Once folded (`duplicate_of > 0`) and unnotified aborted (`duplicate_of < 0`)
+        # rows are skipped above, `notified = 0` covers three unrelated outcomes and
+        # they must not be reported as one: the severity gate held the event back as
         # informational, the daily ceiling dropped an alert that was going to
         # be posted, or chat itself refused the post. Conflating the second
         # with the first is how a day of cap-dropped OOMKills comes out as
@@ -448,8 +465,10 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # agree today; they are written apart so they keep agreeing if a
         # future writer batches sightings into one row.
         cap_row = False
-        event_delivery_failed = bool(event.get("delivery_error"))
         notified_val = event.get("notified")
+        event_delivery_failed = bool(event.get("delivery_error")) or (
+            dup < 0 and bool(notified_val)
+        )
         if event_delivery_failed:
             delivery_failed += 1
         elif notified_val == 2 and not isinstance(notified_val, bool):
@@ -473,9 +492,6 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # name ending in five alphanumerics, merging `api-store` and `api-cache`
         # into one `api` line the SRE cannot resolve back to a service.
         workload = event.get("workload", "") or "unknown-workload"
-        cluster = event.get("cluster", "") or ""
-        if cluster:
-            clusters_seen.add(cluster)
         # Cluster, severity and outcome are all in the key, and each for the
         # same reason: a group is listed or dropped as a unit, and its `count`
         # is printed as a fact about every row in it, so anything the listing
