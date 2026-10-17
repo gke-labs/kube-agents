@@ -2796,6 +2796,9 @@ unit_cost_hint() {
     # A plain chat request that runs the compliance collector's sweep (#2386):
     # the audit band, without the ledger write.
     security-chat-request-runs-collector) echo 900 ;;
+    # A plain chat request that now runs the waste collector's sweep (#2386):
+    # the waste audit's band, without the ledger write.
+    cost-chat-request-runs-collector) echo 900 ;;
     # Presubmit again since 2026-09-29, held out (#2013 step 2); nightly-only
     # 2026-09-22 to then (#1023; held out on #1171, closed 2026-09-08, the
     # bar now on #2013 step 3). The canary measured 1002s median, 2074s p90,

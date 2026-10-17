@@ -94,6 +94,54 @@ readonly SCOPE_MAX_PROJECTS_MIN=1
 readonly SCOPE_MAX_PROJECTS_MAX=5000
 readonly SCOPE_MAX_PROJECTS_DEFAULT=100
 
+# ─── OpenAI-compatible model server ───────────────────────────────────────────
+# The ports a base URL without one is dialled on, and the TCP port range.
+readonly HTTP_DEFAULT_PORT=80
+readonly HTTPS_DEFAULT_PORT=443
+readonly TCP_PORT_MIN=1
+readonly TCP_PORT_MAX=65535
+# The bounds the operator holds the gateway's model-server egress rule to: at
+# most this many CIDRs, none broader than these prefixes, none touching IPv4
+# link-local space or the metadata server's addresses. An entry it refuses
+# drops the whole rule, so the installer refuses it first.
+readonly OPENAI_COMPATIBLE_MAX_EGRESS_CIDRS=50
+readonly OPENAI_COMPATIBLE_MIN_IPV4_PREFIX=12
+readonly OPENAI_COMPATIBLE_MIN_IPV6_PREFIX=48
+readonly LINK_LOCAL_IPV4_NETWORK="169.254.0.0"
+readonly LINK_LOCAL_IPV4_PREFIX=16
+readonly LINK_LOCAL_IPV6_NETWORK="fe80::"
+readonly LINK_LOCAL_IPV6_PREFIX=10
+# The IPv6 metadata server address, the one metadata address outside 169.254/16.
+readonly IPV6_METADATA_ADDRESS="fd20:ce::254"
+# The /48 holding it, which the chart refuses whole, and the IPv4-mapped block
+# (::ffff:0:0/96), which the operator reads as the IPv4 block it maps.
+readonly IPV6_METADATA_NETWORK="fd20:ce::"
+readonly IPV6_METADATA_PREFIX=48
+readonly IPV4_MAPPED_IPV6_NETWORK="::ffff:0:0"
+readonly IPV4_MAPPED_IPV6_PREFIX=96
+# Address widths, an IPv4 octet's width and largest value, and the longest name
+# Kubernetes takes for a Secret (a DNS subdomain).
+readonly IPV4_ADDRESS_BITS=32
+readonly IPV6_ADDRESS_BITS=128
+readonly IPV6_GROUP_COUNT=8
+readonly IPV6_GROUP_BITS=16
+readonly IPV4_OCTET_BITS=8
+readonly IPV4_OCTET_MAX=255
+readonly K8S_SECRET_NAME_MAX_LENGTH=253
+# A dotted-quad host, and one in the ranges the gateway's port-443 rule excepts
+# (RFC 1918, link-local, CGNAT), the chart's own patterns: such a host needs
+# CIDRs even on 443.
+readonly IPV4_LITERAL_PATTERN='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+readonly PRIVATE_IPV4_LITERAL_PATTERN='^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)'
+# An in-cluster Service with its namespace (captured), <svc>.<ns>.svc or
+# <svc>.<ns>.svc.cluster.local, and a two-label host, which is a hostname but
+# may be a Service written without .svc. The chart's own patterns.
+readonly SERVICE_HOST_PATTERN='^[^.]+\.([^.]+)\.svc(\.cluster\.local)?\.?$'
+# A host that ends like a Service name; one not matching the pattern above is
+# an in-cluster name with a part missing, refused as the chart refuses it.
+readonly SERVICE_SUFFIX_PATTERN='\.(svc|cluster\.local)\.?$'
+readonly TWO_LABEL_HOST_PATTERN='^[^.]*\.[^.]*$'
+
 # ─── Scoped service account pool ──────────────────────────────────────────────
 # SCOPED_SA_POOL_ENABLED arms the pool (the composition's scoped_pool_enabled,
 # spec.security.scopedServiceAccountPool.enabled on the CR); off by default,
@@ -391,12 +439,306 @@ default_model_for_provider() {
   case "${1:-}" in
     openai) echo "$DEFAULT_MODEL_OPENAI" ;;
     anthropic) echo "$DEFAULT_MODEL_ANTHROPIC" ;;
+    # No default: the model is whatever the server serves.
+    openai_compatible) echo "" ;;
     *) echo "$DEFAULT_MODEL_GEMINI" ;;
   esac
 }
 
 is_valid_model_provider() {
-  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai)$ ]]
+  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai|openai_compatible)$ ]]
+}
+
+# An OpenAI-compatible base URL → "<host> <port>", the host lowercased and an
+# IPv6 literal's brackets kept, the port the scheme's default when the URL names
+# none. Fails, as the chart's render does, for anything that is not http:// or
+# https:// with a host and a port in range, and for userinfo, a query or a
+# fragment before the path, which leave the host unreadable (and userinfo would
+# put a credential in the gateway's ConfigMap). $1 the URL.
+openai_compatible_url_host_port() {
+  local url="${1:-}" rest authority host after_host port
+  case "$url" in
+    http://*) rest="${url#http://}"; port="$HTTP_DEFAULT_PORT" ;;
+    https://*) rest="${url#https://}"; port="$HTTPS_DEFAULT_PORT" ;;
+    *) return 1 ;;
+  esac
+  authority="${rest%%/*}"
+  case "$authority" in *[?#@]*) return 1 ;; esac
+  if [[ "$authority" =~ ^(\[[0-9A-Fa-f:.]+\])(.*)$ ]] || [[ "$authority" =~ ^([A-Za-z0-9._-]+)(.*)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    after_host="${BASH_REMATCH[2]}"
+  else
+    return 1
+  fi
+  if [ -n "$after_host" ]; then
+    [[ "$after_host" =~ ^:([0-9]+)$ ]] || return 1
+    port="${BASH_REMATCH[1]}"
+    # The chart reads the port with atoi, so :0443 is 443 there; strip the
+    # leading zeros here so the two agree on the port and on what it needs.
+    port="${port#"${port%%[!0]*}"}"
+    port="${port:-0}"
+  fi
+  is_tcp_port "$port" || return 1
+  printf '%s %s\n' "$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')" "$port"
+}
+
+# A whole number in the TCP port range. $1 the value.
+is_tcp_port() {
+  [[ "${1:-}" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$1))" -ge "$TCP_PORT_MIN" ] && [ "$((10#$1))" -le "$TCP_PORT_MAX" ]
+}
+
+# The namespace of the in-cluster Service a base URL's host names, or nothing
+# when it names none. The chart's rule, so the two agree on which URLs need a
+# target port and which need CIDRs: <svc> is a Service in the release's own
+# namespace, <svc>.<ns>.svc and <svc>.<ns>.svc.cluster.local one in <ns>, and
+# any other shape (a two-label host such as openrouter.ai, an IP literal) is
+# not a Service. $1 the host.
+openai_compatible_service_namespace() {
+  local host="${1:-}"
+  [[ "$host" == \[* ]] && return 0
+  [[ "$host" =~ $IPV4_LITERAL_PATTERN ]] && return 0
+  if [[ "$host" != *.* ]]; then
+    printf '%s\n' "${NAMESPACE:-$DEFAULT_NAMESPACE}"
+  elif [[ "$host" =~ $SERVICE_HOST_PATTERN ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  fi
+}
+
+# Why the chart or the operator would refuse one egress CIDR for the gateway's
+# model-server rule, or nothing when neither would: not in CIDR form, broader
+# than the operator's floors, overlapping IPv4 or IPv6 link-local space, inside
+# the IPv6 metadata server's /48, or IPv4-mapped. The chart fails the render
+# after the cluster is built, and the operator drops the whole rule over one bad
+# entry, leaving the server unreachable with no error. $1 the entry.
+openai_compatible_cidr_refusal() {
+  local cidr="${1:-}" address prefix
+  address="${cidr%/*}"
+  prefix="${cidr##*/}"
+  if [ "$address" = "$cidr" ] || [[ ! "$prefix" =~ ^[0-9]{1,3}$ ]]; then
+    printf "'%s' is not in CIDR form (address/prefix)" "$cidr"
+    return 0
+  fi
+  prefix="$((10#$prefix))"
+  # No leading zeros in an octet: the operator's parser refuses them.
+  if [[ "$address" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$ ]]; then
+    local octet value=0 overlap_bits link_local_value=0
+    for octet in "${BASH_REMATCH[@]:1}"; do
+      if [ "$((10#$octet))" -gt "$IPV4_OCTET_MAX" ]; then
+        printf "'%s' is not an IPv4 CIDR" "$cidr"
+        return 0
+      fi
+      value=$(( (value << IPV4_OCTET_BITS) | 10#$octet ))
+    done
+    if [ "$prefix" -gt "$IPV4_ADDRESS_BITS" ]; then
+      printf "'%s' is not an IPv4 CIDR" "$cidr"
+      return 0
+    fi
+    if [ "$prefix" -lt "$OPENAI_COMPATIBLE_MIN_IPV4_PREFIX" ]; then
+      printf "'%s' is broader than /%s" "$cidr" "$OPENAI_COMPATIBLE_MIN_IPV4_PREFIX"
+      return 0
+    fi
+    for octet in ${LINK_LOCAL_IPV4_NETWORK//./ }; do
+      link_local_value=$(( (link_local_value << IPV4_OCTET_BITS) | octet ))
+    done
+    overlap_bits="$prefix"
+    [ "$overlap_bits" -le "$LINK_LOCAL_IPV4_PREFIX" ] || overlap_bits="$LINK_LOCAL_IPV4_PREFIX"
+    if [ "$(( value >> (IPV4_ADDRESS_BITS - overlap_bits) ))" -eq "$(( link_local_value >> (IPV4_ADDRESS_BITS - overlap_bits) ))" ]; then
+      printf "'%s' overlaps link-local %s/%s, where the metadata server answers" "$cidr" "$LINK_LOCAL_IPV4_NETWORK" "$LINK_LOCAL_IPV4_PREFIX"
+    fi
+    return 0
+  fi
+  if [[ "$address" == *:* ]]; then
+    local groups
+    if ! groups="$(ipv6_groups "$address")" || [ "$prefix" -gt "$IPV6_ADDRESS_BITS" ]; then
+      printf "'%s' is not an IPv6 CIDR" "$cidr"
+      return 0
+    fi
+    if [ "$prefix" -lt "$OPENAI_COMPATIBLE_MIN_IPV6_PREFIX" ]; then
+      printf "'%s' is broader than /%s" "$cidr" "$OPENAI_COMPATIBLE_MIN_IPV6_PREFIX"
+      return 0
+    fi
+    # Past the /48 floor, overlapping the metadata /48 means lying inside it.
+    # The IPv4-mapped test reads the address alone, as the chart does.
+    if ipv6_prefixes_overlap "$groups" "$prefix" "$(ipv6_groups "$LINK_LOCAL_IPV6_NETWORK")" "$LINK_LOCAL_IPV6_PREFIX"; then
+      printf "'%s' overlaps IPv6 link-local %s/%s" "$cidr" "$LINK_LOCAL_IPV6_NETWORK" "$LINK_LOCAL_IPV6_PREFIX"
+    elif ipv6_prefixes_overlap "$groups" "$prefix" "$(ipv6_groups "$IPV6_METADATA_NETWORK")" "$IPV6_METADATA_PREFIX"; then
+      printf "'%s' is inside %s/%s, which holds the IPv6 metadata server address %s" "$cidr" "$IPV6_METADATA_NETWORK" "$IPV6_METADATA_PREFIX" "$IPV6_METADATA_ADDRESS"
+    elif ipv6_prefixes_overlap "$groups" "$IPV4_MAPPED_IPV6_PREFIX" "$(ipv6_groups "$IPV4_MAPPED_IPV6_NETWORK")" "$IPV4_MAPPED_IPV6_PREFIX"; then
+      printf "'%s' is an IPv4-mapped IPv6 block, which the operator reads as the IPv4 block it maps; give that IPv4 CIDR instead" "$cidr"
+    fi
+    return 0
+  fi
+  printf "'%s' is not in CIDR form (address/prefix)" "$cidr"
+}
+
+# An IPv6 address → its eight groups as decimal numbers, space-separated, with
+# "::" expanded. Fails for anything else, an embedded IPv4 tail included.
+# $1 the address.
+ipv6_groups() {
+  local address="${1:-}" head tail group count=0 out="" missing
+  [[ "$address" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  case "$address" in *::*::*) return 1 ;; esac
+  # A colon at either end that is not part of "::" leaves an empty group, which
+  # the chart and Go's parser refuse; bash's split would drop a trailing one.
+  if [[ "$address" =~ ^:[^:] ]] || [[ "$address" =~ [^:]:$ ]]; then
+    return 1
+  fi
+  head="$address" tail=""
+  if [[ "$address" == *::* ]]; then
+    head="${address%%::*}"
+    tail="${address#*::}"
+  fi
+  local IFS=:
+  # shellcheck disable=SC2206  # the split on colons is the point
+  local head_groups=($head) tail_groups=($tail)
+  count=$(( ${#head_groups[@]} + ${#tail_groups[@]} ))
+  if [[ "$address" == *::* ]]; then
+    [ "$count" -lt "$IPV6_GROUP_COUNT" ] || return 1
+  else
+    [ "$count" -eq "$IPV6_GROUP_COUNT" ] || return 1
+  fi
+  for group in ${head_groups[@]+"${head_groups[@]}"}; do
+    [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    out+="$((16#$group)) "
+  done
+  for ((missing = IPV6_GROUP_COUNT - count; missing > 0; missing--)); do
+    out+="0 "
+  done
+  for group in ${tail_groups[@]+"${tail_groups[@]}"}; do
+    [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    out+="$((16#$group)) "
+  done
+  printf '%s\n' "${out% }"
+}
+
+# Whether two IPv6 prefixes overlap: they agree on the bits the shorter one
+# fixes. $1 and $3 the groups (ipv6_groups), $2 and $4 the prefix lengths.
+ipv6_prefixes_overlap() {
+  local -a left_groups right_groups
+  read -r -a left_groups <<< "$1"
+  read -r -a right_groups <<< "$3"
+  local bits="$2" index group_bits shift_by
+  [ "$4" -ge "$bits" ] || bits="$4"
+  for ((index = 0; index < IPV6_GROUP_COUNT && bits > 0; index++)); do
+    group_bits="$bits"
+    [ "$group_bits" -le "$IPV6_GROUP_BITS" ] || group_bits="$IPV6_GROUP_BITS"
+    shift_by=$((IPV6_GROUP_BITS - group_bits))
+    [ $(( left_groups[index] >> shift_by )) -eq $(( right_groups[index] >> shift_by )) ] || return 1
+    bits=$((bits - group_bits))
+  done
+  return 0
+}
+
+# openai_compatible needs values the chart refuses to render without, and an
+# egress shape the operator accepts, so check them before anything is built
+# rather than at helm_release, after the cluster and IAM. The chart's rules:
+# a model name and an http(s) base URL; an in-cluster Service needs the server
+# pod's port (NetworkPolicy matches after Service translation); any other host
+# needs the CIDRs it is reached at, unless it is a public endpoint on 443,
+# which the gateway's existing egress rule reaches. Each CIDR is held to the
+# operator's rules as well (openai_compatible_cidr_refusal). Quiet for any
+# other provider. $1 provider, $2 model, $3 base URL, $4 target port,
+# $5 egress CIDRs (comma- or space-separated), $6 CA bundle Secret name.
+validate_openai_compatible_inputs() {
+  local provider="${1:-}" model_name="${2:-}" api_base="${3:-}" target_port="${4:-}"
+  local egress_cidrs="${5:-}" ca_bundle_name="${6:-}"
+  [ "$provider" = "openai_compatible" ] || return 0
+  if [ -z "$model_name" ]; then
+    print_error "openai_compatible has no default model: set --model-default-name (MODEL_DEFAULT_NAME in install.env) to the model the server serves."
+    return 1
+  fi
+  if [ -z "$api_base" ]; then
+    print_error "openai_compatible needs the server's base URL including /v1: set --openai-compatible-api-base (OPENAI_COMPATIBLE_API_BASE in install.env)."
+    return 1
+  fi
+  local host_port host port
+  if ! host_port="$(openai_compatible_url_host_port "$api_base")"; then
+    # Not echoed: the userinfo this refuses may be the key itself.
+    print_error "OPENAI_COMPATIBLE_API_BASE is not an http:// or https:// URL with a host, an optional port from ${TCP_PORT_MIN} to ${TCP_PORT_MAX}, and no userinfo, query or fragment before the path (a key belongs in OPENAI_COMPATIBLE_API_KEY)."
+    return 1
+  fi
+  host="${host_port% *}"
+  port="${host_port##* }"
+
+  local cidr refusal cidr_count=0
+  while IFS= read -r cidr; do
+    [ -n "$cidr" ] || continue
+    cidr_count=$((cidr_count + 1))
+    refusal="$(openai_compatible_cidr_refusal "$cidr")"
+    if [ -n "$refusal" ]; then
+      print_error "OPENAI_COMPATIBLE_EGRESS_CIDRS: ${refusal}. The gateway's NetworkPolicy would drop the whole rule."
+      return 1
+    fi
+  done <<< "$(csv_list_items "$egress_cidrs")"
+  if [ "$cidr_count" -gt "$OPENAI_COMPATIBLE_MAX_EGRESS_CIDRS" ]; then
+    print_error "OPENAI_COMPATIBLE_EGRESS_CIDRS lists ${cidr_count} CIDRs; the gateway's NetworkPolicy takes at most ${OPENAI_COMPATIBLE_MAX_EGRESS_CIDRS}."
+    return 1
+  fi
+
+  # Checked whatever the host: only a Service reads it, but the generator
+  # writes it as a bare number either way.
+  if [ -n "$target_port" ] && ! is_tcp_port "$target_port"; then
+    print_error "OPENAI_COMPATIBLE_TARGET_PORT='${target_port}' is not a port from ${TCP_PORT_MIN} to ${TCP_PORT_MAX}."
+    return 1
+  fi
+
+  local service_namespace
+  service_namespace="$(openai_compatible_service_namespace "$host")"
+  if [ -z "$service_namespace" ] && [[ "$host" != \[* ]] && [[ "$host" =~ $SERVICE_SUFFIX_PATTERN ]]; then
+    print_error "OPENAI_COMPATIBLE_API_BASE='${api_base}' ends like an in-cluster Service name but is not <svc>.<ns>.svc or <svc>.<ns>.svc.cluster.local, so the gateway could not be given an egress rule for it. Write the Service with both its name and its namespace."
+    return 1
+  fi
+  if [ -n "$service_namespace" ]; then
+    if [[ ! "$service_namespace" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]]; then
+      print_error "OPENAI_COMPATIBLE_API_BASE='${api_base}' names a Service in namespace '${service_namespace}', which is not a valid namespace name."
+      return 1
+    fi
+    if [ -z "$target_port" ]; then
+      print_error "OPENAI_COMPATIBLE_API_BASE='${api_base}' names an in-cluster Service: set --openai-compatible-target-port (OPENAI_COMPATIBLE_TARGET_PORT in install.env) to the server pod's port. The gateway's NetworkPolicy matches the pod's port, not the Service's."
+      return 1
+    fi
+  elif [ "$cidr_count" -eq 0 ]; then
+    # <a>.<b> is a hostname here, but it is also the short form of an
+    # in-cluster Service, so a mistaken Service gets the hint -- not when <b>
+    # is already "svc": that host is missing its namespace.
+    local service_hint=""
+    if [[ "$host" =~ $TWO_LABEL_HOST_PATTERN ]] && [[ "${host#*.}" != "svc" ]]; then
+      service_hint=" If this is an in-cluster Service, write it as <svc>.<ns>.svc (${host}.svc)."
+    fi
+    # Any host that is not a Service ignores the port, so a set one means a
+    # Service was meant (the chart refuses the same).
+    if [ -n "$target_port" ]; then
+      print_error "OPENAI_COMPATIBLE_API_BASE='${api_base}' is a hostname, not an in-cluster Service, so OPENAI_COMPATIBLE_TARGET_PORT is not used and no egress rule would reach the server.${service_hint}"
+      return 1
+    fi
+    if [[ "$host" == \[* ]] || [[ "$host" =~ $PRIVATE_IPV4_LITERAL_PATTERN ]]; then
+      print_error "OPENAI_COMPATIBLE_API_BASE='${api_base}' names a private or IPv6 address, which the gateway's port-${HTTPS_DEFAULT_PORT} rule does not reach: set --openai-compatible-egress-cidrs (OPENAI_COMPATIBLE_EGRESS_CIDRS in install.env) to the ranges the server is reached at."
+      return 1
+    fi
+    if [ "$port" != "$HTTPS_DEFAULT_PORT" ]; then
+      print_error "OPENAI_COMPATIBLE_API_BASE='${api_base}' is not an in-cluster Service and is reached on port ${port}: set --openai-compatible-egress-cidrs (OPENAI_COMPATIBLE_EGRESS_CIDRS in install.env) to the private ranges the server is reached at. NetworkPolicy cannot match a DNS name, and without them the gateway reaches only public addresses on ${HTTPS_DEFAULT_PORT}.${service_hint}"
+      return 1
+    fi
+    # A two-label host on 443 may be a public endpoint or a short in-cluster
+    # Service name; neither the chart nor this can tell, so it passes, as in
+    # the chart's NOTES, with a warning.
+    if [ -n "$service_hint" ]; then
+      print_warning "OPENAI_COMPATIBLE_API_BASE='${api_base}' is read as a public hostname, so the gateway gets no egress rule for it.${service_hint}"
+    fi
+  fi
+
+  # Allowed, as the chart allows it, but said: install.sh and Terraform never
+  # show the chart's NOTES, where the same warning lives.
+  if [ -z "$service_namespace" ] && [[ "$api_base" == http://* ]]; then
+    print_warning "OPENAI_COMPATIBLE_API_BASE='${api_base}' is plain http to a server outside the cluster: prompts, which can carry cluster data, and OPENAI_COMPATIBLE_API_KEY cross the network unencrypted. Serve the endpoint over https."
+  fi
+
+  if [ -n "$ca_bundle_name" ] &&
+    { [ "${#ca_bundle_name}" -gt "$K8S_SECRET_NAME_MAX_LENGTH" ] ||
+      [[ ! "$ca_bundle_name" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]; }; then
+    print_error "OPENAI_COMPATIBLE_CA_SECRET_NAME='${ca_bundle_name}' is not a valid Kubernetes Secret name."
+    return 1
+  fi
 }
 
 # MODEL_MAX_TOKENS: a whole number of output tokens, 0 meaning none. Digits
@@ -3710,7 +4052,7 @@ write_tfvars_from_state() {
   expected_ctx="$(gke_context_name)"
   if command -v kubectl >/dev/null 2>&1 &&
     [ "$(kubectl config current-context 2>/dev/null || true)" = "$expected_ctx" ]; then
-    for secret_key in API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT; do
+    for secret_key in API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY OPENAI_COMPATIBLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT; do
       [ -z "${!secret_key:-}" ] || continue
       # Every stage exits 0 on its own (|| true inside the substitution):
       # install.sh runs an inherited ERR trap (set -E), and a failing kubectl
@@ -3994,6 +4336,12 @@ write_tfvars_from_state() {
   require_scope_cluster_triples "${SCOPE_EXCLUDE_CLUSTERS:-}" || return 1
   require_scope_container_ids "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" || return 1
   require_scope_max_projects "${SCOPE_MAX_PROJECTS:-}" || return 1
+  # Checked here for the MODEL_MAX_TOKENS reason: the chart refuses to render
+  # openai_compatible without these, and upgrade.sh regenerates without
+  # install.sh's interview.
+  validate_openai_compatible_inputs "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" "${MODEL_DEFAULT_NAME:-}" \
+    "${OPENAI_COMPATIBLE_API_BASE:-}" "${OPENAI_COMPATIBLE_TARGET_PORT:-}" \
+    "${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}" "${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}" || return 1
   # Checked here for the MODEL_MAX_TOKENS reason: upgrade.sh and uninstall.sh
   # regenerate from install.env without install.sh's checks. A misspelt toggle
   # is refused rather than read as off, which would forward requests
@@ -4087,6 +4435,14 @@ write_tfvars_from_state() {
     echo "vertex_project_id  = $(hcl_str "${VERTEX_PROJECT_ID:-}")"
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"
+    # Only for this provider, so every other install's file stays as it was.
+    # The target port is 0, the variable's "unset", when empty.
+    if [ "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" = "openai_compatible" ]; then
+      echo "openai_compatible_api_base       = $(hcl_str "${OPENAI_COMPATIBLE_API_BASE:-}")"
+      echo "openai_compatible_target_port    = $((10#${OPENAI_COMPATIBLE_TARGET_PORT:-0}))"
+      echo "openai_compatible_egress_cidrs   = $(hcl_csv_list "${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}")"
+      echo "openai_compatible_ca_secret_name = $(hcl_str "${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}")"
+    fi
     echo ""
     echo "# The daily alert ceilings (ALERT_DAILY_LIMIT_* in install.env), only the"
     echo "# keys that are set. A bucket that is not here keeps the image default."
@@ -4128,6 +4484,9 @@ write_tfvars_from_state() {
       echo "gemini_api_key    = $(hcl_str "${GEMINI_API_KEY:-}")"
       echo "openai_api_key    = $(hcl_str "${OPENAI_API_KEY:-}")"
       echo "anthropic_api_key = $(hcl_str "${ANTHROPIC_API_KEY:-}")"
+      if [ "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" = "openai_compatible" ]; then
+        echo "openai_compatible_api_key = $(hcl_str "${OPENAI_COMPATIBLE_API_KEY:-}")"
+      fi
       if [ -n "${SESSION_KV_API_KEY:-}" ] || [ -n "${SESSION_KV_SALT:-}" ]; then
         echo "# Recovered from the live Secret: an adoption re-install must keep the"
         echo "# salt, or every chat identity re-pseudonymises."
@@ -4277,6 +4636,7 @@ write_tfvars_from_state() {
   export TF_VAR_gemini_api_key="${GEMINI_API_KEY:-}"
   export TF_VAR_openai_api_key="${OPENAI_API_KEY:-}"
   export TF_VAR_anthropic_api_key="${ANTHROPIC_API_KEY:-}"
+  export TF_VAR_openai_compatible_api_key="${OPENAI_COMPATIBLE_API_KEY:-}"
   export TF_VAR_slack_bot_token="${SLACK_BOT_TOKEN:-}"
   export TF_VAR_slack_app_token="${SLACK_APP_TOKEN:-}"
   export TF_VAR_session_kv_api_key="${SESSION_KV_API_KEY:-}"
