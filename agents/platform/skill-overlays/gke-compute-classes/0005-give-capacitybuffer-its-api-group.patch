@@ -1,0 +1,19 @@
+Subject: Give `CapacityBuffer` its API group
+
+Why: SKILL.md put `buffer.x-k8s.io`, the provisioning-strategy prefix, where the API group goes; the CRD is `autoscaling.x-k8s.io` (the provisioning-methods reference, the gke-cluster-autoscaler asset, and the CRD on a 1.35 cluster all say so), and an agent copying the bullet into `apiVersion:` writes a manifest the API server rejects.
+Local-Issue: #2692
+Upstream-Issue: none filed yet
+Retire-When: when upstream SKILL.md names `autoscaling.x-k8s.io` for `CapacityBuffer`
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -226,7 +226,7 @@ not block the user's initial request.** If asked for YAML/recommendations:
+ -   **Fallback Ladder & Standby Headroom Best Practices (`machineFamily` vs `nodepools` & `CapacityBuffer`):**
+     -   *Prefer `machineFamily` over `priorities[].nodepools`*: Rules referencing manual node pools do not benefit from ComputeClass cooldown prolongation and rely solely on standard 5-minute GCE MIG backoffs. Sprawling manual pool lists (>6–8 pools) cause early MIG backoffs to expire before lower rungs are evaluated, bouncing the autoscaler back to the top in an infinite loop. Use `machineFamily` with `nodePoolAutoCreation.enabled: true`.
+     -   *Place `flexStart: true` at the very end*: Dynamic Workload Scheduler (DWS) queuing takes 3–15+ minutes to return stockout signals; placing `flexStart` higher in the ladder allows earlier backoffs to expire during the wait and resets the autoscaler to the top.
+-    -   *Avoid `min-nodes` on fallback pools (Scheduler Bypass)*: `kube-scheduler` assigns incoming pods to idle nodes held by `min-nodes` *before* Cluster Autoscaler evaluates ComputeClass priorities. If fallback pools have `min-nodes > 0`, pods land on fallback hardware permanently, bypassing preferred tiers. Set `min-nodes: 0` and use `CapacityBuffer` (`buffer.x-k8s.io`).
++    -   *Avoid `min-nodes` on fallback pools (Scheduler Bypass)*: `kube-scheduler` assigns incoming pods to idle nodes held by `min-nodes` *before* Cluster Autoscaler evaluates ComputeClass priorities. If fallback pools have `min-nodes > 0`, pods land on fallback hardware permanently, bypassing preferred tiers. Set `min-nodes: 0` and use `CapacityBuffer` (`autoscaling.x-k8s.io`, with `provisioningStrategy: buffer.x-k8s.io/active-capacity`).
+     -   *GKE 1.36+ Synchronous Obtainability*: Starting in GKE 1.36, Cluster Autoscaler checks internal capacity obtainability synchronously in memory before creating VMs, skipping exhausted families without tripping GCE API errors or backoff cooldowns. Note: `gcloud beta compute advice capacity` is a discrete Spot/Flex heuristic (0.1, 0.5, 0.9); Google does not expose public real-time on-demand APIs.
+ -   **Stateful PV StorageClass — recommend `dynamic-rwo`:** GKE
+     1.35.3-gke.1290000+. Back stateful data PVs with built-in **`dynamic-rwo`**
