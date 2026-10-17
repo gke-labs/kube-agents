@@ -1336,7 +1336,9 @@ class ToolCalledVerifier(BaseVerifier):
     worker call's result is clipped in the pod, so the pattern must match near
     the start of it. A call whose result the capture could not read (none
     recorded, or withheld because the pod's redactor did not load) makes the
-    check ``status="error"``, since a pattern over it would read as no match.
+    check ``status="error"``, since a pattern over it would read as no match --
+    but only when its arguments are withheld too or still match ``arguments``;
+    an unread call whose readable arguments rule it out is left out instead.
     """
 
     type: Literal["tool_called"]

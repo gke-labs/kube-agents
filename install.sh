@@ -430,6 +430,14 @@ PARAM_VERTEX_MANAGE_SERVING_PROJECT="${VERTEX_MANAGE_SERVING_PROJECT:-}"
 PARAM_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 PARAM_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 PARAM_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+# openai_compatible: the server's base URL, the server pod's port (an
+# in-cluster Service), the private ranges it is reached at (anything else),
+# the Secret holding a CA that signs its certificate, and its optional key.
+PARAM_OPENAI_COMPATIBLE_API_BASE="${OPENAI_COMPATIBLE_API_BASE:-}"
+PARAM_OPENAI_COMPATIBLE_TARGET_PORT="${OPENAI_COMPATIBLE_TARGET_PORT:-}"
+PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS="${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
+PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME="${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
+PARAM_OPENAI_COMPATIBLE_API_KEY="${OPENAI_COMPATIBLE_API_KEY:-}"
 PARAM_GITOPS_ORG="${GITOPS_ORG:-${GITHUB_ORG:-}}"
 PARAM_GITOPS_REPO="${GITOPS_REPO:-${GITHUB_REPO:-}}"
 PARAM_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
@@ -589,6 +597,11 @@ PARAM_PLATFORM_AGENT_MODE="${PLATFORM_AGENT_MODE:-}"
 PARAM_PLATFORM_AGENT_MODE_PASSED="false"
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
+# Whether --model-default-name was typed: a switch to openai_compatible does not
+# carry over a model install.env pinned for another provider.
+PARAM_MODEL_DEFAULT_NAME_PASSED="false"
+# The interview answer that clears a recorded optional openai_compatible value.
+readonly OPENAI_COMPATIBLE_CLEAR_ANSWER="-"
 # Empty takes DEFAULT_MODEL_MAX_TOKENS (0, no budget) in the tfvars generator,
 # as an empty MODEL_DEFAULT_NAME takes the provider's default model.
 PARAM_MODEL_MAX_TOKENS="${MODEL_MAX_TOKENS:-}"
@@ -654,7 +667,9 @@ Flags for AI Agents & Automation:
                                 (default: DEFAULT_NAMESPACE, currently kubeagents-system).
                                 The chart wires the agent's model-gateway endpoint to this
                                 namespace, so changing it is for CI and second installs
-  --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai
+  --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai |
+                                openai_compatible (a server speaking the OpenAI chat
+                                completions API: vLLM, TGI, an internal gateway)
                                 (default: DEFAULT_MODEL_PROVIDER, currently gemini)
   --model-default-name=NAME     Default model name for the provider
   --model-max-tokens=N          Output tokens the gateway asks the provider for on a
@@ -685,6 +700,24 @@ Flags for AI Agents & Automation:
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
   --anthropic-api-key=KEY       Anthropic API Key
+  --openai-compatible-api-base=URL
+                                openai_compatible only: the server's base URL including
+                                /v1. Required, as is --model-default-name: no defaults
+  --openai-compatible-target-port=N
+                                openai_compatible only: the server pod's port, required
+                                when the URL names an in-cluster Service (<svc>,
+                                <svc>.<namespace>.svc, <svc>.<namespace>.svc.cluster.local);
+                                the gateway's NetworkPolicy matches it, not the Service port
+  --openai-compatible-egress-cidrs=LIST
+                                openai_compatible only: comma-separated private ranges the
+                                server is reached at, required when the URL is not an
+                                in-cluster Service, unless it is a public endpoint on 443
+  --openai-compatible-ca-secret-name=NAME
+                                openai_compatible only: Secret in the agent's namespace
+                                holding the PEM CA that signs the server's certificate,
+                                under the key ca.crt; trusted for this server only
+  --openai-compatible-api-key=KEY
+                                openai_compatible only: the server's API key (optional)
   --gitops-org=ORG              GitHub organization of the GitOps repo (GitHub only)
   --gitops-repo=REPO            GitOps IaC repository: on GitHub its name (default:
                                 DEFAULT_GITOPS_REPO, currently gke-fleet-iac); on GitLab the
@@ -997,7 +1030,7 @@ parse_args() {
         shift ;;
       --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
-      --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; shift ;;
+      --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; PARAM_MODEL_DEFAULT_NAME_PASSED="true"; shift ;;
       --model-max-tokens=*) PARAM_MODEL_MAX_TOKENS="${1#*=}"; shift ;;
       --litellm-redaction|--litellm-redaction=*)
         PARAM_LITELLM_REDACTION_ENABLED="$(flag_bool_value "$1")"
@@ -1014,6 +1047,11 @@ parse_args() {
       --gemini-api-key=*) PARAM_GEMINI_API_KEY="${1#*=}"; shift ;;
       --openai-api-key=*) PARAM_OPENAI_API_KEY="${1#*=}"; shift ;;
       --anthropic-api-key=*) PARAM_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
+      --openai-compatible-api-base=*) PARAM_OPENAI_COMPATIBLE_API_BASE="${1#*=}"; shift ;;
+      --openai-compatible-target-port=*) PARAM_OPENAI_COMPATIBLE_TARGET_PORT="${1#*=}"; shift ;;
+      --openai-compatible-egress-cidrs=*) PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS="${1#*=}"; shift ;;
+      --openai-compatible-ca-secret-name=*) PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME="${1#*=}"; shift ;;
+      --openai-compatible-api-key=*) PARAM_OPENAI_COMPATIBLE_API_KEY="${1#*=}"; shift ;;
       --gitops-org=*) PARAM_GITOPS_ORG="${1#*=}"; shift ;;
       --gitops-repo=*) PARAM_GITOPS_REPO="${1#*=}"; shift ;;
       --gitops-forge=*) PARAM_GITOPS_FORGE="${1#*=}"; shift ;;
@@ -1855,13 +1893,28 @@ warn_unrecorded_interview_answers() {
   local interview_keys=(GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME
     CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
+    OPENAI_COMPATIBLE_API_BASE OPENAI_COMPATIBLE_TARGET_PORT OPENAI_COMPATIBLE_EGRESS_CIDRS OPENAI_COMPATIBLE_CA_SECRET_NAME
     PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
     USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET)
   # One evaluation of the file for the whole list, in this shell, so the reads
   # below land on the cache instead of re-running whatever the file's lines run.
   read_recorded_install_env_values "$file" "${interview_keys[@]}"
+  # A file written for another provider never records the OPENAI_COMPATIBLE_*
+  # keys (bootstrap_install_env_file writes them for openai_compatible only),
+  # so a switch to it must name them anyway: without them the next run stops in
+  # validate_openai_compatible_inputs, contradicting the remedy printed here.
+  local switched_to_openai_compatible=false
+  if [ "${MODEL_PROVIDER:-}" = "openai_compatible" ] && install_env_records_key "$file" MODEL_PROVIDER &&
+    [ "$(recorded_install_env_value "$file" MODEL_PROVIDER)" != "openai_compatible" ]; then
+    switched_to_openai_compatible=true
+  fi
   for key in "${interview_keys[@]}"; do
-    install_env_records_key "$file" "$key" || continue
+    if ! install_env_records_key "$file" "$key"; then
+      if [ "$switched_to_openai_compatible" = "true" ] && [[ "$key" == OPENAI_COMPATIBLE_* ]]; then
+        drifted="${drifted}${drifted:+ }${key}"
+      fi
+      continue
+    fi
     recorded="$(recorded_install_env_value "$file" "$key")"
     case "$key" in
       MEMORY) current="${PARAM_MEMORY:-}" ;;
@@ -2715,6 +2768,14 @@ bootstrap_install_env_file() {
   write_secret_env_var "$tmp" GEMINI_API_KEY "${GEMINI_API_KEY:-}"
   write_secret_env_var "$tmp" OPENAI_API_KEY "${OPENAI_API_KEY:-}"
   write_secret_env_var "$tmp" ANTHROPIC_API_KEY "${ANTHROPIC_API_KEY:-}"
+  # Only for this provider, so every other install's file stays as it was.
+  if [ "${MODEL_PROVIDER:-}" = "openai_compatible" ]; then
+    write_env_var "$tmp" OPENAI_COMPATIBLE_API_BASE "${OPENAI_COMPATIBLE_API_BASE:-}"
+    write_env_var "$tmp" OPENAI_COMPATIBLE_TARGET_PORT "${OPENAI_COMPATIBLE_TARGET_PORT:-}"
+    write_env_var "$tmp" OPENAI_COMPATIBLE_EGRESS_CIDRS "${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
+    write_env_var "$tmp" OPENAI_COMPATIBLE_CA_SECRET_NAME "${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
+    write_secret_env_var "$tmp" OPENAI_COMPATIBLE_API_KEY "${OPENAI_COMPATIBLE_API_KEY:-}"
+  fi
   write_env_var "$tmp" ALLOWED_USERS "${ALLOWED_USERS:-}"
   write_env_var "$tmp" CHAT_TOPIC_NAME "${CHAT_TOPIC_NAME:-}"
   write_env_var "$tmp" CHAT_SUB_NAME "${CHAT_SUB_NAME:-}"
@@ -4507,6 +4568,62 @@ validate_platform_agent_mode() {
   return 1
 }
 
+# The openai_compatible questions, shared by step 7 and the Day-2 menu: the
+# model, the base URL, then the server pod's port or the CIDRs, whichever the
+# URL needs, and the optional key and CA Secret. Each argument names the
+# variable that holds an answer; its current value is the prompt's default.
+# validate_openai_compatible_inputs judges the answers afterwards.
+# The model name step 7 starts from. A model install.env pinned for another
+# provider is not this server's, so on a switch to openai_compatible with no
+# --model-default-name it starts empty and the check that follows stops the
+# run instead of asking the server for the old provider's model. Only a
+# recorded other provider counts: with none, a MODEL_DEFAULT_NAME given in the
+# environment is this run's own answer.
+# $1 the provider, $2 the model so far, $3 whether --model-default-name was
+# typed, $4 the recorded MODEL_PROVIDER.
+openai_compatible_model_for_run() {
+  local provider="${1:-}" model="${2:-}" passed="${3:-false}" recorded="${4:-}"
+  if [ "$provider" = "openai_compatible" ] && [ -n "$recorded" ] &&
+    [ "$recorded" != "openai_compatible" ] && [ "$passed" != "true" ]; then
+    model=""
+  fi
+  printf '%s\n' "$model"
+}
+
+prompt_openai_compatible_settings() {
+  local model_var="$1" api_base_var="$2" target_port_var="$3" egress_cidrs_var="$4"
+  local api_key_var="$5" ca_name_var="$6" host_port="" host=""
+  prompt_read "Model name the server serves (no default)" "$model_var" "${!model_var:-}"
+  prompt_read "Server base URL including /v1 (e.g. http://<svc>.<namespace>.svc.cluster.local/v1)" "$api_base_var" "${!api_base_var:-}"
+  if host_port="$(openai_compatible_url_host_port "${!api_base_var:-}")"; then
+    host="${host_port% *}"
+  fi
+  # Each URL shape reads one of the two egress values and ignores the other.
+  # Clear the one it does not ask for, so a value kept from an earlier URL
+  # cannot fail validation behind a prompt that is never shown.
+  if [ -n "$host" ] && [ -n "$(openai_compatible_service_namespace "$host")" ]; then
+    printf -v "$egress_cidrs_var" '%s' ""
+    prompt_read "Server pod port (the gateway's NetworkPolicy matches it, not the Service port)" "$target_port_var" "${!target_port_var:-}"
+  elif [ -n "$host" ]; then
+    printf -v "$target_port_var" '%s' ""
+    prompt_read "Private ranges the server is reached at, comma-separated CIDRs (empty only for a public endpoint on 443; ${OPENAI_COMPATIBLE_CLEAR_ANSWER} clears a recorded value)" "$egress_cidrs_var" "${!egress_cidrs_var:-}"
+  fi
+  # The label keeps a recorded key off the screen.
+  # No clear answer for the key: write_tfvars_from_state recovers an empty key
+  # from the live Secret, so clearing it here would not stick. A key a server
+  # no longer checks is harmless; remove it from the Secret to drop it.
+  prompt_read "Server API key (optional)" "$api_key_var" "${!api_key_var:-}" true "${!api_key_var:+the current key}"
+  prompt_read "Secret holding a CA, under ca.crt, that signs the server's certificate (optional; ${OPENAI_COMPATIBLE_CLEAR_ANSWER} clears a recorded name)" "$ca_name_var" "${!ca_name_var:-}"
+  # prompt_read keeps a recorded value on an empty answer, so an endpoint that
+  # no longer needs one of these optional values says so with the clear answer.
+  local optional_var
+  for optional_var in "$egress_cidrs_var" "$ca_name_var"; do
+    if [ "${!optional_var:-}" = "$OPENAI_COMPATIBLE_CLEAR_ANSWER" ]; then
+      printf -v "$optional_var" '%s' ""
+    fi
+  done
+}
+
 # Validates explicit values for existing-cluster opt-in flags (loud like --enable-gvisor)
 validate_existing_cluster_opt_in_flags() {
   if { [ "${PARAM_MIGRATE_NODE_POOLS_PASSED:-false}" = "true" ] || [ -n "${PARAM_MIGRATE_NODE_POOLS:-}" ]; } && \
@@ -5530,6 +5647,11 @@ run_menu_system() {
   local gemini_api_key="${GEMINI_API_KEY:-}"
   local openai_api_key="${OPENAI_API_KEY:-}"
   local anthropic_api_key="${ANTHROPIC_API_KEY:-}"
+  local openai_compatible_api_base="${OPENAI_COMPATIBLE_API_BASE:-}"
+  local openai_compatible_target_port="${OPENAI_COMPATIBLE_TARGET_PORT:-}"
+  local openai_compatible_egress_cidrs="${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
+  local openai_compatible_ca_secret_name="${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
+  local openai_compatible_api_key="${OPENAI_COMPATIBLE_API_KEY:-}"
   local google_chat_enabled="${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
   local google_chat_home_channel="${GOOGLE_CHAT_HOME_CHANNEL:-}"
   local slack_enabled="${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
@@ -5580,7 +5702,7 @@ run_menu_system() {
     echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name:-Not Set} (${region:-$DEFAULT_REGION})"
     echo -e "  • ${C_CYAN}Hermes Web UI (Port 9119):${C_RESET} $([ "$enable_webui" = "true" ] && echo -e "${C_GREEN}ENABLED${C_RESET}" || echo -e "${C_YELLOW}DISABLED${C_RESET}")"
     echo -e "  • ${C_CYAN}Chat Integrations:${C_RESET} Google Chat: $([ "$google_chat_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF"), Slack: $([ "$slack_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF")"
-    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")"
+    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")$([ "$model_provider" = "openai_compatible" ] && echo " @ ${openai_compatible_api_base}" || echo "")"
     echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
     echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} $([ "$enable_gvisor" = "true" ] && echo -e "${C_GREEN}gVisor Sandbox${C_RESET}" || echo "Standard")"
 
@@ -5588,7 +5710,7 @@ run_menu_system() {
     prompt_menu "Select configuration task:" \
       "🌐 Toggle Hermes Web UI (Port 9119 Dashboard)" \
       "💬 Manage Chat & Messaging Integrations (Google Chat / Slack)" \
-      "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI)" \
+      "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI / OpenAI-compatible)" \
       "🛡️ Modify Security & Permission Boundaries (gVisor / SRE vs Read-Only)" \
       "🗄️ Manage GitOps Repository & GitHub Auth (${DEFAULT_GITOPS_REPO})" \
       "🚀 Save & Apply Configuration Changes (~15s update)" \
@@ -5635,6 +5757,7 @@ run_menu_system() {
           "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
           "OpenAI ($(default_model_for_provider openai))" \
           "Anthropic ($(default_model_for_provider anthropic))" \
+          "OpenAI-compatible server (vLLM, TGI, an internal gateway; you name the model)" \
           m_opt
         case "$m_opt" in
           1)
@@ -5663,6 +5786,15 @@ run_menu_system() {
             model_provider="anthropic"
             model_default_name="$(default_model_for_provider anthropic)"
             prompt_read "Anthropic API Key" anthropic_api_key "$anthropic_api_key" true
+            ;;
+          5)
+            # A model pinned for another provider is not this server's, so the
+            # prompt starts empty on a switch, as main() does.
+            [ "$model_provider" = "openai_compatible" ] || model_default_name=""
+            model_provider="openai_compatible"
+            prompt_openai_compatible_settings model_default_name openai_compatible_api_base \
+              openai_compatible_target_port openai_compatible_egress_cidrs \
+              openai_compatible_api_key openai_compatible_ca_secret_name
             ;;
         esac
         ;;
@@ -5711,6 +5843,10 @@ run_menu_system() {
         export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
         export PARAM_PERMISSION_SET="$permission_set" PARAM_ENABLE_GVISOR="$enable_gvisor"
         export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"
+        # The check main() makes at step 7, before anything is saved; back to
+        # the menu on failure.
+        validate_openai_compatible_inputs "$model_provider" "$model_default_name" "$openai_compatible_api_base" \
+          "$openai_compatible_target_port" "$openai_compatible_egress_cidrs" "$openai_compatible_ca_secret_name" || continue
         # Before anything is saved: this apply renders PLATFORM_AGENT_MODE
         # from install.env, and if Slack moves to the A2A gateway under next,
         # the settings it cannot use are refused (and again after the
@@ -5754,6 +5890,13 @@ run_menu_system() {
         save_secret_env_var GEMINI_API_KEY "$gemini_api_key"
         save_secret_env_var OPENAI_API_KEY "$openai_api_key"
         save_secret_env_var ANTHROPIC_API_KEY "$anthropic_api_key"
+        if [ "$model_provider" = "openai_compatible" ]; then
+          save_env_var OPENAI_COMPATIBLE_API_BASE "$openai_compatible_api_base"
+          save_env_var OPENAI_COMPATIBLE_TARGET_PORT "$openai_compatible_target_port"
+          save_env_var OPENAI_COMPATIBLE_EGRESS_CIDRS "$openai_compatible_egress_cidrs"
+          save_env_var OPENAI_COMPATIBLE_CA_SECRET_NAME "$openai_compatible_ca_secret_name"
+          save_secret_env_var OPENAI_COMPATIBLE_API_KEY "$openai_compatible_api_key"
+        fi
         save_env_var ALLOWED_USERS "$allowed_users"
         save_env_var CHAT_TOPIC_NAME "$chat_topic_name"
         save_env_var CHAT_SUB_NAME "$chat_sub_name"
@@ -6543,13 +6686,14 @@ main() {
   print_step "7. AI Model Provider Credentials"
   local model_provider="$PARAM_MODEL_PROVIDER"
   if ! is_valid_model_provider "$model_provider"; then
-    print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, or openai."
+    print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, openai, or openai_compatible."
     exit 1
   fi
   local model_default_name="${PARAM_MODEL_DEFAULT_NAME:-${MODEL_DEFAULT_NAME:-}}"
   if [ -z "$model_default_name" ]; then
     model_default_name="$(default_model_for_provider "$model_provider")"
   fi
+  model_default_name="$(openai_compatible_model_for_run "$model_provider" "$model_default_name" "$PARAM_MODEL_DEFAULT_NAME_PASSED" "${MODEL_PROVIDER:-}")"
   local model_max_tokens="${PARAM_MODEL_MAX_TOKENS:-${MODEL_MAX_TOKENS:-}}"
   validate_model_max_tokens || exit 1
   local redaction_ip_action="${PARAM_LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"
@@ -6606,6 +6750,11 @@ main() {
   local gemini_api_key="${detected_gemini_key:-}"
   local openai_api_key="${PARAM_OPENAI_API_KEY:-}"
   local anthropic_api_key="${PARAM_ANTHROPIC_API_KEY:-}"
+  local openai_compatible_api_base="${PARAM_OPENAI_COMPATIBLE_API_BASE:-}"
+  local openai_compatible_target_port="${PARAM_OPENAI_COMPATIBLE_TARGET_PORT:-}"
+  local openai_compatible_egress_cidrs="${PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
+  local openai_compatible_ca_secret_name="${PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
+  local openai_compatible_api_key="${PARAM_OPENAI_COMPATIBLE_API_KEY:-}"
 
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     # Pre-set to the provider already configured, so pressing enter keeps it.
@@ -6617,12 +6766,14 @@ main() {
       vertex_ai) model_choice="2" ;;
       openai) model_choice="3" ;;
       anthropic) model_choice="4" ;;
+      openai_compatible) model_choice="5" ;;
     esac
     prompt_menu "Select Model Provider for the Platform Agent:" \
       "Google Gemini (Recommended: $(default_model_for_provider gemini) / Gemini API)" \
       "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
       "OpenAI ($(default_model_for_provider openai) / OpenAI API)" \
       "Anthropic ($(default_model_for_provider anthropic) / Anthropic API)" \
+      "OpenAI-compatible server (vLLM, TGI, an internal gateway; you name the model)" \
       model_choice
 
     # A model the install already pins survives a re-run that leaves the
@@ -6669,6 +6820,13 @@ main() {
         fi
         prompt_read "Anthropic API Key" anthropic_api_key "${ANTHROPIC_API_KEY:-}" true
         ;;
+      5)
+        model_provider="openai_compatible"
+        [ "$model_provider_was" = "openai_compatible" ] || model_default_name=""
+        prompt_openai_compatible_settings model_default_name openai_compatible_api_base \
+          openai_compatible_target_port openai_compatible_egress_cidrs \
+          openai_compatible_api_key openai_compatible_ca_secret_name
+        ;;
     esac
   fi
 
@@ -6702,6 +6860,13 @@ main() {
       ;;
     anthropic)
       [ -n "$anthropic_api_key" ] || print_warning "No Anthropic API key was provided; the agent will require a credential update before model calls can succeed."
+      ;;
+    openai_compatible)
+      # Loud, unlike the missing keys above: a keyless install still deploys,
+      # and this one cannot render.
+      validate_openai_compatible_inputs "$model_provider" "$model_default_name" "$openai_compatible_api_base" \
+        "$openai_compatible_target_port" "$openai_compatible_egress_cidrs" "$openai_compatible_ca_secret_name" || exit 1
+      print_info "Serving ${model_default_name} from ${openai_compatible_api_base} through the gateway."
       ;;
   esac
 
@@ -7279,6 +7444,11 @@ main() {
   export GEMINI_API_KEY="$gemini_api_key"
   export OPENAI_API_KEY="$openai_api_key"
   export ANTHROPIC_API_KEY="$anthropic_api_key"
+  export OPENAI_COMPATIBLE_API_BASE="$openai_compatible_api_base"
+  export OPENAI_COMPATIBLE_TARGET_PORT="$openai_compatible_target_port"
+  export OPENAI_COMPATIBLE_EGRESS_CIDRS="$openai_compatible_egress_cidrs"
+  export OPENAI_COMPATIBLE_CA_SECRET_NAME="$openai_compatible_ca_secret_name"
+  export OPENAI_COMPATIBLE_API_KEY="$openai_compatible_api_key"
   export ALLOWED_USERS="$allowed_users"
   export CHAT_TOPIC_NAME="$chat_topic_name"
   export CHAT_SUB_NAME="$chat_sub_name"
@@ -7509,6 +7679,8 @@ main() {
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   if [ "$model_provider" = "vertex_ai" ]; then
     echo -e "  • ${C_CYAN}Vertex AI Endpoint:${C_RESET} projects/${vertex_project_id}/locations/${vertex_location}"
+  elif [ "$model_provider" = "openai_compatible" ]; then
+    echo -e "  • ${C_CYAN}OpenAI-compatible Server:${C_RESET} ${openai_compatible_api_base}"
   fi
   echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
   echo -e "  • ${C_CYAN}Long-Term Memory:${C_RESET} ${memory_mode}"
