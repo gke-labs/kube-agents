@@ -4969,7 +4969,6 @@ class TestDriftInject(unittest.TestCase):
         self.assertIn(f'injectKindDrift = "{session_kv_server.INJECT_KIND_DRIFT}"', source)
 
 
-
 class TestStallInject(unittest.TestCase):
     """The `controller-stall` half of /sessions/{id}/inject."""
 
@@ -5738,6 +5737,876 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
                     session_kv_server._kanban_db_path(),
                     "/custom/home/kanban.db",
                 )
+
+
+
+class TestTaskWorkerStepsFeed(unittest.TestCase):
+    """`GET /v1/tasks/{id}` and `GET /v1/sessions/{sid}/tasks` return the worker's live Hermes steps from `state.db`."""
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.root = Path(self._tmpdir.name)
+        self.kanban_path = self.root / "kanban.db"
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    body TEXT,
+                    assignee TEXT,
+                    status TEXT,
+                    priority INTEGER,
+                    session_id TEXT,
+                    created_at REAL,
+                    started_at REAL,
+                    completed_at REAL,
+                    last_heartbeat_at REAL,
+                    result TEXT,
+                    last_failure_error TEXT
+                );
+                CREATE TABLE task_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    profile TEXT,
+                    status TEXT,
+                    started_at REAL,
+                    ended_at REAL,
+                    outcome TEXT,
+                    summary TEXT,
+                    error TEXT,
+                    metadata TEXT
+                );
+                CREATE TABLE task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    run_id INTEGER,
+                    kind TEXT,
+                    payload TEXT,
+                    created_at REAL
+                );
+                CREATE TABLE task_comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    author TEXT,
+                    body TEXT,
+                    created_at REAL
+                );
+                """
+            )
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, assignee, status, priority, session_id, created_at) "
+                "VALUES ('t_d1c3323e', 'Open GitOps PR', 'body', 'platform', 'running', 1, 'k8s-evt-1', 100.0)"
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, metadata) "
+                "VALUES ('t_d1c3323e', 'platform', 'running', 101.0, '{}')"
+            )
+
+        patcher = patch.object(session_kv_server, "KANBAN_DB_PATH", str(self.kanban_path))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+
+    def _write_profile_store(self, profile: str, rows: list[tuple], *, with_tool_call_id: bool = False):
+        import sqlite3
+
+        if not profile or profile == "default":
+            db_path = self.root / "state.db"
+        else:
+            db_path = self.root / "profiles" / profile / "state.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        id_col = ", tool_call_id TEXT" if with_tool_call_id else ""
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS messages ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
+                "content TEXT, tool_name TEXT, tool_calls TEXT, timestamp REAL, "
+                f"reasoning TEXT, active INTEGER DEFAULT 1{id_col})"
+            )
+            for row in rows:
+                if with_tool_call_id:
+                    *base, tool_call_id = row
+                else:
+                    base, tool_call_id = row, None
+                sid, role, content, tool_name, tool_calls, ts, reasoning = base
+                values = [
+                    sid,
+                    role,
+                    content,
+                    tool_name,
+                    json.dumps(tool_calls) if tool_calls is not None else None,
+                    ts,
+                    reasoning,
+                ]
+                cols = "session_id, role, content, tool_name, tool_calls, timestamp, reasoning"
+                if with_tool_call_id:
+                    cols += ", tool_call_id"
+                    values.append(tool_call_id)
+                conn.execute(
+                    f"INSERT INTO messages ({cols}) VALUES ({', '.join('?' * len(values))})",
+                    values,
+                )
+
+    def test_worker_steps_are_matched_by_dispatcher_prompt_and_returned_in_order(self):
+        long_output = "diff --git a/deployment.yaml b/deployment.yaml\n" + ("+line\n" * 80)
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-other", "user", "work kanban task t_d1c3323e_other", None, None, 90.0, None),
+                (
+                    "sess-other",
+                    "assistant",
+                    None,
+                    None,
+                    [{"function": {"name": "terminal", "arguments": '{"command":"wrong"}'}}],
+                    91.0,
+                    None,
+                ),
+                ("sess-worker", "user", "work kanban task t_d1c3323e", None, None, 101.0, None),
+                (
+                    "sess-worker",
+                    "assistant",
+                    None,
+                    None,
+                    [{"function": {"name": "terminal", "arguments": '{"command":"submit_suggestion.py prepare"}'}}],
+                    102.0,
+                    "Checking the triage options and preparing the suggestion branch.",
+                ),
+                ("sess-worker", "tool", long_output, "terminal", None, 103.0, None),
+                ("sess-worker", "assistant", "Opened Pull Request #1.", None, None, 104.0, None),
+            ],
+        )
+
+        resp = self.client.get("/v1/tasks/t_d1c3323e")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertFalse(body["steps_truncated"])
+        steps = body["steps"]
+        self.assertEqual([s["kind"] for s in steps], ["thinking", "tool_call", "tool_result", "reply"])
+        self.assertEqual(steps[0]["preview"], "Checking the triage options and preparing the suggestion branch.")
+        self.assertEqual(steps[1]["tool"], "terminal")
+        self.assertIn("submit_suggestion.py prepare", steps[1]["preview"])
+        self.assertEqual(steps[2]["tool"], "terminal")
+        self.assertTrue(steps[2]["preview"].endswith("…"))
+        self.assertIn("+line", steps[2]["detail"])
+        self.assertEqual(steps[3]["preview"], "Opened Pull Request #1.")
+
+        sess_resp = self.client.get("/v1/sessions/k8s-evt-1/tasks")
+        self.assertEqual(sess_resp.status_code, 200)
+        sess_tasks = sess_resp.json()["tasks"]
+        self.assertEqual(len(sess_tasks), 1)
+        self.assertEqual([s["kind"] for s in sess_tasks[0]["live_steps"]], ["thinking", "tool_call", "tool_result", "reply"])
+        self.assertTrue(sess_tasks[0]["live_steps"][2]["preview"].endswith("…"))
+        self.assertNotIn("detail", sess_tasks[0]["live_steps"][2])
+        self.assertFalse(sess_tasks[0]["steps_truncated"])
+
+    def test_missing_profile_store_returns_empty_steps_without_failing(self):
+        resp = self.client.get("/v1/tasks/t_d1c3323e")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["steps"], [])
+        self.assertFalse(body["steps_truncated"])
+
+    def test_worker_steps_redact_credentials_and_withhold_when_redactor_unavailable(self):
+        import base64
+        import sqlite3
+
+        secret_tok = "ghp_" + "A" * 36
+        bearer_tok = "opaque-bearer-cred-value-987654"
+        token_scheme_val = "opaque-gitea-token-scheme-54321"
+        auth_code_val = "4/0AX4XfWh-opaque-oauth-code-777"
+        data_secret_val = "dGVzdC1kYXRhLXNlY3JldC12YWx1ZQ=="
+        string_data_val = "plain-stringdata-secret-value-42"
+        cli_tok = "s3cr3t-opaque-flag"
+        api_token_val = "opaque-api-token-flag-val-99"
+        cli_pass = "hunter2-cli-pass"
+        long_user_pw = "hunter2-long-user-pw"
+        wget_user_pw = "hunter2-wget-user-pw"
+        quoted_spaced_pw = "hunter2 quoted spaced pw"
+        attached_mysql_pw = "hunter2-attached-mysql"
+        numeric_sshpass_pw = "1234"
+        mongosh_pw = "hunter2-mongosh-pw"
+        redis_pw = "hunter2-redis-pw"
+        az_secret = "hunter2-az-sp-secret"
+        docker_pw = "hunter2-docker-flag"
+        literal_cred = "hunter2-from-literal"
+        url_pass = "url-secret-pw-99"
+        block_scalar_pw = "hunter2-block-line-1"
+        block_scalar_key = "tls-block-line-1"
+        kubeconfig_key = "LS0tLS1CRUdJTi1LUBEKEY"
+        quoted_text_key = "LS0tLS1CRUdJTi1RVU9URUQtS0VZ"
+        db_creds = "supersecret-db-val-123"
+        env_pair_creds = "user:hunter2-env-pair"
+        tls_crt_val = "LS0tLS1CRUdJTi1DRVJUSUZJQ0FURQ=="
+        p12_val = "cDEyLWtleXN0b3JlLWJ5dGVz"
+        custom_b64 = "c2VjcmV0MTIzNDU2"
+        multi_item_b64 = "bXVsdGktc2VjcmV0LWJ5dGVzLTEyMzQ1Ng=="
+        cut_json_b64 = "Y3V0LXNlY3JldC12YWw="
+        bare_secret_val = "bare-decoded-secret-hunter2-value"
+        long_ssh_b64 = base64.b64encode(("OPENSSH-KEY-" + ("K" * 1200)).encode("utf-8")).decode("ascii")
+        long_pem_body = "MIIEpAIBAAKCAQEA" + ("P" * 1800)
+        long_pem_doc = (
+            f"-----BEGIN RSA PRIVATE KEY-----\n{long_pem_body}\n-----END RSA PRIVATE KEY-----"
+        )
+        unterminated_pem_body = "MIIEpAIBAAKCAQEA" + ("U" * 1200)
+        unterminated_pem_doc = (
+            f"-----BEGIN RSA PRIVATE KEY-----\n{unterminated_pem_body}"
+        )
+        long_kubeconfig_b64 = "LS0tLS1CRUdJTi1MT05HLUtVQkVLRVk="
+        long_kubeconfig_json = json.dumps(
+            {
+                "apiVersion": "v1",
+                "kind": "Config",
+                "clusters": [{"name": "c1", "cluster": {"server": "https://10.0.0.1:6443"}}],
+                "users": [{"name": "u1", "user": {"client-key-data": long_kubeconfig_b64}}],
+                "padding": "x" * 9000,
+            },
+            indent=2,
+        )
+        card_body_secret = "card-body-opaque-secret-777"
+        comment_secret = "comment-opaque-secret-888"
+        run_summary_secret = "run-summary-opaque-secret-555"
+        run_error_secret = "run-error-opaque-secret-666"
+        event_payload_secret = "event-payload-opaque-secret-999"
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute(
+                "UPDATE tasks SET title = ?, body = ?, result = ? WHERE id = 't_d1c3323e'",
+                (
+                    "mkdir -p failing on node",
+                    f"password: {card_body_secret}",
+                    f"Finished with token={cli_tok}",
+                ),
+            )
+            conn.execute(
+                "UPDATE task_runs SET summary = ?, error = ? WHERE task_id = 't_d1c3323e'",
+                (
+                    f"summary password: {run_summary_secret}",
+                    f"login failed: token={run_error_secret}",
+                ),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                ("t_d1c3323e", 1, "blocked", f"password: {event_payload_secret}", 104.5),
+            )
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                ("t_d1c3323e", "platform", f"api_key={comment_secret}", 105.0),
+            )
+
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-sec", "user", "work kanban task t_d1c3323e", None, None, 101.0, None),
+                (
+                    "sess-sec",
+                    "assistant",
+                    None,
+                    None,
+                    [
+                        {
+                            "function": {
+                                "name": "terminal",
+                                "arguments": json.dumps(
+                                    {
+                                        "command": (
+                                            f"kubectl --token {cli_tok} get secrets && "
+                                            f"some-cli --api-token {api_token_val} && "
+                                            f"kubectl create secret generic s --from-literal=credentials={literal_cred} && "
+                                            f"mysql -p{attached_mysql_pw} && "
+                                            f"mysql -u root -p -h db && "
+                                            f"mysql -P 3306 -p {attached_mysql_pw} && "
+                                            f"sshpass -p {numeric_sshpass_pw} ssh host && "
+                                            f"mongosh --host db -u admin -p {mongosh_pw} && "
+                                            f"redis-cli -a {redis_pw} && "
+                                            f"az login --service-principal -u app -p {az_secret} && "
+                                            f"docker login --docker-password {docker_pw} && "
+                                            f"curl -u admin:{cli_pass} --user admin:{long_user_pw} "
+                                            f"-x proxy:3128 -p https://registry.internal/proxy "
+                                            f"-H 'Authorization: Bearer {bearer_tok}' "
+                                            f"-H 'Authorization: Token {token_scheme_val}' "
+                                            f"https://admin:{url_pass}@registry.internal/v2/ && "
+                                            f"wget --user admin:{wget_user_pw} https://registry.internal/ && "
+                                            f'curl -u "admin:{quoted_spaced_pw}" https://registry.internal/ && '
+                                            f"docker run -u 1000:1000 busybox && "
+                                            f"gcloud container clusters create x --no-enable-basic-auth --zone us-central1-a && "
+                                            f"gh auth login --with-token && "
+                                            "mkdir -p /opt/data/gitops/x && "
+                                            'kubectl patch deploy api -p \'{"spec":{"replicas":2}}\' && '
+                                            "psql -U postgres && docker run -p 8080:80 && "
+                                            "grep -P '\\d+' && sort -u && pip install -U pkg && git log -p"
+                                        )
+                                    }
+                                ),
+                            }
+                        }
+                    ],
+                    102.0,
+                    f"Using token {secret_tok} to inspect endpoint.",
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    (
+                        f"apiVersion: v1\nkind: Secret\ndata:\n  token: {data_secret_val}\n"
+                        f"stringData:\n  admin-pw: {string_data_val}\n"
+                        f"users:\n- user:\n    client-key-data: {kubeconfig_key}\n"
+                        f'  "client-key-data": "{quoted_text_key}"\n'
+                        f"authorization_code: {auth_code_val}\n"
+                        f"Authorization: Token {token_scheme_val}\n"
+                        f"Environment:\n  DB_CREDENTIALS:  {db_creds}\n"
+                        f"env:\n- name: DB_CREDENTIALS\n  value: {env_pair_creds}\n"
+                        f"password: |\n  {block_scalar_pw}\n"
+                        f"tls.key: |\n  {block_scalar_key}\n"
+                        f"secretName: app-tls-secret\n"
+                        f"tokenPath: /var/run/secrets/token\n"
+                        f"authMode: mtls\n"
+                        f"automountServiceAccountToken: false\n"
+                        f"file1:1:-----BEGIN RSA PRIVATE KEY-----\n"
+                        f"file2_second_match.pem:1:-----BEGIN RSA PRIVATE KEY-----\n"
+                        f"Note: check the cluster credentials: deployment-controller mounts them.\n"
+                        f'{{"apiVersion":"v1","kind":"Secret","data":{{"pw":"{cut_json_b64}"'
+                    ),
+                    "terminal",
+                    None,
+                    103.0,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    json.dumps(
+                        {
+                            "output": json.dumps({"ssh-privatekey": long_ssh_b64, "custom_a": custom_b64}),
+                            "exit_code": 0,
+                            "error": None,
+                        }
+                    ),
+                    "terminal",
+                    None,
+                    103.2,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    json.dumps(
+                        {
+                            "output": (
+                                json.dumps({"ssh-privatekey": long_ssh_b64})
+                                + " "
+                                + json.dumps({"opaque_item": multi_item_b64})
+                            ),
+                            "exit_code": 0,
+                            "error": None,
+                        }
+                    ),
+                    "terminal",
+                    None,
+                    103.25,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    long_pem_doc,
+                    "terminal",
+                    None,
+                    103.3,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    unterminated_pem_doc,
+                    "terminal",
+                    None,
+                    103.35,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    long_kubeconfig_json,
+                    "terminal",
+                    None,
+                    103.4,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    json.dumps(
+                        {
+                            "kind": "ConfigMap",
+                            "data": {
+                                "tls.crt": tls_crt_val,
+                                "keystore.p12": p12_val,
+                                "plain_field": "kept_plain_value",
+                            },
+                            "env": [{"name": "DB_CREDENTIALS", "value": env_pair_creds}],
+                            "credentials_path": "/etc/creds/mounted-path",
+                        }
+                    ),
+                    "terminal",
+                    None,
+                    103.5,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    json.dumps({"status": "Done", "tier": "web1", "LOG_LEVEL": "info"}),
+                    "terminal",
+                    None,
+                    103.6,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "assistant",
+                    None,
+                    None,
+                    [
+                        {
+                            "function": {
+                                "name": "terminal",
+                                "arguments": json.dumps(
+                                    {
+                                        "command": (
+                                            "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d && "
+                                            "aws secretsmanager get-secret-value --secret-id prod/db"
+                                        )
+                                    }
+                                ),
+                            }
+                        }
+                    ],
+                    103.7,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    json.dumps({"output": f"{bare_secret_val}\n", "exit_code": 0, "error": None}),
+                    "terminal",
+                    None,
+                    103.75,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    json.dumps(
+                        {
+                            "status": "success",
+                            "data": {
+                                "resultType": "vector",
+                                "LOG_LEVEL": "info",
+                                "PORT": "8080",
+                            },
+                            "secretName": "app-tls-secret",
+                        }
+                    ),
+                    "terminal",
+                    None,
+                    103.8,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    "[" * 2000 + "]" * 2000,
+                    "terminal",
+                    None,
+                    103.9,
+                    None,
+                ),
+                ("sess-sec", "assistant", f"Checked {secret_tok} successfully.", None, None, 104.0, None),
+            ],
+        )
+
+        body = self.client.get("/v1/tasks/t_d1c3323e").json()
+        sess_body = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()
+        serialized = json.dumps(body["steps"])
+        sess_serialized = json.dumps(sess_body["tasks"][0]["live_steps"])
+        for leaked in (
+            secret_tok,
+            bearer_tok,
+            token_scheme_val,
+            auth_code_val,
+            data_secret_val,
+            string_data_val,
+            cli_tok,
+            api_token_val,
+            cli_pass,
+            long_user_pw,
+            wget_user_pw,
+            quoted_spaced_pw,
+            "quoted spaced",
+            attached_mysql_pw,
+            numeric_sshpass_pw,
+            mongosh_pw,
+            redis_pw,
+            az_secret,
+            docker_pw,
+            literal_cred,
+            url_pass,
+            block_scalar_pw,
+            block_scalar_key,
+            kubeconfig_key,
+            quoted_text_key,
+            db_creds,
+            env_pair_creds,
+            tls_crt_val,
+            p12_val,
+            custom_b64,
+            multi_item_b64,
+            cut_json_b64,
+            bare_secret_val,
+            long_ssh_b64[:32],
+            long_pem_body[:32],
+            unterminated_pem_body[:32],
+            long_kubeconfig_b64,
+        ):
+            self.assertNotIn(leaked, serialized)
+            self.assertNotIn(leaked, sess_serialized)
+        self.assertIn("[REDACTED_SECRET]", serialized)
+        self.assertIn("[REDACTED_PRIVATE_KEY]", serialized)
+        for preserved in (
+            "app-tls-secret",
+            "/var/run/secrets/token",
+            "mtls",
+            "8080",
+            "vector",
+            "Done",
+            "web1",
+            "file2_second_match.pem",
+            "kept_plain_value",
+            "/etc/creds/mounted-path",
+            "deployment-controller mounts them",
+            "/opt/data/gitops/x",
+            "postgres",
+            "8080:80",
+            "replicas",
+            "automountServiceAccountToken: false",
+            "--no-enable-basic-auth --zone us-central1-a",
+            "--with-token",
+            "--secret-id prod/db",
+            "docker run -u 1000:1000",
+            "-p https://registry.internal/proxy",
+            "-h db",
+            "3306",
+        ):
+            self.assertIn(preserved, serialized)
+        self.assertEqual(body["task"]["title"], "mkdir -p failing on node")
+        self.assertNotIn(card_body_secret, json.dumps(body["task"]))
+        self.assertNotIn(cli_tok, json.dumps(body["task"]))
+        self.assertNotIn(run_summary_secret, json.dumps(body["runs"]))
+        self.assertNotIn(run_error_secret, json.dumps(body["runs"]))
+        self.assertIn("[REDACTED_SECRET]", json.dumps(body["runs"]))
+        self.assertNotIn(event_payload_secret, json.dumps(body["events"]))
+        self.assertIn("[REDACTED_SECRET]", json.dumps(body["events"]))
+        self.assertNotIn(comment_secret, json.dumps(body["comments"]))
+
+        with patch.object(session_kv_server, "_get_audit_redactor", return_value=None):
+            fallback_resp = self.client.get("/v1/tasks/t_d1c3323e").json()
+            fallback = fallback_resp["steps"]
+            self.assertTrue(
+                all(s["preview"] == session_kv_server.WORKER_STEP_WITHHELD and "detail" not in s for s in fallback),
+                f"expected all step kinds withheld without detail when redactor is unavailable, got {fallback}",
+            )
+            self.assertNotIn(secret_tok, json.dumps(fallback))
+            self.assertEqual(fallback_resp["task"]["body"], session_kv_server.WORKER_STEP_WITHHELD)
+            sess_fallback = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()["tasks"][0]["live_steps"]
+            self.assertTrue(
+                all(s["preview"] == session_kv_server.WORKER_STEP_WITHHELD for s in sess_fallback),
+                f"expected all listing live_steps withheld without ellipsis, got {sess_fallback}",
+            )
+
+    def test_line_start_auth_scheme_pair_masks_the_token_not_only_the_scheme(self):
+        opaque = "3f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c"
+        for line in (
+            f"Authorization: Bearer {opaque}",
+            f"auth: Bearer {opaque}",
+            f"token: Bearer {opaque}",
+            f"AUTH_HEADER=Bearer {opaque}",
+        ):
+            with self.subTest(line=line):
+                cleaned = session_kv_server._scrub_worker_step_text("tool_result", line)
+                self.assertNotIn(opaque, cleaned)
+                self.assertIn("[REDACTED_SECRET]", cleaned)
+
+    def test_cli_short_p_re_linear_scan_on_crafted_line(self):
+        import time
+
+        crafted_line = "curl " * 20000 + "mysql " * 20000
+        t0 = time.monotonic()
+        cleaned = session_kv_server._scrub_worker_step_text("tool_result", crafted_line)
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 1.0, f"regex took {elapsed:.2f}s, expected < 1s")
+        self.assertEqual(cleaned, crafted_line)
+
+    def test_secret_read_result_is_withheld_when_store_pairs_by_tool_call_id(self):
+        secret_val = "paired-secret-hunter2-value"
+        read_args = json.dumps({"command": "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d"})
+        list_args = json.dumps({"command": "kubectl get pods"})
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-ids", "user", "work kanban task t_d1c3323e", None, None, 101.0, None, None),
+                (
+                    "sess-ids",
+                    "assistant",
+                    None,
+                    None,
+                    [
+                        {"id": "c1", "function": {"name": "terminal", "arguments": list_args}},
+                        {"call_id": "c2", "name": "terminal", "arguments": read_args},
+                    ],
+                    102.0,
+                    None,
+                    None,
+                ),
+                ("sess-ids", "tool", f"{secret_val}\n", "terminal", None, 103.0, None, "c2"),
+                ("sess-ids", "tool", "pod-a Running", "terminal", None, 103.5, None, "c1"),
+                (
+                    "sess-ids",
+                    "assistant",
+                    None,
+                    None,
+                    [{"name": "terminal", "arguments": read_args}],
+                    104.0,
+                    None,
+                    None,
+                ),
+                ("sess-ids", "tool", f"{secret_val}\n", "terminal", None, 105.0, None, "id-with-no-call"),
+            ],
+            with_tool_call_id=True,
+        )
+
+        resp = self.client.get("/v1/tasks/t_d1c3323e")
+        self.assertEqual(resp.status_code, 200)
+        steps = resp.json()["steps"]
+        self.assertEqual(
+            [s["preview"] for s in steps if s["kind"] == "tool_result"],
+            [session_kv_server.WORKER_STEP_WITHHELD, "pod-a Running", session_kv_server.WORKER_STEP_WITHHELD],
+        )
+        self.assertNotIn(secret_val, json.dumps(steps))
+
+    def test_steps_truncated_is_true_when_sql_row_window_clips_older_rows(self):
+        rows: list[tuple] = [
+            ("sess-win", "user", "work kanban task t_d1c3323e", None, None, 1.0, None),
+            ("sess-win", "assistant", "Old step that will be clipped", None, None, 2.0, None),
+        ]
+        window = session_kv_server.TASK_DETAIL_MAX_STEPS * session_kv_server.TASK_STEP_ROW_MULTIPLIER
+        for idx in range(window):
+            rows.append(("sess-win", "user", f"user-turn-{idx}", None, None, float(10 + idx), None))
+        rows.append(("sess-win", "assistant", "Final visible reply", None, None, 999.0, None))
+        self._write_profile_store("platform", rows)
+
+        body = self.client.get("/v1/tasks/t_d1c3323e").json()
+        self.assertTrue(body["steps_truncated"])
+        self.assertEqual(len(body["steps"]), 1)
+        self.assertEqual(body["steps"][0]["preview"], "Final visible reply")
+
+    def test_session_tasks_reuses_single_profile_connection_across_multiple_cards(self):
+        import sqlite3
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, assignee, status, priority, session_id, created_at) "
+                "VALUES ('t_second', 'Second task', 'body2', 'platform', 'running', 1, 'k8s-evt-1', 105.0)"
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, metadata) "
+                "VALUES ('t_second', 'platform', 'running', 106.0, '{}')"
+            )
+        rows: list[tuple] = [
+            ("sess-1", "user", "work kanban task t_d1c3323e", None, None, 101.0, None),
+            ("sess-1", "assistant", "First card reply", None, None, 102.0, None),
+            ("sess-2", "user", "work kanban task t_second", None, None, 106.0, None),
+        ]
+        for idx in range(15):
+            rows.append(("sess-2", "assistant", f"Second card step {idx}", None, None, float(107 + idx), None))
+        self._write_profile_store("platform", rows)
+
+        real_read_only = session_kv_server._read_only
+        opened_paths: list[str] = []
+
+        def counting_read_only(path: str):
+            opened_paths.append(path)
+            return real_read_only(path)
+
+        with patch.object(session_kv_server, "_read_only", side_effect=counting_read_only):
+            resp = self.client.get("/v1/sessions/k8s-evt-1/tasks")
+        self.assertEqual(resp.status_code, 200)
+        tasks = resp.json()["tasks"]
+        self.assertEqual([t["id"] for t in tasks], ["t_d1c3323e", "t_second"])
+        self.assertEqual(tasks[0]["live_steps"][0]["preview"], "First card reply")
+        self.assertFalse(tasks[0]["steps_truncated"])
+        # Listing caps `live_steps` at SESSION_TASK_LIVE_STEPS_MAX (10) newest steps.
+        self.assertEqual(len(tasks[1]["live_steps"]), session_kv_server.SESSION_TASK_LIVE_STEPS_MAX)
+        self.assertTrue(tasks[1]["steps_truncated"])
+        self.assertEqual(tasks[1]["live_steps"][0]["preview"], "Second card step 5")
+        self.assertEqual(tasks[1]["live_steps"][-1]["preview"], "Second card step 14")
+        profile_opens = [p for p in opened_paths if p.endswith("state.db")]
+        self.assertEqual(len(profile_opens), 1)
+
+        # Second poll with no new `messages` rows hits `_PROMPT_INDEX_CACHE` without
+        # running another `LIKE '%work kanban task %'` scan; appending a row scans only `WHERE id > last_seen_id`.
+        like_queries: list[tuple] = []
+
+        class _SpyConn:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, params=()):
+                if "LIKE ?" in sql:
+                    like_queries.append((sql, tuple(params)))
+                return self._inner.execute(sql, params)
+
+            def close(self):
+                return self._inner.close()
+
+        with patch.object(
+            session_kv_server,
+            "_read_only",
+            side_effect=lambda p: _SpyConn(real_read_only(p)) if p.endswith("state.db") else real_read_only(p),
+        ):
+            self.client.get("/v1/sessions/k8s-evt-1/tasks")
+            self.assertEqual(like_queries, [])
+            self._write_profile_store(
+                "platform",
+                [
+                    ("sess-1", "assistant", "Incremental step", None, None, 200.0, None),
+                ],
+            )
+            self.client.get("/v1/sessions/k8s-evt-1/tasks")
+            self.assertEqual(len(like_queries), 1)
+            self.assertGreater(like_queries[0][1][0], 0)
+
+        # If a `LIKE` scan raises `sqlite3.Error`, `last_seen_id` is NOT advanced so the next poll retries the skipped rows.
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-retry", "user", "work kanban task t_second", None, None, 300.0, None),
+                ("sess-retry", "assistant", "Retried after transient lock", None, None, 301.0, None),
+            ],
+        )
+        fail_once = [True]
+
+        class _FlakyLikeConn:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, params=()):
+                if "LIKE ?" in sql and fail_once[0]:
+                    fail_once[0] = False
+                    raise sqlite3.OperationalError("database is locked")
+                return self._inner.execute(sql, params)
+
+            def close(self):
+                return self._inner.close()
+
+        with patch.object(
+            session_kv_server,
+            "_read_only",
+            side_effect=lambda p: _FlakyLikeConn(real_read_only(p)) if p.endswith("state.db") else real_read_only(p),
+        ):
+            self.client.get("/v1/sessions/k8s-evt-1/tasks")
+            recovered = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()["tasks"]
+            self.assertEqual(recovered[1]["live_steps"][-1]["preview"], "Retried after transient lock")
+
+    def test_worker_session_id_in_run_metadata_resolves_without_prompt_scan_and_falls_back_when_absent(self):
+        import sqlite3
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute("DELETE FROM task_runs WHERE task_id = 't_d1c3323e'")
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, metadata) "
+                "VALUES ('t_d1c3323e', 'default', 'running', 101.0, ?)",
+                (json.dumps({"worker_session_id": "sess-stamped"}),),
+            )
+        # Write into the default profile store (<agent_home>/state.db) with NO
+        # `work kanban task` user prompt row so only `worker_session_id` can match.
+        self._write_profile_store(
+            "default",
+            [
+                ("sess-stamped", "assistant", "Resolved via stamped worker_session_id", None, None, 102.0, None),
+            ],
+        )
+
+        with patch.object(
+            session_kv_server._WorkerStepReader,
+            "sessions_by_prompt",
+            wraps=session_kv_server._WorkerStepReader.sessions_by_prompt,
+        ) as spy_prompt:
+            body = self.client.get("/v1/tasks/t_d1c3323e").json()
+            spy_prompt.assert_not_called()
+        self.assertEqual([s["preview"] for s in body["steps"]], ["Resolved via stamped worker_session_id"])
+
+        # When a stamped worker_session_id is absent from the store, fall back to the prompt index.
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute(
+                "UPDATE task_runs SET profile = 'platform', metadata = ? WHERE task_id = 't_d1c3323e'",
+                (json.dumps({"worker_session_id": "sess-nonexistent"}),),
+            )
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-fallback", "user", "work kanban task t_d1c3323e", None, None, 110.0, None),
+                ("sess-fallback", "assistant", "Resolved via prompt fallback", None, None, 111.0, None),
+            ],
+        )
+        fallback_body = self.client.get("/v1/tasks/t_d1c3323e").json()
+        self.assertEqual([s["preview"] for s in fallback_body["steps"]], ["Resolved via prompt fallback"])
+
+    def test_retried_card_with_mixed_metadata_and_prompt_sessions_orders_attempts_chronologically(self):
+        import sqlite3
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute("DELETE FROM task_runs WHERE task_id = 't_d1c3323e'")
+            # Run 1 has no worker_session_id (pre-upgrade attempt); Run 2 stamps worker_session_id.
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, metadata) "
+                "VALUES ('t_d1c3323e', 'platform', 'failed', 100.0, 150.0, '{}')"
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, metadata) "
+                "VALUES ('t_d1c3323e', 'platform', 'running', 200.0, ?)",
+                (json.dumps({"worker_session_id": "s2"}),),
+            )
+
+        rows: list[tuple] = [
+            ("s1", "user", "work kanban task t_d1c3323e", None, None, 100.0, None),
+        ]
+        for idx in range(80):
+            rows.append(("s1", "assistant", f"attempt-1-step-{idx}", None, None, float(101 + idx), None))
+        rows.append(("s2", "user", "work kanban task t_d1c3323e", None, None, 200.0, None))
+        for idx in range(30):
+            rows.append(("s2", "assistant", f"attempt-2-step-{idx}", None, None, float(201 + idx), None))
+        self._write_profile_store("platform", rows)
+
+        body = self.client.get("/v1/tasks/t_d1c3323e").json()
+        self.assertTrue(body["steps_truncated"])
+        previews = [s["preview"] for s in body["steps"]]
+        self.assertEqual(len(previews), session_kv_server.TASK_DETAIL_MAX_STEPS)
+        # Oldest 10 steps of attempt 1 were cut; the remaining 70 steps of attempt 1
+        # precede all 30 steps of the live retry attempt 2.
+        self.assertEqual(previews[0], "attempt-1-step-10")
+        self.assertEqual(previews[69], "attempt-1-step-79")
+        self.assertEqual(previews[70], "attempt-2-step-0")
+        self.assertEqual(previews[-1], "attempt-2-step-29")
 
 
 
