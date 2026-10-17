@@ -156,6 +156,8 @@ type slackShortcutMessage struct {
 			Title string `json:"title"`
 			Value string `json:"value"`
 		} `json:"fields"`
+		// Blocks is an attachment's Block Kit body, under its colour bar.
+		Blocks []slackShortcutBlock `json:"blocks"`
 	} `json:"attachments"`
 	Files []struct {
 		Name string `json:"name"`
@@ -276,18 +278,23 @@ func (s *SlackAdapter) shortcut(ctx context.Context, raw json.RawMessage, handle
 		return
 	}
 	runCtx := ctx
-	ctx, cancel := context.WithTimeout(ctx, slackShortcutTimeout)
-	defer cancel()
-	note, ok := s.shortcutUnreachable(ctx, p.Channel.ID, p.Channel.Name)
+	// Two budgets, one per phase: a membership read that spends all of its
+	// own must not leave the name reads an expired context, which would
+	// name the poster and the clicker "Someone".
+	checkCtx, cancelCheck := context.WithTimeout(runCtx, slackShortcutTimeout)
+	defer cancelCheck()
+	note, ok := s.shortcutUnreachable(checkCtx, p.Channel.ID, p.Channel.Name)
 	if !ok {
 		return
 	}
 	if note != "" {
 		s.log.Info("slack: shortcut used where the bot cannot post; told the clicker",
 			"channel", p.Channel.ID, "user", p.User.ID)
-		s.respondPrivately(ctx, p.ResponseURL, note)
+		s.respondPrivately(checkCtx, p.ResponseURL, note)
 		return
 	}
+	ctx, cancel := context.WithTimeout(runCtx, slackShortcutTimeout)
+	defer cancel()
 	thread := p.Message.ThreadTS
 	if thread == "" {
 		thread = p.Message.TS
@@ -433,6 +440,11 @@ func slackShortcutQuoted(m slackShortcutMessage) string {
 	}
 	for _, a := range m.Attachments {
 		before := len(parts)
+		for _, b := range a.Blocks {
+			for _, w := range b.words() {
+				add(w)
+			}
+		}
 		add(a.Pretext)
 		add(a.Title)
 		add(a.Text)

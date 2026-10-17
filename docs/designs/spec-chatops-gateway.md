@@ -1674,7 +1674,8 @@ the message, so the ask's reaction goes on it, and its text is a fixed frame
 (`slackShortcutAsk`) around the message quoted: the words of its Block Kit blocks (sections,
 fields, headers, context and rich_text, not buttons), or its text when it has none, since an
 app's text beside blocks is only the fallback; its attachments' pretext, title, text and
-fields (the fallback when it has none); and its files' names, opened by who posted it
+fields, and its Block Kit body (the fallback when none of them has words); and its files'
+names, opened by who posted it
 (a member's Slack name, an app's posting name, on one line and clipped), with the channel's
 name in the frame. The poster's name goes inside the quote because it is the message's word:
 an app chooses the name it posts under and a member sets their own. The frame tells the agent
@@ -1684,8 +1685,10 @@ the message's author may be anyone, a program included; the eval case
 verified the clicker and the shortcut's own task starts, the adapter posts a context-only
 message in the thread naming them by their Slack name (`<name> asked me to look at this`),
 from `TaskStarted`, under the session lock and before anything of the task's can post, so
-Slack shows the task's first reply directly under it from the same sender and a channel
-reading a bot's reply under someone else's message can see who asked. It is its own message,
+a channel reading a bot's reply under someone else's message can see who asked. It precedes
+the task's first reply; it is not glued to it. A reply typed in the thread before the
+executor's first post is a turn of its own, and the gateway's answer to it (a steer's ack, a
+refusal) lands between the line and the task's reply. It is its own message,
 not a line on the task's first post, because nothing ties a post to the task it is for: under
 Agent Sessions there is no placeholder, and the first post in the thread can be the gateway's
 reply to another turn (a steer's ack, a refusal). A shortcut whose turn starts no task (a

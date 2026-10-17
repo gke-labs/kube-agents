@@ -440,6 +440,19 @@ func TestSlackShortcutQuotesBlockKitAndNotItsFallback(t *testing.T) {
 	}
 }
 
+// An attachment can carry its body as Block Kit under its colour bar, with a
+// terse fallback: the quote is the body.
+func TestSlackShortcutQuotesAnAttachmentsBlocks(t *testing.T) {
+	var m slackShortcutMessage
+	if err := json.Unmarshal([]byte(`{"text":"New alert","attachments":[{"color":"danger","fallback":"New alert",
+	 "blocks":[{"type":"section","text":{"type":"mrkdwn","text":"payments-api OOMKilled 6x"}}]}]}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := slackShortcutQuoted(m), "New alert\npayments-api OOMKilled 6x"; got != want {
+		t.Errorf("quote = %q, want %q", got, want)
+	}
+}
+
 // A message typed in Slack carries its words twice, as text and as
 // rich_text: quoted once, a link by its label or URL.
 func TestSlackShortcutQuotesRichTextOnce(t *testing.T) {
