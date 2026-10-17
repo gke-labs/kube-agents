@@ -260,6 +260,12 @@ via `mark_delivery_headless` and starts the triage turn without attempting a cha
 read-only activity feed (`/v1/intercepted-events`, `/v1/tasks`) is the intended consumer,
 `dispatched_headless` neither prints a `⚠️` failure line nor vetoes the ✅ all-clear / 🟢 header.
 
+Sibling-replica events folded into an earlier workload anchor event (`duplicate_of > 0`, written when
+`INCIDENT_WORKLOAD_DEDUP_SECONDS` is set; see
+[`session_management.md`](../../agents/platform/docs/session_management.md)) also carry
+`notified = 0`, and are skipped before the counts above run: the anchor row was already admitted,
+so a folded sibling is neither a ceiling drop nor a second workload incident.
+
 Both `⚠️` lines are printed only when the ledger was readable; an unreadable one reports as 🔴 and the
 counts would be meaningless. Beyond counting, `cap_dropped` and `delivery_failed` veto the ✅ all-clear and the 🟢 header:
 "Nothing was held back from chat today" printed over a day the ceiling ate thirty `Critical` alerts

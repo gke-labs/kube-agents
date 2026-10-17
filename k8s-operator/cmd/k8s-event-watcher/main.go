@@ -439,12 +439,13 @@ type dispatcher struct {
 	// scaleUps carries cluster-autoscaler's verdict on a pod from the event that
 	// records it to the FailedScheduling events it qualifies. Per-cluster for
 	// the same reason; pod UIDs are unique across clusters regardless.
-	scaleUps  *scaleUpMemo
-	injector  *injector
-	metrics   *metrics
-	mode      string // "per-incident" or "shared"
-	targetSid string // for shared mode
-	dryRun    bool
+	scaleUps             *scaleUpMemo
+	injector             *injector
+	metrics              *metrics
+	mode                 string // "per-incident" or "shared"
+	targetSid            string // for shared mode
+	dryRun               bool
+	resolveControllerRef func(ctx context.Context, namespace, kind, name string) string
 }
 
 // newDispatcher builds a dispatcher around one cluster's dedup cache. filter,
@@ -628,6 +629,12 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		// payload treats Count as the number of sightings this row stands for.
 		result = reopened
 	}
+	// Resolve the live controller reference before creating a session so an API
+	// lookup delay does not orphan an allocated session row, and skip it in
+	// dry-run mode where no session server will read the field.
+	if !d.dryRun && ev.ControllerRef == "" && d.resolveControllerRef != nil {
+		ev.ControllerRef = d.resolveControllerRef(ctx, ev.Namespace, ev.KindOfObject, ev.Name)
+	}
 	// Create or reuse a troubleshooter session, then inject event telemetry.
 	sid := d.targetSid
 	if d.mode == "per-incident" && !d.dryRun {
@@ -687,6 +694,17 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		d.dedup.Forget(ev.Key, ev.Message)
 		log.Printf("dispatcher: inject for %s/%s (sid=%s): %v", ev.Namespace, ev.Name, sid, err)
 		d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, "inject").Inc()
+		return
+	}
+	if status == injectStatusFolded {
+		// 2xx, and folded into the workload's recent anchor event within the
+		// dedup window: the dedup entry stays closed (unlike "suppressed") and
+		// is NOT marked policy-filtered (unlike "filtered", which would let a
+		// subsequent Warning on the same pod reopen the entry and re-inject on
+		// every kubelet resync).
+		d.metrics.eventsWorkloadFolded.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
+		log.Printf("workload-folded %s pod=%s/%s (sid=%s) — folded into recent workload anchor event",
+			ev.Key.Reason, ev.Namespace, ev.Name, sid)
 		return
 	}
 	if status == injectStatusFiltered {
