@@ -132,6 +132,12 @@ def test_the_older_skill_key_counts():
     assert _status(SKILL, ANSWER, record) == "pass"
 
 
+@pytest.mark.parametrize("skill", ["pod-crashloop-oom", "pod-pending-scheduling", "pod-container-creating", "service-connectivity"])
+def test_the_symptom_skills_count(skill: str):
+    record = _inject(_call("Skill", {"skill": skill}), KUBECTL)
+    assert _status(SKILL, ANSWER, record) == "pass"
+
+
 def test_a_skill_that_is_not_a_shipped_gke_skill_does_not_count():
     assert _status(SKILL, ANSWER, _inject(_call("Skill", {"skill": "review"}), KUBECTL)) == "fail"
 

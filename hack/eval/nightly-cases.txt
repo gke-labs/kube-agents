@@ -1118,3 +1118,12 @@
 # its own on the host cluster, so it too serializes on the infra lock. Priced
 # at that case's 1450s hint until it has a record.
 ./tasks/ai-security-chat-request-runs-collector/task.yaml
+
+# A cluster-wide "what is failing?" question across the seeded fleet: every
+# Cluster Agent runs workload_triage.py once, healthy clusters finish without
+# polling or exploring system namespaces, and the crashloop-workload role's
+# payments-api is still named OOMKilled (#3181). deployer: noop, one fan-out
+# round trip; reads the seeded fleet's crashloop-workload role.
+# Blocks: validated: false until a red run on main and three green runs are
+# recorded for it.
+./tasks/cluster-agent-fleet-health-triage/task.yaml

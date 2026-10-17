@@ -192,6 +192,7 @@ ADDED_AFTER_THE_MOVE = [
     "upgrade-chat-request-runs-collector",  # a plain upgrade-readiness request runs the patch collector, #2386
     "drift-chat-request-runs-collector",  # a plain peer-consistency request runs the drift collector, #2386
     "ai-security-chat-request-runs-collector",  # a plain AI-security request runs the AI security collector, #2386
+    "cluster-agent-fleet-health-triage",  # #3181: cluster-wide health scan across seeded fleet
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.

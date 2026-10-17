@@ -490,6 +490,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          skill trees are not staged in this image (see
 #                          deploy/sandbox/entrypoint.sh: everything agents/cluster
 #                          names is under /opt/data/scripts)
+#   workload_triage.py     the Cluster Agent's workload-triage-scan reader: one
+#                          pass over pods, controllers and Warning events; stdlib
+#                          only, its kubectl reads go through the same wrapper,
+#                          and it is here for the same reason as stall_report.py
 #   inventory_findings.py  the onboarding ranking card's bridge from
 #                          INVENTORY.raw.md to the findings queue
 #                          (governance/inventory_prioritize_sop.md). `extract`
@@ -531,6 +535,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/gke_endpoint.py \
      agents/platform/scripts/cluster_preflight.sh \
      agents/platform/scripts/stall_report.py \
+     agents/platform/scripts/workload_triage.py \
      agents/platform/scripts/inventory_findings.py \
      agents/platform/scripts/findings_queue.py \
      /opt/defaults/scripts/

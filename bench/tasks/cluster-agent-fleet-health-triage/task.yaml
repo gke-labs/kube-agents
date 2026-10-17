@@ -1,0 +1,115 @@
+# Domain: cluster debugging. Journey: a cluster-wide "what is failing?"
+# question, answered with one scan per cluster, a fast exit where nothing is
+# failing, and a root cause where something is (#3181).
+#
+# What this grades. Before #3181 the Cluster Agent had one workload skill,
+# gke-workload-troubleshooting, written for one named workload. Asked about a
+# whole cluster, the agent improvised a scan one kubectl command per model turn:
+# in the traced benchmark of 2026-10-15 a healthy cluster took 34 commands and
+# 561.5s, listed every pod four times, explored kube-system and waited on a new
+# node with `sleep 15` loops. #3181 adds workload-triage-scan, which runs
+# /opt/data/scripts/workload_triage.py once (pods, controllers and Warning
+# events across all namespaces), finishes at once when it ends `unhealthy: 0`,
+# and hands each finding to a focused skill (pod-crashloop-oom here).
+#
+# Two halves, both on the seeded fleet:
+#
+# (a) Fast exit. The question covers every seeded cluster, and the clusters
+#     that carry no workload defect have nothing to find. The route checks
+#     below grade how the agents got there: at least one worker ran the scan
+#     script, and no worker slept, watched, fetched credentials, or described
+#     or tailed pods in a system namespace. The command count per card is not
+#     gradable here (worker_commands reads commands, not cards), so the
+#     forbidden list stands in for "did not explore": those are the commands
+#     the slow runs spent their turns on.
+#
+# (b) Root-cause depth. seeded-a carries the crashloop-workload fixture:
+#     payments-api in seeded-debug is OOMKilled on every start with a 64Mi
+#     limit. The answer must still name payments-api and OOMKilled, the same
+#     phrases cluster-agent-crashloop-debug requires, so a faster scan that
+#     drops the root cause fails here.
+#
+# RED ON MAIN: main ships no workload_triage.py, so
+# the-scan-ran-once-per-cluster-question fails; main's skill tells the agent to
+# run `gcloud container clusters get-credentials`, which
+# the-scan-did-not-poll-or-explore forbids. The depth objective passes on main,
+# which is the point: it is the guard that the speed-up kept the answer.
+#
+# Safeguard: the fixture came out the way it went in. Same check as
+# cluster-agent-crashloop-debug.
+id: cluster-agent-fleet-health-triage
+name: A cluster-wide failing-workloads question scans once, exits fast when healthy, and still finds the OOM
+prompt: >-
+  What workloads are failing or degraded across the seeded clusters? For
+  anything that is failing, tell me why.
+expected_output: >-
+  One card per cluster. Each Cluster Agent runs the workload triage scan once.
+  Clusters with no failing workload are reported as healthy with pod counts,
+  without per-pod investigation, waiting or exploring system namespaces. On the
+  cluster carrying seeded-debug, payments-api is named as crashlooping because
+  its container is OOMKilled against a 64Mi memory limit, with the evidence
+  (last termination state, restart count, limit) and a raised limit proposed as
+  a recommendation only. Nothing is changed.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: cluster-debugging
+
+owner: fkc1e100
+
+fixtures:
+  - crashloop-workload
+
+verification_spec:
+  - name: the-scan-ran-once-per-cluster-question
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_runs:
+        - script: workload_triage.py
+  - name: the-scan-did-not-poll-or-explore
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns:
+        - '(^|[;&|(\s])sleep\s+\d'
+        - 'kubectl\s.*\s(-w|--watch)(\s|$)'
+        - 'gcloud\s+container\s+clusters\s+get-credentials'
+        - 'kubectl\s+(describe|logs)\s.*(-n|--namespace)[\s=](kube-[\w-]+|gke-[\w-]+|gmp-[\w-]+)(\s|$)'
+  # Order-aware: once any worker's scan has printed `unhealthy: 0`, no later
+  # command in the fan-out re-lists the cluster or re-runs the scan wider to
+  # confirm it. The skill forbids both after a clean scan, and on the cluster
+  # with the OOM the scan output already is the cluster-wide listing, so the
+  # crashloop path (per-pod reads in seeded-debug) never needs an
+  # all-namespaces list either. R3 of the 2026-10-15 benchmark saw three to
+  # six such reads per healthy cluster.
+  - name: the-clean-scan-was-not-re-checked
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      after_result_pattern: "unhealthy: 0"
+      forbidden_patterns:
+        - 'workload_triage\.py\s.*--include-system'
+        - 'kubectl\s+get\s+(pods?|po|events?|ev|daemonsets?|ds|deployments?|deploy)(,\S+)?\s.*(-A|--all-namespaces)(\s|$)'
+  - name: rca-names-the-oom
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["payments-api", "OOMKilled"]
+  - name: the-crashloop-was-diagnosed-not-fixed
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: crashloop-workload
+      kind: deployment
+      resource_name: payments-api
+      namespace: seeded-debug
+      path: spec.template.spec.containers[?(@.name=='api')].resources.limits.memory
+      op: eq
+      value: 64Mi
