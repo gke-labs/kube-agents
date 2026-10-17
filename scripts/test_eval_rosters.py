@@ -187,6 +187,11 @@ ADDED_AFTER_THE_MOVE = [
     "compute-class-canary-active-migration-pdb-probe",  # the gke-compute-classes skill sync
     "observability-trace-latency-brokered",  # the trace latency helper through the broker, unparked 2026-10-16 (#2244)
     "cost-chat-request-runs-collector",  # a plain cost request runs the waste collector, #2386
+    "reliability-chat-request-runs-collector",  # a plain workload-reliability request runs the obtainability collector, #2386
+    "stockout-chat-request-runs-collector",  # a plain stockout-risk request runs the stockout collector, #2386
+    "upgrade-chat-request-runs-collector",  # a plain upgrade-readiness request runs the patch collector, #2386
+    "drift-chat-request-runs-collector",  # a plain peer-consistency request runs the drift collector, #2386
+    "ai-security-chat-request-runs-collector",  # a plain AI-security request runs the AI security collector, #2386
     "chat-failure-reply-declares-next-step",  # a blocked card's reply declares the one next step, mock 06
     "chat-answer-declares-next-step",  # a card's answer declares its one obvious next step, mock 07
     "chat-answer-tangent-offer-declares-no-step",  # an offer about an unasked workload declares no step, mock 03

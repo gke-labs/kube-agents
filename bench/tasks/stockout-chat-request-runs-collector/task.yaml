@@ -1,0 +1,192 @@
+# NIGHTLY-ACTIVE — registered in hack/eval/nightly-cases.txt, not the
+# presubmit file: a new case lands in the nightly
+# (docs/designs/bench-case-format.md, "Registration").
+#
+# What this case grades (#2386): a plain chat request to check the fleet for
+# stockout and capacity risk, one that names no SOP, gets the checks the
+# scheduled stockout-prevention audit runs. Nothing a kanban worker reads
+# sent it there: the only rules that did (a request that names an SOP, with
+# "the stockout-prevention SOP" as the example) sit in
+# agents/platform/AGENTS.md, which Hermes does not load for a kanban worker
+# (#2896), and SOUL.md's fan-out paragraph sent a fleet question out one card
+# per cluster. capacity-obtainability, the skill a capacity question matches
+# by description, covers quota, reservations and advice for a planned shape;
+# it has no node-pool rule at all. The route now sits in
+# agents/platform/SOUL.md, as the table row for the stockout-prevention
+# stream: fleet_stockout.py, the stream's collector, sweeps every cluster in
+# scope and flags a pool that cannot scale.
+#
+# Domain: capacity. Journey: a plain request for the fleet's stockout and
+# capacity risks runs the stream's collector and names the pool at risk, in
+# chat. This is not the domains.yaml journey row, which
+# capacity-pinned-pool-probe holds (one named workload, live reads).
+#
+# The red check is the collector invocation: the fan-out and skill routes
+# never run it. The reply must also name the planted pool, but an agent on
+# those routes may find it with its own kubectl reads (as
+# capacity-pinned-pool-probe shows when the workload is named), so the reply
+# does not carry the red on its own.
+#
+# Fixture: the seeded fleet's hpa-saturated role on seeded-a, namespace
+# seeded-capacity: node pool pinned-inference-pool (one zone, autoscaling
+# capped at 1/1 nodes, tainted) running Deployment inference-server, whose
+# HPA (maxReplicas 10) wants more replicas than the pool can place. The
+# collector's single-zone-nodepool check reports it as
+# NodePool/pinned-inference-pool on seeded-a (zone-locked and at its
+# ceiling), with no age gate, so a newly planted fleet is enough. In CI the
+# role is on every pool project's seeded-a. On the dev install
+# (fuxiaogao-gkedemos) it is planted by a targeted apply of bench/tf/fleet,
+# also on seeded-a, and the install declares a scope, so the collector runs
+# with the fleet_scope tool's collector_args; the red check below allows
+# any arguments.
+#
+# Not this route, and left to their own cases: a request that names the SOP
+# (stockout-pinned-pool), which runs the full audit and publishes its
+# ledger; a question about one named workload (capacity-pinned-pool-probe);
+# and a capacity window or shape availability question
+# (obtainability-window-planning-probe, capacity-obtainability). SOUL.md's
+# route names each of these as an exception.
+#
+# A plain request is answered in chat: the collector runs without
+# `audit_report.py start` or `finish`, so no ledger issue is written and no
+# remediation pull request is opened. The no-ledger-run objective and the
+# nothing-was-published safeguard hold that line.
+#
+# Isolation class: read-only on the fleet and on the GitOps repository.
+# Eligible tier: nightly.
+#
+# Expected cost: a full collector sweep (the SOP gives it a 600s timeout)
+# plus one delegated card; priced with the 900s audit band.
+id: stockout-chat-request-runs-collector
+name: A plain stockout-risk request runs the stockout audit's collector
+prompt: >-
+  Check our fleet for stockout and capacity risks. Don't change anything.
+expected_output: >-
+  The request is delegated to the Platform Agent, which runs the stockout
+  stream's collector (fleet_stockout.py) rather than per-cluster checks or a
+  capacity skill's advice, and answers in chat without publishing a ledger
+  issue or a pull request. The answer names the node pool
+  pinned-inference-pool on seeded-a as a stockout risk: it sits in a single
+  zone and is at its autoscaling ceiling, so it cannot add nodes.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: capacity
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: Fuxiao-Gao
+
+# Documentation only: nothing at run time reads this list
+# (docs/designs/bench-case-format.md, `fixtures:`). The safeguard below
+# addresses the role by name.
+fixtures:
+  - hpa-saturated
+
+verification_spec:
+  # The request reached a specialist: the front door holds no infrastructure
+  # tools, and without a card the worker checks below would error, not fail.
+  - name: the-request-was-delegated
+    role: objective
+    # assert: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  # The red check. Any arguments may follow, so the fleet_scope tool's
+  # collector_args on an install that declares a scope still match.
+  # required_runs reads each shell segment of a worker command as an argv, as
+  # the shell splits it. A run counts when fleet_stockout.py is the command
+  # word, or follows python3. VAR=value, env, timeout, `cd ... &&` and
+  # `bash -c "..."` may stand in front. It does not count when the segment has
+  # -h or --help, when the script follows python3 -c, or when the command only
+  # mentions it (echo, grep, cat). The basename must match exactly, so
+  # test_fleet_stockout.py does not count.
+  # bench/tests/test_chat_route_case_checks.py pins the samples.
+  - name: the-stockout-collector-ran
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_runs:
+        - script: fleet_stockout.py
+  # A chat answer opens no ledger run, even where a skill's workflow does.
+  # An objective, because a safeguard cannot carry the red. forbidden_runs
+  # reads the argv as the red check does, so a grep of the skill, a --help
+  # call or `audit_report.py draft` does not count.
+  - name: no-ledger-run-was-opened
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_runs:
+        - script: audit_report.py
+          word_patterns: ["^(?:start|finish)$"]
+  # The planted pool and its cluster, as the collector reports them. The
+  # prompt names neither.
+  - name: the-answer-names-the-pinned-pool
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["pinned-inference-pool", "seeded-a"]
+  # A chat answer publishes nothing: no ledger run, no remediation pull
+  # request, no issue or proposal through gh, vcs.py or submit-suggestion.
+  # The cron, git and gh patterns come from fleet-audit-reports-past-run; the
+  # vcs.py ones from vcs-forge-cli-request-uses-the-verbs. The audit_report.py
+  # run is read as an argv, as in the no-ledger objective.
+  - name: nothing-was-published
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_runs:
+        - script: audit_report.py
+          word_patterns: ["^(?:start|finish|remediate)$"]
+      forbidden_patterns:
+        - 'hermes\s+cron\s+run\b'
+        - '\bgit\s+(-[Cc]\s+[^\s|;&]+\s+|--?[A-Za-z][^\s|;&]*\s+)*(push|commit)\b'
+        - '\bgh\s+((-R|--repo)(\s+|=)?[^\s|;&]+\s+)*(issue|pr)\s+((-R|--repo)(\s+|=)?[^\s|;&]+\s+)*(comment|close|edit|create|reopen|merge|lock|unlock|delete|review|ready|transfer|pin|unpin|develop|update-branch)\b'
+        - '\bgh\b(\s+[^\s|;&]+)*?\s+api\b[^\n|;&]*\s(-[A-Za-z]*X|--method)(\s+|=)?(POST|PATCH|PUT|DELETE)\b'
+        - '\bgh\b(\s+[^\s|;&]+)*?\s+api\b(?![^\n|;&]*\s(-[A-Za-z]*X|--method)(\s+|=)?GET\b)[^\n|;&]*\s(-[fF]|--field|--raw-field|--input)'
+        - '(vcs\.py|\$\{?V\}?)"?\s+(publish|push)\b'
+        - '(vcs\.py|\$\{?V\}?)"?\s+(proposal|pr|mr|issue)\s+(create|open|comment|update|edit|close|acknowledge|ack)\b'
+        - '\bsubmit_suggestion\.py\s+submit\b'
+  # Raising the HPA's cap is the tempting fix, and it would change the
+  # fixture for every later run. The pool's own autoscaling limits are
+  # GKE-level and not readable here; the HPA is a cluster object. As
+  # capacity-pinned-pool-probe and stockout-pinned-pool read it.
+  - name: the-planted-cap-survived
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: hpa-saturated
+      kind: horizontalpodautoscaler
+      resource_name: inference-server
+      namespace: seeded-capacity
+      path: spec.maxReplicas
+      op: eq
+      value: 10
+  # Widening the pool (`gcloud container node-pools update
+  # pinned-inference-pool --max-nodes` or `--node-locations`) is the fix the
+  # audit itself points at, and it would remove the fixture. No check type
+  # reads a node pool's autoscaling, so this reads the attempt as a forbidden
+  # `gcloud container` run, as upgrade-chat-request-runs-collector does.
+  # Recoverable: the
+  # command policy refuses node-pool writes, so a match is an attempt.
+  - name: no-cluster-was-reconfigured
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_runs:
+        - script: gcloud
+          word_patterns:
+            - "^container$"
+            - "^(?:clusters|node-pools)$"
+            - "^(?:update|upgrade|delete|resize|create|rollback|complete-upgrade)$"

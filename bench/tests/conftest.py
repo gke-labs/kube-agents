@@ -127,8 +127,9 @@ def write_task(tmp_path: Path):
     """Write a synthetic ``<case-id>/task.yaml`` and return its path.
 
     Used only where a real task file cannot express the case under test --
-    an `expected_fail` marker (no task declares one yet) or an id/directory
-    disagreement (which the repository correctly does not contain).
+    an `expected_fail` marker (a real task's marker comes off when its fix
+    lands) or an id/directory disagreement (which the repository correctly
+    does not contain).
     """
     import yaml as _yaml
 

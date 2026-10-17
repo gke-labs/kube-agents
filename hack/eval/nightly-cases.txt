@@ -1082,6 +1082,43 @@
 # Nightly rather than presubmit for the collector's full sweep.
 ./tasks/cost-chat-request-runs-collector/task.yaml
 
+# A plain chat request about workload reliability across the fleet runs the
+# reliability audit's collector (#2386), and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's no-pdb-workload role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/reliability-chat-request-runs-collector/task.yaml
+
+# A plain chat request for the fleet's stockout and capacity risks runs the
+# stockout-prevention audit's collector (#2386), and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's hpa-saturated role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/stockout-chat-request-runs-collector/task.yaml
+
+# A plain chat request about upgrade and patch readiness runs the patch
+# audit's collector (#2386), and answers in chat without publishing.
+# deployer: noop; reads seeded-a's shipped no-notifications posture (no
+# fixtures role). Nightly rather than presubmit for the collector's full sweep.
+./tasks/upgrade-chat-request-runs-collector/task.yaml
+
+# A plain chat request for the clusters that differ from their peers runs the
+# drift audit's collector (#2386), and answers in chat without publishing.
+# deployer: noop; reads the seeded fleet's drift-outlier role (slot c).
+# Nightly rather than presubmit: consistency-authorized-networks-probe holds
+# the domain's presubmit seat. Red on main: no SOUL.md row routes the question
+# to fleet_drift.py. Marked expected_fail: true, so the nightly records it as
+# EXPECTED_FAIL and also records whether the outlier and facet reply checks
+# pass on seeded-c. The follow-up that adds the drift row removes the marker.
+./tasks/drift-chat-request-runs-collector/task.yaml
+
+# A plain chat request about the security of the fleet's AI and
+# model-serving workloads runs the AI security audit's collector (#2386), and
+# answers in chat without publishing. The chat form of
+# ai-security-planted-model-audit above: a tofu stack
+# (prebuilt/ai-model-defects) that plants its own workload in a namespace of
+# its own on the host cluster, so it too serializes on the infra lock. Priced
+# at that case's 1450s hint until it has a record.
+./tasks/ai-security-chat-request-runs-collector/task.yaml
+
 # The front door's reply to a blocked card declares the one next step on a
 # last line of its own, `[next: <label>]`, which Slack draws as a button
 # (agents/chat/SOUL.md §2, step 5). deployer: noop; the blocked card is
