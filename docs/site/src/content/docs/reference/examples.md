@@ -45,7 +45,7 @@ vLLM serving Gemma (`gemma-4-e2b-it`) on GKE GPU nodes, based on GKE's official 
 
 ## Layering
 
-Both LiteLLM examples and `vllm-gemma` speak OpenAI-compatible Completions. You can layer LiteLLM in front of vLLM to get routing and observability across a mix of hosted and local models — that's the pattern for "one config for many providers".
+Both LiteLLM examples speak OpenAI-compatible Completions. `vllm-gemma` as shipped runs vLLM's demo server, which does not serve the OpenAI API; to layer LiteLLM in front of vLLM, run vLLM's OpenAI-compatible server and set `MODEL_PROVIDER=openai_compatible` ([Inference gateway](/kube-agents/concepts/inference-gateway/#openai-compatible-endpoints-self-hosted-or-private)).
 
 ## Not shipped as examples (but reference-worthy)
 

@@ -8,7 +8,8 @@ location     = "us-central1"
 api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 
 # Model-provider credential(s) — set at least one so the agent can run, unless
-# model_provider = "vertex_ai" (see below), which needs none.
+# model_provider = "vertex_ai" or "openai_compatible" (see below), which need
+# none.
 # Empty keys are omitted from the Secret.
 # NOTE: all keys above and below end up in plaintext in the Terraform state
 # (and in the in-cluster Secret) — keep the state in a protected backend.
@@ -130,6 +131,19 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # false when vertex_project_id is a project you cannot administer: you enable the
 # API and grant the gateway's service account roles/aiplatform.user by hand.
 # vertex_manage_serving_project = true
+
+# A server speaking the OpenAI chat-completions API (vLLM, TGI, an internal
+# gateway) instead — see variables.tf. No defaults: the model and the base URL
+# are required. An in-cluster Service needs the server pod's port; any other
+# host needs the private ranges it is reached at, unless it is a public
+# endpoint on 443. The CA Secret holds a PEM CA under ca.crt; create it first.
+# model_provider                   = "openai_compatible"
+# model_default_name               = "some-org/some-model"
+# openai_compatible_api_base       = "http://llm-service.models.svc.cluster.local/v1"
+# openai_compatible_target_port    = 8000
+# openai_compatible_egress_cidrs   = []
+# openai_compatible_ca_secret_name = ""
+# openai_compatible_api_key        = ""
 
 
 # Optional GitHub integration and token minter backend (GSA + KMS signing key).
