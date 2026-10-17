@@ -45,9 +45,13 @@ PLATFORM_TOOL = re.compile(r"^@mcp\.tool\(\)\s*\ndef (\w+)\(", re.M)
 
 def declared_tools(configs: tuple[str, ...]) -> set[str]:
     servers: set[str] = set()
+    included: set[str] = set()
     for config in configs:
-        servers |= set((yaml.safe_load((REPO_ROOT / config).read_text()) or {}).get("mcp_servers") or {})
-    names = servers | {MCP_TOOLSET_PREFIX + alias for alias in servers}
+        declared = (yaml.safe_load((REPO_ROOT / config).read_text()) or {}).get("mcp_servers") or {}
+        servers |= set(declared)
+        for spec in declared.values():
+            included |= set(((spec or {}).get("tools") or {}).get("include") or [])
+    names = servers | {MCP_TOOLSET_PREFIX + alias for alias in servers} | included
     if PLATFORM_CONTROL_ALIAS in servers:
         names |= set(PLATFORM_TOOL.findall(PLATFORM_MCP_SERVER.read_text()))
     return names

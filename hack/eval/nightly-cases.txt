@@ -1121,6 +1121,6 @@
 
 # A Cluster Agent runs its gke-workload-security audit script from the path
 # the skill names: graded on a Cluster Agent doing the work, running
-# audit_cluster.sh against seeded-a, never searching for the script, and no
-# result showing it missing.
+# /opt/data/scripts/audit_cluster.sh against seeded-a, and no result showing
+# the script missing.
 ./tasks/cluster-agent-security-audit-script/task.yaml

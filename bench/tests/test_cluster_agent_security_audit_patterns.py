@@ -71,6 +71,8 @@ def test_a_run_from_the_skill_path_counts(command):
         # A search is not a run.
         "find / -name audit_cluster.sh 2>/dev/null",
         "find /opt/data -type f 2>/dev/null | grep audit_cluster",
+        # A cd into the staged directory does not credit a copy named elsewhere.
+        "cd /opt/data/scripts && bash /opt/defaults/skills/gke-workload-security/scripts/audit_cluster.sh seeded-a r p",
         # Another cluster is not the one asked for.
         "/opt/data/scripts/audit_cluster.sh seeded-b us-central1-a p",
     ],
@@ -98,7 +100,14 @@ def test_the_script_output_is_not_a_missing_script():
 
 @pytest.mark.parametrize(
     "line",
-    ["- [PASS] Workload Identity is ENABLED", "Shielded Nodes: failed", "Binary Authorization: warning", "**FAIL** Network Policy"],
+    [
+        "- [PASS] Workload Identity is ENABLED",
+        "Shielded Nodes: failed",
+        "Binary Authorization: warning",
+        "**FAIL** Network Policy",
+        "Workload Identity passes; Shielded Nodes fails; Binary Authorization warns",
+        "one failure",
+    ],
 )
 def test_the_result_words_count(line):
     assert re.search(REPORT.any_of_patterns[0], _normalize_lines(line))
