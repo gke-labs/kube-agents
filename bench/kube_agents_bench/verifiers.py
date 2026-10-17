@@ -2684,10 +2684,19 @@ class WorkerCommandsVerifier(BaseVerifier):
 
         ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
         # A forbidden command that was read is conclusive whatever else was
-        # not; a missing required command, or a clean read, is not when the
-        # capture has gaps (the siblings' rule, ``worker_agents`` first).
-        partial = bool(snap.worker_capture_gaps) and (self.after_result_pattern is not None or has_succeeded_runs)
-        if hits or ran or ((missing or unrun_missing or unrun_failed) and not partial):
+        # not; under after_result_pattern, capture gaps make clearing forbidden
+        # patterns or missing required items inconclusive; on the standard path,
+        # card-log misses are conclusive (fail), credited runs pass, and capture
+        # gaps make only an uncredited succeeded: true run inconclusive (error).
+        uncredited_succeeded = [run for run in [*unrun_missing, *unrun_failed] if run.succeeded]
+        if self.after_result_pattern is not None:
+            card_log_miss = False
+            partial = bool(snap.worker_capture_gaps)
+        else:
+            card_log_miss = bool(missing or any(not run.succeeded for run in unrun_missing))
+            partial = bool(snap.worker_capture_gaps) and bool(uncredited_succeeded) and not card_log_miss
+
+        if hits or ran or card_log_miss or ((missing or unrun_missing or unrun_failed) and not partial):
             parts = []
             if missing:
                 parts.append(
@@ -2722,12 +2731,21 @@ class WorkerCommandsVerifier(BaseVerifier):
                 reason="; ".join(parts) + window,
             )
         if partial:
-            unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
+            gaps_str = "; ".join(snap.worker_capture_gaps or ())
+            if self.after_result_pattern is not None:
+                unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
+                reason = _PARTIAL_WORKER_CAPTURE_REASON.format(gaps=gaps_str) + unseen + window
+            else:
+                named = ", ".join(" ".join([run.script, *run.flags]) for run in uncredited_succeeded)
+                reason = (
+                    f"the worker-trajectory capture was partial ({gaps_str}), "
+                    f"so required run(s) requiring success ({named}) could not be verified"
+                )
             return VerificationResult(
                 success=False,
                 status="error",
                 elapsed_time=time.monotonic() - start,
-                reason=_PARTIAL_WORKER_CAPTURE_REASON.format(gaps="; ".join(snap.worker_capture_gaps)) + unseen + window,
+                reason=reason,
             )
         return VerificationResult(
             success=True,

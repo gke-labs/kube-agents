@@ -8369,15 +8369,45 @@ def test_worker_commands_required_run_succeeded_flag():
     res_notraj = v.verify(5.0)
     assert res_notraj.status == "error" and "no delegated worker's terminal or execute_code calls are readable in the trajectory" in res_notraj.reason
 
-    # Capture with gaps under succeeded: true yields status="error".
+    # Credited run with capture gaps passes (positive evidence is conclusive).
     transcript.set(
         "ok",
         traj_ok,
         worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
         worker_capture_gaps=["card_1 unread session store"],
     )
-    res_gap = v.verify(5.0)
-    assert res_gap.status == "error" and "the worker-trajectory capture was partial (card_1 unread session store)" in res_gap.reason
+    res_gap_ok = v.verify(5.0)
+    assert res_gap_ok.status == "pass"
+
+    # Absent/uncredited run with capture gaps yields status="error".
+    traj_other = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo other"}, "result": "other", "status": "completed", "at": 1.0}
+    ]
+    transcript.set(
+        "ok",
+        traj_other,
+        worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
+        worker_capture_gaps=["card_1 unread session store"],
+    )
+    res_gap_missing = v.verify(5.0)
+    assert res_gap_missing.status == "error" and "the worker-trajectory capture was partial (card_1 unread session store)" in res_gap_missing.reason
+    assert "fleet_upgrade_report.py --readiness" in res_gap_missing.reason
+
+    # Card-log required pattern miss beside capture gaps yields conclusive failure (status="fail").
+    v_with_pattern = WorkerCommandsVerifier(
+        type="worker_commands",
+        required_patterns=[r"pattern_that_is_missing"],
+        required_runs=[run],
+    )
+    transcript.set(
+        "ok",
+        traj_ok,
+        worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
+        worker_capture_gaps=["card_1 unread session store"],
+    )
+    res_gap_card_miss = v_with_pattern.verify(5.0)
+    assert res_gap_card_miss.status == "fail"
+    assert "no worker command matched required pattern(s)" in res_gap_card_miss.reason
 
     # Without succeeded=True (default False), card log alone is credited.
     run_any = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"])

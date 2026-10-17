@@ -205,3 +205,33 @@ def test_collector_run_with_no_trajectory_is_error():
         assert "no delegated worker's terminal or execute_code calls are readable in the trajectory" in res.reason
     finally:
         transcript.clear()
+
+
+def test_collector_run_with_gaps_passes_when_completed():
+    cmd = f"python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json"
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": cmd}, "result": "done", "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": cmd}], worker_capture_gaps=["card_2 unread session store"])
+    try:
+        res = WorkerCommandsVerifier(**_check(COLLECTOR_CHECK)).verify(5.0)
+        assert res.success
+        assert res.status == "pass"
+    finally:
+        transcript.clear()
+
+
+def test_collector_run_with_gaps_errors_when_uncredited():
+    cmd = f"python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json"
+    traj_other = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "kubectl get nodes"}, "result": "nodes", "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj_other, worker_commands=[{"task": "t_1", "command": cmd}], worker_capture_gaps=["card_2 unread session store"])
+    try:
+        res = WorkerCommandsVerifier(**_check(COLLECTOR_CHECK)).verify(5.0)
+        assert not res.success
+        assert res.status == "error"
+        assert "the worker-trajectory capture was partial (card_2 unread session store)" in res.reason
+        assert "collect.py" in res.reason
+    finally:
+        transcript.clear()
