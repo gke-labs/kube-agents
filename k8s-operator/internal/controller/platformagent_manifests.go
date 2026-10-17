@@ -706,7 +706,10 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// gateway reaches no metadata server, so this is now the answer. The container env
 	// carries it too, but the PVC .env beats the container env, so without this pin one
 	// line there would re-point the management project exactly as above.
-	if harness := agent.Spec.Harness; harness != nil {
+	// Not on kind, where the container env deliberately carries no GKE_PROJECT_ID
+	// (buildPodTemplateSpec): pinning `kind` here would hand every reader in the
+	// gateway a project that does not exist.
+	if harness := agent.Spec.Harness; harness != nil && !harnessOnKind(harness) {
 		add(gkeProjectEnvKey, harness.ProjectID)
 	}
 

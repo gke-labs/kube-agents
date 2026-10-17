@@ -603,6 +603,16 @@ Mutation(
         "for each fleet cluster that has client certificate issuance on",
     ),
     Mutation(
+        "C1-gateway-metadata-dns-rule-widened-to-a-range",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("        - port: 53\n          protocol: TCP\n      to:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: kube-dns\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: node-local-dns\n        - ipBlock:\n            cidr: 169.254.20.10/32\n        - ipBlock:\n            cidr: 169.254.169.254/32\n        - ipBlock:\n            cidr: 10.96.0.10/32\n    - ports:\n        - port: 80\n",
+         "        - port: 53\n          endPort: 988\n          protocol: TCP\n      to:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: kube-dns\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: node-local-dns\n        - ipBlock:\n            cidr: 169.254.20.10/32\n        - ipBlock:\n            cidr: 169.254.169.254/32\n        - ipBlock:\n            cidr: 10.96.0.10/32\n    - ports:\n        - port: 80\n"),
+        "test_C1_the_rendered_egress_policy_reaches_no_metadata_address",
+        "widen the gateway's DNS rule to a range for a new resolver port -- "
+        "{port: 53, endPort: 988} still reads as port 53 and admits the "
+        "pre-NAT and post-NAT token fetches",
+    ),
+    Mutation(
         "C3-management-project-unpinned",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("    RECONCILE_PROJECT=\n    GKE_PROJECT_ID=example-project\n",

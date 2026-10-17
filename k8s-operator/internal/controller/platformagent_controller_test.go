@@ -2203,6 +2203,11 @@ func egressPortsForCIDR(netpol *networkingv1.NetworkPolicy, cidr string) []int32
 			if p.Port != nil {
 				seen[p.Port.IntVal] = true
 			}
+			// A range's upper end too: {Port: 53, EndPort: 988} opens the
+			// post-NAT token port while Port still reads 53 (see ruleIsDNSOnly).
+			if p.EndPort != nil {
+				seen[*p.EndPort] = true
+			}
 		}
 	}
 	ports := make([]int32, 0, len(seen))

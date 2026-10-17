@@ -186,7 +186,7 @@ func (r *PlatformAgentReconciler) resolveNetpolProfile(ctx context.Context, agen
 	if p.MetadataDaemonSource == "" && agent != nil && agent.Spec.NetworkPolicy != nil && agent.Spec.NetworkPolicy.MetadataDaemon != nil {
 		ep := strings.TrimSpace(agent.Spec.NetworkPolicy.MetadataDaemon.Endpoint)
 		if ep == "" {
-			// Explicit empty string suppresses rule 3 entirely
+			// Explicit empty string suppresses litellm-policy's post-NAT metadata rule entirely
 			p.MetadataDaemonIP = ""
 			p.MetadataDaemonPort = 0
 			p.MetadataDaemonSource = netpolSourceSuppressed

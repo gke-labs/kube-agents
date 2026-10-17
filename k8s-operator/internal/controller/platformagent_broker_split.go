@@ -21,8 +21,9 @@ package controller
 // The broker itself is rendered by credential_proxy_manifests.go — one pod, one
 // builder, unconditionally. What is left here is what stays behind on the agent
 // Pod once it moves: the audience-bound token the agent presents, the container
-// that presents it, the ServiceAccount both Pods share, and the TokenReview
-// grant the broker needs to check the token it is handed.
+// that presents it, the gateway's own ServiceAccount (the broker keeps the
+// annotated one), and the TokenReview grant the broker needs to check the token
+// it is handed.
 //
 // The boundary itself is that the agent no longer shares a network namespace
 // with the process holding the cloud credentials, so "reachable on 127.0.0.1"

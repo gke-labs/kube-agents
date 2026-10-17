@@ -942,9 +942,11 @@ class C1IsolationIsStructural(unittest.TestCase):
             for rule in policy["spec"].get("egress") or []:
                 ports = rule.get("ports") or []
                 # A rule naming no ports opens every port, so it is never the
-                # DNS exemption however it is spelled.
+                # DNS exemption however it is spelled; nor is a port carrying
+                # endPort, which opens a range ({port: 53, endPort: 988} admits
+                # the post-NAT token port) while `port` still reads 53.
                 dns_only = bool(ports) and all(
-                    str(port.get("port")) == "53" for port in ports
+                    str(port.get("port")) == "53" and "endPort" not in port for port in ports
                 )
                 for peer in rule.get("to") or []:
                     block = peer.get("ipBlock")

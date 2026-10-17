@@ -1027,3 +1027,36 @@ func TestAnOverrideNamingAnOperatorServiceAccountWritesNoServiceAccount(t *testi
 		t.Fatalf("get: %v", err)
 	}
 }
+
+// TestTheManagedEnvPinsTheManagementProjectExceptOnKind pins GKE_PROJECT_ID in
+// the managed .env, which the agent's PVC .env cannot outrank, on a GKE
+// harness; and leaves it out on kind, where the container env carries none.
+func TestTheManagedEnvPinsTheManagementProjectExceptOnKind(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		harness *agentv1alpha1.HarnessSpec
+		want    string
+	}{
+		{"gke", &agentv1alpha1.HarnessSpec{ProjectID: "mgmt-project", Location: "us-east4", ClusterName: "mgmt"}, "GKE_PROJECT_ID=mgmt-project"},
+		{"kind", &agentv1alpha1.HarnessSpec{ProjectID: "kind", Location: "kind", ClusterName: "kind"}, ""},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+				Spec:       agentv1alpha1.PlatformAgentSpec{Harness: testCase.harness},
+			}
+			var pinned []string
+			for _, line := range strings.Split(renderManagedEnv(agent), "\n") {
+				if strings.HasPrefix(line, "GKE_PROJECT_ID=") {
+					pinned = append(pinned, line)
+				}
+			}
+			switch {
+			case testCase.want == "" && len(pinned) != 0:
+				t.Errorf("kind harness pins %v; the container env carries no project there", pinned)
+			case testCase.want != "" && (len(pinned) != 1 || pinned[0] != testCase.want):
+				t.Errorf("managed .env pins %v, want [%s]", pinned, testCase.want)
+			}
+		})
+	}
+}

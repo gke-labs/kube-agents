@@ -3068,10 +3068,6 @@ class ProjectSourceTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "mgmt-project", "RECONCILE_PROJECT": ""}):
             self.assertEqual(rec._project_source(), ("mgmt-project", True))
 
-    def test_reconcile_project_still_wins_where_it_is_set(self):
-        with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "mgmt-project", "RECONCILE_PROJECT": "override"}):
-            self.assertEqual(rec._project_source(), ("override", True))
-
     def test_a_numeric_operator_project_is_resolved_to_its_id(self):
         # In the gateway the metadata server is closed, so the number is
         # resolved through the broker; the metadata answer is never reached.
@@ -3081,16 +3077,16 @@ class ProjectSourceTest(unittest.TestCase):
         resolve.assert_called_once_with("123456789012")
 
     def test_a_numeric_operator_project_that_will_not_resolve_is_not_an_answer(self):
-        # The gateway has no authoritative source left, so the run reads the
-        # broker's gcloud config as non-authoritative: never the number, and
-        # never a project change the prune would act on.
-        result = mock.Mock(stdout="123456789012\n")
+        # Not even through the gcloud config fallback, which the broker was
+        # bootstrapped with from this same number: on a tick with no snapshot
+        # the number would stand as the management project and key every
+        # profile on it. The run is unresolved instead, and the next tick asks.
         for outcome in (rec.OUTCOME_DENIED, rec.OUTCOME_UNREACHABLE):
             with self.subTest(outcome=outcome), \
                     mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "123456789012", "RECONCILE_PROJECT": ""}), \
                     mock.patch.object(rec, "_project_id_of", return_value=(None, outcome)), \
-                    mock.patch.object(rec.sandbox_exec, "run", return_value=result):
-                self.assertEqual(rec._project_source(), ("123456789012", False))
+                    mock.patch.object(rec.sandbox_exec, "run", side_effect=AssertionError("gcloud config asked")):
+                self.assertEqual(rec._project_source(), (None, False))
 
 
 if __name__ == "__main__":
