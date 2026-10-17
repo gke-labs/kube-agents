@@ -25,9 +25,12 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# The Platform profile's config is merged onto the shared defaults at image
+# build (deploy/docker/Dockerfile, merge_configs.py); the Cluster profile's is not.
+SHARED_DEFAULTS = "deploy/shared/defaults/config.yaml"
 PERSONAS = {
-    "agents/cluster/SOUL.md": "agents/cluster/config.yaml",
-    "agents/platform/AGENTS.md": "agents/platform/config.yaml",
+    "agents/cluster/SOUL.md": ("agents/cluster/config.yaml",),
+    "agents/platform/AGENTS.md": ("agents/platform/config.yaml", SHARED_DEFAULTS),
 }
 PLATFORM_MCP_SERVER = REPO_ROOT / "agents/platform/scripts/platform_mcp_server.py"
 PLATFORM_CONTROL_ALIAS = "platform_control"
@@ -40,9 +43,11 @@ FIXED_TMP_FILE = re.compile(r"`/tmp/[\w.-]+`")
 PLATFORM_TOOL = re.compile(r"^@mcp\.tool\(\)\s*\ndef (\w+)\(", re.M)
 
 
-def declared_tools(config: str) -> set[str]:
-    servers = (yaml.safe_load((REPO_ROOT / config).read_text()) or {}).get("mcp_servers") or {}
-    names = set(servers) | {MCP_TOOLSET_PREFIX + alias for alias in servers}
+def declared_tools(configs: tuple[str, ...]) -> set[str]:
+    servers: set[str] = set()
+    for config in configs:
+        servers |= set((yaml.safe_load((REPO_ROOT / config).read_text()) or {}).get("mcp_servers") or {})
+    names = servers | {MCP_TOOLSET_PREFIX + alias for alias in servers}
     if PLATFORM_CONTROL_ALIAS in servers:
         names |= set(PLATFORM_TOOL.findall(PLATFORM_MCP_SERVER.read_text()))
     return names
@@ -50,20 +55,21 @@ def declared_tools(config: str) -> set[str]:
 
 class PersonaSandboxBulletsTest(unittest.TestCase):
     def test_the_preferred_mcp_tools_are_declared(self):
-        for persona, config in PERSONAS.items():
+        for persona, configs in PERSONAS.items():
             text = (REPO_ROOT / persona).read_text()
             lists = TOOL_LIST.findall(text)
             with self.subTest(persona=persona):
                 self.assertTrue(lists, "the 'Prefer dedicated MCP tools' list is gone; update this test")
                 named = {name for group in lists for name in BACKTICKED.findall(group)}
-                self.assertEqual(named - declared_tools(config), set(), f"{persona} names MCP tools {config} does not declare")
+                self.assertEqual(named - declared_tools(configs), set(), f"{persona} names MCP tools {configs} do not declare")
 
     def test_the_overflow_file_is_named_by_mktemp(self):
         for persona in PERSONAS:
             bullets = OVERFLOW_BULLET.findall((REPO_ROOT / persona).read_text())
             with self.subTest(persona=persona):
                 self.assertEqual(len(bullets), 1, "the overflow bullet is gone or doubled; update this test")
-                self.assertIn("`mktemp ", bullets[0])
+                # /tmp goes with the pod; a file under /opt/data outlives it on the volume.
+                self.assertIn("`mktemp /tmp/", bullets[0])
                 self.assertEqual(FIXED_TMP_FILE.findall(bullets[0]), [], "a fixed /tmp file name is shared by every session")
 
 

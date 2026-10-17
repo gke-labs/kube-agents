@@ -69,9 +69,10 @@ verification_spec:
       after_result_pattern: '[\s\S]'
       required_patterns:
         # The path the skill names, so a copy found some other way does not count.
-        - '/opt/data/scripts/audit_cluster\.sh[''"]?\s+[''"]?seeded-a\b'
+        - '(?:/opt/data/scripts/|\bcd\s+/opt/data/scripts/?\s*&&[^\n]*?)audit_cluster\.sh[''"]?\s+[''"]?seeded-a\b'
       forbidden_patterns:
-        - '\b(?:find|locate|which)\b[^\n]*audit_cluster'
+        # From a segment start, so a `which` batched ahead of the run is not a search.
+        - '(?:^|[;&|(]\s*)(?:find|locate|which)\b[^;&|\n]*audit_cluster'
       forbidden_result_patterns:
         - 'audit_cluster\.sh[''"]?: (?:[Nn]o such file or directory|(?:command )?not found|[Pp]ermission denied)'
   - name: report-carries-the-script-results
