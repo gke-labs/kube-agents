@@ -12,10 +12,10 @@
 # (`./scripts/audit_cluster.sh`) resolves to nothing from the card's working
 # directory. Observed on main: the worker searched for the script
 # (`find / -name audit_cluster.sh`) and ran the first copy it found, or a
-# relative call printed `No such file or directory`. The answer can still
+# call by the profile's skill path printed `No such file or directory`. The answer can still
 # read right, so the checks grade the route: a Cluster Agent did the work,
-# ran audit_cluster.sh against seeded-a, never searched for the script, and
-# no call's result shows it missing.
+# ran /opt/data/scripts/audit_cluster.sh against seeded-a, never searched
+# for the script, and no call's result shows it missing.
 #
 # The run is read as a text pattern rather than `required_runs`: the worker
 # types `bash <path>/audit_cluster.sh`, as SOUL.md dictates for preflight,
@@ -68,7 +68,8 @@ verification_spec:
       type: worker_commands
       after_result_pattern: '[\s\S]'
       required_patterns:
-        - 'audit_cluster\.sh\s+seeded-a\b'
+        # The path the skill names, so a copy found some other way does not count.
+        - '/opt/data/scripts/audit_cluster\.sh[''"]?\s+[''"]?seeded-a\b'
       forbidden_patterns:
         - '\b(?:find|locate)\b[^\n]*audit_cluster'
       forbidden_result_patterns:
