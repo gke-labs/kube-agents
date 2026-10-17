@@ -307,9 +307,8 @@ of the four first-run audits as marked due and each has a run claimed since the 
 that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended.
 `oobe_late_report`, in its own module (`bench/kube_agents_bench/oobe_late.py`), reads the same
 store with each audit's saved final message and the default profile's saved `oobe` runs, and passes
-when the report delivered on the stack's late first message links the ledger issue of every
-first-run audit the stage started or adopted (`fired`) whose summary failed to deliver, or names it as not posted
-when its message had no link.
+when the report delivered on the stack's late first message names, as not posted, every first-run
+audit the stage started or adopted (`fired`) whose summary failed to deliver.
 `relay_posted_as_written`, in its own module (`bench/kube_agents_bench/relay.py`), reads the
 `relay-report` stack's state file and what the Session KV server stored for the report's threads,
 and passes when the route answered `delivered` and every stored post is the report exactly; a

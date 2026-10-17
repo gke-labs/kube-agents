@@ -6,9 +6,9 @@ onboarding report the delivery stage (``agents/chat/scripts/bootstrap_delivery.p
 first message is then the first thing that user reads.
 
 The case's stack (``bench/tf/prebuilt/oobe-late-first-message``) clears the home channel, lets the
-four audits run, then opens the chat. This passes when the delivered report links the ledger issue
-of every audit the stage started or adopted whose summary failed and named one in its final message, and names
-every other such audit as not posted. It needs at least one failed summary: without one the stack did not take the
+four audits run, then opens the chat. This passes when the delivered report names, as not posted,
+every audit the stage started or adopted whose last run that tried to post failed; it counts the
+ledger links it carries beside the verdict. It needs at least one failed summary: without one the stack did not take the
 home channel away, and the case tested nothing.
 
 Its own module, registered through the ``devops_bench.verifiers`` entry-point group.
@@ -46,7 +46,7 @@ from datetime import datetime
 arm_state, late_state, marker, db, out_dir, oobe_dir, title, sentinel, audits = (
     sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9:])
 SQLITE_BUSY_TIMEOUT = 10
-SLACK_SECONDS = 300
+SILENT = ("suppressed", None)
 HEADING = "## Response"
 LEDGER = re.compile(r"https://[^\s()<>\[\]]+/issues/\d+")
 LEDGER_WORD = "ledger"
@@ -86,11 +86,12 @@ if out["applied_at"] and not out["error"] and os.path.exists(db):
             for claimed, finished, outcome in con.execute(
                 "SELECT claimed_at, finished_at, delivery_outcome FROM executions"
                 " WHERE job_id = ? AND status = 'completed' ORDER BY claimed_at", (audit,)):
-                if ts(claimed) >= armed:
+                # A run that posted nothing on purpose (suppressed, or no outcome) does not stand in
+                # for the last run that tried to post.
+                if ts(claimed) >= armed and outcome not in SILENT:
                     last = {"claimed_at": claimed, "finished_at": finished, "delivery_outcome": outcome, "ledger": None}
             if last is not None:
-                since = ts(last["finished_at"]) - SLACK_SECONDS if last["finished_at"] else armed
-                docs = newest(os.path.join(out_dir, audit), since)
+                docs = newest(os.path.join(out_dir, audit), ts(last["claimed_at"]))
                 if docs:
                     text = response(docs[0])
                     named = [l for l in text.splitlines() if LEDGER_WORD in l.lower() and LEDGER.search(l)]
@@ -158,18 +159,13 @@ def grade(read: dict[str, Any]) -> tuple[VerificationStatus, str]:
     report = read.get("report")
     if not report:
         return "fail", f"no saved run of the oobe job since {read['opened_at']} carries the planted report: nothing was delivered on the first message"
-    missing_links = [f"{a} ({runs[a]['ledger']})" for a in failed if runs[a].get("ledger") and runs[a]["ledger"] not in report]
-    unlinked = [a for a in failed if not runs[a].get("ledger")]
+    # The link is the product's to vouch for (only a managed repository's issue is copied), so the
+    # grade is the name; the count of links is reported beside it.
     after = report.partition(NOT_POSTED)[2] if NOT_POSTED in report else ""
-    unnamed = [a for a in unlinked if f"`{a}`" not in after]
-    if missing_links or unnamed:
-        parts = []
-        if missing_links:
-            parts.append(f"it does not link the ledger issue of {', '.join(missing_links)}")
-        if unnamed:
-            parts.append(f"it does not name {', '.join(unnamed)} as not posted")
-        return "fail", f"the report sent on the first message leaves out audits whose summaries were never posted: {'; '.join(parts)}"
-    linked = [a for a in failed if runs[a].get("ledger")]
+    unnamed = [a for a in failed if f"`{a}`" not in after]
+    if unnamed:
+        return "fail", f"the report sent on the first message leaves out audits whose summaries were never posted: it does not name {', '.join(unnamed)} as not posted"
+    linked = [a for a in failed if runs[a].get("ledger") and runs[a]["ledger"] in after]
     return "pass", (
         f"the report sent on the first message carries the {len(failed)} summaries that never reached the chat"
         f" ({len(linked)} with their ledger link)"
@@ -178,10 +174,9 @@ def grade(read: dict[str, Any]) -> tuple[VerificationStatus, str]:
 
 @VERIFIERS.register("oobe_late_report")
 class OobeLateReportVerifier(_OnboardingPollVerifier):
-    """Passes once the report delivered on the first message links the ledger issue of every
-    first-run audit the stage started or adopted whose summary failed to deliver, and names as not
-    posted any such audit whose final message had no link. At least one summary must have failed; none is ``status="error"``,
-    as is an unreadable agent pod or state file.
+    """Passes once the report delivered on the first message names, as not posted, every first-run
+    audit the stage started or adopted whose summary failed to deliver. At least one summary must
+    have failed; none is ``status="error"``, as is an unreadable agent pod or state file.
     """
 
     type: Literal["oobe_late_report"]

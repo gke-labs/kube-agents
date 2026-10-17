@@ -247,6 +247,10 @@ OUTPUT_SLACK_SECONDS = 300
 # the model's prose and can cite other issues, so a link on a line that names the ledger wins.
 LEDGER_URL_RE = re.compile(r"https://[^\s()<>\[\]]+/issues/\d+")
 LEDGER_WORD = "ledger"
+# The parts a managed ledger issue's URL must have (_managed_issue).
+MANAGED_ISSUE_RE = re.compile(r"https://(?P<host>[A-Za-z0-9.-]+)/(?P<repo>[\w.-]+/[\w.-]+)/issues/\d+")
+# A run that posted nothing on purpose: the scheduler's suppressed outcome, or none recorded.
+SILENT_OUTCOMES = ("suppressed", None)
 
 # The delivery job's ``origin`` and the keys the plugin writes into it.
 ORIGIN_KEY = "origin"
@@ -729,42 +733,70 @@ def _completed_runs(data_dir: Path, jobs: list[str]) -> dict[str, list[tuple[flo
 def _undelivered_audits(
     data_dir: Path, audits: list[str], runs: dict[str, list[tuple[float, float | None, str | None]]]
 ) -> list[str]:
-    """The audits whose latest completed run could not post its summary, each with its ledger link when it has one.
+    """The audits whose latest run that tried to post its summary failed, each with its ledger link when it has one.
 
     A run that ends before anyone has opened the chat finds no home channel, the relay refuses
     it, and nothing posts it later; this delivery is the first message that user reads. Any other
-    failed delivery is listed too, since its summary is just as missing.
+    failed delivery is listed too, since its summary is just as missing. A later run that posted
+    nothing on purpose (a silent run: suppressed, or no outcome recorded) does not stand in for
+    the lost one.
     """
     out = []
     for audit in audits:
-        if not runs.get(audit) or runs[audit][-1][2] != DELIVERY_FAILED:
+        tried = [run for run in runs.get(audit, ()) if run[2] not in SILENT_OUTCOMES]
+        if not tried or tried[-1][2] != DELIVERY_FAILED:
             continue
-        url = _ledger_url(data_dir, audit, runs[audit][-1][1])
+        claimed, finished, _ = tried[-1]
+        url = _ledger_url(data_dir, audit, claimed, finished)
         out.append(AUDITS_LEDGER_NOTE.format(audit=audit, url=url) if url else f"`{audit}`")
     return out
 
 
-def _ledger_url(data_dir: Path, audit: str, finished_at: float | None) -> str | None:
-    """The ledger issue linked in the final message of ``audit``'s run that finished at ``finished_at``.
+def _ledger_url(data_dir: Path, audit: str, claimed_at: float, finished_at: float | None) -> str | None:
+    """The ledger issue linked in the final message of ``audit``'s run claimed at ``claimed_at``.
 
-    Only the link is taken from the message: the rest is the model's prose, which can carry its
-    working notes.
+    The run's message is the document the scheduler saved between its claim and a little after
+    its finish. Only the link is taken from it, and only a link to an issue in a repository the
+    install manages: the rest is the model's prose, which can carry its working notes, and a link
+    the audit read elsewhere is not its ledger.
     """
     output_dir = data_dir / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR / CRON_OUTPUT_DIR / audit
+    latest = (finished_at if finished_at is not None else claimed_at) + OUTPUT_SLACK_SECONDS
     try:
-        docs = [p for p in output_dir.iterdir() if p.is_file() and p.suffix == CRON_OUTPUT_SUFFIX]
+        docs = [
+            p for p in output_dir.iterdir()
+            if p.is_file() and p.suffix == CRON_OUTPUT_SUFFIX and claimed_at <= p.stat().st_mtime <= latest
+        ]
         if not docs:
             return None
-        newest = max(docs, key=lambda p: p.stat().st_mtime)
-        if finished_at is not None and newest.stat().st_mtime < finished_at - OUTPUT_SLACK_SECONDS:
-            return None
-        text = newest.read_text(encoding="utf-8", errors="replace")
+        text = max(docs, key=lambda p: p.stat().st_mtime).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     response = text.rpartition(RESPONSE_HEADING)[2]
-    named = [line for line in response.splitlines() if LEDGER_WORD in line.lower() and LEDGER_URL_RE.search(line)]
-    match = LEDGER_URL_RE.search(named[0] if named else response)
-    return match.group(0) if match else None
+    candidates = [m.group(0) for m in LEDGER_URL_RE.finditer(response) if _managed_issue(m.group(0))]
+    named = [url for url in candidates if any(url in line and LEDGER_WORD in line.lower() for line in response.splitlines())]
+    return (named or candidates or [None])[0]
+
+
+def _managed_issue(url: str) -> bool:
+    """Whether ``url`` is an issue in a repository the install manages, on its GitHub host.
+
+    False when the managed list cannot be read, so the note names the audit without a link.
+    """
+    match = MANAGED_ISSUE_RE.fullmatch(url)
+    if not match:
+        return False
+    try:
+        import gitops_workspace  # beside this script in the pod
+
+        if not gitops_workspace.is_github_host(match.group("host")):
+            return False
+        managed = {repo.lower() for repo in gitops_workspace.get_managed_repos()}
+    except Exception as e:  # noqa: BLE001 - no link is the safe answer
+        sys.stderr.write(f"bootstrap_delivery: cannot read the managed repositories: {e}\n")
+        return False
+    repo = match.group("repo").lower()
+    return repo in managed or f"{match.group('host').lower()}/{repo}" in managed
 
 
 def _list(value) -> list:

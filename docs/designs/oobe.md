@@ -262,7 +262,7 @@ times. It rides with the audits stage, whose eval case covers both.
 - **Reaching an install with no home channel.** Audit summaries go to the home channel only. An
   audit that finishes before anyone opens the chat posts nothing, and nothing posts it later; the
   onboarding report, sent on the first message, names every audit the stage started or adopted and
-  that finished whose summary failed to deliver, with its ledger issue when its final message links one
+  that finished whose summary failed to deliver, with its ledger issue when its final message links one in a managed repository
   (`bootstrap_delivery._undelivered_audits`). A held, given-up or skipped audit's scheduled run is
   not named yet ([#3283](https://github.com/gke-labs/kube-agents/issues/3283)). Posting the report there at T+0 when one is set is a
   separate change.

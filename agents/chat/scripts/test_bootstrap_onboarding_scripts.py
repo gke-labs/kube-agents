@@ -1673,6 +1673,13 @@ class FirstRunAuditsTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.d = Path(self._tmp.name)
+        # The install manages o/r on github.com.
+        self.managed = types.SimpleNamespace(
+            is_github_host=lambda host: host.lower() == "github.com", get_managed_repos=lambda: ["o/r"]
+        )
+        patcher = mock.patch.dict(sys.modules, {"gitops_workspace": self.managed})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     @staticmethod
     def _slug_table() -> set[str]:
@@ -1874,6 +1881,41 @@ class FirstRunAuditsTest(unittest.TestCase):
         note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
                            oobe.STATE_DONE: True})
         self.assertIn("`compliance-audit` (findings: https://github.com/o/r/issues/3)", note)
+
+    def test_a_link_outside_the_managed_repositories_is_not_the_ledger(self):
+        now = time.time()
+        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
+        self._document("compliance-audit", "- **Ledger Issue:** https://example.test/o/r/issues/3\n"
+                       "Ledger: https://github.com/someone/else/issues/4", now - 500)
+        state = {oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
+                 oobe.STATE_DONE: True}
+        self.assertTrue(self._note(state).endswith("were not posted to the chat: `compliance-audit`. Ask me for any of these reports."))
+
+    def test_no_link_when_the_managed_repositories_cannot_be_read(self):
+        now = time.time()
+        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
+        self._document("compliance-audit", "- **Ledger Issue:** https://github.com/o/r/issues/3", now - 500)
+        def unreadable():
+            raise OSError("no list")
+        self.managed.get_managed_repos = unreadable
+        with contextlib.redirect_stderr(io.StringIO()):
+            note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
+                               oobe.STATE_DONE: True})
+        self.assertIn("were not posted to the chat: `compliance-audit`.", note)
+        self.assertNotIn("issues/3", note)
+
+    def test_a_later_silent_run_does_not_hide_the_lost_summary(self):
+        # Day 2: the first run's summary was refused; the next scheduled run found nothing new.
+        now = time.time()
+        self._run("compliance-audit", now - 86400, bootstrap_delivery.DELIVERY_FAILED)
+        self._document("compliance-audit", "- **Ledger Issue:** https://github.com/o/r/issues/3", now - 86400 + 90)
+        for outcome in ("suppressed", None):
+            self._run("compliance-audit", now - 600, outcome)
+        self._document("compliance-audit", "[SILENT]", now - 500)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 86400 - 60},
+                           oobe.STATE_DONE: True})
+        # The link is the lost run's, from the document saved during it, not the newest document.
+        self.assertIn("were not posted to the chat: `compliance-audit` (findings: https://github.com/o/r/issues/3)", note)
 
     def test_delivered_summaries_are_not_listed(self):
         for outcome in ("delivered", "suppressed", None):

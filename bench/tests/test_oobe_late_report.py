@@ -150,19 +150,44 @@ def test_the_names_match_the_stack_and_the_delivery() -> None:
 # --- the verdict ----------------------------------------------------------
 
 
-def test_a_report_that_links_every_failed_summary_passes(install: Install) -> None:
+def _note(audits, links=True) -> str:
+    """The product's note naming ``audits`` as not posted, with the chain's links."""
+    items = [
+        f"`{a}` (findings: https://github.com/o/r/issues/{oobe_late.FIRST_RUN_AUDITS.index(a) + 1})" if links else f"`{a}`"
+        for a in audits
+    ]
+    return f"These finished, but their {oobe_late.NOT_POSTED} to the chat: {', '.join(items)}."
+
+
+def test_a_report_that_names_every_failed_summary_passes(install: Install) -> None:
     install.chain()
-    install.deliver("These finished ... " + ", ".join(f"https://github.com/o/r/issues/{i}" for i in range(1, 5)))
+    install.deliver(_note(oobe_late.FIRST_RUN_AUDITS))
     result = _verify()
     assert result.status == "pass", result.reason
+    assert "(4 with their ledger link)" in result.reason
 
 
-def test_the_note_main_sends_fails_and_names_the_missing_links(install: Install) -> None:
+def test_a_named_audit_without_its_link_still_passes(install: Install) -> None:
+    # The product copies only a managed repository's issue link; the grade is the name.
+    install.chain()
+    install.deliver(_note(oobe_late.FIRST_RUN_AUDITS, links=False))
+    result = _verify()
+    assert result.status == "pass", result.reason
+    assert "(0 with their ledger link)" in result.reason
+
+
+def test_the_note_main_sends_fails_and_names_the_missing_audits(install: Install) -> None:
     install.chain()
     install.deliver("Workload checks come from the first-run audits, which have started: `compliance-audit`.")
     result = _verify()
     assert result.status == "fail"
-    assert "compliance-audit (https://github.com/o/r/issues/2)" in result.reason
+    assert "does not name fleet-wide-cost-analysis, compliance-audit" in result.reason
+
+
+def test_links_alone_do_not_name_an_audit(install: Install) -> None:
+    install.chain()
+    install.deliver(" ".join(f"https://github.com/o/r/issues/{i}" for i in range(1, 5)))
+    assert _verify().status == "fail"
 
 
 def test_an_audit_with_no_link_must_be_named_as_not_posted(install: Install) -> None:
@@ -177,15 +202,24 @@ def test_an_audit_with_no_link_must_be_named_as_not_posted(install: Install) -> 
 def test_delivered_summaries_need_no_mention(install: Install) -> None:
     install.chain()
     install.run("compliance-audit", ARMED + timedelta(minutes=50), "delivered", "https://github.com/o/r/issues/7")
-    install.deliver("https://github.com/o/r/issues/1 https://github.com/o/r/issues/3 https://github.com/o/r/issues/4")
+    install.deliver(_note(["fleet-wide-cost-analysis", "obtainability-audit", "stockout-prevention"]))
     result = _verify()
     assert result.status == "pass", result.reason
+
+
+def test_a_later_silent_run_does_not_stand_in_for_a_failed_one(install: Install) -> None:
+    install.chain()
+    install.run("compliance-audit", ARMED + timedelta(minutes=50), "suppressed", None)
+    install.deliver(_note(["fleet-wide-cost-analysis", "obtainability-audit", "stockout-prevention"]))
+    result = _verify()
+    assert result.status == "fail"
+    assert "does not name compliance-audit" in result.reason
 
 
 def test_an_audit_the_stage_did_not_start_is_not_graded(install: Install) -> None:
     install.chain()
     install.marker.write_text(json.dumps({"fired": ["fleet-wide-cost-analysis"], "gave_up": ["compliance-audit"]}))
-    install.deliver("https://github.com/o/r/issues/1")
+    install.deliver(_note(["fleet-wide-cost-analysis"]))
     result = _verify()
     assert result.status == "pass", result.reason
 
@@ -222,18 +256,14 @@ def test_no_delivered_report_fails(install: Install) -> None:
     assert "nothing was delivered" in result.reason
 
 
-def test_a_link_on_the_ledger_line_wins(install: Install) -> None:
+def test_the_link_count_reads_the_ledger_line(install: Install) -> None:
     install.run("compliance-audit", ARMED, "failed", None)
     _doc(install.out / "compliance-audit", "z", "See https://github.com/k/k/issues/5\nLedger: https://github.com/o/r/issues/3",
          ARMED + timedelta(minutes=6))
-    install.deliver("https://github.com/k/k/issues/5")
-    assert _verify().status == "fail"
-
-
-def test_the_prompt_links_in_a_saved_run_are_not_its_ledger(install: Install) -> None:
-    install.run("compliance-audit", ARMED, "failed", None)
-    install.deliver("https://github.com/o/r/issues/99")
-    assert _verify().status == "fail"
+    install.deliver(f"their {oobe_late.NOT_POSTED}: `compliance-audit` (findings: https://github.com/k/k/issues/5).")
+    result = _verify()
+    assert result.status == "pass", result.reason
+    assert "(0 with their ledger link)" in result.reason
 
 
 def test_an_unarmed_stack_is_an_error(install: Install) -> None:
