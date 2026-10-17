@@ -29,6 +29,9 @@ import (
 	"time"
 )
 
+// realMainStopAfter bounds a test that runs realMain until a log line.
+const realMainStopAfter = 5 * time.Second
+
 // refusingURL returns a loopback URL nothing listens on, and the listener's
 // address so a test can bind it later.
 func refusingURL(t *testing.T) (string, string) {
@@ -52,6 +55,34 @@ func writeKubeconfig(t *testing.T, server string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// waitForLog polls logs until line appears or realMainStopAfter passes.
+func waitForLog(logs *lockedBuffer, line string) {
+	deadline := time.Now().Add(realMainStopAfter)
+	for time.Now().Before(deadline) && !strings.Contains(logs.String(), line) {
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// sigtermWhenLogged stops a running realMain, which exits on SIGTERM, once
+// line is logged or realMainStopAfter passes. The test registers for SIGTERM
+// too, and keeps that registration until the signal has been sent, so the
+// signal cannot kill the test binary after realMain has returned.
+func sigtermWhenLogged(t *testing.T, logs *lockedBuffer, line string) {
+	t.Helper()
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM)
+	sent := make(chan struct{})
+	go func() {
+		defer close(sent)
+		waitForLog(logs, line)
+		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+	}()
+	t.Cleanup(func() {
+		<-sent
+		signal.Stop(sigs)
+	})
 }
 
 // The Hermes API answers 401 to a caller without its key. That still proves
@@ -166,32 +197,10 @@ func TestRealMain_HoldsTheInformersUntilTheGatewayWaitEnds(t *testing.T) {
 	_, metricsAddr := refusingURL(t)
 	const wait = time.Second
 
-	// realMain stops on SIGTERM. Registering for it here as well keeps the
-	// signal from killing the test binary if it lands after realMain returns.
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGTERM)
-	defer signal.Stop(sigs)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	go func() {
-		<-ctx.Done()
-		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
-	}()
-	stopAfter := func(line string) {
-		for ctx.Err() == nil {
-			if strings.Contains(logs.String(), line) {
-				cancel()
-				return
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-	go stopAfter("starting: preflight")
+	sigtermWhenLogged(t, logs, "starting: preflight")
 	scraped := make(chan string, 1)
 	go func() {
-		for ctx.Err() == nil && !strings.Contains(logs.String(), "waiting up to") {
-			time.Sleep(10 * time.Millisecond)
-		}
+		waitForLog(logs, "waiting up to")
 		body := ""
 		if resp, err := http.Get("http://" + metricsAddr + "/metrics"); err == nil {
 			b, _ := io.ReadAll(resp.Body)
@@ -228,25 +237,26 @@ func TestRealMain_HoldsTheInformersUntilTheGatewayWaitEnds(t *testing.T) {
 // A watch set that cannot be built must still exit at once, so the
 // entrypoint's supervisor counts it as a failed start and raises its ALERT.
 func TestRealMain_AnUnbuildableWatchSetDoesNotWaitForTheGateway(t *testing.T) {
-	captureLog(t)
+	logs := captureLog(t)
 	t.Setenv("WATCHER_TEST_TOKEN", "token")
 	badKubeconfig := filepath.Join(t.TempDir(), "kubeconfig")
 	if err := os.WriteFile(badKubeconfig, []byte("not: [a kubeconfig"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	url, _ := refusingURL(t)
+	const wait = 2 * time.Second
 
 	start := time.Now()
 	err := realMain([]string{
 		"--daemon-url", "http://127.0.0.1:1", "--token-env", "WATCHER_TEST_TOKEN", "--owner", "watcher",
 		"--kubeconfig", badKubeconfig, "--cluster-name", "x",
-		"--gateway-url", url, "--gateway-wait", time.Hour.String(),
+		"--gateway-url", url, "--gateway-wait", wait.String(),
 	})
 	if err == nil || !strings.Contains(err.Error(), "kubeconfig") {
 		t.Fatalf("want realMain to stop on the kubeconfig, got err=%v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 10*time.Second {
-		t.Errorf("realMain took %s to report an unbuildable watch set; it waited for the gateway first", elapsed)
+	if strings.Contains(logs.String(), "waiting up to") || time.Since(start) >= wait {
+		t.Errorf("realMain waited for the gateway before reporting an unbuildable watch set:\n%s", logs.String())
 	}
 }
 
@@ -254,17 +264,7 @@ func TestRealMain_AnUnbuildableWatchSetDoesNotWaitForTheGateway(t *testing.T) {
 func TestRealMain_DryRunDoesNotWaitForTheGateway(t *testing.T) {
 	logs := captureLog(t)
 	url, _ := refusingURL(t)
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGTERM)
-	defer signal.Stop(sigs)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	go func() {
-		for ctx.Err() == nil && !strings.Contains(logs.String(), "starting: preflight") {
-			time.Sleep(10 * time.Millisecond)
-		}
-		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
-	}()
+	sigtermWhenLogged(t, logs, "starting: preflight")
 
 	start := time.Now()
 	if err := realMain([]string{
