@@ -99,6 +99,8 @@ in, where the operator sets it.
 4. **How the operator reaches the agent** — a terminal when no chat flag is passed (see
    [Handing over a chat-less install](#handing-over-a-chat-less-install)), `--enable-google-chat`,
    or `--enable-slack` (tokens in `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN`).
+   `--enable-web-console` adds a browser chat page for chat-less installs, reached by port-forward
+   ([Web console](../../../docs/site/src/content/docs/deploy/web-console.md)).
    `--enable-hermes-dashboard=true` adds the Hermes Web UI, which a port-forward cannot reach under
    gVisor; the
    [PlatformAgent reference](../../../docs/site/src/content/docs/operator/platformagent-crd.md)
@@ -185,8 +187,9 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   status leaves the cluster unchanged — relay the options and stop.
 - `SUCCESS`, or `SUCCESS_PENDING_ROLLOUT` (applied, but a deployment had not reported ready; relay
   the `kubectl rollout status` command the installer printed): relay how to reach the agent — the
-  terminal commands in [Handing over a chat-less install](#handing-over-a-chat-less-install), which
-  also fetch credentials, or the chat platform the operator enabled — then confirm the pods with
+  terminal commands in [Handing over a chat-less install](#handing-over-a-chat-less-install) (including
+  the `kubectl port-forward` command for the web console when `--enable-web-console` was enabled),
+  which also fetch credentials, or the chat platform the operator enabled — then confirm the pods with
   `kubectl get pods -n kubeagents-system`. Relay `network_policy_enforcement` when it is not
   `enforced` ([Machine-Readable Results](#machine-readable-results)).
 
@@ -274,11 +277,13 @@ consent and you must obtain it before passing one. Present each pending change w
 - **Legacy node pools** (`REFUSED_MISSING_NODE_POOL_MIGRATION`) — two answers: `--migrate-node-pools`
   recreates every node on those pools and restarts the workloads on them, kube-agents' or not; or
   stop. There is no install without Workload Identity.
-- **No NetworkPolicy enforcement** (`REFUSED_MISSING_NETWORK_POLICY`) — three answers, and you
-  present all three:
+- **No NetworkPolicy enforcement** (`REFUSED_MISSING_NETWORK_POLICY`) — three answers (or two when
+  `--enable-web-console` is enabled, since the web console requires NetworkPolicy enforcement and
+  cannot be combined with `--accept-no-network-policy`), and you present the applicable ones:
   1. `--enable-network-policy` enables the legacy Calico addon: a control-plane update that may
      recreate node pools and restart workloads unrelated to kube-agents.
-  2. `--accept-no-network-policy` installs without enforcement. The cluster is not modified. Every
+  2. `--accept-no-network-policy` installs without enforcement (unavailable when `--enable-web-console`
+     is enabled). The cluster is not modified. Every
      NetworkPolicy kube-agents ships is inert: the agent pod's egress confinement, the shell
      sandbox's deny-all (the sandbox is where model-authored commands run), and the LiteLLM,
      minter and Hindsight policies. The confinement lost is kube-agents'
@@ -353,7 +358,8 @@ Chat is opt-in and both platforms default off, and a non-interactive run with no
 has no chat and the operator has no way to reach the agent unless you give them one. The
 installer prints it at the chat-configuration step and again when it finishes, under
 `--- [Talking to the Agent from a Terminal] ---`, with the cluster, region, project and namespace
-already substituted. Relay those two commands verbatim:
+already substituted. Relay those two commands verbatim (plus the `Web Console` `kubectl port-forward`
+command and `http://localhost:8080` URL when `--enable-web-console` was enabled):
 
 ```bash
 gcloud container clusters get-credentials <CLUSTER_NAME> --location <REGION> --project <PROJECT_ID> --dns-endpoint
@@ -364,8 +370,11 @@ kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platf
   on a cluster publishing no externally reachable DNS endpoint, and the installer omits it there.
 - `-p platform` reaches the Platform Agent. A bare `hermes` reaches the Planning Agent front door,
   which is where a chat message would have landed.
-- `kubectl port-forward` is not an alternative: the agent is sandboxed under gVisor by default and
-  the forward cannot see into the sandbox. `kubectl exec` enters it.
+- `kubectl port-forward` to the agent pod is not an alternative: the agent is sandboxed under gVisor
+  by default and the forward cannot see into the sandbox. `kubectl exec` enters it. (When
+  `--enable-web-console` is enabled, the separate web console pod does not run under gVisor and is
+  reached via the `kubectl port-forward svc/kube-agents-web-console -n kubeagents-system 8080:8080`
+  command the installer prints.)
 - Say what the operator does not get until they enable a platform: scheduled reports and
   alert-driven triage are delivered to chat only, and the first-run inventory report waits on a
   human connecting over chat — read it with
@@ -570,9 +579,10 @@ Defaults marked "`installer_common.sh`" reach the installer through
 | `--slack-home-channel-name=NAME`          | Display name of that channel (e.g. `#gke-alerts`)                                                                                                                                                                                                                                                                                                                                 | _unset_                                                                                                                                            |
 | `--enable-gvisor=true\|false`             | Enable GKE Sandbox (gVisor) runtime isolation                                                                                                                                                                                                                                                                                                                                     | `true`                                                                                                                                             |
 | `--enable-hermes-dashboard=true\|false`   | Enable the Hermes Web UI on port 9119                                                                                                                                                                                                                                                                                                                                             | `false`                                                                                                                                            |
+| `--enable-web-console=true\|false`        | Deploy the web console, a browser page for the agent reached by `kubectl port-forward`: chat threads, event triage and scheduled checks, and usage. Requires NetworkPolicy enforcement (cannot be combined with `--accept-no-network-policy`)                                                                                                                                     | `false`                                                                                                                                            |
 | `--enable-gke-backup-plan=true\|false`    | Provision a GKE Backup Plan for the cluster                                                                                                                                                                                                                                                                                                                                       | `false`                                                                                                                                            |
 | `--migrate-node-pools`                    | Authorize migrating legacy GCE metadata server node pools to `GKE_METADATA` (recreates those nodes, restarts their workloads). Without it such a cluster is refused unchanged. The cluster's owner decides; never pass it unasked                                                                                                                                                 | `false`                                                                                                                                            |
-| `--enable-network-policy`                 | Authorize enabling the legacy Calico NetworkPolicy addon on an existing Standard cluster without Dataplane V2 (may recreate nodes). One of two answers; with neither the cluster is refused unchanged. The owner decides; never pass it unasked                                                                                                                                   | `false`                                                                                                                                            |
-| `--accept-no-network-policy`              | The other answer: install without modifying the cluster. Every NetworkPolicy kube-agents ships is then inert, the agent sandbox's included; recorded in the report and on the `PlatformAgent`. The owner decides; never pass it unasked                                                                                                                                           | `false`                                                                                                                                            |
+| `--enable-network-policy`                 | Authorize enabling the legacy Calico NetworkPolicy addon on an existing Standard cluster without Dataplane V2 (may recreate nodes). One of two answers (or the only answer when `--enable-web-console` is enabled); with neither the cluster is refused unchanged. The owner decides; never pass it unasked                                                                       | `false`                                                                                                                                            |
+| `--accept-no-network-policy`              | The other answer (unavailable when `--enable-web-console` is enabled): install without modifying the cluster. Every NetworkPolicy kube-agents ships is then inert, the agent sandbox's included; recorded in the report and on the `PlatformAgent`. The owner decides; never pass it unasked                                                                                      | `false`                                                                                                                                            |
 | `--memory=MODE`                           | Long-term agent memory engine: `file` \| `hindsight` \| `off`                                                                                                                                                                                                                                                                                                                     | `file`                                                                                                                                             |
 | `-h, --help, -?`                          | Output CLI usage banner and parameter details                                                                                                                                                                                                                                                                                                                                     | `N/A`                                                                                                                                              |

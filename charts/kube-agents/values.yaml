@@ -1276,3 +1276,91 @@ plugins:
       sink: gke-stockout-alerts-sink
       thresholdCount: 1
       thresholdWindowSeconds: 300
+
+# Web console: a browser chat page for the Platform Agent, for installs with no
+# Slack or Google Chat configured. It talks to the Hermes gateway on the agent
+# Service with the agent's API_SERVER_KEY, which stays in the pod. It is
+# reachable only through `kubectl port-forward`: the Service is always
+# ClusterIP and a NetworkPolicy refuses ingress from every other pod. See
+# docs/site/src/content/docs/deploy/web-console.md.
+webConsole:
+  enabled: false
+  # GET /api/environment: versions, install and last-rollout dates, and
+  # counts of nodes, namespaces, pods and controllers, for the console's
+  # feedback reports. Needs a service account with list on those kinds and
+  # get on the PlatformAgent, which the chart creates. Counts only: the
+  # console discards the listed items and never returns a name.
+  environment:
+    enabled: true
+  # "Polish with Gemini" in the feedback form: POST /api/assist sends the
+  # user's draft title and details to the install's own inference gateway
+  # (the LiteLLM Service the agent uses) with an editing prompt, and puts
+  # the edited text back in the form. One completion per click, no tools,
+  # nothing stored. Off when litellm.enabled is false, or set url to another
+  # OpenAI-compatible endpoint reachable from the console pod. The
+  # environment block of a report is generated and is never sent.
+  assist:
+    enabled: true
+    # The model name LiteLLM routes; empty means the gateway's default alias.
+    model: model-default
+    # Overrides the in-cluster inference-gateway URL.
+    url: ""
+  # GET /api/release: the version this install runs (from the image tag:
+  # a release tag, or a commit for a build from source) and the newest
+  # release on GitHub. One anonymous read of
+  # api.github.com/repos/<repo>/releases/latest per hour from the console
+  # pod; set enabled to false on a cluster without egress to GitHub.
+  releaseCheck:
+    enabled: true
+    repo: gke-labs/kube-agents
+  # POST /api/upgrade and GET /api/upgrade/status: launches an ephemeral
+  # Pod/kube-agents-upgrade-runner in the release namespace to run the
+  # release-pinned upgrade.sh script and stream its logs to the browser.
+  # When autoUpgrade is true (or enabled in the console UI), the console
+  # runs upgrade.sh on its own once a newer release is published. An
+  # upgrade restarts the agent gateway, so every chat surface is offline
+  # until the new pod is ready. The automatic path waits until no kanban
+  # card is running (and fails closed when it cannot read the board), until
+  # the release is autoUpgradeMinReleaseAge old, and, when
+  # autoUpgradeWindow is set, until the window opens. The Upgrade button in
+  # the console is not gated.
+  upgradeRunner:
+    enabled: true
+    autoUpgrade: false
+    # Weekly window for automatic upgrades: "[DAYS ]HH:MM-HH:MM[ ZONE]",
+    # e.g. "Sat,Sun 02:00-06:00 America/Toronto". Days are optional (every
+    # day), the zone defaults to UTC, and an end before the start crosses
+    # midnight. Empty means any time.
+    autoUpgradeWindow: ""
+    # Go duration a release must have been published before an automatic
+    # upgrade installs it; "0" turns the check off.
+    autoUpgradeMinReleaseAge: "72h"
+  image:
+    repository: ghcr.io/gke-labs/kube-agents/web-console
+    tag: "" # defaults to platformAgent.deployment.image.tag, then Chart.appVersion
+    pullPolicy: "" # defaults to Always for the latest tag, IfNotPresent otherwise
+  # The agent's Google identity, shown in the console's identity box. The
+  # console holds no credentials to read IAM, so these are recorded at
+  # install: the Terraform composition fills them from the kube-agents-iam
+  # module. A role granted later is not shown until the next install.
+  agentIdentity:
+    # The Google service account the agent's KSA maps to through Workload
+    # Identity.
+    gcpServiceAccount: ""
+    # Project-level IAM roles granted to that service account.
+    roles: []
+  resources:
+    limits:
+      cpu: 200m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 32Mi
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
