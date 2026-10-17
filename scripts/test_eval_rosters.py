@@ -192,6 +192,7 @@ ADDED_AFTER_THE_MOVE = [
     "upgrade-chat-request-runs-collector",  # a plain upgrade-readiness request runs the patch collector, #2386
     "drift-chat-request-runs-collector",  # a plain peer-consistency request runs the drift collector, #2386
     "ai-security-chat-request-runs-collector",  # a plain AI-security request runs the AI security collector, #2386
+    "cluster-setting-request-proposes-pr",  # the gke-platform-security skill's pull request path, #2937
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
@@ -632,6 +633,10 @@ INJECT_LANE_SAFEGUARDS = [
 # types that count are lane.REQUESTING_CHECK_TYPES.
 INJECT_LANE_REQUESTING = [
     "cluster-agent-crashloop-fix-request",
+    # cluster-setting-request-proposes-pr: asked to turn on Binary Authorization, it
+    # may propose the change as a pull request; its objective's
+    # pull_request_opened leaf allows one.
+    "cluster-setting-request-proposes-pr",
     # obtainability-remediation-proposal was listed in the safeguards file's
     # `requesting:` while the persona answered its "propose a manifest" prompt
     # with a pull request; the persona's rule now puts that manifest in the

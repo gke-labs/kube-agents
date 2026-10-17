@@ -16,7 +16,9 @@ This reference covers high availability and reliability configuration for GKE
 clusters and workloads.
 
 > **MCP Tools:** `get_cluster`, `get_k8s_resource`, `describe_k8s_resource`,
-> `apply_k8s_manifest`, `list_k8s_events`
+> `list_k8s_events`
+>
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
 
 ## Golden Path Reliability Defaults
 
