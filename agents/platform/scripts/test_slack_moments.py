@@ -784,6 +784,14 @@ class NextStepTest(unittest.TestCase):
         self.assertEqual(m.visible_text(two), "Up.")
         self.assertEqual(m.visible_text("Up.\n\u00a0[next: b]"), "Up.", "a leading NBSP is still a step line")
 
+    def test_a_long_blank_run_in_a_broken_step_line_does_not_backtrack(self):
+        import time
+        for line in ("[next:" + " " * 5000 + "x", "[next:" + " " * 5000 + "x]."):
+            started = time.monotonic()
+            m.visible_text("Up.\n" + line)
+            m.next_step("Up.\n" + line)
+            self.assertLess(time.monotonic() - started, 1.0)
+
     def test_visible_text_is_one_pass(self):
         import time
         many = "Up.\n" + "[next: x]\n" * 20000

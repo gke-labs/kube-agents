@@ -341,7 +341,8 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 			// completed wins, per the payload spec's cancel mapping, as on
 			// the subprocess path.
 			if routeLost {
-				text += routeLostNote
+				// Above a declared step's line, which has to stay last.
+				text = withNote(text, routeLostNote)
 			}
 			b.finalize(run, lib.StateCompleted, "", &text)
 			return

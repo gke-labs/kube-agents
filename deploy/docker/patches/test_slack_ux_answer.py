@@ -518,8 +518,11 @@ class SendTest(unittest.TestCase):
         # split accepts the answer, but its rest holds a divider, which a fold cannot keep.
         answer = "All good in seeded-b. Two pods restarted.\n\n---\n\nOne pod restarted.\n\n[next: check seeded-a]"
         adapter = _Adapter()
-        with self.assertLogs(runtime.logger):
+        with self.assertLogs(runtime.logger) as logs:
             self.send(adapter, answer)
+        # The log says what happened: the fold was refused, and the answer was drawn whole.
+        self.assertIn("the fold is refused", logs.output[0])
+        self.assertIn("posted the answer drawn whole with its step's button", logs.output[-1])
         blocks = adapter.log[0][1]["blocks"]
         self.assertIn({"type": "divider"}, blocks)
         self.assertEqual(blocks[-1]["elements"][0]["value"], "check seeded-a")

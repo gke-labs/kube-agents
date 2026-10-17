@@ -140,7 +140,7 @@ def _not_prose(line: str) -> bool:
 
 
 def _refuse(reason: str) -> None:
-    logger.info("slack_ux_answer: keeping the upstream post, the fold is refused: %s", reason)
+    logger.info("slack_ux_answer: the fold is refused: %s", reason)
 
 
 _block_kit = None
@@ -364,7 +364,7 @@ class _AnswerFolder:
         shown_answer = _moments.visible_text(content)
         step_blocks = choice_blocks([(step, False)]) if step and in_thread else []
         parts = split(shown_answer)
-        layout, offered = None, None
+        layout, offered, drawn = None, None, "folded"
         if parts is not None:
             headline, rest = parts
             offered = _moments.answer_choices(rest, buttons=in_thread)
@@ -393,6 +393,7 @@ class _AnswerFolder:
             if whole_blocks is None or len(whole_blocks) >= MESSAGE_BLOCKS_MAX:
                 return None
             layout = [*whole_blocks, *step_blocks]
+            drawn = "drawn whole with its step's button"
         if adapter._outbound_blocked(self._chat_id, OUTBOUND_LABEL):
             # Upstream's send refuses it as well, and says so in its result.
             return None
@@ -426,7 +427,7 @@ class _AnswerFolder:
                 adapter._trim_bot_message_timestamps()
         except Exception as exc:  # noqa: BLE001 — posted; only the status clear or reply tracking is lost
             logger.debug("slack_ux_answer: could not finish after posting %s: %s", ts, exc)
-        logger.info("slack_ux_answer: posted the answer folded in %s", channel)
+        logger.info("slack_ux_answer: posted the answer %s in %s", drawn, channel)
         return SimpleNamespace(success=True, message_id=ts, error=None)
 
 

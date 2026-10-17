@@ -470,3 +470,21 @@ func TestVisibleText(t *testing.T) {
 		}
 	}
 }
+
+// withNote puts a note above a declared step's line, which has to stay last,
+// and after the answer when it declares none.
+func TestWithNote(t *testing.T) {
+	note := "\n\n(note)"
+	for in, want := range map[string]string{
+		"Up.\n\n[next: check seeded-a]": "Up.\n\n(note)\n\n[next: check seeded-a]",
+		"Up.":                           "Up.\n\n(note)",
+	} {
+		got := withNote(in, note)
+		if got != want {
+			t.Errorf("withNote(%q) = %q, want %q", in, got, want)
+		}
+		if _, step := nextStep(got); strings.Contains(in, "[next:") && step != "check seeded-a" {
+			t.Errorf("withNote(%q) lost the step: nextStep = %q", in, step)
+		}
+	}
+}

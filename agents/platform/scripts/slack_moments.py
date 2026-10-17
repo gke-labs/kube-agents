@@ -296,7 +296,9 @@ SHOWN_SUMMARY = "{line} — {summary}"
 #: A line that is not prose: a quote or a table row, beside the presenter's headings, items and fences.
 NOT_PROSE = re.compile(r"^\s*[>|]")
 #: The next step an answer declares (:func:`next_step`): a line of its own, ``[next: <label>]``.
-NEXT_STEP_LINE = re.compile(r"[ \t]*\[next:[ \t]*([^\]\n]*?)[ \t]*\][ \t]*", re.IGNORECASE)
+#: Matched against a line already stripped, with one quantifier, so a long blank run cannot
+#: backtrack; the label's own blanks are collapsed afterwards.
+NEXT_STEP_LINE = re.compile(r"\[next:([^\]\n]*)\]", re.IGNORECASE)
 #: What a declared step's label cannot hold: a Slack link or mention, which a button shows as
 #: typed, and the brackets of a second step.
 NEXT_STEP_REFUSED = re.compile(r"[<>|\[\]]")

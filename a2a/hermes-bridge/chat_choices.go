@@ -89,7 +89,7 @@ var (
 	// nextStepLine is NEXT_STEP_LINE, matched against a whole line, and
 	// nextStepRefused is NEXT_STEP_REFUSED: what a declared step's label
 	// cannot hold.
-	nextStepLine    = regexp.MustCompile(`(?i)^[ \t]*\[next:[ \t]*([^\]\n]*?)[ \t]*\][ \t]*$`)
+	nextStepLine    = regexp.MustCompile(`(?i)^\[next:([^\]\n]*)\]$`)
 	nextStepRefused = regexp.MustCompile(`[<>|\[\]]`)
 )
 
@@ -508,6 +508,16 @@ func visibleText(answer string) string {
 // whole answer is, is a step line.
 func stepShaped(line string) bool {
 	return nextStepLine.MatchString(pyStrip(line))
+}
+
+// withNote is answer with note added above any step lines at its end, so
+// the step line stays last, where every reader looks for it.
+func withNote(answer, note string) string {
+	shown := visibleText(answer)
+	if shown == answer {
+		return answer + note
+	}
+	return shown + note + "\n\n" + strings.TrimLeftFunc(answer[len(shown):], isPySpace)
 }
 
 // visibleOr is visibleText, or answer as written when nothing else is left,
