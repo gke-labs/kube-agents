@@ -9,6 +9,7 @@ checkout is written.
 
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -50,7 +51,13 @@ class ChatInstructionHelpersTest(unittest.TestCase):
 
     def test_a_disabled_platform_prints_nothing_on_a_pipe(self):
         # The EXIT trap's tput writes only to a terminal: on a pipe, with the
-        # platform off, the run prints nothing at all.
+        # platform off, the run prints nothing at all. That proves the guard
+        # only where an unguarded `tput cnorm` would have written something,
+        # so the premise is checked first rather than assumed.
+        probe = subprocess.run(["tput", "cnorm"], capture_output=True, env={**os.environ, "TERM": "xterm-256color"},
+                               check=False) if shutil.which("tput") else None
+        if probe is None or not probe.stdout:
+            self.skipTest("tput writes nothing for TERM=xterm-256color here, so the guard is unobservable")
         for script in _HELPERS:
             with self.subTest(script=script):
                 proc = self._run(script, "--dry-run")
