@@ -364,15 +364,8 @@ class _AnswerFolder:
         shown_answer = _moments.visible_text(content)
         step_blocks = choice_blocks([(step, False)]) if step and in_thread else []
         parts = split(shown_answer)
-        if parts is None:
-            if not step_blocks:
-                return None
-            # The answer as upstream draws it, without the step's line, and the step's button.
-            whole_blocks = render_whole(shown_answer, mrkdwn_fn)
-            if whole_blocks is None or len(whole_blocks) >= MESSAGE_BLOCKS_MAX:
-                return None
-            layout = [*whole_blocks, *step_blocks]
-        else:
+        layout, offered = None, None
+        if parts is not None:
             headline, rest = parts
             offered = _moments.answer_choices(rest, buttons=in_thread)
             if offered is not None:
@@ -389,9 +382,17 @@ class _AnswerFolder:
                 detail_blocks, action_blocks = [], step_blocks
             fold_blocks = render_fold(rest, mrkdwn_fn) if rest else []
             question_blocks = render_fold(question, mrkdwn_fn) if question else []
-            if fold_blocks is None or question_blocks is None or detail_blocks is None:
+            if fold_blocks is not None and question_blocks is not None and detail_blocks is not None:
+                layout = blocks_answer(headline, fold_blocks, question_blocks, detail_blocks, action_blocks)
+        if layout is None:
+            # split or the fold refused (a divider cannot fold): with a declared step and no options,
+            # the answer as upstream draws it, without the step's line, and the step's button.
+            if not step_blocks or offered is not None:
                 return None
-            layout = blocks_answer(headline, fold_blocks, question_blocks, detail_blocks, action_blocks)
+            whole_blocks = render_whole(shown_answer, mrkdwn_fn)
+            if whole_blocks is None or len(whole_blocks) >= MESSAGE_BLOCKS_MAX:
+                return None
+            layout = [*whole_blocks, *step_blocks]
         if adapter._outbound_blocked(self._chat_id, OUTBOUND_LABEL):
             # Upstream's send refuses it as well, and says so in its result.
             return None

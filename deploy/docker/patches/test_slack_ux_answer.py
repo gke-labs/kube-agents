@@ -514,6 +514,17 @@ class SendTest(unittest.TestCase):
         self.assertEqual(asked, _render_blocks(question, adapter.format_message)[0])
         self.assertNotIn("[next:", json.dumps(post))
 
+    def test_a_fold_that_refuses_a_divider_draws_the_answer_whole_with_its_step(self):
+        # split accepts the answer, but its rest holds a divider, which a fold cannot keep.
+        answer = "All good in seeded-b. Two pods restarted.\n\n---\n\nOne pod restarted.\n\n[next: check seeded-a]"
+        adapter = _Adapter()
+        with self.assertLogs(runtime.logger):
+            self.send(adapter, answer)
+        blocks = adapter.log[0][1]["blocks"]
+        self.assertIn({"type": "divider"}, blocks)
+        self.assertEqual(blocks[-1]["elements"][0]["value"], "check seeded-a")
+        self.assertNotIn("[next:", json.dumps(adapter.log[0][1]))
+
     def test_an_answer_drawn_whole_keeps_a_divider(self):
         # A top-level post may hold any block the plugin renders; only a fold limits the types.
         answer = "## Summary\n\nAll good in seeded-b.\n\n---\n\nOne pod restarted.\n\n[next: check seeded-a]"

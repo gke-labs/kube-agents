@@ -300,7 +300,6 @@ NEXT_STEP_LINE = re.compile(r"[ \t]*\[next:[ \t]*([^\]\n]*?)[ \t]*\][ \t]*", re.
 #: What a declared step's label cannot hold: a Slack link or mention, which a button shows as
 #: typed, and the brackets of a second step.
 NEXT_STEP_REFUSED = re.compile(r"[<>|\[\]]")
-CARRIAGE_RETURN = "\r"
 
 
 def opened_pr(
@@ -853,9 +852,14 @@ def step_line(text: str) -> tuple[str, str]:
     :func:`next_step` accepts its label; ``(text, "")`` otherwise. A layout that reads the closing
     question from the last line sets the line aside first, so a refused step cannot hide it."""
     lines = (text or "").rstrip().split("\n")
-    if not NEXT_STEP_LINE.fullmatch(lines[-1].rstrip(CARRIAGE_RETURN)):
+    if not _step_shaped(lines[-1]):
         return text, ""
     return "\n".join(lines[:-1]).rstrip(), lines[-1].strip()
+
+
+def _step_shaped(line: str) -> bool:
+    """Whether ``line``, trimmed as the whole answer is (any whitespace, ``\r`` included), is a step line."""
+    return NEXT_STEP_LINE.fullmatch(line.strip()) is not None
 
 
 def visible_text(text: str) -> str:
@@ -866,12 +870,13 @@ def visible_text(text: str) -> str:
     text, a refused or second one included. Returns the text as written when it
     ends on no such line.
     """
-    shown, line = step_line(text)
-    if not line:
-        return text
-    while line:
-        shown, line = step_line(shown)
-    return shown
+    # One pass from the end: blank lines and step lines come off until anything else.
+    lines = (text or "").rstrip().split("\n")
+    end, took = len(lines), False
+    while end and (not lines[end - 1].strip() or _step_shaped(lines[end - 1])):
+        took = took or bool(lines[end - 1].strip())
+        end -= 1
+    return "\n".join(lines[:end]).rstrip() if took else text
 
 
 def next_step(text: str) -> tuple[str, str]:
@@ -887,9 +892,9 @@ def next_step(text: str) -> tuple[str, str]:
     the text as written.
     """
     lines = (text or "").rstrip().split("\n")
-    # A CRLF answer's lines end in "\r", which no step line may hide behind.
-    match = NEXT_STEP_LINE.fullmatch(lines[-1].rstrip(CARRIAGE_RETURN))
-    if match is None or any(NEXT_STEP_LINE.fullmatch(line.rstrip(CARRIAGE_RETURN)) for line in lines[:-1]):
+    # Each line is trimmed as the whole answer is, so no step line hides behind a "\r" or other space.
+    match = NEXT_STEP_LINE.fullmatch(lines[-1].strip())
+    if match is None or any(_step_shaped(line) for line in lines[:-1]):
         return text, ""
     label = " ".join(_presenter._plain(match.group(1)).split())
     if (

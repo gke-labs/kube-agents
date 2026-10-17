@@ -778,6 +778,19 @@ class NextStepTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(m.visible_text(text), want)
 
+    def test_any_whitespace_around_a_step_line_reads_as_none(self):
+        two = "Up.\n[next: a]\x0c\n[next: b]"
+        self.assertEqual(m.next_step(two), (two, ""), "a form feed hides no second step")
+        self.assertEqual(m.visible_text(two), "Up.")
+        self.assertEqual(m.visible_text("Up.\n\u00a0[next: b]"), "Up.", "a leading NBSP is still a step line")
+
+    def test_visible_text_is_one_pass(self):
+        import time
+        many = "Up.\n" + "[next: x]\n" * 20000
+        started = time.monotonic()
+        self.assertEqual(m.visible_text(many), "Up.")
+        self.assertLess(time.monotonic() - started, 1.0)
+
     def test_a_crlf_answer_reads_as_an_lf_one(self):
         self.assertEqual(m.next_step("Up.\r\n\r\n[next: check seeded-a]\r\n"), ("Up.", "check seeded-a"))
         two = "Up.\r\n[next: check seeded-b]\r\n[next: check seeded-a]\r\n"

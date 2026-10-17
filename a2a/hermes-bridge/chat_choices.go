@@ -59,8 +59,6 @@ const (
 	shownSummary = "%s — %s"
 	// labelTrim is what a label sheds from its end ("Fix it:").
 	labelTrim = ":"
-	// carriageReturn ends each line of a CRLF answer (CARRIAGE_RETURN).
-	carriageReturn = "\r"
 )
 
 var (
@@ -492,14 +490,24 @@ func answerChoices(rest string) (answerOffer, bool) {
 // line at its end taken off, since the "[next: ...]" line is plumbing no
 // surface shows as text; the answer as written when it ends on none.
 func visibleText(answer string) string {
-	shown := answer
-	for {
-		lines := strings.Split(strings.TrimRightFunc(shown, isPySpace), "\n")
-		if !nextStepLine.MatchString(strings.TrimRight(lines[len(lines)-1], carriageReturn)) {
-			return shown
-		}
-		shown = strings.TrimRightFunc(strings.Join(lines[:len(lines)-1], "\n"), isPySpace)
+	// One pass from the end: blank lines and step lines come off until
+	// anything else.
+	lines := strings.Split(strings.TrimRightFunc(answer, isPySpace), "\n")
+	end, took := len(lines), false
+	for end > 0 && (pyStrip(lines[end-1]) == "" || stepShaped(lines[end-1])) {
+		took = took || pyStrip(lines[end-1]) != ""
+		end--
 	}
+	if !took {
+		return answer
+	}
+	return strings.TrimRightFunc(strings.Join(lines[:end], "\n"), isPySpace)
+}
+
+// stepShaped is slack_moments._step_shaped: whether line, trimmed as the
+// whole answer is, is a step line.
+func stepShaped(line string) bool {
+	return nextStepLine.MatchString(pyStrip(line))
 }
 
 // visibleOr is visibleText, or answer as written when nothing else is left,
@@ -520,12 +528,12 @@ func visibleOr(answer string) string {
 // an empty label.
 func nextStep(answer string) (string, string) {
 	lines := strings.Split(strings.TrimRightFunc(answer, isPySpace), "\n")
-	m := nextStepLine.FindStringSubmatch(strings.TrimRight(lines[len(lines)-1], carriageReturn))
+	m := nextStepLine.FindStringSubmatch(pyStrip(lines[len(lines)-1]))
 	if m == nil {
 		return answer, ""
 	}
 	for _, line := range lines[:len(lines)-1] {
-		if nextStepLine.MatchString(strings.TrimRight(line, carriageReturn)) {
+		if stepShaped(line) {
 			return answer, ""
 		}
 	}

@@ -460,6 +460,8 @@ func TestVisibleText(t *testing.T) {
 		"Up.\r\n\r\n[next: check seeded-a]\r\n":          "Up.",
 		"Up.\n\n[next: " + strings.Repeat("x", 80) + "]": "Up.",
 		"Up. [next: inline]":                             "Up. [next: inline]",
+		"Up.\n[next: a]\x0c\n[next: b]":                  "Up.",
+		"Up.\n\u00a0[next: b]":                           "Up.",
 		"Up.":                                            "Up.",
 		"[next: check]":                                  "",
 	} {

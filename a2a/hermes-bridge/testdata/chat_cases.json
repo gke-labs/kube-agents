@@ -1218,6 +1218,13 @@
       }
     },
     {
+      "in": "seeded-c is behind.\n[next: check seeded-b]\f\n[next: upgrade plan for seeded-c]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is behind."
+      }
+    },
+    {
       "in": "Five pods match.\n\n[next: **delete pods matching** `app=web-*`]",
       "chat": {
         "schema": "kube-agents.chat/v1",
