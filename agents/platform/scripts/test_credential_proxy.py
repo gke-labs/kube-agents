@@ -14129,5 +14129,142 @@ class ApiRelayQueryStrippingTest(unittest.TestCase):
         )
 
 
+class GitAllowProtocolForHttpForgeTest(unittest.TestCase):
+    """`_execute` widens `GIT_ALLOW_PROTOCOL` to `https:http` for an `http` forge across both `execute_vcs_git` and `execute_workspace_git`."""
+
+    def test_git_allow_protocol_widens_for_allow_http_or_http_credential_helper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
+                executor = CommandExecutor(
+                    timeout_seconds=5,
+                    max_output_bytes=4096,
+                    state_dir=root / "state",
+                )
+            executor.vcs_root.mkdir(parents=True, exist_ok=True)
+            executor.content_workspace_root.mkdir(parents=True, exist_ok=True)
+            captured_envs = []
+
+            class FakeProcess:
+                returncode = 0
+
+            def fake_popen(argv, *, cwd=None, env=None, **_kwargs):
+                captured_envs.append(dict(env or {}))
+                return FakeProcess()
+
+            fake_captured = credential_proxy._CapturedOutput(
+                stdout=b"", stderr=b"", truncated=False, timed_out=False, abandoned=False
+            )
+            with (
+                mock.patch.object(subprocess, "Popen", side_effect=fake_popen),
+                mock.patch.object(credential_proxy, "_capture_output", return_value=fake_captured),
+            ):
+                executor.execute_vcs_git(
+                    ["git", "init"],
+                    executor.vcs_root,
+                    config=(
+                        ("credential.helper", ""),
+                        ("credential.https://gitea.example.test.helper", "/bin/true"),
+                    ),
+                )
+                executor.execute_vcs_git(
+                    ["git", "init"],
+                    executor.vcs_root,
+                    config=(("credential.helper", ""),),
+                    allow_http=True,
+                )
+                executor.execute_workspace_git(
+                    [
+                        "git",
+                        "clone",
+                        "--quiet",
+                        "http://gitea.gitea.svc.cluster.local:3000/acme/infra.git",
+                        str(executor.content_workspace_root / "repo"),
+                    ],
+                    executor.content_workspace_root,
+                    config=(),
+                    allow_http=True,
+                )
+            self.assertEqual("https", captured_envs[0]["GIT_ALLOW_PROTOCOL"])
+            self.assertEqual("https:http", captured_envs[1]["GIT_ALLOW_PROTOCOL"])
+            self.assertEqual("https:http", captured_envs[2]["GIT_ALLOW_PROTOCOL"])
+
+    def test_content_workspace_store_open_on_http_gitea_forge_widens_git_allow_protocol(self):
+        import content_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            token_file = root / "gitea-token"
+            token_file.write_text("gitea-pat-token\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
+                executor = CommandExecutor(
+                    timeout_seconds=5,
+                    max_output_bytes=4096,
+                    state_dir=root / "state",
+                )
+            executor.content_workspace_root.mkdir(parents=True, exist_ok=True)
+            agent_dir = root / "agent"
+            agent_dir.mkdir(parents=True, exist_ok=True)
+
+            gitea_forge = providers.build_forges({
+                "forges": [
+                    {
+                        "provider": "gitea",
+                        "name": "gitea",
+                        "host": "gitea.gitea.svc.cluster.local",
+                        "scheme": "http",
+                        "port": 3000,
+                        "token_path": str(token_file),
+                        "allowed_paths": ["acme"],
+                    }
+                ]
+            })[-1]
+
+            captured_clone_envs = []
+
+            class FakeProcess:
+                returncode = 0
+
+            def fake_popen(argv, *, cwd=None, env=None, **_kwargs):
+                if "clone" in argv:
+                    captured_clone_envs.append(dict(env or {}))
+                    Path(argv[-1]).mkdir(parents=True, exist_ok=True)
+                return FakeProcess()
+
+            def fake_capture(_proc, *_args, **_kwargs):
+                return credential_proxy._CapturedOutput(
+                    stdout=b"refs/remotes/origin/main\n" + (b"a" * 40) + b"\n",
+                    stderr=b"",
+                    truncated=False,
+                    timed_out=False,
+                    abandoned=False,
+                )
+
+            for label, cred_fn in (
+                ("managed stored credential", lambda _repo: gitea_forge.credential),
+                ("context or unregistered NoCredential", lambda _repo: providers.NoCredential()),
+            ):
+                with self.subTest(case=label):
+                    captured_clone_envs.clear()
+                    store = content_workspace.ContentWorkspaceStore(
+                        executor.content_workspace_root,
+                        agent_dir,
+                        executor.execute_workspace_git,
+                        credential_for=cred_fn,
+                        locate=lambda _repo: (
+                            "gitea.gitea.svc.cluster.local/acme/infra",
+                            gitea_forge.clone_url("acme/infra"),
+                        ),
+                    )
+                    with (
+                        mock.patch.object(subprocess, "Popen", side_effect=fake_popen),
+                        mock.patch.object(credential_proxy, "_capture_output", side_effect=fake_capture),
+                    ):
+                        ws = store.open("gitea.gitea.svc.cluster.local/acme/infra")
+                    self.assertEqual("gitea.gitea.svc.cluster.local/acme/infra", ws.repo)
+                    self.assertEqual(1, len(captured_clone_envs))
+                    self.assertEqual("https:http", captured_clone_envs[0]["GIT_ALLOW_PROTOCOL"])
+
+
 if __name__ == "__main__":
     unittest.main()

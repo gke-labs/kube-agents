@@ -2973,11 +2973,24 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// install a plugin's value would reroute Google Chat posts from
 		// hermes send to a chat.notify route that does not exist there. The
 		// operator renders them only under next, after this merge.
+		// Drop any plugin env entry that references a forge credentialsRef or
+		// caBundleRef Secret, matching the reconcile-time refusal in
+		// validateExtraVolumeMounts so buildPodTemplateSpec never renders a
+		// forge Secret into the platform-agent container even when called
+		// directly in unit tests.
+		var forgeSecrets []string
+		if agent.Spec.Integration != nil {
+			forgeSecrets = agent.Spec.Integration.ForgeCredentialSecretNames()
+		}
 		kept := extEnvs[:0]
 		for _, e := range extEnvs {
-			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar {
-				kept = append(kept, e)
+			if e.Name == a2aNotifyPlatformEnvVar || e.Name == a2aNotifyConversationsEnvVar {
+				continue
 			}
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+				continue
+			}
+			kept = append(kept, e)
 		}
 		extEnvs = kept
 		if len(extEnvs) > 0 {

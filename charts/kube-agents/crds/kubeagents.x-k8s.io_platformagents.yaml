@@ -9800,8 +9800,9 @@ spec:
                           same-named repository on this one. See
                           docs/designs/version-control-support.md §6.
 
-                          A gitlab forge's credentialsRef is required by the API server too, so it
-                          holds with the webhook off -- the chart ships it off.
+                          A gitlab or gitea forge's credentialsRef (and a gitea forge's host) are
+                          required by the API server too, so they hold with the webhook off -- the
+                          chart ships it off.
                         properties:
                           caBundleRef:
                             description: |-
@@ -9852,11 +9853,10 @@ spec:
                               the install's GitHub App through the token minter, so it is ignored for
                               provider "github", and admission warns when it is set there.
 
-                              For GitLab the Secret holds an access token under the key `token`: a
-                              group or project access token, or a dedicated account's personal access
-                              token where the tier offers neither. It is mounted into the credential
-                              broker's pod only, never the agent's or the sandbox's, and read on every
-                              call, so rotating the token is updating the Secret.
+                              For GitLab and Gitea the Secret holds an access token under the key
+                              `token`. It is mounted into the credential broker's pod only, never the
+                              agent's or the sandbox's, and read on every call, so rotating the token
+                              is updating the Secret.
                             properties:
                               name:
                                 description:
@@ -9875,12 +9875,13 @@ spec:
                               ("github.com" for GitHub, "gitlab.com" for GitLab). A host the declared
                               provider does not serve is rejected, and an alternative spelling of one
                               it does serve resolves to the provider's canonical host. It may also be a
-                              self-managed instance's hostname: a GitLab instance, or a GitHub
-                              Enterprise Server instance. Every repository on the forge must then name
-                              that host or leave it implied. A host another provider serves is
-                              rejected, and so is a host under a domain where the provider runs its own
-                              services (for GitHub: github.com, githubusercontent.com, ghe.com and
-                              others).
+                              self-managed instance's hostname: a GitLab instance, a Gitea instance, or
+                              a GitHub Enterprise Server instance. Every repository on the forge must
+                              then name that host or leave it implied. A self-managed provider such as
+                              "gitea" has no default, so the host is required there. A host another
+                              provider serves is rejected, and so is a host under a domain where the
+                              provider runs its own services (for GitHub: github.com,
+                              githubusercontent.com, ghe.com and others).
 
                               An install serves one GitHub host: github.com, or one GitHub Enterprise
                               Server instance. A second GitHub forge at another host is rejected, and
@@ -9925,6 +9926,14 @@ spec:
                             maxLength: 255
                             pattern: ^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$
                             type: string
+                          port:
+                            description: |-
+                              Port is the forge's port, for a self-managed forge not on the scheme's
+                              default port. It is refused for a hosted provider such as GitHub.
+                            format: int32
+                            maximum: 65535
+                            minimum: 1
+                            type: integer
                           provider:
                             description: |-
                               Provider names the forge's kind. It is the discriminator the operator
@@ -9932,7 +9941,7 @@ spec:
                               the agent reads which forge was declared rather than guessing from the
                               URL's text.
 
-                              "github" and "gitlab" are registered; the enum grows with each
+                              "github", "gitlab", and "gitea" are registered; the enum grows with each
                               agent-side provider. Omitted, it is "github".
 
                               A forge at a host other than a spelling of github.com must name it, so
@@ -9941,6 +9950,18 @@ spec:
                             enum:
                               - github
                               - gitlab
+                              - gitea
+                            type: string
+                          scheme:
+                            description: |-
+                              Scheme is how the forge is reached: "https", the default, or "http".
+                              Only a provider that allows plain http accepts it, and only when it is
+                              written out; GitHub is https only. Over http the token and repository
+                              contents cross the network unencrypted, so admission warns, and it is
+                              meant for a forge inside the cluster.
+                            enum:
+                              - https
+                              - http
                             type: string
                         required:
                           - name
@@ -9949,7 +9970,7 @@ spec:
                           - message:
                               "a forge at a host other than github.com names its
                               provider: github for a GitHub Enterprise Server, gitlab
-                              for a GitLab instance"
+                              for a GitLab instance, gitea for a Gitea instance"
                             rule:
                               has(self.provider) || !has(self.host) || size(self.host)
                               == 0 || self.host.lowerAscii() in ['github.com', 'www.github.com',
@@ -9961,6 +9982,16 @@ spec:
                               "!has(self.provider) || self.provider != 'gitlab'
                               || has(self.credentialsRef)"
                           - message:
+                              "a gitea forge needs credentialsRef.name: the Secret
+                              holding its access token under the key token"
+                            rule:
+                              "!has(self.provider) || self.provider != 'gitea' ||
+                              has(self.credentialsRef)"
+                          - message: a gitea forge has no default host; host is required
+                            rule:
+                              "!has(self.provider) || self.provider != 'gitea' ||
+                              (has(self.host) && size(self.host) > 0)"
+                          - message:
                               "caBundleRef is for a self-managed host: gitlab.com
                               and github.com present a certificate the public CAs sign,
                               and a private CA must never vouch for it"
@@ -9968,6 +9999,25 @@ spec:
                               "!has(self.caBundleRef) || (has(self.host) && size(self.host)
                               > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com',
                               'github.com', 'www.github.com', 'ssh.github.com']))"
+                          - message: caBundleRef cannot be set when scheme is http
+                            rule:
+                              "!has(self.caBundleRef) || !has(self.scheme) || self.scheme
+                              != 'http'"
+                          - message: scheme http is only supported for provider gitea
+                            rule:
+                              "!has(self.scheme) || self.scheme != 'http' || (has(self.provider)
+                              && self.provider == 'gitea')"
+                          - message:
+                              scheme http sends the forge token unencrypted and
+                              is only allowed for an in-cluster service host (*.svc or
+                              *.svc.cluster.local)
+                            rule:
+                              "!has(self.scheme) || self.scheme != 'http' || (has(self.host)
+                              && (self.host.lowerAscii().endsWith('.svc') || self.host.lowerAscii().endsWith('.svc.cluster.local')))"
+                          - message: port is only supported for provider gitea
+                            rule:
+                              "!has(self.port) || self.port == 0 || (has(self.provider)
+                              && self.provider == 'gitea')"
                       maxItems: 16
                       type: array
                       x-kubernetes-list-map-keys:
