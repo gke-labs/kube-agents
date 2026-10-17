@@ -49,9 +49,10 @@
 # each is graded on the pull requests its own reply names.
 # scripts/test_eval_rosters.py pins the set of requesting cases.
 #
-# WHO APPROVES. The normal approvers, as for inject-lane-exclusions.txt: this
-# file changes what the inject lane grades, not what can red a pull request
-# on the api lane, so hack/OWNERS leaves it to the root OWNERS.
+# WHO APPROVES. The eval crew, as for inject-lane-exclusions.txt: the
+# merge-blocking presubmit runs on the inject lane, so an entry here is a
+# rung 1 check on every pull request; hack/OWNERS scopes this file to the
+# eval-crew alias.
 
 # Cases the lane treats as requesting a pull request before their own checks
 # say so, each with the count it is allowed: the persona answers their prompt

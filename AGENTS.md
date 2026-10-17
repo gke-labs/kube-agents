@@ -222,13 +222,14 @@ user" clauses here. Agents with a user in the loop follow this file.
 
 ### The behavioural presubmit gate
 
-`pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` (3 repetitions per active
-case, 1.5–3.5 hours against a 360-minute ceiling). Non-inert pushes restart it, so open the PR early
-and batch changes; a Tide retest after `main` moves reuses the head's green in minutes. It goes red
-when a case on `BOOTSTRAP_ADMITTED` in `hack/ci-eval-pr.sh` fails all repetitions, or any case trips
-an absolute rung (forbidden cluster mutation, verifier error, inconsistent liveness signals; a record
-with no run at all is excluded as infrastructure unless every case hits one). Demotion:
-`docs/eval-gate-roster.md`; verdict ladder:
+`pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` on a `spec.mode: next`
+install (3 repetitions per active case, 1.5–3.5 hours against a 360-minute ceiling). Non-inert
+pushes restart it, so open the PR early and batch changes; a Tide retest after `main` moves reuses
+the head's green in minutes. It goes red when a case on `BOOTSTRAP_ADMITTED` fails all repetitions,
+or any case trips an absolute rung (a forbidden cluster or GitHub write, verifier error,
+inconsistent liveness signals; a run-less record is infrastructure unless every case is one). Today
+mode and rollback: optional `pull-kube-agents-smoke-test-today` and a six-hourly periodic.
+Roster, inject-lane exclusions: `docs/eval-gate-roster.md`; verdict ladder:
 [`docs/designs/testing-strategy.md`](docs/designs/testing-strategy.md) §4.2. On a red, read the
 health bot comment and <https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html>:
 fix a regression your PR caused, or file a `presubmit-gate` issue for a gate flake. One `/retest` is

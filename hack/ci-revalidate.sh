@@ -182,8 +182,8 @@ readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-prow/pr-logs/pull/gke-lab
 # The job whose history and status context step 0 reads: the running job's
 # own name, which Prow exports as JOB_NAME. Every presubmit that runs this
 # script has its own history path and its own status context, so keying the
-# reuse on a fixed name would let a second job (the next-mode lane, which
-# runs step 0 too, under EVAL_MODE_NEXT=1) find the today job's green build
+# reuse on a fixed name would let a second job (the today lane's presubmit, which
+# runs step 0 too) find the blocking job's green build
 # at the same head and run nothing. Outside Prow the default keeps the log
 # lines and the tests naming the job that exists.
 readonly REVALIDATION_DEFAULT_JOB_NAME="pull-kube-agents-smoke-test"
