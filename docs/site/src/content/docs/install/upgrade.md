@@ -286,6 +286,11 @@ before it applies.
   describes.
 - **Switching back** to `today` is the same `install.env` edit the other way. Put the Slack app's
   slash commands back too, as that section says.
+- **A mode set on the PlatformAgent by hand** (`kubectl patch`, as 0.9.0 needed) survives upgrades,
+  because Helm sees no change in a value the release already renders. When `install.env` names a
+  mode and the CR carries the other one, the run says so and leaves the CR as it is. To bring them
+  together, patch `spec.mode` on the CR to the mode you want, or apply once with
+  `PLATFORM_AGENT_MODE` set to the mode the CR carries and then again with the one you want.
 
 What a switch changes inside the install is in the design document,
 [`docs/designs/spec-mode-switch.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-mode-switch.md).
