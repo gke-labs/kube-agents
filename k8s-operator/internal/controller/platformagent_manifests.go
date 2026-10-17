@@ -3176,7 +3176,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 	// A kanban card's report back to the gateway conversation it was filed
 	// in rides the same route whenever the gateway arms it, home channel or
-	// not; only the kanban notifier reads this.
+	// not. The kanban notifier routes by this; the cron relay only names it
+	// when it refuses a report for want of a home channel.
 	if a2aAgentSurface(agent) && a2aGchatNotifyArmed(agent) {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformGchat})
 	} else if a2aAgentSurface(agent) && a2aSlackNotifyArmed(agent) {
@@ -3184,7 +3185,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 	// A kanban card's report back to the gateway conversation it was filed
 	// in rides the same route whenever the gateway arms it, home channel or
-	// not; only the kanban notifier reads this.
+	// not. The kanban notifier routes by this; the cron relay only names it
+	// when it refuses a report for want of a home channel.
 	if a2aAgentSurface(agent) && a2aGchatNotifyArmed(agent) {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformGchat})
 	}
