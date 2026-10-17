@@ -381,9 +381,11 @@ CREATE TABLE intercepted_events(
   session_id  TEXT NOT NULL DEFAULT '',  -- the session the inject arrived on, joining the row to GET /v1/sessions/{id}/tasks
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_intercepted_events_session_id
+  ON intercepted_events (session_id);
 ```
 
-For installs with no chat platform enabled (or external callers reaching the loopback `127.0.0.1:8699` listener via `kubectl port-forward <agent-pod> 8699:8699`), `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, and `GET /v1/tasks/{task_id}`) that open `session_kv.db` and `kanban.db` with `?mode=ro`.
+For installs with no chat platform enabled (or external callers reaching the loopback `127.0.0.1:8699` listener via `kubectl port-forward <agent-pod> 8699:8699`), `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, and `GET /v1/tasks/{task_id}`) that open `session_kv.db`, `kanban.db`, and the Hermes session stores (`<agent_home>/state.db` and `<agent_home>/profiles/<profile>/state.db`) with `?mode=ro`, scrubbing worker step text through `AuditRedactor` before returning it. When `GET /v1/sessions/{session_id}/tasks` is called for a dispatched `intercepted_events` triage session before the front door has filed a kanban card, it returns a sibling `routing` object (`profile = "default"`) beside `tasks: []` (`in_progress` while the front-door turn is active, or terminal `completed` / `failed` once `sessions.ended_at` is set or the turn — or a ledger row whose gateway session never started in `state.db` — ages past `PRE_KANBAN_STALE_AFTER_SECONDS`, 900 s; if `<agent_home>/state.db` exists and raises `sqlite3.Error`, `routing` falls back to the ledger-backed object with `live_steps: []` and `routing_error` naming the read error).
 
 ##### Two bounds, not one
 
@@ -405,8 +407,8 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 
 `init_db` runs `ALTER TABLE intercepted_events ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`
 for `session_id` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
-databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id` in place on
-startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
+databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id` and
+`idx_intercepted_events_session_id` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
 `cluster`, `object_uid` or `delivery_error` anywhere in the tree. Those three columns landed
 before the table ever shipped in a release, so the only databases carrying an earlier shape
 without them are pre-0.2.0 dev installs that ran an intermediate commit of the change that

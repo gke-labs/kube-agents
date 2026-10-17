@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import base64
 import hmac
+import importlib.util
 import json
 import os
 import hashlib
@@ -12,6 +14,7 @@ import sqlite3
 import subprocess
 import tempfile
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -19,7 +22,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, NamedTuple, Optional, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import ExitStack, closing
 from pathlib import Path
 
 import logging
@@ -105,6 +108,46 @@ FEED_TASKS_MAX_LIMIT = 200
 TASK_DETAIL_MAX_RUNS = 100
 TASK_DETAIL_MAX_EVENTS = 500
 TASK_DETAIL_MAX_COMMENTS = 200
+TASK_DETAIL_MAX_STEPS = 100
+# `GET /v1/sessions/{session_id}/tasks` is a polling listing route, so each card
+# carries only the newest `SESSION_TASK_LIVE_STEPS_MAX` step previews (`detail`
+# is served only on `GET /v1/tasks/{task_id}`).
+SESSION_TASK_LIVE_STEPS_MAX = 10
+TASK_STEP_ROW_MULTIPLIER = 2
+TASK_STEP_PREVIEW_MAX_CHARS = 240
+TASK_STEP_DETAIL_MAX_CHARS = 4000
+# The user prompt the kanban dispatcher starts a worker session with
+# (`hermes -p <profile> chat -q "work kanban task <id>"`). Used to map a card
+# to its worker session in the profile's `state.db` when `task_runs.metadata`
+# does not record `worker_session_id`.
+WORKER_PROMPT_PREFIX = "work kanban task "
+HERMES_JSON_CONTENT_PREFIX = "\x00json:"
+HERMES_STATE_DB_FILENAME = "state.db"
+# Fail-closed placeholder returned for every worker step kind (`thinking`,
+# `tool_call`, `tool_result`, `reply`) and card text field whenever
+# `AuditRedactor` cannot be loaded or structural recursion exceeds Python's limit.
+WORKER_STEP_WITHHELD = "[withheld: redactor unavailable]"
+PRE_KANBAN_STATUS_IN_PROGRESS = "in_progress"
+PRE_KANBAN_STATUS_COMPLETED = "completed"
+PRE_KANBAN_STATUS_FAILED = "failed"
+# Upper bound for an unclosed front-door routing turn before it is treated as
+# stale rather than permanently `in_progress`. `_start_agent_turn` uses a 300s
+# client-side `urlopen` read timeout, but the Hermes gateway turn can continue
+# running server-side (and a single MCP call in `agents/platform/config.yaml`
+# allows up to 420s: `connect_timeout: 120` + `timeout: 300`), so 900s (15m)
+# gives slow multi-step routing turns headroom before marking them stale.
+PRE_KANBAN_STALE_AFTER_SECONDS = 900.0
+PRE_KANBAN_STALE_ERROR = "front-door routing turn ended without creating a kanban task"
+_REDACTOR_CANDIDATES = (
+    Path("/opt/defaults/plugins/common/redactor.py"),
+    Path(__file__).resolve().parents[2] / "chat" / "defaults" / "plugins" / "common" / "redactor.py",
+)
+_AUDIT_REDACTOR: Any = None
+_AUDIT_REDACTOR_LOADED = False
+_AUDIT_REDACTOR_LOCK = threading.Lock()
+_PROMPT_INDEX_LOCK = threading.Lock()
+# Maps resolved `state.db` path -> `(st_ino, last_seen_id, {task_id: [session_id, ...]})`.
+_PROMPT_INDEX_CACHE: Dict[str, tuple[int, int, Dict[str, list[str]]]] = {}
 # The `status` a feed row reports, derived from what the ledger stored. The
 # first three are the inject route's own answers. `undelivered` is the fourth
 # outcome the ledger can hold on an install with chat enabled: injected, then
@@ -786,6 +829,13 @@ def init_db() -> None:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_intercepted_events_created_at "
                 "ON intercepted_events (created_at)"
+            )
+            # `_is_intercepted_event_session` looks a session up by id on every
+            # poll of a card-less session; without this that is the same full
+            # scan, once per second per poller.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_session_id "
+                "ON intercepted_events (session_id)"
             )
             # Today's alert budget per severity. In the database rather than in
             # memory because this table's whole job is to survive a restart:
@@ -2948,15 +2998,32 @@ def _slack_audit_headline(
     return AuditHeadline(text, issue, ref)
 
 
+def _profile_home(profile: str, data_root: Optional[Path] = None) -> Optional[Path]:
+    """Return the validated directory for `profile` under `data_root` (or `agent_home()`)."""
+    if not _PROFILE_SEGMENT_RE.match(profile):
+        return None
+    root = data_root if data_root is not None else Path(gitops_workspace.agent_home())
+    try:
+        root_resolved = root.resolve()
+        candidate = (
+            root_resolved
+            if profile == DEFAULT_PROFILE
+            else (root_resolved / PROFILES_DIR / profile).resolve()
+        )
+        if candidate != root_resolved and not candidate.is_relative_to(root_resolved):
+            return None
+        return candidate
+    except OSError:
+        return None
+
+
 def _is_fleet_audit_job(profile: str, job_id: str) -> bool:
     """Whether `job_id` in `profile`'s cron roster runs fleet-audit; False when it cannot be read."""
-    if not _PROFILE_SEGMENT_RE.match(profile):
+    home = _profile_home(profile)
+    if home is None:
         return False
     try:
-        from gitops_workspace import agent_home
-
-        base = agent_home() if profile == DEFAULT_PROFILE else os.path.join(agent_home(), PROFILES_DIR, profile)
-        with open(os.path.join(base, *CRON_ROSTER), encoding="utf-8") as handle:
+        with open(home.joinpath(*CRON_ROSTER), encoding="utf-8") as handle:
             store = json.load(handle)
     except Exception as exc:
         logger.warning(f"Audit headline skipped: {profile} cron roster unreadable: {exc}")
@@ -4123,14 +4190,16 @@ def get_alert_quota(day: str = "") -> Dict[str, Any]:
 # the pod (docs/designs/admin-console.md); these are the authenticated reads
 # that path can move onto.
 #
-# Every connection here opens with `mode=ro`, so a bug in a query cannot write
-# to either database. Task rows are returned column by column rather than as
-# `t.*`: Hermes' `tasks` table also carries the claim lock, worker pid and
-# workspace path, which are dispatcher state rather than activity, and a new
-# column upstream does not reach a caller until it is named here. Text fields
-# (`body`, `result`, run summaries, comments, event payloads) are returned as
-# the board holds them; they are model-written and can quote cluster objects,
-# so a caller that renders them treats them as untrusted text.
+# Every connection here opens `session_kv.db`, `kanban.db`, and the Hermes
+# session stores (`<agent_home>/state.db` and `<agent_home>/profiles/<profile>/state.db`)
+# with `mode=ro`, so a bug in a query cannot write to any of those databases.
+# Task rows are returned column by column rather than as `t.*`: Hermes' `tasks`
+# table also carries the claim lock, worker pid and workspace path, which are
+# dispatcher state rather than activity, and a new column upstream does not
+# reach a caller until it is named here. Worker step text (`thinking`,
+# `tool_call`, `tool_result`, `reply`) and card text fields are scrubbed through
+# `AuditRedactor` (and withheld if the redactor cannot be loaded) before leaving
+# the pod; callers that render text fields still treat them as untrusted text.
 # --------------------------------------------------------------------------
 
 
@@ -4275,13 +4344,64 @@ def _read_kanban(read) -> Any:
         raise HTTPException(status_code=503, detail=f"the kanban board could not be read: {exc}") from None
 
 
+_TASK_TEXT_FIELDS = ("title", "body", "result", "summary", "error")
+_RUN_TEXT_FIELDS = ("summary", "error")
+_EVENT_TEXT_FIELDS = ("payload",)
+_COMMENT_TEXT_FIELDS = ("body",)
+
+
+def _scrub_row_fields(row: Dict[str, Any], fields: tuple[str, ...]) -> Dict[str, Any]:
+    for field in fields:
+        val = row.get(field)
+        if isinstance(val, str) and val:
+            row[field] = _scrub_worker_step_text("reply", val)
+    return row
+
+
 def _task_rows(conn: sqlite3.Connection, where: str, params: Sequence[Any], order: str, limit: int) -> Dict[str, Any]:
     rows = [dict(row) for row in conn.execute(f"{_TASK_FEED_SELECT.format(extra='')} {where} ORDER BY {order} LIMIT ?", (*params, limit + 1))]
-    return {"tasks": rows[:limit], "truncated": len(rows) > limit}
+    visible = [_scrub_row_fields(row, _TASK_TEXT_FIELDS) for row in rows[:limit]]
+    return {"tasks": visible, "truncated": len(rows) > limit}
 
 
 def _empty_task_feed() -> Dict[str, Any]:
     return {"tasks": [], "truncated": False, "board": False}
+
+
+def _feed_data_root() -> Path:
+    """The agent data root where `state.db` and `profiles/<profile>/state.db` live."""
+    if KANBAN_DB_PATH:
+        return Path(KANBAN_DB_PATH).parent
+    return Path(gitops_workspace.agent_home())
+
+
+def _session_task_rows(conn: sqlite3.Connection, session_id: str, limit: int) -> Dict[str, Any]:
+    feed = _task_rows(conn, "WHERE t.session_id = ?", (session_id,), "t.created_at, t.id", limit)
+    if not feed["tasks"]:
+        return feed
+    run_cols = {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}
+    meta_select = ", metadata" if "metadata" in run_cols else ", NULL AS metadata"
+    with _WorkerStepReader(_feed_data_root()) as reader:
+        for task in feed["tasks"]:
+            raw_runs = [
+                dict(r)
+                for r in conn.execute(
+                    f"SELECT id, profile, status, started_at, ended_at, outcome, summary, error{meta_select} "
+                    "FROM task_runs WHERE task_id = ? ORDER BY id ASC LIMIT ?",
+                    (str(task["id"]), TASK_DETAIL_MAX_RUNS),
+                )
+            ]
+            steps, steps_truncated = _read_task_worker_steps(
+                str(task["id"]),
+                str(task.get("assignee") or ""),
+                raw_runs,
+                reader=reader,
+                max_steps=SESSION_TASK_LIVE_STEPS_MAX,
+                include_detail=False,
+            )
+            task["live_steps"] = steps
+            task["steps_truncated"] = steps_truncated
+    return feed
 
 
 @app.get("/v1/sessions/{session_id}/tasks", dependencies=[Depends(verify_api_key)])
@@ -4290,12 +4410,23 @@ def list_session_tasks(session_id: str, limit: int = FEED_TASKS_DEFAULT_LIMIT) -
 
     For an event, `session_id` is the ledger row's, and the first card is the
     triage the front door filed; later ones are whatever that work spawned
-    under the same session.
+    under the same session. Each card also carries `live_steps` and
+    `steps_truncated` from the worker's Hermes session (`state.db`).
+
+    When an intercepted event session has no kanban card yet, a sibling
+    `routing` object (`profile = "default"`) is returned beside `tasks: []`
+    from the default profile's `state.db` (`status = "in_progress"` while the
+    front-door routing turn is active, or terminal `"completed"` / `"failed"`
+    once `sessions.ended_at` is set or the routing turn ages past
+    `PRE_KANBAN_STALE_AFTER_SECONDS` without filing a card).
     """
     limit = _clamp_limit(limit, FEED_TASKS_MAX_LIMIT)
-    result = _read_kanban(
-        lambda conn: _task_rows(conn, "WHERE t.session_id = ?", (session_id,), "t.created_at, t.id", limit)
-    )
+    result = _read_kanban(lambda conn: _session_task_rows(conn, session_id, limit))
+    board_exists = result is not None
+    if result is None or not result["tasks"]:
+        routing = _read_pre_kanban_session_task(session_id)
+        if routing is not None:
+            return {"tasks": [], "truncated": False, "board": board_exists, "routing": routing}
     return {**result, "board": True} if result is not None else _empty_task_feed()
 
 
@@ -4321,14 +4452,1117 @@ def list_tasks(since: int = 0, limit: int = FEED_TASKS_DEFAULT_LIMIT, assignee: 
     return {**result, "board": True} if result is not None else _empty_task_feed()
 
 
+def _profile_state_db(data_root: Path, profile: str) -> Optional[Path]:
+    """Return the read-only `state.db` path for `profile` under `data_root`."""
+    home = _profile_home(profile or DEFAULT_PROFILE, data_root)
+    if home is None:
+        return None
+    candidate = home / HERMES_STATE_DB_FILENAME
+    try:
+        return candidate if candidate.is_file() else None
+    except OSError:
+        return None
+
+
+def _get_audit_redactor() -> Any:
+    """Lazily load `AuditRedactor` from the image or checkout plugin directory."""
+    global _AUDIT_REDACTOR, _AUDIT_REDACTOR_LOADED
+    if _AUDIT_REDACTOR_LOADED:
+        return _AUDIT_REDACTOR
+    with _AUDIT_REDACTOR_LOCK:
+        if _AUDIT_REDACTOR_LOADED:
+            return _AUDIT_REDACTOR
+        loaded = None
+        module_name = "kube_agents_session_kv_redactor"
+        for candidate in _REDACTOR_CANDIDATES:
+            if not candidate.is_file():
+                continue
+            try:
+                spec = importlib.util.spec_from_file_location(module_name, candidate)
+                if spec is None or spec.loader is None:
+                    continue
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+                loaded = getattr(module, "AuditRedactor", None)
+                if loaded is not None:
+                    break
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Could not load AuditRedactor from {candidate}: {exc}")
+        _AUDIT_REDACTOR = loaded
+        _AUDIT_REDACTOR_LOADED = True
+        return _AUDIT_REDACTOR
+
+
+_REDACTED_SECRET_MARKER = "[REDACTED_SECRET]"
+_REDACTED_PRIVATE_KEY_MARKER = "[REDACTED_PRIVATE_KEY]"
+_YAML_SECRET_BLOCK_RE = re.compile(r"^(\s*)(data|stringData)\s*:\s*$")
+_YAML_PAIR_RE = re.compile(r"^(\s*)([^\s:]+)\s*:\s*(.*)$")
+_JSON_SECRET_BLOCK_RE = re.compile(r'("(?:data|stringData)"\s*:\s*\{)([^{}]*)(\}|\Z)')
+_JSON_PAIR_RE = re.compile(r'("(?:[^"\\]|\\.)*"\s*:\s*")((?:[^"\\]|\\.)*)("|\Z)')
+_URL_USERINFO_RE = re.compile(r"(://[^\s:/?#@\[\]\"'<>{}\\|^`,;]*:)[^\s/?#\[\]\"'<>{}\\|^`,;]+(?=@)")
+_UNTERMINATED_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----[ \t]*\r?\n[A-Za-z0-9+/=\s]*\Z",
+    re.IGNORECASE,
+)
+_CLI_LONG_FLAG_RE = re.compile(
+    r"(?P<prefix>(?:^|\s)--)(?P<flag>[A-Za-z0-9][A-Za-z0-9_-]*)(?P<sep>[ \t=]+)"
+    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|\S+)"
+)
+_CLI_EXTRA_SECRET_FLAGS = frozenset(
+    {
+        "docker-password",
+        "admin-password",
+        "auth-token",
+        "authtoken",
+        "bearer-token",
+        "passphrase",
+    }
+)
+_CLI_NON_SECRET_FLAGS = frozenset({"with-token"})
+_CLI_USERPASS_FLAG_RE = re.compile(
+    r"\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm(?:\s+registry)?)\s+login)\b[^\r\n;|&]*"
+)
+_CLI_USERPASS_ARG_RE = re.compile(
+    r"(?P<prefix>\s(?:-u|--user)[ \t=]*)"
+    r"(?:(?P<quote>[\"'])(?P<quser>[^:\s\"']+:)(?P<qval>(?:(?!(?P=quote))[^\r\n])+)(?P=quote)"
+    r"|(?P<user>[^:\s\"']+:)(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
+)
+_CLI_SHORT_P_RE = re.compile(
+    r"(?P<prefix>\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm(?:\s+registry)?)\s+login)\b"
+    r"[^\r\n;|&]{0,512}?\s-(?:p|a)[ \t=]*)"
+    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+)"
+)
+_AUTH_SCHEME_HEADER_RE = re.compile(
+    r"(?i)(?P<prefix>[\"']?\bauthorization[\"']?[ \t]*:[ \t]*(?:bearer|basic|token|apikey|api-key|digest|negotiate|aws4-hmac-sha256|mutual)[ \t]+)"
+    r"(?P<val>[^\s\"',}{\[\]\\]+)"
+)
+_TEXT_COLON_KV_RE = re.compile(
+    r"(?m)^(?P<prefix>[ \t]*(?:-[ \t]+)?[\"']?)(?P<key>[\w.\-]+)(?P<sep>[\"']?[ \t]*:[ \t]*)"
+    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*(?:\"|\Z)|'[^'\r\n]*(?:'|\Z)|[^\s\"',}{\[\]]+)"
+)
+_QUOTED_COLON_KV_RE = re.compile(
+    r"(?P<prefix>[\"'])(?P<key>[\w.\-]+)(?P<sep>(?P=prefix)[ \t]*:[ \t]*)"
+    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*(?:\"|\Z)|'[^'\r\n]*(?:'|\Z)|[^\s\"',}{\[\]]+)"
+)
+_TEXT_EQUALS_KV_RE = re.compile(
+    r"(?<![\w.\-/\"])(?P<prefix>)(?P<key>[\w.\-]+)(?P<sep>[ \t]*=[ \t]*)"
+    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"',}{\[\]]+)"
+)
+_SUPPLEMENT_BLOCK_SCALAR_RE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)(?:-[ \t]+)?[\"']?(?P<key>[\w.\-]+)[\"']?[ \t]*:[ \t]*[|>][+-]?[0-9]?[+-]?[ \t]*\r?\n"
+    r"(?P<body>(?:(?:[ \t]*\r?\n)*(?P=indent)[ \t]+[^\r\n]*(?:\r?\n|$))+)"
+)
+_SUPPLEMENT_ENV_BLOCK_RE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)(?:-[ \t]+)?name:[ \t]*(?P<nq>[\"']?)(?P<name>[\w.\-]+)(?P=nq)"
+    r"[ \t]*\r?\n(?P=indent)(?P<keyindent>[ \t]*)value:[ \t]*[|>][+-]?[0-9]?[+-]?[ \t]*\r?\n"
+    r"(?P<body>(?:(?:[ \t]*\r?\n)*(?P=indent)(?P=keyindent)[ \t]+[^\r\n]*(?:\r?\n|$))+)"
+)
+_SUPPLEMENT_ENV_YAML_PATTERNS = (
+    re.compile(
+        r"(?m)^(?P<indent>[ \t]*)(?:-[ \t]+)?name:[ \t]*(?P<nq>[\"']?)(?P<name>[\w.\-]+)(?P=nq)"
+        r"[ \t]*\r?\n(?P=indent)[ \t]*value:[ \t]*(?P<value>(?:\S[^\r\n]*)?)(?=\r?$)"
+    ),
+    re.compile(
+        r"(?m)^(?P<indent>[ \t]*)(?:-[ \t]+)?value:[ \t]*(?P<value>(?:\S[^\r\n]*)?)\r?\n"
+        r"(?P=indent)[ \t]*name:[ \t]*(?P<nq>[\"']?)(?P<name>[\w.\-]+)(?P=nq)[ \t]*(?=\r?$)"
+    ),
+)
+_KEY_DATA_WORDS = ({"key", "data"}, {"certificate", "data"})
+_SENSITIVE_KEY_SUFFIXES = (
+    ".key",
+    ".pem",
+    ".crt",
+    ".p12",
+    ".pfx",
+    ".dockercfg",
+    ".dockerconfigjson",
+    "privatekey",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+)
+_BASE64_SECRET_VALUE_RE = re.compile(r"^[A-Za-z0-9+/]{4,}={0,2}$")
+_INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]+\}")
+_SECRET_READ_COMMAND_RE = re.compile(
+    r"(?i)(?:"
+    r"\bkubectl\b[^\r\n]*\bget\s+secrets?\b[^\r\n]*(?:-o\s*(?:jsonpath|go-template|custom-columns)|\|\s*base64\b)"
+    r"|\bjsonpath\s*=\s*['\"]?[^'\"]*\.(?:data|stringData)\b"
+    r"|\bgcloud\s+secrets\s+versions\s+access\b"
+    r"|\baws\s+secretsmanager\s+get-secret-value\b"
+    r"|\bvault\s+(?:kv\s+get|read)\b"
+    r"|\b(?:cat|head|tail|less|more|base64)\b[^\r\n]*/(?:var/run/secrets|etc/kubernetes/pki|etc/ssl/private|\.ssh/id_)[^\r\n]*"
+    r")"
+)
+
+
+def _scrub_secret_blocks(redactor: Any, text: str) -> str:
+    if "data" not in text:
+        return text
+    lines = text.split("\n")
+    block: Optional[int] = None
+    for i, line in enumerate(lines):
+        opener = _YAML_SECRET_BLOCK_RE.match(line)
+        if opener:
+            block = len(opener.group(1))
+            continue
+        if block is None or not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= block:
+            block = None
+            continue
+        pair = _YAML_PAIR_RE.match(line)
+        if pair is None:
+            lines[i] = " " * indent + _REDACTED_SECRET_MARKER
+        elif pair.group(3):
+            lines[i] = f"{pair.group(1)}{pair.group(2)}: {_REDACTED_SECRET_MARKER}"
+    joined = "\n".join(lines)
+
+    def _mask_json_block(m: "re.Match[str]") -> str:
+        if '"stringData"' not in m.group(1) and not redactor.JSON_CREDENTIAL_KIND_PATTERN.search(joined):
+            return m.group(0)
+        return (
+            m.group(1)
+            + _JSON_PAIR_RE.sub(lambda p: p.group(1) + _REDACTED_SECRET_MARKER + p.group(3), m.group(2))
+            + m.group(3)
+        )
+
+    return _JSON_SECRET_BLOCK_RE.sub(_mask_json_block, joined)
+
+
+def _is_non_credential_key_suffix(redactor: Any, name: str) -> bool:
+    last_word = redactor._last_key_word(name)
+    non_cred_suffixes = getattr(
+        sys.modules.get("kube_agents_session_kv_redactor"),
+        "NON_CREDENTIAL_KEY_SUFFIXES",
+        frozenset({"name", "names", "path", "file", "mode", "ref", "type", "kind"}),
+    )
+    return last_word in non_cred_suffixes
+
+
+def _cli_flag_is_sensitive(redactor: Any, flag: str) -> bool:
+    norm_flag = flag.lower().replace("_", "-")
+    if norm_flag in _CLI_NON_SECRET_FLAGS or _is_non_credential_key_suffix(redactor, norm_flag):
+        return False
+    return norm_flag in _CLI_EXTRA_SECRET_FLAGS or bool(redactor.CREDENTIAL_NAME_PATTERN.match(norm_flag))
+
+
+def _dict_key_needs_supplement(redactor: Any, name: str) -> bool:
+    """Supplemental dictionary key check for keys `AuditRedactor.SENSITIVE_KEYS`
+    does not cover (`client-key-data`, `client-certificate-data`, and `.key`/`.crt`
+    file-name keys)."""
+    if _is_non_credential_key_suffix(redactor, name):
+        return False
+    words = redactor._get_key_words(name)
+    return (
+        any(w <= words for w in _KEY_DATA_WORDS)
+        or name.lower().endswith(_SENSITIVE_KEY_SUFFIXES)
+    )
+
+
+def _named_value_is_sensitive(redactor: Any, name: str) -> bool:
+    if _is_non_credential_key_suffix(redactor, name):
+        return False
+    words = redactor._get_key_words(name)
+    return (
+        bool(words & redactor.SENSITIVE_KEYS)
+        or any(w <= words for w in _KEY_DATA_WORDS)
+        or name.lower().endswith(_SENSITIVE_KEY_SUFFIXES)
+    )
+
+
+def _unquote_token(raw: str) -> str:
+    stripped = raw.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in ("'", '"'):
+        return stripped[1:-1]
+    if len(stripped) >= 1 and stripped[0] in ("'", '"'):
+        return stripped[1:]
+    return stripped
+
+
+def _scrub_supplement_env_pairs(redactor: Any, text: str) -> str:
+    if "name" not in text or "value" not in text:
+        return text
+
+    def _mask_env_block(match: "re.Match[str]") -> str:
+        if not _named_value_is_sensitive(redactor, match.group("name")):
+            return match.group(0)
+        body = match.group("body")
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        if lines and all(line.startswith("[REDACTED_") for line in lines):
+            return match.group(0)
+        body_indent = body[: len(body) - len(body.lstrip(" \t"))]
+        ending = "\n" if body.endswith("\n") else ""
+        return f"{match.group(0)[: match.start('body') - match.start()]}{body_indent}{_REDACTED_SECRET_MARKER}{ending}"
+
+    def _mask_env_span(match: "re.Match[str]", start: int, end: int) -> str:
+        value = match.string[start:end]
+        if not redactor._is_credential_value(value) or not _named_value_is_sensitive(
+            redactor, match.group("name")
+        ):
+            return match.group(0)
+        whole = match.group(0)
+        return f"{whole[:start - match.start()]}{_REDACTED_SECRET_MARKER}{whole[end - match.start():]}"
+
+    def _mask_env_yaml(match: "re.Match[str]") -> str:
+        raw = match.group("value").rstrip()
+        start = match.start("value")
+        if len(raw) > 1 and raw[0] in ("'", '"') and raw[-1] == raw[0]:
+            return _mask_env_span(match, start + 1, start + len(raw) - 1)
+        return _mask_env_span(match, start, start + len(raw))
+
+    def _mask_env_json(match: "re.Match[str]") -> str:
+        return _mask_env_span(match, match.start("value"), match.end("value"))
+
+    text = _SUPPLEMENT_ENV_BLOCK_RE.sub(_mask_env_block, text)
+    for pattern in _SUPPLEMENT_ENV_YAML_PATTERNS:
+        text = pattern.sub(_mask_env_yaml, text)
+    for pattern in getattr(redactor, "ENV_PAIR_JSON_PATTERNS", ()):
+        text = pattern.sub(_mask_env_json, text)
+    return text
+
+
+def _blank_named_values(redactor: Any, text: str) -> str:
+    def _mask_block(match: "re.Match[str]") -> str:
+        if not _named_value_is_sensitive(redactor, match.group("key")):
+            return match.group(0)
+        body = match.group("body")
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        if lines and all(line.startswith("[REDACTED_") for line in lines):
+            return match.group(0)
+        body_indent = body[: len(body) - len(body.lstrip(" \t"))]
+        ending = "\n" if body.endswith("\n") else ""
+        head = match.group(0)[: match.start("body") - match.start()]
+        return f"{head}{body_indent}{_REDACTED_SECRET_MARKER}{ending}"
+
+    def _mask_colon_kv(match: "re.Match[str]") -> str:
+        key = match.group("key")
+        if _named_value_is_sensitive(redactor, key) and redactor._is_credential_value(
+            _unquote_token(match.group("val"))
+        ):
+            return f"{match.group('prefix')}{key}{match.group('sep')}{_REDACTED_SECRET_MARKER}"
+        return match.group(0)
+
+    def _mask_equals_kv(match: "re.Match[str]") -> str:
+        key = match.group("key")
+        raw_val = match.group("val")
+        unquoted = _unquote_token(raw_val)
+        if _named_value_is_sensitive(redactor, key) and redactor._is_credential_value(unquoted):
+            return f"{match.group('prefix')}{key}{match.group('sep')}{_REDACTED_SECRET_MARKER}"
+        if "=" in unquoted:
+            rescanned = _TEXT_EQUALS_KV_RE.sub(_mask_equals_kv, unquoted)
+            if rescanned != unquoted:
+                if len(raw_val) >= 2 and raw_val[0] == raw_val[-1] and raw_val[0] in ("'", '"'):
+                    return f"{match.group('prefix')}{key}{match.group('sep')}{raw_val[0]}{rescanned}{raw_val[0]}"
+                return f"{match.group('prefix')}{key}{match.group('sep')}{rescanned}"
+        return match.group(0)
+
+    def _mask_long_flag(match: "re.Match[str]") -> str:
+        flag = match.group("flag")
+        raw_val = match.group("val")
+        unquoted = _unquote_token(raw_val)
+        if unquoted.startswith("-"):
+            return match.group(0)
+        if _cli_flag_is_sensitive(redactor, flag) and redactor._is_credential_value(unquoted):
+            return f"{match.group('prefix')}{flag}{match.group('sep')}{_REDACTED_SECRET_MARKER}"
+        return match.group(0)
+
+    def _mask_short_p(match: "re.Match[str]") -> str:
+        unquoted = _unquote_token(match.group("val"))
+        if unquoted.startswith("-") or not redactor._is_credential_value(unquoted):
+            return match.group(0)
+        return f"{match.group('prefix')}{_REDACTED_SECRET_MARKER}"
+
+    def _mask_userpass(match: "re.Match[str]") -> str:
+        quote = match.group("quote") or ""
+        user = match.group("quser") if quote else match.group("user")
+        val = match.group("qval") if quote else _unquote_token(match.group("val"))
+        if val.startswith("-") or not redactor._is_credential_value(val):
+            return match.group(0)
+        return f"{match.group('prefix')}{quote}{user}{_REDACTED_SECRET_MARKER}{quote}"
+
+    def _mask_auth_scheme(match: "re.Match[str]") -> str:
+        val = _unquote_token(match.group("val"))
+        if not redactor._is_credential_value(val):
+            return match.group(0)
+        return f"{match.group('prefix')}{_REDACTED_SECRET_MARKER}"
+
+    text = _scrub_supplement_env_pairs(redactor, text)
+    text = _SUPPLEMENT_BLOCK_SCALAR_RE.sub(_mask_block, text)
+    text = _AUTH_SCHEME_HEADER_RE.sub(_mask_auth_scheme, text)
+    text = _CLI_LONG_FLAG_RE.sub(_mask_long_flag, text)
+    text = _CLI_USERPASS_FLAG_RE.sub(lambda seg: _CLI_USERPASS_ARG_RE.sub(_mask_userpass, seg.group(0)), text)
+    text = _CLI_SHORT_P_RE.sub(_mask_short_p, text)
+    text = _TEXT_COLON_KV_RE.sub(_mask_colon_kv, text)
+    text = _QUOTED_COLON_KV_RE.sub(_mask_colon_kv, text)
+    return _TEXT_EQUALS_KV_RE.sub(_mask_equals_kv, text)
+
+
+def _as_json_structure(text: str) -> Any:
+    if text.lstrip()[:1] not in "{[":
+        return None
+    try:
+        parsed = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, (dict, list)) else None
+
+
+def _is_base64_encoded_secret_value(v: str) -> bool:
+    if len(v) < 4 or len(v) % 4 != 0 or _BASE64_SECRET_VALUE_RE.fullmatch(v) is None:
+        return False
+    try:
+        raw = base64.b64decode(v, validate=True)
+    except ValueError:
+        return False
+    if not raw:
+        return False
+    try:
+        decoded_text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return v.endswith("=")
+    return all(ch.isprintable() or ch in "\n\r\t" for ch in decoded_text)
+
+
+def _is_flat_base64_secret_map(redactor: Any, value: Dict[Any, Any]) -> bool:
+    if not value:
+        return False
+    has_long_or_sensitive = False
+    for k, v in value.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            return False
+        if not _is_base64_encoded_secret_value(v):
+            return False
+        if len(v) >= 16 or _named_value_is_sensitive(redactor, k):
+            has_long_or_sensitive = True
+    return has_long_or_sensitive
+
+
+def _supplement_redact(
+    redactor: Any,
+    value: Any,
+    key: Optional[str] = None,
+    *,
+    is_tool_result: bool = False,
+    parent_is_secret: bool = False,
+) -> Any:
+    if isinstance(value, str):
+        nested = _as_json_structure(value)
+        if nested is not None:
+            return json.dumps(
+                _supplement_redact(redactor, nested, key=None, is_tool_result=is_tool_result)
+            )
+        if is_tool_result and "{" in value and "}" in value:
+
+            def _scrub_inline_obj(m: "re.Match[str]") -> str:
+                obj = _as_json_structure(m.group(0))
+                if isinstance(obj, dict) and _is_flat_base64_secret_map(redactor, obj):
+                    return json.dumps(
+                        {
+                            k: _REDACTED_SECRET_MARKER if isinstance(v, str) else v
+                            for k, v in obj.items()
+                        }
+                    )
+                return m.group(0)
+
+            value = _INLINE_JSON_OBJECT_RE.sub(_scrub_inline_obj, value)
+        text = redactor.PRIVATE_KEY_PATTERN.sub(_REDACTED_PRIVATE_KEY_MARKER, value)
+        text = _UNTERMINATED_PRIVATE_KEY_RE.sub(_REDACTED_PRIVATE_KEY_MARKER, text)
+        text = _URL_USERINFO_RE.sub(lambda m: m.group(1) + _REDACTED_SECRET_MARKER, text)
+        return _blank_named_values(redactor, _scrub_secret_blocks(redactor, text))
+    if isinstance(value, dict):
+        if (
+            key == "stringData"
+            or (key == "data" and parent_is_secret)
+            or (is_tool_result and key is None and _is_flat_base64_secret_map(redactor, value))
+        ):
+            return {
+                k: _REDACTED_SECRET_MARKER
+                if isinstance(v, str)
+                else _supplement_redact(redactor, v, str(k), is_tool_result=is_tool_result)
+                for k, v in value.items()
+            }
+        is_secret_obj = value.get("kind") == "Secret"
+        env_name = value.get("name")
+        is_cred_env = isinstance(env_name, str) and _named_value_is_sensitive(redactor, env_name)
+        return {
+            k: (
+                _REDACTED_SECRET_MARKER
+                if isinstance(v, str)
+                and ((is_cred_env and k == "value") or _dict_key_needs_supplement(redactor, str(k)))
+                and redactor._is_credential_value(v.strip())
+                else _supplement_redact(
+                    redactor,
+                    v,
+                    str(k),
+                    is_tool_result=is_tool_result,
+                    parent_is_secret=is_secret_obj,
+                )
+            )
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_supplement_redact(redactor, v, is_tool_result=is_tool_result) for v in value]
+    return value
+
+
+def _scrub_worker_step_text(kind: str, text: str) -> str:
+    """Scrub worker step text with `AuditRedactor.redact`, then supplemental key/block rules;
+    withhold step text across all kinds if the redactor module is unavailable."""
+    redactor = _get_audit_redactor()
+    if redactor is None:
+        return WORKER_STEP_WITHHELD
+    try:
+        parsed = _as_json_structure(text)
+        if parsed is not None:
+            return json.dumps(
+                _supplement_redact(redactor, redactor.redact(parsed), is_tool_result=(kind == "tool_result"))
+            )
+        return str(_supplement_redact(redactor, redactor.redact(text), is_tool_result=(kind == "tool_result")))
+    except RecursionError:
+        return WORKER_STEP_WITHHELD
+
+
+def _decode_hermes_content(content: Any) -> str:
+    if isinstance(content, str) and content.startswith(HERMES_JSON_CONTENT_PREFIX):
+        try:
+            content = json.loads(content[len(HERMES_JSON_CONTENT_PREFIX):])
+        except ValueError:
+            return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(parts)
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    return json.dumps(content, default=str)
+
+
+def _parse_tool_calls(raw: Any) -> list[Dict[str, Any]]:
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+def _is_secret_read_tool_call(raw_args: Any) -> bool:
+    parsed = _as_json_structure(raw_args) if isinstance(raw_args, str) else raw_args
+    if isinstance(parsed, dict):
+        cmd = parsed.get("command") or parsed.get("cmd") or ""
+        if isinstance(cmd, str) and _SECRET_READ_COMMAND_RE.search(cmd):
+            return True
+    elif isinstance(raw_args, str) and _SECRET_READ_COMMAND_RE.search(raw_args):
+        return True
+    return False
+
+
+def _make_worker_step(
+    kind: str,
+    tool: str,
+    text: str,
+    at: Any,
+    *,
+    include_detail: bool = True,
+    withhold: bool = False,
+) -> Dict[str, Any]:
+    cleaned = WORKER_STEP_WITHHELD if withhold else _scrub_worker_step_text(kind, text).strip()
+    if cleaned == WORKER_STEP_WITHHELD or len(cleaned) <= TASK_STEP_PREVIEW_MAX_CHARS:
+        preview = cleaned
+        detail = ""
+    else:
+        preview = cleaned[:TASK_STEP_PREVIEW_MAX_CHARS].rstrip() + "…"
+        detail = cleaned[:TASK_STEP_DETAIL_MAX_CHARS] if include_detail else ""
+    step: Dict[str, Any] = {"kind": kind, "preview": preview}
+    if tool:
+        step["tool"] = tool
+    if detail and include_detail:
+        step["detail"] = detail
+    if at is not None:
+        step["at"] = at
+    return step
+
+
+_WORKER_PROMPT_TASK_RE = re.compile(re.escape(WORKER_PROMPT_PREFIX) + r"([\w-]+)(?![\w-])")
+
+
+def _extract_steps_from_conn(
+    sconn: sqlite3.Connection,
+    cols: set[str],
+    session_id: str,
+    window_size: int,
+    *,
+    include_detail: bool = True,
+    raise_on_error: bool = False,
+) -> tuple[list[Dict[str, Any]], bool]:
+    """Read up to `window_size` newest message rows for `session_id` and return `(steps, rows_clipped)`."""
+    if not cols:
+        return [], False
+    reasoning_col = "reasoning" if "reasoning" in cols else "NULL AS reasoning"
+    tool_call_id_col = "tool_call_id" if "tool_call_id" in cols else "NULL AS tool_call_id"
+    active_clause = " AND COALESCE(active, 1) = 1" if "active" in cols else ""
+    try:
+        msg_rows = sconn.execute(
+            f"SELECT id, role, content, tool_name, tool_calls, {tool_call_id_col}, timestamp, {reasoning_col} "
+            f"FROM messages WHERE session_id = ?{active_clause} ORDER BY id DESC LIMIT ?",
+            (session_id, window_size + 1),
+        ).fetchall()
+    except sqlite3.Error:
+        if raise_on_error:
+            raise
+        return [], False
+    rows_clipped = len(msg_rows) > window_size
+    if rows_clipped:
+        msg_rows = msg_rows[:window_size]
+    steps: list[Dict[str, Any]] = []
+    pending_withhold: list[tuple[Optional[str], bool]] = []
+    for m in reversed(msg_rows):
+        role = m["role"]
+        ts = m["timestamp"]
+        if role == "assistant":
+            reasoning = str(m["reasoning"] or "").strip()
+            if reasoning:
+                steps.append(
+                    _make_worker_step("thinking", "", reasoning, ts, include_detail=include_detail)
+                )
+            tcalls = _parse_tool_calls(m["tool_calls"])
+            if tcalls:
+                pending_withhold = []
+            for tc in tcalls:
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+                name = str(fn.get("name") or "")
+                raw_args = fn.get("arguments")
+                args_str = (
+                    raw_args
+                    if isinstance(raw_args, str)
+                    else (json.dumps(raw_args, default=str) if raw_args is not None else "")
+                )
+                raw_id = tc.get("id") or tc.get("call_id")
+                tc_id = raw_id if isinstance(raw_id, str) and raw_id else None
+                pending_withhold.append((tc_id, _is_secret_read_tool_call(raw_args)))
+                steps.append(
+                    _make_worker_step("tool_call", name, args_str, ts, include_detail=include_detail)
+                )
+            if not tcalls:
+                reply = _decode_hermes_content(m["content"]).strip()
+                if reply:
+                    steps.append(
+                        _make_worker_step("reply", "", reply, ts, include_detail=include_detail)
+                    )
+        elif role == "tool":
+            res_text = _decode_hermes_content(m["content"])
+            row_tc_id = m["tool_call_id"] if isinstance(m["tool_call_id"], str) and m["tool_call_id"] else None
+            withhold_result = False
+            matched_id = False
+            if row_tc_id is not None:
+                for idx, (cid, flag) in enumerate(pending_withhold):
+                    if cid == row_tc_id:
+                        withhold_result = flag
+                        pending_withhold.pop(idx)
+                        matched_id = True
+                        break
+            if not matched_id and pending_withhold:
+                _, withhold_result = pending_withhold.pop(0)
+            steps.append(
+                _make_worker_step(
+                    "tool_result",
+                    str(m["tool_name"] or ""),
+                    res_text,
+                    ts,
+                    include_detail=include_detail,
+                    withhold=withhold_result,
+                )
+            )
+    return steps, rows_clipped
+
+
+def _session_first_order_key(
+    sconn: sqlite3.Connection,
+    cols: set[str],
+    session_id: str,
+) -> tuple[float, int]:
+    """Return `(first_timestamp, first_id)` for `session_id` so multi-run sessions
+    sort chronologically even when only a subset of runs carry `worker_session_id`."""
+    active_clause = " AND COALESCE(active, 1) = 1" if "active" in cols else ""
+    try:
+        row = sconn.execute(
+            f"SELECT id, timestamp FROM messages WHERE session_id = ?{active_clause} ORDER BY id ASC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is None:
+        return (float("inf"), 0)
+    raw_ts = row["timestamp"]
+    ts = float(raw_ts) if isinstance(raw_ts, (int, float)) else float("inf")
+    raw_id = row["id"]
+    msg_id = int(raw_id) if isinstance(raw_id, int) else 0
+    return (ts, msg_id)
+
+
+def _is_intercepted_event_session(session_id: str) -> Optional[Any]:
+    """Return the ledger row's `created_at` when `session_id` was admitted and
+    dispatched (`notified >= 1` or `delivery_error != ''`), or `None` when no
+    dispatched row exists."""
+    if not session_id or not os.path.isfile(SESSION_KV_DB_PATH):
+        return None
+    try:
+        with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
+            row = conn.execute(
+                "SELECT created_at FROM intercepted_events "
+                "WHERE session_id = ? AND (notified >= 1 OR COALESCE(delivery_error, '') != '') "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            return (row["created_at"] or "") if row is not None else None
+    except sqlite3.Error:
+        return None
+
+
+def _is_triage_first_prompt(prompt_text: str) -> bool:
+    """True when the session's initial user message comes from an autonomous triage turn."""
+    lowered = prompt_text.lower()
+    return "triage" in lowered or "kanban_create" in lowered
+
+
+def _timestamp_epoch_seconds(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
+def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
+    """Read the front-door routing turn from `default` profile `state.db` before `kanban_create` runs.
+
+    Returned as a sibling `routing` object beside `tasks: []` (attributed to
+    `profile = "default"`, with no synthetic kanban task `id`) so portals do not
+    link a non-existent card id against `GET /v1/tasks/{id}`. Scoped strictly to
+    dispatched triage sessions (`notified >= 1` or `delivery_error != ''` in
+    `intercepted_events` whose `state.db` session title and initial prompt match
+    the triage router) so arbitrary chat conversations in the front-door
+    `state.db` cannot be read even if a caller injects their `session_id`. When
+    `sessions.ended_at` is set, or the session was never closed (or never
+    started in `state.db`) and the turn's start timestamp is older than
+    `PRE_KANBAN_STALE_AFTER_SECONDS`, returns a terminal status (`completed`
+    when the front door produced a reply, or `failed` when a routing turn ended,
+    timed out, or failed to open a gateway session) instead of staying
+    `in_progress` or returning `tasks: []` alone. When `<agent_home>/state.db`
+    exists but raises `sqlite3.Error`, falls back to the ledger-backed object
+    with `live_steps: []` and `routing_error` naming the read error.
+    """
+    ledger_created_at = _is_intercepted_event_session(session_id)
+    if ledger_created_at is None:
+        return None
+    db_path = _profile_state_db(_feed_data_root(), DEFAULT_PROFILE)
+    window_size = SESSION_TASK_LIVE_STEPS_MAX * TASK_STEP_ROW_MULTIPLIER
+    steps: list[Dict[str, Any]] = []
+    rows_clipped = False
+    latest_raw_reply: Optional[str] = None
+    title = _scrub_worker_step_text("reply", f"Triage {session_id}")
+    created_at: Any = None
+    ended_at: Any = None
+    has_session = False
+    state_db_error: Optional[str] = None
+    if db_path is not None:
+        try:
+            with closing(_read_only(str(db_path))) as sconn:
+                sess_cols = {r[1] for r in sconn.execute("PRAGMA table_info(sessions)")}
+                if "id" in sess_cols:
+                    title_col = "title" if "title" in sess_cols else "NULL AS title"
+                    started_col = "started_at" if "started_at" in sess_cols else "NULL AS started_at"
+                    ended_col = "ended_at" if "ended_at" in sess_cols else "NULL AS ended_at"
+                    srow = sconn.execute(
+                        f"SELECT {title_col}, {started_col}, {ended_col} FROM sessions WHERE id = ? LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                    if srow is not None:
+                        has_session = True
+                        if "title" in sess_cols:
+                            raw_title = str(srow["title"] or "")
+                            if not raw_title.startswith("Triage "):
+                                return None
+                            title = _scrub_worker_step_text("reply", raw_title)
+                        created_at = srow["started_at"]
+                        ended_at = srow["ended_at"]
+                msg_cols = {r[1] for r in sconn.execute("PRAGMA table_info(messages)")}
+                if {"session_id", "role", "content"}.issubset(msg_cols):
+                    first_user = sconn.execute(
+                        "SELECT content FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id ASC LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                    if first_user is not None:
+                        first_prompt = _decode_hermes_content(first_user["content"])
+                        if not _is_triage_first_prompt(first_prompt):
+                            return None
+                    active_clause = " AND COALESCE(active, 1) = 1" if "active" in msg_cols else ""
+                    tcalls_col = "tool_calls" if "tool_calls" in msg_cols else "NULL AS tool_calls"
+                    for r in sconn.execute(
+                        f"SELECT content, {tcalls_col} FROM messages "
+                        f"WHERE session_id = ? AND role = 'assistant'{active_clause} "
+                        f"ORDER BY id DESC LIMIT ?",
+                        (session_id, window_size),
+                    ):
+                        if not _parse_tool_calls(r["tool_calls"]):
+                            cand = _decode_hermes_content(r["content"]).strip()
+                            if cand:
+                                latest_raw_reply = cand
+                                break
+                steps, rows_clipped = _extract_steps_from_conn(
+                    sconn,
+                    msg_cols,
+                    session_id,
+                    window_size,
+                    include_detail=False,
+                    raise_on_error=True,
+                )
+                has_session = has_session or bool(steps)
+                if (not has_session or created_at is None) and "session_id" in msg_cols:
+                    mrow = sconn.execute(
+                        "SELECT timestamp FROM messages WHERE session_id = ? ORDER BY id ASC LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                    if mrow is not None:
+                        has_session = True
+                        if created_at is None:
+                            created_at = mrow["timestamp"]
+        except sqlite3.Error as exc:
+            state_db_error = _scrub_worker_step_text("reply", str(exc))
+            steps = []
+            rows_clipped = False
+            latest_raw_reply = None
+            title = _scrub_worker_step_text("reply", f"Triage {session_id}")
+            created_at = None
+            ended_at = None
+            has_session = False
+    if not has_session:
+        ledger_epoch = _timestamp_epoch_seconds(ledger_created_at)
+        if (
+            ledger_epoch is not None
+            and (time.time() - ledger_epoch) > PRE_KANBAN_STALE_AFTER_SECONDS
+        ):
+            failed_routing: Dict[str, Any] = {
+                "title": title,
+                "profile": DEFAULT_PROFILE,
+                "status": PRE_KANBAN_STATUS_FAILED,
+                "session_id": session_id,
+                "created_at": ledger_epoch,
+                "started_at": ledger_epoch,
+                "completed_at": ledger_epoch,
+                "updated_at": ledger_epoch,
+                "summary": None,
+                "result": None,
+                "error": PRE_KANBAN_STALE_ERROR,
+                "live_steps": [],
+                "steps_truncated": False,
+            }
+            if state_db_error is not None:
+                failed_routing["routing_error"] = state_db_error
+            return failed_routing
+        if state_db_error is not None:
+            return {
+                "title": title,
+                "profile": DEFAULT_PROFILE,
+                "status": PRE_KANBAN_STATUS_IN_PROGRESS,
+                "session_id": session_id,
+                "created_at": ledger_epoch,
+                "started_at": ledger_epoch,
+                "completed_at": None,
+                "updated_at": ledger_epoch,
+                "summary": None,
+                "result": None,
+                "error": None,
+                "routing_error": state_db_error,
+                "live_steps": [],
+                "steps_truncated": False,
+            }
+        return None
+    steps_truncated = rows_clipped or len(steps) > SESSION_TASK_LIVE_STEPS_MAX
+    if len(steps) > SESSION_TASK_LIVE_STEPS_MAX:
+        steps = steps[-SESSION_TASK_LIVE_STEPS_MAX:]
+    updated_at = steps[-1].get("at") if steps else created_at
+    reply_step = next((s for s in reversed(steps) if s.get("kind") == "reply"), None)
+    reply_summary = reply_step.get("preview") if reply_step else None
+    live_steps = steps
+
+    status = PRE_KANBAN_STATUS_IN_PROGRESS
+    completed_at: Any = None
+    summary: Optional[str] = None
+    result: Optional[str] = None
+    error: Optional[str] = None
+
+    has_ended = ended_at is not None and str(ended_at).strip() != ""
+    turn_start_epoch = (
+        _timestamp_epoch_seconds(ledger_created_at)
+        or _timestamp_epoch_seconds(created_at)
+        or _timestamp_epoch_seconds(updated_at)
+    )
+    is_stale = (
+        not has_ended
+        and turn_start_epoch is not None
+        and (time.time() - turn_start_epoch) > PRE_KANBAN_STALE_AFTER_SECONDS
+    )
+    if has_ended or is_stale:
+        completed_at = ended_at if has_ended else (updated_at if updated_at is not None else created_at)
+        if reply_step is not None:
+            status = PRE_KANBAN_STATUS_COMPLETED
+            summary = reply_summary
+            result = (
+                _scrub_worker_step_text("reply", latest_raw_reply).strip()
+                if latest_raw_reply
+                else reply_summary
+            )
+        else:
+            status = PRE_KANBAN_STATUS_FAILED
+            error = PRE_KANBAN_STALE_ERROR
+
+    return {
+        "title": title,
+        "profile": DEFAULT_PROFILE,
+        "status": status,
+        "session_id": session_id,
+        "created_at": created_at,
+        "started_at": created_at,
+        "completed_at": completed_at,
+        "updated_at": completed_at if completed_at is not None else updated_at,
+        "summary": summary,
+        "result": result,
+        "error": error,
+        "live_steps": live_steps,
+        "steps_truncated": steps_truncated,
+    }
+
+
+class _WorkerStepReader:
+    """Per-request reader caching profile `state.db` paths, open read-only
+    connections, and `messages` schemas, backed by the process-level incremental
+    dispatcher prompt -> session cache (`_PROMPT_INDEX_CACHE`)."""
+
+    def __init__(self, data_root: Path) -> None:
+        self.data_root = data_root
+        self._stack = ExitStack()
+        self._conns: Dict[str, Optional[sqlite3.Connection]] = {}
+        self._cols: Dict[str, set[str]] = {}
+        self._paths: Dict[str, Optional[Path]] = {}
+
+    def close(self) -> None:
+        self._stack.close()
+
+    def __enter__(self) -> "_WorkerStepReader":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+    def conn_for(self, profile: str) -> tuple[Optional[sqlite3.Connection], set[str]]:
+        if profile in self._conns:
+            return self._conns[profile], self._cols[profile]
+        db_path = _profile_state_db(self.data_root, profile)
+        self._paths[profile] = db_path
+        if db_path is None:
+            self._conns[profile] = None
+            self._cols[profile] = set()
+            return None, set()
+        try:
+            conn = self._stack.enter_context(closing(_read_only(str(db_path))))
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+        except sqlite3.Error:
+            self._conns[profile] = None
+            self._cols[profile] = set()
+            return None, set()
+        self._conns[profile] = conn
+        self._cols[profile] = cols
+        return conn, cols
+
+    def sessions_by_prompt(self, profile: str, task_id: str) -> list[str]:
+        conn, cols = self.conn_for(profile)
+        if conn is None or not cols or not {"id", "session_id", "role", "content"}.issubset(cols):
+            return []
+        db_path = self._paths.get(profile)
+        if db_path is None:
+            return []
+        try:
+            cache_key = str(db_path.resolve())
+            st_ino = db_path.stat().st_ino
+        except OSError:
+            cache_key = str(db_path)
+            st_ino = 0
+        try:
+            max_row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()
+            max_id = int(max_row[0]) if max_row and max_row[0] is not None else 0
+        except sqlite3.Error:
+            return []
+
+        with _PROMPT_INDEX_LOCK:
+            cached = _PROMPT_INDEX_CACHE.get(cache_key)
+            if cached is not None and cached[0] == st_ino and cached[1] <= max_id:
+                last_seen_id = cached[1]
+                index = cached[2]
+            else:
+                last_seen_id = 0
+                index = {}
+
+            if max_id > last_seen_id:
+                try:
+                    rows = conn.execute(
+                        "SELECT id, session_id, content FROM messages "
+                        "WHERE id > ? AND role = 'user' AND content LIKE ? ESCAPE '\\' "
+                        "ORDER BY id ASC",
+                        (last_seen_id, f"%{WORKER_PROMPT_PREFIX}%"),
+                    ).fetchall()
+                except sqlite3.Error:
+                    # A scan that raised indexed nothing: leave `last_seen_id`
+                    # where it was so the next poll retries these rows.
+                    return list(index.get(task_id, ()))
+                for row in rows:
+                    sid = row["session_id"]
+                    if not isinstance(sid, str) or not sid:
+                        continue
+                    content = _decode_hermes_content(row["content"])
+                    for matched_task in _WORKER_PROMPT_TASK_RE.findall(content):
+                        bucket = index.setdefault(matched_task, [])
+                        if sid not in bucket:
+                            bucket.append(sid)
+                _PROMPT_INDEX_CACHE[cache_key] = (st_ino, max_id, index)
+            elif cached is None:
+                _PROMPT_INDEX_CACHE[cache_key] = (st_ino, max_id, index)
+
+            return list(index.get(task_id, ()))
+
+
+def _read_task_worker_steps(
+    task_id: str,
+    assignee: str,
+    runs: Sequence[Dict[str, Any]],
+    *,
+    reader: Optional[_WorkerStepReader] = None,
+    max_steps: int = TASK_DETAIL_MAX_STEPS,
+    include_detail: bool = True,
+) -> tuple[list[Dict[str, Any]], bool]:
+    """Read the worker's live reasoning and tool calls from its profile `state.db`.
+
+    Best-effort: an absent or locked profile store yields no steps rather than
+    failing the card detail read.
+    """
+    if reader is None:
+        with _WorkerStepReader(_feed_data_root()) as owned_reader:
+            return _read_task_worker_steps(
+                task_id,
+                assignee,
+                runs,
+                reader=owned_reader,
+                max_steps=max_steps,
+                include_detail=include_detail,
+            )
+
+    stamped_sessions: list[tuple[str, str]] = []
+    seen_sids: set[str] = set()
+    missing_run_session = not runs
+
+    for run in runs:
+        raw_meta = run.get("metadata")
+        try:
+            meta = json.loads(raw_meta) if isinstance(raw_meta, str) and raw_meta else {}
+        except ValueError:
+            meta = {}
+        sid = meta.get("worker_session_id") if isinstance(meta, dict) else None
+        prof = str(run.get("profile") or assignee or "")
+        if isinstance(sid, str) and sid:
+            if sid not in seen_sids:
+                seen_sids.add(sid)
+                stamped_sessions.append((sid, prof))
+        else:
+            missing_run_session = True
+
+    window_size = max_steps * TASK_STEP_ROW_MULTIPLIER
+    session_chunks: list[tuple[tuple[float, int, int], list[Dict[str, Any]]]] = []
+    rows_clipped = False
+
+    for idx, (sid, profile) in enumerate(stamped_sessions):
+        sconn, cols = reader.conn_for(profile)
+        if sconn is None or not cols:
+            missing_run_session = True
+            continue
+        sess_steps, sess_clipped = _extract_steps_from_conn(
+            sconn, cols, sid, window_size, include_detail=include_detail
+        )
+        if not sess_steps:
+            missing_run_session = True
+            continue
+        order_key = _session_first_order_key(sconn, cols, sid)
+        session_chunks.append(((order_key[0], order_key[1], idx), sess_steps))
+        rows_clipped = rows_clipped or sess_clipped
+
+    if missing_run_session:
+        profiles = list(
+            dict.fromkeys([str(r.get("profile") or assignee or "") for r in runs] + [str(assignee or "")])
+        )
+        base_idx = len(stamped_sessions)
+        offset = 0
+        for profile in profiles:
+            if not profile:
+                continue
+            for sid in reader.sessions_by_prompt(profile, task_id):
+                if sid in seen_sids:
+                    continue
+                seen_sids.add(sid)
+                sconn, cols = reader.conn_for(profile)
+                if sconn is None or not cols:
+                    continue
+                sess_steps, sess_clipped = _extract_steps_from_conn(
+                    sconn, cols, sid, window_size, include_detail=include_detail
+                )
+                if not sess_steps:
+                    continue
+                order_key = _session_first_order_key(sconn, cols, sid)
+                session_chunks.append(((order_key[0], order_key[1], base_idx + offset), sess_steps))
+                rows_clipped = rows_clipped or sess_clipped
+                offset += 1
+
+    session_chunks.sort(key=lambda item: item[0])
+    steps: list[Dict[str, Any]] = []
+    for _, chunk_steps in session_chunks:
+        steps.extend(chunk_steps)
+
+    steps_truncated = rows_clipped or len(steps) > max_steps
+    if len(steps) > max_steps:
+        steps = steps[-max_steps:]
+    return steps, steps_truncated
+
+
 @app.get("/v1/tasks/{task_id}", dependencies=[Depends(verify_api_key)])
 def get_task(task_id: str) -> Dict[str, Any]:
-    """One card with its body, report, runs, events and comments.
+    """One card with its body, report, runs, events, comments and worker steps.
 
     Mirrors the admin console's `task_detail`, less two of its parts: chat
     delivery rows (`kanban_notify_subs` holds chat and user ids) and
-    attachments. Each child list keeps its newest rows under its ceiling, and
-    its `*_truncated` flag says when older ones were cut.
+    attachments. Also reads the worker's Hermes session (`steps`: reasoning,
+    tool calls and tool results) from the assigned profile's `state.db` when
+    present. Each child list keeps its newest rows under its ceiling, and its
+    `*_truncated` flag says when older ones were cut.
     """
 
     def read(conn: sqlite3.Connection) -> Dict[str, Any]:
@@ -4345,27 +5579,42 @@ def get_task(task_id: str) -> Dict[str, Any]:
             rows.reverse()
             return rows, truncated
 
-        runs, runs_truncated = newest(
-            "SELECT id, profile, status, started_at, ended_at, outcome, summary, error "
+        run_cols = {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}
+        meta_select = ", metadata" if "metadata" in run_cols else ", NULL AS metadata"
+        raw_runs, runs_truncated = newest(
+            f"SELECT id, profile, status, started_at, ended_at, outcome, summary, error{meta_select} "
             "FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT ?",
             TASK_DETAIL_MAX_RUNS,
         )
+        steps, steps_truncated = _read_task_worker_steps(
+            str(task["id"]),
+            str(task["assignee"] or ""),
+            raw_runs,
+        )
+        runs = [
+            _scrub_row_fields({k: v for k, v in r.items() if k != "metadata"}, _RUN_TEXT_FIELDS)
+            for r in raw_runs
+        ]
         events, events_truncated = newest(
             "SELECT id, run_id, kind, payload, created_at FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT ?",
             TASK_DETAIL_MAX_EVENTS,
         )
+        events = [_scrub_row_fields(e, _EVENT_TEXT_FIELDS) for e in events]
         comments, comments_truncated = newest(
             "SELECT id, author, body, created_at FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?",
             TASK_DETAIL_MAX_COMMENTS,
         )
+        comments = [_scrub_row_fields(c, _COMMENT_TEXT_FIELDS) for c in comments]
         return {
-            "task": dict(task),
+            "task": _scrub_row_fields(dict(task), _TASK_TEXT_FIELDS),
             "runs": runs,
             "runs_truncated": runs_truncated,
             "events": events,
             "events_truncated": events_truncated,
             "comments": comments,
             "comments_truncated": comments_truncated,
+            "steps": steps,
+            "steps_truncated": steps_truncated,
         }
 
     result = _read_kanban(read)
