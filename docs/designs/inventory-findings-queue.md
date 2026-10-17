@@ -953,7 +953,10 @@ card, written to `/opt/data/INVENTORY.limits.json`. `select` also writes the lis
 publisher `first_report` and class `critical`, right after it claims delivery and before it posts.
 The items count as shown when the report's delivery is claimed, not when it is written, so a report
 that is never claimed leaves them new for the nudge; one claimed and then lost in posting does not. The claim ends the nudge's hold, so a nudge run in the
-moment between the claim and the marks can announce the report's items as new. Marking never holds
+moment between the claim and the marks can announce the report's items as new. Under
+`spec.mode: next`, where the report goes into the conversation the user first wrote in, the marks
+follow the post instead: a claim there is released when the post reached nothing, so only a landed
+post marks the items, and one that may have landed marks none. Marking never holds
 delivery back: a row the queue refuses, such as one it never registered, is skipped, a queue that
 does not answer ends the marking for that delivery, and either goes to the delivery run's stderr. An
 item whose mark failed stays unshown, and the nudge adds it as new later. A paced publisher may

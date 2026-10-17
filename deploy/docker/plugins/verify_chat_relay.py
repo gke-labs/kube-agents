@@ -159,7 +159,7 @@ def main() -> None:
     #    report's selection; a scrubbed one would silently fall back to its
     #    default. Onboarding's delivery under next runs `a2a notify` from the
     #    `oobe` child, which needs the bus and the conversation route's
-    #    platform; scrubbed, it would claim the report and post nothing.
+    #    platform; scrubbed, the report would wait for good.
     for name in (
         "SESSION_KV_API_KEY",
         "CRON_REPORT_RELAY_URL",

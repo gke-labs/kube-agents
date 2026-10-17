@@ -462,7 +462,7 @@ class ConversationRouteTest(unittest.TestCase):
     def test_the_bus_and_the_served_platform_come_from_the_env(self):
         with mock.patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: " slack ", "NATS_URL": "nats://n:4222",
                                           "A2A_BUS_USER": "agent", "NATS_USER": ""}):
-            self.assertEqual(chat_notify.conversations_platform(), "slack")
+            self.assertEqual(chat_notify.gateway_platform(), "slack")
             self.assertEqual(chat_notify.bus_unreachable_reason(), "")
             with mock.patch.dict(os.environ, {"A2A_BUS_USER": "", "NATS_USER": "legacy"}):
                 self.assertEqual(chat_notify.bus_unreachable_reason(), "")

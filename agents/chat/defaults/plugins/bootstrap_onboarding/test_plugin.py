@@ -841,6 +841,25 @@ class ConversationPrimingTest(unittest.TestCase):
             self.assertFalse((self.data_dir / name).exists(), name)
         self.trigger_job.assert_not_called()
 
+    def test_a_new_binding_starts_the_attempt_count_again(self):
+        (self.data_dir / plugin.CONVERSATION_ATTEMPTS_FILE).write_text('{"attempts": 5}', encoding="utf-8")
+        self.assertIsNotNone(self._bridge_call())
+        self.assertFalse((self.data_dir / plugin.CONVERSATION_ATTEMPTS_FILE).exists())
+
+    def test_a_turn_that_takes_the_priming_after_a_greeting_binds_nothing(self):
+        # It passed the greeted check while another turn was priming, and takes the marker after.
+        real_take = plugin._take_priming
+
+        def take_after_greeting(data_dir):
+            (data_dir / plugin.GREETED_MARKER).touch()
+            return real_take(data_dir)
+
+        with mock.patch.object(plugin, "_take_priming", side_effect=take_after_greeting):
+            self.assertIsNone(self._bridge_call())
+        self.assertFalse((self.data_dir / plugin.CONVERSATION_FILE).exists())
+        self.assertFalse((self.data_dir / plugin.PRIMING_MARKER).exists())
+        self.trigger_job.assert_not_called()
+
     def test_already_greeted_is_ignored(self):
         (self.data_dir / plugin.GREETED_MARKER).touch()
         self.assertIsNone(self._bridge_call())

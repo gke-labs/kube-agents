@@ -142,6 +142,10 @@ PRIMING_STALE_SECONDS = 120
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 SCAN_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 CONVERSATION_JOB_ID = "oobe"
+# Delivery's count of posts to the bound conversation that posted nothing
+# (bootstrap_delivery.py, CONVERSATION_ATTEMPTS_FILE). A new binding starts it
+# again, so a re-run after a capped one is not refused on the old count.
+CONVERSATION_ATTEMPTS_FILE = ".bootstrap_conversation_attempts.json"
 
 # The greeting's word ceiling; both bench cases' at-most-sixty-words check holds it.
 GREETING_MAX_WORDS = 60
@@ -432,7 +436,7 @@ def _prime_conversation(data_dir: Path, session_id: str) -> Optional[Dict[str, s
     try:
         chat_notify = _load_image_module(CHAT_NOTIFY_PATH, CHAT_NOTIFY_MODULE)
         route = chat_notify.conversation_route(session_id)
-        served = chat_notify.conversations_platform()
+        served = chat_notify.gateway_platform()
     except Exception as e:
         logger.warning("Could not read the conversation route for %s: %s", session_id, e)
         return None
@@ -450,7 +454,12 @@ def _prime_conversation(data_dir: Path, session_id: str) -> Optional[Dict[str, s
     if not _take_priming(data_dir):
         return None
     try:
+        # Again under the priming marker: a turn that passed the first check
+        # while another was priming must not bind its own chat after it.
+        if (data_dir / ".bootstrap_completed").exists() or (data_dir / GREETED_MARKER).exists():
+            return None
         try:
+            (data_dir / CONVERSATION_ATTEMPTS_FILE).unlink(missing_ok=True)
             _write_conversation(data_dir, route)
         except Exception as e:
             logger.warning("Could not record the onboarding conversation: %s", e)
@@ -500,8 +509,10 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     """Prime first-time onboarding on the opening interactive user turn.
 
     Runs at most ONCE per deployment, the eval seam below aside: an API-server
-    turn naming a live eval request is greeted every time. On the one human
-    turn that primes it, this:
+    turn naming a live eval request is greeted every time. Under spec.mode
+    next a chat turn arrives as an API-server turn and is primed by
+    _prime_conversation instead of the steps below. On the one human turn that
+    primes it on a chat platform, this:
       1. binds the delivery job to this chat and, only if that succeeded,
          marks ``.user_aligned`` so the delivery job may fire against a valid
          target, and makes this chat the home channel if none is configured;

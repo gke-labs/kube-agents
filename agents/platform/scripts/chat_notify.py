@@ -41,8 +41,9 @@ from contextlib import closing
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 #: The Slack platform name, whose threads go out channel-qualified (command).
 SLACK_PLATFORM = "slack"
-# The platform whose gateway conversations a post may go into, home channel or
-# not (platformagent_manifests.go, a2aNotifyConversationsEnvVar).
+# The variable the operator renders whenever the gateway arms its chat.notify
+# route, home channel or not (platformagent_a2a_manifests.go,
+# a2aNotifyConversationsEnvVar): the platform whose backend the gateway holds.
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 # What `a2a notify` needs to reach the bus (a2a/cmd/a2a/main.go, connect): the
 # bus URL and an identity, A2A_BUS_USER or the older NATS_USER.
@@ -110,8 +111,12 @@ def routes(platform: str) -> bool:
     return bool(routed) and platform == routed
 
 
-def conversations_platform() -> str:
-    """The platform whose gateway conversations a post may go into, or "" when none."""
+def gateway_platform() -> str:
+    """The platform whose backend the gateway holds, or "" when it holds none.
+
+    Unlike :func:`routed_platform` this is set with no home channel, so it names
+    the platform whose conversations :func:`conversation_command` can post into.
+    """
     return os.environ.get(NOTIFY_CONVERSATIONS_ENV, "").strip()
 
 

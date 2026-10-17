@@ -1441,7 +1441,8 @@ half a minute of those before giving up. The agent-side callers
 (`agents/platform/scripts/chat_notify.py`) switch on `A2A_NOTIFY_PLATFORM`, which the operator
 renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name, and send to every
 other platform through `hermes send` as before. The kanban notifier's report back to a gateway
-conversation (below) is armed by its own variable, `A2A_NOTIFY_CONVERSATIONS`, which the
+conversation (below), and onboarding's first report into the conversation the user first wrote in,
+are armed by their own variable, `A2A_NOTIFY_CONVERSATIONS`, which the
 operator renders whenever the gateway arms the route: `homeChannel` unset (the route then
 serves conversation requests only) or a space name. The Hermes kanban notifier, which posts a card's events into the thread the card
 subscribes to and wakes its creator when a card blocks or fails, reaches the same route

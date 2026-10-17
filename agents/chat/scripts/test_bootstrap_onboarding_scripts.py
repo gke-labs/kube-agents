@@ -294,6 +294,7 @@ class DeliveryToConversationTest(unittest.TestCase):
         spec.loader.exec_module(plugin)
         self.assertEqual(plugin.CONVERSATION_FILE, bootstrap_delivery.CONVERSATION_FILE)
         self.assertEqual(plugin.CONVERSATION_ALIGNED_MARKER, bootstrap_delivery.CONVERSATION_ALIGNED_MARKER)
+        self.assertEqual(plugin.CONVERSATION_ATTEMPTS_FILE, bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE)
 
     def test_the_report_and_its_note_post_into_the_conversation_once(self):
         self.assertEqual(self._run(), 0)
@@ -407,6 +408,15 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertEqual([c.args[0] for c in delays.call_args_list], list(chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS))
         self.assertFalse((self.d / COMPLETED).exists())
         self.assertEqual(self._attempts()["attempts"], 1)
+
+    def test_an_exit_1_with_no_gateway_answer_posted_nothing(self):
+        # The bus or the login refused it before the gateway saw it.
+        self._answer(1, "", "a2a: notify: the bus refused it, so nothing was posted")
+        self._run()
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+        self.assertEqual(self._attempts()["attempts"], 1)
+        self.assertIn("bus refused", self._attempts()["last_reason"])
 
     def test_findings_are_marked_shown_only_after_the_post(self):
         order = []
