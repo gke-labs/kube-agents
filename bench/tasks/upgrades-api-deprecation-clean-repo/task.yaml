@@ -13,8 +13,11 @@
 # not "which clusters lag" (upgrades-fleet-version-table asks that) but "is the
 # linked GitOps repository ready for the next minor", which the skill's
 # api_deprecation_scan.py answers per repository with the commit it read. The
-# report is graded, not the tool path: an agent that reads the manifests any
-# other way and states the same source and verdict passes.
+# report is graded, and so is one step of the tool path: the scan must have run.
+# The platform persona puts the "repo manifests as of <sha>" wording in every
+# worker's context, so a worker that greps a clone by hand can copy that
+# wording; a hand read reports neither the files it read nor the ones it
+# skipped, so its "clean" cannot be checked.
 #
 # The clean variant. The eval repositories carry no manifest on an apiVersion
 # the next minor removes, so the correct answer is a clean section that names
@@ -76,6 +79,17 @@ verification_spec:
       # so that phrase cannot fail. A report that read the repository another
       # way still has to say which commit its manifests were read at.
       required_phrases: ["manifests as of"]
+  # The routing check. required_runs reads each shell segment of a worker
+  # command as an argv: a run counts when api_deprecation_scan.py is the
+  # command word or follows python3, and not when the segment has -h or
+  # --help, follows python3 -c, or only mentions the script (echo, grep, cat).
+  - name: the-deprecation-scan-ran
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_runs:
+        - script: api_deprecation_scan.py
   - name: the-section-gives-a-verdict
     role: objective
     mode: assert
